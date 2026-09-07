@@ -693,36 +693,41 @@ struct OutlookQueueHandoffTests {
         defer { server.close() }
 
         let f = try fixture(accountId: "graph-handoff-failed-account")
-        let handoffSeed = try seedHeader(f, graphId: "graph-1", rfc: handoffRfc)
-        let unrelatedSeed = try seedHeader(f, graphId: "graph-2", rfc: unrelatedRfc)
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-1", rfc: handoffRfc,
+            destination: Self.firstDestination, isRead: true)
+        var unrelatedSeed = try seedHeader(f, graphId: "graph-2", rfc: unrelatedRfc)
+        unrelatedSeed.isRead = true
+        unrelatedSeed.isFlagged = true
+        let unrelatedOptimistic = unrelatedSeed
+        try await f.pool.writeWithoutTransaction { db in try unrelatedOptimistic.update(db) }
 
-        // NO PROVIDER IS REGISTERED YET, so every gesture is durably queued
-        // before any of them runs. (`NetworkMonitor.checkConnected()` is `true`
-        // in the test process — nothing calls `NetworkMonitor.shared.start()`, so
-        // its mutex keeps its `true` default — and the drain's connectivity guard
-        // therefore always passes. What holds these gestures back is the claim
-        // walk's `providers[op.accountId] != nil`, not connectivity.)
-        //
-        // THE ORDER IS THE FIXTURE. Position 1 is the move whose retirement
-        // re-addresses the follower; position 2 is the unrelated failure that
-        // suppresses the account; positions 3 and 4 are what must NOT run
-        // afterwards — the unrelated follow-up, and the re-addressed follower
-        // this test is about.
-        await AccountManager.shared.move([handoffSeed], to: Self.firstDestination)
-        let optimistic = try rows(f).filter { $0.rfc822MessageId == handoffRfc }
-        #expect(optimistic.count == 1)
-        guard optimistic.count == 1 else { return }
-        await AccountManager.shared.markFlagged([unrelatedSeed], flagged: true)
-        await AccountManager.shared.markRead([unrelatedSeed])
-        await AccountManager.shared.markRead([optimistic[0]])
+        // Seed the gesture result without spawning competing drain tasks. The
+        // explicit drain below owns move → unrelated failure → held followers.
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .move, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markFlagged, messageIds: ["graph-2"],
+                accountId: f.accountId, folderPath: Self.source),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-2"],
+                accountId: f.accountId, folderPath: Self.source),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+        ])
         #expect(try queuedOperationCount(f) == 4,
-                "all four gestures must be queued before the provider exists")
-
+                "all four intentions must be queued before the provider exists")
         let followerOpId = try await f.pool.read { db -> String? in
             try PendingOperation.order(Column("queuePosition").asc).fetchAll(db).last?.id
         }
-        #expect(followerOpId != nil, "the re-addressed follower was not queued last")
+        #expect(followerOpId == ordered.last?.id, "the re-addressed follower was not queued last")
         guard let followerOpId else { return }
+        try #require(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                     "an earlier drain still owns the queue")
 
         await register(server.provider(), f)
         // The FIRST PATCH this server serves fails. Position 2 is the unrelated
@@ -730,7 +735,13 @@ struct OutlookQueueHandoffTests {
         // position 1 is a `POST /move`, not a PATCH.
         server.failNextPatch()
 
+        try #require(server.mutationLog().isEmpty,
+                     "the failure witness must be absent before the owned drain starts")
         await AccountManager.shared.drainPendingQueue()
+        try #require(server.mutationLog().contains("PATCH graph-2"),
+                     "the owned drain never reached the intended failure")
+        try #require(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                     "the owned failing pass has not settled")
 
         // NON-VACUITY, wire side: the move landed and Graph reallocated the id,
         // so a follower left at the pre-move address has a dead id to fail on.
@@ -880,12 +891,20 @@ struct OutlookQueueHandoffTests {
         defer { server.close() }
 
         let f = try fixture(accountId: "graph-handoff-retained")
-        let seeded = try seedHeader(f, graphId: "graph-1", rfc: rfc)
-
-        // NO PROVIDER REGISTERED YET (see T1), so the follower is guaranteed to be claimed in the SAME pass
-        // as the move it is queued behind — the shape in which the lane's
-        // serialization promise is what makes the handoff load-bearing.
-        await AccountManager.shared.move([seeded], to: Self.firstDestination)
+        let seeded = try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-1", rfc: rfc,
+            destination: Self.firstDestination, isRead: true).source
+        _ = try seedSchedule(f, [
+            PendingOperation(
+                type: .move, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+        ])
+        try #require(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                     "an earlier drain still owns the queue")
 
         // THE UNDO STACK, pushed exactly as the swipe pushes it: from the
         // PRE-move snapshot, naming the source address. A committed retirement
@@ -906,16 +925,11 @@ struct OutlookQueueHandoffTests {
         let undoActionId = undoAction.id
         UndoService.shared.push(undoAction)
         defer { UndoService.shared.dismissAll() }
-        let optimistic = try rows(f)
-        #expect(optimistic.count == 1)
-        guard optimistic.count == 1 else { return }
-        await AccountManager.shared.markRead([optimistic[0]])
-
         let queued = try await f.pool.read { db in
-            try PendingOperation.order(Column("createdAt").asc).fetchAll(db)
+            try PendingOperation.order(Column("queuePosition").asc).fetchAll(db)
         }
         #expect(queued.count == 2,
-                "both gestures must be durably queued before the provider exists, or this test proves nothing")
+                "both intentions must be durably queued before the provider exists, or this test proves nothing")
         guard queued.count == 2 else { return }
         let moveOpId = queued.first(where: { $0.type == .move })?.id
         let followerOpId = queued.first(where: { $0.type == .markRead })?.id
@@ -930,7 +944,13 @@ struct OutlookQueueHandoffTests {
         let refuser = HeaderCommitRefuser()
         f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
 
+        try #require(server.mutationLog().isEmpty,
+                     "the failure witness must be absent before the owned drain starts")
         await AccountManager.shared.drainPendingQueue()
+        try #require(server.mutationLog().contains("MOVE graph-1") && refuser.refusals.withLock { $0 } > 0,
+                     "the owned drain never reached the intended failure")
+        try #require(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                     "the owned failing pass has not settled")
 
         // NON-VACUITY: the retirement really was attempted, and really was
         // refused — once per `retryWrite` attempt, and never more. More than
@@ -1117,25 +1137,34 @@ struct OutlookQueueHandoffTests {
         defer { server.close() }
 
         let f = try fixture(accountId: "graph-handoff-read-fault")
-        let seeded = try seedHeader(f, graphId: "graph-1", rfc: rfc)
-
-        // NO PROVIDER REGISTERED YET (see T1), so the move and BOTH followers are
-        // durably queued before anything runs, in gesture order.
-        await AccountManager.shared.move([seeded], to: Self.firstDestination)
-        let optimistic = try rows(f)
-        #expect(optimistic.count == 1)
-        guard optimistic.count == 1 else { return }
-        await AccountManager.shared.markRead([optimistic[0]])
-        await AccountManager.shared.markFlagged([optimistic[0]], flagged: true)
+        try seedOptimisticallyMovedHeader(
+            f, graphId: "graph-1", rfc: rfc,
+            destination: Self.firstDestination, isRead: true, isFlagged: true)
+        // Seed the exact gesture result so the failing pass has one owner.
+        let ordered = try seedSchedule(f, [
+            PendingOperation(
+                type: .move, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.source,
+                destinationPath: Self.firstDestination),
+            PendingOperation(
+                type: .markRead, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+            PendingOperation(
+                type: .markFlagged, messageIds: ["graph-1"],
+                accountId: f.accountId, folderPath: Self.firstDestination),
+        ])
         #expect(try queuedOperationCount(f) == 3,
                 "the move and both followers must be queued offline")
-
         let followerIds = try await f.pool.read { db -> [String] in
             try PendingOperation.order(Column("queuePosition").asc).fetchAll(db)
                 .filter { $0.type != .move }.map(\.id)
         }
+        #expect(followerIds == ordered.filter { $0.type != .move }.map(\.id),
+                "both followers must retain their seeded order")
         #expect(followerIds.count == 2, "both followers must be queued: \(followerIds)")
         guard followerIds.count == 2 else { return }
+        try #require(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                     "an earlier drain still owns the queue")
 
         await register(server.provider(), f)
         // The FIRST follower's PATCH is refused once. The move ahead of it
@@ -1143,7 +1172,13 @@ struct OutlookQueueHandoffTests {
         // hands back; the refusal then defers that whole chain to the tail, which
         // is the write this test is about.
         server.failNextPatch()
+        try #require(server.mutationLog().isEmpty,
+                     "the failure witness must be absent before the owned drain starts")
         await AccountManager.shared.drainPendingQueue()
+        try #require(server.mutationLog().contains("PATCH \(liveId(server, rfc: rfc) ?? "<missing>")"),
+                     "the owned drain never reached the intended failure")
+        try #require(await AccountManager.shared.pendingQueueIsQuiescentForTesting(),
+                     "the owned failing pass has not settled")
 
         // NON-VACUITY: the handoff really happened, so there is a proven address
         // for the deferral to be able to revert.
