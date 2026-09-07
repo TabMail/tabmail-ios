@@ -3489,80 +3489,13 @@ extension AccountManager {
     /// ⚠ CORRECTED (`IOS-GRAPH-002`) — this note used to end "NO PROVIDER
     /// CURRENTLY RETURNS A STRICT SUBSET", and the narrowing path was described
     /// as having no producer. `ExchangeProvider.moveProvingDestinations` IS one:
-    /// a Graph move that fails partway through a batch returns the prefix it
-    /// proved, because each of those members has already had its `id` churned
-    /// and throwing the attempt away would discard the very addresses the wire
-    /// just supplied. So the narrowing path is live, not merely contractual.
+    /// a Graph move attempt settles one native member and carries the address
+    /// returned by that move. The rest remain owed under the same durable row;
+    /// discarding the outcome would lose the address the wire supplied.
     func executeOperation(_ op: PendingOperation, provider: any EmailProvider) async throws -> ExecutedOperation {
-        do {
-            return try await dispatchOperation(op, provider: provider)
-        } catch let report as ProviderMembersDispositioned {
-            // 🚨 THE ONLY PLACE `ProviderMembersDispositioned` IS UNDERSTOOD, AND
-            // IT IS A COMPLETION REPORT, NOT A FAILURE.
-            //
-            // A provider's per-member loop settled the members it names — mutated
-            // or authoritatively gone — and says NOTHING about any member after
-            // them. Those settled members are exactly `provenMembers`, so a report
-            // naming the whole request takes the ordinary whole-op retirement and
-            // a report naming a PREFIX takes `retirePartiallyCompletedOp`: the
-            // same durable row, narrowed to the members still owed, with its id,
-            // its order and its position untouched. What is carried forward on top
-            // is the ATTRIBUTION the `Void`-returning action protocol cannot
-            // express: WHICH of them were gone, so the drain can retire their
-            // confirmed-gone local headers.
-            //
-            // 🚨 A PREFIX IS THE ORDINARY REPORT, NOT AN EXCEPTIONAL STOP.
-            // There is no elapsed-time budget on these loops any more, so nothing
-            // here depends on one running out. `GmailProvider.modifyEachMessage`
-            // and `ExchangeProvider.patchEachMessage` address exactly ONE id per
-            // attempt and then raise this report whenever `ids.count != 1`, so
-            // `dispositionedMemberIds` is a ONE-ELEMENT proper prefix on the FIRST
-            // attempt of every multi-member Gmail or Graph operation. The
-            // narrowing conversion is therefore the COMMON path for that traffic,
-            // not a contingency — scope anything downstream of it accordingly.
-            // A report names the whole request only when the request named a
-            // single member.
-            //
-            // WHY ONE MEMBER PER ATTEMPT, which is what makes the prefix routine
-            // (`MIS-IOS-022`, twice). `withTimeout` resumes this caller with
-            // `TimeoutError` and cancels the operation task second, so anything a
-            // loop is still holding at the deadline is discarded with the
-            // abandoned task, the row is requeued whole, and every retry repeats
-            // the same prefix into the same deadline — the final member never
-            // reaches the provider. A margin measured in ELAPSED TIME cannot close
-            // that: it bounds what an attempt has already spent and nothing bounds
-            // the duration of the request it is about to start, so members that
-            // each fit the deadline still straddle it two at a time. Bounding an
-            // attempt to ONE request makes its exposure equal to the quantity the
-            // deadline actually bounds, and narrowing on the reported prefix is
-            // what turns the starvation into strict per-attempt progress.
-            //
-            // ⚠ IT MUST NOT ESCAPE TO `executeSingleOp`. Out there it would be an
-            // unclassified error, land in the generic transient arm, requeue an
-            // operation whose work is finished, and poison the account for the
-            // rest of the drain. The conversion is here — one wrapper around the
-            // whole dispatch — rather than repeated in each arm, so a new arm
-            // cannot forget it.
-            //
-            // ⚠ NO DESTINATION EVIDENCE, EVER, ON THIS PATH. An absent member
-            // landed nowhere; `provenDestinations` stays empty and
-            // `addressChangesOnMove` stays false, so nothing is re-keyed to an
-            // address no server named. Graph's move arm does NOT come through
-            // here — it returns its outcome rather than throwing, precisely
-            // because it has destinations to report for the members that DID
-            // move.
-            queueLog("[Queue] \(op.type.rawValue) (\(op.messageIds.count) msgs): provider settled \(report.dispositionedMemberIds.count) member(s), \(report.absentMemberIds.count) of them confirmed gone by the server — those members' local headers are retired and any member the loop did not reach stays owed under the same operation")
-            return ExecutedOperation(
-                provenMembers: report.dispositionedMemberIds,
-                provenDestinations: [],
-                confirmedGoneMembers: report.absentMemberIds)
-        }
-    }
-
-    /// The op-type switch `executeOperation` wraps. Split out for exactly one
-    /// reason: `ProviderMembersDispositioned` must be converted in ONE place
-    /// rather than in every arm that can raise it.
-    private func dispatchOperation(_ op: PendingOperation, provider: any EmailProvider) async throws -> ExecutedOperation {
+        let source = ProviderMessageSource(memberIds: op.messageIds, folderPath: op.folderPath,
+                                           admittedUidValidity: op.observedUidValidity)
+        let action: ProviderMessageAction
         switch op.type {
         case .archive, .delete:
             // Legacy enum cases — all new ops use .move. No-op for any stale rows.
@@ -3581,117 +3514,22 @@ extension AccountManager {
             }
             let opAgeMin = Date().timeIntervalSince(op.createdAt) / 60
             queueLog("[MoveTrace] executeOperation.move — msgIds=\(op.messageIds) from=\(op.folderPath) to=\(dest) provider=\(type(of: provider)) accountId=\(op.accountId) opId=\(op.id) retryCount=\(op.retryCount) ageMin=\(String(format: "%.1f", opAgeMin))")
-            if let imap = provider as? IMAPProvider,
-               let admitted = op.observedUidValidity,
-               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
-                let outcome = try await imap.move(
-                    ids: op.messageIds, from: op.folderPath, to: dest,
-                    admittedUidValidity: admittedUInt)
-                queueLog("[MoveTrace] executeOperation.move — completed for \(outcome.provenIds.count)/\(op.messageIds.count) member(s), \(outcome.provenDestinations.count) with a server-named destination address")
-                return ExecutedOperation(
-                    provenMembers: outcome.provenIds,
-                    provenDestinations: outcome.provenDestinations,
-                    addressChangesOnMove: true,
-                    reconcileMoveSource: outcome.requiresSourceReconciliation,
-                    confirmedGoneMembers: outcome.confirmedGoneIds)
-            }
-            // 🚨 THE SIBLING ARM THE `COPYUID` CENSUS NEVER REACHED
-            // (`IOS-GRAPH-002`, `MIS-006` instance 5). Graph reallocates a
-            // message's `id` on every folder move, and this arm used to drop
-            // through to the `Void`-returning protocol call — so the address
-            // the wire had just handed us was thrown away, the local row kept
-            // an id the app itself had invalidated, and the user's NEXT gesture
-            // on that message 404'd and had its `PendingOperation` deleted as
-            // though the provider had said the work was done.
-            //
-            // NO EPOCH GUARD, deliberately and for the same reason
-            // `.addUserLabel` has none: Graph ids are provider-stable resource
-            // ids rather than numbers in a UIDVALIDITY space, so
-            // `admittedOrdinaryActionTargets` records `nil` for Exchange and a
-            // guard modelled on IMAP's would refuse every Outlook move forever.
-            // What replaces it is that the address is re-learned from the
-            // mutation's own response instead of being assumed to survive.
-            if let exchange = provider as? ExchangeProvider {
-                let outcome = try await exchange.moveProvingDestinations(
-                    ids: op.messageIds, from: op.folderPath, to: dest)
-                queueLog("[MoveTrace] executeOperation.move — completed for \(outcome.provenIds.count)/\(op.messageIds.count) member(s), \(outcome.provenDestinations.count) with a server-named destination address")
-                return ExecutedOperation(
-                    provenMembers: outcome.provenIds,
-                    provenDestinations: outcome.provenDestinations,
-                    addressChangesOnMove: true,
-                    confirmedGoneMembers: outcome.confirmedGoneIds)
-            }
-            try await provider.move(ids: op.messageIds, from: op.folderPath, to: dest)
-            queueLog("[MoveTrace] executeOperation.move — completed successfully")
-            return .allMembers
+            action = .move(destination: dest)
         case .markRead:
-            if let imap = provider as? IMAPProvider,
-               let admitted = op.observedUidValidity,
-               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
-                try await imap.markRead(
-                    ids: op.messageIds, folder: op.folderPath,
-                    admittedUidValidity: admittedUInt)
-            } else {
-                try await provider.markRead(ids: op.messageIds, folder: op.folderPath)
-            }
+            action = .read(true)
         case .markUnread:
-            if let imap = provider as? IMAPProvider,
-               let admitted = op.observedUidValidity,
-               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
-                try await imap.markUnread(
-                    ids: op.messageIds, folder: op.folderPath,
-                    admittedUidValidity: admittedUInt)
-            } else {
-                try await provider.markUnread(ids: op.messageIds, folder: op.folderPath)
-            }
+            action = .read(false)
         case .markFlagged:
-            if let imap = provider as? IMAPProvider,
-               let admitted = op.observedUidValidity,
-               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
-                try await imap.markFlagged(
-                    ids: op.messageIds, flagged: true, folder: op.folderPath,
-                    admittedUidValidity: admittedUInt)
-            } else {
-                try await provider.markFlagged(ids: op.messageIds, flagged: true, folder: op.folderPath)
-            }
+            action = .flagged(true)
         case .markUnflagged:
-            if let imap = provider as? IMAPProvider,
-               let admitted = op.observedUidValidity,
-               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
-                try await imap.markFlagged(
-                    ids: op.messageIds, flagged: false, folder: op.folderPath,
-                    admittedUidValidity: admittedUInt)
-            } else {
-                try await provider.markFlagged(ids: op.messageIds, flagged: false, folder: op.folderPath)
-            }
+            action = .flagged(false)
         case .setTag, .removeTag:
-            // Action tags are local-only (ADR-IOS-036). Local state is already
-            // applied at the call site; the op drains to a no-op so legacy
-            // queued rows flush cleanly. No provider write.
-            break
+            // Action tags are local-only; their state was applied at admission.
+            return .allMembers
         case .markReplied:
-            // A1 — `v1.6.38` had a WORKING IMAP `markReplied` (`resolveUID` +
-            // `STORE \Answered`). v3 removed RFC-as-mutation-authority (D4), so
-            // the restoration is the same STORE addressed by the op's own proven
-            // provider address and admitted epoch. An op with no epoch is one
-            // checkpoint A never admits, so this arm is only reached WITH one.
-            if let imap = provider as? IMAPProvider,
-               let admitted = op.observedUidValidity,
-               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
-                try await imap.markReplied(
-                    ids: op.messageIds, folder: op.folderPath,
-                    admittedUidValidity: admittedUInt)
-            }
-            // Gmail/Exchange REST APIs don't support \Answered flag — local state preserved by sync
+            action = .replied
         case .markForwarded:
-            if let imap = provider as? IMAPProvider,
-               let admitted = op.observedUidValidity,
-               let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
-                try await imap.markForwarded(
-                    ids: op.messageIds, folder: op.folderPath,
-                    admittedUidValidity: admittedUInt)
-            }
-            // Gmail/Exchange REST APIs don't support $Forwarded keyword — local state preserved by sync
+            action = .forwarded
         case .saveDraft:
             guard let draftId = op.draftId ?? op.messageIds.first,
                   let instanceEpoch = op.instanceEpoch,
@@ -3730,6 +3568,7 @@ extension AccountManager {
             if DebugModeManager.isLoggingEnabled() {
                 print("[DraftQueue] Retiring save producer \(op.id) with disposition \(disposition)")
             }
+            return .allMembers
         case .deleteDraft:
             guard let encodedId = op.messageIds.first else { return .allMembers }
             let runtimeKind = Self.draftRuntimeIdentityKind(for: provider)
@@ -3765,58 +3604,19 @@ extension AccountManager {
                 throw ProviderError.actionIdentityResolutionFailed(encodedId)
             }
             try await provider.deleteDraft(identity: identity)
-        case .addUserLabel:
-            guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return .allMembers }
-            if let gmail = provider as? GmailProvider {
-                try await gmail.modifyMessage(id: msgId, addLabelIds: [labelId])
-            } else if let exchange = provider as? ExchangeProvider {
-                // 🚨 CLOSES A LIVE NEVER-DROP VIOLATION. This arm used to be
-                // `print("[Queue] addUserLabel not yet supported for Exchange")`
-                // and then fall through to `return .allMembers` — the op was
-                // RETIRED AS SUCCESSFUL having done nothing. That is not a
-                // missing feature, it is exit-2 abuse: nothing provider-
-                // authoritative said the work was done or inapplicable.
-                //
-                // `labelId` is `PendingOperation.userLabelId`, the BARE
-                // `UserLabel.providerLabelId` (D10 / `IOS-LABEL-001`), which on
-                // Outlook is the Graph category name verbatim.
-                //
-                // GMAIL'S SHAPE, NOT IMAP'S — deliberately no
-                // `admittedUidValidity` guard. Graph ids are provider-stable
-                // resource ids, not UIDs in a numbering space; Exchange has no
-                // UIDVALIDITY, and `admittedOrdinaryActionTargets` records `nil`
-                // for it, so requiring one here would refuse every Outlook label
-                // op forever.
-                try await exchange.setUserLabel(
-                    messageId: msgId, category: labelId, add: true)
-            } else if let imap = provider as? IMAPProvider,
-                      let admitted = op.observedUidValidity,
-                      let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
-                // A1 — `v1.6.38`'s IMAP keyword STORE, re-addressed by the op's
-                // own provider address and admitted epoch (see `.markReplied`).
-                try await imap.setUserLabel(
-                    messageId: msgId, keyword: labelId, add: true,
-                    folder: op.folderPath, admittedUidValidity: admittedUInt)
-            }
-        case .removeUserLabel:
-            guard let labelId = op.userLabelId, let msgId = op.messageIds.first else { return .allMembers }
-            if let gmail = provider as? GmailProvider {
-                try await gmail.modifyMessage(id: msgId, removeLabelIds: [labelId])
-            } else if let exchange = provider as? ExchangeProvider {
-                // See the identical comment in `.addUserLabel`, including why
-                // this follows Gmail's shape rather than IMAP's and why the
-                // `print`-and-retire it replaced was a never-drop violation.
-                try await exchange.setUserLabel(
-                    messageId: msgId, category: labelId, add: false)
-            } else if let imap = provider as? IMAPProvider,
-                      let admitted = op.observedUidValidity,
-                      let admittedUInt = UInt32(exactly: admitted), admittedUInt > 0 {
-                try await imap.setUserLabel(
-                    messageId: msgId, keyword: labelId, add: false,
-                    folder: op.folderPath, admittedUidValidity: admittedUInt)
-            }
+            return .allMembers
+        case .addUserLabel, .removeUserLabel:
+            guard let labelId = op.userLabelId, !op.messageIds.isEmpty else { return .allMembers }
+            action = .userLabel(id: labelId, add: op.type == .addUserLabel)
         }
-        return .allMembers
+        let outcome = try await provider.performMessageAction(action, at: source)
+        queueLog("[Queue] \(op.type.rawValue) (\(op.messageIds.count) msgs): provider settled \(outcome.dispositionedMemberIds.count) member(s), \(outcome.confirmedGoneMemberIds.count) confirmed gone, \(outcome.provenDestinations.count) server-named destinations")
+        return ExecutedOperation(
+            provenMembers: outcome.dispositionedMemberIds,
+            provenDestinations: outcome.provenDestinations,
+            addressChangesOnMove: outcome.addressChangesOnMove,
+            reconcileMoveSource: outcome.requiresSourceReconciliation,
+            confirmedGoneMembers: outcome.confirmedGoneMemberIds)
     }
 
     /// The post-connect queue kick: drain whatever the durable action queue
