@@ -11,6 +11,113 @@ import UIKit
 @Suite("Startup failure caller lifetimes", .processGlobalState)
 @MainActor
 struct StartupFailureCallerTests {
+    @Test("APNs token owner refuses failed startup and preserves ready effect ordering")
+    func tokenCallbackGuardsStorageAndRegistration() async throws {
+        for stage in ["probe", "build", "ready"] {
+            let fixture = try StartupReadinessFixture()
+            let startup = fixture.startup(failingAt: stage == "ready" ? nil : stage)
+            let suite = UUID().uuidString
+            let defaults = try #require(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.set("previous-token", forKey: PushConfig.lastDeviceTokenKey)
+            let calls = Mutex<[String]>([])
+            let wrapped = SendableRemovedAccountCleanupDefaults(value: defaults)
+            let service = PushNotificationService(
+                tokenReadiness: { await startup.awaitLaunchReady(background: true) },
+                tokenDefaults: wrapped,
+                mirrorToken: {
+                    #expect(wrapped.value.string(forKey: PushConfig.lastDeviceTokenKey) == "010aff")
+                    calls.withLock { $0.append("mirror") }
+                },
+                registerToken: { token, force in
+                    #expect(token == "010aff" && force)
+                    calls.withLock { $0.append("register") }
+                },
+                reregisterAccounts: { calls.withLock { $0.append("reregister") } }
+            )
+            await service.didReceiveDeviceToken(Data([1, 10, 255]))
+            #expect(calls.withLock { $0 } == (stage == "ready" ? ["mirror", "register", "reregister"] : []))
+            #expect(defaults.string(forKey: PushConfig.lastDeviceTokenKey) == (stage == "ready" ? "010aff" : "previous-token"))
+            #expect(startup.dbReady == (stage == "ready"))
+        }
+    }
+
+    @Test("Foreground notification owner refuses failed startup before merge and sync")
+    func foregroundNotificationGuardsMergeAndSync() async throws {
+        for stage in ["probe", "build", "ready"] {
+            let fixture = try StartupReadinessFixture()
+            let startup = fixture.startup(failingAt: stage == "ready" ? nil : stage)
+            let calls = Mutex<[String]>([])
+            let delegate = NotificationDelegate(
+                readiness: { await startup.awaitLaunchReady(background: true) },
+                action: { _, _, _ in Issue.record("Unexpected notification action") },
+                foregroundMerge: { calls.withLock { $0.append("merge") } },
+                foregroundSync: { calls.withLock { $0.append("sync") } }
+            )
+            await delegate.startForegroundNotificationWork().value
+            #expect(calls.withLock { $0 } == (stage == "ready" ? ["merge", "sync"] : []))
+            #expect(startup.dbReady == (stage == "ready"))
+        }
+    }
+
+    @Test("Checkpoint observer body refuses failed startup before admission and balances ready work")
+    func checkpointGuardsAdmissionAndBalancesWork() async throws {
+        for stage in ["probe", "build", "ready"] {
+            let fixture = try StartupReadinessFixture()
+            let startup = fixture.startup(failingAt: stage == "ready" ? nil : stage)
+            #expect(await startup.ensureDatabaseReady() == (stage == "ready"))
+            let initialWorkCount = DatabaseSuspension.shared.backgroundWorkCountForTesting
+            let calls = Mutex<[String]>([])
+            let finish = Mutex<(@MainActor @Sendable () -> Void)?>(nil)
+            let finished = OneShotGate()
+            let delegate = AppDelegate(
+                checkpointReady: { startup.dbReady },
+                beginAssertion: { expiration in
+                    #expect(DatabaseSuspension.shared.backgroundWorkCountForTesting == initialWorkCount)
+                    finish.withLock { $0 = expiration }
+                    calls.withLock { $0.append("begin") }
+                    return .invalid
+                },
+                endAssertion: { _ in calls.withLock { $0.append("end") }; finished.open() },
+                drain: {
+                    #expect(DatabaseSuspension.shared.backgroundWorkCountForTesting == initialWorkCount + 1)
+                    calls.withLock { $0.append("drain") }
+                },
+                checkpoint: { calls.withLock { $0.append("checkpoint") } }
+            )
+            delegate.startBackgroundCheckpoint()
+            if stage == "ready" {
+                // Admission is synchronous with the observer, before the Task gets an actor turn.
+                #expect(calls.withLock { $0 } == ["begin"])
+                try await withTimeout(seconds: 3) { await finished.wait() }
+                let expiration = try #require(finish.withLock { $0 })
+                expiration()
+                #expect(calls.withLock { $0 } == ["begin", "drain", "checkpoint", "end"])
+            } else {
+                #expect(calls.withLock { $0.isEmpty })
+                #expect(finish.withLock { $0 == nil })
+            }
+            #expect(DatabaseSuspension.shared.backgroundWorkCountForTesting == initialWorkCount)
+        }
+    }
+
+    @Test("Detached embedding startup body refuses failures and initializes after usable readiness")
+    func embeddingGuardsInitialization() async throws {
+        for stage in ["probe", "build", "ready"] {
+            let fixture = try StartupReadinessFixture()
+            let startup = fixture.startup(failingAt: stage == "ready" ? nil : stage)
+            let calls = Mutex(0)
+            await Task.detached(priority: .utility) {
+                await TabMailApp.initializeEmbeddingForTesting(
+                    readiness: { await startup.awaitLaunchReady(background: false, firstPaintTimeoutSeconds: 0) },
+                    initialize: { calls.withLock { $0 += 1 } }
+                )
+            }.value
+            #expect(calls.withLock { $0 } == (stage == "ready" ? 1 : 0))
+            #expect(startup.dbReady == (stage == "ready"))
+        }
+    }
+
     @Test("Every notification action finishes once after either startup failure")
     func notificationActionsFinishAfterStartupFailure() async throws {
         for stage in ["probe", "build"] {
@@ -122,9 +229,12 @@ private final class BackgroundReadinessEvents: Sendable {
     let completions = Mutex<[Bool]>([])
     let schedules = Mutex<[Bool]>([])
     let work = Mutex<[Bool]>([])
+    let workQueries = Mutex(0)
     let expirationEffects = Mutex<[String]>([])
     let expiration = Mutex<(@Sendable () -> Void)?>(nil)
     let cancellationReceived = OneShotGate()
+    let workEntered = OneShotGate()
+    let releaseWork = OneShotGate()
 }
 
 @MainActor
@@ -137,7 +247,8 @@ private final class BackgroundReadinessFixture {
         startup: AppStartup,
         remainingWork: Bool = false,
         connected: Bool = true,
-        pollActive: Bool = false
+        pollActive: Bool = false,
+        pauseWork: Bool = false
     ) {
         let events = BackgroundReadinessEvents()
         self.events = events
@@ -155,8 +266,12 @@ private final class BackgroundReadinessFixture {
         )
         scheduler = SyncScheduler(
             backgroundReadiness: { await startup.awaitLaunchReady(background: true) },
-            backgroundWork: { inboxOnly in events.work.withLock { $0.append(inboxOnly) } },
-            processingHasWork: { remainingWork },
+            backgroundWork: { inboxOnly in
+                events.work.withLock { $0.append(inboxOnly) }
+                events.workEntered.open()
+                if pauseWork { await events.releaseWork.wait() }
+            },
+            processingHasWork: { events.workQueries.withLock { $0 += 1 }; return remainingWork },
             backgroundSchedule: { processing in events.schedules.withLock { $0.append(processing) } },
             refreshNetworkAvailable: connected,
             pollActive: pollActive
@@ -268,6 +383,33 @@ struct BackgroundStartupHandlerTests {
             // Models an already-in-flight retained closure; the OS clears its property on completion.
             try await fixture.expireOffMain()
             try await fixture.assertFailed(processing: processing, initialWorkCount: initialWorkCount)
+        }
+    }
+
+    @Test("Expiration after work entry owns terminal completion and scheduling")
+    func expirationAfterWorkEntryCompletesAndSchedulesOnce() async throws {
+        for processing in [false, true] {
+            let startupFixture = try StartupReadinessFixture()
+            let fixture = BackgroundReadinessFixture(
+                startup: startupFixture.startup(), remainingWork: true, pauseWork: true
+            )
+            let initialWorkCount = DatabaseSuspension.shared.backgroundWorkCountForTesting
+            fixture.start(processing: processing)
+            defer { fixture.events.releaseWork.open() }
+            try await withTimeout(seconds: 3) { await fixture.events.workEntered.wait() }
+            #expect(fixture.events.work.withLock { $0 } == [!processing])
+            #expect(fixture.events.completions.withLock { $0.isEmpty })
+            #expect(DatabaseSuspension.shared.backgroundWorkCountForTesting == initialWorkCount + 1)
+            try await fixture.expireOffMain()
+            #expect(fixture.events.completions.withLock { $0 } == [false])
+            fixture.events.releaseWork.open()
+            try await fixture.join()
+            try await observeStartup { !AccountManagerState.shared.fastSyncModeActive }
+            #expect(fixture.events.completions.withLock { $0 } == [false])
+            #expect(fixture.events.schedules.withLock { $0 } == (processing ? [true] : [false, true]))
+            #expect(fixture.events.work.withLock { $0 } == [!processing])
+            #expect(fixture.events.workQueries.withLock { $0 } == 0)
+            #expect(DatabaseSuspension.shared.backgroundWorkCountForTesting == initialWorkCount)
         }
     }
 

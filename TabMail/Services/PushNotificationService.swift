@@ -199,19 +199,44 @@ actor PushNotificationService {
     /// account from the banner.
     private var hasSucceededConsentScanOnce: Bool = false
 
-    private init() {}
+    #if DEBUG
+    private var tokenReadinessHook: (@Sendable () async -> Bool)?
+    private var tokenDefaultsOverride: SendableRemovedAccountCleanupDefaults?
+    private var tokenMirrorHook: (@Sendable () -> Void)?
+    private var tokenRegisterHook: (@Sendable (String, Bool) async -> Void)?
+    private var tokenReregisterHook: (@Sendable () async -> Void)?
+
+    init(
+        tokenReadiness: @escaping @Sendable () async -> Bool,
+        tokenDefaults: SendableRemovedAccountCleanupDefaults,
+        mirrorToken: @escaping @Sendable () -> Void,
+        registerToken: @escaping @Sendable (String, Bool) async -> Void,
+        reregisterAccounts: @escaping @Sendable () async -> Void
+    ) {
+        deviceId = "test-device"
+        tokenReadinessHook = tokenReadiness
+        tokenDefaultsOverride = tokenDefaults
+        tokenMirrorHook = mirrorToken
+        tokenRegisterHook = registerToken
+        tokenReregisterHook = reregisterAccounts
+    }
+    #endif
+
+    private init() { deviceId = Self.loadDeviceId() }
 
     // MARK: - Device ID
 
     /// Stable device identifier, generated once and persisted in UserDefaults.
-    private(set) var deviceId: String = {
+    private(set) var deviceId: String
+
+    private static func loadDeviceId() -> String {
         if let existing = UserDefaults.standard.string(forKey: PushConfig.deviceIdKey) {
             return existing
         }
         let id = UUID().uuidString
         UserDefaults.standard.set(id, forKey: PushConfig.deviceIdKey)
         return id
-    }()
+    }
 
     // MARK: - Permission & Registration
 
@@ -241,21 +266,39 @@ actor PushNotificationService {
         // early-return guards, and reregisterAllDeviceAccounts has none. The
         // registration waits for usable readiness. A failed launch must not
         // reach registration work that assumes the pool was published.
-        guard await AppStartup.shared.awaitLaunchReady(background: true) else { return }
+        #if DEBUG
+        let usable = if let tokenReadinessHook { await tokenReadinessHook() }
+            else { await AppStartup.shared.awaitLaunchReady(background: true) }
+        #else
+        let usable = await AppStartup.shared.awaitLaunchReady(background: true)
+        #endif
+        guard usable else { return }
         let tokenHex = tokenData.map { String(format: "%02x", $0) }.joined()
         print("[Push] APNs device token: \(tokenHex.prefix(16))...")
         BackgroundSyncLogger.logPush("APNs device token received: \(tokenHex.prefix(16))...")
 
+        #if DEBUG
+        (tokenDefaultsOverride?.value ?? .standard).set(tokenHex, forKey: PushConfig.lastDeviceTokenKey)
+        if let tokenMirrorHook { tokenMirrorHook() } else { NSEDataBridge.mirrorDeviceToken() }
+        if let tokenRegisterHook { await tokenRegisterHook(tokenHex, true) }
+        else { await registerDeviceWithWorker(tokenHex: tokenHex, force: true) }
+        #else
         UserDefaults.standard.set(tokenHex, forKey: PushConfig.lastDeviceTokenKey)
         NSEDataBridge.mirrorDeviceToken()
         await registerDeviceWithWorker(tokenHex: tokenHex, force: true)
+        #endif
         // CRITICAL: the per-(device, account) records are the dispatch path —
         // dispatch prefers them over the legacy device record. On a token
         // rotation we must refresh THEM too, not just the legacy record above,
         // or dispatch keeps firing the stale per-account token (in the stale
         // APNs environment) and every push is silently dropped. Covers both
         // nseCapable=true (visible) and nseCapable=false (silent) accounts.
+        #if DEBUG
+        if let tokenReregisterHook { await tokenReregisterHook() }
+        else { await reregisterAllDeviceAccounts() }
+        #else
         await reregisterAllDeviceAccounts()
+        #endif
     }
 
     /// Called from AppDelegate when APNs registration fails.

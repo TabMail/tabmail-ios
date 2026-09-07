@@ -25,6 +25,49 @@ struct TabMailApp: App {
     @State private var showDelayedSplash = false
     @Environment(\.scenePhase) private var scenePhase
 
+    nonisolated private static func initializeEmbeddingAfterStartup(
+        readiness: @Sendable () async -> Bool = {
+            await AppStartup.shared.awaitLaunchReady(
+                background: false,
+                firstPaintTimeoutSeconds: SyncConfig.embeddingLoadGateTimeoutSeconds
+            )
+        },
+        initialize: @Sendable () -> Void = {
+            // Restored from `v2final` (`e28dd4edb`) — `EmbeddingStartupPolicy`.
+            // An app-hosted XCTest launch would otherwise compile and load the
+            // ~45 MB bundled CoreML model in every unit-test process, for tests
+            // that never embed anything. The unit-test-host policy branch is
+            // absent from Release: the `#else` arm retains the plain call.
+            #if DEBUG
+            let embeddingDecision = EmbeddingStartupPolicy.initializeForAppStartup()
+            if embeddingDecision == .skippedUnitTestHost {
+                BootProfiler.mark("EmbeddingService.initialize() SKIPPED (unit-test host)")
+            }
+            #else
+            EmbeddingService.initialize()
+            #endif
+        }
+    ) async {
+        // background: false → wait for first paint (foreground) so the CoreML
+        // load can't starve the pre-paint merge / first render. On a cold
+        // BACKGROUND launch (no paint) the shorter `embeddingLoadGateTimeoutSeconds`
+        // applies instead of the 8s herd default: just long enough for the
+        // now-unburdened merge to win the CPU, then load — no wasted budget.
+        guard await readiness() else { return }
+        BootProfiler.mark("EmbeddingService.initialize() START (CoreML ~45MB, .utility, post-first-paint)")
+        initialize()
+        BootProfiler.mark("EmbeddingService.initialize() DONE")
+    }
+
+    #if DEBUG
+    nonisolated static func initializeEmbeddingForTesting(
+        readiness: @escaping @Sendable () async -> Bool,
+        initialize: @escaping @Sendable () -> Void
+    ) async {
+        await initializeEmbeddingAfterStartup(readiness: readiness, initialize: initialize)
+    }
+    #endif
+
     init() {
         // First app-code mark — its `+Nms` is the pre-main (dyld / runtime /
         // static-init) cost, usually the biggest single chunk of a cold launch.
@@ -112,31 +155,7 @@ struct TabMailApp: App {
         // `EmbeddingService.shared` and degrade to keyword-only until it lands. Left
         // here (not in body.task) so a cold BACKGROUND launch still loads it.
         Task.detached(priority: .utility) {
-            // background: false → wait for first paint (foreground) so the CoreML
-            // load can't starve the pre-paint merge / first render. On a cold
-            // BACKGROUND launch (no paint) the shorter `embeddingLoadGateTimeoutSeconds`
-            // applies instead of the 8s herd default: just long enough for the
-            // now-unburdened merge to win the CPU, then load — no wasted budget.
-            guard await AppStartup.shared.awaitLaunchReady(
-                background: false,
-                firstPaintTimeoutSeconds: SyncConfig.embeddingLoadGateTimeoutSeconds
-            ) else { return }
-            BootProfiler.mark("EmbeddingService.initialize() START (CoreML ~45MB, .utility, post-first-paint)")
-            // Restored from `v2final` (`e28dd4edb`) — `EmbeddingStartupPolicy`.
-            // An app-hosted XCTest launch would otherwise compile and load the
-            // ~45 MB bundled CoreML model in every unit-test process, for tests
-            // that never embed anything. RELEASE BUILDS HAVE NO SEAM AND NO
-            // BRANCH: the `#else` arm is the plain call, so shipped behaviour is
-            // byte-for-byte what it was.
-            #if DEBUG
-            let embeddingDecision = EmbeddingStartupPolicy.initializeForAppStartup()
-            if embeddingDecision == .skippedUnitTestHost {
-                BootProfiler.mark("EmbeddingService.initialize() SKIPPED (unit-test host)")
-            }
-            #else
-            EmbeddingService.initialize()
-            #endif
-            BootProfiler.mark("EmbeddingService.initialize() DONE")
+            await Self.initializeEmbeddingAfterStartup()
         }
         // SearchIndex's eager init is deliberately NOT here. Its 257k-doc FTS open
         // was landing IN the inbox first-render window (it fired at dbReady, before
