@@ -3719,8 +3719,8 @@ struct OutlookQueueHandoffTests {
         f.pool.add(transactionObserver: refuser, extent: .databaseLifetime)
 
         // THE PROVIDER IS ATTEMPTED AND REFUSES. A 503 on the PATCH is a
-        // connection/transient error, which is the arm that requeues with
-        // `incrementRetryCount: true` — the charge this test follows.
+        // counted provider failure. The executor commits its accounting before
+        // the scheduler's uncharged tail write — the charge this test follows.
         server.failNextPatch()
 
         await AccountManager.shared.drainPendingQueue()
@@ -3742,24 +3742,20 @@ struct OutlookQueueHandoffTests {
             \(String(describing: server.snapshot(providerMessageId: "graph-1")))
             """)
 
-        // NON-VACUITY, the other side: the refusal landed on the two writes the
-        // transient arm makes and on nothing else — one permitted commit, the
-        // drain's own claim, without which nothing was claimed at all, then three
-        // `retryWrite` attempts at moving the chain to the tail and three more at
-        // the requeue that failure falls back to (`MIS-027`).
+        // The claim commits once, then all three attempts to account for the
+        // eligible failure are refused. Scheduler deferral cannot start until
+        // that accounting commits.
         #expect(refuser.allowed.withLock { $0 } == 1, """
             the operation's claim did not commit exactly once: \
             \(refuser.allowed.withLock { $0 })
             """)
-        #expect(refuser.refusals.withLock { $0 } == 6, """
-            the refusal did not land on the tail movement and the requeue that \
-            follows it for exactly three attempts each: \
+        #expect(refuser.refusals.withLock { $0 } == 3, """
+            the refusal did not land on accounting for exactly three attempts: \
             \(refuser.refusals.withLock { $0 })
             """)
 
         // Durable state, read after the drain RETURNED. This process owns the row,
-        // and the charge the transient arm asked for is not on it — the increment
-        // rolled back with the requeue that carried it.
+        // and the earned charge is not on it — its accounting transaction rolled back.
         let held = try await f.pool.read { db in try PendingOperation.fetchOne(db, key: opId) }
         #expect(held?.status == PendingStatus.inFlight.rawValue, """
             the requeue survived a refusal aimed at exactly it, so this test \
@@ -3779,8 +3775,8 @@ struct OutlookQueueHandoffTests {
             a drain taken while the requeue was still refused sent new provider \
             work: \(server.http.servedCallSequence())
             """)
-        #expect(refuser.refusals.withLock { $0 } == 9, """
-            the recovery did not attempt the guarded requeue for exactly its \
+        #expect(refuser.refusals.withLock { $0 } == 6, """
+            the recovery did not attempt the retained accounting for exactly its \
             three attempts: \(refuser.refusals.withLock { $0 })
             """)
         let stillHeld = try await f.pool.read { db in
@@ -3798,7 +3794,7 @@ struct OutlookQueueHandoffTests {
         // The database accepts writes again — the state every live process reaches
         // when it returns to the foreground. Unregistering the provider
         // neutralises the SECOND provider attempt this recovery would otherwise
-        // release, WITHOUT touching the recovery itself: `recoverPendingRequeues`
+        // release, WITHOUT touching the recovery itself: retained failure accounting
         // runs above the claim walk and does not consult the provider registry.
         refuser.disarm()
         await AccountManager.shared.unregisterProviderForTesting(accountId: f.accountId)

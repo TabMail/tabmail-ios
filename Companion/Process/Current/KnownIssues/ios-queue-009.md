@@ -1,3 +1,21 @@
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **Current amendment (2026-09-06): bounded ordinary message-action retries.** The historical
+> no-cap/no-drop statements below no longer describe all ordinary message-action failures.
+> `AccountOperationExecutor` retires an ordinary message action after ten counted no-progress
+> provider failures using the existing `PendingOperation.retryCount`. The unchanged
+> `!SyncEngine.isConnectionError` classifier includes final HTTP 429/5xx and authentication
+> refusals; opaque `AuthError.refreshFailed`, cancellation, local storage failures, unavailable
+> evidence and empty/ambiguous reports remain uncharged. Progress never charges or triggers the
+> cap, and draft producers, Outbox, calendar and AI retries retain their separate policies.
+>
+> The accepted cost is loss of automatic retry after the limit; a user may have to repeat the
+> gesture. Existing historical counts are used without reset. An always-on App Logs error follows
+> the durable retirement commit, before deferred-successor removal and follower admission. A failed
+> terminal write keeps local ownership and stops the drain until recovery, without another wire
+> attempt. This does not add a reauthentication banner or change the historical signal decision.
+> See the fifth runtime exit in
+> [the normative rule](../../../Rules/Active/never-drop-user-intention.md).
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-QUEUE-009
 
 > Routed from `KNOWN_ISSUES.md` line 1208 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).

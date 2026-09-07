@@ -125,8 +125,9 @@ final class AccountOperationExecutor {
     func beginDrain(using manager: isolated AccountManager) { drainContext = DrainContext() }
     func prepareDrain(using manager: isolated AccountManager) { manager.pruneRecentlyCompleted() }
 
-    /// A retirement whose LOCAL write could not commit, kept exactly as the
-    /// provider handed it to us so the next drain can replay it.
+    /// A provider outcome whose LOCAL write could not commit. Full/partial
+    /// cases retain settlement proof; providerFailure retains one eligible failure
+    /// event, whose accounting is evaluated against the live row on replay.
     ///
     /// The wire has already PROVEN the move — Graph answered `2xx` and named
     /// the destination id, or IMAP returned `COPYUID` — and the only thing that
@@ -154,6 +155,8 @@ final class AccountOperationExecutor {
     enum RetainedSettlement: Sendable {
         /// `executeSingleOp`'s whole-op success path.
         case full(op: PendingOperation, executed: ExecutedOperation)
+        /// One eligible provider failure whose local accounting has not committed.
+        case providerFailure(op: PendingOperation)
         /// `retirePartiallyCompletedOp`'s narrowing path.
         ///
         /// `confirmedGoneMembers` is the subset of `provenMembers` the provider
@@ -196,13 +199,14 @@ final class AccountOperationExecutor {
         }
     }
 
-    func recoverPendingSettlement(
+    func recoverPendingSettlement(state: inout AccountManager.QueueDrainState,
                                   using manager: isolated AccountManager) async -> Bool {
         let context = drainContext
         guard let settlement = retainedSettlement else { return true }
         let op: PendingOperation
         switch settlement {
         case .full(let value, _): op = value
+        case .providerFailure(let value): op = value
         case .partial(let value, _, _, _, _, _): op = value
         }
         do {
@@ -216,6 +220,10 @@ final class AccountOperationExecutor {
             let gone: [String]
             let reconcileSource: Bool
             switch settlement {
+            case .providerFailure:
+                let disposition = await settleProviderFailure(op, using: manager)
+                let job = Self.schedulingMetadata(op, accountScopedIds: [])
+                return await manager.applyQueueDisposition(disposition, job: job, state: &state)
             case .full(_, let executed):
                 retired = op
                 result = try await retryWrite(manager.dbPool, label: "Queue") { db in
@@ -569,7 +577,7 @@ final class AccountOperationExecutor {
                         context.diagnosedOpIds.insert(currentOp.id)
                         await manager.logStuckOpDiagnostic(currentOp, error: ProviderError.messageNotFound)
                     }
-                    return .retryLater(scope: .relatedChain, chargeRetry: true)
+                    return .retryLater(scope: .relatedChain, chargeRetry: false)
                 }
                 return await retirePartiallyCompletedOp(
                     currentOp, provenMembers: provenMembers, remaining: remaining,
@@ -796,7 +804,7 @@ final class AccountOperationExecutor {
                         context.diagnosedOpIds.insert(currentOp.id)
                         await manager.logStuckOpDiagnostic(currentOp, error: error)
                     }
-                    return .retryLater(scope: .relatedChain, chargeRetry: true)
+                    return .retryLater(scope: .relatedChain, chargeRetry: false)
                 }
                 // Single-message conflict — drop (server wins)
                 queueLog("[Queue] Conflict: \(opType) — message not found, dropping")
@@ -1060,7 +1068,7 @@ final class AccountOperationExecutor {
                     context.diagnosedOpIds.insert(currentOp.id)
                     await manager.logStuckOpDiagnostic(currentOp, error: error)
                 }
-                return .retryLater(scope: .relatedChain, chargeRetry: true)
+                return .retryLater(scope: .relatedChain, chargeRetry: false)
             }
             // Connection/transient error — reset op to queued and mark account failed.
             // NEVER drop on age alone — transient errors don't confirm the op is stale.
@@ -1098,19 +1106,55 @@ final class AccountOperationExecutor {
                     print("[Queue] \(opType) destination Folder missing locally: \(currentOp.accountId):\(destPath) — op stays queued (local absence is not provider authority)")
                 }
             }
-            // Bump retryCount on each failure so the value matches reality (and
-            // is visible in [QueueDiag] dumps). Previously this stayed at 0
-            // forever, masking the runaway-retry case where we observed
-            // `retryCount=0 ageHours=217` on the same op.
-            //
-            // 🚨 THE CHAIN MOVES TO THE TAIL EVEN THOUGH THE ACCOUNT IS ALREADY
-            // MARKED FAILED, and the redundancy is deliberate. account suppression
-            // is per-drain and this row's position is DURABLE, so without the
-            // move a connection blip would leave a whole gesture parked at the
-            // head of the queue and the NEXT drain would open by re-attempting
-            // it before any newer intention. The deferred set additionally stops
-            // this drain re-claiming it after the account recovers.
-            return .retryLater(scope: .account, chargeRetry: true)
+            // Draft producers keep their separate existing retry policy. Ordinary
+            // message actions count only a provider failure with no member progress.
+            // This deliberately uses the existing transport classifier, not the
+            // broader transient HTTP classifier: final 429/5xx refusals count too.
+            let isDraft = currentOp.type == .saveDraft || currentOp.type == .deleteDraft
+            var chargeRetry = isDraft
+            if !isDraft {
+                let opaqueAuth: Bool
+                if case AuthError.refreshFailed = error { opaqueAuth = true }
+                else { opaqueAuth = false }
+                chargeRetry = !Task.isCancelled && !(error is CancellationError)
+                    && !(error is DatabaseError) && !opaqueAuth
+                    && !SyncEngine.isConnectionError(error)
+                if chargeRetry {
+                    return await settleProviderFailure(currentOp, using: manager)
+                }
+            }
+            return .retryLater(scope: .account, chargeRetry: chargeRetry)
+        }
+    }
+
+    /// Consume one eligible failure against the LIVE durable count. Accounting
+    /// and terminal deletion share one transaction; the scheduler must not charge
+    /// again. A refused transaction keeps this one event in the existing owner.
+    private func settleProviderFailure(_ op: PendingOperation,
+        using manager: isolated AccountManager) async -> QueueAttemptDisposition {
+        do {
+            let retired: Bool? = try await retryWrite(manager.dbPool, label: "Queue provider failure") { db in
+                guard let live = try PendingOperation.fetchOne(db, key: op.id),
+                      live.status != PendingStatus.cancelled.rawValue else { return nil }
+                if live.retryCount >= SyncConfig.pendingOperationServerRefusalRetryLimit - 1 {
+                    return try PendingOperation.deleteOne(db, key: live.id)
+                }
+                try db.execute(sql: "UPDATE pendingOperation SET retryCount = retryCount + 1 WHERE id = ?",
+                    arguments: [live.id])
+                return false
+            }
+            retainedSettlement = nil
+            guard let retired else { return .completed }
+            guard retired else { return .retryLater(scope: .account, chargeRetry: false) }
+            BackgroundSyncLogger.logError(
+                "Message action \(op.type.rawValue) retired after reaching the provider failure retry limit (\(SyncConfig.pendingOperationServerRefusalRetryLimit)); repeat the gesture to try again.",
+                source: "actionQueue")
+            manager.dropDeferredMoveSuccessors(for: op.id)
+            return .completed
+        } catch {
+            retainedSettlement = .providerFailure(op: op)
+            queueLog("[Queue] provider-failure accounting could not commit; retaining ownership until local recovery")
+            return .blockedOnCommit
         }
     }
 

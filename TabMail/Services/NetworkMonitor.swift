@@ -33,6 +33,13 @@ final class NetworkMonitor {
         connectedMutex.withLock { $0 }
     }
 
+    #if DEBUG
+    /// Scoped native fixtures restore the prior cached value after their drain joins.
+    nonisolated static func setConnectedForTesting(_ connected: Bool) {
+        connectedMutex.withLock { $0 = connected }
+    }
+    #endif
+
     /// Read expensive-network flag from any isolation context without MainActor hop.
     nonisolated static func checkExpensive() -> Bool {
         expensiveMutex.withLock { $0 }

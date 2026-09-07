@@ -237,7 +237,7 @@ struct AccountManagerQueueDrainTests {
         // chain move to the tail and are held for the rest of this drain. Every
         // later op that names one of its messages moves WITH it, so none of them
         // can run ahead of it; unrelated mail proceeds.
-        #expect(outcome == .retryLater(scope: .relatedChain, chargeRetry: true))
+        #expect(outcome == .retryLater(scope: .relatedChain, chargeRetry: false))
 
         // The related-chain disposition preserves account availability; the real
         // drain's wire-order tests independently prove the scheduler applies it.
@@ -262,7 +262,7 @@ struct AccountManagerQueueDrainTests {
             restamped createdAt would starve it behind any sibling queued since
             """)
         #expect(retained.status == PendingStatus.queued.rawValue, "an unresolved op must be retryable, not left claimed")
-        #expect(retained.retryCount == op.retryCount + 1)
+        #expect(retained.retryCount == op.retryCount)
     }
 
     // MARK: - 8. GAP1: AppDatabase startup recovery (real initializer) — previous-session residue
@@ -666,13 +666,13 @@ struct AccountManagerQueueDrainTests {
         let context = AccountOperationExecutor.DrainContext()
         let outcome = await executeAndSchedule(op, provider: provider, context: context)
 
-        #expect(outcome == .retryLater(scope: .account, chargeRetry: true))
+        #expect(outcome == .retryLater(scope: .account, chargeRetry: false))
 
         let after = try fetchOp(op.id, pool: pool)
         #expect(after != nil, "the whole op must be reset to queued — a generic transient error is not confirmed staleness, so it must NOT split")
         guard let after else { return }
         #expect(after.status == PendingStatus.queued.rawValue)
-        #expect(after.retryCount == 1)
+        #expect(after.retryCount == 0)
         #expect(after.messageIds == ["A", "B", "C"], "batch stays intact")
 
         let movedAfterFailure = await provider.movedIds
@@ -1062,7 +1062,7 @@ struct AccountManagerQueueDrainTests {
     /// hard-enabled would satisfy the first half and look correct.
     ///
     /// A third phase, between the two, arms a RETRYABLE provider fault so the
-    /// operation is DEFERRED: `outcome=retryLater(scope: TabMail.QueueAttemptDisposition.RetryScope.account, chargeRetry: true)` is the instrument's only positive
+    /// operation is DEFERRED: `outcome=retryLater(scope: TabMail.QueueAttemptDisposition.RetryScope.account, chargeRetry: false)` is the instrument's only positive
     /// statement that an operation yielded, and an all-succeed phase can never
     /// observe it — replacing that interpolation with the literal
     /// `outcome=completed` left every test in the tree green while the exported log
@@ -1186,7 +1186,7 @@ struct AccountManagerQueueDrainTests {
             // describing a wire event that did not happen.
             let armedExpected = [
                 "[Queue] drain pos 1 — executing \(armedInverse) move TRASH→INBOX ids=[m3]",
-                "[Queue] drain pos 1 — executed \(armedInverse) move TRASH→INBOX ids=[m3] outcome=retryLater(scope: TabMail.QueueAttemptDisposition.RetryScope.account, chargeRetry: true)",
+                "[Queue] drain pos 1 — executed \(armedInverse) move TRASH→INBOX ids=[m3] outcome=retryLater(scope: TabMail.QueueAttemptDisposition.RetryScope.account, chargeRetry: false)",
             ]
             let armedObserved = Self.laneOrderEntries(in: AppLogStore.read(channel: .queue))
             #expect(armedObserved == armedExpected,
@@ -1210,7 +1210,7 @@ struct AccountManagerQueueDrainTests {
                     "the tail movement preserves the pair's relative order: \(haltedOp.queuePosition) vs \(heldOp.queuePosition)")
             #expect(haltedOp.status == PendingStatus.queued.rawValue)
             #expect(heldOp.status == PendingStatus.queued.rawValue)
-            #expect(haltedOp.retryCount == 1, "the deferred op was attempted once")
+            #expect(haltedOp.retryCount == 0, "connection failures remain uncharged")
             #expect(heldOp.retryCount == 0,
                     "a follower deferred WITHOUT a provider attempt consumes no retry")
             #expect(haltedOp.everAttempted,
@@ -1452,9 +1452,8 @@ struct AccountManagerQueueDrainTests {
                 the front operation was never claimed, so nothing in this test \
                 distinguishes a stopped drain from a drain that did not run
                 """)
-            #expect(failedOp?.retryCount == 1, """
-                the front operation's provider failure did not charge exactly the \
-                one retry it earned: \(failedOp?.retryCount ?? -1)
+            #expect(failedOp?.retryCount == 0, """
+                the front operation's connection failure must remain uncharged: \(failedOp?.retryCount ?? -1)
                 """)
 
             // 🚨 THE ORACLE. Nothing behind the failure was CLAIMED — so no
@@ -1644,7 +1643,7 @@ struct AccountManagerQueueDrainTests {
     // (`case .networkError(400), .networkErrorWithBody(400, _): return true`),
     // `unclassifiedGmailActionBadRequestKeepsTheDurableOpQueued` fails at
     // `after != nil` — the row is nil, the intention destroyed — and its
-    // `outcome == .retryLater(scope: .relatedChain, chargeRetry: true)` expectation fails with `.proceed`.
+    // `outcome == .retryLater(scope: .relatedChain, chargeRetry: false)` expectation fails with `.proceed`.
     //
     // NON-VACUITY is two-sided and DURABLE + WIRE on every one of the three:
     // each asserts both the row's end state and that its injected response was
@@ -1677,7 +1676,7 @@ struct AccountManagerQueueDrainTests {
             op, provider: server.provider(), context: AccountOperationExecutor.DrainContext()
         )
 
-        #expect(outcome == .retryLater(scope: .account, chargeRetry: true))
+        #expect(outcome == .retryLater(scope: .account, chargeRetry: false))
         let after = try fetchOp(op.id, pool: pool)
         #expect(
             after != nil,
@@ -1765,7 +1764,7 @@ struct AccountManagerQueueDrainTests {
         // The CONTROL: if the terminal classification were over-broad — or if
         // "the row is gone" in the sibling test came from something other than
         // the 400 — this row would be gone too.
-        #expect(outcome == .retryLater(scope: .account, chargeRetry: true))
+        #expect(outcome == .retryLater(scope: .account, chargeRetry: false))
         let after = try fetchOp(op.id, pool: pool)
         #expect(after != nil, "a transient failure must never retire the user's intention")
         guard let after else { return }
