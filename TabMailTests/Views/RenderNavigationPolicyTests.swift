@@ -823,6 +823,23 @@ struct BridgeLivenessBeaconTests {
 @Suite("Committed-document gate — a one-shot belongs to the document that committed")
 struct CommittedDocumentGateTests {
 
+    @Test("The empty view cannot reveal a pending document or consume its eventual reveal")
+    func revealRequiresCommittedContent() {
+        var gate = CommittedDocumentGate()
+        #expect(gate.evaluate(.reveal) == .refuse(.noCommittedDocument))
+        gate.issue(generation: 1)
+        #expect(gate.evaluate(.reveal) == .refuse(.noCommittedDocument))
+        gate.commit(isIssuedLoad: true)
+        #expect(gate.evaluate(.reveal) == .honour)
+        #expect(gate.evaluate(.reveal) == .refuse(.duplicate))
+        gate.issue(generation: 2)
+        #expect(gate.evaluate(.reveal) == .refuse(.duplicate))
+        gate.commit(isIssuedLoad: true)
+        #expect(gate.evaluate(.reveal) == .honour)
+        gate.invalidate()
+        #expect(gate.evaluate(.reveal) == .refuse(.noCommittedDocument))
+    }
+
     /// The production sequence for one load: `wrapAndLoad` hands it to WebKit, then
     /// `didCommit` promotes it. Kept as a helper so every test spells the two events out
     /// separately — running them together is the bug.

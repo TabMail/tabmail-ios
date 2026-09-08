@@ -22,6 +22,28 @@ import JavaScriptCore
 @Suite("Email render pipeline — CSS + JS regressions")
 struct EmailRenderPipelineTests {
 
+    @Test("Long whitespace without a lazy attribute wraps promptly and preserves the body")
+    func longWhitespaceWrapsPromptly() {
+        let body = "<p>Before" + String(repeating: " ", count: 16_000) + "After</p>"
+        let start = ProcessInfo.processInfo.systemUptime
+        let wrapped = EmailHTMLWrapper.wrapHTML(body)
+        let elapsed = ProcessInfo.processInfo.systemUptime - start
+        #expect(wrapped.contains(body))
+        // Deliberately generous: the quadratic implementation takes seconds;
+        // linear wrapping should remain far below this even on a busy simulator.
+        #expect(elapsed < 2, "wrapping whitespace took \(elapsed) seconds")
+    }
+
+    @Test("Lazy attributes are removed while adjacent attributes and unmatched text survive")
+    func lazyAttributeRemovalPreservesSurroundingContent() {
+        let body = #"<img id="first" loading="lazy" alt="sample"><p> loading = "eager" </p>"#
+        let wrapped = EmailHTMLWrapper.wrapHTML(body)
+        #expect(wrapped.contains(#"<img id="first" alt="sample">"#))
+        #expect(wrapped.contains(#"<p> loading = "eager" </p>"#))
+        let spaced = "<img id=\"second\"" + String(repeating: " ", count: 16_000) + "loading = \"lazy\" alt=\"other\">"
+        #expect(EmailHTMLWrapper.wrapHTML(spaced).contains(#"<img id="second" alt="other">"#))
+    }
+
     // MARK: - wrapHTML CSS regressions
 
     @Test("Body has no horizontal or bottom padding (SwiftUI owns the gutters)")
@@ -3113,6 +3135,53 @@ struct EmailRenderPipelineTests {
         }
         """
 
+    @Test("render diagnostics observe font and resource completion without logging request paths")
+    func renderResourceTimingDiagnostics() {
+        let ctx = JSContext()!
+        ctx.evaluateScript(Self.imageDiagnosticHarness)
+        ctx.evaluateScript("""
+            var _resourceCallback;
+            var _fontListeners = {};
+            var _frames = [];
+            function URL(raw) { this.origin = 'https://example.com'; }
+            function PerformanceObserver(callback) {
+                _resourceCallback = callback;
+                this.observe = function(options) {};
+            }
+            function requestAnimationFrame(callback) { _frames.push(callback); }
+            document.readyState = 'loading';
+            document.fonts = {
+                status: 'loading',
+                addEventListener: function(name, callback) { _fontListeners[name] = callback; },
+                ready: { then: function(callback) { callback(); } }
+            };
+            """)
+        ctx.evaluateScript(_imageLoadDiagnosticJS(enabled: true))
+        ctx.evaluateScript("""
+            _resourceCallback({ getEntries: function() { return [{
+                name: 'https://example.com/private-path/font.ttf?token=private-query',
+                initiatorType: 'css', startTime: 12, duration: 850,
+                responseStart: 800, transferSize: 512
+            }]; } });
+            _frames.shift()();
+            _frames.shift()();
+            document.readyState = 'interactive';
+            fireDomContentLoaded();
+            document.fonts.status = 'loaded';
+            _fontListeners.loadingdone();
+            """)
+        #expect(ctx.exception == nil, "timing diagnostic threw: \(ctx.exception?.toString() ?? "")")
+        let logs = ctx.evaluateScript("_logs.join('|')")?.toString() ?? ""
+        #expect(logs.contains("durationMs=850"))
+        #expect(logs.contains("origin=https://example.com"))
+        #expect(!logs.contains("private-path"))
+        #expect(!logs.contains("private-query"))
+        #expect(logs.contains("event=document-start"))
+        #expect(logs.contains("event=second-animation-frame"))
+        #expect(logs.contains("event=fonts-loadingdone"))
+        #expect(logs.contains("event=fonts-ready"))
+    }
+
     @Test("a crafted attribute cannot forge a second diagnostic log line")
     func imageDiagnosticsSanitizeControlCharacters() {
         // `reportInventory` logs EVERY image, loaded or not, so this needs no
@@ -3139,8 +3208,9 @@ struct EmailRenderPipelineTests {
         #expect(ctx.exception == nil, "diagnostic script threw: \(ctx.exception?.toString() ?? "")")
 
         let count = ctx.evaluateScript("_logs.length")?.toInt32() ?? 0
-        // inventory header + 1 image + legacy-background header + 1 background.
-        #expect(count == 4)
+        // Four inventory/background lines, two lifecycle lines, and the
+        // explicit unavailable-resource-observer line in this minimal host.
+        #expect(count == 7)
         // The invariant: NO emitted message can become more than one line, for
         // every terminator the sanitizer claims to cover.
         let multiline = ctx.evaluateScript(

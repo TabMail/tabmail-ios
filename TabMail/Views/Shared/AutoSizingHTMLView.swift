@@ -313,7 +313,13 @@ struct AutoSizingHTMLView: View {
             .task(id: html) {
                 guard headerId != nil else { return }
                 try? await Task.sleep(for: .seconds(4))
-                if !hasRevealed { hasRevealed = true }
+                if !hasRevealed {
+                    if DebugModeManager.isLoggingEnabled() {
+                        let epoch = Int64(Date().timeIntervalSince1970 * 1_000)
+                        print("[RenderTiming native epochMs=\(epoch)] placeholder.safety-timeout taskCancelled=\(Task.isCancelled)")
+                    }
+                    hasRevealed = true
+                }
             }
     }
 }
@@ -479,6 +485,8 @@ private struct HTMLWebView: UIViewRepresentable {
     static let bridgeChannels = _renderBridgeChannels
 
     func makeUIView(context: Context) -> WKWebView {
+        let timing = EmailRenderTiming(id: context.coordinator.webViewId, generation: 0)
+        timing?.mark("webview.create.begin")
         let config = WKWebViewConfiguration()
         // ── P1b render hardening (ADR-IOS-076 decision 1) ──
         // The message document is FULLY attacker-controlled input: anyone who can mail the user
@@ -732,6 +740,7 @@ private struct HTMLWebView: UIViewRepresentable {
         webView.scrollView.isScrollEnabled = false
         webView.scrollView.bounces = false
         webView.navigationDelegate = context.coordinator
+        timing?.mark("webview.create.done")
         return webView
     }
 
@@ -881,6 +890,7 @@ private struct HTMLWebView: UIViewRepresentable {
         /// `loadHTMLString` if a newer load superseded it — so a slow wrap of an
         /// OLD body can't clobber a newer one when the card is rebound mid-wrap.
         var loadGeneration: Int = 0
+        private var renderTiming: EmailRenderTiming?
         /// Arming state AND liveness evidence for the bridge-liveness verdict (P1d).
         /// See `BridgeLivenessBeacon` for the device evidence that moved the arm
         /// from `didFinish` to `didCommit`, and for why every generation it handles
@@ -1213,15 +1223,25 @@ private struct HTMLWebView: UIViewRepresentable {
             loadGeneration &+= 1
             let gen = loadGeneration
             let hasHeader = loadedHeaderId != nil
+            let timing = EmailRenderTiming(id: webViewId, generation: gen)
+            renderTiming = timing
+            timing?.mark("wrap.queued")
             Task { @MainActor in
+                timing?.mark("wrap.main-task.started")
                 let wrapped = await Task.detached(priority: .userInitiated) {
-                    EmailHTMLWrapper.wrapHTML(rawHTML, previewFilename: previewFilename)
+                    let result = EmailHTMLWrapper.wrapHTML(rawHTML, previewFilename: previewFilename, timing: timing)
+                    timing?.mark("wrap.detached.done")
+                    return result
                 }.value
+                timing?.mark("wrap.main-resumed")
                 // A newer load superseded this one (card rebound mid-wrap), or
                 // the web view went away — drop this stale result. Note this
                 // returns BEFORE arming: a wrap that loses the race never arms a
                 // permit, so it cannot leak one.
-                guard self.loadGeneration == gen, let webView = self.webView else { return }
+                guard self.loadGeneration == gen, let webView = self.webView else {
+                    timing?.mark("wrap.discarded")
+                    return
+                }
                 if DebugModeManager.isLoggingEnabled() {
                     // Privacy-safe per-email fingerprint: SHA256 of the wrapped
                     // html, truncated to 8 hex chars (one-way, not reversible to
@@ -1255,7 +1275,9 @@ private struct HTMLWebView: UIViewRepresentable {
                 // running, keeps posting, and keeps its own one-shot slots until
                 // this load actually commits. See `CommittedDocumentGate`.
                 self.documentGate.issue(generation: gen)
+                timing?.mark("loadHTMLString.begin")
                 let navigation = webView.loadHTMLString(wrapped, baseURL: base)
+                timing?.mark("loadHTMLString.returned")
                 self.trackedNavigation = navigation
                 self.trackedGeneration = gen
                 if navigation == nil {
@@ -1574,7 +1596,11 @@ private struct HTMLWebView: UIViewRepresentable {
         /// from the log alone without a rebuild.
         private func navLog(_ line: @autoclosure () -> String) {
             guard DebugModeManager.isLoggingEnabled() else { return }
-            print("[NavPermit id=\(webViewId)] \(line())")
+            let message = line()
+            print("[NavPermit id=\(webViewId)] \(message)")
+            // Existing text includes tracked/committed generation evidence;
+            // the clock is since the latest issued wrap, not proof of identity.
+            renderTiming?.mark("navigation \(message)")
         }
 
         /// A navigation action's URL is SENDER-CONTROLLED. `print` is a
@@ -1806,6 +1832,8 @@ private struct HTMLWebView: UIViewRepresentable {
                 // SwiftUI loading placeholder. Idempotent — reveal() can fire on
                 // re-fits; we only need the first.
                 if dict["revealed"] as? Bool == true {
+                    renderTiming?.mark("reveal.received committedGen=\(documentGate.committedGeneration.map(String.init) ?? "-") wasRevealed=\(hasRevealed)")
+                    guard honourOneShot(.reveal, channel: "heightChanged") else { return }
                     if !hasRevealed { hasRevealed = true }
                     return
                 }
@@ -4194,6 +4222,52 @@ private func imageLoadDiagnosticJS(enabled: Bool) -> String {
                 + 'ms transfer=' + transfer + ' encoded=' + encoded + ' protocol=' + protocol;
         }
 
+        // Observe WebKit's existing requests, including fonts and CSS images.
+        // No probes, resource assignments, or layout mutations. Cross-origin
+        // timing restrictions can leave detailed fields zero/unavailable.
+        var resourceCount = 0;
+        var RESOURCE_LOG_LIMIT = 80;
+        function reportResource(entry) {
+            resourceCount++;
+            if (resourceCount > RESOURCE_LOG_LIMIT) return;
+            var origin = '(unavailable)';
+            try { origin = new URL(entry.name, document.baseURI).origin; } catch (_) {}
+            log('resource kind=' + entry.initiatorType + ' origin=' + origin
+                + ' startMs=' + Math.round(entry.startTime)
+                + ' durationMs=' + Math.round(entry.duration)
+                + ' responseStartMs=' + Math.round(entry.responseStart || 0)
+                + ' transfer=' + (entry.transferSize || 0));
+        }
+        try {
+            if (typeof PerformanceObserver !== 'undefined') {
+                var resourceObserver = new PerformanceObserver(function(list) {
+                    list.getEntries().forEach(reportResource);
+                });
+                resourceObserver.observe({ entryTypes: ['resource'] });
+            } else {
+                log('resource-observer unavailable');
+            }
+        } catch (_) { log('resource-observer unsupported'); }
+
+        function lifecycle(event) {
+            log('lifecycle event=' + event + ' epochMs=' + Date.now()
+                + ' readyState=' + document.readyState
+                + ' fonts=' + (document.fonts ? document.fonts.status : 'unavailable'));
+        }
+        lifecycle('document-start');
+        document.addEventListener('readystatechange', function() { lifecycle('readystatechange'); });
+        if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(function() {
+                lifecycle('first-animation-frame');
+                requestAnimationFrame(function() { lifecycle('second-animation-frame'); });
+            });
+        }
+        if (document.fonts && document.fonts.addEventListener) {
+            ['loading', 'loadingdone', 'loadingerror'].forEach(function(event) {
+                document.fonts.addEventListener(event, function() { lifecycle('fonts-' + event); });
+            });
+        }
+
         function reportImageEvent(kind, image) {
             setTimeout(function() {
                 var raw = imageURL(image);
@@ -4266,13 +4340,23 @@ private func imageLoadDiagnosticJS(enabled: Bool) -> String {
         });
 
         document.addEventListener('DOMContentLoaded', function() {
+            lifecycle('dom-content-loaded');
+            if (document.fonts && document.fonts.ready) {
+                document.fonts.ready.then(function() { lifecycle('fonts-ready'); });
+            }
             reportInventory();
             reportLegacyBackgrounds('dom-content-loaded');
         }, { once: true });
         window.addEventListener('load', function() {
+            lifecycle('window-load');
             setTimeout(function() { reportLegacyBackgrounds('window-load'); }, 50);
         }, { once: true });
-        setTimeout(function() { reportLegacyBackgrounds('t2000'); }, 2000);
+        setTimeout(function() {
+            lifecycle('t2000');
+            log('resources-observed=' + resourceCount + ' logged=' + Math.min(resourceCount, RESOURCE_LOG_LIMIT));
+            reportInventory();
+            reportLegacyBackgrounds('t2000');
+        }, 2000);
     })();
     """
 }
@@ -5762,6 +5846,7 @@ private let fitViewportJS: String = {
         // stylesheet's opacity:0.
         function reveal() {
             try { document.documentElement.style.setProperty('opacity', '1', 'important'); } catch(_){}
+            \(debug ? "log('reveal epochMs=' + Date.now() + ' navigationMs=' + Math.round(performance.now()) + ' readyState=' + document.readyState);" : "")
             // Tell Swift the content is now visible so the loading placeholder is
             // removed. Funnels through reveal() so EVERY reveal path (no-overflow,
             // widen, idempotent re-fit, vw<100 skip) emits it. Idempotent Swift-side.
