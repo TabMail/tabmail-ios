@@ -152,22 +152,22 @@ struct SignOutHandshakeTests {
             throw InjectedFailure.offline
         }
 
-        func unsubscribeIMAP(userEmail: String) async throws {
+        func unsubscribeIMAP(userEmail: String, deviceId: String) async throws {
             journal.append("unexpected:imap")
             throw InjectedFailure.offline
         }
 
-        func deleteGmailConsent(userEmail: String) async throws {
+        func deleteGmailConsent(userEmail: String, deviceId: String) async throws {
             journal.append("unexpected:gmail-consent")
             throw InjectedFailure.offline
         }
 
-        func deleteOutlookConsent(userEmail: String) async throws {
+        func deleteOutlookConsent(userEmail: String, deviceId: String) async throws {
             journal.append("unexpected:outlook-consent")
             throw InjectedFailure.offline
         }
 
-        func unsubscribe(provider: String, userEmail: String, accessToken: String) async throws {
+        func unsubscribe(provider: String, userEmail: String, deviceId: String, accessToken: String) async throws {
             journal.append("unexpected:provider-subscription")
             throw InjectedFailure.offline
         }

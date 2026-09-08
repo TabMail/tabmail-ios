@@ -38,10 +38,23 @@ enum PushCleanupIdentity {
 /// Auth: Supabase JWT (via TabMailTokenCoordinator) for all endpoints.
 actor PushClient {
     private let baseURL: URL
-    private let session = sharedEphemeralSession
+    private let session: URLSession
+    private let encryptIMAP: @Sendable (IMAPCredPayload, IMAPSubscribeContext) throws -> String
+    private let authTokenProvider: @Sendable () async -> String?
 
-    init() {
-        self.baseURL = URL(string: PushConfig.baseURL)!
+    init(baseURL: URL = URL(string: PushConfig.baseURL)!, session: URLSession = sharedEphemeralSession,
+         encryptIMAP: @escaping @Sendable (IMAPCredPayload, IMAPSubscribeContext) throws -> String = {
+             try IMAPCredCrypto.encrypt($0, context: $1)
+         }, authTokenProvider: @escaping @Sendable () async -> String? = {
+             switch await TabMailTokenCoordinator.shared.validToken() {
+             case .success(let token): return token
+             case .permanentFailure, .transientFailure, .noSession: return nil
+             }
+         }) {
+        self.baseURL = baseURL
+        self.session = session
+        self.encryptIMAP = encryptIMAP
+        self.authTokenProvider = authTokenProvider
     }
 
     private struct WorkerErrorBody: Decodable {
@@ -63,16 +76,23 @@ actor PushClient {
         // A pinned bearer wins over the ambient session: this pass was admitted
         // under that identity and must complete under it or not at all.
         if let pinned = PushCleanupIdentity.pinnedAuthToken { return pinned }
-        switch await TabMailTokenCoordinator.shared.validToken() {
-        case .success(let token): return token
-        case .permanentFailure, .transientFailure, .noSession: return nil
-        }
+        return await authTokenProvider()
     }
 
     private func authRequest(path: String, method: String) async throws -> URLRequest {
         guard let token = await currentAuthToken() else {
             throw PushError.noAuthToken
         }
+        return authRequest(path: path, method: method, token: token)
+    }
+
+    /// Resolve authentication before the caller's final subscription eligibility check.
+    func subscriptionAuthToken() async throws -> String {
+        guard let token = await currentAuthToken() else { throw PushError.noAuthToken }
+        return token
+    }
+
+    private func authRequest(path: String, method: String, token: String) -> URLRequest {
         var request = URLRequest(url: baseURL.appending(path: path))
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -210,11 +230,13 @@ actor PushClient {
     /// `iosRedirect` with `?status=ok|error&reason=...`.
     func initGmailConsentWeb(
         userEmail: String,
+        deviceId: String,
         iosRedirect: String
     ) async throws -> URL {
         var request = try await authRequest(path: "/push-consent/gmail/init", method: "POST")
         let body: [String: Any] = [
             "userEmail": userEmail,
+            "deviceId": deviceId,
             "iosRedirect": iosRedirect,
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -233,15 +255,15 @@ actor PushClient {
         return url
     }
 
-    /// Revoke the stored refresh token at Google and remove the consent
-    /// record from the worker's KV. Called on NSE toggle OFF, account
+    /// Remove this device's consent credential from the worker's D1 ledger.
+    /// Called on NSE toggle OFF, account
     /// removal, or explicit user revocation.
     ///
     /// POST with `userEmail` in JSON body (not query param): email stays
     /// out of Cloudflare's HTTP access log. See log-privacy audit 2026-04-16.
-    func deleteGmailConsent(userEmail: String) async throws {
+    func deleteGmailConsent(userEmail: String, deviceId: String) async throws {
         var request = try await authRequest(path: "/push-consent/gmail/revoke", method: "POST")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["userEmail": userEmail])
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["userEmail": userEmail, "deviceId": deviceId])
 
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -256,9 +278,9 @@ actor PushClient {
     /// foreground to surface a "fix smart notifications" banner when the
     /// server has flagged a classification error (refresh-failed, Gmail
     /// 401/404/5xx, etc.).
-    func getGmailConsentStatus(userEmail: String) async throws -> PushConsentStatus {
+    func getGmailConsentStatus(userEmail: String, deviceId: String) async throws -> PushConsentStatus {
         var request = try await authRequest(path: "/push-consent/gmail/status", method: "POST")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["userEmail": userEmail])
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["userEmail": userEmail, "deviceId": deviceId])
 
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -308,13 +330,23 @@ actor PushClient {
         provider: String,
         userId: String,
         userEmail: String,
-        accessToken: String
+        deviceId: String,
+        deviceToken: String,
+        apnsSandbox: Bool,
+        nseCapable: Bool,
+        accessToken: String,
+        authToken: String
     ) async throws {
-        var request = try await authRequest(path: "/subscribe", method: "POST")
-        let body: [String: String] = [
+        var request = authRequest(path: "/subscribe", method: "POST", token: authToken)
+        let body: [String: Any] = [
+            "protocolVersion": 2,
             "provider": provider,
             "userId": userId,
-            "userEmail": userEmail,
+            "accountEmail": userEmail,
+            "deviceId": deviceId,
+            "deviceToken": deviceToken,
+            "apnsSandbox": apnsSandbox,
+            "nseCapable": nseCapable,
             "accessToken": accessToken,
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -330,27 +362,19 @@ actor PushClient {
 
     /// Subscribe an IMAP account for push via the IMAP IDLE proxy.
     ///
-    /// End-to-end credential path:
-    ///   iOS → AES-GCM encrypts `{host, port, username, password, security}`
-    ///         with `IMAP_CRED_ENCRYPTION_KEY` (pre-shared iOS ↔ proxy).
-    ///   iOS → POSTs `{userId, userEmail, credsCiphertext}` to push-worker.
-    ///   Worker → forwards ciphertext to the proxy's `/start-idle` (never
-    ///            holds the key, never persists creds).
-    ///   Proxy  → decrypts just-in-time, IMAP LOGIN, zeros plaintext
-    ///            immediately after LOGIN returns OK.
-    ///
-    /// The worker stores only a credless subscription record
-    /// `{userId, accountEmail, proxy instance id, subscribedAt}`. The privacy
-    /// policy §3 invariant "no host/port/username/password at rest" is
-    /// preserved end-to-end.
+    /// AES-GCM binds the transient credential envelope to this request's
+    /// installation/account context. The worker reserves an exact generation
+    /// before forwarding to the proxy; only the proxy decrypts, after consuming
+    /// that admission. Success requires committed active authority. Neither
+    /// side persists the envelope or decrypted IMAP credentials.
     func subscribeIMAP(
-        userId: String,
-        userEmail: String,
+        context: IMAPSubscribeContext,
         host: String,
         port: Int,
         username: String,
         password: String,
-        security: String? = nil
+        security: String? = nil,
+        authToken: String
     ) async throws {
         let payload = IMAPCredPayload(
             host: host,
@@ -361,7 +385,7 @@ actor PushClient {
         )
         let credsCiphertext: String
         do {
-            credsCiphertext = try IMAPCredCrypto.encrypt(payload)
+            credsCiphertext = try encryptIMAP(payload, context)
         } catch {
             // Don't print the error — its type (e.g. keyMissing, sealFailed)
             // is itself build-config-sensitive information. A generic line
@@ -371,28 +395,23 @@ actor PushClient {
             throw PushError.requestFailed(statusCode: 0)
         }
 
-        var request = try await authRequest(path: "/subscribe-imap", method: "POST")
-        let body: [String: Any] = [
-            "userId": userId,
-            "userEmail": userEmail,
-            "credsCiphertext": credsCiphertext,
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        var request = authRequest(path: "/subscribe", method: "POST", token: authToken)
+        request.httpBody = try context.requestBody(credentialEnvelope: credsCiphertext)
 
-        let (_, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard 200..<300 ~= code else {
-            print("[PushClient] subscribeIMAP failed for \(userEmail): HTTP \(code)")
+        guard IMAPSubscribeOutcome.decode(statusCode: code, body: data) == .active else {
+            print("[PushClient] subscribeIMAP not active: HTTP \(code)")
             throw PushError.requestFailed(statusCode: code)
         }
-        print("[PushClient] Subscribed IMAP push for \(userEmail) via IDLE proxy")
+        print("[PushClient] Subscribed IMAP push via IDLE proxy")
     }
 
-    /// Unsubscribe an IMAP account from the IMAP IDLE proxy.
-    /// Server deletes stored credentials and tells the proxy to disconnect IDLE.
-    func unsubscribeIMAP(userEmail: String) async throws {
+    /// Remove this installation's IMAP route. The worker revokes pending
+    /// admissions and closes the monitor when no eligible sibling remains.
+    func unsubscribeIMAP(userEmail: String, deviceId: String) async throws {
         var request = try await authRequest(path: "/unsubscribe-imap", method: "POST")
-        let body: [String: Any] = ["userEmail": userEmail]
+        let body: [String: Any] = ["userEmail": userEmail, "deviceId": deviceId]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await session.data(for: request)
@@ -408,12 +427,14 @@ actor PushClient {
     func unsubscribe(
         provider: String,
         userEmail: String,
+        deviceId: String,
         accessToken: String
     ) async throws {
         var request = try await authRequest(path: "/unsubscribe", method: "POST")
         let body: [String: String] = [
             "provider": provider,
             "userEmail": userEmail,
+            "deviceId": deviceId,
             "accessToken": accessToken,
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -438,11 +459,13 @@ actor PushClient {
     /// iOS. Mirror of `initGmailConsentWeb`.
     func initOutlookConsentWeb(
         userEmail: String,
+        deviceId: String,
         iosRedirect: String
     ) async throws -> URL {
         var request = try await authRequest(path: "/push-consent/outlook/init", method: "POST")
         let body: [String: Any] = [
             "userEmail": userEmail,
+            "deviceId": deviceId,
             "iosRedirect": iosRedirect,
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -466,9 +489,9 @@ actor PushClient {
     ///
     /// POST with `userEmail` in JSON body (not query param): email stays
     /// out of Cloudflare's HTTP access log. See log-privacy audit 2026-04-16.
-    func deleteOutlookConsent(userEmail: String) async throws {
+    func deleteOutlookConsent(userEmail: String, deviceId: String) async throws {
         var request = try await authRequest(path: "/push-consent/outlook/revoke", method: "POST")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["userEmail": userEmail])
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["userEmail": userEmail, "deviceId": deviceId])
 
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -480,9 +503,9 @@ actor PushClient {
     }
 
     /// Query the worker for the Outlook account's consent state.
-    func getOutlookConsentStatus(userEmail: String) async throws -> PushConsentStatus {
+    func getOutlookConsentStatus(userEmail: String, deviceId: String) async throws -> PushConsentStatus {
         var request = try await authRequest(path: "/push-consent/outlook/status", method: "POST")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["userEmail": userEmail])
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["userEmail": userEmail, "deviceId": deviceId])
 
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -516,8 +539,8 @@ enum PushError: Error {
 /// code always uses the real `PushClient` conformance; tests install a mock via
 /// `PushNotificationService._setConsentCheckerForTesting` (DEBUG-only).
 protocol PushConsentChecking: Sendable {
-    func getGmailConsentStatus(userEmail: String) async throws -> PushClient.PushConsentStatus
-    func getOutlookConsentStatus(userEmail: String) async throws -> PushClient.PushConsentStatus
+    func getGmailConsentStatus(userEmail: String, deviceId: String) async throws -> PushClient.PushConsentStatus
+    func getOutlookConsentStatus(userEmail: String, deviceId: String) async throws -> PushClient.PushConsentStatus
 }
 
 extension PushClient: PushConsentChecking {}
@@ -535,10 +558,10 @@ protocol RemovedAccountPushCleaning: Sendable {
         apnsSandbox: Bool
     ) async throws
     func unregisterDevice(deviceId: String) async throws
-    func unsubscribeIMAP(userEmail: String) async throws
-    func deleteGmailConsent(userEmail: String) async throws
-    func deleteOutlookConsent(userEmail: String) async throws
-    func unsubscribe(provider: String, userEmail: String, accessToken: String) async throws
+    func unsubscribeIMAP(userEmail: String, deviceId: String) async throws
+    func deleteGmailConsent(userEmail: String, deviceId: String) async throws
+    func deleteOutlookConsent(userEmail: String, deviceId: String) async throws
+    func unsubscribe(provider: String, userEmail: String, deviceId: String, accessToken: String) async throws
 }
 
 extension PushClient: RemovedAccountPushCleaning {}

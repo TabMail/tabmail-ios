@@ -255,6 +255,7 @@ final class OAuthService: NSObject {
         do {
             startURL = try await pushClient.initGmailConsentWeb(
                 userEmail: loginHint,
+                deviceId: PushNotificationService.shared.deviceId,
                 iosRedirect: iosRedirect
             )
         } catch {
@@ -353,4 +354,3 @@ extension OAuthService: ASWebAuthenticationPresentationContextProviding {
         return ASPresentationAnchor(windowScene: scenes.first!)
     }
 }
-

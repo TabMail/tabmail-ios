@@ -23,7 +23,7 @@ struct NSEDataBridgeTests {
                      "nse.compositionPrompt", "nse.backendBaseURL", "nse.pushWorkerURL",
                      "nse.lastHistoryIds", "nse.filteringApproved",
                      "nse.deviceSyncEnabled", "nse.syncBaseURL", "nse.deviceToken",
-                     "nse.googleClientId"] {
+                     "nse.googleClientId", "nse.deviceId", "nse.apnsSandbox", "nse.reconnectEnabled"] {
             s.removeObject(forKey: key)
         }
     }
@@ -210,13 +210,46 @@ struct NSEDataBridgeTests {
         #expect(suite?.string(forKey: "nse.userName") == "")
     }
 
-    @Test("mirrorDeviceToken uses 'lastDeviceToken' key")
+    @Test("mirrorDeviceToken uses the canonical APNs token source, not the obsolete literal")
     func deviceTokenMirrorKey() {
         cleanupSuite()
-        UserDefaults.standard.set("tok-123", forKey: "lastDeviceToken")
-        defer { UserDefaults.standard.removeObject(forKey: "lastDeviceToken") }
+        let defaults = UserDefaults.standard
+        let oldToken = defaults.object(forKey: PushConfig.lastDeviceTokenKey)
+        let oldLiteral = defaults.object(forKey: "lastDeviceToken")
+        defer {
+            defaults.set(oldToken, forKey: PushConfig.lastDeviceTokenKey)
+            defaults.set(oldLiteral, forKey: "lastDeviceToken")
+            cleanupSuite()
+        }
+        defaults.set("tok-123", forKey: PushConfig.lastDeviceTokenKey)
+        defaults.set("obsolete-token", forKey: "lastDeviceToken")
+        suite?.set("stale-token", forKey: "nse.deviceToken")
         NSEDataBridge.mirrorDeviceToken()
         #expect(suite?.string(forKey: "nse.deviceToken") == "tok-123")
+    }
+
+    @Test("device mirror uses the existing installation ID and clears absent values")
+    func installationMirror() {
+        cleanupSuite()
+        let defaults = UserDefaults.standard
+        let oldToken = defaults.object(forKey: PushConfig.lastDeviceTokenKey)
+        let oldDevice = defaults.object(forKey: PushConfig.deviceIdKey)
+        defer {
+            defaults.set(oldToken, forKey: PushConfig.lastDeviceTokenKey)
+            defaults.set(oldDevice, forKey: PushConfig.deviceIdKey)
+            cleanupSuite()
+        }
+        defaults.set("synthetic-installation", forKey: PushConfig.deviceIdKey)
+        defaults.set("synthetic-token", forKey: PushConfig.lastDeviceTokenKey)
+        NSEDataBridge.mirrorDeviceToken()
+        #expect(suite?.string(forKey: "nse.deviceId") == "synthetic-installation")
+        #expect(suite?.string(forKey: "nse.deviceToken") == "synthetic-token")
+        #expect(suite?.object(forKey: "nse.apnsSandbox") as? Bool == PushConfig.isAPNsSandbox)
+        defaults.removeObject(forKey: PushConfig.deviceIdKey)
+        defaults.removeObject(forKey: PushConfig.lastDeviceTokenKey)
+        NSEDataBridge.mirrorDeviceToken()
+        #expect(suite?.object(forKey: "nse.deviceId") == nil)
+        #expect(suite?.object(forKey: "nse.deviceToken") == nil)
     }
 
     @Test("mirrorPushSettings uses 'device_sync_auto_enabled' key and defaults to true")

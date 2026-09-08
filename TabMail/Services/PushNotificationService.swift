@@ -112,10 +112,17 @@ struct SendableRemovedAccountCleanupDefaults: @unchecked Sendable {
 actor PushNotificationService {
     static let shared = PushNotificationService()
 
-    let pushClient = PushClient()
+    let pushClient: PushClient
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     #if DEBUG
+    private var subscriptionAccessTokenOverride: (@Sendable (Account) async throws -> String)?
+    init(pushClient: PushClient, subscriptionAccessToken: @escaping @Sendable (Account) async throws -> String) {
+        self.pushClient = pushClient
+        self.subscriptionAccessTokenOverride = subscriptionAccessToken
+        self.deviceId = "test-device"
+    }
+
     /// Test-only override for the consent-status scan. When nil, the real
     /// `pushClient` is used. `checkPushConsentStatusForForeground` reads via
     /// `consentChecker` so tests can inject a mock without touching network
@@ -213,6 +220,7 @@ actor PushNotificationService {
         registerToken: @escaping @Sendable (String, Bool) async -> Void,
         reregisterAccounts: @escaping @Sendable () async -> Void
     ) {
+        pushClient = PushClient()
         deviceId = "test-device"
         tokenReadinessHook = tokenReadiness
         tokenDefaultsOverride = tokenDefaults
@@ -222,7 +230,7 @@ actor PushNotificationService {
     }
     #endif
 
-    private init() { deviceId = Self.loadDeviceId() }
+    private init() { pushClient = PushClient(); deviceId = Self.loadDeviceId() }
 
     // MARK: - Device ID
 
@@ -610,7 +618,9 @@ actor PushNotificationService {
                 outcomes[record.generation] = record.actions
                 guard !record.actions.isEmpty else { continue }
             }
-            if let onlyEmail,
+            // Final installation erasure covers every eligible generation,
+            // including older debt omitted by an immediate email-filtered pass.
+            if !activeAccounts.isEmpty, let onlyEmail,
                record.email.caseInsensitiveCompare(onlyEmail) != .orderedSame {
                 continue
             }
@@ -693,9 +703,9 @@ actor PushNotificationService {
                 do {
                     switch selected[index].provider {
                     case AccountProvider.gmail.rawValue:
-                        try await client.deleteGmailConsent(userEmail: selected[index].email)
+                        try await client.deleteGmailConsent(userEmail: selected[index].email, deviceId: cleanupDeviceId)
                     case AccountProvider.outlook.rawValue:
-                        try await client.deleteOutlookConsent(userEmail: selected[index].email)
+                        try await client.deleteOutlookConsent(userEmail: selected[index].email, deviceId: cleanupDeviceId)
                     default:
                         break
                     }
@@ -711,11 +721,9 @@ actor PushNotificationService {
                 }
             }
 
-            // Consent must be removed before `/unsubscribe`: legacy consent
-            // rows use the account-ownership proof for authorization, while
-            // `/unsubscribe` deliberately revokes that proof first. Reversing
-            // these calls can turn a transient consent failure into a durable
-            // 403 with no proof left to authorize its retry.
+            // Keep explicit consent cleanup ahead of completing provider debt.
+            // Both operations are scoped to this installation and idempotent;
+            // a sibling's route and consent survive this account removal.
             if selected[index].actions.contains(.providerSubscription),
                !selected[index].actions.contains(.consent) {
                 do {
@@ -728,6 +736,7 @@ actor PushNotificationService {
                     try await client.unsubscribe(
                         provider: selected[index].provider,
                         userEmail: selected[index].email,
+                        deviceId: cleanupDeviceId,
                         accessToken: token
                     )
                     selected[index].actions.remove(.providerSubscription)
@@ -744,7 +753,7 @@ actor PushNotificationService {
 
             if selected[index].actions.contains(.imapSubscription) {
                 do {
-                    try await client.unsubscribeIMAP(userEmail: selected[index].email)
+                    try await client.unsubscribeIMAP(userEmail: selected[index].email, deviceId: cleanupDeviceId)
                     selected[index].actions.remove(.imapSubscription)
                 } catch {
                     print("[Push] Removed-account IMAP cleanup deferred for \(selected[index].email): \(error)")
@@ -758,7 +767,7 @@ actor PushNotificationService {
 
         // The legacy device record is global, so one successful refresh retires
         // every selected tombstone's copy of this action.
-        if selected.contains(where: { $0.actions.contains(.deviceRegistration) }) {
+        if activeAccounts.isEmpty || selected.contains(where: { $0.actions.contains(.deviceRegistration) }) {
             do {
                 try await refreshDeviceRegistrationForRemovedAccountCleanup(
                     activeEmails: activeAccounts.map(\.emailAddress),
@@ -767,7 +776,13 @@ actor PushNotificationService {
                     pinnedUserId: pinnedUserId
                 )
                 for index in selected.indices {
-                    selected[index].actions.remove(.deviceRegistration)
+                    if activeAccounts.isEmpty {
+                        // Acknowledged installation erasure covers its remote
+                        // child actions, including any that failed earlier.
+                        selected[index].actions.formIntersection([.localArtifacts])
+                    } else {
+                        selected[index].actions.remove(.deviceRegistration)
+                    }
                 }
             } catch {
                 print("[Push] Removed-account legacy device cleanup deferred: \(error)")
@@ -876,12 +891,18 @@ actor PushNotificationService {
 
     // MARK: - Account Subscription
 
+    private func subscriptionAccessToken(for account: Account) async throws -> String {
+        #if DEBUG
+        if let override = subscriptionAccessTokenOverride { return try await override(account) }
+        #endif
+        return try await AccountManager.shared.freshAccessToken(for: account)
+    }
+
     /// Subscribe a single account for push notifications.
     /// Gmail/Outlook → Pub/Sub / Graph subscription. IMAP → IDLE proxy
-    /// subscription (server endpoint stubbed; client implementation is complete).
-    /// When `updateDeviceRegistration` is true (default), also re-registers the device
-    /// to update the email list. Set to false when called in a batch loop.
-    func subscribeAccount(_ account: Account, updateDeviceRegistration: Bool = true) async {
+    /// subscription. Each request also publishes this device's account route.
+    @discardableResult
+    func subscribeAccount(_ account: Account) async -> Bool {
         // Push is fully disabled in demo (no real
         // server to subscribe to; prompting iOS for push consent here
         // would be misleading).
@@ -890,62 +911,94 @@ actor PushNotificationService {
         }
         if demoActive {
             print("[Push] Demo mode active — skipping subscribe \(account.emailAddress)")
-            return
+            return false
         }
         guard let session = TabMailAuthService.getSession() else {
             print("[Push] No session — cannot subscribe \(account.emailAddress)")
-            return
+            return false
         }
 
         do {
             switch account.provider {
             case .gmail, .outlook:
-                let accessToken = try await AccountManager.shared.freshAccessToken(for: account)
+                guard let sessionGeneration = TabMailSessionStore.shared.loadActiveSession()?.generation else { return false }
+                let accessToken = try await subscriptionAccessToken(for: account)
+                let authToken = try await pushClient.subscriptionAuthToken()
+                let visualOn = await visualAlertsEnabled()
+                guard await currentSubscribeAccount(account, userId: session.userId,
+                    sessionGeneration: sessionGeneration, requiresPushEnabled: false) else { return false }
+                guard let destination = UserDefaults.standard.string(forKey: PushConfig.lastDeviceTokenKey),
+                      !destination.isEmpty else { return false }
+                let nseEnabled = UserDefaults.standard.bool(forKey: PushConfig.pushNotificationsEnabledKey)
                 try await pushClient.subscribe(
                     provider: account.provider.rawValue,
                     userId: session.userId,
                     userEmail: account.emailAddress,
-                    accessToken: accessToken
+                    deviceId: deviceId,
+                    deviceToken: destination,
+                    apnsSandbox: PushConfig.isAPNsSandbox,
+                    nseCapable: nseEnabled && NSEProviderSupport.isReady(account.provider.rawValue) && visualOn,
+                    accessToken: accessToken,
+                    authToken: authToken
                 )
+                guard await currentSubscribeAccount(account, userId: session.userId,
+                    sessionGeneration: sessionGeneration, requiresPushEnabled: false) else { return false }
                 BackgroundSyncLogger.logPush("Subscribed \(account.emailAddress) (\(account.provider.rawValue))")
             case .imap, .icloud:
                 // iCloud uses IMAP via app-password (imap.mail.me.com:993) — same
                 // IDLE proxy path as generic IMAP. CalDAV is calendar-only, no
                 // mailbox, so it's excluded below.
+                guard let sessionGeneration = TabMailSessionStore.shared.loadActiveSession()?.generation else { return false }
                 let nseEnabled = UserDefaults.standard.object(forKey: PushConfig.pushNotificationsEnabledKey) as? Bool ?? false
                 guard nseEnabled else {
                     print("[Push] IMAP subscribe skipped — NSE push toggle off (\(account.emailAddress))")
-                    return
+                    return false
                 }
                 guard let host = account.imapHost,
                       let password = KeychainHelper.loadString(key: KeychainHelper.passwordKey(accountId: account.id)) else {
                     print("[Push] IMAP subscribe skipped — missing host/password for \(account.emailAddress)")
-                    return
+                    return false
                 }
+                let authToken = try await pushClient.subscriptionAuthToken()
+                let visualOn = await visualAlertsEnabled()
+                guard await currentSubscribeAccount(account, userId: session.userId, sessionGeneration: sessionGeneration) else { return false }
+                guard let destination = UserDefaults.standard.string(forKey: PushConfig.lastDeviceTokenKey),
+                      !destination.isEmpty else { return false }
+                let context = IMAPSubscribeContext(userId: session.userId, deviceId: deviceId,
+                    accountEmail: account.emailAddress, deviceToken: destination,
+                    apnsSandbox: PushConfig.isAPNsSandbox, nseCapable: nseEnabled && visualOn)
                 try await pushClient.subscribeIMAP(
-                    userId: session.userId,
-                    userEmail: account.emailAddress,
+                    context: context,
                     host: host,
                     port: account.imapPort ?? 993,
                     username: account.imapUsername ?? account.emailAddress,
-                    password: password
+                    password: password,
+                    authToken: authToken
                 )
+                guard await currentSubscribeAccount(account, userId: session.userId, sessionGeneration: sessionGeneration) else { return false }
                 BackgroundSyncLogger.logPush("Subscribed IMAP \(account.emailAddress) via IDLE proxy")
             case .caldav:
-                return  // calendar-only, no mailbox to IDLE on
+                return false  // calendar-only, no mailbox to IDLE on
             }
 
-            // Per-(device, account) registration — the dispatch record. Decides
-            // visible vs silent push per-account at dispatch time.
-            await registerDeviceAccountRecord(for: account)
         } catch {
             print("[Push] Subscribe failed for \(account.emailAddress): \(error)")
             BackgroundSyncLogger.logPush("Subscribe FAILED for \(account.emailAddress): \(error.localizedDescription)")
+            return false
         }
+        return true
+    }
 
-        if updateDeviceRegistration {
-            await registerDeviceWithWorker()
-        }
+    /// Recheck after suspension; a captured Account is not current eligibility.
+    private func currentSubscribeAccount(_ account: Account, userId: String, sessionGeneration: String,
+        requiresPushEnabled: Bool = true) async -> Bool {
+        guard let current = try? await dbPool.read({ db in
+            try Account.fetchOne(db, key: account.id)
+        }), current.isActive, current.emailAddress == account.emailAddress,
+              current.provider == account.provider else { return false }
+        return TabMailAuthService.getSession()?.userId == userId
+            && TabMailSessionStore.shared.loadActiveSession()?.generation == sessionGeneration
+            && (!requiresPushEnabled || UserDefaults.standard.bool(forKey: PushConfig.pushNotificationsEnabledKey))
     }
 
     /// (Re)register the per-(device, account) dispatch record for one account
@@ -1014,9 +1067,8 @@ actor PushNotificationService {
         }
     }
 
-    /// Subscribe all active accounts (Gmail/Outlook + IMAP via IDLE proxy),
-    /// then re-register device once. Account subscriptions run in parallel —
-    /// each is an independent worker round-trip with no shared state.
+    /// Subscribe all active accounts. Each request carries the current device
+    /// identity and publishes its route; token rotation has its own operation.
     func subscribeAllAccounts() async {
         // Ordinary foreground subscription cannot heal a deleted account: it
         // enumerates only live rows, and the old per-account dispatch record is
@@ -1030,7 +1082,7 @@ actor PushNotificationService {
             await withTaskGroup(of: Void.self) { group in
                 for account in accounts {
                     group.addTask {
-                        await self.subscribeAccount(account, updateDeviceRegistration: false)
+                        _ = await self.subscribeAccount(account)
                     }
                 }
             }
@@ -1038,7 +1090,6 @@ actor PushNotificationService {
             print("[Push] Failed to load accounts for subscription: \(error)")
         }
 
-        await registerDeviceWithWorker()
     }
 
     // MARK: - Notification visibility (presentation gate)
@@ -1121,9 +1172,9 @@ actor PushNotificationService {
         do {
             switch account.provider {
             case .gmail:
-                status = try await pushClient.getGmailConsentStatus(userEmail: email)
+                status = try await pushClient.getGmailConsentStatus(userEmail: email, deviceId: deviceId)
             case .outlook:
-                status = try await pushClient.getOutlookConsentStatus(userEmail: email)
+                status = try await pushClient.getOutlookConsentStatus(userEmail: email, deviceId: deviceId)
             default:
                 return  // non-push-capable provider
             }
@@ -1251,9 +1302,9 @@ actor PushNotificationService {
     func revokePushConsentForAccount(_ account: Account) async {
         switch account.provider {
         case .gmail:
-            try? await pushClient.deleteGmailConsent(userEmail: account.emailAddress)
+            try? await pushClient.deleteGmailConsent(userEmail: account.emailAddress, deviceId: deviceId)
         case .outlook:
-            try? await pushClient.deleteOutlookConsent(userEmail: account.emailAddress)
+            try? await pushClient.deleteOutlookConsent(userEmail: account.emailAddress, deviceId: deviceId)
         default:
             return
         }
@@ -1331,13 +1382,14 @@ actor PushNotificationService {
             case threw(String)           // network/timeout — status unknown
         }
         let checker = consentChecker
+        let consentDeviceId = deviceId
         let timeout = PushConfig.consentStatusCheckTimeoutSeconds
         let probes = await withTaskGroup(of: ProbeResult.self) { group -> [ProbeResult] in
             for email in gmailEmails {
                 group.addTask {
                     do {
                         let status = try await withTimeout(seconds: timeout) {
-                            try await checker.getGmailConsentStatus(userEmail: email)
+                            try await checker.getGmailConsentStatus(userEmail: email, deviceId: consentDeviceId)
                         }
                         switch status {
                         case .error, .missing: return .confirmedError(email)
@@ -1353,7 +1405,7 @@ actor PushNotificationService {
                 group.addTask {
                     do {
                         let status = try await withTimeout(seconds: timeout) {
-                            try await checker.getOutlookConsentStatus(userEmail: email)
+                            try await checker.getOutlookConsentStatus(userEmail: email, deviceId: consentDeviceId)
                         }
                         switch status {
                         case .error, .missing: return .confirmedError(email)
@@ -1510,19 +1562,9 @@ actor PushNotificationService {
             let accounts = try await dbPool.read { db in
                 try Account.filter(Column("isActive") == true).fetchAll(db)
             }
-            for account in accounts where account.provider != .imap {
-                do {
-                    let accessToken = try await AccountManager.shared.freshAccessToken(for: account)
-                    try await pushClient.subscribe(
-                        provider: account.provider.rawValue,
-                        userId: session.userId,
-                        userEmail: account.emailAddress,
-                        accessToken: accessToken
-                    )
-                    log += "6. Subscribe \(account.emailAddress): OK\n"
-                } catch {
-                    log += "6. Subscribe \(account.emailAddress): FAILED — \(error)\n"
-                }
+            for account in accounts where account.provider == .gmail || account.provider == .outlook {
+                let subscribed = await subscribeAccount(account)
+                log += "6. Subscribe \(account.emailAddress): \(subscribed ? "OK" : "skipped or failed")\n"
             }
         } catch {
             log += "6. Load accounts: FAILED — \(error)\n"

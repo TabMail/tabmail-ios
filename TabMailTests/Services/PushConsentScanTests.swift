@@ -41,8 +41,10 @@ struct PushConsentScanTests {
             case outlook(Result<PushClient.PushConsentStatus, Error>)
         }
         var outcomes: [String: Outcome] = [:]
+        var expectedDeviceId = ""
 
-        func getGmailConsentStatus(userEmail: String) async throws -> PushClient.PushConsentStatus {
+        func getGmailConsentStatus(userEmail: String, deviceId: String) async throws -> PushClient.PushConsentStatus {
+            #expect(!deviceId.isEmpty && deviceId == expectedDeviceId)
             guard let o = outcomes[userEmail] else { return .ok }
             guard case .gmail(let r) = o else { return .ok }
             switch r {
@@ -51,7 +53,8 @@ struct PushConsentScanTests {
             }
         }
 
-        func getOutlookConsentStatus(userEmail: String) async throws -> PushClient.PushConsentStatus {
+        func getOutlookConsentStatus(userEmail: String, deviceId: String) async throws -> PushClient.PushConsentStatus {
+            #expect(!deviceId.isEmpty && deviceId == expectedDeviceId)
             guard let o = outcomes[userEmail] else { return .ok }
             guard case .outlook(let r) = o else { return .ok }
             switch r {
@@ -106,6 +109,7 @@ struct PushConsentScanTests {
             else { UserDefaults.standard.removeObject(forKey: prefsKey) }
         }
 
+        mock.expectedDeviceId = await PushNotificationService.shared.deviceId
         await PushNotificationService.shared._setConsentCheckerForTesting(mock)
         // Reset first-scan-success flag at the START of each test so
         // behavior is deterministic regardless of prior test order (the

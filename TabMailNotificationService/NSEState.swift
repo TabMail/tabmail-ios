@@ -54,6 +54,18 @@ enum NSEState {
         suite.bool(forKey: SharedNSEData.imapPushEnabledKey)
     }
 
+    static func reconnectContext(userId: String, accountEmail: String, nseCapable: Bool = true) -> IMAPSubscribeContext? {
+        guard suite.bool(forKey: "nse.reconnectEnabled"),
+              let deviceId = suite.string(forKey: "nse.deviceId"),
+              let deviceToken = suite.string(forKey: "nse.deviceToken"),
+              let sandbox = suite.defaults.object(forKey: "nse.apnsSandbox") as? Bool else { return nil }
+        let context = IMAPSubscribeContext(userId: userId, deviceId: deviceId,
+            accountEmail: accountEmail, deviceToken: deviceToken,
+            apnsSandbox: sandbox, nseCapable: nseCapable)
+        guard (try? context.credentialContext()) != nil else { return nil }
+        return context
+    }
+
     /// Minimal IMAP connection info the NSE needs to open a one-shot socket
     /// for `imap_new_mail` / `imap_reconnect` processing. Password lives in
     /// shared Keychain — `SharedKeychain.getPassword(for: accountId)`.

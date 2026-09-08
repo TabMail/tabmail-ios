@@ -1022,9 +1022,9 @@ final class NotificationService: UNNotificationServiceExtension {
     //     can't confirm success (timeout, non-2xx, no-accountId, etc.)
     //     it leaves the payload default untouched — we don't claim
     //     success or final-failure on our own.
-    //   • On a confirmed 2xx from /subscribe-imap: mutate the alert to
+    //   • On explicit committed active from /subscribe: mutate the alert to
     //     "Restored push notification connection for <email>". The
-    //     push-worker also sees the success (via KV) and clears retry
+    //     push-worker also commits the success in D1 and clears retry
     //     state, so no further ladder tick fires.
     //   • Final give-up copy ("Failed to reconnect..., open TabMail to
     //     retry") is sent by the push-worker AFTER the retry ladder
@@ -1057,7 +1057,7 @@ final class NotificationService: UNNotificationServiceExtension {
             // Stamp PushHealthStore so any sibling imap_reconnect failure
             // notifications for this account get released by the next sweep.
             // Weaker proof than receiving a real push (the IDLE socket may
-            // still drop after a 2xx /subscribe-imap), but the push-worker's
+            // still drop after committed activation), but the push-worker's
             // retry ladder is the safety net — if the socket dies again,
             // another imap_reconnect push will arrive.
             if !accountEmail.isEmpty {
@@ -1088,7 +1088,7 @@ final class NotificationService: UNNotificationServiceExtension {
 
     /// Encrypt the account's IMAP creds with the shared
     /// `IMAP_CRED_ENCRYPTION_KEY` and POST to the push-worker's
-    /// `/subscribe-imap`. Returns true on 2xx.
+    /// unified `/subscribe`. Only committed active is restored success.
     private static func attemptSilentResubscribe(
         accountId: String, accountEmail: String
     ) async -> Bool {
@@ -1101,12 +1101,24 @@ final class NotificationService: UNNotificationServiceExtension {
             NSELog.step("NSE resubscribe: no password in shared Keychain")
             return false
         }
-        guard let userId = NSETokenManager.supabaseUserId() else {
+        guard let sessionGeneration = TabMailSessionStore.shared.loadActiveSession()?.generation,
+              let userId = NSETokenManager.supabaseUserId() else {
             NSELog.step("NSE resubscribe: no supabase userId")
             return false
         }
         guard let token = await NSETokenManager.validAccessToken() else {
             NSELog.step("NSE resubscribe: no valid JWT")
+            return false
+        }
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        let visualCapable = (settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional)
+            && (settings.lockScreenSetting == .enabled || settings.notificationCenterSetting == .enabled
+                || settings.alertSetting == .enabled)
+        guard TabMailSessionStore.shared.loadActiveSession()?.generation == sessionGeneration,
+              NSETokenManager.supabaseUserId() == userId,
+              NSEState.findAccountId(for: accountEmail) == accountId,
+              let context = NSEState.reconnectContext(userId: userId, accountEmail: accountEmail,
+                  nseCapable: visualCapable) else {
             return false
         }
 
@@ -1119,13 +1131,13 @@ final class NotificationService: UNNotificationServiceExtension {
         )
         let ciphertext: String
         do {
-            ciphertext = try IMAPCredCrypto.encrypt(payload)
+            ciphertext = try IMAPCredCrypto.encrypt(payload, context: context)
         } catch {
-            NSELog.step("NSE resubscribe: encrypt failed: \(String(describing: error))")
+            NSELog.step("NSE resubscribe: encrypt failed")
             return false
         }
 
-        let urlString = NSEState.getPushWorkerURL() + "/subscribe-imap"
+        let urlString = NSEState.getPushWorkerURL() + "/subscribe"
         guard let url = URL(string: urlString) else {
             NSELog.step("NSE resubscribe: bad push worker URL")
             return false
@@ -1134,29 +1146,24 @@ final class NotificationService: UNNotificationServiceExtension {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "userId": userId,
-            "userEmail": accountEmail,
-            "credsCiphertext": ciphertext,
-        ])
+        guard let body = try? context.requestBody(credentialEnvelope: ciphertext) else { return false }
+        request.httpBody = body
         request.timeoutInterval = 15
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if !(200..<300).contains(code) {
-                // Log the status + a body snippet so we can tell the failure
-                // mode apart: push-worker 401/403 (JWT invalid), 502 (proxy
-                // unreachable), 503 (no proxy capacity), etc. Body is
-                // truncated to 200 bytes — it's opaque JSON from the worker,
-                // never contains credentials.
-                let bodyPreview = String(data: data.prefix(200), encoding: .utf8) ?? "<binary>"
-                NSELog.step("NSE resubscribe: HTTP \(code) body=\(bodyPreview)")
+            if IMAPSubscribeOutcome.decode(statusCode: code, body: data) != .active {
+                // Status only: a response body is not a safe logging boundary.
+                NSELog.step("NSE resubscribe: not active, HTTP \(code)")
                 return false
             }
-            return true
+            return TabMailSessionStore.shared.loadActiveSession()?.generation == sessionGeneration
+                && NSETokenManager.supabaseUserId() == userId
+                && NSEState.findAccountId(for: accountEmail) == accountId
+                && NSEState.reconnectContext(userId: userId, accountEmail: accountEmail) != nil
         } catch {
-            NSELog.step("NSE resubscribe: HTTP failed: \(String(describing: error))")
+            NSELog.step("NSE resubscribe: HTTP failed")
             return false
         }
     }

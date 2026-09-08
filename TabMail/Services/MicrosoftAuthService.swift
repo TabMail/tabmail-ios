@@ -191,6 +191,7 @@ extension OAuthService {
         do {
             startURL = try await pushClient.initOutlookConsentWeb(
                 userEmail: loginHint,
+                deviceId: PushNotificationService.shared.deviceId,
                 iosRedirect: iosRedirect
             )
         } catch {

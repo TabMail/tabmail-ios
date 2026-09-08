@@ -13,9 +13,9 @@ import Foundation
 ///    `outlook`) at NSE `didReceive` and the main-app silent-
 ///    push handler. Proves the IMAP/Gmail → push-worker → APNs → iOS
 ///    pipeline works end-to-end for this account.
-/// 2. **Weaker** — successful NSE silent re-subscribe (`/subscribe-imap`
-///    returned 2xx) inside the `imap_reconnect` recovery path. Proves
-///    push-worker accepted the enrollment but does NOT guarantee the IDLE
+/// 2. **Weaker** — successful NSE silent re-subscribe (`/subscribe`
+///    confirmed active authority) inside the `imap_reconnect` recovery path. Proves
+///    push-worker committed activation but does NOT guarantee the IDLE
 ///    socket stays up; the push-worker's retry ladder fires another
 ///    `imap_reconnect` if the socket drops again.
 ///

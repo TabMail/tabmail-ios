@@ -668,18 +668,25 @@ enum NSEDataBridge {
     /// process needs to read the opt-in state.
     static func mirrorPushSettings() {
         guard let suite else { return }
+        // Reconnect eligibility only; this does not change passive-delivery
+        // suppression or the independent silent/background routing contract.
+        suite.set(UserDefaults.standard.bool(forKey: PushConfig.pushNotificationsEnabledKey),
+                  forKey: "nse.reconnectEnabled")
         suite.set(PushConfig.nseFilteringApproved, forKey: "nse.filteringApproved")
         let syncEnabled = UserDefaults.standard.object(forKey: "device_sync_auto_enabled") as? Bool ?? true
         suite.set(syncEnabled, forKey: "nse.deviceSyncEnabled")
         suite.set(BackendConfig.syncBaseURL, forKey: "nse.syncBaseURL")
     }
 
-    /// Mirror device token so NSE can call /nse-done.
+    /// Mirror existing installation identity and delivery configuration for the
+    /// NSE's single-call reconnect. This is not subscription-state bookkeeping.
     static func mirrorDeviceToken() {
         guard let suite else { return }
-        if let token = UserDefaults.standard.string(forKey: "lastDeviceToken") {
-            suite.set(token, forKey: "nse.deviceToken")
-        }
+        suite.set(UserDefaults.standard.string(forKey: PushConfig.lastDeviceTokenKey),
+                  forKey: "nse.deviceToken")
+        suite.set(UserDefaults.standard.string(forKey: PushConfig.deviceIdKey),
+                  forKey: "nse.deviceId")
+        suite.set(PushConfig.isAPNsSandbox, forKey: "nse.apnsSandbox")
     }
 
     /// Mirror the debug-logging gate flag so the NSE process — which has no
