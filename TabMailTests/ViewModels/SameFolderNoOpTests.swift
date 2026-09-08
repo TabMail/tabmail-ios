@@ -315,6 +315,43 @@ struct SameFolderNoOpTests {
         #expect(AccountManager.shared.snapshotOverlay()[moveId] == nil)
     }
 
+    @Test("Mixed Drafts and Inbox thread actions skip only Drafts members")
+    @MainActor func mixedDraftsThreadActionsSkipOnlyDrafts() async throws {
+        let (pool, inbox, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
+        try await pool.writeWithoutTransaction { db in try drafts.insert(db) }
+        let draftArchiveId = try insertMessage(pool, messageId: "mixed-draft-archive", folder: drafts, date: baseDate)
+        let inboxArchiveId = try insertMessage(pool, messageId: "mixed-inbox-archive", folder: inbox, date: baseDate)
+        let draftMoveId = try insertMessage(pool, messageId: "mixed-draft-move", folder: drafts, date: baseDate)
+        let inboxMoveId = try insertMessage(pool, messageId: "mixed-inbox-move", folder: inbox, date: baseDate)
+        let vm = InboxViewModel(folders: [drafts, inbox, archive])
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+        defer {
+            AccountManager.shared.removeOverlayEntries(ids: [
+                draftArchiveId, inboxArchiveId, draftMoveId, inboxMoveId,
+            ])
+        }
+
+        let archiveSkipped = vm.archiveThread([draftArchiveId, inboxArchiveId])
+        #expect(archiveSkipped == [draftArchiveId])
+        #expect(AccountManager.shared.snapshotOverlay()[draftArchiveId] == nil)
+        #expect(AccountManager.shared.snapshotOverlay()[inboxArchiveId]?.folderId == archive.id)
+
+        let moveSkipped = vm.moveThread(
+            [draftMoveId, inboxMoveId], toFolderPath: archive.path)
+        #expect(moveSkipped == [draftMoveId])
+        #expect(AccountManager.shared.snapshotOverlay()[draftMoveId] == nil)
+        #expect(AccountManager.shared.snapshotOverlay()[inboxMoveId]?.folderId == archive.id)
+        #expect(UndoService.shared.undoStack.count == 2)
+    }
+
     // MARK: - InboxViewModel.delete / deleteThread guards
 
     @Test("delete() from the trash folder is a no-op — no undo, no overlay")

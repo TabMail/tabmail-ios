@@ -16,30 +16,30 @@ enum InboxMode: String, CaseIterable {
 /// inside the button means every row layout shares the same no-action contract.
 struct RestrictedMailActionButton<Label: View>: View {
     let isRestricted: Bool
+    /// This is the only action retained by the view. The unrestricted closure
+    /// is deliberately not stored, so changing presentation state cannot make
+    /// a restricted control execute it.
     let action: () -> Void
     @ViewBuilder let label: () -> Label
 
+    init(
+        isRestricted: Bool,
+        action: @escaping () -> Void,
+        @ViewBuilder label: @escaping () -> Label
+    ) {
+        self.isRestricted = isRestricted
+        self.action = {
+            guard !isRestricted else { return }
+            action()
+        }
+        self.label = label
+    }
+
     var body: some View {
-        Button {
-            RestrictedMailActionControl.perform(
-                isRestricted: isRestricted,
-                action: action)
-        } label: {
+        Button(action: action) {
             label()
         }
         .disabled(isRestricted)
-    }
-}
-
-/// Executes the exact action closure owned by `RestrictedMailActionButton`.
-/// Returning whether it ran gives tests an observable no-picker/no-hide seam,
-/// rather than testing only the spelling of a policy predicate.
-enum RestrictedMailActionControl {
-    @discardableResult
-    static func perform(isRestricted: Bool, action: () -> Void) -> Bool {
-        guard !isRestricted else { return false }
-        action()
-        return true
     }
 }
 
