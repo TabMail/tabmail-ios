@@ -1235,6 +1235,7 @@ struct ServerDraftComposeLoader: View {
                 } actions: {
                     Button("Close") { dismiss() }
                         .buttonStyle(.bordered)
+                        .accessibilityIdentifier("server-draft-close")
                 }
             case .resolveFailed:
                 // Copy deliberately parallel to `DraftComposePresenter`'s
@@ -1253,6 +1254,7 @@ struct ServerDraftComposeLoader: View {
                         .padding(.horizontal, 32)
                     Button("Close") { dismiss() }
                         .buttonStyle(.bordered)
+                        .accessibilityIdentifier("server-draft-close")
                     Button("Try Again") {
                         resolution = nil
                         Task { await resolveLocallyAuthoredDraft() }
