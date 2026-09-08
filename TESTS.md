@@ -17,6 +17,10 @@ it does not terminate the hosted test process.
 `interruptedIMAPMoveRetainsAuthority` exercise
 real providers against stateful servers before and after remote completion,
 including changed/unknown IMAP epochs and untouched bystanders.
+`interruptedGroupedGmailMoveConverges` snapshots a real claim for one or three
+messages and reopens it through both testing and production startup modes, with
+existing-release flags. It checks every target, the bystander and durable queue
+settlement.
 `AccountManagerQueueDrainTests` retains startup-only coverage of cancelled-row
 cleanup and unrelated queued work.
 

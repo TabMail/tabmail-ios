@@ -999,6 +999,72 @@ struct GlobalFifoExecutorTests {
         #expect(try rowsByPosition(f).isEmpty)
     }
 
+    @Test("Every member of a claimed move survives either startup entry", arguments: [false, true], [1, 3])
+    @MainActor
+    func interruptedGroupedGmailMoveConverges(productionStartup: Bool, memberCount: Int) async throws {
+        let f = try fixture(accountId: "restart-grouped-gmail", provider: .gmail)
+        defer { finish(f) }
+        // Existing-release process death: the original production launch already
+        // completed the one-time startup resets before admitting this gesture.
+        let flags = StartupMigrationsTests.snapshotFlags()
+        for key in StartupMigrationsTests.allFlagKeys { UserDefaults.standard.set(true, forKey: key) }
+        defer { StartupMigrationsTests.restoreFlags(flags) }
+        let ids = Array(["member-a", "member-b", "member-c"].prefix(memberCount))
+        let bystander = "member-other"
+        let labels: Set<String> = ["INBOX", "UNREAD"]
+        let server = StatefulGmailActionServer(messages: (ids + [bystander]).map {
+            .init(rfc822MessageId: "\($0)@example.com", providerMessageId: $0, labels: labels)
+        })
+        defer { server.close() }
+        let admitted = try admit(f, PendingOperation(type: .move, messageIds: ids,
+            accountId: f.accountId, folderPath: Self.source, destinationPath: "TRASH"))
+        let snapshotPath = f.directory.appendingPathComponent("claimed.sqlite").path
+        let captured = Mutex(false)
+        let original = MockEmailProvider()
+        await original.setMoveHook {
+            guard !captured.withLock({ $0 }) else { return }
+            do {
+                try await f.pool.writeWithoutTransaction { db in
+                    try db.execute(sql: "VACUUM INTO ?", arguments: [snapshotPath])
+                }
+                captured.withLock { $0 = true }
+            } catch { Issue.record("snapshot failed: \(error)") }
+        }
+        await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: original) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+        #expect(captured.withLock { $0 })
+        guard captured.withLock({ $0 }) else { return }
+        let restartedPool = try DatabasePool(path: snapshotPath)
+        let before = try await restartedPool.read { try PendingOperation.fetchOne($0, key: admitted.id) }
+        #expect(before?.messageIds == ids)
+        #expect(before?.status == PendingStatus.inFlight.rawValue)
+        #expect(before?.everAttempted == true)
+        #expect(server.modifyLog().isEmpty)
+        for id in ids { #expect(server.snapshot(providerMessageId: id)?.labels == labels) }
+        let restarted = try AppDatabase(pool: restartedPool, runStartupResets: productionStartup)
+        let previous = AppDatabase.shared.withLock { current in
+            let old = current
+            current = restarted
+            return old
+        }
+        defer {
+            InstalledTestDatabaseLifetime.finish(
+                previous: previous, pool: restartedPool, directory: f.directory)
+        }
+        let replay = server.provider()
+        await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: replay) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+        for id in ids {
+            #expect(server.snapshot(providerMessageId: id)?.labels == ["TRASH", "UNREAD"],
+                    "every selected member must reach its requested destination after restart")
+        }
+        #expect(server.snapshot(providerMessageId: bystander)?.labels == labels)
+        #expect(Set(server.modifyLog().map(\.providerMessageId)) == Set(ids))
+        #expect(try await restartedPool.read { try PendingOperation.fetchCount($0) } == 0)
+    }
+
     // MARK: - 8. Cost on a realistic queue
 
     /// **THE PROPERTY: the frontier walk and the deferral transaction stay cheap
