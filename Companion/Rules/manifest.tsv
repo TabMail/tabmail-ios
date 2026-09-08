@@ -8,7 +8,7 @@ order	status	sha256	separator	path	heading
 0	historical	01d4f99ecaafbd4cff5611466cc3ee6a69434e4c3a8ed265b8b5dd6c3b657726	LF	Companion/Process/History/000-pre-compaction-preamble.md	__preamble__
 1	historical	cbc359a3d36c37df0190afdddeecec5119677ef55e87fc28cf0e06c9c0edd745	LF	Companion/Process/History/001-pre-compaction-routing.md	Companion Routing (MANDATORY BEFORE EVERY TASK)
 2	active	9c08d68cbea957cba890491d35bae9d1e418c3f62dbada0c8c03e150c2b921c1	LF	Companion/Rules/Active/development-rules.md	Development Rules
-3	current	8c34cb8b0a871b2a88774f68a9790fadd865def425aaaa8a07fd8deb0d92c742	LF	Companion/Process/Current/audit-workflow.md	Cross-Model Audit Workflow — STANDARD (current owner-directed role assignment 2026-07-27)
+3	current	d25f4bad6ba3208f08ab914a799fecad125e6eb54cbc2ded7ff4400b5185e384	LF	Companion/Process/Current/audit-workflow.md	Cross-Model Audit Workflow — platform constraints only; model, effort, roles, and delegation route to the root canonical rule
 4	active	d463d9210f35ae38b2e0c9f557f6b980b377266b32f567e8a9332e80cf59bbca	LF	Companion/Rules/Active/never-drop-user-intention.md	Core Philosophy: Never Drop User Intention
 5	active	d09260626986709b23d65935dbfea1678ba4e4c74d6dade1669110177ad78d2b	LF	Companion/Rules/Active/data-integrity.md	Data Integrity Rules — ABSOLUTE
 6	active	88dd272da3f0edb041a4fd5ff398511a80982bc0b00327388526d8a317560746	LF	Companion/Rules/Active/resilience.md	Resilience Rules
