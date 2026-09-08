@@ -484,7 +484,7 @@ struct TabMailApp: App {
             }
             #if DEBUG
             .overlay {
-                if ProcessInfo.processInfo.arguments.contains("--draft-close-ui-test") {
+                if startup.isReady && ProcessInfo.processInfo.arguments.contains("--draft-close-ui-test") {
                     ServerDraftCloseTestScene()
                 }
             }

@@ -1173,7 +1173,7 @@ private struct PushedMessageDestination: View {
 struct ServerDraftComposeLoader: View {
     let header: MessageHeader
     #if DEBUG
-    var resolveOpenAuthorityForTesting: (@MainActor () async throws -> LocallyAuthoredDraftOpenAuthority?)? = nil
+    @Environment(\.draftOpenResolverForTesting) private var resolveOpenAuthorityForTesting
     #endif
     @State private var resolution: Resolution?
     @Environment(\.dismiss) private var dismiss

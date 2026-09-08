@@ -71,7 +71,11 @@ The SAME scenario histories as Layer 1, driven through the REAL pipeline instead
 `TabMailScreenshots/ServerDraftCloseUITests.swift` runs in the existing
 `TabMailScreenshots` UI-test scheme. Its six cases cover unavailable and failed
 resolution in full-screen, pushed, and collapsed detail-column presentations.
-Each presses the real Close button and then interacts with the presenting mailbox;
-the failure cases also press Try Again. `ServerDraftCloseTestScene` and the resolver
-dependency seam exist only in Debug and use synthetic data, without provider calls.
-These are presentation-contract tests, not provider-resolution integration tests.
+The Debug fixture seeds disposable account, folder, and header rows and mounts the
+production `MailNavigationView`. Cover cases tap the real Drafts row; push and detail
+cases emit the existing email-pill and notification input events. No substitute
+navigation stack or cover owns the loader. Each opens and closes twice, checks the
+real mailbox is usable, and checks that the fixture rows remain intact. Failure
+cases also verify that Try Again invokes the injected dependency again. The
+resolver seam is a Debug-only environment value, defaulting to nil. These are
+mailbox-presentation integration tests, not provider-resolution integration tests.
