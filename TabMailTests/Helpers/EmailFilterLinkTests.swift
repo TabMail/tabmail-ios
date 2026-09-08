@@ -39,6 +39,8 @@ struct EmailFilterLinkTests {
     }
 
     @Test func noAddressRemainsText() {
+        #expect(EmailFilter.htmlToPlainText(#"<a href="&#32;">Empty</a>"#) == "Empty")
+
         #expect(EmailFilter.htmlToPlainText(#"<a name="section">Section</a> <a href="">Empty</a>"#) == "Section Empty")
     }
 
@@ -53,6 +55,9 @@ struct EmailFilterLinkTests {
     }
 
     @Test(arguments: [
+        (#"<a href="&#32;https://example.com/x&#32;">Read</a>"#, "https://example.com/x"),
+        (#"<a href="https://example.com/x&#32;">Read</a>"#, "https://example.com/x"),
+        (#"<a href="https://example.com/?x=&amp=2">Read</a>"#, "https://example.com/?x=&amp=2"),
         (#"<a href="https://example.com/&#110;eedle">Read</a>"#, "https://example.com/needle"),
         (#"<a href="https://example.com/caf&#xE9;">Read</a>"#, "https://example.com/caf%C3%A9"),
         (#"<a href="https://example.com/?x=&amp;#110;">Read</a>"#, "https://example.com/?x=&#110;"),
@@ -154,6 +159,17 @@ struct EmailFilterLinkTests {
     @Test func decodedLettersRemainReadableInStoredText() {
         let text = EmailFilter.htmlToPlainText(#"<a href="https://example.com/&#110;eedle/caf&#xE9;">Read</a>"#)
         #expect(text == "[Read](https://example.com/needle/café)")
+    }
+
+    @Test func combiningMarksPreserveSeparateLinkLabels() throws {
+        let first = "one`\u{0301}"
+        let second = "two`\u{0301}"
+        let html = "<a href='https://example.com/one'>\(first)</a> <a href='https://example.com/two'>\(second)</a>"
+        let parsed = try AttributedString(markdown: EmailFilter.htmlToPlainText(html))
+        #expect(String(parsed.characters) == "\(first) \(second)")
+        #expect(parsed.runs.compactMap { $0.link?.absoluteString } == ["https://example.com/one", "https://example.com/two"])
+        let labels = parsed.runs.filter { $0.link != nil }.map { String(parsed[$0.range].characters) }
+        #expect(labels == [first, second])
     }
 
 }

@@ -245,23 +245,20 @@ enum EmailFilter {
             let label = String(decoding: out[active.start...], as: UTF8.self)
                 .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
             out.removeSubrange(active.start...)
-            let escapedLabel = label.replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "&", with: "&amp;")
-                .replacingOccurrences(of: "[", with: "\\[")
-                .replacingOccurrences(of: "]", with: "\\]")
-                .replacingOccurrences(of: "`", with: "\\`")
-                .replacingOccurrences(of: "*", with: "\\*")
-                .replacingOccurrences(of: "_", with: "\\_")
-                .replacingOccurrences(of: "<", with: "\\<")
-                .replacingOccurrences(of: ">", with: "\\>")
-                .replacingOccurrences(of: "~", with: "\\~")
-            // Decode the attribute once. This tokenizer throws only for an invalid built-in
-            // entity table; malformed or unknown mail references use its normal recovery path.
-            let address = try! Parser.unescapeEntities(active.href, true)
+            let labelPunctuation = CharacterSet(charactersIn: "\\[]`*_<>~")
+            var escapedLabel = ""
+            for scalar in label.unicodeScalars {
+                if scalar == "&" {
+                    escapedLabel += "&amp;"
+                } else {
+                    if labelPunctuation.contains(scalar) { escapedLabel.append("\\") }
+                    escapedLabel.unicodeScalars.append(scalar)
+                }
+            }
             let encoded = CharacterSet.controlCharacters.union(.whitespacesAndNewlines)
             let escaped = CharacterSet(charactersIn: "\\()<>;")
             var destination = ""
-            for scalar in address.unicodeScalars {
+            for scalar in active.href.unicodeScalars {
                 if encoded.contains(scalar) {
                     for byte in String(scalar).utf8 {
                         destination += String(format: "%%%02X", byte)
@@ -357,7 +354,10 @@ enum EmailFilter {
                         if !lastWasSpace { out.append(0x20); lastWasSpace = true }
                         if !isClosing, tagEnd < count,
                            let range = plainTextAttributeRange(bytes, from: ns + tagLen, to: tagEnd, named: "href") {
-                            let href = String(decoding: UnsafeBufferPointer(start: bytes + range.lowerBound, count: range.count), as: UTF8.self)
+                            let attribute = String(decoding: UnsafeBufferPointer(start: bytes + range.lowerBound, count: range.count), as: UTF8.self)
+                            // Decode before trimming and checking emptiness. This tokenizer throws
+                            // only for an invalid built-in entity table; malformed references recover.
+                            let href = try! Parser.unescapeEntities(attribute, true)
                                 .trimmingCharacters(in: .whitespacesAndNewlines)
                             if !href.isEmpty { link = (out.count, href) }
                         }
