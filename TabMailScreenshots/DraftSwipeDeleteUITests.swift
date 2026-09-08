@@ -7,22 +7,83 @@ import XCTest
 @MainActor
 final class DraftSwipeDeleteUITests: XCTestCase {
     func testFullSwipeDeletesDraft() {
+        checkDelete(expected: "bystander")
+    }
+
+    func testCollapsedThreadDeletesBothDrafts() {
+        checkDelete(thread: true, expected: "bystander")
+    }
+
+    func testExpandedRepresentativeDeletesOnlyThatDraft() {
+        checkDelete(thread: true, expand: true, expected: "bystander,child")
+    }
+
+    func testExpandedChildDeletesOnlyThatDraft() {
+        checkDelete(thread: true, expand: true, child: true, expected: "bystander,target")
+    }
+
+    func testTriageDeletesOnlyThatDraft() {
+        checkDelete(triage: true, expected: "bystander")
+    }
+
+    func testOrdinaryArchiveFirstAndSameRoleControlsAreInert() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test", "--swipe-controls-ui-test"]
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.staticTexts["Ordinary mail"].waitForExistence(timeout: 20))
+        fullSwipe(app.staticTexts["Ordinary mail"], in: app)
+        XCTAssertTrue(app.staticTexts["Archived: 1 Deleted: 0"].waitForExistence(timeout: 5))
+        fullSwipe(app.staticTexts["Archive folder"], in: app)
+        XCTAssertTrue(app.staticTexts["Archive folder"].exists)
+        XCTAssertTrue(app.staticTexts["Archived: 1 Deleted: 0"].exists)
+        let trash = app.staticTexts["Trash folder"]
+        let y = trash.frame.midY / app.frame.height
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: y))
+            .press(forDuration: 0.05, thenDragTo:
+                app.coordinate(withNormalizedOffset: CGVector(dx: 0.55, dy: y)))
+        XCTAssertTrue(app.buttons["Trash"].waitForExistence(timeout: 5))
+        app.buttons["Trash"].tap()
+        XCTAssertTrue(trash.exists)
+        XCTAssertTrue(app.staticTexts["Archived: 1 Deleted: 0"].exists)
+    }
+
+    private func checkDelete(thread: Bool = false, expand: Bool = false,
+                             child: Bool = false, triage: Bool = false, expected: String) {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test", "--draft-delete-ui-test"]
+        if thread { app.launchArguments.append("--draft-delete-thread") }
         app.launch()
         defer { app.terminate() }
         XCTAssertTrue(app.staticTexts["Fixture ready"].waitForExistence(timeout: 20))
-        let row = app.staticTexts["Draft close fixture"].firstMatch
+        let representative = app.staticTexts["Draft close fixture"].firstMatch
+        XCTAssertTrue(representative.waitForExistence(timeout: 10))
+        if expand {
+            // The thread toggle is the trailing circular chevron on the sender line.
+            let y = (representative.frame.minY - 13) / app.frame.height
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.92, dy: y)).tap()
+            XCTAssertTrue(app.staticTexts["Draft child"].firstMatch.waitForExistence(timeout: 5))
+        }
+        if triage {
+            app.buttons["Switch to triage"].tap()
+            XCTAssertTrue(app.buttons["Switch to list"].waitForExistence(timeout: 5))
+        }
+        let row = app.staticTexts[child ? "Draft child" : "Draft close fixture"].firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: 10))
-        let rowY = row.frame.midY / app.frame.height
-        app.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: rowY))
-            .press(forDuration: 0.05, thenDragTo:
-                app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: rowY)))
+        fullSwipe(row, in: app)
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: row)
         waitForExpectations(timeout: 10)
         XCTAssertFalse(app.buttons["Archive"].exists)
         app.buttons["Check rows"].tap()
-        XCTAssertTrue(app.staticTexts["Draft deleted"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Remaining: \(expected)"].waitForExistence(timeout: 5))
+    }
+
+    private func fullSwipe(_ row: XCUIElement, in app: XCUIApplication) {
+        let y = row.frame.midY / app.frame.height
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: y))
+            .press(forDuration: 0.05, thenDragTo:
+                app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: y)))
     }
 }

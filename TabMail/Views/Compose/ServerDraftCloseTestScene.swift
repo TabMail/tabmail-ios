@@ -35,7 +35,9 @@ struct ServerDraftCloseTestScene: View {
 
     var body: some View {
         Group {
-            if ready {
+            if ProcessInfo.processInfo.arguments.contains("--swipe-controls-ui-test") {
+                InboxSwipeControlsTestScene()
+            } else if ready {
                 MailNavigationView(initialSelection: .unified(.drafts))
                     .environment(navigationStore)
                     .environment(\.draftOpenResolverForTesting, {
@@ -45,7 +47,7 @@ struct ServerDraftCloseTestScene: View {
                         }
                         return nil
                     })
-                    .safeAreaInset(edge: .top) {
+                    .safeAreaInset(edge: ProcessInfo.processInfo.arguments.contains("--draft-delete-ui-test") ? .bottom : .top) {
                         VStack {
                             HStack {
                                 Button("Open push") {
@@ -76,7 +78,12 @@ struct ServerDraftCloseTestScene: View {
                 let accountID = Self.accountID
                 let fixtureRow = Self.row
                 let deleteFixture = ProcessInfo.processInfo.arguments.contains("--draft-delete-ui-test")
+                let deleteRows = deleteFixture ? Self.deleteRows(
+                    thread: ProcessInfo.processInfo.arguments.contains("--draft-delete-thread")) : []
                 try await AppDatabase.dbPool.write { db in
+                    // Each launch owns only this synthetic account's fixture rows.
+                    try Draft.filter(Column("accountId") == accountID).deleteAll(db)
+                    try MessageHeader.filter(Column("accountId") == accountID).deleteAll(db)
                     var account = Account(emailAddress: "sender@example.com", displayName: "Draft fixture", provider: .imap)
                     account.id = accountID
                     try account.save(db)
@@ -86,24 +93,16 @@ struct ServerDraftCloseTestScene: View {
                         folder.totalCount = role == .drafts ? 1 : 0
                         try folder.save(db)
                     }
-                    var header = fixtureRow.toMessageHeader()
                     if deleteFixture {
-                        let now = Date().timeIntervalSince1970
-                        var draft = Draft(
-                            id: "swipe-delete-fixture", accountId: accountID,
-                            toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
-                            subject: fixtureRow.subject, body: "Authored text", replyToId: nil,
-                            isForward: false, editHistoryJSON: nil, createdAt: now, updatedAt: now,
-                            serverDraftId: nil, serverPushStatus: nil,
-                            rfc822MessageId: nil, attachmentsDirName: nil)
-                        draft.instanceEpoch = "swipe-generation"
-                        try draft.save(db)
-                        header.messageId = PendingOperation.draftPlaceholderMessageId(
-                            draftId: draft.id, instanceEpoch: draft.instanceEpoch)
-                        header.id = "\(accountID):Drafts:\(header.messageId)"
+                        for (draft, header) in deleteRows {
+                            try draft.save(db)
+                            try header.save(db)
+                        }
+                    } else {
+                        var header = fixtureRow.toMessageHeader()
+                        header.isInInbox = false
+                        try header.save(db)
                     }
-                    header.isInInbox = false
-                    try header.save(db)
                 }
                 await navigationStore.refresh()
                 status = "Fixture ready"
@@ -114,14 +113,50 @@ struct ServerDraftCloseTestScene: View {
         }
     }
 
+    private static func deleteRows(thread: Bool) -> [(Draft, MessageHeader)] {
+        let ids = thread ? ["target", "child", "bystander"] : ["target", "bystander"]
+        return ids.enumerated().map { index, id in
+            let date = Date().addingTimeInterval(Double(-60 * index))
+            let subject = id == "target" ? "Draft close fixture" : "Draft \(id)"
+            var draft = Draft(
+                id: id, accountId: accountID, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: subject, body: "Authored \(id)", replyToId: nil,
+                isForward: false, editHistoryJSON: nil,
+                createdAt: date.timeIntervalSince1970, updatedAt: date.timeIntervalSince1970,
+                serverDraftId: nil, serverPushStatus: nil,
+                rfc822MessageId: nil, attachmentsDirName: nil)
+            draft.instanceEpoch = "generation-\(id)"
+            var header = row.toMessageHeader()
+            header.messageId = PendingOperation.draftPlaceholderMessageId(
+                draftId: id, instanceEpoch: draft.instanceEpoch)
+            header.id = "\(accountID):Drafts:\(header.messageId)"
+            header.subject = subject
+            header.snippet = "Authored \(id)"
+            header.date = date
+            header.rfc822MessageId = "\(id)@example.com"
+            header.computedThreadId = thread && id != "bystander" ? "draft-thread" : id
+            header.isInInbox = false
+            return (draft, header)
+        }
+    }
+
     private func checkRows() {
         do {
             if ProcessInfo.processInfo.arguments.contains("--draft-delete-ui-test") {
-                let deleted = try AppDatabase.dbPool.read { db in
-                    try Draft.filter(Column("accountId") == Self.accountID).fetchCount(db) == 0
-                        && MessageHeader.filter(Column("accountId") == Self.accountID).fetchCount(db) == 0
+                let result = try AppDatabase.dbPool.read { db in
+                    let drafts = try Draft.filter(Column("accountId") == Self.accountID).fetchAll(db)
+                    let headers = try MessageHeader.filter(Column("accountId") == Self.accountID).fetchAll(db)
+                    let expectedHeaders = Set(drafts.map {
+                        PendingOperation.draftPlaceholderHeaderPK(
+                            accountId: Self.accountID, draftsFolderPath: "Drafts",
+                            draftId: $0.id, instanceEpoch: $0.instanceEpoch)
+                    })
+                    let intact = Set(headers.map(\.id)) == expectedHeaders
+                        && headers.allSatisfy { $0.folderPath == "Drafts" && !$0.isInInbox }
+                        && drafts.allSatisfy { $0.body == "Authored \($0.id)" }
+                    return intact ? "Remaining: \(drafts.map(\.id).sorted().joined(separator: ","))" : "Unexpected mutation"
                 }
-                status = deleted ? "Draft deleted" : "Draft remains"
+                status = result
                 return
             }
             let preserved = try AppDatabase.dbPool.read { db in
