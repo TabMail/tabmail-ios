@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftSoup
 
 /// Pure, GRDB-free email filtering and parsing utilities.
 /// Compiled into both the main app and the NSE via the Shared/ glob in project.yml.
@@ -227,7 +228,7 @@ enum EmailFilter {
     }
 
     /// Strips HTML to plain text suitable for FTS indexing.
-    /// Single-pass UTF-8 byte scanner — O(1) extra memory (no copy of the input).
+    /// Single-pass UTF-8 byte scanner; visible anchors retain destinations as Markdown links.
     /// Skips <style>/<script>/<head> block content, strips tags, decodes entities,
     /// and collapses whitespace in one pass.
     /// All HTML structural characters (< > & ; / ! -) are ASCII, so byte-level
@@ -237,6 +238,41 @@ enum EmailFilter {
         var out: [UInt8] = []
         out.reserveCapacity(html.utf8.count / 4)
         var lastWasSpace = true
+        var link: (start: Int, href: String)?
+
+        func finishLink() {
+            guard let active = link else { return }
+            let label = String(decoding: out[active.start...], as: UTF8.self)
+                .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            out.removeSubrange(active.start...)
+            let labelPunctuation = CharacterSet(charactersIn: "\\[]`*_<>~")
+            var escapedLabel = ""
+            for scalar in label.unicodeScalars {
+                if scalar == "&" {
+                    escapedLabel += "&amp;"
+                } else {
+                    if labelPunctuation.contains(scalar) { escapedLabel.append("\\") }
+                    escapedLabel.unicodeScalars.append(scalar)
+                }
+            }
+            let encoded = CharacterSet.controlCharacters.union(.whitespacesAndNewlines)
+            let escaped = CharacterSet(charactersIn: "\\()<>;")
+            var destination = ""
+            for scalar in active.href.unicodeScalars {
+                if encoded.contains(scalar) {
+                    for byte in String(scalar).utf8 {
+                        destination += String(format: "%%%02X", byte)
+                    }
+                } else {
+                    // Escaping semicolons prevents Markdown from decoding an entity twice.
+                    if escaped.contains(scalar) { destination.append("\\") }
+                    destination.unicodeScalars.append(scalar)
+                }
+            }
+            out.append(contentsOf: "[\(escapedLabel)](\(destination))".utf8)
+            link = nil
+            lastWasSpace = false
+        }
 
         // Zero-copy access to the string's UTF-8 bytes via withUTF8.
         // Falls back to a 1x copy only for bridged NSStrings (rare).
@@ -280,14 +316,16 @@ enum EmailFilter {
                         continue
                     }
 
+                    // Quotes may contain '>'; only an unquoted '>' ends a tag.
+                    let tagEnd = plainTextTagEnd(bytes, count: count, from: ns + tagLen)
+
                     // Opening tags with display:none — skip all content to matching close tag
                     let isClosing = (i + 1 < count && bytes[i + 1] == 0x2F)
                     if tagLen > 0 && !isClosing {
-                        // Scan tag attributes (between tag name and '>') for display:none
+                        // Only the actual style value controls inline visibility.
                         let tagAttrStart = ns + tagLen
-                        var tagEnd = tagAttrStart
-                        while tagEnd < count, bytes[tagEnd] != 0x3E { tagEnd += 1 }
-                        if tagEnd > tagAttrStart && hasDisplayNone(bytes, from: tagAttrStart, to: tagEnd) {
+                        if let style = plainTextAttributeRange(bytes, from: tagAttrStart, to: tagEnd, named: "style"),
+                           hasDisplayNone(bytes, from: style.lowerBound, to: style.upperBound) {
                             // Skip past opening tag '>'
                             i = tagEnd
                             if i < count { i += 1 }
@@ -311,6 +349,22 @@ enum EmailFilter {
                         }
                     }
 
+                    if tagName == "a" {
+                        finishLink()
+                        if !lastWasSpace { out.append(0x20); lastWasSpace = true }
+                        if !isClosing, tagEnd < count,
+                           let range = plainTextAttributeRange(bytes, from: ns + tagLen, to: tagEnd, named: "href") {
+                            let attribute = String(decoding: UnsafeBufferPointer(start: bytes + range.lowerBound, count: range.count), as: UTF8.self)
+                            // Decode before trimming and checking emptiness. This tokenizer throws
+                            // only for an invalid built-in entity table; malformed references recover.
+                            let href = try! Parser.unescapeEntities(attribute, true)
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !href.isEmpty { link = (out.count, href) }
+                        }
+                        i = min(tagEnd + 1, count)
+                        continue
+                    }
+
                     // Check if this is a block-level tag or <br> — emit newline
                     let isBlockTag: Bool
                     switch tagName {
@@ -323,9 +377,8 @@ enum EmailFilter {
                     let isBlock = tagLen > 0 && isBlockTag
                     let isBr = tagLen > 0 && tagName == "br"
 
-                    // Regular tag — skip to '>'
-                    while i < count, bytes[i] != 0x3E { i += 1 }
-                    if i < count { i += 1 }
+                    // Regular tag — skip to its unquoted end.
+                    i = min(tagEnd + 1, count)
 
                     if isBr || (isBlock && isClosing) {
                         // Block-level close tags and <br> → newline
@@ -414,6 +467,8 @@ enum EmailFilter {
             }
         }
 
+        finishLink()
+
         // Trim trailing whitespace (space, newline, CR, tab)
         while let last = out.last, last == 0x20 || last == 0x0A || last == 0x0D || last == 0x09 {
             out.removeLast()
@@ -422,6 +477,67 @@ enum EmailFilter {
     }
 
     // MARK: - UTF-8 byte scanner helpers
+
+    /// Find an HTML tag end without treating quoted attribute content as markup.
+    private static func plainTextTagEnd(_ bytes: UnsafePointer<UInt8>, count: Int, from: Int) -> Int {
+        var quote: UInt8?
+        var beforeValue = false
+        var unquotedValue = false
+        var i = from
+        while i < count {
+            let byte = bytes[i]
+            let whitespace = byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D || byte == 0x0C
+            if let current = quote {
+                if byte == current { quote = nil }
+            } else if byte == 0x3E {
+                return i
+            } else if unquotedValue {
+                if whitespace { unquotedValue = false }
+            } else if beforeValue {
+                if !whitespace {
+                    beforeValue = false
+                    if byte == 0x22 || byte == 0x27 { quote = byte }
+                    else { unquotedValue = true }
+                }
+            } else if byte == 0x3D {
+                beforeValue = true
+            }
+            i += 1
+        }
+        return count
+    }
+
+    /// Read whole attributes, so names inside another value cannot masquerade as attributes.
+    /// Unlike the embedded-message metadata reader, HTML anchors also allow unquoted values.
+    private static func plainTextAttributeRange(_ bytes: UnsafePointer<UInt8>, from: Int, to: Int, named wanted: String) -> Range<Int>? {
+        func whitespace(_ byte: UInt8) -> Bool {
+            byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D || byte == 0x0C
+        }
+        var i = from
+        while i < to {
+            while i < to, whitespace(bytes[i]) || bytes[i] == 0x2F { i += 1 }
+            let nameStart = i
+            while i < to, !whitespace(bytes[i]), bytes[i] != 0x3D { i += 1 }
+            let name = String(decoding: UnsafeBufferPointer(start: bytes + nameStart, count: i - nameStart), as: UTF8.self)
+            while i < to, whitespace(bytes[i]) { i += 1 }
+            guard i < to, bytes[i] == 0x3D else { continue }
+            i += 1
+            while i < to, whitespace(bytes[i]) { i += 1 }
+            guard i < to else { return nil }
+            let quote = bytes[i] == 0x22 || bytes[i] == 0x27 ? bytes[i] : nil
+            if quote != nil { i += 1 }
+            let start = i
+            while i < to {
+                if let quote { if bytes[i] == quote { break } }
+                else if whitespace(bytes[i]) { break }
+                i += 1
+            }
+            let end = i
+            if quote != nil, i < to { i += 1 }
+            if name.lowercased() == wanted { return start..<end }
+        }
+        return nil
+    }
 
     /// Length of a UTF-8 multi-byte sequence given the leading byte.
     /// Returns true if `v` is an invisible Unicode scalar value (zero-width spaces,
@@ -481,9 +597,7 @@ enum EmailFilter {
         return count
     }
 
-    /// Scan tag attribute bytes for `display` `:` (optional whitespace) `none` (case-insensitive).
-    /// Catches inline styles like `style="display: none"`, `style="display:none; ..."`, etc.
-    /// Operates on raw bytes between tag-name end and `>`.
+    /// Find an inline display:none declaration, ignoring text inside CSS values and comments.
     private static func hasDisplayNone(_ bytes: UnsafePointer<UInt8>, from: Int, to: Int) -> Bool {
         // "display" = 7 bytes, ":" = 1, "none" = 4 → min 12 bytes needed
         guard to - from >= 12 else { return false }
@@ -491,7 +605,30 @@ enum EmailFilter {
         let display: [UInt8] = [0x64, 0x69, 0x73, 0x70, 0x6C, 0x61, 0x79] // "display"
         let none: [UInt8] = [0x6E, 0x6F, 0x6E, 0x65] // "none"
         var j = from
+        var quote: UInt8?
+        var depth = 0
+        var propertyStart = true
         while j + 11 < to {
+            let byte = bytes[j]
+            if byte == 0x5C { j = min(j + 2, to); propertyStart = false; continue }
+            if let current = quote {
+                if byte == current { quote = nil }
+                j += 1; continue
+            }
+            if byte == 0x22 || byte == 0x27 { quote = byte; propertyStart = false; j += 1; continue }
+            if byte == 0x2F, j + 1 < to, bytes[j + 1] == 0x2A {
+                j += 2
+                while j + 1 < to, !(bytes[j] == 0x2A && bytes[j + 1] == 0x2F) { j += 1 }
+                j = min(j + 2, to)
+                continue
+            }
+            if byte == 0x28 { depth += 1; propertyStart = false; j += 1; continue }
+            if byte == 0x29 { depth = max(0, depth - 1); j += 1; continue }
+            if depth > 0 { j += 1; continue }
+            if byte == 0x3B { propertyStart = true; j += 1; continue }
+            if byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D || byte == 0x0C { j += 1; continue }
+            guard propertyStart else { j += 1; continue }
+            propertyStart = false
             // Match "display" (case-insensitive)
             var match = true
             for k in 0..<7 {

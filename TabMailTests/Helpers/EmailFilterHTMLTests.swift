@@ -352,7 +352,7 @@ struct EmailFilterHTMLDraftTests {
         #expect(!result.contains("<p>"))
     }
 
-    @Test("Rich HTML draft with links extracts text only")
+    @Test("Rich HTML draft retains link destinations in text")
     func richDraftWithLinks() {
         let html = """
         <div>Check out <a href="https://example.com">this link</a> for details.</div>
@@ -362,7 +362,7 @@ struct EmailFilterHTMLDraftTests {
         #expect(result.contains("this link"))
         #expect(result.contains("for details."))
         #expect(!result.contains("href"))
-        #expect(!result.contains("https://"))
+        #expect(result.contains("[this link](https://example.com)"))
     }
 
     @Test("Plain text body passes through unchanged")

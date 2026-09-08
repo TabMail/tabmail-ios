@@ -12,6 +12,8 @@ Root [`../CLAUDE.md`](../CLAUDE.md) is normative; the [full pre-pass iOS routing
 
 ## Current topics
 
+- [HTML-to-text Markdown links, href destinations in FTS and agent reads; forward-only (#100)](Companion/Memory/Current/125-html-links-in-converted-text.md).
+
 Search the topic text below as subsystem keywords. Each link is mandatory when its row matches the task.
 
 **Save Draft adopts the visible AI suggestion synchronously:** [Topic 049](Companion/Memory/Current/049-compose-ai-suggestion-chat-pill-edits-suggestion-in-place-when-bubble-is.md).

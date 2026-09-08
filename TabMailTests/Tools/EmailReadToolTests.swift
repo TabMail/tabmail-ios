@@ -45,7 +45,8 @@ struct EmailReadToolTests {
             from: "Alice", fromAddress: "alice@test.com",
             to: "bob@test.com"
         )
-        try TestDatabase.insertMessageBody(db, headerId: header.id, htmlContent: "<p>Hello world</p>")
+        try TestDatabase.insertMessageBody(db, headerId: header.id, htmlContent: "<p><a href='https://example.com/cachelinkunique'>Hello world</a></p>")
+        #expect(try await SearchIndex.shared.rawFTSBody(contentKey: ContentKey(rawValue: header.id))?.contains("cachelinkunique") != true)
         await translator.seed(header.id, as: 42)
 
         let tool = EmailReadTool(context: ctx)
@@ -54,7 +55,7 @@ struct EmailReadToolTests {
         #expect(result.contains("subject: Test Subject"))
         #expect(result.contains("Alice <alice@test.com>"))
         #expect(result.contains("to: bob@test.com"))
-        #expect(result.contains("Hello world")) // HTML stripped to text
+        #expect(result.contains("[Hello world](https://example.com/cachelinkunique)"))
     }
 
     @Test("Falls back to snippet when no body")
@@ -145,5 +146,89 @@ struct EmailReadToolTests {
         let result = try await tool.execute(arguments: ["unique_id": .int(99)])
         #expect(result.contains("error"))
         #expect(result.contains("message not found"))
+    }
+}
+
+@Suite("HTML link ingestion", .serialized, .processGlobalState)
+struct HTMLLinkIngestionTests {
+    @Test("Fetched HTML links reach stored text, search, and cached or indexed agent reads", arguments: [
+        "",
+        #"title="A > display:none""#,
+        #"style="background:url('>display:none')""#
+    ], [
+        ("https://example.com/uniquelinkdestination", "https://example.com/uniquelinkdestination"),
+        ("https://example.com/&#117;niquelinkdestination", "https://example.com/uniquelinkdestination"),
+        ("https://example.com/uniquelinkdestination?first=alpha&amp;second=omega", "https://example.com/uniquelinkdestination?first=alpha&second=omega"),
+        ("https://example.com/caf&#xE9;/uniquelinkdestination", "https://example.com/café/uniquelinkdestination"),
+        ("https://example.com/&sol;uniquelinkdestination", "https://example.com//uniquelinkdestination"),
+        ("https://example.com/uniquelinkdestination?value=&amp;copy;", "https://example.com/uniquelinkdestination?value=&copy;"),
+        ("https://example.com/uniquelinkdestination?value=&custom;", "https://example.com/uniquelinkdestination?value=&custom;")
+    ])
+    func linkAddressesReachAgentAndSearch(attributes: String, address: (String, String)) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let accountId = "link-ingestion-\(UUID().uuidString)"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        let header = MessageHeader(messageId: "links", subject: "Details",
+            from: "Sender", fromAddress: "sender@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "No body yet", folderId: "\(accountId):INBOX",
+            accountId: accountId, folderPath: "INBOX", isInInbox: false)
+        try await pool.write { db in
+            try header.insert(db)
+            // A false empty result would now consume the terminal empty-body branch.
+            try db.execute(sql: "UPDATE messageHeader SET emptyFetchCount = 2 WHERE id = ?", arguments: [header.id])
+        }
+        let key = ContentKey(rawValue: header.id)
+        let index = SearchIndex.shared
+        _ = try await index.indexHeaders([FTSHeaderRecord(contentKey: key, headerId: header.id,
+            messageId: header.messageId, subject: header.subject, from: header.fromAddress,
+            to: header.to, dateMs: Int64(header.date.timeIntervalSince1970 * 1000))])
+        let term = "uniquelinkdestination"
+        #expect(!(try await index.keywordSearch(query: term)).contains { $0.contentKey == key })
+        #expect(try await index.rawFTSBody(contentKey: key)?.contains(term) != true)
+
+        let html = "<p \(attributes)>See <a href='\(address.0)'>the details</a>.</p>"
+        let info = MessageHeaderInfo(messageId: header.messageId, rfc822MessageId: nil,
+            inReplyTo: nil, references: [], threadId: nil, subject: header.subject,
+            from: header.from, fromAddress: header.fromAddress, to: header.to, cc: "", bcc: "",
+            replyTo: nil, date: header.date, snippet: header.snippet, isRead: false,
+            isFlagged: false, hasAttachments: false, isReplied: false, isForwarded: false, actionTag: nil)
+        let provider = MockEmailProvider()
+        await provider.setFetchMessageResult(FullMessageInfo(header: info, htmlBody: html, textBody: "See the details."))
+        let outcome = await BodyFetchProcessor.fetchAndProcess(item: .init(headerId: header.id,
+            accountId: accountId, folderPath: "INBOX", messageId: header.messageId, isInInbox: false),
+            provider: provider, enableAI: true)
+        await ActiveEmbeddingQueue.shared.clearForTesting()
+        if case .success = outcome {} else { Issue.record("Body ingestion did not succeed") }
+        let storedText = try #require(await index.rawFTSBody(contentKey: key))
+        #expect(storedText.contains(term))
+        let parsed = try AttributedString(markdown: storedText)
+        let normalizedAddress = try #require(URL(string: address.1)).absoluteString
+        #expect(parsed.runs.compactMap { $0.link?.absoluteString } == [normalizedAddress])
+        #expect((try await index.keywordSearch(query: term)).contains { $0.contentKey == key })
+        #expect((try await index.keywordSearch(query: address.1)).contains { $0.contentKey == key })
+        let storedHeader = try #require(await pool.read { try MessageHeader.fetchOne($0, key: header.id) })
+        #expect(storedHeader.bodyComplete)
+        #expect(!storedHeader.bodyEmptyConfirmed)
+        #expect(storedHeader.actionTag != .delete)
+        #expect(storedHeader.summaryBlurb != "This message has no content.")
+
+        let translator = MockChatIdTranslator()
+        await translator.seed(header.id, as: 42)
+        let tool = EmailReadTool(context: ToolContext(db: pool, translator: translator))
+        #expect(try await tool.execute(arguments: ["unique_id": .int(42)]).contains(storedText))
+        // Evict display HTML and clear the snippet so only indexed body text can satisfy the read.
+        try await pool.write { db in
+            _ = try MessageBody.deleteOne(db, key: key.rawValue)
+            try db.execute(sql: "UPDATE messageHeader SET snippet = '' WHERE id = ?", arguments: [header.id])
+        }
+        #expect(try await pool.read { try MessageBody.fetchOne($0, key: key.rawValue) } == nil)
+        #expect(try await tool.execute(arguments: ["unique_id": .int(42)]).contains(storedText))
+        try await index.removeMessages(contentKeys: [key])
+        #expect(!(try await index.keywordSearch(query: term)).contains { $0.contentKey == key })
     }
 }
