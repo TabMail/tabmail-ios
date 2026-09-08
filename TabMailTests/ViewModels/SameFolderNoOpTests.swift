@@ -350,6 +350,35 @@ struct SameFolderNoOpTests {
         #expect(AccountManager.shared.snapshotOverlay()[draftMoveId] == nil)
         #expect(AccountManager.shared.snapshotOverlay()[inboxMoveId]?.folderId == archive.id)
         #expect(UndoService.shared.undoStack.count == 2)
+        guard UndoService.shared.undoStack.count == 2 else { return }
+        #expect(UndoService.shared.undoStack[0].messages.map(\.id) == [inboxArchiveId])
+        #expect(UndoService.shared.undoStack[1].messages.map(\.id) == [inboxMoveId])
+        #expect(
+            UndoService.shared.undoStack[0].commands.flatMap {
+                $0.members.map(\.originalHeaderId)
+            } == [inboxArchiveId])
+        #expect(
+            UndoService.shared.undoStack[1].commands.flatMap {
+                $0.members.map(\.originalHeaderId)
+            } == [inboxMoveId])
+
+        await AccountManager.shared.awaitWriteQueueDrain()
+        let forwardRows = try await pool.read { db in
+            try MessageHeader.fetchAll(db)
+        }
+        #expect(forwardRows.first { $0.id == inboxArchiveId }?.folderId == archive.id)
+        #expect(forwardRows.first { $0.id == inboxMoveId }?.folderId == archive.id)
+        await UndoService.shared.undo()
+        await AccountManager.shared.awaitWriteQueueDrain()
+        await UndoService.shared.undo()
+        await AccountManager.shared.awaitWriteQueueDrain()
+        let restoredRows = try await pool.read { db in
+            try MessageHeader.fetchAll(db)
+        }
+        #expect(restoredRows.first { $0.id == inboxArchiveId }?.folderId == inbox.id)
+        #expect(restoredRows.first { $0.id == inboxMoveId }?.folderId == inbox.id)
+        #expect(restoredRows.first { $0.id == draftArchiveId }?.folderId == drafts.id)
+        #expect(restoredRows.first { $0.id == draftMoveId }?.folderId == drafts.id)
     }
 
     // MARK: - InboxViewModel.delete / deleteThread guards
