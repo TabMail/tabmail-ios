@@ -437,6 +437,17 @@ final class HeightSeedCache: Sendable {
     }
 }
 
+#if DEBUG
+extension AutoSizingHTMLView {
+    @MainActor
+    static func makeRevealTestDriver(hasRevealed: Binding<Bool>) -> (
+        webView: WKWebView, committed: () -> Bool, acknowledge: () -> Void, load: () -> Void
+    ) {
+        HTMLWebView.Coordinator.makeRevealTestDriver(hasRevealed: hasRevealed)
+    }
+}
+#endif
+
 /// Gives the disclosure lease a synchronous hook at the exact native layout
 /// pass that applies SwiftUI's tagged height. The callback is weakly wired by
 /// HTMLWebView and cleared on dismantle; ordinary layouts do one nil/lease guard.
@@ -1028,6 +1039,24 @@ private struct HTMLWebView: UIViewRepresentable {
         /// break WebKit's internal `viewForZooming` and disable zoom entirely.
         /// Released in deinit.
         private var zoomObservation: NSKeyValueObservation?
+
+        #if DEBUG
+        /// Drives the real native consumer and WebKit commit callback without
+        /// the SwiftUI four-second escape masking an early acknowledgement.
+        static func makeRevealTestDriver(hasRevealed: Binding<Bool>) -> (
+            webView: WKWebView, committed: () -> Bool, acknowledge: () -> Void, load: () -> Void
+        ) {
+            let coordinator = Coordinator(height: .constant(100), hasRevealed: hasRevealed,
+                                          leadingPad: .constant(0), trailingPad: .constant(0),
+                                          onUserDisclosureToggle: {})
+            let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 390, height: 100))
+            coordinator.webView = webView
+            webView.navigationDelegate = coordinator
+            return (webView, { coordinator.documentGate.committedGeneration != nil },
+                    { coordinator.handleHeightMessage(["revealed": true]) },
+                    { coordinator.wrapAndLoad(rawHTML: "<p>Test content</p>", previewFilename: nil) })
+        }
+        #endif
 
         init(
             height: Binding<CGFloat>,
