@@ -15,7 +15,10 @@ final class DraftSwipeDeleteUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Fixture ready"].waitForExistence(timeout: 20))
         let row = app.staticTexts["Draft close fixture"].firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: 10))
-        row.swipeLeft(velocity: .slow)
+        let rowY = row.frame.midY / app.frame.height
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: rowY))
+            .press(forDuration: 0.05, thenDragTo:
+                app.coordinate(withNormalizedOffset: CGVector(dx: 0.02, dy: rowY)))
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: row)
         waitForExpectations(timeout: 10)
         XCTAssertFalse(app.buttons["Archive"].exists)
