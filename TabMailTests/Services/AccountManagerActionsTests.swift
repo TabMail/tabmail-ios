@@ -1259,6 +1259,55 @@ struct AccountManagerActionsTagClearTests {
 
     // MARK: - (2) Move between two non-inbox folders does NOT clear the tag
 
+    @Test("Drafts-source Archive and ordinary Move are refused at shared admission, while Trash remains available")
+    func draftsSourceRefusesArchiveAndMoveButAllowsTrash() async throws {
+        let (pool, _, archive, trash, dir, previous) = try makeTestDB()
+        defer { restoreTestDB(pool: pool, previous: previous, dir: dir); clearOverlay() }
+        clearOverlay()
+
+        let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
+        let custom = Folder(name: "Projects", path: "Projects", role: .custom, accountId: "acc1")
+        try await pool.writeWithoutTransaction { db in
+            try drafts.insert(db)
+            try custom.insert(db)
+        }
+        let archiveCandidate = makeDurableHeader(folder: drafts, messageId: "draft-archive-refused")
+        let moveCandidate = makeDurableHeader(folder: drafts, messageId: "draft-move-refused")
+        let customMoveCandidate = makeDurableHeader(folder: drafts, messageId: "draft-custom-move-refused")
+        let trashCandidate = makeDurableHeader(folder: drafts, messageId: "draft-trash-allowed")
+        try await pool.writeWithoutTransaction { db in
+            try archiveCandidate.insert(db)
+            try moveCandidate.insert(db)
+            try customMoveCandidate.insert(db)
+            try trashCandidate.insert(db)
+        }
+
+        let archiveResult = await AccountManager.shared.archive([archiveCandidate])
+        let moveResult = await AccountManager.shared.move([moveCandidate], to: archive.path)
+        let customMoveResult = await AccountManager.shared.move([customMoveCandidate], to: custom.path)
+        let trashResult = await AccountManager.shared.move([trashCandidate], to: trash.path)
+
+        #expect(archiveResult.failedIds == [archiveCandidate.id])
+        #expect(moveResult.failedIds == [moveCandidate.id])
+        #expect(customMoveResult.failedIds == [customMoveCandidate.id])
+        #expect(trashResult.admittedIds == [trashCandidate.id])
+
+        let rows = try await pool.read { db in
+            try MessageHeader.fetchAll(db)
+        }
+        let byId = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
+        #expect(byId[archiveCandidate.id]?.folderId == drafts.id)
+        #expect(byId[moveCandidate.id]?.folderId == drafts.id)
+        #expect(byId[customMoveCandidate.id]?.folderId == drafts.id)
+        #expect(byId[trashCandidate.id]?.folderId == trash.id)
+
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.count == 1)
+        guard ops.count == 1 else { return }
+        #expect(ops[0].messageIds == [trashCandidate.messageId])
+        #expect(ops[0].destinationPath == trash.path)
+    }
+
     @Test("move() between two non-inbox folders (Archive -> Trash, real production path): actionTag is NOT cleared — leavingInbox is false")
     func moveBetweenNonInboxFoldersDoesNotClearTag() async throws {
         let (pool, _, archive, trash, dir, previous) = try makeTestDB()

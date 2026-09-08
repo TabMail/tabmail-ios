@@ -11,6 +11,38 @@ enum InboxMode: String, CaseIterable {
     case triage
 }
 
+/// A single action-control primitive for operations that must be visibly and
+/// behaviorally unavailable in a restricted mail context. Keeping the guard
+/// inside the button means every row layout shares the same no-action contract.
+struct RestrictedMailActionButton<Label: View>: View {
+    let isRestricted: Bool
+    /// This is the only action retained by the view. The unrestricted closure
+    /// is deliberately not stored, so changing presentation state cannot make
+    /// a restricted control execute it.
+    let action: () -> Void
+    @ViewBuilder let label: () -> Label
+
+    init(
+        isRestricted: Bool,
+        action: @escaping () -> Void,
+        @ViewBuilder label: @escaping () -> Label
+    ) {
+        self.isRestricted = isRestricted
+        self.action = {
+            guard !isRestricted else { return }
+            action()
+        }
+        self.label = label
+    }
+
+    var body: some View {
+        Button(action: action) {
+            label()
+        }
+        .disabled(isRestricted)
+    }
+}
+
 /// Presentation decision for the inbox error banner — BOTH halves in one place.
 ///
 /// 🚨 **The debug flag is an ARGUMENT here, never a branch condition in `body`.**
@@ -246,6 +278,12 @@ struct InboxView: View {
             return false
         }
     }
+
+    /// Ordinary Archive and Move are invalid while viewing Drafts. A draft's
+    /// editable provider identity depends on remaining in its Drafts-role
+    /// folder; Delete stays available through the established draft pipeline.
+    private var archiveSwipeIsInert: Bool { isArchiveContext || isDraftsContext }
+    private var moveSwipeIsInert: Bool { isDraftsContext }
 
     /// Disabled-look background tint for a same-role no-op swipe button.
     private var disabledSwipeTint: Color { Color(.systemGray3) }
@@ -1114,20 +1152,20 @@ struct InboxView: View {
                     // Same-role no-op buttons stay visible but gray out; the tap
                     // no-ops (handler guards) and just closes the swipe menu.
                     // See isTrashContext for why the destructive role is dropped.
-                    Button {
+                    RestrictedMailActionButton(isRestricted: isDraftsContext) {
                         if group.isThread && !isExpanded {
                             swipeAndArchiveThread(group)
                         } else {
                             swipeAndArchive(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
                         }
                     } label: {
-                        if isArchiveContext {
+                        if archiveSwipeIsInert {
                             disabledSwipeLabel("Archive", systemImage: "archivebox")
                         } else {
                             Label("Archive", systemImage: "archivebox")
                         }
                     }
-                    .tint(isArchiveContext ? disabledSwipeTint : Theme.archive)
+                    .tint(archiveSwipeIsInert ? disabledSwipeTint : Theme.archive)
                     Button(role: isTrashContext ? nil : .destructive) {
                         if group.isThread && !isExpanded {
                             swipeAndDeleteThread(group)
@@ -1153,16 +1191,20 @@ struct InboxView: View {
                         )
                     }
                     .tint(Theme.accent)
-                    Button {
+                    RestrictedMailActionButton(isRestricted: moveSwipeIsInert) {
                         if group.isThread && !isExpanded {
                             moveThreadGroup = group
                         } else {
                             moveMessageId = snapshot.id
                         }
                     } label: {
-                        Label("Move", systemImage: "folder")
+                        if moveSwipeIsInert {
+                            disabledSwipeLabel("Move", systemImage: "folder")
+                        } else {
+                            Label("Move", systemImage: "folder")
+                        }
                     }
-                    .tint(Palette.untagged)
+                    .tint(moveSwipeIsInert ? disabledSwipeTint : Palette.untagged)
                 }
                 .listRowInsets(EdgeInsets(top: 12, leading: 8, bottom: 12, trailing: 16))
                 .modifier(MessageRowBackgroundModifier(
@@ -1202,16 +1244,16 @@ struct InboxView: View {
                         .onAppear { viewModel.requestSnippetIfNeeded(for: child) }
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                             // Gray no-op buttons — see head-row swipe actions.
-                            Button {
+                            RestrictedMailActionButton(isRestricted: isDraftsContext) {
                                 swipeAndArchive(child)
                             } label: {
-                                if isArchiveContext {
+                                if archiveSwipeIsInert {
                                     disabledSwipeLabel("Archive", systemImage: "archivebox")
                                 } else {
                                     Label("Archive", systemImage: "archivebox")
                                 }
                             }
-                            .tint(isArchiveContext ? disabledSwipeTint : Theme.archive)
+                            .tint(archiveSwipeIsInert ? disabledSwipeTint : Theme.archive)
                             Button(role: isTrashContext ? nil : .destructive) {
                                 swipeAndDelete(child)
                             } label: {
@@ -1233,14 +1275,18 @@ struct InboxView: View {
                                 )
                             }
                             .tint(Theme.accent)
-                            Button {
+                            RestrictedMailActionButton(isRestricted: moveSwipeIsInert) {
                                 viewModel.beginInteraction()
                                 moveMessageId = child.id
                                 viewModel.endInteraction()
                             } label: {
-                                Label("Move", systemImage: "folder")
+                                if moveSwipeIsInert {
+                                    disabledSwipeLabel("Move", systemImage: "folder")
+                                } else {
+                                    Label("Move", systemImage: "folder")
+                                }
                             }
-                            .tint(Palette.untagged)
+                            .tint(moveSwipeIsInert ? disabledSwipeTint : Palette.untagged)
                         }
                         .listRowInsets(EdgeInsets(top: 12, leading: 8, bottom: 12, trailing: 16))
                         .listRowBackground(Color(.tertiarySystemFill))
@@ -1316,16 +1362,16 @@ struct InboxView: View {
                 )
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     // Gray no-op buttons — see head-row swipe actions.
-                    Button {
+                    RestrictedMailActionButton(isRestricted: isDraftsContext) {
                         swipeAndArchive(snapshot)
                     } label: {
-                        if isArchiveContext {
+                        if archiveSwipeIsInert {
                             disabledSwipeLabel("Archive", systemImage: "archivebox")
                         } else {
                             Label("Archive", systemImage: "archivebox")
                         }
                     }
-                    .tint(isArchiveContext ? disabledSwipeTint : Theme.archive)
+                    .tint(archiveSwipeIsInert ? disabledSwipeTint : Theme.archive)
                     Button(role: isTrashContext ? nil : .destructive) {
                         swipeAndDelete(snapshot)
                     } label: {
@@ -1347,12 +1393,16 @@ struct InboxView: View {
                         )
                     }
                     .tint(Theme.accent)
-                    Button {
+                    RestrictedMailActionButton(isRestricted: moveSwipeIsInert) {
                         moveMessageId = snapshot.id
                     } label: {
-                        Label("Move", systemImage: "folder")
+                        if moveSwipeIsInert {
+                            disabledSwipeLabel("Move", systemImage: "folder")
+                        } else {
+                            Label("Move", systemImage: "folder")
+                        }
                     }
-                    .tint(Palette.untagged)
+                    .tint(moveSwipeIsInert ? disabledSwipeTint : Palette.untagged)
                 }
             }
 
@@ -1717,6 +1767,7 @@ struct InboxView: View {
     }
 
     private func swipeAndArchiveThread(_ group: ThreadGroup) {
+        guard !isDraftsContext else { return }
         // FU-1: per-member visibility (see dismissAndArchiveThread) — an
         // archive-resident member stays VISIBLE (excluded from the hide/act
         // set); only the genuinely-actionable members fade and archive.
@@ -1784,6 +1835,7 @@ struct InboxView: View {
     // then defer row removal to the next run-loop tick so the collapse
     // animation plays in a clean transaction (not batched with the opacity change).
     private func swipeAndArchive(_ snapshot: MessageSnapshot, expandedGroup: ThreadGroup? = nil) {
+        guard !isDraftsContext else { return }
         // Archive-from-Archive is a no-op — never hide the row.
         guard !viewModel.archiveIsNoOp(snapshot.id) else {
             BackgroundSyncLogger.logInbox("[NoOpGuard] swipeAndArchive suppressed — already archived: \(snapshot.id)")

@@ -1741,7 +1741,8 @@ final class MessageDetailViewModel {
         // move. Role check first — accounts can carry more than one folder of
         // the same role (e.g. iCloud "Trash" + "Deleted Messages") and the
         // canonical lookup below is fetchOne-arbitrary among them.
-        guard lookupFolderRole(msg.folderId) != .archive else {
+        guard lookupFolderRole(msg.folderId) != .archive,
+              lookupFolderRole(msg.folderId) != .drafts else {
             BackgroundSyncLogger.logInbox("[NoOpGuard] detail archiveMessage suppressed — already archived: \(msg.id)")
             return false
         }
@@ -1953,6 +1954,7 @@ final class MessageDetailViewModel {
     /// flash then. See `archiveMessage(_:)` for the full contract.
     @discardableResult
     func moveMessage(_ msg: MessageHeader, toFolderPath: String) -> Bool {
+        guard lookupFolderRole(msg.folderId) != .drafts else { return false }
         let destFolderId = "\(msg.accountId):\(toFolderPath)"
         // Generic move: destination CAN be the inbox — reuse the same
         // dest-is-inbox lookup `updateThreadMessageFolder` below already
@@ -2016,6 +2018,12 @@ final class MessageDetailViewModel {
 
     private func lookupFolderRole(_ folderId: String) -> FolderRole? {
         try? dbPool.read { db in try Folder.fetchOne(db, key: folderId)?.role }
+    }
+
+    /// Whether ordinary Archive/Move controls must be inert for this row.
+    /// Draft deletion is deliberately separate and remains available.
+    func folderMoveIsForbidden(_ message: MessageHeader) -> Bool {
+        lookupFolderRole(message.folderId) == .drafts
     }
 
     // MARK: - Thread Messages

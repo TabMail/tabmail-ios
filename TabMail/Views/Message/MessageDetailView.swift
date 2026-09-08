@@ -382,7 +382,10 @@ struct MessageDetailView: View {
             .listRowBackground(Color.clear)
             .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
             .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                Button { handleArchive(msg) } label: {
+                RestrictedMailActionButton(
+                    isRestricted: viewModel.folderMoveIsForbidden(msg),
+                    action: { handleArchive(msg) }
+                ) {
                     Label("Archive", systemImage: "archivebox")
                 }
                 .tint(Theme.archive)
@@ -395,7 +398,10 @@ struct MessageDetailView: View {
                     Label(msg.isRead ? "Unread" : "Read", systemImage: msg.isRead ? "envelope.badge" : "envelope.open")
                 }
                 .tint(Theme.accent)
-                Button { moveMessage = msg } label: {
+                RestrictedMailActionButton(
+                    isRestricted: viewModel.folderMoveIsForbidden(msg),
+                    action: { moveMessage = msg }
+                ) {
                     Label("Move", systemImage: "folder")
                 }
                 .tint(Palette.untagged)
@@ -588,9 +594,15 @@ struct MessageDetailView: View {
                 })
 
                 Menu {
-                    Button { archiveActiveMessage() } label: { Label("Archive", systemImage: "archivebox") }
+                    RestrictedMailActionButton(
+                        isRestricted: activeMessage.map(viewModel.folderMoveIsForbidden) ?? true,
+                        action: archiveActiveMessage
+                    ) { Label("Archive", systemImage: "archivebox") }
                     Button(role: .destructive) { deleteActiveMessage() } label: { Label("Delete", systemImage: "trash") }
-                    Button { moveMessage = activeMessage } label: { Label("Move", systemImage: "folder") }
+                    RestrictedMailActionButton(
+                        isRestricted: activeMessage.map(viewModel.folderMoveIsForbidden) ?? true,
+                        action: { moveMessage = activeMessage }
+                    ) { Label("Move", systemImage: "folder") }
                 } label: {
                     Image(systemName: "archivebox")
                         .font(.title3)
