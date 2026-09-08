@@ -1453,6 +1453,28 @@ extension AccountManager {
                 for (_, msgs) in grouped {
                     let accountId = msgs[0].accountId
                     let folderPath = msgs[0].folderPath
+                    // Drafts are not ordinary mail: moving one out of the
+                    // Drafts role breaks the provider address that makes it
+                    // editable. Keep Trash available because delete has its
+                    // own established provider-specific routing, but refuse
+                    // every ordinary Archive/Move at this final admission
+                    // boundary so search, agent tools, and future callers
+                    // cannot bypass the UI guards.
+                    if try Folder.fetchOne(
+                        db,
+                        key: MessageIdentity.folderId(
+                            accountId: accountId, folderPath: folderPath)
+                    )?.role == .drafts {
+                        let destinationRole = try Folder.fetchOne(
+                            db,
+                            key: MessageIdentity.folderId(
+                                accountId: accountId, folderPath: destinationPath)
+                        )?.role
+                        guard destinationRole == .trash else {
+                            admission.set(.terminalStale, ids: msgs.map(\.id))
+                            continue
+                        }
+                    }
                     let moved = try Self.optimisticMoveToFolder(msgs: msgs, accountId: accountId, folderPath: folderPath, destinationPath: destinationPath, opType: .move, removeTagsIfLeavingInbox: true, db: db)
                     folderIds.formUnion(moved.folderIds)
                     admission.merge(moved.admission)

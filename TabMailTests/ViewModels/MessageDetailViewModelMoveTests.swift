@@ -51,8 +51,10 @@ struct MessageDetailViewModelMoveTests {
             try acc.insert(db)
             let inbox = Folder(name: "INBOX", path: Self.inboxPath, role: .inbox, accountId: "acc1")
             let archive = Folder(name: "Archive", path: Self.archivePath, role: .archive, accountId: "acc1")
+            let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
             try inbox.insert(db)
             try archive.insert(db)
+            try drafts.insert(db)
         }
         return (pool, dir, previous)
     }
@@ -97,6 +99,40 @@ struct MessageDetailViewModelMoveTests {
     }
 
     // MARK: - Tests
+
+    @Test("Drafts detail refuses Archive and Move before recording optimistic state")
+    @MainActor
+    func draftsDetailRefusesArchiveAndMove() async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        let draft = try insertHeader(
+            pool, messageId: "draft-detail-refused", folderPath: "Drafts", isInInbox: false)
+        let vm = MessageDetailViewModel(
+            messageId: draft.id, dbPool: pool, fetchBodyOverride: { _ in })
+        vm._testSeedMessage(draft)
+
+        #expect(vm.folderMoveIsForbidden(draft))
+        #expect(!vm.archiveMessage(draft))
+        #expect(!vm.moveMessage(draft, toFolderPath: Self.archivePath))
+        #expect(AccountManager.shared.snapshotOverlay()[draft.id] == nil)
+        #expect(UndoService.shared.undoStack.isEmpty)
+
+        await settle()
+        let persisted = try await pool.read { db in
+            try MessageHeader.fetchOne(db, key: draft.id)
+        }
+        #expect(persisted?.folderPath == "Drafts")
+        let ops = try await pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(ops.isEmpty)
+    }
 
     @Test("Moving a thread message back to Inbox updates THAT message in place + re-enables inbox UI")
     @MainActor

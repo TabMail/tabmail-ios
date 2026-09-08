@@ -267,6 +267,54 @@ struct SameFolderNoOpTests {
         AccountManager.shared.removeOverlayEntries(ids: [id])
     }
 
+    @Test("Drafts archive and move are not recorded by the inbox view model")
+    @MainActor func draftsArchiveAndMoveAreNotRecorded() async throws {
+        let (pool, _, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
+        try await pool.writeWithoutTransaction { db in try drafts.insert(db) }
+        let archiveId = try insertMessage(pool, messageId: "draft-archive", folder: drafts, date: baseDate)
+        let moveId = try insertMessage(pool, messageId: "draft-move", folder: drafts, date: baseDate)
+        let vm = InboxViewModel(folders: [drafts, archive], selection: .folder(drafts))
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        #expect(vm.archive(archiveId) == false)
+        #expect(vm.move(moveId, toFolderPath: archive.path) == false)
+        #expect(UndoService.shared.undoStack.isEmpty)
+        #expect(AccountManager.shared.snapshotOverlay()[archiveId] == nil)
+        #expect(AccountManager.shared.snapshotOverlay()[moveId] == nil)
+    }
+
+    @Test("Drafts thread members are reported skipped without optimistic state")
+    @MainActor func draftsThreadMembersAreSkipped() async throws {
+        let (pool, _, archive, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "acc1")
+        try await pool.writeWithoutTransaction { db in try drafts.insert(db) }
+        let archiveId = try insertMessage(pool, messageId: "draft-thread-archive", folder: drafts, date: baseDate)
+        let moveId = try insertMessage(pool, messageId: "draft-thread-move", folder: drafts, date: baseDate)
+        let vm = InboxViewModel(folders: [drafts, archive], selection: .folder(drafts))
+
+        UndoService.shared.dismissAll()
+        defer { UndoService.shared.dismissAll() }
+
+        #expect(vm.archiveThread([archiveId]) == [archiveId])
+        #expect(vm.moveThread([moveId], toFolderPath: archive.path) == [moveId])
+        #expect(UndoService.shared.undoStack.isEmpty)
+        #expect(AccountManager.shared.snapshotOverlay()[archiveId] == nil)
+        #expect(AccountManager.shared.snapshotOverlay()[moveId] == nil)
+    }
+
     // MARK: - InboxViewModel.delete / deleteThread guards
 
     @Test("delete() from the trash folder is a no-op — no undo, no overlay")

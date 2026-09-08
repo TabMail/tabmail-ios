@@ -385,6 +385,7 @@ struct MessageDetailView: View {
                 Button { handleArchive(msg) } label: {
                     Label("Archive", systemImage: "archivebox")
                 }
+                .disabled(viewModel.folderMoveIsForbidden(msg))
                 .tint(Theme.archive)
                 Button(role: .destructive) { handleDelete(msg) } label: {
                     Label("Delete", systemImage: "trash")
@@ -398,6 +399,7 @@ struct MessageDetailView: View {
                 Button { moveMessage = msg } label: {
                     Label("Move", systemImage: "folder")
                 }
+                .disabled(viewModel.folderMoveIsForbidden(msg))
                 .tint(Palette.untagged)
             }
     }
@@ -589,8 +591,10 @@ struct MessageDetailView: View {
 
                 Menu {
                     Button { archiveActiveMessage() } label: { Label("Archive", systemImage: "archivebox") }
+                        .disabled(activeMessage.map(viewModel.folderMoveIsForbidden) ?? true)
                     Button(role: .destructive) { deleteActiveMessage() } label: { Label("Delete", systemImage: "trash") }
                     Button { moveMessage = activeMessage } label: { Label("Move", systemImage: "folder") }
+                        .disabled(activeMessage.map(viewModel.folderMoveIsForbidden) ?? true)
                 } label: {
                     Image(systemName: "archivebox")
                         .font(.title3)

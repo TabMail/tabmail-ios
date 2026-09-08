@@ -1987,7 +1987,8 @@ final class InboxViewModel {
         let actionId = message.id
         // Archive-from-Archive is a no-op: no undo entry, no overlay, no queued
         // move. Role check first — see archiveIsNoOp.
-        guard lookupFolderRole(message.folderId) != .archive else { return false }
+        guard lookupFolderRole(message.folderId) != .archive,
+              lookupFolderRole(message.folderId) != .drafts else { return false }
         guard let archivePath = lookupFolderPath(accountId: message.accountId, role: .archive) else {
             if DebugModeManager.isLoggingEnabled() { print("[Queue] ERROR: no archive folder for account \(message.accountId)") }
             return false
@@ -2046,7 +2047,10 @@ final class InboxViewModel {
                 (requestedId: requestedId, message: overlayAdjustedForAction($0))
             }
         }
-        let messages = resolved.map(\.message)
+        let actionable = resolved.filter {
+            lookupFolderRole($0.message.folderId) != .drafts
+        }
+        let messages = actionable.map(\.message)
         // Nothing resolved — every id reported skipped so the caller un-hides.
         guard let first = messages.first else { return messageIds }
         // Archive-from-Archive is a no-op: no undo entry, no overlay, no queued
@@ -2093,7 +2097,7 @@ final class InboxViewModel {
         }
         // Members that never resolved were never acted upon — report them
         // skipped so the caller un-hides exactly those rows.
-        let recorded = Set(resolved.map(\.requestedId))
+        let recorded = Set(actionable.map(\.requestedId))
         return messageIds.filter { !recorded.contains($0) }
     }
 
@@ -2817,6 +2821,7 @@ final class InboxViewModel {
             if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] ViewModel.move — lookupMessage FAILED for id=\(messageId)") }
             return false
         }
+        guard lookupFolderRole(message.folderId) != .drafts else { return false }
         let actionId = message.id
         if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] ViewModel.move — msgId=\(message.messageId) from=\(message.folderPath) to=\(toFolderPath) folderId=\(message.folderId) headerDbId=\(message.id)") }
         let destFolderId = "\(message.accountId):\(toFolderPath)"
@@ -2858,7 +2863,10 @@ final class InboxViewModel {
                 (requestedId: requestedId, message: $0)
             }
         }
-        let messages = resolved.map(\.message)
+        let actionable = resolved.filter {
+            lookupFolderRole($0.message.folderId) != .drafts
+        }
+        let messages = actionable.map(\.message)
         // Nothing resolved — every id reported skipped so the caller un-hides.
         guard let first = messages.first else {
             if DebugModeManager.isLoggingEnabled() {
@@ -2894,7 +2902,7 @@ final class InboxViewModel {
         }
         // Members that never resolved were never acted upon — report them
         // skipped so the caller un-hides exactly those rows.
-        let recorded = Set(resolved.map(\.requestedId))
+        let recorded = Set(actionable.map(\.requestedId))
         return messageIds.filter { !recorded.contains($0) }
     }
 
