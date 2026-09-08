@@ -19,8 +19,9 @@ real providers against stateful servers before and after remote completion,
 including changed/unknown IMAP epochs and untouched bystanders.
 `interruptedGroupedGmailMoveConverges` snapshots a real claim for one or three
 messages and reopens it through both testing and production startup modes, with
-existing-release flags. It checks every target, the bystander and durable queue
-settlement.
+existing-release flags, both normally and after a refused recovery UPDATE clears.
+It checks preserved intent/history, every target, the bystander and durable queue
+settlement through the database returned as usable.
 `AccountManagerQueueDrainTests` retains startup-only coverage of cancelled-row
 cleanup and unrelated queued work.
 

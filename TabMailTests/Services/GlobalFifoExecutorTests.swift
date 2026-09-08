@@ -999,9 +999,12 @@ struct GlobalFifoExecutorTests {
         #expect(try rowsByPosition(f).isEmpty)
     }
 
-    @Test("Every member of a claimed move survives either startup entry", arguments: [false, true], [1, 3])
+    @Test("Every member of a claimed move survives startup and a transient recovery write failure",
+          arguments: [false, true], [(1, false), (3, false), (1, true), (3, true)])
     @MainActor
-    func interruptedGroupedGmailMoveConverges(productionStartup: Bool, memberCount: Int) async throws {
+    func interruptedGroupedGmailMoveConverges(
+        productionStartup: Bool, scenario: (memberCount: Int, refusesRecoveryUpdate: Bool)
+    ) async throws {
         let f = try fixture(accountId: "restart-grouped-gmail", provider: .gmail)
         defer { finish(f) }
         // Existing-release process death: the original production launch already
@@ -1009,15 +1012,18 @@ struct GlobalFifoExecutorTests {
         let flags = StartupMigrationsTests.snapshotFlags()
         for key in StartupMigrationsTests.allFlagKeys { UserDefaults.standard.set(true, forKey: key) }
         defer { StartupMigrationsTests.restoreFlags(flags) }
-        let ids = Array(["member-a", "member-b", "member-c"].prefix(memberCount))
+        let ids = Array(["member-a", "member-b", "member-c"].prefix(scenario.memberCount))
         let bystander = "member-other"
         let labels: Set<String> = ["INBOX", "UNREAD"]
         let server = StatefulGmailActionServer(messages: (ids + [bystander]).map {
             .init(rfc822MessageId: "\($0)@example.com", providerMessageId: $0, labels: labels)
         })
         defer { server.close() }
-        let admitted = try admit(f, PendingOperation(type: .move, messageIds: ids,
-            accountId: f.accountId, folderPath: Self.source, destinationPath: "TRASH"))
+        var pending = PendingOperation(type: .move, messageIds: ids,
+            accountId: f.accountId, folderPath: Self.source, destinationPath: "TRASH")
+        pending.everAttempted = true
+        pending.retryCount = 3
+        let admitted = try admit(f, pending)
         let snapshotPath = f.directory.appendingPathComponent("claimed.sqlite").path
         let captured = Mutex(false)
         let original = MockEmailProvider()
@@ -1036,22 +1042,54 @@ struct GlobalFifoExecutorTests {
         #expect(captured.withLock { $0 })
         guard captured.withLock({ $0 }) else { return }
         let restartedPool = try DatabasePool(path: snapshotPath)
-        let before = try await restartedPool.read { try PendingOperation.fetchOne($0, key: admitted.id) }
-        #expect(before?.messageIds == ids)
-        #expect(before?.status == PendingStatus.inFlight.rawValue)
-        #expect(before?.everAttempted == true)
-        #expect(server.modifyLog().isEmpty)
-        for id in ids { #expect(server.snapshot(providerMessageId: id)?.labels == labels) }
-        let restarted = try AppDatabase(pool: restartedPool, runStartupResets: productionStartup)
-        let previous = AppDatabase.shared.withLock { current in
-            let old = current
-            current = restarted
-            return old
-        }
+        let previous = AppDatabase.shared.withLock { $0 }
         defer {
             InstalledTestDatabaseLifetime.finish(
                 previous: previous, pool: restartedPool, directory: f.directory)
         }
+        let before = try await restartedPool.read { try PendingOperation.fetchOne($0, key: admitted.id) }
+        #expect(before?.messageIds == ids)
+        #expect(before?.status == PendingStatus.inFlight.rawValue)
+        #expect(before?.everAttempted == true)
+        #expect(before?.retryCount == 3)
+        #expect(server.modifyLog().isEmpty)
+        for id in ids { #expect(server.snapshot(providerMessageId: id)?.labels == labels) }
+        if scenario.refusesRecoveryUpdate {
+            try await restartedPool.write { db in
+                try db.execute(sql: """
+                    CREATE TRIGGER refuse_recovery_update
+                    BEFORE UPDATE OF status ON pendingOperation
+                    WHEN OLD.status = 'inFlight' AND NEW.status = 'queued'
+                    BEGIN SELECT RAISE(ABORT, 'test_recovery_update_refused'); END
+                    """)
+            }
+        }
+        var opened: AppDatabase?
+        do {
+            opened = try AppDatabase(pool: restartedPool, runStartupResets: productionStartup)
+        } catch {
+            guard scenario.refusesRecoveryUpdate else { throw error }
+            #expect(String(describing: error).contains("test_recovery_update_refused"),
+                    "the injected UPDATE refusal must be the reason startup failed")
+        }
+        if scenario.refusesRecoveryUpdate {
+            let retained = try await restartedPool.read { try PendingOperation.fetchOne($0, key: admitted.id) }
+            #expect(retained?.messageIds == ids)
+            #expect(retained?.everAttempted == true)
+            #expect(retained?.retryCount == 3)
+            #expect(retained?.queuePosition == before?.queuePosition)
+            try await restartedPool.write { try $0.execute(sql: "DROP TRIGGER refuse_recovery_update") }
+            // Retry a refused open once storage works. A database already returned
+            // as usable must drain as-is: foregrounding does not reopen its pool.
+            if opened == nil {
+                opened = try AppDatabase(pool: restartedPool, runStartupResets: productionStartup)
+            }
+        }
+        guard let restarted = opened else {
+            Issue.record("No usable database after recovery writes became available")
+            return
+        }
+        AppDatabase.shared.withLock { $0 = restarted }
         let replay = server.provider()
         await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: replay) {
             await AccountManager.shared.drainPendingQueue()
