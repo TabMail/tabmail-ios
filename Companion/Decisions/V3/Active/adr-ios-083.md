@@ -35,3 +35,12 @@ tri-state per-header classifier.
 never an ordinary Archive or Move destination.
 
 **Relates:** ADR-IOS-018, ADR-IOS-068, issue #133, issue #135, issue #136.
+
+**Follow-up:** The Drafts list exposes Delete as its first and only trailing
+swipe action, so full swipe invokes the existing draft-delete route. Ordinary
+mail keeps Archive followed by Trash. Archive/Move refusal remains in force.
+For pushed IMAP drafts, deleting a uniquely owned native header also deletes
+the local authored Draft using its complete folder/UID/UIDVALIDITY address and
+instance generation. The writer rechecks the address before committing. A fresh
+reply then has no saved body to restore and can offer the parent's cached reply
+as an unaccepted suggestion again; the cached suggestion itself is preserved.

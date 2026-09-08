@@ -2586,6 +2586,13 @@ extension AccountManager {
                         throw DraftStore.DraftEpochAdmissionError.staleOrReserved
                     }
                     let dir = owned.attachmentsDirName
+                    if case .imap(let addressFolder, let uidValidity, let uid) = identity {
+                        guard owned.serverDraftId == String(uid),
+                              owned.serverDraftFolderPath == addressFolder,
+                              owned.serverDraftUidValidity == uidValidity else {
+                            throw DraftStore.DraftEpochAdmissionError.staleOrReserved
+                        }
+                    }
                     try DraftStore.applyDelete(
                         id: draftId,
                         expectedInstanceEpoch: instanceEpoch,
