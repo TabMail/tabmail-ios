@@ -125,6 +125,15 @@ struct MessageDetailViewModelMoveTests {
         #expect(AccountManager.shared.snapshotOverlay()[draft.id] == nil)
         #expect(UndoService.shared.undoStack.isEmpty)
 
+        let inboxMessage = try insertHeader(
+            pool, messageId: "inbox-detail-allowed", folderPath: Self.inboxPath,
+            isInInbox: true)
+        let archiveMessage = try insertHeader(
+            pool, messageId: "archive-detail-allowed", folderPath: Self.archivePath,
+            isInInbox: false)
+        #expect(!vm.folderMoveIsForbidden(inboxMessage))
+        #expect(!vm.folderMoveIsForbidden(archiveMessage))
+
         await settle()
         let persisted = try await pool.read { db in
             try MessageHeader.fetchOne(db, key: draft.id)
