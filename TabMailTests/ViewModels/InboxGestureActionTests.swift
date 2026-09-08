@@ -1955,13 +1955,13 @@ struct InboxGestureActionTests {
 
     /// A local draft row already pushed to Gmail, so its only provider address
     /// is the RESOURCE id it carries.
-    private func makePushedGmailDraft(id: String, epoch: String, resourceId: String) -> Draft {
+    nonisolated private func makePushedGmailDraft(id: String, epoch: String, resourceId: String, accountId: String = "acc1", replyToId: String? = nil) -> Draft {
         let now = Date().timeIntervalSince1970
         var draft = Draft(
-            id: id, accountId: "acc1",
+            id: id, accountId: accountId,
             toJSON: "[\"recipient@example.com\"]", ccJSON: "[]", bccJSON: "[]",
             subject: "Quarterly notes", body: "Body the user authored.",
-            replyToId: nil, isForward: false, editHistoryJSON: nil,
+            replyToId: replyToId, isForward: false, editHistoryJSON: nil,
             createdAt: now, updatedAt: now,
             serverDraftId: resourceId, serverPushStatus: "pushed",
             rfc822MessageId: nil, attachmentsDirName: nil
@@ -2133,8 +2133,9 @@ struct InboxGestureActionTests {
         }
     }
 
-    @Test("A synced IMAP Drafts row deletes exactly its source-bound UID")
-    func syncedIMAPDraftsRowDeletesExactUid() async throws {
+    @Test("Deleting a pushed IMAP reply removes only its proven local draft",
+          arguments: ["absent", "owned", "other-folder", "other-epoch", "other-uid", "ambiguous"])
+    func syncedIMAPDraftsRowDeletesExactUid(ownership: String) async throws {
         let accountId = "imap-draft-gesture-live"
         let epoch = 922_001
         let targetUid = 1_225
@@ -2153,9 +2154,39 @@ struct InboxGestureActionTests {
         let header = makeIMAPDraftsHeader(
             accountId: accountId, uid: targetUid,
             observedUidValidity: epoch)
+        let localDraftId = "reply:\(accountId):parent@example.com"
+        let parentId = "\(accountId):INBOX:101"
         try await fixture.pool.writeWithoutTransaction { db in
             let row = header
             try row.insert(db)
+            let inbox = Folder(name: "Inbox", path: "INBOX", role: .inbox, accountId: accountId)
+            try inbox.insert(db)
+            var parent = MessageHeader(
+                messageId: "101", subject: "Reply parent", from: "Sender",
+                fromAddress: "sender@example.com", to: "recipient@example.com",
+                date: Date(), snippet: "Parent", folderId: inbox.id,
+                accountId: accountId, folderPath: inbox.path, isInInbox: true)
+            parent.cachedReply = "An offered reply"
+            parent.rfc822MessageId = "parent@example.com"
+            parent.observedUidValidity = epoch
+            try parent.insert(db)
+            if ownership != "absent" {
+                var draft = makePushedGmailDraft(
+                    id: localDraftId, epoch: "local-generation", resourceId: String(targetUid),
+                    accountId: accountId, replyToId: parentId)
+                draft.serverDraftFolderPath = ownership == "other-folder" ? "Other" : "Drafts"
+                draft.serverDraftUidValidity = ownership == "other-epoch" ? epoch + 1 : epoch
+                if ownership == "other-uid" { draft.serverDraftId = String(bystanderUid) }
+                try draft.insert(db)
+                if ownership == "ambiguous" {
+                    var duplicate = makePushedGmailDraft(
+                        id: "second-local-draft", epoch: "other-generation",
+                        resourceId: String(targetUid), accountId: accountId)
+                    duplicate.serverDraftFolderPath = "Drafts"
+                    duplicate.serverDraftUidValidity = epoch
+                    try duplicate.insert(db)
+                }
+            }
         }
 
         let server = FakeIMAPServer(mailboxes: [
@@ -2182,6 +2213,17 @@ struct InboxGestureActionTests {
         }
         #expect(localHeader == nil,
                 "the admitted IMAP draft delete left the tapped row visible")
+        let reopenedDraft = try await fixture.pool.read { db in
+            try Draft.fetchOne(db, key: localDraftId)
+        }
+        #expect((reopenedDraft == nil) == (ownership == "owned" || ownership == "absent"),
+                "Reply must start fresh after deleting its owned draft; unproven local content must survive")
+        if ownership == "owned" {
+            #expect(ComposeDraftGuards.readState(.success(reopenedDraft)) == .notFound)
+            #expect(try await fixture.pool.read {
+                try MessageHeader.fetchOne($0, key: parentId)?.cachedReply
+            } == "An offered reply", "The fresh composer must still have its unaccepted suggestion")
+        }
         #expect(server.snapshotMessagesWithFlags(in: "Drafts").map(\.message.uid) == [bystanderUid],
                 "the delete did not remove exactly the tapped UID")
         #expect(server.wrongMessageViolations().isEmpty,

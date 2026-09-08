@@ -16,6 +16,49 @@ struct DraftDeleteEpochBoundaryTests {
     private static let e1 = 810_001
     private static let e2 = 810_002
 
+    @Test("Owned IMAP deletion rolls back when the local address changed",
+          arguments: ["uid", "folder", "epoch", "generation"])
+    func changedOwnedAddressIsPreserved(component: String) async throws {
+        let accountId = "owned-delete-address"
+        let fixture = try fixture(accountId: accountId)
+        defer { finish(fixture) }
+        let now = Date().timeIntervalSince1970
+        let draftId = "reply:\(accountId):parent@example.com"
+        let headerId = "\(accountId):Drafts:42"
+        let recordedEpoch = component == "epoch" ? Self.e2 : Self.e1
+        try await fixture.pool.write { db in
+            var draft = Draft(
+                id: draftId, accountId: accountId,
+                toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Reply", body: "Newer authored content", replyToId: nil,
+                isForward: false, editHistoryJSON: nil, createdAt: now, updatedAt: now,
+                serverDraftId: component == "uid" ? "43" : "42",
+                serverPushStatus: "pushed", rfc822MessageId: nil, attachmentsDirName: nil)
+            draft.instanceEpoch = component == "generation" ? "new-generation" : "generation"
+            draft.serverDraftFolderPath = component == "folder" ? "Other" : "Drafts"
+            draft.serverDraftUidValidity = recordedEpoch
+            try draft.insert(db)
+            let header = MessageHeader(
+                messageId: "42", subject: "Draft", from: "Sender",
+                fromAddress: "sender@example.com", to: "recipient@example.com",
+                date: Date(), snippet: "Draft", folderId: "\(accountId):Drafts",
+                accountId: accountId, folderPath: "Drafts", isInInbox: false)
+            try header.insert(db)
+        }
+        #expect(await AccountManager.shared.queueDraftDelete(
+            identity: .imap(folder: "Drafts", uidValidity: Self.e1, uid: 42),
+            accountId: accountId, folderPath: "Drafts", draftId: draftId,
+            instanceEpoch: "generation", deleteOwnedLocalDraft: true) == false)
+        let state = try await fixture.pool.read { db in
+            (try Draft.fetchOne(db, key: draftId)?.body,
+             try MessageHeader.fetchOne(db, key: headerId),
+             try PendingOperation.fetchCount(db))
+        }
+        #expect(state.0 == "Newer authored content")
+        #expect(state.1 != nil)
+        #expect(state.2 == 0)
+    }
+
     private func fixture(
         accountId: String
     ) throws -> (pool: DatabasePool, directory: URL, previous: AppDatabase?) {

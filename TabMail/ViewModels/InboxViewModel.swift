@@ -2418,7 +2418,14 @@ final class InboxViewModel {
                 return false
             case .outlook, .demo:
                 return draft.serverDraftId == message.messageId
-            case .imap, .unknown:
+            case .imap:
+                // A pushed IMAP draft is owned by its complete mailbox address,
+                // never by its bare UID. Admission rechecks this in the writer.
+                return draft.serverDraftId == message.messageId
+                    && draft.serverDraftFolderPath == message.folderPath
+                    && draft.serverDraftUidValidity == message.observedUidValidity
+                    && draft.instanceEpoch?.isEmpty == false
+            case .unknown:
                 return false
             }
         }

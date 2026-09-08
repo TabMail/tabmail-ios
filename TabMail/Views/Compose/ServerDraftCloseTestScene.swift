@@ -73,17 +73,35 @@ struct ServerDraftCloseTestScene: View {
         .background(Color(.systemBackground))
         .task {
             do {
+                let accountID = Self.accountID
+                let fixtureRow = Self.row
+                let deleteFixture = ProcessInfo.processInfo.arguments.contains("--draft-delete-ui-test")
                 try await AppDatabase.dbPool.write { db in
                     var account = Account(emailAddress: "sender@example.com", displayName: "Draft fixture", provider: .imap)
-                    account.id = Self.accountID
+                    account.id = accountID
                     try account.save(db)
                     for role in [FolderRole.drafts, .inbox] {
                         let path = role == .drafts ? "Drafts" : "INBOX"
-                        var folder = Folder(name: path, path: path, role: role, accountId: Self.accountID)
+                        var folder = Folder(name: path, path: path, role: role, accountId: accountID)
                         folder.totalCount = role == .drafts ? 1 : 0
                         try folder.save(db)
                     }
-                    var header = Self.row.toMessageHeader()
+                    var header = fixtureRow.toMessageHeader()
+                    if deleteFixture {
+                        let now = Date().timeIntervalSince1970
+                        var draft = Draft(
+                            id: "swipe-delete-fixture", accountId: accountID,
+                            toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                            subject: fixtureRow.subject, body: "Authored text", replyToId: nil,
+                            isForward: false, editHistoryJSON: nil, createdAt: now, updatedAt: now,
+                            serverDraftId: nil, serverPushStatus: nil,
+                            rfc822MessageId: nil, attachmentsDirName: nil)
+                        draft.instanceEpoch = "swipe-generation"
+                        try draft.save(db)
+                        header.messageId = PendingOperation.draftPlaceholderMessageId(
+                            draftId: draft.id, instanceEpoch: draft.instanceEpoch)
+                        header.id = "\(accountID):Drafts:\(header.messageId)"
+                    }
                     header.isInInbox = false
                     try header.save(db)
                 }
@@ -98,6 +116,14 @@ struct ServerDraftCloseTestScene: View {
 
     private func checkRows() {
         do {
+            if ProcessInfo.processInfo.arguments.contains("--draft-delete-ui-test") {
+                let deleted = try AppDatabase.dbPool.read { db in
+                    try Draft.filter(Column("accountId") == Self.accountID).fetchCount(db) == 0
+                        && MessageHeader.filter(Column("accountId") == Self.accountID).fetchCount(db) == 0
+                }
+                status = deleted ? "Draft deleted" : "Draft remains"
+                return
+            }
             let preserved = try AppDatabase.dbPool.read { db in
                 let header = try MessageHeader.fetchOne(db, key: Self.row.headerId)
                 let draftCount = try Draft.filter(Column("accountId") == Self.accountID).fetchCount(db)
