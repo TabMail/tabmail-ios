@@ -1,3 +1,10 @@
+> **Current recovery amendment (2026-09-07, #116):** the historical statements
+> below that startup deletes attempted moves are superseded. Startup requeues them
+> with their original addresses and attempt history. Graph replay against an id
+> invalidated by a completed move may retire on confirmed absence; it cannot recover
+> a lost destination response or re-address followers. That separate process-death
+> limitation remains tracked by issue #117. The live-process ownership rules stand.
+
 # THE ADDRESS PROBLEM has TWO address spaces — Graph's `/move` response IS the `COPYUID`
 
 **Status:** Current. Landed 2026-08-04 with the `IOS-GRAPH-002` fix.

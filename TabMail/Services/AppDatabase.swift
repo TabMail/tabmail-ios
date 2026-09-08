@@ -322,11 +322,16 @@ final class AppDatabase: Sendable {
     /// PREVIOUS-SESSION QUEUE AND DRAFT RESIDUE, reconciled at the one boundary
     /// where "residue" is provable.
     ///
-    /// Ordinary in-flight operations return to `queued`. An attempted MOVE is
-    /// deliberately DELETED instead: after a process death we cannot know whether
-    /// the server committed it, and resending can duplicate the move — the normal
-    /// foreground sync that follows launch restores whichever state the server
-    /// actually has (`IOS-MOVE-003`). Cancelled rows are cleaned up.
+    /// Every in-flight intention returns to `queued`, including an attempted MOVE.
+    /// A process death is not provider evidence of completion. Preserve the source
+    /// address, queue position, retry count and `everAttempted` (undo must not
+    /// annihilate an operation that may already have reached the provider).
+    /// Replay uses the existing provider-id and UIDVALIDITY guards.
+    ///
+    /// On the owned COPY-then-expunge route, death after COPY can leave a duplicate
+    /// on replay (`IOS-IMAP-006` / `IOS-QUEUE-007`). A lost Graph move response can
+    /// still leave followers at the old id (#117). Neither limitation justifies
+    /// discarding a move that may not have executed. Cancelled rows are cleaned up.
     ///
     /// 🚨 WHY IT RUNS HERE, AND WHY IT MAY NEVER RUN LATER. This is a BLIND
     /// whole-table sweep: it resets, deletes and normalises rows without asking
@@ -364,10 +369,6 @@ final class AppDatabase: Sendable {
                 .fetchAll(db)
             if !staleOps.isEmpty {
                 for op in staleOps {
-                    if op.type == .move, op.everAttempted {
-                        _ = try PendingOperation.deleteOne(db, key: op.id)
-                        continue
-                    }
                     var updated = op
                     updated.status = PendingStatus.queued.rawValue
                     try updated.save(db)

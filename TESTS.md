@@ -4,6 +4,27 @@ This file documents cross-cutting test architecture that spans multiple files/la
 
 ---
 
+## Interrupted action recovery
+
+`GlobalFifoExecutorTests.interruptedMovesConvergeAfterRestart` captures a real
+SQLite snapshot at the provider boundary after the FIFO claim and reopens it
+through `AppDatabase.init`. It checks ordered effects across the restart with
+zero or two earlier moves completed, plus preserved operation identity, position,
+retry count and attempt history. It models process death through a snapshot;
+it does not terminate the hosted test process.
+
+`interruptedGraphMoveConverges`, `interruptedGmailMoveConverges`, and
+`interruptedIMAPMoveRetainsAuthority` exercise
+real providers against stateful servers before and after remote completion,
+including changed/unknown IMAP epochs and untouched bystanders.
+`interruptedGroupedGmailMoveConverges` snapshots a real claim for one or three
+messages and reopens it through both testing and production startup modes, with
+existing-release flags, both normally and after a refused recovery UPDATE clears.
+It checks preserved intent/history, every target, the bystander and durable queue
+settlement through the database returned as usable.
+`AccountManagerQueueDrainTests` retains startup-only coverage of cancelled-row
+cleanup and unrelated queued work.
+
 ## Inbox list — layered test architecture
 
 `PLAN_INBOX_UNIFIED_READ.md` replaced four disagreeing inbox-list read paths with one unified reader (`InboxListReader` → `InboxListComposer.compose`). Getting this right — and *keeping* it right as the code evolves — needs coverage at four distinct layers, each catching a different class of bug. A 5-round adversarial audit of the refactor found two HIGH-severity findings (F1, F2) that lived entirely *between* layers, invisible to any single layer's test suite — that's why the fourth layer (E2E) exists.
