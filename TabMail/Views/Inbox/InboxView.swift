@@ -11,6 +11,38 @@ enum InboxMode: String, CaseIterable {
     case triage
 }
 
+/// A single action-control primitive for operations that must be visibly and
+/// behaviorally unavailable in a restricted mail context. Keeping the guard
+/// inside the button means every row layout shares the same no-action contract.
+struct RestrictedMailActionButton<Label: View>: View {
+    let isRestricted: Bool
+    let action: () -> Void
+    @ViewBuilder let label: () -> Label
+
+    var body: some View {
+        Button {
+            RestrictedMailActionControl.perform(
+                isRestricted: isRestricted,
+                action: action)
+        } label: {
+            label()
+        }
+        .disabled(isRestricted)
+    }
+}
+
+/// Executes the exact action closure owned by `RestrictedMailActionButton`.
+/// Returning whether it ran gives tests an observable no-picker/no-hide seam,
+/// rather than testing only the spelling of a policy predicate.
+enum RestrictedMailActionControl {
+    @discardableResult
+    static func perform(isRestricted: Bool, action: () -> Void) -> Bool {
+        guard !isRestricted else { return false }
+        action()
+        return true
+    }
+}
+
 /// Presentation decision for the inbox error banner — BOTH halves in one place.
 ///
 /// 🚨 **The debug flag is an ARGUMENT here, never a branch condition in `body`.**
@@ -1120,7 +1152,7 @@ struct InboxView: View {
                     // Same-role no-op buttons stay visible but gray out; the tap
                     // no-ops (handler guards) and just closes the swipe menu.
                     // See isTrashContext for why the destructive role is dropped.
-                    Button {
+                    RestrictedMailActionButton(isRestricted: isDraftsContext) {
                         if group.isThread && !isExpanded {
                             swipeAndArchiveThread(group)
                         } else {
@@ -1159,8 +1191,7 @@ struct InboxView: View {
                         )
                     }
                     .tint(Theme.accent)
-                    Button {
-                        guard !moveSwipeIsInert else { return }
+                    RestrictedMailActionButton(isRestricted: moveSwipeIsInert) {
                         if group.isThread && !isExpanded {
                             moveThreadGroup = group
                         } else {
@@ -1213,7 +1244,7 @@ struct InboxView: View {
                         .onAppear { viewModel.requestSnippetIfNeeded(for: child) }
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                             // Gray no-op buttons — see head-row swipe actions.
-                            Button {
+                            RestrictedMailActionButton(isRestricted: isDraftsContext) {
                                 swipeAndArchive(child)
                             } label: {
                                 if archiveSwipeIsInert {
@@ -1244,8 +1275,7 @@ struct InboxView: View {
                                 )
                             }
                             .tint(Theme.accent)
-                            Button {
-                                guard !moveSwipeIsInert else { return }
+                            RestrictedMailActionButton(isRestricted: moveSwipeIsInert) {
                                 viewModel.beginInteraction()
                                 moveMessageId = child.id
                                 viewModel.endInteraction()
@@ -1332,7 +1362,7 @@ struct InboxView: View {
                 )
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     // Gray no-op buttons — see head-row swipe actions.
-                    Button {
+                    RestrictedMailActionButton(isRestricted: isDraftsContext) {
                         swipeAndArchive(snapshot)
                     } label: {
                         if archiveSwipeIsInert {
@@ -1363,8 +1393,7 @@ struct InboxView: View {
                         )
                     }
                     .tint(Theme.accent)
-                    Button {
-                        guard !moveSwipeIsInert else { return }
+                    RestrictedMailActionButton(isRestricted: moveSwipeIsInert) {
                         moveMessageId = snapshot.id
                     } label: {
                         if moveSwipeIsInert {
