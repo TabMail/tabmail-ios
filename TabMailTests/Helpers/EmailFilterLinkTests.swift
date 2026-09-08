@@ -10,6 +10,7 @@ import Foundation
 struct EmailFilterLinkTests {
     @Test(arguments: [
         #"<a href="https://example.com/read">Read</a>"#,
+        #"<a download href="https://example.com/read">Read</a>"#,
         "<A HREF='https://example.com/read'>Read</A>",
         "<a href=https://example.com/read>Read</a>",
         "<a href=https://example.com/read title=details>Read</a>",
