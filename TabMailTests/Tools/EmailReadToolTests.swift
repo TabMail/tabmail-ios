@@ -45,7 +45,8 @@ struct EmailReadToolTests {
             from: "Alice", fromAddress: "alice@test.com",
             to: "bob@test.com"
         )
-        try TestDatabase.insertMessageBody(db, headerId: header.id, htmlContent: "<p>Hello world</p>")
+        try TestDatabase.insertMessageBody(db, headerId: header.id, htmlContent: "<p><a href='https://example.com/cachelinkunique'>Hello world</a></p>")
+        #expect(try await SearchIndex.shared.rawFTSBody(contentKey: ContentKey(rawValue: header.id))?.contains("cachelinkunique") != true)
         await translator.seed(header.id, as: 42)
 
         let tool = EmailReadTool(context: ctx)
@@ -54,7 +55,7 @@ struct EmailReadToolTests {
         #expect(result.contains("subject: Test Subject"))
         #expect(result.contains("Alice <alice@test.com>"))
         #expect(result.contains("to: bob@test.com"))
-        #expect(result.contains("Hello world")) // HTML stripped to text
+        #expect(result.contains("[Hello world](https://example.com/cachelinkunique)"))
     }
 
     @Test("Falls back to snippet when no body")
@@ -150,8 +151,12 @@ struct EmailReadToolTests {
 
 @Suite("HTML link ingestion", .serialized, .processGlobalState)
 struct HTMLLinkIngestionTests {
-    @Test("Fetched HTML links reach stored text, search, and cached or indexed agent reads")
-    func linkAddressesReachAgentAndSearch() async throws {
+    @Test("Fetched HTML links reach stored text, search, and cached or indexed agent reads", arguments: [
+        "",
+        #"title="A > display:none""#,
+        #"style="background:url('>display:none')""#
+    ])
+    func linkAddressesReachAgentAndSearch(attributes: String) async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -164,7 +169,11 @@ struct HTMLLinkIngestionTests {
             from: "Sender", fromAddress: "sender@example.com", to: "recipient@example.com",
             date: Date(), snippet: "No body yet", folderId: "\(accountId):INBOX",
             accountId: accountId, folderPath: "INBOX", isInInbox: false)
-        try await pool.write { try header.insert($0) }
+        try await pool.write { db in
+            try header.insert(db)
+            // A false empty result would now consume the terminal empty-body branch.
+            try db.execute(sql: "UPDATE messageHeader SET emptyFetchCount = 2 WHERE id = ?", arguments: [header.id])
+        }
         let key = ContentKey(rawValue: header.id)
         let index = SearchIndex.shared
         _ = try await index.indexHeaders([FTSHeaderRecord(contentKey: key, headerId: header.id,
@@ -174,7 +183,7 @@ struct HTMLLinkIngestionTests {
         #expect(!(try await index.keywordSearch(query: term)).contains { $0.contentKey == key })
         #expect(try await index.rawFTSBody(contentKey: key)?.contains(term) != true)
 
-        let html = #"<p>See <a href="https://example.com/uniquelinkdestination">the details</a>.</p>"#
+        let html = "<p \(attributes)>See <a href='https://example.com/uniquelinkdestination'>the details</a>.</p>"
         let markdown = "[the details](https://example.com/uniquelinkdestination)"
         let info = MessageHeaderInfo(messageId: header.messageId, rfc822MessageId: nil,
             inReplyTo: nil, references: [], threadId: nil, subject: header.subject,
@@ -190,7 +199,11 @@ struct HTMLLinkIngestionTests {
         if case .success = outcome {} else { Issue.record("Body ingestion did not succeed") }
         #expect(try await index.rawFTSBody(contentKey: key)?.contains(markdown) == true)
         #expect((try await index.keywordSearch(query: term)).contains { $0.contentKey == key })
-        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: header.id)?.bodyComplete } == true)
+        let storedHeader = try #require(await pool.read { try MessageHeader.fetchOne($0, key: header.id) })
+        #expect(storedHeader.bodyComplete)
+        #expect(!storedHeader.bodyEmptyConfirmed)
+        #expect(storedHeader.actionTag != .delete)
+        #expect(storedHeader.summaryBlurb != "This message has no content.")
 
         let translator = MockChatIdTranslator()
         await translator.seed(header.id, as: 42)

@@ -23,9 +23,9 @@ struct EmailFilterLinkTests {
 
     @Test func decodesAddressEntities() {
         #expect(EmailFilter.htmlToPlainText(#"<a href="https://example.com/?a=1&amp;b=&#50;">A &amp; B</a>"#)
-            == #"[A &amp; B](https://example.com/?a=1&amp;b=2)"#)
+            == #"[A &amp; B](https://example.com/?a=1&amp;b=&#50;)"#)
         #expect(EmailFilter.htmlToPlainText(#"<a href="https://example.com/?a=1&custom;">Read</a>"#)
-            == #"[Read](https://example.com/?a=1&amp;custom;)"#)
+            == #"[Read](https://example.com/?a=1&custom;)"#)
     }
 
     @Test func keepsMultipleLinksAndSurroundingText() {
@@ -53,6 +53,9 @@ struct EmailFilterLinkTests {
     }
 
     @Test(arguments: [
+        (#"<a href="https://example.com/?x=&sol;">Read</a>"#, "https://example.com/?x=/"),
+        (#"<a href="https://example.com/?x=1&AMP;y=2">Read</a>"#, "https://example.com/?x=1&y=2"),
+        (#"<a href="https://example.com/a\!b">Read</a>"#, "https://example.com/a%5C!b"),
         (#"<a href="https://example.com/a b">Read</a>"#, "https://example.com/a%20b"),
         (#"<a href="https://example.com/a&#32;b">Read</a>"#, "https://example.com/a%20b"),
         (#"<a href="https://example.com/?x=&amp;copy;">Read</a>"#, "https://example.com/?x=&copy;"),
@@ -69,6 +72,17 @@ struct EmailFilterLinkTests {
 
     @Test(arguments: [
         "<div data-value=don't>Visible message</div>",
+        "<div data-value=a='b>Visible message</div>",
+        "<div data-value=plain title='quoted > value'>Visible message</div>",
+        "<div data-value='plain' title='quoted > value'>Visible message</div>",
+        #"<div title="A > display:none">Visible message</div>"#,
+        #"<div title="style='display:none'">Visible message</div>"#,
+        #"<div data-style="display:none">Visible message</div>"#,
+        #"<div style="background:url('>display:none')">Visible message</div>"#,
+        #"<div style="background:url('x;display:none')">Visible message</div>"#,
+        #"<div style="/* > display:none */ color:red">Visible message</div>"#,
+        #"<div style="background:url(x;display:none)">Visible message</div>"#,
+        #"<div style='background:url("x\";display:none")'>Visible message</div>"#,
         #"<div data-value=a=b"c>Visible message</div>"#,
         "<div title='quoted > value'>Visible message</div>"
     ])
@@ -85,6 +99,30 @@ struct EmailFilterLinkTests {
             == "[One](/one) tail")
         #expect(EmailFilter.htmlToPlainText(#"Visible<a href="/unfinished"#) == "Visible")
         #expect(EmailFilter.htmlToPlainText(#"<a href>Label</a> <a href= >Empty</a>"#) == "Label Empty")
+    }
+
+    @Test func literalLabelsKeepBothAdjacentLinks() throws {
+        let html = #"<a href="https://example.com/one">one `</a> and <a href="https://example.com/two">two `</a>"#
+        let parsed = try AttributedString(markdown: EmailFilter.htmlToPlainText(html))
+        #expect(String(parsed.characters) == "one ` and two `")
+        #expect(parsed.runs.compactMap { $0.link?.absoluteString } == ["https://example.com/one", "https://example.com/two"])
+    }
+
+    @Test(arguments: [#"A \* B"#, "*literal*", "_literal_", "`literal`", "[literal]"])
+    func literalLabelRoundTrip(label: String) throws {
+        let html = "<a href='https://example.com/read'>\(label)</a>"
+        let parsed = try AttributedString(markdown: EmailFilter.htmlToPlainText(html))
+        #expect(String(parsed.characters) == label)
+        #expect(parsed.runs.compactMap { $0.link?.absoluteString } == ["https://example.com/read"])
+    }
+
+    @Test func addressTextIsNotAStyle() throws {
+        let html = #"<a href="https://example.com/?q=>display:none">Visible</a>"#
+        let parsed = try AttributedString(markdown: EmailFilter.htmlToPlainText(html))
+        #expect(String(parsed.characters) == "Visible")
+        #expect(parsed.runs.compactMap { $0.link?.absoluteString } == ["https://example.com/?q=%3Edisplay:none"])
+        #expect(EmailFilter.htmlToPlainText(#"<a style='color:red; display:none !important' href='/hidden'>Hidden</a>"#).isEmpty)
+        #expect(EmailFilter.htmlToPlainText(#"<div style="background:url('x;display:none'); /* ignored */ display:none">Hidden</div>"#).isEmpty)
     }
 
 }

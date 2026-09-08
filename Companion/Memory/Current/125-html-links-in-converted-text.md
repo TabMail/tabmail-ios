@@ -5,8 +5,9 @@ This is the shared conversion used by `extractPlainText` for new FTS body writes
 `EmailReadTool` for cached HTML reads. The existing FTS read path retains the same text
 after display-cache eviction. Snippets and outgoing plain-text conversion also use this helper.
 
-The byte scanner reads quoted and unquoted href values, decodes entities, and escapes
-Markdown label/destination delimiters. Existing hidden-content suppression remains in place.
+The byte scanner reads quoted and unquoted href values, preserves entities for one Markdown
+interpretation, and escapes literal labels and destination delimiters. Inline hidden-content
+suppression reads only actual style declarations, ignoring quoted values and comments.
 Anchors without a nonempty href remain plain text; empty labels still retain the address.
 
 Owner scope: forward-only conversion. No backfill, cache sweep, historical repair, or

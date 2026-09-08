@@ -248,11 +248,16 @@ enum EmailFilter {
                 .replacingOccurrences(of: "&", with: "&amp;")
                 .replacingOccurrences(of: "[", with: "\\[")
                 .replacingOccurrences(of: "]", with: "\\]")
-            // Markdown decodes entities again, and bare destinations cannot contain whitespace.
+                .replacingOccurrences(of: "`", with: "\\`")
+                .replacingOccurrences(of: "*", with: "\\*")
+                .replacingOccurrences(of: "_", with: "\\_")
+                .replacingOccurrences(of: "<", with: "\\<")
+                .replacingOccurrences(of: ">", with: "\\>")
+                .replacingOccurrences(of: "~", with: "\\~")
+            // Keep attribute entities for one Markdown interpretation; encode literal whitespace.
             let address = active.href.addingPercentEncoding(withAllowedCharacters:
                 CharacterSet.controlCharacters.union(.whitespacesAndNewlines).inverted) ?? active.href
             let destination = address.replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "&", with: "&amp;")
                 .replacingOccurrences(of: "(", with: "\\(")
                 .replacingOccurrences(of: ")", with: "\\)")
             out.append(contentsOf: "[\(escapedLabel)](\(destination))".utf8)
@@ -308,9 +313,10 @@ enum EmailFilter {
                     // Opening tags with display:none — skip all content to matching close tag
                     let isClosing = (i + 1 < count && bytes[i + 1] == 0x2F)
                     if tagLen > 0 && !isClosing {
-                        // Scan tag attributes (between tag name and '>') for display:none
+                        // Only the actual style value controls inline visibility.
                         let tagAttrStart = ns + tagLen
-                        if tagEnd > tagAttrStart && hasDisplayNone(bytes, from: tagAttrStart, to: tagEnd) {
+                        if let style = plainTextAttributeRange(bytes, from: tagAttrStart, to: tagEnd, named: "style"),
+                           hasDisplayNone(bytes, from: style.lowerBound, to: style.upperBound) {
                             // Skip past opening tag '>'
                             i = tagEnd
                             if i < count { i += 1 }
@@ -338,9 +344,10 @@ enum EmailFilter {
                         finishLink()
                         if !lastWasSpace { out.append(0x20); lastWasSpace = true }
                         if !isClosing, tagEnd < count,
-                           let href = plainTextLinkAddress(bytes, from: ns + tagLen, to: tagEnd),
-                           !href.isEmpty {
-                            link = (out.count, href)
+                           let range = plainTextAttributeRange(bytes, from: ns + tagLen, to: tagEnd, named: "href") {
+                            let href = String(decoding: UnsafeBufferPointer(start: bytes + range.lowerBound, count: range.count), as: UTF8.self)
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !href.isEmpty { link = (out.count, href) }
                         }
                         i = min(tagEnd + 1, count)
                         continue
@@ -488,9 +495,9 @@ enum EmailFilter {
         return count
     }
 
-    /// Read whole attributes, so href-like text in another value is never an address.
+    /// Read whole attributes, so names inside another value cannot masquerade as attributes.
     /// Unlike the embedded-message metadata reader, HTML anchors also allow unquoted values.
-    private static func plainTextLinkAddress(_ bytes: UnsafePointer<UInt8>, from: Int, to: Int) -> String? {
+    private static func plainTextAttributeRange(_ bytes: UnsafePointer<UInt8>, from: Int, to: Int, named wanted: String) -> Range<Int>? {
         func whitespace(_ byte: UInt8) -> Bool {
             byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D || byte == 0x0C
         }
@@ -515,22 +522,7 @@ enum EmailFilter {
             }
             let end = i
             if quote != nil, i < to { i += 1 }
-            guard name.lowercased() == "href" else { continue }
-            var address: [UInt8] = []
-            var j = start
-            while j < end {
-                if bytes[j] == 0x26 {
-                    let (decoded, advance) = decodeEntityBytes(bytes, count: end, from: j, preserveUnknown: true)
-                    if let decoded {
-                        address.append(contentsOf: decoded.utf8)
-                        j += advance
-                        continue
-                    }
-                }
-                address.append(bytes[j])
-                j += 1
-            }
-            return String(decoding: address, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            if name.lowercased() == wanted { return start..<end }
         }
         return nil
     }
@@ -593,9 +585,7 @@ enum EmailFilter {
         return count
     }
 
-    /// Scan tag attribute bytes for `display` `:` (optional whitespace) `none` (case-insensitive).
-    /// Catches inline styles like `style="display: none"`, `style="display:none; ..."`, etc.
-    /// Operates on raw bytes between tag-name end and `>`.
+    /// Find an inline display:none declaration, ignoring text inside CSS values and comments.
     private static func hasDisplayNone(_ bytes: UnsafePointer<UInt8>, from: Int, to: Int) -> Bool {
         // "display" = 7 bytes, ":" = 1, "none" = 4 → min 12 bytes needed
         guard to - from >= 12 else { return false }
@@ -603,7 +593,30 @@ enum EmailFilter {
         let display: [UInt8] = [0x64, 0x69, 0x73, 0x70, 0x6C, 0x61, 0x79] // "display"
         let none: [UInt8] = [0x6E, 0x6F, 0x6E, 0x65] // "none"
         var j = from
+        var quote: UInt8?
+        var depth = 0
+        var propertyStart = true
         while j + 11 < to {
+            let byte = bytes[j]
+            if byte == 0x5C { j = min(j + 2, to); propertyStart = false; continue }
+            if let current = quote {
+                if byte == current { quote = nil }
+                j += 1; continue
+            }
+            if byte == 0x22 || byte == 0x27 { quote = byte; propertyStart = false; j += 1; continue }
+            if byte == 0x2F, j + 1 < to, bytes[j + 1] == 0x2A {
+                j += 2
+                while j + 1 < to, !(bytes[j] == 0x2A && bytes[j + 1] == 0x2F) { j += 1 }
+                j = min(j + 2, to)
+                continue
+            }
+            if byte == 0x28 { depth += 1; propertyStart = false; j += 1; continue }
+            if byte == 0x29 { depth = max(0, depth - 1); j += 1; continue }
+            if depth > 0 { j += 1; continue }
+            if byte == 0x3B { propertyStart = true; j += 1; continue }
+            if byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D || byte == 0x0C { j += 1; continue }
+            guard propertyStart else { j += 1; continue }
+            propertyStart = false
             // Match "display" (case-insensitive)
             var match = true
             for k in 0..<7 {
@@ -762,7 +775,7 @@ enum EmailFilter {
     }
 
     /// Decode an HTML entity at `from` (pointing to '&'). Returns (decoded string, bytes consumed).
-    private static func decodeEntityBytes(_ bytes: UnsafePointer<UInt8>, count: Int, from: Int, preserveUnknown: Bool = false) -> (String?, Int) {
+    private static func decodeEntityBytes(_ bytes: UnsafePointer<UInt8>, count: Int, from: Int) -> (String?, Int) {
         var end = from + 1
         let limit = min(from + 12, count)
         while end < limit {
@@ -819,7 +832,7 @@ enum EmailFilter {
         case "shy": return ("\u{00AD}", advance)
         case "zwj": return ("\u{200D}", advance)
         case "zwnj": return ("\u{200C}", advance)
-        default: return preserveUnknown ? (nil, 1) : (" ", advance)
+        default: return (" ", advance)
         }
     }
 
