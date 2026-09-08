@@ -1172,6 +1172,9 @@ private struct PushedMessageDestination: View {
 /// server-origin drafts intentionally fail closed; sync remains authoritative.
 struct ServerDraftComposeLoader: View {
     let header: MessageHeader
+    #if DEBUG
+    var resolveOpenAuthorityForTesting: (@MainActor () async throws -> LocallyAuthoredDraftOpenAuthority?)? = nil
+    #endif
     @State private var resolution: Resolution?
     @Environment(\.dismiss) private var dismiss
 
@@ -1297,6 +1300,11 @@ struct ServerDraftComposeLoader: View {
     /// whose runtime kind changed under us. None of them is a thrown read, and none
     /// changes behaviour here; only the `catch` in the caller does.
     private func resolveOpenAuthority() async throws -> LocallyAuthoredDraftOpenAuthority? {
+        #if DEBUG
+        if let resolveOpenAuthorityForTesting {
+            return try await resolveOpenAuthorityForTesting()
+        }
+        #endif
         guard let runtimeKind = await AccountManager.shared
             .draftRuntimeIdentityKind(accountId: header.accountId),
               runtimeKind != .unknown else {

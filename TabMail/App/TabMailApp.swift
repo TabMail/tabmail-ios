@@ -482,6 +482,13 @@ struct TabMailApp: App {
                     Self.deferredSearchIndexInitIfNeeded()
                 }
             }
+            #if DEBUG
+            .overlay {
+                if ProcessInfo.processInfo.arguments.contains("--draft-close-ui-test") {
+                    ServerDraftCloseTestScene()
+                }
+            }
+            #endif
         }
     }
 }

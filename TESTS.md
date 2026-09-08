@@ -65,3 +65,13 @@ The SAME scenario histories as Layer 1, driven through the REAL pipeline instead
 **Granularity note:** the E2E step vocabulary is coarser than the pure layer's — staging a terminal (header+body+AI) row and running one `mergeNSEStagingData` call performs phase-1, the FTS flush, phase-2, and the staging drain all within one real "wake" (the merge awaits its own FTS flush). This is deliberate: Layer 1 proves invariants hold at every micro-step; Layer 4 proves they hold across real wake boundaries, which is the actual unit of observability a production reload/render cycle has. Scenarios that need to observe an in-between state (e.g. `aiNeverFlashesAcrossWakes`) drive two explicit gradual-staging wakes instead of relying on sub-wake granularity that doesn't exist at this layer.
 
 **Retro-fit discipline:** per PLAN §5A.4, a harness that can't re-catch a known bug isn't done. Both F1 and F2 were deliberately re-introduced (scrub-branch post disabled; `excludeIds` moved to post-trim) against this layer and confirmed to fail `scrubOnlyWakeStillConverges`/I8 and `paginationCompletenessTriage`/I9 respectively before the fixes were restored.
+
+## Server-draft dismissal UI
+
+`TabMailScreenshots/ServerDraftCloseUITests.swift` runs in the existing
+`TabMailScreenshots` UI-test scheme. Its six cases cover unavailable and failed
+resolution in full-screen, pushed, and collapsed detail-column presentations.
+Each presses the real Close button and then interacts with the presenting mailbox;
+the failure cases also press Try Again. `ServerDraftCloseTestScene` and the resolver
+dependency seam exist only in Debug and use synthetic data, without provider calls.
+These are presentation-contract tests, not provider-resolution integration tests.
