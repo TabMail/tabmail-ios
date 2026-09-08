@@ -282,6 +282,7 @@ struct InboxView: View {
     /// Ordinary Archive and Move are invalid while viewing Drafts. A draft's
     /// editable provider identity depends on remaining in its Drafts-role
     /// folder; Delete stays available through the established draft pipeline.
+    private var archiveSwipeIsInert: Bool { isArchiveContext || isDraftsContext }
     private var moveSwipeIsInert: Bool { isDraftsContext }
 
     /// Disabled-look background tint for a same-role no-op swipe button.
@@ -1148,21 +1149,50 @@ struct InboxView: View {
                     }
                 }
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    InboxTrailingSwipeActions(
-                        isDrafts: isDraftsContext, isArchive: isArchiveContext, isTrash: isTrashContext,
-                        archive: {
-                            if group.isThread && !isExpanded {
-                                swipeAndArchiveThread(group)
-                            } else {
-                                swipeAndArchive(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
-                            }
-                        }, delete: {
+                    if isDraftsContext {
+                        Button(role: .destructive) {
                             if group.isThread && !isExpanded {
                                 swipeAndDeleteThread(group)
                             } else {
                                 swipeAndDelete(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
                             }
-                        })
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                        .tint(.red)
+                    } else {
+                        // Same-role no-op buttons stay visible but gray out; the tap
+                        // no-ops (handler guards) and just closes the swipe menu.
+                        // See isTrashContext for why the destructive role is dropped.
+                        RestrictedMailActionButton(isRestricted: isDraftsContext) {
+                            if group.isThread && !isExpanded {
+                                swipeAndArchiveThread(group)
+                            } else {
+                                swipeAndArchive(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
+                            }
+                        } label: {
+                            if archiveSwipeIsInert {
+                                disabledSwipeLabel("Archive", systemImage: "archivebox")
+                            } else {
+                                Label("Archive", systemImage: "archivebox")
+                            }
+                        }
+                        .tint(archiveSwipeIsInert ? disabledSwipeTint : Theme.archive)
+                        Button(role: isTrashContext ? nil : .destructive) {
+                            if group.isThread && !isExpanded {
+                                swipeAndDeleteThread(group)
+                            } else {
+                                swipeAndDelete(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
+                            }
+                        } label: {
+                            if isTrashContext {
+                                disabledSwipeLabel("Trash", systemImage: "trash")
+                            } else {
+                                Label("Trash", systemImage: "trash")
+                            }
+                        }
+                        .tint(isTrashContext ? disabledSwipeTint : .red)
+                    }
                 }
                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
                     Button {
@@ -1226,13 +1256,36 @@ struct InboxView: View {
                         .tag(child.id)
                         .onAppear { viewModel.requestSnippetIfNeeded(for: child) }
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                            InboxTrailingSwipeActions(
-                                isDrafts: isDraftsContext, isArchive: isArchiveContext, isTrash: isTrashContext,
-                                archive: {
-                                    swipeAndArchive(child)
-                                }, delete: {
+                            if isDraftsContext {
+                                Button(role: .destructive) {
                                     swipeAndDelete(child)
-                                })
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                                .tint(.red)
+                            } else {
+                                // Gray no-op buttons — see head-row swipe actions.
+                                RestrictedMailActionButton(isRestricted: isDraftsContext) {
+                                    swipeAndArchive(child)
+                                } label: {
+                                    if archiveSwipeIsInert {
+                                        disabledSwipeLabel("Archive", systemImage: "archivebox")
+                                    } else {
+                                        Label("Archive", systemImage: "archivebox")
+                                    }
+                                }
+                                .tint(archiveSwipeIsInert ? disabledSwipeTint : Theme.archive)
+                                Button(role: isTrashContext ? nil : .destructive) {
+                                    swipeAndDelete(child)
+                                } label: {
+                                    if isTrashContext {
+                                        disabledSwipeLabel("Trash", systemImage: "trash")
+                                    } else {
+                                        Label("Trash", systemImage: "trash")
+                                    }
+                                }
+                                .tint(isTrashContext ? disabledSwipeTint : .red)
+                            }
                         }
                         .swipeActions(edge: .leading, allowsFullSwipe: true) {
                             Button {
@@ -1330,13 +1383,36 @@ struct InboxView: View {
                                         prevTag: prevTag, nextTag: nextTag)
                 )
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    InboxTrailingSwipeActions(
-                        isDrafts: isDraftsContext, isArchive: isArchiveContext, isTrash: isTrashContext,
-                        archive: {
-                            swipeAndArchive(snapshot)
-                        }, delete: {
+                    if isDraftsContext {
+                        Button(role: .destructive) {
                             swipeAndDelete(snapshot)
-                        })
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                        .tint(.red)
+                    } else {
+                        // Gray no-op buttons — see head-row swipe actions.
+                        RestrictedMailActionButton(isRestricted: isDraftsContext) {
+                            swipeAndArchive(snapshot)
+                        } label: {
+                            if archiveSwipeIsInert {
+                                disabledSwipeLabel("Archive", systemImage: "archivebox")
+                            } else {
+                                Label("Archive", systemImage: "archivebox")
+                            }
+                        }
+                        .tint(archiveSwipeIsInert ? disabledSwipeTint : Theme.archive)
+                        Button(role: isTrashContext ? nil : .destructive) {
+                            swipeAndDelete(snapshot)
+                        } label: {
+                            if isTrashContext {
+                                disabledSwipeLabel("Trash", systemImage: "trash")
+                            } else {
+                                Label("Trash", systemImage: "trash")
+                            }
+                        }
+                        .tint(isTrashContext ? disabledSwipeTint : .red)
+                    }
                 }
                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
                     Button {

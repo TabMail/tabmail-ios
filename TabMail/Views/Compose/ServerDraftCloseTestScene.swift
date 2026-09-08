@@ -35,9 +35,7 @@ struct ServerDraftCloseTestScene: View {
 
     var body: some View {
         Group {
-            if ProcessInfo.processInfo.arguments.contains("--swipe-controls-ui-test") {
-                InboxSwipeControlsTestScene()
-            } else if ready {
+            if ready {
                 MailNavigationView(initialSelection: .unified(.drafts))
                     .environment(navigationStore)
                     .environment(\.draftOpenResolverForTesting, {

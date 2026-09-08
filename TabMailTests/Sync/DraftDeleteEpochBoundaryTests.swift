@@ -17,7 +17,7 @@ struct DraftDeleteEpochBoundaryTests {
     private static let e2 = 810_002
 
     @Test("Owned IMAP deletion rolls back when the local address changed",
-          arguments: ["uid", "folder", "epoch", "generation"])
+          arguments: ["uid", "folder", "epoch", "generation", "transaction-failure"])
     func changedOwnedAddressIsPreserved(component: String) async throws {
         let accountId = "owned-delete-address"
         let fixture = try fixture(accountId: accountId)
@@ -26,6 +26,12 @@ struct DraftDeleteEpochBoundaryTests {
         let draftId = "reply:\(accountId):parent@example.com"
         let headerId = "\(accountId):Drafts:42"
         let recordedEpoch = component == "epoch" ? Self.e2 : Self.e1
+        let attachmentDirectory = DraftAttachmentStorage.newStagingDirName()
+        let attachmentBytes = Data("preserved attachment".utf8)
+        try DraftAttachmentStorage.saveAttachments([
+            DraftAttachment(filename: "draft.txt", mimeType: "text/plain", data: attachmentBytes)
+        ], dirName: attachmentDirectory)
+        defer { DraftAttachmentStorage.deleteAttachments(dirName: attachmentDirectory) }
         try await fixture.pool.write { db in
             var draft = Draft(
                 id: draftId, accountId: accountId,
@@ -33,7 +39,7 @@ struct DraftDeleteEpochBoundaryTests {
                 subject: "Reply", body: "Newer authored content", replyToId: nil,
                 isForward: false, editHistoryJSON: nil, createdAt: now, updatedAt: now,
                 serverDraftId: component == "uid" ? "43" : "42",
-                serverPushStatus: "pushed", rfc822MessageId: nil, attachmentsDirName: nil)
+                serverPushStatus: "pushed", rfc822MessageId: nil, attachmentsDirName: attachmentDirectory)
             draft.instanceEpoch = component == "generation" ? "new-generation" : "generation"
             draft.serverDraftFolderPath = component == "folder" ? "Other" : "Drafts"
             draft.serverDraftUidValidity = recordedEpoch
@@ -44,6 +50,12 @@ struct DraftDeleteEpochBoundaryTests {
                 date: Date(), snippet: "Draft", folderId: "\(accountId):Drafts",
                 accountId: accountId, folderPath: "Drafts", isInInbox: false)
             try header.insert(db)
+            if component == "transaction-failure" {
+                try db.execute(sql: """
+                    CREATE TRIGGER refuse_fixture_draft_delete BEFORE DELETE ON draft
+                    BEGIN SELECT RAISE(ABORT, 'Injected draft delete failure'); END
+                    """)
+            }
         }
         #expect(await AccountManager.shared.queueDraftDelete(
             identity: .imap(folder: "Drafts", uidValidity: Self.e1, uid: 42),
@@ -57,6 +69,7 @@ struct DraftDeleteEpochBoundaryTests {
         #expect(state.0 == "Newer authored content")
         #expect(state.1 != nil)
         #expect(state.2 == 0)
+        #expect(try DraftAttachmentStorage.loadAttachments(dirName: attachmentDirectory).map(\.data) == [attachmentBytes])
     }
 
     private func fixture(

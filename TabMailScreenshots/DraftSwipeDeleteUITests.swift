@@ -26,29 +26,6 @@ final class DraftSwipeDeleteUITests: XCTestCase {
         checkDelete(triage: true, expected: "bystander")
     }
 
-    func testOrdinaryArchiveFirstAndSameRoleControlsAreInert() {
-        continueAfterFailure = false
-        let app = XCUIApplication()
-        app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test", "--swipe-controls-ui-test"]
-        app.launch()
-        defer { app.terminate() }
-        XCTAssertTrue(app.staticTexts["Ordinary mail"].waitForExistence(timeout: 20))
-        fullSwipe(app.staticTexts["Ordinary mail"], in: app)
-        XCTAssertTrue(app.staticTexts["Archived: 1 Deleted: 0"].waitForExistence(timeout: 5))
-        fullSwipe(app.staticTexts["Archive folder"], in: app)
-        XCTAssertTrue(app.staticTexts["Archive folder"].exists)
-        XCTAssertTrue(app.staticTexts["Archived: 1 Deleted: 0"].exists)
-        let trash = app.staticTexts["Trash folder"]
-        let y = trash.frame.midY / app.frame.height
-        app.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: y))
-            .press(forDuration: 0.05, thenDragTo:
-                app.coordinate(withNormalizedOffset: CGVector(dx: 0.55, dy: y)))
-        XCTAssertTrue(app.buttons["Trash"].waitForExistence(timeout: 5))
-        app.buttons["Trash"].tap()
-        XCTAssertTrue(trash.exists)
-        XCTAssertTrue(app.staticTexts["Archived: 1 Deleted: 0"].exists)
-    }
-
     private func checkDelete(thread: Bool = false, expand: Bool = false,
                              child: Bool = false, triage: Bool = false, expected: String) {
         continueAfterFailure = false

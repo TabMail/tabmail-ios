@@ -2134,7 +2134,8 @@ struct InboxGestureActionTests {
     }
 
     @Test("Deleting a pushed IMAP reply removes only its proven local draft",
-          arguments: ["absent", "owned", "other-folder", "other-epoch", "other-uid", "ambiguous"])
+          arguments: ["absent", "owned", "other-folder", "other-epoch", "other-uid", "ambiguous",
+                      "owned-placeholder", "stale-placeholder", "owned-provider-failure"])
     func syncedIMAPDraftsRowDeletesExactUid(ownership: String) async throws {
         let accountId = "imap-draft-gesture-live"
         let epoch = 922_001
@@ -2142,8 +2143,10 @@ struct InboxGestureActionTests {
         let bystanderUid = 1_226
         let targetRFC = "target-\(UUID().uuidString)@example.com"
         let bystanderRFC = "bystander-\(UUID().uuidString)@example.com"
+        let refused = ownership == "stale-placeholder"
+        let ownsLocal = ownership.hasPrefix("owned")
         let fixture = try makeIMAPDraftDeleteDB(
-            accountId: accountId, uidValidity: epoch)
+            accountId: accountId, uidValidity: refused ? epoch + 1 : epoch)
         defer {
             restoreTestDB(
                 previous: fixture.previous, pool: fixture.pool, dir: fixture.dir)
@@ -2151,14 +2154,42 @@ struct InboxGestureActionTests {
         }
         clearOverlay(); resetStagedGlobal()
 
-        let header = makeIMAPDraftsHeader(
+        var sourceHeader = makeIMAPDraftsHeader(
             accountId: accountId, uid: targetUid,
             observedUidValidity: epoch)
         let localDraftId = "reply:\(accountId):parent@example.com"
+        if ownership.hasSuffix("placeholder") {
+            sourceHeader.messageId = PendingOperation.draftPlaceholderMessageId(
+                draftId: localDraftId, instanceEpoch: "local-generation")
+            sourceHeader.id = "\(accountId):Drafts:\(sourceHeader.messageId)"
+            sourceHeader.observedUidValidity = nil
+        }
+        let header = sourceHeader
         let parentId = "\(accountId):INBOX:101"
+        let attachmentDirectory = DraftAttachmentStorage.newStagingDirName()
+        let bystanderDirectory = DraftAttachmentStorage.newStagingDirName()
+        let attachmentBytes = Data("owned attachment".utf8)
+        let bystanderBytes = Data("bystander attachment".utf8)
+        try DraftAttachmentStorage.saveAttachments([
+            DraftAttachment(filename: "owned.txt", mimeType: "text/plain", data: attachmentBytes)
+        ], dirName: attachmentDirectory)
+        try DraftAttachmentStorage.saveAttachments([
+            DraftAttachment(filename: "bystander.txt", mimeType: "text/plain", data: bystanderBytes)
+        ], dirName: bystanderDirectory)
+        defer {
+            DraftAttachmentStorage.deleteAttachments(dirName: attachmentDirectory)
+            DraftAttachmentStorage.deleteAttachments(dirName: bystanderDirectory)
+        }
         try await fixture.pool.writeWithoutTransaction { db in
             let row = header
             try row.insert(db)
+            var bystanderDraft = makePushedGmailDraft(
+                id: "attachment-bystander", epoch: "bystander-generation",
+                resourceId: String(bystanderUid), accountId: accountId)
+            bystanderDraft.serverDraftFolderPath = "Drafts"
+            bystanderDraft.serverDraftUidValidity = epoch
+            bystanderDraft.attachmentsDirName = bystanderDirectory
+            try bystanderDraft.insert(db)
             let inbox = Folder(name: "Inbox", path: "INBOX", role: .inbox, accountId: accountId)
             try inbox.insert(db)
             var parent = MessageHeader(
@@ -2176,6 +2207,7 @@ struct InboxGestureActionTests {
                     accountId: accountId, replyToId: parentId)
                 draft.serverDraftFolderPath = ownership == "other-folder" ? "Other" : "Drafts"
                 draft.serverDraftUidValidity = ownership == "other-epoch" ? epoch + 1 : epoch
+                draft.attachmentsDirName = attachmentDirectory
                 if ownership == "other-uid" { draft.serverDraftId = String(bystanderUid) }
                 try draft.insert(db)
                 if ownership == "ambiguous" {
@@ -2195,8 +2227,11 @@ struct InboxGestureActionTests {
                 makeIMAPMessage(uid: bystanderUid, rfc822MessageId: bystanderRFC),
             ],
         ])
-        server.setUidValidity(epoch, for: "Drafts")
+        server.setUidValidity(refused ? epoch + 1 : epoch, for: "Drafts")
         server.expectMutation(rfc822MessageId: targetRFC)
+        if ownership == "owned-provider-failure" {
+            server.failNextCommand(containing: "UID STORE")
+        }
 
         try await withRegisteredIMAPProvider(
             accountId: accountId, server: server, pool: fixture.pool
@@ -2204,27 +2239,66 @@ struct InboxGestureActionTests {
             let vm = InboxViewModel(folders: [fixture.drafts])
             let acted = await vm.delete(header.id)
 
-            #expect(acted == true,
+            #expect(acted == !refused,
                     "a source-bound IMAP Drafts row was refused even though its UID and UIDVALIDITY still match the selected mailbox")
+            if ownership == "owned-provider-failure" {
+                for _ in 0..<200 {
+                    let retried = try await fixture.pool.read { db in
+                        try PendingOperation.fetchAll(db).contains { $0.retryCount > 0 }
+                    }
+                    if retried, await AccountManager.shared.pendingQueueIsQuiescentForTesting() { break }
+                    try await Task.sleep(for: .milliseconds(20))
+                }
+                let pending = try await fixture.pool.read { db in
+                    try PendingOperation.fetchAll(db)
+                }
+                #expect(server.consumedInjectedFailureCount() == 1)
+                #expect(pending.count == 1)
+                #expect(pending.first?.type == .deleteDraft)
+                #expect(pending.first?.messageIds == [String(targetUid)])
+                #expect(pending.first?.folderPath == "Drafts")
+                #expect(pending.first?.draftServerUidValidity == epoch)
+                #expect(pending.first?.draftId == localDraftId)
+                #expect(pending.first?.instanceEpoch == "local-generation")
+                #expect((pending.first?.retryCount ?? 0) > 0)
+                #expect(try await fixture.pool.read { try Draft.fetchOne($0, key: localDraftId) } == nil)
+                #expect(!FileManager.default.fileExists(
+                    atPath: DraftAttachmentStorage.dirURL(for: attachmentDirectory).path))
+                #expect(try DraftAttachmentStorage.loadAttachments(dirName: bystanderDirectory).map(\.data) == [bystanderBytes])
+                #expect(server.snapshotMessagesWithFlags(in: "Drafts").map(\.message.uid) == [targetUid, bystanderUid])
+                // The injected transport failure is one-shot. Exercise the actual
+                // durable retry before the fixture tears down its provider.
+                await AccountManager.shared.drainPendingQueue()
+            }
         }
 
         let localHeader = try await fixture.pool.read { db in
             try MessageHeader.fetchOne(db, key: header.id)
         }
-        #expect(localHeader == nil,
+        #expect((localHeader == nil) == !refused,
                 "the admitted IMAP draft delete left the tapped row visible")
         let reopenedDraft = try await fixture.pool.read { db in
             try Draft.fetchOne(db, key: localDraftId)
         }
-        #expect((reopenedDraft == nil) == (ownership == "owned" || ownership == "absent"),
+        #expect((reopenedDraft == nil) == (ownsLocal || ownership == "absent"),
                 "Reply must start fresh after deleting its owned draft; unproven local content must survive")
-        if ownership == "owned" {
+        if ownsLocal {
+            #expect(!FileManager.default.fileExists(
+                atPath: DraftAttachmentStorage.dirURL(for: attachmentDirectory).path))
+        } else {
+            #expect(try DraftAttachmentStorage.loadAttachments(dirName: attachmentDirectory).map(\.data) == [attachmentBytes])
+        }
+        #expect(try DraftAttachmentStorage.loadAttachments(dirName: bystanderDirectory).map(\.data) == [bystanderBytes])
+        #expect(try await fixture.pool.read {
+            try Draft.fetchOne($0, key: "attachment-bystander")?.attachmentsDirName
+        } == bystanderDirectory)
+        if ownsLocal {
             #expect(ComposeDraftGuards.readState(.success(reopenedDraft)) == .notFound)
             #expect(try await fixture.pool.read {
                 try MessageHeader.fetchOne($0, key: parentId)?.cachedReply
             } == "An offered reply", "The fresh composer must still have its unaccepted suggestion")
         }
-        #expect(server.snapshotMessagesWithFlags(in: "Drafts").map(\.message.uid) == [bystanderUid],
+        #expect(server.snapshotMessagesWithFlags(in: "Drafts").map(\.message.uid) == (refused ? [targetUid, bystanderUid] : [bystanderUid]),
                 "the delete did not remove exactly the tapped UID")
         #expect(server.wrongMessageViolations().isEmpty,
                 "the provider mutated a message other than the source-bound target")
