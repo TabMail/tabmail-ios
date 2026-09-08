@@ -189,9 +189,8 @@ extension AccountManager {
     /// database-wide (GRDB suspension while backgrounded, ADR-IOS-041; a full
     /// disk; an I/O error at COMMIT), the row stays `inFlight`, the claim loop
     /// refuses `inFlight`, and no later pass in this process can ever pick it up.
-    /// At the next launch `AppDatabase.recoverPreviousSessionResidue` deletes it
-    /// if it is an `everAttempted` `.move` — a gesture that never reached the
-    /// provider, lost with no crash at all.
+    /// Startup recovery can requeue it after a restart, but this live process
+    /// must retain ownership so the user does not need to restart to make progress.
     ///
     /// On success the id is released; on a throw this process KEEPS it, with the
     /// caller's own retry-count choice, and `recoverPendingRequeues` finishes the

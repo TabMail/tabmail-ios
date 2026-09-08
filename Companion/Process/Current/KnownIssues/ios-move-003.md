@@ -1,4 +1,18 @@
 <!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **2026-09-07 — #116 supersedes the discard disposition below.** On an unchanged
+> app release, `AppDatabase.recoverPreviousSessionResidue` returns every interrupted
+> operation, including an attempted `.move`, to `queued`. It preserves the original
+> address, queue position, retry count and `everAttempted` history. The FIFO executor
+> claims only one operation at a time; whole-snapshot claiming is historical.
+>
+> Restart alone is not evidence that the provider completed an intention. Replay
+> uses the existing provider-address and UIDVALIDITY gates. The existing
+> `IOS-IMAP-006` / `IOS-QUEUE-007` COPY-before-expunge duplicate risk remains, as does
+> the lost Graph response/follower-address window tracked by issue #117. No receipt
+> or Message-ID mutation authority is introduced. Release-boundary purging remains
+> the separate policy in ADR-IOS-071.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
 > **⚠️ SITE CORRECTED (2026-09-05, #114 round 4) — the disposition below is UNCHANGED; only where it
 > runs has moved.** The body is preserved unedited (it is regenerated from the hash-pinned archive
 > and byte-compared); this block records the correction instead.

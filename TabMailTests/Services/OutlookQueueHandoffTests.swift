@@ -3388,9 +3388,9 @@ struct OutlookQueueHandoffTests {
     /// (`try? await retryWrite { PendingOperation.markQueued }`) and DISCARD the
     /// write's error. When that write fails the row stays `inFlight` — a state
     /// only the claim transaction writes, and one the claim walk refuses — so no
-    /// later drain in this process can pick it up. At the next launch
-    /// `AppDatabase.recoverPreviousSessionResidue` deletes an `everAttempted`
-    /// `.move`: a user gesture, lost with no crash at all. The producer is a
+    /// later drain in this process can pick it up. Startup recovery requeues
+    /// the move after a restart; live-process recovery must not require one.
+    /// The producer is a
     /// database-wide refusal that swallows the recovery write as well as the one
     /// that provoked it (`ADR-IOS-041`).
     ///

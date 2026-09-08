@@ -267,10 +267,8 @@ struct AccountManagerQueueDrainTests {
 
     // MARK: - 8. GAP1: AppDatabase startup recovery (real initializer) — previous-session residue
 
-    /// THE INVARIANT IS UNCHANGED — ordinary `inFlight` operations return to
-    /// `queued`, an attempted MOVE is dropped, cancelled rows are deleted — and
-    /// every assertion below is the one this test has always made. What changed
-    /// is the ENTRY POINT.
+    /// Interrupted intentions remain retryable, including attempted moves;
+    /// cancelled rows are deleted and already-queued work is preserved.
     ///
     /// 🚨 WHY IT MOVED (`IOS-GRAPH-005`, #114). This sweep used to run at the top
     /// of `AccountManager.reconcilePendingOperations`, and this test drove it
@@ -284,7 +282,7 @@ struct AccountManagerQueueDrainTests {
     /// "residue" is provable rather than assumed. Pinning it here at that
     /// boundary is what stops it drifting back to a site where a drain can
     /// already be in flight.
-    @Test("AppDatabase startup recovery: ordinary inFlight retries, attempted MOVE is dropped, cancelled deletes")
+    @Test("AppDatabase startup recovery: inFlight intentions retry, cancelled deletes")
     func databaseStartupRecoveryResetsInFlightDeletesCancelledLeavesQueued() async throws {
         let (pool, dir, previous) = try makeTestDB()
         defer { restoreTestDB(pool: pool, previous: previous, dir: dir) }
@@ -292,7 +290,7 @@ struct AccountManagerQueueDrainTests {
         // The startup boundary DRAINS NOTHING — `AppDatabase.init` runs
         // migrations, the gated startup resets and this recovery write, and
         // returns. So what follows observes ONLY the recovery SQL (reset
-        // inFlight→queued, delete the attempted move, delete cancelled), with no
+        // inFlight→queued, retain the attempted move, delete cancelled), with no
         // drain behaviour mixed in at all. The account row is still seeded
         // because the fixture's foreign keys require it.
         var inFlightOp = PendingOperation(type: .markRead, messageIds: ["msg-inflight"], accountId: "acc-gap1", folderPath: "INBOX")
@@ -307,6 +305,7 @@ struct AccountManagerQueueDrainTests {
             destinationPath: "Archive")
         uncertainMove.status = PendingStatus.inFlight.rawValue
         uncertainMove.everAttempted = true
+        uncertainMove.retryCount = 3
         var preEmissionMove = PendingOperation(
             type: .move,
             messageIds: ["msg-prewire"],
@@ -332,7 +331,7 @@ struct AccountManagerQueueDrainTests {
         let remaining = try await pool.read { db in
             try PendingOperation.filter(Column("accountId") == "acc-gap1").fetchAll(db)
         }
-        #expect(remaining.count == 3)
+        #expect(remaining.count == 4)
 
         let inFlightAfter = try fetchOp(inFlightOp.id, pool: pool)
         #expect(inFlightAfter != nil, "inFlight op must survive (reset, not dropped)")
@@ -342,7 +341,9 @@ struct AccountManagerQueueDrainTests {
         #expect(cancelledAfter == nil, "cancelled op deleted by crash recovery")
 
         let uncertainMoveAfter = try fetchOp(uncertainMove.id, pool: pool)
-        #expect(uncertainMoveAfter == nil, "an attempted MOVE with an unknown provider outcome must never be replayed")
+        #expect(uncertainMoveAfter?.status == PendingStatus.queued.rawValue, "an interrupted attempt must remain retryable")
+        #expect(uncertainMoveAfter?.everAttempted == true, "recovery must preserve undo annihilation evidence")
+        #expect(uncertainMoveAfter?.retryCount == 3, "recovery must neither forgive nor charge provider failures")
 
         let preEmissionMoveAfter = try fetchOp(preEmissionMove.id, pool: pool)
         #expect(preEmissionMoveAfter?.status == PendingStatus.queued.rawValue,

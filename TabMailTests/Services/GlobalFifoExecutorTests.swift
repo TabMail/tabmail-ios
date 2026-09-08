@@ -786,6 +786,219 @@ struct GlobalFifoExecutorTests {
                 "recovery must retain the position, got \(after[1].queuePosition)")
     }
 
+    /// Capture the real database at the provider boundary, after the FIFO claim
+    /// committed and before that move applied. Reopen that snapshot through the
+    /// production initializer, with a fresh provider runtime. This models process
+    /// death without allowing the original drain's later writes into the restart.
+    @Test("Interrupted move and the queued suffix converge after restart", arguments: [0, 2])
+    @MainActor
+    func interruptedMovesConvergeAfterRestart(completedCount: Int) async throws {
+        let f = try fixture(accountId: "restart-moves", provider: .gmail,
+                            folders: [Self.archive, "Trash", "Custom"])
+        defer { finish(f) }
+        let destinations = [Self.archive, "Trash", "Custom", Self.source]
+        let members = destinations.indices.map { "restart-\($0)" }
+        for (index, destination) in destinations.enumerated() {
+            let source = destination == Self.source ? Self.archive : Self.source
+            try seedHeader(f, messageId: members[index], folderPath: destination)
+            try admit(f, PendingOperation(type: .move, messageIds: [members[index]],
+                accountId: f.accountId, folderPath: source, destinationPath: destination))
+        }
+        let admitted = try rowsByPosition(f)
+        let snapshotPath = f.directory.appendingPathComponent("restart.sqlite").path
+        let captured = Mutex(false)
+        let original = MockEmailProvider()
+        await original.setMoveHook {
+            let applied = await original.movedIds.count
+            guard applied == completedCount else { return }
+            do {
+                try await f.pool.writeWithoutTransaction { db in
+                    try db.execute(sql: "VACUUM INTO ?", arguments: [snapshotPath])
+                }
+                captured.withLock { $0 = true }
+            } catch {
+                Issue.record("Could not capture the claimed database: \(error)")
+            }
+        }
+        await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: original) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+        #expect(captured.withLock { $0 }, "the real provider boundary was never reached")
+        guard captured.withLock({ $0 }) else { return }
+        let restartedPool = try DatabasePool(path: snapshotPath)
+        let before = try await restartedPool.read { db in
+            try PendingOperation.order(Column("queuePosition")).fetchAll(db)
+        }
+        #expect(before.map(\.id) == Array(admitted.dropFirst(completedCount)).map(\.id))
+        #expect(before.first?.status == PendingStatus.inFlight.rawValue)
+        #expect(before.first?.everAttempted == true)
+        #expect(before.dropFirst().allSatisfy { $0.status == PendingStatus.queued.rawValue && !$0.everAttempted })
+
+        let restarted = try AppDatabase(dbPool: restartedPool)
+        let originalDatabase = AppDatabase.shared.withLock { current in
+            let old = current
+            current = restarted
+            return old
+        }
+        defer {
+            InstalledTestDatabaseLifetime.finish(previous: originalDatabase,
+                pool: restartedPool, directory: f.directory)
+        }
+        let recovered = try await restartedPool.read { db in
+            try PendingOperation.order(Column("queuePosition")).fetchAll(db)
+        }
+        #expect(recovered.map(\.id) == before.map(\.id))
+        #expect(recovered.map(\.queuePosition) == before.map(\.queuePosition))
+        #expect(recovered.map(\.everAttempted) == before.map(\.everAttempted))
+        #expect(recovered.map(\.retryCount) == before.map(\.retryCount))
+        let replay = MockEmailProvider()
+        await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: replay) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+        // Only the prefix applied before death belongs to the original process.
+        // All effects after the snapshot are deliberately excluded from its world.
+        let effectsBeforeDeath = Array(await original.movedIds.prefix(completedCount))
+        let effectsAfterRestart = await replay.movedIds
+        let effects = effectsBeforeDeath + effectsAfterRestart
+        #expect(effects.flatMap(\.ids) == members,
+                "every admitted gesture must execute once, in order, without another target")
+        #expect(effects.map(\.to) == destinations)
+        #expect(try await restartedPool.read { try PendingOperation.fetchCount($0) } == 0)
+    }
+
+    @Test("Interrupted Graph moves converge before or after remote completion", arguments: [false, true])
+    @MainActor
+    func interruptedGraphMoveConverges(remoteCompleted: Bool) async throws {
+        let f = try fixture(accountId: "restart-graph")
+        defer { finish(f) }
+        let rfc = "restart-graph@example.com"
+        let bystanderRFC = "restart-graph-bystander@example.com"
+        let server = StatefulExchangeActionServer(messages: [
+            .init(rfc822MessageId: rfc, providerMessageId: "target", folderId: Self.source),
+            .init(rfc822MessageId: bystanderRFC, providerMessageId: "bystander", folderId: Self.source),
+        ])
+        defer { server.close() }
+        try seedHeader(f, messageId: "target", folderPath: Self.archive)
+        var interrupted = PendingOperation(type: .move, messageIds: ["target"],
+            accountId: f.accountId, folderPath: Self.source, destinationPath: Self.archive)
+        interrupted.status = PendingStatus.inFlight.rawValue
+        interrupted.everAttempted = true
+        let admitted = try admit(f, interrupted)
+        if remoteCompleted {
+            try await server.provider().move(ids: ["target"], from: Self.source, to: Self.archive)
+            #expect(server.snapshot(providerMessageId: "target") == nil)
+        }
+        _ = try AppDatabase(dbPool: f.pool)
+        #expect(try rowsByPosition(f).map(\.id) == [admitted.id])
+        await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: server.provider()) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+        let target = server.snapshots(rfc822MessageId: rfc)
+        #expect(target.count == 1)
+        #expect(target.first?.folderId == Self.archive)
+        #expect(server.snapshot(providerMessageId: "bystander")?.folderId == Self.source)
+        #expect(server.mutationLog().allSatisfy { $0 == "MOVE target" })
+        #expect(try rowsByPosition(f).isEmpty)
+    }
+
+    @Test("Restarted IMAP moves retain source authority and never mutate a bystander",
+           arguments: ["pending", "completed", "changedEpoch", "unknownEpoch"])
+    @MainActor
+    func interruptedIMAPMoveRetainsAuthority(scenario: String) async throws {
+        let f = try fixture(accountId: "restart-imap", provider: .imap)
+        defer { finish(f) }
+        let rfc = "restart-imap@example.com"
+        let bystanderRFC = "restart-imap-bystander@example.com"
+        func message(_ uid: Int, _ identity: String) -> FakeIMAPServer.Message {
+            FakeIMAPServer.makeMessage(uid: uid, rfc822Text:
+                "From: sender@example.com\r\nTo: recipient@example.com\r\nSubject: restart\r\nMessage-ID: <\(identity)>\r\n\r\nbody\r\n")
+        }
+        let server = FakeIMAPServer(mailboxes: [
+            Self.source: [message(1, rfc), message(2, bystanderRFC)], Self.archive: []
+        ])
+        try server.start()
+        defer { server.stop() }
+        server.expectMutations([rfc])
+        try await f.pool.write { db in
+            try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = 1 WHERE accountId = ?",
+                           arguments: [f.accountId])
+        }
+        var interrupted = PendingOperation(type: .move, messageIds: ["1"],
+            accountId: f.accountId, folderPath: Self.source, destinationPath: Self.archive)
+        interrupted.observedUidValidity = 1
+        interrupted.status = PendingStatus.inFlight.rawValue
+        interrupted.everAttempted = true
+        let admitted = try admit(f, interrupted)
+        let provider = IMAPProvider(host: "127.0.0.1", port: server.port,
+            username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await provider.connect()
+        if scenario == "completed" {
+            _ = try await provider.move(ids: ["1"], from: Self.source, to: Self.archive,
+                                        admittedUidValidity: 1)
+        } else if scenario == "changedEpoch" {
+            server.setMessages([message(1, bystanderRFC), message(2, rfc)], in: Self.source)
+            server.setUidValidity(2, for: Self.source)
+        } else if scenario == "unknownEpoch" {
+            server.suppressSelectUidValidity(for: Self.source)
+        }
+        _ = try AppDatabase(dbPool: f.pool)
+        #expect(try rowsByPosition(f).map(\.id) == [admitted.id])
+        await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+        if scenario == "pending" || scenario == "completed" {
+            #expect(server.messageIDs(in: Self.archive) == ["<\(rfc)>"])
+            #expect(server.messageIDs(in: Self.source) == ["<\(bystanderRFC)>"])
+            #expect(try rowsByPosition(f).isEmpty)
+        } else {
+            #expect(server.messageIDs(in: Self.archive).isEmpty)
+            #expect(Set(server.messageIDs(in: Self.source)) == Set(["<\(rfc)>", "<\(bystanderRFC)>"]))
+            if scenario == "unknownEpoch" {
+                #expect(try rowsByPosition(f).map(\.id) == [admitted.id],
+                        "an unavailable epoch must retain the intention")
+                server.restoreSelectUidValidity(for: Self.source)
+                await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: provider) {
+                    await AccountManager.shared.drainPendingQueue()
+                }
+                #expect(server.messageIDs(in: Self.archive) == ["<\(rfc)>"])
+                #expect(try rowsByPosition(f).isEmpty)
+            }
+        }
+        #expect(server.wrongMessageViolations().isEmpty)
+        try await provider.disconnect()
+    }
+
+    @Test("Interrupted Gmail move replay is idempotent", arguments: [false, true])
+    @MainActor
+    func interruptedGmailMoveConverges(remoteCompleted: Bool) async throws {
+        let f = try fixture(accountId: "restart-gmail", provider: .gmail)
+        defer { finish(f) }
+        let labels: Set<String> = ["INBOX", "UNREAD"]
+        let server = StatefulGmailActionServer(messages: [
+            .init(rfc822MessageId: "target@example.com", providerMessageId: "target", labels: labels),
+            .init(rfc822MessageId: "bystander@example.com", providerMessageId: "bystander", labels: labels),
+        ])
+        defer { server.close() }
+        var interrupted = PendingOperation(type: .move, messageIds: ["target"],
+            accountId: f.accountId, folderPath: Self.source, destinationPath: "TRASH")
+        interrupted.status = PendingStatus.inFlight.rawValue
+        interrupted.everAttempted = true
+        let admitted = try admit(f, interrupted)
+        if remoteCompleted {
+            try await server.provider().move(ids: ["target"], from: Self.source, to: "TRASH")
+        }
+        _ = try AppDatabase(dbPool: f.pool)
+        #expect(try rowsByPosition(f).map(\.id) == [admitted.id])
+        await TestProviderRegistry.withRegisteredProvider(accountId: f.accountId, provider: server.provider()) {
+            await AccountManager.shared.drainPendingQueue()
+        }
+        #expect(server.snapshot(providerMessageId: "target")?.labels == ["TRASH", "UNREAD"])
+        #expect(server.snapshot(providerMessageId: "bystander")?.labels == labels)
+        #expect(server.modifyLog().map(\.providerMessageId) == Array(repeating: "target", count: remoteCompleted ? 2 : 1))
+        #expect(try rowsByPosition(f).isEmpty)
+    }
+
     // MARK: - 8. Cost on a realistic queue
 
     /// **THE PROPERTY: the frontier walk and the deferral transaction stay cheap
@@ -958,10 +1171,9 @@ struct GlobalFifoExecutorTests {
     /// it never checked leaves that row `inFlight` with no entry in
     /// `pendingRetirements` or `pendingRequeues`: every later drain, for EVERY
     /// account, stops at it for the life of the process. Gestures are applied
-    /// locally and acknowledged in the UI and never reach the wire again, and at
-    /// the next launch `recoverPreviousSessionResidue` deletes an `everAttempted`
-    /// `.move` outright — the wedge corollary, which terminates in a DROPPED
-    /// intention rather than a delay.
+    /// locally and acknowledged in the UI and never reach the wire again.
+    /// Startup can requeue it after a restart, but that does not resolve the
+    /// live-process wedge or allow this drain to claim unrelated work.
     ///
     /// The write refusal here is a `BEFORE DELETE` trigger scoped to the one row,
     /// which fails all three `retryWrite` attempts and nothing else — the shape

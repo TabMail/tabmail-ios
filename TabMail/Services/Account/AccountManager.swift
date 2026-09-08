@@ -481,10 +481,9 @@ actor AccountManager {
     /// same breath as whatever forced it. The row is then left `inFlight`, a
     /// state only the claim transaction writes and one `claimFrontierOperation`
     /// refuses, so
-    /// NO later pass in this process can pick it up; at the next launch
-    /// `AppDatabase.recoverPreviousSessionResidue` DELETES it if it is an
-    /// `everAttempted` `.move`. A user gesture that never reached the provider,
-    /// lost in a live process with no crash in it.
+    /// NO later pass in this process can pick it up. Startup recovery requeues
+    /// it after a restart, but live-process ownership must make progress without
+    /// requiring the user to restart.
     ///
     /// The value is the retry-count choice rather than `Void` so the recovery
     /// charges exactly what the original site would have charged: the
