@@ -1529,7 +1529,12 @@ struct EmailRenderSecurityCanaryTests {
             }
             defer { host.tearDown() }
             let wv = host.webView
-            try? await Task.sleep(for: .seconds(3))
+            // A cold WebContent process may take longer than three seconds to
+            // launch. Wait for navigation completion, then assert the same URL,
+            // origin and rendered-body invariants (including incorrect loads).
+            #expect(await CanaryKit.waitUntil {
+                wv.url != nil && !wv.isLoading && wv.estimatedProgress == 1
+            }, "\(label): the document must finish loading within the bounded wait")
 
             let baseURI = await CanaryKit.eval(wv, "document.baseURI")
             let origin = await CanaryKit.eval(wv, "String(window.origin)")

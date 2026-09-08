@@ -404,7 +404,17 @@ struct TabMailApp: App {
                     .padding(40)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if startup.isReady {
-                    RootView()
+                    Group {
+                        #if DEBUG
+                        if ProcessInfo.processInfo.arguments.contains("--draft-close-ui-test") {
+                            ServerDraftCloseTestScene()
+                        } else {
+                            RootView()
+                        }
+                        #else
+                        RootView()
+                        #endif
+                    }
                         .environment(navigationStore)
                         .environment(storeKitManager)
                         .task {

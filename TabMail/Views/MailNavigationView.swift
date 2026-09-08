@@ -1172,7 +1172,11 @@ private struct PushedMessageDestination: View {
 /// server-origin drafts intentionally fail closed; sync remains authoritative.
 struct ServerDraftComposeLoader: View {
     let header: MessageHeader
+    #if DEBUG
+    @Environment(\.draftOpenResolverForTesting) private var resolveOpenAuthorityForTesting
+    #endif
     @State private var resolution: Resolution?
+    @Environment(\.dismiss) private var dismiss
 
     /// The three outcomes this view can reach. Mirrors
     /// `DraftComposePresenter.LoadResult`'s shape on purpose — the same distinction,
@@ -1224,14 +1228,19 @@ struct ServerDraftComposeLoader: View {
                 // back — and equally, do not let the retryable arm swallow this one:
                 // a header with no local `Draft` must keep getting this honest card
                 // rather than an endless "try again" the user can never satisfy.
-                ContentUnavailableView(
-                    "Draft unavailable",
-                    systemImage: "exclamationmark.shield",
-                    description: Text("No editable copy of this draft was found on this device."))
+                ContentUnavailableView {
+                    Label("Draft unavailable", systemImage: "exclamationmark.shield")
+                } description: {
+                    Text("No editable copy of this draft was found on this device.")
+                } actions: {
+                    Button("Close") { dismiss() }
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("server-draft-close")
+                }
             case .resolveFailed:
                 // Copy deliberately parallel to `DraftComposePresenter`'s
-                // `.loadFailed` arm. No "Close" button: this is detail-column
-                // content, not a sheet, so there is nothing to dismiss.
+                // `.loadFailed` arm. This loader also appears in the Drafts-list
+                // full-screen cover, so both terminal states need an escape.
                 VStack(spacing: 16) {
                     Image(systemName: "exclamationmark.triangle")
                         .font(.largeTitle)
@@ -1243,6 +1252,9 @@ struct ServerDraftComposeLoader: View {
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 32)
+                    Button("Close") { dismiss() }
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("server-draft-close")
                     Button("Try Again") {
                         resolution = nil
                         Task { await resolveLocallyAuthoredDraft() }
@@ -1290,6 +1302,11 @@ struct ServerDraftComposeLoader: View {
     /// whose runtime kind changed under us. None of them is a thrown read, and none
     /// changes behaviour here; only the `catch` in the caller does.
     private func resolveOpenAuthority() async throws -> LocallyAuthoredDraftOpenAuthority? {
+        #if DEBUG
+        if let resolveOpenAuthorityForTesting {
+            return try await resolveOpenAuthorityForTesting()
+        }
+        #endif
         guard let runtimeKind = await AccountManager.shared
             .draftRuntimeIdentityKind(accountId: header.accountId),
               runtimeKind != .unknown else {
