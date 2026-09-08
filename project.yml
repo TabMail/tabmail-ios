@@ -105,6 +105,7 @@ targets:
         # NSE locally; no effect on Release builds (they don't use the debug dylib).
         ENABLE_DEBUG_DYLIB: NO
     dependencies:
+      - package: SwiftSoup
       - package: GRDB
         product: GRDB
       # SwiftMail powers NSE-side IMAP fetches on `imap_new_mail` / `imap_reconnect`

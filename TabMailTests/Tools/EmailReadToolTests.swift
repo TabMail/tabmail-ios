@@ -155,8 +155,16 @@ struct HTMLLinkIngestionTests {
         "",
         #"title="A > display:none""#,
         #"style="background:url('>display:none')""#
+    ], [
+        ("https://example.com/uniquelinkdestination", "https://example.com/uniquelinkdestination"),
+        ("https://example.com/&#117;niquelinkdestination", "https://example.com/uniquelinkdestination"),
+        ("https://example.com/uniquelinkdestination?first=alpha&amp;second=omega", "https://example.com/uniquelinkdestination?first=alpha&second=omega"),
+        ("https://example.com/caf&#xE9;/uniquelinkdestination", "https://example.com/café/uniquelinkdestination"),
+        ("https://example.com/&sol;uniquelinkdestination", "https://example.com//uniquelinkdestination"),
+        ("https://example.com/uniquelinkdestination?value=&amp;copy;", "https://example.com/uniquelinkdestination?value=&copy;"),
+        ("https://example.com/uniquelinkdestination?value=&custom;", "https://example.com/uniquelinkdestination?value=&custom;")
     ])
-    func linkAddressesReachAgentAndSearch(attributes: String) async throws {
+    func linkAddressesReachAgentAndSearch(attributes: String, address: (String, String)) async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -183,8 +191,7 @@ struct HTMLLinkIngestionTests {
         #expect(!(try await index.keywordSearch(query: term)).contains { $0.contentKey == key })
         #expect(try await index.rawFTSBody(contentKey: key)?.contains(term) != true)
 
-        let html = "<p \(attributes)>See <a href='https://example.com/uniquelinkdestination'>the details</a>.</p>"
-        let markdown = "[the details](https://example.com/uniquelinkdestination)"
+        let html = "<p \(attributes)>See <a href='\(address.0)'>the details</a>.</p>"
         let info = MessageHeaderInfo(messageId: header.messageId, rfc822MessageId: nil,
             inReplyTo: nil, references: [], threadId: nil, subject: header.subject,
             from: header.from, fromAddress: header.fromAddress, to: header.to, cc: "", bcc: "",
@@ -197,8 +204,13 @@ struct HTMLLinkIngestionTests {
             provider: provider, enableAI: true)
         await ActiveEmbeddingQueue.shared.clearForTesting()
         if case .success = outcome {} else { Issue.record("Body ingestion did not succeed") }
-        #expect(try await index.rawFTSBody(contentKey: key)?.contains(markdown) == true)
+        let storedText = try #require(await index.rawFTSBody(contentKey: key))
+        #expect(storedText.contains(term))
+        let parsed = try AttributedString(markdown: storedText)
+        let normalizedAddress = try #require(URL(string: address.1)).absoluteString
+        #expect(parsed.runs.compactMap { $0.link?.absoluteString } == [normalizedAddress])
         #expect((try await index.keywordSearch(query: term)).contains { $0.contentKey == key })
+        #expect((try await index.keywordSearch(query: address.1)).contains { $0.contentKey == key })
         let storedHeader = try #require(await pool.read { try MessageHeader.fetchOne($0, key: header.id) })
         #expect(storedHeader.bodyComplete)
         #expect(!storedHeader.bodyEmptyConfirmed)
@@ -208,14 +220,14 @@ struct HTMLLinkIngestionTests {
         let translator = MockChatIdTranslator()
         await translator.seed(header.id, as: 42)
         let tool = EmailReadTool(context: ToolContext(db: pool, translator: translator))
-        #expect(try await tool.execute(arguments: ["unique_id": .int(42)]).contains(markdown))
+        #expect(try await tool.execute(arguments: ["unique_id": .int(42)]).contains(storedText))
         // Evict display HTML and clear the snippet so only indexed body text can satisfy the read.
         try await pool.write { db in
             _ = try MessageBody.deleteOne(db, key: key.rawValue)
             try db.execute(sql: "UPDATE messageHeader SET snippet = '' WHERE id = ?", arguments: [header.id])
         }
         #expect(try await pool.read { try MessageBody.fetchOne($0, key: key.rawValue) } == nil)
-        #expect(try await tool.execute(arguments: ["unique_id": .int(42)]).contains(markdown))
+        #expect(try await tool.execute(arguments: ["unique_id": .int(42)]).contains(storedText))
         try await index.removeMessages(contentKeys: [key])
         #expect(!(try await index.keywordSearch(query: term)).contains { $0.contentKey == key })
     }

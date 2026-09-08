@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftSoup
 
 /// Pure, GRDB-free email filtering and parsing utilities.
 /// Compiled into both the main app and the NSE via the Shared/ glob in project.yml.
@@ -242,7 +243,7 @@ enum EmailFilter {
         func finishLink() {
             guard let active = link else { return }
             let label = String(decoding: out[active.start...], as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
             out.removeSubrange(active.start...)
             let escapedLabel = label.replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "&", with: "&amp;")
@@ -254,12 +255,23 @@ enum EmailFilter {
                 .replacingOccurrences(of: "<", with: "\\<")
                 .replacingOccurrences(of: ">", with: "\\>")
                 .replacingOccurrences(of: "~", with: "\\~")
-            // Keep attribute entities for one Markdown interpretation; encode literal whitespace.
-            let address = active.href.addingPercentEncoding(withAllowedCharacters:
-                CharacterSet.controlCharacters.union(.whitespacesAndNewlines).inverted) ?? active.href
-            let destination = address.replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "(", with: "\\(")
-                .replacingOccurrences(of: ")", with: "\\)")
+            // Decode the attribute once. This tokenizer throws only for an invalid built-in
+            // entity table; malformed or unknown mail references use its normal recovery path.
+            let address = try! Parser.unescapeEntities(active.href, true)
+            let encoded = CharacterSet.controlCharacters.union(.whitespacesAndNewlines)
+            let escaped = CharacterSet(charactersIn: "\\()<>;")
+            var destination = ""
+            for scalar in address.unicodeScalars {
+                if encoded.contains(scalar) {
+                    for byte in String(scalar).utf8 {
+                        destination += String(format: "%%%02X", byte)
+                    }
+                } else {
+                    // Escaping semicolons prevents Markdown from decoding an entity twice.
+                    if escaped.contains(scalar) { destination.append("\\") }
+                    destination.unicodeScalars.append(scalar)
+                }
+            }
             out.append(contentsOf: "[\(escapedLabel)](\(destination))".utf8)
             link = nil
             lastWasSpace = false
