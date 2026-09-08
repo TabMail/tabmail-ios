@@ -111,22 +111,26 @@ struct RemovedAccountPushCleanupTests {
             try record("unregister-device")
         }
 
-        func unsubscribeIMAP(userEmail: String) async throws {
+        func unsubscribeIMAP(userEmail: String, deviceId: String) async throws {
+            #expect(deviceId == "test-device")
             noteBearer()
             try record("imap:\(userEmail)")
         }
 
-        func deleteGmailConsent(userEmail: String) async throws {
+        func deleteGmailConsent(userEmail: String, deviceId: String) async throws {
+            #expect(deviceId == "test-device")
             noteBearer()
             try recordOwnershipCleanup("gmail-consent:\(userEmail)")
         }
 
-        func deleteOutlookConsent(userEmail: String) async throws {
+        func deleteOutlookConsent(userEmail: String, deviceId: String) async throws {
+            #expect(deviceId == "test-device")
             noteBearer()
             try recordOwnershipCleanup("outlook-consent:\(userEmail)")
         }
 
-        func unsubscribe(provider: String, userEmail: String, accessToken: String) async throws {
+        func unsubscribe(provider: String, userEmail: String, deviceId: String, accessToken: String) async throws {
+            #expect(deviceId == "test-device")
             noteBearer()
             let call = "provider-subscription:\(provider):\(userEmail):\(accessToken.isEmpty ? "empty" : "set")"
             calls.append(call)
@@ -347,11 +351,12 @@ struct RemovedAccountPushCleanupTests {
             )
             await mock.setOwnershipRefusal(false)
             await mock.setGenericForbidden(true)
+            await mock.setShouldFail(true) // Final device release must fail too; no authoritative erasure.
             await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
             let denied = PendingRemovedAccountPushCleanup.load(from: defaults)
                 .first { $0.generation == deniedGeneration }
             #expect(denied?.actions.contains(.consent) == true,
-                    "a bare infrastructure 403 must remain durable")
+                    "a bare infrastructure 403 without acknowledged device erasure must remain durable")
             #expect(denied?.actions.contains(.providerSubscription) == true)
             await PushNotificationService.shared.cancelPreparedRemovedAccountCleanup(
                 generation: deniedGeneration
@@ -399,6 +404,42 @@ struct RemovedAccountPushCleanupTests {
             #expect(calls.filter { $0 == "provider-subscription:gmail:removed-token@example.com:empty" }.count == 1)
             #expect(!calls.contains(where: { $0.hasPrefix("register-device:") }),
                     "without an APNs token there is no legacy registration to rewrite")
+        }
+    }
+
+    @Test("acknowledged final device erasure settles failed child cleanup")
+    func finalDeviceReleaseSettlesFailedChildCleanup() async throws {
+        var last = Account(emailAddress: "last@example.test", displayName: "Last", provider: .gmail)
+        last.id = "last-account"
+        let lastAccount = last
+        try await withHarness(activeAccount: lastAccount) { defaults, mock in
+            var removed = Account(emailAddress: "removed@example.test", displayName: "Removed", provider: .gmail)
+            removed.id = "older-removed-account"
+            let generation = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                removed, caldavConfigIds: [], outboxAttachmentDirNames: [])
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: generation)
+            await mock.setShouldFail(false)
+            await mock.setProviderFailuresRemaining(1)
+            await PushNotificationService.shared.retryPendingRemovedAccountCleanups(onlyEmail: removed.emailAddress)
+            #expect(PendingRemovedAccountPushCleanup.load(from: defaults).first?.actions == [.providerSubscription])
+
+            let lastGeneration = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                lastAccount, caldavConfigIds: [], outboxAttachmentDirNames: [])
+            _ = try await AppDatabase.dbPool.write { db in try Account.deleteOne(db, key: lastAccount.id) }
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: lastGeneration)
+            await mock.setShouldFail(true)
+            await PushNotificationService.shared.retryPendingRemovedAccountCleanups(onlyEmail: lastAccount.emailAddress)
+            #expect(PendingRemovedAccountPushCleanup.load(from: defaults).count == 2,
+                    "failed installation release must retain both cleanup generations")
+            await mock.setShouldFail(false)
+            await mock.setProviderFailuresRemaining(2)
+            await PushNotificationService.shared.retryPendingRemovedAccountCleanups(onlyEmail: lastAccount.emailAddress)
+            #expect(PendingRemovedAccountPushCleanup.load(from: defaults).isEmpty)
+            let completedCalls = await mock.recordedCalls()
+            #expect(completedCalls.last == "unregister-device")
+            await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
+            #expect(await mock.recordedCalls() == completedCalls,
+                    "acknowledged installation erasure leaves no child requests to retry")
         }
     }
 
