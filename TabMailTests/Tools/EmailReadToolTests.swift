@@ -146,35 +146,64 @@ struct EmailReadToolTests {
         #expect(result.contains("error"))
         #expect(result.contains("message not found"))
     }
-    @Test("HTML link addresses survive cached reads and searchable FTS text")
+}
+
+@Suite("HTML link ingestion", .serialized, .processGlobalState)
+struct HTMLLinkIngestionTests {
+    @Test("Fetched HTML links reach stored text, search, and cached or indexed agent reads")
     func linkAddressesReachAgentAndSearch() async throws {
-        let (ctx, db, translator) = try makeContext()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "link-address-test", subject: "Links")
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let accountId = "link-ingestion-\(UUID().uuidString)"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        let header = MessageHeader(messageId: "links", subject: "Details",
+            from: "Sender", fromAddress: "sender@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "No body yet", folderId: "\(accountId):INBOX",
+            accountId: accountId, folderPath: "INBOX", isInInbox: false)
+        try await pool.write { try header.insert($0) }
+        let key = ContentKey(rawValue: header.id)
+        let index = SearchIndex.shared
+        _ = try await index.indexHeaders([FTSHeaderRecord(contentKey: key, headerId: header.id,
+            messageId: header.messageId, subject: header.subject, from: header.fromAddress,
+            to: header.to, dateMs: Int64(header.date.timeIntervalSince1970 * 1000))])
+        let term = "uniquelinkdestination"
+        #expect(!(try await index.keywordSearch(query: term)).contains { $0.contentKey == key })
+        #expect(try await index.rawFTSBody(contentKey: key)?.contains(term) != true)
+
         let html = #"<p>See <a href="https://example.com/uniquelinkdestination">the details</a>.</p>"#
         let markdown = "[the details](https://example.com/uniquelinkdestination)"
-        try TestDatabase.insertMessageBody(db, headerId: header.id, htmlContent: html)
+        let info = MessageHeaderInfo(messageId: header.messageId, rfc822MessageId: nil,
+            inReplyTo: nil, references: [], threadId: nil, subject: header.subject,
+            from: header.from, fromAddress: header.fromAddress, to: header.to, cc: "", bcc: "",
+            replyTo: nil, date: header.date, snippet: header.snippet, isRead: false,
+            isFlagged: false, hasAttachments: false, isReplied: false, isForwarded: false, actionTag: nil)
+        let provider = MockEmailProvider()
+        await provider.setFetchMessageResult(FullMessageInfo(header: info, htmlBody: html, textBody: "See the details."))
+        let outcome = await BodyFetchProcessor.fetchAndProcess(item: .init(headerId: header.id,
+            accountId: accountId, folderPath: "INBOX", messageId: header.messageId, isInInbox: false),
+            provider: provider, enableAI: true)
+        await ActiveEmbeddingQueue.shared.clearForTesting()
+        if case .success = outcome {} else { Issue.record("Body ingestion did not succeed") }
+        #expect(try await index.rawFTSBody(contentKey: key)?.contains(markdown) == true)
+        #expect((try await index.keywordSearch(query: term)).contains { $0.contentKey == key })
+        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: header.id)?.bodyComplete } == true)
+
+        let translator = MockChatIdTranslator()
         await translator.seed(header.id, as: 42)
-        let tool = EmailReadTool(context: ctx)
-        let cached = try await tool.execute(arguments: ["unique_id": .int(42)])
-        #expect(cached.contains(markdown))
-
-        let index = SearchIndex.shared
-        let key = ContentKey(rawValue: header.id)
-        let record = FTSHeaderRecord(contentKey: key, headerId: header.id,
-            messageId: "<links@example.com>", subject: "Links",
-            from: "sender@example.com", to: "recipient@example.com",
-            dateMs: Int64(Date().timeIntervalSince1970 * 1000))
-        _ = try await index.indexHeaders([record])
-        let text = try #require(EmailFilter.extractPlainText(htmlBody: html, textBody: nil))
-        try await index.updateBody(contentKey: key, body: text)
-        let hits = try await index.keywordSearch(query: "uniquelinkdestination")
-        #expect(hits.contains { $0.contentKey == key })
-        try await db.write { db in _ = try MessageBody.deleteOne(db, key: header.id) }
-        let indexed = try await tool.execute(arguments: ["unique_id": .int(42)])
-        #expect(indexed.contains(markdown))
+        let tool = EmailReadTool(context: ToolContext(db: pool, translator: translator))
+        #expect(try await tool.execute(arguments: ["unique_id": .int(42)]).contains(markdown))
+        // Evict display HTML and clear the snippet so only indexed body text can satisfy the read.
+        try await pool.write { db in
+            _ = try MessageBody.deleteOne(db, key: key.rawValue)
+            try db.execute(sql: "UPDATE messageHeader SET snippet = '' WHERE id = ?", arguments: [header.id])
+        }
+        #expect(try await pool.read { try MessageBody.fetchOne($0, key: key.rawValue) } == nil)
+        #expect(try await tool.execute(arguments: ["unique_id": .int(42)]).contains(markdown))
         try await index.removeMessages(contentKeys: [key])
+        #expect(!(try await index.keywordSearch(query: term)).contains { $0.contentKey == key })
     }
-
 }

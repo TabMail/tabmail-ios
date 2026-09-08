@@ -13,4 +13,5 @@ Owner scope: forward-only conversion. No backfill, cache sweep, historical repai
 older-client compatibility work. Existing FTS rows change only through ordinary future writes.
 
 Regression coverage: `EmailFilterLinkTests` and
-`EmailReadToolTests.linkAddressesReachAgentAndSearch`.
+`HTMLLinkIngestionTests.linkAddressesReachAgentAndSearch`, including Markdown destination
+round trips and the real fetch/render/persistence/FTS pipeline.

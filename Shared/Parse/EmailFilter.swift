@@ -245,9 +245,14 @@ enum EmailFilter {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             out.removeSubrange(active.start...)
             let escapedLabel = label.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "&", with: "&amp;")
                 .replacingOccurrences(of: "[", with: "\\[")
                 .replacingOccurrences(of: "]", with: "\\]")
-            let destination = active.href.replacingOccurrences(of: "\\", with: "\\\\")
+            // Markdown decodes entities again, and bare destinations cannot contain whitespace.
+            let address = active.href.addingPercentEncoding(withAllowedCharacters:
+                CharacterSet.controlCharacters.union(.whitespacesAndNewlines).inverted) ?? active.href
+            let destination = address.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "&", with: "&amp;")
                 .replacingOccurrences(of: "(", with: "\\(")
                 .replacingOccurrences(of: ")", with: "\\)")
             out.append(contentsOf: "[\(escapedLabel)](\(destination))".utf8)
@@ -457,15 +462,26 @@ enum EmailFilter {
     /// Find an HTML tag end without treating quoted attribute content as markup.
     private static func plainTextTagEnd(_ bytes: UnsafePointer<UInt8>, count: Int, from: Int) -> Int {
         var quote: UInt8?
+        var beforeValue = false
+        var unquotedValue = false
         var i = from
         while i < count {
             let byte = bytes[i]
+            let whitespace = byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D || byte == 0x0C
             if let current = quote {
                 if byte == current { quote = nil }
-            } else if byte == 0x22 || byte == 0x27 {
-                quote = byte
             } else if byte == 0x3E {
                 return i
+            } else if unquotedValue {
+                if whitespace { unquotedValue = false }
+            } else if beforeValue {
+                if !whitespace {
+                    beforeValue = false
+                    if byte == 0x22 || byte == 0x27 { quote = byte }
+                    else { unquotedValue = true }
+                }
+            } else if byte == 0x3D {
+                beforeValue = true
             }
             i += 1
         }
@@ -518,7 +534,6 @@ enum EmailFilter {
         }
         return nil
     }
-
 
     /// Length of a UTF-8 multi-byte sequence given the leading byte.
     /// Returns true if `v` is an invisible Unicode scalar value (zero-width spaces,
