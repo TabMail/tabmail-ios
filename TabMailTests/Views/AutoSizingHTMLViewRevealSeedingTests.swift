@@ -4,6 +4,8 @@
 
 import Testing
 import Foundation
+import SwiftUI
+import WebKit
 @testable import TabMail
 
 /// T4.V17 — the reveal flag is SEEDED at construction; it is not reset from
@@ -22,6 +24,43 @@ import Foundation
 /// expression `init` uses, so asserting on it asserts on production behaviour.
 @Suite("AutoSizingHTMLView reveal seeding (T4.V17)")
 struct AutoSizingHTMLViewRevealSeedingTests {
+
+    @MainActor
+    @Test("The native reveal consumer keeps an uncommitted message loading")
+    func nativeRevealWaitsForCommit() async {
+        var revealed = false
+        let driver = AutoSizingHTMLView.makeRevealTestDriver(
+            hasRevealed: Binding(get: { revealed }, set: { revealed = $0 })
+        )
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let controller = UIViewController()
+        window.rootViewController = controller
+        controller.view.addSubview(driver.webView)
+        window.makeKeyAndVisible()
+        defer {
+            driver.webView.stopLoading()
+            driver.webView.removeFromSuperview()
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        #expect(driver.webView.bounds.width > 0)
+        #expect(!driver.committed())
+        driver.acknowledge()
+        #expect(!revealed, "the binding driving the loading placeholder must remain false")
+        driver.load()
+        driver.acknowledge()
+        #expect(!revealed, "queued wrapping is not a committed document")
+        let deadline = ProcessInfo.processInfo.systemUptime + 15
+        while !driver.committed() && ProcessInfo.processInfo.systemUptime < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(driver.committed(), "the real WebKit navigation must commit")
+        guard driver.committed() else { return }
+        driver.acknowledge()
+        #expect(revealed, "committed content must dismiss the loading placeholder")
+        driver.acknowledge()
+        #expect(revealed)
+    }
 
     /// Unique per call so process-global `HeightSeedCache` state cannot leak
     /// between tests or between suites running concurrently.

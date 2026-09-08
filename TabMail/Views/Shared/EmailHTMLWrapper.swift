@@ -4,6 +4,28 @@
 
 import Foundation
 
+/// Console-only render timings. Immutable so one load's clock can cross the
+/// detached wrapping task without attributing its time to a later load.
+struct EmailRenderTiming: Sendable {
+    private let id: String
+    private let generation: Int
+    private let startedAt: TimeInterval
+
+    init?(id: String, generation: Int) {
+        guard DebugModeManager.isLoggingEnabled() else { return nil }
+        self.id = id
+        self.generation = generation
+        self.startedAt = ProcessInfo.processInfo.systemUptime
+    }
+
+    func mark(_ event: String) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        let elapsed = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
+        let epoch = Date().timeIntervalSince1970 * 1_000
+        print("[RenderTiming id=\(id) gen=\(generation) native +\(Int(elapsed))ms epochMs=\(Int64(epoch))] \(DebugModeManager.escapedForLogLine(event))")
+    }
+}
+
 /// Wraps email message HTML with TabMail's viewport, CSS, and unwrap-full-document
 /// handling. Produces the HTML string that HTMLWebView loads into WKWebView.
 ///
@@ -163,7 +185,8 @@ enum EmailHTMLWrapper {
     ///   this filename. Used by `EmlAttachmentPreview` to show a single attached .eml.
     ///   When nil (default, main view mode), emits CSS that hides ALL `.tm-eml-section`
     ///   blocks so they don't appear inline in the message body.
-    static func wrapHTML(_ body: String, previewFilename: String? = nil) -> String {
+    static func wrapHTML(_ body: String, previewFilename: String? = nil, timing: EmailRenderTiming? = nil) -> String {
+        timing?.mark("wrap.begin")
         var content: String
         let lower = body.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if lower.hasPrefix("<!doctype") || lower.hasPrefix("<html") {
@@ -183,12 +206,16 @@ enum EmailHTMLWrapper {
             content = body
         }
 
+        timing?.mark("wrap.unwrap.done")
         // Strip loading="lazy" from images — prevents chicken-and-egg deadlock
         // where lazy images in a 0-height container never enter the viewport
         // and thus never load, keeping the container at 0 height forever.
+        // Only start at the beginning of a whitespace run, and consume it once.
+        // Retrying every suffix of a long run makes non-matches quadratic.
         content = content.replacingOccurrences(
-            of: #"\s+loading\s*=\s*"lazy""#, with: "", options: .regularExpression
+            of: #"(?<!\s)\s++loading\s*=\s*"lazy""#, with: "", options: .regularExpression
         )
+        timing?.mark("wrap.lazy-attribute.done")
 
         // Strip external render-blocking <link rel="stylesheet"> (e.g. Google
         // Fonts). WebKit blocks the FIRST PAINT until every external stylesheet
@@ -208,6 +235,7 @@ enum EmailHTMLWrapper {
         content = content.replacingOccurrences(
             of: stylesheetLinkPattern, with: "", options: [.regularExpression, .caseInsensitive]
         )
+        timing?.mark("wrap.stylesheet-links.done")
 
         // Defer REMOTE <img> loading so it doesn't block the first paint. WebKit
         // holds the first compositor frame until readyState=complete, which waits
@@ -230,9 +258,13 @@ enum EmailHTMLWrapper {
         let imgSrcsetSingle = #"(<img\b[^>]*?)\ssrcset(\s*=\s*)'([^']*https?://[^']*)'"#
         let imgOpts: NSString.CompareOptions = [.regularExpression, .caseInsensitive]
         content = content.replacingOccurrences(of: imgSrcDouble, with: "$1 data-tmsrc$2\"$3\"", options: imgOpts)
+        timing?.mark("wrap.image-src-double.done")
         content = content.replacingOccurrences(of: imgSrcSingle, with: "$1 data-tmsrc$2'$3'", options: imgOpts)
+        timing?.mark("wrap.image-src-single.done")
         content = content.replacingOccurrences(of: imgSrcsetDouble, with: "$1 data-tmsrcset$2\"$3\"", options: imgOpts)
+        timing?.mark("wrap.image-srcset-double.done")
         content = content.replacingOccurrences(of: imgSrcsetSingle, with: "$1 data-tmsrcset$2'$3'", options: imgOpts)
+        timing?.mark("wrap.image-srcset-single.done")
 
         let viewModeCSS: String
         let bodyClass: String

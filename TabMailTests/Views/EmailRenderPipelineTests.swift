@@ -22,6 +22,28 @@ import JavaScriptCore
 @Suite("Email render pipeline — CSS + JS regressions")
 struct EmailRenderPipelineTests {
 
+    @Test("Long whitespace without a lazy attribute wraps promptly and preserves the body")
+    func longWhitespaceWrapsPromptly() {
+        let body = "<p>Before" + String(repeating: " ", count: 16_000) + "After</p>"
+        let start = ProcessInfo.processInfo.systemUptime
+        let wrapped = EmailHTMLWrapper.wrapHTML(body)
+        let elapsed = ProcessInfo.processInfo.systemUptime - start
+        #expect(wrapped.contains(body))
+        // Deliberately generous: the quadratic implementation takes seconds;
+        // linear wrapping should remain far below this even on a busy simulator.
+        #expect(elapsed < 2, "wrapping whitespace took \(elapsed) seconds")
+    }
+
+    @Test("Lazy attributes are removed while adjacent attributes and unmatched text survive")
+    func lazyAttributeRemovalPreservesSurroundingContent() {
+        let body = #"<img id="first" loading="lazy" alt="sample"><p> loading = "eager" </p>"#
+        let wrapped = EmailHTMLWrapper.wrapHTML(body)
+        #expect(wrapped.contains(#"<img id="first" alt="sample">"#))
+        #expect(wrapped.contains(#"<p> loading = "eager" </p>"#))
+        let spaced = "<img id=\"second\"" + String(repeating: " ", count: 16_000) + "loading = \"lazy\" alt=\"other\">"
+        #expect(EmailHTMLWrapper.wrapHTML(spaced).contains(#"<img id="second" alt="other">"#))
+    }
+
     // MARK: - wrapHTML CSS regressions
 
     @Test("Body has no horizontal or bottom padding (SwiftUI owns the gutters)")
@@ -3113,6 +3135,122 @@ struct EmailRenderPipelineTests {
         }
         """
 
+    private func resourceDiagnosticContext(mode: String = "working") -> JSContext {
+        let ctx = JSContext()!
+        ctx.evaluateScript(Self.imageDiagnosticHarness)
+        ctx.evaluateScript("""
+            var _subscriptions = [], _fontListeners = {}, _windowListeners = {};
+            var _frames = [], _timers = [], _requests = 0;
+            function URL(raw) { this.origin = 'https://example.com'; }
+            function PerformanceObserver(callback) {
+                this.observe = function(options) {
+                    if (options.entryTypes.indexOf('resource') >= 0) _subscriptions.push(callback);
+                };
+            }
+            function deliverResources(count) {
+                var entries = [];
+                for (var i = 0; i < count; i++) entries.push({
+                    name: 'https://example.com/private-path/font.ttf?token=private-query',
+                    initiatorType: 'css', startTime: 12, duration: 850,
+                    responseStart: 800, transferSize: 512
+                });
+                _subscriptions.forEach(function(callback) {
+                    callback({ getEntries: function() { return entries; } });
+                });
+            }
+            function requestAnimationFrame(callback) { _frames.push(callback); }
+            function setTimeout(callback, delay) { _timers.push({ callback: callback, delay: delay }); }
+            function fetch() { _requests++; }
+            function XMLHttpRequest() { _requests++; }
+            function Image() { _requests++; }
+            var navigator = { sendBeacon: function() { _requests++; } };
+            function importScripts() { _requests++; }
+            window.addEventListener = function(name, callback) {
+                (_windowListeners[name] = _windowListeners[name] || []).push(callback);
+            };
+            document.readyState = 'loading';
+            document.fonts = {
+                status: 'loading',
+                addEventListener: function(name, callback) {
+                    (_fontListeners[name] = _fontListeners[name] || []).push(callback);
+                },
+                ready: { then: function(callback) { callback(); } }
+            };
+            function fireFonts() {
+                ['loading', 'loadingdone', 'loadingerror'].forEach(function(name) {
+                    (_fontListeners[name] || []).forEach(function(callback) { callback(); });
+                });
+            }
+            """)
+        if mode == "unavailable" {
+            ctx.evaluateScript("PerformanceObserver = undefined; document.fonts = undefined;")
+        } else if mode == "throwing" {
+            ctx.evaluateScript("PerformanceObserver = function() { this.observe = function() { throw Error('unsupported'); }; };")
+        } else if mode == "sink-throws" {
+            ctx.evaluateScript("window.webkit.messageHandlers.consoleLog.postMessage = function() { throw Error('unavailable'); };")
+        }
+        return ctx
+    }
+
+    @Test("render diagnostics subscribe once, bound output, and report resource and font lifecycle")
+    func renderResourceTimingDiagnostics() {
+        let ctx = resourceDiagnosticContext()
+        ctx.evaluateScript(_imageLoadDiagnosticJS(enabled: true))
+        ctx.evaluateScript(_imageLoadDiagnosticJS(enabled: true))
+        ctx.evaluateScript("""
+            deliverResources(40);
+            deliverResources(45);
+            _frames.shift()();
+            _frames.shift()();
+            document.readyState = 'interactive';
+            (_docListeners.readystatechange || []).forEach(function(callback) { callback(); });
+            fireDomContentLoaded();
+            fireFonts();
+            (_windowListeners.load || []).forEach(function(callback) { callback(); });
+            _timers.filter(function(timer) { return timer.delay === 2000; })
+                .forEach(function(timer) { timer.callback(); });
+            """)
+        #expect(ctx.exception == nil, "timing diagnostic threw: \(ctx.exception?.toString() ?? "")")
+        #expect(ctx.evaluateScript("_subscriptions.length")?.toInt32() == 1)
+        #expect(ctx.evaluateScript("_logs.filter(function(line) { return line.indexOf('resource kind=') >= 0; }).length")?.toInt32() == 80)
+        #expect(ctx.evaluateScript("_requests")?.toInt32() == 0)
+        let logs = ctx.evaluateScript("_logs.join('|')")?.toString() ?? ""
+        #expect(logs.contains("resources-observed=85 logged=80"))
+        #expect(logs.contains("durationMs=850"))
+        #expect(logs.contains("origin=https://example.com"))
+        #expect(!logs.contains("private-path"))
+        #expect(!logs.contains("private-query"))
+        for event in ["document-start", "first-animation-frame", "second-animation-frame",
+                      "readystatechange", "dom-content-loaded", "window-load", "t2000",
+                      "fonts-loading", "fonts-loadingdone", "fonts-loadingerror", "fonts-ready"] {
+            #expect(logs.contains("event=\(event) "), "missing lifecycle event \(event)")
+        }
+    }
+
+    @Test("unavailable diagnostic dependencies preserve installation without requests",
+          arguments: ["unavailable", "throwing", "sink-throws"])
+    func renderDiagnosticDependencyFailures(mode: String) {
+        let ctx = resourceDiagnosticContext(mode: mode)
+        ctx.evaluateScript(_imageLoadDiagnosticJS(enabled: true))
+        ctx.evaluateScript(_imageLoadDiagnosticJS(enabled: true))
+        ctx.evaluateScript("deliverResources(2); fireDomContentLoaded();")
+        #expect(ctx.exception == nil)
+        #expect(ctx.evaluateScript("typeof window.__tmImageDiagWillAssign")?.toString() == "function")
+        #expect(ctx.evaluateScript("_docListeners.DOMContentLoaded.length")?.toInt32() == 1)
+        #expect(ctx.evaluateScript("_requests")?.toInt32() == 0)
+        let logs = ctx.evaluateScript("_logs.join('|')")?.toString() ?? ""
+        if mode == "unavailable" {
+            #expect(logs.contains("resource-observer unavailable"))
+            #expect(logs.contains("fonts=unavailable"))
+        } else if mode == "throwing" {
+            #expect(logs.contains("resource-observer unsupported"))
+            #expect(logs.contains("event=fonts-ready"))
+        } else {
+            #expect(logs.isEmpty)
+            #expect(ctx.evaluateScript("_subscriptions.length")?.toInt32() == 1)
+        }
+    }
+
     @Test("a crafted attribute cannot forge a second diagnostic log line")
     func imageDiagnosticsSanitizeControlCharacters() {
         // `reportInventory` logs EVERY image, loaded or not, so this needs no
@@ -3139,8 +3277,9 @@ struct EmailRenderPipelineTests {
         #expect(ctx.exception == nil, "diagnostic script threw: \(ctx.exception?.toString() ?? "")")
 
         let count = ctx.evaluateScript("_logs.length")?.toInt32() ?? 0
-        // inventory header + 1 image + legacy-background header + 1 background.
-        #expect(count == 4)
+        // Four inventory/background lines, two lifecycle lines, and the
+        // explicit unavailable-resource-observer line in this minimal host.
+        #expect(count == 7)
         // The invariant: NO emitted message can become more than one line, for
         // every terminator the sanitizer claims to cover.
         let multiline = ctx.evaluateScript(

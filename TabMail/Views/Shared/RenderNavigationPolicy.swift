@@ -424,6 +424,8 @@ internal struct BridgeLivenessBeacon: Equatable {
 /// The bridge requests that may be honoured AT MOST ONCE per document. Raw values are the
 /// tokens the coordinator's debug log already used.
 internal enum RenderOneShot: String, Equatable, CaseIterable {
+    /// The first visible paint of a committed document, never the initial empty view.
+    case reveal = "revealed"
     /// `monitorHeightJS`'s first-layout `{requestFit:true}`.
     case fit = "requestFit"
     /// `postImageWidthRecheckJS`'s `{requestWidthRefit:true}`.

@@ -12,6 +12,8 @@ Root [`../CLAUDE.md`](../CLAUDE.md) is normative; the [full pre-pass iOS routing
 
 ## Current topics
 
+- [Slow email rendering: lazy-attribute regex quadratic whitespace retries, premature empty-view reveal, native/WebKit timing diagnostics](Companion/Memory/Current/render-timing-diagnostics.md).
+
 - [HTML-to-text Markdown links, href destinations in FTS and agent reads; forward-only (#100)](Companion/Memory/Current/125-html-links-in-converted-text.md).
 
 Search the topic text below as subsystem keywords. Each link is mandatory when its row matches the task.
