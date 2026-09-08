@@ -146,4 +146,35 @@ struct EmailReadToolTests {
         #expect(result.contains("error"))
         #expect(result.contains("message not found"))
     }
+    @Test("HTML link addresses survive cached reads and searchable FTS text")
+    func linkAddressesReachAgentAndSearch() async throws {
+        let (ctx, db, translator) = try makeContext()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "link-address-test", subject: "Links")
+        let html = #"<p>See <a href="https://example.com/uniquelinkdestination">the details</a>.</p>"#
+        let markdown = "[the details](https://example.com/uniquelinkdestination)"
+        try TestDatabase.insertMessageBody(db, headerId: header.id, htmlContent: html)
+        await translator.seed(header.id, as: 42)
+        let tool = EmailReadTool(context: ctx)
+        let cached = try await tool.execute(arguments: ["unique_id": .int(42)])
+        #expect(cached.contains(markdown))
+
+        let index = SearchIndex.shared
+        let key = ContentKey(rawValue: header.id)
+        let record = FTSHeaderRecord(contentKey: key, headerId: header.id,
+            messageId: "<links@example.com>", subject: "Links",
+            from: "sender@example.com", to: "recipient@example.com",
+            dateMs: Int64(Date().timeIntervalSince1970 * 1000))
+        _ = try await index.indexHeaders([record])
+        let text = try #require(EmailFilter.extractPlainText(htmlBody: html, textBody: nil))
+        try await index.updateBody(contentKey: key, body: text)
+        let hits = try await index.keywordSearch(query: "uniquelinkdestination")
+        #expect(hits.contains { $0.contentKey == key })
+        try await db.write { db in _ = try MessageBody.deleteOne(db, key: header.id) }
+        let indexed = try await tool.execute(arguments: ["unique_id": .int(42)])
+        #expect(indexed.contains(markdown))
+        try await index.removeMessages(contentKeys: [key])
+    }
+
 }

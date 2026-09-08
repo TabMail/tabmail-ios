@@ -92,7 +92,7 @@ struct EmailFilterHTMLEdgeCaseTests {
         let result = EmailFilter.htmlToPlainText(html)
         #expect(result.contains("Click here"))
         #expect(!result.contains("href"))
-        #expect(!result.contains("example.com"))
+        #expect(result.contains("[Click here](https://example.com)"))
     }
 
     @Test("HTML entities: ndash and mdash")

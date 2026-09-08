@@ -227,7 +227,7 @@ enum EmailFilter {
     }
 
     /// Strips HTML to plain text suitable for FTS indexing.
-    /// Single-pass UTF-8 byte scanner — O(1) extra memory (no copy of the input).
+    /// Single-pass UTF-8 byte scanner; visible anchors retain destinations as Markdown links.
     /// Skips <style>/<script>/<head> block content, strips tags, decodes entities,
     /// and collapses whitespace in one pass.
     /// All HTML structural characters (< > & ; / ! -) are ASCII, so byte-level
@@ -237,6 +237,23 @@ enum EmailFilter {
         var out: [UInt8] = []
         out.reserveCapacity(html.utf8.count / 4)
         var lastWasSpace = true
+        var link: (start: Int, href: String)?
+
+        func finishLink() {
+            guard let active = link else { return }
+            let label = String(decoding: out[active.start...], as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            out.removeSubrange(active.start...)
+            let escapedLabel = label.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "[", with: "\\[")
+                .replacingOccurrences(of: "]", with: "\\]")
+            let destination = active.href.replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "(", with: "\\(")
+                .replacingOccurrences(of: ")", with: "\\)")
+            out.append(contentsOf: "[\(escapedLabel)](\(destination))".utf8)
+            link = nil
+            lastWasSpace = false
+        }
 
         // Zero-copy access to the string's UTF-8 bytes via withUTF8.
         // Falls back to a 1x copy only for bridged NSStrings (rare).
@@ -280,13 +297,14 @@ enum EmailFilter {
                         continue
                     }
 
+                    // Quotes may contain '>'; only an unquoted '>' ends a tag.
+                    let tagEnd = plainTextTagEnd(bytes, count: count, from: ns + tagLen)
+
                     // Opening tags with display:none — skip all content to matching close tag
                     let isClosing = (i + 1 < count && bytes[i + 1] == 0x2F)
                     if tagLen > 0 && !isClosing {
                         // Scan tag attributes (between tag name and '>') for display:none
                         let tagAttrStart = ns + tagLen
-                        var tagEnd = tagAttrStart
-                        while tagEnd < count, bytes[tagEnd] != 0x3E { tagEnd += 1 }
                         if tagEnd > tagAttrStart && hasDisplayNone(bytes, from: tagAttrStart, to: tagEnd) {
                             // Skip past opening tag '>'
                             i = tagEnd
@@ -311,6 +329,18 @@ enum EmailFilter {
                         }
                     }
 
+                    if tagName == "a" {
+                        finishLink()
+                        if !lastWasSpace { out.append(0x20); lastWasSpace = true }
+                        if !isClosing, tagEnd < count,
+                           let href = plainTextLinkAddress(bytes, from: ns + tagLen, to: tagEnd),
+                           !href.isEmpty {
+                            link = (out.count, href)
+                        }
+                        i = min(tagEnd + 1, count)
+                        continue
+                    }
+
                     // Check if this is a block-level tag or <br> — emit newline
                     let isBlockTag: Bool
                     switch tagName {
@@ -323,9 +353,8 @@ enum EmailFilter {
                     let isBlock = tagLen > 0 && isBlockTag
                     let isBr = tagLen > 0 && tagName == "br"
 
-                    // Regular tag — skip to '>'
-                    while i < count, bytes[i] != 0x3E { i += 1 }
-                    if i < count { i += 1 }
+                    // Regular tag — skip to its unquoted end.
+                    i = min(tagEnd + 1, count)
 
                     if isBr || (isBlock && isClosing) {
                         // Block-level close tags and <br> → newline
@@ -414,6 +443,8 @@ enum EmailFilter {
             }
         }
 
+        finishLink()
+
         // Trim trailing whitespace (space, newline, CR, tab)
         while let last = out.last, last == 0x20 || last == 0x0A || last == 0x0D || last == 0x09 {
             out.removeLast()
@@ -422,6 +453,72 @@ enum EmailFilter {
     }
 
     // MARK: - UTF-8 byte scanner helpers
+
+    /// Find an HTML tag end without treating quoted attribute content as markup.
+    private static func plainTextTagEnd(_ bytes: UnsafePointer<UInt8>, count: Int, from: Int) -> Int {
+        var quote: UInt8?
+        var i = from
+        while i < count {
+            let byte = bytes[i]
+            if let current = quote {
+                if byte == current { quote = nil }
+            } else if byte == 0x22 || byte == 0x27 {
+                quote = byte
+            } else if byte == 0x3E {
+                return i
+            }
+            i += 1
+        }
+        return count
+    }
+
+    /// Read whole attributes, so href-like text in another value is never an address.
+    /// Unlike the embedded-message metadata reader, HTML anchors also allow unquoted values.
+    private static func plainTextLinkAddress(_ bytes: UnsafePointer<UInt8>, from: Int, to: Int) -> String? {
+        func whitespace(_ byte: UInt8) -> Bool {
+            byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D || byte == 0x0C
+        }
+        var i = from
+        while i < to {
+            while i < to, whitespace(bytes[i]) || bytes[i] == 0x2F { i += 1 }
+            let nameStart = i
+            while i < to, !whitespace(bytes[i]), bytes[i] != 0x3D { i += 1 }
+            let name = String(decoding: UnsafeBufferPointer(start: bytes + nameStart, count: i - nameStart), as: UTF8.self)
+            while i < to, whitespace(bytes[i]) { i += 1 }
+            guard i < to, bytes[i] == 0x3D else { continue }
+            i += 1
+            while i < to, whitespace(bytes[i]) { i += 1 }
+            guard i < to else { return nil }
+            let quote = bytes[i] == 0x22 || bytes[i] == 0x27 ? bytes[i] : nil
+            if quote != nil { i += 1 }
+            let start = i
+            while i < to {
+                if let quote { if bytes[i] == quote { break } }
+                else if whitespace(bytes[i]) { break }
+                i += 1
+            }
+            let end = i
+            if quote != nil, i < to { i += 1 }
+            guard name.lowercased() == "href" else { continue }
+            var address: [UInt8] = []
+            var j = start
+            while j < end {
+                if bytes[j] == 0x26 {
+                    let (decoded, advance) = decodeEntityBytes(bytes, count: end, from: j, preserveUnknown: true)
+                    if let decoded {
+                        address.append(contentsOf: decoded.utf8)
+                        j += advance
+                        continue
+                    }
+                }
+                address.append(bytes[j])
+                j += 1
+            }
+            return String(decoding: address, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
+    }
+
 
     /// Length of a UTF-8 multi-byte sequence given the leading byte.
     /// Returns true if `v` is an invisible Unicode scalar value (zero-width spaces,
@@ -650,7 +747,7 @@ enum EmailFilter {
     }
 
     /// Decode an HTML entity at `from` (pointing to '&'). Returns (decoded string, bytes consumed).
-    private static func decodeEntityBytes(_ bytes: UnsafePointer<UInt8>, count: Int, from: Int) -> (String?, Int) {
+    private static func decodeEntityBytes(_ bytes: UnsafePointer<UInt8>, count: Int, from: Int, preserveUnknown: Bool = false) -> (String?, Int) {
         var end = from + 1
         let limit = min(from + 12, count)
         while end < limit {
@@ -707,7 +804,7 @@ enum EmailFilter {
         case "shy": return ("\u{00AD}", advance)
         case "zwj": return ("\u{200D}", advance)
         case "zwnj": return ("\u{200C}", advance)
-        default: return (" ", advance)
+        default: return preserveUnknown ? (nil, 1) : (" ", advance)
         }
     }
 
