@@ -1063,7 +1063,14 @@ actor PushNotificationService {
             return
         }
         for account in accounts where account.provider != .caldav {
-            await registerDeviceAccountRecord(for: account)
+            if account.provider == .imap || account.provider == .icloud {
+                // A cold launch may receive its APNs token before the foreground
+                // subscription pass. Establish the watch and route together;
+                // route-only registration requires a watch that may not exist.
+                _ = await subscribeAccount(account)
+            } else {
+                await registerDeviceAccountRecord(for: account)
+            }
         }
     }
 

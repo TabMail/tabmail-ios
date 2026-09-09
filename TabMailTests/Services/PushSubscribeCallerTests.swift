@@ -32,7 +32,7 @@ struct PushSubscribeCallerTests {
     }
 
     @Test(arguments: [(AccountProvider.gmail, "rotate"), (.outlook, "remove"),
-        (.imap, "rotate"), (.imap, "remove")])
+        (.imap, "rotate"), (.imap, "remove"), (.imap, "token_callback"), (.icloud, "token_callback")])
     func contextChangesDuringAuthentication(provider: AccountProvider, change: String) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -78,7 +78,7 @@ struct PushSubscribeCallerTests {
             account.imapPort = 993
             return account
         }()
-        try await pool.write { db in var row = account; try row.insert(db) }
+        try await pool.write { db in try account.insert(db) }
         let passwordKey = KeychainHelper.passwordKey(accountId: account.id)
         try KeychainHelper.save("synthetic-password", for: passwordKey)
         defer { KeychainHelper.delete(key: passwordKey) }
@@ -96,7 +96,13 @@ struct PushSubscribeCallerTests {
             }, authTokenProvider: { await gate.waitOnce(); return "synthetic-worker-token" })
         let service = PushNotificationService(pushClient: client, subscriptionAccessToken: { _ in "synthetic-provider-token" })
         await service._setNotificationSettingsProviderForTesting(VisibleSettings())
-        let running = Task { await service.subscribeAccount(account) }
+        let running = Task {
+            if change == "token_callback" {
+                await service.reregisterAllDeviceAccounts()
+                return true
+            }
+            return await service.subscribeAccount(account)
+        }
         for _ in 0..<200 {
             if await gate.entered { break }
             try await Task.sleep(for: .milliseconds(10))
@@ -111,6 +117,8 @@ struct PushSubscribeCallerTests {
             case "remove":
                 try await client.unregisterDeviceAccount(deviceId: "test-device", accountEmail: account.emailAddress)
                 _ = try await pool.write { db in try Account.deleteOne(db, key: account.id) }
+            case "token_callback":
+                break
             default:
                 Issue.record("Unexpected regression case")
             }
@@ -121,15 +129,16 @@ struct PushSubscribeCallerTests {
         let succeeded = await running.value
         let requests = PushRequestProtocol.observed()
         let subscriptions = requests.filter { $0.path == "/subscribe" }
-        let shouldSubscribe = change == "rotate"
+        let shouldSubscribe = change != "remove"
         #expect(succeeded == shouldSubscribe)
         #expect(subscriptions.count == (shouldSubscribe ? 1 : 0))
         if let sent = subscriptions.first {
             let body = try #require(JSONSerialization.jsonObject(with: sent.body) as? [String: Any])
-            #expect(body["deviceToken"] as? String == "token-new")
+            #expect(body["deviceToken"] as? String == (change == "rotate" ? "token-new" : "token-old"))
             #expect(body["nseCapable"] as? Bool == true)
         }
         if change == "rotate" { #expect(requests.first?.path == "/register-device") }
         if change == "remove" { #expect(requests.map(\.path) == ["/register-account-device"]) }
+        if change == "token_callback" { #expect(requests.map(\.path) == ["/subscribe"]) }
     }
 }
