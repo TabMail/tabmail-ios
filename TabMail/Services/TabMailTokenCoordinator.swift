@@ -24,8 +24,6 @@ actor TabMailTokenCoordinator {
         case noSession             // no session in Keychain
     }
 
-    private static let supabaseURL = "https://auth.tabmail.ai"
-    private static let supabaseAnonKey = "sb_publishable_1mtT87g-94P0yxFgM19Itw_P3ih9PUD"
     private let dataForRequest: DataForRequest
     private let sessionStore: TabMailSessionStore
 
@@ -42,29 +40,11 @@ actor TabMailTokenCoordinator {
     /// In-flight refresh task. Subsequent callers await this instead of starting a new refresh.
     private var inFlightRefresh: Task<RefreshResult, Never>?
 
-    /// The Supabase subject `inFlightRefresh` was started for.
-    ///
-    /// Deduplication is only ever safe BETWEEN CALLERS THAT OWN THE SAME
-    /// SESSION. The dedup exists to stop two callers burning the same rotated
-    /// refresh token; it was never meant to hand one user another user's
-    /// bearer. Without this tag, a sign-out/sign-in switch lets B join A's
-    /// in-flight refresh and receive `.success(A_accessToken)` — B then makes
-    /// backend requests under A's identity, and a `/whoami` fetched that way
-    /// describes A while carrying B's epoch.
-    private var inFlightRefreshUserId: String?
+    /// A replacement login by the same user is still a different session.
+    private var inFlightRefreshGeneration: String?
 
-    /// Pure join-decision: may a caller owning `requestingUserId` share the
-    /// in-flight refresh started for `inFlightUserId`?
-    ///
-    /// JOIN only on an exact subject match. Refusing to join is always
-    /// auth-safe: the caller simply starts its OWN refresh with its OWN
-    /// refresh token, so no legitimate session is ever denied a token. (Two
-    /// different users hold two different refresh tokens, so declining to
-    /// share cannot cause a rotation conflict — the failure mode the dedup
-    /// exists to prevent applies only within one subject, which still dedups.)
-    static func canJoinInFlightRefresh(inFlightUserId: String?, requestingUserId: String) -> Bool {
-        guard let inFlightUserId else { return false }
-        return inFlightUserId == requestingUserId
+    static func canJoinInFlightRefresh(inFlightGeneration: String?, requestingGeneration: String) -> Bool {
+        inFlightGeneration == requestingGeneration
     }
 
     /// Get a valid access token, refreshing if needed.
@@ -98,27 +78,25 @@ actor TabMailTokenCoordinator {
         // owns the same session (see `canJoinInFlightRefresh`).
         if let existing = inFlightRefresh,
            Self.canJoinInFlightRefresh(
-               inFlightUserId: inFlightRefreshUserId,
-               requestingUserId: session.userId
+               inFlightGeneration: inFlightRefreshGeneration,
+               requestingGeneration: record.generation!
            ) {
             print("[TabMailToken] Awaiting in-flight refresh...")
             return await existing.value
         }
 
-        let refreshToken = session.refreshToken
         let generation = record.generation!
         print("[TabMailToken] Token expired (expiresAt=\(session.expiresAt) now=\(now)), starting refresh...")
 
         let task = Task<RefreshResult, Never> {
             await Self.performRefresh(
-                refreshToken: refreshToken,
-                generation: generation,
+                record: record,
                 sessionStore: sessionStore,
                 dataForRequest: dataForRequest
             )
         }
         inFlightRefresh = task
-        inFlightRefreshUserId = session.userId
+        inFlightRefreshGeneration = generation
 
         let result = await task.value
         // Only retire the slot if it is still OURS. A different user's refresh
@@ -127,7 +105,7 @@ actor TabMailTokenCoordinator {
         // untagged refresh.
         if inFlightRefresh == task {
             inFlightRefresh = nil
-            inFlightRefreshUserId = nil
+            inFlightRefreshGeneration = nil
         }
         return result
     }
@@ -136,7 +114,7 @@ actor TabMailTokenCoordinator {
     /// Used after `updateUserMetadata()` to ensure the JWT carries updated `user_metadata` claims.
     func forceRefresh() async -> RefreshResult {
         guard var record = sessionStore.loadActiveSession(),
-              var session = try? JSONDecoder().decode(TabMailSession.self, from: record.data) else {
+              let session = try? JSONDecoder().decode(TabMailSession.self, from: record.data) else {
             return .noSession
         }
 
@@ -144,101 +122,65 @@ actor TabMailTokenCoordinator {
             await retryLegacyMigration()
             guard let migrated = sessionStore.loadActiveSession(),
                   let migratedSession = try? JSONDecoder().decode(TabMailSession.self, from: migrated.data),
-                  migrated.generation != nil else {
+                  migrated.generation != nil, migratedSession.userId == session.userId else {
                 return .transientFailure
             }
             record = migrated
-            session = migratedSession
         }
 
-        // Deduplicate if a refresh is already in-flight — same-subject only.
+        // Deduplicate if a refresh is already in-flight — same-generation only.
         // This path has NO expiry check, so without the ownership tag it joins
         // another user's refresh unconditionally. Its sole production caller
         // (`ConsentGateView`) runs immediately after sign-in, i.e. exactly in
         // the sign-out/sign-in window where the subject can have just changed.
         if let existing = inFlightRefresh,
            Self.canJoinInFlightRefresh(
-               inFlightUserId: inFlightRefreshUserId,
-               requestingUserId: session.userId
+               inFlightGeneration: inFlightRefreshGeneration,
+               requestingGeneration: record.generation!
            ) {
             return await existing.value
         }
 
         print("[TabMailToken] Force-refreshing token to pick up updated user_metadata")
 
-        let refreshToken = session.refreshToken
         let generation = record.generation!
         let task = Task<RefreshResult, Never> {
             await Self.performRefresh(
-                refreshToken: refreshToken,
-                generation: generation,
+                record: record,
                 sessionStore: sessionStore,
                 dataForRequest: dataForRequest
             )
         }
         inFlightRefresh = task
-        inFlightRefreshUserId = session.userId
+        inFlightRefreshGeneration = generation
 
         let result = await task.value
         if inFlightRefresh == task {
             inFlightRefresh = nil
-            inFlightRefreshUserId = nil
+            inFlightRefreshGeneration = nil
         }
         return result
     }
 
-    /// Perform the actual HTTP refresh call to Supabase.
+    /// Both processes use the same snapshot-checked refresh persistence.
     private static func performRefresh(
-        refreshToken: String,
-        generation: String,
+        record: TabMailSessionStore.ActiveSession,
         sessionStore: TabMailSessionStore,
-        dataForRequest: DataForRequest
+        dataForRequest: @escaping DataForRequest
     ) async -> RefreshResult {
-        guard let url = URL(string: "\(supabaseURL)/auth/v1/token?grant_type=refresh_token") else {
-            return .transientFailure
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(supabaseAnonKey, forHTTPHeaderField: "apikey")
-        request.setValue("Bearer \(supabaseAnonKey)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["refresh_token": refreshToken])
-
         do {
-            let (data, response) = try await dataForRequest(request)
-            guard let httpResponse = response as? HTTPURLResponse else {
-                return .transientFailure
+            let result = try await CredentialRefreshBackgroundTask.run {
+                try await TabMailSessionRefresh.token(record: record, force: true,
+                    store: sessionStore, transport: dataForRequest)
             }
-
-            guard httpResponse.statusCode == 200 else {
-                let code = httpResponse.statusCode
-                AuthDiagnostics.log("Token refresh HTTP \(code)")
-                // 400/401/403 = refresh token revoked or invalid — permanent, needs re-auth.
-                // Do NOT auto-logout — only the user can sign out. Callers should
-                // treat this as a transient-like failure and retry on next attempt.
-                if code == 400 || code == 401 || code == 403 {
-                    AuthDiagnostics.log("Refresh permanently failed (HTTP \(code)) — token may be revoked")
-                    return .permanentFailure
-                }
-                return .transientFailure
-            }
-
-            let newSession = try JSONDecoder().decode(TabMailSession.self, from: data)
-            let encoded = try JSONEncoder().encode(newSession)
-            // Update exactly the generation captured before the request. A
-            // sign-out or later login can delete that slot, but a late response
-            // can never recreate it or touch the active pointer.
-            let persistence = sessionStore.updateCapturedGeneration(generation, data: encoded)
-            if case .failed(let status) = persistence {
-                AuthDiagnostics.log("Token refresh persistence failed (OSStatus \(status)); current invocation may continue")
-            }
-            AuthDiagnostics.log("Token refreshed, expiresAt=\(newSession.expiresAt)")
-            return .success(newSession.accessToken)
-        } catch {
-            AuthDiagnostics.log("Token refresh error: \(error)")
-            return .transientFailure
-        }
+            // Preserve the existing held-invocation contract. This never changes
+            // activation; NSE recovery separately requires durable active state.
+            return .success(result.session.accessToken)
+        } catch CredentialRefreshError.requiresAuthorization {
+            return .permanentFailure
+        } catch CredentialRefreshError.inactive {
+            return .noSession
+        } catch { return .transientFailure }
     }
 
     @MainActor

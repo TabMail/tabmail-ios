@@ -191,7 +191,7 @@ extension KeychainHelper {
             for item in items {
                 guard let account = item[kSecAttrAccount as String] as? String,
                       let data = item[kSecValueData as String] as? Data else { continue }
-                guard !TabMailSessionStore.isSessionAccount(account) else { continue }
+                guard !(TabMailSessionStore.isSessionAccount(account) || ProviderCredentialStore.isProviderAccount(account)) else { continue }
 
                 // Check if item already exists in shared access group
                 let checkQuery: [String: Any] = [
@@ -232,7 +232,7 @@ extension KeychainHelper {
         if status == errSecSuccess, let items = sharedItems as? [[String: Any]] {
             for item in items {
                 guard let account = item[kSecAttrAccount as String] as? String,
-                      !TabMailSessionStore.isSessionAccount(account) else { continue }
+                      !(TabMailSessionStore.isSessionAccount(account) || ProviderCredentialStore.isProviderAccount(account)) else { continue }
                 let exactQuery: [String: Any] = [
                     kSecClass as String: kSecClassGenericPassword,
                     kSecAttrService as String: service,

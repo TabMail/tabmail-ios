@@ -5,6 +5,9 @@
 import UserNotifications
 import GRDB
 import Synchronization
+#if TABMAIL_TESTS
+@testable import TabMail
+#endif
 
 /// Thread-safe one-shot flag for content handler race prevention.
 final class OneShotFlag: @unchecked Sendable {
@@ -31,11 +34,24 @@ final class OneShotFlag: @unchecked Sendable {
 /// exit handlers (cancel it). `cancelAndClear` is idempotent — both paths can
 /// call it.
 final class CancellableTaskHolder: @unchecked Sendable {
-    private let slot = Mutex<Task<Void, Never>?>(nil)
-    func set(_ task: Task<Void, Never>) { slot.withLock { $0 = task } }
+    private struct State { var task: Task<Void, Never>?; var closed = false }
+    private let slot = Mutex(State())
+    func set(_ task: Task<Void, Never>) {
+        let refuse = slot.withLock { state in
+            if state.closed { return true }
+            state.task = task
+            return false
+        }
+        if refuse { task.cancel() }
+    }
     func cancelAndClear() {
-        let t = slot.withLock { let was = $0; $0 = nil; return was }
-        t?.cancel()
+        let task = slot.withLock { state in
+            state.closed = true
+            let task = state.task
+            state.task = nil
+            return task
+        }
+        task?.cancel()
     }
 }
 
@@ -92,6 +108,16 @@ final class PartialSignalHolder: @unchecked Sendable {
 final class NotificationService: UNNotificationServiceExtension {
     private var contentHandler: ((UNNotificationContent) -> Void)?
     private var bestAttemptContent: UNMutableNotificationContent?
+    @TaskLocal static var reconnectTransport: TabMailSessionRefresh.Transport = {
+        try await URLSession.shared.data(for: $0)
+    }
+    @TaskLocal static var visualCapability: @Sendable () async -> Bool = {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        return (settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional)
+            && (settings.lockScreenSetting == .enabled || settings.notificationCenterSetting == .enabled
+                || settings.alertSetting == .enabled)
+    }
+
     private lazy var nseDB: DatabaseQueue? = NSEStagingDB.open()
     private let delivered = OneShotFlag()
     /// Instance-scoped holder for the AI lease heartbeat Task spawned inside
@@ -105,6 +131,7 @@ final class NotificationService: UNNotificationServiceExtension {
     /// + deliver passive with margin. Natural completion and the iOS expiration
     /// handler cancel it so it never fires after we've already exited.
     private let watchdogHolder = CancellableTaskHolder()
+    private let processingHolder = CancellableTaskHolder()
     /// Carries the claimed AI-lease identity so every exit path can release it.
     private let leaseHolder = LeaseHolder()
     /// Carries the best-known partial result (header-only, then +summary) so
@@ -168,6 +195,8 @@ final class NotificationService: UNNotificationServiceExtension {
             "provider": request.content.userInfo["provider"] as? String ?? "",
             "accountEmail": request.content.userInfo["accountEmail"] as? String ?? "",
             "historyId": historyIdStr,
+            "final": (request.content.userInfo["final"] as? Bool) == true ? "true" :
+                (request.content.userInfo["final"] as? String ?? "false"),
             // Worker classifier now emits one visible push per arrived message
             // with `messageId` in the payload. When present, NSE uses it directly
             // and skips its own Gmail history.list call (saves ~1-3s of the 30s
@@ -180,6 +209,7 @@ final class NotificationService: UNNotificationServiceExtension {
         let deliverGuard = delivered
         let heartbeatHolder = self.heartbeatHolder
         let watchdogHolder = self.watchdogHolder
+        let processingHolder = self.processingHolder
         let leaseHolder = self.leaseHolder
         let partialHolder = self.partialHolder
         nonisolated(unsafe) let deliver = contentHandler
@@ -194,6 +224,7 @@ final class NotificationService: UNNotificationServiceExtension {
                 NSELog.step("NSE deliver: already fired (race)")
                 return
             }
+            processingHolder.cancelAndClear()
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             if let n = notification as? UNMutableNotificationContent {
                 // SHAPE, NOT CONTENT — same rule and same pattern as the step4 /
@@ -211,19 +242,27 @@ final class NotificationService: UNNotificationServiceExtension {
             deliver(notification)
         }
 
-        Task { @Sendable in
-            await NSELog.$runTag.withValue(runTag) {
-                await NotificationService.process(
-                    c: c, info: info, fanOutIds: fanOutIds, db: db,
-                    heartbeatHolder: heartbeatHolder,
-                    watchdogHolder: watchdogHolder,
-                    leaseHolder: leaseHolder,
-                    partialHolder: partialHolder,
-                    deliveredFlag: deliverGuard,
-                    runStart: t0,
-                    deliver: deliverOnce)
+        let boundAccountId = NSEState.findAccountId(for: accountEmailStr) ?? ""
+        let providerBinding = NSEAuthSource.Binding(accountId: boundAccountId,
+            generation: ProviderCredentialStore.shared.activation(accountId: boundAccountId)?.generation)
+        let sessionGeneration = NSETokenManager.store.loadActiveSession()?.generation ?? ""
+        processingHolder.set(Task { @Sendable in
+            await NSEAuthSource.$binding.withValue(providerBinding) {
+                await NSETokenManager.$expectedGeneration.withValue(sessionGeneration) {
+                    await NSELog.$runTag.withValue(runTag) {
+                        await NotificationService.process(
+                            c: c, info: info, fanOutIds: fanOutIds, db: db,
+                            heartbeatHolder: heartbeatHolder,
+                            watchdogHolder: watchdogHolder,
+                            leaseHolder: leaseHolder,
+                            partialHolder: partialHolder,
+                            deliveredFlag: deliverGuard,
+                            runStart: t0,
+                            deliver: deliverOnce)
+                    }
+                }
             }
-        }
+        })
 
         // ── Graceful-exit watchdog ──
         // Fires NSEConfig.watchdogSeconds before iOS's ~30s hard-kill so cleanup
@@ -262,6 +301,7 @@ final class NotificationService: UNNotificationServiceExtension {
             // iOS gave us a shorter-than-watchdog budget does this do the actual
             // release; a single conditional UPDATE is the lesser evil vs. a held
             // lease (which the main app would otherwise wait out for staleMs=4s).
+            processingHolder.cancelAndClear()
             watchdogHolder.cancelAndClear()
             heartbeatHolder.cancelAndClear()
             let released = leaseHolder.releaseIfHeld()
@@ -319,6 +359,7 @@ final class NotificationService: UNNotificationServiceExtension {
         runStart: CFAbsoluteTime,
         deliver: @escaping (UNNotificationContent) -> Void
     ) async {
+        guard !Task.isCancelled, !deliveredFlag.hasFired() else { return }
         let provider = info["provider"] ?? ""
         let accountEmail = info["accountEmail"] ?? ""
         NSELog.step("NSE process: provider=\(provider) email=\(accountEmail) fanOut=\(fanOutIds.count)")
@@ -378,17 +419,8 @@ final class NotificationService: UNNotificationServiceExtension {
             accessToken = ""
             refreshToken = nil
         } else {
-            guard let token = SharedKeychain.getAccessToken(for: accountId) else {
-                NSELog.step("NSE FAIL: no token for \(accountId)")
-                deliverPassive(
-                    c: c,
-                    overrideTitle: "Connection to \(accountEmail) lost",
-                    overrideBody: "Open TabMail to reconnect",
-                    deliver: deliver
-                )
-                return
-            }
-            accessToken = token
+            // AuthSource decides whether the atomic grant is current or refreshable.
+            accessToken = SharedKeychain.getAccessToken(for: accountId) ?? ""
             refreshToken = SharedKeychain.getRefreshToken(for: accountId)
         }
         NSELog.step("NSE step1 OK: accountId=\(String(accountId.prefix(20))) provider=\(provider)")
@@ -1051,6 +1083,7 @@ final class NotificationService: UNNotificationServiceExtension {
             accountId: accountId, accountEmail: accountEmail
         )
 
+        guard !Task.isCancelled else { return }
         if success {
             let email = accountEmail.isEmpty ? "your account" : accountEmail
             NSELog.step("NSE imap_reconnect: silent re-subscribe OK")
@@ -1101,20 +1134,17 @@ final class NotificationService: UNNotificationServiceExtension {
             NSELog.step("NSE resubscribe: no password in shared Keychain")
             return false
         }
-        guard let sessionGeneration = TabMailSessionStore.shared.loadActiveSession()?.generation,
-              let userId = NSETokenManager.supabaseUserId() else {
-            NSELog.step("NSE resubscribe: no supabase userId")
+        guard let session = await NSETokenManager.validSession(), let sessionGeneration = session.generation else {
+            NSELog.step("NSE resubscribe: no durable active session")
             return false
         }
-        guard let token = await NSETokenManager.validAccessToken() else {
-            NSELog.step("NSE resubscribe: no valid JWT")
-            return false
-        }
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        let visualCapable = (settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional)
-            && (settings.lockScreenSetting == .enabled || settings.notificationCenterSetting == .enabled
-                || settings.alertSetting == .enabled)
-        guard TabMailSessionStore.shared.loadActiveSession()?.generation == sessionGeneration,
+        let userId = session.session.userId
+        let token = session.session.accessToken
+        let visualCapable = await visualCapability()
+        guard !Task.isCancelled,
+              SharedKeychain.getPassword(for: accountId) == password,
+              NSEState.getIMAPAccount(for: accountId) == imap,
+              NSETokenManager.store.loadActiveSession()?.generation == sessionGeneration,
               NSETokenManager.supabaseUserId() == userId,
               NSEState.findAccountId(for: accountEmail) == accountId,
               let context = NSEState.reconnectContext(userId: userId, accountEmail: accountEmail,
@@ -1151,17 +1181,21 @@ final class NotificationService: UNNotificationServiceExtension {
         request.timeoutInterval = 15
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await reconnectTransport(request)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             if IMAPSubscribeOutcome.decode(statusCode: code, body: data) != .active {
                 // Status only: a response body is not a safe logging boundary.
                 NSELog.step("NSE resubscribe: not active, HTTP \(code)")
                 return false
             }
-            return TabMailSessionStore.shared.loadActiveSession()?.generation == sessionGeneration
+            return !Task.isCancelled
+                && SharedKeychain.getPassword(for: accountId) == password
+                && NSEState.getIMAPAccount(for: accountId) == imap
+                && NSETokenManager.store.loadActiveSession()?.generation == sessionGeneration
                 && NSETokenManager.supabaseUserId() == userId
                 && NSEState.findAccountId(for: accountEmail) == accountId
-                && NSEState.reconnectContext(userId: userId, accountEmail: accountEmail) != nil
+                && NSEState.reconnectContext(userId: userId, accountEmail: accountEmail,
+                    nseCapable: visualCapable) == context
         } catch {
             NSELog.step("NSE resubscribe: HTTP failed")
             return false

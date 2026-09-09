@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Security
 import GRDB
 import Synchronization
 import Testing
@@ -171,6 +172,7 @@ struct RemovedAccountPushCleanupTests {
 
     private func withHarness(
         activeAccount: Account? = nil,
+        credentialStore: ProviderCredentialStore? = nil,
         body: (UserDefaults, MockCleanupClient) async throws -> Void
     ) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -203,7 +205,8 @@ struct RemovedAccountPushCleanupTests {
         let mock = MockCleanupClient()
         await PushNotificationService.shared._setRemovedAccountCleanupDependenciesForTesting(
             client: mock,
-            defaults: SendableRemovedAccountCleanupDefaults(value: defaults)
+            defaults: SendableRemovedAccountCleanupDefaults(value: defaults),
+            credentialStore: credentialStore
         )
         // Sign-out releases the device registration and then ends the session
         // server-side; that logout leg must never reach the live auth host from
@@ -440,6 +443,60 @@ struct RemovedAccountPushCleanupTests {
             await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
             #expect(await mock.recordedCalls() == completedCalls,
                     "acknowledged installation erasure leaves no child requests to retry")
+        }
+    }
+
+    @Test("Failed provider erasure stays durably pending until a later cleanup drain succeeds",
+          arguments: ["pointer", "legacy-access", "legacy-refresh", "enumeration", "grant"])
+    func failedProviderErasureRetainsCleanup(failure: String) async throws {
+        let h = CredentialTestHarness(), store = h.provider
+        let accountId = "synthetic-cleanup-account"
+        let active = try store.install(accountId: accountId, tokens: CredentialTestHarness.tokens("synthetic-access", "synthetic-secret"))
+        let legacyAccess = h.backend.insertShared(account: "accessToken:" + accountId, data: Data("synthetic-legacy-access".utf8))
+        let legacyRefresh = h.backend.insertShared(account: "refreshToken:" + accountId, data: Data("synthetic-legacy-secret".utf8))
+        let grantKey = ProviderCredentialStore.lineagePrefix + accountId + ":" + active.lineage
+        let grant = try #require(h.backend.item(account: grantKey, accessGroup: TabMailSessionStore.accessGroup))
+        let pointer = try #require(h.backend.item(account: ProviderCredentialStore.pointerPrefix + accountId,
+                                               accessGroup: TabMailSessionStore.accessGroup))
+        let failedReference: Data?
+        switch failure {
+        case "pointer": failedReference = pointer.persistentReference
+        case "legacy-access": failedReference = legacyAccess
+        case "legacy-refresh": failedReference = legacyRefresh
+        case "grant": failedReference = grant.persistentReference
+        default: failedReference = nil
+        }
+        try await withHarness(credentialStore: store) { defaults, mock in
+            _ = await TabMailAuthService.completeSession(mode: .deactivate, notify: false)
+            var removed = Account(emailAddress: "synthetic-cleanup@example.com", displayName: "Synthetic", provider: .gmail)
+            removed.id = accountId
+            let generation = await PushNotificationService.shared.prepareRemovedAccountCleanup(
+                removed, caldavConfigIds: [], outboxAttachmentDirNames: [])
+            await PushNotificationService.shared.commitPreparedRemovedAccountCleanup(generation: generation)
+            if let failedReference { h.backend.failDelete(reference: failedReference) }
+            else { h.backend.failNextEnumeration(status: errSecInteractionNotAllowed) }
+            await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
+            let pending = PendingRemovedAccountPushCleanup.load(from: defaults)
+            #expect(pending.count == 1)
+            #expect(pending.first?.generation == generation)
+            #expect(pending.first?.actions == [.localArtifacts])
+            // A hidden activation is not proof of erasure: inspect the real bytes.
+            #expect(h.backend.item(reference: grant.persistentReference) == grant)
+            if let failedReference {
+                #expect(h.backend.item(reference: failedReference) != nil)
+                h.backend.allowDelete(reference: failedReference)
+            }
+            // Recreate the credential-store instance as a subsequent process would.
+            await PushNotificationService.shared._setRemovedAccountCleanupDependenciesForTesting(
+                client: mock, defaults: SendableRemovedAccountCleanupDefaults(value: defaults), credentialStore: h.provider)
+            await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
+            #expect(PendingRemovedAccountPushCleanup.load(from: defaults).isEmpty)
+            switch h.backend.enumerateServiceItems() {
+            case .notFound: break
+            case .success(let items): #expect(items.isEmpty)
+            case .failed: Issue.record("Could not verify actual credential erasure")
+            }
+            #expect(await mock.recordedCalls().isEmpty)
         }
     }
 

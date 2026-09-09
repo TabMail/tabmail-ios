@@ -33,7 +33,9 @@ struct SendableUserDefaults: @unchecked Sendable {
 
 enum SharedNSEData {
     static let appGroupIdentifier = "group.ai.tabmail"
-    static let suite = SendableUserDefaults(defaults: UserDefaults(suiteName: appGroupIdentifier)!)
+    private static let sharedSuite = SendableUserDefaults(defaults: UserDefaults(suiteName: appGroupIdentifier)!)
+    @TaskLocal static var suiteOverride: SendableUserDefaults?
+    static var suite: SendableUserDefaults { suiteOverride ?? sharedSuite }
 
     // Main app writes, NSE reads
     static let accountMapKey = "nse.accountMap"

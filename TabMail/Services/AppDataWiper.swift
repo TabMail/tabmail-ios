@@ -73,9 +73,7 @@ enum AppDataWiper {
                 let accessToken: String?
                 switch account.provider {
                 case .gmail, .outlook:
-                    accessToken = KeychainHelper.loadString(
-                        key: KeychainHelper.accessTokenKey(accountId: account.id)
-                    )
+                    accessToken = ProviderCredentialStore.shared.current(accountId: account.id)?.accessToken
                 default:
                     accessToken = nil
                 }

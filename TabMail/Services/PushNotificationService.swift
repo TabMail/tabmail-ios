@@ -135,12 +135,15 @@ actor PushNotificationService {
 
     private var removedAccountCleanupClientOverride: (any RemovedAccountPushCleaning)?
     private var removedAccountCleanupDefaultsOverride: SendableRemovedAccountCleanupDefaults?
+    private var removedAccountCredentialStoreOverride: ProviderCredentialStore?
     func _setRemovedAccountCleanupDependenciesForTesting(
         client: (any RemovedAccountPushCleaning)?,
-        defaults: SendableRemovedAccountCleanupDefaults?
+        defaults: SendableRemovedAccountCleanupDefaults?,
+        credentialStore: ProviderCredentialStore? = nil
     ) {
         removedAccountCleanupClientOverride = client
         removedAccountCleanupDefaultsOverride = defaults
+        removedAccountCredentialStoreOverride = credentialStore
     }
     func _resetConsentScanStateForTesting() {
         self.hasSucceededConsentScanOnce = false
@@ -579,8 +582,9 @@ actor PushNotificationService {
             }
 
             if record.actions.contains(.localArtifacts) {
-                cleanupRemovedAccountLocalArtifacts(record)
-                record.actions.remove(.localArtifacts)
+                if cleanupRemovedAccountLocalArtifacts(record) {
+                    record.actions.remove(.localArtifacts)
+                }
                 outcomes[record.generation] = record.actions
             }
 
@@ -801,7 +805,14 @@ actor PushNotificationService {
         }
     }
 
-    private func cleanupRemovedAccountLocalArtifacts(_ record: PendingRemovedAccountPushCleanup) {
+    private func cleanupRemovedAccountLocalArtifacts(_ record: PendingRemovedAccountPushCleanup) -> Bool {
+        #if DEBUG
+        let credentialStore = removedAccountCredentialStoreOverride ?? .shared
+        #else
+        let credentialStore = ProviderCredentialStore.shared
+        #endif
+        do { try credentialStore.remove(accountId: record.accountId) }
+        catch { return false }
         KeychainHelper.delete(key: KeychainHelper.passwordKey(accountId: record.accountId))
         KeychainHelper.delete(key: KeychainHelper.accessTokenKey(accountId: record.accountId))
         KeychainHelper.delete(key: KeychainHelper.refreshTokenKey(accountId: record.accountId))
@@ -818,6 +829,7 @@ actor PushNotificationService {
             }
             try? FileManager.default.removeItem(at: candidate)
         }
+        return true
     }
 
     /// Merge only action results for the exact generations this pass loaded.

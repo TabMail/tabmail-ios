@@ -110,54 +110,54 @@ struct RefreshResultTests {
 ///
 /// `validToken`/`forceRefresh` used to await ANY in-flight refresh task. The
 /// dedup exists only to stop two callers burning the same rotated refresh
-/// token — a per-token, therefore per-subject, hazard. Sharing across subjects
+/// token — a per-token, therefore per-generation, hazard. Sharing across generations
 /// returns `.success(A_accessToken)` to B, so B makes backend requests as A and
 /// a `/whoami` fetched that way describes A while carrying B's epoch. This is
 /// the same harm class as the session-slot clobber.
 @Suite("TabMailTokenCoordinator refresh-join ownership")
 struct TokenCoordinatorRefreshJoinTests {
-    @Test("Same subject → JOIN (deduplication is preserved where it is actually needed)")
-    func sameSubjectJoins() {
+    @Test("Same generation → JOIN (deduplication is preserved where it is actually needed)")
+    func sameGenerationJoins() {
         #expect(TabMailTokenCoordinator.canJoinInFlightRefresh(
-            inFlightUserId: "user-A",
-            requestingUserId: "user-A"
+            inFlightGeneration: "generation-A",
+            requestingGeneration: "generation-A"
         ))
     }
 
-    @Test("Different subject → REFUSE to join (never hand B a bearer minted for A)")
-    func differentSubjectRefusesToJoin() {
+    @Test("Different generation → REFUSE to join (never hand B a bearer minted for A)")
+    func differentGenerationRefusesToJoin() {
         #expect(!TabMailTokenCoordinator.canJoinInFlightRefresh(
-            inFlightUserId: "user-A",
-            requestingUserId: "user-B"
+            inFlightGeneration: "generation-A",
+            requestingGeneration: "generation-B"
         ))
     }
 
     @Test("Untagged in-flight refresh → REFUSE to join (an unprovable owner is not a matching owner)")
     func untaggedRefreshRefusesToJoin() {
         #expect(!TabMailTokenCoordinator.canJoinInFlightRefresh(
-            inFlightUserId: nil,
-            requestingUserId: "user-A"
+            inFlightGeneration: nil,
+            requestingGeneration: "generation-A"
         ))
     }
 
     /// Refusing to join is ALWAYS auth-safe, which is why this guard cannot
     /// break login: the refusing caller simply starts its own refresh with its
-    /// own refresh token. Two subjects necessarily hold two different refresh
-    /// tokens — each is read from that subject's own session blob — so
+    /// own refresh token. Two generations necessarily hold two different refresh
+    /// tokens — each is read from that generation's own session blob — so
     /// declining to share cannot produce the Supabase rotation conflict the
-    /// dedup exists to prevent. Within one subject, joining still happens.
-    @Test("The join decision depends ONLY on subject identity, never on token values")
+    /// dedup exists to prevent. Within one generation, joining still happens.
+    @Test("The join decision depends ONLY on generation identity, never on token values")
     func joinDecisionIsPurelyAboutIdentity() {
-        // Same subject joins regardless of how different the rest of the
-        // session looks; a different subject never joins even if everything
+        // Same generation joins regardless of how different the rest of the
+        // session looks; a different generation never joins even if everything
         // else about the request is identical.
         #expect(TabMailTokenCoordinator.canJoinInFlightRefresh(
-            inFlightUserId: "shared-subject",
-            requestingUserId: "shared-subject"
+            inFlightGeneration: "shared-generation",
+            requestingGeneration: "shared-generation"
         ))
         #expect(!TabMailTokenCoordinator.canJoinInFlightRefresh(
-            inFlightUserId: "shared-subject",
-            requestingUserId: "shared-subject-2"
+            inFlightGeneration: "shared-generation",
+            requestingGeneration: "shared-generation-2"
         ))
     }
 }

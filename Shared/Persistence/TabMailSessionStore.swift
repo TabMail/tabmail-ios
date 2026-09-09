@@ -43,12 +43,6 @@ final class TabMailSessionStore: @unchecked Sendable {
         case ambiguousLegacy
     }
 
-    enum UpdateResult: Sendable, Equatable {
-        case updated
-        case inactive
-        case failed(OSStatus)
-    }
-
     private struct Pointer: Codable, Equatable {
         let format: String
         let generation: String
@@ -66,16 +60,19 @@ final class TabMailSessionStore: @unchecked Sendable {
         }
     }
 
+    private let refreshGate: CredentialRefreshGate
     private let backend: any TabMailSessionKeychainBackend
     private let cleanupDefaults: UserDefaults
     private let makeGeneration: @Sendable () -> String
 
     init(
         backend: any TabMailSessionKeychainBackend = SecurityTabMailSessionBackend(),
+        storageLock: CredentialStorageLock = .init(),
         cleanupDefaults: UserDefaults = UserDefaults(suiteName: BodyAssetConfig.appGroup) ?? .standard,
         makeGeneration: @escaping @Sendable () -> String = { UUID().uuidString }
     ) {
         self.backend = backend
+        self.refreshGate = CredentialRefreshGate(backend: backend, storageLock: storageLock)
         self.cleanupDefaults = cleanupDefaults
         self.makeGeneration = makeGeneration
     }
@@ -159,23 +156,18 @@ final class TabMailSessionStore: @unchecked Sendable {
         }
 
         if let oldGeneration, oldGeneration != generation {
-            _ = backend.deleteShared(account: Self.generationPrefix + oldGeneration)
+            try? refreshGate.delete(Self.generationPrefix + oldGeneration)
         }
         sweepInactiveGenerations()
         return ActiveSession(data: data, location: .generation(generation))
     }
 
-    /// Update-only persistence. It can neither create a deleted generation nor
-    /// write the active pointer.
-    func updateCapturedGeneration(_ generation: String, data: Data) -> UpdateResult {
-        switch backend.updateShared(account: Self.generationPrefix + generation, data: data) {
-        case .success:
-            return .updated
-        case .notFound:
-            return .inactive
-        case .failed(let status):
-            return .failed(status)
-        }
+    /// Refresh owns only the captured record; it never writes activation.
+    func refreshCapturedSession(_ record: ActiveSession,
+        exchange: @Sendable (Data) async throws -> Data) async throws -> CredentialRefreshGate.Result {
+        guard let generation = record.generation else { throw CredentialRefreshError.inactive }
+        return try await refreshGate.refresh(account: Self.generationPrefix + generation,
+                                             captured: record.data, exchange: exchange)
     }
 
     /// Ordinary sign-out. Historical flat shadows are removed and verified
@@ -193,7 +185,7 @@ final class TabMailSessionStore: @unchecked Sendable {
         }
 
         if let capturedGeneration {
-            _ = backend.deleteShared(account: Self.generationPrefix + capturedGeneration)
+            try? refreshGate.delete(Self.generationPrefix + capturedGeneration)
         }
         sweepInactiveGenerations()
     }
@@ -269,7 +261,7 @@ final class TabMailSessionStore: @unchecked Sendable {
         guard case .success(let items) = backend.enumerateServiceItems() else { return }
         for item in items where item.accessGroup == Self.accessGroup &&
             item.account.hasPrefix(Self.generationPrefix) && item.account != keep {
-            _ = backend.deletePersistentReference(item.persistentReference)
+            try? delete(item)
         }
     }
 
