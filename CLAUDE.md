@@ -37,7 +37,7 @@ Before starting any task in this project, read these files and update them when 
 
 ## Core Philosophy: Never Drop User Intention
 
-**Current amendment:** ordinary message-action provider failures have a bounded fifth runtime exit; the [normative rule](Companion/Rules/Active/never-drop-user-intention.md) defines the exact cap, exclusions and commit-before-effects requirement. The earlier enumeration below is historical.
+**Current amendment:** ordinary message-action provider failures have a bounded fifth runtime exit; the normative rule `Companion/Rules/Active/never-drop-user-intention.md` (linked in item 1 below) defines the exact cap, exclusions and commit-before-effects requirement. The earlier enumeration below is historical.
 
 **This is the single most important principle in the entire codebase. Every system — actions, sends, tags — is built on it.**
 
