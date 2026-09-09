@@ -111,6 +111,45 @@ struct EmailFilterTests {
         #expect(result.count <= 150)
     }
 
+    // MARK: - snippetFromPlainText Markdown links (#148)
+
+    @Test("snippetFromPlainText renders a Markdown link as its label")
+    func snippetUnwrapsMarkdownLink() {
+        let text = "Click [here](https://example.com/a?b=c) now"
+        #expect(EmailFilter.snippetFromPlainText(text) == "Click here now")
+    }
+
+    @Test("snippetFromPlainText unwraps every link and reverses the converter's label escapes")
+    func snippetUnwrapsEscapedLabels() {
+        // `htmlToPlainText.finishLink` escapes `[]*_` etc. with a backslash and `&` as `&amp;`
+        let text = "[Terms &amp; Conditions](https://example.com/t) or [\\[beta\\]](https://example.com/b\\))"
+        #expect(EmailFilter.snippetFromPlainText(text) == "Terms & Conditions or [beta]")
+    }
+
+    @Test("snippetFromPlainText leaves non-link brackets and unterminated links alone")
+    func snippetKeepsNonLinks() {
+        #expect(EmailFilter.snippetFromPlainText("see [note] and (aside)") == "see [note] and (aside)")
+        #expect(EmailFilter.snippetFromPlainText("[label](https://example.com/unterminated") == "[label](https://example.com/unterminated")
+        #expect(EmailFilter.snippetFromPlainText("[a\nb](https://example.com)") == "[a b](https://example.com)")
+        #expect(EmailFilter.snippetFromPlainText("[x] (https://example.com)") == "[x] (https://example.com)")
+    }
+
+    @Test("snippetFromPlainText is not starved by a long link destination")
+    func snippetSurvivesLongDestination() {
+        let destination = "https://example.com/" + String(repeating: "t", count: 800)
+        let text = "Hello [Unsubscribe](\(destination)) and the rest of the message"
+        #expect(EmailFilter.snippetFromPlainText(text) == "Hello Unsubscribe and the rest of the message")
+    }
+
+    @Test("htmlToPlainText + snippetFromPlainText hides converted anchors while the stored text keeps them")
+    func snippetHidesConvertedAnchorDestination() {
+        let html = "<p>Hi, please <a href=\"https://example.com/x?y=1&amp;z=2\">confirm &amp; continue</a> today.</p>"
+        let plain = EmailFilter.htmlToPlainText(html)
+        #expect(plain.contains("](https://example.com/x?y=1&z=2)"))
+        #expect(EmailFilter.snippetFromPlainText(plain) == "Hi, please confirm & continue today.")
+        #expect(EmailFilter.cleanSnippet(plain) == "Hi, please confirm & continue today.")
+    }
+
     // MARK: - htmlToPlainText
 
     @Test("htmlToPlainText strips tags")

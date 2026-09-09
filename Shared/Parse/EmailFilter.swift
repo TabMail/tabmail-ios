@@ -164,8 +164,10 @@ enum EmailFilter {
     /// Use for snippet extraction from textBody (already plain text, but may contain
     /// newlines, tabs, signature separators, etc. that need collapsing).
     static func snippetFromPlainText(_ text: String, maxChars: Int = 150) -> String {
-        // Truncate early — only need ~500 chars to guarantee 150 clean chars
-        let truncated = text.prefix(500)
+        // Truncate early — only need ~500 chars to guarantee 150 clean chars.
+        // Markdown links are unwrapped BEFORE the cut so a long destination can
+        // neither leak into the preview nor eat the scan budget (#148).
+        let truncated = unwrapMarkdownLinks(text, limit: snippetScanChars)
         var result = ""
         result.reserveCapacity(maxChars)
         var lastWasSpace = true
@@ -188,6 +190,81 @@ enum EmailFilter {
         }
         while result.hasSuffix(" ") { result.removeLast() }
         return result
+    }
+
+    /// Characters `snippetFromPlainText` scans before giving up on filling `maxChars`.
+    private static let snippetScanChars = 500
+
+    /// Renders Markdown links as their bare label for SNIPPET display only (#148):
+    /// `[label](destination)` → `label`, reversing the escapes `htmlToPlainText`'s
+    /// `finishLink` adds (backslash-escaped punctuation, `&amp;`). The stored FTS
+    /// text and the agent read path keep the full link; only the preview drops it.
+    /// Anything that is not a complete single-line link — a bare `[note]`, an
+    /// unterminated `[label](…` — is copied through unchanged. Emits at most
+    /// `limit` characters so an unbounded body is never walked to its end.
+    static func unwrapMarkdownLinks(_ text: String, limit: Int) -> String {
+        var out = ""
+        out.reserveCapacity(limit)
+        var emitted = 0
+        var i = text.startIndex
+        while i < text.endIndex, emitted < limit {
+            if text[i] == "[", let link = markdownLink(in: text, openingAt: i) {
+                for c in link.label where emitted < limit {
+                    out.append(c)
+                    emitted += 1
+                }
+                i = link.end
+            } else {
+                out.append(text[i])
+                emitted += 1
+                i = text.index(after: i)
+            }
+        }
+        return out
+    }
+
+    /// Parses `[label](destination)` starting at the `[` at `open`. Returns the
+    /// unescaped label and the index just past the closing `)`, or nil when the
+    /// text there is not a complete link. Backslash escapes are honoured in both
+    /// parts (the converter escapes `]` in labels and `)` in destinations); a
+    /// newline inside either part means it is not a link, so a stray `[` in prose
+    /// cannot swallow the rest of the message.
+    private static func markdownLink(in text: String, openingAt open: String.Index)
+        -> (label: String, end: String.Index)? {
+        var label = ""
+        var i = text.index(after: open)
+        var closedLabel = false
+        while i < text.endIndex {
+            let c = text[i]
+            if c.isNewline { return nil }
+            if c == "\\" {
+                let next = text.index(after: i)
+                guard next < text.endIndex, !text[next].isNewline else { return nil }
+                label.append(text[next])
+                i = text.index(after: next)
+                continue
+            }
+            if c == "]" { closedLabel = true; i = text.index(after: i); break }
+            label.append(c)
+            i = text.index(after: i)
+        }
+        guard closedLabel, i < text.endIndex, text[i] == "(" else { return nil }
+        i = text.index(after: i)
+        while i < text.endIndex {
+            let c = text[i]
+            if c.isNewline || c.isWhitespace { return nil }
+            if c == "\\" {
+                i = text.index(after: i)
+                guard i < text.endIndex else { return nil }
+                i = text.index(after: i)
+                continue
+            }
+            if c == ")" {
+                return (label.replacingOccurrences(of: "&amp;", with: "&"), text.index(after: i))
+            }
+            i = text.index(after: i)
+        }
+        return nil
     }
 
     /// Extract plain text from a fetched message body for FTS indexing.
