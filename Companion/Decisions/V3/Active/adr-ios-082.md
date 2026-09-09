@@ -212,3 +212,14 @@ another ACCOUNT's wire on the NEXT drain** (clause 6). `PendingQueueChainTests` 
 timestamp sort disagrees with the durable order. `QueueMemberAbsenceTests`,
 `OutlookQueueHandoffTests` and `ProviderIdQueueFuzzTests` continue to run the identity and
 member-absence invariants against the new scheduler unchanged.
+
+
+---
+
+## Pre-compaction index line (verbatim, 2026-09-09, pass 10)
+
+Routed out of `tabmail-ios/DECISIONS.md` (now a search-only index, owner 2026-09-09) by the `companion-compact` skill: the index stood at 25,048 B against its 25,000 B budget. Kept **byte-for-byte** inside a fenced block so its index-relative link is not re-resolved from this directory; the replacement index line carries the same discriminating keywords.
+
+```text
+- **[ADR-IOS-082](Companion/Decisions/V3/Active/adr-ios-082.md)** — Active. **The action queue is drained by a GLOBAL SINGLE-OPERATION FIFO EXECUTOR** ordered by a durable `queuePosition` (migration **v90**, `NOT NULL CHECK(queuePosition > 0)`, no DEFAULT, indexed), allocated after the current maximum in the SAME transaction that admits the row; `createdAt` is AGE ONLY. One owner claims the front row (`claimFrontierOperation`) and commits before claiming again; the **protected-frontier law** stops the walk at an `inFlight` row. Lane DISPATCH is retired — the relation survives as `buildRelatedChains`/`addressKey` and scopes a TAIL deferral (`deferRelatedChainToTail`). 🚨 **THE `.proceed` INVARIANT: an arm may return `.proceed` only if the claimed row is provably GONE, NARROWED, or OWNED by `pendingRequeues`/`pendingRetirements`** — else it stays `inFlight` and wedges every account's drain. Startup requeues interrupted moves with their original identity and attempt history (#116).
+```

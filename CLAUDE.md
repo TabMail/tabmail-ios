@@ -1,10 +1,10 @@
 # TabMail iOS - Claude Code Rules
 
-> **STOP. Before answering, I must read ALL companion files listed below — both global and project-specific. I must also update them when I discover something new. This is mandatory for every task, every time — no exceptions. You MUST always state in your response that you have read the companion files, so you are reminded of this obligation in every answer.**
+> **STOP. Before answering, I must follow the root `../CLAUDE.md` § Companion Routing: load the ALWAYS-LOADED set in full, then `rg -ni` the SEARCH-ONLY indexes and `Companion/` trees for the task's terms and read every hit in full. I must update the routed document when I discover durable knowledge. This is mandatory for every task, every time — no exceptions.**
 
-## Companion Files (READ BEFORE EVERY TASK)
+## Companion Files
 
-Before starting any task in this project, read these files and update them when you learn something new:
+**Loading rule lives in the root `../CLAUDE.md` § Companion Routing (owner 2026-09-09).** ALWAYS LOADED in full: `../CLAUDE.md`, `../PROJECT_STRUCTURE.md`, `../NEXT_UP.md`, this file, and this project's `PROJECT_STRUCTURE.md`. SEARCH-ONLY (`rg -ni`, read every hit in full, never read whole): the `PROJECT_MEMORY.md`, `DECISIONS.md`, `MISTAKES.md` indexes at root and here, and every `Companion/` tree. Update the routed detail plus its index line when you learn something durable.
 
 **Global (parent directory):**
 - **`../CLAUDE.md`** — Global rules that apply to all subprojects.
@@ -21,7 +21,7 @@ Before starting any task in this project, read these files and update them when 
 
 **⚠️ `KNOWN_ISSUES.md` is a generated dashboard, NOT the register.** Search `Companion/Process/Current/KnownIssues/`; never infer completeness or hand-edit it. [Full routing rule](Companion/Process/Current/known-issues-dashboard-routing-rule.md).
 
-**You MUST read all companion files before every task. Update them when you discover something new.**
+**Search the indexes before every task; read every hit in full. Update them when you discover something new.**
 
 **Preserved pre-compaction startup protocols, byte-for-byte:** [preamble](Companion/Process/History/000-pre-compaction-preamble.md) · [index-plus-search routing protocol](Companion/Process/History/001-pre-compaction-routing.md) · [original full-ingestion protocol at `0bcc851`](Companion/Process/History/002-original-full-ingestion-protocol-at-0bcc851.md).
 

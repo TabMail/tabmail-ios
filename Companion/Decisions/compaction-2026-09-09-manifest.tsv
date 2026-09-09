@@ -1,0 +1,6 @@
+# companion-compact manifest — tabmail-ios/DECISIONS.md (2026-09-09 pass 10)
+# Source: DECISIONS.md BEFORE this pass (25048 B, sha256 930f02f670234ad89a9f0bb95cd5ba79c235ce888869569bc7d3f29b19319c12)
+# CONTENT DELETED: none. The pre-pass index LINE is preserved byte-exact in a ```text fence under
+# 'Pre-compaction index line (verbatim, 2026-09-09, pass 10)' in the named ADR file.
+id	line_sha256	path
+ADR-IOS-082	cf12e534f9e3a356bcbc4b7fbc012fb8e0b71f91b045b959e44d403dcf7f7d61	Companion/Decisions/V3/Active/adr-ios-082.md
