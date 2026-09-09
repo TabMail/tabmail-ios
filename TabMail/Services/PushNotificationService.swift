@@ -1063,7 +1063,8 @@ actor PushNotificationService {
             return
         }
         for account in accounts where account.provider != .caldav {
-            if account.provider == .imap || account.provider == .icloud {
+            if (account.provider == .imap || account.provider == .icloud)
+                && UserDefaults.standard.bool(forKey: PushConfig.pushNotificationsEnabledKey) {
                 // A cold launch may receive its APNs token before the foreground
                 // subscription pass. Establish the watch and route together;
                 // route-only registration requires a watch that may not exist.

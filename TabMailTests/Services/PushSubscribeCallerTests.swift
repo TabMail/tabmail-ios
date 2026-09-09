@@ -32,7 +32,8 @@ struct PushSubscribeCallerTests {
     }
 
     @Test(arguments: [(AccountProvider.gmail, "rotate"), (.outlook, "remove"),
-        (.imap, "rotate"), (.imap, "remove"), (.imap, "token_callback"), (.icloud, "token_callback")])
+        (.imap, "rotate"), (.imap, "remove"), (.imap, "token_callback"), (.icloud, "token_callback"),
+        (.imap, "token_callback_disabled"), (.icloud, "token_callback_disabled")])
     func contextChangesDuringAuthentication(provider: AccountProvider, change: String) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -63,9 +64,14 @@ struct PushSubscribeCallerTests {
         let toggleKey = PushConfig.pushNotificationsEnabledKey
         let previousToken = UserDefaults.standard.object(forKey: tokenKey)
         let previousToggle = UserDefaults.standard.object(forKey: toggleKey)
+        let deviceIdKey = PushConfig.deviceIdKey
+        let previousDeviceId = UserDefaults.standard.object(forKey: deviceIdKey)
+        UserDefaults.standard.set("test-device", forKey: deviceIdKey)
         UserDefaults.standard.set("token-old", forKey: tokenKey)
-        UserDefaults.standard.set(true, forKey: toggleKey)
+        UserDefaults.standard.set(change != "token_callback_disabled", forKey: toggleKey)
         defer {
+            if let previousDeviceId { UserDefaults.standard.set(previousDeviceId, forKey: deviceIdKey) }
+            else { UserDefaults.standard.removeObject(forKey: deviceIdKey) }
             if let previousToken { UserDefaults.standard.set(previousToken, forKey: tokenKey) }
             else { UserDefaults.standard.removeObject(forKey: tokenKey) }
             if let previousToggle { UserDefaults.standard.set(previousToggle, forKey: toggleKey) }
@@ -97,7 +103,7 @@ struct PushSubscribeCallerTests {
         let service = PushNotificationService(pushClient: client, subscriptionAccessToken: { _ in "synthetic-provider-token" })
         await service._setNotificationSettingsProviderForTesting(VisibleSettings())
         let running = Task {
-            if change == "token_callback" {
+            if change.hasPrefix("token_callback") {
                 await service.reregisterAllDeviceAccounts()
                 return true
             }
@@ -117,7 +123,7 @@ struct PushSubscribeCallerTests {
             case "remove":
                 try await client.unregisterDeviceAccount(deviceId: "test-device", accountEmail: account.emailAddress)
                 _ = try await pool.write { db in try Account.deleteOne(db, key: account.id) }
-            case "token_callback":
+            case "token_callback", "token_callback_disabled":
                 break
             default:
                 Issue.record("Unexpected regression case")
@@ -129,8 +135,8 @@ struct PushSubscribeCallerTests {
         let succeeded = await running.value
         let requests = PushRequestProtocol.observed()
         let subscriptions = requests.filter { $0.path == "/subscribe" }
-        let shouldSubscribe = change != "remove"
-        #expect(succeeded == shouldSubscribe)
+        let shouldSubscribe = change != "remove" && change != "token_callback_disabled"
+        #expect(succeeded == (change != "remove"))
         #expect(subscriptions.count == (shouldSubscribe ? 1 : 0))
         if let sent = subscriptions.first {
             let body = try #require(JSONSerialization.jsonObject(with: sent.body) as? [String: Any])
@@ -140,5 +146,12 @@ struct PushSubscribeCallerTests {
         if change == "rotate" { #expect(requests.first?.path == "/register-device") }
         if change == "remove" { #expect(requests.map(\.path) == ["/register-account-device"]) }
         if change == "token_callback" { #expect(requests.map(\.path) == ["/subscribe"]) }
+        if change == "token_callback_disabled" {
+            #expect(requests.map(\.path) == ["/register-account-device-silent"])
+            let sent = try #require(requests.first)
+            let body = try #require(JSONSerialization.jsonObject(with: sent.body) as? [String: Any])
+            #expect(body["provider"] as? String == "imap")
+            #expect(body["deviceToken"] as? String == "token-old")
+        }
     }
 }
