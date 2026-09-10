@@ -6,7 +6,7 @@ import Foundation
 
 /// Request inputs available before the single subscribe call. Server admission
 /// identities remain internal; this context is not a client subscription ledger.
-struct IMAPSubscribeContext: Codable, Sendable {
+struct IMAPSubscribeContext: Codable, Sendable, Equatable {
     let userId: String
     let deviceId: String
     let accountEmail: String

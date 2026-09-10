@@ -3,6 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+#if TABMAIL_TESTS
+@testable import TabMail
+#endif
 import SwiftMail
 
 /// One-shot IMAP fetcher used by the NSE on `imap_new_mail` pushes.

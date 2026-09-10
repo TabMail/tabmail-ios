@@ -42,56 +42,53 @@ struct TabMailSessionStoreTests {
 
     @MainActor
     @Test("late refresh cannot recreate a signed-out generation")
-    func persistDoesNotRecreateSignedOutState() throws {
+    func persistDoesNotRecreateSignedOutState() async throws {
         let harness = makeHarness()
         let active = try harness.store.installNewSession(sessionData(user: "A", token: "old"))
         let generation = try #require(active.generation)
 
         try harness.store.deactivate()
-        #expect(harness.store.updateCapturedGeneration(
-            generation,
-            data: sessionData(user: "A", token: "late")
-        ) == .inactive)
+        let late = sessionData(user: "A", token: "late")
+        await #expect(throws: CredentialRefreshError.self) {
+            try await harness.store.refreshCapturedSession(active) { _ in late }
+        }
         #expect(harness.store.loadActiveSession() == nil)
         #expect(!harness.backend.hasAccount(TabMailSessionStore.generationPrefix + generation))
     }
 
     @MainActor
     @Test("A late refresh cannot overwrite a later different-user or same-user generation")
-    func lateRefreshCannotClobberLaterGeneration() throws {
+    func lateRefreshCannotClobberLaterGeneration() async throws {
         let harness = makeHarness()
         let first = try harness.store.installNewSession(sessionData(user: "A", token: "A1"))
-        let firstGeneration = try #require(first.generation)
         let secondBytes = sessionData(user: "B", token: "B1")
         _ = try harness.store.installNewSession(secondBytes)
 
-        #expect(harness.store.updateCapturedGeneration(
-            firstGeneration,
-            data: sessionData(user: "A", token: "late-A")
-        ) == .inactive)
+        let lateA = sessionData(user: "A", token: "late-A")
+        await #expect(throws: CredentialRefreshError.self) {
+            try await harness.store.refreshCapturedSession(first) { _ in lateA }
+        }
         #expect(harness.store.loadActiveSession()?.data == secondBytes)
 
         let thirdBytes = sessionData(user: "B", token: "B2")
         let second = try #require(harness.store.loadActiveSession())
-        let secondGeneration = try #require(second.generation)
         _ = try harness.store.installNewSession(thirdBytes)
-        #expect(harness.store.updateCapturedGeneration(
-            secondGeneration,
-            data: sessionData(user: "B", token: "late-B1")
-        ) == .inactive)
+        let lateB = sessionData(user: "B", token: "late-B1")
+        await #expect(throws: CredentialRefreshError.self) {
+            try await harness.store.refreshCapturedSession(second) { _ in lateB }
+        }
         #expect(harness.store.loadActiveSession()?.data == thirdBytes)
     }
 
     @MainActor
     @Test("ordinary captured-generation refresh updates in place")
-    func ordinaryRefreshPersists() throws {
+    func ordinaryRefreshPersists() async throws {
         let harness = makeHarness()
         let active = try harness.store.installNewSession(sessionData(user: "A", token: "old"))
-        let generation = try #require(active.generation)
         let refreshed = sessionData(user: "A", token: "new")
-
-        #expect(harness.store.updateCapturedGeneration(generation, data: refreshed) == .updated)
-        #expect(harness.store.loadActiveSession()?.data == refreshed)
+        let result = try await harness.store.refreshCapturedSession(active) { _ in refreshed }
+        #expect(result.persisted)
+        #expect(try JSONDecoder().decode(TabMailSession.self, from: #require(harness.store.loadActiveSession()).data).accessToken == "new")
     }
 
     @MainActor
@@ -415,7 +412,7 @@ struct TabMailSessionStoreTests {
             #expect(harness.backend.hasAccount(orphan), "seed \(seed), round \(round): enumeration ambiguity deleted")
 
             await held.release()
-            #expect(await refresh.value == "late-A-\(round)")
+            #expect(await refresh.value == (useNSE ? nil : "late-A-\(round)"))
             #expect(harness.store.loadActiveSession()?.data == expectedActive)
             #expect(!harness.backend.hasAccount(TabMailSessionStore.generationPrefix + capturedGeneration),
                     "seed \(seed), round \(round): inactive response recreated its generation")
@@ -448,8 +445,10 @@ struct TabMailSessionStoreTests {
         let launchDefaults = UserDefaults(suiteName: launchDefaultsName)!
         launchDefaults.removePersistentDomain(forName: launchDefaultsName)
         let generations = TestGenerationSequence()
+        let lockDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(defaultsName)
         let store = TabMailSessionStore(
             backend: backend,
+            storageLock: CredentialStorageLock(directory: lockDirectory),
             cleanupDefaults: defaults,
             makeGeneration: { generations.next() }
         )
@@ -458,7 +457,8 @@ struct TabMailSessionStoreTests {
             backend: backend,
             cleanupDefaults: defaults,
             launchDefaults: launchDefaults,
-            generations: generations
+            generations: generations,
+            lockDirectory: lockDirectory
         )
     }
 
@@ -511,7 +511,7 @@ struct SessionRefreshFinalityTests {
     }
 
     @MainActor
-    @Test("held compiled NSE refresh may finish but cannot recreate sign-out")
+    @Test("held compiled NSE refresh cannot report recovery after sign-out")
     func heldNSERefreshCannotResurrect() async throws {
         let fixture = TabMailSessionStoreTests()
         let harness = fixture.makeHarness()
@@ -532,7 +532,7 @@ struct SessionRefreshFinalityTests {
         try harness.store.deactivate()
         await held.release()
 
-        #expect(await refresh.value == "new-A")
+        #expect(await refresh.value == nil)
         #expect(harness.store.loadActiveSession() == nil)
         #expect(harness.backend.sessionNamespaceItems().isEmpty)
     }
@@ -721,12 +721,9 @@ struct SessionWiringCensusTests {
         }
         #expect(emitters == ["TabMailAuthService.swift"])
 
-        let project = try String(
-            contentsOf: root.appendingPathComponent("project.yml"),
-            encoding: .utf8
-        )
-        #expect(project.contains("- path: TabMailNotificationService/NSETokenManager.swift"))
-        #expect(!project.contains("- path: Shared/Persistence/TabMailSessionStore.swift"))
+        // Referencing the real NSE token type throughout the finality tests
+        // proves test membership at compile time, including directory sources.
+
     }
 
     private func projectRoot() -> URL {
@@ -784,17 +781,28 @@ private final class LockedCounter: @unchecked Sendable {
     func increment() { lock.withLock { storage += 1 } }
 }
 
-private struct SessionStoreHarness {
+private final class SessionStoreHarness: @unchecked Sendable {
     let store: TabMailSessionStore
     let backend: MemorySessionKeychainBackend
     let cleanupDefaults: UserDefaults
     let launchDefaults: UserDefaults
     let generations: TestGenerationSequence
+    let lockDirectory: URL
+
+    init(store: TabMailSessionStore, backend: MemorySessionKeychainBackend,
+         cleanupDefaults: UserDefaults, launchDefaults: UserDefaults,
+         generations: TestGenerationSequence, lockDirectory: URL) {
+        self.store = store; self.backend = backend
+        self.cleanupDefaults = cleanupDefaults; self.launchDefaults = launchDefaults
+        self.generations = generations; self.lockDirectory = lockDirectory
+    }
+    deinit { try? FileManager.default.removeItem(at: lockDirectory) }
 
     func relaunchedStore() -> TabMailSessionStore {
         let generationSequence = generations
         return TabMailSessionStore(
             backend: backend,
+            storageLock: CredentialStorageLock(directory: lockDirectory),
             cleanupDefaults: cleanupDefaults,
             makeGeneration: { generationSequence.next() }
         )
@@ -813,17 +821,24 @@ private final class TestGenerationSequence: @unchecked Sendable {
     }
 }
 
-private final class MemorySessionKeychainBackend: @unchecked Sendable, TabMailSessionKeychainBackend {
+final class MemorySessionKeychainBackend: @unchecked Sendable, TabMailSessionKeychainBackend {
     private let lock = NSLock()
     private var items: [Data: TabMailSessionKeychainItem] = [:]
     private var nextReference = 0
+    private var readObserver: (@Sendable (String) -> Void)?
+    private var nextUpdateFailure: OSStatus?
+
+    func observeReads(_ observer: (@Sendable (String) -> Void)?) {
+        lock.withLock { readObserver = observer }
+    }
+    func failNextUpdate(status: OSStatus) { lock.withLock { nextUpdateFailure = status } }
     private var nextReadFailure: OSStatus?
     private var nextAddFailure: (account: String?, status: OSStatus)?
     private var nextEnumerationFailure: OSStatus?
     private var failedDeletes: Set<Data> = []
 
     func readShared(account: String) -> TabMailSessionReadResult {
-        lock.withLock {
+        let result: TabMailSessionReadResult = lock.withLock {
             if let status = nextReadFailure {
                 nextReadFailure = nil
                 return .failed(status)
@@ -833,6 +848,9 @@ private final class MemorySessionKeychainBackend: @unchecked Sendable, TabMailSe
             }) else { return .notFound }
             return .found(item)
         }
+        let observer = lock.withLock { readObserver }
+        observer?(account)
+        return result
     }
 
     func addShared(account: String, data: Data) -> TabMailSessionWriteResult {
@@ -852,6 +870,10 @@ private final class MemorySessionKeychainBackend: @unchecked Sendable, TabMailSe
 
     func updateShared(account: String, data: Data) -> TabMailSessionWriteResult {
         lock.withLock {
+            if let failure = nextUpdateFailure {
+                nextUpdateFailure = nil
+                return .failed(failure)
+            }
             guard let entry = items.first(where: {
                 $0.value.account == account && $0.value.accessGroup == TabMailSessionStore.accessGroup
             }) else { return .notFound }

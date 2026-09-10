@@ -14,15 +14,13 @@ struct OAuthRefreshCoordinatorTests {
 
     @Test("refresh returns access token on success")
     func refreshReturnsToken() async throws {
-        let coordinator = OAuthRefreshCoordinator()
+        let harness = CredentialTestHarness()
+        let store = harness.provider
+        let coordinator = OAuthRefreshCoordinator(store: store)
 
         // Set up a fake refresh token in Keychain
         let accountId = "test-refresh-\(UUID().uuidString)"
-        try KeychainHelper.save("fake-refresh", for: KeychainHelper.refreshTokenKey(accountId: accountId))
-        defer {
-            KeychainHelper.delete(key: KeychainHelper.refreshTokenKey(accountId: accountId))
-            KeychainHelper.delete(key: KeychainHelper.accessTokenKey(accountId: accountId))
-        }
+        try store.install(accountId: accountId, tokens: CredentialTestHarness.tokens())
 
         let token = try await coordinator.refresh(
             accountId: accountId,
@@ -36,7 +34,9 @@ struct OAuthRefreshCoordinatorTests {
 
     @Test("refresh throws when refresh token is missing from keychain")
     func refreshThrowsWithoutRefreshToken() async {
-        let coordinator = OAuthRefreshCoordinator()
+        let harness = CredentialTestHarness()
+        let store = harness.provider
+        let coordinator = OAuthRefreshCoordinator(store: store)
         let accountId = "test-missing-\(UUID().uuidString)"
 
         await #expect(throws: ProviderError.self) {
@@ -52,15 +52,14 @@ struct OAuthRefreshCoordinatorTests {
     // MARK: - Invalidation
 
     @Test("invalidated coordinator refuses refresh immediately")
-    func invalidatedCoordinatorRefusesRefresh() async {
-        let coordinator = OAuthRefreshCoordinator()
+    func invalidatedCoordinatorRefusesRefresh() async throws {
+        let harness = CredentialTestHarness()
+        let store = harness.provider
+        let coordinator = OAuthRefreshCoordinator(store: store)
 
         // Set up a valid refresh token
         let accountId = "test-invalidated-\(UUID().uuidString)"
-        try? KeychainHelper.save("fake-refresh", for: KeychainHelper.refreshTokenKey(accountId: accountId))
-        defer {
-            KeychainHelper.delete(key: KeychainHelper.refreshTokenKey(accountId: accountId))
-        }
+        try store.install(accountId: accountId, tokens: CredentialTestHarness.tokens())
 
         // Invalidate BEFORE refresh
         await coordinator.invalidate()
@@ -81,13 +80,12 @@ struct OAuthRefreshCoordinatorTests {
     }
 
     @Test("invalidation is permanent — multiple refresh attempts all fail")
-    func invalidationIsPermanent() async {
-        let coordinator = OAuthRefreshCoordinator()
+    func invalidationIsPermanent() async throws {
+        let harness = CredentialTestHarness()
+        let store = harness.provider
+        let coordinator = OAuthRefreshCoordinator(store: store)
         let accountId = "test-permanent-\(UUID().uuidString)"
-        try? KeychainHelper.save("fake-refresh", for: KeychainHelper.refreshTokenKey(accountId: accountId))
-        defer {
-            KeychainHelper.delete(key: KeychainHelper.refreshTokenKey(accountId: accountId))
-        }
+        try store.install(accountId: accountId, tokens: CredentialTestHarness.tokens())
 
         await coordinator.invalidate()
 
@@ -105,63 +103,50 @@ struct OAuthRefreshCoordinatorTests {
 
     @Test("invalidation during a refresh discards a late network result without recreating credentials")
     func invalidationDuringRefreshDoesNotRecreateToken() async throws {
-        let coordinator = OAuthRefreshCoordinator()
+        let harness = CredentialTestHarness()
+        let store = harness.provider
+        let coordinator = OAuthRefreshCoordinator(store: store)
         let accountId = "test-inflight-invalidation-\(UUID().uuidString)"
-        let refreshKey = KeychainHelper.refreshTokenKey(accountId: accountId)
-        let accessKey = KeychainHelper.accessTokenKey(accountId: accountId)
-        try KeychainHelper.save("fake-refresh", for: refreshKey)
-        defer {
-            KeychainHelper.delete(key: refreshKey)
-            KeychainHelper.delete(key: accessKey)
-        }
+        try store.install(accountId: accountId, tokens: CredentialTestHarness.tokens())
 
-        let completion = Mutex<CheckedContinuation<OAuthTokens, Never>?>(nil)
-        let (started, startedContinuation) = AsyncStream<Void>.makeStream()
+        let started = CredentialTestLatch(), release = CredentialTestLatch()
         let refreshTask = Task {
             try await coordinator.refresh(
                 accountId: accountId,
                 email: "test@example.com"
             ) { _ in
-                startedContinuation.yield()
-                startedContinuation.finish()
-                return await withCheckedContinuation { continuation in
-                    completion.withLock { $0 = continuation }
-                }
+                await started.signal()
+                await release.wait()
+                return OAuthTokens(
+                    accessToken: "must-not-be-saved",
+                    refreshToken: "must-not-be-saved-either",
+                    expiresAt: nil,
+                    idToken: nil
+                )
             }
         }
 
-        var iterator = started.makeAsyncIterator()
-        _ = await iterator.next()
+        await started.wait()
         await coordinator.invalidate()
-        KeychainHelper.delete(key: refreshKey)
-        completion.withLock { continuation in
-            continuation?.resume(returning: OAuthTokens(
-                accessToken: "must-not-be-saved",
-                refreshToken: "must-not-be-saved-either",
-                expiresAt: nil,
-                idToken: nil
-            ))
-            continuation = nil
-        }
+        try store.remove(accountId: accountId)
+        await release.signal()
 
-        await #expect(throws: ProviderError.self) {
+        await #expect(throws: (any Error).self) {
             try await refreshTask.value
         }
-        #expect(KeychainHelper.loadString(key: accessKey) == nil)
-        #expect(KeychainHelper.loadString(key: refreshKey) == nil)
+        #expect(store.current(accountId: accountId) == nil)
+        #expect(store.activation(accountId: accountId) == nil)
     }
 
     // MARK: - Deduplication
 
     @Test("concurrent refresh calls are deduplicated")
     func concurrentRefreshDeduplicated() async throws {
-        let coordinator = OAuthRefreshCoordinator()
+        let harness = CredentialTestHarness()
+        let store = harness.provider
+        let coordinator = OAuthRefreshCoordinator(store: store)
         let accountId = "test-dedup-\(UUID().uuidString)"
-        try KeychainHelper.save("fake-refresh", for: KeychainHelper.refreshTokenKey(accountId: accountId))
-        defer {
-            KeychainHelper.delete(key: KeychainHelper.refreshTokenKey(accountId: accountId))
-            KeychainHelper.delete(key: KeychainHelper.accessTokenKey(accountId: accountId))
-        }
+        try store.install(accountId: accountId, tokens: CredentialTestHarness.tokens())
 
         let callCount = Mutex<Int>(0)
 

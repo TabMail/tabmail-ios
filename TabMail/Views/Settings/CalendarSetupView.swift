@@ -259,10 +259,7 @@ struct CalendarSetupView: View {
                 account.calendarOnly = true
                 let acct = account
                 try await AppDatabase.dbPool.write { db in try acct.insert(db) }
-                try KeychainHelper.save(tokens.accessToken, for: KeychainHelper.accessTokenKey(accountId: account.id))
-                if let refresh = tokens.refreshToken {
-                    try KeychainHelper.save(refresh, for: KeychainHelper.refreshTokenKey(accountId: account.id))
-                }
+                try await manager.installOAuthCredentials(accountId: account.id, tokens: tokens)
                 try await manager.connectAccount(account)
                 dismiss()
             } catch {
@@ -291,10 +288,7 @@ struct CalendarSetupView: View {
                 account.calendarOnly = true
                 let acct = account
                 try await AppDatabase.dbPool.write { db in try acct.insert(db) }
-                try KeychainHelper.save(tokens.accessToken, for: KeychainHelper.accessTokenKey(accountId: account.id))
-                if let refresh = tokens.refreshToken {
-                    try KeychainHelper.save(refresh, for: KeychainHelper.refreshTokenKey(accountId: account.id))
-                }
+                try await manager.installOAuthCredentials(accountId: account.id, tokens: tokens)
                 try await manager.connectAccount(account)
                 dismiss()
             } catch {

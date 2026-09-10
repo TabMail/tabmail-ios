@@ -20,6 +20,7 @@ struct HTTPRetryPolicy: Sendable {
 /// Both main app providers and NSE clients construct one of these per call site.
 /// On 401 → `auth.refresh()` → retry once. On rate-limit → exponential backoff.
 struct AuthedHTTP: Sendable {
+    @TaskLocal static var sessionOverride: URLSession?
     let auth: any AuthSource
     let retry: HTTPRetryPolicy
     let logLabel: String?
@@ -31,7 +32,7 @@ struct AuthedHTTP: Sendable {
         self.auth = auth
         self.retry = retry
         self.logLabel = logLabel
-        self.session = session
+        self.session = session ?? Self.sessionOverride
     }
 
     func get(_ url: String, extraHeaders: [String: String] = [:]) async throws -> Data {
@@ -67,7 +68,7 @@ struct AuthedHTTP: Sendable {
             logLabel: logLabel
         )
         if result.statusCode == 401 {
-            token = try await auth.refresh()
+            token = try await auth.refresh(rejecting: token)
             result = try await performHTTPRequest(
                 url: url, method: method, body: body, token: token,
                 session: session, logLabel: logLabel
@@ -126,7 +127,7 @@ struct AuthedHTTP: Sendable {
         )
 
         if result.statusCode == 401 {
-            token = try await auth.refresh()
+            token = try await auth.refresh(rejecting: token)
             result = try await performHTTPRequest(
                 url: url, method: method, body: body, token: token,
                 extraHeaders: extraHeaders, session: session, logLabel: logLabel
@@ -156,7 +157,7 @@ struct AuthedHTTP: Sendable {
         )
 
         if result.statusCode == 401 {
-            token = try await auth.refresh()
+            token = try await auth.refresh(rejecting: token)
             result = try await performHTTPRequest(
                 url: url, method: method, body: body, token: token,
                 extraHeaders: extraHeaders, session: session, logLabel: logLabel
@@ -170,6 +171,7 @@ struct AuthedHTTP: Sendable {
     }
 
     private func currentOrRefresh() async throws -> String {
+        try Task.checkCancellation()
         if let t = await auth.current() { return t }
         return try await auth.refresh()
     }
