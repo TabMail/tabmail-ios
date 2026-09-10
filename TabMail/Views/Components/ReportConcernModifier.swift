@@ -46,10 +46,7 @@ struct ReportConcernModifier: ViewModifier {
                         showPopover = false
                         showSheet = true
                     } label: {
-                        Label("Report Concern", systemImage: "exclamationmark.bubble")
-                            .font(.body)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
+                        popoverRow("Report Concern", systemImage: "exclamationmark.bubble")
                     }
                     .buttonStyle(.borderless)
                     .tint(.red)
@@ -60,14 +57,12 @@ struct ReportConcernModifier: ViewModifier {
                             showPopover = false
                             extraAction.action()
                         } label: {
-                            Label(extraAction.title, systemImage: extraAction.systemImage)
-                                .font(.body)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
+                            popoverRow(extraAction.title, systemImage: extraAction.systemImage)
                         }
                         .buttonStyle(.borderless)
                     }
                 }
+                .padding(.vertical, Self.popoverVerticalInset)
                 .frame(minWidth: 220)
                 .presentationCompactAdaptation(.popover)
             }
@@ -79,6 +74,33 @@ struct ReportConcernModifier: ViewModifier {
             } message: {
                 Text("Thank you. We'll review this content.")
             }
+    }
+
+    // MARK: - Popover rows
+
+    /// Outer breathing room above the first row and below the last one.
+    private static let popoverVerticalInset: CGFloat = 6
+    /// Per-row padding; two rows plus the divider need more air than the old
+    /// single-entry popover had.
+    private static let popoverRowVerticalPadding: CGFloat = 10
+    private static let popoverRowHorizontalPadding: CGFloat = 14
+    /// Fixed icon column so titles line up regardless of each SF Symbol's
+    /// intrinsic width (an eye is wider than a speech bubble).
+    private static let popoverIconWidth: CGFloat = 24
+
+    /// One popover entry: fixed-width icon column + title, so multiple rows
+    /// share the same text x-origin and the same height.
+    private func popoverRow(_ title: String, systemImage: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: systemImage)
+                .frame(width: Self.popoverIconWidth, alignment: .center)
+            Text(title)
+            Spacer(minLength: 0)
+        }
+        .font(.body)
+        .padding(.horizontal, Self.popoverRowHorizontalPadding)
+        .padding(.vertical, Self.popoverRowVerticalPadding)
+        .contentShape(Rectangle())
     }
 
     private var reportSheet: some View {
