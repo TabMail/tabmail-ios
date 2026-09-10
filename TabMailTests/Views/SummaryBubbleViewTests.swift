@@ -24,7 +24,8 @@ struct SummaryBubbleViewTests {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: true,
             summaryBlurb: "Vendor confirmed Friday delivery.",
-            demoSuppressed: false
+            demoSuppressed: false,
+            userHidden: false
         )
         #expect(mode == .content)
     }
@@ -37,7 +38,8 @@ struct SummaryBubbleViewTests {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: true,
             summaryBlurb: "This message has no content.",
-            demoSuppressed: false
+            demoSuppressed: false,
+            userHidden: false
         )
         #expect(mode == .content)
     }
@@ -51,7 +53,8 @@ struct SummaryBubbleViewTests {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: false,
             summaryBlurb: "Vendor confirmed Friday delivery.",
-            demoSuppressed: false
+            demoSuppressed: false,
+            userHidden: false
         )
         #expect(mode == .content)
     }
@@ -64,7 +67,8 @@ struct SummaryBubbleViewTests {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: false,
             summaryBlurb: "This message has no content.",
-            demoSuppressed: false
+            demoSuppressed: false,
+            userHidden: false
         )
         #expect(mode == .content)
     }
@@ -81,7 +85,8 @@ struct SummaryBubbleViewTests {
                 let mode = SummaryBubbleView.displayMode(
                     isInInbox: isInInbox,
                     summaryBlurb: blurb,
-                    demoSuppressed: false
+                    demoSuppressed: false,
+                    userHidden: false
                 )
                 #expect(
                     mode == .content,
@@ -98,7 +103,8 @@ struct SummaryBubbleViewTests {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: true,
             summaryBlurb: nil,
-            demoSuppressed: false
+            demoSuppressed: false,
+            userHidden: false
         )
         #expect(mode == .empty)
     }
@@ -108,7 +114,8 @@ struct SummaryBubbleViewTests {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: true,
             summaryBlurb: "",
-            demoSuppressed: false
+            demoSuppressed: false,
+            userHidden: false
         )
         #expect(mode == .empty)
     }
@@ -122,7 +129,8 @@ struct SummaryBubbleViewTests {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: false,
             summaryBlurb: nil,
-            demoSuppressed: false
+            demoSuppressed: false,
+            userHidden: false
         )
         #expect(mode == .hidden)
     }
@@ -132,12 +140,49 @@ struct SummaryBubbleViewTests {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: false,
             summaryBlurb: "",
-            demoSuppressed: false
+            demoSuppressed: false,
+            userHidden: false
         )
         #expect(mode == .hidden)
     }
 
     // MARK: - Demo suppression takes precedence
+
+    // MARK: - User preference "Show AI Summaries" = off (iOS #153)
+
+    @Test("user-hidden preference hides the bubble for EXISTING content in every folder")
+    func userHiddenHidesExistingContent() {
+        // The preference is the user's own presentation choice; unlike the
+        // processing window (ADR-IOS-078) it is allowed to precede the content
+        // check, and the cached summary stays in place for re-enabling.
+        for isInInbox in [true, false] {
+            let mode = SummaryBubbleView.displayMode(
+                isInInbox: isInInbox,
+                summaryBlurb: "Vendor confirmed Friday delivery.",
+                demoSuppressed: false,
+                userHidden: true
+            )
+            #expect(mode == .hidden, "isInInbox=\(isInInbox)")
+        }
+    }
+
+    @Test("user-hidden preference hides the inbox empty state (control pair: same input with the preference on is .empty)")
+    func userHiddenHidesInboxEmpty() {
+        let hidden = SummaryBubbleView.displayMode(
+            isInInbox: true,
+            summaryBlurb: nil,
+            demoSuppressed: false,
+            userHidden: true
+        )
+        #expect(hidden == .hidden)
+        let shown = SummaryBubbleView.displayMode(
+            isInInbox: true,
+            summaryBlurb: nil,
+            demoSuppressed: false,
+            userHidden: false
+        )
+        #expect(shown == .empty)
+    }
 
     @Test("demo with AI declined hides bubble even for inbox + content")
     func demoSuppressedHidesContent() {
@@ -146,7 +191,8 @@ struct SummaryBubbleViewTests {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: true,
             summaryBlurb: "Pre-baked demo summary.",
-            demoSuppressed: true
+            demoSuppressed: true,
+            userHidden: false
         )
         #expect(mode == .hidden)
     }
@@ -161,7 +207,8 @@ struct SummaryBubbleViewTests {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: true,
             summaryBlurb: nil,
-            demoSuppressed: true
+            demoSuppressed: true,
+            userHidden: false
         )
         #expect(mode == .hidden)
     }
@@ -197,7 +244,8 @@ struct SummaryBubbleViewTests {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: header.isInInbox,
             summaryBlurb: header.summaryBlurb,
-            demoSuppressed: false
+            demoSuppressed: false,
+            userHidden: false
         )
         #expect(mode == .content)
         #expect(header.summaryBlurb == "Summary retained from before move")
@@ -225,7 +273,8 @@ struct SummaryBubbleViewTests {
         let mode = SummaryBubbleView.displayMode(
             isInInbox: header.isInInbox,
             summaryBlurb: header.summaryBlurb,
-            demoSuppressed: false
+            demoSuppressed: false,
+            userHidden: false
         )
         #expect(mode == .content)
     }

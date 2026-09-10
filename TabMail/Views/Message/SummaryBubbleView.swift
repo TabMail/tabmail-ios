@@ -13,7 +13,15 @@ struct SummaryBubbleView: View {
     @State private var expanded = false
     @State private var failed = false
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
+    @AppStorage(SummaryBubbleView.showAISummariesKey) private var showAISummaries = true
     @Environment(\.hasTabMailSession) private var hasTabMailSession
+
+    /// User preference: render AI summary bubbles at all (iOS #153). Surfaced
+    /// as "Show AI Summaries" in Settings → User Interface and as "Hide Summary
+    /// Bubbles" in the bubble's long-press menu. DISPLAY only — summaries keep
+    /// being generated and cached exactly as before, so turning the toggle back
+    /// on shows the retained content immediately.
+    static let showAISummariesKey = "showAISummaries"
 
     /// Whether at least one AI source (LLM backend or Device Sync) is enabled.
     /// When both are off, there's no way to get AI results — hide loading bubble.
@@ -29,8 +37,9 @@ struct SummaryBubbleView: View {
     /// sub-branches (loading / failed / nudge) are decided at render time and
     /// share the same `.empty` mode here.
     enum DisplayMode: Equatable {
-        /// Nothing is rendered: demo with AI declined, or the absent-summary
-        /// empty state outside the Inbox (nothing will ever process there).
+        /// Nothing is rendered: the user turned "Show AI Summaries" off, demo
+        /// with AI declined, or the absent-summary empty state outside the
+        /// Inbox (nothing will ever process there).
         case hidden
         /// Render the cached AI summary content bubble.
         case content
@@ -44,8 +53,16 @@ struct SummaryBubbleView: View {
     static func displayMode(
         isInInbox: Bool,
         summaryBlurb: String?,
-        demoSuppressed: Bool
+        demoSuppressed: Bool,
+        userHidden: Bool
     ) -> DisplayMode {
+        // The user's own "Show AI Summaries" = off preference precedes
+        // everything (iOS #153). Like the demo consent check below it is a
+        // PRESENTATION choice made by the user, not an eligibility policy —
+        // the ADR-IOS-078 rule that existing AI content is never gated by
+        // PROCESSING policy is untouched, and the content stays cached so
+        // re-enabling the toggle shows it again.
+        if userHidden { return .hidden }
         // Demo consent precedes content BY DESIGN — this is a consent surface,
         // not an eligibility gate: a demo user who declined AI sees no AI output
         // at all, even pre-baked demo content (ADR-IOS-078 lists the remaining
@@ -72,7 +89,8 @@ struct SummaryBubbleView: View {
         let mode = Self.displayMode(
             isInInbox: message.isInInbox,
             summaryBlurb: message.summaryBlurb,
-            demoSuppressed: DemoModeStore.shared.isActive && !DemoModeStore.shared.aiEnabled
+            demoSuppressed: DemoModeStore.shared.isActive && !DemoModeStore.shared.aiEnabled,
+            userHidden: !showAISummaries
         )
         switch mode {
         case .hidden:
@@ -152,7 +170,14 @@ struct SummaryBubbleView: View {
         .onTapGesture {
             expanded.toggle()
         }
-        .reportConcern(contentType: .summary, content: blurb)
+        .reportConcern(
+            contentType: .summary,
+            content: blurb,
+            extraAction: ReportConcernExtraAction(
+                title: "Hide Summary Bubbles",
+                systemImage: "eye.slash"
+            ) { showAISummaries = false }
+        )
         .popoverTip(SummaryBubbleTip(), arrowEdge: .bottom)
         .padding(.horizontal, 6)
     }

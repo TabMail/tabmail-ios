@@ -4,6 +4,14 @@
 
 import SwiftUI
 
+/// An additional entry shown in the long-press popover under "Report Concern"
+/// (e.g. "Hide Summary Bubbles" on the AI summary bubble, iOS #153).
+struct ReportConcernExtraAction {
+    let title: String
+    let systemImage: String
+    let action: () -> Void
+}
+
 /// Adds a long-press "Report Concern" flow to any view displaying
 /// AI-generated or community-driven content.
 /// Required by App Store Guidelines 1.2, 4.7.1.
@@ -16,6 +24,7 @@ import SwiftUI
 struct ReportConcernModifier: ViewModifier {
     let contentType: ReportContentType
     let content: String
+    let extraAction: ReportConcernExtraAction?
 
     @State private var showPopover = false
     @State private var showSheet = false
@@ -32,17 +41,33 @@ struct ReportConcernModifier: ViewModifier {
                 withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { showPopover = true }
             })
             .popover(isPresented: $showPopover, arrowEdge: .top) {
-                Button {
-                    showPopover = false
-                    showSheet = true
-                } label: {
-                    Label("Report Concern", systemImage: "exclamationmark.bubble")
-                        .font(.body)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
+                VStack(alignment: .leading, spacing: 0) {
+                    Button {
+                        showPopover = false
+                        showSheet = true
+                    } label: {
+                        Label("Report Concern", systemImage: "exclamationmark.bubble")
+                            .font(.body)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.borderless)
+                    .tint(.red)
+
+                    if let extraAction {
+                        Divider()
+                        Button {
+                            showPopover = false
+                            extraAction.action()
+                        } label: {
+                            Label(extraAction.title, systemImage: extraAction.systemImage)
+                                .font(.body)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
+                        }
+                        .buttonStyle(.borderless)
+                    }
                 }
-                .buttonStyle(.borderless)
-                .tint(.red)
                 .frame(minWidth: 220)
                 .presentationCompactAdaptation(.popover)
             }
@@ -123,7 +148,11 @@ struct ReportConcernModifier: ViewModifier {
 }
 
 extension View {
-    func reportConcern(contentType: ReportContentType, content: String) -> some View {
-        modifier(ReportConcernModifier(contentType: contentType, content: content))
+    func reportConcern(
+        contentType: ReportContentType,
+        content: String,
+        extraAction: ReportConcernExtraAction? = nil
+    ) -> some View {
+        modifier(ReportConcernModifier(contentType: contentType, content: content, extraAction: extraAction))
     }
 }
