@@ -45,6 +45,27 @@ enum NSELog {
     /// timestamp on every line rescues per-run delta math when needed.
     @TaskLocal static var runTag: String?
 
+    /// Only fixed categories leave the credential boundary; errors may contain
+    /// URLs, response bodies or credentials in their descriptions/userInfo.
+    static func credentialFailure(_ error: any Error) -> String {
+        switch error {
+        case is CancellationError: return "cancelled"
+        case CredentialRefreshError.inactive: return "inactive"
+        case CredentialRefreshError.requiresAuthorization, CredentialRefreshError.rejected: return "authorization_required"
+        case CredentialRefreshError.busy: return "lock_busy"
+        case CredentialRefreshError.unavailable: return "unavailable"
+        case let error as URLError:
+            switch error.code {
+            case .cancelled: return "cancelled"
+            case .timedOut: return "timeout"
+            case .notConnectedToInternet, .networkConnectionLost: return "offline"
+            default: return "transport_failed"
+            }
+        case is DecodingError: return "invalid_response"
+        default: return "failed"
+        }
+    }
+
     static func info(_ message: String) {
         #if DEBUG
         logger.info("🔔 \(message, privacy: .public)")

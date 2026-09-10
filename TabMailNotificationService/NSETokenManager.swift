@@ -31,13 +31,50 @@ enum NSETokenManager {
     static func validSession(sessionStore: TabMailSessionStore? = nil,
                              dataForRequest: DataForRequest? = nil) async -> TabMailSessionRefresh.Result? {
         let sessionStore = sessionStore ?? store
-        guard let record = sessionStore.loadActiveSession(),
-              expectedGeneration == nil || expectedGeneration == record.generation,
-              let result = try? await TabMailSessionRefresh.token(record: record, store: sessionStore,
-                  transport: dataForRequest ?? transport),
-              !Task.isCancelled, result.persisted,
-              sessionStore.loadActiveSession()?.location == record.location else { return nil }
-        return result
+        let started = ProcessInfo.processInfo.systemUptime
+        defer {
+            let elapsed = Int((ProcessInfo.processInfo.systemUptime - started) * 1000)
+            NSELog.step("NSE credential: scope=session stage=end elapsed_ms=\(elapsed)")
+        }
+        guard let record = sessionStore.loadActiveSession() else {
+            NSELog.step("NSE credential: scope=session stage=lookup outcome=missing_or_unreadable")
+            return nil
+        }
+        guard expectedGeneration == nil || expectedGeneration == record.generation else {
+            NSELog.step("NSE credential: scope=session stage=lookup outcome=activation_changed")
+            return nil
+        }
+        NSELog.step("NSE credential: scope=session stage=lookup outcome=loaded")
+        do {
+            let requestTransport = dataForRequest ?? transport
+            let result = try await CredentialRefreshGate.$diagnostic.withValue({ event in
+                NSELog.step("NSE credential: scope=session \(event)")
+            }) {
+                try await TabMailSessionRefresh.token(record: record, store: sessionStore) { request in
+                    NSELog.step("NSE credential: scope=session stage=network outcome=started")
+                    let response = try await requestTransport(request)
+                    NSELog.step("NSE credential: scope=session stage=network http=\((response.1 as? HTTPURLResponse)?.statusCode ?? 0)")
+                    return response
+                }
+            }
+            guard !Task.isCancelled else {
+                NSELog.step("NSE credential: scope=session stage=finish outcome=cancelled")
+                return nil
+            }
+            guard result.persisted else {
+                NSELog.step("NSE credential: scope=session stage=finish outcome=not_persisted")
+                return nil
+            }
+            guard sessionStore.loadActiveSession()?.location == record.location else {
+                NSELog.step("NSE credential: scope=session stage=finish outcome=activation_changed")
+                return nil
+            }
+            NSELog.step("NSE credential: scope=session stage=finish outcome=usable_shared_credential")
+            return result
+        } catch {
+            NSELog.step("NSE credential: scope=session stage=finish outcome=\(NSELog.credentialFailure(error))")
+            return nil
+        }
     }
 
     static func validAccessToken(sessionStore: TabMailSessionStore? = nil,

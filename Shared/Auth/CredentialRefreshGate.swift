@@ -52,6 +52,10 @@ struct CredentialStorageLock: Sendable {
 /// Duplicate requests are allowed; a failed or vanished owner cannot disable
 /// the next foreground retry of otherwise valid authorization.
 final class CredentialRefreshGate: @unchecked Sendable {
+    /// Optional invocation-scoped diagnostics; foreground callers remain silent.
+    /// Call sites emit fixed labels only, never credential or account data.
+    @TaskLocal static var diagnostic: (@Sendable (String) -> Void)?
+
     let backend: any TabMailSessionKeychainBackend
     let storageLock: CredentialStorageLock
 
@@ -78,6 +82,7 @@ final class CredentialRefreshGate: @unchecked Sendable {
         try Task.checkCancellation()
         let current = try read(account)
         guard try Self.canonical(current) == Self.canonical(captured) else {
+            Self.diagnostic?("stage=storage outcome=peer_result_reused_before_exchange")
             return Result(data: current, persisted: true)
         }
         let response: Data
@@ -89,15 +94,25 @@ final class CredentialRefreshGate: @unchecked Sendable {
             return try storageLock.withLock(account) {
                 let latest = try read(account)
                 guard try Self.canonical(latest) == Self.canonical(current) else {
+                    Self.diagnostic?("stage=storage outcome=peer_result_reused_at_commit")
                     return Result(data: latest, persisted: true)
                 }
                 let data = try Self.canonical(response)
                 guard backend.updateShared(account: account, data: data) == .success else {
+                    Self.diagnostic?("stage=storage outcome=update_failed")
                     throw CredentialRefreshError.unavailable
                 }
+                Self.diagnostic?("stage=storage outcome=persisted")
                 return Result(data: data, persisted: true)
             }
         } catch {
+            let reason: String
+            switch error {
+            case CredentialRefreshError.busy: reason = "lock_busy"
+            case CredentialRefreshError.inactive: reason = "credential_removed"
+            default: reason = "storage_unavailable"
+            }
+            Self.diagnostic?("stage=storage outcome=not_persisted reason=\(reason)")
             return Result(data: response, persisted: false)
         }
     }
