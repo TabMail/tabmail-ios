@@ -155,33 +155,42 @@ struct SummaryBubbleViewTests {
         // The preference is the user's own presentation choice; unlike the
         // processing window (ADR-IOS-078) it is allowed to precede the content
         // check, and the cached summary stays in place for re-enabling.
+        // The no-content stub (written by AccountManager.processOpenedMessage)
+        // is an existing artifact too and must hide the same way.
+        let blurbs = ["Vendor confirmed Friday delivery.", "This message has no content."]
         for isInInbox in [true, false] {
-            let mode = SummaryBubbleView.displayMode(
-                isInInbox: isInInbox,
-                summaryBlurb: "Vendor confirmed Friday delivery.",
-                demoSuppressed: false,
-                userHidden: true
-            )
-            #expect(mode == .hidden, "isInInbox=\(isInInbox)")
+            for blurb in blurbs {
+                let mode = SummaryBubbleView.displayMode(
+                    isInInbox: isInInbox,
+                    summaryBlurb: blurb,
+                    demoSuppressed: false,
+                    userHidden: true
+                )
+                #expect(mode == .hidden, "isInInbox=\(isInInbox) blurb=\(blurb)")
+            }
         }
     }
 
     @Test("user-hidden preference hides the inbox empty state (control pair: same input with the preference on is .empty)")
     func userHiddenHidesInboxEmpty() {
-        let hidden = SummaryBubbleView.displayMode(
-            isInInbox: true,
-            summaryBlurb: nil,
-            demoSuppressed: false,
-            userHidden: true
-        )
-        #expect(hidden == .hidden)
-        let shown = SummaryBubbleView.displayMode(
-            isInInbox: true,
-            summaryBlurb: nil,
-            demoSuppressed: false,
-            userHidden: false
-        )
-        #expect(shown == .empty)
+        // Both absent-summary representations: nil, and the empty string an
+        // NSE-staged header can carry (NSEDataBridge.insertNewHeaderFromStaging).
+        for blurb in [nil, ""] as [String?] {
+            let hidden = SummaryBubbleView.displayMode(
+                isInInbox: true,
+                summaryBlurb: blurb,
+                demoSuppressed: false,
+                userHidden: true
+            )
+            #expect(hidden == .hidden, "blurb=\(String(describing: blurb))")
+            let shown = SummaryBubbleView.displayMode(
+                isInInbox: true,
+                summaryBlurb: blurb,
+                demoSuppressed: false,
+                userHidden: false
+            )
+            #expect(shown == .empty, "blurb=\(String(describing: blurb))")
+        }
     }
 
     @Test("demo with AI declined hides bubble even for inbox + content")
