@@ -164,16 +164,15 @@ enum EmailFilter {
     /// Use for snippet extraction from textBody (already plain text, but may contain
     /// newlines, tabs, signature separators, etc. that need collapsing).
     static func snippetFromPlainText(_ text: String, maxChars: Int = 150) -> String {
-        // Truncate early — only need ~500 chars to guarantee 150 clean chars.
-        // Markdown links are unwrapped BEFORE that cut so a long destination can
-        // neither leak into the preview nor eat the scan budget (#148), but the
-        // unwrap itself only ever sees `snippetLinkScanChars` of input: a link
-        // longer than that degrades to raw Markdown instead of walking the body.
+        // Truncate early — the loop below stops at `maxChars`, so only a bounded
+        // window of input is ever read. Markdown links are unwrapped INSIDE that
+        // window (#148): a link longer than the window degrades to raw Markdown
+        // instead of walking the body.
         // The window is counted in UNICODE SCALARS, not Characters: a grapheme
         // cluster can carry hundreds of combining marks, so a Character-counted
         // prefix would admit megabytes for the per-`[` re-walk to copy.
         let window = String(String.UnicodeScalarView(text.unicodeScalars.prefix(snippetLinkScanChars)))
-        let truncated = unwrapMarkdownLinks(window, limit: snippetScanChars)
+        let truncated = unwrapMarkdownLinks(window)
         var result = ""
         result.reserveCapacity(maxChars)
         var lastWasSpace = true
@@ -208,85 +207,39 @@ enum EmailFilter {
     /// Same bracketed style as `BodyFetchProcessor`'s `[attachment]` placeholder.
     static let noTextSnippet = "[no text]"
 
-    /// Characters `snippetFromPlainText` scans before giving up on filling `maxChars`.
-    private static let snippetScanChars = 500
-
-    /// Input Unicode scalars `unwrapMarkdownLinks` may read. Bounds the worst case
-    /// at `snippetScanChars` × this (every `[` re-walks to the end of the window),
-    /// and is comfortably above the longest real tracking URL.
+    /// Input Unicode scalars `snippetFromPlainText` reads (and `unwrapMarkdownLinks`
+    /// may match within). Scalars, not Characters: a grapheme cluster can carry
+    /// hundreds of combining marks. Comfortably above the longest real tracking URL.
     static let snippetLinkScanChars = 4_000
 
     /// Renders Markdown links as their bare label for SNIPPET display only (#148):
     /// `[label](destination)` → `label`, reversing the escapes `htmlToPlainText`'s
     /// `finishLink` adds (backslash-escaped punctuation, `&amp;`). The stored FTS
     /// text and the agent read path keep the full link; only the preview drops it.
-    /// Anything that is not a complete single-line link — a bare `[note]`, an
-    /// unterminated `[label](…` — is copied through unchanged. Emits at most
-    /// `limit` characters; the caller bounds the INPUT (`snippetLinkScanChars`),
-    /// since each `[` walks forward to the end of its line looking for `](…)`.
-    static func unwrapMarkdownLinks(_ text: String, limit: Int) -> String {
-        var out = ""
-        out.reserveCapacity(limit)
-        var emitted = 0
-        var i = text.startIndex
-        while i < text.endIndex, emitted < limit {
-            if text[i] == "[", let link = markdownLink(in: text, openingAt: i) {
-                for c in link.label where emitted < limit {
-                    out.append(c)
-                    emitted += 1
-                }
-                i = link.end
-            } else {
-                out.append(text[i])
-                emitted += 1
-                i = text.index(after: i)
-            }
-        }
-        return out
-    }
+    /// The pattern IS the grammar: a link sits on one line; a backslash escapes the
+    /// next character on either side (`\]` in labels, `\)` in destinations) but
+    /// never a line break; a destination contains no whitespace (the converter
+    /// percent-encodes it). Anything else — a bare `[note]`, an unterminated
+    /// `[label](…`, `[x] (…)` — is not a link and is copied through unchanged.
+    /// Callers bound the INPUT (`snippetLinkScanChars` scalars), so cost is capped.
+    private static let markdownLinkRegex = try! NSRegularExpression(
+        pattern: #"\[((?:\\.|[^\]\\\v])*)\]\((?:\\.|[^)\\\s])*\)"#)
+    private static let labelEscapeRegex = try! NSRegularExpression(pattern: #"\\(.)"#)
 
-    /// Parses `[label](destination)` starting at the `[` at `open`. Returns the
-    /// unescaped label and the index just past the closing `)`, or nil when the
-    /// text there is not a complete link. Backslash escapes are honoured in both
-    /// parts (the converter escapes `]` in labels and `)` in destinations); a
-    /// newline inside either part means it is not a link, so a stray `[` in prose
-    /// cannot swallow the rest of the message.
-    private static func markdownLink(in text: String, openingAt open: String.Index)
-        -> (label: String, end: String.Index)? {
-        var label = ""
-        var i = text.index(after: open)
-        while i < text.endIndex {
-            let c = text[i]
-            if c.isNewline { return nil }
-            if c == "\\" {
-                let next = text.index(after: i)
-                guard next < text.endIndex, !text[next].isNewline else { return nil }
-                label.append(text[next])
-                i = text.index(after: next)
-                continue
-            }
-            if c == "]" { i = text.index(after: i); break }
-            label.append(c)
-            i = text.index(after: i)
+    static func unwrapMarkdownLinks(_ text: String) -> String {
+        let ns = text as NSString
+        var out = ""
+        var cursor = 0
+        for match in markdownLinkRegex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            out += ns.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
+            let label = ns.substring(with: match.range(at: 1))
+            let unescaped = labelEscapeRegex.stringByReplacingMatches(
+                in: label, range: NSRange(location: 0, length: (label as NSString).length), withTemplate: "$1")
+            out += unescaped.replacingOccurrences(of: "&amp;", with: "&")
+            cursor = match.range.location + match.range.length
         }
-        // Falling out at `endIndex` (no `]`) fails this guard too.
-        guard i < text.endIndex, text[i] == "(" else { return nil }
-        i = text.index(after: i)
-        while i < text.endIndex {
-            let c = text[i]
-            if c.isNewline || c.isWhitespace { return nil }
-            if c == "\\" {
-                i = text.index(after: i)
-                guard i < text.endIndex, !text[i].isNewline else { return nil }
-                i = text.index(after: i)
-                continue
-            }
-            if c == ")" {
-                return (label.replacingOccurrences(of: "&amp;", with: "&"), text.index(after: i))
-            }
-            i = text.index(after: i)
-        }
-        return nil
+        out += ns.substring(from: cursor)
+        return out
     }
 
     /// Extract plain text from a fetched message body for FTS indexing.
