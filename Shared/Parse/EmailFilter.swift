@@ -277,7 +277,7 @@ enum EmailFilter {
             if c.isNewline || c.isWhitespace { return nil }
             if c == "\\" {
                 i = text.index(after: i)
-                guard i < text.endIndex else { return nil }
+                guard i < text.endIndex, !text[i].isNewline else { return nil }
                 i = text.index(after: i)
                 continue
             }

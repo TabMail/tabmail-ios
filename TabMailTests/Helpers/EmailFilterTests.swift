@@ -142,6 +142,8 @@ struct EmailFilterTests {
         #expect(EmailFilter.snippetFromPlainText("[a](x\\") == "[a](x\\")
         // Label escape immediately before a line break
         #expect(EmailFilter.snippetFromPlainText("[a\\\nb](https://example.com)") == "[a\\ b](https://example.com)")
+        // Destination escape immediately before a line break: a link never spans lines
+        #expect(EmailFilter.snippetFromPlainText("[notice](x\\\nACTION) tail") == "[notice](x\\ ACTION) tail")
     }
 
     @Test("snippetFromPlainText never reads a link past its scan window")
