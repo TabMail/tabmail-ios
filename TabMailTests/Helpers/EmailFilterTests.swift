@@ -147,8 +147,8 @@ struct EmailFilterTests {
     @Test("snippetFromPlainText never reads a link past its scan window")
     func snippetLinkScanIsBounded() {
         // A `[` whose closing `](…)` lies beyond the window must be treated as
-        // plain text, not chased to the end of the body — the base's O(500)
-        // cost bound that #148 must preserve (reviewer finding R1).
+        // plain text, not chased to the end of the body — the helper's
+        // long-standing O(500) cost bound that #148 must preserve.
         let filler = String(repeating: "a", count: EmailFilter.snippetLinkScanChars)
         let text = "[" + filler + "](https://example.com) tail"
         #expect(EmailFilter.snippetFromPlainText(text).hasPrefix("[aaaa"))
@@ -157,6 +157,15 @@ struct EmailFilterTests {
         let start = Date()
         _ = EmailFilter.snippetFromPlainText(body)
         #expect(Date().timeIntervalSince(start) < 2)
+        // The window is bounded in SCALARS: a Character-counted window would
+        // admit 3,500 clusters × 100 combining marks (hundreds of KB) for every
+        // one of 500 failed openers to re-walk — measured at tens of seconds.
+        let zalgo = String(repeating: "a" + String(repeating: "\u{0301}", count: 100), count: 3_500)
+        let combining = String(repeating: "[", count: 500) + zalgo
+        let start2 = Date()
+        let result = EmailFilter.snippetFromPlainText(combining)
+        #expect(Date().timeIntervalSince(start2) < 2)
+        #expect(result.hasPrefix("["))
     }
 
     @Test("image-only mail previews as the no-text placeholder, never as an empty snippet")

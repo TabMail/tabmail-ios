@@ -152,9 +152,14 @@ struct StagedSetRepostSuppressionTests {
         #expect(s == "Don't miss this & that \"deal\"")
         // Empty-everything stays empty (IMAP metadata-only staging).
         #expect(NSEDataBridge.stagedDisplaySnippet(providerSnippet: "", textContent: nil).isEmpty)
-        // Empty/whitespace body falls back to the cleaned provider snippet.
-        let fallback = NSEDataBridge.stagedDisplaySnippet(providerSnippet: "Plain &amp; simple", textContent: "  \n ")
-        #expect(fallback == "Plain & simple")
+        // A staged body that is whitespace-only is DERIVED text (#148): it shows
+        // the no-text placeholder — byte-identical to what phase 2 writes, so the
+        // row never snaps — rather than falling back to the provider snippet.
+        let whitespaceBody = NSEDataBridge.stagedDisplaySnippet(providerSnippet: "Plain &amp; simple", textContent: "  \n ")
+        #expect(whitespaceBody == EmailFilter.noTextSnippet)
+        // Only genuinely ABSENT text falls back to the cleaned provider snippet.
+        let absentBody = NSEDataBridge.stagedDisplaySnippet(providerSnippet: "Plain &amp; simple", textContent: "")
+        #expect(absentBody == "Plain & simple")
     }
 
     @Test("drained set resets the memo — a later identical re-stage posts again")

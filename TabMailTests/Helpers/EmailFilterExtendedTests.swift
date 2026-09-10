@@ -395,9 +395,12 @@ struct EmailFilterSnippetPlainTextEdgeCaseTests {
         #expect(result == "Hello World")
     }
 
-    @Test("Only whitespace returns empty")
+    @Test("Only whitespace previews as the no-text placeholder, never as an empty snippet")
     func onlyWhitespace() {
+        // #148: an EMPTY snippet is the inbox loader's "not derived yet" sentinel
+        // and would re-fetch the body on every reload; derived-but-empty text
+        // gets the visible placeholder instead.
         let result = EmailFilter.snippetFromPlainText("   \n\n\t  ")
-        #expect(result.isEmpty)
+        #expect(result == EmailFilter.noTextSnippet)
     }
 }

@@ -169,8 +169,11 @@ enum EmailFilter {
         // neither leak into the preview nor eat the scan budget (#148), but the
         // unwrap itself only ever sees `snippetLinkScanChars` of input: a link
         // longer than that degrades to raw Markdown instead of walking the body.
-        let truncated = unwrapMarkdownLinks(String(text.prefix(snippetLinkScanChars)),
-                                            limit: snippetScanChars)
+        // The window is counted in UNICODE SCALARS, not Characters: a grapheme
+        // cluster can carry hundreds of combining marks, so a Character-counted
+        // prefix would admit megabytes for the per-`[` re-walk to copy.
+        let window = String(String.UnicodeScalarView(text.unicodeScalars.prefix(snippetLinkScanChars)))
+        let truncated = unwrapMarkdownLinks(window, limit: snippetScanChars)
         var result = ""
         result.reserveCapacity(maxChars)
         var lastWasSpace = true
@@ -208,8 +211,8 @@ enum EmailFilter {
     /// Characters `snippetFromPlainText` scans before giving up on filling `maxChars`.
     private static let snippetScanChars = 500
 
-    /// Input characters `unwrapMarkdownLinks` may read. Bounds the worst case at
-    /// `snippetScanChars` × this (every `[` re-walks to the end of the window),
+    /// Input Unicode scalars `unwrapMarkdownLinks` may read. Bounds the worst case
+    /// at `snippetScanChars` × this (every `[` re-walks to the end of the window),
     /// and is comfortably above the longest real tracking URL.
     static let snippetLinkScanChars = 4_000
 
@@ -252,7 +255,6 @@ enum EmailFilter {
         -> (label: String, end: String.Index)? {
         var label = ""
         var i = text.index(after: open)
-        var closedLabel = false
         while i < text.endIndex {
             let c = text[i]
             if c.isNewline { return nil }
@@ -263,11 +265,12 @@ enum EmailFilter {
                 i = text.index(after: next)
                 continue
             }
-            if c == "]" { closedLabel = true; i = text.index(after: i); break }
+            if c == "]" { i = text.index(after: i); break }
             label.append(c)
             i = text.index(after: i)
         }
-        guard closedLabel, i < text.endIndex, text[i] == "(" else { return nil }
+        // Falling out at `endIndex` (no `]`) fails this guard too.
+        guard i < text.endIndex, text[i] == "(" else { return nil }
         i = text.index(after: i)
         while i < text.endIndex {
             let c = text[i]
