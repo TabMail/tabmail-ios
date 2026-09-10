@@ -43,7 +43,7 @@ struct InboxSnippetOversizedQuarantineTests {
     /// two-sidedness is built into the fixture so both cases run against identical rows)
     /// and a restore closure the caller MUST run in `defer`.
     @MainActor
-    private func makeSwappedDB() throws -> (flagged: String, clean: String, folder: Folder, restore: () -> Void) {
+    private func makeSwappedDB(cleanSnippet: String = "") throws -> (flagged: String, clean: String, folder: Folder, restore: () -> Void) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let path = dir.appendingPathComponent("test.sqlite").path
@@ -59,7 +59,7 @@ struct InboxSnippetOversizedQuarantineTests {
         account.id = "acc1"
         let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
 
-        func header(_ messageId: String, oversized: Bool) -> MessageHeader {
+        func header(_ messageId: String, oversized: Bool, snippet: String = "") -> MessageHeader {
             var h = MessageHeader(
                 messageId: messageId,
                 subject: "A message with no snippet yet",
@@ -67,7 +67,7 @@ struct InboxSnippetOversizedQuarantineTests {
                 fromAddress: "sender@example.com",
                 to: "recipient@example.com",
                 date: Date(),
-                snippet: "",                    // empty — this is what queues it
+                snippet: snippet,               // empty — this is what queues it
                 folderId: MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX"),
                 accountId: "acc1",
                 folderPath: "INBOX",
@@ -78,7 +78,7 @@ struct InboxSnippetOversizedQuarantineTests {
             return h
         }
         let flagged = header("9001", oversized: true)
-        let clean = header("9002", oversized: false)
+        let clean = header("9002", oversized: false, snippet: cleanSnippet)
         try pool.write { db in
             try account.insert(db)
             try folder.insert(db)
@@ -123,6 +123,28 @@ struct InboxSnippetOversizedQuarantineTests {
                 "an identical row without the flag must still be fetched")
         #expect(blacklisted.contains(flaggedId),
                 "…and the flagged row is also blacklisted, so this reload does not re-queue it")
+    }
+
+    /// #148/#149: a DERIVED preview that happens to carry no text must not look like the
+    /// loader's "not derived yet" sentinel. Image-only mail converts to `[](url)` links
+    /// whose labels unwrap to nothing; if that produced an EMPTY snippet, the row would
+    /// be re-fetched in full on every reload for as long as it stays visible. The
+    /// control for this test is `quarantinedRowNeverReachesTheNetworkTier` above: the
+    /// same row with an EMPTY snippet does reach the wire.
+    @Test("A row whose derived snippet is the no-text placeholder is never re-fetched")
+    @MainActor
+    func noTextPlaceholderRowIsNotRefetched() async throws {
+        let (_, cleanId, folder, restore) = try makeSwappedDB(cleanSnippet: EmailFilter.noTextSnippet)
+        defer { restore() }
+
+        let provider = MockEmailProvider()
+        await TestProviderRegistry.withRegisteredProvider(accountId: "acc1", provider: provider) {
+            let vm = InboxViewModel(folders: [folder])
+            _ = await vm.runSnippetBatchForTesting([cleanId])
+        }
+        let calls = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }
+        #expect(!calls.contains { $0.contains("id:9002") },
+                "a derived placeholder snippet is final — the loader must not spend a body fetch on it")
     }
 
     /// The eviction fail-safe, at this initiator too. `BodyAssetMaintenance` deletes the

@@ -192,8 +192,18 @@ enum EmailFilter {
             if result.count >= maxChars { break }
         }
         while result.hasSuffix(" ") { result.removeLast() }
+        // Non-empty text that leaves nothing previewable — image-only mail whose
+        // links all have empty labels, or whitespace-only bodies — gets a visible
+        // placeholder (owner 2026-09-09, #149 review). An EMPTY snippet is the
+        // inbox loader's "not derived yet" sentinel and would re-fetch the body on
+        // every reload; a derived-but-empty preview must never look like that.
+        if result.isEmpty, !text.isEmpty { return noTextSnippet }
         return result
     }
+
+    /// Snippet shown for a message whose text yields nothing previewable.
+    /// Same bracketed style as `BodyFetchProcessor`'s `[attachment]` placeholder.
+    static let noTextSnippet = "[no text]"
 
     /// Characters `snippetFromPlainText` scans before giving up on filling `maxChars`.
     private static let snippetScanChars = 500

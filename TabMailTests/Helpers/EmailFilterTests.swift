@@ -159,6 +159,23 @@ struct EmailFilterTests {
         #expect(Date().timeIntervalSince(start) < 2)
     }
 
+    @Test("image-only mail previews as the no-text placeholder, never as an empty snippet")
+    func snippetImageOnlyMailIsNeverEmpty() {
+        // The converter emits `[](destination)` for an anchor wrapping only an image.
+        let html = (0..<3).map { i in "<a href=\"https://example.com/t/\(i)\"><img src=\"i.png\"></a>" }.joined()
+        let plain = EmailFilter.htmlToPlainText(html)
+        #expect(plain.contains("](https://example.com/t/0)"))
+        let snippet = EmailFilter.snippetFromPlainText(plain)
+        #expect(snippet == EmailFilter.noTextSnippet)
+        #expect(!snippet.isEmpty)
+        // Whitespace-only text is the same population; genuinely absent text is not.
+        #expect(EmailFilter.snippetFromPlainText(" \n\t ") == EmailFilter.noTextSnippet)
+        #expect(EmailFilter.snippetFromPlainText("") == "")
+        #expect(EmailFilter.cleanSnippet("") == "")
+        // Image links followed by real text still preview the text.
+        #expect(EmailFilter.snippetFromPlainText(plain + " Hello there") == "Hello there")
+    }
+
     @Test("snippetFromPlainText is not starved by a long link destination")
     func snippetSurvivesLongDestination() {
         let destination = "https://example.com/" + String(repeating: "t", count: 800)
