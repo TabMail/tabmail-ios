@@ -3,6 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+#if TABMAIL_TESTS
+@testable import TabMail
+#endif
 
 /// Thin NSE-side wrapper over `Shared/API/GraphAPI`. No HTTP, no parsing,
 /// no token refresh, no body extraction — all lifted to the shared layer.

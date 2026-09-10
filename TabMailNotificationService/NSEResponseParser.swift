@@ -3,6 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+#if TABMAIL_TESTS
+@testable import TabMail
+#endif
 
 /// NSE response parser — delegates to shared AIResponseParser.
 /// Single source of truth in Shared/AIResponseParser.swift.

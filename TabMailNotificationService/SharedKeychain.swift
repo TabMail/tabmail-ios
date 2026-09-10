@@ -4,17 +4,20 @@
 
 import Foundation
 import Security
+#if TABMAIL_TESTS
+@testable import TabMail
+#endif
 
 enum SharedKeychain {
     private static let service = "ai.tabmail.ios"
     private static let accessGroup = SharedNSEData.appGroupIdentifier
 
     static func getAccessToken(for accountId: String) -> String? {
-        load(key: "accessToken:\(accountId)")
+        ProviderCredentialStore.shared.current(accountId: accountId)?.accessToken
     }
 
     static func getRefreshToken(for accountId: String) -> String? {
-        load(key: "refreshToken:\(accountId)")
+        ProviderCredentialStore.shared.current(accountId: accountId)?.refreshToken
     }
 
     static func getPassword(for accountId: String) -> String? {
@@ -24,10 +27,6 @@ enum SharedKeychain {
     static func getDeviceToken() -> String? {
         // Device token stored in UserDefaults by PushNotificationService, mirrored to shared
         SharedNSEData.suite.string(forKey: "nse.deviceToken")
-    }
-
-    static func setAccessToken(_ token: String, for accountId: String) {
-        save(key: "accessToken:\(accountId)", value: token)
     }
 
     // MARK: - Private
@@ -47,23 +46,4 @@ enum SharedKeychain {
         return String(data: data, encoding: .utf8)
     }
 
-    private static func save(key: String, value: String) {
-        guard let data = value.data(using: .utf8) else { return }
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: key,
-            kSecAttrAccessGroup as String: accessGroup
-        ]
-        let update: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
-        ]
-        let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
-        if status == errSecItemNotFound {
-            var newItem = query
-            newItem.merge(update) { _, new in new }
-            SecItemAdd(newItem as CFDictionary, nil)
-        }
-    }
 }

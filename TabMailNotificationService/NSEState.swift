@@ -3,6 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+#if TABMAIL_TESTS
+@testable import TabMail
+#endif
 
 enum NSEState {
     private static var suite: SendableUserDefaults { SharedNSEData.suite }
@@ -94,7 +97,7 @@ enum NSEState {
     /// through the sidebar, which lists active non-calendar accounts, so an
     /// account that can be edited is by construction one that keeps the
     /// foreground pass's account gate open.
-    struct IMAPAccountInfo: Sendable {
+    struct IMAPAccountInfo: Sendable, Equatable {
         let host: String
         let port: Int
         let username: String

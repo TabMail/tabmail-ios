@@ -113,76 +113,56 @@ struct BackfillProgress {
     }
 }
 
-/// Deduplicates concurrent OAuth refresh calls for a single account.
-/// Prevents race where mail + calendar providers both get 401 and refresh the same token.
-/// Microsoft rotates refresh tokens on use — second caller with the old token would fail.
+/// Coalesces foreground callers; the shared store fences concurrent NSE writes.
 actor OAuthRefreshCoordinator {
-    private var inFlightTask: (id: UUID, task: Task<OAuthTokens, any Error>)?
-    /// Once invalidated, all future refresh attempts immediately fail.
-    /// Prevents stale closures from refreshing tokens after account removal.
+    private var inFlightTask: (id: UUID, generation: String, task: Task<String, any Error>)?
     private var invalidated = false
+    private let store: ProviderCredentialStore
 
-    init(invalidated: Bool = false) {
+    init(invalidated: Bool = false, store: ProviderCredentialStore = .shared) {
         self.invalidated = invalidated
+        self.store = store
     }
 
-    /// Mark this coordinator as invalidated. Cancels any in-flight refresh.
     func invalidate() {
         invalidated = true
         inFlightTask?.task.cancel()
         inFlightTask = nil
     }
 
-    func refresh(
-        accountId: String,
-        email: String,
-        using refresher: @escaping @Sendable (_ refreshToken: String) async throws -> OAuthTokens
-    ) async throws -> String {
-        // SECURITY: Refuse to refresh after account has been removed
-        guard !invalidated else {
-            print("[OAuth] Refusing refresh for \(email): coordinator invalidated (account removed)")
+    func refresh(accountId: String, email: String,
+                 using refresher: @escaping @Sendable (String) async throws -> OAuthTokens) async throws -> String {
+        guard !invalidated, let generation = store.activation(accountId: accountId)?.generation else {
             throw ProviderError.authenticationFailed
         }
-
         let taskId: UUID
-        let task: Task<OAuthTokens, any Error>
-        if let existing = inFlightTask {
-            print("[OAuth] Awaiting in-flight refresh for \(email)...")
+        let task: Task<String, any Error>
+        if let existing = inFlightTask, existing.generation == generation {
             taskId = existing.id
             task = existing.task
         } else {
             taskId = UUID()
-            task = Task<OAuthTokens, any Error> {
-                guard let refreshToken = KeychainHelper.loadString(key: KeychainHelper.refreshTokenKey(accountId: accountId)) else {
-                    print("[OAuth] Auth failed for \(email): refresh token missing from keychain")
-                    throw ProviderError.authenticationFailed
+            task = Task {
+                try await CredentialRefreshBackgroundTask.run { [store] in
+                    let result = try await store.refresh(accountId: accountId, generation: generation) { refresh in
+                        let tokens = try await refresher(refresh)
+                        return ProviderCredentialStore.Tokens(accessToken: tokens.accessToken,
+                            refreshToken: tokens.refreshToken, expiresAt: tokens.expiresAt)
+                    }
+                    return result.accessToken
                 }
-                print("[OAuth] Refreshing access token for \(email)...")
-                return try await refresher(refreshToken)
             }
-            inFlightTask = (taskId, task)
+            inFlightTask = (taskId, generation, task)
         }
-
-        do {
-            let tokens = try await task.value
-            if inFlightTask?.id == taskId { inFlightTask = nil }
-
-            // `invalidate()` can run while the network refresh is suspended.
-            // Persist only after returning to this actor and re-checking the
-            // terminal bit; no await exists between this guard and the writes.
-            guard !invalidated else {
-                print("[OAuth] Discarding refreshed token for \(email): account removed")
-                throw ProviderError.authenticationFailed
-            }
-            try KeychainHelper.save(tokens.accessToken, for: KeychainHelper.accessTokenKey(accountId: accountId))
-            if let newRefresh = tokens.refreshToken {
-                try KeychainHelper.save(newRefresh, for: KeychainHelper.refreshTokenKey(accountId: accountId))
-            }
-            return tokens.accessToken
-        } catch {
-            if inFlightTask?.id == taskId { inFlightTask = nil }
-            throw error
+        defer { if inFlightTask?.id == taskId { inFlightTask = nil } }
+        let token: String
+        do { token = try await task.value }
+        catch CredentialRefreshError.requiresAuthorization { throw ProviderError.authenticationFailed }
+        catch CredentialRefreshError.inactive { throw ProviderError.authenticationFailed }
+        guard !invalidated, store.activation(accountId: accountId)?.generation == generation else {
+            throw ProviderError.authenticationFailed
         }
+        return token
     }
 }
 
@@ -1307,6 +1287,9 @@ actor AccountManager {
         guard !isRuntimeRemoved(account.id) else {
             throw ProviderError.notConnected
         }
+        if account.provider == .gmail || account.provider == .outlook {
+            try ProviderCredentialStore.shared.migrateLegacy(accountId: account.id)
+        }
         // Calendar-only accounts skip email provider creation
         if account.calendarOnly {
             switch account.provider {
@@ -1538,6 +1521,8 @@ actor AccountManager {
         // await. The synchronous runtime fence above also makes every captured
         // OAuth accessor refuse cached-token and refresh paths immediately.
         if let caldavConfigIds {
+            // The cleanup ledger retries any durable storage failure.
+            try? ProviderCredentialStore.shared.remove(accountId: account.id)
             KeychainHelper.delete(key: KeychainHelper.passwordKey(accountId: account.id))
             KeychainHelper.delete(key: KeychainHelper.accessTokenKey(accountId: account.id))
             KeychainHelper.delete(key: KeychainHelper.refreshTokenKey(accountId: account.id))
@@ -1621,20 +1606,27 @@ actor AccountManager {
 
     /// Build a `@Sendable` access token closure that uses the shared OAuthRefreshCoordinator
     /// for this account. Mail + calendar providers for the same account share one coordinator,
-    /// preventing concurrent refresh token rotation races.
-    private func makeOAuthAccessor(
+    /// preventing concurrent refresh token rotation races. Resolve the current
+    /// activation per invocation so a temporary read failure cannot poison a
+    /// provider retained for later foreground reconnects.
+    func makeOAuthAccessor(
         accountId: String,
         email: String,
+        store: ProviderCredentialStore = .shared,
+        refreshCoordinator: OAuthRefreshCoordinator? = nil,
         refresher: @escaping @Sendable (_ refreshToken: String) async throws -> OAuthTokens
     ) -> @Sendable (_ forceRefresh: Bool) async throws -> String {
-        let coordinator = oauthCoordinator(for: accountId)
+        let coordinator = refreshCoordinator ?? oauthCoordinator(for: accountId)
         return { @Sendable forceRefresh in
             guard !self.isRuntimeRemoved(accountId) else {
                 throw ProviderError.authenticationFailed
             }
-            if !forceRefresh,
-               let token = KeychainHelper.loadString(key: KeychainHelper.accessTokenKey(accountId: accountId)) {
-                return token
+            guard let generation = store.activation(accountId: accountId)?.generation else {
+                throw ProviderError.authenticationFailed
+            }
+            if !forceRefresh, let tokens = store.current(accountId: accountId, generation: generation),
+               !tokens.accessToken.isEmpty, tokens.expiresAt.map({ $0 > Date().addingTimeInterval(60) }) ?? true {
+                return tokens.accessToken
             }
             let token = try await coordinator.refresh(accountId: accountId, email: email, using: refresher)
             guard !self.isRuntimeRemoved(accountId) else {

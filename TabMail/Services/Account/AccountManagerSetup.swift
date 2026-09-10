@@ -70,6 +70,15 @@ extension AccountManager {
         }
     }
 
+    /// All mail/calendar installations run on the account lifecycle actor.
+    func installOAuthCredentials(accountId: String, tokens: OAuthTokens, expectedGeneration: String? = nil) throws {
+        guard !isRuntimeRemoved(accountId) else { throw ProviderError.authenticationFailed }
+        try ProviderCredentialStore.shared.migrateLegacy(accountId: accountId)
+        try ProviderCredentialStore.shared.install(accountId: accountId,
+            tokens: .init(accessToken: tokens.accessToken, refreshToken: tokens.refreshToken, expiresAt: tokens.expiresAt),
+            expectedGeneration: expectedGeneration)
+    }
+
     // MARK: - Shared OAuth Account Setup
 
     /// Common setup for Gmail and Outlook accounts. Handles duplicate detection,
@@ -85,10 +94,7 @@ extension AccountManager {
         // differently-cased address as a new row and create a duplicate),
         // update its tokens and reconnect instead of creating a duplicate.
         if let existing = try await existingAccount(forEmail: email, provider: provider) {
-            try KeychainHelper.save(tokens.accessToken, for: KeychainHelper.accessTokenKey(accountId: existing.id))
-            if let refresh = tokens.refreshToken {
-                try KeychainHelper.save(refresh, for: KeychainHelper.refreshTokenKey(accountId: existing.id))
-            }
+            try installOAuthCredentials(accountId: existing.id, tokens: tokens)
             await disconnectAccount(existing)
             guard existing.calendarOnly else {
                 // Fully-configured mail account — token refresh + reconnect.
@@ -124,24 +130,31 @@ extension AccountManager {
             provider: provider
         )
 
-        // Store tokens in Keychain
-        try KeychainHelper.save(tokens.accessToken, for: KeychainHelper.accessTokenKey(accountId: account.id))
-        if let refresh = tokens.refreshToken {
-            try KeychainHelper.save(refresh, for: KeychainHelper.refreshTokenKey(accountId: account.id))
+        let stored = try await Self.persistNewOAuthAccount(account, database: dbPool) { account in
+            try await self.installOAuthCredentials(accountId: account.id, tokens: tokens)
         }
+        try await activateMailAccount(stored)
+        return stored
+    }
 
-        // Save to GRDB — notify NavigationStore to refresh
-        // Auto-promote to primary if no other primary account exists.
-        let acct = account
-        try await dbPool.write { db in
+    /// Commit the cleanup/retry owner before writing any provider secret. A
+    /// failed or interrupted install leaves the same account addressable by
+    /// foreground migration, another sign-in, or ordinary account removal.
+    nonisolated static func persistNewOAuthAccount(
+        _ account: Account,
+        database: PrioritizedDatabase,
+        install: @Sendable (Account) async throws -> Void
+    ) async throws -> Account {
+        let stored = try await database.write { db in
             let hasPrimary = try Account.filter(Column("isPrimary") == true && Column("isActive") == true).fetchCount(db) > 0
-            var toInsert = acct
-            if !hasPrimary { toInsert.isPrimary = true }
-            try toInsert.insert(db)
+            var row = account
+            if !hasPrimary { row.isPrimary = true }
+            try row.insert(db)
+            return row
         }
-
-        try await activateMailAccount(account)
-        return account
+        NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
+        try await install(stored)
+        return stored
     }
 
     /// Post-persist activation shared by a freshly-inserted mail account and
@@ -560,9 +573,7 @@ extension AccountManager {
         let upstreamAccessToken: String?
         switch account.provider {
         case .gmail, .outlook:
-            upstreamAccessToken = KeychainHelper.loadString(
-                key: KeychainHelper.accessTokenKey(accountId: acctId)
-            )
+            upstreamAccessToken = ProviderCredentialStore.shared.current(accountId: acctId)?.accessToken
         default:
             upstreamAccessToken = nil
         }
@@ -762,32 +773,58 @@ extension AccountManager {
     }
 
     /// Re-authenticate Gmail via OAuth and reconnect.
-    func reauthenticateGmail(for account: Account) async throws {
+    func reauthenticateGmail(
+        for account: Account,
+        authenticate: (@Sendable () async throws -> OAuthTokens)? = nil,
+        reconnect: (@Sendable (Account) async throws -> Void)? = nil
+    ) async throws {
         guard account.provider == .gmail else { return }
 
-        let tokens = try await oauthService.authenticateGoogle()
-        try KeychainHelper.save(tokens.accessToken, for: KeychainHelper.accessTokenKey(accountId: account.id))
-        if let refresh = tokens.refreshToken {
-            try KeychainHelper.save(refresh, for: KeychainHelper.refreshTokenKey(accountId: account.id))
+        guard !isRuntimeRemoved(account.id) else { throw ProviderError.authenticationFailed }
+        try ProviderCredentialStore.shared.migrateLegacy(accountId: account.id)
+        let generation = ProviderCredentialStore.shared.activation(accountId: account.id)?.generation
+        let tokens: OAuthTokens
+        if let authenticate { tokens = try await authenticate() }
+        else { tokens = try await oauthService.authenticateGoogle() }
+        guard !isRuntimeRemoved(account.id),
+              ProviderCredentialStore.shared.activation(accountId: account.id)?.generation == generation else {
+            throw ProviderError.authenticationFailed
         }
+        try installOAuthCredentials(accountId: account.id, tokens: tokens, expectedGeneration: generation)
 
         // Reconnect with fresh tokens
-        await disconnectAccount(account)
-        try await connectAccount(account)
+        if let reconnect { try await reconnect(account) }
+        else {
+            await disconnectAccount(account)
+            try await connectAccount(account)
+        }
     }
 
     /// Re-authenticate Outlook via OAuth and reconnect.
-    func reauthenticateMicrosoft(for account: Account) async throws {
+    func reauthenticateMicrosoft(
+        for account: Account,
+        authenticate: (@Sendable () async throws -> OAuthTokens)? = nil,
+        reconnect: (@Sendable (Account) async throws -> Void)? = nil
+    ) async throws {
         guard account.provider == .outlook else { return }
 
-        let tokens = try await oauthService.authenticateMicrosoft()
-        try KeychainHelper.save(tokens.accessToken, for: KeychainHelper.accessTokenKey(accountId: account.id))
-        if let refresh = tokens.refreshToken {
-            try KeychainHelper.save(refresh, for: KeychainHelper.refreshTokenKey(accountId: account.id))
+        guard !isRuntimeRemoved(account.id) else { throw ProviderError.authenticationFailed }
+        try ProviderCredentialStore.shared.migrateLegacy(accountId: account.id)
+        let generation = ProviderCredentialStore.shared.activation(accountId: account.id)?.generation
+        let tokens: OAuthTokens
+        if let authenticate { tokens = try await authenticate() }
+        else { tokens = try await oauthService.authenticateMicrosoft() }
+        guard !isRuntimeRemoved(account.id),
+              ProviderCredentialStore.shared.activation(accountId: account.id)?.generation == generation else {
+            throw ProviderError.authenticationFailed
         }
+        try installOAuthCredentials(accountId: account.id, tokens: tokens, expectedGeneration: generation)
 
         // Reconnect with fresh tokens
-        await disconnectAccount(account)
-        try await connectAccount(account)
+        if let reconnect { try await reconnect(account) }
+        else {
+            await disconnectAccount(account)
+            try await connectAccount(account)
+        }
     }
 }

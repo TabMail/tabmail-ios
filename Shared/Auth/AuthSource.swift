@@ -20,6 +20,11 @@ protocol AuthSource: Sendable {
     /// Force refresh. Called on 401 or when `current()` returns nil/expired.
     /// Throws `AuthError` on permanent failure (revoked, invalid refresh token).
     func refresh() async throws -> String
+    func refresh(rejecting token: String) async throws -> String
+}
+
+extension AuthSource {
+    func refresh(rejecting token: String) async throws -> String { try await refresh() }
 }
 
 enum AuthError: Error, Sendable {
