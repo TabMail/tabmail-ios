@@ -221,9 +221,12 @@ enum EmailFilter {
     /// never a line break; a destination contains no whitespace (the converter
     /// percent-encodes it). Anything else — a bare `[note]`, an unterminated
     /// `[label](…`, `[x] (…)` — is not a link and is copied through unchanged.
-    /// Callers bound the INPUT (`snippetLinkScanChars` scalars), so cost is capped.
+    /// An unescaped `[` cannot appear inside a label (the converter emits `\[`),
+    /// and both groups are possessive, so a run of `[` costs O(n) rather than
+    /// each opener re-scanning to the end of the window. Callers bound the INPUT
+    /// (`snippetLinkScanChars` scalars), so cost is capped.
     private static let markdownLinkRegex = try! NSRegularExpression(
-        pattern: #"\[((?:\\.|[^\]\\\v])*)\]\((?:\\.|[^)\\\s])*\)"#)
+        pattern: #"\[((?:\\.|[^\[\]\\\v])*+)\]\((?:\\.|[^)\\\s])*+\)"#)
     private static let labelEscapeRegex = try! NSRegularExpression(pattern: #"\\(.)"#)
 
     static func unwrapMarkdownLinks(_ text: String) -> String {

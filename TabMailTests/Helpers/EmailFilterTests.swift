@@ -168,6 +168,13 @@ struct EmailFilterTests {
         let result = EmailFilter.snippetFromPlainText(combining)
         #expect(Date().timeIntervalSince(start2) < 2)
         #expect(result.hasPrefix("["))
+        // A run of openers must be linear: with `[` admitted inside a label every
+        // opener re-scans to the end of the window (measured ~455 ms for 4,000).
+        let openers = String(repeating: "[", count: EmailFilter.snippetLinkScanChars)
+        let start3 = Date()
+        let opened = EmailFilter.snippetFromPlainText(openers)
+        #expect(Date().timeIntervalSince(start3) < 0.25)
+        #expect(opened.hasPrefix("[["))
     }
 
     @Test("image-only mail previews as the no-text placeholder, never as an empty snippet")
