@@ -163,7 +163,10 @@ final class ProviderCredentialStore: @unchecked Sendable {
         let captured = try gate.read(key)
         let grant = try JSONDecoder().decode(Grant.self, from: captured)
         if let rejectedToken, let current = current(accountId: accountId, generation: generation),
-           !current.accessToken.isEmpty, current.accessToken != rejectedToken { return current }
+           !current.accessToken.isEmpty, current.accessToken != rejectedToken {
+            CredentialRefreshGate.diagnostic?("stage=lookup outcome=peer_credential_reused")
+            return current
+        }
         guard let refresh = grant.tokens.refreshToken, !refresh.isEmpty else {
             throw CredentialRefreshError.requiresAuthorization
         }
@@ -180,8 +183,18 @@ final class ProviderCredentialStore: @unchecked Sendable {
                 tokens: Tokens(accessToken: tokens.accessToken,
                                refreshToken: tokens.refreshToken ?? consumed, expiresAt: tokens.expiresAt)))
         }
-        guard completion.persisted, activation(accountId: accountId)?.generation == generation,
-              let result = current(accountId: accountId, generation: generation) else { throw CredentialRefreshError.inactive }
+        guard completion.persisted else {
+            CredentialRefreshGate.diagnostic?("stage=authorization outcome=refused_not_persisted")
+            throw CredentialRefreshError.inactive
+        }
+        guard activation(accountId: accountId)?.generation == generation else {
+            CredentialRefreshGate.diagnostic?("stage=authorization outcome=activation_changed")
+            throw CredentialRefreshError.inactive
+        }
+        guard let result = current(accountId: accountId, generation: generation) else {
+            CredentialRefreshGate.diagnostic?("stage=authorization outcome=credential_unavailable")
+            throw CredentialRefreshError.inactive
+        }
         return result
     }
 

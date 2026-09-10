@@ -1125,6 +1125,12 @@ final class NotificationService: UNNotificationServiceExtension {
     private static func attemptSilentResubscribe(
         accountId: String, accountEmail: String
     ) async -> Bool {
+        let started = ProcessInfo.processInfo.systemUptime
+        NSELog.step("NSE credential: scope=imap stage=reconnect outcome=started")
+        defer {
+            let elapsed = Int((ProcessInfo.processInfo.systemUptime - started) * 1000)
+            NSELog.step("NSE credential: scope=imap stage=end elapsed_ms=\(elapsed)")
+        }
         guard let imap = NSEState.getIMAPAccount(for: accountId) else {
             NSELog.step("NSE resubscribe: no shared IMAP config")
             return false
@@ -1149,6 +1155,7 @@ final class NotificationService: UNNotificationServiceExtension {
               NSEState.findAccountId(for: accountEmail) == accountId,
               let context = NSEState.reconnectContext(userId: userId, accountEmail: accountEmail,
                   nseCapable: visualCapable) else {
+            NSELog.step("NSE credential: scope=imap stage=prepare outcome=cancelled_or_context_changed")
             return false
         }
 
@@ -1188,7 +1195,7 @@ final class NotificationService: UNNotificationServiceExtension {
                 NSELog.step("NSE resubscribe: not active, HTTP \(code)")
                 return false
             }
-            return !Task.isCancelled
+            let valid = !Task.isCancelled
                 && SharedKeychain.getPassword(for: accountId) == password
                 && NSEState.getIMAPAccount(for: accountId) == imap
                 && NSETokenManager.store.loadActiveSession()?.generation == sessionGeneration
@@ -1196,7 +1203,10 @@ final class NotificationService: UNNotificationServiceExtension {
                 && NSEState.findAccountId(for: accountEmail) == accountId
                 && NSEState.reconnectContext(userId: userId, accountEmail: accountEmail,
                     nseCapable: visualCapable) == context
+            NSELog.step("NSE credential: scope=imap stage=finish outcome=\(valid ? "confirmed_active" : "cancelled_or_context_changed") http=\(code)")
+            return valid
         } catch {
+            NSELog.step("NSE credential: scope=imap stage=finish outcome=\(NSELog.credentialFailure(error))")
             NSELog.step("NSE resubscribe: HTTP failed")
             return false
         }

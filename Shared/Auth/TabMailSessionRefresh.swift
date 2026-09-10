@@ -20,6 +20,7 @@ enum TabMailSessionRefresh {
             throw CredentialRefreshError.unavailable
         }
         if !force && session.expiresAt > Int(Date().timeIntervalSince1970) + 60 {
+            CredentialRefreshGate.diagnostic?("stage=lookup outcome=cached_usable")
             return Result(session: session, generation: record.generation, persisted: true)
         }
         guard record.generation != nil, !session.refreshToken.isEmpty else {
