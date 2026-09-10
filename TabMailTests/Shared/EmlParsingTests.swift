@@ -47,6 +47,40 @@ struct EmlParsingTests {
         #expect(parsed.bodyHtml.contains("HELLO FROM HTML BODY"))
     }
 
+    @Test("parse decodes RFC 2047 display names in From/To/Cc for rendering")
+    func parseDecodesEncodedDisplayNames() throws {
+        // `=?UTF-8?B?Sm9zw6k=?=` is "José". SwiftMail may hand the name back
+        // in wire form; TabMail's envelope must carry the decoded text, since
+        // EmlMarker renders and indexes it without any further MIME decoding.
+        let rfc822 = """
+        From: =?UTF-8?B?Sm9zw6k=?= <sender@example.com>\r
+        To: =?UTF-8?Q?Ren=C3=A9e?= <to@example.com>, Plain <plain@example.com>\r
+        Cc: =?UTF-8?B?7ZWc7IaU?= <cc@example.com>\r
+        Subject: =?UTF-8?B?7ZWc7IaU?= subject\r
+        Date: Wed, 2 Oct 2025 01:50:00 +0000\r
+        Content-Type: text/plain; charset=utf-8\r
+        \r
+        body
+        """
+        let parsed = try #require(EmlParsing.parse(rawBytes: Data(rfc822.utf8)))
+
+        let from = try #require(parsed.envelope.from)
+        #expect(from.contains("José"))
+        #expect(from.contains("sender@example.com"))
+        #expect(!from.contains("=?"))
+        #expect(parsed.envelope.to.contains { $0.contains("Renée") && $0.contains("to@example.com") })
+        #expect(parsed.envelope.to.contains { $0.contains("Plain") && $0.contains("plain@example.com") })
+        #expect(parsed.envelope.cc.contains { $0.contains("한솔") && $0.contains("cc@example.com") })
+        #expect(parsed.envelope.subject == "한솔 subject")
+        #expect(!parsed.envelope.to.contains { $0.contains("=?") })
+        #expect(!parsed.envelope.cc.contains { $0.contains("=?") })
+
+        // The decoded name reaches the rendered marker text, not only the envelope.
+        let html = EmlMarker.build(filename: "n.eml", partSection: "1", envelope: parsed.envelope, bodyHtml: parsed.bodyHtml)
+        #expect(html.contains("José"))
+        #expect(!html.contains("=?UTF-8?"))
+    }
+
     @Test("parse text/plain message returns plainTextToHTML-converted body")
     func parsePlainTextBody() throws {
         let rfc822 = """
