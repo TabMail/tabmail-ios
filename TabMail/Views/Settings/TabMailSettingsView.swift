@@ -12,6 +12,7 @@ struct TabMailSettingsView: View {
     @AppStorage(ChatPillState.maxMemoryTurnsKey) private var maxMemoryTurns = ChatPillState.defaultMaxMemoryTurns
     @AppStorage(ChatPillState.autoDictationKey) private var autoDictation = false
     @AppStorage(AccountManager.markReadOnArchiveDeleteKey) private var markReadOnArchiveDelete = true
+    @AppStorage(SummaryBubbleView.showAISummariesKey) private var showAISummaries = true
     @AppStorage(ProactiveNotifyService.enabledKey) private var proactiveEnabled = true
     @AppStorage(ProactiveNotifyService.windowDaysKey) private var windowDays = ProactiveNotifyService.defaultWindowDays
     @AppStorage(ProactiveNotifyService.advanceMinutesKey) private var advanceMinutes = ProactiveNotifyService.defaultAdvanceMinutes
@@ -241,6 +242,20 @@ struct TabMailSettingsView: View {
             }
 
             Section("User Interface") {
+                Toggle(isOn: $showAISummaries) {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Show AI Summaries")
+                            Text("Display the AI summary above each email")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "wand.and.sparkles")
+                            .foregroundStyle(.primary)
+                    }
+                }
+
                 Toggle(isOn: $autoDictation) {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
