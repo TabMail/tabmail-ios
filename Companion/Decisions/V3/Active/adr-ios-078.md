@@ -217,3 +217,14 @@ within that directive's intent and are explicitly surfaced for owner veto.
   owner's preferred behavior already held.
 - **No durable exception state.** Exempt processing is direct and ephemeral — no marker columns,
   no triggers, no redrive. IOS-AI-004's retirement of PR #39's durable machinery stands.
+
+**Amendment 2026-09-10 (iOS #153, PR #154).** A THIRD `.hidden` outcome joins the two presentation
+states listed in Decision 1: the user preference **"Show AI Summaries"** (`UserDefaults` key
+`SummaryBubbleView.showAISummariesKey`, default ON), surfaced as a toggle in Settings → TabMail →
+User Interface and as "Hide Summary Bubbles" in the bubble's long-press popover
+(`ReportConcernExtraAction`). It is checked FIRST in `SummaryBubbleView.displayMode`
+(`userHidden`), before demo consent and before the content check, and it is a USER-CHOSEN
+presentation gate in the same class as the demo-consent check — not an eligibility policy. It does
+not narrow this ADR: processing, caching and the never-gate-existing-content-by-processing-policy
+rule are untouched, and re-enabling the toggle renders the retained summaries immediately.
+Thunderbird's counterpart is a Settings → Appearance toggle only (tabmail-thunderbird #34).
