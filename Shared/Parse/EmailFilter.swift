@@ -165,9 +165,12 @@ enum EmailFilter {
     /// newlines, tabs, signature separators, etc. that need collapsing).
     static func snippetFromPlainText(_ text: String, maxChars: Int = 150) -> String {
         // Truncate early — only need ~500 chars to guarantee 150 clean chars.
-        // Markdown links are unwrapped BEFORE the cut so a long destination can
-        // neither leak into the preview nor eat the scan budget (#148).
-        let truncated = unwrapMarkdownLinks(text, limit: snippetScanChars)
+        // Markdown links are unwrapped BEFORE that cut so a long destination can
+        // neither leak into the preview nor eat the scan budget (#148), but the
+        // unwrap itself only ever sees `snippetLinkScanChars` of input: a link
+        // longer than that degrades to raw Markdown instead of walking the body.
+        let truncated = unwrapMarkdownLinks(String(text.prefix(snippetLinkScanChars)),
+                                            limit: snippetScanChars)
         var result = ""
         result.reserveCapacity(maxChars)
         var lastWasSpace = true
@@ -195,13 +198,19 @@ enum EmailFilter {
     /// Characters `snippetFromPlainText` scans before giving up on filling `maxChars`.
     private static let snippetScanChars = 500
 
+    /// Input characters `unwrapMarkdownLinks` may read. Bounds the worst case at
+    /// `snippetScanChars` × this (every `[` re-walks to the end of the window),
+    /// and is comfortably above the longest real tracking URL.
+    static let snippetLinkScanChars = 4_000
+
     /// Renders Markdown links as their bare label for SNIPPET display only (#148):
     /// `[label](destination)` → `label`, reversing the escapes `htmlToPlainText`'s
     /// `finishLink` adds (backslash-escaped punctuation, `&amp;`). The stored FTS
     /// text and the agent read path keep the full link; only the preview drops it.
     /// Anything that is not a complete single-line link — a bare `[note]`, an
     /// unterminated `[label](…` — is copied through unchanged. Emits at most
-    /// `limit` characters so an unbounded body is never walked to its end.
+    /// `limit` characters; the caller bounds the INPUT (`snippetLinkScanChars`),
+    /// since each `[` walks forward to the end of its line looking for `](…)`.
     static func unwrapMarkdownLinks(_ text: String, limit: Int) -> String {
         var out = ""
         out.reserveCapacity(limit)

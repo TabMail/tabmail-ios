@@ -134,6 +134,31 @@ struct EmailFilterTests {
         #expect(EmailFilter.snippetFromPlainText("[x] (https://example.com)") == "[x] (https://example.com)")
     }
 
+    @Test("snippetFromPlainText rejects whitespace, a trailing backslash, or an escaped newline inside a link")
+    func snippetKeepsMalformedLinks() {
+        // Prose that merely looks like a link — the destination has a space
+        #expect(EmailFilter.snippetFromPlainText("[note](see below) x") == "[note](see below) x")
+        // Destination ends in a dangling escape
+        #expect(EmailFilter.snippetFromPlainText("[a](x\\") == "[a](x\\")
+        // Label escape immediately before a line break
+        #expect(EmailFilter.snippetFromPlainText("[a\\\nb](https://example.com)") == "[a\\ b](https://example.com)")
+    }
+
+    @Test("snippetFromPlainText never reads a link past its scan window")
+    func snippetLinkScanIsBounded() {
+        // A `[` whose closing `](…)` lies beyond the window must be treated as
+        // plain text, not chased to the end of the body — the base's O(500)
+        // cost bound that #148 must preserve (reviewer finding R1).
+        let filler = String(repeating: "a", count: EmailFilter.snippetLinkScanChars)
+        let text = "[" + filler + "](https://example.com) tail"
+        #expect(EmailFilter.snippetFromPlainText(text).hasPrefix("[aaaa"))
+        // Pathological: many openers in front of a huge single-line body
+        let body = String(repeating: "[", count: 400) + String(repeating: "b", count: 4_000_000)
+        let start = Date()
+        _ = EmailFilter.snippetFromPlainText(body)
+        #expect(Date().timeIntervalSince(start) < 2)
+    }
+
     @Test("snippetFromPlainText is not starved by a long link destination")
     func snippetSurvivesLongDestination() {
         let destination = "https://example.com/" + String(repeating: "t", count: 800)
