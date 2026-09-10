@@ -111,6 +111,110 @@ struct EmailFilterTests {
         #expect(result.count <= 150)
     }
 
+    // MARK: - snippetFromPlainText Markdown links (#148)
+
+    @Test("snippetFromPlainText renders a Markdown link as its label")
+    func snippetUnwrapsMarkdownLink() {
+        let text = "Click [here](https://example.com/a?b=c) now"
+        #expect(EmailFilter.snippetFromPlainText(text) == "Click here now")
+    }
+
+    @Test("snippetFromPlainText unwraps every link and reverses the converter's label escapes")
+    func snippetUnwrapsEscapedLabels() {
+        // `htmlToPlainText.finishLink` escapes `[]*_` etc. with a backslash and `&` as `&amp;`
+        let text = "[Terms &amp; Conditions](https://example.com/t) or [\\[beta\\]](https://example.com/b\\))"
+        #expect(EmailFilter.snippetFromPlainText(text) == "Terms & Conditions or [beta]")
+    }
+
+    @Test("snippetFromPlainText leaves non-link brackets and unterminated links alone")
+    func snippetKeepsNonLinks() {
+        #expect(EmailFilter.snippetFromPlainText("see [note] and (aside)") == "see [note] and (aside)")
+        #expect(EmailFilter.snippetFromPlainText("[label](https://example.com/unterminated") == "[label](https://example.com/unterminated")
+        #expect(EmailFilter.snippetFromPlainText("[a\nb](https://example.com)") == "[a b](https://example.com)")
+        #expect(EmailFilter.snippetFromPlainText("[x] (https://example.com)") == "[x] (https://example.com)")
+        // A `[` never belongs to a label: the inner link unwraps, the outer bracket stays
+        #expect(EmailFilter.snippetFromPlainText("[a [b](https://example.com) c") == "[a b c")
+    }
+
+    @Test("snippetFromPlainText rejects whitespace, a trailing backslash, or an escaped newline inside a link")
+    func snippetKeepsMalformedLinks() {
+        // Prose that merely looks like a link — the destination has a space
+        #expect(EmailFilter.snippetFromPlainText("[note](see below) x") == "[note](see below) x")
+        // Destination ends in a dangling escape
+        #expect(EmailFilter.snippetFromPlainText("[a](x\\") == "[a](x\\")
+        // Label escape immediately before a line break
+        #expect(EmailFilter.snippetFromPlainText("[a\\\nb](https://example.com)") == "[a\\ b](https://example.com)")
+        // Destination escape immediately before a line break: a link never spans lines
+        #expect(EmailFilter.snippetFromPlainText("[notice](x\\\nACTION) tail") == "[notice](x\\ ACTION) tail")
+    }
+
+    @Test("snippetFromPlainText never reads a link past its scan window")
+    func snippetLinkScanIsBounded() {
+        // A `[` whose closing `](…)` lies beyond the window must be treated as
+        // plain text, not chased to the end of the body — the helper's
+        // long-standing O(500) cost bound that #148 must preserve.
+        let filler = String(repeating: "a", count: EmailFilter.snippetLinkScanChars)
+        let text = "[" + filler + "](https://example.com) tail"
+        #expect(EmailFilter.snippetFromPlainText(text).hasPrefix("[aaaa"))
+        // Pathological: many openers in front of a huge single-line body
+        let body = String(repeating: "[", count: 400) + String(repeating: "b", count: 4_000_000)
+        let start = Date()
+        _ = EmailFilter.snippetFromPlainText(body)
+        #expect(Date().timeIntervalSince(start) < 2)
+        // The window is bounded in SCALARS, not Characters: a link that sits
+        // within 4,000 Characters but past 4,000 scalars stays raw.
+        let cluster = "a" + String(repeating: "\u{0301}", count: EmailFilter.snippetLinkScanChars - 2)
+        let pastWindow = EmailFilter.snippetFromPlainText(cluster + " [x](https://example.com)")
+        #expect(!pastWindow.contains("x"))
+        // Combining-mark-heavy text must also stay cheap.
+        let zalgo = String(repeating: "a" + String(repeating: "\u{0301}", count: 100), count: 3_500)
+        let combining = String(repeating: "[", count: 500) + zalgo
+        let start2 = Date()
+        let result = EmailFilter.snippetFromPlainText(combining)
+        #expect(Date().timeIntervalSince(start2) < 2)
+        #expect(result.hasPrefix("["))
+        // A run of openers must be linear: with `[` admitted inside a label every
+        // opener re-scans to the end of the window (measured ~455 ms for 4,000).
+        let openers = String(repeating: "[", count: EmailFilter.snippetLinkScanChars)
+        let start3 = Date()
+        let opened = EmailFilter.snippetFromPlainText(openers)
+        #expect(Date().timeIntervalSince(start3) < 0.25)
+        #expect(opened.hasPrefix("[["))
+    }
+
+    @Test("image-only mail previews as the no-text placeholder, never as an empty snippet")
+    func snippetImageOnlyMailIsNeverEmpty() {
+        // The converter emits `[](destination)` for an anchor wrapping only an image.
+        let html = (0..<3).map { i in "<a href=\"https://example.com/t/\(i)\"><img src=\"i.png\"></a>" }.joined()
+        let plain = EmailFilter.htmlToPlainText(html)
+        #expect(plain.contains("](https://example.com/t/0)"))
+        let snippet = EmailFilter.snippetFromPlainText(plain)
+        #expect(snippet == EmailFilter.noTextSnippet)
+        #expect(!snippet.isEmpty)
+        // Whitespace-only text is the same population; genuinely absent text is not.
+        #expect(EmailFilter.snippetFromPlainText(" \n\t ") == EmailFilter.noTextSnippet)
+        #expect(EmailFilter.snippetFromPlainText("") == "")
+        #expect(EmailFilter.cleanSnippet("") == "")
+        // Image links followed by real text still preview the text.
+        #expect(EmailFilter.snippetFromPlainText(plain + " Hello there") == "Hello there")
+    }
+
+    @Test("snippetFromPlainText is not starved by a long link destination")
+    func snippetSurvivesLongDestination() {
+        let destination = "https://example.com/" + String(repeating: "t", count: 800)
+        let text = "Hello [Unsubscribe](\(destination)) and the rest of the message"
+        #expect(EmailFilter.snippetFromPlainText(text) == "Hello Unsubscribe and the rest of the message")
+    }
+
+    @Test("htmlToPlainText + snippetFromPlainText hides converted anchors while the stored text keeps them")
+    func snippetHidesConvertedAnchorDestination() {
+        let html = "<p>Hi, please <a href=\"https://example.com/x?y=1&amp;z=2\">confirm &amp; continue</a> today.</p>"
+        let plain = EmailFilter.htmlToPlainText(html)
+        #expect(plain.contains("](https://example.com/x?y=1&z=2)"))
+        #expect(EmailFilter.snippetFromPlainText(plain) == "Hi, please confirm & continue today.")
+        #expect(EmailFilter.cleanSnippet(plain) == "Hi, please confirm & continue today.")
+    }
+
     // MARK: - htmlToPlainText
 
     @Test("htmlToPlainText strips tags")

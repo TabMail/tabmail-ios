@@ -164,8 +164,15 @@ enum EmailFilter {
     /// Use for snippet extraction from textBody (already plain text, but may contain
     /// newlines, tabs, signature separators, etc. that need collapsing).
     static func snippetFromPlainText(_ text: String, maxChars: Int = 150) -> String {
-        // Truncate early — only need ~500 chars to guarantee 150 clean chars
-        let truncated = text.prefix(500)
+        // Truncate early — the loop below stops at `maxChars`, so only a bounded
+        // window of input is ever read. Markdown links are unwrapped INSIDE that
+        // window (#148): a link longer than the window degrades to raw Markdown
+        // instead of walking the body.
+        // The window is counted in UNICODE SCALARS, not Characters: a grapheme
+        // cluster can carry hundreds of combining marks, so a Character-counted
+        // prefix would admit megabytes for the per-`[` re-walk to copy.
+        let window = String(String.UnicodeScalarView(text.unicodeScalars.prefix(snippetLinkScanChars)))
+        let truncated = unwrapMarkdownLinks(window)
         var result = ""
         result.reserveCapacity(maxChars)
         var lastWasSpace = true
@@ -187,7 +194,55 @@ enum EmailFilter {
             if result.count >= maxChars { break }
         }
         while result.hasSuffix(" ") { result.removeLast() }
+        // Non-empty text that leaves nothing previewable — image-only mail whose
+        // links all have empty labels, or whitespace-only bodies — gets a visible
+        // placeholder (owner 2026-09-09, #149 review). An EMPTY snippet is the
+        // inbox loader's "not derived yet" sentinel and would re-fetch the body on
+        // every reload; a derived-but-empty preview must never look like that.
+        if result.isEmpty, !text.isEmpty { return noTextSnippet }
         return result
+    }
+
+    /// Snippet shown for a message whose text yields nothing previewable.
+    /// Same bracketed style as `BodyFetchProcessor`'s `[attachment]` placeholder.
+    static let noTextSnippet = "[no text]"
+
+    /// Input Unicode scalars `snippetFromPlainText` reads (and `unwrapMarkdownLinks`
+    /// may match within). Scalars, not Characters: a grapheme cluster can carry
+    /// hundreds of combining marks. Comfortably above the longest real tracking URL.
+    static let snippetLinkScanChars = 4_000
+
+    /// Renders Markdown links as their bare label for SNIPPET display only (#148):
+    /// `[label](destination)` → `label`, reversing the escapes `htmlToPlainText`'s
+    /// `finishLink` adds (backslash-escaped punctuation, `&amp;`). The stored FTS
+    /// text and the agent read path keep the full link; only the preview drops it.
+    /// The pattern IS the grammar: a link sits on one line; a backslash escapes the
+    /// next character on either side (`\]` in labels, `\)` in destinations) but
+    /// never a line break; a destination contains no whitespace (the converter
+    /// percent-encodes it). Anything else — a bare `[note]`, an unterminated
+    /// `[label](…`, `[x] (…)` — is not a link and is copied through unchanged.
+    /// An unescaped `[` cannot appear inside a label (the converter emits `\[`),
+    /// and both groups are possessive, so a run of `[` costs O(n) rather than
+    /// each opener re-scanning to the end of the window. Callers bound the INPUT
+    /// (`snippetLinkScanChars` scalars), so cost is capped.
+    private static let markdownLinkRegex = try! NSRegularExpression(
+        pattern: #"\[((?:\\.|[^\[\]\\\v])*+)\]\((?:\\.|[^)\\\s])*+\)"#)
+    private static let labelEscapeRegex = try! NSRegularExpression(pattern: #"\\(.)"#)
+
+    static func unwrapMarkdownLinks(_ text: String) -> String {
+        let ns = text as NSString
+        var out = ""
+        var cursor = 0
+        for match in markdownLinkRegex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+            out += ns.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
+            let label = ns.substring(with: match.range(at: 1))
+            let unescaped = labelEscapeRegex.stringByReplacingMatches(
+                in: label, range: NSRange(location: 0, length: (label as NSString).length), withTemplate: "$1")
+            out += unescaped.replacingOccurrences(of: "&amp;", with: "&")
+            cursor = match.range.location + match.range.length
+        }
+        out += ns.substring(from: cursor)
+        return out
     }
 
     /// Extract plain text from a fetched message body for FTS indexing.
