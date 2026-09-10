@@ -51,20 +51,22 @@ enum EmlParsing {
     static func parse(rawBytes: Data) -> Parsed? {
         guard let message = try? EMLParser.parse(rawBytes) else { return nil }
 
-        // SwiftMail hands back address strings in header wire form: a
-        // display name that could not be written literally stays an RFC 2047
-        // encoded-word (`=?UTF-8?B?...?=`). `EmlMarker` escapes HTML but does
-        // not decode MIME, so the names are decoded here, at the boundary
-        // between the parser and TabMail's rendering/indexing. The decoder is
-        // a no-op on text that carries no encoded-word, so a revision of
-        // SwiftMail that already decodes names is unaffected. Subject is
-        // decoded by the same helper for the same reason.
+        // SwiftMail decodes the Subject itself but hands address strings back
+        // in header wire form: a display name that could not be written
+        // literally stays an RFC 2047 encoded-word (`=?UTF-8?B?...?=`), so the
+        // addr-spec is identified before any decoding can turn name text into
+        // address syntax. `EmlMarker` escapes HTML but does not decode MIME, so
+        // the names are decoded here with SwiftMail's own `decodeMIMEHeader`,
+        // the decoder that produced the Subject: it carries the full charset
+        // table and does bounded work on malformed input. The Subject is passed
+        // through untouched; decoding it a second time would turn a literal
+        // encoded-word-shaped subject into its decoded form.
         let envelope = EmlMarker.Envelope(
-            subject: message.subject.map(RFC5322Parse.decodeRFC2047),
-            from: message.from.map(RFC5322Parse.decodeRFC2047),
+            subject: message.subject,
+            from: message.from?.decodeMIMEHeader(),
             date: message.date,
-            to: message.to.map(RFC5322Parse.decodeRFC2047),
-            cc: message.cc.map(RFC5322Parse.decodeRFC2047)
+            to: message.to.map { $0.decodeMIMEHeader() },
+            cc: message.cc.map { $0.decodeMIMEHeader() }
         )
 
         let bodyHtml: String

@@ -81,6 +81,62 @@ struct EmlParsingTests {
         #expect(!html.contains("=?UTF-8?"))
     }
 
+    @Test("parse keeps a literal encoded-word-shaped subject and decodes legacy-charset names")
+    func parseDecodesLegacyCharsetNamesAndKeepsLiteralSubject() throws {
+        // The Subject below is the OUTER encoding of the literal text
+        // `=?UTF-8?B?Sm9l?=` (what `RFC2047.encodeHeaderValue` emits for a
+        // subject that merely looks like an encoded-word). SwiftMail decodes
+        // that outer layer once; the app must not decode the literal again.
+        // The names use charsets outside the minimal app decoder's table.
+        let rfc822 = """
+        From: =?windows-1252?B?Sm9z6Q==?= <sender@example.com>\r
+        To: =?windows-1252?Q?Jos=E9?= <to@example.com>\r
+        Cc: =?ISO-8859-2?Q?=A3ukasz?= <cc@example.com>\r
+        Subject: =?UTF-8?B?PT9VVEYtOD9CP1NtOWw/PQ==?=\r
+        Date: Wed, 2 Oct 2025 01:50:00 +0000\r
+        Content-Type: text/plain; charset=utf-8\r
+        \r
+        body
+        """
+        let parsed = try #require(EmlParsing.parse(rawBytes: Data(rfc822.utf8)))
+
+        #expect(parsed.envelope.subject == "=?UTF-8?B?Sm9l?=")
+        #expect(parsed.envelope.from == "José <sender@example.com>")
+        #expect(parsed.envelope.to == ["José <to@example.com>"])
+        #expect(parsed.envelope.cc == ["Łukasz <cc@example.com>"])
+        #expect(parsed.bodyHtml.contains("body"))
+
+        let metadata = EmailFilter.parseEmlSectionMetadata(
+            html: EmlMarker.build(filename: "l.eml", partSection: "1", envelope: parsed.envelope, bodyHtml: parsed.bodyHtml),
+            filename: "l.eml"
+        )
+        #expect(metadata?.subject == "=?UTF-8?B?Sm9l?=")
+        #expect(metadata?.from == "José <sender@example.com>")
+    }
+
+    @Test("parse does bounded work on an oversized malformed Q-encoded name")
+    func parseBoundedWorkOnOversizedMalformedName() throws {
+        // A sender controls the header bytes of an attached .eml. One huge
+        // Q-encoded name (far past RFC 2047's 75-octet word limit) must not
+        // turn envelope decoding into quadratic work; the parse must finish
+        // quickly and still yield the decoded name and the body.
+        let escapes = 16_384
+        let name = "=?UTF-8?Q?" + String(repeating: "=41", count: escapes) + "?="
+        let rfc822 = "From: \(name) <sender@example.com>\r\nTo: Plain <to@example.com>\r\nSubject: S\r\nDate: Wed, 2 Oct 2025 01:50:00 +0000\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nbody"
+
+        let clock = ContinuousClock()
+        var parsed: EmlParsing.Parsed?
+        let elapsed = clock.measure {
+            parsed = EmlParsing.parse(rawBytes: Data(rfc822.utf8))
+        }
+        let result = try #require(parsed)
+        let from = try #require(result.envelope.from)
+        #expect(from.hasSuffix(" <sender@example.com>"))
+        #expect(from.filter { $0 == "A" }.count == escapes)
+        #expect(result.bodyHtml.contains("body"))
+        #expect(elapsed < .seconds(1))
+    }
+
     @Test("parse text/plain message returns plainTextToHTML-converted body")
     func parsePlainTextBody() throws {
         let rfc822 = """
