@@ -1,5 +1,7 @@
 # IOS-IMAP-016 — SwiftMail's header encoder has the same inverted guard, and its part-header builder interpolates filenames raw
 
+> **2026-09-09 status amendment:** upstream acceptance is complete through SwiftMail #226 and #230 (superseding #215 and #216). App/fork synchronization and regression verification remain pending; this record stays open. The historical defect and pin descriptions below are retained. See [current sync and release-train status](../../../../Memory/Current/126-swiftmail-upstream-sync-and-oversized-train.md).
+
 **Class:** `open` · **Opened:** 2026-08-12 · **Remedy is UPSTREAM** (Cocoanetics/SwiftMail, not the
 TabMail fork — per the repo convention that SwiftMail PRs go upstream).
 **Fully mitigated at TabMail's app boundary by PR #37**, so these are no longer live Subject defects
