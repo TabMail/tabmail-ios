@@ -132,6 +132,8 @@ struct EmailFilterTests {
         #expect(EmailFilter.snippetFromPlainText("[label](https://example.com/unterminated") == "[label](https://example.com/unterminated")
         #expect(EmailFilter.snippetFromPlainText("[a\nb](https://example.com)") == "[a b](https://example.com)")
         #expect(EmailFilter.snippetFromPlainText("[x] (https://example.com)") == "[x] (https://example.com)")
+        // A `[` never belongs to a label: the inner link unwraps, the outer bracket stays
+        #expect(EmailFilter.snippetFromPlainText("[a [b](https://example.com) c") == "[a b c")
     }
 
     @Test("snippetFromPlainText rejects whitespace, a trailing backslash, or an escaped newline inside a link")
@@ -159,9 +161,12 @@ struct EmailFilterTests {
         let start = Date()
         _ = EmailFilter.snippetFromPlainText(body)
         #expect(Date().timeIntervalSince(start) < 2)
-        // The window is bounded in SCALARS: a Character-counted window would
-        // admit 3,500 clusters × 100 combining marks (hundreds of KB) for every
-        // one of 500 failed openers to re-walk — measured at tens of seconds.
+        // The window is bounded in SCALARS, not Characters: a link that sits
+        // within 4,000 Characters but past 4,000 scalars stays raw.
+        let cluster = "a" + String(repeating: "\u{0301}", count: EmailFilter.snippetLinkScanChars - 2)
+        let pastWindow = EmailFilter.snippetFromPlainText(cluster + " [x](https://example.com)")
+        #expect(!pastWindow.contains("x"))
+        // Combining-mark-heavy text must also stay cheap.
         let zalgo = String(repeating: "a" + String(repeating: "\u{0301}", count: 100), count: 3_500)
         let combining = String(repeating: "[", count: 500) + zalgo
         let start2 = Date()
