@@ -1695,9 +1695,11 @@ final class MessageDetailViewModel {
                 }
                 self.messageBody = refreshedBody ?? previousBody
                 if refreshedBody != nil { self.bodyReloadToken &+= 1 }
-                let htmlLen = self.messageBody?.htmlContent?.count ?? 0
-                let htmlPreview = String(self.messageBody?.htmlContent?.prefix(200) ?? "nil")
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Refetch] Body loaded: htmlLen=\(htmlLen) preview=\(htmlPreview)") }
+                if DebugModeManager.isLoggingEnabled() {
+                    let htmlLen = self.messageBody?.htmlContent?.count ?? 0
+                    let htmlPreview = String(self.messageBody?.htmlContent?.prefix(200) ?? "nil")
+                    BackgroundSyncLogger.logDebug("[Refetch] Body loaded: htmlLen=\(htmlLen) preview=\(htmlPreview)")
+                }
                 self.isLoading = false
                 if self.messageBody == nil {
                     self.startBodyPoll()

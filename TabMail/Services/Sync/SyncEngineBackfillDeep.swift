@@ -711,8 +711,10 @@ extension SyncEngine {
             try await Task.sleep(for: .seconds(await getBackfillProfile().deepCrawlInterWindowDelay))
         }
 
-        if StorageEstimator.isOverBudget() {
-            BackgroundSyncLogger.logDebug("[Backfill] Deep crawl stopped for \(folder.name) — over storage budget")
+        if DebugModeManager.isLoggingEnabled() {
+            if StorageEstimator.isOverBudget() {
+                BackgroundSyncLogger.logDebug("[Backfill] Deep crawl stopped for \(folder.name) — over storage budget")
+            }
         }
     }
 }

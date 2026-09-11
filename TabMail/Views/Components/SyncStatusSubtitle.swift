@@ -135,10 +135,12 @@ struct SyncStatusObservationModifier: ViewModifier {
         let newPhase = s.syncPhase
         let newLast = s.lastSyncCompletedAt
         let newFailed = s.lastSyncFailed
-        let phaseStr = newPhase.map { String(describing: $0) } ?? "nil"
-        let lastStr = newLast.map { "\(Int(Date().timeIntervalSince($0)))s ago" } ?? "nil"
-        let changed = (phase != newPhase) || (last != newLast) || (failed != newFailed)
-        BackgroundSyncLogger.logDebug("[SyncStatusObs:\(tag):\(id)] refresh(\(reason)) phase=\(phaseStr) last=\(lastStr) failed=\(newFailed) changed=\(changed)")
+        if DebugModeManager.isLoggingEnabled() {
+            let phaseStr = newPhase.map { String(describing: $0) } ?? "nil"
+            let lastStr = newLast.map { "\(Int(Date().timeIntervalSince($0)))s ago" } ?? "nil"
+            let changed = (phase != newPhase) || (last != newLast) || (failed != newFailed)
+            BackgroundSyncLogger.logDebug("[SyncStatusObs:\(tag):\(id)] refresh(\(reason)) phase=\(phaseStr) last=\(lastStr) failed=\(newFailed) changed=\(changed)")
+        }
         phase = newPhase
         last = newLast
         failed = newFailed

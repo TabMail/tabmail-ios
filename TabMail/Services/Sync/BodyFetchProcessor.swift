@@ -783,9 +783,11 @@ enum BodyFetchProcessor {
 
         let skippedCount = items.count - writtenToFts.count
         if skippedCount > 0 {
-            let skippedItems = items.filter { !writtenToFts.contains($0.contentKey) }
-            let accountIds = Set(skippedItems.map(\.accountId)).sorted().joined(separator: ",")
-            BackgroundSyncLogger.logDebug("[BodyFetch] flushBatch: \(skippedCount)/\(items.count) items not in FTS yet — bodyComplete deferred (accounts=[\(accountIds)])")
+            if DebugModeManager.isLoggingEnabled() {
+                let skippedItems = items.filter { !writtenToFts.contains($0.contentKey) }
+                let accountIds = Set(skippedItems.map(\.accountId)).sorted().joined(separator: ",")
+                BackgroundSyncLogger.logDebug("[BodyFetch] flushBatch: \(skippedCount)/\(items.count) items not in FTS yet — bodyComplete deferred (accounts=[\(accountIds)])")
+            }
         }
 
         // 2. Batch GRDB flag update (snippets + bodyComplete) — ONLY for items written to FTS.

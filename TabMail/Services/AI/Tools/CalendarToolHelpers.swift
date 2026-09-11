@@ -127,8 +127,10 @@ enum CalendarToolHelpers {
                     do {
                         let allCalendars = try await provider.listCalendars()
                         BackgroundSyncLogger.logDebug("[CalendarToolHelpers] account=\(accountId) listCalendars returned \(allCalendars.count)")
-                        for cal in allCalendars {
-                            BackgroundSyncLogger.logDebug("[CalendarToolHelpers]   account=\(accountId) cal id='\(cal.id)' name='\(cal.summary ?? "?")' primary=\(cal.primary == true) selected=\(cal.selected.map(String.init(describing:)) ?? "nil") accessRole=\(cal.accessRole ?? "?")")
+                        if DebugModeManager.isLoggingEnabled() {
+                            for cal in allCalendars {
+                                BackgroundSyncLogger.logDebug("[CalendarToolHelpers]   account=\(accountId) cal id='\(cal.id)' name='\(cal.summary ?? "?")' primary=\(cal.primary == true) selected=\(cal.selected.map(String.init(describing:)) ?? "nil") accessRole=\(cal.accessRole ?? "?")")
+                            }
                         }
                         // Resolve visibility per calendar: user override (from
                         // `CalendarVisibilityStore`) wins, otherwise we honor
@@ -137,8 +139,10 @@ enum CalendarToolHelpers {
                         // (nil → false). CalDAV/Exchange leave nil → visible.
                         let calendars = allCalendars.filter { cal in
                             if !CalendarVisibilityStore.isVisible(cal, accountId: accountId) {
-                                let why = CalendarVisibilityStore.reason(cal, accountId: accountId).rawValue
-                                BackgroundSyncLogger.logDebug("[CalendarToolHelpers] SKIP calendar id='\(cal.id)' name='\(cal.summary ?? "?")' acct=\(accountId) reason=\(why)")
+                                if DebugModeManager.isLoggingEnabled() {
+                                    let why = CalendarVisibilityStore.reason(cal, accountId: accountId).rawValue
+                                    BackgroundSyncLogger.logDebug("[CalendarToolHelpers] SKIP calendar id='\(cal.id)' name='\(cal.summary ?? "?")' acct=\(accountId) reason=\(why)")
+                                }
                                 return false
                             }
                             return true
@@ -157,8 +161,10 @@ enum CalendarToolHelpers {
                                     maxResults: maxResults,
                                     orderBy: orderBy
                                 )
-                                let emptyCount = calEvents.filter { ($0.summary?.isEmpty ?? true) }.count
-                                BackgroundSyncLogger.logDebug("[CalendarToolHelpers] account=\(accountId) calendar='\(calendar.summary ?? "?")' (id=\(calendar.id)) → \(calEvents.count) events (\(emptyCount) empty-title)")
+                                if DebugModeManager.isLoggingEnabled() {
+                                    let emptyCount = calEvents.filter { ($0.summary?.isEmpty ?? true) }.count
+                                    BackgroundSyncLogger.logDebug("[CalendarToolHelpers] account=\(accountId) calendar='\(calendar.summary ?? "?")' (id=\(calendar.id)) → \(calEvents.count) events (\(emptyCount) empty-title)")
+                                }
                                 for event in calEvents {
                                     if (event.summary?.isEmpty ?? true) {
                                         BackgroundSyncLogger.logDebug("[CalendarToolHelpers]   EMPTY id=\(event.id ?? "?") on calendar='\(calendar.summary ?? "?")' accessRole=\(calendar.accessRole ?? "?") attendees=\(event.attendees?.count ?? 0) loc='\(event.location ?? "")' status=\(event.status ?? "?") eventType=\(event.eventType ?? "?") iCalUID=\(event.iCalUID ?? "?") visibility=\(event.visibility ?? "?")")

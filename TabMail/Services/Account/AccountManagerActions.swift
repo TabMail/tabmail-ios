@@ -1927,6 +1927,7 @@ extension AccountManager {
     /// cross-account contamination.
     /// `callSite` identifies the entry point (multiple code paths queue a delete).
     static nonisolated func logDeleteTrace(accountId: String, messages: [MessageHeader], callSite: String) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
         let allTrash: [Folder] = (try? AppDatabase.dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.trash.rawValue)
                 .fetchAll(db)

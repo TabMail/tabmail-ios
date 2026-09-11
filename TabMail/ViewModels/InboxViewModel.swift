@@ -1024,8 +1024,10 @@ final class InboxViewModel {
         // here blocked the UI on a GRDB read during warm-foreground return
         // (the warm-foreground hang; Half A / PLAN_HANG_FIX).
         await selfHealFoldersAsync()
-        let folderNames = folders.map { "\($0.name)(\($0.id))" }.joined(separator: ", ")
-        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[MoveTrace] reloadMessages — folders=[\(folderNames)] prevCount=\(loadedMessages.count)") }
+        if DebugModeManager.isLoggingEnabled() {
+            let folderNames = folders.map { "\($0.name)(\($0.id))" }.joined(separator: ", ")
+            BackgroundSyncLogger.logDebug("[MoveTrace] reloadMessages — folders=[\(folderNames)] prevCount=\(loadedMessages.count)")
+        }
 
         resetSnippetState()
 

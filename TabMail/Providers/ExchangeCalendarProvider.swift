@@ -188,12 +188,16 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
 
         let body = try JSONSerialization.data(withJSONObject: createEventJSON(event))
-        if let bodyStr = String(data: body, encoding: .utf8) {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] createEvent POST body=\(bodyStr.prefix(4000))")
+        if DebugModeManager.isLoggingEnabled() {
+            if let bodyStr = String(data: body, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] createEvent POST body=\(bodyStr.prefix(4000))")
+            }
         }
         let data = try await request(path: "\(calPath)/events", method: "POST", body: body)
-        if let respStr = String(data: data, encoding: .utf8) {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] createEvent response=\(respStr.prefix(4000))")
+        if DebugModeManager.isLoggingEnabled() {
+            if let respStr = String(data: data, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] createEvent response=\(respStr.prefix(4000))")
+            }
         }
         let created = try JSONDecoder().decode(MSEvent.self, from: data)
         return toGCalEvent(created)
@@ -220,12 +224,16 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // Dump the body so we can diagnose date/tz drift in smoke tests.
         // Graph responses are silent on success; without this we can't tell
         // if a wrong-time symptom came from a wrong-time request.
-        if let bodyStr = String(data: body, encoding: .utf8) {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateEvent PATCH body=\(bodyStr.prefix(4000))")
+        if DebugModeManager.isLoggingEnabled() {
+            if let bodyStr = String(data: body, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateEvent PATCH body=\(bodyStr.prefix(4000))")
+            }
         }
         let data = try await request(path: "/events/\(encodedEventId)", method: "PATCH", body: body)
-        if let respStr = String(data: data, encoding: .utf8) {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateEvent response=\(respStr.prefix(4000))")
+        if DebugModeManager.isLoggingEnabled() {
+            if let respStr = String(data: data, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateEvent response=\(respStr.prefix(4000))")
+            }
         }
         let updated = try JSONDecoder().decode(MSEvent.self, from: data)
         return toGCalEvent(updated)
@@ -272,12 +280,16 @@ actor ExchangeCalendarProvider: CalendarProvider {
         var instancePatch = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: existingInstance, patch: event)
         instancePatch.recurrence = nil
         let body = try JSONSerialization.data(withJSONObject: toGraphEventJSON(instancePatch))
-        if let bodyStr = String(data: body, encoding: .utf8) {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateOccurrence PATCH body=\(bodyStr.prefix(4000))")
+        if DebugModeManager.isLoggingEnabled() {
+            if let bodyStr = String(data: body, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateOccurrence PATCH body=\(bodyStr.prefix(4000))")
+            }
         }
         let data = try await request(path: "/events/\(encodedInstanceId)", method: "PATCH", body: body)
-        if let respStr = String(data: data, encoding: .utf8) {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateOccurrence response=\(respStr.prefix(4000))")
+        if DebugModeManager.isLoggingEnabled() {
+            if let respStr = String(data: data, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateOccurrence response=\(respStr.prefix(4000))")
+            }
         }
         let updated = try JSONDecoder().decode(MSEvent.self, from: data)
         return toGCalEvent(updated)
@@ -360,16 +372,20 @@ actor ExchangeCalendarProvider: CalendarProvider {
             ]
         }
         let cappedBody = try JSONSerialization.data(withJSONObject: cappedJSON)
-        if let bodyStr = String(data: cappedBody, encoding: .utf8) {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries cap PATCH body=\(bodyStr.prefix(4000))")
+        if DebugModeManager.isLoggingEnabled() {
+            if let bodyStr = String(data: cappedBody, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries cap PATCH body=\(bodyStr.prefix(4000))")
+            }
         }
         let encodedMasterId = try Self.encodedGraphPathSegment(eventId, context: "Graph series master id")
         let capRespData = try await request(path: "/events/\(encodedMasterId)", method: "PATCH", body: cappedBody)
         // Log the response so we can see what Graph stored — particularly the
         // master's start/end/recurrence after capping, to diagnose visible
         // "occurrence moved to earlier day" symptoms after a split.
-        if let capRespStr = String(data: capRespData, encoding: .utf8) {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries cap PATCH response=\(capRespStr.prefix(4000))")
+        if DebugModeManager.isLoggingEnabled() {
+            if let capRespStr = String(data: capRespData, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries cap PATCH response=\(capRespStr.prefix(4000))")
+            }
         }
 
         // 2. Build the new series — inherit master + patch overrides + start at splitDate.
@@ -400,12 +416,16 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
         do {
             let createBody = try JSONSerialization.data(withJSONObject: createJSON)
-            if let bodyStr = String(data: createBody, encoding: .utf8) {
-                BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries new-series POST body=\(bodyStr.prefix(4000))")
+            if DebugModeManager.isLoggingEnabled() {
+                if let bodyStr = String(data: createBody, encoding: .utf8) {
+                    BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries new-series POST body=\(bodyStr.prefix(4000))")
+                }
             }
             let data = try await request(path: "\(calPath)/events", method: "POST", body: createBody)
-            if let respStr = String(data: data, encoding: .utf8) {
-                BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries new-series response=\(respStr.prefix(4000))")
+            if DebugModeManager.isLoggingEnabled() {
+                if let respStr = String(data: data, encoding: .utf8) {
+                    BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries new-series response=\(respStr.prefix(4000))")
+                }
             }
             let created = try JSONDecoder().decode(MSEvent.self, from: data)
             return toGCalEvent(created)
@@ -464,8 +484,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
             }
             var revertFailure: Error?
             if let revertBody = try? JSONSerialization.data(withJSONObject: toGraphEventJSON(revertInput)) {
-                if let bodyStr = String(data: revertBody, encoding: .utf8) {
-                    BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries revert PATCH body=\(bodyStr.prefix(4000))")
+                if DebugModeManager.isLoggingEnabled() {
+                    if let bodyStr = String(data: revertBody, encoding: .utf8) {
+                        BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries revert PATCH body=\(bodyStr.prefix(4000))")
+                    }
                 }
                 do {
                     _ = try await request(path: "/events/\(encodedMasterId)", method: "PATCH", body: revertBody)

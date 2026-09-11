@@ -738,7 +738,6 @@ enum EmailHTMLWrapper {
             let fullRange = match.range
 
             let selectorText = nsCSS.substring(with: selectorRange)
-            let bodyText = nsCSS.substring(with: bodyRange)
             let selectors = selectorText.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
 
             // Redirect body → .tm-email-body (the converted <body> div) instead of removing.
@@ -756,6 +755,7 @@ enum EmailHTMLWrapper {
 
             if filtered.isEmpty {
                 if isDbg {
+                    let bodyText = nsCSS.substring(with: bodyRange)
                     let preview = String(bodyText.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
                     BackgroundSyncLogger.logDebug("[HTMLDebug] neutralizeCSSRules: REMOVING rule selector='\(selectorText.trimmingCharacters(in: .whitespacesAndNewlines))' preview='\(preview)'")
                 }

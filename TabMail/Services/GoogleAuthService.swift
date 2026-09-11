@@ -127,10 +127,12 @@ final class OAuthService: NSObject {
                     BackgroundSyncLogger.logDebug("[OAuth] callback ERROR — domain=\(nsError.domain), code=\(nsError.code), userInfo=\(nsError.userInfo), description=\(nsError.localizedDescription)")
                     continuation.resume(throwing: error)
                 } else if let url {
-                    let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-                    let hasCode = queryItems.contains(where: { $0.name == "code" })
-                    let hasError = queryItems.first(where: { $0.name == "error" })?.value
-                    BackgroundSyncLogger.logDebug("[OAuth] callback received — hasCode=\(hasCode), googleError=\(hasError ?? "nil")")
+                    if DebugModeManager.isLoggingEnabled() {
+                        let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+                        let hasCode = queryItems.contains(where: { $0.name == "code" })
+                        let hasError = queryItems.first(where: { $0.name == "error" })?.value
+                        BackgroundSyncLogger.logDebug("[OAuth] callback received — hasCode=\(hasCode), googleError=\(hasError ?? "nil")")
+                    }
                     continuation.resume(returning: url)
                 } else {
                     BackgroundSyncLogger.logDebug("[OAuth] callback received — url: nil, error: nil (treating as cancel)")

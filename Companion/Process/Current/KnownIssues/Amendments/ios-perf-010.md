@@ -94,7 +94,9 @@ edit-context, quote, and suggestion reads; `UndoReopenCompose`; `PendingSendServ
 the Device-Sync AI-cache probe; `AIChat`/cached-user-email lookups; `AccountDetailView`; the two
 `AccountManagerOutbox` decision writes; and the debug-gated `UndoService.push` diagnostics. The
 adjacent ungated deletion diagnostic discovered by the same predicate belongs to the
-`IOS-PERF-016` recurrence audit, not to this bounded change.
+`IOS-PERF-016` recurrence audit, not to this bounded change. (2026-09-11: that diagnostic,
+`AccountManager.logDeleteTrace`, now returns at a whole-body debug gate before its `Folder` read;
+`Amendments/ios-log-001.md`.)
 
 **The fixed high-frequency invariant.** `AccountDetailView.saveAccountField` was byte-identical in
 shipped `v1.6.38`: Name, Email, and IMAP username field setters synchronously entered GRDB's single

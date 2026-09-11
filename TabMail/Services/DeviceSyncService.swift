@@ -150,6 +150,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         task: URLSessionTask,
         didFinishCollecting metrics: URLSessionTaskMetrics
     ) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
         for tm in metrics.transactionMetrics {
             let proto = tm.networkProtocolName ?? "unknown"
             BackgroundSyncLogger.logDebug("[DeviceSync] Protocol negotiated: \(proto)")
@@ -731,6 +732,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
         // Helper: log git-style unified diff between old and new content
         func logDiff(field: SyncField, old: String, new: String, mergeType: String) {
+            guard DebugModeManager.isLoggingEnabled() else { return }
             let oldLines = old.components(separatedBy: "\n")
             let newLines = new.components(separatedBy: "\n")
             let oldSet = Set(oldLines)

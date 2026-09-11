@@ -131,7 +131,9 @@ rerouted to `reclaimedIds`; until 2026-09-05 either edit passed every test in th
 ## 2026-09-10 — a SEVENTEENTH channel, `.debug`, and it is the largest writer by far
 
 GitHub `TabMail/tabmail-ios#72`, owner decision 2026-09-10: every console `print` in the `TabMail/`
-target (gated AND ungated) was folded into the persisted log. Detail and site table:
+target (gated AND ungated) was folded into the persisted log, except the console-only prints inside
+database write contexts and the three `🚨 UNGATED BY DECISION` sites (qualified 2026-09-11). Detail
+and site table:
 `Amendments/ios-log-001.md` (2026-09-10).
 
 - **`case debug`, tag `DEBUG`**, sole writer `BackgroundSyncLogger.logDebug(_ message: @autoclosure
@@ -159,6 +161,9 @@ target (gated AND ungated) was folded into the persisted log. Detail and site ta
 - **Line forgery:** whole-line escaping is now closed for `logChatError`, `logQueue` **and
   `logDebug`** — never "no user-authored text can forge a channel"; the other fourteen channels
   still leave escaping to their call sites.
+
+**Owner-accepted, 2026-09-11** ("other tradeoffs are fine"): the sooner `[ERROR]` / `[AUTH]`
+eviction and the class A/B/C content in an unlocked user's debug export, both above.
 
 Search terms: seventeenth channel; `AppLogChannel.debug`; `DEBUG` tag; `logDebug`; five always-on
 twelve debug-gated; class A now persisted for unlocked users; #72

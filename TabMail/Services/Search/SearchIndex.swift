@@ -248,8 +248,10 @@ actor SearchIndex {
         isInitialized = true
 
         let count = try documentCount()
-        let shardList = knownYears.sorted().map(String.init).joined(separator: ", ")
-        BackgroundSyncLogger.logDebug("[SearchIndex] Initialized with \(count) documents, shards: [\(shardList)]")
+        if DebugModeManager.isLoggingEnabled() {
+            let shardList = knownYears.sorted().map(String.init).joined(separator: ", ")
+            BackgroundSyncLogger.logDebug("[SearchIndex] Initialized with \(count) documents, shards: [\(shardList)]")
+        }
 
         // Tokenizer migration: rebuild shards created with an outdated tokenize=
         // string, in the background. Init is NOT blocked — searches keep working
@@ -1976,8 +1978,10 @@ actor SearchIndex {
             }
         }
 
-        let filterInfo = eligibleRowids != nil ? ", filtered to \(eligibleRowids!.count) eligible" : ""
-        BackgroundSyncLogger.logDebug("[SearchIndex] Hybrid search: \(results.count) results (FTS: \(ftsCandidates.count), Vec: \(vectorCandidates.count)\(filterInfo))")
+        if DebugModeManager.isLoggingEnabled() {
+            let filterInfo = eligibleRowids != nil ? ", filtered to \(eligibleRowids!.count) eligible" : ""
+            BackgroundSyncLogger.logDebug("[SearchIndex] Hybrid search: \(results.count) results (FTS: \(ftsCandidates.count), Vec: \(vectorCandidates.count)\(filterInfo))")
+        }
         return results
     }
 

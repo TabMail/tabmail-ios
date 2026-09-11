@@ -141,8 +141,10 @@ actor CalDAVClient {
 
         // For non-success codes that aren't specifically handled
         if !(200...299).contains(code) && code != 207 {
-            if let body = String(data: data, encoding: .utf8) {
-                BackgroundSyncLogger.logDebug("[CalDAV] HTTP \(code) \(request.httpMethod ?? "") \(request.url?.absoluteString ?? ""): \(body.prefix(500))")
+            if DebugModeManager.isLoggingEnabled() {
+                if let body = String(data: data, encoding: .utf8) {
+                    BackgroundSyncLogger.logDebug("[CalDAV] HTTP \(code) \(request.httpMethod ?? "") \(request.url?.absoluteString ?? ""): \(body.prefix(500))")
+                }
             }
             throw CalDAVError.httpError(code, data)
         }

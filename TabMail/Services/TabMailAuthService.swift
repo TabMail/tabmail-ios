@@ -385,8 +385,10 @@ final class TabMailAuthService: NSObject {
         }
 
         BackgroundSyncLogger.logDebug("[TabMailAuth] OTP response: HTTP \(httpResponse.statusCode)")
-        if let bodyStr = String(data: data, encoding: .utf8) {
-            BackgroundSyncLogger.logDebug("[TabMailAuth] OTP response body: \(bodyStr)")
+        if DebugModeManager.isLoggingEnabled() {
+            if let bodyStr = String(data: data, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[TabMailAuth] OTP response body: \(bodyStr)")
+            }
         }
 
         if httpResponse.statusCode == 200 {

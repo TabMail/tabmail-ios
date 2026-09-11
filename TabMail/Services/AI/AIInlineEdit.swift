@@ -207,14 +207,16 @@ extension AIService {
         )
 
         // Log raw JSON for debugging
-        if let jsonData = try? JSONEncoder().encode(request),
-           let jsonStr = String(data: jsonData, encoding: .utf8) {
-            BackgroundSyncLogger.logDebug("[AIService] performInlineEdit REQUEST JSON (\(jsonData.count) bytes):")
-            // Truncate to avoid flooding logs — print first and last 500 chars
-            if jsonStr.count > 1200 {
-                BackgroundSyncLogger.logDebug("[AIService]   \(jsonStr.prefix(500))...TRUNCATED...\(jsonStr.suffix(500))")
-            } else {
-                BackgroundSyncLogger.logDebug("[AIService]   \(jsonStr)")
+        if DebugModeManager.isLoggingEnabled() {
+            if let jsonData = try? JSONEncoder().encode(request),
+               let jsonStr = String(data: jsonData, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[AIService] performInlineEdit REQUEST JSON (\(jsonData.count) bytes):")
+                // Truncate to avoid flooding logs — print first and last 500 chars
+                if jsonStr.count > 1200 {
+                    BackgroundSyncLogger.logDebug("[AIService]   \(jsonStr.prefix(500))...TRUNCATED...\(jsonStr.suffix(500))")
+                } else {
+                    BackgroundSyncLogger.logDebug("[AIService]   \(jsonStr)")
+                }
             }
         }
 
@@ -247,10 +249,12 @@ extension AIService {
         BackgroundSyncLogger.logDebug("[AIService]   response preview: \(text.prefix(200))")
 
         let result = Self.parseInlineEditResponse(text)
-        let toDesc = result.toDelta.map { "+\($0.adds.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
-        let ccDesc = result.ccDelta.map { "+\($0.adds.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
-        let bccDesc = result.bccDelta.map { "+\($0.adds.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
-        BackgroundSyncLogger.logDebug("[AIService] performInlineEdit PARSED: response=\(result.response?.prefix(60) ?? "nil") subject=\(result.subject?.prefix(40) ?? "nil") bodyLen=\(result.body?.count ?? 0) to=\(toDesc) cc=\(ccDesc) bcc=\(bccDesc)")
+        if DebugModeManager.isLoggingEnabled() {
+            let toDesc = result.toDelta.map { "+\($0.adds.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
+            let ccDesc = result.ccDelta.map { "+\($0.adds.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
+            let bccDesc = result.bccDelta.map { "+\($0.adds.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
+            BackgroundSyncLogger.logDebug("[AIService] performInlineEdit PARSED: response=\(result.response?.prefix(60) ?? "nil") subject=\(result.subject?.prefix(40) ?? "nil") bodyLen=\(result.body?.count ?? 0) to=\(toDesc) cc=\(ccDesc) bcc=\(bccDesc)")
+        }
         return result
     }
 
