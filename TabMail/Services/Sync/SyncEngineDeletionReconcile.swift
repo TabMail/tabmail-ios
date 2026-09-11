@@ -359,22 +359,21 @@ extension SyncEngine {
     @discardableResult
     func deleteServerConfirmedDeletions(folder: Folder, uids: [UInt32], reason: String) async throws -> Int {
         guard !uids.isEmpty else { return 0 }
-        // Prune before snapshotting — deleteConfirmedGhostHeaders does a presence
-        // check (`!= nil`) that doesn't consult per-entry expiry.
-        await AccountManager.shared.pruneRecentlyCompleted()
-        let recentlyCompleted = await AccountManager.shared.recentlyCompleted
         let folderId = folder.id
         let folderPath = folder.path
         let accountId = folder.accountId
         let folderRole = folder.role
         let deletedIds: [String] = try await dbPool.write { db in
+            // Protection set read INSIDE the transaction (expiry-filtered at read),
+            // so a completion landing during the SELECT/SEARCH that produced `uids`
+            // is honoured — same rule as `runSyncMessages` (issue #106).
             try Self.deleteConfirmedGhostHeaders(
                 folderId: folderId,
                 folderPath: folderPath,
                 accountId: accountId,
                 folderRole: folderRole,
                 uids: uids,
-                recentlyCompleted: recentlyCompleted,
+                recentlyCompleted: AccountManager.shared.liveRecentlyCompleted(),
                 db: db
             )
         }

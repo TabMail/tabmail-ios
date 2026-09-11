@@ -67,13 +67,14 @@ struct StaleProtectionTests {
         let (folder, headerId) = try seed(pool)
 
         // Exactly what the merge registers: provider messageId + normalized rfc822.
-        let recent: [String: Date] = [
-            "500": Date(),
-            EmailFilter.normalizeMessageId("<new-500@ex.com>"): Date()
-        ]
+        // Recorded on the live store — `runSyncMessages` reads it inside its write
+        // transaction; there is no injection parameter (issue #106).
+        await AccountManager.shared.recordRecentlyCompleted(
+            messageIds: ["500", EmailFilter.normalizeMessageId("<new-500@ex.com>")])
+        defer { Task { await AccountManager.shared.clearRecentlyCompletedForTesting() } }
         let result = try await SyncEngine.runSyncMessages(
             for: folder, provider: missingFetchMock(), limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool, recentlyCompleted: recent)
+            dbPool: AppDatabase.dbPool)
 
         #expect(!result.staleIds.contains(headerId),
                 "a protected just-arrived message must not be stale-deleted by a racing sync")
@@ -85,9 +86,10 @@ struct StaleProtectionTests {
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let (folder, headerId) = try seed(pool)
 
+        await AccountManager.shared.clearRecentlyCompletedForTesting()  // no protection
         let result = try await SyncEngine.runSyncMessages(
             for: folder, provider: missingFetchMock(), limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool, recentlyCompleted: [:])  // no protection
+            dbPool: AppDatabase.dbPool)
 
         #expect(result.staleIds.contains(headerId),
                 "an unprotected message the fetch missed IS stale-deleted — the pre-fix drop race")

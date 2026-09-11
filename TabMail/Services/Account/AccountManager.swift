@@ -665,20 +665,45 @@ actor AccountManager {
     ///   action-completion propagation gap.
     /// Sync writes check this to avoid overwriting/deleting just-arrived rows with
     /// stale server data.
-    private(set) var recentlyCompleted: [String: Date] = [:]
+    ///
+    /// 🚨 THE STORE IS A `Mutex`, NOT ACTOR STATE, so a sync WRITE TRANSACTION can
+    /// read it synchronously (`liveRecentlyCompleted()`) at the moment it decides
+    /// what to insert or delete. Every consumer used to take an actor snapshot
+    /// BEFORE its network listing fetch and consult that snapshot in the write
+    /// afterwards. A move that completed during the fetch — no longer pending,
+    /// protection entry postdating the snapshot — was invisible to both guards,
+    /// and the source folder's pass re-inserted the just-moved message as a
+    /// header-only, snippet-less ghost (issue #106; still reproduced after the
+    /// per-folder read landed, because the residual window was the fetch itself,
+    /// which a weak connection stretches to seconds). `recordRecentlyCompleted`
+    /// runs BEFORE the op's retirement transaction commits, and every sync write
+    /// is serialised behind that transaction on the same writer, so a read taken
+    /// inside the sync transaction sees either the pending op or the protection
+    /// entry — never neither.
+    nonisolated private let recentlyCompletedStore = Mutex<[String: Date]>([:])
+
+    var recentlyCompleted: [String: Date] { recentlyCompletedStore.withLock { $0 } }
+
+    /// The unexpired protection set, readable from ANY isolation — call this
+    /// inside the sync write transaction, not before the fetch that precedes it.
+    nonisolated func liveRecentlyCompleted(now: Date = Date()) -> [String: Date] {
+        recentlyCompletedStore.withLock { $0.filter { $0.value > now } }
+    }
 
     func recordRecentlyCompleted(messageIds: [String], ttl: TimeInterval = SyncConfig.recentlyCompletedTTLSeconds) {
         let expiresAt = Date().addingTimeInterval(ttl)
-        for id in messageIds { recentlyCompleted[id] = expiresAt }
+        recentlyCompletedStore.withLock { store in
+            for id in messageIds { store[id] = expiresAt }
+        }
     }
 
     func pruneRecentlyCompleted() {
         let now = Date()
-        recentlyCompleted = recentlyCompleted.filter { $0.value > now }
+        recentlyCompletedStore.withLock { $0 = $0.filter { $0.value > now } }
     }
 
     func isRecentlyCompleted(_ msgId: String) -> Bool {
-        guard let expiresAt = recentlyCompleted[msgId] else { return false }
+        guard let expiresAt = recentlyCompletedStore.withLock({ $0[msgId] }) else { return false }
         return Date() < expiresAt
     }
 
@@ -702,7 +727,7 @@ actor AccountManager {
     /// Mirrors the `…ForTesting()` convention
     /// (`clearUidValidityReactionInFlightForTesting`).
     func clearRecentlyCompletedForTesting() {
-        recentlyCompleted.removeAll()
+        recentlyCompletedStore.withLock { $0.removeAll() }
     }
 
     // MARK: - Optimistic Overlay

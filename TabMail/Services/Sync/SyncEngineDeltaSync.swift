@@ -95,15 +95,11 @@ extension SyncEngine {
 
         if !toFetch.isEmpty { publishDownloading(toFetch.count, forAccount: account.id) }
 
-        // Capture recentlyCompleted — bridges the gap between PendingOp deletion
-        // and historyId cursor lag (default TTL), and protects freshly push-merged
-        // arrivals (longer TTL). Replaces per-folder recentActions. Prune first: the
-        // reads below are presence checks (`!= nil`), which don't consult the
-        // per-entry expiry — an unpruned map would treat expired entries as still
-        // protected forever.
-        let mgr = AccountManager.shared
-        await mgr.pruneRecentlyCompleted()
-        let recentlyCompletedSnapshot = await mgr.recentlyCompleted
+        // `recentlyCompleted` — bridges the gap between PendingOp deletion and
+        // historyId cursor lag (default TTL), and protects freshly push-merged
+        // arrivals (longer TTL) — is read INSIDE the write transaction below, next
+        // to the pending-op snapshot, not captured here before the fetch (issue
+        // #106; see `AccountManager.liveRecentlyCompleted`).
 
         // Delete removed messages — skip messages with pending operations.
         // Pending ops loaded INSIDE write to prevent TOCTOU race with user actions.
@@ -162,6 +158,7 @@ extension SyncEngine {
             let accountIdCapture = account.id
             let writeResult: (headers: [MessageHeader], discoveredParents: [String], removedIds: [String]) = try await dbPool.write { db in
                 let snapshot = try PendingOperationSnapshot.load(accountId: accountIdCapture, db: db)
+                let recentlyCompletedSnapshot = AccountManager.shared.liveRecentlyCompleted()
                 var headers: [MessageHeader] = []
                 var discoveredParents: [String] = []
                 // Header ids removed from a folder by a label change (Gmail
@@ -534,12 +531,8 @@ extension SyncEngine {
 
         if !toFetch.isEmpty { publishDownloading(toFetch.count, forAccount: account.id) }
 
-        // Capture recentlyCompleted — same guard as Gmail delta. Prune first (see
-        // comment above the Gmail delta snapshot) since the reads below are
-        // presence checks that don't consult per-entry expiry.
-        let exMgr = AccountManager.shared
-        await exMgr.pruneRecentlyCompleted()
-        let exRecentlyCompleted = await exMgr.recentlyCompleted
+        // `recentlyCompleted` — same guard as Gmail delta — is read inside the
+        // write transaction below, not captured here before the fetch.
 
         // Delete removed messages — skip messages with pending operations.
         if !toDelete.isEmpty {
@@ -577,6 +570,7 @@ extension SyncEngine {
             let exchangeAccountId = account.id
             let writeResult: (headers: [MessageHeader], discoveredParents: [String], removedIds: [String]) = try await dbPool.write { db in
                 let snapshot = try PendingOperationSnapshot.load(accountId: exchangeAccountId, db: db)
+                let exRecentlyCompleted = AccountManager.shared.liveRecentlyCompleted()
                 var headers: [MessageHeader] = []
                 var discoveredParents: [String] = []
                 // Header ids deleted by sent-dedup — must be pulled from FTS too,

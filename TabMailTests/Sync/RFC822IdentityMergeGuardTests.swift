@@ -182,7 +182,7 @@ struct RFC822IdentityMergeGuardTests {
         try await SyncEngine.runSyncMessages(
             for: try folder(pool, id: folderId), provider: provider,
             limit: SyncConfig.syncMessageLimit,
-            dbPool: AppDatabase.dbPool, recentlyCompleted: [:])
+            dbPool: AppDatabase.dbPool)
     }
 
     private func header(_ pool: DatabasePool, id: String) throws -> MessageHeader? {

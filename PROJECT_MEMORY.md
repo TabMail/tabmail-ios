@@ -15,6 +15,7 @@ Root [`../CLAUDE.md`](../CLAUDE.md) is normative; the [full pre-pass iOS routing
 - [Slow email rendering: lazy-attribute regex quadratic whitespace retries, premature empty-view reveal, native/WebKit timing diagnostics](Companion/Memory/Current/render-timing-diagnostics.md).
 
 - [HTML-to-text Markdown links, href destinations in FTS and agent reads; forward-only (#100)](Companion/Memory/Current/125-html-links-in-converted-text.md).
+- 🚨 [Archived mail "comes back" without a snippet on a weak connection = the #106 ghost re-insert, NOT a queue drop; `recentlyCompleted` protection set is now a `Mutex` read INSIDE every sync write transaction via `liveRecentlyCompleted()`, never snapshotted before the listing fetch](Companion/Memory/Current/127-sync-protection-set-is-read-inside-the-write-transaction.md).
 
 Search the topic text below as subsystem keywords. Each link is mandatory when its row matches the task.
 

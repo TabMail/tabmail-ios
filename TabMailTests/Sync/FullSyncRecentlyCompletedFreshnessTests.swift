@@ -113,6 +113,41 @@ struct FullSyncRecentlyCompletedFreshnessTests {
             "a folder syncing after the completion must honour it — re-inserting here is the snippet-less, unfetchable ghost of issue #106")
     }
 
+    /// The residual window after the per-folder read (v1.7.16): the completion
+    /// lands DURING the source folder's own listing fetch. Reproduced on-device
+    /// 2026-09-07 (UID 74740, INBOX→Archive): op `completed` and, in the same
+    /// second, the INBOX pass inserted a snippet-less `INBOX:74740` ghost. A
+    /// snapshot taken before the fetch cannot see it; a weak connection makes the
+    /// fetch — and so the window — seconds long. Same invariant as above, stated
+    /// at the tighter boundary: **an operation that completes while a folder's
+    /// listing is in flight is still honoured by that folder's write.**
+    @Test("An operation completing during the folder's own listing fetch is honoured by that folder")
+    func completionDuringTheFolderFetchIsHonoured() async throws {
+        let (pool, dir, previous, account) = try Self.fixture()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        await AccountManager.shared.clearRecentlyCompletedForTesting()
+        defer { Task { await AccountManager.shared.clearRecentlyCompletedForTesting() } }
+
+        let mock = await Self.makeMock()
+        // Fire while ARCHIVE itself is being listed — after any read that precedes
+        // the fetch, before the write that consults it.
+        await mock.setFetchMessagesHook { folder in
+            guard folder == "Archive" else { return }
+            await AccountManager.shared.recordRecentlyCompleted(messageIds: [Self.movedUid])
+        }
+
+        try await SyncEngine().fullSync(account: account, provider: mock)
+
+        let archived = try FolderEpochTestFixture.headerCount(
+            accountId: Self.accountId, path: "Archive", pool: pool)
+        #expect(
+            archived == 0,
+            "a completion during the folder's own fetch must be honoured by its write — a pre-fetch snapshot re-inserts the issue #106 ghost")
+    }
+
     /// THE CONTROL, and it is what makes the assertion above mean something. With
     /// no completion recorded, the identical fixture MUST insert — otherwise the
     /// test above would pass against a sync that inserts nothing at all, or a
