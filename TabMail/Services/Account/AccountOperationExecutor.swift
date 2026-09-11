@@ -589,13 +589,15 @@ final class AccountOperationExecutor {
             // TOCTOU fix: record recentActions BEFORE deleting PendingOp.
             // Sync engine has two guards against re-inserting moved messages:
             //   1. pendingDestructiveIds — read inside the sync write transaction
-            //   2. recentMoveIdsByFolder — snapshot from actor before the sync write
-            // If we delete the PendingOp first and record recentAction after, there's
-            // a window where neither guard is active (PendingOp gone from DB, recentAction
-            // not yet on actor). By recording recentAction first, at every instant at least
-            // one guard is active:
+            //   2. recentlyCompleted — ALSO read inside the sync write transaction
+            //      (`AccountManager.liveRecentlyCompleted()`; a pre-fetch snapshot left the
+            //      folder's own listing fetch as a window — issue #106 residual, memory 127)
+            // If we delete the PendingOp first and record recentlyCompleted after, there's
+            // a window where neither guard is active (PendingOp gone from DB, entry not
+            // yet recorded). By recording first, at every instant at least one guard is
+            // active for any sync write, whichever side of the retirement it serialises on:
             //   - Before step 3 (delete): PendingOp in DB → pendingDestructiveIds catches it
-            //   - After step 2 (record): recentAction on actor → recentMoveIdsByFolder catches it
+            //   - After step 2 (record): entry in the live store → recentlyCompleted catches it
             // If app crashes between steps 2 and 3, the PendingOp re-executes (idempotent).
 
             // Step 1: Collect rfc822MessageIds (read-only, separate from delete).
