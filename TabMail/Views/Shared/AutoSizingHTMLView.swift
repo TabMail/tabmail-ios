@@ -2989,6 +2989,75 @@ function walkUpToWrapStart(quoteStart, body, logFn) {
 ///
 /// Defined as a top-level JS string so that production (`collapseQuotesJS`)
 /// and unit tests (JSContext + synthetic node trees) consume the same source.
+/// Bare ">" quote fallback thresholds — mirrors the Thunderbird addon's
+/// `config.quotedFallbackMinConsecutiveLines` / `quotedFallbackMaxTrailingLines`
+/// in `agent/modules/quoteAndSignature.js` (ADR-IOS-008 parity). Keep the two in step.
+enum QuotedFallbackConfig {
+    /// A lone ">>"-prefixed line (newsletter "›› Read the full story" link) must
+    /// not collapse the message; a real quote carries the marker on a run.
+    static let minConsecutiveLines = 2
+    /// The run must be TRAILING: at most this many non-blank non-">" lines may
+    /// follow it before the end of the message or a "-- " signature delimiter.
+    /// A sign-off plus an undelimited signature is well under this; a digest that
+    /// merely EMBEDS a ">" excerpt (e.g. a Reddit post quoting a notice, followed
+    /// by more posts and the footer) is far over it and must NOT collapse.
+    static let maxTrailingLines = 10
+}
+
+/// Finds the boundary line for the bare ">" quote fallback, or -1.
+///
+/// A candidate line starts a run of at least `minRun` consecutive ">"-prefixed
+/// lines (leading whitespace ignored, as in the TB addon). The run must also be
+/// trailing: after it ends, more than `maxTrailing` non-blank non-">" lines
+/// before the end of the text or the first non-quoted "-- " signature delimiter
+/// means the ">" block is embedded content (digest excerpt, bottom-posted
+/// reply), not a trailing quote — collapsing from there would hide the message.
+/// A later ">" line means the message is an interleaved (inline) reply or a
+/// digest embedding several excerpts. With a `<blockquote>` present the run is
+/// ACCEPTED and the caller's blockquote-based trailing-quote logic decides,
+/// exactly as before this rule existed; with `hasBlockquote` false there is no
+/// trailing section to isolate and collapsing from the first run would hide the
+/// answers between the runs, so the result is -1 (leave visible) — the TB
+/// addon's `setupCollapsibleQuotes` bails the same way. The "-- " stop is a
+/// heuristic allowance for a signature-like tail, not a guarantee that the tail
+/// stays visible (the sweep collapses everything after the boundary, as it
+/// always has).
+///
+/// Each run is walked once and each walk is bounded by the gap to the next run,
+/// so a long ">" body stays linear (the TB addon's review measured 17 s for 32k
+/// quoted lines when every quoted line re-walked the suffix).
+///
+/// Defined as a top-level JS string so that production (`collapseQuotesJS`)
+/// and unit tests (JSContext) consume the same source.
+let quotedFallbackBoundaryJS = """
+function findQuotedFallbackBoundary(lines, minRun, maxTrailing, hasBlockquote) {
+    function isQuoted(l) { return /^>/.test((l || '').trimStart()); }
+    for (var q = 0; q < lines.length; q++) {
+        if (!isQuoted(lines[q])) continue;
+        var ok = true;
+        for (var k = 0; k < minRun; k++) {
+            if (q + k >= lines.length || !isQuoted(lines[q + k])) { ok = false; break; }
+        }
+        if (!ok) continue;
+        var idx = q;
+        while (idx < lines.length && isQuoted(lines[idx])) idx++;
+        var trailing = 0;
+        var laterRun = false;
+        for (; idx < lines.length; idx++) {
+            var t = (lines[idx] || '').trim();
+            if (!t) continue;
+            if (/^>/.test(t)) { laterRun = true; break; }
+            if (/^--\\s*$/.test(t)) break;
+            trailing++;
+        }
+        if (laterRun) return hasBlockquote ? q : -1;
+        if (trailing <= maxTrailing) return q;
+        q = idx - 1;
+    }
+    return -1;
+}
+"""
+
 let splitBlockBeforeTargetJS = """
 function splitBlockBeforeTarget(targetNode, doc, logFn) {
     if (!targetNode || targetNode.nodeType !== 3) return null;
@@ -3172,6 +3241,7 @@ private var collapseQuotesJS: String {
         function _log(m) { \(logBody) }
         \(walkUpToWrapStartJS)
         \(splitBlockBeforeTargetJS)
+        \(quotedFallbackBoundaryJS)
         \(findQuoteStartBlockJS)
         \(sweepQuoteContentJS)
         var body = document.body;
@@ -3339,16 +3409,11 @@ private var collapseQuotesJS: String {
             }
         }
 
-        // Fallback: look for > prefix quoted lines (only if no other pattern matched)
+        // Fallback: look for > prefix quoted lines (only if no other pattern matched).
+        // Requires a RUN of consecutive ">" lines that is TRAILING — see
+        // `findQuotedFallbackBoundary` / `QuotedFallbackConfig` (TB addon parity).
         if (boundaryLine === -1) {
-            for (var q = 0; q < lines.length; q++) {
-                if (/^>/.test(lines[q])) {
-                    // Need at least 2 consecutive > lines to count
-                    if (q + 1 < lines.length && /^>/.test(lines[q + 1])) {
-                        boundaryLine = q; break;
-                    }
-                }
-            }
+            boundaryLine = findQuotedFallbackBoundary(lines, \(QuotedFallbackConfig.minConsecutiveLines), \(QuotedFallbackConfig.maxTrailingLines), !!body.querySelector('blockquote'));
         }
 
         _log('[QuoteDetect] Result: boundaryLine=' + boundaryLine + ', isForward=' + isForward);
