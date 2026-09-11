@@ -315,8 +315,10 @@ actor GoogleCalendarProvider: CalendarProvider {
             )
         }
         BackgroundSyncLogger.logDebug("[GoogleCalendar] Listed \(normalized.count) calendars")
-        for cal in normalized {
-            BackgroundSyncLogger.logDebug("[GoogleCalendar]   id=\(cal.id) name='\(cal.summary ?? "?")' primary=\(cal.primary == true) selected=\(cal.selected.map(String.init(describing:)) ?? "nil") accessRole=\(cal.accessRole ?? "?")")
+        if DebugModeManager.isLoggingEnabled() {
+            for cal in normalized {
+                BackgroundSyncLogger.logDebug("[GoogleCalendar]   id=\(cal.id) name='\(cal.summary ?? "?")' primary=\(cal.primary == true) selected=\(cal.selected.map(String.init(describing:)) ?? "nil") accessRole=\(cal.accessRole ?? "?")")
+            }
         }
         return normalized
     }
@@ -405,20 +407,24 @@ actor GoogleCalendarProvider: CalendarProvider {
         let path = "/calendars/\(encodedCalId)/events?\(queryItems.joined(separator: "&"))"
         BackgroundSyncLogger.logDebug("[GoogleCalendar] listEvents calendarId='\(calendarId)' path=\(path)")
         let data = try await request(path: path)
-        if let preview = String(data: data, encoding: .utf8) {
-            BackgroundSyncLogger.logDebug("[GoogleCalendar] listEvents response (first 800 chars): \(preview.prefix(800))")
+        if DebugModeManager.isLoggingEnabled() {
+            if let preview = String(data: data, encoding: .utf8) {
+                BackgroundSyncLogger.logDebug("[GoogleCalendar] listEvents response (first 800 chars): \(preview.prefix(800))")
+            }
         }
         let response = try JSONDecoder().decode(GCalEventListResponse.self, from: data)
         let raw = response.items ?? []
         let filtered = raw.filter { $0.status != "cancelled" }
         BackgroundSyncLogger.logDebug("[GoogleCalendar] listEvents calendarId='\(calendarId)' rawCount=\(raw.count) afterCancelFilter=\(filtered.count)")
-        for ev in filtered {
-            let isEmpty = (ev.summary?.isEmpty ?? true)
-                && (ev.attendees?.isEmpty ?? true)
-                && (ev.location?.isEmpty ?? true)
-                && (ev.description?.isEmpty ?? true)
-            let marker = isEmpty ? "EMPTY" : "ok"
-            BackgroundSyncLogger.logDebug("[GoogleCalendar]   [\(marker)] id=\(ev.id ?? "?") iCalUID=\(ev.iCalUID ?? "?") eventType=\(ev.eventType ?? "?") kind=\(ev.kind ?? "?") visibility=\(ev.visibility ?? "?") status=\(ev.status ?? "?") summary='\(ev.summary ?? "")' attendees=\(ev.attendees?.count ?? 0) location='\(ev.location ?? "")' desc.len=\(ev.description?.count ?? 0) htmlLink=\(ev.htmlLink ?? "?")")
+        if DebugModeManager.isLoggingEnabled() {
+            for ev in filtered {
+                let isEmpty = (ev.summary?.isEmpty ?? true)
+                    && (ev.attendees?.isEmpty ?? true)
+                    && (ev.location?.isEmpty ?? true)
+                    && (ev.description?.isEmpty ?? true)
+                let marker = isEmpty ? "EMPTY" : "ok"
+                BackgroundSyncLogger.logDebug("[GoogleCalendar]   [\(marker)] id=\(ev.id ?? "?") iCalUID=\(ev.iCalUID ?? "?") eventType=\(ev.eventType ?? "?") kind=\(ev.kind ?? "?") visibility=\(ev.visibility ?? "?") status=\(ev.status ?? "?") summary='\(ev.summary ?? "")' attendees=\(ev.attendees?.count ?? 0) location='\(ev.location ?? "")' desc.len=\(ev.description?.count ?? 0) htmlLink=\(ev.htmlLink ?? "?")")
+            }
         }
         return filtered
     }

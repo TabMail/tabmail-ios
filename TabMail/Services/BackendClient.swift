@@ -790,8 +790,10 @@ extension BackendClient {
             #endif
             return response
         } catch {
-            let raw = String(data: jsonData.prefix(500), encoding: .utf8) ?? "<binary>"
-            BackgroundSyncLogger.logDebug("[BackendClient] Failed to decode completions response: \(error)\n  Raw body (\(jsonData.count) bytes): \(raw)")
+            if DebugModeManager.isLoggingEnabled() {
+                let raw = String(data: jsonData.prefix(500), encoding: .utf8) ?? "<binary>"
+                BackgroundSyncLogger.logDebug("[BackendClient] Failed to decode completions response: \(error)\n  Raw body (\(jsonData.count) bytes): \(raw)")
+            }
             throw error
         }
     }

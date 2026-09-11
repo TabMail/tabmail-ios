@@ -41,8 +41,6 @@ extension AIService {
             metadata: metadata, body: body, summary: summaryCtx, account: account
         )
         let vars: [String: JSONValue] = rawVars.mapValues { JSONValue.fromAny($0) }
-        let isNoReply = EmailFilter.isNoReply(fromAddress)
-        let hasUnsubscribe = EmailFilter.hasUnsubscribeLink(htmlContent)
 
         let message = CompletionsMessage(
             role: "system",
@@ -56,7 +54,11 @@ extension AIService {
             disable_tools: true
         )
 
-        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[AIService] Action payload: subject=\(subject.prefix(60)), from=\(from.prefix(40)), body.len=\(bodyText.count), noReply=\(isNoReply), unsub=\(hasUnsubscribe), todo=\((summary.todos ?? "N/A").prefix(60)), summary=\((summary.blurb ?? "N/A").prefix(60))") }
+        if DebugModeManager.isLoggingEnabled() {
+            let isNoReply = EmailFilter.isNoReply(fromAddress)
+            let hasUnsubscribe = EmailFilter.hasUnsubscribeLink(htmlContent)
+            BackgroundSyncLogger.logDebug("[AIService] Action payload: subject=\(subject.prefix(60)), from=\(from.prefix(40)), body.len=\(bodyText.count), noReply=\(isNoReply), unsub=\(hasUnsubscribe), todo=\((summary.todos ?? "N/A").prefix(60)), summary=\((summary.blurb ?? "N/A").prefix(60))")
+        }
 
         // Single attempt — natural retry via queue loop on next sync cycle.
         let llmT0 = CFAbsoluteTimeGetCurrent()

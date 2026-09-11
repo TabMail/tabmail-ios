@@ -14,10 +14,12 @@ extension SyncEngine {
     nonisolated static func runPruneIfOverBudget(dbPool: PrioritizedDatabase) {
         guard StorageEstimator.isOverBudget() else { return }
 
-        let totalMB = StorageEstimator.totalSizeMB()
         let budgetMB = StorageEstimator.budgetMB
         let floor = StorageEstimator.floorPerFolder
-        BackgroundSyncLogger.logDebug("[Prune] Over budget (\(String(format: "%.1f", totalMB))MB / \(budgetMB)MB)")
+        if DebugModeManager.isLoggingEnabled() {
+            let totalMB = StorageEstimator.totalSizeMB()
+            BackgroundSyncLogger.logDebug("[Prune] Over budget (\(String(format: "%.1f", totalMB))MB / \(budgetMB)MB)")
+        }
 
         let accounts = (try? dbPool.read { db in try Account.fetchAll(db) }) ?? []
         let pruneChunkSize = SyncConfig.pruneChunkSize

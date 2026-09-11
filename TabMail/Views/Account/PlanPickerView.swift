@@ -399,8 +399,10 @@ struct PlanPickerView: View {
                 if statusCode == 200 {
                     BackgroundSyncLogger.logDebug("[PlanPicker] Backend verified purchase successfully")
                 } else {
-                    let body = String(data: data, encoding: .utf8) ?? ""
-                    BackgroundSyncLogger.logDebug("[PlanPicker] Backend verify-purchase returned \(statusCode): \(body)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        let body = String(data: data, encoding: .utf8) ?? ""
+                        BackgroundSyncLogger.logDebug("[PlanPicker] Backend verify-purchase returned \(statusCode): \(body)")
+                    }
                 }
             } catch {
                 BackgroundSyncLogger.logDebug("[PlanPicker] Backend verify-purchase failed: \(error)")

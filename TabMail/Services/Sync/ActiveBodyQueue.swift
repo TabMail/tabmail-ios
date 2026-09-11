@@ -636,9 +636,11 @@ actor ActiveBodyQueue {
             for item in items { storage.releaseInFlightOnly(item) }
         }
 
-        let dispatchCount = groupsToDispatch.reduce(0) { $0 + $1.value.count }
-        let deferredCount = groupsDeferred.reduce(0) { $0 + $1.value.count }
-        BackgroundSyncLogger.logDebug("[ActiveBody] Dispatching \(dispatchCount) items in \(groupsToDispatch.count) folder groups (deferred=\(deferredCount), activeBatches=\(activeBatchCount))")
+        if DebugModeManager.isLoggingEnabled() {
+            let dispatchCount = groupsToDispatch.reduce(0) { $0 + $1.value.count }
+            let deferredCount = groupsDeferred.reduce(0) { $0 + $1.value.count }
+            BackgroundSyncLogger.logDebug("[ActiveBody] Dispatching \(dispatchCount) items in \(groupsToDispatch.count) folder groups (deferred=\(deferredCount), activeBatches=\(activeBatchCount))")
+        }
 
         for (key, allItems) in groupsToDispatch {
             guard let provider = providerByAccount[key.accountId] else { continue }

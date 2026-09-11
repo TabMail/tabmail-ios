@@ -85,6 +85,9 @@ before the fix. It is lexical, with two limits:
   write, is not seen. A census of small same-file `logDebug` helpers called from those contexts
   found none.
 
+The owner accepted the first limit on 2026-09-11 ("other tradeoffs are fine"), together with
+`IOS-LOG-002`'s `.debug` retention and content trades.
+
 **Corrected before merge, second review round (2026-09-11).** The first version of that test
 recognised a write closure only by a parameter named `db` or typed `Database`, with its return type
 on one line. Twenty write closures in the target spell it otherwise: `conn` / `dbConn` in the demo
@@ -109,6 +112,42 @@ added to the write entry points; the target uses neither. Root `MIS-007`, instan
   argument found **224** candidates at the transform (mostly timing values and `if let` decode
   bindings); the rest are unchanged. The census over-counts (an `if let` binding also guards its
   body) and is not asserted exhaustive.
+
+  **Narrowed 2026-09-11.** The owner asked for log-only computation to move inside the gate too, on
+  one condition: nothing but the logs may change. A SwiftSyntax census of bindings, loops, `do`
+  blocks and helpers whose only effect is a log line, with each value checked for a use outside the
+  log, drove 57 edits in 31 files at `e0f8c0e04`:
+  - 54 put diagnostic-only work inside a gate: 45 new canonical gates, 6 existing gates that took in
+    the value computed above them (one is `EmailHTMLWrapper`'s `if isDbg {`, a local copy of the
+    gate), and 3 inner gates hoisted over the work before them. The
+    heaviest: `MemoryIndex`'s two `COUNT(*)` reads per search and its init census read, the calendar
+    providers' response-body `String(data:)` decodes, `SyncEngineFullSync`'s stale-check set
+    differences and `pendingSkipped` filter, `IMAPProvider`'s returned/requested/missing UID sets,
+    `ReminderBuilder`'s count loop and `EmailHTMLWrapper`'s `bodyText` extraction.
+  - 3 log-only helpers return at a whole-body gate (`IOS-PERF-016`'s rule):
+    `AccountManager.logDeleteTrace`, whose `Folder` read ran on every queued delete, and
+    `DeviceSyncService`'s `urlSession(_:task:didFinishCollecting:)` delegate and nested `logDiff`.
+  - A line moved only if it is value-only (no write, no propagating `try`, no `await`, no state
+    another line reads) and every use of its value is inside the gated log. A value captured before
+    other code runs moved only where its inputs cannot change in between. A script checked that
+    every changed line is a gate, a closing brace, a guard or one of 169 moved lines (braces aside),
+    and the census re-run lost 60 of its 240 candidates and gained none.
+
+  Left ungated on purpose, because moving it would change what the app does with the gate closed:
+  - reads whose `try` propagates: `ChatStore.historyTurnIdsForSelfHeal`'s scope breakdown,
+    `SearchIndex`'s `documentCount()` after initialisation, and its `SELECT changes()` after the
+    dedup-table clear;
+  - reads behind `try await`, where removing the suspension point changes interleaving:
+    `AccountManagerOutbox`'s stuck-message read at drain start, and the one-shot
+    `EXPLAIN QUERY PLAN` probes in `BackfillEmbeddingQueue` and `SyncEngineFTS`;
+  - values real work also uses, lengths measured before a mutation (`BodyFetchProcessor`'s raw
+    HTML/text lengths, `EmailHTMLWrapper`'s pre-neutralisation lengths), clock starts, and
+    `IMAPProvider`'s `rfc822Parts`, which feeds a branch condition;
+  - O(1) scalars (counts, arithmetic, clock reads), where moving saves nothing, and `#if DEBUG`
+    sites, which release builds do not compile.
+
+  These integers are a lead pinned to `e0f8c0e04`, not a bound (`MIS-044`); the census is lexical
+  and not asserted exhaustive.
 - **The NSE and `Shared/` are unchanged, because the two processes persist to different files.** The
   main app writes `tabmail.log` (`AppLogStore`, 32 MB cap). The notification service extension writes
   `nse.log` (`NSELog` → `NSELogStore`, App Group container, 3 MB cap, its own
@@ -125,4 +164,6 @@ added to the write entry points; the target uses neither. Root `MIS-007`, instan
 
 `logDebug`; `AppLogChannel.debug`; `DEBUG` tag; #72; ungated print sweep; `DiagnosticPrintGateTests`;
 console-only gate inside a database write; `🚨 UNGATED BY DECISION`; autoclosure defers
-interpolation not a preceding `let`; `setSyncPhase`
+interpolation not a preceding `let`; `setSyncPhase`; log-only compute moved inside the gate;
+whole-body gate on a log-only helper; `logDeleteTrace`; propagating `try` left ungated; suspension
+point left ungated

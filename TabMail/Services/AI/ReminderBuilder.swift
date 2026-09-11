@@ -223,13 +223,15 @@ enum ReminderBuilder {
             return false
         }
 
-        let disabledCount = allReminders.filter { !$0.enabled }.count
-        var messageCount = 0, kbCount = 0
-        for r in allReminders {
-            if r.source == "message" { messageCount += 1 }
-            else if r.source == "kb" { kbCount += 1 }
+        if DebugModeManager.isLoggingEnabled() {
+            let disabledCount = allReminders.filter { !$0.enabled }.count
+            var messageCount = 0, kbCount = 0
+            for r in allReminders {
+                if r.source == "message" { messageCount += 1 }
+                else if r.source == "kb" { kbCount += 1 }
+            }
+            BackgroundSyncLogger.logDebug("[ReminderBuilder] Built reminder list: \(allReminders.count) total (\(messageCount) message + \(kbCount) KB, \(disabledCount) disabled)")
         }
-        BackgroundSyncLogger.logDebug("[ReminderBuilder] Built reminder list: \(allReminders.count) total (\(messageCount) message + \(kbCount) KB, \(disabledCount) disabled)")
 
         return allReminders
     }

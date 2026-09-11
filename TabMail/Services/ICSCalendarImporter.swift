@@ -154,10 +154,10 @@ enum ICSCalendarImporter {
                     self.requestCount += 1
                     if self.stopped { self.sawRequestAfterStop = true }
                 }
-                if let data, let request = String(data: data, encoding: .utf8) {
-                    let firstLine = request.components(separatedBy: "\r\n").first ?? ""
-                    BackgroundSyncLogger.logDebug("[ICSImport] Request: \(firstLine)")
-                    if DebugModeManager.isLoggingEnabled() {
+                if DebugModeManager.isLoggingEnabled() {
+                    if let data, let request = String(data: data, encoding: .utf8) {
+                        let firstLine = request.components(separatedBy: "\r\n").first ?? ""
+                        BackgroundSyncLogger.logDebug("[ICSImport] Request: \(firstLine)")
                         let n = self?.requestCount ?? 0
                         let late = (self?.sawRequestAfterStop ?? false) ? " ⚠️ ARRIVED AFTER stop()" : ""
                         BackgroundSyncLogger.logDebug("[ICSImport][diag] request #\(n)\(late) — full request head follows")

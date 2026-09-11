@@ -355,8 +355,10 @@ extension AccountManager {
             }
 
             if pass == 0 {
-                let summary = ops.map { "\($0.operationType)(event=\($0.eventId ?? "new"))" }.joined(separator: ", ")
-                BackgroundSyncLogger.logDebug("[CalendarQueue] Draining \(ops.count) calendar operations: \(summary)")
+                if DebugModeManager.isLoggingEnabled() {
+                    let summary = ops.map { "\($0.operationType)(event=\($0.eventId ?? "new"))" }.joined(separator: ", ")
+                    BackgroundSyncLogger.logDebug("[CalendarQueue] Draining \(ops.count) calendar operations: \(summary)")
+                }
             }
 
             var executedAny = false

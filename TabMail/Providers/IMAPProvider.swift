@@ -3684,10 +3684,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // `Companion/Memory/Current/105-a-print-is-not-production-observability-on-ios.md`
         // §3 records the sibling where that happened. Keeping it inside also means
         // a non-logging statement added here later still runs in production.
-        let bodyParts = message.bodies
         let rfc822Parts = message.parts.filter { $0.contentType.lowercased().hasPrefix("message/rfc822") }
         if !rfc822Parts.isEmpty {
             if DebugModeManager.isLoggingEnabled() {
+                let bodyParts = message.bodies
                 BackgroundSyncLogger.logDebug("[EmlRender] Message has \(rfc822Parts.count) rfc822 part(s), \(bodyParts.count) body parts:")
                 for part in bodyParts {
                     BackgroundSyncLogger.logDebug("[EmlRender]   section=\(part.section.description) type=\(DebugModeManager.escapedForLogLine(part.contentType)) len=\(part.textContent?.count ?? 0)")
@@ -6629,10 +6629,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             let returnedCount = infos.count
             let requestedCount = batch.count
             if returnedCount < requestedCount {
-                let returnedUIDs = Set(infos.compactMap { $0.uid?.value })
-                let requestedUIDs = Set(batch)
-                let missingUIDs = requestedUIDs.subtracting(returnedUIDs)
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP-FETCH-GAP] \(folder): requested \(requestedCount) UIDs, got \(returnedCount). Missing UIDs: \(missingUIDs.sorted())") }
+                if DebugModeManager.isLoggingEnabled() {
+                    let returnedUIDs = Set(infos.compactMap { $0.uid?.value })
+                    let requestedUIDs = Set(batch)
+                    let missingUIDs = requestedUIDs.subtracting(returnedUIDs)
+                    BackgroundSyncLogger.logDebug("[IMAP-FETCH-GAP] \(folder): requested \(requestedCount) UIDs, got \(returnedCount). Missing UIDs: \(missingUIDs.sorted())")
+                }
             }
 
             allHeaders.append(contentsOf: infos.compactMap { mapMessageInfo($0) })

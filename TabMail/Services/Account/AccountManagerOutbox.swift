@@ -1639,8 +1639,10 @@ extension AccountManager {
         }
 
         let sweep = Self.reclaimUnreferencedAttachmentDirs(baseDir: baseDir, referenced: existingIds)
-        for dirName in sweep.reclaimed {
-            BackgroundSyncLogger.logDebug("[Outbox] Cleaning orphaned attachment dir: \(dirName)")
+        if DebugModeManager.isLoggingEnabled() {
+            for dirName in sweep.reclaimed {
+                BackgroundSyncLogger.logDebug("[Outbox] Cleaning orphaned attachment dir: \(dirName)")
+            }
         }
         if DebugModeManager.isLoggingEnabled(), !sweep.deferredInFlight.isEmpty {
             BackgroundSyncLogger.logDebug("[Outbox] Deferred \(sweep.deferredInFlight.count) unreferenced attachment dir(s) inside the staging grace window")

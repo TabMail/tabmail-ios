@@ -41,9 +41,11 @@ struct EmailSearchTool: AgentTool, Sendable {
         let fromDate = ToolFormatters.parseDate(arguments["from_date"])
         let toDate = ToolFormatters.parseDate(arguments["to_date"])
 
-        let fromStr = fromDate.map { ToolFormatters.formatDate($0) } ?? "-"
-        let toStr = toDate.map { ToolFormatters.formatDate($0) } ?? "-"
-        BackgroundSyncLogger.logDebug("[EmailSearchTool] email_search: query='\(String(query.prefix(80)))' from_date='\(fromStr)' to_date='\(toStr)' page_index=\(pageIndex)")
+        if DebugModeManager.isLoggingEnabled() {
+            let fromStr = fromDate.map { ToolFormatters.formatDate($0) } ?? "-"
+            let toStr = toDate.map { ToolFormatters.formatDate($0) } ?? "-"
+            BackgroundSyncLogger.logDebug("[EmailSearchTool] email_search: query='\(String(query.prefix(80)))' from_date='\(fromStr)' to_date='\(toStr)' page_index=\(pageIndex)")
+        }
 
         // Convert date filters to epoch ms for search layer.
         // When to_date is a date-only string (YYYY-MM-DD), extend to end-of-day
@@ -85,9 +87,11 @@ struct EmailSearchTool: AgentTool, Sendable {
         BackgroundSyncLogger.logDebug("[EmailSearchTool] email_search: \(total) items total (sort=\(sort))")
 
         // Log top results for debugging
-        for (i, hit) in hits.prefix(10).enumerated() {
-            let date = Date(timeIntervalSince1970: Double(hit.dateMs) / 1000)
-            BackgroundSyncLogger.logDebug("[EmailSearchTool]   [\(i)] rank=\(String(format: "%.4f", hit.rank)) headerId=\(hit.contentKey.rawValue.prefix(40)) date=\(ToolFormatters.formatDate(date)) snippet=\(hit.snippet.prefix(60))")
+        if DebugModeManager.isLoggingEnabled() {
+            for (i, hit) in hits.prefix(10).enumerated() {
+                let date = Date(timeIntervalSince1970: Double(hit.dateMs) / 1000)
+                BackgroundSyncLogger.logDebug("[EmailSearchTool]   [\(i)] rank=\(String(format: "%.4f", hit.rank)) headerId=\(hit.contentKey.rawValue.prefix(40)) date=\(ToolFormatters.formatDate(date)) snippet=\(hit.snippet.prefix(60))")
+            }
         }
 
         if total == 0 {

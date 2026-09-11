@@ -100,6 +100,12 @@ the travelled `UndoService.push` defect. When sweeping the remaining class, enum
 every diagnostic site whose *work* is ungated — rather than by grepping for `print(`, which finds
 emissions and misses the reads that feed them.
 
+**2026-09-11 — swept.** `TabMail/tabmail-ios#72` routed the `TabMail/` target's console `print`s
+through the debug-gated `logDebug`, except the console-only prints inside database write contexts and
+the three `🚨 UNGATED BY DECISION` sites. A follow-up enumerated the diagnostic WORK by state, with
+a SwiftSyntax census of bindings, loops, `do` blocks and helpers whose only effect is a log line, and
+moved its value-only part inside the gate. What stays ungated, and why: `Amendments/ios-log-001.md`.
+
 ## Related
 
 - `IOS-PERF-010` — the blocked-main-thread-reader class this is a member of.

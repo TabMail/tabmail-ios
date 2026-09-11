@@ -1396,10 +1396,10 @@ extension SyncEngine {
                 let localIds = Set(allLocal.map(\.messageId))
                 allLocalIds = localIds
                 if !allLocal.isEmpty && !remoteIds.isEmpty {
-                    let onlyLocal = localIds.subtracting(remoteIds)
-                    let onlyRemote = remoteIds.subtracting(localIds)
-                    if !onlyLocal.isEmpty || !onlyRemote.isEmpty {
-                        if DebugModeManager.isLoggingEnabled() {
+                    if DebugModeManager.isLoggingEnabled() {
+                        let onlyLocal = localIds.subtracting(remoteIds)
+                        let onlyRemote = remoteIds.subtracting(localIds)
+                        if !onlyLocal.isEmpty || !onlyRemote.isEmpty {
                             print("[Sync] \(folder.name) stale-check: local=\(allLocal.count) remote=\(messages.count) onlyLocal=\(Array(onlyLocal.prefix(5))) onlyRemote=\(Array(onlyRemote.prefix(5)))")
                         }
                     }
@@ -1465,9 +1465,9 @@ extension SyncEngine {
                 }
             }
             let protectedIds = pendingAllIds
-            let pendingSkipped = stale.filter { isProtectedByPending($0) || isProtectedByRecent($0) }
-            if !pendingSkipped.isEmpty {
-                if DebugModeManager.isLoggingEnabled() {
+            if DebugModeManager.isLoggingEnabled() {
+                let pendingSkipped = stale.filter { isProtectedByPending($0) || isProtectedByRecent($0) }
+                if !pendingSkipped.isEmpty {
                     print("[MoveTrace] fullSync \(folder.name) — skipping stale delete for \(pendingSkipped.count) msgs with pending/recent ops: \(pendingSkipped.map(\.messageId))")
                 }
             }

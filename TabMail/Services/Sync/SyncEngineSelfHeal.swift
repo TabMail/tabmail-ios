@@ -257,9 +257,11 @@ extension SyncEngine {
         )
 
         if headers.count < missingUIDs.count {
-            let fetched = Set(headers.map(\.messageId))
-            let stillMissing = missingUIDs.filter { !fetched.contains(String($0)) }
-            BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): IMAP FETCH returned \(headers.count)/\(missingUIDs.count). Permanently missing UIDs: \(stillMissing.sorted().prefix(20))")
+            if DebugModeManager.isLoggingEnabled() {
+                let fetched = Set(headers.map(\.messageId))
+                let stillMissing = missingUIDs.filter { !fetched.contains(String($0)) }
+                BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): IMAP FETCH returned \(headers.count)/\(missingUIDs.count). Permanently missing UIDs: \(stillMissing.sorted().prefix(20))")
+            }
         }
 
         guard !headers.isEmpty else { return 0 }

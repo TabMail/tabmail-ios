@@ -235,7 +235,8 @@ doc comment enumerates seven evasion shapes it cannot see. Recorded as `MIS-019`
 ## 2026-09-10 — the rule-12 half of the residual record above is closed by #72; the escaping half in `Shared/` is not
 
 GitHub `TabMail/tabmail-ios#72` (owner 2026-09-10) routed every console `print` in the `TabMail/`
-target through `BackgroundSyncLogger.logDebug` — gated inside the façade, `@autoclosure` so a locked
+target through `BackgroundSyncLogger.logDebug` (except the console-only prints inside database write
+contexts and the three `🚨 UNGATED BY DECISION` sites; qualified 2026-09-11) — gated inside the façade, `@autoclosure` so a locked
 gate renders nothing, whole-line `escapedForLogLine`, persisted on `AppLogChannel.debug`. Measured at
 the sweep: `IMAPProvider.swift`, `ComposeView.swift` and `GoogleCalendarProvider.swift` carry **zero**
 bare `print`s (109, 34 and 9 `logDebug` calls; `fetchFolders` + `dedupRoles` hold 2 of IMAPProvider's).

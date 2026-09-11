@@ -540,8 +540,10 @@ actor ChatIdTranslator {
             }
         }
 
-        let remappedCount = remapTable.filter { $0.key != $0.value }.count
-        BackgroundSyncLogger.logDebug("[ChatIdTranslator] mergeFromIsolated: merged \(isolatedMap.count) entries, \(remappedCount) remapped, map now has \(idMap.count) entries")
+        if DebugModeManager.isLoggingEnabled() {
+            let remappedCount = remapTable.filter { $0.key != $0.value }.count
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] mergeFromIsolated: merged \(isolatedMap.count) entries, \(remappedCount) remapped, map now has \(idMap.count) entries")
+        }
         return result
     }
 
