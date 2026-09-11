@@ -2987,10 +2987,12 @@ enum QuotedFallbackConfig {
 /// before the end of the text or the first non-quoted "-- " signature delimiter
 /// means the ">" block is embedded content (digest excerpt, bottom-posted
 /// reply), not a trailing quote — collapsing from there would hide the message.
-/// A later ">" run preceded by an answer-like line (`inlineAnswerMinLineLength`
-/// or more characters; blank lines and 1-char gaps do not count, as in TB's
-/// `detectInlineAnswersInPlainText`) means the message is an interleaved
-/// (inline) reply or a digest embedding several excerpts. With a `<blockquote>` present the run is
+/// A later ">" run ANYWHERE after the run, preceded by an answer-like line
+/// (`inlineAnswerMinLineLength` or more characters; blank lines and 1-char gaps
+/// do not count, as in TB's `detectInlineAnswersInPlainText`), means the message
+/// is an interleaved (inline) reply or a digest embedding several excerpts. A
+/// later ">" run with no answer before it is the same quote continuing and
+/// accepts the run outright (TB `multiLineCheck`), while the scan continues. With a `<blockquote>` present the run is
 /// ACCEPTED and the caller's blockquote-based trailing-quote logic decides,
 /// exactly as before this rule existed; with `hasBlockquote` false there is no
 /// trailing section to isolate and collapsing from the first run would hide the
@@ -3020,17 +3022,26 @@ function findQuotedFallbackBoundary(lines, minRun, maxTrailing, minAnswerLen, ha
         while (idx < lines.length && isQuoted(lines[idx])) idx++;
         var trailing = 0;
         var answer = false;
-        var laterRun = false;
+        var accepted = false;
+        var inlineCycle = false;
         for (; idx < lines.length; idx++) {
             var t = (lines[idx] || '').trim();
             if (!t) continue;
-            if (/^>/.test(t)) { laterRun = answer; break; }
+            if (/^>/.test(t)) {
+                // quoted -> answer -> quoted: an interleaved reply (TB cycle check).
+                if (answer) { inlineCycle = true; break; }
+                // A later ">" run with no answer before it (blank / 1-char gaps)
+                // is the same quote continuing: the run is accepted (TB
+                // multiLineCheck) but the scan goes on looking for a cycle.
+                accepted = true;
+                continue;
+            }
             if (/^--\\s*$/.test(t)) break;
             if (t.length >= minAnswerLen) answer = true;
             trailing++;
         }
-        if (laterRun) return hasBlockquote ? q : -1;
-        if (trailing <= maxTrailing) return q;
+        if (inlineCycle) return hasBlockquote ? q : -1;
+        if (accepted || trailing <= maxTrailing) return q;
         q = idx - 1;
     }
     return -1;

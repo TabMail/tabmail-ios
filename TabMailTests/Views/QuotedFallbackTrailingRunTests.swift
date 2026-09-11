@@ -26,16 +26,18 @@ struct QuotedFallbackBoundaryHelperTests {
 
     /// Evaluates the SHARED production source in a fresh JSContext.
     private func boundary(_ lines: [String], hasBlockquote: Bool = false) -> Int32 {
+        boundary(lines,
+                 minRun: QuotedFallbackConfig.minConsecutiveLines,
+                 maxTrailing: QuotedFallbackConfig.maxTrailingLines,
+                 minAnswerLen: QuotedFallbackConfig.inlineAnswerMinLineLength,
+                 hasBlockquote: hasBlockquote)
+    }
+
+    private func boundary(_ lines: [String], minRun: Int, maxTrailing: Int, minAnswerLen: Int, hasBlockquote: Bool) -> Int32 {
         let ctx = JSContext()!
         ctx.evaluateScript(quotedFallbackBoundaryJS)
         let fn = ctx.objectForKeyedSubscript("findQuotedFallbackBoundary")!
-        return fn.call(withArguments: [
-            lines,
-            QuotedFallbackConfig.minConsecutiveLines,
-            QuotedFallbackConfig.maxTrailingLines,
-            QuotedFallbackConfig.inlineAnswerMinLineLength,
-            hasBlockquote,
-        ])?.toInt32() ?? -99
+        return fn.call(withArguments: [lines, minRun, maxTrailing, minAnswerLen, hasBlockquote])?.toInt32() ?? -99
     }
 
     private func digestTail(_ n: Int) -> [String] {
@@ -162,6 +164,34 @@ struct QuotedFallbackBoundaryHelperTests {
         let lines = ["Thanks!", "> Q1", "> Q1b", "ok", "> Q2", "> Q2b"]
         #expect(boundary(lines, hasBlockquote: false) == -1)
         #expect(boundary(lines, hasBlockquote: true) == 1)
+    }
+
+    @Test("an answer between ANY two later \">\" runs makes it an inline reply, not just after the first run")
+    func inlineCycleAfterABlankSeparatedRun() {
+        // Invariant (TB detectInlineAnswersInPlainText): quoted -> answer -> quoted
+        // anywhere after the boundary means the answers are interleaved; with no
+        // blockquote to isolate a trailing section the message stays visible.
+        let lines = ["Thanks!", "> a", "> b", "", "> c", "> d", "My answer here.", "> e", "> f"]
+        #expect(boundary(lines, hasBlockquote: false) == -1)
+        #expect(boundary(lines, hasBlockquote: true) == 1)
+    }
+
+    @Test("blank-separated runs followed by a long non-quoted tail still collapse (any later run accepts, as in TB)")
+    func blankSeparatedRunsThenLongTailStillCollapse() {
+        let lines = ["Thanks!", "> a", "> b", "", "> c", "> d"] + (1...20).map { "Tail \($0)" }
+        #expect(boundary(lines, hasBlockquote: false) == 1)
+    }
+
+    @Test("every threshold is LIVE: non-default minRun / maxTrailing / minAnswerLen change the result")
+    func thresholdsAreLive() {
+        // minRun 3 rejects a 2-line run that the default accepts.
+        #expect(boundary(["Sure.", "> a", "> b"], minRun: 3, maxTrailing: 10, minAnswerLen: 2, hasBlockquote: false) == -1)
+        #expect(boundary(["Sure.", "> a", "> b"], minRun: 2, maxTrailing: 10, minAnswerLen: 2, hasBlockquote: false) == 1)
+        // maxTrailing 1 rejects a 2-line tail that the default accepts.
+        #expect(boundary(["> a", "> b", "Thanks,", "Name"], minRun: 2, maxTrailing: 1, minAnswerLen: 2, hasBlockquote: false) == -1)
+        // minAnswerLen 1 turns a 1-char gap into an answer (inline cycle -> -1).
+        #expect(boundary(["Hi", "> a", "> b", "x", "> c", "> d"], minRun: 2, maxTrailing: 10, minAnswerLen: 1, hasBlockquote: false) == -1)
+        #expect(boundary(["Hi", "> a", "> b", "x", "> c", "> d"], minRun: 2, maxTrailing: 10, minAnswerLen: 2, hasBlockquote: false) == 1)
     }
 
     @Test("processes many short \">\" runs separated by blank lines in bounded time")

@@ -36,7 +36,7 @@ order	status	source_lines	sha256	path	title
 34	current	359-369	029248a931c1fddb36f5fbf3fa614c78da32cbcdaee5a903f4e9795360286a73	Companion/Memory/Current/034-gmail-label-system.md	Gmail Label System
 35	current	370-386	582afb57c5abc0cf8c0b47648f7c674fdc4746f3b32661c059d36850c7672314	Companion/Memory/Current/035-swiftui-observable-array-mutation-safety.md	SwiftUI Observable Array Mutation Safety
 36	current	387-398	a8ddc69afff6882db14f3c327c1d4aab05c731ec9a9ca7d0e0b9f554661d79e5	Companion/Memory/Current/036-swiftui-layout-gotchas.md	SwiftUI Layout Gotchas
-37	current	399-434	0d8635739d0bff0133380b4ed3ff774647cc9ee4f465dd59d964ca910089d6a8	Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md	HTML Email Render Pipeline (AutoSizingHTMLView) — MUST stay idempotent (ADR-IOS-039)
+37	current	399-434	9389e27908a0e2beab17efc679450aa1a00cfba8f6b63acd95955c715bfd7142	Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md	HTML Email Render Pipeline (AutoSizingHTMLView) — MUST stay idempotent (ADR-IOS-039)
 38	current	435-439	0f22100ace930e3a11e7099faeb806b334f59067aa4828f35b37413506c4c318	Companion/Memory/Current/038-swift-gotchas.md	Swift Gotchas
 39	current	440-444	db5e71c57f1ec01ab3ac8ec8139de97197d628b371e5349bbeffbcc678b14a2d	Companion/Memory/Current/039-folder-must-include-every-ui-visible-field.md	Folder.== must include every UI-visible field
 40	current	445-451	a7b2fefb16edd121aba5963a5d4d88451bb0b0b424386d9265531e77c0ed8f17	Companion/Memory/Current/040-imap-folder-role-detection-dedup-icloud-trash-deleted-messages.md	IMAP Folder Role Detection & Dedup (iCloud "Trash" + "Deleted Messages")
