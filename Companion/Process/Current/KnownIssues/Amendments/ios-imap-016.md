@@ -1,5 +1,7 @@
 # IOS-IMAP-016 — SwiftMail's header encoder has the same inverted guard, and its part-header builder interpolates filenames raw
 
+> **2026-09-10 status amendment:** the app is re-pinned to the resynced fork (`packages.SwiftMail.revision` = `d87295e3`, PR #152 merged 2026-09-10) which carries upstream `64a9a86` plus the fork's one deviation, the RFC 2231 fix now under review as Cocoanetics/SwiftMail#233. That PR has been through four maintainer review rounds, all on the extended-parameter charset guard; its head is `9f1a2b6` (blank charset ⇒ US-ASCII only; UTF-8 placeholder guard scoped to non-Apple platforms). The three post-`d87295e` fixes change Darwin behaviour only for a blank charset with non-ASCII bytes, so the app pin is not blocked on them. Completion criteria 2–5 stay open until #233 merges and the fork is resynced to upstream's version; see [sync status](../../../../Memory/Current/126-swiftmail-upstream-sync-and-oversized-train.md).
+>
 > **2026-09-09 status amendment:** upstream acceptance is complete through SwiftMail #226 and #230 (superseding #215 and #216). App/fork synchronization and regression verification remain pending; this record stays open. The historical defect and pin descriptions below are retained. See [current sync and release-train status](../../../../Memory/Current/126-swiftmail-upstream-sync-and-oversized-train.md).
 
 **Class:** `open` · **Opened:** 2026-08-12 · **Remedy is UPSTREAM** (Cocoanetics/SwiftMail, not the
