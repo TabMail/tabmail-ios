@@ -22,7 +22,11 @@ import WebKit
 /// `_hasRevealed` — because a `@State` initial value is not observable from
 /// outside a SwiftUI render pass. `AutoSizingHTMLView.initialHasRevealed` is the
 /// expression `init` uses, so asserting on it asserts on production behaviour.
-@Suite("AutoSizingHTMLView reveal seeding (T4.V17)")
+///
+/// `.processGlobalState`: the test makes its own window key and restores the
+/// previous key window on exit, as the other key-window suites do, so it must not
+/// interleave with them.
+@Suite("AutoSizingHTMLView reveal seeding (T4.V17)", .serialized, .processGlobalState)
 struct AutoSizingHTMLViewRevealSeedingTests {
 
     @MainActor
@@ -32,7 +36,15 @@ struct AutoSizingHTMLViewRevealSeedingTests {
         let driver = AutoSizingHTMLView.makeRevealTestDriver(
             hasRevealed: Binding(get: { revealed }, set: { revealed = $0 })
         )
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first else {
+            Issue.record("no UIWindowScene is available to host the reveal driver")
+            return
+        }
+        let previousKeyWindow = scene.windows.first(where: \.isKeyWindow)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
         let controller = UIViewController()
         window.rootViewController = controller
         controller.view.addSubview(driver.webView)
@@ -42,6 +54,7 @@ struct AutoSizingHTMLViewRevealSeedingTests {
             driver.webView.removeFromSuperview()
             window.isHidden = true
             window.rootViewController = nil
+            previousKeyWindow?.makeKeyAndVisible()
         }
         #expect(driver.webView.bounds.width > 0)
         #expect(!driver.committed())
