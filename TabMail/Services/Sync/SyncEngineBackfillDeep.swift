@@ -69,7 +69,7 @@ extension SyncEngine {
                 return allUIDs.filter { !existingIds.contains("\($0)") }
             }
             guard !missingUIDs.isEmpty else { return (inserted: 0, found: totalFound) }
-            print("[IMAP Backfill] \(folder.path): \(missingUIDs.count) missing UIDs to fetch [\(profile)]")
+            BackgroundSyncLogger.logDebug("[IMAP Backfill] \(folder.path): \(missingUIDs.count) missing UIDs to fetch [\(profile)]")
 
             // Step 3: Chunked fetch + insert (FTS deferred to end of window)
             let imapBatchSize = profile.imapFetchBatchSize
@@ -90,7 +90,7 @@ extension SyncEngine {
                 if headers.count < chunk.count {
                     let returnedIds = Set(headers.map(\.messageId))
                     let droppedUIDs = chunk.filter { !returnedIds.contains("\($0)") }
-                    print("[Backfill-FETCH-GAP] \(folder.path): requested \(chunk.count) UIDs, got \(headers.count). Retrying \(droppedUIDs.count) dropped UIDs: \(droppedUIDs.sorted().prefix(20))")
+                    BackgroundSyncLogger.logDebug("[Backfill-FETCH-GAP] \(folder.path): requested \(chunk.count) UIDs, got \(headers.count). Retrying \(droppedUIDs.count) dropped UIDs: \(droppedUIDs.sorted().prefix(20))")
                     if !droppedUIDs.isEmpty {
                         let retryFetch = try await workQueue.execute(priority: .headerFetch) {
                             try await provider.fetchMessageHeadersWithObservedEpoch(
@@ -100,10 +100,10 @@ extension SyncEngine {
                         let retryHeaders = retryFetch.messages
                         contributingEpochs.append(retryFetch.observedEpoch)
                         if !retryHeaders.isEmpty {
-                            print("[Backfill-FETCH-GAP] \(folder.path): retry recovered \(retryHeaders.count)/\(droppedUIDs.count)")
+                            BackgroundSyncLogger.logDebug("[Backfill-FETCH-GAP] \(folder.path): retry recovered \(retryHeaders.count)/\(droppedUIDs.count)")
                             headers.append(contentsOf: retryHeaders)
                         } else {
-                            print("[Backfill-FETCH-GAP] \(folder.path): retry returned 0 — UIDs may be expunged: \(droppedUIDs.sorted().prefix(20))")
+                            BackgroundSyncLogger.logDebug("[Backfill-FETCH-GAP] \(folder.path): retry returned 0 — UIDs may be expunged: \(droppedUIDs.sorted().prefix(20))")
                         }
                     }
                 }
@@ -151,7 +151,7 @@ extension SyncEngine {
                 return allIds.filter { !existingIds.contains($0) }
             }
             guard !missingIds.isEmpty else { return (inserted: 0, found: totalFound) }
-            print("[Gmail Backfill] \(folder.path): \(missingIds.count) missing IDs to fetch [\(profile)]")
+            BackgroundSyncLogger.logDebug("[Gmail Backfill] \(folder.path): \(missingIds.count) missing IDs to fetch [\(profile)]")
 
             // Step 3: Chunked fetch + insert (FTS deferred to end of window)
             let gmailBatchSize = profile.gmailFetchBatchSize
@@ -208,7 +208,7 @@ extension SyncEngine {
                 return allIds.filter { !existingIds.contains($0) }
             }
             guard !missingIds.isEmpty else { return (inserted: 0, found: totalFound) }
-            print("[Exchange Backfill] \(folder.path): \(missingIds.count) missing IDs to fetch [\(profile)]")
+            BackgroundSyncLogger.logDebug("[Exchange Backfill] \(folder.path): \(missingIds.count) missing IDs to fetch [\(profile)]")
 
             // Step 3: Chunked fetch + insert
             let batchSize = profile.gmailFetchBatchSize
@@ -248,9 +248,9 @@ extension SyncEngine {
         if !allCcBccUpdates.isEmpty {
             do {
                 try await SearchIndex.shared.updateCcBcc(allCcBccUpdates)
-                print("[Backfill] Updated cc/bcc in FTS for \(allCcBccUpdates.count) existing messages")
+                BackgroundSyncLogger.logDebug("[Backfill] Updated cc/bcc in FTS for \(allCcBccUpdates.count) existing messages")
             } catch {
-                print("[Backfill] FTS cc/bcc update failed: \(error)")
+                BackgroundSyncLogger.logDebug("[Backfill] FTS cc/bcc update failed: \(error)")
             }
         }
 
@@ -561,7 +561,9 @@ extension SyncEngine {
                                     tagValue: ActionTag.none.rawValue
                                 )
                                 try tagOp.insert(db)
-                                print("[ReplyDetect] Backfill insert: reply→none for \(header.messageId) (already replied)")
+                                if DebugModeManager.isLoggingEnabled() {
+                                    print("[ReplyDetect] Backfill insert: reply→none for \(header.messageId) (already replied)")
+                                }
                             }
                             try header.insert(db)
                             try ThreadUtils.insertMessageReferences(for: header, db: db)
@@ -611,12 +613,12 @@ extension SyncEngine {
                 ccBccFtsUpdates.append(contentsOf: result.ccBcc)
                 discoveredParents.append(contentsOf: result.parents)
             } catch {
-                print("[Backfill] Insert chunk failed: \(error)")
+                BackgroundSyncLogger.logDebug("[Backfill] Insert chunk failed: \(error)")
             }
         }
 
         if count > 0 {
-            print("[Backfill] +\(count) messages (\(unreadInserted) unread)")
+            BackgroundSyncLogger.logDebug("[Backfill] +\(count) messages (\(unreadInserted) unread)")
             if unreadInserted > 0 {
                 let fid = folderId
                 Task {
@@ -646,12 +648,12 @@ extension SyncEngine {
         var windowEnd = utcCal.startOfDay(for: before)
         var windowDays = account.provider == .imap ? 30 : 90
 
-        print("[Backfill] Deep crawl starting for \(folder.name) (before \(before))")
+        BackgroundSyncLogger.logDebug("[Backfill] Deep crawl starting for \(folder.name) (before \(before))")
 
         while !StorageEstimator.isOverBudget() {
             try Task.checkCancellation()
             if let deadline, Date() >= deadline {
-                print("[Backfill] Deep crawl deadline reached for \(folder.name)")
+                BackgroundSyncLogger.logDebug("[Backfill] Deep crawl deadline reached for \(folder.name)")
                 return
             }
             let windowStart = utcCal.date(byAdding: .day, value: -windowDays, to: windowEnd) ?? Date.distantPast
@@ -672,12 +674,12 @@ extension SyncEngine {
                 if desc.contains("PayloadTooLargeError") {
                     if windowDays > 1 {
                         windowDays = max(1, windowDays / 2)
-                        print("[Backfill] Deep crawl window too large for \(folder.name) — shrinking to \(windowDays) days")
+                        BackgroundSyncLogger.logDebug("[Backfill] Deep crawl window too large for \(folder.name) — shrinking to \(windowDays) days")
                         continue
                     }
                     // Single day still overflows — skip this day and continue deeper.
                     // Better to lose one dense day than abort the entire deep crawl.
-                    print("[Backfill] Deep crawl: single day overflow for \(folder.name) at \(windowEnd) — skipping day")
+                    BackgroundSyncLogger.logDebug("[Backfill] Deep crawl: single day overflow for \(folder.name) at \(windowEnd) — skipping day")
                     windowEnd = windowStart
                     windowDays = account.provider == .imap ? 30 : 90 // reset window size
                     continue
@@ -690,18 +692,18 @@ extension SyncEngine {
             // messages already exist locally (dedup). found==0 means the server has
             // no messages in this date range — truly empty.
             if result.found == 0 {
-                print("[Backfill] Deep crawl complete for \(folder.name) — no more messages (found=0)")
+                BackgroundSyncLogger.logDebug("[Backfill] Deep crawl complete for \(folder.name) — no more messages (found=0)")
                 break
             }
             if result.inserted == 0 {
-                print("[Backfill] Deep crawl \(folder.name): all \(result.found) found already exist — continuing deeper")
+                BackgroundSyncLogger.logDebug("[Backfill] Deep crawl \(folder.name): all \(result.found) found already exist — continuing deeper")
             }
 
             try await AppDatabase.backgroundPool.write { db in
                 _ = try Folder.filter(Column("id") == folder.id)
                     .updateAll(db, Column("oldestSyncedDate").set(to: windowStart))
             }
-            print("[Backfill] Deep crawl \(folder.name): window \(windowStart)–\(windowEnd)")
+            BackgroundSyncLogger.logDebug("[Backfill] Deep crawl \(folder.name): window \(windowStart)–\(windowEnd)")
 
             windowEnd = windowStart
 
@@ -710,7 +712,7 @@ extension SyncEngine {
         }
 
         if StorageEstimator.isOverBudget() {
-            print("[Backfill] Deep crawl stopped for \(folder.name) — over storage budget")
+            BackgroundSyncLogger.logDebug("[Backfill] Deep crawl stopped for \(folder.name) — over storage budget")
         }
     }
 }

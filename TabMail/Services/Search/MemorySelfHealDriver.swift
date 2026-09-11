@@ -34,12 +34,12 @@ enum MemorySelfHealDriver {
     /// Run both stages. Safe to call concurrently (actors serialize;
     /// `QueueStorage` dedups). Set-diff empties produce no work on re-runs.
     static func runStageAPlusB() async {
-        print("[MemorySelfHealDriver] runStageAPlusB BEGIN")
+        BackgroundSyncLogger.logDebug("[MemorySelfHealDriver] runStageAPlusB BEGIN")
         let t0 = Date()
         await runStageA()
         await BackfillMemoryEmbeddingQueue.shared.repopulateFromDatabase()
         let ms = Int(Date().timeIntervalSince(t0) * 1000)
-        print("[MemorySelfHealDriver] runStageAPlusB END (\(ms)ms)")
+        BackgroundSyncLogger.logDebug("[MemorySelfHealDriver] runStageAPlusB END (\(ms)ms)")
     }
 
     /// Stage A only — exposed for tests.
@@ -58,13 +58,13 @@ enum MemorySelfHealDriver {
             eligibleA = try await ChatStore.shared.historyTurnIdsForSelfHeal(olderThan: idleCutoffMs)
             allChatHistory = try await ChatStore.shared.allHistoryTurnIds()
         } catch {
-            print("[MemorySelfHealDriver] ChatStore query failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemorySelfHealDriver] ChatStore query failed: \(error)")
             return
         }
         let knownB = await MemoryIndex.shared.knownChatHistoryIds()
         let missing = eligibleA.subtracting(knownB)
         let orphans = knownB.subtracting(allChatHistory)
-        print("[MemorySelfHealDriver] Stage A eligible=\(eligibleA.count) allChatHistory=\(allChatHistory.count) known=\(knownB.count) missing=\(missing.count) orphans=\(orphans.count) idleCutoffMs=\(idleCutoffMs)")
+        BackgroundSyncLogger.logDebug("[MemorySelfHealDriver] Stage A eligible=\(eligibleA.count) allChatHistory=\(allChatHistory.count) known=\(knownB.count) missing=\(missing.count) orphans=\(orphans.count) idleCutoffMs=\(idleCutoffMs)")
 
         // B − allChatHistory → delete orphans.
         if !orphans.isEmpty {
@@ -90,7 +90,7 @@ enum MemorySelfHealDriver {
         do {
             turns = try await ChatStore.shared.loadHistoryTurns(ids: ids)
         } catch {
-            print("[MemorySelfHealDriver] loadHistoryTurns(chunk=\(ids.count)) failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemorySelfHealDriver] loadHistoryTurns(chunk=\(ids.count)) failed: \(error)")
             return
         }
 
@@ -108,11 +108,11 @@ enum MemorySelfHealDriver {
         }
 
         guard !entries.isEmpty else {
-            print("[MemorySelfHealDriver] indexChunk SKIP requested=\(ids.count) indexable=0 (all turns non-normal or empty text)")
+            BackgroundSyncLogger.logDebug("[MemorySelfHealDriver] indexChunk SKIP requested=\(ids.count) indexable=0 (all turns non-normal or empty text)")
             return
         }
 
-        print("[MemorySelfHealDriver] indexChunk requested=\(ids.count) indexable=\(entries.count)")
+        BackgroundSyncLogger.logDebug("[MemorySelfHealDriver] indexChunk requested=\(ids.count) indexable=\(entries.count)")
         await MemoryIndex.shared.indexTurns(entries)
         await BackfillMemoryEmbeddingQueue.shared.enqueueBatch(entries.map { $0.chatHistoryId })
     }

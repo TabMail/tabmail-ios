@@ -35,15 +35,15 @@ extension SyncEngine {
     /// Fetches only what changed since lastHistoryId — typically 1 API call when nothing changed.
     private func gmailDeltaSync(account: Account, provider: GmailProvider) async throws -> (succeeded: Bool, hadChanges: Bool) {
         guard let historyId = account.lastHistoryId else {
-            print("[Sync] Gmail delta: no historyId for \(account.emailAddress) — skipping (needs full sync)")
+            BackgroundSyncLogger.logDebug("[Sync] Gmail delta: no historyId for \(account.emailAddress) — skipping (needs full sync)")
             BackgroundSyncLogger.log("gmailDelta: \(account.emailAddress) noHistoryId")
             return (false, false)
         }
 
-        print("[Sync] Gmail delta: fetching history since \(historyId) for \(account.emailAddress)")
+        BackgroundSyncLogger.logDebug("[Sync] Gmail delta: fetching history since \(historyId) for \(account.emailAddress)")
         guard let history = try await provider.fetchHistory(since: historyId) else {
             // History expired (404) — clear cursor so next sync does full
-            print("[Sync] Gmail delta: history expired (404) for \(account.emailAddress) — clearing cursor")
+            BackgroundSyncLogger.logDebug("[Sync] Gmail delta: history expired (404) for \(account.emailAddress) — clearing cursor")
             BackgroundSyncLogger.log("gmailDelta: \(account.emailAddress) historyExpired(404)")
             try await dbPool.write { db in
                 _ = try Account.filter(Column("id") == account.id)
@@ -55,7 +55,7 @@ extension SyncEngine {
         let totalChanges = history.messagesAdded.count + history.messagesDeleted.count +
             history.labelsAdded.count + history.labelsRemoved.count
         let deltaLog = "gmailDelta: \(account.emailAddress) hid=\(historyId)→\(history.newHistoryId) +\(history.messagesAdded.count) -\(history.messagesDeleted.count) ~\(history.labelsAdded.count + history.labelsRemoved.count)"
-        print("[Sync] \(deltaLog)")
+        BackgroundSyncLogger.logDebug("[Sync] \(deltaLog)")
         BackgroundSyncLogger.log(deltaLog)
 
         // historyId is advanced AFTER processing completes successfully (at end of method).
@@ -75,11 +75,11 @@ extension SyncEngine {
                 _ = try Account.filter(Column("id") == account.id)
                     .updateAll(db, Column("lastHistoryId").set(to: newHistoryId))
             }
-            print("[Sync] Gmail delta: no changes")
+            BackgroundSyncLogger.logDebug("[Sync] Gmail delta: no changes")
             return (true, false)
         }
 
-        print("[Sync] Gmail delta: +\(history.messagesAdded.count) added, -\(history.messagesDeleted.count) deleted, \(history.labelsAdded.count + history.labelsRemoved.count) label changes")
+        BackgroundSyncLogger.logDebug("[Sync] Gmail delta: +\(history.messagesAdded.count) added, -\(history.messagesDeleted.count) deleted, \(history.labelsAdded.count + history.labelsRemoved.count) label changes")
 
         // Collect all affected message IDs
         var toFetch = Set<String>()
@@ -135,7 +135,9 @@ extension SyncEngine {
                         // Drafts folder so this doesn't spray logs for ordinary mail.
                         if DebugModeManager.isLoggingEnabled(),
                            let draftsFolder = folders.first(where: { $0.id == msg.folderId && $0.role == .drafts }) {
-                            print("[DraftRekey] Gmail delta: deleting drafts-folder header id=\(msg.id) messageId=\(msg.messageId) rfc822=\(msg.rfc822MessageId ?? "nil") folder=\(draftsFolder.name)")
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[DraftRekey] Gmail delta: deleting drafts-folder header id=\(msg.id) messageId=\(msg.messageId) rfc822=\(msg.rfc822MessageId ?? "nil") folder=\(draftsFolder.name)")
+                            }
                         }
                         ids.append(msg.id)
                         try msg.delete(db)
@@ -145,7 +147,7 @@ extension SyncEngine {
             }
             if !removedIds.isEmpty {
                 removeHeadersFromFTS(removedIds)
-                print("[Sync] Gmail delta: removed \(removedIds.count) messages")
+                BackgroundSyncLogger.logDebug("[Sync] Gmail delta: removed \(removedIds.count) messages")
             }
         }
 
@@ -205,8 +207,10 @@ extension SyncEngine {
                             // Other half of draft rekey visibility (see the matching
                             // delete-side log above): the NEW message.id Gmail minted
                             // for a re-pushed draft lands here as an ordinary insert.
-                            if DebugModeManager.isLoggingEnabled(), folder.role == .drafts {
-                                print("[DraftRekey] Gmail delta: inserting drafts-folder header messageId=\(info.messageId) into \(folder.name)")
+                            if folder.role == .drafts {
+                                if DebugModeManager.isLoggingEnabled() {
+                                    print("[DraftRekey] Gmail delta: inserting drafts-folder header messageId=\(info.messageId) into \(folder.name)")
+                                }
                             }
                             var header = MessageHeader(
                                 messageId: info.messageId,
@@ -255,7 +259,9 @@ extension SyncEngine {
                                     tagValue: ActionTag.none.rawValue
                                 )
                                 try tagOp.insert(db)
-                                print("[ReplyDetect] Delta insert: reply→none for \(header.messageId) (already replied)")
+                                if DebugModeManager.isLoggingEnabled() {
+                                    print("[ReplyDetect] Delta insert: reply→none for \(header.messageId) (already replied)")
+                                }
                             }
                             // Check for orphaned row with same id but wrong folderId
                             // (left behind by no-op optimistic move, e.g., archive from
@@ -275,7 +281,9 @@ extension SyncEngine {
                                 if orphanIsPending {
                                     continue
                                 }
-                                print("[Sync] deltaSync reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folder.id)")
+                                if DebugModeManager.isLoggingEnabled() {
+                                    print("[Sync] deltaSync reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folder.id)")
+                                }
                                 orphaned.folderId = folder.id
                                 orphaned.folderPath = folder.path
                                 orphaned.observedUidValidity = nil
@@ -343,7 +351,9 @@ extension SyncEngine {
                                     }
                                     removedIds.append(oldId)
                                     try optimistic.delete(db)
-                                    print("[Sync] Gmail delta dedup: replaced optimistic sent header \(oldId) with \(header.id)")
+                                    if DebugModeManager.isLoggingEnabled() {
+                                        print("[Sync] Gmail delta dedup: replaced optimistic sent header \(oldId) with \(header.id)")
+                                    }
                                 }
                                 // The orphan check above (`fetchOne(db, key: header.id)`)
                                 // established inside THIS write transaction that no row
@@ -407,7 +417,9 @@ extension SyncEngine {
                                     existing.isFlagged = info.isFlagged
                                     if let serverTag = info.actionTag {
                                         if existing.actionTag != serverTag {
-                                            print("[Sync] Gmail delta: remote tag change for \(info.messageId): \(existing.actionTag?.rawValue ?? "nil") -> \(serverTag.rawValue)")
+                                            if DebugModeManager.isLoggingEnabled() {
+                                                print("[Sync] Gmail delta: remote tag change for \(info.messageId): \(existing.actionTag?.rawValue ?? "nil") -> \(serverTag.rawValue)")
+                                            }
                                             try MessageAICache.writeThrough(
                                                 accountId: account.id,
                                                 folderPath: folder.path,
@@ -435,7 +447,7 @@ extension SyncEngine {
             // folder via label change. Mirrors the messages-deleted path above.
             if !writeResult.removedIds.isEmpty {
                 removeHeadersFromFTS(writeResult.removedIds)
-                print("[Sync] Gmail delta: removed \(writeResult.removedIds.count) FTS entries for folder-departed messages")
+                BackgroundSyncLogger.logDebug("[Sync] Gmail delta: removed \(writeResult.removedIds.count) FTS entries for folder-departed messages")
             }
 
         }
@@ -446,7 +458,7 @@ extension SyncEngine {
 
         if !newHeaders.isEmpty {
             await indexHeadersForFTS(newHeaders)
-            print("[Sync] Gmail delta: +\(newHeaders.count) new messages")
+            BackgroundSyncLogger.logDebug("[Sync] Gmail delta: +\(newHeaders.count) new messages")
             await ActiveBodyQueue.shared.enqueueBatch(newHeaders)
         }
 
@@ -465,14 +477,14 @@ extension SyncEngine {
     /// Fetches only what changed since lastHistoryId (deltaLink token).
     private func exchangeDeltaSync(account: Account, provider: ExchangeProvider) async throws -> (succeeded: Bool, hadChanges: Bool) {
         guard let deltaToken = account.lastHistoryId else {
-            print("[Sync] Exchange delta: no deltaToken for \(account.emailAddress) — skipping (needs full sync)")
+            BackgroundSyncLogger.logDebug("[Sync] Exchange delta: no deltaToken for \(account.emailAddress) — skipping (needs full sync)")
             BackgroundSyncLogger.log("exchangeDelta: \(account.emailAddress) noToken")
             return (false, false)
         }
 
         guard let history = try await provider.fetchHistory(since: deltaToken) else {
             // Delta expired — clear cursor so next sync does full
-            print("[Sync] Exchange delta: token expired for \(account.emailAddress) — clearing cursor")
+            BackgroundSyncLogger.logDebug("[Sync] Exchange delta: token expired for \(account.emailAddress) — clearing cursor")
             BackgroundSyncLogger.log("exchangeDelta: \(account.emailAddress) tokenExpired")
             try await dbPool.write { db in
                 _ = try Account.filter(Column("id") == account.id)
@@ -484,7 +496,7 @@ extension SyncEngine {
         let totalChanges = history.messagesAdded.count + history.messagesDeleted.count +
             history.labelsAdded.count + history.labelsRemoved.count
         let exDeltaLog = "exchangeDelta: \(account.emailAddress) +\(history.messagesAdded.count) -\(history.messagesDeleted.count) ~\(history.labelsAdded.count + history.labelsRemoved.count)"
-        print("[Sync] \(exDeltaLog)")
+        BackgroundSyncLogger.logDebug("[Sync] \(exDeltaLog)")
         BackgroundSyncLogger.log(exDeltaLog)
 
         // deltaToken is advanced AFTER processing completes successfully (at end of method).
@@ -502,11 +514,11 @@ extension SyncEngine {
                 _ = try Account.filter(Column("id") == account.id)
                     .updateAll(db, Column("lastHistoryId").set(to: newDeltaToken))
             }
-            print("[Sync] Exchange delta: no changes")
+            BackgroundSyncLogger.logDebug("[Sync] Exchange delta: no changes")
             return (true, false)
         }
 
-        print("[Sync] Exchange delta: +\(history.messagesAdded.count) added, -\(history.messagesDeleted.count) deleted, \(history.labelsAdded.count + history.labelsRemoved.count) label changes")
+        BackgroundSyncLogger.logDebug("[Sync] Exchange delta: +\(history.messagesAdded.count) added, -\(history.messagesDeleted.count) deleted, \(history.labelsAdded.count + history.labelsRemoved.count) label changes")
 
         // Collect all affected message IDs
         var toFetch = Set<String>()
@@ -553,7 +565,7 @@ extension SyncEngine {
             }
             if !removedIds.isEmpty {
                 removeHeadersFromFTS(removedIds)
-                print("[Sync] Exchange delta: removed \(removedIds.count) messages")
+                BackgroundSyncLogger.logDebug("[Sync] Exchange delta: removed \(removedIds.count) messages")
             }
         }
 
@@ -604,7 +616,9 @@ extension SyncEngine {
                             existing.isFlagged = info.isFlagged
                             if let serverTag = info.actionTag {
                                 if existing.actionTag != serverTag {
-                                    print("[Sync] Exchange delta: remote tag change for \(info.messageId): \(existing.actionTag?.rawValue ?? "nil") -> \(serverTag.rawValue)")
+                                    if DebugModeManager.isLoggingEnabled() {
+                                        print("[Sync] Exchange delta: remote tag change for \(info.messageId): \(existing.actionTag?.rawValue ?? "nil") -> \(serverTag.rawValue)")
+                                    }
                                     try MessageAICache.writeThrough(
                                         accountId: account.id,
                                         folderPath: folder.path,
@@ -622,10 +636,14 @@ extension SyncEngine {
                         }
                     } else if isPendingDestructive || isRecentlyDone {
                         // Skip — pending destructive op or recently completed
-                        print("[MoveTrace] exchangeDelta — SKIPPING insert of \(info.messageId) into \(folder.name) — has pending destructive op or recent completion")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[MoveTrace] exchangeDelta — SKIPPING insert of \(info.messageId) into \(folder.name) — has pending destructive op or recent completion")
+                        }
                     } else {
                         // New message
-                        print("[MoveTrace] exchangeDelta — inserting \(info.messageId) into \(folder.name)(\(folder.id))")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[MoveTrace] exchangeDelta — inserting \(info.messageId) into \(folder.name)(\(folder.id))")
+                        }
                         var header = MessageHeader(
                             messageId: info.messageId,
                             subject: info.subject,
@@ -670,7 +688,9 @@ extension SyncEngine {
                                 tagValue: ActionTag.none.rawValue
                             )
                             try tagOp.insert(db)
-                            print("[ReplyDetect] Delta insert: reply→none for \(header.messageId) (already replied)")
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[ReplyDetect] Delta insert: reply→none for \(header.messageId) (already replied)")
+                            }
                         }
                         // Check for orphaned row with same id but wrong folderId.
                         if var orphaned = try MessageHeader.fetchOne(db, key: header.id) {
@@ -679,10 +699,14 @@ extension SyncEngine {
                                 rfc822MessageId: orphaned.rfc822MessageId
                             )
                             if orphanIsPending {
-                                print("[MoveTrace] exchangeDelta — SKIPPING orphan reclaim for \(orphaned.id) — pending destructive op (server folder=\(folder.name) but user moved locally)")
+                                if DebugModeManager.isLoggingEnabled() {
+                                    print("[MoveTrace] exchangeDelta — SKIPPING orphan reclaim for \(orphaned.id) — pending destructive op (server folder=\(folder.name) but user moved locally)")
+                                }
                                 continue
                             }
-                            print("[Sync] exchangeDelta reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folder.id)")
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Sync] exchangeDelta reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folder.id)")
+                            }
                             orphaned.folderId = folder.id
                             orphaned.folderPath = folder.path
                             orphaned.observedUidValidity = nil
@@ -738,7 +762,9 @@ extension SyncEngine {
                                 }
                                 removedIds.append(oldId)
                                 try optimistic.delete(db)
-                                print("[Sync] Exchange delta dedup: replaced optimistic sent header \(oldId) with \(header.id)")
+                                if DebugModeManager.isLoggingEnabled() {
+                                    print("[Sync] Exchange delta dedup: replaced optimistic sent header \(oldId) with \(header.id)")
+                                }
                             }
                             // Same invariant as the Gmail arm's insert above: the orphan check
                             // established `header.id`'s absence inside THIS transaction, the
@@ -808,7 +834,7 @@ extension SyncEngine {
 
         if !exNewHeaders.isEmpty {
             await indexHeadersForFTS(exNewHeaders)
-            print("[Sync] Exchange delta: +\(exNewHeaders.count) new messages")
+            BackgroundSyncLogger.logDebug("[Sync] Exchange delta: +\(exNewHeaders.count) new messages")
             await ActiveBodyQueue.shared.enqueueBatch(exNewHeaders)
         }
 
@@ -1188,7 +1214,7 @@ extension SyncEngine {
                 server: status.highestModSeq, cached: folder.lastKnownHighestModSeq)
 
             if !uidNextChanged && !countChanged && !modSeqChanged {
-                print("[Sync] IMAP delta: \(folder.name) unchanged (uidNext=\(status.uidNext), count=\(status.messageCount), modseq=\(status.highestModSeq.map(String.init) ?? "-"))")
+                BackgroundSyncLogger.logDebug("[Sync] IMAP delta: \(folder.name) unchanged (uidNext=\(status.uidNext), count=\(status.messageCount), modseq=\(status.highestModSeq.map(String.init) ?? "-"))")
                 // A QUIET folder is exactly the folder that would otherwise never get an
                 // epoch: the changed-branch persist below never runs for it, and the
                 // deletion-reconcile walk (the only other writer) only fires on a count
@@ -1216,7 +1242,7 @@ extension SyncEngine {
             }
 
             // Something changed — sync this folder
-            print("[Sync] IMAP delta: \(folder.name) changed (uidNext: \(folder.lastKnownUidNext ?? 0)→\(status.uidNext), count: \(folder.totalCount)→\(status.messageCount))")
+            BackgroundSyncLogger.logDebug("[Sync] IMAP delta: \(folder.name) changed (uidNext: \(folder.lastKnownUidNext ?? 0)→\(status.uidNext), count: \(folder.totalCount)→\(status.messageCount))")
             let newCount = max(0, status.messageCount - folder.totalCount)
             if newCount > 0 { publishDownloading(newCount, forAccount: account.id) }
             do {
@@ -1227,7 +1253,7 @@ extension SyncEngine {
                 )
             } catch {
                 if SyncEngine.isSelectFailedError(error) {
-                    print("[Sync] IMAP delta: SELECT failed for \(folder.name) — skipping")
+                    BackgroundSyncLogger.logDebug("[Sync] IMAP delta: SELECT failed for \(folder.name) — skipping")
                     continue
                 }
                 throw error
@@ -1275,7 +1301,7 @@ extension SyncEngine {
                     tolerance: SyncConfig.deletionReconcileCountTolerance
                 ) {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[Sync] IMAP delta: \(folder.name) local=\(localCount) > server=\(status.messageCount) — reconciling external deletions")
+                        BackgroundSyncLogger.logDebug("[Sync] IMAP delta: \(folder.name) local=\(localCount) > server=\(status.messageCount) — reconciling external deletions")
                     }
                     await reconcileExternallyDeletedMessages(
                         folder: folder,
@@ -1287,7 +1313,7 @@ extension SyncEngine {
                 // Trigger evaluation is best-effort — the evidence is durable
                 // and re-fires on the next delta/full sync pass.
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Sync] IMAP delta: reconcile trigger check failed for \(folder.name): \(error)")
+                    BackgroundSyncLogger.logDebug("[Sync] IMAP delta: reconcile trigger check failed for \(folder.name): \(error)")
                 }
             }
 
@@ -1296,7 +1322,7 @@ extension SyncEngine {
         }
 
         if !anyChanged {
-            print("[Sync] IMAP delta: no changes across \(syncableFolders.count) folders")
+            BackgroundSyncLogger.logDebug("[Sync] IMAP delta: no changes across \(syncableFolders.count) folders")
             BackgroundSyncLogger.log("imapDelta: \(account.emailAddress) noChanges (\(syncableFolders.count) folders)")
         } else {
             BackgroundSyncLogger.log("imapDelta: \(account.emailAddress) changed")
@@ -1320,15 +1346,17 @@ extension SyncEngine {
                        let newVal = UInt64(newId),
                        let curVal = UInt64(current),
                        newVal <= curVal {
-                        print("[Sync] Gmail historyId: keeping \(current) (profile returned \(newId))")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] Gmail historyId: keeping \(current) (profile returned \(newId))")
+                        }
                         return
                     }
                     _ = try Account.filter(Column("id") == account.id)
                         .updateAll(db, Column("lastHistoryId").set(to: newHistoryId))
                 }
-                print("[Sync] Captured Gmail historyId: \(newHistoryId ?? "nil")")
+                BackgroundSyncLogger.logDebug("[Sync] Captured Gmail historyId: \(newHistoryId ?? "nil")")
             } catch {
-                print("[Sync] Failed to capture Gmail historyId: \(error)")
+                BackgroundSyncLogger.logDebug("[Sync] Failed to capture Gmail historyId: \(error)")
             }
         } else if account.provider == .outlook, let exchangeProvider = provider as? ExchangeProvider {
             do {
@@ -1337,7 +1365,7 @@ extension SyncEngine {
                     try Folder.filter(Column("accountId") == account.id && Column("role") == FolderRole.inbox.rawValue).fetchOne(db)
                 }
                 guard let inboxFolder else {
-                    print("[Sync] No inbox folder found for Exchange account — skipping delta capture")
+                    BackgroundSyncLogger.logDebug("[Sync] No inbox folder found for Exchange account — skipping delta capture")
                     return
                 }
                 let deltaLink = try await exchangeProvider.getCurrentDeltaLink(folderId: inboxFolder.path)
@@ -1345,9 +1373,9 @@ extension SyncEngine {
                     _ = try Account.filter(Column("id") == account.id)
                         .updateAll(db, Column("lastHistoryId").set(to: deltaLink))
                 }
-                print("[Sync] Captured Exchange deltaLink: \(deltaLink != nil ? "present" : "nil")")
+                BackgroundSyncLogger.logDebug("[Sync] Captured Exchange deltaLink: \(deltaLink != nil ? "present" : "nil")")
             } catch {
-                print("[Sync] Failed to capture Exchange deltaLink: \(error)")
+                BackgroundSyncLogger.logDebug("[Sync] Failed to capture Exchange deltaLink: \(error)")
             }
         } else if account.provider == .imap || account.provider == .icloud {
             // uidNext is set during fullSync → fetchFolders via FolderInfo.uidNext

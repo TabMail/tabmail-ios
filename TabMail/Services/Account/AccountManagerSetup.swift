@@ -184,7 +184,7 @@ extension AccountManager {
             do {
                 try await engine.sync(account: account)
             } catch {
-                print("[AccountManager] Background initial sync failed for \(account.emailAddress): \(error)")
+                BackgroundSyncLogger.logDebug("[AccountManager] Background initial sync failed for \(account.emailAddress): \(error)")
             }
         }
 
@@ -303,7 +303,7 @@ extension AccountManager {
             do {
                 try await engine.sync(account: syncAccount)
             } catch {
-                print("[AccountManager] Background initial sync failed for \(syncAccount.emailAddress): \(error)")
+                BackgroundSyncLogger.logDebug("[AccountManager] Background initial sync failed for \(syncAccount.emailAddress): \(error)")
             }
         }
 
@@ -399,7 +399,7 @@ extension AccountManager {
                 )
             } catch {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[AccountManager] iCloud Calendar setup failed for \(account.emailAddress); email account kept: \(error)")
+                    BackgroundSyncLogger.logDebug("[AccountManager] iCloud Calendar setup failed for \(account.emailAddress); email account kept: \(error)")
                 }
                 // Record the failure so the user is told: the returned account
                 // drives the add-time alert; the persisted column drives the
@@ -415,7 +415,7 @@ extension AccountManager {
                     }
                 } catch let writeError {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[AccountManager] Failed to persist calendarSetupFailed for \(failedId): \(writeError)")
+                        BackgroundSyncLogger.logDebug("[AccountManager] Failed to persist calendarSetupFailed for \(failedId): \(writeError)")
                     }
                 }
             }
@@ -428,7 +428,7 @@ extension AccountManager {
             do {
                 try await engine.sync(account: syncAccount)
             } catch {
-                print("[AccountManager] Background initial sync failed for \(syncAccount.emailAddress): \(error)")
+                BackgroundSyncLogger.logDebug("[AccountManager] Background initial sync failed for \(syncAccount.emailAddress): \(error)")
             }
         }
 
@@ -478,7 +478,7 @@ extension AccountManager {
             )
             calendarProviders[accountId] = provider
 
-            print("[AccountManager] CalDAV set up for account \(accountId): home=\(discovery.calendarHomeURL)")
+            BackgroundSyncLogger.logDebug("[AccountManager] CalDAV set up for account \(accountId): home=\(discovery.calendarHomeURL)")
         } catch {
             // Calendar setup failed after the password was written to the
             // Keychain but before a CalDAVConfig row exists to own it. config.id
@@ -532,7 +532,7 @@ extension AccountManager {
                 }
             } catch {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[AccountManager] CalDAV rollback failed to delete synthetic account \(rollbackId): \(error)")
+                    BackgroundSyncLogger.logDebug("[AccountManager] CalDAV rollback failed to delete synthetic account \(rollbackId): \(error)")
                 }
             }
             // The rollback DELETES an `account` row, so it is a mirrored-identity
@@ -689,9 +689,9 @@ extension AccountManager {
         // truthfully instead of logging false success.
         do {
             try await SearchIndex.shared.removeMessagesForAccount(accountId: acctId)
-            print("[AccountManager] Cleaned up FTS entries for removed account \(acctId)")
+            BackgroundSyncLogger.logDebug("[AccountManager] Cleaned up FTS entries for removed account \(acctId)")
         } catch {
-            print("[AccountManager] Removed account but FTS cleanup failed for \(acctId): \(error)")
+            BackgroundSyncLogger.logDebug("[AccountManager] Removed account but FTS cleanup failed for \(acctId): \(error)")
             throw AccountRemovalError.searchIndexCleanupFailed(error.localizedDescription)
         }
     }

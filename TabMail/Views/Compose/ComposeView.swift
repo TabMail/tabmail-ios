@@ -940,7 +940,7 @@ struct ComposeView: View {
         self.retainedDraftAuthority = retainedDraftAuthority
         self.onAgentOutcome = onAgentOutcome
         if DebugModeManager.isLoggingEnabled() {
-            print("[ComposeView] init: prefillDraftId=\(prefillDraftId ?? "nil") replyTo=\(replyTo?.stableId ?? "nil") isForward=\(isForward)")
+            BackgroundSyncLogger.logDebug("[ComposeView] init: prefillDraftId=\(prefillDraftId ?? "nil") replyTo=\(replyTo?.stableId ?? "nil") isForward=\(isForward)")
         }
     }
 
@@ -1614,7 +1614,7 @@ struct ComposeView: View {
 
     private func handleChatExpandedChange(_ expanded: Bool) {
         if DebugModeManager.isLoggingEnabled() {
-            print("[ComposeView] chatExpanded -> \(expanded) instance=\(instanceToken) draftId=\(draftId)")
+            BackgroundSyncLogger.logDebug("[ComposeView] chatExpanded -> \(expanded) instance=\(instanceToken) draftId=\(draftId)")
         }
         if expanded {
             bodyFocused = false
@@ -1636,13 +1636,13 @@ struct ComposeView: View {
 
     private func handleSavingDraftChange(_ saving: Bool) {
         if DebugModeManager.isLoggingEnabled() {
-            print("[ComposeView] isSavingDraft -> \(saving) instance=\(instanceToken) draftId=\(draftId)")
+            BackgroundSyncLogger.logDebug("[ComposeView] isSavingDraft -> \(saving) instance=\(instanceToken) draftId=\(draftId)")
         }
     }
 
     private func handleApplyingEditChange(_ applying: Bool) {
         if DebugModeManager.isLoggingEnabled() {
-            print("[ComposeView] isApplyingEdit -> \(applying) instance=\(instanceToken) draftId=\(draftId) chatExpanded=\(chatExpanded) isSavingDraft=\(isSavingDraft)")
+            BackgroundSyncLogger.logDebug("[ComposeView] isApplyingEdit -> \(applying) instance=\(instanceToken) draftId=\(draftId) chatExpanded=\(chatExpanded) isSavingDraft=\(isSavingDraft)")
         }
         stuckFadeWatchTask?.cancel()
         stuckFadeWatchTask = nil
@@ -1655,7 +1655,7 @@ struct ComposeView: View {
                 elapsedSeconds += 3
                 guard isApplyingEdit else { return }
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[ComposeView] ⚠ STUCK FADE: isApplyingEdit still true after \(elapsedSeconds)s — editor invisible; chatExpanded=\(chatExpanded) isSavingDraft=\(isSavingDraft) instance=\(instanceToken) draftId=\(draftId)")
+                    BackgroundSyncLogger.logDebug("[ComposeView] ⚠ STUCK FADE: isApplyingEdit still true after \(elapsedSeconds)s — editor invisible; chatExpanded=\(chatExpanded) isSavingDraft=\(isSavingDraft) instance=\(instanceToken) draftId=\(draftId)")
                 }
             }
         }
@@ -1685,7 +1685,7 @@ struct ComposeView: View {
                     recordAttachmentPreparationFailure(
                         "Selected photo or video \(index + 1)")
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[ComposeView] Photo picker import failed: \(error)")
+                        BackgroundSyncLogger.logDebug("[ComposeView] Photo picker import failed: \(error)")
                     }
                 }
                 attachmentCarryGate.completeOne(succeeded: succeeded)
@@ -1716,7 +1716,7 @@ struct ComposeView: View {
 
     private func performDisappear() {
         if DebugModeManager.isLoggingEnabled() {
-            print("[ComposeView] onDisappear instance=\(instanceToken) draftId=\(draftId)")
+            BackgroundSyncLogger.logDebug("[ComposeView] onDisappear instance=\(instanceToken) draftId=\(draftId)")
         }
         // PORT — this compose closed; drop its eviction guard (refcounted, so
         // a sibling view replying to the same message stays protected). A
@@ -1761,7 +1761,7 @@ struct ComposeView: View {
         // block, so the two calls always name the same id.
         DraftSessionRegistry.shared.register(draftId)
         if DebugModeManager.isLoggingEnabled() {
-            print("[ComposeView] onAppear instance=\(instanceToken) draftId=\(draftId)")
+            BackgroundSyncLogger.logDebug("[ComposeView] onAppear instance=\(instanceToken) draftId=\(draftId)")
         }
         contactSearch.requestAccess()
         Task { await loadDraftOrPrepopulate() }
@@ -1909,12 +1909,12 @@ struct ComposeView: View {
                             arguments: [result, reply.id]
                         )
                     }
-                    print("[Compose] Recomputed reply for \(reply.messageId)")
+                    BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId)")
                 } else {
-                    print("[Compose] Recompute returned nil/empty for \(reply.messageId)")
+                    BackgroundSyncLogger.logDebug("[Compose] Recompute returned nil/empty for \(reply.messageId)")
                 }
             } catch {
-                print("[Compose] Recompute reply failed: \(error)")
+                BackgroundSyncLogger.logDebug("[Compose] Recompute reply failed: \(error)")
             }
             isRecomputing = false
         }
@@ -2027,25 +2027,25 @@ struct ComposeView: View {
             guard let d else { return "nil" }
             return "+\(d.adds.count)/-\(d.removes.count)\(d.clearsField ? "*" : "")"
         }
-        print("[ComposeView] applyInlineEdit: subject=\(newSubject?.prefix(40) ?? "nil") bodyLen=\(newBody?.count ?? 0) to=\(desc(toDelta)) cc=\(desc(ccDelta)) bcc=\(desc(bccDelta))")
+        BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: subject=\(newSubject?.prefix(40) ?? "nil") bodyLen=\(newBody?.count ?? 0) to=\(desc(toDelta)) cc=\(desc(ccDelta)) bcc=\(desc(bccDelta))")
         // Phase 1: fade text out completely
         withAnimation(.easeIn(duration: 0.25)) {
             isApplyingEdit = true
         }
         if DebugModeManager.isLoggingEnabled() {
-            print("[ComposeView] applyInlineEdit: fade-out begin instance=\(instanceToken) draftId=\(draftId)")
+            BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: fade-out begin instance=\(instanceToken) draftId=\(draftId)")
         }
         Task { @MainActor in
             // Wait for fade-out to finish
             try? await Task.sleep(for: .milliseconds(280))
             // Phase 2: swap text while invisible
             if let s = newSubject {
-                print("[ComposeView] applyInlineEdit: updating subject to '\(s.prefix(40))'")
+                BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating subject to '\(s.prefix(40))'")
                 subject = s
             }
             if let b = newBody {
                 if showingSuggestion {
-                    print("[ComposeView] applyInlineEdit: updating suggestion (len=\(b.count))")
+                    BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating suggestion (len=\(b.count))")
                     currentSuggestion = b
                     // Only persist to messageHeader.cachedReply in reply mode.
                     // Compose has no source message; forward would write to the
@@ -2054,7 +2054,7 @@ struct ComposeView: View {
                         persistCachedReply(b)
                     }
                 } else {
-                    print("[ComposeView] applyInlineEdit: updating body (len=\(b.count))")
+                    BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating body (len=\(b.count))")
                     messageBody = b
                 }
             }
@@ -2062,16 +2062,16 @@ struct ComposeView: View {
             applyRecipientDelta(field: .cc, delta: ccDelta)
             applyRecipientDelta(field: .bcc, delta: bccDelta)
             if DebugModeManager.isLoggingEnabled() {
-                print("[ComposeView] applyInlineEdit: mutation applied instance=\(instanceToken) draftId=\(draftId)")
+                BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: mutation applied instance=\(instanceToken) draftId=\(draftId)")
             }
             // Phase 3: dissolve back in with new text
             withAnimation(.easeOut(duration: 0.4)) {
                 isApplyingEdit = false
             }
             if DebugModeManager.isLoggingEnabled() {
-                print("[ComposeView] applyInlineEdit: fade-in begin instance=\(instanceToken) draftId=\(draftId)")
+                BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: fade-in begin instance=\(instanceToken) draftId=\(draftId)")
             }
-            print("[ComposeView] applyInlineEdit: done, isApplyingEdit=false")
+            BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: done, isApplyingEdit=false")
         }
     }
 
@@ -2193,7 +2193,7 @@ struct ComposeView: View {
         loadedDraft = true
 
         // Try loading persisted draft
-        print("[ComposeView] loadDraftOrPrepopulate: draftId=\(draftId) prefillDraftId=\(prefillDraftId ?? "nil")")
+        BackgroundSyncLogger.logDebug("[ComposeView] loadDraftOrPrepopulate: draftId=\(draftId) prefillDraftId=\(prefillDraftId ?? "nil")")
         let draftKey = draftId
         let readResult: Result<Draft?, Error>
         do {
@@ -2266,7 +2266,7 @@ struct ComposeView: View {
                 draftReadState = .error
                 sendError = "This draft's account couldn't be verified. Close and reopen it to try again."
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[ComposeView] ⚠ Persisted-draft account bind FAILED for draftId=\(draftId) accountId=\(draft.accountId.prefix(20)) — failing closed, binding nothing")
+                    BackgroundSyncLogger.logDebug("[ComposeView] ⚠ Persisted-draft account bind FAILED for draftId=\(draftId) accountId=\(draft.accountId.prefix(20)) — failing closed, binding nothing")
                 }
                 return
             }
@@ -2276,7 +2276,7 @@ struct ComposeView: View {
             let epoch = observed ?? UUID().uuidString
             admissionCursor = ComposeGenerationCursor(
                 newEpoch: epoch, initialExpectedPredecessor: observed)
-            print("[ComposeView] Found draft: subject=\(draft.subject.prefix(40)) editHistory=\(draft.editHistoryJSON?.prefix(40) ?? "nil")")
+            BackgroundSyncLogger.logDebug("[ComposeView] Found draft: subject=\(draft.subject.prefix(40)) editHistory=\(draft.editHistoryJSON?.prefix(40) ?? "nil")")
             // Restore draft state
             subject = draft.subject
             messageBody = draft.body
@@ -2299,7 +2299,7 @@ struct ComposeView: View {
                 attachmentLoadFailed = true
                 sendError = "Some attachments couldn't be loaded, so this draft can't be sent or saved to the server. Close and reopen the draft to retry, or discard it."
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[ComposeView] ⚠ Draft attachment load FAILED for draftId=\(draftId) — blocking Send/save-to-server: \(error)")
+                    BackgroundSyncLogger.logDebug("[ComposeView] ⚠ Draft attachment load FAILED for draftId=\(draftId) — blocking Send/save-to-server: \(error)")
                 }
             }
 
@@ -2350,7 +2350,7 @@ struct ComposeView: View {
                 draftReadState = .error
                 sendError = "This draft did not finish loading. Close and reopen it to try again."
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[ComposeView] ⚠ Reply-target read THREW for draftId=\(draftId) — retryable, NOT an identity refusal; blocking all mutation until reopen")
+                    BackgroundSyncLogger.logDebug("[ComposeView] ⚠ Reply-target read THREW for draftId=\(draftId) — retryable, NOT an identity refusal; blocking all mutation until reopen")
                 }
                 return
             }
@@ -2393,10 +2393,10 @@ struct ComposeView: View {
                     quotedHTML = EmailFilter.stripEmbeddedEmlSections(html)
                 }
             } else if draft.isReplyOrForward, DebugModeManager.isLoggingEnabled() {
-                print("[ComposeView] ⚠ T5.8: reply target for draftId=\(draftId) could not be identity-confirmed — quote OMITTED and SEND BLOCKED (authored body untouched; save/discard unaffected)")
+                BackgroundSyncLogger.logDebug("[ComposeView] ⚠ T5.8: reply target for draftId=\(draftId) could not be identity-confirmed — quote OMITTED and SEND BLOCKED (authored body untouched; save/discard unaffected)")
             }
 
-            print("[ComposeView] Loaded draft: id=\(draftId) subject=\(subject.prefix(40))")
+            BackgroundSyncLogger.logDebug("[ComposeView] Loaded draft: id=\(draftId) subject=\(subject.prefix(40))")
             snapshotInitialState()
             return
         }
@@ -2407,7 +2407,7 @@ struct ComposeView: View {
             sendError = "This draft changed while it was opening. Close and reopen it to try again."
             return
         }
-        print("[ComposeView] No draft found for draftId=\(draftId), falling back to prepopulate")
+        BackgroundSyncLogger.logDebug("[ComposeView] No draft found for draftId=\(draftId), falling back to prepopulate")
         prepopulate()
     }
 
@@ -2547,7 +2547,7 @@ struct ComposeView: View {
                 onDeleteFailure: { error in
                     sendError = "The draft could not be deleted: \(error.localizedDescription)"
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[ComposeView] R5: deleteAsync failed on close for draftId=\(draftId): \(error)")
+                        BackgroundSyncLogger.logDebug("[ComposeView] R5: deleteAsync failed on close for draftId=\(draftId): \(error)")
                     }
                 })
         case .dismiss:
@@ -2656,7 +2656,7 @@ struct ComposeView: View {
             readState: ComposeDraftGuards.readState(readResult)) else {
             sendError = "Couldn't save this draft — the database was busy. Try again in a moment."
             if DebugModeManager.isLoggingEnabled() {
-                print("[ComposeView] ⚠ Save-path draft read THREW for draftId=\(capDraftId) — failing closed (no disk/DB write)")
+                BackgroundSyncLogger.logDebug("[ComposeView] ⚠ Save-path draft read THREW for draftId=\(capDraftId) — failing closed (no disk/DB write)")
             }
             return
         }
@@ -2780,7 +2780,7 @@ struct ComposeView: View {
             return
         }
         if DebugModeManager.isLoggingEnabled() {
-            print("[ComposeView] Saved draft on cancel: id=\(draftId) prevStatus=\(existing?.serverPushStatus ?? "nil")")
+            BackgroundSyncLogger.logDebug("[ComposeView] Saved draft on cancel: id=\(draftId) prevStatus=\(existing?.serverPushStatus ?? "nil")")
         }
         // POST-COMMIT (outside the staging-cleanup catch). A throw here must NOT
         // reach any attachment-dir delete. Queue server push via PendingOperation
@@ -3127,7 +3127,7 @@ struct ComposeView: View {
     /// tension; they just need the counter.
     private func carryForwardAttachments(from reply: MessageHeader, attachments atts: [AttachmentInfo]) {
         if DebugModeManager.isLoggingEnabled() {
-            print("[ComposeForward] Carrying over \(atts.count) attachment(s) from \(DebugModeManager.escapedForLogLine(reply.id))")
+            BackgroundSyncLogger.logDebug("[ComposeForward] Carrying over \(atts.count) attachment(s) from \(DebugModeManager.escapedForLogLine(reply.id))")
         }
         guard !atts.isEmpty else { return }
         attachmentCarryGate.begin(atts.count)
@@ -3151,11 +3151,11 @@ struct ComposeView: View {
                     // may become a path component — and `print` is a
                     // line-oriented sink. See `DebugModeManager.escapedForLogLine`.
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[ComposeForward] Attached \(DebugModeManager.escapedForLogLine(att.filename)) (\(data.count) bytes)")
+                        BackgroundSyncLogger.logDebug("[ComposeForward] Attached \(DebugModeManager.escapedForLogLine(att.filename)) (\(data.count) bytes)")
                     }
                 } catch {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[ComposeForward] Failed to carry \(DebugModeManager.escapedForLogLine(att.filename)): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                        BackgroundSyncLogger.logDebug("[ComposeForward] Failed to carry \(DebugModeManager.escapedForLogLine(att.filename)): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
                     }
                     if case ProviderError.addressPendingMove = error {
                         self.carryForwardBlockedByMove = true
@@ -3280,7 +3280,7 @@ struct ComposeView: View {
                 } catch {
                     recordAttachmentPreparationFailure(url.lastPathComponent)
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[ComposeView] File import failed for \(url.lastPathComponent): \(error)")
+                        BackgroundSyncLogger.logDebug("[ComposeView] File import failed for \(url.lastPathComponent): \(error)")
                     }
                 }
             }

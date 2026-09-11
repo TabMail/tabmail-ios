@@ -658,8 +658,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // creator plant-over-non-nil). DEBUG-only by the enclosing `#if`;
         // prints only when about to trap.
         if previous != nil {
-            print("[IMAPProvider] PLANT-OVER-NON-NIL POST-MORTEM (\(slot)) MUTLOG TAIL:")
-            for line in mutLog.suffix(50) { print("  \(line)") }
+            BackgroundSyncLogger.logDebug("[IMAPProvider] PLANT-OVER-NON-NIL POST-MORTEM (\(slot)) MUTLOG TAIL:")
+            for line in mutLog.suffix(50) { BackgroundSyncLogger.logDebug("  \(line)") }
         }
         assert(previous == nil, "[IMAPProvider] R6 pool invariant violated: planted a connection over a non-nil \(slot) slot", file: file, line: line)
     }
@@ -991,7 +991,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         if serverConnectionLimit == nil || limit < serverConnectionLimit! {
             serverConnectionLimit = limit
             Self.persistServerLimit(limit, host: host, username: username)
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] Server connection limit detected: \(limit) (folder slots: \(maxFolderConnections))") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Server connection limit detected: \(limit) (folder slots: \(maxFolderConnections))") }
             BackgroundSyncLogger.logBackfill("[IMAP] \(senderEmail) server connection limit detected: \(limit) (folder slots: \(maxFolderConnections))")
         }
     }
@@ -1061,7 +1061,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // waiter receives from a teardown's fail-all sweep.
         guard generation == acquiredGeneration else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[IMAP] Stale generation for \(folder) before body — discarding silently")
+                BackgroundSyncLogger.logDebug("[IMAP] Stale generation for \(folder) before body — discarding silently")
             }
             throw ProviderError.notConnected
         }
@@ -1073,7 +1073,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // If markDirty() ran while body was executing, this connection is stale.
             // Don't touch folderServers — a new connection may already exist for this folder.
             guard generation == acquiredGeneration else {
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP] Stale generation for \(folder) — discarding connection silently") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Stale generation for \(folder) — discarding connection silently") }
                 return result
             }
             await releaseFolderConnection(folder: folder, healthy: true)
@@ -1083,7 +1083,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             if let hook = folderConnectionHolderExitTestHook { hook(folder, server, generation) }
             #endif
             guard generation == acquiredGeneration else {
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP] Stale generation for \(folder) after error — discarding connection silently") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Stale generation for \(folder) after error — discarding connection silently") }
                 throw error
             }
             let desc = "\(error)"
@@ -1131,7 +1131,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 } catch {
                     guard generation == acquiredGeneration else {
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Stale generation for \(folder) during liveness check — discarding silently")
+                            BackgroundSyncLogger.logDebug("[IMAP] Stale generation for \(folder) during liveness check — discarding silently")
                         }
                         throw ProviderError.notConnected
                     }
@@ -1144,7 +1144,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // success. Never leave the OLD mark stuck across the swap.
                     // The removal is identity-guarded (D-09 / B-2): only ever
                     // remove the exact instance this task just NOOPed.
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP] Pinned connection for \(folder) dead (idle \(Int(idle))s) — recreating") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Pinned connection for \(folder) dead (idle \(Int(idle))s) — recreating") }
                     noteDeadDrop(server)
                     folderInUse.remove(folder)
                     if folderServers[folder] === server {
@@ -1161,7 +1161,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // wiped the mark, so this throw leaves nothing stale behind.)
                 guard generation == acquiredGeneration else {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[IMAP] Stale generation for \(folder) after liveness check succeeded — discarding silently")
+                        BackgroundSyncLogger.logDebug("[IMAP] Stale generation for \(folder) after liveness check succeeded — discarding silently")
                     }
                     throw ProviderError.notConnected
                 }
@@ -1176,7 +1176,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // resurrecting an orphaned tracking entry.
                 guard folderServers[folder] === server else {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[IMAP] Folder connection for \(folder) removed during liveness re-validation — releasing mark and discarding")
+                        BackgroundSyncLogger.logDebug("[IMAP] Folder connection for \(folder) removed during liveness re-validation — releasing mark and discarding")
                     }
                     await releaseFolderConnection(folder: folder, healthy: false)
                     throw ProviderError.notConnected
@@ -1220,7 +1220,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // using the first one — two holders on one `IMAPServer`.
             guard generation == queuedGeneration, let server = folderServers[folder] else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[IMAP] Voided folder-connection transfer for \(folder) detected at waiter resume — throwing for retry")
+                    BackgroundSyncLogger.logDebug("[IMAP] Voided folder-connection transfer for \(folder) detected at waiter resume — throwing for retry")
                 }
                 throw ProviderError.notConnected
             }
@@ -1263,7 +1263,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         while folderServers.count >= maxFolderConnections {
             guard evictLRUFolder() || evictIdleConnection() else {
                 // All connections in use and IDLE already evicted — wait for ANY folder to free up
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP] All \(folderServers.count) folder connections in use — waiting") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] All \(folderServers.count) folder connections in use — waiting") }
                 // T3.7 PORT (D-14) — `v2final:…:IMAPProvider
                 // .createFolderConnection`'s capacity branch. Park in the
                 // dedicated CAPACITY queue, NOT `folderWaiters[folder]`: that
@@ -1280,7 +1280,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // already in flight can still race the bump).
                 guard generation == queuedGeneration else {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[IMAP] Voided capacity-wait for \(folder) — throwing for retry")
+                        BackgroundSyncLogger.logDebug("[IMAP] Voided capacity-wait for \(folder) — throwing for retry")
                     }
                     throw ProviderError.notConnected
                 }
@@ -1298,7 +1298,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // single-flight. Throw for retry, exactly like a voided
                     // transfer.
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[IMAP] Capacity-wake found \(folder) owned elsewhere — throwing for retry")
+                        BackgroundSyncLogger.logDebug("[IMAP] Capacity-wake found \(folder) owned elsewhere — throwing for retry")
                     }
                     throw ProviderError.notConnected
                 }
@@ -1349,7 +1349,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             folderLastUsed[folder] = Date()
             folderInUse.insert(folder)
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] Created pinned connection for \(folder) in \(ms)ms (total: \(folderServers.count)/\(maxFolderConnections))") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Created pinned connection for \(folder) in \(ms)ms (total: \(folderServers.count)/\(maxFolderConnections))") }
             // T3.7 PORT (R5-F1) — do NOT resume a queued waiter here. THIS
             // call's caller (`withFolderConnection`) is about to use `server`
             // via its own `body`, and already holds `folderInUse`. Resuming a
@@ -1388,7 +1388,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
             // Connection limit hit — evict LRU folder (or IDLE as last resort) and retry once
             if isLimitError && (evictLRUFolder() || evictIdleConnection()) {
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP] Connection limit hit for \(folder) — evicted LRU, retrying") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Connection limit hit for \(folder) — evicted LRU, retrying") }
                 #if DEBUG
                 // T3.7 test seam (D-11 / R8-F2): fires right after eviction
                 // succeeds but BEFORE the retry's own `createServer()` — lets a
@@ -1415,7 +1415,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     folderLastUsed[folder] = Date()
                     folderInUse.insert(folder)
                     let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP] Created pinned connection for \(folder) in \(ms)ms (total: \(folderServers.count)/\(maxFolderConnections))") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Created pinned connection for \(folder) in \(ms)ms (total: \(folderServers.count)/\(maxFolderConnections))") }
                     // Same R5-F1 rationale as the primary success path above —
                     // no premature resume; the creator's own release hands off.
                     return server
@@ -1481,7 +1481,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         if let server {
             noteLogoutAttempt(server)
             Task { try? await server.logout() }
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] Evicted LRU pinned connection for \(folder)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Evicted LRU pinned connection for \(folder)") }
         }
         return true
     }
@@ -1654,7 +1654,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         #endif
         guard generation == acquiredGeneration else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[IMAP] Stale generation for action connection — discarding release after error")
+                BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action connection — discarding release after error")
             }
             #if DEBUG
             logMut("withActionConnection releaseAfterFailure DISCARD (acquired=\(acquiredGeneration)): \(error)")
@@ -1739,7 +1739,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 error, server: server, acquiredGeneration: acquiredGeneration)
             if confirmedAbsent {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[IMAP] Action SELECT failed and LIST confirms '\(folder)' is absent — terminal, not transient")
+                    BackgroundSyncLogger.logDebug("[IMAP] Action SELECT failed and LIST confirms '\(folder)' is absent — terminal, not transient")
                 }
                 throw IMAPActionMailboxAbsent()
             }
@@ -1764,7 +1764,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // RETRYABLE refusal (`ProviderError.notConnected`).
         guard generation == acquiredGeneration else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[IMAP] Stale generation for action connection before body — discarding silently")
+                BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action connection before body — discarding silently")
             }
             #if DEBUG
             logMut("withActionConnection PRE-BODY GUARD fired (acquired=\(acquiredGeneration))")
@@ -1778,7 +1778,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             #endif
             guard generation == acquiredGeneration else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[IMAP] Stale generation for action connection — discarding connection silently")
+                    BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action connection — discarding connection silently")
                 }
                 return result
             }
@@ -1814,7 +1814,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // D-16's sibling — see `withActionConnectionSelection`'s pre-body guard.
         guard generation == acquiredGeneration else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[IMAP] Stale generation for action connection (no-select) before body — discarding silently")
+                BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action connection (no-select) before body — discarding silently")
             }
             #if DEBUG
             logMut("withActionConnectionNoSelect PRE-BODY GUARD fired (acquired=\(acquiredGeneration))")
@@ -1828,7 +1828,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             #endif
             guard generation == acquiredGeneration else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[IMAP] Stale generation for action connection (no-select) — discarding connection silently")
+                    BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action connection (no-select) — discarding connection silently")
                 }
                 return result
             }
@@ -1840,7 +1840,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             #endif
             guard generation == acquiredGeneration else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[IMAP] Stale generation for action connection (no-select) — discarding release after error")
+                    BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action connection (no-select) — discarding release after error")
                 }
                 throw error
             }
@@ -1906,7 +1906,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // legitimately hold the same reference).
             guard generation == queuedGeneration, actionServer === fresh else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[IMAP] Voided action-server creation-waiter transfer detected at resume — throwing for retry")
+                    BackgroundSyncLogger.logDebug("[IMAP] Voided action-server creation-waiter transfer detected at resume — throwing for retry")
                 }
                 #if DEBUG
                 logMut("creation-waiter-resume VOIDED (queuedGen=\(queuedGeneration))")
@@ -1969,7 +1969,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         #endif
         guard generation == preCreateGeneration else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[IMAP] Stale generation for action-server creation — discarding fresh connection, failing waiters for retry")
+                BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action-server creation — discarding fresh connection, failing waiters for retry")
             }
             #if DEBUG
             logMut("ensureServer creator generation MISMATCH (pre=\(preCreateGeneration)) — discard fresh, fail waiters")
@@ -1997,7 +1997,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         #if DEBUG
         logMut("ensureServer creator PLANTED fresh")
         #endif
-        if DebugModeManager.isLoggingEnabled() { print("[IMAP] Created action connection") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Created action connection") }
         let waiters = actionServerCreationWaiters
         actionServerCreationWaiters.removeAll()
         #if DEBUG
@@ -2061,7 +2061,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // (ADR-IOS-059). RETRYABLE refusal.
                     guard generation == acquiredGeneration else {
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Stale generation for action connection during liveness check — discarding silently")
+                            BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action connection during liveness check — discarding silently")
                         }
                         throw ProviderError.notConnected
                     }
@@ -2083,7 +2083,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     let reensured = try await ensureServer()
                     guard generation == acquiredGeneration else {
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Stale generation for action connection after liveness check — discarding silently")
+                            BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action connection after liveness check — discarding silently")
                         }
                         throw ProviderError.notConnected
                     }
@@ -2099,14 +2099,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         // wholesale. Release exactly like every other
                         // unchanged-generation failure exit here. RETRYABLE.
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Action connection rebound to a different instance during liveness re-validation — releasing mark and discarding")
+                            BackgroundSyncLogger.logDebug("[IMAP] Action connection rebound to a different instance during liveness re-validation — releasing mark and discarding")
                         }
                         await releaseActionConnection(healthy: false)
                         throw ProviderError.notConnected
                     }
                     server = reensured
                 } else {
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP] Action connection dead — recreating") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Action connection dead — recreating") }
                     #if DEBUG
                     logMut("dead-recreate ENTER")
                     #endif
@@ -2128,7 +2128,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         #endif
                         guard generation == acquiredGeneration else {
                             if DebugModeManager.isLoggingEnabled() {
-                                print("[IMAP] Stale generation for action connection after failed recreate — discarding silently")
+                                BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action connection after failed recreate — discarding silently")
                             }
                             throw ProviderError.notConnected
                         }
@@ -2156,7 +2156,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // and throw WITHOUT touching the slot. RETRYABLE.
                     guard generation == acquiredGeneration else {
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Stale generation for action connection after recreate — discarding silently")
+                            BackgroundSyncLogger.logDebug("[IMAP] Stale generation for action connection after recreate — discarding silently")
                         }
                         #if DEBUG
                         logMut("dead-recreate generation MISMATCH (acquired=\(acquiredGeneration)) — discard fresh")
@@ -2181,7 +2181,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // this task holds, throw. RETRYABLE.
                     guard actionServer === deadInstance else {
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Dead instance released out from under the action dead-recreate — refusing the plant, releasing mark and discarding")
+                            BackgroundSyncLogger.logDebug("[IMAP] Dead instance released out from under the action dead-recreate — refusing the plant, releasing mark and discarding")
                         }
                         #if DEBUG
                         logMut("dead-recreate IDENTITY MISMATCH — refuse plant, release")
@@ -2250,7 +2250,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // the responsibility of whichever release/teardown voided the transfer.
         guard generation == queuedGeneration, let transferred = actionServer else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[IMAP] Voided action-connection transfer detected at waiter resume — throwing for retry")
+                BackgroundSyncLogger.logDebug("[IMAP] Voided action-connection transfer detected at waiter resume — throwing for retry")
             }
             #if DEBUG
             logMut("waiter-resume VOIDED (queuedGen=\(queuedGeneration))")
@@ -2439,7 +2439,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 }
             } catch {
                 guard folderServers[folder] === server, !folderInUse.contains(folder) else { continue }
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP] Keepalive failed for \(folder) — removing") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Keepalive failed for \(folder) — removing") }
                 noteDeadDrop(server)
                 folderServers.removeValue(forKey: folder)
                 folderLastUsed.removeValue(forKey: folder)
@@ -2461,7 +2461,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 }
             } catch {
                 guard actionServer === server, !actionInUse else { return }
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP] Keepalive failed for action connection — removing") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Keepalive failed for action connection — removing") }
                 noteDeadDrop(server)
                 actionServer = nil
             }
@@ -2485,7 +2485,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // "replace me". The plant, and its `assertPoolSlotWasNil` trap, now
         // live in exactly one place.
         _ = try await ensureServer()
-        if DebugModeManager.isLoggingEnabled() { print("[IMAP] Action connection ready") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Action connection ready") }
         startKeepAlive()
     }
 
@@ -2607,7 +2607,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             #endif
             noteLogoutAttempt(server)
             try? await server.logout()
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] Disconnected pinned connection for \(folder)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Disconnected pinned connection for \(folder)") }
         }
         // Drain primary connection
         if let server = capturedActionServer {
@@ -2670,7 +2670,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // Nuke ALL folder connections (both idle and in-use)
         for (folder, server) in folderServers {
             detachedTeardownLogout(server)
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] markDirty: disconnecting pinned connection for \(folder)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] markDirty: disconnecting pinned connection for \(folder)") }
         }
         folderServers.removeAll()
         folderLastUsed.removeAll()
@@ -2708,14 +2708,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // first terminates the IDLE session cleanly so the LOGOUT proceeds
             // immediately.
             detachedTeardownLogout(server, sendDoneFirst: true)
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] markDirty: disconnecting IDLE connection") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] markDirty: disconnecting IDLE connection") }
         }
         idleServer = nil
 
         // Nuke action connection
         if let server = actionServer {
             detachedTeardownLogout(server)
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] markDirty: disconnecting action connection") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] markDirty: disconnecting action connection") }
         }
         actionServer = nil
         actionInUse = false
@@ -3198,7 +3198,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         guard idleEnabled, idleServer == nil else { return }
         // Don't launch IDLE if server limit is known and too tight
         if let limit = serverConnectionLimit, limit < Self.idleMinServerLimit {
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP:IDLE] Skipping — server limit \(limit) < \(Self.idleMinServerLimit), falling back to polling") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Skipping — server limit \(limit) < \(Self.idleMinServerLimit), falling back to polling") }
             return
         }
 
@@ -3238,14 +3238,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // reports here is a real, otherwise-unrecorded observation of
                 // INBOX at the instant the IDLE lane opened.
                 _ = try await self.selectMailboxTracked(fresh, folder: "INBOX")
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP:IDLE] Dedicated IDLE connection ready") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Dedicated IDLE connection ready") }
                 let events = try await fresh.idle()
                 for await event in events {
                     guard !Task.isCancelled else { break }
                     await self.dispatchIdleEvent(event)
                 }
                 // Stream ended (server broke IDLE or connection dropped)
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP:IDLE] Stream ended — reconnecting in 5s") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Stream ended — reconnecting in 5s") }
                 await self.onIdleStreamEnded(owner: fresh)
             } catch is CancellationError {
                 // Expected — stopIdle or markDirty. If the claim already
@@ -3255,10 +3255,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // was intentional.
             } catch {
                 if let claimed {
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP:IDLE] Error: \(error) — reconnecting in 10s") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Error: \(error) — reconnecting in 10s") }
                     await self.onIdleStreamEnded(owner: claimed, delay: 10)
                 } else {
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP:IDLE] Error creating IDLE connection: \(error) — reconnecting in 10s") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Error creating IDLE connection: \(error) — reconnecting in 10s") }
                     await self.retryLaunchIdleConnection(delay: 10)
                 }
             }
@@ -3341,7 +3341,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     @discardableResult
     private func evictIdleConnection() -> Bool {
         guard let server = idleServer else { return false }
-        if DebugModeManager.isLoggingEnabled() { print("[IMAP:IDLE] Evicting IDLE connection to free server slot") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Evicting IDLE connection to free server slot") }
         idleListenerTask?.cancel()
         idleListenerTask = nil
         noteLogoutAttempt(server)
@@ -3393,7 +3393,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // sync layer wearing the shape of a real epoch.
                     uidValidityVal = SyncEngine.knownUidValidity(status.uidValidity.map { Int($0.value) })
                 } catch {
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP] STATUS failed for \(info.name): \(error)") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] STATUS failed for \(info.name): \(error)") }
                 }
                 pairs.append((
                     info: FolderInfo(
@@ -3520,7 +3520,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             do {
                 let infos = try await server.fetchMessageInfosBulk(using: range)
                 if infos.count < limit && infos.count < selection.messageCount {
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP-FETCH-GAP] \(folder): fetchMessages requested \(limit) (msgCount=\(selection.messageCount)), got \(infos.count)") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP-FETCH-GAP] \(folder): fetchMessages requested \(limit) (msgCount=\(selection.messageCount)), got \(infos.count)") }
                 }
                 // compactMap: mapMessageInfo returns nil for unparseable messages (treated as fetch failure)
                 let mapped = infos.compactMap { self.mapMessageInfo($0) }.sorted { $0.date > $1.date }
@@ -3535,7 +3535,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             } catch {
                 let msg = "\(error)"
                 if msg.contains("Invalid messageset") || msg.contains("invalid messageset") {
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP] Invalid messageset for \(folder) (messageCount=\(selection.messageCount)) — skipping") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Invalid messageset for \(folder) (messageCount=\(selection.messageCount)) — skipping") }
                     return ([], observedEpoch, .unproven)
                 }
                 throw error
@@ -3688,12 +3688,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let rfc822Parts = message.parts.filter { $0.contentType.lowercased().hasPrefix("message/rfc822") }
         if !rfc822Parts.isEmpty {
             if DebugModeManager.isLoggingEnabled() {
-                print("[EmlRender] Message has \(rfc822Parts.count) rfc822 part(s), \(bodyParts.count) body parts:")
+                BackgroundSyncLogger.logDebug("[EmlRender] Message has \(rfc822Parts.count) rfc822 part(s), \(bodyParts.count) body parts:")
                 for part in bodyParts {
-                    print("[EmlRender]   section=\(part.section.description) type=\(DebugModeManager.escapedForLogLine(part.contentType)) len=\(part.textContent?.count ?? 0)")
+                    BackgroundSyncLogger.logDebug("[EmlRender]   section=\(part.section.description) type=\(DebugModeManager.escapedForLogLine(part.contentType)) len=\(part.textContent?.count ?? 0)")
                 }
                 for part in rfc822Parts {
-                    print("[EmlRender]   rfc822: section=\(part.section.description) filename=\(DebugModeManager.escapedForLogLine(part.filename ?? "nil"))")
+                    BackgroundSyncLogger.logDebug("[EmlRender]   rfc822: section=\(part.section.description) filename=\(DebugModeManager.escapedForLogLine(part.filename ?? "nil"))")
                 }
             }
         }
@@ -3706,7 +3706,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // only two lengths — so there is nothing to escape; rule 12 still applies.
         if !rfc822Parts.isEmpty {
             if DebugModeManager.isLoggingEnabled() {
-                print("[EmlRender] htmlBody len=\(htmlBody?.count ?? 0), textBody len=\(textBody?.count ?? 0)")
+                BackgroundSyncLogger.logDebug("[EmlRender] htmlBody len=\(htmlBody?.count ?? 0), textBody len=\(textBody?.count ?? 0)")
             }
         }
 
@@ -3744,7 +3744,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // miss-counter → eventual CASCADE-delete path. Throw loudly instead.
         let synthetic = ids.filter(isSyntheticPlaceholderId)
         if !synthetic.isEmpty {
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] ERROR: synthetic placeholder ids leaked into fetchMessagesBatch — upstream queue regression. folder=\(folder) ids=\(synthetic.prefix(5))") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] ERROR: synthetic placeholder ids leaked into fetchMessagesBatch — upstream queue regression. folder=\(folder) ids=\(synthetic.prefix(5))") }
             throw ProviderError.syntheticPlaceholderId(synthetic)
         }
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -3753,11 +3753,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             return (id, uid)
         }
         guard !uidPairs.isEmpty else {
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch: no valid UIDs in \(ids.count) ids") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] fetchMessagesBatch: no valid UIDs in \(ids.count) ids") }
             return [:]
         }
 
-        if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch START: \(uidPairs.count) UIDs in \(folder)") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] fetchMessagesBatch START: \(uidPairs.count) UIDs in \(folder)") }
 
         return try await withFolderConnection(folder: folder) { server in
             // 1. SELECT (re-selects on pinned connection — fast, refreshes state)
@@ -3769,7 +3769,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // first to see a turnover.
             _ = try await selectMailboxTracked(server, folder: folder)
             let selectMs = Int((CFAbsoluteTimeGetCurrent() - tSelect) * 1000)
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch SELECT: \(selectMs)ms") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] fetchMessagesBatch SELECT: \(selectMs)ms") }
 
             // 2. Bulk BODYSTRUCTURE for all UIDs — we already get parts from this
             let tStruct = CFAbsoluteTimeGetCurrent()
@@ -3777,7 +3777,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             for (_, uid) in uidPairs { uidSet.insert(UID(uid)) }
             let infos = try await server.fetchMessageInfosBulk(using: uidSet)
             let structMs = Int((CFAbsoluteTimeGetCurrent() - tStruct) * 1000)
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch BODYSTRUCTURE: \(infos.count)/\(uidPairs.count) returned in \(structMs)ms") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] fetchMessagesBatch BODYSTRUCTURE: \(infos.count)/\(uidPairs.count) returned in \(structMs)ms") }
 
             // Map UID → (id, MessageInfo) for lookup
             var infoByUID: [UInt32: (id: String, info: MessageInfo)] = [:]
@@ -3805,7 +3805,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
 
             let totalParts = partRequests.count
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch: \(totalParts) parts to fetch across \(infoByUID.count) messages") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] fetchMessagesBatch: \(totalParts) parts to fetch across \(infoByUID.count) messages") }
 
             // 4. Pipelined fetch — all parts in one burst.
             //    PayloadTooLarge contaminates the NIO connection (unfulfilled promises crash
@@ -3820,7 +3820,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
 
             let partsMs = Int((CFAbsoluteTimeGetCurrent() - tParts) * 1000)
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch PARTS PIPELINED: \(pipelinedResults.count) UIDs returned in \(partsMs)ms") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] fetchMessagesBatch PARTS PIPELINED: \(pipelinedResults.count) UIDs returned in \(partsMs)ms") }
 
             // 5. Assemble Message objects from BODYSTRUCTURE + fetched part data
             var results: [String: FullMessageInfo] = [:]
@@ -3870,7 +3870,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 if IMAPFetchMapping.hasDroppedTopLevelHTMLSection(
                     info: entry.info, fetchedSections: Set(fetchedBySection.keys)
                 ) {
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch: UID \(uidValue) — top-level text/html section dropped by pipelined fetch; failing batch for retry (not caching HTML as plaintext)") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] fetchMessagesBatch: UID \(uidValue) — top-level text/html section dropped by pipelined fetch; failing batch for retry (not caching HTML as plaintext)") }
                     throw NSError(
                         domain: "IMAPProvider.IncompleteBodyFetch", code: 1,
                         userInfo: [NSLocalizedDescriptionKey: "top-level text/html section dropped after pipelined fetch for UID \(uidValue)"]
@@ -3883,13 +3883,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // Check for UIDs that were in our request but not in BODYSTRUCTURE response
             for (_, uidValue) in uidPairs {
                 if infoByUID[uidValue] == nil {
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch: UID \(uidValue) not in BODYSTRUCTURE — skipping") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] fetchMessagesBatch: UID \(uidValue) not in BODYSTRUCTURE — skipping") }
                     failedCount += 1
                 }
             }
 
             let totalMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] fetchMessagesBatch DONE: \(fetchedCount) fetched, \(failedCount) failed in \(totalMs)ms (select=\(selectMs)ms, struct=\(structMs)ms, parts=\(partsMs)ms)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] fetchMessagesBatch DONE: \(fetchedCount) fetched, \(failedCount) failed in \(totalMs)ms (select=\(selectMs)ms, struct=\(structMs)ms, parts=\(partsMs)ms)") }
             return results
         }
     }
@@ -3923,7 +3923,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         } catch {
             let desc = "\(error)"
             if desc.contains("PayloadTooLargeError") && after == nil {
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP Search] SEARCH too large, retrying with 1-year constraint") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP Search] SEARCH too large, retrying with 1-year constraint") }
                 let oneYearAgo = Calendar.current.date(byAdding: .year, value: -1, to: Date()) ?? Date.distantPast
                 return try await searchOnConnection(query: query, folder: folder, after: oneYearAgo, before: before, from: from, to: to, server: server)
             }
@@ -4144,7 +4144,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         guard Self.isStrictlyAscending(evidence.mapping.map(\.source.value)),
               Self.isStrictlyAscending(evidence.mapping.map(\.destination.value)) else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[IMAP] COPYUID pairing REFUSED — the response's source/destination lists are not both strictly ascending, so the positional zip that produced this mapping cannot be trusted to have paired them correctly; no local re-key is admitted (fail closed; the move itself is unaffected and sync repairs the row)")
+                BackgroundSyncLogger.logDebug("[IMAP] COPYUID pairing REFUSED — the response's source/destination lists are not both strictly ascending, so the positional zip that produced this mapping cannot be trusted to have paired them correctly; no local re-key is admitted (fail closed; the move itself is unaffected and sync repairs the row)")
             }
             return []
         }
@@ -4285,7 +4285,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             using: requested, options: .uidFlagsOnly) {
             guard let uid = info.uid else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[IMAP] liveness probe of '\(folder)': a UID FETCH response record carried no parseable UID (RFC 3501 §6.4.8 requires one), so this probe cannot say which of the \(requested.count) requested uid(s) the source still holds — REFUSING all source cleanup (fail closed; an unanswerable probe is not proof a member left the mailbox) and keeping the op retryable")
+                    BackgroundSyncLogger.logDebug("[IMAP] liveness probe of '\(folder)': a UID FETCH response record carried no parseable UID (RFC 3501 §6.4.8 requires one), so this probe cannot say which of the \(requested.count) requested uid(s) the source still holds — REFUSING all source cleanup (fail closed; an unanswerable probe is not proof a member left the mailbox) and keeping the op retryable")
                 }
                 throw IMAPLivenessProbeInconclusive.unparsedUid(
                     folder: folder, requested: requested.count)
@@ -4857,7 +4857,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                                 flags: legacyFlags, on: sourceUIDs, operation: .remove)
                         } catch {
                             if DebugModeManager.isLoggingEnabled() {
-                                print("[IMAP] Legacy tm_* strip failed before atomic move (continuing): \(error)")
+                                BackgroundSyncLogger.logDebug("[IMAP] Legacy tm_* strip failed before atomic move (continuing): \(error)")
                             }
                         }
                     }
@@ -4886,7 +4886,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         // removes only this move's unsafe Undo member. Retrying
                         // here could move a later UID occupant or duplicate work.
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Atomic MOVE completed with malformed COPYUID; converging by sync")
+                            BackgroundSyncLogger.logDebug("[IMAP] Atomic MOVE completed with malformed COPYUID; converging by sync")
                         }
                         return MoveOutcome(provenIds: ids, provenDestinations: [])
                     } catch IMAPError.moveFailedAfterPartialCompletion(
@@ -4900,7 +4900,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         // attempt, preserve the verified destination addresses,
                         // and make the queue reconcile BOTH mailboxes.
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Atomic MOVE partially completed with COPYUID; reconciling both mailboxes without retry")
+                            BackgroundSyncLogger.logDebug("[IMAP] Atomic MOVE partially completed with COPYUID; reconciling both mailboxes without retry")
                         }
                         return MoveOutcome(
                             provenIds: ids,
@@ -4999,13 +4999,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         if let responseCode,
                            Self.permanentMoveRefusalCodes.contains(responseCode) {
                             if DebugModeManager.isLoggingEnabled() {
-                                print("[IMAP] Atomic MOVE refused with permanent response code [\(responseCode)] — the server says this command can never succeed as issued, so the op RETIRES with zero wire mutation; the message is untouched in '\(source)' and the next source sync reclaims the row: \(reason)")
+                                BackgroundSyncLogger.logDebug("[IMAP] Atomic MOVE refused with permanent response code [\(responseCode)] — the server says this command can never succeed as issued, so the op RETIRES with zero wire mutation; the message is untouched in '\(source)' and the next source sync reclaims the row: \(reason)")
                             }
                             throw IMAPActionPermanentlyRefused(
                                 code: responseCode, reason: reason)
                         }
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Atomic MOVE refused with no COPYUID (leading response code: \(responseCode ?? "none")) — op stays queued, it and its related chain move to the queue tail and are deferred for this drain, the rest of the account keeps draining: \(reason)")
+                            BackgroundSyncLogger.logDebug("[IMAP] Atomic MOVE refused with no COPYUID (leading response code: \(responseCode ?? "none")) — op stays queued, it and its related chain move to the queue tail and are deferred for this drain, the rest of the account keeps draining: \(reason)")
                         }
                         throw IMAPAtomicMoveRefused.taggedFailureWithoutCopyUID(
                             destination: destination, reason: reason)
@@ -5112,7 +5112,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         throw error
                     }
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[MoveTrace] IMAPProvider.move — destination '\(destination)' confirmed absent — whole-op no-op")
+                        BackgroundSyncLogger.logDebug("[MoveTrace] IMAPProvider.move — destination '\(destination)' confirmed absent — whole-op no-op")
                     }
                     throw IMAPActionMailboxAbsent()
                 }
@@ -5136,7 +5136,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 let observedDestinationUidValidity = destinationProbe.uidValidity.value
                 guard observedDestinationUidValidity > 0 else {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[IMAP] move \(source)→\(destination): destination SELECT reported no UIDVALIDITY, so no COPYUID could ever be proven to belong to the mailbox we probed — REFUSING before any wire mutation (fail closed; nothing copied, nothing deleted) and keeping the op retryable")
+                        BackgroundSyncLogger.logDebug("[IMAP] move \(source)→\(destination): destination SELECT reported no UIDVALIDITY, so no COPYUID could ever be proven to belong to the mailbox we probed — REFUSING before any wire mutation (fail closed; nothing copied, nothing deleted) and keeping the op retryable")
                     }
                     throw IMAPDestinationEpochRefusal.unknownAtProbe(destination: destination)
                 }
@@ -5157,7 +5157,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         try await server.store(flags: legacyFlags, on: sourceUIDs, operation: .remove)
                     } catch {
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] Legacy tm_* strip failed for native move (continuing): \(error)")
+                            BackgroundSyncLogger.logDebug("[IMAP] Legacy tm_* strip failed for native move (continuing): \(error)")
                         }
                     }
                 }
@@ -5209,7 +5209,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         messages: sourceUIDs, to: destination)
                 } catch IMAPError.malformedCopyUIDAfterTaggedOK {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[IMAP] move \(source)→\(destination): the COPY's tagged OK carried a COPYUID that could not be parsed — the server COMMITTED the copy, so this is NO EVIDENCE about a copy that DID happen, never a failed copy: no re-copy, no UID EXPUNGE (purge authorization is empty), at most a reversible \\Deleted on members the source still holds")
+                        BackgroundSyncLogger.logDebug("[IMAP] move \(source)→\(destination): the COPY's tagged OK carried a COPYUID that could not be parsed — the server COMMITTED the copy, so this is NO EVIDENCE about a copy that DID happen, never a failed copy: no re-copy, no UID EXPUNGE (purge authorization is empty), at most a reversible \\Deleted on members the source still holds")
                     }
                     copyEvidence = nil
                 }
@@ -5272,7 +5272,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                         // refusal is re-raised as the retryable one. See
                         // `IMAPDestinationEpochRefusal` for the full argument.
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[IMAP] move \(source)→\(destination): destination UIDVALIDITY moved from \(observedDestinationUidValidity) (probed) to \(copyEvidence.destinationUIDValidity.value) (COPYUID) across the COPY — REFUSING all source cleanup (fail closed; the copy landed in an address space this attempt never validated) and keeping the op retryable")
+                            BackgroundSyncLogger.logDebug("[IMAP] move \(source)→\(destination): destination UIDVALIDITY moved from \(observedDestinationUidValidity) (probed) to \(copyEvidence.destinationUIDValidity.value) (COPYUID) across the COPY — REFUSING all source cleanup (fail closed; the copy landed in an address space this attempt never validated) and keeping the op retryable")
                         }
                         throw IMAPDestinationEpochRefusal.movedAcrossCopy(
                             destination: destination,
@@ -5367,7 +5367,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     purgeAuthorizedUIDs = UIDSet(
                         copyProvenUIDs.toArray().filter { liveValues.contains($0.value) })
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): COPYUID named \(copyProvenUIDs.count) of \(sourceUIDs.count) requested uid(s); the source still holds \(live.count) of them, so \(live.count) are soft-deleted on the tagged OK and \(sourceUIDs.count - live.count) are already gone from the source (provider-authoritative no-op, nothing to do)")
+                        BackgroundSyncLogger.logDebug("[MoveTrace] IMAPProvider.move — \(source)→\(destination): COPYUID named \(copyProvenUIDs.count) of \(sourceUIDs.count) requested uid(s); the source still holds \(live.count) of them, so \(live.count) are soft-deleted on the tagged OK and \(sourceUIDs.count - live.count) are already gone from the source (provider-authoritative no-op, nothing to do)")
                     }
                 }
 
@@ -5401,7 +5401,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // `UID STORE` naming only absent UIDs is a silent no-op, so
                     // issuing one would be a wire round trip that proves and
                     // changes nothing).
-                    print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): the source holds none of the \(sourceUIDs.count) requested uid(s) — whole-op no-op, nothing mutated anywhere")
+                    BackgroundSyncLogger.logDebug("[MoveTrace] IMAPProvider.move — \(source)→\(destination): the source holds none of the \(sourceUIDs.count) requested uid(s) — whole-op no-op, nothing mutated anywhere")
                 }
 
                 try Task.checkCancellation()
@@ -5482,7 +5482,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // destination already has the copy, and a UIDPLUS-capable
                     // client or the server's own policy completes the purge.
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[MoveTrace] IMAPProvider.move — \(source)→\(destination): no UID EXPUNGE (uidPlus=\(serverSupportsUIDPlus), copyuid-proven-and-live=\(purgeAuthorizedUIDs.count)) — the tagged-OK COPY plus source liveness authorized the soft delete, so the source is copied and marked \\Deleted; the mailbox-wide EXPUNGE is skipped to avoid a wrong-delete (IOS-IMAP-001) and the move COMPLETES")
+                        BackgroundSyncLogger.logDebug("[MoveTrace] IMAPProvider.move — \(source)→\(destination): no UID EXPUNGE (uidPlus=\(serverSupportsUIDPlus), copyuid-proven-and-live=\(purgeAuthorizedUIDs.count)) — the tagged-OK COPY plus source liveness authorized the soft delete, so the source is copied and marked \\Deleted; the mailbox-wide EXPUNGE is skipped to avoid a wrong-delete (IOS-IMAP-001) and the move COMPLETES")
                     }
                 }
                 return MoveOutcome(
@@ -5576,7 +5576,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     func send(draft: DraftMessage) async throws {
         try await withTimeout(seconds: SyncConfig.smtpSendTimeoutSeconds) {
-            if DebugModeManager.isLoggingEnabled() { print("[SMTP] Sending via \(self.smtpHost):\(self.smtpPort) from=\(self.senderEmail) to=\(draft.to) attachments=\(draft.attachments.count)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[SMTP] Sending via \(self.smtpHost):\(self.smtpPort) from=\(self.senderEmail) to=\(draft.to) attachments=\(draft.attachments.count)") }
             let smtpServer = SMTPServer(host: self.smtpHost, port: self.smtpPort)
             do {
                 try await smtpServer.connect()
@@ -5604,7 +5604,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
             // Email is sent — disconnect is cleanup, must not throw
             try? await smtpServer.disconnect()
-            if DebugModeManager.isLoggingEnabled() { print("[SMTP] Send complete") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[SMTP] Send complete") }
         }
     }
 
@@ -5615,13 +5615,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         return try await withActionConnection(folder: sentFolderPath) { server in
             let existing = try await self.searchByMessageId(messageId, server: server)
             if !existing.isEmpty {
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP] Sent message \(messageId) already exists in \(sentFolderPath) — skipping append") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Sent message \(messageId) already exists in \(sentFolderPath) — skipping append") }
                 return true
             }
 
             let email = Self.buildEmail(from: draft, senderEmail: senderAddr)
             _ = try await server.append(email: email, to: sentFolderPath, flags: [.seen], internalDate: Date())
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] Appended sent message \(messageId) to \(sentFolderPath)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Appended sent message \(messageId) to \(sentFolderPath)") }
             return true
         }
     }
@@ -5640,7 +5640,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         // It is CORROBORATING METADATA ONLY — ADR-IOS-068/D4 forbids it from ever
         // selecting or authorizing a mutation target (see the no-APPENDUID arm below).
         guard let messageId = draft.messageId, !messageId.isEmpty else {
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] saveDraft: no messageId — cannot track draft UID reliably") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] saveDraft: no messageId — cannot track draft UID reliably") }
             throw NSError(domain: "IMAPProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "Draft must have a Message-ID for IMAP tracking"])
         }
 
@@ -5686,7 +5686,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                let appendedEpoch = appendResult.uidValidity,
                appendedUid.value != 0,
                appendedEpoch.value != 0 {
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP] Saved draft to \(draftsFolderPath) via APPENDUID uid=\(appendedUid) uidValidity=\(appendedEpoch)") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Saved draft to \(draftsFolderPath) via APPENDUID uid=\(appendedUid) uidValidity=\(appendedEpoch)") }
                 return .created(.imap(
                     folder: draftsFolderPath,
                     uidValidity: Int(appendedEpoch.value),
@@ -5753,7 +5753,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // mailbox's ability to report UIDs on FETCH/SELECT. Expunging the
             // wrong draft is NOT recoverable. Failing closed is correct here.
             // Registered as `KNOWN_ISSUES.md` `IOS-DRAFT-011`.
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] saveDraft: APPEND to \(draftsFolderPath) succeeded WITHOUT APPENDUID for '\(messageId)' (uidValidity=\(selection.uidValidity.value)) — no attempt-correlated address exists; NOT searching by Message-ID (ADR-IOS-068/D4: a SEARCH result is never a mutation target)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] saveDraft: APPEND to \(draftsFolderPath) succeeded WITHOUT APPENDUID for '\(messageId)' (uidValidity=\(selection.uidValidity.value)) — no attempt-correlated address exists; NOT searching by Message-ID (ADR-IOS-068/D4: a SEARCH result is never a mutation target)") }
             return .unaddressable
         }
     }
@@ -5779,7 +5779,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // touch draft IDENTITY handling (T3.9/T3.10) — an unknown,
             // malformed or stale address still fails closed in
             // `deleteDraftStrong` exactly as before.
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] Drafts mailbox absent — draft delete completed as no-op (mailbox '\(folder)' confirmed gone)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Drafts mailbox absent — draft delete completed as no-op (mailbox '\(folder)' confirmed gone)") }
         }
     }
 
@@ -5805,7 +5805,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
               uidValidity > 0,
               let recordedUidValidity = UInt32(exactly: uidValidity),
               let targetUidValue = UInt32(exactly: uid) else {
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] deleteDraft (strong): out-of-range identity (uid=\(uid), uidValidity=\(uidValidity)) in \(draftsFolderPath) — REFUSING") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] deleteDraft (strong): out-of-range identity (uid=\(uid), uidValidity=\(uidValidity)) in \(draftsFolderPath) — REFUSING") }
             throw ProviderError.actionIdentityResolutionFailed(String(uid))
         }
         try await withActionConnectionSelection(folder: draftsFolderPath) { server, selection in
@@ -5943,11 +5943,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // arm already logs it. Gating it cannot hide a loss, because there
                 // is no loss.
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[IMAP] deleteDraft (strong): SELECT of \(draftsFolderPath) reported NO usable UIDVALIDITY for uid=\(uid) (recorded=\(uidValidity), current=\(selection.uidValidity.value)) — REFUSING and keeping the op QUEUED (absence of evidence is not a proven turnover; retries when the server reports one)")
+                    BackgroundSyncLogger.logDebug("[IMAP] deleteDraft (strong): SELECT of \(draftsFolderPath) reported NO usable UIDVALIDITY for uid=\(uid) (recorded=\(uidValidity), current=\(selection.uidValidity.value)) — REFUSING and keeping the op QUEUED (absence of evidence is not a proven turnover; retries when the server reports one)")
                 }
                 throw missing
             } catch {
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP] deleteDraft (strong): UIDVALIDITY mismatch for uid=\(uid) in \(draftsFolderPath) (recorded=\(uidValidity), current=\(selection.uidValidity.value)) — REFUSING (fail closed; never rebind by rfc822)") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] deleteDraft (strong): UIDVALIDITY mismatch for uid=\(uid) in \(draftsFolderPath) (recorded=\(uidValidity), current=\(selection.uidValidity.value)) — REFUSING (fail closed; never rebind by rfc822)") }
                 throw error
             }
             let targetSet = UIDSet(UID(targetUidValue))
@@ -5956,14 +5956,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // Already gone — expunged by another actor, or by a prior attempt whose
                 // response was lost. Terminal no-op, and NOT an invitation to go looking
                 // for something else that carries the same Message-ID.
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP] deleteDraft (strong): uid=\(uid) in \(draftsFolderPath) not found on FETCH — treating as already deleted") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] deleteDraft (strong): uid=\(uid) in \(draftsFolderPath) not found on FETCH — treating as already deleted") }
                 return
             }
             try await server.store(flags: [.deleted], on: targetSet, operation: .add)
             try await self.expungeScopedToTargets(
                 targetSet, server: server,
                 logDescription: "draft uid=\(uid) from \(draftsFolderPath)")
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] Deleted draft uid=\(uid) from \(draftsFolderPath)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Deleted draft uid=\(uid) from \(draftsFolderPath)") }
         }
     }
 
@@ -6017,7 +6017,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         if await server.supportsUIDPlus {
             try await server.expunge(messages: target)
             if DebugModeManager.isLoggingEnabled() {
-                print("[IMAP] Purged \(logDescription) (UID EXPUNGE)")
+                BackgroundSyncLogger.logDebug("[IMAP] Purged \(logDescription) (UID EXPUNGE)")
             }
         } else {
             // No UIDPLUS: a mailbox-wide EXPUNGE is the ONLY server-side purge
@@ -6037,7 +6037,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // UIDPLUS-capable client or the server's own policy completes the purge.
             // NEVER a mailbox-wide EXPUNGE.
             if DebugModeManager.isLoggingEnabled() {
-                print("[IMAP] \(logDescription): server lacks UIDPLUS — marked \\Deleted (soft delete), skipped mailbox-wide EXPUNGE to avoid a wrong-delete")
+                BackgroundSyncLogger.logDebug("[IMAP] \(logDescription): server lacks UIDPLUS — marked \\Deleted (soft delete), skipped mailbox-wide EXPUNGE to avoid a wrong-delete")
             }
         }
     }
@@ -6210,12 +6210,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 if currentBatchSize <= 1 {
                     // Single UID still too large — return empty result so caller can confirm empty
                     let uid = batchUIDs.first ?? 0
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP] Single UID \(uid) too large — marking as empty") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Single UID \(uid) too large — marking as empty") }
                     results.append(TextBodyResult(uid: uid, htmlBody: nil, textBody: nil))
                     index += 1
                 } else {
                     currentBatchSize = max(1, currentBatchSize / 2)
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP] Batch too large, reducing chunk to \(currentBatchSize)") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Batch too large, reducing chunk to \(currentBatchSize)") }
                 }
             }
         }
@@ -6282,9 +6282,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                                 htmlBody = populated.textContent
                             }
                         } catch {
-                            if DebugModeManager.isLoggingEnabled() { print("[IMAP] Failed to fetch part \(part.section) for UID \(uid.value): \(error)") }
+                            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Failed to fetch part \(part.section) for UID \(uid.value): \(error)") }
                             if SyncEngine.isConnectionError(error) {
-                                if DebugModeManager.isLoggingEnabled() { print("[IMAP] Connection dead during batch — aborting remaining fetches") }
+                                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Connection dead during batch — aborting remaining fetches") }
                                 connectionDead = true
                                 break
                             }
@@ -6454,11 +6454,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     // Can't split further — IMAP SINCE/BEFORE uses date-only granularity.
                     // Re-throw so callers can handle (skip folder, shrink window, etc.)
                     // rather than silently dropping all messages in this range.
-                    if DebugModeManager.isLoggingEnabled() { print("[IMAP Search] \(folder): PayloadTooLargeError on single day \(since) — cannot split further, propagating error") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP Search] \(folder): PayloadTooLargeError on single day \(since) — cannot split further, propagating error") }
                     throw error
                 }
                 let midpoint = since.addingTimeInterval(totalSeconds / 2)
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP Search] \(folder): SEARCH too large, splitting at \(midpoint)") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP Search] \(folder): SEARCH too large, splitting at \(midpoint)") }
                 let firstHalf = try await searchDateRange(folder: folder, since: since, before: midpoint, server: server)
                 try Task.checkCancellation()
                 let secondHalf = try await searchDateRange(folder: folder, since: midpoint, before: before, server: server)
@@ -6632,7 +6632,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 let returnedUIDs = Set(infos.compactMap { $0.uid?.value })
                 let requestedUIDs = Set(batch)
                 let missingUIDs = requestedUIDs.subtracting(returnedUIDs)
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP-FETCH-GAP] \(folder): requested \(requestedCount) UIDs, got \(returnedCount). Missing UIDs: \(missingUIDs.sorted())") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP-FETCH-GAP] \(folder): requested \(requestedCount) UIDs, got \(returnedCount). Missing UIDs: \(missingUIDs.sorted())") }
             }
 
             allHeaders.append(contentsOf: infos.compactMap { mapMessageInfo($0) })
@@ -6722,15 +6722,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// then bare value for servers that do RFC 3501 substring matching.
     private func searchByMessageId(_ messageId: String, server: IMAPServer) async throws -> UIDSet {
         let normalizedId = EmailFilter.normalizeMessageId(messageId)
-        if DebugModeManager.isLoggingEnabled() { print("[IMAP] searchByMessageId — searching for '\(normalizedId)'") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] searchByMessageId — searching for '\(normalizedId)'") }
         var ext: ExtendedSearchResult<UID> = try await server.extendedSearch(criteria: [.header("Message-ID", "<\(normalizedId)>")])
         var results: UIDSet = ext.asSet
         if results.isEmpty {
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] searchByMessageId — bracket search empty, trying bare") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] searchByMessageId — bracket search empty, trying bare") }
             ext = try await server.extendedSearch(criteria: [.header("Message-ID", normalizedId)])
             results = ext.asSet
         }
-        if DebugModeManager.isLoggingEnabled() { print("[IMAP] searchByMessageId — '\(normalizedId)' → \(results.isEmpty ? "NOT FOUND" : "\(results.count) UIDs")") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] searchByMessageId — '\(normalizedId)' → \(results.isEmpty ? "NOT FOUND" : "\(results.count) UIDs")") }
         return results
     }
 
@@ -6761,7 +6761,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // Both date sources failed — treat as fetch failure. The message is likely
             // still being indexed by the server (happens right after APPEND). Skipping
             // here means it never enters GRDB with a broken 1970 date. Next sync retries.
-            if DebugModeManager.isLoggingEnabled() { print("[IMAP] Date parse failed for message: \(info.subject ?? "unknown") (id: \(info.messageId?.description ?? "?")) — treating as fetch failure, will retry") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Date parse failed for message: \(info.subject ?? "unknown") (id: \(info.messageId?.description ?? "?")) — treating as fetch failure, will retry") }
             return nil
         }
 
@@ -6926,7 +6926,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }!
             for i in indices where i != winner {
                 demoted.insert(i)
-                if DebugModeManager.isLoggingEnabled() { print("[IMAP:dedup] role=\(role) collision — demoting \"\(folders[i].info.name)\" to .custom; winner=\"\(folders[winner].info.name)\"") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:dedup] role=\(role) collision — demoting \"\(folders[i].info.name)\" to .custom; winner=\"\(folders[winner].info.name)\"") }
             }
         }
 

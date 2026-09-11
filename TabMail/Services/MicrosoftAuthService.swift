@@ -31,8 +31,8 @@ extension OAuthService {
     private func runMicrosoftAuth(scope: String, loginHint: String?) async throws -> OAuthTokens {
         let clientId = OAuthConfig.microsoftClientId
         let redirectScheme = OAuthConfig.microsoftRedirectScheme
-        print("[OAuth] Microsoft clientId: \(clientId)")
-        print("[OAuth] Microsoft redirectScheme: \(redirectScheme)")
+        BackgroundSyncLogger.logDebug("[OAuth] Microsoft clientId: \(clientId)")
+        BackgroundSyncLogger.logDebug("[OAuth] Microsoft redirectScheme: \(redirectScheme)")
         guard !clientId.isEmpty else {
             throw OAuthError.notConfigured("Microsoft OAuth client ID not set")
         }
@@ -61,11 +61,11 @@ extension OAuthService {
         components.queryItems = queryItems
 
         let authURL = components.url!
-        print("[OAuth] Microsoft authURL: \(authURL)")
+        BackgroundSyncLogger.logDebug("[OAuth] Microsoft authURL: \(authURL)")
 
         let callbackURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
             let session = ASWebAuthenticationSession(url: authURL, callback: .customScheme(redirectScheme)) { url, error in
-                print("[OAuth] Microsoft callback — url: \(String(describing: url)), error: \(String(describing: error))")
+                BackgroundSyncLogger.logDebug("[OAuth] Microsoft callback — url: \(String(describing: url)), error: \(String(describing: error))")
                 if let error { continuation.resume(throwing: error) }
                 else if let url { continuation.resume(returning: url) }
                 else { continuation.resume(throwing: OAuthError.cancelled) }
@@ -74,7 +74,7 @@ extension OAuthService {
             session.presentationContextProvider = self
             self.currentSession = session
             let started = session.start()
-            print("[OAuth] Microsoft session.start() returned: \(started)")
+            BackgroundSyncLogger.logDebug("[OAuth] Microsoft session.start() returned: \(started)")
         }
 
         guard let code = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
@@ -195,7 +195,7 @@ extension OAuthService {
                 iosRedirect: iosRedirect
             )
         } catch {
-            print("[MetadataConsent-Outlook] /init failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MetadataConsent-Outlook] /init failed: \(error)")
             throw error
         }
 
@@ -223,7 +223,7 @@ extension OAuthService {
         if reason == "access_denied" {
             throw OAuthError.cancelled
         }
-        print("[MetadataConsent-Outlook] consent failed: reason=\(reason ?? "unknown")")
+        BackgroundSyncLogger.logDebug("[MetadataConsent-Outlook] consent failed: reason=\(reason ?? "unknown")")
         throw OAuthError.consentFailed(reason ?? "unknown")
     }
 }

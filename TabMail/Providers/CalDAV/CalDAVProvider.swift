@@ -59,7 +59,7 @@ actor CalDAVProvider: CalendarProvider {
             // Skip VTODO-only collections (e.g., iCloud Reminders)
             let components = resp.supportedComponents
             if !components.isEmpty && !components.contains("VEVENT") {
-                print("[CalDAV] Skipping non-VEVENT collection: \(resp.properties["displayname"] ?? resp.href) (components: \(components))")
+                BackgroundSyncLogger.logDebug("[CalDAV] Skipping non-VEVENT collection: \(resp.properties["displayname"] ?? resp.href) (components: \(components))")
                 continue
             }
 
@@ -103,7 +103,7 @@ actor CalDAVProvider: CalendarProvider {
             )
         }
 
-        print("[CalDAV] Listed \(calendars.count) calendars (\(calendars.filter { $0.accessRole == "owner" }.count) writable)")
+        BackgroundSyncLogger.logDebug("[CalDAV] Listed \(calendars.count) calendars (\(calendars.filter { $0.accessRole == "owner" }.count) writable)")
         return calendars
     }
 
@@ -206,7 +206,7 @@ actor CalDAVProvider: CalendarProvider {
             events = Array(events.prefix(maxResults))
         }
 
-        print("[CalDAV] listEvents: \(events.count) events from \(calendarId)")
+        BackgroundSyncLogger.logDebug("[CalDAV] listEvents: \(events.count) events from \(calendarId)")
         return events
     }
 
@@ -330,7 +330,7 @@ actor CalDAVProvider: CalendarProvider {
         let eventURL = try resolveEventURL(eventId, calendarId: calendarId)
         let (_, _) = try await client.delete(url: eventURL)
         etagCache.removeValue(forKey: eventId)
-        print("[CalDAV] Deleted event \(eventId)")
+        BackgroundSyncLogger.logDebug("[CalDAV] Deleted event \(eventId)")
     }
 
     /// Single-occurrence override (this_only). CalDAV represents overrides as
@@ -608,7 +608,7 @@ actor CalDAVProvider: CalendarProvider {
                                                cause: CalDAVError.preconditionFailed)
             }
             if DebugModeManager.isLoggingEnabled() {
-                print("[CalDAV] splitSeries: successor \(newUid) already exists and is ours — treating the split as already complete (lost ACK)")
+                BackgroundSyncLogger.logDebug("[CalDAV] splitSeries: successor \(newUid) already exists and is ours — treating the split as already complete (lost ACK)")
             }
         } catch {
             // Revert the master cap so the calendar isn't left truncated with
@@ -678,7 +678,7 @@ actor CalDAVProvider: CalendarProvider {
         } catch {
             // The revert PUT itself failed — the master is capped with no
             // replacement. Surface loudly so the queue/LLM/user knows.
-            print("[CalDAV] splitSeries: REVERT FAILED — master is capped with no successor series. revertError=\(error) cause=\(cause)")
+            BackgroundSyncLogger.logDebug("[CalDAV] splitSeries: REVERT FAILED — master is capped with no successor series. revertError=\(error) cause=\(cause)")
             throw CalDAVError.inconsistentState(
                 "Calendar event split failed and could not be rolled back — the recurring series may be cut short with no replacement. Please check the event in your calendar app. (cause: \(cause); revert error: \(error))"
             )
@@ -686,7 +686,7 @@ actor CalDAVProvider: CalendarProvider {
         // Revert succeeded — the calendar is back to consistent state. Surface
         // the ORIGINAL failure (thrown outside the do/catch so it isn't caught
         // by our own revert handler) so the queue can retry the split cleanly.
-        print("[CalDAV] splitSeries: reverted master cap after failure: \(cause)")
+        BackgroundSyncLogger.logDebug("[CalDAV] splitSeries: reverted master cap after failure: \(cause)")
         throw cause
     }
 
@@ -714,7 +714,7 @@ actor CalDAVProvider: CalendarProvider {
             return Self.extractUID(from: ics) == uid
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                print("[CalDAV] splitSeries: successor probe failed for \(url.path) — rolling back. error=\(error)")
+                BackgroundSyncLogger.logDebug("[CalDAV] splitSeries: successor probe failed for \(url.path) — rolling back. error=\(error)")
             }
             return false
         }
@@ -1790,7 +1790,7 @@ actor CalDAVProvider: CalendarProvider {
             // by the timezone offset). Returning nil makes the caller
             // (`buildNewSeriesInput`) fail fast with a clear error instead.
             guard let zone = TimeZone(identifier: tzid) else {
-                print("[CalDAV] parseICSDateTime: unresolvable TZID '\(tzid)' — refusing to guess")
+                BackgroundSyncLogger.logDebug("[CalDAV] parseICSDateTime: unresolvable TZID '\(tzid)' — refusing to guess")
                 return nil
             }
             resolvedZone = zone

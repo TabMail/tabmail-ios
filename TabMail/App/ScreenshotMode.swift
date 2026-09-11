@@ -361,9 +361,9 @@ enum ScreenshotMode {
                 // (NOT in GRDB — GRDB chatTurns create session history pages that land
                 // on the "__new__" placeholder, hiding the pre-populated messages).
             }
-            if DebugModeManager.isLoggingEnabled() { print("[ScreenshotMode] Demo data seeded successfully") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[ScreenshotMode] Demo data seeded successfully") }
         } catch {
-            if DebugModeManager.isLoggingEnabled() { print("[ScreenshotMode] Failed to seed demo data: \(error)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[ScreenshotMode] Failed to seed demo data: \(error)") }
         }
 
     }

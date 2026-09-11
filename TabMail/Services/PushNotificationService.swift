@@ -257,9 +257,9 @@ actor PushNotificationService {
     func requestPermissionAndRegister() async {
         do {
             let granted = try await UNUserNotificationCenter.current().requestAuthorization(options: [.badge, .alert, .sound])
-            print("[Push] Notification authorization: \(granted ? "granted" : "denied")")
+            BackgroundSyncLogger.logDebug("[Push] Notification authorization: \(granted ? "granted" : "denied")")
         } catch {
-            print("[Push] Notification authorization error: \(error)")
+            BackgroundSyncLogger.logDebug("[Push] Notification authorization error: \(error)")
         }
 
         await MainActor.run { UIApplication.shared.registerForRemoteNotifications() }
@@ -285,7 +285,7 @@ actor PushNotificationService {
         #endif
         guard usable else { return }
         let tokenHex = tokenData.map { String(format: "%02x", $0) }.joined()
-        print("[Push] APNs device token: \(tokenHex.prefix(16))...")
+        BackgroundSyncLogger.logDebug("[Push] APNs device token: \(tokenHex.prefix(16))...")
         BackgroundSyncLogger.logPush("APNs device token received: \(tokenHex.prefix(16))...")
 
         #if DEBUG
@@ -314,7 +314,7 @@ actor PushNotificationService {
 
     /// Called from AppDelegate when APNs registration fails.
     nonisolated func didFailToRegisterForRemoteNotifications(_ error: Error) {
-        print("[Push] APNs registration failed: \(error)")
+        BackgroundSyncLogger.logDebug("[Push] APNs registration failed: \(error)")
         BackgroundSyncLogger.logPush("APNs registration FAILED: \(error.localizedDescription)")
     }
 
@@ -331,13 +331,13 @@ actor PushNotificationService {
     /// (e.g., when APNs token changes).
     func registerDeviceWithWorker(tokenHex: String? = nil, force: Bool = false) async {
         guard let session = TabMailAuthService.getSession() else {
-            print("[Push] No session — skipping device registration")
+            BackgroundSyncLogger.logDebug("[Push] No session — skipping device registration")
             return
         }
 
         let token = tokenHex ?? UserDefaults.standard.string(forKey: PushConfig.lastDeviceTokenKey)
         guard let deviceToken = token else {
-            print("[Push] No device token — skipping registration")
+            BackgroundSyncLogger.logDebug("[Push] No device token — skipping registration")
             return
         }
 
@@ -358,7 +358,7 @@ actor PushNotificationService {
             }
 
             guard !emails.isEmpty else {
-                print("[Push] No active accounts — skipping device registration")
+                BackgroundSyncLogger.logDebug("[Push] No active accounts — skipping device registration")
                 return
             }
 
@@ -371,7 +371,7 @@ actor PushNotificationService {
                let lastHash = lastRegisteredStateHash,
                lastHash == stateHash,
                Date().timeIntervalSince(lastTime) < SyncConfig.deviceRegistrationCacheTTLSeconds {
-                print("[Push] Device registration cached — skipping (no changes, TTL ok)")
+                BackgroundSyncLogger.logDebug("[Push] Device registration cached — skipping (no changes, TTL ok)")
                 return
             }
 
@@ -386,10 +386,10 @@ actor PushNotificationService {
             lastRegistrationTime = Date()
             lastRegisteredStateHash = stateHash
             UserDefaults.standard.set(emails, forKey: PushConfig.registeredEmailsKey)
-            print("[Push] Device registered with \(emails.count) account(s)")
+            BackgroundSyncLogger.logDebug("[Push] Device registered with \(emails.count) account(s)")
             BackgroundSyncLogger.logPush("Device registered with \(emails.count) account(s)")
         } catch {
-            print("[Push] Device registration failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Push] Device registration failed: \(error)")
             BackgroundSyncLogger.logPush("Device registration FAILED: \(error.localizedDescription)")
         }
     }
@@ -401,7 +401,7 @@ actor PushNotificationService {
         try await pushClient.unregisterDevice(deviceId: deviceId)
         UserDefaults.standard.removeObject(forKey: PushConfig.lastDeviceTokenKey)
         UserDefaults.standard.removeObject(forKey: PushConfig.registeredEmailsKey)
-        print("[Push] Device unregistered for factory reset")
+        BackgroundSyncLogger.logDebug("[Push] Device unregistered for factory reset")
         BackgroundSyncLogger.logPush("Device unregistered for factory reset")
     }
 
@@ -557,7 +557,7 @@ actor PushNotificationService {
                 try Account.filter(Column("isActive") == true).fetchAll(db)
             }
         } catch {
-            print("[Push] Removed-account cleanup deferred: account census failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Push] Removed-account cleanup deferred: account census failed: \(error)")
             return
         }
         let currentWorkerUserId = currentRemovedAccountCleanupUserId()
@@ -650,7 +650,7 @@ actor PushNotificationService {
         guard let pinnedUserId = currentWorkerUserId,
               let pinnedToken = await currentRemovedAccountCleanupToken(),
               currentRemovedAccountCleanupUserId() == pinnedUserId else {
-            print("[Push] Removed-account cleanup deferred: no pinned identity for the admitted subject")
+            BackgroundSyncLogger.logDebug("[Push] Removed-account cleanup deferred: no pinned identity for the admitted subject")
             mergeRemovedAccountCleanupOutcomes(outcomes)
             return
         }
@@ -699,7 +699,7 @@ actor PushNotificationService {
                     )
                     selected[index].actions.remove(.deviceAccount)
                 } catch {
-                    print("[Push] Removed-account device route cleanup deferred for \(selected[index].email): \(error)")
+                    BackgroundSyncLogger.logDebug("[Push] Removed-account device route cleanup deferred for \(selected[index].email): \(error)")
                 }
             }
 
@@ -720,7 +720,7 @@ actor PushNotificationService {
                         // worker already revoked this caller's provider proof.
                         selected[index].actions.remove(.consent)
                     } else {
-                        print("[Push] Removed-account consent cleanup deferred for \(selected[index].email): \(error)")
+                        BackgroundSyncLogger.logDebug("[Push] Removed-account consent cleanup deferred for \(selected[index].email): \(error)")
                     }
                 }
             }
@@ -750,7 +750,7 @@ actor PushNotificationService {
                         // refuses teardown of a co-owner's singleton watch.
                         selected[index].actions.remove(.providerSubscription)
                     } else {
-                        print("[Push] Removed-account provider subscription cleanup deferred for \(selected[index].email): \(error)")
+                        BackgroundSyncLogger.logDebug("[Push] Removed-account provider subscription cleanup deferred for \(selected[index].email): \(error)")
                     }
                 }
             }
@@ -760,7 +760,7 @@ actor PushNotificationService {
                     try await client.unsubscribeIMAP(userEmail: selected[index].email, deviceId: cleanupDeviceId)
                     selected[index].actions.remove(.imapSubscription)
                 } catch {
-                    print("[Push] Removed-account IMAP cleanup deferred for \(selected[index].email): \(error)")
+                    BackgroundSyncLogger.logDebug("[Push] Removed-account IMAP cleanup deferred for \(selected[index].email): \(error)")
                 }
             }
 
@@ -789,7 +789,7 @@ actor PushNotificationService {
                     }
                 }
             } catch {
-                print("[Push] Removed-account legacy device cleanup deferred: \(error)")
+                BackgroundSyncLogger.logDebug("[Push] Removed-account legacy device cleanup deferred: \(error)")
             }
         }
         return selected
@@ -824,7 +824,7 @@ actor PushNotificationService {
         for dirName in record.outboxAttachmentDirNames {
             let candidate = base.appendingPathComponent(dirName, isDirectory: true).standardizedFileURL
             guard candidate.deletingLastPathComponent() == base else {
-                print("[Push] Refusing unsafe removed-account attachment directory: \(dirName)")
+                BackgroundSyncLogger.logDebug("[Push] Refusing unsafe removed-account attachment directory: \(dirName)")
                 continue
             }
             try? FileManager.default.removeItem(at: candidate)
@@ -922,11 +922,11 @@ actor PushNotificationService {
             DemoModeStore.shared.isActive
         }
         if demoActive {
-            print("[Push] Demo mode active — skipping subscribe \(account.emailAddress)")
+            BackgroundSyncLogger.logDebug("[Push] Demo mode active — skipping subscribe \(account.emailAddress)")
             return false
         }
         guard let session = TabMailAuthService.getSession() else {
-            print("[Push] No session — cannot subscribe \(account.emailAddress)")
+            BackgroundSyncLogger.logDebug("[Push] No session — cannot subscribe \(account.emailAddress)")
             return false
         }
 
@@ -963,12 +963,12 @@ actor PushNotificationService {
                 guard let sessionGeneration = TabMailSessionStore.shared.loadActiveSession()?.generation else { return false }
                 let nseEnabled = UserDefaults.standard.object(forKey: PushConfig.pushNotificationsEnabledKey) as? Bool ?? false
                 guard nseEnabled else {
-                    print("[Push] IMAP subscribe skipped — NSE push toggle off (\(account.emailAddress))")
+                    BackgroundSyncLogger.logDebug("[Push] IMAP subscribe skipped — NSE push toggle off (\(account.emailAddress))")
                     return false
                 }
                 guard let host = account.imapHost,
                       let password = KeychainHelper.loadString(key: KeychainHelper.passwordKey(accountId: account.id)) else {
-                    print("[Push] IMAP subscribe skipped — missing host/password for \(account.emailAddress)")
+                    BackgroundSyncLogger.logDebug("[Push] IMAP subscribe skipped — missing host/password for \(account.emailAddress)")
                     return false
                 }
                 let authToken = try await pushClient.subscriptionAuthToken()
@@ -994,7 +994,7 @@ actor PushNotificationService {
             }
 
         } catch {
-            print("[Push] Subscribe failed for \(account.emailAddress): \(error)")
+            BackgroundSyncLogger.logDebug("[Push] Subscribe failed for \(account.emailAddress): \(error)")
             BackgroundSyncLogger.logPush("Subscribe FAILED for \(account.emailAddress): \(error.localizedDescription)")
             return false
         }
@@ -1052,7 +1052,7 @@ actor PushNotificationService {
                 nseCapable: nseCapable
             )
         } catch {
-            print("[Push] registerDeviceAccount failed for \(account.emailAddress): \(error)")
+            BackgroundSyncLogger.logDebug("[Push] registerDeviceAccount failed for \(account.emailAddress): \(error)")
             // Not fatal — dispatch falls back to the legacy device-level record.
         }
     }
@@ -1071,7 +1071,7 @@ actor PushNotificationService {
                 try Account.filter(Column("isActive") == true).fetchAll(db)
             }
         } catch {
-            print("[Push] reregisterAllDeviceAccounts: failed to load accounts: \(error)")
+            BackgroundSyncLogger.logDebug("[Push] reregisterAllDeviceAccounts: failed to load accounts: \(error)")
             return
         }
         for account in accounts where account.provider != .caldav {
@@ -1107,7 +1107,7 @@ actor PushNotificationService {
                 }
             }
         } catch {
-            print("[Push] Failed to load accounts for subscription: \(error)")
+            BackgroundSyncLogger.logDebug("[Push] Failed to load accounts for subscription: \(error)")
         }
 
     }
@@ -1173,7 +1173,7 @@ actor PushNotificationService {
                 try Account.filter(Column("isActive") == true).fetchAll(db)
             }
         } catch {
-            print("[Push] consent: loading accounts failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Push] consent: loading accounts failed: \(error)")
             return report
         }
 
@@ -1199,7 +1199,7 @@ actor PushNotificationService {
                 return  // non-push-capable provider
             }
         } catch {
-            print("[Push] consent: status check failed for \(email): \(error)")
+            BackgroundSyncLogger.logDebug("[Push] consent: status check failed for \(email): \(error)")
             return
         }
 
@@ -1207,11 +1207,11 @@ actor PushNotificationService {
         case .ok:
             return
         case .error(let reason):
-            print("[Push] consent: \(email) has error state (\(reason ?? "?")) — requesting re-consent")
+            BackgroundSyncLogger.logDebug("[Push] consent: \(email) has error state (\(reason ?? "?")) — requesting re-consent")
             report.accountsNeedingReconsent.append(email)
             await runMetadataConsentAndUpload(account: account, auth: auth)
         case .missing:
-            print("[Push] consent: \(email) missing — requesting consent")
+            BackgroundSyncLogger.logDebug("[Push] consent: \(email) missing — requesting consent")
             report.accountsMissingConsent.append(email)
             await runMetadataConsentAndUpload(account: account, auth: auth)
         }
@@ -1258,11 +1258,11 @@ actor PushNotificationService {
             // toggle NSE off in Settings / Debug menu — that path revokes
             // all consents deliberately.
             if let err = error as? ASWebAuthenticationSessionError, err.code == .canceledLogin {
-                print("[Push] consent: user declined for \(email) — account stays in missing state, banner will re-prompt")
+                BackgroundSyncLogger.logDebug("[Push] consent: user declined for \(email) — account stays in missing state, banner will re-prompt")
             } else if let err = error as? OAuthError, case .cancelled = err {
-                print("[Push] consent: user declined for \(email) — account stays in missing state, banner will re-prompt")
+                BackgroundSyncLogger.logDebug("[Push] consent: user declined for \(email) — account stays in missing state, banner will re-prompt")
             } else {
-                print("[Push] consent: transient flow failure for \(email): \(error)")
+                BackgroundSyncLogger.logDebug("[Push] consent: transient flow failure for \(email): \(error)")
             }
         }
     }
@@ -1278,11 +1278,11 @@ actor PushNotificationService {
                 try Account.filter(Column("emailAddress") == emailAddress && Column("isActive") == true).fetchOne(db)
             }
         } catch {
-            print("[Push] consent: lookup-by-email failed for \(emailAddress): \(error)")
+            BackgroundSyncLogger.logDebug("[Push] consent: lookup-by-email failed for \(emailAddress): \(error)")
             return
         }
         guard let account else {
-            print("[Push] consent: no active account for \(emailAddress)")
+            BackgroundSyncLogger.logDebug("[Push] consent: no active account for \(emailAddress)")
             return
         }
         await ensurePushConsentAfterAccountAdd(account, auth: auth)
@@ -1313,7 +1313,7 @@ actor PushNotificationService {
                 await revokePushConsentForAccount(account)
             }
         } catch {
-            print("[Push] consent: loading accounts for revocation failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Push] consent: loading accounts for revocation failed: \(error)")
         }
     }
 
@@ -1359,7 +1359,7 @@ actor PushNotificationService {
         // posting preserves whatever banner state existed before connectivity
         // dropped — a later foreground / reconnect tick re-runs the scan.
         guard NetworkMonitor.checkConnected() else {
-            print("[Push] consent scan skipped — device offline")
+            BackgroundSyncLogger.logDebug("[Push] consent scan skipped — device offline")
             return
         }
 
@@ -1369,7 +1369,7 @@ actor PushNotificationService {
                 try Account.filter(Column("isActive") == true).fetchAll(db)
             }
         } catch {
-            print("[Push] consent: foreground scan load accounts failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Push] consent: foreground scan load accounts failed: \(error)")
             return
         }
 
@@ -1416,7 +1416,7 @@ actor PushNotificationService {
                         case .ok: return .ok(email)
                         }
                     } catch {
-                        print("[Push] gmail consent-status check failed for \(email): \(error)")
+                        BackgroundSyncLogger.logDebug("[Push] gmail consent-status check failed for \(email): \(error)")
                         return .threw(email)
                     }
                 }
@@ -1432,7 +1432,7 @@ actor PushNotificationService {
                         case .ok: return .ok(email)
                         }
                     } catch {
-                        print("[Push] outlook consent-status check failed for \(email): \(error)")
+                        BackgroundSyncLogger.logDebug("[Push] outlook consent-status check failed for \(email): \(error)")
                         return .threw(email)
                     }
                 }
@@ -1472,7 +1472,7 @@ actor PushNotificationService {
         // flash a false positive). A subsequent foreground / sync trigger will
         // re-run the scan once the network is warm.
         guard anyAuthoritative else {
-            print("[Push] consent scan produced no authoritative results — skipping banner update")
+            BackgroundSyncLogger.logDebug("[Push] consent scan produced no authoritative results — skipping banner update")
             return
         }
 
@@ -1509,11 +1509,11 @@ actor PushNotificationService {
             // Foreground banner keeps prompting; user dismisses by completing
             // consent or by toggling NSE off globally themselves.
             if let err = error as? ASWebAuthenticationSessionError, err.code == .canceledLogin {
-                print("[Push] outlook-consent: user declined for \(email) — account stays in missing state, banner will re-prompt")
+                BackgroundSyncLogger.logDebug("[Push] outlook-consent: user declined for \(email) — account stays in missing state, banner will re-prompt")
             } else if let err = error as? OAuthError, case .cancelled = err {
-                print("[Push] outlook-consent: user declined for \(email) — account stays in missing state, banner will re-prompt")
+                BackgroundSyncLogger.logDebug("[Push] outlook-consent: user declined for \(email) — account stays in missing state, banner will re-prompt")
             } else {
-                print("[Push] outlook-consent: transient flow failure for \(email): \(error)")
+                BackgroundSyncLogger.logDebug("[Push] outlook-consent: transient flow failure for \(email): \(error)")
             }
         }
     }
@@ -1608,7 +1608,7 @@ actor PushNotificationService {
     /// Only syncs the specific account that received the push (not all accounts).
     /// Coalesced pushes for OTHER accounts trigger a targeted follow-up.
     func handleSilentPush(provider: String?, accountEmail: String?) async -> UIBackgroundFetchResult {
-        print("[Push] Silent push: provider=\(provider ?? "?"), email=\(accountEmail ?? "?")")
+        BackgroundSyncLogger.logDebug("[Push] Silent push: provider=\(provider ?? "?"), email=\(accountEmail ?? "?")")
         BackgroundSyncLogger.logPush("Silent push RECEIVED (provider=\(provider ?? "?"), email=\(accountEmail ?? "?"))")
 
         // Coalescing check FIRST — before any `await`. Two pushes arriving close together
@@ -1643,7 +1643,7 @@ actor PushNotificationService {
 
         // NSE follow-up push — NSE already did summary + action. Do heavy work now.
         if provider == "nse_followup" {
-            print("[Push] NSE follow-up — merging staging data + heavy AI work")
+            BackgroundSyncLogger.logDebug("[Push] NSE follow-up — merging staging data + heavy AI work")
             BackgroundSyncLogger.log("SilentPush NSE_FOLLOWUP — merge + reply precompute + FTS + tags")
             BackgroundSyncLogger.logPush("NSE_FOLLOWUP — heavy AI work")
             await NSEDataBridge.mergeNSEStagingData()
@@ -1742,7 +1742,7 @@ actor PushNotificationService {
         let pushElapsed = Int((CFAbsoluteTimeGetCurrent() - pushT0) * 1000)
         BackgroundSyncLogger.log("SilentPush COMPLETED in \(pushElapsed)ms")
         BackgroundSyncLogger.logPush("Silent push COMPLETED in \(pushElapsed)ms")
-        print("[Push] Silent push completed in \(pushElapsed)ms")
+        BackgroundSyncLogger.logDebug("[Push] Silent push completed in \(pushElapsed)ms")
 
         // Coalesced pushes for other accounts — syncStartup already synced all accounts,
         // so just clear the coalesced set. No per-account follow-up needed.

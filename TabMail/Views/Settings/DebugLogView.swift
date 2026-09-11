@@ -185,7 +185,7 @@ struct DebugMenuView: View {
         for account in navigationStore.accounts {
             await AccountManager.shared.syncEngine.startBackfill(account: account)
         }
-        print("[Debug] Sync progress reset via resetCrawlState — backfill will re-walk all folders")
+        BackgroundSyncLogger.logDebug("[Debug] Sync progress reset via resetCrawlState — backfill will re-walk all folders")
     }
 
     private func testPushRegistration() async {
@@ -221,10 +221,10 @@ struct DebugMenuView: View {
             do {
                 try await center.add(request)
                 reminderTestStatus = "Scheduled — fires in 5s"
-                print("[ProactiveNotify] Test reminder scheduled — fires in 5s")
+                BackgroundSyncLogger.logDebug("[ProactiveNotify] Test reminder scheduled — fires in 5s")
             } catch {
                 reminderTestStatus = "Failed: \(error.localizedDescription)"
-                print("[ProactiveNotify] Failed to schedule test reminder: \(error)")
+                BackgroundSyncLogger.logDebug("[ProactiveNotify] Failed to schedule test reminder: \(error)")
             }
         }
     }

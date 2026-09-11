@@ -183,11 +183,11 @@ struct ConsentGateView: View {
                 let refreshResult = await TabMailTokenCoordinator.shared.forceRefresh()
                 switch refreshResult {
                 case .success:
-                    print("[ConsentGate] Token refreshed with updated consent metadata")
+                    BackgroundSyncLogger.logDebug("[ConsentGate] Token refreshed with updated consent metadata")
                 case .permanentFailure, .noSession:
-                    print("[ConsentGate] Token refresh failed permanently — consent saved but token stale")
+                    BackgroundSyncLogger.logDebug("[ConsentGate] Token refresh failed permanently — consent saved but token stale")
                 case .transientFailure:
-                    print("[ConsentGate] Token refresh transient failure — consent saved, will refresh on next call")
+                    BackgroundSyncLogger.logDebug("[ConsentGate] Token refresh transient failure — consent saved, will refresh on next call")
                 }
 
                 await MainActor.run {

@@ -70,7 +70,7 @@ actor ProviderWorkQueue {
         guard !isInvalidated, newMax > maxConcurrency else { return }
         let oldMax = maxConcurrency
         maxConcurrency = newMax
-        if DebugModeManager.isLoggingEnabled() { print("[WorkQueue] Max concurrency updated \(oldMax) → \(newMax)") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[WorkQueue] Max concurrency updated \(oldMax) → \(newMax)") }
         // Wake waiters that can now run with the expanded capacity
         while activeCount < maxConcurrency {
             var woke = false

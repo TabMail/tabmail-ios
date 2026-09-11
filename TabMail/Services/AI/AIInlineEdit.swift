@@ -92,7 +92,7 @@ extension AIService {
         invocation: ToolInvocation = .noninteractive
     ) async throws -> InlineEditResult {
         guard !disableLLMCalls else {
-            print("[AIService] performInlineEdit: SKIP — LLM calls disabled")
+            BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: SKIP — LLM calls disabled")
             return InlineEditResult(response: "AI calls are disabled.", subject: nil, body: nil, toDelta: nil, ccDelta: nil, bccDelta: nil, raw: "")
         }
 
@@ -163,10 +163,10 @@ extension AIService {
             vars["related_cc"] = .string(context.relatedCc)
         }
 
-        print("[AIService] performInlineEdit: mode=\(context.mode) instruction=\(instruction.prefix(80))")
-        print("[AIService]   subject=\(currentSubject.prefix(60)) bodyLen=\(currentBody.count)")
-        print("[AIService]   chatHistory turns=\(chatHistory.count)")
-        print("[AIService]   vars keys=\(vars.keys.sorted().joined(separator: ","))")
+        BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: mode=\(context.mode) instruction=\(instruction.prefix(80))")
+        BackgroundSyncLogger.logDebug("[AIService]   subject=\(currentSubject.prefix(60)) bodyLen=\(currentBody.count)")
+        BackgroundSyncLogger.logDebug("[AIService]   chatHistory turns=\(chatHistory.count)")
+        BackgroundSyncLogger.logDebug("[AIService]   vars keys=\(vars.keys.sorted().joined(separator: ","))")
 
         // Each call is atomic — no real chat turns. Past edits are embedded as
         // formatted text context in the system message. Each history entry stores
@@ -197,8 +197,8 @@ extension AIService {
         )
 
         let messages: [CompletionsMessage] = [systemMsg]
-        print("[AIService]   messages[0] = system (system_prompt_compose_interactive) varsCount=\(vars.count)")
-        print("[AIService]   total messages count=\(messages.count)")
+        BackgroundSyncLogger.logDebug("[AIService]   messages[0] = system (system_prompt_compose_interactive) varsCount=\(vars.count)")
+        BackgroundSyncLogger.logDebug("[AIService]   total messages count=\(messages.count)")
 
         let request = CompletionsRequest(
             messages: messages,
@@ -209,16 +209,16 @@ extension AIService {
         // Log raw JSON for debugging
         if let jsonData = try? JSONEncoder().encode(request),
            let jsonStr = String(data: jsonData, encoding: .utf8) {
-            print("[AIService] performInlineEdit REQUEST JSON (\(jsonData.count) bytes):")
+            BackgroundSyncLogger.logDebug("[AIService] performInlineEdit REQUEST JSON (\(jsonData.count) bytes):")
             // Truncate to avoid flooding logs — print first and last 500 chars
             if jsonStr.count > 1200 {
-                print("[AIService]   \(jsonStr.prefix(500))...TRUNCATED...\(jsonStr.suffix(500))")
+                BackgroundSyncLogger.logDebug("[AIService]   \(jsonStr.prefix(500))...TRUNCATED...\(jsonStr.suffix(500))")
             } else {
-                print("[AIService]   \(jsonStr)")
+                BackgroundSyncLogger.logDebug("[AIService]   \(jsonStr)")
             }
         }
 
-        print("[AIService] performInlineEdit: calling sendCompletionsWithToolsDirect...")
+        BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: calling sendCompletionsWithToolsDirect...")
         let response: CompletionsResponse
         do {
             response = try await backend.sendCompletionsWithToolsDirect(request, onSSEEvent: onSSEEvent, invocation: invocation)
@@ -228,10 +228,10 @@ extension AIService {
             }
             throw error
         }
-        print("[AIService] performInlineEdit: sendCompletionsWithToolsDirect returned — assistant=\(response.assistant != nil) error=\(response.error ?? "nil")")
+        BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: sendCompletionsWithToolsDirect returned — assistant=\(response.assistant != nil) error=\(response.error ?? "nil")")
 
         guard let text = response.assistant, !text.isEmpty else {
-            print("[AIService] performInlineEdit: no assistant text (error=\(response.error ?? "nil"))")
+            BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: no assistant text (error=\(response.error ?? "nil"))")
             return InlineEditResult(
                 response: response.error ?? "No response from AI.",
                 subject: nil,
@@ -243,14 +243,14 @@ extension AIService {
             )
         }
 
-        print("[AIService] performInlineEdit: raw response length=\(text.count)")
-        print("[AIService]   response preview: \(text.prefix(200))")
+        BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: raw response length=\(text.count)")
+        BackgroundSyncLogger.logDebug("[AIService]   response preview: \(text.prefix(200))")
 
         let result = Self.parseInlineEditResponse(text)
         let toDesc = result.toDelta.map { "+\($0.adds.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
         let ccDesc = result.ccDelta.map { "+\($0.adds.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
         let bccDesc = result.bccDelta.map { "+\($0.adds.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
-        print("[AIService] performInlineEdit PARSED: response=\(result.response?.prefix(60) ?? "nil") subject=\(result.subject?.prefix(40) ?? "nil") bodyLen=\(result.body?.count ?? 0) to=\(toDesc) cc=\(ccDesc) bcc=\(bccDesc)")
+        BackgroundSyncLogger.logDebug("[AIService] performInlineEdit PARSED: response=\(result.response?.prefix(60) ?? "nil") subject=\(result.subject?.prefix(40) ?? "nil") bodyLen=\(result.body?.count ?? 0) to=\(toDesc) cc=\(ccDesc) bcc=\(bccDesc)")
         return result
     }
 

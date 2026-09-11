@@ -121,7 +121,9 @@ enum ReplyParentResolver {
             }
 
             updated.append(id)
-            print("[ReplyDetect] SentDiscover: marked parent \(id) as replied\(clearedReplyTag ? " (cleared .reply tag)" : "")")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[ReplyDetect] SentDiscover: marked parent \(id) as replied\(clearedReplyTag ? " (cleared .reply tag)" : "")")
+            }
         }
 
         return updated
@@ -207,7 +209,7 @@ enum ReplyParentResolver {
                 NotificationCenter.default.post(name: .messageDataDidChange, object: id)
             }
         } else {
-            print("[ReplyDetect] Skipping per-ID fan-out (\(parentIds.count) > \(SyncConfig.sentDiscoverNotifyPerIdLimit)) — relying on inboxDataDidChange")
+            BackgroundSyncLogger.logDebug("[ReplyDetect] Skipping per-ID fan-out (\(parentIds.count) > \(SyncConfig.sentDiscoverNotifyPerIdLimit)) — relying on inboxDataDidChange")
         }
         NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
     }

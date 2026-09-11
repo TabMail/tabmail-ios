@@ -31,7 +31,7 @@ enum MergeSurfaceProbe {
         guard t0 > 0 else { return }
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         guard ms <= 30_000 else { return } // ignore events unrelated to a recent merge
-        print("[MergeSurface] \(label()) +\(ms)ms after merge signal")
+        BackgroundSyncLogger.logDebug("[MergeSurface] \(label()) +\(ms)ms after merge signal")
     }
 }
 
@@ -614,7 +614,7 @@ enum NSEDataBridge {
             let data = try JSONEncoder().encode(map)
             suite.set(String(data: data, encoding: .utf8), forKey: "nse.lastHistoryIds")
         } catch {
-            print("[NSEDataBridge] Failed to mirror lastHistoryIds: \(error)")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] Failed to mirror lastHistoryIds: \(error)")
         }
     }
 
@@ -787,7 +787,7 @@ enum NSEDataBridge {
             return true
         case .unreachable:
             if DebugModeManager.isLoggingEnabled() {
-                print("[NSEDataBridge] purgeStagedStateForFolder could not open the staging DB for \(accountId.prefix(8)):\(folderPath) — contents unknown, reporting FAILURE")
+                BackgroundSyncLogger.logDebug("[NSEDataBridge] purgeStagedStateForFolder could not open the staging DB for \(accountId.prefix(8)):\(folderPath) — contents unknown, reporting FAILURE")
             }
             return false
         case .queue(let queue):
@@ -802,7 +802,7 @@ enum NSEDataBridge {
                 return true
             } catch {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[NSEDataBridge] purgeStagedStateForFolder nse_processed_message delete failed for \(accountId.prefix(8)):\(folderPath): \(error)")
+                    BackgroundSyncLogger.logDebug("[NSEDataBridge] purgeStagedStateForFolder nse_processed_message delete failed for \(accountId.prefix(8)):\(folderPath): \(error)")
                 }
                 return false
             }
@@ -834,7 +834,7 @@ enum NSEDataBridge {
             return true
         case .unreachable:
             if DebugModeManager.isLoggingEnabled() {
-                print("[NSEDataBridge] purgeInboxRemovalMarkersForAccount could not open the staging DB for \(accountId.prefix(8)) — contents unknown, reporting FAILURE")
+                BackgroundSyncLogger.logDebug("[NSEDataBridge] purgeInboxRemovalMarkersForAccount could not open the staging DB for \(accountId.prefix(8)) — contents unknown, reporting FAILURE")
             }
             return false
         case .queue(let queue):
@@ -846,7 +846,7 @@ enum NSEDataBridge {
                 return true
             } catch {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[NSEDataBridge] purgeInboxRemovalMarkersForAccount failed for \(accountId.prefix(8)): \(error)")
+                    BackgroundSyncLogger.logDebug("[NSEDataBridge] purgeInboxRemovalMarkersForAccount failed for \(accountId.prefix(8)): \(error)")
                 }
                 return false
             }
@@ -1398,7 +1398,7 @@ enum NSEDataBridge {
             }
         } catch {
             if !error.isDatabaseSuspensionAbort {
-                print("[NSEDataBridge] Old-epoch staged row delete failed: \(error) — retried next wake (idempotent)")
+                BackgroundSyncLogger.logDebug("[NSEDataBridge] Old-epoch staged row delete failed: \(error) — retried next wake (idempotent)")
             }
         }
         latestStagedRows.withLock { rowsBox in
@@ -1456,7 +1456,7 @@ enum NSEDataBridge {
         onSnapshotPublished: (@Sendable () -> Void)? = nil
     ) async {
         let t0 = CFAbsoluteTimeGetCurrent()
-        print("[NSEDataBridge] mergeNSEStagingData: START")
+        BackgroundSyncLogger.logDebug("[NSEDataBridge] mergeNSEStagingData: START")
         BootProfiler.mark("mergeNSEStagingData START")
 
         // Production reads the App Group staging DB. Tests inject a path: the
@@ -1469,13 +1469,13 @@ enum NSEDataBridge {
             guard let containerURL = FileManager.default.containerURL(
                 forSecurityApplicationGroupIdentifier: appGroupId
             ) else {
-                print("[NSEDataBridge] mergeNSEStagingData: no app group container")
+                BackgroundSyncLogger.logDebug("[NSEDataBridge] mergeNSEStagingData: no app group container")
                 return
             }
             stagingPath = containerURL.appendingPathComponent("nse_staging.sqlite").path
         }
         guard FileManager.default.fileExists(atPath: stagingPath) else {
-            print("[NSEDataBridge] mergeNSEStagingData: no staging DB file — nothing to merge")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] mergeNSEStagingData: no staging DB file — nothing to merge")
             return
         }
 
@@ -1491,10 +1491,10 @@ enum NSEDataBridge {
                 nseDB = db
                 break
             }
-            print("[NSEDataBridge] Staging DB busy, retrying with \(timeout)s timeout")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] Staging DB busy, retrying with \(timeout)s timeout")
         }
         guard let nseDB else {
-            print("[NSEDataBridge] Staging DB locked after retries — merge deferred to next wake")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] Staging DB locked after retries — merge deferred to next wake")
             return
         }
 
@@ -1551,12 +1551,12 @@ enum NSEDataBridge {
             // Log + fall through with empty `processed`. The helpers below
             // read different tables and may still succeed; the unread
             // populated rows stay in staging and retry next wake.
-            print("[NSEDataBridge] mergeNSEStagingData: populated read failed: \(error) — skipping main loop, helpers continue")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] mergeNSEStagingData: populated read failed: \(error) — skipping main loop, helpers continue")
             processed = []
         }
 
         let aiCount = processed.filter { $0.aiCompleted }.count
-        print("[NSEDataBridge] mergeNSEStagingData: found \(processed.count) staged message(s) (\(aiCount) with AI)")
+        BackgroundSyncLogger.logDebug("[NSEDataBridge] mergeNSEStagingData: found \(processed.count) staged message(s) (\(aiCount) with AI)")
         BootProfiler.mark("mergeNSEStagingData: found \(processed.count) staged (\(aiCount) AI-complete)")
 
         // ADR-IOS-049: hand the just-read staged rows to the inbox NOW — before the
@@ -1660,7 +1660,7 @@ enum NSEDataBridge {
                 }
             } catch {
                 if !error.isDatabaseSuspensionAbort {
-                    print("[NSEDataBridge] Stale-by-move staging delete failed: \(error) — retried next wake (idempotent)")
+                    BackgroundSyncLogger.logDebug("[NSEDataBridge] Stale-by-move staging delete failed: \(error) — retried next wake (idempotent)")
                 }
             }
 
@@ -1959,7 +1959,9 @@ enum NSEDataBridge {
                             // Savepoint rolled back + re-threw; outer tx still
                             // alive. Row stays in staging (phase 2 re-attempts it
                             // this same wake; otherwise next wake).
-                            print("[NSEDataBridge] Merge phase 1 failed for \(msg.id): \(error) — left in staging for retry")
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[NSEDataBridge] Merge phase 1 failed for \(msg.id): \(error) — left in staging for retry")
+                            }
                         }
                     }
                     phase1BodyEnd.withLock { $0 = CFAbsoluteTimeGetCurrent() }
@@ -1984,7 +1986,7 @@ enum NSEDataBridge {
                 // Outer write threw — nothing durable from phase 1. Phase 2 below
                 // still runs and creates the headers via its own new-header
                 // branch; staging is untouched so nothing is lost.
-                print("[NSEDataBridge] Merge phase 1 failed (outer tx): \(error)")
+                BackgroundSyncLogger.logDebug("[NSEDataBridge] Merge phase 1 failed (outer tx): \(error)")
             }
             } // if !writeSet.isEmpty (phase 1)
 
@@ -2479,7 +2481,9 @@ enum NSEDataBridge {
                             // is still alive. Skip recording this id so the
                             // staging row stays for retry. Local deltas are
                             // discarded with the rollback.
-                            print("[NSEDataBridge] Per-message merge failed for \(msg.id): \(error) — left in staging for retry")
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[NSEDataBridge] Per-message merge failed for \(msg.id): \(error) — left in staging for retry")
+                            }
                         }
                     }
                     let tcEnd = try Int.fetchOne(db, sql: "SELECT total_changes()") ?? 0
@@ -2509,7 +2513,7 @@ enum NSEDataBridge {
                 // wait (contention); ACQUIRED→here = the actual main write; here→DONE
                 // = post-tx FTS flush. Whichever Δ dominates is the real residual.
                 BootProfiler.mark("merge: main tx committed (\(committedCount) merged) — FTS flush next")
-                print("[NSEDataBridge] mergeNSEStagingData: \(committedCount)/\(writeSet.count) merged (\(successfullyMergedIds.count) terminal → delete)")
+                BackgroundSyncLogger.logDebug("[NSEDataBridge] mergeNSEStagingData: \(committedCount)/\(writeSet.count) merged (\(successfullyMergedIds.count) terminal → delete)")
 
                 // NOTE: no UI-refresh post here anymore. performMerge posts its
                 // end-of-flow `.inboxDataDidChange` (immediate) at the very end,
@@ -2528,7 +2532,7 @@ enum NSEDataBridge {
                 // durable in main GRDB. The post-tx staging delete is gated
                 // on `outerCommitted` and won't run, leaving all rows in
                 // staging for retry.
-                print("[NSEDataBridge] Merge failed (outer tx): \(error)")
+                BackgroundSyncLogger.logDebug("[NSEDataBridge] Merge failed (outer tx): \(error)")
             }
             } // if !writeSet.isEmpty (phase 2)
 
@@ -2646,7 +2650,7 @@ enum NSEDataBridge {
                     // Already idempotent across wakes. A suspension abort
                     // (ADR-IOS-041) is benign — don't log it as a failure.
                     if !error.isDatabaseSuspensionAbort {
-                        print("[NSEDataBridge] Staging delete failed: \(error) — successfullyMergedIds may be re-merged next wake (idempotent)")
+                        BackgroundSyncLogger.logDebug("[NSEDataBridge] Staging delete failed: \(error) — successfullyMergedIds may be re-merged next wake (idempotent)")
                     }
                 }
             }
@@ -2678,7 +2682,7 @@ enum NSEDataBridge {
                     // a failure just means this (already-durable, unchanged) row
                     // re-appears next wake and is re-evaluated as a skip candidate.
                     if !error.isDatabaseSuspensionAbort {
-                        print("[NSEDataBridge] Skip-set staging delete failed: \(error) — retried next wake (idempotent)")
+                        BackgroundSyncLogger.logDebug("[NSEDataBridge] Skip-set staging delete failed: \(error) — retried next wake (idempotent)")
                     }
                 }
             }
@@ -2746,14 +2750,14 @@ enum NSEDataBridge {
                 return db.changesCount
             }
             if reaped > 0 {
-                print("[NSEDataBridge] Orphan reap: deleted \(reaped) stale placeholder(s) older than \(Int(staleStagingWindowSeconds))s")
+                BackgroundSyncLogger.logDebug("[NSEDataBridge] Orphan reap: deleted \(reaped) stale placeholder(s) older than \(Int(staleStagingWindowSeconds))s")
             }
         } catch {
             // Best-effort. A failed reap is benign — the placeholders stay
             // populated=0 and remain invisible to merge; next wake retries.
             // (Includes ADR-IOS-041 suspension aborts; don't log those at all.)
             if !error.isDatabaseSuspensionAbort {
-                print("[NSEDataBridge] Orphan reap failed: \(error)")
+                BackgroundSyncLogger.logDebug("[NSEDataBridge] Orphan reap failed: \(error)")
             }
         }
 
@@ -2823,7 +2827,7 @@ enum NSEDataBridge {
         }
 
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-        print("[NSEDataBridge] mergeNSEStagingData: DONE in \(ms)ms (didMutate=\(didMutate))")
+        BackgroundSyncLogger.logDebug("[NSEDataBridge] mergeNSEStagingData: DONE in \(ms)ms (didMutate=\(didMutate))")
         BootProfiler.mark("mergeNSEStagingData DONE in \(ms)ms (didMutate=\(didMutate))")
     }
 
@@ -2851,7 +2855,7 @@ enum NSEDataBridge {
                 }
             }
         } catch {
-            print("[NSEDataBridge] Inbox removal read failed: \(error)")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] Inbox removal read failed: \(error)")
             return false
         }
 
@@ -2912,21 +2916,23 @@ enum NSEDataBridge {
                         // the two key spaces diverge.
                         releasedContentKeys.append(contentsOf: doomedIds.map(ContentKey.init(rawValue:)))
                     } catch {
-                        print("[NSEDataBridge] Per-removal failed for \(removal.id): \(error) — left in staging for retry")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[NSEDataBridge] Per-removal failed for \(removal.id): \(error) — left in staging for retry")
+                        }
                     }
                 }
             }
             // dbPool.write returned normally → outer tx committed; the per-
             // removal DELETEs are durable and we can safely clear staging.
             outerCommitted = true
-            print("[NSEDataBridge] Merged \(successfullyConsumedIds.count)/\(removals.count) inbox removal(s), deleted \(deletedTotal) header row(s)")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] Merged \(successfullyConsumedIds.count)/\(removals.count) inbox removal(s), deleted \(deletedTotal) header row(s)")
             // No post here — `performMerge` emits its immediate `.inboxDataDidChange`
             // at the end (this function's `deletedTotal > 0` return feeds `didMutate`).
         } catch {
             // Outer dbPool.write threw — even per-row DELETEs that we logged
             // as committed got rolled back with the outer tx. Don't clear
             // staging; let next wake retry the whole batch.
-            print("[NSEDataBridge] Inbox removal merge failed (outer tx): \(error)")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] Inbox removal merge failed (outer tx): \(error)")
         }
 
         // Staging cleanup gated on outer-tx success. If the outer commit
@@ -3281,7 +3287,7 @@ enum NSEDataBridge {
                 return Dictionary(uniqueKeysWithValues: headers.map { ($0.id, $0) })
             }
         } catch {
-            print("[NSEDataBridge] FTS header flush: bulk header read failed: \(error) — next wake will recover")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] FTS header flush: bulk header read failed: \(error) — next wake will recover")
             return 0
         }
 
@@ -3312,7 +3318,7 @@ enum NSEDataBridge {
         do {
             _ = try await SearchIndex.shared.indexHeaders(records)
         } catch {
-            print("[NSEDataBridge] FTS header flush: indexHeaders failed: \(error) — recoverIncompleteHeaders will retry next wake")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] FTS header flush: indexHeaders failed: \(error) — recoverIncompleteHeaders will retry next wake")
             return 0
         }
 
@@ -3342,7 +3348,7 @@ enum NSEDataBridge {
                 return db.changesCount
             }
         } catch {
-            print("[NSEDataBridge] FTS header flush: headerComplete update failed: \(error)")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] FTS header flush: headerComplete update failed: \(error)")
             return 0
         }
     }
@@ -3386,7 +3392,7 @@ enum NSEDataBridge {
                 return Dictionary(uniqueKeysWithValues: headers.map { ($0.id, $0) })
             }
         } catch {
-            print("[NSEDataBridge] FTS batch: bulk header read failed: \(error) — next wake will recover")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] FTS batch: bulk header read failed: \(error) — next wake will recover")
             return
         }
 
@@ -3414,7 +3420,7 @@ enum NSEDataBridge {
         do {
             _ = try await SearchIndex.shared.indexHeaders(records)
         } catch {
-            print("[NSEDataBridge] FTS batch: indexHeaders failed: \(error) — recoverIncompleteHeaders will retry next wake")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] FTS batch: indexHeaders failed: \(error) — recoverIncompleteHeaders will retry next wake")
             return
         }
 
@@ -3434,7 +3440,7 @@ enum NSEDataBridge {
                 )
             }
         } catch {
-            print("[NSEDataBridge] FTS batch: headerComplete update failed: \(error)")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] FTS batch: headerComplete update failed: \(error)")
             return
         }
 
@@ -3457,13 +3463,13 @@ enum NSEDataBridge {
         do {
             written = try await SearchIndex.shared.updateBodies(ftsBodies)
         } catch {
-            print("[NSEDataBridge] FTS batch: updateBodies failed: \(error) — body queue will retry")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] FTS batch: updateBodies failed: \(error) — body queue will retry")
             return
         }
 
         let confirmedItems = validBodyItems.filter { written.contains($0.item.contentKey) }
         guard !confirmedItems.isEmpty else {
-            print("[NSEDataBridge] FTS batch: no body writes confirmed (\(ftsBodies.count) attempted) — body queue will retry")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] FTS batch: no body writes confirmed (\(ftsBodies.count) attempted) — body queue will retry")
             return
         }
 
@@ -3488,7 +3494,7 @@ enum NSEDataBridge {
                 )
             }
         } catch {
-            print("[NSEDataBridge] FTS batch: bodyComplete update failed: \(error)")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] FTS batch: bodyComplete update failed: \(error)")
             return
         }
 
@@ -3552,7 +3558,7 @@ enum NSEDataBridge {
         }
 
         if confirmedItems.count > 1 {
-            print("[NSEDataBridge] FTS batch: wrote \(confirmedItems.count) headers + bodies in one pass")
+            BackgroundSyncLogger.logDebug("[NSEDataBridge] FTS batch: wrote \(confirmedItems.count) headers + bodies in one pass")
         }
     }
 
@@ -3805,7 +3811,9 @@ enum NSEDataBridge {
         ) ?? 0
         let didInsert = rowsAfter > rowsBefore
 
-        print("[NSEDataBridge] Created header for \(msg.messageId) from NSE staging (pre-sync), inserted=\(didInsert)")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[NSEDataBridge] Created header for \(msg.messageId) from NSE staging (pre-sync), inserted=\(didInsert)")
+        }
         markReachedOutIfNotified(
             notified: msg.notified,
             reminderContent: msg.reminderContent,

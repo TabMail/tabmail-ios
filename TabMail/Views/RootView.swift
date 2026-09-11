@@ -109,7 +109,7 @@ struct RootView: View {
                             try await DemoModeService.shared.completeSetup()
                             withAnimation { demoSeedingComplete = true }
                         } catch {
-                            print("[RootView] Demo setup failed: \(error)")
+                            BackgroundSyncLogger.logDebug("[RootView] Demo setup failed: \(error)")
                             demoStartError = error.localizedDescription
                             await DemoModeService.shared.exit()
                         }
@@ -430,7 +430,7 @@ struct RootView: View {
                 var results = [String: AICacheResult]()
                 let dbPool = AppDatabase.dbPool
                 for key in keys {
-                    print("[AIProbe] Looking up key: \"\(key)\" (fields=\(fields ?? ["all"]))")
+                    BackgroundSyncLogger.logDebug("[AIProbe] Looking up key: \"\(key)\" (fields=\(fields ?? ["all"]))")
                     // Match by rfc822MessageId (stored normalized, no angle brackets).
                     // Fetch ALL copies (inbox + all mail + etc.) because fetchLimit=1
                     // could return the All Mail copy which has no AI data (AI is inbox-scoped).
@@ -444,7 +444,7 @@ struct RootView: View {
                                 .fetchAll(db)
                         }
                     } catch {
-                        print("[AIProbe] Fetch error for key \"\(key)\": \(error)")
+                        BackgroundSyncLogger.logDebug("[AIProbe] Fetch error for key \"\(key)\": \(error)")
                         continue
                     }
 
@@ -469,7 +469,7 @@ struct RootView: View {
                         let hasSummary = wantSummary && header.summaryBlurb != nil
                         let hasAction = wantAction && header.actionTag != nil
                         let hasReply = wantReply && header.cachedReply != nil
-                        print("[AIProbe] Found \(headers.count) match(es) for key \"\(key)\" — best: summary=\(hasSummary ? "present" : "nil"), action=\(header.actionTag?.rawValue ?? "nil"), reply=\(hasReply ? "present" : "nil")")
+                        BackgroundSyncLogger.logDebug("[AIProbe] Found \(headers.count) match(es) for key \"\(key)\" — best: summary=\(hasSummary ? "present" : "nil"), action=\(header.actionTag?.rawValue ?? "nil"), reply=\(hasReply ? "present" : "nil")")
 
                         var result = AICacheResult()
                         if hasSummary {
@@ -489,14 +489,14 @@ struct RootView: View {
                         if result.summary != nil || result.action != nil || result.reply != nil {
                             results[key] = result
                         } else {
-                            print("[AIProbe] Header matched but no requested fields populated for key \"\(key)\" — skipping")
+                            BackgroundSyncLogger.logDebug("[AIProbe] Header matched but no requested fields populated for key \"\(key)\" — skipping")
                         }
                         continue
                     }
 
                     // No MessageHeader with AI data — fall through to MessageAICache
                     // (survives header deletion from stale detection)
-                    print("[AIProbe] Found \(headers.count) header(s) but none with AI data for key \"\(key)\" — checking MessageAICache")
+                    BackgroundSyncLogger.logDebug("[AIProbe] Found \(headers.count) header(s) but none with AI data for key \"\(key)\" — checking MessageAICache")
                     do {
                         if let cached = try dbPool.read({ db in
                             try MessageAICache
@@ -520,15 +520,15 @@ struct RootView: View {
                             }
                             if result.summary != nil || result.action != nil || result.reply != nil {
                                 results[key] = result
-                                print("[AIProbe] Cache hit for key \"\(key)\" (from MessageAICache)")
+                                BackgroundSyncLogger.logDebug("[AIProbe] Cache hit for key \"\(key)\" (from MessageAICache)")
                             } else {
-                                print("[AIProbe] Cache entry found but no matching fields for key \"\(key)\"")
+                                BackgroundSyncLogger.logDebug("[AIProbe] Cache entry found but no matching fields for key \"\(key)\"")
                             }
                         } else {
-                            print("[AIProbe] No match for key \"\(key)\" in headers or cache")
+                            BackgroundSyncLogger.logDebug("[AIProbe] No match for key \"\(key)\" in headers or cache")
                         }
                     } catch {
-                        print("[AIProbe] Cache lookup error for key \"\(key)\": \(error)")
+                        BackgroundSyncLogger.logDebug("[AIProbe] Cache lookup error for key \"\(key)\": \(error)")
                     }
                 }
                 return results
@@ -548,25 +548,25 @@ struct RootView: View {
             do {
                 let accountInfo = try await BackendClient().fetchAccountInfo()
                 if accountInfo.consentRequired == false {
-                    print("[RootView] User already consented (web/TB) — skipping consent gate")
+                    BackgroundSyncLogger.logDebug("[RootView] User already consented (web/TB) — skipping consent gate")
                     withAnimation { hasCompletedConsentGate = true }
                 }
             } catch BackendError.accountGone {
-                print("[RootView] Account no longer exists — showing account gone alert")
+                BackgroundSyncLogger.logDebug("[RootView] Account no longer exists — showing account gone alert")
                 NotificationCenter.default.post(name: .tabMailAccountGone, object: nil)
                 return
             } catch BackendError.unauthorized {
                 // Check if auth permanently failed (account deleted/token revoked)
                 let tokenState = await TabMailTokenCoordinator.shared.validToken()
                 if case .permanentFailure = tokenState {
-                    print("[RootView] Auth permanently failed — showing account gone alert")
+                    BackgroundSyncLogger.logDebug("[RootView] Auth permanently failed — showing account gone alert")
                     NotificationCenter.default.post(name: .tabMailAccountGone, object: nil)
                     return
                 }
-                print("[RootView] /whoami unauthorized (transient) — showing consent gate")
+                BackgroundSyncLogger.logDebug("[RootView] /whoami unauthorized (transient) — showing consent gate")
             } catch {
                 // Non-fatal — user will see the consent gate and can consent natively
-                print("[RootView] /whoami consent check failed: \(error) — showing consent gate")
+                BackgroundSyncLogger.logDebug("[RootView] /whoami consent check failed: \(error) — showing consent gate")
             }
         }
         // Pending-deletion check, deliberately its OWN task rather than a tail
@@ -587,17 +587,17 @@ struct RootView: View {
                 pendingDeletionDate = status.pending ? status.deletion_date : nil
                 pendingDeletionRequestId = status.pending ? status.request_id : nil
             } catch {
-                print("[RootView] Deletion status check failed: \(error)")
+                BackgroundSyncLogger.logDebug("[RootView] Deletion status check failed: \(error)")
             }
         }
         .onChange(of: hasTabMailSession) { old, new in
             if DebugModeManager.isLoggingEnabled() {
-                print("[RootView] hasTabMailSession \(old) -> \(new)")
+                BackgroundSyncLogger.logDebug("[RootView] hasTabMailSession \(old) -> \(new)")
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .tabMailDidSignOut).receive(on: DispatchQueue.main)) { _ in
             if DebugModeManager.isLoggingEnabled() {
-                print("[RootView] received .tabMailDidSignOut")
+                BackgroundSyncLogger.logDebug("[RootView] received .tabMailDidSignOut")
             }
             // Save consent gate state for the current user before clearing (per-account)
             saveConsentStateForCurrentUser()
@@ -622,7 +622,7 @@ struct RootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .tabMailAccountGone).receive(on: DispatchQueue.main)) { _ in
             if DebugModeManager.isLoggingEnabled() {
-                print("[RootView] received .tabMailAccountGone")
+                BackgroundSyncLogger.logDebug("[RootView] received .tabMailAccountGone")
             }
             showAccountGoneAlert = true
         }
@@ -726,7 +726,7 @@ struct RootView: View {
             // foreground /whoami fetch — no extra poll.
             UsageThrottleStore.shared.update(from: info)
         } catch {
-            print("[AISubscriptionGate] Revalidation failed: \(error)")
+            BackgroundSyncLogger.logDebug("[AISubscriptionGate] Revalidation failed: \(error)")
         }
     }
 
@@ -843,7 +843,7 @@ struct RootView: View {
         pendingDeletionDate = nil
         pendingDeletionRequestId = nil
         showSubscriptionLapsedAlert = response.subscriptionLapsedDuringGrace
-        print("[RootView] Account deletion cancelled")
+        BackgroundSyncLogger.logDebug("[RootView] Account deletion cancelled")
         return true
     }
 }

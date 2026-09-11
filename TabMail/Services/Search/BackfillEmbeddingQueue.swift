@@ -46,7 +46,7 @@ actor BackfillEmbeddingQueue {
         let items = headerIds.map { Item(headerId: $0) }
         let added = storage.enqueueBatch(items)
         guard added > 0 else { return }
-        print("[BackfillEmbeddingQueue] Enqueued \(added) items (total: \(storage.count))")
+        BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Enqueued \(added) items (total: \(storage.count))")
         scheduleDispatch()
     }
 
@@ -76,12 +76,12 @@ actor BackfillEmbeddingQueue {
                     }
                 }
                 let probeMs = Int((CFAbsoluteTimeGetCurrent() - probeT0) * 1000)
-                print("[BackfillEmbeddingQueue:EXPLAIN] probe \(probeMs)ms — plan:")
+                BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue:EXPLAIN] probe \(probeMs)ms — plan:")
                 for row in rows {
-                    print("[BackfillEmbeddingQueue:EXPLAIN]   id=\(row.id) parent=\(row.parent) \(row.detail)")
+                    BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue:EXPLAIN]   id=\(row.id) parent=\(row.parent) \(row.detail)")
                 }
             } catch {
-                print("[BackfillEmbeddingQueue:EXPLAIN] failed: \(error)")
+                BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue:EXPLAIN] failed: \(error)")
             }
         }
 
@@ -92,20 +92,20 @@ actor BackfillEmbeddingQueue {
             }
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             guard !headerIds.isEmpty else {
-                print("[BackfillEmbeddingQueue] Repopulate: 0 items (\(ms)ms)")
+                BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Repopulate: 0 items (\(ms)ms)")
                 return
             }
 
             let added = storage.enqueueBatch(headerIds.map { Item(headerId: $0) })
             if added > 0 {
-                print("[BackfillEmbeddingQueue] Repopulated \(added) items from GRDB in \(ms)ms")
+                BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Repopulated \(added) items from GRDB in \(ms)ms")
             }
             // Re-kick on every wake — items left pending by a suspend-abandoned
             // cycle (ADR-IOS-046) are already enqueued, so `added` (new rows only)
             // would skip them. scheduleDispatch is idempotent/guarded.
             if storage.pendingCount > 0 { scheduleDispatch() }
         } catch {
-            print("[BackfillEmbeddingQueue] Repopulate failed: \(error)")
+            BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Repopulate failed: \(error)")
         }
     }
 
@@ -117,7 +117,7 @@ actor BackfillEmbeddingQueue {
         debounceTask?.cancel()
         debounceTask = nil
         if count > 0 {
-            print("[BackfillEmbeddingQueue] Cancelled \(count) in-flight items on foreground return")
+            BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Cancelled \(count) in-flight items on foreground return")
         }
     }
 
@@ -167,7 +167,7 @@ actor BackfillEmbeddingQueue {
         // write would only abort; candidates stay pending and re-dispatch next wake.
         guard !DatabaseSuspension.isSuspended else {
             #if DEBUG
-            print("[BackfillEmbeddingQueue] DB suspended — abandoning dispatch (ADR-IOS-046)")
+            BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] DB suspended — abandoning dispatch (ADR-IOS-046)")
             #endif
             return
         }
@@ -176,7 +176,7 @@ actor BackfillEmbeddingQueue {
         guard !candidates.isEmpty else { return }
 
         storage.incrementActiveJobs()
-        print("[BackfillEmbeddingQueue] Dispatching batch of \(candidates.count) items (pending: \(storage.pendingCount))")
+        BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Dispatching batch of \(candidates.count) items (pending: \(storage.pendingCount))")
 
         Task { [self] in
             await processBatch(candidates)
@@ -206,7 +206,7 @@ actor BackfillEmbeddingQueue {
                 return Dictionary(uniqueKeysWithValues: headers.map { ($0.id, $0) })
             }
         } catch {
-            print("[BackfillEmbeddingQueue] Bulk header read failed: \(error)")
+            BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Bulk header read failed: \(error)")
             for item in items { storage.batchItemCompleted(item, shouldRetry: true, maxRetries: SyncConfig.maxQueueRetries) }
             storage.decrementActiveJobs()
             if storage.pendingCount > 0 { await dispatchBatch() }
@@ -222,7 +222,7 @@ actor BackfillEmbeddingQueue {
             bodiesByContentKey = try await SearchIndex.shared.bodyTexts(
                 contentKeys: headerIds.map(ContentKey.init(rawValue:)))
         } catch {
-            print("[BackfillEmbeddingQueue] Bulk body read failed: \(error)")
+            BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Bulk body read failed: \(error)")
             for item in items { storage.batchItemCompleted(item, shouldRetry: true, maxRetries: SyncConfig.maxQueueRetries) }
             storage.decrementActiveJobs()
             if storage.pendingCount > 0 { await dispatchBatch() }
@@ -257,7 +257,7 @@ actor BackfillEmbeddingQueue {
                 succeeded.append((headerId: item.headerId, embedding: embedding))
                 storage.batchItemCompleted(item, shouldRetry: false, maxRetries: SyncConfig.maxQueueRetries)
             } catch {
-                print("[BackfillEmbeddingQueue] Embed failed for \(item.headerId.prefix(30)): \(error)")
+                BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Embed failed for \(item.headerId.prefix(30)): \(error)")
                 let hasMore = storage.batchItemCompleted(item, shouldRetry: true, maxRetries: SyncConfig.maxQueueRetries)
                 _ = hasMore
             }
@@ -270,7 +270,7 @@ actor BackfillEmbeddingQueue {
                     (contentKey: ContentKey(rawValue: $0.headerId), embedding: $0.embedding)
                 })
             } catch {
-                print("[BackfillEmbeddingQueue] Bulk embedding write failed: \(error)")
+                BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Bulk embedding write failed: \(error)")
             }
         }
 
@@ -288,7 +288,7 @@ actor BackfillEmbeddingQueue {
 
         storage.decrementActiveJobs()
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-        print("[BackfillEmbeddingQueue] Batch done: \(succeeded.count) embedded, \(emptyBodyIds.count) empty in \(ms)ms")
+        BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Batch done: \(succeeded.count) embedded, \(emptyBodyIds.count) empty in \(ms)ms")
         // Boot-log mirror (debug-gated): embedding batches are the CoreML-heavy
         // half of backfill — must be correlatable against ⚠ MAIN THREAD STALL
         // marks in the downloadable boot log.
@@ -333,11 +333,11 @@ actor BackfillEmbeddingQueue {
             let items = ids.map { Item(headerId: $0) }
             let added = storage.enqueueBatch(items)
             if added > 0 {
-                print("[BackfillEmbeddingQueue] Drain-time self-repopulate enqueued \(added) items")
+                BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Drain-time self-repopulate enqueued \(added) items")
                 scheduleDispatch()
             }
         } catch {
-            print("[BackfillEmbeddingQueue] Drain-time repopulate failed: \(error)")
+            BackgroundSyncLogger.logDebug("[BackfillEmbeddingQueue] Drain-time repopulate failed: \(error)")
         }
     }
 }

@@ -304,7 +304,7 @@ struct AutoSizingHTMLView: View {
             .onChange(of: bodyContentKey) { old, new in
                 guard DebugModeManager.isLoggingEnabled() else { return }
                 let render = { (k: ContentKey?) in k.map { String($0.rawValue.prefix(12)) + "…" } ?? "(none)" }
-                print("[RenderSec] body ContentKey changed \(render(old)) → \(render(new)) — recreating the web view")
+                BackgroundSyncLogger.logDebug("[RenderSec] body ContentKey changed \(render(old)) → \(render(new)) — recreating the web view")
             }
             // Safety timeout so a missed reveal signal can never strand the
             // placeholder forever. `.task(id: html)` restarts on every content
@@ -316,7 +316,7 @@ struct AutoSizingHTMLView: View {
                 if !hasRevealed {
                     if DebugModeManager.isLoggingEnabled() {
                         let epoch = Int64(Date().timeIntervalSince1970 * 1_000)
-                        print("[RenderTiming native epochMs=\(epoch)] placeholder.safety-timeout taskCancelled=\(Task.isCancelled)")
+                        BackgroundSyncLogger.logDebug("[RenderTiming native epochMs=\(epoch)] placeholder.safety-timeout taskCancelled=\(Task.isCancelled)")
                     }
                     hasRevealed = true
                 }
@@ -353,7 +353,7 @@ final class ScrollFreezeGate: Sendable {
             v = true
             return true
         }
-        if changed, DebugModeManager.isLoggingEnabled() { print("[ScrollFreeze] begin") }
+        if changed, DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[ScrollFreeze] begin") }
     }
 
     func end() {
@@ -363,7 +363,7 @@ final class ScrollFreezeGate: Sendable {
             return true
         }
         guard changed else { return }
-        if DebugModeManager.isLoggingEnabled() { print("[ScrollFreeze] end — flushing deferred heights") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[ScrollFreeze] end — flushing deferred heights") }
         NotificationCenter.default.post(name: .scrollFreezeReleased, object: nil)
     }
 }
@@ -594,7 +594,7 @@ private struct HTMLWebView: UIViewRepresentable {
                     // Read at call time, not captured, so toggling debug logging
                     // takes effect without recreating the web view.
                     guard DebugModeManager.isLoggingEnabled() else { return }
-                    print(line)
+                    BackgroundSyncLogger.logDebug(line)
                 },
                 forURLScheme: BodyAssetConfig.urlScheme
             )
@@ -707,11 +707,11 @@ private struct HTMLWebView: UIViewRepresentable {
         // development rule 12 — a no-op in production.
         if DebugModeManager.isLoggingEnabled() {
             let world = RenderContentWorld.isolated
-            print("[RenderSec id=\(context.coordinator.webViewId)] "
+            BackgroundSyncLogger.logDebug("[RenderSec id=\(context.coordinator.webViewId)] "
                   + "contentWorld=\(world.name ?? "<pageWorld>") "
                   + "userScripts=\(config.userContentController.userScripts.count)")
             for channel in HTMLWebView.bridgeChannels {
-                print("[RenderSec id=\(context.coordinator.webViewId)] "
+                BackgroundSyncLogger.logDebug("[RenderSec id=\(context.coordinator.webViewId)] "
                       + "handler registered channel=\(channel) world=\(world.name ?? "<pageWorld>")")
             }
         }
@@ -779,7 +779,7 @@ private struct HTMLWebView: UIViewRepresentable {
             context.coordinator.pendingHeight = nil
             context.coordinator.loadedColorScheme = colorScheme
             if DebugModeManager.isLoggingEnabled() {
-                print("[HTMLDebug] HTMLWebView.updateUIView: loading html len=\(html.count)")
+                BackgroundSyncLogger.logDebug("[HTMLDebug] HTMLWebView.updateUIView: loading html len=\(html.count)")
                 // Log input HTML in chunks so we can see EXACTLY what's being rendered
                 let inputChunkSize = 800
                 let inputPreview = String(html.prefix(inputChunkSize * 3))
@@ -796,7 +796,7 @@ private struct HTMLWebView: UIViewRepresentable {
                     let start = inputPreview.index(inputPreview.startIndex, offsetBy: chunkStart)
                     let end = inputPreview.index(start, offsetBy: min(inputChunkSize, inputPreview.count - chunkStart))
                     let chunk = DebugModeManager.escapedForLogLine(String(inputPreview[start..<end]))
-                    print("[HTMLDebug] INPUT HTML chunk #\(i): \(chunk)")
+                    BackgroundSyncLogger.logDebug("[HTMLDebug] INPUT HTML chunk #\(i): \(chunk)")
                 }
                 // Count <style>, <p>, <span>, <br>, and font-size occurrences
                 let styleCount = html.components(separatedBy: "<style").count - 1
@@ -805,7 +805,7 @@ private struct HTMLWebView: UIViewRepresentable {
                 let brCount = html.components(separatedBy: "<br").count - 1
                 let fontSizeCount = html.components(separatedBy: "font-size").count - 1
                 let msoCount = html.components(separatedBy: "MsoNormal").count - 1
-                print("[HTMLDebug] INPUT HTML stats: <style>=\(styleCount) <p>=\(pCount) <span>=\(spanCount) <br>=\(brCount) font-size=\(fontSizeCount) MsoNormal=\(msoCount)")
+                BackgroundSyncLogger.logDebug("[HTMLDebug] INPUT HTML stats: <style>=\(styleCount) <p>=\(pCount) <span>=\(spanCount) <br>=\(brCount) font-size=\(fontSizeCount) MsoNormal=\(msoCount)")
             }
             // P1c: the base URL is no longer chosen here. `wrapAndLoad` mints a
             // per-load synthetic nonce base URL for EVERY load, at every call
@@ -1165,7 +1165,7 @@ private struct HTMLWebView: UIViewRepresentable {
                         let zoom = sv.zoomScale
                         let frameH = webView.bounds.height
                         let oldH = change.oldValue?.height ?? 0
-                        print(String(format: "[ContentSizeKVO id=%@] contentH=%.0f (was %.0f) zoom=%.3f frameH=%.0f",
+                        BackgroundSyncLogger.logDebug(String(format: "[ContentSizeKVO id=%@] contentH=%.0f (was %.0f) zoom=%.3f frameH=%.0f",
                                      id, new.height, oldH, zoom, frameH))
                     }
                 }
@@ -1280,8 +1280,8 @@ private struct HTMLWebView: UIViewRepresentable {
                     let bytes = Data(wrapped.utf8)
                     let digest = SHA256.hash(data: bytes)
                     let fp = digest.prefix(4).map { String(format: "%02x", $0) }.joined()
-                    print("[HTMLDebug] HTMLWebView.wrapAndLoad: wrapped len=\(wrapped.count)")
-                    print("[Load id=\(self.webViewId)] bytes=\(wrapped.count) fp=\(fp) hasHeader=\(hasHeader)")
+                    BackgroundSyncLogger.logDebug("[HTMLDebug] HTMLWebView.wrapAndLoad: wrapped len=\(wrapped.count)")
+                    BackgroundSyncLogger.logDebug("[Load id=\(self.webViewId)] bytes=\(wrapped.count) fp=\(fp) hasHeader=\(hasHeader)")
                 }
                 self.logRenderSecurityPosture(webView: webView, generation: gen, schemeHandlerRegistered: hasHeader)
 
@@ -1334,7 +1334,7 @@ private struct HTMLWebView: UIViewRepresentable {
         private func logRenderSecurityPosture(webView: WKWebView, generation: Int, schemeHandlerRegistered: Bool) {
             guard DebugModeManager.isLoggingEnabled() else { return }
             let cfg = webView.configuration
-            print("[RenderSec id=\(webViewId) gen=\(generation)] "
+            BackgroundSyncLogger.logDebug("[RenderSec id=\(webViewId) gen=\(generation)] "
                   + "contentJS=\(cfg.defaultWebpagePreferences.allowsContentJavaScript) "
                   + "persistentStore=\(cfg.websiteDataStore.isPersistent) "
                   + "dataDetectors=\(cfg.dataDetectorTypes.rawValue) "
@@ -1344,7 +1344,7 @@ private struct HTMLWebView: UIViewRepresentable {
             // content reaches it — so it needs no escaping, and printing it whole
             // is the point: a truncated CSP cannot be compared against the
             // `securitypolicyviolation` reports in the same log.
-            print("[RenderSec id=\(webViewId) gen=\(generation)] csp=\(EmailHTMLWrapper.contentSecurityPolicy)")
+            BackgroundSyncLogger.logDebug("[RenderSec id=\(webViewId) gen=\(generation)] csp=\(EmailHTMLWrapper.contentSecurityPolicy)")
         }
 
         /// Schedule the bridge-liveness verdict for the document that just
@@ -1403,9 +1403,9 @@ private struct HTMLWebView: UIViewRepresentable {
                     ) else { return }
                     switch verdict {
                     case .live:
-                        print("[RenderSec id=\(id) gen=\(generation)] bridge=LIVE (app user scripts executed and reached Swift)")
+                        BackgroundSyncLogger.logDebug("[RenderSec id=\(id) gen=\(generation)] bridge=LIVE (app user scripts executed and reached Swift)")
                     case .silent:
-                        print("[RenderSec id=\(id) gen=\(generation)] bridge=SILENT — no bridge message received for this load; user scripts may not be executing")
+                        BackgroundSyncLogger.logDebug("[RenderSec id=\(id) gen=\(generation)] bridge=SILENT — no bridge message received for this load; user scripts may not be executing")
                     }
                 }
             }
@@ -1417,7 +1417,7 @@ private struct HTMLWebView: UIViewRepresentable {
             // re-derived from `loadedHeaderId` — `wrapAndLoad` mints a fresh
             // nonce base URL for this load like any other.
             if DebugModeManager.isLoggingEnabled() {
-                print("[ImageLoadDiag id=\(webViewId)] web-content-process-terminated persistedBody=\(loadedHeaderId != nil)")
+                BackgroundSyncLogger.logDebug("[ImageLoadDiag id=\(webViewId)] web-content-process-terminated persistedBody=\(loadedHeaderId != nil)")
             }
             // P1c: invalidate BOTH states before the recovery load. The dead
             // content process cannot deliver the callbacks the old navigation
@@ -1626,7 +1626,7 @@ private struct HTMLWebView: UIViewRepresentable {
         private func navLog(_ line: @autoclosure () -> String) {
             guard DebugModeManager.isLoggingEnabled() else { return }
             let message = line()
-            print("[NavPermit id=\(webViewId)] \(message)")
+            BackgroundSyncLogger.logDebug("[NavPermit id=\(webViewId)] \(message)")
             // Existing text includes tracked/committed generation evidence;
             // the clock is since the latest issued wrap, not proof of identity.
             renderTiming?.mark("navigation \(message)")
@@ -1756,7 +1756,7 @@ private struct HTMLWebView: UIViewRepresentable {
                     bridgeLog("rejected channel=consoleLog reason=not-a-string")
                     return
                 }
-                print(line)
+                BackgroundSyncLogger.logDebug(line)
             } else if message.name == "imageLoadFailure" {
                 // P4 — `postImageWidthRecheckJS` counted the remote images that
                 // ended in `error` and posted the census once, after the last
@@ -1811,7 +1811,7 @@ private struct HTMLWebView: UIViewRepresentable {
         /// Same production-silence rule as `navLog`.
         private func bridgeLog(_ line: @autoclosure () -> String) {
             guard DebugModeManager.isLoggingEnabled() else { return }
-            print("\(RenderBridgeDiagnostics.prefix(webViewId: webViewId, gate: documentGate)) \(line())")
+            BackgroundSyncLogger.logDebug("\(RenderBridgeDiagnostics.prefix(webViewId: webViewId, gate: documentGate)) \(line())")
         }
 
         /// Consume the `{ h, vp }` payload from `monitorHeightJS` (ResizeObserver-
@@ -1953,7 +1953,7 @@ private struct HTMLWebView: UIViewRepresentable {
                 // for "what did contentSize end up at." Correlate by id.
                 let zoom = webView.scrollView.zoomScale
                 let contentH = webView.scrollView.contentSize.height
-                print(String(format: "[MeasureHeight id=%@] %@ h=%.0f (scroll=%.0f rect=%.0f) vp=%.0f bounds=%.0f scale=%.3f → %.0f zoom=%.3f contentH=%.0f",
+                BackgroundSyncLogger.logDebug(String(format: "[MeasureHeight id=%@] %@ h=%.0f (scroll=%.0f rect=%.0f) vp=%.0f bounds=%.0f scale=%.3f → %.0f zoom=%.3f contentH=%.0f",
                              webViewId, sourceForLog, h, scrollForLog, rectForLog, effectiveVp, boundsWidth, scale, visualHeight, zoom, contentH))
                 let visualHeightSnapshot = visualHeight
                 let id = webViewId
@@ -1962,7 +1962,7 @@ private struct HTMLWebView: UIViewRepresentable {
                     let z = webView.scrollView.zoomScale
                     let cH = webView.scrollView.contentSize.height
                     let frameH = webView.bounds.height
-                    print(String(format: "[MeasureHeight id=%@] +300ms zoom=%.3f contentH=%.0f frameH=%.0f visual=%.0f overflow=%.0f",
+                    BackgroundSyncLogger.logDebug(String(format: "[MeasureHeight id=%@] +300ms zoom=%.3f contentH=%.0f frameH=%.0f visual=%.0f overflow=%.0f",
                                  id, z, cH, frameH, visualHeightSnapshot, max(0, cH - frameH)))
                 }
             }
@@ -1997,7 +1997,7 @@ private struct HTMLWebView: UIViewRepresentable {
                     }
                     pendingHeight = visualHeight
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[MeasureHeight id=\(webViewId)] deferred during scroll: \(Int(visualHeight)) (frame stays \(Int(height)))")
+                        BackgroundSyncLogger.logDebug("[MeasureHeight id=\(webViewId)] deferred during scroll: \(Int(visualHeight)) (frame stays \(Int(height)))")
                     }
                 } else {
                     pendingHeight = nil

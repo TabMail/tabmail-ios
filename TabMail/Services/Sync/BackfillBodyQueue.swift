@@ -267,7 +267,7 @@ actor BackfillBodyQueue {
         clearOversizedDurably(accountId: accountId, folderPath: folderPath)
         let removed = before - (oversizedDeferredThisSession.count + isolationPending.count)
         if removed > 0, DebugModeManager.isLoggingEnabled() {
-            print("[BackfillBody] Cleared \(removed) oversized-deferred/isolation key(s) for \(folderPath) after UIDVALIDITY reset")
+            BackgroundSyncLogger.logDebug("[BackfillBody] Cleared \(removed) oversized-deferred/isolation key(s) for \(folderPath) after UIDVALIDITY reset")
         }
     }
 
@@ -281,7 +281,7 @@ actor BackfillBodyQueue {
     /// They were duplicated verbatim here and on the sibling queue until 2026-09-02.
     private func markOversizedDurably(_ headerId: String) {
         if DebugModeManager.isLoggingEnabled() {
-            print("[BackfillBody] Durably flagging oversized \(headerId.prefix(30))")
+            BackgroundSyncLogger.logDebug("[BackfillBody] Durably flagging oversized \(headerId.prefix(30))")
         }
         enqueueDurableWrite(label: "flag \(headerId.prefix(30))") { db in
             // Both guards — "a proven body always wins" and "the observation must be
@@ -372,7 +372,7 @@ actor BackfillBodyQueue {
             if admit(item) { added += 1 }
         }
         guard added > 0 else { return }
-        print("[BackfillBody] Enqueued \(added) items (total: \(storage.count))")
+        BackgroundSyncLogger.logDebug("[BackfillBody] Enqueued \(added) items (total: \(storage.count))")
         scheduleDispatch()
     }
 
@@ -387,7 +387,7 @@ actor BackfillBodyQueue {
             if admit(item) { added += 1 }
         }
         guard added > 0 else { return }
-        print("[BackfillBody] Enqueued \(added) backfill items (total: \(storage.count))")
+        BackgroundSyncLogger.logDebug("[BackfillBody] Enqueued \(added) backfill items (total: \(storage.count))")
         scheduleDispatch()
     }
 
@@ -413,9 +413,9 @@ actor BackfillBodyQueue {
 
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             if totalAdded > 0 {
-                print("[BackfillBody] Repopulated \(totalAdded) items in \(ms)ms")
+                BackgroundSyncLogger.logDebug("[BackfillBody] Repopulated \(totalAdded) items in \(ms)ms")
             } else {
-                print("[BackfillBody] Repopulate: 0 non-inbox messages need body fetch (\(ms)ms)")
+                BackgroundSyncLogger.logDebug("[BackfillBody] Repopulate: 0 non-inbox messages need body fetch (\(ms)ms)")
             }
             BackgroundSyncLogger.logBackfill("[BackfillBody] repopulate loaded=\(totalAdded) pending=\(storage.pendingCount) (\(ms)ms)")
             // Re-kick on every wake. `totalAdded` counts only NEW rows; items left
@@ -425,7 +425,7 @@ actor BackfillBodyQueue {
             // queue resumes on the next wake. scheduleDispatch is idempotent/guarded.
             if storage.pendingCount > 0 { scheduleDispatch() }
         } catch {
-            print("[BackfillBody] Repopulate failed: \(error)")
+            BackgroundSyncLogger.logDebug("[BackfillBody] Repopulate failed: \(error)")
         }
     }
 
@@ -442,7 +442,7 @@ actor BackfillBodyQueue {
         connectivityWatchTask?.cancel()
         connectivityWatchTask = nil
         if itemCount > 0 || taskCount > 0 {
-            print("[BackfillBody] Cancelled \(taskCount) batch tasks, \(itemCount) in-flight items")
+            BackgroundSyncLogger.logDebug("[BackfillBody] Cancelled \(taskCount) batch tasks, \(itemCount) in-flight items")
         }
     }
 
@@ -506,7 +506,7 @@ actor BackfillBodyQueue {
         // nothing is lost. Just stop.
         guard !DatabaseSuspension.isSuspended else {
             #if DEBUG
-            print("[BackfillBody] DB suspended — abandoning dispatch (ADR-IOS-046)")
+            BackgroundSyncLogger.logDebug("[BackfillBody] DB suspended — abandoning dispatch (ADR-IOS-046)")
             #endif
             return
         }
@@ -519,7 +519,7 @@ actor BackfillBodyQueue {
 
         // Always collect a full batch — concurrency is limited by activeBatchCount, not per-item
         let batch = storage.collectCandidates(maxJobs: storage.activeJobs + batchSize)
-        guard !batch.isEmpty else { print("[BackfillBody] dispatchBatch: no candidates"); return }
+        guard !batch.isEmpty else { BackgroundSyncLogger.logDebug("[BackfillBody] dispatchBatch: no candidates"); return }
 
         // Resolve providers
         var providerByAccount: [String: any EmailProvider] = [:]
@@ -562,9 +562,7 @@ actor BackfillBodyQueue {
             for item in items { storage.releaseInFlightOnly(item) }
         }
 
-        let dispatchCount = groupsToDispatch.reduce(0) { $0 + $1.value.count }
-        let deferredCount = groupsDeferred.reduce(0) { $0 + $1.value.count }
-        print("[BackfillBody] Dispatching \(dispatchCount) items in \(groupsToDispatch.count) folder groups (deferred=\(deferredCount), activeBatches=\(activeBatchCount))")
+        BackgroundSyncLogger.logDebug("[BackfillBody] Dispatching \(groupsToDispatch.reduce(0) { $0 + $1.value.count }) items in \(groupsToDispatch.count) folder groups (deferred=\(groupsDeferred.reduce(0) { $0 + $1.value.count }), activeBatches=\(activeBatchCount))")
 
         for (key, allItems) in groupsToDispatch {
             guard let provider = providerByAccount[key.accountId] else { continue }
@@ -600,7 +598,7 @@ actor BackfillBodyQueue {
 
             let batchTask = Task { [self] in
                 let t0 = CFAbsoluteTimeGetCurrent()
-                print("[BackfillBody] Batch START: \(itemCount) items in \(key.folderPath)")
+                BackgroundSyncLogger.logDebug("[BackfillBody] Batch START: \(itemCount) items in \(key.folderPath)")
                 // Boot-log mirror (debug-gated): backfill batch windows must be
                 // correlatable against ⚠ MAIN THREAD STALL marks in ONE file —
                 // the "app is sharp once backfill dies" hypothesis needs the
@@ -614,7 +612,7 @@ actor BackfillBodyQueue {
                         ids: items.map(\.messageId), folder: key.folderPath
                     )
                     let fetchMs = Int((CFAbsoluteTimeGetCurrent() - tFetch) * 1000)
-                    print("[BackfillBody] Batch FETCH: \(fetched.count)/\(itemCount) succeeded in \(fetchMs)ms")
+                    BackgroundSyncLogger.logDebug("[BackfillBody] Batch FETCH: \(fetched.count)/\(itemCount) succeeded in \(fetchMs)ms")
 
                     // 2. Render + process each result (parallel — renders are independent)
                     let tProcess = CFAbsoluteTimeGetCurrent()
@@ -649,7 +647,7 @@ actor BackfillBodyQueue {
                                     }
                                 }
                             } else {
-                                print("[BackfillBody] Item \(item.messageId) not in batch result — will retry")
+                                BackgroundSyncLogger.logDebug("[BackfillBody] Item \(item.messageId) not in batch result — will retry")
                             }
                         }
                         var collected: [BodyFetchProcessor.ProcessedItem] = []
@@ -686,7 +684,7 @@ actor BackfillBodyQueue {
                     }
 
                     let totalMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-                    print("[BackfillBody] Batch DONE: \(itemCount) items (\(processedItems.count) with body) in \(totalMs)ms (fetch=\(fetchMs)ms, process=\(processMs)ms)")
+                    BackgroundSyncLogger.logDebug("[BackfillBody] Batch DONE: \(itemCount) items (\(processedItems.count) with body) in \(totalMs)ms (fetch=\(fetchMs)ms, process=\(processMs)ms)")
                     BootProfiler.mark("backfillBody batch DONE \(itemCount) items in \(totalMs)ms (fetch=\(fetchMs)ms process=\(processMs)ms) [\(key.folderPath)]")
                     BackgroundSyncLogger.logBackfill("[BackfillBody] batch DONE \(itemCount) items (\(processedItems.count) with body, \(missedItems.count) missed) in \(totalMs)ms [\(key.folderPath)] pending=\(storage.pendingCount)")
                     await SyncEngine.checkpointWALThrottled()
@@ -704,7 +702,7 @@ actor BackfillBodyQueue {
                         )
                     } else {
                         // Connection-level error — retry all items
-                        print("[BackfillBody] Batch FAILED for \(key.folderPath): \(error)")
+                        BackgroundSyncLogger.logDebug("[BackfillBody] Batch FAILED for \(key.folderPath): \(error)")
                         // Boot-log mirror: the user-observed "backfill jobs die
                         // after a while" needs its death timestamped next to the
                         // stall marks. Error text deliberately not included
@@ -798,13 +796,13 @@ actor BackfillBodyQueue {
             let item = items[0]
             if stale {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[BackfillBody] Oversized single item in \(folderPath) raced a UIDVALIDITY reset — NOT deferring stale \(item.headerId.prefix(30)); retrying")
+                    BackgroundSyncLogger.logDebug("[BackfillBody] Oversized single item in \(folderPath) raced a UIDVALIDITY reset — NOT deferring stale \(item.headerId.prefix(30)); retrying")
                 }
                 batchItemDone(item: item, shouldRetry: true)
                 return
             }
             if DebugModeManager.isLoggingEnabled() {
-                print("[BackfillBody] Single item too large in \(folderPath) — deferring \(item.headerId.prefix(30)) in-memory (bodyComplete=0, NOT marked empty)")
+                BackgroundSyncLogger.logDebug("[BackfillBody] Single item too large in \(folderPath) — deferring \(item.headerId.prefix(30)) in-memory (bodyComplete=0, NOT marked empty)")
             }
             BackgroundSyncLogger.logBackfill("[BackfillBody] oversized single item in \(folderPath) — deferring \(item.headerId.prefix(30)) in-memory (bodyComplete=0, NOT marked empty)")
             oversizedDeferredThisSession.insert(item.headerId)
@@ -826,9 +824,9 @@ actor BackfillBodyQueue {
             }
             if DebugModeManager.isLoggingEnabled() {
                 if stale {
-                    print("[BackfillBody] PayloadTooLarge for \(folderPath) raced a UIDVALIDITY reset — NOT isolating \(items.count) stale items; retrying")
+                    BackgroundSyncLogger.logDebug("[BackfillBody] PayloadTooLarge for \(folderPath) raced a UIDVALIDITY reset — NOT isolating \(items.count) stale items; retrying")
                 } else {
-                    print("[BackfillBody] PayloadTooLarge for \(folderPath) — isolating \(items.count) items for single-item testing")
+                    BackgroundSyncLogger.logDebug("[BackfillBody] PayloadTooLarge for \(folderPath) — isolating \(items.count) items for single-item testing")
                 }
             }
         }
@@ -892,14 +890,14 @@ actor BackfillBodyQueue {
             // (incl. a benign ADR-IOS-041 suspension abort — retries next wake).
             // Only the LOG is gated: a suspension abort isn't a real failure.
             if !error.isDatabaseSuspensionAbort {
-                print("[BackfillBody] missFetchCount update failed: \(error) — treating all as retry")
+                BackgroundSyncLogger.logDebug("[BackfillBody] missFetchCount update failed: \(error) — treating all as retry")
             }
             for item in missedItems { self.batchItemDone(item: item, shouldRetry: true) }
             return
         }
 
         for item in partitioned.toRetry {
-            print("[BackfillBody] UID miss \(item.messageId) folder=\(item.folderPath) — retrying")
+            BackgroundSyncLogger.logDebug("[BackfillBody] UID miss \(item.messageId) folder=\(item.folderPath) — retrying")
             self.batchItemDone(item: item, shouldRetry: true)
         }
         for item in partitioned.toDelete {
@@ -910,7 +908,7 @@ actor BackfillBodyQueue {
             let confirmation = await self.confirmGoneAtThreshold(item: item, provider: provider)
             switch confirmation {
             case .gone:
-                print("[BackfillBody] CONFIRMED GONE \(item.messageId) folder=\(item.folderPath) — deleting header")
+                BackgroundSyncLogger.logDebug("[BackfillBody] CONFIRMED GONE \(item.messageId) folder=\(item.folderPath) — deleting header")
                 BackgroundSyncLogger.logBackfill("[BackfillBody] CONFIRMED GONE \(item.messageId) folder=\(item.folderPath) — deleting header")
                 await AccountManager.shared.deleteConfirmedGoneHeader(
                     headerId: item.headerId,
@@ -925,12 +923,12 @@ actor BackfillBodyQueue {
                     // dead UID forever otherwise.
                     switch await self.rekeyRemappedHeader(item: item, newUID: newUID) {
                     case .migrated(let newItem):
-                        print("[BackfillBody] UID remap re-key \(item.messageId)→\(newUID) in \(item.folderPath) — fetching under new UID")
+                        BackgroundSyncLogger.logDebug("[BackfillBody] UID remap re-key \(item.messageId)→\(newUID) in \(item.folderPath) — fetching under new UID")
                         BackgroundSyncLogger.logBackfill("[BackfillBody] UID remap re-key \(item.messageId)→\(newUID) folder=\(item.folderPath)")
                         self.batchItemDone(item: item, shouldRetry: false)
                         enqueueSingle(newItem)
                     case .duplicateDropped:
-                        print("[BackfillBody] UID remap \(item.messageId)→\(newUID) in \(item.folderPath) — new UID already has a row, old duplicate dropped")
+                        BackgroundSyncLogger.logDebug("[BackfillBody] UID remap \(item.messageId)→\(newUID) in \(item.folderPath) — new UID already has a row, old duplicate dropped")
                         BackgroundSyncLogger.logBackfill("[BackfillBody] UID remap duplicate dropped \(item.messageId)→\(newUID) folder=\(item.folderPath)")
                         self.batchItemDone(item: item, shouldRetry: false)
                     case .failed:
@@ -938,7 +936,7 @@ actor BackfillBodyQueue {
                     }
                 } else {
                     // Same UID still present on the server — the miss was transient.
-                    print("[BackfillBody] Threshold reached but \(item.messageId) still at same UID in \(item.folderPath) — transient miss, resetting counter")
+                    BackgroundSyncLogger.logDebug("[BackfillBody] Threshold reached but \(item.messageId) still at same UID in \(item.folderPath) — transient miss, resetting counter")
                     try? await dbPool.write { db in
                         try db.execute(
                             sql: "UPDATE messageHeader SET missFetchCount = 0 WHERE id = ?",
@@ -948,7 +946,7 @@ actor BackfillBodyQueue {
                     self.batchItemDone(item: item, shouldRetry: true)
                 }
             case .cannotConfirm:
-                print("[BackfillBody] Threshold reached for \(item.messageId) but cannot confirm gone — keeping for retry / full-sync")
+                BackgroundSyncLogger.logDebug("[BackfillBody] Threshold reached for \(item.messageId) but cannot confirm gone — keeping for retry / full-sync")
                 BackgroundSyncLogger.logBackfill("[BackfillBody] cannotConfirm \(item.messageId) folder=\(item.folderPath) — keeping for retry")
                 self.batchItemDone(item: item, shouldRetry: true)
             }
@@ -979,11 +977,11 @@ actor BackfillBodyQueue {
                 )
             }
         } catch {
-            print("[BackfillBody] confirmGone: rfc822 lookup failed for \(item.headerId): \(error)")
+            BackgroundSyncLogger.logDebug("[BackfillBody] confirmGone: rfc822 lookup failed for \(item.headerId): \(error)")
             return .cannotConfirm
         }
         guard let rfc822 = rfc822, !rfc822.isEmpty else {
-            print("[BackfillBody] confirmGone: \(item.messageId) has no rfc822MessageId — cannot confirm")
+            BackgroundSyncLogger.logDebug("[BackfillBody] confirmGone: \(item.messageId) has no rfc822MessageId — cannot confirm")
             return .cannotConfirm
         }
         do {
@@ -999,7 +997,7 @@ actor BackfillBodyQueue {
             let newUID = uids.max { (UInt32($0) ?? 0) < (UInt32($1) ?? 0) }
             return .stillExists(newUID: newUID)
         } catch {
-            print("[BackfillBody] confirmGone: existence probe failed for \(rfc822): \(error)")
+            BackgroundSyncLogger.logDebug("[BackfillBody] confirmGone: existence probe failed for \(rfc822): \(error)")
             return .cannotConfirm
         }
     }
@@ -1094,7 +1092,7 @@ actor BackfillBodyQueue {
             }
         } catch {
             if !error.isDatabaseSuspensionAbort {
-                print("[BackfillBody] UID remap re-key failed for \(item.messageId)→\(newUID): \(error)")
+                BackgroundSyncLogger.logDebug("[BackfillBody] UID remap re-key failed for \(item.messageId)→\(newUID): \(error)")
                 BackgroundSyncLogger.logBackfill("[BackfillBody] UID remap re-key FAILED \(item.messageId)→\(newUID) folder=\(item.folderPath): \(error)")
             }
             return .failed
@@ -1170,11 +1168,11 @@ actor BackfillBodyQueue {
                 if admit(item) { added += 1 }
             }
             if added > 0 {
-                print("[BackfillBody] Drain-time self-repopulate enqueued \(added) items")
+                BackgroundSyncLogger.logDebug("[BackfillBody] Drain-time self-repopulate enqueued \(added) items")
                 scheduleDispatch()
             }
         } catch {
-            print("[BackfillBody] Drain-time repopulate failed: \(error)")
+            BackgroundSyncLogger.logDebug("[BackfillBody] Drain-time repopulate failed: \(error)")
         }
     }
 }

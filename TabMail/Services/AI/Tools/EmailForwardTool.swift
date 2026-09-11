@@ -45,7 +45,7 @@ struct EmailForwardTool: AgentTool, Sendable {
         // Demo boundary (ADR-IOS-038): a demo chat must never forward a real
         // email (and vice versa) — stale translator IDs can cross the line.
         guard DemoToolGuard.headerAccessible(header) else {
-            print("[EmailForwardTool] Blocked cross-boundary access to \(realId.prefix(30))")
+            BackgroundSyncLogger.logDebug("[EmailForwardTool] Blocked cross-boundary access to \(realId.prefix(30))")
             return ComposeOutcome.failed("Email not found for unique_id \(numericId)").describeForLLM
         }
 
@@ -75,7 +75,7 @@ struct EmailForwardTool: AgentTool, Sendable {
         }
 
         let recipientsFormatted = to.joined(separator: ", ")
-        print("[EmailForwardTool] Opening forward: numericId=\(numericId) subject=\(header.subject.prefix(40)) to=\(to) request=\(composeRequest != nil)")
+        BackgroundSyncLogger.logDebug("[EmailForwardTool] Opening forward: numericId=\(numericId) subject=\(header.subject.prefix(40)) to=\(to) request=\(composeRequest != nil)")
 
         // When a compose instruction is present, run it through performInlineEdit
         // with mode "edit_forward" — matching TB's runComposeEdit() flow.
@@ -102,9 +102,9 @@ struct EmailForwardTool: AgentTool, Sendable {
                 )
                 generatedSubject = result.subject
                 generatedBody = result.body ?? generatedBody
-                print("[EmailForwardTool] AI generated: subject=\(generatedSubject?.prefix(60) ?? "nil") bodyLen=\(generatedBody?.count ?? 0)")
+                BackgroundSyncLogger.logDebug("[EmailForwardTool] AI generated: subject=\(generatedSubject?.prefix(60) ?? "nil") bodyLen=\(generatedBody?.count ?? 0)")
             } catch {
-                print("[EmailForwardTool] performInlineEdit failed: \(error) — opening forward with original content")
+                BackgroundSyncLogger.logDebug("[EmailForwardTool] performInlineEdit failed: \(error) — opening forward with original content")
             }
         }
 
@@ -120,7 +120,7 @@ struct EmailForwardTool: AgentTool, Sendable {
             mode: .forward
         )
         if await MainActor.run(body: { ctx.router.recentlySentCompose.isRecentlySent(cacheKey) }) {
-            print("[EmailForwardTool] Skipping duplicate forward for \(header.accountId):\(header.stableId) — recently sent")
+            BackgroundSyncLogger.logDebug("[EmailForwardTool] Skipping duplicate forward for \(header.accountId):\(header.stableId) — recently sent")
             return "This email was already forwarded moments ago. No further action needed."
         }
 

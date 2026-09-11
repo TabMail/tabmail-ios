@@ -112,7 +112,7 @@ enum ReminderBuilder {
     /// surface for the user. The cache is invalidated on demo entry/exit via
     /// the `.remindersDidChange` posts in DemoModeService.
     private static func performBuild() async -> [Reminder] {
-        print("[ReminderBuilder] Building complete reminder list...")
+        BackgroundSyncLogger.logDebug("[ReminderBuilder] Building complete reminder list...")
 
         let demoActive = await MainActor.run { DemoModeStore.shared.isActive }
 
@@ -125,7 +125,7 @@ enum ReminderBuilder {
         let kbParsed = KBReminderParser.parse(kbText)
         var disabledHashes = DisabledRemindersStore.getDisabledHashes()
 
-        print("[ReminderBuilder] Collected \(messageReminders.count) message reminders and \(kbParsed.count) KB reminders")
+        BackgroundSyncLogger.logDebug("[ReminderBuilder] Collected \(messageReminders.count) message reminders and \(kbParsed.count) KB reminders")
 
         // Convert KB reminders to unified Reminder type
         let kbReminders = kbParsed.map { kb -> Reminder in
@@ -155,7 +155,7 @@ enum ReminderBuilder {
                     let isDisabled = !(oldEntry?.enabled ?? true)
                     DisabledRemindersStore.setEnabled(hash: hash, enabled: !isDisabled)
                     if isDisabled { disabledHashes.insert(hash) }
-                    print("[ReminderBuilder] Migrated disabled hash: \(oldHash) → \(hash)")
+                    BackgroundSyncLogger.logDebug("[ReminderBuilder] Migrated disabled hash: \(oldHash) → \(hash)")
                 }
             }
 
@@ -229,7 +229,7 @@ enum ReminderBuilder {
             if r.source == "message" { messageCount += 1 }
             else if r.source == "kb" { kbCount += 1 }
         }
-        print("[ReminderBuilder] Built reminder list: \(allReminders.count) total (\(messageCount) message + \(kbCount) KB, \(disabledCount) disabled)")
+        BackgroundSyncLogger.logDebug("[ReminderBuilder] Built reminder list: \(allReminders.count) total (\(messageCount) message + \(kbCount) KB, \(disabledCount) disabled)")
 
         return allReminders
     }
@@ -309,7 +309,7 @@ enum ReminderBuilder {
         if !force && elapsed < cooldownInterval {
             let cached = await MainActor.run { lastRandomRemindersResult }
             if !cached.isEmpty {
-                print("[ReminderBuilder] Skipped — cooldown (\(Int(elapsed))s < \(Int(cooldownInterval))s)")
+                BackgroundSyncLogger.logDebug("[ReminderBuilder] Skipped — cooldown (\(Int(elapsed))s < \(Int(cooldownInterval))s)")
                 return cached
             }
         }
@@ -357,7 +357,7 @@ enum ReminderBuilder {
             selected.append(contentsOf: shuffled.prefix(take))
         }
 
-        print("[ReminderBuilder] Selected \(selected.count) reminders (\(dueReminders.count) due + \(selected.count - dueReminders.count) random) from \(allReminders.count) total")
+        BackgroundSyncLogger.logDebug("[ReminderBuilder] Selected \(selected.count) reminders (\(dueReminders.count) due + \(selected.count - dueReminders.count) random) from \(allReminders.count) total")
         // Cache result and timestamp for cooldown
         await MainActor.run {
             lastRandomRemindersAt = Date()
@@ -423,7 +423,7 @@ enum ReminderBuilder {
         }
 
         defaults.set(true, forKey: didAutoDisableKey)
-        print("[ReminderBuilder] First-launch overdue suppression: disabled \(hashesToDisable.count) reminders with due dates before \(cutoff)")
+        BackgroundSyncLogger.logDebug("[ReminderBuilder] First-launch overdue suppression: disabled \(hashesToDisable.count) reminders with due dates before \(cutoff)")
         return !hashesToDisable.isEmpty
     }
 
@@ -493,10 +493,10 @@ enum ReminderBuilder {
                 ))
             }
 
-            print("[ReminderBuilder] Collected \(reminders.count) message reminders from \(messages.count) inbox messages with reminder content")
+            BackgroundSyncLogger.logDebug("[ReminderBuilder] Collected \(reminders.count) message reminders from \(messages.count) inbox messages with reminder content")
             return reminders
         } catch {
-            print("[ReminderBuilder] Error collecting message reminders: \(error)")
+            BackgroundSyncLogger.logDebug("[ReminderBuilder] Error collecting message reminders: \(error)")
             return []
         }
     }

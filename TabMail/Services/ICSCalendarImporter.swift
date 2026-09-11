@@ -81,13 +81,13 @@ enum ICSCalendarImporter {
                 do {
                     listener = try NWListener(using: params)
                 } catch {
-                    print("[ICSImport] Port \(port) in use, trying random port")
+                    BackgroundSyncLogger.logDebug("[ICSImport] Port \(port) in use, trying random port")
                     // Still loopback — the fallback must not widen the bind.
                     params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
                     listener = try NWListener(using: params)
                 }
             } catch {
-                print("[ICSImport] Failed to create listener: \(error)")
+                BackgroundSyncLogger.logDebug("[ICSImport] Failed to create listener: \(error)")
                 resolve(nil, completion)
                 return
             }
@@ -104,21 +104,21 @@ enum ICSCalendarImporter {
                 switch state {
                 case .ready:
                     if let port = self?.listener?.port?.rawValue {
-                        print("[ICSImport] Server listening on port \(port)")
+                        BackgroundSyncLogger.logDebug("[ICSImport] Server listening on port \(port)")
                         self?.resolve(port, completion)
                     } else {
                         // `.ready` without a port is terminal for the CALLER either way:
                         // there is no URL to hand Safari. Resolving as a failure keeps the
                         // "exactly once, on every terminal state" contract; the old code
                         // fell through here and the caller was never told anything.
-                        print("[ICSImport] Listener ready but reported no port")
+                        BackgroundSyncLogger.logDebug("[ICSImport] Listener ready but reported no port")
                         self?.stop()
                         self?.resolve(nil, completion)
                     }
                 case .failed(let error):
-                    print("[ICSImport] Listener failed: \(error)")
+                    BackgroundSyncLogger.logDebug("[ICSImport] Listener failed: \(error)")
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[ICSImport][diag] .failed reached — resolving with no port;"
+                        BackgroundSyncLogger.logDebug("[ICSImport][diag] .failed reached — resolving with no port;"
                               + " Safari will NOT be presented and the user gets silence")
                     }
                     self?.stop()
@@ -146,7 +146,7 @@ enum ICSCalendarImporter {
             connection.start(queue: queue)
             connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, _, error in
                 if let error {
-                    print("[ICSImport] Receive error: \(error)")
+                    BackgroundSyncLogger.logDebug("[ICSImport] Receive error: \(error)")
                     connection.cancel()
                     return
                 }
@@ -156,16 +156,16 @@ enum ICSCalendarImporter {
                 }
                 if let data, let request = String(data: data, encoding: .utf8) {
                     let firstLine = request.components(separatedBy: "\r\n").first ?? ""
-                    print("[ICSImport] Request: \(firstLine)")
+                    BackgroundSyncLogger.logDebug("[ICSImport] Request: \(firstLine)")
                     if DebugModeManager.isLoggingEnabled() {
                         let n = self?.requestCount ?? 0
                         let late = (self?.sawRequestAfterStop ?? false) ? " ⚠️ ARRIVED AFTER stop()" : ""
-                        print("[ICSImport][diag] request #\(n)\(late) — full request head follows")
+                        BackgroundSyncLogger.logDebug("[ICSImport][diag] request #\(n)\(late) — full request head follows")
                         // The whole head, not just the first line: the HTTP verb tells a GET from a
                         // HEAD preflight, and `Accept:` says whether iOS is asking for calendar data
                         // or for something else entirely.
                         for line in request.components(separatedBy: "\r\n") where !line.isEmpty {
-                            print("[ICSImport][diag]   > \(line)")
+                            BackgroundSyncLogger.logDebug("[ICSImport][diag]   > \(line)")
                         }
                     }
                 }
@@ -181,7 +181,7 @@ enum ICSCalendarImporter {
                     // Logged verbatim because the leading hypothesis for the update-only failure is
                     // a missing iTIP `method=` parameter here (RFC 6047 §2.1); this line is what
                     // confirms or kills it without reading the source.
-                    print("[ICSImport][diag] response head: "
+                    BackgroundSyncLogger.logDebug("[ICSImport][diag] response head: "
                           + header.replacingOccurrences(of: "\r\n", with: " | "))
                 }
 
@@ -191,7 +191,7 @@ enum ICSCalendarImporter {
                 let server = self
                 connection.send(content: responseData, completion: .contentProcessed { _ in
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[ICSImport][diag] response sent; cancelling connection and stopping server"
+                        BackgroundSyncLogger.logDebug("[ICSImport][diag] response sent; cancelling connection and stopping server"
                               + " — any further request from iOS will find no listener")
                     }
                     connection.cancel()
@@ -202,7 +202,7 @@ enum ICSCalendarImporter {
 
         func stop() {
             if DebugModeManager.isLoggingEnabled() {
-                print("[ICSImport][diag] stop() — listener=\(listener == nil ? "already nil" : "cancelling")"
+                BackgroundSyncLogger.logDebug("[ICSImport][diag] stop() — listener=\(listener == nil ? "already nil" : "cancelling")"
                       + " requestsServed=\(requestCount)"
                       + " sawRequestAfterStop=\(sawRequestAfterStop)"
                       + " alreadyStopped=\(stopped)")
@@ -219,7 +219,7 @@ enum ICSCalendarImporter {
         static let shared = SafariDelegate()
 
         func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
-            print("[ICSImport] Safari dismissed by user")
+            BackgroundSyncLogger.logDebug("[ICSImport] Safari dismissed by user")
             Task { @MainActor in ICSCalendarImporter.teardown() }
         }
     }
@@ -342,10 +342,10 @@ enum ICSCalendarImporter {
         // stops being recognisable as one, these two lines say whether it arrived that way
         // or whether we made it that way.
         if DebugModeManager.isLoggingEnabled() {
-            print(itipFingerprint(rawICSData, label: "raw, as received"))
-            print(itipFingerprint(icsData, label: "sanitized, as served to iOS"))
+            BackgroundSyncLogger.logDebug(itipFingerprint(rawICSData, label: "raw, as received"))
+            BackgroundSyncLogger.logDebug(itipFingerprint(icsData, label: "sanitized, as served to iOS"))
         }
-        print("[ICSImport] presentCalendarImport called, activeSafari=\(activeSafari != nil)")
+        BackgroundSyncLogger.logDebug("[ICSImport] presentCalendarImport called, activeSafari=\(activeSafari != nil)")
         // In demo mode, ICS imports MUST NOT touch the
         // real EKEventStore (would persist past demo exit). Route to the
         // demo calendar provider instead.
@@ -369,11 +369,11 @@ enum ICSCalendarImporter {
         guard let icsText = String(data: icsData, encoding: .utf8) else { return }
         let events = ICSParser.parse(icsText: icsText, resourceHref: "demo-import-\(UUID().uuidString.prefix(8))", etag: nil)
         guard let first = events.first else {
-            print("[ICSImport] Demo: no events parsed from ICS")
+            BackgroundSyncLogger.logDebug("[ICSImport] Demo: no events parsed from ICS")
             return
         }
         guard let provider = await AccountManager.shared.calendarProviders[DemoSeed.demoAccountId] else {
-            print("[ICSImport] Demo: no demo calendar provider registered")
+            BackgroundSyncLogger.logDebug("[ICSImport] Demo: no demo calendar provider registered")
             return
         }
         var input = GCalEventInput()
@@ -386,15 +386,15 @@ enum ICSCalendarImporter {
         input.endDate = first.end?.date
         do {
             _ = try await provider.createEvent(calendarId: "primary", event: input, sendUpdates: "none")
-            print("[ICSImport] Demo: imported '\(first.summary ?? "(no title)")' into demo calendar")
+            BackgroundSyncLogger.logDebug("[ICSImport] Demo: imported '\(first.summary ?? "(no title)")' into demo calendar")
         } catch {
-            print("[ICSImport] Demo import failed: \(error)")
+            BackgroundSyncLogger.logDebug("[ICSImport] Demo import failed: \(error)")
         }
     }
 
     @MainActor
     private static func beginPresentation(icsData: Data) {
-        print("[ICSImport] beginPresentation")
+        BackgroundSyncLogger.logDebug("[ICSImport] beginPresentation")
         let server = Server()
         activeServer = server
 
@@ -408,17 +408,17 @@ enum ICSCalendarImporter {
                 // presentation may already own the slot.
                 guard let port else {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[ICSImport][diag] server resolved with no port —"
+                        BackgroundSyncLogger.logDebug("[ICSImport][diag] server resolved with no port —"
                               + " Safari will NOT be presented")
                     }
                     if activeServer === server { activeServer = nil }
                     return
                 }
                 guard let url = URL(string: "http://127.0.0.1:\(port)/invite.ics") else {
-                    print("[ICSImport] Invalid URL for port \(port)")
+                    BackgroundSyncLogger.logDebug("[ICSImport] Invalid URL for port \(port)")
                     return
                 }
-                print("[ICSImport] Opening Safari with \(url)")
+                BackgroundSyncLogger.logDebug("[ICSImport] Opening Safari with \(url)")
 
                 let safari = SFSafariViewController(url: url)
                 safari.delegate = SafariDelegate.shared
@@ -434,13 +434,13 @@ enum ICSCalendarImporter {
                 activeSafari = safari
 
                 guard let presenter = Self.topViewController() else {
-                    print("[ICSImport] No view controller to present from")
+                    BackgroundSyncLogger.logDebug("[ICSImport] No view controller to present from")
                     server.stop()
                     activeServer = nil
                     activeSafari = nil
                     return
                 }
-                print("[ICSImport] Presenting from \(type(of: presenter))")
+                BackgroundSyncLogger.logDebug("[ICSImport] Presenting from \(type(of: presenter))")
                 presenter.present(safari, animated: false) {
                     // Remove the shadow from UIDropShadowView (thin line at sheet edge)
                     var v: UIView? = safari.view.superview
@@ -451,7 +451,7 @@ enum ICSCalendarImporter {
                         }
                         v = view.superview
                     }
-                    print("[ICSImport] Safari presented successfully")
+                    BackgroundSyncLogger.logDebug("[ICSImport] Safari presented successfully")
                 }
 
                 startSceneObserver()
@@ -480,7 +480,7 @@ enum ICSCalendarImporter {
             object: nil,
             queue: .main
         ) { _ in
-            print("[ICSImport] Scene entered background, cleaning up")
+            BackgroundSyncLogger.logDebug("[ICSImport] Scene entered background, cleaning up")
             Task { @MainActor in teardown() }
         }
     }
@@ -489,7 +489,7 @@ enum ICSCalendarImporter {
 
     @MainActor
     private static func teardown() {
-        print("[ICSImport] teardown called, activeSafari=\(activeSafari != nil)")
+        BackgroundSyncLogger.logDebug("[ICSImport] teardown called, activeSafari=\(activeSafari != nil)")
 
         if let obs = sceneObserver {
             NotificationCenter.default.removeObserver(obs)

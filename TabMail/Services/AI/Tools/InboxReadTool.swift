@@ -59,7 +59,7 @@ struct InboxReadTool: AgentTool, Sendable {
         var blocks: [String] = []
         for msg in pageItems {
             let numericId = await translator.toNumericId(msg.id)
-            print("[AIChatDebug] InboxReadTool: registered id=\(numericId) → realId=\(msg.id.prefix(30)) subject=\(msg.subject.prefix(40))")
+            BackgroundSyncLogger.logDebug("[AIChatDebug] InboxReadTool: registered id=\(numericId) → realId=\(msg.id.prefix(30)) subject=\(msg.subject.prefix(40))")
             var lines: [String] = []
             lines.append("unique_id: \(numericId)")
             lines.append("date: \(ToolFormatters.formatDate(msg.date))")
@@ -84,7 +84,7 @@ struct InboxReadTool: AgentTool, Sendable {
         // Build JSON result matching TB's return format
         let result = formatted + footer
 
-        print("[InboxReadTool] Returning page \(safePage + 1) of \(totalPages) (pageCount=\(pageItems.count) totalItems=\(totalCount))")
+        BackgroundSyncLogger.logDebug("[InboxReadTool] Returning page \(safePage + 1) of \(totalPages) (pageCount=\(pageItems.count) totalItems=\(totalCount))")
 
         var resultDict: [String: Any] = [
             "results": result,

@@ -62,13 +62,13 @@ extension AccountManager {
             return changed
         } catch is TimeoutError {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-            print("[SyncScheduler:bg] Delta sync timed out for \(account.emailAddress)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler:bg] Delta sync timed out for \(account.emailAddress)")
             BackgroundSyncLogger.logError("timeout", source: "bgSync:\(account.emailAddress)")
             BackgroundSyncLogger.log("bgSync: TIMEOUT \(account.emailAddress) after \(elapsed)ms")
             return false
         } catch {
             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-            print("[SyncScheduler:bg] Sync failed for \(account.emailAddress): \(error)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler:bg] Sync failed for \(account.emailAddress): \(error)")
             if !SyncEngine.isConnectionError(error) && !(error is CancellationError) {
                 BackgroundSyncLogger.logError("\(error)", source: "bgSync:\(account.emailAddress)")
             }
@@ -105,21 +105,21 @@ extension AccountManager {
             }
             return SyncResult(hadChanges: changed, failed: false)
         } catch is TimeoutError {
-            print("[SyncScheduler] Sync timed out for \(account.emailAddress) after \(SyncConfig.perAccountSyncTimeoutSeconds)s")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] Sync timed out for \(account.emailAddress) after \(SyncConfig.perAccountSyncTimeoutSeconds)s")
             return SyncResult(hadChanges: false, failed: true)
         } catch let error where SyncEngine.isTransientError(error) {
             // Transient provider blip (HTTP 5xx/429 from a reachable server) — not a
             // real sync failure. Report `failed: false` so the foreground poll doesn't
             // flip the sync-status subtitle to "failed"; the next cycle retries.
-            print("[SyncScheduler] Transient error for \(account.emailAddress) (not surfaced): \(error)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] Transient error for \(account.emailAddress) (not surfaced): \(error)")
             return SyncResult(hadChanges: false, failed: false)
         } catch let error where error.isDatabaseSuspensionAbort {
             // GRDB write aborted by database suspension (ADR-IOS-041) — benign,
             // retried on the next wake. Not a sync failure; don't flip the subtitle.
-            print("[SyncScheduler] DB suspended for \(account.emailAddress) (not surfaced): \(error)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] DB suspended for \(account.emailAddress) (not surfaced): \(error)")
             return SyncResult(hadChanges: false, failed: false)
         } catch {
-            print("[SyncScheduler] Sync failed for \(account.emailAddress): \(error)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] Sync failed for \(account.emailAddress): \(error)")
             if !SyncEngine.isConnectionError(error) && !(error is CancellationError) {
                 BackgroundSyncLogger.logError("\(error)", source: "fgSync:\(account.emailAddress)")
             }
@@ -140,7 +140,7 @@ extension AccountManager {
                 try Account.filter(Column("isActive") == true).fetchAll(db)
             }
         } catch {
-            print("[SyncScheduler:bg] Failed to load accounts: \(error)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler:bg] Failed to load accounts: \(error)")
             return false
         }
         guard !accounts.isEmpty else { return false }
@@ -177,7 +177,7 @@ extension AccountManager {
                 .filter(Column("isActive") == true)
                 .fetchOne(db)
         }) else {
-            print("[SyncScheduler:bg] No active account for email \(email)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler:bg] No active account for email \(email)")
             return false
         }
         return await backgroundSyncOne(account)
@@ -192,7 +192,7 @@ extension AccountManager {
                 try Account.filter(Column("isActive") == true).fetchAll(db)
             }
         } catch {
-            print("[SyncScheduler:fg] Failed to load accounts: \(error)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler:fg] Failed to load accounts: \(error)")
             return SyncResult(hadChanges: false, failed: true)
         }
         guard !accounts.isEmpty else { return SyncResult(hadChanges: false, failed: false) }

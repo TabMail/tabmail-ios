@@ -148,7 +148,7 @@ final class UserLabelMenuModel {
             sortedLabels = state.entries.map(\.label)
             appliedIds = Set(state.entries.filter(\.isApplied).map(\.label.id))
         } catch {
-            print("[UserLabelMenu] Failed to load labels: \(error)")
+            BackgroundSyncLogger.logDebug("[UserLabelMenu] Failed to load labels: \(error)")
         }
     }
 
@@ -182,7 +182,7 @@ final class UserLabelMenuModel {
             }
             appliedIds = Set(applied.map(\.id))
         } catch {
-            print("[UserLabelMenu] Failed to reconcile applied labels: \(error)")
+            BackgroundSyncLogger.logDebug("[UserLabelMenu] Failed to reconcile applied labels: \(error)")
         }
     }
 
@@ -305,7 +305,7 @@ final class UserLabelMenuModel {
             await AccountManager.shared.drainPendingQueue()
             return true
         } catch {
-            print("[UserLabelMenu] Apply label failed: \(error)")
+            BackgroundSyncLogger.logDebug("[UserLabelMenu] Apply label failed: \(error)")
             return false
         }
     }
@@ -356,7 +356,7 @@ final class UserLabelMenuModel {
             await AccountManager.shared.drainPendingQueue()
             return true
         } catch {
-            print("[UserLabelMenu] Remove label failed: \(error)")
+            BackgroundSyncLogger.logDebug("[UserLabelMenu] Remove label failed: \(error)")
             return false
         }
     }
@@ -469,7 +469,7 @@ final class UserLabelMenuModel {
             if admitted { appliedIds.insert(newLabel.id) }
             return true
         } catch {
-            print("[UserLabelMenu] Create label failed: \(error)")
+            BackgroundSyncLogger.logDebug("[UserLabelMenu] Create label failed: \(error)")
             return false
         }
     }

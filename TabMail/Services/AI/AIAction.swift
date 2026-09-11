@@ -56,7 +56,7 @@ extension AIService {
             disable_tools: true
         )
 
-        if DebugModeManager.isLoggingEnabled() { print("[AIService] Action payload: subject=\(subject.prefix(60)), from=\(from.prefix(40)), body.len=\(bodyText.count), noReply=\(isNoReply), unsub=\(hasUnsubscribe), todo=\((summary.todos ?? "N/A").prefix(60)), summary=\((summary.blurb ?? "N/A").prefix(60))") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[AIService] Action payload: subject=\(subject.prefix(60)), from=\(from.prefix(40)), body.len=\(bodyText.count), noReply=\(isNoReply), unsub=\(hasUnsubscribe), todo=\((summary.todos ?? "N/A").prefix(60)), summary=\((summary.blurb ?? "N/A").prefix(60))") }
 
         // Single attempt — natural retry via queue loop on next sync cycle.
         let llmT0 = CFAbsoluteTimeGetCurrent()
@@ -65,7 +65,7 @@ extension AIService {
         let llmElapsed = Int((CFAbsoluteTimeGetCurrent() - llmT0) * 1000)
         BackgroundSyncLogger.logAIProcessing("Action LLM END in \(llmElapsed)ms")
         guard let text = response.assistant, let tag = Self.parseActionResponse(text) else {
-            if DebugModeManager.isLoggingEnabled() { print("[AIService] Action: no valid action from LLM response. Raw: \(response.assistant?.prefix(200) ?? "nil")") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[AIService] Action: no valid action from LLM response. Raw: \(response.assistant?.prefix(200) ?? "nil")") }
             return nil
         }
         return tag
@@ -76,7 +76,7 @@ extension AIService {
     /// Delegates to shared AIResponseParser — single source of truth for both main app and NSE.
     static func parseActionResponse(_ text: String) -> ActionTag? {
         guard let raw = AIResponseParser.parseActionTag(from: text) else {
-            if DebugModeManager.isLoggingEnabled() { print("[AIService] No action field found in response: \(text.prefix(200))") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[AIService] No action field found in response: \(text.prefix(200))") }
             return nil
         }
         return ActionTag(rawValue: raw)

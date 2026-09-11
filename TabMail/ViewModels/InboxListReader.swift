@@ -38,7 +38,7 @@ enum InboxListReader {
                 try gather(db: db, folders: folders, query: query, overlay: overlay, staged: staged)
             }
         } catch {
-            if DebugModeManager.isLoggingEnabled() { print("[InboxListReader] fetch error: \(error)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[InboxListReader] fetch error: \(error)") }
             return []
         }
         return InboxListComposer.compose(ComposeInputs(
@@ -66,7 +66,7 @@ enum InboxListReader {
                 try gather(db: db, folders: folders, query: query, overlay: overlay, staged: staged)
             }
         } catch {
-            if DebugModeManager.isLoggingEnabled() { print("[InboxListReader] fetchSync error: \(error)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[InboxListReader] fetchSync error: \(error)") }
             return []
         }
         return InboxListComposer.compose(ComposeInputs(

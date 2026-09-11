@@ -314,9 +314,9 @@ actor GoogleCalendarProvider: CalendarProvider {
                 selected: cal.selected ?? false
             )
         }
-        print("[GoogleCalendar] Listed \(normalized.count) calendars")
+        BackgroundSyncLogger.logDebug("[GoogleCalendar] Listed \(normalized.count) calendars")
         for cal in normalized {
-            print("[GoogleCalendar]   id=\(cal.id) name='\(cal.summary ?? "?")' primary=\(cal.primary == true) selected=\(cal.selected.map(String.init(describing:)) ?? "nil") accessRole=\(cal.accessRole ?? "?")")
+            BackgroundSyncLogger.logDebug("[GoogleCalendar]   id=\(cal.id) name='\(cal.summary ?? "?")' primary=\(cal.primary == true) selected=\(cal.selected.map(String.init(describing:)) ?? "nil") accessRole=\(cal.accessRole ?? "?")")
         }
         return normalized
     }
@@ -403,22 +403,22 @@ actor GoogleCalendarProvider: CalendarProvider {
         }
 
         let path = "/calendars/\(encodedCalId)/events?\(queryItems.joined(separator: "&"))"
-        print("[GoogleCalendar] listEvents calendarId='\(calendarId)' path=\(path)")
+        BackgroundSyncLogger.logDebug("[GoogleCalendar] listEvents calendarId='\(calendarId)' path=\(path)")
         let data = try await request(path: path)
         if let preview = String(data: data, encoding: .utf8) {
-            print("[GoogleCalendar] listEvents response (first 800 chars): \(preview.prefix(800))")
+            BackgroundSyncLogger.logDebug("[GoogleCalendar] listEvents response (first 800 chars): \(preview.prefix(800))")
         }
         let response = try JSONDecoder().decode(GCalEventListResponse.self, from: data)
         let raw = response.items ?? []
         let filtered = raw.filter { $0.status != "cancelled" }
-        print("[GoogleCalendar] listEvents calendarId='\(calendarId)' rawCount=\(raw.count) afterCancelFilter=\(filtered.count)")
+        BackgroundSyncLogger.logDebug("[GoogleCalendar] listEvents calendarId='\(calendarId)' rawCount=\(raw.count) afterCancelFilter=\(filtered.count)")
         for ev in filtered {
             let isEmpty = (ev.summary?.isEmpty ?? true)
                 && (ev.attendees?.isEmpty ?? true)
                 && (ev.location?.isEmpty ?? true)
                 && (ev.description?.isEmpty ?? true)
             let marker = isEmpty ? "EMPTY" : "ok"
-            print("[GoogleCalendar]   [\(marker)] id=\(ev.id ?? "?") iCalUID=\(ev.iCalUID ?? "?") eventType=\(ev.eventType ?? "?") kind=\(ev.kind ?? "?") visibility=\(ev.visibility ?? "?") status=\(ev.status ?? "?") summary='\(ev.summary ?? "")' attendees=\(ev.attendees?.count ?? 0) location='\(ev.location ?? "")' desc.len=\(ev.description?.count ?? 0) htmlLink=\(ev.htmlLink ?? "?")")
+            BackgroundSyncLogger.logDebug("[GoogleCalendar]   [\(marker)] id=\(ev.id ?? "?") iCalUID=\(ev.iCalUID ?? "?") eventType=\(ev.eventType ?? "?") kind=\(ev.kind ?? "?") visibility=\(ev.visibility ?? "?") status=\(ev.status ?? "?") summary='\(ev.summary ?? "")' attendees=\(ev.attendees?.count ?? 0) location='\(ev.location ?? "")' desc.len=\(ev.description?.count ?? 0) htmlLink=\(ev.htmlLink ?? "?")")
         }
         return filtered
     }
@@ -686,7 +686,7 @@ actor GoogleCalendarProvider: CalendarProvider {
                 // it. A bare `print` reaches nothing in a production iOS build
                 // anyway, so this is not exception (b) either.
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[GoogleCalendar] splitSeries proof-GET for \(newSeriesId) FAILED after a proven duplicate: \(error) — keeping the operation queued")
+                    BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries proof-GET for \(newSeriesId) FAILED after a proven duplicate: \(error) — keeping the operation queued")
                 }
                 throw GoogleCalendarError.httpError(409, conflictBody)
             }
@@ -730,7 +730,7 @@ actor GoogleCalendarProvider: CalendarProvider {
                 )
             } catch let revertError {
                 revertFailure = revertError
-                print("[GoogleCalendar] splitSeries revert FAILED: \(revertError)")
+                BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries revert FAILED: \(revertError)")
             }
             throw Self.splitRollbackError(original: error, revertFailure: revertFailure)
         }
@@ -1283,7 +1283,7 @@ actor GoogleCalendarProvider: CalendarProvider {
 
         // 401 — token expired, force refresh and retry once
         if result.statusCode == 401 {
-            print("[GoogleCalendar] Token expired, refreshing...")
+            BackgroundSyncLogger.logDebug("[GoogleCalendar] Token expired, refreshing...")
             let freshToken = try await accessToken(true)
             let retry = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: freshToken, session: testSession, logLabel: "GoogleCalendar")
             if let data = retry.data {

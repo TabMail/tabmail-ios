@@ -87,8 +87,8 @@ final class OAuthService: NSObject {
     ) async throws -> OAuthTokens {
         let clientId = OAuthConfig.googleClientId
         let redirectScheme = OAuthConfig.googleRedirectScheme
-        print("[OAuth] clientId: \(clientId)")
-        print("[OAuth] redirectScheme: \(redirectScheme)")
+        BackgroundSyncLogger.logDebug("[OAuth] clientId: \(clientId)")
+        BackgroundSyncLogger.logDebug("[OAuth] redirectScheme: \(redirectScheme)")
         guard !clientId.isEmpty else {
             throw OAuthError.notConfigured("Google OAuth client ID not set")
         }
@@ -118,22 +118,22 @@ final class OAuthService: NSObject {
         components.queryItems = queryItems
 
         let authURL = components.url!
-        print("[OAuth] authURL: \(authURL)")
+        BackgroundSyncLogger.logDebug("[OAuth] authURL: \(authURL)")
 
         let callbackURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
             let session = ASWebAuthenticationSession(url: authURL, callback: .customScheme(redirectScheme)) { url, error in
                 if let error {
                     let nsError = error as NSError
-                    print("[OAuth] callback ERROR — domain=\(nsError.domain), code=\(nsError.code), userInfo=\(nsError.userInfo), description=\(nsError.localizedDescription)")
+                    BackgroundSyncLogger.logDebug("[OAuth] callback ERROR — domain=\(nsError.domain), code=\(nsError.code), userInfo=\(nsError.userInfo), description=\(nsError.localizedDescription)")
                     continuation.resume(throwing: error)
                 } else if let url {
                     let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
                     let hasCode = queryItems.contains(where: { $0.name == "code" })
                     let hasError = queryItems.first(where: { $0.name == "error" })?.value
-                    print("[OAuth] callback received — hasCode=\(hasCode), googleError=\(hasError ?? "nil")")
+                    BackgroundSyncLogger.logDebug("[OAuth] callback received — hasCode=\(hasCode), googleError=\(hasError ?? "nil")")
                     continuation.resume(returning: url)
                 } else {
-                    print("[OAuth] callback received — url: nil, error: nil (treating as cancel)")
+                    BackgroundSyncLogger.logDebug("[OAuth] callback received — url: nil, error: nil (treating as cancel)")
                     continuation.resume(throwing: OAuthError.cancelled)
                 }
             }
@@ -141,7 +141,7 @@ final class OAuthService: NSObject {
             session.presentationContextProvider = self
             self.currentSession = session
             let started = session.start()
-            print("[OAuth] session.start() returned: \(started) (scope=\(scope))")
+            BackgroundSyncLogger.logDebug("[OAuth] session.start() returned: \(started) (scope=\(scope))")
         }
 
         guard let code = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
@@ -259,7 +259,7 @@ final class OAuthService: NSObject {
                 iosRedirect: iosRedirect
             )
         } catch {
-            print("[MetadataConsent] /init failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MetadataConsent] /init failed: \(error)")
             throw error
         }
 
@@ -285,7 +285,7 @@ final class OAuthService: NSObject {
         if reason == "access_denied" {
             throw OAuthError.cancelled
         }
-        print("[MetadataConsent] consent failed: reason=\(reason ?? "unknown")")
+        BackgroundSyncLogger.logDebug("[MetadataConsent] consent failed: reason=\(reason ?? "unknown")")
         throw OAuthError.consentFailed(reason ?? "unknown")
     }
 

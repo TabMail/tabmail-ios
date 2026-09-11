@@ -113,7 +113,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         webSocketTask: URLSessionWebSocketTask,
         didOpenWithProtocol protocol: String?
     ) {
-        print("[DeviceSync] WebSocket didOpen, protocol: \(`protocol` ?? "none")")
+        BackgroundSyncLogger.logDebug("[DeviceSync] WebSocket didOpen, protocol: \(`protocol` ?? "none")")
     }
 
     nonisolated func urlSession(
@@ -125,7 +125,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         let reasonStr = reason.flatMap { String(data: $0, encoding: .utf8) } ?? "none"
         DeviceSyncLogger.log("WS_CLOSE code=\(closeCode.rawValue) reason=\(reasonStr)")
         if closeCode != .normalClosure {
-            print("[DeviceSync] WebSocket didClose, code: \(closeCode.rawValue), reason: \(reasonStr)")
+            BackgroundSyncLogger.logDebug("[DeviceSync] WebSocket didClose, code: \(closeCode.rawValue), reason: \(reasonStr)")
         }
     }
 
@@ -137,10 +137,10 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         if let error {
             let redacted = Self.redactedTransportError(error)
             DeviceSyncLogger.log("WS_ERROR \(redacted)")
-            print("[DeviceSync] Task completed with error: \(redacted)")
+            BackgroundSyncLogger.logDebug("[DeviceSync] Task completed with error: \(redacted)")
             if let httpResponse = task.response as? HTTPURLResponse {
-                print("[DeviceSync] HTTP status: \(httpResponse.statusCode)")
-                print("[DeviceSync] HTTP headers: \(httpResponse.allHeaderFields)")
+                BackgroundSyncLogger.logDebug("[DeviceSync] HTTP status: \(httpResponse.statusCode)")
+                BackgroundSyncLogger.logDebug("[DeviceSync] HTTP headers: \(httpResponse.allHeaderFields)")
             }
         }
     }
@@ -152,9 +152,9 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     ) {
         for tm in metrics.transactionMetrics {
             let proto = tm.networkProtocolName ?? "unknown"
-            print("[DeviceSync] Protocol negotiated: \(proto)")
+            BackgroundSyncLogger.logDebug("[DeviceSync] Protocol negotiated: \(proto)")
             if let resp = tm.response as? HTTPURLResponse {
-                print("[DeviceSync] Response status: \(resp.statusCode), headers: \(resp.allHeaderFields)")
+                BackgroundSyncLogger.logDebug("[DeviceSync] Response status: \(resp.statusCode), headers: \(resp.allHeaderFields)")
             }
         }
     }
@@ -166,11 +166,11 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         // The anonymous demo session has no peer-pairing context, and
         // probing peers from a demo install would leak demo state.
         if DemoModeStore.shared.isActive {
-            print("[DeviceSync] Demo mode active — skipping connect")
+            BackgroundSyncLogger.logDebug("[DeviceSync] Demo mode active — skipping connect")
             return
         }
         guard isAutoEnabled else {
-            print("[DeviceSync] Auto-sync disabled, skipping connect")
+            BackgroundSyncLogger.logDebug("[DeviceSync] Auto-sync disabled, skipping connect")
             return
         }
         guard webSocket == nil, !isConnecting else { return }
@@ -219,7 +219,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         isConnected = false
         isConnecting = false
         reconnectAttempts = 0 // fresh network, reset backoff
-        print("[DeviceSync] Force reconnect — network interface changed")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Force reconnect — network interface changed")
         connect()
     }
 
@@ -238,18 +238,18 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         case .success(let t):
             token = t
         case .noSession:
-            print("[DeviceSync] No session found, cannot connect")
+            BackgroundSyncLogger.logDebug("[DeviceSync] No session found, cannot connect")
             DeviceSyncLogger.log("CONNECT_FAIL no session")
             isConnecting = false
             return
         case .permanentFailure:
-            print("[DeviceSync] Token refresh permanently failed — will retry later")
+            BackgroundSyncLogger.logDebug("[DeviceSync] Token refresh permanently failed — will retry later")
             DeviceSyncLogger.log("CONNECT_FAIL token refresh permanent failure")
             isConnecting = false
             scheduleReconnect()
             return
         case .transientFailure:
-            print("[DeviceSync] Token refresh failed (transient), scheduling reconnect")
+            BackgroundSyncLogger.logDebug("[DeviceSync] Token refresh failed (transient), scheduling reconnect")
             DeviceSyncLogger.log("CONNECT_FAIL token refresh transient failure")
             isConnecting = false
             scheduleReconnect()
@@ -275,7 +275,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             return
         }
 
-        print("[DeviceSync] Connecting to \(baseURL)...")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Connecting to \(baseURL)...")
         DeviceSyncLogger.log("CONNECT → \(baseURL)")
 
         let config = URLSessionConfiguration.default
@@ -333,7 +333,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         isConnecting = false
         isConnected = false
         reconnectAttempts = 0
-        print("[DeviceSync] Disconnected")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Disconnected")
     }
 
     /// Public "Sync Now" — broadcasts local state AND requests state from peers.
@@ -354,7 +354,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     private func probeAllFields() {
         let allFields = SyncField.allCases.map(\.rawValue)
         requestStateFromPeers(fields: allFields)
-        print("[DeviceSync] Probe: requested all fields from peers")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Probe: requested all fields from peers")
     }
 
     // MARK: - Per-Field Timestamps
@@ -395,7 +395,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         let defaults = UserDefaults.standard
         let anyExists = SyncField.allCases.contains { defaults.string(forKey: TimestampKey.key(for: $0)) != nil }
         if !anyExists {
-            print("[DeviceSync] New device — initializing per-field timestamps to epoch 0")
+            BackgroundSyncLogger.logDebug("[DeviceSync] New device — initializing per-field timestamps to epoch 0")
             for field in SyncField.allCases {
                 writeTimestamp(Self.epochZero, for: field)
             }
@@ -423,7 +423,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             backups = Array(backups.suffix(maxBackups))
         }
         defaults.set(backups, forKey: backupKey)
-        print("[DeviceSync] Backed up current state (\(backups.count) snapshots)")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Backed up current state (\(backups.count) snapshots)")
     }
 
     // MARK: - Debounced Broadcast (called from PromptStore.didSet)
@@ -461,10 +461,10 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         if let data = try? JSONSerialization.data(withJSONObject: msg),
            let text = String(data: data, encoding: .utf8) {
             ws.send(.string(text)) { error in
-                if let error { print("[DeviceSync] request_state send failed: \(Self.redactedTransportError(error))") }
+                if let error { BackgroundSyncLogger.logDebug("[DeviceSync] request_state send failed: \(Self.redactedTransportError(error))") }
             }
         }
-        print("[DeviceSync] Requested state from peers for fields: \(fields)")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Requested state from peers for fields: \(fields)")
     }
 
     private func flushBroadcast() {
@@ -496,7 +496,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         }
 
         sendPromptState(state, via: ws)
-        print("[DeviceSync] Auto-broadcast \(fields.map(\.rawValue)) to peers")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Auto-broadcast \(fields.map(\.rawValue)) to peers")
     }
 
     /// Broadcast all fields with per-field timestamps (used on connect).
@@ -508,7 +508,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
         let allEpochZero = SyncField.allCases.allSatisfy { readTimestamp(for: $0) == Self.epochZero }
         if allEpochZero {
-            print("[DeviceSync] Virgin device — skipping broadcast, probing peers instead")
+            BackgroundSyncLogger.logDebug("[DeviceSync] Virgin device — skipping broadcast, probing peers instead")
             probeAllFields()
             return
         }
@@ -527,7 +527,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             disabledRemindersUpdatedAt: readTimestamp(for: .disabledReminders)
         )
         sendPromptState(state, via: ws)
-        print("[DeviceSync] Broadcast all fields on connect")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Broadcast all fields on connect")
     }
 
     // MARK: - Private Message Handling
@@ -540,10 +540,10 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             let payload = try encoder.encode(msg)
             let text = String(data: payload, encoding: .utf8) ?? "{}"
             ws.send(.string(text)) { error in
-                if let error { print("[DeviceSync] Failed to send: \(Self.redactedTransportError(error))") }
+                if let error { BackgroundSyncLogger.logDebug("[DeviceSync] Failed to send: \(Self.redactedTransportError(error))") }
             }
         } catch {
-            print("[DeviceSync] Failed to encode state: \(error)")
+            BackgroundSyncLogger.logDebug("[DeviceSync] Failed to encode state: \(error)")
         }
     }
 
@@ -568,7 +568,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 // awaiting, this error is from a stale connection — don't touch state.
                 guard webSocket === ws else { return }
                 if !intentionalDisconnect {
-                    print("[DeviceSync] WebSocket receive error: \(Self.redactedTransportError(error))")
+                    BackgroundSyncLogger.logDebug("[DeviceSync] WebSocket receive error: \(Self.redactedTransportError(error))")
                 }
                 isConnecting = false
                 isConnected = false
@@ -601,7 +601,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
             switch msg.type {
             case "connected":
-                print("[DeviceSync] Connected as user \(msg.userId?.prefix(8) ?? "?")")
+                BackgroundSyncLogger.logDebug("[DeviceSync] Connected as user \(msg.userId?.prefix(8) ?? "?")")
                 DeviceSyncLogger.log("CONNECTED as user \(msg.userId?.prefix(8) ?? "?") via \(baseURL)")
                 isConnecting = false
                 isConnected = true
@@ -611,7 +611,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
             case "request_state":
                 // Another client asked for our state — respond with requested fields (or all)
-                print("[DeviceSync] Received request_state — responding")
+                BackgroundSyncLogger.logDebug("[DeviceSync] Received request_state — responding")
                 respondToRequestState(fields: msg.fields)
 
             case "prompt_state":
@@ -631,10 +631,10 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 handleAICacheResponse(results: msg.results ?? [:], probeId: msg.probeId)
 
             default:
-                print("[DeviceSync] Unknown message type: \(msg.type)")
+                BackgroundSyncLogger.logDebug("[DeviceSync] Unknown message type: \(msg.type)")
             }
         } catch {
-            print("[DeviceSync] Failed to decode message: \(error)")
+            BackgroundSyncLogger.logDebug("[DeviceSync] Failed to decode message: \(error)")
         }
     }
 
@@ -738,13 +738,13 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             let removed = oldLines.filter { !newSet.contains($0) }
             let added = newLines.filter { !oldSet.contains($0) }
             if removed.isEmpty && added.isEmpty {
-                print("[DeviceSync] \(field.rawValue) (\(mergeType)): no visible diff (reordering only)")
+                BackgroundSyncLogger.logDebug("[DeviceSync] \(field.rawValue) (\(mergeType)): no visible diff (reordering only)")
                 return
             }
             var lines = ["[DeviceSync] \(field.rawValue) (\(mergeType)) diff:"]
             for r in removed { lines.append("  - \(r)") }
             for a in added { lines.append("  + \(a)") }
-            print(lines.joined(separator: "\n"))
+            BackgroundSyncLogger.logDebug(lines.joined(separator: "\n"))
         }
 
         // Helper: 3-way merge dispatcher per field type
@@ -773,7 +773,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
             // 1. Epoch-zero → skip (virgin/reset device)
             if incomingTs == Self.epochZero {
-                print("[DeviceSync] Skipping \(field.rawValue) — epoch-zero timestamp (virgin/reset)")
+                BackgroundSyncLogger.logDebug("[DeviceSync] Skipping \(field.rawValue) — epoch-zero timestamp (virgin/reset)")
                 continue
             }
 
@@ -783,7 +783,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
             // 2. Stale — already processed this or newer from the peer
             if incomingTs <= peerBaseTs {
-                print("[DeviceSync] Skipping \(field.rawValue) — stale (incoming \(incomingTs) <= peer_base \(peerBaseTs))")
+                BackgroundSyncLogger.logDebug("[DeviceSync] Skipping \(field.rawValue) — stale (incoming \(incomingTs) <= peer_base \(peerBaseTs))")
                 continue
             }
 
@@ -793,22 +793,22 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 // 3. First sync — no common ancestor, use LWW
                 if incomingTs > localTs {
                     result = remote
-                    print("[DeviceSync] \(field.rawValue): first sync, LWW accept (incoming \(incomingTs) > local \(localTs))")
+                    BackgroundSyncLogger.logDebug("[DeviceSync] \(field.rawValue): first sync, LWW accept (incoming \(incomingTs) > local \(localTs))")
                 } else {
-                    print("[DeviceSync] \(field.rawValue): first sync, LWW keep local (local \(localTs) >= incoming \(incomingTs))")
+                    BackgroundSyncLogger.logDebug("[DeviceSync] \(field.rawValue): first sync, LWW keep local (local \(localTs) >= incoming \(incomingTs))")
                 }
             } else if local == peerBase {
                 // 4. Fast-forward — no local changes since last sync
                 result = remote
-                print("[DeviceSync] \(field.rawValue): fast-forward (no local changes since last sync)")
+                BackgroundSyncLogger.logDebug("[DeviceSync] \(field.rawValue): fast-forward (no local changes since last sync)")
             } else {
                 // 5. Both sides changed — 3-way merge using peer_base as common ancestor
                 let merged = merge3way(base: peerBase!, local: local, remote: remote, field: field)
                 if merged != local {
                     result = merged
-                    print("[DeviceSync] \(field.rawValue): 3-way merge (both sides changed)")
+                    BackgroundSyncLogger.logDebug("[DeviceSync] \(field.rawValue): 3-way merge (both sides changed)")
                 } else {
-                    print("[DeviceSync] \(field.rawValue): 3-way merge produced no change")
+                    BackgroundSyncLogger.logDebug("[DeviceSync] \(field.rawValue): 3-way merge produced no change")
                 }
             }
 
@@ -840,12 +840,12 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         if let incomingTemplates = incoming.templates {
             let incomingTs = incoming.templatesUpdatedAt ?? incoming.updatedAt ?? Self.epochZero
             if incomingTs == Self.epochZero {
-                print("[DeviceSync] Skipping templates merge — epoch-zero timestamp (virgin device)")
+                BackgroundSyncLogger.logDebug("[DeviceSync] Skipping templates merge — epoch-zero timestamp (virgin device)")
             } else {
                 let validTemplates = incomingTemplates.filter { !$0.id.isEmpty && !$0.name.isEmpty }
                 let skipped = incomingTemplates.count - validTemplates.count
                 if skipped > 0 {
-                    print("[DeviceSync] Skipped \(skipped) invalid templates (missing id/name)")
+                    BackgroundSyncLogger.logDebug("[DeviceSync] Skipped \(skipped) invalid templates (missing id/name)")
                 }
                 if !validTemplates.isEmpty {
                     let before = store.templates
@@ -862,7 +862,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         if let incomingMap = incoming.disabledReminders {
             let incomingTs = incoming.disabledRemindersUpdatedAt ?? incoming.updatedAt ?? Self.epochZero
             if incomingTs == Self.epochZero {
-                print("[DeviceSync] Skipping disabledReminders merge — epoch-zero timestamp (virgin device)")
+                BackgroundSyncLogger.logDebug("[DeviceSync] Skipping disabledReminders merge — epoch-zero timestamp (virgin device)")
             } else {
                 let beforeHashes = DisabledRemindersStore.getDisabledHashes()
                 DisabledRemindersStore.mergeIncoming(incomingMap)
@@ -892,7 +892,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         if store.templates != preMergeTemplates { changedFieldNames.append("templates") }
 
         guard !changedFieldNames.isEmpty else {
-            print("[DeviceSync] No actual changes after merge — skipping history")
+            BackgroundSyncLogger.logDebug("[DeviceSync] No actual changes after merge — skipping history")
             return
         }
 
@@ -917,7 +917,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         }
         store.saveHistory(history)
 
-        print("[DeviceSync] Applied sync: \(changedFieldNames.joined(separator: ", "))")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Applied sync: \(changedFieldNames.joined(separator: ", "))")
     }
 
     // MARK: - AI Cache Probe (Phase 5 — placeholder handlers)
@@ -943,11 +943,11 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         if let data = try? JSONSerialization.data(withJSONObject: probe),
            let text = String(data: data, encoding: .utf8) {
             ws.send(.string(text)) { error in
-                if let error { print("[DeviceSync] AI cache probe send failed: \(Self.redactedTransportError(error))") }
+                if let error { BackgroundSyncLogger.logDebug("[DeviceSync] AI cache probe send failed: \(Self.redactedTransportError(error))") }
             }
         }
         DeviceSyncLogger.log("PROBE_SEND WSS keys=[\(keys.joined(separator: ", "))] probeId=\(probeId.prefix(8)) timeout=\(timeoutMs)ms")
-        print("[DeviceSync] Sent ai_cache_probe for [\(keys.joined(separator: ", "))] (probeId=\(probeId.prefix(8)))")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Sent ai_cache_probe for [\(keys.joined(separator: ", "))] (probeId=\(probeId.prefix(8)))")
 
         // Wait for response with timeout
         return await withCheckedContinuation { continuation in
@@ -965,7 +965,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
     private func handleAICacheProbe(keys: [String], probeId: String?, fields: [String]? = nil) {
         guard let ws = webSocket, !keys.isEmpty else { return }
-        print("[DeviceSync] Received ai_cache_probe for [\(keys.joined(separator: ", "))] fields=\(fields ?? ["all"]) (probeId=\(probeId?.prefix(8) ?? "nil"))")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Received ai_cache_probe for [\(keys.joined(separator: ", "))] fields=\(fields ?? ["all"]) (probeId=\(probeId?.prefix(8) ?? "nil"))")
 
         Task { @MainActor in
             var results = [String: AICacheResult]()
@@ -992,12 +992,12 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             if let data = try? JSONSerialization.data(withJSONObject: response),
                let text = String(data: data, encoding: .utf8) {
                 ws.send(.string(text)) { error in
-                    if let error { print("[DeviceSync] AI cache response send failed: \(Self.redactedTransportError(error))") }
+                    if let error { BackgroundSyncLogger.logDebug("[DeviceSync] AI cache response send failed: \(Self.redactedTransportError(error))") }
                 }
             }
             let hitKeys = Array(results.keys)
             DeviceSyncLogger.log("PROBE_RESPOND \(hitKeys.count) hit(s) for keys=[\(keys.joined(separator: ", "))] probeId=\(probeId?.prefix(8) ?? "nil")")
-            print("[DeviceSync] Responded to ai_cache_probe for [\(keys.joined(separator: ", "))]: \(hitKeys.count) hit(s)\(hitKeys.isEmpty ? "" : " [\(hitKeys.joined(separator: ", "))]") (probeId=\(probeId?.prefix(8) ?? "nil"))")
+            BackgroundSyncLogger.logDebug("[DeviceSync] Responded to ai_cache_probe for [\(keys.joined(separator: ", "))]: \(hitKeys.count) hit(s)\(hitKeys.isEmpty ? "" : " [\(hitKeys.joined(separator: ", "))]") (probeId=\(probeId?.prefix(8) ?? "nil"))")
         }
     }
 
@@ -1009,7 +1009,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         }
         let hitKeys = Array(results.keys)
         DeviceSyncLogger.log("PROBE_HIT \(hitKeys.count) hit(s) keys=[\(hitKeys.joined(separator: ", "))] probeId=\(probeId.prefix(8))")
-        print("[DeviceSync] Resolved ai_cache_probe: \(hitKeys.count) hit(s)\(hitKeys.isEmpty ? "" : " [\(hitKeys.joined(separator: ", "))]") (probeId=\(probeId.prefix(8)))")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Resolved ai_cache_probe: \(hitKeys.count) hit(s)\(hitKeys.isEmpty ? "" : " [\(hitKeys.joined(separator: ", "))]") (probeId=\(probeId.prefix(8)))")
         continuation.resume(returning: results.isEmpty ? nil : results)
     }
 
@@ -1019,7 +1019,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         guard let ws = webSocket else { return }
         let msg = #"{"type":"ping"}"#
         ws.send(.string(msg)) { error in
-            if let error { print("[DeviceSync] Ping failed: \(Self.redactedTransportError(error))") }
+            if let error { BackgroundSyncLogger.logDebug("[DeviceSync] Ping failed: \(Self.redactedTransportError(error))") }
         }
     }
 
@@ -1028,22 +1028,22 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         // Don't reconnect in background — iOS gives no execution time for WebSocket + token fetch.
         // Foreground return (RootView scenePhase .active) calls reconnectIfNeeded().
         guard UIApplication.shared.applicationState == .active else {
-            print("[DeviceSync] Skipping reconnect — app not in foreground")
+            BackgroundSyncLogger.logDebug("[DeviceSync] Skipping reconnect — app not in foreground")
             return
         }
         if reconnectAttempts >= maxReconnectAttempts {
-            print("[DeviceSync] Max reconnect attempts (\(maxReconnectAttempts)) reached — giving up")
+            BackgroundSyncLogger.logDebug("[DeviceSync] Max reconnect attempts (\(maxReconnectAttempts)) reached — giving up")
             return
         }
         let delay = min(reconnectBaseDelay * pow(2.0, Double(reconnectAttempts)), reconnectMaxDelay)
         reconnectAttempts += 1
-        print("[DeviceSync] Reconnecting in \(Int(delay))s (attempt \(reconnectAttempts)/\(maxReconnectAttempts))")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Reconnecting in \(Int(delay))s (attempt \(reconnectAttempts)/\(maxReconnectAttempts))")
         reconnectTask = Task {
             try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled else { return }
             // Re-check foreground after delay — app may have backgrounded during sleep
             guard UIApplication.shared.applicationState == .active else {
-                print("[DeviceSync] Skipping reconnect — app backgrounded during delay")
+                BackgroundSyncLogger.logDebug("[DeviceSync] Skipping reconnect — app backgrounded during delay")
                 reconnectTask = nil
                 return
             }

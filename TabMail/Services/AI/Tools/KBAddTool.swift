@@ -13,17 +13,17 @@ struct KBAddTool: AgentTool, Sendable {
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
         guard case .string(let raw) = arguments["statement"] else {
-            print("[KBAddTool] Missing or empty 'statement'")
+            BackgroundSyncLogger.logDebug("[KBAddTool] Missing or empty 'statement'")
             return #"{"error": "missing statement"}"#
         }
 
         let statement = AIService.normalizeUnicode(raw).trimmingCharacters(in: .whitespaces)
         guard !statement.isEmpty else {
-            print("[KBAddTool] Empty statement after normalization")
+            BackgroundSyncLogger.logDebug("[KBAddTool] Empty statement after normalization")
             return #"{"error": "missing statement"}"#
         }
 
-        print("[KBAddTool] Starting with statement='\(statement.prefix(140))' len=\(statement.count)")
+        BackgroundSyncLogger.logDebug("[KBAddTool] Starting with statement='\(statement.prefix(140))' len=\(statement.count)")
 
         // Load current KB
         let current = PromptStore.kbTextSnapshot()
@@ -33,20 +33,20 @@ struct KBAddTool: AgentTool, Sendable {
         let patchText = "ADD\n\(pinned)"
 
         guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText) else {
-            print("[KBAddTool] applyKBPatch returned nil")
+            BackgroundSyncLogger.logDebug("[KBAddTool] applyKBPatch returned nil")
             return #"{"error": "failed to update knowledge base"}"#
         }
 
         if updated == current {
-            print("[KBAddTool] No-op (duplicate or unchanged)")
+            BackgroundSyncLogger.logDebug("[KBAddTool] No-op (duplicate or unchanged)")
             return "No change (duplicate or unchanged)."
         }
 
         // Persist — Device Sync triggers automatically via PromptStore's rawKB didSet
         await MainActor.run { PromptStore.shared.rawKB = updated }
-        print("[KBAddTool] Persisted user_kb.md (\(updated.count) chars)")
+        BackgroundSyncLogger.logDebug("[KBAddTool] Persisted user_kb.md (\(updated.count) chars)")
 
-        print("[KBAddTool] Success")
+        BackgroundSyncLogger.logDebug("[KBAddTool] Success")
         return "Added to knowledge base."
     }
 }

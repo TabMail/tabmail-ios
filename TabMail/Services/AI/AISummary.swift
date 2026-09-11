@@ -77,7 +77,7 @@ extension AIService {
             disable_tools: false  // TB sends disableTools: false for summary (tools enabled)
         )
 
-        if DebugModeManager.isLoggingEnabled() { print("[AIService] Summary payload: subject=\(subject.prefix(60)), from=\(from.prefix(40)), date=\(rawVars["email_date"] ?? "?"), body.len=\(bodyText.count), noReply=\(rawVars["is_noreply_address"] ?? "?"), unsub=\(rawVars["has_unsubscribe_link"] ?? "?"), recipient_status=\(recipientStatus.isEmpty ? "omitted" : "\"\(recipientStatus)\" (SENT)")") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[AIService] Summary payload: subject=\(subject.prefix(60)), from=\(from.prefix(40)), date=\(rawVars["email_date"] ?? "?"), body.len=\(bodyText.count), noReply=\(rawVars["is_noreply_address"] ?? "?"), unsub=\(rawVars["has_unsubscribe_link"] ?? "?"), recipient_status=\(recipientStatus.isEmpty ? "omitted" : "\"\(recipientStatus)\" (SENT)")") }
 
         // Single attempt — failed messages stay unprocessed and get re-queued
         // on the next sync cycle (natural retry via queue loop).
@@ -88,7 +88,7 @@ extension AIService {
         BackgroundSyncLogger.logAIProcessing("Summary LLM END in \(llmElapsed)ms")
 
         guard let rawText = response.assistant else {
-            print("[AIService] Summary: no assistant text in response")
+            BackgroundSyncLogger.logDebug("[AIService] Summary: no assistant text in response")
             return SummaryResult(blurb: nil, todos: nil, reminderDate: nil, reminderTime: nil, reminderContent: nil)
         }
 

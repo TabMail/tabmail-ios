@@ -129,7 +129,7 @@ enum DisabledRemindersStore {
                 map[hash] = DisabledEntry(enabled: false, ts: now)
             }
             saveDisabledMap(map, key: storageKeyV2)
-            print("[DisabledRemindersStore] Migrated \(oldHashes.count) entries from v1 to v2 CRDT format")
+            BackgroundSyncLogger.logDebug("[DisabledRemindersStore] Migrated \(oldHashes.count) entries from v1 to v2 CRDT format")
         }
     }
 
@@ -174,7 +174,7 @@ enum DisabledRemindersStore {
         var map = getDisabledMap(key: key)
         map[hash] = DisabledEntry(enabled: enabled, ts: Date().ISO8601Format())
         saveDisabledMap(map, key: key)
-        print("[DisabledRemindersStore] Set \(hash) enabled=\(enabled) (disabled count: \(map.filter { !$0.value.enabled }.count))")
+        BackgroundSyncLogger.logDebug("[DisabledRemindersStore] Set \(hash) enabled=\(enabled) (disabled count: \(map.filter { !$0.value.enabled }.count))")
 
         // Broadcast to Device Sync peers. Demo dismiss/snooze stays local to
         // the demo map — broadcasting would also stamp the real
@@ -211,7 +211,7 @@ enum DisabledRemindersStore {
         if merged > 0 {
             saveDisabledMap(localMap, key: key)
         }
-        print("[DisabledRemindersStore] CRDT merge: \(merged) entries adopted from \(incomingMap.count) incoming (local total: \(localMap.count))")
+        BackgroundSyncLogger.logDebug("[DisabledRemindersStore] CRDT merge: \(merged) entries adopted from \(incomingMap.count) incoming (local total: \(localMap.count))")
     }
 
     /// Bulk-disable hashes with epoch-zero timestamps. Used by first-launch overdue
@@ -229,7 +229,7 @@ enum DisabledRemindersStore {
             }
         }
         saveDisabledMap(map, key: key)
-        print("[DisabledRemindersStore] Bulk-disabled \(hashes.count) hashes with epoch-zero timestamps")
+        BackgroundSyncLogger.logDebug("[DisabledRemindersStore] Bulk-disabled \(hashes.count) hashes with epoch-zero timestamps")
     }
 
     /// Time-based GC: remove entries NOT in fresh set AND older than gcAgeDays.
@@ -272,7 +272,7 @@ enum DisabledRemindersStore {
 
         if removed > 0 {
             saveDisabledMap(map, key: key)
-            print("[DisabledRemindersStore] GC removed \(removed) entries older than \(gcAgeDays) days")
+            BackgroundSyncLogger.logDebug("[DisabledRemindersStore] GC removed \(removed) entries older than \(gcAgeDays) days")
         }
     }
 }

@@ -115,10 +115,10 @@ enum StartupMigrations {
                 try writer.write { db in
                     try db.execute(sql: "DELETE FROM messageHeader")
                 }
-                print("[Migration] Batch-deleted old-format MessageHeaders")
+                BackgroundSyncLogger.logDebug("[Migration] Batch-deleted old-format MessageHeaders")
                 UserDefaults.standard.set(true, forKey: "didMigrateHeaderIds_v2")
             } catch {
-                print("[Migration] didMigrateHeaderIds_v2 failed: \(error) — will retry next launch")
+                BackgroundSyncLogger.logDebug("[Migration] didMigrateHeaderIds_v2 failed: \(error) — will retry next launch")
             }
         }
 
@@ -127,10 +127,10 @@ enum StartupMigrations {
                 try writer.write { db in
                     try db.execute(sql: "DELETE FROM messageBody")
                 }
-                print("[Migration] Batch-deleted MessageBody entries for attachment encoding fix")
+                BackgroundSyncLogger.logDebug("[Migration] Batch-deleted MessageBody entries for attachment encoding fix")
                 UserDefaults.standard.set(true, forKey: "didClearBodiesForAttachmentEncoding_v1")
             } catch {
-                print("[Migration] didClearBodiesForAttachmentEncoding_v1 failed: \(error) — will retry next launch")
+                BackgroundSyncLogger.logDebug("[Migration] didClearBodiesForAttachmentEncoding_v1 failed: \(error) — will retry next launch")
             }
         }
 
@@ -150,11 +150,13 @@ enum StartupMigrations {
                         )
                     try Account.filter(imapAccountIds.contains(Column("id")))
                         .updateAll(db, Column("lastFullSyncAt").set(to: nil as Date?))
-                    print("[Migration] Reset backfill state on IMAP folders for INTERNALDATE fix")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Migration] Reset backfill state on IMAP folders for INTERNALDATE fix")
+                    }
                 }
                 UserDefaults.standard.set(true, forKey: "didResetImapDatesForInternalDate_v1")
             } catch {
-                print("[Migration] didResetImapDatesForInternalDate_v1 failed: \(error) — will retry next launch")
+                BackgroundSyncLogger.logDebug("[Migration] didResetImapDatesForInternalDate_v1 failed: \(error) — will retry next launch")
             }
         }
 
@@ -172,13 +174,13 @@ enum StartupMigrations {
                     )
                     try Account.updateAll(db, Column("lastFullSyncAt").set(to: nil as Date?))
                 }
-                print("[Migration] Clean reset: batch deleted all headers + bodies")
+                BackgroundSyncLogger.logDebug("[Migration] Clean reset: batch deleted all headers + bodies")
                 // FTS lives in a separate DB; clear it in the SAME step so the flag
                 // is set only once both halves are done (crash → re-run next launch).
                 resetFTS()
                 UserDefaults.standard.set(true, forKey: "didCleanResetMessageData_v1")
             } catch {
-                print("[Migration] didCleanResetMessageData_v1 failed: \(error) — will retry next launch")
+                BackgroundSyncLogger.logDebug("[Migration] didCleanResetMessageData_v1 failed: \(error) — will retry next launch")
             }
         }
 
@@ -199,13 +201,13 @@ enum StartupMigrations {
             }
             // Rule 12: diagnostic, so it must be a no-op in a production build.
             if DebugModeManager.isLoggingEnabled() {
-                print("[Migration] Deleted \(cleanup.deleted) orphaned legacy log file(s); "
+                BackgroundSyncLogger.logDebug("[Migration] Deleted \(cleanup.deleted) orphaned legacy log file(s); "
                     + "\(cleanup.failed) failed, \(legacyLogCleanupFlagKey) armed: \(cleanup.failed == 0)")
             }
         }
 
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-        print("[Migration] Startup data resets completed in \(ms)ms")
+        BackgroundSyncLogger.logDebug("[Migration] Startup data resets completed in \(ms)ms")
     }
 
     /// Outcome of one legacy-log cleanup pass: how many of the fifteen names
@@ -308,7 +310,7 @@ enum StartupMigrations {
             result.failed += 1
             // Rule 12: diagnostic, so it must be a no-op in a production build.
             if DebugModeManager.isLoggingEnabled() {
-                print("[Migration] Could not unlink legacy log \(name): "
+                BackgroundSyncLogger.logDebug("[Migration] Could not unlink legacy log \(name): "
                     + "\(String(cString: strerror(err))) — will retry next launch")
             }
         }
@@ -327,9 +329,9 @@ enum StartupMigrations {
         guard fm.fileExists(atPath: ftsDir.path) else { return }
         do {
             try fm.removeItem(at: ftsDir)
-            print("[Migration] Deleted FTS directory (clean reset)")
+            BackgroundSyncLogger.logDebug("[Migration] Deleted FTS directory (clean reset)")
         } catch {
-            print("[Migration] FTS directory delete failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Migration] FTS directory delete failed: \(error)")
         }
     }
 }

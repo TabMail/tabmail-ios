@@ -32,7 +32,7 @@ struct EmailOpenTool: AgentTool, Sendable {
         // Resolve numeric ID to real MessageHeader ID
         let translator = ctx.translator
         guard let realId = await translator.toRealId(numericId) else {
-            print("[EmailOpenTool] Failed to resolve numeric id \(numericId)")
+            BackgroundSyncLogger.logDebug("[EmailOpenTool] Failed to resolve numeric id \(numericId)")
             return #"{"error": "message not found for the given unique_id"}"#
         }
 
@@ -40,13 +40,13 @@ struct EmailOpenTool: AgentTool, Sendable {
         guard let header: MessageHeader = try await ctx.db.read({ db in
             try MessageHeader.fetchOne(db, key: realId)
         }) else {
-            print("[EmailOpenTool] MessageHeader not found for realId=\(realId)")
+            BackgroundSyncLogger.logDebug("[EmailOpenTool] MessageHeader not found for realId=\(realId)")
             return #"{"error": "message not found"}"#
         }
 
         // Demo boundary (ADR-IOS-038): never navigate across the demo/real line.
         guard DemoToolGuard.headerAccessible(header) else {
-            print("[EmailOpenTool] Blocked cross-boundary access to \(realId.prefix(30))")
+            BackgroundSyncLogger.logDebug("[EmailOpenTool] Blocked cross-boundary access to \(realId.prefix(30))")
             return #"{"error": "message not found"}"#
         }
 
@@ -60,7 +60,7 @@ struct EmailOpenTool: AgentTool, Sendable {
         }
 
         let subject = header.subject.isEmpty ? "(No subject)" : header.subject
-        print("[EmailOpenTool] Opening email numericId=\(numericId) realId=\(realId.prefix(30)) subject=\(subject.prefix(40))")
+        BackgroundSyncLogger.logDebug("[EmailOpenTool] Opening email numericId=\(numericId) realId=\(realId.prefix(30)) subject=\(subject.prefix(40))")
 
         return ToolJSON.string(from: [
             "success": true,

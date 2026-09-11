@@ -209,7 +209,7 @@ struct AttachmentListView: View {
             } catch {
                 self.error = SyncEngine.isConnectionError(error) ? "Download failed. Check your connection and try again." : "Download failed: \(error.localizedDescription)"
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Attachment] ICS download failed: \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                    BackgroundSyncLogger.logDebug("[Attachment] ICS download failed: \(DebugModeManager.escapedForLogLine(String(describing: error)))")
                 }
             }
             downloadingSection = nil
@@ -234,7 +234,7 @@ struct AttachmentListView: View {
         // `DebugModeManager.escapedForLogLine`.
         if DebugModeManager.isLoggingEnabled() {
             let escape = DebugModeManager.escapedForLogLine
-            print("[Attachment] Starting download: section=\(escape(attachment.section)) contentType=\(escape(attachment.contentType)) filename=\(escape(attachment.filename)) encoding=\(escape(attachment.encoding ?? "nil"))")
+            BackgroundSyncLogger.logDebug("[Attachment] Starting download: section=\(escape(attachment.section)) contentType=\(escape(attachment.contentType)) filename=\(escape(attachment.filename)) encoding=\(escape(attachment.encoding ?? "nil"))")
         }
         Task {
             // Reserve the one global QuickLook slot before the network fetch or
@@ -283,14 +283,14 @@ struct AttachmentListView: View {
                     identityStamp: identityStamp),
                    let storedURL = BodyAssetStore.urlOnDisk(assetId: assetId) {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[Attachment] Cache HIT for \(DebugModeManager.escapedForLogLine(attachment.filename)) — skipping network")
+                        BackgroundSyncLogger.logDebug("[Attachment] Cache HIT for \(DebugModeManager.escapedForLogLine(attachment.filename)) — skipping network")
                     }
                     BodyAssetStore.bumpMessageAccess(contentKey: ContentKey(rawValue: message.id))
                     data = try Data(contentsOf: storedURL)
                 } else {
                     data = try await manager.fetchAttachment(for: message, section: attachment.section, encoding: attachment.encoding)
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[Attachment] Downloaded \(data.count) bytes for \(DebugModeManager.escapedForLogLine(attachment.filename))")
+                        BackgroundSyncLogger.logDebug("[Attachment] Downloaded \(data.count) bytes for \(DebugModeManager.escapedForLogLine(attachment.filename))")
                     }
                     // Cache to BodyAssetStore — best-effort, and only for a message whose
                     // identity we can prove. An unstamped row would be unreadable by
@@ -333,14 +333,14 @@ struct AttachmentListView: View {
                     // separators and the C0/C1 controls, so no line break can
                     // reach this line-oriented sink through the path. The escape
                     // stays because the rest of the path is not that guarded.
-                    print("[Attachment] Staged at \(DebugModeManager.escapedForLogLine(fileURL.path)), QuickLook presented")
+                    BackgroundSyncLogger.logDebug("[Attachment] Staged at \(DebugModeManager.escapedForLogLine(fileURL.path)), QuickLook presented")
                 }
                 downloadedFiles[attachment.section] = fileURL
                 presented = true
             } catch {
                 self.error = SyncEngine.isConnectionError(error) ? "Download failed. Check your connection and try again." : "Download failed: \(error.localizedDescription)"
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Attachment] Download failed: \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                    BackgroundSyncLogger.logDebug("[Attachment] Download failed: \(DebugModeManager.escapedForLogLine(String(describing: error)))")
                 }
             }
             downloadingSection = nil
@@ -679,7 +679,7 @@ enum AttachmentQuickLook {
     static func present(url: URL) -> Bool {
         guard reservePresentation() else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Attachment] QuickLook already presented — ignoring tap")
+                BackgroundSyncLogger.logDebug("[Attachment] QuickLook already presented — ignoring tap")
             }
             return false
         }
@@ -698,7 +698,7 @@ enum AttachmentQuickLook {
         guard let presenter = topViewController() else {
             presentationReserved = false
             if DebugModeManager.isLoggingEnabled() {
-                print("[Attachment] QuickLook: no view controller to present from")
+                BackgroundSyncLogger.logDebug("[Attachment] QuickLook: no view controller to present from")
             }
             return false
         }
@@ -714,7 +714,7 @@ enum AttachmentQuickLook {
             // `lastPathComponent` is the sender's filename after the stager's
             // reduction, which removes `U+002F` and nothing else — a CR/LF in the
             // MIME `filename` parameter reaches here intact.
-            print("[Attachment] QuickLook presenting \(DebugModeManager.escapedForLogLine(url.lastPathComponent)) from \(type(of: presenter))")
+            BackgroundSyncLogger.logDebug("[Attachment] QuickLook presenting \(DebugModeManager.escapedForLogLine(url.lastPathComponent)) from \(type(of: presenter))")
         }
         presenter.present(controller, animated: true)
         return true
@@ -729,7 +729,7 @@ enum AttachmentQuickLook {
         activeSource = nil
         PreviewFreezeGate.shared.end()
         if DebugModeManager.isLoggingEnabled() {
-            print("[Attachment] QuickLook dismissed — freeze released")
+            BackgroundSyncLogger.logDebug("[Attachment] QuickLook dismissed — freeze released")
         }
     }
 

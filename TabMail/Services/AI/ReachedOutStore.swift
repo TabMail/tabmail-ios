@@ -83,7 +83,7 @@ enum ReachedOutStore {
         }
         if refreshed > 0 {
             saveAll(map)
-            print("[ReachedOutStore] Refreshed TTL for \(refreshed) active entries")
+            BackgroundSyncLogger.logDebug("[ReachedOutStore] Refreshed TTL for \(refreshed) active entries")
         }
     }
 
@@ -100,7 +100,7 @@ enum ReachedOutStore {
         let removed = before - map.count
         if removed > 0 {
             saveAll(map)
-            print("[ReachedOutStore] Pruned \(removed) expired entries")
+            BackgroundSyncLogger.logDebug("[ReachedOutStore] Pruned \(removed) expired entries")
         }
     }
 }

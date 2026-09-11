@@ -614,7 +614,7 @@ struct MessageCardView: View {
                     } else {
                         branch = "safetySpinner"
                     }
-                    print("[DetailRender] card focused bodyContent branch=\(branch) id=\(message.id.prefix(40)) hasAttachments=\(message.hasAttachments) summaryBlurb=\(message.summaryBlurb == nil ? "nil" : "set")")
+                    BackgroundSyncLogger.logDebug("[DetailRender] card focused bodyContent branch=\(branch) id=\(message.id.prefix(40)) hasAttachments=\(message.hasAttachments) summaryBlurb=\(message.summaryBlurb == nil ? "nil" : "set")")
                 }
             }()
             // Focused card reads from viewModel.messageBody (loaded by loadBody)

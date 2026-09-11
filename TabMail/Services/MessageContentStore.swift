@@ -648,14 +648,14 @@ enum MessageContentStore {
                     }
                 }
             } catch {
-                print("[MessageContentStore] body release failed for \(contentKeys.count) key(s): \(error)")
+                BackgroundSyncLogger.logDebug("[MessageContentStore] body release failed for \(contentKeys.count) key(s): \(error)")
             }
         }
         if stores.contains(.searchIndex) {
             do {
                 try await SearchIndex.shared.removeMessages(contentKeys: contentKeys)
             } catch {
-                print("[MessageContentStore] search-index release failed for \(contentKeys.count) key(s): \(error)")
+                BackgroundSyncLogger.logDebug("[MessageContentStore] search-index release failed for \(contentKeys.count) key(s): \(error)")
             }
         }
         if stores.contains(.assets) {
@@ -671,6 +671,6 @@ enum MessageContentStore {
     /// whole index, so this must be a no-op in production builds.
     private static func log(_ message: String) {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        print("[MessageContentStore] \(message)")
+        BackgroundSyncLogger.logDebug("[MessageContentStore] \(message)")
     }
 }

@@ -294,7 +294,7 @@ actor AccountManager {
         accountId: String, folderPath: String, storedValue: UInt32, observedValue: UInt32
     ) {
         if DebugModeManager.isLoggingEnabled() {
-            print("[UIDValidity] CHANGED accountId=\(accountId.prefix(8)) folder=\(folderPath) stored=\(storedValue) observed=\(observedValue) — triggering reset reaction")
+            BackgroundSyncLogger.logDebug("[UIDValidity] CHANGED accountId=\(accountId.prefix(8)) folder=\(folderPath) stored=\(storedValue) observed=\(observedValue) — triggering reset reaction")
         }
         Task {
             await AccountManager.shared.runUidValidityResetReaction(accountId: accountId, folderPath: folderPath)
@@ -372,14 +372,14 @@ actor AccountManager {
     func registerDemoProviders(email: any EmailProvider, calendar: any CalendarProvider, accountId: String) {
         providers[accountId] = email
         calendarProviders[accountId] = calendar
-        print("[AccountManager] Registered demo providers for accountId=\(accountId)")
+        BackgroundSyncLogger.logDebug("[AccountManager] Registered demo providers for accountId=\(accountId)")
     }
 
     /// Remove the demo providers. Called by `DemoModeService.exit()`.
     func unregisterDemoProviders(accountId: String) {
         providers.removeValue(forKey: accountId)
         calendarProviders.removeValue(forKey: accountId)
-        print("[AccountManager] Unregistered demo providers for accountId=\(accountId)")
+        BackgroundSyncLogger.logDebug("[AccountManager] Unregistered demo providers for accountId=\(accountId)")
     }
 
     // MARK: - Test-only provider injection
@@ -1405,10 +1405,10 @@ actor AccountManager {
         } catch {
             BootProfiler.mark("connectAccount[\(acctTag)]: provider.connect() FAILED in \(Int((CFAbsoluteTimeGetCurrent() - connectT0) * 1000))ms (auth=\(isAuthError(error)))")
             if isAuthError(error) {
-                print("[AccountManager] Auth failed for \(account.emailAddress): \(error)")
+                BackgroundSyncLogger.logDebug("[AccountManager] Auth failed for \(account.emailAddress): \(error)")
                 authFailedAccounts.insert(account.id)
             } else {
-                print("[AccountManager] Connect failed for \(account.emailAddress) (non-auth): \(error)")
+                BackgroundSyncLogger.logDebug("[AccountManager] Connect failed for \(account.emailAddress) (non-auth): \(error)")
             }
             throw error
         }
@@ -1457,7 +1457,7 @@ actor AccountManager {
         // no longer written and no longer read.
 
         guard let password = KeychainHelper.loadString(key: "caldav_password_\(config.id)") else {
-            print("[AccountManager] No CalDAV password in Keychain for config \(config.id)")
+            BackgroundSyncLogger.logDebug("[AccountManager] No CalDAV password in Keychain for config \(config.id)")
             return nil
         }
 

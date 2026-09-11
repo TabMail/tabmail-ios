@@ -304,7 +304,7 @@ struct QueueStorage<Item: Hashable> {
         retryCount.removeAll()
         recentlyCompleted.removeAll()
         if count > 0 {
-            print("[QueueStorage] Cancelled \(count) in-flight items")
+            BackgroundSyncLogger.logDebug("[QueueStorage] Cancelled \(count) in-flight items")
         }
     }
 
@@ -339,7 +339,7 @@ func retryWrite<T: Sendable>(
         do {
             return try await dbPool.write(operation)
         } catch {
-            print("[\(label)] Write failed (attempt \(attempt)/\(maxAttempts)): \(error)")
+            BackgroundSyncLogger.logDebug("[\(label)] Write failed (attempt \(attempt)/\(maxAttempts)): \(error)")
             if attempt < maxAttempts {
                 try? await Task.sleep(for: retryDelay)
             } else {

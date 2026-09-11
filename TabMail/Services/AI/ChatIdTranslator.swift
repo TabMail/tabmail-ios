@@ -195,10 +195,10 @@ actor ChatIdTranslator {
                 nextId = max(nextId, numericId + 1)
             }
             if !idMap.isEmpty {
-                print("[ChatIdTranslator] Loaded \(idMap.count) persisted ID mappings, nextId=\(nextId)")
+                BackgroundSyncLogger.logDebug("[ChatIdTranslator] Loaded \(idMap.count) persisted ID mappings, nextId=\(nextId)")
             }
         } catch {
-            print("[ChatIdTranslator] Failed to load persisted ID mappings: \(error)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] Failed to load persisted ID mappings: \(error)")
         }
     }
 
@@ -212,7 +212,7 @@ actor ChatIdTranslator {
                 )
             }
         } catch {
-            print("[ChatIdTranslator] Failed to persist mapping \(numericId) → \(realId): \(error)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] Failed to persist mapping \(numericId) → \(realId): \(error)")
         }
     }
 
@@ -228,7 +228,7 @@ actor ChatIdTranslator {
                 )
             }
         } catch {
-            print("[ChatIdTranslator] Failed to delete \(numericIds.count) persisted mappings: \(error)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] Failed to delete \(numericIds.count) persisted mappings: \(error)")
         }
     }
 
@@ -247,7 +247,7 @@ actor ChatIdTranslator {
         // TB parity: if realId is already numeric, return as-is (no mapping created).
         // This should never happen — tools should always output real IDs.
         if let asInt = Int(realId), realId == String(asInt) {
-            print("[ChatIdTranslator] WARNING: toNumericId called with numeric value '\(realId)' — returning as-is (bug upstream?)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] WARNING: toNumericId called with numeric value '\(realId)' — returning as-is (bug upstream?)")
             return asInt
         }
 
@@ -265,7 +265,7 @@ actor ChatIdTranslator {
         let numericId: Int
         if let recycled = freeIds.popLast() {
             numericId = recycled
-            print("[ChatIdTranslator] Reused free ID \(numericId) for: \(realId)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] Reused free ID \(numericId) for: \(realId)")
         } else {
             numericId = nextId
             nextId += 1
@@ -296,7 +296,7 @@ actor ChatIdTranslator {
         // Collect unreferenced IDs, sorted ascending (FIFO: oldest allocated first)
         let orphans = idMap.keys.filter { (refCounts[$0] ?? 0) == 0 }.sorted()
         guard !orphans.isEmpty else {
-            print("[ChatIdTranslator] sweepOrphans: no orphans to evict (all \(idMap.count) IDs are referenced)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] sweepOrphans: no orphans to evict (all \(idMap.count) IDs are referenced)")
             return
         }
 
@@ -320,7 +320,7 @@ actor ChatIdTranslator {
             deletePersistedMappings(orphans)
             deletePersistedEventCalendars(evictedRealIds)
         }
-        print("[ChatIdTranslator] sweepOrphans: evicted \(evicted) orphan IDs, map now \(idMap.count), freeIds pool \(freeIds.count)")
+        BackgroundSyncLogger.logDebug("[ChatIdTranslator] sweepOrphans: evicted \(evicted) orphan IDs, map now \(idMap.count), freeIds pool \(freeIds.count)")
     }
 
     // MARK: - Reference Counting (matches TB's registerTurnRefs / unregisterTurnRefs / collectTurnRefs)
@@ -366,7 +366,7 @@ actor ChatIdTranslator {
         for id in refs {
             refCounts[id, default: 0] += 1
         }
-        print("[ChatIdTranslator] Registered \(refs.count) refs: \(refs)")
+        BackgroundSyncLogger.logDebug("[ChatIdTranslator] Registered \(refs.count) refs: \(refs)")
     }
 
     /// Unregister refs for a removed/evicted turn. Decrements refCounts,
@@ -390,7 +390,7 @@ actor ChatIdTranslator {
         }
         if !freedIds.isEmpty {
             deletePersistedMappings(freedIds)
-            print("[ChatIdTranslator] unregisterTurnRefs: freed \(freedIds.count) IDs, freeIds pool now \(freeIds.count)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] unregisterTurnRefs: freed \(freedIds.count) IDs, freeIds pool now \(freeIds.count)")
         }
     }
 
@@ -417,7 +417,7 @@ actor ChatIdTranslator {
         }
         if totalFreed > 0 {
             deletePersistedMappings(freedIds)
-            print("[ChatIdTranslator] cleanupEvictedIds: freed \(totalFreed) IDs from \(evictedTurns.count) evicted turns, freeIds pool now \(freeIds.count)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] cleanupEvictedIds: freed \(totalFreed) IDs from \(evictedTurns.count) evicted turns, freeIds pool now \(freeIds.count)")
         }
     }
 
@@ -458,7 +458,7 @@ actor ChatIdTranslator {
             deletePersistedMappings(orphanIds)
         }
         if !idMap.isEmpty || orphanCount > 0 {
-            print("[ChatIdTranslator] buildRefCounts: \(newRefCounts.count) IDs referenced, \(orphanCount) orphans freed, freeIds pool: \(freeIds.count)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] buildRefCounts: \(newRefCounts.count) IDs referenced, \(orphanCount) orphans freed, freeIds pool: \(freeIds.count)")
         }
     }
 
@@ -541,7 +541,7 @@ actor ChatIdTranslator {
         }
 
         let remappedCount = remapTable.filter { $0.key != $0.value }.count
-        print("[ChatIdTranslator] mergeFromIsolated: merged \(isolatedMap.count) entries, \(remappedCount) remapped, map now has \(idMap.count) entries")
+        BackgroundSyncLogger.logDebug("[ChatIdTranslator] mergeFromIsolated: merged \(isolatedMap.count) entries, \(remappedCount) remapped, map now has \(idMap.count) entries")
         return result
     }
 
@@ -562,7 +562,7 @@ actor ChatIdTranslator {
         reverseMap[newRealId] = numericId
         persistMapping(numericId: numericId, realId: newRealId)
         lastAccessed = Date()
-        print("[ChatIdTranslator] Remapped id=\(numericId): \(oldRealId) → \(newRealId)")
+        BackgroundSyncLogger.logDebug("[ChatIdTranslator] Remapped id=\(numericId): \(oldRealId) → \(newRealId)")
         return 1
     }
 
@@ -631,7 +631,7 @@ actor ChatIdTranslator {
         displayCache.removeAll()
         deletePersistedMappings(Array(matches.keys))
         if DebugModeManager.isLoggingEnabled() {
-            print("[ChatIdTranslator] Purged \(matches.count) mapping(s) for folder \(accountId.prefix(8)):\(folderPath)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] Purged \(matches.count) mapping(s) for folder \(accountId.prefix(8)):\(folderPath)")
         }
     }
 
@@ -710,7 +710,7 @@ actor ChatIdTranslator {
             if fieldName == "event_id" || fieldName == "new_series_event_id" {
                 translatedEventIds[realId] = numericId
             }
-            print("[AIChatDebug] processToolOutputForLLM: \(fieldName) '\(realId.prefix(30))...' → \(numericId)")
+            BackgroundSyncLogger.logDebug("[AIChatDebug] processToolOutputForLLM: \(fieldName) '\(realId.prefix(30))...' → \(numericId)")
             result.replaceSubrange(match.range, with: "\(fieldName): \(numericId)")
         }
 
@@ -718,7 +718,7 @@ actor ChatIdTranslator {
         for (realId, numericId) in translatedEventIds {
             if let title = eventTitles[realId], !title.isEmpty {
                 eventTitleCache[numericId] = title
-                print("[AIChatDebug] Cached event title id=\(numericId): '\(title.prefix(40))'")
+                BackgroundSyncLogger.logDebug("[AIChatDebug] Cached event title id=\(numericId): '\(title.prefix(40))'")
             }
         }
 
@@ -812,7 +812,7 @@ actor ChatIdTranslator {
         if let cached = displayCache[text] { return cached }
         ensureLoadedFromDB()
 
-        print("[AIChatDebug] processResponseForDisplay: idMap has \(idMap.count) entries, nextId=\(nextId)")
+        BackgroundSyncLogger.logDebug("[AIChatDebug] processResponseForDisplay: idMap has \(idMap.count) entries, nextId=\(nextId)")
 
         var result = text
 
@@ -820,14 +820,14 @@ actor ChatIdTranslator {
         // Also handle backtick-wrapped variants
         let entityPattern = /`?\[(Email|Contact|Event|Template)\]\((\d+)\)`?/
         let matches = Array(result.matches(of: entityPattern))
-        print("[AIChatDebug] Entity pattern: \(matches.count) matches")
+        BackgroundSyncLogger.logDebug("[AIChatDebug] Entity pattern: \(matches.count) matches")
 
         // Process in reverse order to preserve indices
         for match in matches.reversed() {
             let entityType = String(match.1)
             guard let numericId = Int(match.2) else { continue }
             guard idMap[numericId] != nil else {
-                print("[AIChatDebug]   skip \(entityType) id=\(numericId) — NOT in idMap")
+                BackgroundSyncLogger.logDebug("[AIChatDebug]   skip \(entityType) id=\(numericId) — NOT in idMap")
                 continue
             }
 
@@ -854,7 +854,7 @@ actor ChatIdTranslator {
             default:
                 continue
             }
-            print("[AIChatDebug]   replacing \(entityType) id=\(numericId) → '\(replacement)'")
+            BackgroundSyncLogger.logDebug("[AIChatDebug]   replacing \(entityType) id=\(numericId) → '\(replacement)'")
             result.replaceSubrange(match.range, with: replacement)
         }
 
@@ -869,14 +869,14 @@ actor ChatIdTranslator {
         for pattern in shorthandPatterns {
             let shorthandMatches = Array(result.matches(of: pattern))
             if !shorthandMatches.isEmpty {
-                print("[AIChatDebug] Shorthand pattern matched \(shorthandMatches.count) times")
+                BackgroundSyncLogger.logDebug("[AIChatDebug] Shorthand pattern matched \(shorthandMatches.count) times")
             }
             for match in shorthandMatches.reversed() {
                 guard let numericId = Int(match.1), idMap[numericId] != nil else { continue }
                 let subject = resolveEmailSubject(numericId)
                 let truncated = truncateSubject(subject ?? "Email")
                 let replacement = "[📧 \(truncated)](tabmail://email/\(numericId))"
-                print("[AIChatDebug]   shorthand replacing id=\(numericId) → '\(replacement)'")
+                BackgroundSyncLogger.logDebug("[AIChatDebug]   shorthand replacing id=\(numericId) → '\(replacement)'")
                 result.replaceSubrange(match.range, with: replacement)
             }
         }
@@ -998,7 +998,7 @@ actor ChatIdTranslator {
             eventCalendarCache[compoundKey] = info
             persistEventCalendar(compoundKey: compoundKey, info: info)
         }
-        print("[ChatIdTranslator] cacheEventDetail: key='\(compoundKey.prefix(50))' title='\(title.prefix(30))' (detail=\(eventDetailCache.count), cal=\(eventCalendarCache.count))")
+        BackgroundSyncLogger.logDebug("[ChatIdTranslator] cacheEventDetail: key='\(compoundKey.prefix(50))' title='\(title.prefix(30))' (detail=\(eventDetailCache.count), cal=\(eventCalendarCache.count))")
     }
 
     /// After a calendar create succeeds on the server, repoint the numericId
@@ -1033,7 +1033,7 @@ actor ChatIdTranslator {
             deletePersistedEventCalendars([oldKey])
             persistEventCalendar(compoundKey: newKey, info: info)
         }
-        print("[ChatIdTranslator] remapEventRealId: '\(oldKey.prefix(40))' → '\(newKey.prefix(40))'")
+        BackgroundSyncLogger.logDebug("[ChatIdTranslator] remapEventRealId: '\(oldKey.prefix(40))' → '\(newKey.prefix(40))'")
     }
 
     /// Evict cached event detail (e.g., after deletion).
@@ -1042,7 +1042,7 @@ actor ChatIdTranslator {
         eventDetailCache.removeValue(forKey: realId)
         eventCalendarCache.removeValue(forKey: realId)
         deletePersistedEventCalendars([realId])
-        print("[ChatIdTranslator] evictEventDetail: realId='\(realId.prefix(40))' (detail=\(eventDetailCache.count), cal=\(eventCalendarCache.count))")
+        BackgroundSyncLogger.logDebug("[ChatIdTranslator] evictEventDetail: realId='\(realId.prefix(40))' (detail=\(eventDetailCache.count), cal=\(eventCalendarCache.count))")
     }
 
     /// Fetch full event detail for a numeric ID (used for pill popover).
@@ -1057,7 +1057,7 @@ actor ChatIdTranslator {
     func resolveEventDetail(_ numericId: Int) async -> EventPillDetail? {
         ensureLoadedFromDB()
         guard let compoundId = idMap[numericId] else {
-            print("[ChatIdTranslator] resolveEventDetail: numericId=\(numericId) NOT in idMap (idMap has \(idMap.count) entries)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] resolveEventDetail: numericId=\(numericId) NOT in idMap (idMap has \(idMap.count) entries)")
             return nil
         }
         if let cached = eventDetailCache[compoundId] {
@@ -1066,12 +1066,12 @@ actor ChatIdTranslator {
         // In-memory miss: re-fetch live from the provider so the popover always
         // reflects current event state — the same pattern as the other pills.
         guard let info = resolveEventCalendarInfoLocked(compoundId: compoundId) else {
-            print("[ChatIdTranslator] resolveEventDetail: no calendar provenance for compoundId='\(compoundId.prefix(50))'")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] resolveEventDetail: no calendar provenance for compoundId='\(compoundId.prefix(50))'")
             return nil
         }
         guard let parts = CompoundEventId.split(compoundId) else { return nil }
         guard let provider = await AccountManager.shared.calendarProviders[info.accountId] else {
-            print("[ChatIdTranslator] resolveEventDetail: provider unavailable for accountId='\(info.accountId.prefix(20))'")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] resolveEventDetail: provider unavailable for accountId='\(info.accountId.prefix(20))'")
             return nil
         }
         do {
@@ -1098,10 +1098,10 @@ actor ChatIdTranslator {
             // Cache in-memory only — no GRDB write — so a subsequent edit from
             // another client invalidates after the next app launch.
             eventDetailCache[compoundId] = entry
-            print("[ChatIdTranslator] resolveEventDetail: live-fetched compoundId='\(compoundId.prefix(50))' from provider")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] resolveEventDetail: live-fetched compoundId='\(compoundId.prefix(50))' from provider")
             return makeEventPillDetail(numericId: numericId, compoundId: compoundId, entry: entry)
         } catch {
-            print("[ChatIdTranslator] resolveEventDetail: provider.getEvent failed for compoundId='\(compoundId.prefix(50))': \(error)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] resolveEventDetail: provider.getEvent failed for compoundId='\(compoundId.prefix(50))': \(error)")
             return nil
         }
     }
@@ -1162,7 +1162,7 @@ actor ChatIdTranslator {
                 )
             }
         } catch {
-            print("[ChatIdTranslator] Failed to persist event calendar \(compoundKey.prefix(40)): \(error)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] Failed to persist event calendar \(compoundKey.prefix(40)): \(error)")
         }
     }
 
@@ -1179,7 +1179,7 @@ actor ChatIdTranslator {
                 return EventCalendarInfo(accountId: accountId, calendarId: calendarId, calendarName: calendarName)
             }
         } catch {
-            print("[ChatIdTranslator] Failed to load event calendar \(compoundKey.prefix(40)) from GRDB: \(error)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] Failed to load event calendar \(compoundKey.prefix(40)) from GRDB: \(error)")
             return nil
         }
     }
@@ -1195,7 +1195,7 @@ actor ChatIdTranslator {
                 )
             }
         } catch {
-            print("[ChatIdTranslator] Failed to delete \(compoundKeys.count) persisted event calendars: \(error)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] Failed to delete \(compoundKeys.count) persisted event calendars: \(error)")
         }
     }
 
@@ -1245,9 +1245,9 @@ actor ChatIdTranslator {
                 try db.execute(sql: "DELETE FROM chatEventCalendar")
             }
         } catch {
-            print("[ChatIdTranslator] Failed to clear persisted ID mappings: \(error)")
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] Failed to clear persisted ID mappings: \(error)")
         }
-        print("[ChatIdTranslator] Cleared all ID mappings")
+        BackgroundSyncLogger.logDebug("[ChatIdTranslator] Cleared all ID mappings")
     }
 
     // MARK: - Debug Stats (matches TB's getTranslationStats)

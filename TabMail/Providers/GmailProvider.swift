@@ -405,7 +405,7 @@ actor GmailProvider: EmailProvider {
             if case ProviderError.authenticationFailed = error {
                 return BackfillResult(id: id, header: nil, htmlBody: nil, textBody: nil, error: error)
             }
-            if DebugModeManager.isLoggingEnabled() { print("[Gmail] Failed to fetch backfill \(id): \(error)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] Failed to fetch backfill \(id): \(error)") }
             return BackfillResult(id: id, header: nil, htmlBody: nil, textBody: nil, error: error)
         }
 
@@ -418,7 +418,7 @@ actor GmailProvider: EmailProvider {
             htmlBody = try await extractBodyWithFallback(from: msg, mimeType: "text/html")
             textBody = try await extractBodyWithFallback(from: msg, mimeType: "text/plain")
         } catch {
-            if DebugModeManager.isLoggingEnabled() { print("[Gmail] Body extraction failed for \(id): \(error) — header preserved") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] Body extraction failed for \(id): \(error) — header preserved") }
         }
 
         return BackfillResult(id: id, header: header, htmlBody: htmlBody, textBody: textBody, error: nil)
@@ -588,13 +588,13 @@ actor GmailProvider: EmailProvider {
             try await modifyMessage(
                 id: id, addLabelIds: addLabelIds, removeLabelIds: removeLabelIds)
             if let moveTraceLabel, DebugModeManager.isLoggingEnabled() {
-                print("[MoveTrace] \(moveTraceLabel) — modifyMessage completed for \(id)")
+                BackgroundSyncLogger.logDebug("[MoveTrace] \(moveTraceLabel) — modifyMessage completed for \(id)")
             }
         } catch {
             guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
             absent.append(id)
             if DebugModeManager.isLoggingEnabled() {
-                print("[Gmail] modifyMessage \(id): the server reports THIS message gone — the member is dispositioned and the operation narrows to the members still owed")
+                BackgroundSyncLogger.logDebug("[Gmail] modifyMessage \(id): the server reports THIS message gone — the member is dispositioned and the operation narrows to the members still owed")
             }
         }
         // Silence is "every member, mutated": the only outcome the `Void`-returning
@@ -670,10 +670,10 @@ actor GmailProvider: EmailProvider {
         // No-op: both source and destination resolve to no label changes (e.g., move from
         // All Mail to All Mail). Skip the API call — Gmail rejects empty modify bodies.
         guard !remove.isEmpty || !add.isEmpty else {
-            if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] GmailProvider.move — no-op (no label changes): ids=\(ids) source=\(source) dest=\(destination)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[MoveTrace] GmailProvider.move — no-op (no label changes): ids=\(ids) source=\(source) dest=\(destination)") }
             return
         }
-        if DebugModeManager.isLoggingEnabled() { print("[MoveTrace] GmailProvider.move — ids=\(ids) addLabels=\(add) removeLabels=\(remove)") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[MoveTrace] GmailProvider.move — ids=\(ids) addLabels=\(add) removeLabels=\(remove)") }
         // A Gmail move is a label mutation, so it goes through the same
         // per-member boundary as the setters: one gone member does not strand
         // the rest, and the id is stable across it (no address churn to re-learn).
@@ -750,7 +750,7 @@ actor GmailProvider: EmailProvider {
         // content is correct and any server-side staleness is on Gmail's side.
         if DebugModeManager.isLoggingEnabled() {
             let bodyPreview = String(draft.body.prefix(120))
-            print("[Gmail] saveDraft REQUEST: existingId=\(existingDraftId ?? "nil") subject=\(String(draft.subject.prefix(60))) to=\(draft.to) bodyLen=\(draft.body.count) bodyPrefix=\(bodyPreview) rawB64Len=\(base64.count)")
+            BackgroundSyncLogger.logDebug("[Gmail] saveDraft REQUEST: existingId=\(existingDraftId ?? "nil") subject=\(String(draft.subject.prefix(60))) to=\(draft.to) bodyLen=\(draft.body.count) bodyPrefix=\(bodyPreview) rawB64Len=\(base64.count)")
         }
 
         if let existingId = existingDraftId {
@@ -762,10 +762,10 @@ actor GmailProvider: EmailProvider {
                 let draftId = json["id"] as? String ?? existingId
                 let msgId = (json["message"] as? [String: Any])?["id"] as? String
                 let msgSnippet = (json["message"] as? [String: Any])?["snippet"] as? String ?? "<none>"
-                if DebugModeManager.isLoggingEnabled() { print("[Gmail] saveDraft UPDATE RESPONSE: draftId=\(draftId) messageId=\(msgId ?? "nil") responseSnippet=\(String(msgSnippet.prefix(120)))") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] saveDraft UPDATE RESPONSE: draftId=\(draftId) messageId=\(msgId ?? "nil") responseSnippet=\(String(msgSnippet.prefix(120)))") }
                 return .created(.gmail(resourceId: draftId, containedMessageId: msgId))
             }
-            if DebugModeManager.isLoggingEnabled() { print("[Gmail] saveDraft UPDATE RESPONSE: failed to parse JSON — returning existingId=\(existingId)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] saveDraft UPDATE RESPONSE: failed to parse JSON — returning existingId=\(existingId)") }
             return .created(.gmail(resourceId: existingId, containedMessageId: nil))
         } else {
             // Create new draft
@@ -777,7 +777,7 @@ actor GmailProvider: EmailProvider {
             }
             let msgId = (json["message"] as? [String: Any])?["id"] as? String
             let msgSnippet = (json["message"] as? [String: Any])?["snippet"] as? String ?? "<none>"
-            if DebugModeManager.isLoggingEnabled() { print("[Gmail] saveDraft CREATE RESPONSE: draftId=\(draftId) messageId=\(msgId ?? "nil") responseSnippet=\(String(msgSnippet.prefix(120)))") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] saveDraft CREATE RESPONSE: draftId=\(draftId) messageId=\(msgId ?? "nil") responseSnippet=\(String(msgSnippet.prefix(120)))") }
             return .created(.gmail(resourceId: draftId, containedMessageId: msgId))
         }
     }
@@ -916,7 +916,7 @@ actor GmailProvider: EmailProvider {
         )
         if trashResult.data != nil { return }
         if trashResult.statusCode == 404 {
-            if DebugModeManager.isLoggingEnabled() { print("[Gmail] deleteDraft: \(messageId) already deleted") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] deleteDraft: \(messageId) already deleted") }
             return
         }
         if trashResult.statusCode == 401 {
@@ -981,7 +981,7 @@ actor GmailProvider: EmailProvider {
             // Safety cap: stop pagination if we've accumulated enough IDs.
             // Remaining messages are picked up on next backfill cycle via date windowing.
             if allIds.count >= maxIds {
-                if DebugModeManager.isLoggingEnabled() { print("[Gmail] WARNING: listBackfillMessageIds hit \(maxIds) ID cap — stopping pagination. This folder has an unusually large number of messages.") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] WARNING: listBackfillMessageIds hit \(maxIds) ID cap — stopping pagination. This folder has an unusually large number of messages.") }
                 break
             }
 
@@ -1038,7 +1038,7 @@ actor GmailProvider: EmailProvider {
                                     return try await self.request(path: "/messages/\(id)\(metadataPath)")
                                 } catch {
                                     if case ProviderError.authenticationFailed = error { throw error }
-                                    if DebugModeManager.isLoggingEnabled() { print("[Gmail] Failed to fetch header \(id): \(error)") }
+                                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] Failed to fetch header \(id): \(error)") }
                                     return nil
                                 }
                             }
@@ -1054,7 +1054,7 @@ actor GmailProvider: EmailProvider {
                                     return try await self.request(path: "/messages/\(id)\(metadataPath)")
                                 } catch {
                                     if case ProviderError.authenticationFailed = error { throw error }
-                                    if DebugModeManager.isLoggingEnabled() { print("[Gmail] Failed to fetch header \(id): \(error)") }
+                                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] Failed to fetch header \(id): \(error)") }
                                     return nil
                                 }
                             }
@@ -1199,7 +1199,7 @@ actor GmailProvider: EmailProvider {
             throw ProviderError.networkError(underlying: error)
         }
         guard let delta else {
-            if DebugModeManager.isLoggingEnabled() { print("[Gmail] History expired (historyId: \(historyId)) — need full sync") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] History expired (historyId: \(historyId)) — need full sync") }
             BackgroundSyncLogger.log("gmail.fetchHistory: 404 history expired")
             return nil
         }
@@ -1212,7 +1212,7 @@ actor GmailProvider: EmailProvider {
         let labelsAdded = delta.labelsAdded.map { HistoryLabelChange(messageId: $0.providerMessageId, labelIds: $0.labelIds) }
         let labelsRemoved = delta.labelsRemoved.map { HistoryLabelChange(messageId: $0.providerMessageId, labelIds: $0.labelIds) }
 
-        if DebugModeManager.isLoggingEnabled() { print("[Gmail] History: +\(added.count) added, -\(deleted.count) deleted, \(labelsAdded.count) label adds, \(labelsRemoved.count) label removes") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] History: +\(added.count) added, -\(deleted.count) deleted, \(labelsAdded.count) label adds, \(labelsRemoved.count) label removes") }
 
         return HistoryResponse(
             newHistoryId: delta.cursor,
@@ -1250,7 +1250,7 @@ actor GmailProvider: EmailProvider {
                 // Normal for Gmail: history reports the messageId but the message
                 // is gone by fetch time. Skipping lets historyId advance instead
                 // of looping forever on the same 404.
-                if DebugModeManager.isLoggingEnabled() { print("[Gmail] fetchMessageDetails: skipping \(id) — \(error)") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] fetchMessageDetails: skipping \(id) — \(error)") }
             }
         }
         return results
@@ -1294,7 +1294,7 @@ actor GmailProvider: EmailProvider {
         // building a request — Gmail returns HTTP 400 "Invalid label" otherwise.
         // Mirrors the syntheticPlaceholderId guard in fetchMessagesBatch.
         if path.contains(GmailProvider.archivePath) {
-            if DebugModeManager.isLoggingEnabled() { print("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)") }
             throw ProviderError.syntheticFolderPath(path)
         }
         let url = baseURL + path
@@ -1349,7 +1349,7 @@ actor GmailProvider: EmailProvider {
         body: Data?
     ) async throws -> Data {
         if path.contains(GmailProvider.archivePath) {
-            if DebugModeManager.isLoggingEnabled() { print("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)") }
             throw ProviderError.syntheticFolderPath(path)
         }
         let url = baseURL + path
@@ -1581,7 +1581,7 @@ actor GmailProvider: EmailProvider {
                 // invalid — it can never resolve on retry. Normal return; the
                 // queue treats this as a completed no-op.
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Gmail] modifyMessage \(id): invalid-id 400 confirmed stale — treating as no-op")
+                    BackgroundSyncLogger.logDebug("[Gmail] modifyMessage \(id): invalid-id 400 confirmed stale — treating as no-op")
                 }
                 return
             }
@@ -1608,7 +1608,7 @@ actor GmailProvider: EmailProvider {
         guard let encoded = try? JSONEncoder().encode(msg),
               let json = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any],
               let metadata = GmailParse.parseMessage(json) else {
-            if DebugModeManager.isLoggingEnabled() { print("[Gmail] Missing/invalid internalDate for message \(msg.id) — treating as fetch failure, will retry") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] Missing/invalid internalDate for message \(msg.id) — treating as fetch failure, will retry") }
             return nil
         }
 
@@ -1816,13 +1816,13 @@ actor GmailProvider: EmailProvider {
                         // parameter and `print` is a line-oriented sink, so it is
                         // escaped: see `DebugModeManager.escapedForLogLine`.
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[Gmail] Failed to parse \(DebugModeManager.escapedForLogLine(part.filename ?? "?.eml")) as RFC 822 — rendering as plain attachment")
+                            BackgroundSyncLogger.logDebug("[Gmail] Failed to parse \(DebugModeManager.escapedForLogLine(part.filename ?? "?.eml")) as RFC 822 — rendering as plain attachment")
                         }
                     }
                 } catch {
                     if DebugModeManager.isLoggingEnabled() {
                         // `error` can carry a server-supplied string as well.
-                        print("[Gmail] Failed to fetch bytes for \(DebugModeManager.escapedForLogLine(part.filename ?? "?")): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                        BackgroundSyncLogger.logDebug("[Gmail] Failed to fetch bytes for \(DebugModeManager.escapedForLogLine(part.filename ?? "?")): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
                     }
                 }
                 continue
@@ -1959,7 +1959,7 @@ actor GmailProvider: EmailProvider {
                     // debug-gated per rule 12, sender-authored `filename` and the
                     // error description both escaped for a line-oriented sink.
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[Gmail] Failed to list nested attachments in \(DebugModeManager.escapedForLogLine(part.filename ?? "?.eml")): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                        BackgroundSyncLogger.logDebug("[Gmail] Failed to list nested attachments in \(DebugModeManager.escapedForLogLine(part.filename ?? "?.eml")): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
                     }
                 }
             }
@@ -2058,7 +2058,7 @@ actor GmailProvider: EmailProvider {
                 // NOT in the brief this fix came from; found by the source scan
                 // in `RenderPathLogSinkTests`, which is the point of having it.
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Gmail] Failed to fetch inline image \(DebugModeManager.escapedForLogLine(item.contentId)): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                    BackgroundSyncLogger.logDebug("[Gmail] Failed to fetch inline image \(DebugModeManager.escapedForLogLine(item.contentId)): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
                 }
             }
         }

@@ -97,7 +97,7 @@ actor DemoTokenManager {
               !clientSecret.isEmpty,
               clientSecret != "demo-client-secret-hex-32-bytes"
         else {
-            print("[DemoToken] DEMO_CLIENT_SECRET missing or unset in Info.plist — rebuild after editing Secrets.xcconfig")
+            BackgroundSyncLogger.logDebug("[DemoToken] DEMO_CLIENT_SECRET missing or unset in Info.plist — rebuild after editing Secrets.xcconfig")
             return .configMissing
         }
         request.setValue(clientSecret, forHTTPHeaderField: "X-Demo-Client-Secret")
@@ -120,7 +120,7 @@ actor DemoTokenManager {
                 if let encoded = try? JSONEncoder().encode(session) {
                     try? KeychainHelper.save(encoded, for: sessionKey)
                 }
-                print("[DemoToken] Minted demo JWT sub=\(body.sub.prefix(8)) exp=\(body.expires_at)")
+                BackgroundSyncLogger.logDebug("[DemoToken] Minted demo JWT sub=\(body.sub.prefix(8)) exp=\(body.expires_at)")
                 return .success(session.accessToken)
             case 429:
                 return .transientFailure("rate_limited")

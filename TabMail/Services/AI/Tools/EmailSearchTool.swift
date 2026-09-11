@@ -43,7 +43,7 @@ struct EmailSearchTool: AgentTool, Sendable {
 
         let fromStr = fromDate.map { ToolFormatters.formatDate($0) } ?? "-"
         let toStr = toDate.map { ToolFormatters.formatDate($0) } ?? "-"
-        print("[EmailSearchTool] email_search: query='\(String(query.prefix(80)))' from_date='\(fromStr)' to_date='\(toStr)' page_index=\(pageIndex)")
+        BackgroundSyncLogger.logDebug("[EmailSearchTool] email_search: query='\(String(query.prefix(80)))' from_date='\(fromStr)' to_date='\(toStr)' page_index=\(pageIndex)")
 
         // Convert date filters to epoch ms for search layer.
         // When to_date is a date-only string (YYYY-MM-DD), extend to end-of-day
@@ -62,7 +62,7 @@ struct EmailSearchTool: AgentTool, Sendable {
         var hits = try await SearchIndex.shared.search(
             query: query, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: Config.maxResults)
         let searchMs = Int((CFAbsoluteTimeGetCurrent() - searchStart) * 1000)
-        print("[EmailSearchTool] email_search: FTS returned \(hits.count) items in \(searchMs)ms")
+        BackgroundSyncLogger.logDebug("[EmailSearchTool] email_search: FTS returned \(hits.count) items in \(searchMs)ms")
 
         // Handle sort option
         let sort: String
@@ -82,12 +82,12 @@ struct EmailSearchTool: AgentTool, Sendable {
         }
 
         let total = hits.count
-        print("[EmailSearchTool] email_search: \(total) items total (sort=\(sort))")
+        BackgroundSyncLogger.logDebug("[EmailSearchTool] email_search: \(total) items total (sort=\(sort))")
 
         // Log top results for debugging
         for (i, hit) in hits.prefix(10).enumerated() {
             let date = Date(timeIntervalSince1970: Double(hit.dateMs) / 1000)
-            print("[EmailSearchTool]   [\(i)] rank=\(String(format: "%.4f", hit.rank)) headerId=\(hit.contentKey.rawValue.prefix(40)) date=\(ToolFormatters.formatDate(date)) snippet=\(hit.snippet.prefix(60))")
+            BackgroundSyncLogger.logDebug("[EmailSearchTool]   [\(i)] rank=\(String(format: "%.4f", hit.rank)) headerId=\(hit.contentKey.rawValue.prefix(40)) date=\(ToolFormatters.formatDate(date)) snippet=\(hit.snippet.prefix(60))")
         }
 
         if total == 0 {
@@ -148,7 +148,7 @@ struct EmailSearchTool: AgentTool, Sendable {
             }
 
             blocks.append(lines.joined(separator: "\n\n"))
-            print("[EmailSearchTool] registered id=\(numericId) → headerId=...\(ftsKeyAsHeaderId.suffix(30))")
+            BackgroundSyncLogger.logDebug("[EmailSearchTool] registered id=\(numericId) → headerId=...\(ftsKeyAsHeaderId.suffix(30))")
         }
 
         let body = blocks.joined(separator: "\n\n")
@@ -165,7 +165,7 @@ struct EmailSearchTool: AgentTool, Sendable {
             resultDict["comment"] = "There are more pages of results. To get the next page, call this tool again with page_index: \(safePage + 2)"
         }
 
-        print("[EmailSearchTool] Returning page \(safePage + 1) of \(totalPages) (pageCount=\(slice.count) totalItems=\(total))")
+        BackgroundSyncLogger.logDebug("[EmailSearchTool] Returning page \(safePage + 1) of \(totalPages) (pageCount=\(slice.count) totalItems=\(total))")
 
         return ToolJSON.string(from: resultDict)
     }

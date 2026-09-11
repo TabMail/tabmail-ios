@@ -28,7 +28,7 @@ extension AIService {
         relatedCc: String
     ) async throws -> String? {
         guard !disableLLMCalls else {
-            print("[AIService] generateReply: SKIP — LLM calls disabled")
+            BackgroundSyncLogger.logDebug("[AIService] generateReply: SKIP — LLM calls disabled")
             return nil
         }
 
@@ -46,24 +46,24 @@ extension AIService {
 
         #if DEBUG
         // Log all prompt variables for debugging (full text, not truncated)
-        print("[AIService] generateReply: === PROMPT VARS ===")
-        print("[AIService]   mode=precache_reply")
-        print("[AIService]   user_name=\(userName)")
-        print("[AIService]   user_composition_prompt=\(compositionPrompt)")
-        print("[AIService]   recipients_formatted=\(recipientsFormatted)")
-        print("[AIService]   current_subject=\(replySubject)")
-        print("[AIService]   current_body=(empty)")
-        print("[AIService]   user_request=Write a reply to this email.")
-        print("[AIService]   user_kb_content=\(kbText)")
-        print("[AIService]   current_time=\(currentTime)")
-        print("[AIService]   message=\(splitBody.message.prefix(200))")
-        print("[AIService]   quotes_section=\(splitBody.quotes.prefix(200))")
-        print("[AIService]   related_date=\(relatedDate)")
-        print("[AIService]   related_subject=\(relatedSubject)")
-        print("[AIService]   related_from=\(relatedFrom)")
-        print("[AIService]   related_to=\(relatedTo)")
-        print("[AIService]   related_cc=\(relatedCc.isEmpty ? "(empty)" : relatedCc)")
-        print("[AIService] generateReply: === END PROMPT VARS ===")
+        BackgroundSyncLogger.logDebug("[AIService] generateReply: === PROMPT VARS ===")
+        BackgroundSyncLogger.logDebug("[AIService]   mode=precache_reply")
+        BackgroundSyncLogger.logDebug("[AIService]   user_name=\(userName)")
+        BackgroundSyncLogger.logDebug("[AIService]   user_composition_prompt=\(compositionPrompt)")
+        BackgroundSyncLogger.logDebug("[AIService]   recipients_formatted=\(recipientsFormatted)")
+        BackgroundSyncLogger.logDebug("[AIService]   current_subject=\(replySubject)")
+        BackgroundSyncLogger.logDebug("[AIService]   current_body=(empty)")
+        BackgroundSyncLogger.logDebug("[AIService]   user_request=Write a reply to this email.")
+        BackgroundSyncLogger.logDebug("[AIService]   user_kb_content=\(kbText)")
+        BackgroundSyncLogger.logDebug("[AIService]   current_time=\(currentTime)")
+        BackgroundSyncLogger.logDebug("[AIService]   message=\(splitBody.message.prefix(200))")
+        BackgroundSyncLogger.logDebug("[AIService]   quotes_section=\(splitBody.quotes.prefix(200))")
+        BackgroundSyncLogger.logDebug("[AIService]   related_date=\(relatedDate)")
+        BackgroundSyncLogger.logDebug("[AIService]   related_subject=\(relatedSubject)")
+        BackgroundSyncLogger.logDebug("[AIService]   related_from=\(relatedFrom)")
+        BackgroundSyncLogger.logDebug("[AIService]   related_to=\(relatedTo)")
+        BackgroundSyncLogger.logDebug("[AIService]   related_cc=\(relatedCc.isEmpty ? "(empty)" : relatedCc)")
+        BackgroundSyncLogger.logDebug("[AIService] generateReply: === END PROMPT VARS ===")
         #endif
 
         let vars: [String: JSONValue] = [
@@ -97,7 +97,7 @@ extension AIService {
             disable_tools: false // V2: tools enabled (contacts, calendar, etc.)
         )
 
-        print("[AIService] generateReply: sending to backend (disable_tools=false, timezone=\(TimeZone.current.identifier))")
+        BackgroundSyncLogger.logDebug("[AIService] generateReply: sending to backend (disable_tools=false, timezone=\(TimeZone.current.identifier))")
         let llmT0 = CFAbsoluteTimeGetCurrent()
         BackgroundSyncLogger.logAIProcessing("Reply LLM START (body.len=\(bodyText.count))")
         let response = try await backend.sendCompletionsWithTools(request)
@@ -105,22 +105,22 @@ extension AIService {
         BackgroundSyncLogger.logAIProcessing("Reply LLM END in \(llmElapsed)ms")
 
         guard let text = response.assistant, !text.isEmpty else {
-            print("[AIService] Reply: no assistant text in response (error=\(response.error ?? "nil"))")
+            BackgroundSyncLogger.logDebug("[AIService] Reply: no assistant text in response (error=\(response.error ?? "nil"))")
             return nil
         }
 
         #if DEBUG
-        print("[AIService] generateReply: === RAW RESPONSE ===")
-        print("[AIService]   \(text)")
-        print("[AIService] generateReply: === END RAW RESPONSE ===")
+        BackgroundSyncLogger.logDebug("[AIService] generateReply: === RAW RESPONSE ===")
+        BackgroundSyncLogger.logDebug("[AIService]   \(text)")
+        BackgroundSyncLogger.logDebug("[AIService] generateReply: === END RAW RESPONSE ===")
         #endif
 
         // Parse compose response (Subject: / Body: format), matching TB's processEditResponse
         let parsed = Self.parseComposeResponse(text)
         #if DEBUG
-        print("[AIService] generateReply: === PARSED BODY ===")
-        print("[AIService]   \(parsed)")
-        print("[AIService] generateReply: === END PARSED BODY ===")
+        BackgroundSyncLogger.logDebug("[AIService] generateReply: === PARSED BODY ===")
+        BackgroundSyncLogger.logDebug("[AIService]   \(parsed)")
+        BackgroundSyncLogger.logDebug("[AIService] generateReply: === END PARSED BODY ===")
         #endif
         return parsed
     }
@@ -146,21 +146,21 @@ extension AIService {
         kbText: String,
         compositionPrompt: String
     ) async throws -> String? {
-        print("[AIService] processReply START for \(messageId)")
-        print("[AIService]   subject=\(subject.prefix(60))")
-        print("[AIService]   from=\(from) fromAddress=\(fromAddress)")
-        print("[AIService]   to=\(to.prefix(80))")
-        print("[AIService]   userName=\(userName)")
-        print("[AIService]   bodyText length=\(bodyText.count)")
-        print("[AIService]   compositionPrompt length=\(compositionPrompt.count)")
-        print("[AIService]   kbText length=\(kbText.count)")
+        BackgroundSyncLogger.logDebug("[AIService] processReply START for \(messageId)")
+        BackgroundSyncLogger.logDebug("[AIService]   subject=\(subject.prefix(60))")
+        BackgroundSyncLogger.logDebug("[AIService]   from=\(from) fromAddress=\(fromAddress)")
+        BackgroundSyncLogger.logDebug("[AIService]   to=\(to.prefix(80))")
+        BackgroundSyncLogger.logDebug("[AIService]   userName=\(userName)")
+        BackgroundSyncLogger.logDebug("[AIService]   bodyText length=\(bodyText.count)")
+        BackgroundSyncLogger.logDebug("[AIService]   compositionPrompt length=\(compositionPrompt.count)")
+        BackgroundSyncLogger.logDebug("[AIService]   kbText length=\(kbText.count)")
 
         // Quality filters (matching TB's analyzeEmailForReplyFilter + isInternalSender)
         let isNoReply = EmailFilter.isNoReply(fromAddress)
         // Check ALL user accounts, not just the current one — matches TB's getUserEmailSetCached()
         let isSelfSent = EmailFilter.isSelfSent(fromAddress)
         if isNoReply || isSelfSent {
-            print("[AIService] Reply: skipping \(messageId) — noReply=\(isNoReply) self=\(isSelfSent)")
+            BackgroundSyncLogger.logDebug("[AIService] Reply: skipping \(messageId) — noReply=\(isNoReply) self=\(isSelfSent)")
             return "" // empty sentinel: filtered, no reply needed (distinct from nil = error/retry)
         }
 
@@ -186,7 +186,7 @@ extension AIService {
             if let probeResults = await DeviceSyncService.shared.probeAICache(keys: [probeKey]),
                let cached = probeResults[probeKey],
                let peerReply = cached.reply, !peerReply.isEmpty {
-                print("[AIService] Reply Device Sync HIT for \(messageId)")
+                BackgroundSyncLogger.logDebug("[AIService] Reply Device Sync HIT for \(messageId)")
                 return peerReply
             }
         }
@@ -210,9 +210,9 @@ extension AIService {
         )
 
         if let reply, !reply.isEmpty {
-            print("[AIService] Reply generated for \(messageId): \(reply.prefix(80))...")
+            BackgroundSyncLogger.logDebug("[AIService] Reply generated for \(messageId): \(reply.prefix(80))...")
         } else {
-            print("[AIService] Reply: no content generated for \(messageId)")
+            BackgroundSyncLogger.logDebug("[AIService] Reply: no content generated for \(messageId)")
         }
 
         return reply

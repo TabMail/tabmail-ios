@@ -49,7 +49,7 @@ enum ReportConcernService {
             category: category?.rawValue,
             reason: reason
         )
-        print("[ReportConcern] \(contentType.rawValue): \(success ? "submitted" : "failed")")
+        BackgroundSyncLogger.logDebug("[ReportConcern] \(contentType.rawValue): \(success ? "submitted" : "failed")")
         return success
     }
 }

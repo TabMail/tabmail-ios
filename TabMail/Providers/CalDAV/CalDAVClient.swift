@@ -94,7 +94,7 @@ actor CalDAVClient {
         // CalDAV servers reject PUT with opaque 403/412/etc. and no body —
         // log the ICS we're sending so we can diagnose without smoke-testing
         // the iCloud sandbox blind.
-        print("[CalDAV] PUT \(url.path) precondition=\(precondition) body=\(body.prefix(4000))")
+        BackgroundSyncLogger.logDebug("[CalDAV] PUT \(url.path) precondition=\(precondition) body=\(body.prefix(4000))")
         return try await perform(request)
     }
 
@@ -129,7 +129,7 @@ actor CalDAVClient {
 
         let code = httpResponse.statusCode
         if code == 401 {
-            print("[CalDAV] 401 Unauthorized for \(request.url?.absoluteString ?? "")")
+            BackgroundSyncLogger.logDebug("[CalDAV] 401 Unauthorized for \(request.url?.absoluteString ?? "")")
             throw CalDAVError.authFailed
         }
         if code == 404 {
@@ -142,7 +142,7 @@ actor CalDAVClient {
         // For non-success codes that aren't specifically handled
         if !(200...299).contains(code) && code != 207 {
             if let body = String(data: data, encoding: .utf8) {
-                print("[CalDAV] HTTP \(code) \(request.httpMethod ?? "") \(request.url?.absoluteString ?? ""): \(body.prefix(500))")
+                BackgroundSyncLogger.logDebug("[CalDAV] HTTP \(code) \(request.httpMethod ?? "") \(request.url?.absoluteString ?? ""): \(body.prefix(500))")
             }
             throw CalDAVError.httpError(code, data)
         }

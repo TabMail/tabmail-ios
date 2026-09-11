@@ -85,7 +85,7 @@ enum AppDataWiper {
                 )
             }
         } catch {
-            print("[AppDataWiper] ABORTED before deleting anything — could not enumerate Keychain owners: \(error)")
+            BackgroundSyncLogger.logDebug("[AppDataWiper] ABORTED before deleting anything — could not enumerate Keychain owners: \(error)")
             throw WipeError.couldNotEnumerateKeychainOwners(underlying: error)
         }
 
@@ -196,7 +196,7 @@ enum AppDataWiper {
             try await SearchIndex.shared.vacuum()
         } catch {
             localCleanupError = error
-            print("[AppDataWiper] Search index reset failed after row commit: \(error)")
+            BackgroundSyncLogger.logDebug("[AppDataWiper] Search index reset failed after row commit: \(error)")
         }
         // 6b. Wipe memory.db (ADR-IOS-034). memory.db lives in a
         // separate file; without this, cleared conversations remain searchable.
@@ -204,7 +204,7 @@ enum AppDataWiper {
             try await MemoryIndex.shared.deleteAllThrowing()
         } catch {
             if localCleanupError == nil { localCleanupError = error }
-            print("[AppDataWiper] Memory index reset failed after row commit: \(error)")
+            BackgroundSyncLogger.logDebug("[AppDataWiper] Memory index reset failed after row commit: \(error)")
         }
 
         // 8b. Clear the remaining Keychain items. Keychain survives app DELETION, so anything missed
@@ -238,14 +238,14 @@ enum AppDataWiper {
             try await push.unregisterDeviceForReset()
         } catch {
             deviceUnregisterError = error
-            print("[AppDataWiper] Device unregister remains retryable: \(error)")
+            BackgroundSyncLogger.logDebug("[AppDataWiper] Device unregister remains retryable: \(error)")
         }
 
         if let localCleanupError {
             throw WipeError.localCleanupIncomplete(underlying: localCleanupError)
         }
         if hasPendingRemoteCleanup {
-            print("[AppDataWiper] Local data wiped; remote account cleanup remains retryable")
+            BackgroundSyncLogger.logDebug("[AppDataWiper] Local data wiped; remote account cleanup remains retryable")
             throw WipeError.remoteAccountCleanupDeferred
         }
         if let deviceUnregisterError {
@@ -276,6 +276,6 @@ enum AppDataWiper {
             )
         }
 
-        print("[AppDataWiper] Local data wiped — true factory reset")
+        BackgroundSyncLogger.logDebug("[AppDataWiper] Local data wiped — true factory reset")
     }
 }

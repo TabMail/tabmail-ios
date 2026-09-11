@@ -229,11 +229,11 @@ struct DraftComposePresenter: View {
             }
         }
         .task {
-            print("[DraftComposePresenter] onAppear fired, isLoading=\(isLoading)")
+            BackgroundSyncLogger.logDebug("[DraftComposePresenter] onAppear fired, isLoading=\(isLoading)")
             guard isLoading else { return }
             isLoading = false
             loadResult = await loadDraft()
-            print("[DraftComposePresenter] loadResult=\(loadResult == nil ? "nil" : "set")")
+            BackgroundSyncLogger.logDebug("[DraftComposePresenter] loadResult=\(loadResult == nil ? "nil" : "set")")
         }
         // ADR-IOS-030: Track presentation lifecycle so the agent compose FIFO queue
         // holds during the brief loading window before the inner ComposeView renders.
@@ -284,7 +284,7 @@ struct DraftComposePresenter: View {
 
     /// Load the draft and its owning account, FAIL CLOSED on both axes.
     private func loadDraft() async -> LoadResult {
-        print("[DraftComposePresenter] Loading draft: \(draftId)")
+        BackgroundSyncLogger.logDebug("[DraftComposePresenter] Loading draft: \(draftId)")
         let loaded: (Draft, Account?)?
         do {
             loaded = try await AppDatabase.dbPool.read { db in
@@ -296,12 +296,12 @@ struct DraftComposePresenter: View {
             // auto-dismissed the presenter, so a busy/suspended database silently
             // swallowed the user's tap on an existing draft.
             if DebugModeManager.isLoggingEnabled() {
-                print("[DraftComposePresenter] ⚠ Draft/Account read THREW for \(draftId) — offering retry, not dismissal: \(error)")
+                BackgroundSyncLogger.logDebug("[DraftComposePresenter] ⚠ Draft/Account read THREW for \(draftId) — offering retry, not dismissal: \(error)")
             }
             return .loadFailed
         }
         guard let (draft, account) = loaded else {
-            print("[DraftComposePresenter] Draft NOT FOUND: \(draftId)")
+            BackgroundSyncLogger.logDebug("[DraftComposePresenter] Draft NOT FOUND: \(draftId)")
             return .notFound
         }
 
@@ -332,7 +332,7 @@ struct DraftComposePresenter: View {
             draftAccountId: draft.accountId, resolvedAccountId: account?.id
         ), let account else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[DraftComposePresenter] Persisted-draft account unavailable — fail closed (draft.accountId=\(draft.accountId.prefix(20)) account=\(account == nil ? "nil" : "set"))")
+                BackgroundSyncLogger.logDebug("[DraftComposePresenter] Persisted-draft account unavailable — fail closed (draft.accountId=\(draft.accountId.prefix(20)) account=\(account == nil ? "nil" : "set"))")
             }
             return .accountUnavailable
         }
@@ -366,7 +366,7 @@ struct DraftComposePresenter: View {
         }
         guard ComposeDraftGuards.readState(replyToResult) != .error else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[DraftComposePresenter] ⚠ Reply-target resolve THREW for \(draftId) — offering retry, not a nil reply target")
+                BackgroundSyncLogger.logDebug("[DraftComposePresenter] ⚠ Reply-target resolve THREW for \(draftId) — offering retry, not a nil reply target")
             }
             return .loadFailed
         }
@@ -375,7 +375,7 @@ struct DraftComposePresenter: View {
         let replyTo: MessageHeader?
         if case .success(let value) = replyToResult { replyTo = value } else { replyTo = nil }
 
-        print("[DraftComposePresenter] Loaded draft: \(draftId) replyTo=\(replyTo?.id.prefix(20) ?? "nil")")
+        BackgroundSyncLogger.logDebug("[DraftComposePresenter] Loaded draft: \(draftId) replyTo=\(replyTo?.id.prefix(20) ?? "nil")")
         return .loaded(draft: draft, replyTo: replyTo, account: account)
     }
 

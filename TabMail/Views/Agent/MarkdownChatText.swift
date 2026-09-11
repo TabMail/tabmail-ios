@@ -350,7 +350,7 @@ struct MarkdownChatText: View {
             processed = content
         } else {
             processed = await ChatIdTranslator.shared.processResponseForDisplay(content)
-            print("[AIChatDebug] processResponseForDisplay (\(processed.count) chars): \(processed.prefix(200))")
+            BackgroundSyncLogger.logDebug("[AIChatDebug] processResponseForDisplay (\(processed.count) chars): \(processed.prefix(200))")
         }
         // Sentinel pre-pass: extract pills BEFORE line classification so the
         // classifier (and its block-level branches) never see tabmail:// links.
@@ -633,14 +633,14 @@ struct MarkdownChatText: View {
     // MARK: - URL Handling
 
     private func handleExternalURL(_ url: URL) {
-        print("[AIChatDebug] External URL tapped: \(url)")
+        BackgroundSyncLogger.logDebug("[AIChatDebug] External URL tapped: \(url)")
         // Safety net: pills should be intercepted by the sentinel pipeline before
         // they ever reach AttributedString as a markdown link. If one slips through
         // (e.g., a future block context that bypasses extractPills), absorb it here
         // so we never hand `tabmail://` to UIApplication — which fails with
         // LSApplicationWorkspaceError 115 and confuses the user.
         if url.scheme == "tabmail" {
-            print("[AIChatDebug] Absorbed stray tabmail:// URL — pill should have rendered as chip")
+            BackgroundSyncLogger.logDebug("[AIChatDebug] Absorbed stray tabmail:// URL — pill should have rendered as chip")
             return
         }
         if url.scheme == "mailto", let email = url.absoluteString.dropFirst("mailto:".count).removingPercentEncoding, !email.isEmpty {
@@ -756,31 +756,31 @@ private struct ChatPillChip: View {
         switch type {
         case "contact":
             if let detail = await ChatIdTranslator.shared.resolveContactDetail(numericId) {
-                print("[AIChatDebug] Contact pill tapped: numericId=\(numericId) name=\(detail.name)")
+                BackgroundSyncLogger.logDebug("[AIChatDebug] Contact pill tapped: numericId=\(numericId) name=\(detail.name)")
                 presentation = .contact(detail)
             } else {
-                print("[AIChatDebug] Contact pill tapped but could not resolve detail for numericId=\(numericId)")
+                BackgroundSyncLogger.logDebug("[AIChatDebug] Contact pill tapped but could not resolve detail for numericId=\(numericId)")
             }
         case "event":
             if let detail = await ChatIdTranslator.shared.resolveEventDetail(numericId) {
-                print("[AIChatDebug] Event pill tapped: numericId=\(numericId) title=\(detail.title.prefix(40))")
+                BackgroundSyncLogger.logDebug("[AIChatDebug] Event pill tapped: numericId=\(numericId) title=\(detail.title.prefix(40))")
                 presentation = .event(detail)
             } else {
-                print("[AIChatDebug] Event pill tapped but could not resolve detail for numericId=\(numericId)")
+                BackgroundSyncLogger.logDebug("[AIChatDebug] Event pill tapped but could not resolve detail for numericId=\(numericId)")
             }
         case "template":
             if let detail = await ChatIdTranslator.shared.resolveTemplateDetail(numericId) {
-                print("[AIChatDebug] Template pill tapped: numericId=\(numericId) name=\(detail.name)")
+                BackgroundSyncLogger.logDebug("[AIChatDebug] Template pill tapped: numericId=\(numericId) name=\(detail.name)")
                 presentation = .template(detail)
             } else {
-                print("[AIChatDebug] Template pill tapped but could not resolve detail for numericId=\(numericId)")
+                BackgroundSyncLogger.logDebug("[AIChatDebug] Template pill tapped but could not resolve detail for numericId=\(numericId)")
             }
         default:
             if let detail = await ChatIdTranslator.shared.resolveEmailDetail(numericId) {
-                print("[AIChatDebug] Pill tapped: numericId=\(numericId) subject=\(detail.subject.prefix(40))")
+                BackgroundSyncLogger.logDebug("[AIChatDebug] Pill tapped: numericId=\(numericId) subject=\(detail.subject.prefix(40))")
                 presentation = .email(detail)
             } else {
-                print("[AIChatDebug] Pill tapped but could not resolve detail for numericId=\(numericId)")
+                BackgroundSyncLogger.logDebug("[AIChatDebug] Pill tapped but could not resolve detail for numericId=\(numericId)")
             }
         }
     }

@@ -142,7 +142,9 @@ final class InboxNotificationObserver: TransactionObserver, @unchecked Sendable 
                     }
                 }
             } catch {
-                print("[InboxNotifObserver] post-commit SELECT failed: \(error)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[InboxNotifObserver] post-commit SELECT failed: \(error)")
+                }
             }
         }
 

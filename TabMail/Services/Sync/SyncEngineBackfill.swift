@@ -73,7 +73,7 @@ actor UIDWalkCursor {
         if consecutiveSuccesses >= Self.recoverAfterSuccesses {
             chunkSize = min(defaultChunkSize, chunkSize * 2)
             consecutiveSuccesses = 0
-            print("[UIDCursor] Chunk recovered to \(chunkSize)")
+            BackgroundSyncLogger.logDebug("[UIDCursor] Chunk recovered to \(chunkSize)")
         }
     }
 
@@ -193,7 +193,7 @@ extension SyncEngine {
         }
         // Reset cc/bcc backfill flag so existing messages get cc/bcc populated
         UserDefaults.standard.set(false, forKey: "ccBccBackfillDone")
-        print("[SmartReindex] Crawl state reset — backfill will re-walk from top")
+        BackgroundSyncLogger.logDebug("[SmartReindex] Crawl state reset — backfill will re-walk from top")
     }
 
     /// Start persistent background backfill for an account.
@@ -203,12 +203,12 @@ extension SyncEngine {
     static let backfillDisabled = false
 
     func startBackfill(account: Account) {
-        if Self.backfillDisabled { print("[Backfill] SKIPPED \(account.emailAddress) — backfillDisabled"); return }
+        if Self.backfillDisabled { BackgroundSyncLogger.logDebug("[Backfill] SKIPPED \(account.emailAddress) — backfillDisabled"); return }
         let accountId = account.id
-        guard providers[accountId] != nil else { print("[Backfill] SKIPPED \(account.emailAddress) — no provider"); return }
+        guard providers[accountId] != nil else { BackgroundSyncLogger.logDebug("[Backfill] SKIPPED \(account.emailAddress) — no provider"); return }
 
         if headerBackfillTasks[accountId] == nil {
-            print("[Backfill] Starting for \(account.emailAddress)")
+            BackgroundSyncLogger.logDebug("[Backfill] Starting for \(account.emailAddress)")
             BackgroundSyncLogger.logBackfill("[Backfill] worker START \(account.emailAddress)")
             let gen = (backfillGeneration[accountId] ?? 0) + 1
             backfillGeneration[accountId] = gen
@@ -246,23 +246,23 @@ extension SyncEngine {
                     // Pauses (not stops) so backfill resumes instantly when WiFi returns or setting is toggled.
                     let wifiOnly = UserDefaults.standard.object(forKey: "backgroundSyncWiFiOnly") as? Bool ?? true
                     if wifiOnly && NetworkMonitor.checkExpensive() {
-                        print("[Backfill] \(account.emailAddress) paused — WiFi-only enabled, on cellular")
+                        BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) paused — WiFi-only enabled, on cellular")
                         BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) PAUSED — WiFi-only enabled, on cellular (retry in 30s)")
                         try? await Task.sleep(for: .seconds(30))
                         continue
                     }
 
-                    guard !Task.isCancelled else { print("[Backfill] \(account.emailAddress) cancelled"); break }
+                    guard !Task.isCancelled else { BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) cancelled"); break }
 
                     let profile = await self?.getBackfillProfile() ?? .low
-                    print("[Backfill] \(account.emailAddress) cycle start (profile=\(profile))")
+                    BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) cycle start (profile=\(profile))")
                     BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) cycle start (profile=\(profile))")
                     let didWork = await self?.runBackfill(account: account) ?? false
                     await self?.updateBackfillProgressForAccount(account)
 
                     if !didWork {
                         let walkDone = await self?.isFolderWalkComplete(account: account) ?? false
-                        print("[Backfill] \(account.emailAddress) no work, walkDone=\(walkDone)")
+                        BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) no work, walkDone=\(walkDone)")
                         BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) cycle no work, walkDone=\(walkDone)")
                         guard walkDone else {
                             let sleepDelay = profile.interCycleActiveDelay
@@ -273,7 +273,7 @@ extension SyncEngine {
                         // Mark cc/bcc backfill done after first full crawl cycle completes
                         if !UserDefaults.standard.bool(forKey: "ccBccBackfillDone") {
                             UserDefaults.standard.set(true, forKey: "ccBccBackfillDone")
-                            print("[Backfill] cc/bcc backfill marked complete for account \(accountId)")
+                            BackgroundSyncLogger.logDebug("[Backfill] cc/bcc backfill marked complete for account \(accountId)")
                         }
 
                         // All folders walked — body fetch handled by BackfillBodyQueue
@@ -285,12 +285,12 @@ extension SyncEngine {
                 }
 
                 // Only clear dictionary if this task is still the current generation.
-                print("[Backfill] \(account.emailAddress) walk loop ended")
+                BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) walk loop ended")
                 BackgroundSyncLogger.logBackfill("[Backfill] worker EXIT \(account.emailAddress) (cancelled=\(Task.isCancelled))")
                 await self?.clearBackfillTaskIfCurrent(accountId: accountId, generation: gen)
             }
         } else {
-            print("[Backfill] \(account.emailAddress) already has active backfill task")
+            BackgroundSyncLogger.logDebug("[Backfill] \(account.emailAddress) already has active backfill task")
         }
     }
 
@@ -300,7 +300,7 @@ extension SyncEngine {
     /// Prevents a finishing old task from overwriting a new task started by resetCrawlState.
     func clearBackfillTaskIfCurrent(accountId: String, generation: Int) {
         guard backfillGeneration[accountId] == generation else {
-            print("[Backfill] Skipping clearBackfillTask — generation mismatch (task=\(generation), current=\(backfillGeneration[accountId] ?? -1))")
+            BackgroundSyncLogger.logDebug("[Backfill] Skipping clearBackfillTask — generation mismatch (task=\(generation), current=\(backfillGeneration[accountId] ?? -1))")
             return
         }
         headerBackfillTasks[accountId] = nil

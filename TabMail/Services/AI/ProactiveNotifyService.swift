@@ -290,12 +290,12 @@ actor ProactiveNotifyService {
             do {
                 try await center.add(request)
             } catch {
-                print("[ProactiveNotify] Failed to schedule due notification: \(error)")
+                BackgroundSyncLogger.logDebug("[ProactiveNotify] Failed to schedule due notification: \(error)")
             }
         }
 
         if !toSchedule.isEmpty {
-            print("[ProactiveNotify] Scheduled \(toSchedule.count) due notifications (limit \(Self.maxPendingNotifications))")
+            BackgroundSyncLogger.logDebug("[ProactiveNotify] Scheduled \(toSchedule.count) due notifications (limit \(Self.maxPendingNotifications))")
         }
     }
 
@@ -345,9 +345,9 @@ actor ProactiveNotifyService {
                 try await center.add(request)
                 ReachedOutStore.markNotified(hash: r.hash)
                 delivered = true
-                print("[ProactiveNotify] Delivered overdue notification: \(r.content.prefix(60))")
+                BackgroundSyncLogger.logDebug("[ProactiveNotify] Delivered overdue notification: \(r.content.prefix(60))")
             } catch {
-                print("[ProactiveNotify] Failed to deliver overdue notification: \(error)")
+                BackgroundSyncLogger.logDebug("[ProactiveNotify] Failed to deliver overdue notification: \(error)")
             }
         }
 
@@ -360,7 +360,7 @@ actor ProactiveNotifyService {
 
     private func deliverNotifications(_ candidates: [Reminder]) async {
         guard !isRateLimited() else {
-            print("[ProactiveNotify] Rate limited — skipping notification batch")
+            BackgroundSyncLogger.logDebug("[ProactiveNotify] Rate limited — skipping notification batch")
             return
         }
 
@@ -405,9 +405,9 @@ actor ProactiveNotifyService {
 
             do {
                 try await center.add(request)
-                print("[ProactiveNotify] Delivered notification: \(r.content.prefix(60))")
+                BackgroundSyncLogger.logDebug("[ProactiveNotify] Delivered notification: \(r.content.prefix(60))")
             } catch {
-                print("[ProactiveNotify] Failed to deliver notification: \(error)")
+                BackgroundSyncLogger.logDebug("[ProactiveNotify] Failed to deliver notification: \(error)")
             }
         }
 

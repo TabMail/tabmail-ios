@@ -123,12 +123,12 @@ enum CalendarToolHelpers {
                 group.addTask {
                     var events: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)] = []
                     var names: [String: String] = [:]
-                    print("[CalendarToolHelpers] account=\(accountId) provider=\(type(of: provider)) listCalendars starting")
+                    BackgroundSyncLogger.logDebug("[CalendarToolHelpers] account=\(accountId) provider=\(type(of: provider)) listCalendars starting")
                     do {
                         let allCalendars = try await provider.listCalendars()
-                        print("[CalendarToolHelpers] account=\(accountId) listCalendars returned \(allCalendars.count)")
+                        BackgroundSyncLogger.logDebug("[CalendarToolHelpers] account=\(accountId) listCalendars returned \(allCalendars.count)")
                         for cal in allCalendars {
-                            print("[CalendarToolHelpers]   account=\(accountId) cal id='\(cal.id)' name='\(cal.summary ?? "?")' primary=\(cal.primary == true) selected=\(cal.selected.map(String.init(describing:)) ?? "nil") accessRole=\(cal.accessRole ?? "?")")
+                            BackgroundSyncLogger.logDebug("[CalendarToolHelpers]   account=\(accountId) cal id='\(cal.id)' name='\(cal.summary ?? "?")' primary=\(cal.primary == true) selected=\(cal.selected.map(String.init(describing:)) ?? "nil") accessRole=\(cal.accessRole ?? "?")")
                         }
                         // Resolve visibility per calendar: user override (from
                         // `CalendarVisibilityStore`) wins, otherwise we honor
@@ -138,12 +138,12 @@ enum CalendarToolHelpers {
                         let calendars = allCalendars.filter { cal in
                             if !CalendarVisibilityStore.isVisible(cal, accountId: accountId) {
                                 let why = CalendarVisibilityStore.reason(cal, accountId: accountId).rawValue
-                                print("[CalendarToolHelpers] SKIP calendar id='\(cal.id)' name='\(cal.summary ?? "?")' acct=\(accountId) reason=\(why)")
+                                BackgroundSyncLogger.logDebug("[CalendarToolHelpers] SKIP calendar id='\(cal.id)' name='\(cal.summary ?? "?")' acct=\(accountId) reason=\(why)")
                                 return false
                             }
                             return true
                         }
-                        print("[CalendarToolHelpers] account=\(accountId) iterating \(calendars.count) calendars (after selected filter)")
+                        BackgroundSyncLogger.logDebug("[CalendarToolHelpers] account=\(accountId) iterating \(calendars.count) calendars (after selected filter)")
                         for calendar in calendars {
                             let nameKey = CompoundEventId.make(accountId: accountId, eventId: calendar.id)
                             names[nameKey] = calendar.summary ?? calendar.id
@@ -158,19 +158,19 @@ enum CalendarToolHelpers {
                                     orderBy: orderBy
                                 )
                                 let emptyCount = calEvents.filter { ($0.summary?.isEmpty ?? true) }.count
-                                print("[CalendarToolHelpers] account=\(accountId) calendar='\(calendar.summary ?? "?")' (id=\(calendar.id)) → \(calEvents.count) events (\(emptyCount) empty-title)")
+                                BackgroundSyncLogger.logDebug("[CalendarToolHelpers] account=\(accountId) calendar='\(calendar.summary ?? "?")' (id=\(calendar.id)) → \(calEvents.count) events (\(emptyCount) empty-title)")
                                 for event in calEvents {
                                     if (event.summary?.isEmpty ?? true) {
-                                        print("[CalendarToolHelpers]   EMPTY id=\(event.id ?? "?") on calendar='\(calendar.summary ?? "?")' accessRole=\(calendar.accessRole ?? "?") attendees=\(event.attendees?.count ?? 0) loc='\(event.location ?? "")' status=\(event.status ?? "?") eventType=\(event.eventType ?? "?") iCalUID=\(event.iCalUID ?? "?") visibility=\(event.visibility ?? "?")")
+                                        BackgroundSyncLogger.logDebug("[CalendarToolHelpers]   EMPTY id=\(event.id ?? "?") on calendar='\(calendar.summary ?? "?")' accessRole=\(calendar.accessRole ?? "?") attendees=\(event.attendees?.count ?? 0) loc='\(event.location ?? "")' status=\(event.status ?? "?") eventType=\(event.eventType ?? "?") iCalUID=\(event.iCalUID ?? "?") visibility=\(event.visibility ?? "?")")
                                     }
                                     events.append((event: event, accountId: accountId, calendarId: calendar.id, accessRole: calendar.accessRole))
                                 }
                             } catch {
-                                print("[CalendarToolHelpers] listEvents FAILED for calendar '\(calendar.id)' acct=\(accountId): \(error)")
+                                BackgroundSyncLogger.logDebug("[CalendarToolHelpers] listEvents FAILED for calendar '\(calendar.id)' acct=\(accountId): \(error)")
                             }
                         }
                     } catch {
-                        print("[CalendarToolHelpers] listCalendars FAILED for account=\(accountId): \(error)")
+                        BackgroundSyncLogger.logDebug("[CalendarToolHelpers] listCalendars FAILED for account=\(accountId): \(error)")
                     }
                     return (events, names)
                 }
@@ -182,7 +182,7 @@ enum CalendarToolHelpers {
         }
 
         allEvents.sort { ($0.event.startDate ?? .distantPast) < ($1.event.startDate ?? .distantPast) }
-        print("[CalendarToolHelpers] fetchEventsFromAllCalendars: \(allEvents.count) events from \(backends.count) accounts, \(calendarNames.count) calendars")
+        BackgroundSyncLogger.logDebug("[CalendarToolHelpers] fetchEventsFromAllCalendars: \(allEvents.count) events from \(backends.count) accounts, \(calendarNames.count) calendars")
         return (allEvents, calendarNames)
     }
 
@@ -234,7 +234,7 @@ enum CalendarToolHelpers {
                         let rrule = master.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") }) ?? ""
                         return (key.masterId, rrule.isEmpty ? nil : rrule)
                     } catch {
-                        print("[CalendarToolHelpers] resolveMasterRecurrence: getEvent failed acct=\(key.accountId) master=\(key.masterId): \(error)")
+                        BackgroundSyncLogger.logDebug("[CalendarToolHelpers] resolveMasterRecurrence: getEvent failed acct=\(key.accountId) master=\(key.masterId): \(error)")
                         return (key.masterId, nil)
                     }
                 }
@@ -243,7 +243,7 @@ enum CalendarToolHelpers {
                 if let rrule { out[masterId] = rrule }
             }
         }
-        print("[CalendarToolHelpers] resolveMasterRecurrence: enriched \(out.count) master(s) from \(keyToCalendarId.count) unique reference(s)")
+        BackgroundSyncLogger.logDebug("[CalendarToolHelpers] resolveMasterRecurrence: enriched \(out.count) master(s) from \(keyToCalendarId.count) unique reference(s)")
         return out
     }
 

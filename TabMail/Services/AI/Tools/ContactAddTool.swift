@@ -32,7 +32,7 @@ struct ContactAddTool: AgentTool, Sendable {
         if !rawAddressbookId.isEmpty, let numericId = Int(rawAddressbookId),
            let realId = await ctx.translator.toRealId(numericId) {
             addressbookId = realId
-            print("[ContactAddTool] Resolved addressbook numeric id \(numericId) → \(realId.prefix(40))...")
+            BackgroundSyncLogger.logDebug("[ContactAddTool] Resolved addressbook numeric id \(numericId) → \(realId.prefix(40))...")
         } else {
             addressbookId = rawAddressbookId
         }
@@ -73,7 +73,7 @@ struct ContactAddTool: AgentTool, Sendable {
             let contactName = CNContactStoreHelper.displayName(contact)
             let contactEmail = CNContactStoreHelper.primaryEmail(contact)
             let containerId = CNContactStoreHelper.containerIdentifier(forContactIdentifier: contact.identifier) ?? ""
-            print("[ContactAddTool] Created contact: \(contact.givenName) \(contact.familyName) id=\(contact.identifier.prefix(20))")
+            BackgroundSyncLogger.logDebug("[ContactAddTool] Created contact: \(contact.givenName) \(contact.familyName) id=\(contact.identifier.prefix(20))")
             // Return contact_id so processToolOutputForLLM creates a numeric mapping for pills
             return [
                 "Contact created successfully.",

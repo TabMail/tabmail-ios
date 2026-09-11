@@ -64,7 +64,7 @@ final class DemoModeService {
                 // back. It will be discarded again before completeSetup seeds.
                 AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[DemoMode] start(): defensive GRDB wipe failed: \(error)")
+                    BackgroundSyncLogger.logDebug("[DemoMode] start(): defensive GRDB wipe failed: \(error)")
                 }
             }
         }
@@ -82,7 +82,7 @@ final class DemoModeService {
         ChatPillState.shared.removeAllSessions()
         DeviceSyncService.shared.disconnect()
 
-        print("[DemoMode] start(): demo mode active")
+        BackgroundSyncLogger.logDebug("[DemoMode] start(): demo mode active")
     }
 
     /// Debug-menu entry: enter demo mode WITHOUT logging out the live user.
@@ -173,7 +173,7 @@ final class DemoModeService {
         // onReceive fires `regenerateReminders` immediately, no race window.
         NotificationCenter.default.post(name: .remindersDidChange, object: nil)
         NotificationCenter.default.post(name: .demoSeedingComplete, object: nil)
-        print("[DemoMode] completeSetup(): seed + providers ready")
+        BackgroundSyncLogger.logDebug("[DemoMode] completeSetup(): seed + providers ready")
     }
 
     /// Exit demo cleanly. Counter, gate flags, tip-shown state
@@ -192,7 +192,7 @@ final class DemoModeService {
                 try await db.dbPool.write { conn in try DemoSeed.wipe(conn) }
             } catch {
                 AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
-                print("[DemoMode] exit(): GRDB wipe failed: \(error)")
+                BackgroundSyncLogger.logDebug("[DemoMode] exit(): GRDB wipe failed: \(error)")
             }
         }
 
@@ -232,7 +232,7 @@ final class DemoModeService {
         NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
         NotificationCenter.default.post(name: .remindersDidChange, object: nil)
         NotificationCenter.default.post(name: .demoModeDidExit, object: nil)
-        print("[DemoMode] exit(): cleanup complete")
+        BackgroundSyncLogger.logDebug("[DemoMode] exit(): cleanup complete")
     }
 
     /// Force a one-shot orphan wipe at app launch when stale demo rows are
@@ -246,7 +246,7 @@ final class DemoModeService {
             } catch {
                 AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[DemoMode] orphan GRDB wipe failed: \(error)")
+                    BackgroundSyncLogger.logDebug("[DemoMode] orphan GRDB wipe failed: \(error)")
                 }
             }
         }
@@ -275,7 +275,7 @@ final class DemoModeService {
                 return (h, b)
             }
         } catch {
-            print("[DemoMode] FTS index read failed: \(error)")
+            BackgroundSyncLogger.logDebug("[DemoMode] FTS index read failed: \(error)")
             return
         }
 
@@ -307,7 +307,7 @@ final class DemoModeService {
                 }
             }
         } catch {
-            print("[DemoMode] FTS indexing failed: \(error)")
+            BackgroundSyncLogger.logDebug("[DemoMode] FTS indexing failed: \(error)")
         }
     }
 

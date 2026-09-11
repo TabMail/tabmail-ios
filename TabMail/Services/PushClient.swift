@@ -127,10 +127,10 @@ actor PushClient {
         let (_, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] registerDevice failed: HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] registerDevice failed: HTTP \(code)")
             throw PushError.requestFailed(statusCode: code)
         }
-        print("[PushClient] Device registered")
+        BackgroundSyncLogger.logDebug("[PushClient] Device registered")
     }
 
     /// Register a single (device, account) pair with the push worker.
@@ -166,10 +166,10 @@ actor PushClient {
         let (_, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] registerDeviceAccount failed (\(accountEmail), nse=\(nseCapable)): HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] registerDeviceAccount failed (\(accountEmail), nse=\(nseCapable)): HTTP \(code)")
             throw PushError.requestFailed(statusCode: code)
         }
-        print("[PushClient] Registered \(accountEmail) (provider=\(provider), nse=\(nseCapable))")
+        BackgroundSyncLogger.logDebug("[PushClient] Registered \(accountEmail) (provider=\(provider), nse=\(nseCapable))")
     }
 
     /// Remove a single (device, account) registration.
@@ -188,10 +188,10 @@ actor PushClient {
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] unregisterDeviceAccount failed (\(accountEmail)): HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] unregisterDeviceAccount failed (\(accountEmail)): HTTP \(code)")
             throw Self.deletionError(data: data, statusCode: code)
         }
-        print("[PushClient] Unregistered \(accountEmail)")
+        BackgroundSyncLogger.logDebug("[PushClient] Unregistered \(accountEmail)")
     }
 
     nonisolated static func unregisterDeviceAccountURL(
@@ -244,7 +244,7 @@ actor PushClient {
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] initGmailConsentWeb failed for \(userEmail): HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] initGmailConsentWeb failed for \(userEmail): HTTP \(code)")
             throw PushError.requestFailed(statusCode: code)
         }
         struct InitResponse: Decodable { let startUrl: String }
@@ -268,10 +268,10 @@ actor PushClient {
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] deleteGmailConsent failed: HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] deleteGmailConsent failed: HTTP \(code)")
             throw Self.deletionError(data: data, statusCode: code)
         }
-        print("[PushClient] Deleted Gmail consent")
+        BackgroundSyncLogger.logDebug("[PushClient] Deleted Gmail consent")
     }
 
     /// Query the worker for this account's consent state. Used on app
@@ -285,7 +285,7 @@ actor PushClient {
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] getGmailConsentStatus failed: HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] getGmailConsentStatus failed: HTTP \(code)")
             throw PushError.requestFailed(statusCode: code)
         }
 
@@ -296,7 +296,7 @@ actor PushClient {
         case "missing": return .missing
         case "error":   return .error(reason: parsed.errorReason)
         default:
-            print("[PushClient] Unknown consent status: \(parsed.status)")
+            BackgroundSyncLogger.logDebug("[PushClient] Unknown consent status: \(parsed.status)")
             return .missing
         }
     }
@@ -316,10 +316,10 @@ actor PushClient {
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] unregisterDevice failed: HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] unregisterDevice failed: HTTP \(code)")
             throw Self.deletionError(data: data, statusCode: code)
         }
-        print("[PushClient] Device unregistered")
+        BackgroundSyncLogger.logDebug("[PushClient] Device unregistered")
     }
 
     // MARK: - Push Subscriptions
@@ -354,10 +354,10 @@ actor PushClient {
         let (_, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] subscribe failed for \(userEmail): HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] subscribe failed for \(userEmail): HTTP \(code)")
             throw PushError.requestFailed(statusCode: code)
         }
-        print("[PushClient] Subscribed \(provider) push for \(userEmail)")
+        BackgroundSyncLogger.logDebug("[PushClient] Subscribed \(provider) push for \(userEmail)")
     }
 
     /// Subscribe an IMAP account for push via the IMAP IDLE proxy.
@@ -391,7 +391,7 @@ actor PushClient {
             // is itself build-config-sensitive information. A generic line
             // is enough for the device console; the thrown PushError tells
             // the caller exactly which path failed.
-            print("[PushClient] subscribeIMAP: credential encryption failed")
+            BackgroundSyncLogger.logDebug("[PushClient] subscribeIMAP: credential encryption failed")
             throw PushError.requestFailed(statusCode: 0)
         }
 
@@ -401,10 +401,10 @@ actor PushClient {
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard IMAPSubscribeOutcome.decode(statusCode: code, body: data) == .active else {
-            print("[PushClient] subscribeIMAP not active: HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] subscribeIMAP not active: HTTP \(code)")
             throw PushError.requestFailed(statusCode: code)
         }
-        print("[PushClient] Subscribed IMAP push via IDLE proxy")
+        BackgroundSyncLogger.logDebug("[PushClient] Subscribed IMAP push via IDLE proxy")
     }
 
     /// Remove this installation's IMAP route. The worker revokes pending
@@ -417,10 +417,10 @@ actor PushClient {
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] unsubscribeIMAP failed for \(userEmail): HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] unsubscribeIMAP failed for \(userEmail): HTTP \(code)")
             throw Self.deletionError(data: data, statusCode: code)
         }
-        print("[PushClient] Unsubscribed IMAP push for \(userEmail)")
+        BackgroundSyncLogger.logDebug("[PushClient] Unsubscribed IMAP push for \(userEmail)")
     }
 
     /// Unsubscribe an account from push notifications.
@@ -442,10 +442,10 @@ actor PushClient {
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] unsubscribe failed for \(userEmail): HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] unsubscribe failed for \(userEmail): HTTP \(code)")
             throw Self.deletionError(data: data, statusCode: code)
         }
-        print("[PushClient] Unsubscribed \(provider) push for \(userEmail)")
+        BackgroundSyncLogger.logDebug("[PushClient] Unsubscribed \(provider) push for \(userEmail)")
     }
 
     // MARK: - Outlook Push-Consent
@@ -473,7 +473,7 @@ actor PushClient {
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] initOutlookConsentWeb failed for \(userEmail): HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] initOutlookConsentWeb failed for \(userEmail): HTTP \(code)")
             throw PushError.requestFailed(statusCode: code)
         }
         struct InitResponse: Decodable { let startUrl: String }
@@ -496,10 +496,10 @@ actor PushClient {
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] deleteOutlookConsent failed: HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] deleteOutlookConsent failed: HTTP \(code)")
             throw Self.deletionError(data: data, statusCode: code)
         }
-        print("[PushClient] Deleted Outlook consent")
+        BackgroundSyncLogger.logDebug("[PushClient] Deleted Outlook consent")
     }
 
     /// Query the worker for the Outlook account's consent state.
@@ -510,7 +510,7 @@ actor PushClient {
         let (data, response) = try await session.data(for: request)
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard 200..<300 ~= code else {
-            print("[PushClient] getOutlookConsentStatus failed: HTTP \(code)")
+            BackgroundSyncLogger.logDebug("[PushClient] getOutlookConsentStatus failed: HTTP \(code)")
             throw PushError.requestFailed(statusCode: code)
         }
 
@@ -521,7 +521,7 @@ actor PushClient {
         case "missing": return .missing
         case "error":   return .error(reason: parsed.errorReason)
         default:
-            print("[PushClient] Unknown Outlook consent status: \(parsed.status)")
+            BackgroundSyncLogger.logDebug("[PushClient] Unknown Outlook consent status: \(parsed.status)")
             return .missing
         }
     }

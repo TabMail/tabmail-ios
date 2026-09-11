@@ -152,7 +152,9 @@ enum ThreadUtils {
             let merged = try runFragmentMergeOnce(db: db)
             totalMerged += merged
             if merged == 0 {
-                if pass > 1, DebugModeManager.isLoggingEnabled() { print("[ThreadUtils] Fragment merge converged after \(pass) pass(es), \(totalMerged) total adoption(s)") }
+                if pass > 1 {
+                    if DebugModeManager.isLoggingEnabled() { print("[ThreadUtils] Fragment merge converged after \(pass) pass(es), \(totalMerged) total adoption(s)") }
+                }
                 return totalMerged
             }
         }

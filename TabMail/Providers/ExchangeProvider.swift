@@ -98,7 +98,7 @@ actor ExchangeProvider: EmailProvider {
                 }
             } catch {
                 // Folder may not exist (e.g., some accounts lack an archive folder)
-                if DebugModeManager.isLoggingEnabled() { print("[Exchange] well-known folder '\(name)' not found: \(error)") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] well-known folder '\(name)' not found: \(error)") }
             }
         }
 
@@ -110,7 +110,7 @@ actor ExchangeProvider: EmailProvider {
 
         for folder in response.value {
             let role = knownFolderIds[folder.id]
-            if DebugModeManager.isLoggingEnabled() { print("[Exchange] folder: \(folder.displayName) role=\(String(describing: role)) id=\(folder.id)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] folder: \(folder.displayName) role=\(String(describing: role)) id=\(folder.id)") }
 
             folders.append(FolderInfo(
                 name: folder.displayName,
@@ -127,7 +127,7 @@ actor ExchangeProvider: EmailProvider {
             }
         }
 
-        if DebugModeManager.isLoggingEnabled() { print("[Exchange] fetchFolders returning \(folders.count) folders: \(folders.map { "\($0.name)(\($0.role))" })") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] fetchFolders returning \(folders.count) folders: \(folders.map { "\($0.name)(\($0.role))" })") }
         return folders
     }
 
@@ -237,7 +237,7 @@ actor ExchangeProvider: EmailProvider {
                     let data = try await fetchAttachment(messageId: id, attachmentId: att.id)
                     inlineImages.append(InlineImage(contentId: cid, contentType: ct, data: data))
                 } catch {
-                    if DebugModeManager.isLoggingEnabled() { print("[Exchange] Failed to fetch inline image \(cid): \(error)") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Failed to fetch inline image \(cid): \(error)") }
                 }
                 continue
             }
@@ -266,7 +266,7 @@ actor ExchangeProvider: EmailProvider {
                 } catch {
                     // Fall back to surfacing the itemAttachment as an unexpandable chip.
                     // User won't be able to preview inline, but at least sees it exists.
-                    if DebugModeManager.isLoggingEnabled() { print("[Exchange] Failed to expand itemAttachment \(att.id): \(error)") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Failed to expand itemAttachment \(att.id): \(error)") }
                     attachments.append(AttachmentInfo(
                         filename: att.name ?? "attached-email.eml",
                         contentType: att.contentType ?? "message/rfc822",
@@ -316,10 +316,10 @@ actor ExchangeProvider: EmailProvider {
                                 ))
                             }
                         } else {
-                            if DebugModeManager.isLoggingEnabled() { print("[Exchange] Failed to parse \(name) as RFC 822 — rendering as plain attachment") }
+                            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Failed to parse \(name) as RFC 822 — rendering as plain attachment") }
                         }
                     } catch {
-                        if DebugModeManager.isLoggingEnabled() { print("[Exchange] Failed to fetch bytes for \(name): \(error)") }
+                        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Failed to fetch bytes for \(name): \(error)") }
                     }
                 }
             }
@@ -389,7 +389,7 @@ actor ExchangeProvider: EmailProvider {
                 } catch {
                     // Marker still renders without children — the envelope/body
                     // is useful on its own.
-                    if DebugModeManager.isLoggingEnabled() { print("[Exchange] Failed to list nested attachments for \(itemAttachmentId): \(error)") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Failed to list nested attachments for \(itemAttachmentId): \(error)") }
                     childList = []
                 }
                 for childAtt in childList {
@@ -498,7 +498,7 @@ actor ExchangeProvider: EmailProvider {
             let textBody = msg.body?.contentType == "text" ? msg.body?.content : nil
             return BackfillResult(id: id, header: header, htmlBody: htmlBody, textBody: textBody, error: nil)
         } catch {
-            if DebugModeManager.isLoggingEnabled() { print("[Exchange] Failed to fetch backfill \(id): \(error)") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Failed to fetch backfill \(id): \(error)") }
             return BackfillResult(id: id, header: nil, htmlBody: nil, textBody: nil, error: error)
         }
     }
@@ -605,7 +605,7 @@ actor ExchangeProvider: EmailProvider {
             guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
             absent.append(id)
             if DebugModeManager.isLoggingEnabled() {
-                print("[Exchange] patchMessage \(id): the server reports THIS message gone — the member is dispositioned and the operation narrows to the members still owed")
+                BackgroundSyncLogger.logDebug("[Exchange] patchMessage \(id): the server reports THIS message gone — the member is dispositioned and the operation narrows to the members still owed")
             }
         }
         if !absent.isEmpty || ids.count != 1 {
@@ -765,7 +765,7 @@ actor ExchangeProvider: EmailProvider {
         ids: [String], from source: String, to destination: String
     ) async throws -> MoveOutcome {
         if DebugModeManager.isLoggingEnabled() {
-            print("[MoveTrace] ExchangeProvider.move — ids=\(ids) to=\(destination)")
+            BackgroundSyncLogger.logDebug("[MoveTrace] ExchangeProvider.move — ids=\(ids) to=\(destination)")
         }
         guard let id = ids.first else {
             return MoveOutcome(provenIds: [], provenDestinations: [], confirmedGoneIds: [])
@@ -778,7 +778,7 @@ actor ExchangeProvider: EmailProvider {
             do {
                 try await stripLegacyCategories(id: id)
             } catch {
-                if DebugModeManager.isLoggingEnabled() { print("[Exchange] Legacy tm_* strip failed for \(id) (continuing): \(error)") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Legacy tm_* strip failed for \(id) (continuing): \(error)") }
             }
         }
         // 🚨 THE PER-MEMBER BOUNDARY, and it is what lets a batch whose
@@ -807,7 +807,7 @@ actor ExchangeProvider: EmailProvider {
         } catch {
             guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
             if DebugModeManager.isLoggingEnabled() {
-                print("[MoveTrace] ExchangeProvider.move — \(id) is gone on the server; the member is dispositioned and the members behind it stay owed")
+                BackgroundSyncLogger.logDebug("[MoveTrace] ExchangeProvider.move — \(id) is gone on the server; the member is dispositioned and the members behind it stay owed")
             }
             return MoveOutcome(
                 provenIds: [id], provenDestinations: [], confirmedGoneIds: [id])
@@ -847,7 +847,7 @@ actor ExchangeProvider: EmailProvider {
                 destinationUidValidity: nil))
         }
         if DebugModeManager.isLoggingEnabled() {
-            print("[MoveTrace] ExchangeProvider.move — completed for \(id)")
+            BackgroundSyncLogger.logDebug("[MoveTrace] ExchangeProvider.move — completed for \(id)")
         }
         return MoveOutcome(
             provenIds: [id], provenDestinations: provenDestinations, confirmedGoneIds: [])
@@ -1009,7 +1009,7 @@ actor ExchangeProvider: EmailProvider {
             retryableStatusCodes: [429], session: testSession, logLabel: "Exchange"
         )
         if result.statusCode == 404 {
-            if DebugModeManager.isLoggingEnabled() { print("[Exchange] deleteDraft: draft \(draftId) already deleted (404) — treating as success") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] deleteDraft: draft \(draftId) already deleted (404) — treating as success") }
             return
         }
         if result.data != nil { return }
@@ -1105,7 +1105,7 @@ actor ExchangeProvider: EmailProvider {
             allIds.append(contentsOf: response.value.map(\.id))
 
             if allIds.count >= maxIds {
-                if DebugModeManager.isLoggingEnabled() { print("[Exchange] WARNING: listBackfillMessageIds hit \(maxIds) ID cap — stopping pagination.") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] WARNING: listBackfillMessageIds hit \(maxIds) ID cap — stopping pagination.") }
                 break
             }
 
@@ -1133,7 +1133,7 @@ actor ExchangeProvider: EmailProvider {
                 }
             } catch {
                 // Message may have been deleted between list and fetch — skip
-                if DebugModeManager.isLoggingEnabled() { print("[Exchange] fetchMessageHeaders: skipping \(id) — \(error)") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] fetchMessageHeaders: skipping \(id) — \(error)") }
             }
             if (i + 1) % batchSize == 0, i + 1 < ids.count {
                 try await Task.sleep(for: .seconds(interBatchDelay))
@@ -1216,7 +1216,7 @@ actor ExchangeProvider: EmailProvider {
             } catch {
                 if link == historyId {
                     // First request failed — delta link expired
-                    if DebugModeManager.isLoggingEnabled() { print("[Exchange] Delta link expired — need full sync") }
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Delta link expired — need full sync") }
                     BackgroundSyncLogger.log("exchange.fetchHistory: delta link expired (first request failed: \(error.localizedDescription))")
                     return nil
                 }
@@ -1245,7 +1245,7 @@ actor ExchangeProvider: EmailProvider {
         let newDeltaLink = finalDeltaLink ?? historyId
 
         BackgroundSyncLogger.log("exchange.fetchHistory: done +\(added.count) -\(deleted.count) newToken=\(finalDeltaLink != nil)")
-        if DebugModeManager.isLoggingEnabled() { print("[Exchange] Delta: +\(added.count) added/changed, -\(deleted.count) deleted") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Delta: +\(added.count) added/changed, -\(deleted.count) deleted") }
 
         return HistoryResponse(
             newHistoryId: newDeltaLink,
@@ -1275,7 +1275,7 @@ actor ExchangeProvider: EmailProvider {
                 }
             } catch {
                 // Message may have been deleted between delta list and detail fetch — skip
-                if DebugModeManager.isLoggingEnabled() { print("[Exchange] fetchMessageDetails: skipping \(id) — \(error)") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] fetchMessageDetails: skipping \(id) — \(error)") }
             }
         }
         return results
@@ -1427,7 +1427,7 @@ actor ExchangeProvider: EmailProvider {
         guard let moved = try? JSONDecoder().decode(GraphMessageRef.self, from: data),
               !moved.id.isEmpty else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[MoveTrace] ExchangeProvider.moveMessage — Graph accepted the move of \(id) but its response named no message id, so the destination address is UNKNOWN (no re-key; sync repairs the row)")
+                BackgroundSyncLogger.logDebug("[MoveTrace] ExchangeProvider.moveMessage — Graph accepted the move of \(id) but its response named no message id, so the destination address is UNKNOWN (no re-key; sync repairs the row)")
             }
             return nil
         }
@@ -1456,7 +1456,7 @@ actor ExchangeProvider: EmailProvider {
         guard let encoded = try? JSONEncoder().encode(msg),
               let json = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any],
               let metadata = GraphParse.parseMessage(json, selection: selection) else {
-            if DebugModeManager.isLoggingEnabled() { print("[Exchange] Missing/invalid receivedDateTime for message \(msg.id) — treating as fetch failure, will retry") }
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Missing/invalid receivedDateTime for message \(msg.id) — treating as fetch failure, will retry") }
             return nil
         }
 

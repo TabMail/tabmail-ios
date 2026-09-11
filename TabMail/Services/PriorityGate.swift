@@ -79,7 +79,7 @@ actor PriorityGate {
         if PriorityGate.inPrivilegedContext { return }
         guard privilegedCount > 0 else { return }
         #if DEBUG
-        print("[PriorityGate] \(label()) parked — merge in flight")
+        BackgroundSyncLogger.logDebug("[PriorityGate] \(label()) parked — merge in flight")
         #endif
         while privilegedCount > 0 {
             await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in

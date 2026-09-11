@@ -252,7 +252,7 @@ actor DraftStore {
         }
         if deleted {
             DraftAttachmentStorage.deleteAttachments(dirName: id)
-            print("[DraftStore] Deleted owned draft + turns (async) for id=\(id)")
+            BackgroundSyncLogger.logDebug("[DraftStore] Deleted owned draft + turns (async) for id=\(id)")
         }
         return deleted
     }
@@ -1107,7 +1107,9 @@ actor DraftStore {
                 orphanEvicted += 1
             }
             if orphanEvicted > 0 {
-                print("[DraftStore] Cleaned \(orphanEvicted) orphaned compose sessions")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[DraftStore] Cleaned \(orphanEvicted) orphaned compose sessions")
+                }
             }
 
             // Evict oldest drafts beyond limit. PORT — order by the MONOTONIC
@@ -1190,7 +1192,9 @@ actor DraftStore {
             }
 
             if evicted > 0 {
-                print("[DraftStore] Evicted \(evicted) drafts (limit=\(limit))")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[DraftStore] Evicted \(evicted) drafts (limit=\(limit))")
+                }
             }
 
             // THE LAST STATEMENT INSIDE THE TRANSACTION, deliberately. Everything
@@ -1212,7 +1216,7 @@ actor DraftStore {
             // those directories are the one part of a draft that no re-save
             // rebuilds.
             if DebugModeManager.isLoggingEnabled() {
-                print("[DraftStore] Eviction rolled back — a compose registered while the sweep was in flight; retrying on the next pass")
+                BackgroundSyncLogger.logDebug("[DraftStore] Eviction rolled back — a compose registered while the sweep was in flight; retrying on the next pass")
             }
             return 0
         }

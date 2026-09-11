@@ -63,7 +63,7 @@ import UIKit
 /// no wire side effect is witnessed only by these.
 private func activeAILog(_ message: @autoclosure () -> String) {
     guard DebugModeManager.isLoggingEnabled() else { return }
-    print(message())
+    BackgroundSyncLogger.logDebug(message())
 }
 
 actor ActiveAIQueue {

@@ -195,7 +195,7 @@ actor SearchIndex {
         do {
             try initialize()
         } catch {
-            print("[SearchIndex] Lazy initialization failed: \(error)")
+            BackgroundSyncLogger.logDebug("[SearchIndex] Lazy initialization failed: \(error)")
         }
     }
 
@@ -207,7 +207,7 @@ actor SearchIndex {
         try FileManager.default.createDirectory(at: ftsDir, withIntermediateDirectories: true)
 
         let dbPath = ftsDir.appendingPathComponent("fts.db").path
-        print("[SearchIndex] Opening FTS database at \(dbPath)")
+        BackgroundSyncLogger.logDebug("[SearchIndex] Opening FTS database at \(dbPath)")
 
         var config = Configuration()
         // Reader pool size: 64. Matches main AppDatabase pool — FTS is also
@@ -225,7 +225,9 @@ actor SearchIndex {
             if let sqliteConn = db.sqliteConnection {
                 let rc = tabmail_register_sqlite_vec_on_db(UnsafeMutableRawPointer(sqliteConn))
                 if rc != 0 /* SQLITE_OK */ {
-                    print("[SearchIndex] WARNING: sqlite-vec registration returned \(rc)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[SearchIndex] WARNING: sqlite-vec registration returned \(rc)")
+                    }
                 }
             }
 
@@ -247,7 +249,7 @@ actor SearchIndex {
 
         let count = try documentCount()
         let shardList = knownYears.sorted().map(String.init).joined(separator: ", ")
-        print("[SearchIndex] Initialized with \(count) documents, shards: [\(shardList)]")
+        BackgroundSyncLogger.logDebug("[SearchIndex] Initialized with \(count) documents, shards: [\(shardList)]")
 
         // Tokenizer migration: rebuild shards created with an outdated tokenize=
         // string, in the background. Init is NOT blocked — searches keep working
@@ -309,7 +311,9 @@ actor SearchIndex {
                         SET accountId = SUBSTR(headerId, 1, INSTR(headerId, ':') - 1)
                         WHERE accountId = ''
                         """)
-                    print("[SearchIndex] Backfilled accountId for \(emptyCount) message_meta rows")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[SearchIndex] Backfilled accountId for \(emptyCount) message_meta rows")
+                    }
                 }
             }
 
@@ -332,7 +336,9 @@ actor SearchIndex {
                         """)
                     let backfilled = db.changesCount
                     if backfilled > 0 {
-                        print("[SearchIndex] Backfilled hasBody for \(backfilled) message_meta rows")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[SearchIndex] Backfilled hasBody for \(backfilled) message_meta rows")
+                        }
                     }
                 }
             }
@@ -348,10 +354,14 @@ actor SearchIndex {
                         INSERT OR IGNORE INTO messages_vec (rowid, embedding)
                         SELECT rowid, embedding FROM message_embeddings
                         """)
-                    print("[SearchIndex] Migrated \(count) embeddings from message_embeddings → messages_vec")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[SearchIndex] Migrated \(count) embeddings from message_embeddings → messages_vec")
+                    }
                 }
                 try db.execute(sql: "DROP TABLE message_embeddings")
-                print("[SearchIndex] Dropped legacy message_embeddings table")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[SearchIndex] Dropped legacy message_embeddings table")
+                }
             }
 
             // v5: Migrate FTS shards from 5-column (msgId, subject, from_, to_, body) to
@@ -382,7 +392,9 @@ actor SearchIndex {
                     """))
                 for table in shardTables {
                     try db.execute(sql: "DROP TABLE IF EXISTS \(table)")
-                    print("[SearchIndex] Dropped old 5-column FTS shard: \(table)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[SearchIndex] Dropped old 5-column FTS shard: \(table)")
+                    }
                 }
                 // Full reset: clear dedup + meta tables so indexHeaders re-inserts from scratch.
                 // Without this, message_ids still has old rowids → indexHeaders skips (thinks
@@ -391,7 +403,9 @@ actor SearchIndex {
                 try db.execute(sql: "DELETE FROM message_meta")
                 try? db.execute(sql: "DELETE FROM messages_vec")
                 let deletedCount = try Int.fetchOne(db, sql: "SELECT changes()") ?? 0
-                print("[SearchIndex] Cleared dedup/meta/vec tables — bulkIndexIfNeeded will rebuild from GRDB (\(deletedCount) rows)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[SearchIndex] Cleared dedup/meta/vec tables — bulkIndexIfNeeded will rebuild from GRDB (\(deletedCount) rows)")
+                }
             }
 
             // v3: Add shardYear for FTS year-table routing
@@ -407,7 +421,9 @@ actor SearchIndex {
                 // Handle dateMs=0 edge case — assign year 2000
                 try db.execute(sql: "UPDATE message_meta SET shardYear = 2000 WHERE shardYear = 0")
                 if backfilled > 0 {
-                    print("[SearchIndex] Backfilled shardYear for \(backfilled) message_meta rows")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[SearchIndex] Backfilled shardYear for \(backfilled) message_meta rows")
+                    }
                 }
             }
 
@@ -415,7 +431,9 @@ actor SearchIndex {
             if !columnNames.contains("folderId") {
                 try db.execute(sql: "ALTER TABLE message_meta ADD COLUMN folderId TEXT NOT NULL DEFAULT ''")
                 try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_meta_folderId ON message_meta(folderId)")
-                print("[SearchIndex] Added folderId column to message_meta (backfill via SyncEngineFTS)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[SearchIndex] Added folderId column to message_meta (backfill via SyncEngineFTS)")
+                }
             }
 
             // v7: Add bodyConfirmedEmpty — server confirmed no body content.
@@ -470,7 +488,7 @@ actor SearchIndex {
         }
         guard hasOldTable else { return }
 
-        print("[SearchIndex] Migrating monolithic FTS to year-sharded tables...")
+        BackgroundSyncLogger.logDebug("[SearchIndex] Migrating monolithic FTS to year-sharded tables...")
         let startTime = Date()
 
         let years = try dbPool.read { db in
@@ -516,11 +534,11 @@ actor SearchIndex {
                 offset += migrated
                 totalMigrated += migrated
                 if totalMigrated % 5000 < chunkSize {
-                    print("[SearchIndex] Migration progress: \(totalMigrated) rows (\(year): \(offset))")
+                    BackgroundSyncLogger.logDebug("[SearchIndex] Migration progress: \(totalMigrated) rows (\(year): \(offset))")
                 }
                 if migrated < chunkSize { break }
             }
-            print("[SearchIndex] Year \(year): migrated \(offset) rows")
+            BackgroundSyncLogger.logDebug("[SearchIndex] Year \(year): migrated \(offset) rows")
         }
 
         // Drop old monolithic table
@@ -529,7 +547,7 @@ actor SearchIndex {
         }
 
         let elapsed = Date().timeIntervalSince(startTime)
-        print("[SearchIndex] Migration complete — \(totalMigrated) rows across \(years.count) years in \(String(format: "%.1f", elapsed))s")
+        BackgroundSyncLogger.logDebug("[SearchIndex] Migration complete — \(totalMigrated) rows across \(years.count) years in \(String(format: "%.1f", elapsed))s")
     }
 
     // MARK: - Tokenizer Migration (one-time shard rebuild)
@@ -586,17 +604,17 @@ actor SearchIndex {
             .sorted(by: >)
         guard !stale.isEmpty else { return }
 
-        print("[SearchIndex] Tokenizer migration: \(stale.count) shard(s) to rebuild: \(stale)")
+        BackgroundSyncLogger.logDebug("[SearchIndex] Tokenizer migration: \(stale.count) shard(s) to rebuild: \(stale)")
         let startTime = Date()
 
         for year in stale {
             guard self.dbPool != nil else { return } // closed for nuke mid-run
             guard !Task.isCancelled else {
-                print("[SearchIndex] Tokenizer migration cancelled — resuming on next run")
+                BackgroundSyncLogger.logDebug("[SearchIndex] Tokenizer migration cancelled — resuming on next run")
                 return
             }
             if let deadline, Date() >= deadline {
-                print("[SearchIndex] Tokenizer migration window budget reached — resuming later")
+                BackgroundSyncLogger.logDebug("[SearchIndex] Tokenizer migration window budget reached — resuming later")
                 return
             }
             do {
@@ -605,15 +623,15 @@ actor SearchIndex {
                 // BG expiration / push-deadline watchdog cancelled us mid-shard.
                 // GRDB aborts the write at the next statement boundary and ROLLS
                 // BACK, so the shard stays old and is redone next run — wind down.
-                print("[SearchIndex] Tokenizer migration cancelled mid-shard \(year) (rolled back) — resuming on next run")
+                BackgroundSyncLogger.logDebug("[SearchIndex] Tokenizer migration cancelled mid-shard \(year) (rolled back) — resuming on next run")
                 return
             } catch {
-                print("[SearchIndex] ERROR: tokenizer rebuild failed for shard \(year): \(error)")
+                BackgroundSyncLogger.logDebug("[SearchIndex] ERROR: tokenizer rebuild failed for shard \(year): \(error)")
             }
         }
 
         let elapsed = Date().timeIntervalSince(startTime)
-        print("[SearchIndex] Tokenizer migration complete in \(String(format: "%.1f", elapsed))s")
+        BackgroundSyncLogger.logDebug("[SearchIndex] Tokenizer migration complete in \(String(format: "%.1f", elapsed))s")
     }
 
     /// Rebuild a single year shard with the current tokenizer. ONE write
@@ -668,7 +686,7 @@ actor SearchIndex {
             return copied
         }
         let elapsed = Date().timeIntervalSince(start)
-        print("[SearchIndex] Re-tokenized \(table): \(copied) rows in \(String(format: "%.1f", elapsed))s")
+        BackgroundSyncLogger.logDebug("[SearchIndex] Re-tokenized \(table): \(copied) rows in \(String(format: "%.1f", elapsed))s")
     }
 
     // MARK: - Test Support (tokenizer migration)
@@ -1367,7 +1385,9 @@ actor SearchIndex {
 
         try dbPool.write { [self] db in
             guard let resolved = try resolveRowidAndYear(contentKey, db: db) else {
-                print("[SearchIndex] updateBody: header \(contentKey.rawValue.prefix(30)) not in FTS yet, deferring")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[SearchIndex] updateBody: header \(contentKey.rawValue.prefix(30)) not in FTS yet, deferring")
+                }
                 return
             }
             let table = ftsTableName(year: resolved.year)
@@ -1490,7 +1510,9 @@ actor SearchIndex {
                 var updatesByYear: [Int: [(rowid: Int64, body: String, contentKey: ContentKey)]] = [:]
                 for (contentKey, body) in chunk {
                     guard let resolved = try resolveRowidAndYear(contentKey, db: db) else {
-                        print("[SearchIndex] updateBodies: header \(contentKey.rawValue.prefix(30)) not in FTS yet, deferring")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[SearchIndex] updateBodies: header \(contentKey.rawValue.prefix(30)) not in FTS yet, deferring")
+                        }
                         continue
                     }
                     updatesByYear[resolved.year, default: []].append((rowid: resolved.rowid, body: body, contentKey: contentKey))
@@ -1861,7 +1883,7 @@ actor SearchIndex {
         // `shardList` is inside the gate because it feeds nothing else.
         if DebugModeManager.isLoggingEnabled() {
             let shardList = knownYears.sorted().map(String.init).joined(separator: ", ")
-            print("[SearchIndex] search: raw='\(query.prefix(80))' fts='\(ftsQuery.prefix(100))' limit=\(limit) shards=[\(shardList)]")
+            BackgroundSyncLogger.logDebug("[SearchIndex] search: raw='\(query.prefix(80))' fts='\(ftsQuery.prefix(100))' limit=\(limit) shards=[\(shardList)]")
         }
 
         // When query parses to empty FTS (e.g., "*") but dates are provided,
@@ -1912,7 +1934,7 @@ actor SearchIndex {
         // Fall back to FTS-only when vec table is empty (e.g., during embedding rebuild).
         // Without this, hybrid weights (text_weight=0.3) penalize text-only results below MIN_SCORE.
         if vectorCandidates.isEmpty {
-            print("[SearchIndex] No vector candidates (vec table may be empty), falling back to FTS-only search")
+            BackgroundSyncLogger.logDebug("[SearchIndex] No vector candidates (vec table may be empty), falling back to FTS-only search")
             return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
         }
 
@@ -1955,7 +1977,7 @@ actor SearchIndex {
         }
 
         let filterInfo = eligibleRowids != nil ? ", filtered to \(eligibleRowids!.count) eligible" : ""
-        print("[SearchIndex] Hybrid search: \(results.count) results (FTS: \(ftsCandidates.count), Vec: \(vectorCandidates.count)\(filterInfo))")
+        BackgroundSyncLogger.logDebug("[SearchIndex] Hybrid search: \(results.count) results (FTS: \(ftsCandidates.count), Vec: \(vectorCandidates.count)\(filterInfo))")
         return results
     }
 
@@ -2023,12 +2045,12 @@ actor SearchIndex {
             // production. Kept, not deleted (debug code is preserved here); the gate is
             // the fix.
             if DebugModeManager.isLoggingEnabled() {
-                print("[SearchIndex] FTS candidates args: \(args)")
+                BackgroundSyncLogger.logDebug("[SearchIndex] FTS candidates args: \(args)")
             }
 
             let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
             if DebugModeManager.isLoggingEnabled() {
-                print("[SearchIndex] FTS candidates returned \(rows.count) rows")
+                BackgroundSyncLogger.logDebug("[SearchIndex] FTS candidates returned \(rows.count) rows")
             }
             return rows.map { row in
                 FTSCandidate(
@@ -2104,12 +2126,12 @@ actor SearchIndex {
             // logged from), and ungated it interpolated a 300-char SQL prefix plus the
             // whole bind-argument array on every search in production. Kept, not deleted.
             if DebugModeManager.isLoggingEnabled() {
-                print("[SearchIndex] FTS-only SQL: \(sql.prefix(300))")
-                print("[SearchIndex] FTS-only args: \(args)")
+                BackgroundSyncLogger.logDebug("[SearchIndex] FTS-only SQL: \(sql.prefix(300))")
+                BackgroundSyncLogger.logDebug("[SearchIndex] FTS-only args: \(args)")
             }
             let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
             if DebugModeManager.isLoggingEnabled() {
-                print("[SearchIndex] FTS-only returned \(rows.count) rows")
+                BackgroundSyncLogger.logDebug("[SearchIndex] FTS-only returned \(rows.count) rows")
             }
 
             // PHASE 2 — snippets for the survivors only.
@@ -2141,7 +2163,7 @@ actor SearchIndex {
                 // So: degrade the one row, and make the anomaly observable instead.
                 let snippet = snippets[year]?[ftsRowid]
                 if snippet == nil, DebugModeManager.isLoggingEnabled() {
-                    print("[SearchIndex] FTS-only: no deferred snippet for shard \(year) rowid \(ftsRowid) — returning the row with an empty snippet")
+                    BackgroundSyncLogger.logDebug("[SearchIndex] FTS-only: no deferred snippet for shard \(year) rowid \(ftsRowid) — returning the row with an empty snippet")
                 }
                 return FTSSearchResult(
                     contentKey: row["headerId"], messageId: row["msgId"],
@@ -2253,7 +2275,7 @@ actor SearchIndex {
             }
         } catch {
             // Graceful fallback — vec table may not exist yet (matching TB's unwrap_or_default)
-            print("[SearchIndex] Vec search failed (table may not exist): \(error)")
+            BackgroundSyncLogger.logDebug("[SearchIndex] Vec search failed (table may not exist): \(error)")
             return []
         }
     }
@@ -2404,7 +2426,7 @@ actor SearchIndex {
                 try db.execute(sql: "INSERT INTO \(table)(\(table)) VALUES('optimize')")
             }
         }
-        print("[SearchIndex] FTS shards optimized: \(knownYears.count) tables")
+        BackgroundSyncLogger.logDebug("[SearchIndex] FTS shards optimized: \(knownYears.count) tables")
     }
 
     /// Drop all tables and recreate the schema. Used for one-time clean resets.
@@ -2432,12 +2454,12 @@ actor SearchIndex {
         let fm = FileManager.default
         if fm.fileExists(atPath: ftsDir.path) {
             try fm.removeItem(at: ftsDir)
-            print("[SearchIndex] Deleted FTS directory: \(ftsDir.path)")
+            BackgroundSyncLogger.logDebug("[SearchIndex] Deleted FTS directory: \(ftsDir.path)")
         }
 
         // 4. Reinitialize — creates fresh directory, schema, and empty database
         try initialize()
-        print("[SearchIndex] Reset complete — fresh database ready")
+        BackgroundSyncLogger.logDebug("[SearchIndex] Reset complete — fresh database ready")
     }
 
 
@@ -2492,9 +2514,9 @@ actor SearchIndex {
                 try db.execute(sql: "DELETE FROM message_meta WHERE accountId = ?", arguments: [accountId])
                 try db.execute(sql: "DELETE FROM message_ids WHERE headerId LIKE ?", arguments: ["\(accountId):%"])
             }
-            print("[SearchIndex] purgeForAccount(\(accountId)) done")
+            BackgroundSyncLogger.logDebug("[SearchIndex] purgeForAccount(\(accountId)) done")
         } catch {
-            print("[SearchIndex] purgeForAccount failed: \(error)")
+            BackgroundSyncLogger.logDebug("[SearchIndex] purgeForAccount failed: \(error)")
         }
     }
 
@@ -2504,7 +2526,7 @@ actor SearchIndex {
         try dbPool.writeWithoutTransaction { db in
             try db.execute(sql: "VACUUM")
         }
-        print("[SearchIndex] VACUUM complete")
+        BackgroundSyncLogger.logDebug("[SearchIndex] VACUUM complete")
     }
 
 

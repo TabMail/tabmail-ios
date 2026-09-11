@@ -90,7 +90,7 @@ extension SyncEngine {
         BootProfiler.mark("fullSync[\(acctTag)] START (network — fetch folders + inbox headers → populates inbox)")
         // Sync folder list
         let remoteFolders = try await provider.fetchFolders()
-        print("[FullSync] \(account.emailAddress) fetchFolders: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
+        BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) fetchFolders: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
         BootProfiler.mark("fullSync[\(acctTag)]: fetchFolders done in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (\(remoteFolders.count) folders)")
 
         let pool = dbPool
@@ -245,7 +245,7 @@ extension SyncEngine {
             BootProfiler.mark("fullSync[\(acctTag)]: skipped \(skippablePaths.count) MODSEQ-unchanged folder(s) — no re-fetch (reconcile still runs)")
         }
 
-        print("[FullSync] \(account.emailAddress) folder upsert: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms")
+        BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) folder upsert: \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms")
 
         // Fetch fresh folder list after upsert
         let folders = try await pool.read { db in
@@ -271,7 +271,7 @@ extension SyncEngine {
             return priority(a) < priority(b)
         }
 
-        print("[FullSync] \(account.emailAddress) syncing \(syncableFolders.count) folders: \(syncableFolders.map(\.name).joined(separator: ", "))")
+        BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) syncing \(syncableFolders.count) folders: \(syncableFolders.map(\.name).joined(separator: ", "))")
 
         // `recentlyCompleted` is deliberately NOT snapshotted here. It is read once
         // per folder, inside the loop below, immediately before that folder's pass.
@@ -323,7 +323,7 @@ extension SyncEngine {
                 }
                 let inserted = try? await SearchIndex.shared.indexHeaders(records)
                 if let inserted, inserted > 0 {
-                    print("[FTS] Indexed \(inserted) new messages")
+                    BackgroundSyncLogger.logDebug("[FTS] Indexed \(inserted) new messages")
                 }
                 // Mark headers as fully indexed
                 let headerIds = records.map(\.headerId)
@@ -335,7 +335,7 @@ extension SyncEngine {
                         )
                     }
                 }
-                print("[Sync] \(folder.name): \(result.newHeaders.count) new messages")
+                BackgroundSyncLogger.logDebug("[Sync] \(folder.name): \(result.newHeaders.count) new messages")
                 await ActiveBodyQueue.shared.enqueueBatch(result.newHeaders)
             }
             return result.uidMigratedOldIds
@@ -391,18 +391,18 @@ extension SyncEngine {
                         for: folder, provider: provider, limit: SyncConfig.syncMessageLimit,
                         dbPool: pool, recentlyCompleted: recentlyCompleted
                     )
-                    print("[FullSync] \(account.emailAddress) \(folder.name): \(Int((CFAbsoluteTimeGetCurrent() - ft0) * 1000))ms")
+                    BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) \(folder.name): \(Int((CFAbsoluteTimeGetCurrent() - ft0) * 1000))ms")
                     allMigratedIds.append(contentsOf: await processSyncResult(result, folder: folder))
                 } catch {
                     if Self.isSelectFailedError(error) {
-                        print("[FullSync] SELECT failed for \(folder.name) (\(folder.path)) — skipping: \(error)")
+                        BackgroundSyncLogger.logDebug("[FullSync] SELECT failed for \(folder.name) (\(folder.path)) — skipping: \(error)")
                         continue
                     }
                     if Self.isConnectionError(error) {
                         // Connection died mid-sync — retry this folder once.
                         // Pool self-heals: dead connections discarded on checkin(healthy: false),
                         // next checkout creates a fresh one.
-                        print("[FullSync] Connection error for \(folder.name): \(error) — retrying")
+                        BackgroundSyncLogger.logDebug("[FullSync] Connection error for \(folder.name): \(error) — retrying")
                         do {
                             // Re-read again rather than reuse the value from before the
                             // failed attempt: a dead connection plus retry spans real
@@ -417,11 +417,11 @@ extension SyncEngine {
                         } catch {
                             if Self.isConnectionError(error) {
                                 // Retry also hit connection error — server unreachable. Skip remaining folders.
-                                print("[FullSync] Retry failed for \(folder.name): \(error) — skipping remaining folders")
+                                BackgroundSyncLogger.logDebug("[FullSync] Retry failed for \(folder.name): \(error) — skipping remaining folders")
                                 break
                             }
                             // Non-connection error on retry — skip this folder, continue with rest
-                            print("[FullSync] Retry failed for \(folder.name): \(error) — skipping")
+                            BackgroundSyncLogger.logDebug("[FullSync] Retry failed for \(folder.name): \(error) — skipping")
                         }
                         continue
                     }
@@ -448,7 +448,7 @@ extension SyncEngine {
                             _ = try Folder.filter(Column("id") == folder.id)
                                 .updateAll(db, Column("oldestSyncedDate").set(to: oldestDate))
                         }
-                        print("[FullSync] Anchored oldestSyncedDate for \(folder.name) to \(oldestDate)")
+                        BackgroundSyncLogger.logDebug("[FullSync] Anchored oldestSyncedDate for \(folder.name) to \(oldestDate)")
                     }
                 }
 
@@ -460,7 +460,7 @@ extension SyncEngine {
         // UID migration tracking — logged for diagnostics but no longer clears undoProtectedIds
         // (pending-op check in sync transaction handles undo protection now)
         if !uidMigratedOldIds.isEmpty {
-            print("[FullSync] UID migrated \(uidMigratedOldIds.count) messages")
+            BackgroundSyncLogger.logDebug("[FullSync] UID migrated \(uidMigratedOldIds.count) messages")
         }
         BootProfiler.mark("fullSync[\(acctTag)] DONE in \(Int((CFAbsoluteTimeGetCurrent() - fs0) * 1000))ms (inbox headers synced)")
         await SyncEngine.checkpointWALThrottled()
@@ -502,7 +502,7 @@ extension SyncEngine {
                         tolerance: SyncConfig.deletionReconcileCountTolerance
                     ) {
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[FullSync] \(folder.name): local=\(localCount) > server=\(folder.totalCount) — reconciling external deletions")
+                            BackgroundSyncLogger.logDebug("[FullSync] \(folder.name): local=\(localCount) > server=\(folder.totalCount) — reconciling external deletions")
                         }
                         await reconcileExternallyDeletedMessages(
                             folder: folder,
@@ -513,7 +513,7 @@ extension SyncEngine {
                 } catch {
                     // Best-effort — the evidence is durable and re-fires next sync.
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[FullSync] reconcile trigger check failed for \(folder.name): \(error)")
+                        BackgroundSyncLogger.logDebug("[FullSync] reconcile trigger check failed for \(folder.name): \(error)")
                     }
                 }
             }
@@ -584,7 +584,7 @@ extension SyncEngine {
         )
 
         if !result.uidMigratedOldIds.isEmpty {
-            print("[FullSync] syncMessages — UID migrated \(result.uidMigratedOldIds.count) messages")
+            BackgroundSyncLogger.logDebug("[FullSync] syncMessages — UID migrated \(result.uidMigratedOldIds.count) messages")
         }
 
         await Self.publishHeaderRekeys(result.headerRekeys)
@@ -611,7 +611,7 @@ extension SyncEngine {
         }
         if !result.newHeaders.isEmpty {
             await indexHeadersForFTS(result.newHeaders)
-            print("[Sync] \(folder.name): \(result.newHeaders.count) new messages")
+            BackgroundSyncLogger.logDebug("[Sync] \(folder.name): \(result.newHeaders.count) new messages")
             await ActiveBodyQueue.shared.enqueueBatch(result.newHeaders)
         }
     }
@@ -833,7 +833,9 @@ extension SyncEngine {
             try row.delete(db)
             _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: row.id))
             removedIds.append(row.id)
-            print("[Sync] Canonicalize: merged duplicate \(row.id) into \(survivor.id) (msgId=\(messageId))")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Sync] Canonicalize: merged duplicate \(row.id) into \(survivor.id) (msgId=\(messageId))")
+            }
         }
 
         let willRekey = survivor.id != canonicalId
@@ -849,7 +851,9 @@ extension SyncEngine {
             // its PK). Don't steal it; keep the remnant PK and retry on a
             // later sync once that row has been canonicalized in its own folder.
             guard try MessageHeader.fetchOne(db, key: canonicalId) == nil else {
-                print("[Sync] Canonicalize: SKIPPING re-key \(survivor.id) → \(canonicalId) — id held by another row")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] Canonicalize: SKIPPING re-key \(survivor.id) → \(canonicalId) — id held by another row")
+                }
                 if !removedIds.isEmpty || survivorHadObservedEpoch { try survivor.update(db) }
                 return (survivor, removedIds, nil, true)
             }
@@ -909,13 +913,17 @@ extension SyncEngine {
                 // `removedIds`, the caller's "this id is gone, drop its FTS entry"
                 // channel, and must NOT ride `ftsRekey`, which would file the index
                 // under a row that was never inserted.
-                print("[Sync] Canonicalize: re-key \(oldId) → \(canonicalId) COLLIDED — old row is gone")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] Canonicalize: re-key \(oldId) → \(canonicalId) COLLIDED — old row is gone")
+                }
                 removedIds.append(oldId)
                 return (try MessageHeader.fetchOne(db, key: canonicalId), removedIds, nil, true)
             }
             survivor = migrated
             ftsRekey = (oldId: oldId, newId: canonicalId)
-            print("[Sync] Canonicalize: re-keyed remnant \(oldId) → \(canonicalId)")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Sync] Canonicalize: re-keyed remnant \(oldId) → \(canonicalId)")
+            }
         } else if !removedIds.isEmpty {
             try survivor.update(db)
         }
@@ -1326,7 +1334,9 @@ extension SyncEngine {
             }
             let pendingAllIds = Set(opsTargetingThisFolder.flatMap(\.messageIds))
             if !pendingDestructiveIds.isEmpty || pendingAllIds.count > pendingDestructiveIds.count {
-                print("[MoveTrace] fullSync \(folder.name) — pendingDestructiveIds=\(pendingDestructiveIds) pendingAllIds=\(pendingAllIds)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[MoveTrace] fullSync \(folder.name) — pendingDestructiveIds=\(pendingDestructiveIds) pendingAllIds=\(pendingAllIds)")
+                }
             }
             var newHeaders: [MessageHeader] = []
             // Diagnostic-only id lists for the `[MoveTrace] fullSync upsert` line
@@ -1389,7 +1399,9 @@ extension SyncEngine {
                     let onlyLocal = localIds.subtracting(remoteIds)
                     let onlyRemote = remoteIds.subtracting(localIds)
                     if !onlyLocal.isEmpty || !onlyRemote.isEmpty {
-                        print("[Sync] \(folder.name) stale-check: local=\(allLocal.count) remote=\(messages.count) onlyLocal=\(Array(onlyLocal.prefix(5))) onlyRemote=\(Array(onlyRemote.prefix(5)))")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] \(folder.name) stale-check: local=\(allLocal.count) remote=\(messages.count) onlyLocal=\(Array(onlyLocal.prefix(5))) onlyRemote=\(Array(onlyRemote.prefix(5)))")
+                        }
                     }
                 }
                 effectiveCoverage = coverage
@@ -1455,7 +1467,9 @@ extension SyncEngine {
             let protectedIds = pendingAllIds
             let pendingSkipped = stale.filter { isProtectedByPending($0) || isProtectedByRecent($0) }
             if !pendingSkipped.isEmpty {
-                print("[MoveTrace] fullSync \(folder.name) — skipping stale delete for \(pendingSkipped.count) msgs with pending/recent ops: \(pendingSkipped.map(\.messageId))")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[MoveTrace] fullSync \(folder.name) — skipping stale delete for \(pendingSkipped.count) msgs with pending/recent ops: \(pendingSkipped.map(\.messageId))")
+                }
             }
             // CONFIRMING INSTRUMENT (stale-race fix): a stale candidate saved ONLY by the
             // recent-arrival/completed guard (not a pending op) is a message the server
@@ -1495,7 +1509,9 @@ extension SyncEngine {
                 let oldId = staleMsg.id
                 let newMsgId = match.messageId
                 let newId = "\(accountId):\(folderPath):\(newMsgId)"
-                print("[Sync] UID remap: rfc822=\(rfc822) \(staleMsg.messageId)→\(newMsgId) in \(folder.name)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] UID remap: rfc822=\(rfc822) \(staleMsg.messageId)→\(newMsgId) in \(folder.name)")
+                }
                 var migrated = staleMsg
                 migrated.id = newId
                 migrated.messageId = newMsgId
@@ -1523,7 +1539,9 @@ extension SyncEngine {
                 // rebuilt, `messageUserLabel` carried) this block used to
                 // destroy silently.
                 guard try MessageHeaderRekey.apply(from: staleMsg, to: migrated, db: db) else {
-                    print("[Sync] UID remap: SKIPPING migrate-insert for \(newId) — already present")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Sync] UID remap: SKIPPING migrate-insert for \(newId) — already present")
+                    }
                     continue
                 }
                 // Move the FTS entry to the new id IN PLACE (preserves the
@@ -1564,12 +1582,16 @@ extension SyncEngine {
             staleIds.append(contentsOf: staleFiltered.map(\.id))
             for msg in staleFiltered {
                 if folder.role == .drafts || folder.role == .sent {
-                    print("[Sync] DraftStaleDelete: removing \(msg.id) msgId=\(msg.messageId) rfc822=\(msg.rfc822MessageId ?? "nil") snippet=\(String(msg.snippet.prefix(60)))")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Sync] DraftStaleDelete: removing \(msg.id) msgId=\(msg.messageId) rfc822=\(msg.rfc822MessageId ?? "nil") snippet=\(String(msg.snippet.prefix(60)))")
+                    }
                 }
                 try msg.delete(db)
             }
             if !staleFiltered.isEmpty {
-                print("[Sync] \(folder.name): removed \(staleFiltered.count) stale messages")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] \(folder.name): removed \(staleFiltered.count) stale messages")
+                }
             }
 
             // Insert new / update existing.
@@ -1589,14 +1611,20 @@ extension SyncEngine {
             let allSkippedIds = skippedByPendingIds
                 .union(skippedByRecentIds)
                 .union(deletedRemoteIds)
-            if !deletedRemoteIds.isEmpty, DebugModeManager.isLoggingEnabled() {
-                print("[Sync] \(folder.name): \(deletedRemoteIds.count) remote message(s) carry \\Deleted — not presented (IOS-IMAP-001)")
+            if !deletedRemoteIds.isEmpty {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Sync] \(folder.name): \(deletedRemoteIds.count) remote message(s) carry \\Deleted — not presented (IOS-IMAP-001)")
+                }
             }
             if !skippedByPendingIds.isEmpty {
-                print("[MoveTrace] fullSync \(folder.name) — skipping upsert for \(skippedByPendingIds.count) msgs with pending destructive ops: \(skippedByPendingIds)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[MoveTrace] fullSync \(folder.name) — skipping upsert for \(skippedByPendingIds.count) msgs with pending destructive ops: \(skippedByPendingIds)")
+                }
             }
             if !skippedByRecentIds.isEmpty {
-                print("[MoveTrace] fullSync \(folder.name) — skipping upsert for \(skippedByRecentIds.count) msgs recently completed: \(skippedByRecentIds)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[MoveTrace] fullSync \(folder.name) — skipping upsert for \(skippedByRecentIds.count) msgs recently completed: \(skippedByRecentIds)")
+                }
             }
             // DIAGNOSTIC (emitted as a debug-gated mark before this closure returns):
             // per-folder upsert churn. `noop` = existing rows whose server data did NOT
@@ -1712,7 +1740,9 @@ extension SyncEngine {
                         existing.isFlagged = info.isFlagged
                         if isInInbox, let serverTag = info.actionTag {
                             if existing.actionTag != serverTag {
-                                print("[Sync] Remote tag change detected for \(info.messageId): \(existing.actionTag?.rawValue ?? "nil") -> \(serverTag.rawValue)")
+                                if DebugModeManager.isLoggingEnabled() {
+                                    print("[Sync] Remote tag change detected for \(info.messageId): \(existing.actionTag?.rawValue ?? "nil") -> \(serverTag.rawValue)")
+                                }
                                 try MessageAICache.writeThrough(
                                     accountId: accountId,
                                     folderPath: folderPath,
@@ -1758,7 +1788,9 @@ extension SyncEngine {
                         )
                         try tagOp.insert(db)
                         replyDetectIds.append(existing.id)
-                        print("[ReplyDetect] Sync update: reply→none for \(info.messageId) (already replied)")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[ReplyDetect] Sync update: reply→none for \(info.messageId) (already replied)")
+                        }
                     }
                     // Change-detection: write ONLY when the server actually changed a
                     // column. The old unconditional `existing.update(db)` rewrote every
@@ -1826,7 +1858,9 @@ extension SyncEngine {
                     )
                     try tagOp.insert(db)
                     replyDetectIds.append(header.id)
-                    print("[ReplyDetect] Sync insert: reply→none for \(header.messageId) (already replied)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[ReplyDetect] Sync insert: reply→none for \(header.messageId) (already replied)")
+                    }
                 }
                 // Dedup by rfc822MessageId in Drafts/Sent folders: optimistic creation
                 // inserts a placeholder MessageHeader before the IMAP UID is known. When
@@ -1866,9 +1900,13 @@ extension SyncEngine {
                     try optimistic.delete(db)
                     guard try MessageHeader.fetchOne(db, key: header.id) == nil else {
                         if folder.role == .drafts || folder.role == .sent {
-                            print("[Sync] DraftDedup: SKIPPING insert for id=\(header.id) — already exists (post-snapshot). remoteSnippet=\(String(header.snippet.prefix(60)))")
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Sync] DraftDedup: SKIPPING insert for id=\(header.id) — already exists (post-snapshot). remoteSnippet=\(String(header.snippet.prefix(60)))")
+                            }
                         } else {
-                            print("[Sync] Dedup: SKIPPING insert for id=\(header.id) — already exists (post-snapshot)")
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Sync] Dedup: SKIPPING insert for id=\(header.id) — already exists (post-snapshot)")
+                            }
                         }
                         // R16-8 — THE REMOVAL CHANNEL, because this leg discards
                         // rather than migrates. `optimistic` is already deleted and
@@ -1906,9 +1944,13 @@ extension SyncEngine {
                     newHeaders.append(header)
                     insertedIds.append(header.id)
                     if folder.role == .drafts || folder.role == .sent {
-                        print("[Sync] DraftDedup: replaced optimistic \(folder.role.rawValue) header \(oldId) → \(header.id) | oldSnippet=\(String(optimistic.snippet.prefix(60))) | newSnippet=\(String(header.snippet.prefix(60)))")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] DraftDedup: replaced optimistic \(folder.role.rawValue) header \(oldId) → \(header.id) | oldSnippet=\(String(optimistic.snippet.prefix(60))) | newSnippet=\(String(header.snippet.prefix(60)))")
+                        }
                     } else {
-                        print("[Sync] Dedup: replaced optimistic \(folder.role == .drafts ? "draft" : "sent") header \(oldId) with \(header.id)")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] Dedup: replaced optimistic \(folder.role == .drafts ? "draft" : "sent") header \(oldId) with \(header.id)")
+                        }
                     }
                     continue
                 }
@@ -1973,7 +2015,9 @@ extension SyncEngine {
                         }
                     }
                     if preSyncRows.count > 1 {
-                        print("[Sync] Pre-sync reclaim: \(preSyncRows.count) matching inbox rows for \(info.messageId) — merging all")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] Pre-sync reclaim: \(preSyncRows.count) matching inbox rows for \(info.messageId) — merging all")
+                        }
                     }
                     if let preSync = preSyncRows.first {
                     let oldId = preSync.id
@@ -2054,7 +2098,9 @@ extension SyncEngine {
                     // above and re-inserted here), so it is an insert for the
                     // diagnostic even though the log line below says "reclaimed".
                     insertedIds.append(header.id)
-                    print("[Sync] Reclaimed pre-sync inbox row \(oldId) → \(header.id) (folderPath drift, preserved AI)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Sync] Reclaimed pre-sync inbox row \(oldId) → \(header.id) (folderPath drift, preserved AI)")
+                    }
                     // Clean up any additional duplicates — their AI fields
                     // already merged via the fetchAll scan isn't worth doing
                     // (the first row won the preservation race; the tail are
@@ -2079,7 +2125,9 @@ extension SyncEngine {
                         // legs: enumerated by *"a header row this block destroys or
                         // re-keys"*, not by *"a block that re-keys"*.
                         staleIds.append(extraId)
-                        print("[Sync] Pre-sync reclaim: removed duplicate inbox row \(extraId)")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] Pre-sync reclaim: removed duplicate inbox row \(extraId)")
+                        }
                     }
                     continue
                     }  // closes `if let preSync`
@@ -2101,7 +2149,9 @@ extension SyncEngine {
                         rfc822MessageId: orphaned.rfc822MessageId
                     )
                     if orphanIsPending {
-                        print("[MoveTrace] fullSync — SKIPPING orphan reclaim for \(orphaned.id) — pending destructive op (server folder=\(folder.name) but user moved locally)")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[MoveTrace] fullSync — SKIPPING orphan reclaim for \(orphaned.id) — pending destructive op (server folder=\(folder.name) but user moved locally)")
+                        }
                         continue
                     }
                     // The v2final orphan-reclaim fail-closed shape remains, but
@@ -2121,7 +2171,9 @@ extension SyncEngine {
                         BackgroundSyncLogger.log("[Sync] orphan reclaim REFUSED for \(orphaned.id) (folder=\(folderPath), survivor folderId=\(orphaned.folderId)) — provider-address ownership is unproven")
                         continue
                     }
-                    print("[Sync] Reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folderId)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Sync] Reclaiming orphaned row \(header.id): folderId \(orphaned.folderId) → \(folderId)")
+                    }
                     orphaned.folderId = folderId
                     orphaned.folderPath = folderPath
                     // Cross-mailbox optimistic ownership is ambiguous until
@@ -2171,15 +2223,21 @@ extension SyncEngine {
                     // throw UNIQUE — sync converges on the next cycle.
                     guard try MessageHeader.fetchOne(db, key: header.id) == nil else {
                         if folder.role == .drafts {
-                            print("[Sync] DraftInsert: SKIPPED id=\(header.id) — already exists (remoteSnippet=\(String(header.snippet.prefix(60))))")
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[Sync] DraftInsert: SKIPPED id=\(header.id) — already exists (remoteSnippet=\(String(header.snippet.prefix(60))))")
+                            }
                         } else {
-                            print("[MoveTrace] fullSync — SKIPPING insert for id=\(header.id) — already exists (post-snapshot)")
+                            if DebugModeManager.isLoggingEnabled() {
+                                print("[MoveTrace] fullSync — SKIPPING insert for id=\(header.id) — already exists (post-snapshot)")
+                            }
                         }
                         continue
                     }
                     try header.insert(db)
                     if folder.role == .drafts {
-                        print("[Sync] DraftInsert: INSERTED id=\(header.id) msgId=\(header.messageId) rfc822=\(header.rfc822MessageId ?? "nil") snippet=\(String(header.snippet.prefix(60)))")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[Sync] DraftInsert: INSERTED id=\(header.id) msgId=\(header.messageId) rfc822=\(header.rfc822MessageId ?? "nil") snippet=\(String(header.snippet.prefix(60)))")
+                        }
                     }
                     try ThreadUtils.insertMessageReferences(for: header, db: db)
                     // Insert user label associations

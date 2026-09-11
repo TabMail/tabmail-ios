@@ -4078,7 +4078,10 @@ struct RenderPathLogSinkTests {
     ]
 
     /// Recognised line-oriented log sinks. Anything else is invisible here.
-    private static let logSinks = ["print", "debugPrint", "NSLog", "os_log"]
+    /// `BackgroundSyncLogger.logDebug` is where the former bare `print`s went (#72).
+    /// Its gate lives inside the façade, not in the source text, so a `logDebug`
+    /// outside a canonical gate still reads UNGATED here — the fail-closed direction.
+    private static let logSinks = ["print", "debugPrint", "NSLog", "os_log", "BackgroundSyncLogger.logDebug"]
 
     /// Accessors whose value is MIME header text the sender chose. Kept to the
     /// ones that cannot also be user-authored under the same spelling — see

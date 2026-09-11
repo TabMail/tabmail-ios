@@ -165,7 +165,7 @@ private struct APIKeyProviderSection: View {
             } catch {
                 savedIndicator = false
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[BYOK] keychain save failed for \(provider): \(error)")
+                    BackgroundSyncLogger.logDebug("[BYOK] keychain save failed for \(provider): \(error)")
                 }
             }
         }

@@ -53,14 +53,14 @@ actor ToolRegistry {
     /// Register a tool. Overwrites any existing tool with the same name.
     func register(_ tool: any AgentTool) {
         tools[tool.name] = tool
-        print("[ToolRegistry] Registered tool: \(tool.name)")
+        BackgroundSyncLogger.logDebug("[ToolRegistry] Registered tool: \(tool.name)")
     }
 
     /// Register all tools in a single actor call (avoids per-tool main→actor→main hops).
     func registerAll(_ tools: [any AgentTool]) {
         for tool in tools {
             self.tools[tool.name] = tool
-            print("[ToolRegistry] Registered tool: \(tool.name)")
+            BackgroundSyncLogger.logDebug("[ToolRegistry] Registered tool: \(tool.name)")
         }
     }
 
@@ -76,7 +76,7 @@ actor ToolRegistry {
         guard !didRegisterDefaults else { return }
         didRegisterDefaults = true
         registerAll(Self.makeDefaultTools())
-        print("[ToolRegistry] Lazily registered \(tools.count) client-side tools on first use")
+        BackgroundSyncLogger.logDebug("[ToolRegistry] Lazily registered \(tools.count) client-side tools on first use")
     }
 
     /// The full client-side tool set (matching TB's core.js TOOL_IMPL). `nonisolated`
@@ -136,7 +136,7 @@ actor ToolRegistry {
     /// Matches TB's `executeToolByName()` in `core.js`.
     func execute(name: String, arguments: [String: JSONValue], invocation: ToolInvocation = .noninteractive) async -> ToolExecutionResult {
         guard let tool = tools[name] else {
-            print("[ToolRegistry] Unknown tool: \(name)")
+            BackgroundSyncLogger.logDebug("[ToolRegistry] Unknown tool: \(name)")
             return ToolExecutionResult(output: "Error: unknown tool '\(name)'", ok: false)
         }
 
@@ -144,10 +144,10 @@ actor ToolRegistry {
             let output = try await tool.execute(arguments: arguments, invocation: invocation)
             return ToolExecutionResult(output: output, ok: true)
         } catch let declined as ToolDeclinedError {
-            print("[ToolRegistry] Tool '\(name)' declined by user")
+            BackgroundSyncLogger.logDebug("[ToolRegistry] Tool '\(name)' declined by user")
             return ToolExecutionResult(output: declined.output, ok: false)
         } catch {
-            print("[ToolRegistry] Tool '\(name)' failed: \(error)")
+            BackgroundSyncLogger.logDebug("[ToolRegistry] Tool '\(name)' failed: \(error)")
             return ToolExecutionResult(output: "Error executing \(name): \(error.localizedDescription)", ok: false)
         }
     }

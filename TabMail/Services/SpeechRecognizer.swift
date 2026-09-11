@@ -34,11 +34,11 @@ final class SpeechRecognizer {
 
     func start(onTranscript: @escaping @MainActor @Sendable (String) -> Void) {
         if DebugModeManager.isLoggingEnabled() {
-            print("[Speech] start() entry: isRecording=\(isRecording) isStarting=\(isStarting)")
+            BackgroundSyncLogger.logDebug("[Speech] start() entry: isRecording=\(isRecording) isStarting=\(isStarting)")
         }
         guard !isRecording, !isStarting else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Speech] start(): skip — already recording or starting")
+                BackgroundSyncLogger.logDebug("[Speech] start(): skip — already recording or starting")
             }
             return
         }
@@ -56,7 +56,7 @@ final class SpeechRecognizer {
         }
 
         guard speechStatus == .authorized, micStatus == .granted else {
-            print("[Speech] Permissions not granted (speech: \(speechStatus.rawValue), mic: \(micStatus.rawValue))")
+            BackgroundSyncLogger.logDebug("[Speech] Permissions not granted (speech: \(speechStatus.rawValue), mic: \(micStatus.rawValue))")
             return
         }
 
@@ -66,14 +66,14 @@ final class SpeechRecognizer {
             return state.generation
         }
         if DebugModeManager.isLoggingEnabled() {
-            print("[Speech] start(): generation=\(gen), calling beginRecording")
+            BackgroundSyncLogger.logDebug("[Speech] start(): generation=\(gen), calling beginRecording")
         }
         beginRecording(generation: gen, onTranscript: onTranscript)
     }
 
     func stop() {
         if DebugModeManager.isLoggingEnabled() {
-            print("[Speech] stop() entry: isRecording=\(isRecording) isStarting=\(isStarting)")
+            BackgroundSyncLogger.logDebug("[Speech] stop() entry: isRecording=\(isRecording) isStarting=\(isStarting)")
         }
         // Extract resources from mutex quickly, update UI state immediately.
         // Heavy audio teardown (engine.stop, removeTap, session deactivation)
@@ -95,7 +95,7 @@ final class SpeechRecognizer {
 
         if engine != nil || task != nil || request != nil {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Speech] stop(): teardown path — async engine/task/request cleanup, generation=\(stopGeneration)")
+                BackgroundSyncLogger.logDebug("[Speech] stop(): teardown path — async engine/task/request cleanup, generation=\(stopGeneration)")
             }
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 task?.cancel()
@@ -116,11 +116,11 @@ final class SpeechRecognizer {
                 if stillCurrent {
                     self.deactivateAudioSession()
                 } else if DebugModeManager.isLoggingEnabled() {
-                    print("[Speech] stop(): teardown skip deactivate — generation advanced past \(stopGeneration)")
+                    BackgroundSyncLogger.logDebug("[Speech] stop(): teardown skip deactivate — generation advanced past \(stopGeneration)")
                 }
             }
         } else if DebugModeManager.isLoggingEnabled() {
-            print("[Speech] stop(): teardown path — nothing to tear down (no engine/task/request)")
+            BackgroundSyncLogger.logDebug("[Speech] stop(): teardown path — nothing to tear down (no engine/task/request)")
         }
     }
 
@@ -135,12 +135,12 @@ final class SpeechRecognizer {
             try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
             if DebugModeManager.isLoggingEnabled() {
                 let ms = Int(Date().timeIntervalSince(start) * 1000)
-                print("[Speech] deactivateAudioSession(): succeeded in \(ms)ms")
+                BackgroundSyncLogger.logDebug("[Speech] deactivateAudioSession(): succeeded in \(ms)ms")
             }
         } catch {
             if DebugModeManager.isLoggingEnabled() {
                 let ms = Int(Date().timeIntervalSince(start) * 1000)
-                print("[Speech] Failed to deactivate audio session (\(ms)ms): \(error)")
+                BackgroundSyncLogger.logDebug("[Speech] Failed to deactivate audio session (\(ms)ms): \(error)")
             }
         }
     }
@@ -153,13 +153,13 @@ final class SpeechRecognizer {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let recognizer = SFSpeechRecognizer(locale: Locale.current)
             guard let recognizer, recognizer.isAvailable else {
-                print("[Speech] Speech recognizer not available")
+                BackgroundSyncLogger.logDebug("[Speech] Speech recognizer not available")
                 DispatchQueue.main.async { [weak self] in self?.isStarting = false }
                 return
             }
 
             guard AVAudioSession.sharedInstance().isInputAvailable else {
-                print("[Speech] No audio input available")
+                BackgroundSyncLogger.logDebug("[Speech] No audio input available")
                 DispatchQueue.main.async { [weak self] in self?.isStarting = false }
                 return
             }
@@ -168,19 +168,19 @@ final class SpeechRecognizer {
                 let audioSession = AVAudioSession.sharedInstance()
                 try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothHFP])
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Speech] beginRecording: setCategory done (generation=\(generation))")
+                    BackgroundSyncLogger.logDebug("[Speech] beginRecording: setCategory done (generation=\(generation))")
                 }
                 let setActiveStart = Date()
                 do {
                     try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
                     if DebugModeManager.isLoggingEnabled() {
                         let ms = Int(Date().timeIntervalSince(setActiveStart) * 1000)
-                        print("[Speech] beginRecording: setActive(true) done in \(ms)ms")
+                        BackgroundSyncLogger.logDebug("[Speech] beginRecording: setActive(true) done in \(ms)ms")
                     }
                 } catch {
                     if DebugModeManager.isLoggingEnabled() {
                         let ms = Int(Date().timeIntervalSince(setActiveStart) * 1000)
-                        print("[Speech] beginRecording: setActive(true) threw after \(ms)ms: \(error)")
+                        BackgroundSyncLogger.logDebug("[Speech] beginRecording: setActive(true) threw after \(ms)ms: \(error)")
                     }
                     throw error
                 }
@@ -193,7 +193,7 @@ final class SpeechRecognizer {
                 let inputNode = engine.inputNode
                 let recordingFormat = inputNode.outputFormat(forBus: 0)
                 guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
-                    print("[Speech] No valid audio input format available")
+                    BackgroundSyncLogger.logDebug("[Speech] No valid audio input format available")
                     // Session was activated above but we're bailing before any
                     // recording starts — release it so haptics aren't left muted.
                     self?.deactivateAudioSession()
@@ -224,7 +224,7 @@ final class SpeechRecognizer {
                 engine.prepare()
                 try engine.start()
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Speech] beginRecording: engine.start() succeeded (generation=\(generation))")
+                    BackgroundSyncLogger.logDebug("[Speech] beginRecording: engine.start() succeeded (generation=\(generation))")
                 }
 
                 // Atomically check generation before committing — if stop() was called
@@ -238,7 +238,7 @@ final class SpeechRecognizer {
                     return true
                 }
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Speech] beginRecording: generation=\(generation) shouldCommit=\(shouldCommit)")
+                    BackgroundSyncLogger.logDebug("[Speech] beginRecording: generation=\(generation) shouldCommit=\(shouldCommit)")
                 }
 
                 if !shouldCommit {
@@ -266,7 +266,7 @@ final class SpeechRecognizer {
                     }
                 }
             } catch {
-                print("[Speech] Failed to start recording: \(error)")
+                BackgroundSyncLogger.logDebug("[Speech] Failed to start recording: \(error)")
                 // setActive(true) above may have succeeded before the failure
                 // (e.g. engine.start() threw) — release the session so haptics
                 // aren't left muted.

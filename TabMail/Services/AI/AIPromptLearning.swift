@@ -20,32 +20,32 @@ extension AIService {
         userManualTag: String,
         currentUserActionMd: String
     ) async {
-        print("[AIService] autoUpdatePrompt: START original=\(originalAction) userTag=\(userManualTag)")
-        print("[AIService] autoUpdatePrompt: subject=\(subject.prefix(60)) from=\(from.prefix(40))")
-        print("[AIService] autoUpdatePrompt: blurb=\(summaryBlurb?.prefix(80) ?? "nil") todos=\(summaryTodos?.prefix(80) ?? "nil")")
-        print("[AIService] autoUpdatePrompt: actionMdLen=\(currentUserActionMd.count) disableLLM=\(disableLLMCalls)")
+        BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: START original=\(originalAction) userTag=\(userManualTag)")
+        BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: subject=\(subject.prefix(60)) from=\(from.prefix(40))")
+        BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: blurb=\(summaryBlurb?.prefix(80) ?? "nil") todos=\(summaryTodos?.prefix(80) ?? "nil")")
+        BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: actionMdLen=\(currentUserActionMd.count) disableLLM=\(disableLLMCalls)")
 
         // Skip if original action matches user's tag (no disagreement)
         guard originalAction != userManualTag else {
-            print("[AIService] autoUpdatePrompt: SKIP original == user tag (\(userManualTag))")
+            BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: SKIP original == user tag (\(userManualTag))")
             return
         }
 
         // Skip if no summary cached (can't generate meaningful patch)
         guard let blurb = summaryBlurb, !blurb.isEmpty else {
-            print("[AIService] autoUpdatePrompt: SKIP no summary cached")
+            BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: SKIP no summary cached")
             return
         }
 
         // Skip if user_action.md is empty
         guard !currentUserActionMd.isEmpty else {
-            print("[AIService] autoUpdatePrompt: SKIP user_action.md empty")
+            BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: SKIP user_action.md empty")
             return
         }
 
         // Skip if LLM calls are disabled
         guard !disableLLMCalls else {
-            print("[AIService] autoUpdatePrompt: SKIP LLM disabled")
+            BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: SKIP LLM disabled")
             return
         }
 
@@ -56,7 +56,7 @@ extension AIService {
         let compactThresholdChars = UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdCharsKey) as? Int
             ?? PromptStore.defaultActionCompactThresholdChars
         if DebugModeManager.isLoggingEnabled() {
-            print("[AIService] autoUpdatePrompt: action_compact_threshold=\(compactThreshold) action_compact_threshold_chars=\(compactThresholdChars)")
+            BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: action_compact_threshold=\(compactThreshold) action_compact_threshold_chars=\(compactThresholdChars)")
         }
 
         // Build the system message matching TB's format for system_prompt_action_refine
@@ -85,41 +85,41 @@ extension AIService {
             disable_tools: true
         )
 
-        print("[AIService] autoUpdatePrompt: sending request to backend (prompt=system_prompt_action_refine)")
+        BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: sending request to backend (prompt=system_prompt_action_refine)")
 
         do {
             let response = try await backend.sendCompletionsDirect(request)
-            print("[AIService] autoUpdatePrompt: backend responded, assistant=\(response.assistant?.prefix(200) ?? "nil")")
+            BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: backend responded, assistant=\(response.assistant?.prefix(200) ?? "nil")")
 
             guard let assistantText = response.assistant, !assistantText.isEmpty else {
-                print("[AIService] autoUpdatePrompt: FAIL LLM returned empty response")
+                BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: FAIL LLM returned empty response")
                 return
             }
 
             // Parse strict JSON: { "patch": "..." }
             guard let patchText = Self.parsePatchResponse(assistantText), !patchText.isEmpty else {
-                print("[AIService] autoUpdatePrompt: FAIL no patch in response. Raw: \(assistantText.prefix(300))")
+                BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: FAIL no patch in response. Raw: \(assistantText.prefix(300))")
                 return
             }
 
-            print("[AIService] autoUpdatePrompt: parsed patch:\n\(patchText)")
+            BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: parsed patch:\n\(patchText)")
 
             // Re-read current prompt — another tag correction may have mutated it during the await.
             // If it changed, skip this patch to avoid overwriting a concurrent update.
             let latestActionMd = PromptStore.actionMarkdownSnapshot()
             guard latestActionMd == currentUserActionMd else {
-                print("[AIService] autoUpdatePrompt: SKIP prompt changed concurrently (was \(currentUserActionMd.count) now \(latestActionMd.count))")
+                BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: SKIP prompt changed concurrently (was \(currentUserActionMd.count) now \(latestActionMd.count))")
                 return
             }
 
             // Apply the patch to current user_action.md
             guard let updated = ActionPatchApplier.applyActionPatch(content: currentUserActionMd, patchText: patchText) else {
-                print("[AIService] autoUpdatePrompt: FAIL patch application failed")
+                BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: FAIL patch application failed")
                 return
             }
 
             guard updated != currentUserActionMd else {
-                print("[AIService] autoUpdatePrompt: patch produced no change")
+                BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: patch produced no change")
                 return
             }
 
@@ -131,15 +131,15 @@ extension AIService {
             let afterLen = updated.count
             await MainActor.run {
                 guard !DemoModeStore.shared.isActive else {
-                    print("[AIService] autoUpdatePrompt: dropped — demo mode became active mid-flight")
+                    BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: dropped — demo mode became active mid-flight")
                     return
                 }
                 PromptStore.shared.rawAction = updated
-                print("[AIService] autoUpdatePrompt: SUCCESS user_action.md updated (before=\(beforeLen) after=\(afterLen))")
+                BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: SUCCESS user_action.md updated (before=\(beforeLen) after=\(afterLen))")
             }
 
         } catch {
-            print("[AIService] autoUpdatePrompt: ERROR \(error)")
+            BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: ERROR \(error)")
         }
     }
 
@@ -159,13 +159,13 @@ extension AIService {
     /// is mergeable. Fire-and-return — returns a CompactResult describing what happened.
     func compactActionRulesNow() async -> CompactResult {
         if DebugModeManager.isLoggingEnabled() {
-            print("[AIService] compactActionRules: START disableLLM=\(disableLLMCalls)")
+            BackgroundSyncLogger.logDebug("[AIService] compactActionRules: START disableLLM=\(disableLLMCalls)")
         }
 
         // Skip if LLM calls are disabled
         guard !disableLLMCalls else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[AIService] compactActionRules: SKIP LLM disabled")
+                BackgroundSyncLogger.logDebug("[AIService] compactActionRules: SKIP LLM disabled")
             }
             return .skipped(reason: "AI is disabled")
         }
@@ -176,7 +176,7 @@ extension AIService {
         // Skip if user_action.md is empty
         guard !currentUserActionMd.isEmpty else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[AIService] compactActionRules: SKIP user_action.md empty")
+                BackgroundSyncLogger.logDebug("[AIService] compactActionRules: SKIP user_action.md empty")
             }
             return .skipped(reason: "No action rules to compact")
         }
@@ -188,7 +188,7 @@ extension AIService {
             ?? PromptStore.defaultActionCompactThresholdChars
 
         if DebugModeManager.isLoggingEnabled() {
-            print("[AIService] compactActionRules: threshold=\(compactThreshold) thresholdChars=\(compactThresholdChars) mdLen=\(currentUserActionMd.count)")
+            BackgroundSyncLogger.logDebug("[AIService] compactActionRules: threshold=\(compactThreshold) thresholdChars=\(compactThresholdChars) mdLen=\(currentUserActionMd.count)")
         }
 
         // Build compact-only request: action_compact_only=true, email-metadata as empty strings
@@ -220,7 +220,7 @@ extension AIService {
         )
 
         if DebugModeManager.isLoggingEnabled() {
-            print("[AIService] compactActionRules: sending compact-only request to backend")
+            BackgroundSyncLogger.logDebug("[AIService] compactActionRules: sending compact-only request to backend")
         }
 
         do {
@@ -229,12 +229,12 @@ extension AIService {
             // it with NSURLError -1001.
             let response = try await backend.sendCompletionsDirect(request, longTimeout: true)
             if DebugModeManager.isLoggingEnabled() {
-                print("[AIService] compactActionRules: backend responded, assistant=\(response.assistant?.prefix(200) ?? "nil")")
+                BackgroundSyncLogger.logDebug("[AIService] compactActionRules: backend responded, assistant=\(response.assistant?.prefix(200) ?? "nil")")
             }
 
             guard let assistantText = response.assistant, !assistantText.isEmpty else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[AIService] compactActionRules: FAIL empty response")
+                    BackgroundSyncLogger.logDebug("[AIService] compactActionRules: FAIL empty response")
                 }
                 return .failed(message: "Empty response from server")
             }
@@ -242,7 +242,7 @@ extension AIService {
             // Parse strict JSON: { "patch": "...", "reason": "<code>"? }
             guard let parsed = Self.parseCompactResponse(assistantText) else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[AIService] compactActionRules: FAIL no patch in response. Raw: \(assistantText.prefix(300))")
+                    BackgroundSyncLogger.logDebug("[AIService] compactActionRules: FAIL no patch in response. Raw: \(assistantText.prefix(300))")
                 }
                 return .failed(message: "Could not parse server response")
             }
@@ -253,7 +253,7 @@ extension AIService {
             // from a genuinely clean rules file.
             guard !patchText.isEmpty else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[AIService] compactActionRules: empty patch, reason=\(parsed.reason ?? "none")")
+                    BackgroundSyncLogger.logDebug("[AIService] compactActionRules: empty patch, reason=\(parsed.reason ?? "none")")
                 }
                 switch parsed.reason {
                 case "guard_char_retention", "guard_pure_delete":
@@ -268,14 +268,14 @@ extension AIService {
             }
 
             if DebugModeManager.isLoggingEnabled() {
-                print("[AIService] compactActionRules: parsed patch:\n\(patchText)")
+                BackgroundSyncLogger.logDebug("[AIService] compactActionRules: parsed patch:\n\(patchText)")
             }
 
             // Drift guard: re-read snapshot; if changed since we started, abort.
             let latestActionMd = PromptStore.actionMarkdownSnapshot()
             guard latestActionMd == currentUserActionMd else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[AIService] compactActionRules: SKIP prompt changed concurrently (was \(currentUserActionMd.count) now \(latestActionMd.count))")
+                    BackgroundSyncLogger.logDebug("[AIService] compactActionRules: SKIP prompt changed concurrently (was \(currentUserActionMd.count) now \(latestActionMd.count))")
                 }
                 return .skipped(reason: "Rules changed while compacting — try again")
             }
@@ -283,14 +283,14 @@ extension AIService {
             // Apply the patch
             guard let updated = ActionPatchApplier.applyActionPatch(content: currentUserActionMd, patchText: patchText) else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[AIService] compactActionRules: FAIL patch application failed")
+                    BackgroundSyncLogger.logDebug("[AIService] compactActionRules: FAIL patch application failed")
                 }
                 return .failed(message: "Could not apply compaction patch")
             }
 
             guard updated != currentUserActionMd else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[AIService] compactActionRules: patch produced no change")
+                    BackgroundSyncLogger.logDebug("[AIService] compactActionRules: patch produced no change")
                 }
                 return .nothingToCompact
             }
@@ -308,13 +308,13 @@ extension AIService {
             let persisted = await MainActor.run { () -> Bool in
                 guard !DemoModeStore.shared.isActive else {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[AIService] compactActionRules: dropped — demo mode became active mid-flight")
+                        BackgroundSyncLogger.logDebug("[AIService] compactActionRules: dropped — demo mode became active mid-flight")
                     }
                     return false
                 }
                 PromptStore.shared.rawAction = updated
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[AIService] compactActionRules: SUCCESS user_action.md updated (before=\(beforeLen) after=\(afterLen) ops=\(opsCount))")
+                    BackgroundSyncLogger.logDebug("[AIService] compactActionRules: SUCCESS user_action.md updated (before=\(beforeLen) after=\(afterLen) ops=\(opsCount))")
                 }
                 return true
             }
@@ -326,7 +326,7 @@ extension AIService {
 
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                print("[AIService] compactActionRules: ERROR \(error)")
+                BackgroundSyncLogger.logDebug("[AIService] compactActionRules: ERROR \(error)")
             }
             return .failed(message: error.localizedDescription)
         }
@@ -350,7 +350,7 @@ extension AIService {
         }
 
         guard let parsed = try? JSONDecoder().decode(PatchResponse.self, from: data) else {
-            print("[AIService] Failed to parse patch JSON: \(jsonString.prefix(200))")
+            BackgroundSyncLogger.logDebug("[AIService] Failed to parse patch JSON: \(jsonString.prefix(200))")
             return nil
         }
 
@@ -381,7 +381,7 @@ extension AIService {
 
         guard let parsed = try? JSONDecoder().decode(CompactResponse.self, from: data) else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[AIService] Failed to parse compact JSON: \(jsonString.prefix(200))")
+                BackgroundSyncLogger.logDebug("[AIService] Failed to parse compact JSON: \(jsonString.prefix(200))")
             }
             return nil
         }

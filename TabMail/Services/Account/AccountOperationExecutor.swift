@@ -1103,7 +1103,7 @@ final class AccountOperationExecutor {
                     try Folder.fetchOne(db, key: "\(currentOp.accountId):\(destPath)") == nil
                 }) ?? false
                 if destMissing {
-                    print("[Queue] \(opType) destination Folder missing locally: \(currentOp.accountId):\(destPath) — op stays queued (local absence is not provider authority)")
+                    BackgroundSyncLogger.logDebug("[Queue] \(opType) destination Folder missing locally: \(currentOp.accountId):\(destPath) — op stays queued (local absence is not provider authority)")
                 }
             }
             // Draft producers keep their separate existing retry policy. Ordinary
@@ -1471,7 +1471,7 @@ final class AccountOperationExecutor {
                 draftsFolderPath: op.folderPath
             )
             if DebugModeManager.isLoggingEnabled() {
-                print("[DraftQueue] Retiring save producer \(op.id) with disposition \(disposition)")
+                BackgroundSyncLogger.logDebug("[DraftQueue] Retiring save producer \(op.id) with disposition \(disposition)")
             }
             return .allMembers
         case .deleteDraft:

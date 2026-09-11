@@ -69,12 +69,12 @@ struct AccountDashboardView: View {
             }
             .onAppear {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Dashboard] onAppear id=\(instanceId)")
+                    BackgroundSyncLogger.logDebug("[Dashboard] onAppear id=\(instanceId)")
                 }
             }
             .onDisappear {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Dashboard] onDisappear id=\(instanceId)")
+                    BackgroundSyncLogger.logDebug("[Dashboard] onDisappear id=\(instanceId)")
                 }
             }
     }
@@ -233,7 +233,7 @@ struct AccountDashboardView: View {
                                 case .presented:
                                     break
                                 case .failed(let error):
-                                    print("[Dashboard] Failed to open subscription management: \(error)")
+                                    BackgroundSyncLogger.logDebug("[Dashboard] Failed to open subscription management: \(error)")
                                 }
                                 // Refresh entitlements + account info after sheet closes
                                 await refreshData()
@@ -416,7 +416,7 @@ struct AccountDashboardView: View {
 
     private func loadData() async {
         if DebugModeManager.isLoggingEnabled() {
-            print("[Dashboard] loadData START id=\(instanceId)")
+            BackgroundSyncLogger.logDebug("[Dashboard] loadData START id=\(instanceId)")
         }
         isLoading = true
         errorMessage = nil
@@ -432,7 +432,7 @@ struct AccountDashboardView: View {
                 errorMessage = "Loading was interrupted."
             }
             if DebugModeManager.isLoggingEnabled() {
-                print("[Dashboard] loadData exit id=\(instanceId) cancelled=\(Task.isCancelled) hasInfo=\(accountInfo != nil) hasStats=\(usageStats != nil) error=\(errorMessage ?? "nil")")
+                BackgroundSyncLogger.logDebug("[Dashboard] loadData exit id=\(instanceId) cancelled=\(Task.isCancelled) hasInfo=\(accountInfo != nil) hasStats=\(usageStats != nil) error=\(errorMessage ?? "nil")")
             }
         }
         await fetchAll()
@@ -468,37 +468,37 @@ struct AccountDashboardView: View {
             UsageThrottleStore.shared.update(from: info)
         } catch is CancellationError {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Dashboard] fetchAccountInfo CANCELLED (CancellationError)")
+                BackgroundSyncLogger.logDebug("[Dashboard] fetchAccountInfo CANCELLED (CancellationError)")
             }
             return
         } catch let urlError as URLError where urlError.code == .cancelled {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Dashboard] fetchAccountInfo CANCELLED (URLError.cancelled)")
+                BackgroundSyncLogger.logDebug("[Dashboard] fetchAccountInfo CANCELLED (URLError.cancelled)")
             }
             return
         } catch BackendError.accountGone {
-            print("[Dashboard] Account no longer exists — showing account gone alert")
+            BackgroundSyncLogger.logDebug("[Dashboard] Account no longer exists — showing account gone alert")
             NotificationCenter.default.post(name: .tabMailAccountGone, object: nil)
             return
         } catch BackendError.unauthorized {
             // Token refresh may have permanently failed (account deleted)
             let tokenState = await TabMailTokenCoordinator.shared.validToken()
             if case .permanentFailure = tokenState {
-                print("[Dashboard] Auth permanently failed — showing account gone alert")
+                BackgroundSyncLogger.logDebug("[Dashboard] Auth permanently failed — showing account gone alert")
                 NotificationCenter.default.post(name: .tabMailAccountGone, object: nil)
                 return
             }
             if case .noSession = tokenState {
-                print("[Dashboard] No session — showing account gone alert")
+                BackgroundSyncLogger.logDebug("[Dashboard] No session — showing account gone alert")
                 NotificationCenter.default.post(name: .tabMailAccountGone, object: nil)
                 return
             }
-            print("[Dashboard] fetchAccountInfo unauthorized (transient)")
+            BackgroundSyncLogger.logDebug("[Dashboard] fetchAccountInfo unauthorized (transient)")
             if accountInfo == nil {
                 errorMessage = "Failed to load account info"
             }
         } catch {
-            print("[Dashboard] fetchAccountInfo failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Dashboard] fetchAccountInfo failed: \(error)")
             if accountInfo == nil {
                 errorMessage = "Failed to load account info"
             }
@@ -508,16 +508,16 @@ struct AccountDashboardView: View {
             usageStats = try await backend.fetchUsageStats()
         } catch is CancellationError {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Dashboard] fetchUsageStats CANCELLED (CancellationError)")
+                BackgroundSyncLogger.logDebug("[Dashboard] fetchUsageStats CANCELLED (CancellationError)")
             }
             return
         } catch let urlError as URLError where urlError.code == .cancelled {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Dashboard] fetchUsageStats CANCELLED (URLError.cancelled)")
+                BackgroundSyncLogger.logDebug("[Dashboard] fetchUsageStats CANCELLED (URLError.cancelled)")
             }
             return
         } catch {
-            print("[Dashboard] fetchUsageStats failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Dashboard] fetchUsageStats failed: \(error)")
             if errorMessage == nil && usageStats == nil {
                 errorMessage = "Failed to load usage stats"
             }

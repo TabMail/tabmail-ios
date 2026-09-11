@@ -53,7 +53,7 @@ enum KBReminderParser {
         let all = parseRemindersFromKB(kbText)
         parseCache.withLock { $0 = ParseCache(inputHash: textHash, result: all) }
         let active = filterActiveReminders(all)
-        print("[KBReminderParser] Found \(all.count) reminder entries, \(active.count) active after filtering")
+        BackgroundSyncLogger.logDebug("[KBReminderParser] Found \(all.count) reminder entries, \(active.count) active after filtering")
         return active
     }
 

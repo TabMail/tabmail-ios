@@ -37,7 +37,7 @@ actor ActiveEmbeddingQueue {
         let items = headerIds.map { Item(headerId: $0) }
         let added = storage.enqueueBatch(items)
         guard added > 0 else { return }
-        print("[ActiveEmbed] Enqueued \(added) items (total: \(storage.count))")
+        BackgroundSyncLogger.logDebug("[ActiveEmbed] Enqueued \(added) items (total: \(storage.count))")
         scheduleDispatch()
     }
 
@@ -47,7 +47,7 @@ actor ActiveEmbeddingQueue {
         debounceTask?.cancel()
         debounceTask = nil
         if count > 0 {
-            print("[ActiveEmbed] Cancelled \(count) in-flight items on foreground return")
+            BackgroundSyncLogger.logDebug("[ActiveEmbed] Cancelled \(count) in-flight items on foreground return")
         }
     }
 
@@ -108,7 +108,7 @@ actor ActiveEmbeddingQueue {
         guard !candidates.isEmpty else { return }
 
         storage.incrementActiveJobs()
-        print("[ActiveEmbed] Dispatching batch of \(candidates.count) items (pending: \(storage.pendingCount))")
+        BackgroundSyncLogger.logDebug("[ActiveEmbed] Dispatching batch of \(candidates.count) items (pending: \(storage.pendingCount))")
 
         Task { [self] in
             await processBatch(candidates)
@@ -138,7 +138,7 @@ actor ActiveEmbeddingQueue {
                 return Dictionary(uniqueKeysWithValues: headers.map { ($0.id, $0) })
             }
         } catch {
-            print("[ActiveEmbed] Bulk header read failed: \(error)")
+            BackgroundSyncLogger.logDebug("[ActiveEmbed] Bulk header read failed: \(error)")
             for item in items { storage.batchItemCompleted(item, shouldRetry: true, maxRetries: SyncConfig.maxQueueRetries) }
             storage.decrementActiveJobs()
             if storage.pendingCount > 0 { await dispatchBatch() }
@@ -151,7 +151,7 @@ actor ActiveEmbeddingQueue {
             bodiesByContentKey = try await SearchIndex.shared.bodyTexts(
                 contentKeys: headerIds.map(ContentKey.init(rawValue:)))
         } catch {
-            print("[ActiveEmbed] Bulk body read failed: \(error)")
+            BackgroundSyncLogger.logDebug("[ActiveEmbed] Bulk body read failed: \(error)")
             for item in items { storage.batchItemCompleted(item, shouldRetry: true, maxRetries: SyncConfig.maxQueueRetries) }
             storage.decrementActiveJobs()
             if storage.pendingCount > 0 { await dispatchBatch() }
@@ -183,7 +183,7 @@ actor ActiveEmbeddingQueue {
                 succeeded.append((headerId: item.headerId, embedding: embedding))
                 storage.batchItemCompleted(item, shouldRetry: false, maxRetries: SyncConfig.maxQueueRetries)
             } catch {
-                print("[ActiveEmbed] Embed failed for \(item.headerId.prefix(30)): \(error)")
+                BackgroundSyncLogger.logDebug("[ActiveEmbed] Embed failed for \(item.headerId.prefix(30)): \(error)")
                 let hasMore = storage.batchItemCompleted(item, shouldRetry: true, maxRetries: SyncConfig.maxQueueRetries)
                 _ = hasMore
             }
@@ -195,7 +195,7 @@ actor ActiveEmbeddingQueue {
                     (contentKey: ContentKey(rawValue: $0.headerId), embedding: $0.embedding)
                 })
             } catch {
-                print("[ActiveEmbed] Bulk embedding write failed: \(error)")
+                BackgroundSyncLogger.logDebug("[ActiveEmbed] Bulk embedding write failed: \(error)")
             }
         }
 
@@ -213,7 +213,7 @@ actor ActiveEmbeddingQueue {
 
         storage.decrementActiveJobs()
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-        print("[ActiveEmbed] Batch done: \(succeeded.count) embedded, \(emptyBodyIds.count) empty in \(ms)ms")
+        BackgroundSyncLogger.logDebug("[ActiveEmbed] Batch done: \(succeeded.count) embedded, \(emptyBodyIds.count) empty in \(ms)ms")
         // Keep the WAL bounded: the embedding backfill is the app's most constant writer,
         // so it's the most reliable place to hang the (throttled) checkpoint.
         await SyncEngine.checkpointWALThrottled()
@@ -255,11 +255,11 @@ actor ActiveEmbeddingQueue {
             let items = ids.map { Item(headerId: $0) }
             let added = storage.enqueueBatch(items)
             if added > 0 {
-                print("[ActiveEmbed] Drain-time self-repopulate enqueued \(added) items")
+                BackgroundSyncLogger.logDebug("[ActiveEmbed] Drain-time self-repopulate enqueued \(added) items")
                 scheduleDispatch()
             }
         } catch {
-            print("[ActiveEmbed] Drain-time repopulate failed: \(error)")
+            BackgroundSyncLogger.logDebug("[ActiveEmbed] Drain-time repopulate failed: \(error)")
         }
     }
 }

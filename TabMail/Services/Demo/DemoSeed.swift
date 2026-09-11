@@ -30,7 +30,7 @@ enum DemoSeed {
             try seedMessages(dbConn, folders: folders)
             try seedCalendarEvents(dbConn)
         }
-        print("[DemoSeed] Seeding complete")
+        BackgroundSyncLogger.logDebug("[DemoSeed] Seeding complete")
     }
 
     /// Wipe all demo rows from GRDB. Mirrors the cleanup pass in

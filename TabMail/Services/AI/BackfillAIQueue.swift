@@ -225,7 +225,7 @@ actor BackfillAIQueue {
         // would only abort; the queue re-dispatches on the next wake.
         guard !DatabaseSuspension.isSuspended else {
             #if DEBUG
-            print("[BackfillAI] DB suspended — abandoning dispatch (ADR-IOS-046)")
+            BackgroundSyncLogger.logDebug("[BackfillAI] DB suspended — abandoning dispatch (ADR-IOS-046)")
             #endif
             return
         }

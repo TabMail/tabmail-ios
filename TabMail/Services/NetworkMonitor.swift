@@ -79,7 +79,7 @@ final class NetworkMonitor {
                     SyncScheduler.shared.scheduleBackgroundSync()
 
                     if isForeground {
-                        print("[NetworkMonitor] Connection restored (foreground) — draining queues")
+                        BackgroundSyncLogger.logDebug("[NetworkMonitor] Connection restored (foreground) — draining queues")
                         BackgroundSyncLogger.log("NetworkMonitor: network restored (fg) — draining queues")
                         await AccountManager.shared.drainPendingQueue()
                         await AccountManager.shared.drainOutbox()
@@ -92,7 +92,7 @@ final class NetworkMonitor {
                 // Reconnect IMAP providers (has built-in debounce).
                 // Skip if not foreground — startForegroundPolling handles reconnect on return.
                 if interfaceChanged && path.status == .satisfied && isForeground {
-                    print("[NetworkMonitor] Interface changed (wifi=\(isOnWiFi)) — marking all providers dirty")
+                    BackgroundSyncLogger.logDebug("[NetworkMonitor] Interface changed (wifi=\(isOnWiFi)) — marking all providers dirty")
                     BackgroundSyncLogger.log("NetworkMonitor: interface changed wifi=\(isOnWiFi) (fg) — marking dirty")
                     await AccountManager.shared.markAllProvidersDirty()
                     // Don't drain again — connection-restored block above already drained,

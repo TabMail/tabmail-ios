@@ -50,7 +50,7 @@ extension SyncEngine {
         do {
             let inserted = try await SearchIndex.shared.indexHeaders(records)
             if inserted > 0 {
-                print("[FTS] Indexed \(inserted) new messages")
+                BackgroundSyncLogger.logDebug("[FTS] Indexed \(inserted) new messages")
             }
             // Mark headers as fully indexed — body queue requires headerComplete=1.
             // ⚠ `[String]` is load-bearing: this binds `messageHeader.id`, so
@@ -65,7 +65,7 @@ extension SyncEngine {
                 }
             }
         } catch {
-            print("[FTS] Indexing failed: \(error)")
+            BackgroundSyncLogger.logDebug("[FTS] Indexing failed: \(error)")
         }
     }
 
@@ -117,12 +117,12 @@ extension SyncEngine {
             guard !missingKeys.isEmpty else { return }
             let missingIds: [String] = missingKeys.map(\.rawValue)
 
-            print("[FTS] Self-heal: \(missingIds.count) headers with bodyComplete=1 missing from FTS — re-indexing")
+            BackgroundSyncLogger.logDebug("[FTS] Self-heal: \(missingIds.count) headers with bodyComplete=1 missing from FTS — re-indexing")
             BackgroundSyncLogger.log("[FTS] Self-heal: re-indexing \(missingIds.count) orphaned headers")
 
             try await reindexAndRequeueBodies(missingIds: missingIds)
         } catch {
-            print("[FTS] Self-heal failed: \(error)")
+            BackgroundSyncLogger.logDebug("[FTS] Self-heal failed: \(error)")
         }
     }
 
@@ -208,7 +208,7 @@ extension SyncEngine {
             guard !missingKeys.isEmpty else { return }
             let missingIds: [String] = missingKeys.map(\.rawValue)
 
-            print("[FTS] Backfill self-heal: \(missingIds.count)/\(candidateIds.count) headers missing from FTS — re-indexing")
+            BackgroundSyncLogger.logDebug("[FTS] Backfill self-heal: \(missingIds.count)/\(candidateIds.count) headers missing from FTS — re-indexing")
             BackgroundSyncLogger.log("[FTS] Backfill self-heal: re-indexing \(missingIds.count) orphans")
 
             let toReindex: [MessageHeader] = try await dbPool.read { db in
@@ -221,7 +221,7 @@ extension SyncEngine {
             }
             await indexHeadersForFTS(toReindex)
         } catch {
-            print("[FTS] Backfill self-heal failed: \(error)")
+            BackgroundSyncLogger.logDebug("[FTS] Backfill self-heal failed: \(error)")
         }
     }
 
@@ -267,12 +267,12 @@ extension SyncEngine {
             let healed = try await healAllFTSBodyMembership(scopePrefix: scopePrefix)
             defaults.set(true, forKey: Self.ftsReconcileDoneKey)
             if pruned > 0 || healed > 0 {
-                print("[FTS] Reconciliation complete: pruned \(pruned) dead entries, healed \(healed) missing entries")
+                BackgroundSyncLogger.logDebug("[FTS] Reconciliation complete: pruned \(pruned) dead entries, healed \(healed) missing entries")
                 BackgroundSyncLogger.log("[FTS] Reconciliation complete: pruned \(pruned), healed \(healed)")
             }
         } catch {
             // Gate NOT set — the sweep restarts from the beginning next launch.
-            print("[FTS] Reconciliation failed: \(error) — resuming next launch")
+            BackgroundSyncLogger.logDebug("[FTS] Reconciliation failed: \(error) — resuming next launch")
         }
     }
 
@@ -328,7 +328,7 @@ extension SyncEngine {
                 // Abandon on suspension (ADR-IOS-046) — gate stays unset, the
                 // pass restarts next launch.
                 guard !DatabaseSuspension.isSuspended else {
-                    print("[FTS] bodyComplete restore paused by suspension — resuming next launch")
+                    BackgroundSyncLogger.logDebug("[FTS] bodyComplete restore paused by suspension — resuming next launch")
                     return
                 }
                 // ⚠ STAGE E1 — `chunk` holds `messageHeader.id`s; the FTS probe and the
@@ -367,13 +367,13 @@ extension SyncEngine {
             }
             defaults.set(true, forKey: Self.bodyCompleteRestoreDoneKey)
             if healed > 0 {
-                print("[FTS] bodyComplete restore: healed \(healed)/\(candidates.count) rows (FTS body present, no cached HTML)")
+                BackgroundSyncLogger.logDebug("[FTS] bodyComplete restore: healed \(healed)/\(candidates.count) rows (FTS body present, no cached HTML)")
                 BackgroundSyncLogger.log("[FTS] bodyComplete restore: healed \(healed)/\(candidates.count) rows")
                 BackgroundSyncLogger.logBackfill("[FTS] bodyComplete restore: healed \(healed)/\(candidates.count) pending rows without refetch")
             }
         } catch {
             // Gate NOT set — the pass restarts from the beginning next launch.
-            print("[FTS] bodyComplete restore failed: \(error) — resuming next launch")
+            BackgroundSyncLogger.logDebug("[FTS] bodyComplete restore failed: \(error) — resuming next launch")
         }
     }
 
@@ -417,7 +417,7 @@ extension SyncEngine {
 
             try await reindexAndRequeueBodies(missingIds: missingIds)
             healed += missingIds.count
-            print("[FTS] Full-history heal: re-indexed \(missingIds.count) (cursor \(cursor))")
+            BackgroundSyncLogger.logDebug("[FTS] Full-history heal: re-indexed \(missingIds.count) (cursor \(cursor))")
         }
         return healed
     }
@@ -510,11 +510,11 @@ extension SyncEngine {
                     try? await SearchIndex.shared.updateFolderIds(
                         contentKeys: [newKey], newFolderId: folderId)
                 }
-                print("[FTS] Orphan reconcile: re-keyed \(rekeys.count) moved messages (cursor \(cursor))")
+                BackgroundSyncLogger.logDebug("[FTS] Orphan reconcile: re-keyed \(rekeys.count) moved messages (cursor \(cursor))")
             }
             if !deadIds.isEmpty {
                 try await SearchIndex.shared.removeMessages(contentKeys: deadIds)
-                print("[FTS] Orphan prune: removed \(deadIds.count) dead entries (cursor \(cursor))")
+                BackgroundSyncLogger.logDebug("[FTS] Orphan prune: removed \(deadIds.count) dead entries (cursor \(cursor))")
             }
             pruned += deadIds.count
         }
@@ -597,12 +597,12 @@ extension SyncEngine {
                     }
                 }
                 let probeMs = Int((CFAbsoluteTimeGetCurrent() - probeT0) * 1000)
-                print("[recoverIncompleteHeaders:EXPLAIN] probe \(probeMs)ms — plan:")
+                BackgroundSyncLogger.logDebug("[recoverIncompleteHeaders:EXPLAIN] probe \(probeMs)ms — plan:")
                 for row in rows {
-                    print("[recoverIncompleteHeaders:EXPLAIN]   id=\(row.id) parent=\(row.parent) \(row.detail)")
+                    BackgroundSyncLogger.logDebug("[recoverIncompleteHeaders:EXPLAIN]   id=\(row.id) parent=\(row.parent) \(row.detail)")
                 }
             } catch {
-                print("[recoverIncompleteHeaders:EXPLAIN] failed: \(error)")
+                BackgroundSyncLogger.logDebug("[recoverIncompleteHeaders:EXPLAIN] failed: \(error)")
             }
         }
 
@@ -614,12 +614,12 @@ extension SyncEngine {
                     .fetchAll(db)
             }
             guard !incomplete.isEmpty else { return }
-            print("[FTS] Recovering \(incomplete.count) incomplete headers")
+            BackgroundSyncLogger.logDebug("[FTS] Recovering \(incomplete.count) incomplete headers")
             BackgroundSyncLogger.log("[FTS] Recovering \(incomplete.count) incomplete headers")
             await indexHeadersForFTS(incomplete)
             // indexHeadersForFTS already sets headerComplete=1
         } catch {
-            print("[FTS] Recovery failed: \(error)")
+            BackgroundSyncLogger.logDebug("[FTS] Recovery failed: \(error)")
         }
     }
 
@@ -665,7 +665,7 @@ extension SyncEngine {
         Task.detached(priority: .medium) {
             let released = await MessageContentStore.releaseUnowned(
                 headerIds.map(ContentKey.init(rawValue:)), stores: [.searchIndex, .body], pool: pool)
-            print("[FTS] Removed \(released)/\(headerIds.count) messages from index")
+            BackgroundSyncLogger.logDebug("[FTS] Removed \(released)/\(headerIds.count) messages from index")
         }
     }
 
@@ -700,7 +700,7 @@ extension SyncEngine {
 
                 // Phase 1: Index headers that aren't in FTS yet
                 if totalCount > indexCount + 10 {
-                    print("[FTS Bulk] Indexing \(totalCount) existing messages (FTS has \(indexCount))")
+                    BackgroundSyncLogger.logDebug("[FTS Bulk] Indexing \(totalCount) existing messages (FTS has \(indexCount))")
 
                     let batchSize = SyncConfig.ftsIndexBatchSize
                     var batchNum = 0
@@ -735,7 +735,7 @@ extension SyncEngine {
                             }
                             let inserted = try await SearchIndex.shared.indexHeaders(records)
                             if inserted > 0 {
-                                print("[FTS Bulk] Batch \(batchNum + 1): indexed \(inserted)")
+                                BackgroundSyncLogger.logDebug("[FTS Bulk] Batch \(batchNum + 1): indexed \(inserted)")
                             }
                             // Mark headers as fully indexed. `[String]` is load-bearing:
                             // this binds `messageHeader.id` (F2).
@@ -760,7 +760,7 @@ extension SyncEngine {
                 // and BackfillBodyQueue (non-inbox). No separate opportunistic path needed.
 
             } catch {
-                print("[FTS Bulk] Failed: \(error)")
+                BackgroundSyncLogger.logDebug("[FTS Bulk] Failed: \(error)")
             }
             await self?.clearBulkIndexTask(accountId: accountId)
         }
@@ -797,7 +797,7 @@ extension SyncEngine {
                     emptyIds = try await SearchIndex.shared.contentKeysWithEmptyFolderId(
                         limit: batchSize).map(\.rawValue)
                 } catch {
-                    print("[FTS Backfill] Failed to query empty folderIds: \(error)")
+                    BackgroundSyncLogger.logDebug("[FTS Backfill] Failed to query empty folderIds: \(error)")
                     break
                 }
                 guard !emptyIds.isEmpty else { break }
@@ -836,13 +836,13 @@ extension SyncEngine {
                     remaining = try await SearchIndex.shared.emptyFolderIdCount()
                 } catch {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[FTS Backfill] Failed to measure remaining entries: \(error)")
+                        BackgroundSyncLogger.logDebug("[FTS Backfill] Failed to measure remaining entries: \(error)")
                     }
                     break
                 }
                 guard remaining < lastRemaining else {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[FTS Backfill] No progress on \(remaining) entries — stopping until the next sync")
+                        BackgroundSyncLogger.logDebug("[FTS Backfill] No progress on \(remaining) entries — stopping until the next sync")
                     }
                     break
                 }
@@ -877,7 +877,7 @@ extension SyncEngine {
                             contentKeys: headerIds.map(ContentKey.init(rawValue:)), newFolderId: folderId)
                         totalUpdated += headerIds.count
                     } catch {
-                        print("[FTS Backfill] Failed to update folderId for \(headerIds.count) entries: \(error)")
+                        BackgroundSyncLogger.logDebug("[FTS Backfill] Failed to update folderId for \(headerIds.count) entries: \(error)")
                     }
                 }
 
@@ -894,7 +894,7 @@ extension SyncEngine {
                     }) ?? Set(orphanKeys)
                     let removable = orphanKeys.filter { !protected.contains($0) }
                     if !removable.isEmpty {
-                        print("[FTS Backfill] Removing \(removable.count)/\(orphanedIds.count) orphaned FTS entries")
+                        BackgroundSyncLogger.logDebug("[FTS Backfill] Removing \(removable.count)/\(orphanedIds.count) orphaned FTS entries")
                         try? await SearchIndex.shared.removeMessages(contentKeys: removable)
                     }
                 }
@@ -903,7 +903,7 @@ extension SyncEngine {
             }
 
             if totalUpdated > 0 {
-                print("[FTS Backfill] Backfilled folderId for \(totalUpdated) entries")
+                BackgroundSyncLogger.logDebug("[FTS Backfill] Backfilled folderId for \(totalUpdated) entries")
             }
         }
     }

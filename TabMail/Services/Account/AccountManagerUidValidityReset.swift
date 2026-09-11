@@ -145,7 +145,7 @@ extension AccountManager {
         }
         guard let provider = providers[accountId] as? IMAPProvider else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[UIDValidity] no connected IMAP provider for \(accountId.prefix(8)) — cannot react to \(folderId) yet; recomputable, retries on next trigger/re-drive")
+                BackgroundSyncLogger.logDebug("[UIDValidity] no connected IMAP provider for \(accountId.prefix(8)) — cannot react to \(folderId) yet; recomputable, retries on next trigger/re-drive")
             }
             releaseUidValidityReaction(accountId: accountId, folderPath: folderPath, folderId: folderId)
             return

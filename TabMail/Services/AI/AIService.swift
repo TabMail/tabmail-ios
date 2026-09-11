@@ -131,7 +131,7 @@ actor AIService {
         var peerReply: String?
         if rfc822MessageId == nil {
             DeviceSyncLogger.log("AI_PROBE SKIP msgId=\(messageId.prefix(30)) — rfc822MessageId is nil")
-            print("[AIService] Device Sync probe SKIPPED for \(messageId) — rfc822MessageId is nil")
+            BackgroundSyncLogger.logDebug("[AIService] Device Sync probe SKIPPED for \(messageId) — rfc822MessageId is nil")
         }
         // Safety: strip any stray angle brackets (should already be clean, but belt-and-suspenders)
         let probeKey = rfc822MessageId?
@@ -146,7 +146,7 @@ actor AIService {
            let probeResults = await DeviceSyncService.shared.probeAICache(keys: [probeKey]),
            let cached = probeResults[probeKey] {
             if let ps = cached.summary {
-                print("[AIService] Device Sync summary HIT for \(messageId)")
+                BackgroundSyncLogger.logDebug("[AIService] Device Sync summary HIT for \(messageId)")
                 // Convert empty strings to nil — TB uses || which treats "" as falsy,
                 // so action payload gets "Not Available" instead of "" for empty Device Sync values
                 peerSummary = SummaryResult(
@@ -159,11 +159,11 @@ actor AIService {
             }
             if let pa = cached.action {
                 peerAction = ActionTag(rawValue: pa)
-                print("[AIService] Device Sync action HIT for \(messageId): \(peerAction?.displayName ?? pa)")
+                BackgroundSyncLogger.logDebug("[AIService] Device Sync action HIT for \(messageId): \(peerAction?.displayName ?? pa)")
             }
             if let pr = cached.reply, !pr.isEmpty {
                 peerReply = pr
-                print("[AIService] Device Sync reply HIT for \(messageId)")
+                BackgroundSyncLogger.logDebug("[AIService] Device Sync reply HIT for \(messageId)")
             }
         } else if let probeKey, !probeKey.isEmpty {
             DeviceSyncLogger.log("AI_PROBE MISS msgId=\(messageId.prefix(30)) key=\"\(probeKey)\"")
@@ -188,12 +188,12 @@ actor AIService {
                 date: date, bodyText: bodyText, htmlContent: htmlContent,
                 userName: userName, kbText: kbText, recipientStatus: recipientStatus
             )
-            print("[AIService] Summary generated for \(messageId): blurb=\(summary.blurb?.prefix(50) ?? "nil")")
+            BackgroundSyncLogger.logDebug("[AIService] Summary generated for \(messageId): blurb=\(summary.blurb?.prefix(50) ?? "nil")")
         } else {
             if demoBlock {
-                print("[AIService] Demo mode — summary LLM blocked for \(messageId)")
+                BackgroundSyncLogger.logDebug("[AIService] Demo mode — summary LLM blocked for \(messageId)")
             } else {
-                print("[AIService] No summary for \(messageId) — LLM disabled, no Device Sync result")
+                BackgroundSyncLogger.logDebug("[AIService] No summary for \(messageId) — LLM disabled, no Device Sync result")
             }
             summary = SummaryResult(blurb: nil, todos: nil, reminderDate: nil, reminderTime: nil, reminderContent: nil)
         }
@@ -208,7 +208,7 @@ actor AIService {
                 bodyText: bodyText, htmlContent: htmlContent,
                 summary: summary, userName: userName, actionPrompt: actionPrompt
             )
-            print("[AIService] Action classified for \(messageId): \(action?.displayName ?? "nil")")
+            BackgroundSyncLogger.logDebug("[AIService] Action classified for \(messageId): \(action?.displayName ?? "nil")")
         } else {
             action = nil
         }

@@ -32,7 +32,7 @@ enum CNContactStoreHelper {
         do {
             return try await store.requestAccess(for: .contacts)
         } catch {
-            print("[CNContactStoreHelper] requestAccess failed: \(error)")
+            BackgroundSyncLogger.logDebug("[CNContactStoreHelper] requestAccess failed: \(error)")
             return false
         }
     }
@@ -98,7 +98,7 @@ enum CNContactStoreHelper {
         if let resolvedId {
             let exists = (try? store.containers(matching: CNContainer.predicateForContainers(withIdentifiers: [resolvedId])))?.isEmpty == false
             if !exists {
-                print("[CNContactStoreHelper] Container \(resolvedId) no longer exists — falling back to default")
+                BackgroundSyncLogger.logDebug("[CNContactStoreHelper] Container \(resolvedId) no longer exists — falling back to default")
                 if explicitContainerId == nil {
                     UserDefaults.standard.removeObject(forKey: preferredContainerKey)
                 }
@@ -145,7 +145,7 @@ enum CNContactStoreHelper {
             let containers = try store.containers(matching: predicate)
             return containers.first?.identifier
         } catch {
-            print("[CNContactStoreHelper] containerIdentifier lookup failed: \(error)")
+            BackgroundSyncLogger.logDebug("[CNContactStoreHelper] containerIdentifier lookup failed: \(error)")
             return nil
         }
     }

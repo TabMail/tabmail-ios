@@ -15,7 +15,7 @@ struct ComposeToolbarButton: View {
     var body: some View {
         Button {
             if let draftId = ActiveAgentTracker.shared.workingComposeDraftId {
-                print("[ComposeToolbar] Opening working draft: \(draftId)")
+                BackgroundSyncLogger.logDebug("[ComposeToolbar] Opening working draft: \(draftId)")
                 draftIdToOpen = draftId
                 showDraft = true
             } else {

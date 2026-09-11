@@ -34,7 +34,7 @@ enum EKEventStoreHelper {
         do {
             return try await store.requestFullAccessToEvents()
         } catch {
-            print("[EKEventStoreHelper] requestAccess failed: \(error)")
+            BackgroundSyncLogger.logDebug("[EKEventStoreHelper] requestAccess failed: \(error)")
             return false
         }
     }

@@ -256,7 +256,7 @@ extension AccountManager {
             BackgroundSyncLogger.logError(
                 "[CalendarQueue] FAILED to record terminal outcome for op \(op.id) — it will be retried: \(error)",
                 source: "CalendarQueue")
-            print("[CalendarQueue] Failed to record terminal outcome for op \(op.id): \(error)")
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Failed to record terminal outcome for op \(op.id): \(error)")
             return false
         }
     }
@@ -314,7 +314,7 @@ extension AccountManager {
             arguments: arguments
         )
         try await dbPool.write { db in try op.insert(db) }
-        print("[CalendarQueue] Queued \(type.rawValue) for account \(accountId) (id: \(op.id))")
+        BackgroundSyncLogger.logDebug("[CalendarQueue] Queued \(type.rawValue) for account \(accountId) (id: \(op.id))")
         Task { await drainCalendarQueue() }
         return op
     }
@@ -324,11 +324,11 @@ extension AccountManager {
     /// multi-pass re-fetch for ops inserted during drain.
     func drainCalendarQueue() async {
         guard !isDrainingCalendar else {
-            print("[CalendarQueue] Skipped drain — already draining")
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Skipped drain — already draining")
             return
         }
         guard NetworkMonitor.checkConnected() else {
-            print("[CalendarQueue] Skipped drain — offline")
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Skipped drain — offline")
             return
         }
         isDrainingCalendar = true
@@ -346,17 +346,17 @@ extension AccountManager {
                         .fetchAll(db)
                 }
             } catch {
-                print("[CalendarQueue] ERROR: Failed to fetch pending ops: \(error)")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] ERROR: Failed to fetch pending ops: \(error)")
                 break
             }
             guard !ops.isEmpty else {
-                if pass == 0 { print("[CalendarQueue] No pending calendar ops") }
+                if pass == 0 { BackgroundSyncLogger.logDebug("[CalendarQueue] No pending calendar ops") }
                 break
             }
 
             if pass == 0 {
                 let summary = ops.map { "\($0.operationType)(event=\($0.eventId ?? "new"))" }.joined(separator: ", ")
-                print("[CalendarQueue] Draining \(ops.count) calendar operations: \(summary)")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Draining \(ops.count) calendar operations: \(summary)")
             }
 
             var executedAny = false
@@ -368,19 +368,19 @@ extension AccountManager {
                     guard let fetched = try await dbPool.read({ db in
                         try PendingCalendarOperation.fetchOne(db, key: op.id)
                     }) else {
-                        print("[CalendarQueue] Op \(op.id) vanished — skipping")
+                        BackgroundSyncLogger.logDebug("[CalendarQueue] Op \(op.id) vanished — skipping")
                         continue
                     }
                     currentOp = fetched
                 } catch {
-                    print("[CalendarQueue] ERROR: Failed to re-read op \(op.id): \(error)")
+                    BackgroundSyncLogger.logDebug("[CalendarQueue] ERROR: Failed to re-read op \(op.id): \(error)")
                     continue
                 }
                 if failedAccounts.contains(currentOp.accountId) { continue }
                 if currentOp.status == PendingStatus.inFlight.rawValue { continue }
 
                 guard let calProvider = calendarProviders[currentOp.accountId] else {
-                    print("[CalendarQueue] No calendar provider for \(currentOp.accountId) — skipping")
+                    BackgroundSyncLogger.logDebug("[CalendarQueue] No calendar provider for \(currentOp.accountId) — skipping")
                     continue
                 }
 
@@ -392,12 +392,12 @@ extension AccountManager {
                         _ = try updated.save(db)
                     }
                 } catch {
-                    print("[CalendarQueue] WARNING: Could not mark \(currentOp.id) in-flight — skipping: \(error)")
+                    BackgroundSyncLogger.logDebug("[CalendarQueue] WARNING: Could not mark \(currentOp.id) in-flight — skipping: \(error)")
                     continue
                 }
 
                 let opType = currentOp.operationType
-                print("[CalendarQueue] Executing \(opType) (id: \(currentOp.id), event: \(currentOp.eventId ?? "new"))")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Executing \(opType) (id: \(currentOp.id), event: \(currentOp.eventId ?? "new"))")
 
                 do {
                     let ids = try await executeCalendarOperation(currentOp, provider: calProvider)
@@ -443,14 +443,14 @@ extension AccountManager {
                         BackgroundSyncLogger.logError(
                             "[CalendarQueue] CRITICAL: failed to delete completed op \(currentOp.id) — it stays inFlight and can re-execute after successful startup recovery: \(error)",
                             source: "CalendarQueue")
-                        print("[CalendarQueue] CRITICAL: Failed to delete completed op \(currentOp.id) — can re-execute after successful startup recovery")
+                        BackgroundSyncLogger.logDebug("[CalendarQueue] CRITICAL: Failed to delete completed op \(currentOp.id) — can re-execute after successful startup recovery")
                     }
                     executedAny = true
 
                     // Best-effort EventKit refresh so iOS Calendar app picks up changes
                     EKEventStoreHelper.refreshSources()
 
-                    print("[CalendarQueue] Completed \(opType) (id: \(currentOp.id))")
+                    BackgroundSyncLogger.logDebug("[CalendarQueue] Completed \(opType) (id: \(currentOp.id))")
                     signalCalendarOpOutcome(
                         opId: currentOp.id,
                         outcome: .success(newSeriesId: ids.newSeriesId, createdRealId: ids.createdRealId)
@@ -486,14 +486,14 @@ extension AccountManager {
 
                     // Permanent errors — retire terminally, no retry.
                     if Self.isCalendarNotFoundError(error) {
-                        print("[CalendarQueue] Event not found for \(opType) — retiring (server wins)")
+                        BackgroundSyncLogger.logDebug("[CalendarQueue] Event not found for \(opType) — retiring (server wins)")
                         let reason = "event not found on server"
                         await retireAndAnnounce(currentOp, reason: reason)
                         executedAny = true
                         continue
                     }
                     if Self.isCalendarMissingScopeError(error) {
-                        print("[CalendarQueue] Calendar scope not granted for \(opType) — retiring. User must re-authenticate in Settings.")
+                        BackgroundSyncLogger.logDebug("[CalendarQueue] Calendar scope not granted for \(opType) — retiring. User must re-authenticate in Settings.")
                         // 🚨 R16-5 — RAISE THE PERSISTENT RE-AUTH SIGNAL HERE TOO.
                         // This arm's own reason string ends *"user must
                         // re-authenticate in Settings"*, i.e. its remedy is a USER
@@ -547,7 +547,7 @@ extension AccountManager {
                     // out on the strength of that false sentence.
                     if Self.isCalendarAuthError(error) {
                         let isCalDAV = Self.isCalDAVAuthError(error)
-                        print("[CalendarQueue] Auth failed for \(opType) (\(isCalDAV ? "CalDAV" : "OAuth")) — stopping retries, user must re-authenticate")
+                        BackgroundSyncLogger.logDebug("[CalendarQueue] Auth failed for \(opType) (\(isCalDAV ? "CalDAV" : "OAuth")) — stopping retries, user must re-authenticate")
                         let reason = Self.calendarAuthFailureReason(error)
                         await retireAndAnnounce(currentOp, reason: reason)
                         executedAny = true
@@ -561,7 +561,7 @@ extension AccountManager {
                     // and surface a clear reason — retrying won't help.
                     if Self.isCalendarUnsupportedError(error) {
                         let reason = unsupportedReason(error)
-                        print("[CalendarQueue] Unsupported \(opType) (\(reason)) — retiring (no retry)")
+                        BackgroundSyncLogger.logDebug("[CalendarQueue] Unsupported \(opType) (\(reason)) — retiring (no retry)")
                         await retireAndAnnounce(currentOp, reason: reason)
                         executedAny = true
                         continue
@@ -573,7 +573,7 @@ extension AccountManager {
                     // capped master and create duplicate successor series, so
                     // drop the op and surface the message for manual attention.
                     if case CalDAVError.inconsistentState(let reason) = error {
-                        print("[CalendarQueue] Inconsistent calendar state for \(opType) — retiring (no retry): \(reason)")
+                        BackgroundSyncLogger.logDebug("[CalendarQueue] Inconsistent calendar state for \(opType) — retiring (no retry): \(reason)")
                         await retireAndAnnounce(currentOp, reason: reason)
                         executedAny = true
                         continue
@@ -585,7 +585,7 @@ extension AccountManager {
                     // `BackgroundSyncLogger`, which is what `DebugLogView` renders
                     // (R16-10 — this sentence claimed that before it was true).
                     if Self.isCalendarBadRequestError(error) {
-                        print("[CalendarQueue] Bad request for \(opType) (\(error)) — retiring (will not retry)")
+                        BackgroundSyncLogger.logDebug("[CalendarQueue] Bad request for \(opType) (\(error)) — retiring (will not retry)")
                         let reason = badRequestReason(error)
                         await retireAndAnnounce(currentOp, reason: reason)
                         executedAny = true
@@ -610,7 +610,7 @@ extension AccountManager {
                     // → 7 at R17-2: the six arms plus the function's own definition.
                     // See `retireAndAnnounce`, which is now the single terminal
                     // announcement gate, and `retireCalendarOperation` beneath it.
-                    print("[CalendarQueue] Failed \(opType): \(error) (age \(String(format: "%.1f", ageHours))h) — will retry")
+                    BackgroundSyncLogger.logDebug("[CalendarQueue] Failed \(opType): \(error) (age \(String(format: "%.1f", ageHours))h) — will retry")
                     // 🚨 R17b-B2 — RECORDED, NOT SWALLOWED. This was `try? await`
                     // until R17b: the requeue is a durable bookkeeping write and a
                     // silently-dropped failure leaves the row `inFlight`, where the
@@ -634,7 +634,7 @@ extension AccountManager {
                         BackgroundSyncLogger.logError(
                             "[CalendarQueue] WARNING: failed to requeue transient op \(currentOp.id) — it stays inFlight until database recovery at next launch: \(error)",
                             source: "CalendarQueue")
-                        print("[CalendarQueue] WARNING: Could not requeue \(currentOp.id) — stays in-flight until next launch: \(error)")
+                        BackgroundSyncLogger.logDebug("[CalendarQueue] WARNING: Could not requeue \(currentOp.id) — stays in-flight until next launch: \(error)")
                     }
                     failedAccounts.insert(currentOp.accountId)
                     // Surface the still-queued status so the agent at least
@@ -695,7 +695,7 @@ extension AccountManager {
         // production-unreachable identity refusal was, because "the caller never
         // produces the value" is a property of today's callers, not an invariant.
         guard let type = CalendarOperationType(rawValue: op.operationType) else {
-            print("[CalendarQueue] Unknown operation type: \(op.operationType) — retiring as a permanent failure")
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Unknown operation type: \(op.operationType) — retiring as a permanent failure")
             throw CalendarProviderError.notSupported(
                 "the queued calendar operation has an unrecognised type '\(op.operationType)' and can never be executed")
         }
@@ -739,7 +739,7 @@ extension AccountManager {
             var createdRealId: String? = nil
             do {
                 let created = try await provider.createEvent(calendarId: calId, event: input, sendUpdates: "all")
-                print("[CalendarQueue] Created event id=\(created.id ?? "nil")")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Created event id=\(created.id ?? "nil")")
                 // Return the real id so the tool can use it in its result
                 // string. Without this, the tool's optimistic `event_id:
                 // <pregenId>` line is what `processToolOutputForLLM`
@@ -771,14 +771,14 @@ extension AccountManager {
                 // the duplicate's real id IS our pre-generated one. Recording it
                 // is what keeps the agent's follow-up edit/delete addressed at the
                 // event instead of at a nil id.
-                print("[CalendarQueue] Google reports our pre-generated id already exists (409 duplicate) — the create already landed")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Google reports our pre-generated id already exists (409 duplicate) — the create already landed")
                 createdRealId = op.eventId
             } catch CalDAVError.preconditionFailed {
                 // 412 Precondition Failed — CalDAV idempotent create (If-None-Match: *). Event exists. Success.
                 // Positive by construction, unlike the two 409s: the provider sent
                 // `If-None-Match: *`, so 412 is the server answering the exact
                 // question "does this resource already exist?" with yes.
-                print("[CalendarQueue] CalDAV event already exists (412) — treating as success")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] CalDAV event already exists (412) — treating as success")
             }
             // ⚠️ THERE IS DELIBERATELY NO `catch ExchangeCalendarError.httpError(409, _)`
             // HERE (R13-U3). It existed until 2026-08-06 and converted EVERY Graph
@@ -808,7 +808,7 @@ extension AccountManager {
             // See the `operationType` guard above for why this throws a
             // TERMINAL-classified error instead of returning (which is success).
             guard let eventId = op.eventId else {
-                print("[CalendarQueue] Edit op missing eventId — retiring as a permanent failure")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Edit op missing eventId — retiring as a permanent failure")
                 throw CalendarProviderError.notSupported(
                     "the queued calendar edit carries no event id and can never be executed")
             }
@@ -876,7 +876,7 @@ extension AccountManager {
                 // Gated per global rule 12 — this is a new diagnostic, and the surrounding ungated
                 // `print`s are the pre-existing corpus registered as `IOS-LOG-003`, not a licence.
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[CalendarQueue] Edit sets an RRULE UNTIL with no all_day argument — resolved allDay=\(resolvedAllDay == true) from the resource")
+                    BackgroundSyncLogger.logDebug("[CalendarQueue] Edit sets an RRULE UNTIL with no all_day argument — resolved allDay=\(resolvedAllDay == true) from the resource")
                 }
             }
             let input = CalendarToolHelpers.buildGCalEventInput(resolvedArgs, isAllDay: resolvedAllDay)
@@ -911,7 +911,7 @@ extension AccountManager {
                     recurrenceIdZone: recurrenceIdZone,
                     event: input, sendUpdates: "all"
                 )
-                print("[CalendarQueue] Updated event id=\(eventId) scope=this_only at \(rid) (\(recurrenceIdZone.identifier))")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(eventId) scope=this_only at \(rid) (\(recurrenceIdZone.identifier))")
             case "this_and_following":
                 guard let rid = recurrenceId else {
                     throw CalendarProviderError.notSupported("edit_scope='this_and_following' requires recurrence_id")
@@ -921,7 +921,7 @@ extension AccountManager {
                     recurrenceIdZone: recurrenceIdZone,
                     patch: input, sendUpdates: "all"
                 )
-                print("[CalendarQueue] Updated event id=\(eventId) scope=this_and_following at \(rid) (\(recurrenceIdZone.identifier)) — new series id=\(created.id ?? "?")")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(eventId) scope=this_and_following at \(rid) (\(recurrenceIdZone.identifier)) — new series id=\(created.id ?? "?")")
                 // Surface the new series id so `awaitCalendarOpOutcome` can hand
                 // it back to the tool — the LLM needs it to address occurrences
                 // in the split's second half. Without this, follow-up edits
@@ -930,7 +930,7 @@ extension AccountManager {
                 return (created.id, nil)
             case "all":
                 _ = try await provider.updateEvent(calendarId: calId, eventId: eventId, event: input, sendUpdates: "all")
-                print("[CalendarQueue] Updated event id=\(eventId) scope=all")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Updated event id=\(eventId) scope=all")
             default:
                 // Unknown edit_scope value — reject rather than silently defaulting
                 // to a series-wide write (which could surprise the user). The
@@ -943,12 +943,12 @@ extension AccountManager {
             // `.success` here told the agent "Calendar event deleted
             // successfully." for a delete that never reached the wire.
             guard let eventId = op.eventId else {
-                print("[CalendarQueue] Delete op missing eventId — retiring as a permanent failure")
+                BackgroundSyncLogger.logDebug("[CalendarQueue] Delete op missing eventId — retiring as a permanent failure")
                 throw CalendarProviderError.notSupported(
                     "the queued calendar delete carries no event id and can never be executed")
             }
             try await provider.deleteEvent(calendarId: calId, eventId: eventId, sendUpdates: "all")
-            print("[CalendarQueue] Deleted event id=\(eventId)")
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Deleted event id=\(eventId)")
         }
         return (nil, nil)
     }
@@ -1003,7 +1003,7 @@ extension AccountManager {
         // Strip the delta keys so downstream code only sees the resolved list.
         out.removeValue(forKey: "add_attendees")
         out.removeValue(forKey: "remove_attendees")
-        print("[CalendarQueue] Resolved attendee delta: base=\(base.count) +\(adds.count) -\(removes.count) → \(merged.count)")
+        BackgroundSyncLogger.logDebug("[CalendarQueue] Resolved attendee delta: base=\(base.count) +\(adds.count) -\(removes.count) → \(merged.count)")
         return out
     }
 

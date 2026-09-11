@@ -75,7 +75,7 @@ struct EmailDeleteTool: AgentTool, Sendable {
         )
 
         guard confirmed else {
-            print("[EmailDeleteTool] User declined to delete \(resolved.count) emails")
+            BackgroundSyncLogger.logDebug("[EmailDeleteTool] User declined to delete \(resolved.count) emails")
             throw ToolDeclinedError(output: ToolJSON.string(from: [
                 "cancelled": true,
                 "message": "User declined to delete. This likely means the wrong emails were selected. Use inbox_read to verify the correct emails before retrying.",
@@ -150,7 +150,7 @@ struct EmailDeleteTool: AgentTool, Sendable {
         }
 
         if DebugModeManager.isLoggingEnabled() {
-            print("[EmailDeleteTool] Admitted \(acted.count), pending \(pendingIds.count), terminal \(failedIds.count)")
+            BackgroundSyncLogger.logDebug("[EmailDeleteTool] Admitted \(acted.count), pending \(pendingIds.count), terminal \(failedIds.count)")
         }
 
         return ToolJSON.string(from: result)

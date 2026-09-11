@@ -118,7 +118,7 @@ actor ChatStore {
                 GROUP BY scope
                 """, arguments: [Double(cutoffMs)])
             let scopeBreakdown = scopeRows.map { (($0["scope"] as String?) ?? "?", ($0["n"] as Int?) ?? 0) }
-            print("[ChatStore] historyTurnIdsForSelfHeal(olderThan=\(cutoffMs)) eligible=\(ids.count) scopeBreakdown=\(scopeBreakdown)")
+            BackgroundSyncLogger.logDebug("[ChatStore] historyTurnIdsForSelfHeal(olderThan=\(cutoffMs)) eligible=\(ids.count) scopeBreakdown=\(scopeBreakdown)")
             return Set(ids)
         }
     }
@@ -197,7 +197,9 @@ actor ChatStore {
             let evictedTurns = try Self.enforceTurnBudgets(db: db, activeComposeSessions: activeComposeSessions)
 
             if !evictedTurns.isEmpty {
-                print("[ChatStore] Evicted \(evictedTurns.count) turns (budget enforcement)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ChatStore] Evicted \(evictedTurns.count) turns (budget enforcement)")
+                }
             }
             return (evictedTurns, historyTurn)
         }
@@ -374,7 +376,7 @@ actor ChatStore {
         // Also wipe memory.db — otherwise `memory_search` keeps surfacing
         // "cleared" conversations. See ADR-IOS-034.
         await MemoryIndex.shared.deleteAll()
-        print("[ChatStore] Cleared all chat history")
+        BackgroundSyncLogger.logDebug("[ChatStore] Cleared all chat history")
     }
 
     // MARK: - Delete Specific Turns
@@ -389,7 +391,7 @@ actor ChatStore {
             try ChatHistoryTurn.filter(ids.contains(Column("id"))).deleteAll(db)
         }
         await MemoryIndex.shared.deleteTurns(chatHistoryIds: ids)
-        print("[ChatStore] Deleted \(ids.count) session+history turns")
+        BackgroundSyncLogger.logDebug("[ChatStore] Deleted \(ids.count) session+history turns")
     }
 
     /// Delete history turns by their IDs (for swipe-to-delete in ChatHistoryView).
@@ -400,7 +402,7 @@ actor ChatStore {
             try ChatHistoryTurn.filter(ids.contains(Column("id"))).deleteAll(db)
         }
         await MemoryIndex.shared.deleteTurns(chatHistoryIds: ids)
-        print("[ChatStore] Deleted \(ids.count) history turns")
+        BackgroundSyncLogger.logDebug("[ChatStore] Deleted \(ids.count) history turns")
     }
 
     // MARK: - Convert to API Messages
@@ -571,7 +573,9 @@ actor ChatStore {
                 updated += 1
             }
             if updated > 0 {
-                print("[ChatStore] Dereferenced \(updated) turns in session \(sessionId.prefix(30))")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ChatStore] Dereferenced \(updated) turns in session \(sessionId.prefix(30))")
+                }
             }
         }
     }
@@ -581,7 +585,7 @@ actor ChatStore {
         _ = try AppDatabase.dbPool.write { db in
             try ChatTurn.filter(Column("sessionId") == sessionId).deleteAll(db)
         }
-        print("[ChatStore] Deleted turns for session \(sessionId)")
+        BackgroundSyncLogger.logDebug("[ChatStore] Deleted turns for session \(sessionId)")
     }
 
     // MARK: - StableId Helpers
@@ -641,7 +645,9 @@ actor ChatStore {
                 evicted += 1
             }
             if evicted > 0 {
-                print("[ChatStore] Evicted \(evicted) inbox sessions (limit=\(limit))")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ChatStore] Evicted \(evicted) inbox sessions (limit=\(limit))")
+                }
             }
             return evicted
         }
@@ -817,7 +823,9 @@ actor ChatStore {
                 sql: "DELETE FROM chatHistory WHERE id IN (\(placeholders))",
                 arguments: StatementArguments(evictedIds)
             )
-            print("[ChatStore] Evicted \(evictedIds.count) history turns (cap=\(maxTurns), was=\(totalCount))")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[ChatStore] Evicted \(evictedIds.count) history turns (cap=\(maxTurns), was=\(totalCount))")
+            }
             // THE LAST STATEMENT INSIDE THE TRANSACTION — see the header. Only
             // `register` moves the counter, so an already-open, untouched compose
             // never trips it and the cap sweep is not starved.
@@ -831,7 +839,7 @@ actor ChatStore {
             // memory.db. The next maintenance pass retries against a registry that now
             // includes the new compose.
             if DebugModeManager.isLoggingEnabled() {
-                print("[ChatStore] History cap eviction rolled back — a compose registered while the sweep was in flight; retrying on the next pass")
+                BackgroundSyncLogger.logDebug("[ChatStore] History cap eviction rolled back — a compose registered while the sweep was in flight; retrying on the next pass")
             }
             return []
         }
@@ -875,7 +883,9 @@ actor ChatStore {
                 }
             }
             if evicted > 0 {
-                print("[ChatStore] Evicted \(evicted) message-detail sessions (limit=\(limit))")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ChatStore] Evicted \(evicted) message-detail sessions (limit=\(limit))")
+                }
             }
             return evicted
         }
@@ -981,7 +991,9 @@ actor ChatStore {
                 evicted += 1
             }
             if evicted > 0 {
-                print("[ChatStore] Evicted \(evicted) compose sessions (ttl=\(ttlDays) days)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ChatStore] Evicted \(evicted) compose sessions (ttl=\(ttlDays) days)")
+                }
             }
             // THE LAST STATEMENT INSIDE THE TRANSACTION — see the header. Only
             // `register` moves the counter, so an already-open, untouched compose
@@ -995,7 +1007,7 @@ actor ChatStore {
             // Rolled back — nothing was deleted. The next maintenance pass retries
             // against a registry that now includes the new compose.
             if DebugModeManager.isLoggingEnabled() {
-                print("[ChatStore] Compose-session TTL sweep rolled back — a compose registered while it was in flight; retrying on the next pass")
+                BackgroundSyncLogger.logDebug("[ChatStore] Compose-session TTL sweep rolled back — a compose registered while it was in flight; retrying on the next pass")
             }
             return 0
         }

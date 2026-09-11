@@ -282,7 +282,7 @@ enum BodyFetchProcessor {
                     try await pool.write { db in try op(db) }
                 } catch {
                     if DebugModeManager.isLoggingEnabled() {
-                        print("\(owner) Durable oversized write failed (\(label)): \(error)")
+                        BackgroundSyncLogger.logDebug("\(owner) Durable oversized write failed (\(label)): \(error)")
                     }
                 }
             }
@@ -363,7 +363,7 @@ enum BodyFetchProcessor {
             let fullMessage = try await provider.fetchMessage(id: item.messageId, folder: item.folderPath)
             let fetchMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             if fetchMs > 500 {
-                print("[BodyFetch] Single fetch slow: \(item.messageId) took \(fetchMs)ms")
+                BackgroundSyncLogger.logDebug("[BodyFetch] Single fetch slow: \(item.messageId) took \(fetchMs)ms")
             }
 
             // Diagnostic: log raw provider output when the fetch comes back without
@@ -373,7 +373,7 @@ enum BodyFetchProcessor {
             let rawHtmlLen = fullMessage.htmlBody?.count ?? 0
             let rawTextLen = fullMessage.textBody?.count ?? 0
             if rawHtmlLen == 0 && rawTextLen == 0 {
-                print("[BodyFetch] RAW empty \(item.messageId) folder=\(item.folderPath) attachments=\(fullMessage.attachments.count) inline=\(fullMessage.inlineImages.count) ics=\(fullMessage.icsData != nil) tookMs=\(fetchMs)")
+                BackgroundSyncLogger.logDebug("[BodyFetch] RAW empty \(item.messageId) folder=\(item.folderPath) attachments=\(fullMessage.attachments.count) inline=\(fullMessage.inlineImages.count) ics=\(fullMessage.icsData != nil) tookMs=\(fetchMs)")
             }
 
             // PRE-RENDER REFUSAL — see `addressRefusal`. Rendering persists inline images to disk
@@ -402,7 +402,7 @@ enum BodyFetchProcessor {
                 let renderedLen = renderedBody.htmlContent?.count ?? 0
                 let htmlSample = String((fullMessage.htmlBody ?? "").prefix(200))
                 let textSample = String((fullMessage.textBody ?? "").prefix(200))
-                print("[BodyFetch] PARSER DROPPED \(item.messageId) folder=\(item.folderPath) rawHtmlLen=\(rawHtmlLen) rawTextLen=\(rawTextLen) renderedHtmlLen=\(renderedLen) htmlSample=\(htmlSample.debugDescription) textSample=\(textSample.debugDescription)")
+                BackgroundSyncLogger.logDebug("[BodyFetch] PARSER DROPPED \(item.messageId) folder=\(item.folderPath) rawHtmlLen=\(rawHtmlLen) rawTextLen=\(rawTextLen) renderedHtmlLen=\(renderedLen) htmlSample=\(htmlSample.debugDescription) textSample=\(textSample.debugDescription)")
             }
 
             return .success(FetchResult(
@@ -465,12 +465,12 @@ enum BodyFetchProcessor {
                 // PORT of `v2final`'s `BodyFetchProcessor.fetch` (commit `737aea64f`),
                 // which deleted this same write from this same branch.
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[BodyFetch] Body too large for \(item.messageId) — exceeds buffer (left honestly-incomplete, not marked empty)")
+                    BackgroundSyncLogger.logDebug("[BodyFetch] Body too large for \(item.messageId) — exceeds buffer (left honestly-incomplete, not marked empty)")
                 }
                 await markOversizedDurably(headerId: item.headerId)
                 return .failure(.payloadTooLarge)
             } else {
-                print("[BodyFetch] Fetch failed for \(item.messageId): \(error)")
+                BackgroundSyncLogger.logDebug("[BodyFetch] Fetch failed for \(item.messageId): \(error)")
                 return .failure(.retry)
             }
         }
@@ -562,7 +562,7 @@ enum BodyFetchProcessor {
                 // stays 0 → re-fetched next wake); only log genuine failures. Never
                 // mint an FTS candidate for bytes that did not reach the body cache.
                 if !error.isDatabaseSuspensionAbort {
-                    print("[BodyFetch] MessageBody insert failed for \(item.headerId.prefix(30)): \(error)")
+                    BackgroundSyncLogger.logDebug("[BodyFetch] MessageBody insert failed for \(item.headerId.prefix(30)): \(error)")
                 }
                 return (.retry, nil)
             }
@@ -602,7 +602,7 @@ enum BodyFetchProcessor {
                 }
             } catch {
                 if !error.isDatabaseSuspensionAbort {
-                    print("[BodyFetch] Attachment-only MessageBody insert failed for \(item.headerId.prefix(30)): \(error)")
+                    BackgroundSyncLogger.logDebug("[BodyFetch] Attachment-only MessageBody insert failed for \(item.headerId.prefix(30)): \(error)")
                 }
                 return (.retry, nil)
             }
@@ -628,7 +628,7 @@ enum BodyFetchProcessor {
             // bodyComplete stays 0 so the background queue re-enqueues for retry. We
             // must NEVER persist an empty/attachment-only body for an unresolved invite.
             if fetchResult.hasUnresolvedICS && DebugModeManager.isLoggingEnabled() {
-                print("[BodyFetch] Unresolved ICS for \(item.headerId.prefix(30)) — retrying, will not cache empty body")
+                BackgroundSyncLogger.logDebug("[BodyFetch] Unresolved ICS for \(item.headerId.prefix(30)) — retrying, will not cache empty body")
             }
             let currentCount = (try? await dbPool.read { db in
                 try Int.fetchOne(db, sql: "SELECT emptyFetchCount FROM messageHeader WHERE id = ?", arguments: [item.headerId])
@@ -661,7 +661,7 @@ enum BodyFetchProcessor {
                     }
                 } catch {
                     if !error.isDatabaseSuspensionAbort {
-                        print("[BodyFetch] Confirmed-empty flag write failed for \(item.headerId.prefix(30)): \(error)")
+                        BackgroundSyncLogger.logDebug("[BodyFetch] Confirmed-empty flag write failed for \(item.headerId.prefix(30)): \(error)")
                     }
                     // Confirmation is an acknowledgement of the combined body+flag
                     // transaction. A suspension abort leaves the message retryable.
@@ -672,7 +672,7 @@ enum BodyFetchProcessor {
                 // First empty fetch — increment counter but leave bodyComplete = 0
                 // so the background queue re-enqueues for retry on next cycle.
                 // Don't write empty body or set bodyEmptyConfirmed.
-                print("[BodyFetch] First empty fetch for \(item.headerId.prefix(30)) — will confirm on next attempt")
+                BackgroundSyncLogger.logDebug("[BodyFetch] First empty fetch for \(item.headerId.prefix(30)) — will confirm on next attempt")
                 do {
                     try await dbPool.write { db in
                         try db.execute(
@@ -682,7 +682,7 @@ enum BodyFetchProcessor {
                     }
                 } catch {
                     if !error.isDatabaseSuspensionAbort {
-                        print("[BodyFetch] emptyFetchCount increment failed for \(item.headerId.prefix(30)): \(error)")
+                        BackgroundSyncLogger.logDebug("[BodyFetch] emptyFetchCount increment failed for \(item.headerId.prefix(30)): \(error)")
                     }
                 }
                 return (.retry, nil)
@@ -773,7 +773,7 @@ enum BodyFetchProcessor {
             // ADR-IOS-046: a suspension abort is expected + benign here — bodyComplete
             // stays 0, the next wake's repopulate retries. Only log real failures.
             if !error.isDatabaseSuspensionAbort {
-                print("[BodyFetch] Batch FTS write failed (\(items.count) items): \(error)")
+                BackgroundSyncLogger.logDebug("[BodyFetch] Batch FTS write failed (\(items.count) items): \(error)")
             }
             // Items already have MessageBody in GRDB. bodyComplete stays 0.
             // Next repopulate will retry.
@@ -785,7 +785,7 @@ enum BodyFetchProcessor {
         if skippedCount > 0 {
             let skippedItems = items.filter { !writtenToFts.contains($0.contentKey) }
             let accountIds = Set(skippedItems.map(\.accountId)).sorted().joined(separator: ",")
-            print("[BodyFetch] flushBatch: \(skippedCount)/\(items.count) items not in FTS yet — bodyComplete deferred (accounts=[\(accountIds)])")
+            BackgroundSyncLogger.logDebug("[BodyFetch] flushBatch: \(skippedCount)/\(items.count) items not in FTS yet — bodyComplete deferred (accounts=[\(accountIds)])")
         }
 
         // 2. Batch GRDB flag update (snippets + bodyComplete) — ONLY for items written to FTS.
@@ -820,7 +820,7 @@ enum BodyFetchProcessor {
             }
         } catch {
             if !error.isDatabaseSuspensionAbort {
-                print("[BodyFetch] flushBatch snippet/bodyComplete write failed (\(confirmedItems.count) items): \(error)")
+                BackgroundSyncLogger.logDebug("[BodyFetch] flushBatch snippet/bodyComplete write failed (\(confirmedItems.count) items): \(error)")
             }
         }
         let dbMs = Int((CFAbsoluteTimeGetCurrent() - tDb) * 1000)
@@ -840,7 +840,7 @@ enum BodyFetchProcessor {
         }
 
         let totalMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-        print("[BodyFetch] flushBatch: \(items.count) items (\(writtenToFts.count) written) in \(totalMs)ms (fts=\(ftsMs)ms, db=\(dbMs)ms)")
+        BackgroundSyncLogger.logDebug("[BodyFetch] flushBatch: \(items.count) items (\(writtenToFts.count) written) in \(totalMs)ms (fts=\(ftsMs)ms, db=\(dbMs)ms)")
     }
 
     /// Render a pre-fetched FullMessageInfo into a FetchResult.
@@ -959,7 +959,7 @@ enum BodyFetchProcessor {
 
         let renderMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         if renderMs > 200 {
-            print("[BodyFetch] renderFetched: \(item.messageId) slow render: \(renderMs)ms")
+            BackgroundSyncLogger.logDebug("[BodyFetch] renderFetched: \(item.messageId) slow render: \(renderMs)ms")
         }
 
         return .success(FetchResult(
