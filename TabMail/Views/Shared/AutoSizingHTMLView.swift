@@ -2960,6 +2960,99 @@ function walkUpToWrapStart(quoteStart, body, logFn) {
 }
 """
 
+/// Bare ">" quote fallback thresholds — mirrors the Thunderbird addon's
+/// `config.quotedFallbackMinConsecutiveLines` / `quotedFallbackMaxTrailingLines`
+/// in `agent/modules/quoteAndSignature.js` (ADR-IOS-008 parity). Keep the two in step.
+enum QuotedFallbackConfig {
+    /// A lone ">>"-prefixed line (newsletter "›› Read the full story" link) must
+    /// not collapse the message; a real quote carries the marker on a run.
+    static let minConsecutiveLines = 2
+    /// The run must be TRAILING: at most this many non-blank non-">" lines may
+    /// follow it before the end of the message or a "-- " signature delimiter.
+    /// A sign-off plus an undelimited signature is well under this; a digest that
+    /// merely EMBEDS a ">" excerpt (e.g. a Reddit post quoting a notice, followed
+    /// by more posts and the footer) is far over it and must NOT collapse.
+    static let maxTrailingLines = 10
+    /// A non-quoted line between two ">" runs counts as an inline ANSWER only
+    /// when it has at least this many characters (TB `inlineAnswerMinLineLength`;
+    /// the same threshold the blockquote-based inline check below uses).
+    static let inlineAnswerMinLineLength = 2
+}
+
+/// Finds the boundary line for the bare ">" quote fallback, or -1.
+///
+/// A candidate line starts a run of at least `minRun` consecutive ">"-prefixed
+/// lines (leading whitespace ignored, as in the TB addon). The run must also be
+/// trailing: after it ends, more than `maxTrailing` non-blank non-">" lines
+/// before the end of the text or the first non-quoted "-- " signature delimiter
+/// means the ">" block is embedded content (digest excerpt, bottom-posted
+/// reply), not a trailing quote — collapsing from there would hide the message.
+/// A later ">" line accepts the run outright (TB `multiLineCheck`). An accepted
+/// run is then checked for an inline-answer cycle over the WHOLE remainder,
+/// including past any "-- " line (TB `detectInlineAnswersInPlainText`): quoted
+/// -> answer-like line (`inlineAnswerMinLineLength` or more characters; blank
+/// lines and 1-char gaps do not count) -> quoted means the message is an
+/// interleaved (inline) reply or a digest embedding several excerpts. With a `<blockquote>` present the run is
+/// ACCEPTED and the caller's blockquote-based trailing-quote logic decides,
+/// exactly as before this rule existed; with `hasBlockquote` false there is no
+/// trailing section to isolate and collapsing from the first run would hide the
+/// answers between the runs, so the result is -1 (leave visible) — the TB
+/// addon's `setupCollapsibleQuotes` bails the same way. The "-- " stop is a
+/// heuristic allowance for a signature-like tail, not a guarantee that the tail
+/// stays visible (the sweep collapses everything after the boundary, as it
+/// always has).
+///
+/// Each rejected run is walked once and the walk is bounded by the gap to the
+/// next run; the cycle scan runs once, on the first accepted run. A long ">"
+/// body therefore stays linear (the TB addon's review measured 17 s for 32k
+/// quoted lines when every quoted line re-walked the suffix).
+///
+/// Defined as a top-level JS string so that production (`collapseQuotesJS`)
+/// and unit tests (JSContext) consume the same source.
+let quotedFallbackBoundaryJS = """
+function findQuotedFallbackBoundary(lines, minRun, maxTrailing, minAnswerLen, hasBlockquote) {
+    function isQuoted(l) { return /^>/.test((l || '').trimStart()); }
+    for (var q = 0; q < lines.length; q++) {
+        if (!isQuoted(lines[q])) continue;
+        var ok = true;
+        for (var k = 0; k < minRun; k++) {
+            if (q + k >= lines.length || !isQuoted(lines[q + k])) { ok = false; break; }
+        }
+        if (!ok) continue;
+        var idx = q;
+        while (idx < lines.length && isQuoted(lines[idx])) idx++;
+        // 1. Trailing-run acceptance (TB multiLineCheck): a later ">" line
+        //    accepts the run; a non-quoted "-- " ends the count.
+        var trailing = 0;
+        var accepted = false;
+        for (; idx < lines.length; idx++) {
+            var t = (lines[idx] || '').trim();
+            if (!t) continue;
+            if (/^>/.test(t)) { accepted = true; break; }
+            if (/^--\\s*$/.test(t)) break;
+            trailing++;
+        }
+        if (!accepted && trailing > maxTrailing) { q = idx - 1; continue; }
+        // 2. Inline-answer cycle over the WHOLE remainder (TB
+        //    detectInlineAnswersInPlainText): quoted -> answer-like line
+        //    (>= minAnswerLen chars; a "-- " line counts like any other) ->
+        //    quoted means interleaved answers. Runs once, on the accepted run.
+        var answer = false;
+        for (var j = q; j < lines.length; j++) {
+            var u = (lines[j] || '').trim();
+            if (!u) continue;
+            if (/^>/.test(u)) {
+                if (answer) return hasBlockquote ? q : -1;
+            } else if (u.length >= minAnswerLen) {
+                answer = true;
+            }
+        }
+        return q;
+    }
+    return -1;
+}
+"""
+
 /// Shared "lift-attribution-out-of-block" helper.
 ///
 /// When the attribution text node lives inside a block that ALSO holds the
@@ -3172,6 +3265,7 @@ private var collapseQuotesJS: String {
         function _log(m) { \(logBody) }
         \(walkUpToWrapStartJS)
         \(splitBlockBeforeTargetJS)
+        \(quotedFallbackBoundaryJS)
         \(findQuoteStartBlockJS)
         \(sweepQuoteContentJS)
         var body = document.body;
@@ -3339,16 +3433,11 @@ private var collapseQuotesJS: String {
             }
         }
 
-        // Fallback: look for > prefix quoted lines (only if no other pattern matched)
+        // Fallback: look for > prefix quoted lines (only if no other pattern matched).
+        // Requires a RUN of consecutive ">" lines that is TRAILING — see
+        // `findQuotedFallbackBoundary` / `QuotedFallbackConfig` (TB addon parity).
         if (boundaryLine === -1) {
-            for (var q = 0; q < lines.length; q++) {
-                if (/^>/.test(lines[q])) {
-                    // Need at least 2 consecutive > lines to count
-                    if (q + 1 < lines.length && /^>/.test(lines[q + 1])) {
-                        boundaryLine = q; break;
-                    }
-                }
-            }
+            boundaryLine = findQuotedFallbackBoundary(lines, \(QuotedFallbackConfig.minConsecutiveLines), \(QuotedFallbackConfig.maxTrailingLines), \(QuotedFallbackConfig.inlineAnswerMinLineLength), !!body.querySelector('blockquote'));
         }
 
         _log('[QuoteDetect] Result: boundaryLine=' + boundaryLine + ', isForward=' + isForward);
