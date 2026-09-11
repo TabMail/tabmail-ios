@@ -53,7 +53,7 @@ import Synchronization
 /// through `DebugModeManager.escapedForLogLine`; that is the pre-existing rule
 /// and this file neither strengthens nor weakens it.
 ///
-/// TWO channels do NOT leave that to their call sites. `logChatError` bounds and
+/// THREE channels do NOT leave that to their call sites. `logChatError` bounds and
 /// escapes BOTH of its spans inside the façade — the literal user-typed
 /// `userMessage`, AND the `message` line, which carries the backend's own error
 /// string at most of its production call sites — because that writer is always-on:
@@ -61,8 +61,10 @@ import Synchronization
 /// on ANOTHER channel in this shared file. `logQueue` escapes its FULLY RENDERED
 /// line for the same reason with a different trigger: its lines interpolate IMAP
 /// mailbox paths, folder names and provider error descriptions, all
-/// server/user-authored, at dozens of sites that would each have to remember. The
-/// other fourteen channels' interpolations remain a call-site duty.
+/// server/user-authored, at dozens of sites that would each have to remember.
+/// `logDebug` does the same for the app's former bare `print` diagnostics, which
+/// interpolate the same kinds of values at far more sites. The other fourteen
+/// channels' interpolations remain a call-site duty.
 ///
 /// SIZE, unlike escaping, is bounded HERE for every channel: `append` truncates
 /// at `maxEntryScalars`, so no façade can hand the file an entry longer than a
@@ -75,8 +77,9 @@ enum AppLogStore {
     /// Hard cap on log file size before tail-trim kicks in.
     ///
     /// Doubled from the 16 MB the per-subsystem `background_sync.log` used,
-    /// because that cap now has to hold SIXTEEN channels instead of one (FIFTEEN
-    /// at consolidation; `.queue` was added for `IOS-QUEUE-008`). The
+    /// because that cap now has to hold SEVENTEEN channels instead of one (FIFTEEN
+    /// at consolidation; `.queue` was added for `IOS-QUEUE-008` and `.debug` for
+    /// `#72`). The
     /// trim is a whole-file tail-trim with no per-channel reservation, so a
     /// chatty channel can evict a quiet one's history — accepted deliberately
     /// (owner, 2026-08-25: "just diagnostics, don't overcomplicate"). Raising
@@ -90,8 +93,9 @@ enum AppLogStore {
     static let keepBytes = 16 * 1024 * 1024
 
     /// Hard ceiling on how many unicode scalars ONE entry's message may
-    /// contribute, applied at the STORE boundary so it covers all sixteen
-    /// façades (fifteen at consolidation, plus `logQueue`) rather than only the
+    /// contribute, applied at the STORE boundary so it covers all seventeen
+    /// façades (fifteen at consolidation, plus `logQueue` and `logDebug`) rather
+    /// than only the
     /// one that bounds its own spans.
     ///
     /// This is a SIZE bound and only a size bound.
@@ -206,7 +210,7 @@ enum AppLogStore {
                     // rewrote their whole file with `write(to:atomically:true)` —
                     // an atomic replace can never leave a partial line — and every
                     // other channel appended to a file only IT wrote. Now all
-                    // sixteen append in place to one shared file, so one channel's
+                    // seventeen append in place to one shared file, so one channel's
                     // torn write corrupts the NEXT channel's entry.
                     //
                     // One extra 1-byte read per append is the whole cost.
@@ -508,6 +512,9 @@ enum AppLogChannel: String, CaseIterable, Sendable {
     /// traffic that would otherwise bury them. Debug-gated: written by
     /// `BackgroundSyncLogger.logQueue` only.
     case queue
+    /// General diagnostics that used to be bare `print`s (`#72`). Debug-gated:
+    /// written by `BackgroundSyncLogger.logDebug` only.
+    case debug
 
     /// The literal written between brackets on every entry. Stable — a reader
     /// looking at an exported log from an older build matches on these, so
@@ -530,6 +537,7 @@ enum AppLogChannel: String, CaseIterable, Sendable {
         case .bodyRender: return "RENDER"
         case .stuckDiag: return "STUCK"
         case .queue: return "QUEUE"
+        case .debug: return "DEBUG"
         }
     }
 

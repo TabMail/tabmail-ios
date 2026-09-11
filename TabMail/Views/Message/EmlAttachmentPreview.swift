@@ -279,7 +279,7 @@ struct EmlAttachmentPreview: View {
             if DebugModeManager.isLoggingEnabled() {
                 // `error` can carry a server- or sender-supplied path, and `print`
                 // is a line-oriented sink: see `DebugModeManager.escapedForLogLine`.
-                print("[EmlNestedAttachment] Download failed: \(DebugModeManager.escapedForLogLine(String(describing: error)))")
+                BackgroundSyncLogger.logDebug("[EmlNestedAttachment] Download failed: \(DebugModeManager.escapedForLogLine(String(describing: error)))")
             }
         }
     }

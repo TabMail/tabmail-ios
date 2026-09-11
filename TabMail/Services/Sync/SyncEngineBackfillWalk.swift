@@ -729,7 +729,7 @@ extension SyncEngine {
                 return priority(a) < priority(b)
             }
         } catch {
-            print("[Backfill] Failed to fetch folders: \(error)")
+            BackgroundSyncLogger.logDebug("[Backfill] Failed to fetch folders: \(error)")
             BackgroundSyncLogger.logError("Failed to fetch folders: \(error)", source: "backfill:\(account.emailAddress)")
             return false
         }
@@ -738,7 +738,7 @@ extension SyncEngine {
         guard let provider = providers[account.id] else { return false }
         guard let workQueue = workQueues[account.id] else { return false }
 
-        print("[Backfill] Starting for \(account.emailAddress): \(incompleteFolders.count) folders to backfill")
+        BackgroundSyncLogger.logDebug("[Backfill] Starting for \(account.emailAddress): \(incompleteFolders.count) folders to backfill")
         BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress) walk: \(incompleteFolders.count) incomplete folders")
 
         var consecutiveConnectionFailures = 0
@@ -936,7 +936,7 @@ extension SyncEngine {
                         guard let observedUidNext = observation.uidNext else {
                             epochDeclinedFolderIds.insert(folder.id)
                             if DebugModeManager.isLoggingEnabled() {
-                                print("[Backfill] \(folder.name) declined: the walk-start SELECT reported no UIDNEXT — absence of evidence, not an empty mailbox; leaving the folder incomplete, retry next cycle")
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) declined: the walk-start SELECT reported no UIDNEXT — absence of evidence, not an empty mailbox; leaving the folder incomplete, retry next cycle")
                             }
                             continue
                         }
@@ -962,7 +962,7 @@ extension SyncEngine {
                             let cause = walkStartObservationFailed
                                 ? "the walk-start SELECT failed"
                                 : "the server reported no UIDVALIDITY on this SELECT"
-                            print("[Backfill] \(folder.name) declined: rows are stamped UIDVALIDITY \(String(describing: storedEpoch)) but this pass observed none — \(cause); retry next cycle")
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) declined: rows are stamped UIDVALIDITY \(String(describing: storedEpoch)) but this pass observed none — \(cause); retry next cycle")
                         }
                         continue
                     case .refuseEpochMismatch:
@@ -1002,12 +1002,12 @@ extension SyncEngine {
                         if readopted {
                             epochReadoptedFolderIds.insert(folder.id)
                             if DebugModeManager.isLoggingEnabled() {
-                                print("[Backfill] \(folder.name) holds no headers — dropping its stale UIDVALIDITY \(String(describing: storedEpoch)) and cursor, re-crawling under \(String(describing: walkEpoch))")
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) holds no headers — dropping its stale UIDVALIDITY \(String(describing: storedEpoch)) and cursor, re-crawling under \(String(describing: walkEpoch))")
                             }
                         } else {
                             epochDeclinedFolderIds.insert(folder.id)
                             if DebugModeManager.isLoggingEnabled() {
-                                print("[Backfill] \(folder.name) declined: rows belong to UIDVALIDITY \(String(describing: storedEpoch)), server is at \(String(describing: walkEpoch))")
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) declined: rows belong to UIDVALIDITY \(String(describing: storedEpoch)), server is at \(String(describing: walkEpoch))")
                             }
                         }
                         continue
@@ -1048,7 +1048,7 @@ extension SyncEngine {
                                     // accounted under, not the nil snapshot.
                                     premiseEpoch = walkEpoch
                                     if DebugModeManager.isLoggingEnabled() {
-                                        print("[Backfill] \(folder.name) epoch bootstrapped from resumed walk")
+                                        BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) epoch bootstrapped from resumed walk")
                                     }
                                 }
                             } catch {
@@ -1073,7 +1073,7 @@ extension SyncEngine {
                                 // retry meets the same preconditions — transient.
                                 epochDeclinedFolderIds.insert(folder.id)
                                 if DebugModeManager.isLoggingEnabled() {
-                                    print("[Backfill] \(folder.name) epoch bootstrap write failed: \(error) — declining this folder before the walk inserts anything, retry next cycle")
+                                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) epoch bootstrap write failed: \(error) — declining this folder before the walk inserts anything, retry next cycle")
                                 }
                                 continue
                             }
@@ -1160,18 +1160,18 @@ extension SyncEngine {
                                 // rest of the call; the next call retries.
                                 epochDeclinedFolderIds.insert(folder.id)
                                 if DebugModeManager.isLoggingEnabled() {
-                                    print("[Backfill] \(folder.name) fully-crawled write failed: \(error) — declining for this call, retry next cycle")
+                                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully-crawled write failed: \(error) — declining for this call, retry next cycle")
                                 }
                             }
                             if written {
-                                print("[Backfill] \(folder.name) fully crawled (UIDNEXT=1, no messages)")
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (UIDNEXT=1, no messages)")
                             } else if !epochDeclinedFolderIds.contains(folder.id) {
                                 // Refused, not thrown: another pass moved the stamp
                                 // out from under this one. Same spin argument as the
                                 // throw — decline for the rest of the call.
                                 epochDeclinedFolderIds.insert(folder.id)
                                 if DebugModeManager.isLoggingEnabled() {
-                                    print("[Backfill] \(folder.name): skipping fully-crawled write — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: writePremise))); declining for this call, retry next cycle")
+                                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name): skipping fully-crawled write — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: writePremise))); declining for this call, retry next cycle")
                                 }
                             }
                             didWork = true
@@ -1249,14 +1249,14 @@ extension SyncEngine {
                         } catch {
                             epochDeclinedFolderIds.insert(folder.id)
                             if DebugModeManager.isLoggingEnabled() {
-                                print("[Backfill] \(folder.name) initial cursor write failed: \(error) — declining for this call, retry next cycle")
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) initial cursor write failed: \(error) — declining for this call, retry next cycle")
                             }
                             continue
                         }
                         guard planted.landed else {
                             epochDeclinedFolderIds.insert(folder.id)
                             if DebugModeManager.isLoggingEnabled() {
-                                print("[Backfill] \(folder.name): skipping initial cursor write — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: writePremise))); declining for this call, retry next cycle")
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name): skipping initial cursor write — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: writePremise))); declining for this call, retry next cycle")
                             }
                             continue
                         }
@@ -1343,10 +1343,10 @@ extension SyncEngine {
                                         // SEARCH failed — return range for retry
                                         await cursor.failRange(from: range.from, to: range.to)
                                         if Self.isConnectionError(error) || Self.isSelectFailedError(error) {
-                                            print("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH connection error: \(error)")
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH connection error: \(error)")
                                             break
                                         }
-                                        print("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH error: \(error)")
+                                        BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH error: \(error)")
                                         continue
                                     }
 
@@ -1362,7 +1362,7 @@ extension SyncEngine {
                                         await cursor.failRange(from: range.from, to: range.to)
                                         outcome.epochDisagreed = true
                                         if DebugModeManager.isLoggingEnabled() {
-                                            print("[Backfill] \(folderCaptured.name) w\(workerIndex) range \(range.from)...\(range.to) refused after SEARCH — UIDVALIDITY moved mid-walk")
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) range \(range.from)...\(range.to) refused after SEARCH — UIDVALIDITY moved mid-walk")
                                         }
                                         break
                                     }
@@ -1401,7 +1401,7 @@ extension SyncEngine {
                                         continue
                                     }
 
-                                    print("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH found \(existingUIDs.count) UIDs in \(range.from)...\(range.to)")
+                                    BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH found \(existingUIDs.count) UIDs in \(range.from)...\(range.to)")
 
                                     // FETCH only the existing UIDs
                                     let fetched: (messages: [MessageHeaderInfo], observedEpoch: UInt32?)
@@ -1420,26 +1420,26 @@ extension SyncEngine {
                                             let currentChunk = await cursor.currentChunkSize
                                             if currentChunk <= 1 {
                                                 // Single UID too large — confirm anyway (can't split further)
-                                                print("[Backfill] \(folderCaptured.name) w\(workerIndex) single UID too large — skipping")
+                                                BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) single UID too large — skipping")
                                                 await cursor.confirmRange(from: range.from, to: range.to)
                                                 continue
                                             }
                                             await cursor.failRange(from: range.from, to: range.to)
                                             let newChunk = await cursor.reduceChunk()
-                                            print("[Backfill] \(folderCaptured.name) w\(workerIndex) payload too large, chunk → \(newChunk)")
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) payload too large, chunk → \(newChunk)")
                                             continue
                                         } else if isTimeout {
                                             await cursor.failRange(from: range.from, to: range.to)
                                             let newChunk = await cursor.reduceChunk()
-                                            print("[Backfill] \(folderCaptured.name) w\(workerIndex) timeout, chunk → \(newChunk)")
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) timeout, chunk → \(newChunk)")
                                             continue
                                         } else if Self.isConnectionError(error) || Self.isSelectFailedError(error) {
                                             await cursor.failRange(from: range.from, to: range.to)
-                                            print("[Backfill] \(folderCaptured.name) w\(workerIndex) connection error: \(error)")
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) connection error: \(error)")
                                             break
                                         } else {
                                             await cursor.failRange(from: range.from, to: range.to)
-                                            print("[Backfill] \(folderCaptured.name) w\(workerIndex) error: \(error)")
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) error: \(error)")
                                             BackgroundSyncLogger.logError("\(folderCaptured.name) w\(workerIndex) error: \(error)", source: "backfill")
                                             break
                                         }
@@ -1463,7 +1463,7 @@ extension SyncEngine {
                                         await cursor.failRange(from: range.from, to: range.to)
                                         outcome.epochDisagreed = true
                                         if DebugModeManager.isLoggingEnabled() {
-                                            print("[Backfill] \(folderCaptured.name) w\(workerIndex) range \(range.from)...\(range.to) refused after FETCH — UIDVALIDITY moved mid-walk, \(fetchedHeaders.count) headers discarded")
+                                            BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) range \(range.from)...\(range.to) refused after FETCH — UIDVALIDITY moved mid-walk, \(fetchedHeaders.count) headers discarded")
                                         }
                                         break
                                     }
@@ -1500,7 +1500,7 @@ extension SyncEngine {
                                             await cursor.failRange(from: range.from, to: range.to)
                                             outcome.epochDisagreed = true
                                             if DebugModeManager.isLoggingEnabled() {
-                                                print("[Backfill] \(folderCaptured.name) w\(workerIndex) range \(range.from)...\(range.to) refused at INSERT — the folder no longer holds the UIDVALIDITY this pass premised, \(fetchedHeaders.count) headers discarded")
+                                                BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) range \(range.from)...\(range.to) refused at INSERT — the folder no longer holds the UIDVALIDITY this pass premised, \(fetchedHeaders.count) headers discarded")
                                             }
                                             break
                                         }
@@ -1604,7 +1604,7 @@ extension SyncEngine {
                         // where it does not yet.)
                         epochDeclinedFolderIds.insert(folder.id)
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[Backfill] \(folder.name): UIDVALIDITY moved mid-walk — skipping cursor/completeness bookkeeping, retry next cycle")
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name): UIDVALIDITY moved mid-walk — skipping cursor/completeness bookkeeping, retry next cycle")
                         }
                         BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) UIDVALIDITY moved mid-walk — bookkeeping skipped")
                         didWork = true
@@ -1632,12 +1632,12 @@ extension SyncEngine {
                             return true
                         }) ?? false)
                         if written {
-                            print("[Backfill] \(folder.name) fully crawled (all ranges confirmed)")
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (all ranges confirmed)")
                             BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) fully crawled (all ranges confirmed)")
                         } else {
                             epochDeclinedFolderIds.insert(folder.id)
                             if DebugModeManager.isLoggingEnabled() {
-                                print("[Backfill] \(folder.name): fully-crawled write did not land — declining for this call, retry next cycle")
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name): fully-crawled write did not land — declining for this call, retry next cycle")
                             }
                         }
                     } else {
@@ -1651,12 +1651,12 @@ extension SyncEngine {
                         if !written {
                             epochDeclinedFolderIds.insert(folder.id)
                             if DebugModeManager.isLoggingEnabled() {
-                                print("[Backfill] \(folder.name): cursor persist did not land — declining for this call, retry next cycle")
+                                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name): cursor persist did not land — declining for this call, retry next cycle")
                             }
                         }
                         let hasPending = await cursor.hasPendingWork
                         if hasPending {
-                            print("[Backfill] \(folder.name) has failed ranges — will retry next cycle (cursor at \(finalCursor))")
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) has failed ranges — will retry next cycle (cursor at \(finalCursor))")
                             BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) has failed ranges — retry next cycle (cursor at \(finalCursor))")
                         }
                     }
@@ -1698,7 +1698,7 @@ extension SyncEngine {
                                     Column("backfillPageToken").set(to: nil as String?)
                                 )
                         }
-                        print("[Backfill] \(folder.name) fully crawled (no more pages)")
+                        BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (no more pages)")
                         BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) fully crawled (no more pages)")
                         didWork = true
                         await updateBackfillProgressForAccount(account)
@@ -1754,16 +1754,16 @@ extension SyncEngine {
                                         Column("backfillPageToken").set(to: nil as String?)
                                     )
                             }
-                            print("[Backfill] \(folder.name) fully crawled (last page, all exist)")
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (last page, all exist)")
                             didWork = true
                         } else {
-                            print("[Backfill] \(folder.name) all \(pageIds.count) IDs on page already exist — advancing to next page")
+                            BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) all \(pageIds.count) IDs on page already exist — advancing to next page")
                         }
                         await updateBackfillProgressForAccount(account)
                         continue
                     }
 
-                    print("[Backfill] \(folder.name) \(missingIds.count) missing of \(pageIds.count) IDs on page")
+                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) \(missingIds.count) missing of \(pageIds.count) IDs on page")
 
                     // Unified fetch: headers + bodies in a single API call per message.
                     // Stream maintains `concurrency` in-flight HTTP requests at all times.
@@ -1848,12 +1848,12 @@ extension SyncEngine {
                                 applySnippetUpdates(confirmedSnippets)
                                 let skipped = ftsBodyBuffer.count - writtenIds.count
                                 if skipped > 0 {
-                                    print("[Backfill] \(folder.name) wrote \(writtenIds.count)/\(ftsBodyBuffer.count) bodies to FTS (\(skipped) deferred)")
+                                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) wrote \(writtenIds.count)/\(ftsBodyBuffer.count) bodies to FTS (\(skipped) deferred)")
                                 } else {
-                                    print("[Backfill] \(folder.name) wrote \(ftsBodyBuffer.count) bodies to FTS")
+                                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) wrote \(ftsBodyBuffer.count) bodies to FTS")
                                 }
                             } catch {
-                                print("[Backfill] FTS body write failed: \(error)")
+                                BackgroundSyncLogger.logDebug("[Backfill] FTS body write failed: \(error)")
                                 BackgroundSyncLogger.logError("FTS body write failed for \(folder.name): \(error)", source: "backfill")
                             }
                         }
@@ -1881,18 +1881,18 @@ extension SyncEngine {
                             isLastPage = true
                         }
                     } else {
-                        print("[Backfill] \(folder.name) stream interrupted — NOT advancing page token")
+                        BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) stream interrupted — NOT advancing page token")
                     }
                 } else {
                     break
                 }
 
                 if headers.isEmpty {
-                    print("[Backfill] \(folder.name) fetch returned 0 headers — will retry next cycle")
+                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fetch returned 0 headers — will retry next cycle")
                     continue
                 }
 
-                print("[Backfill] \(folder.name) fetched \(headers.count) older messages")
+                BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fetched \(headers.count) older messages")
 
                 // Update oldestSyncedDate from oldest fetched message
                 if let oldest = headers.min(by: { $0.date < $1.date }) {
@@ -1911,7 +1911,7 @@ extension SyncEngine {
                                 Column("backfillPageToken").set(to: nil as String?)
                             )
                     }
-                    print("[Backfill] \(folder.name) fully crawled (last page processed)")
+                    BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fully crawled (last page processed)")
                     BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) fully crawled (last page processed)")
                 }
 
@@ -1921,7 +1921,7 @@ extension SyncEngine {
             } catch is CancellationError {
                 return didWork
             } catch {
-                print("[Backfill] Failed for \(folder.name): \(error)")
+                BackgroundSyncLogger.logDebug("[Backfill] Failed for \(folder.name): \(error)")
                 BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) cycle error: \(error)")
                 if !Self.isConnectionError(error) && !Self.isSelectFailedError(error) {
                     BackgroundSyncLogger.logError("Failed for \(folder.name): \(error)", source: "backfill:\(account.emailAddress)")
@@ -1936,7 +1936,7 @@ extension SyncEngine {
                     // Pool self-heals: dead connections are discarded on checkin(healthy: false),
                     // next checkout creates a fresh one.
                     consecutiveConnectionFailures += 1
-                    print("[Backfill] Connection failure \(consecutiveConnectionFailures) — backing off \(Int(connectionBackoffSeconds))s")
+                    BackgroundSyncLogger.logDebug("[Backfill] Connection failure \(consecutiveConnectionFailures) — backing off \(Int(connectionBackoffSeconds))s")
                     BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) connection failure #\(consecutiveConnectionFailures) — backoff \(Int(connectionBackoffSeconds))s")
                     try? await Task.sleep(for: .seconds(connectionBackoffSeconds))
                     connectionBackoffSeconds = min(60, connectionBackoffSeconds * 2)

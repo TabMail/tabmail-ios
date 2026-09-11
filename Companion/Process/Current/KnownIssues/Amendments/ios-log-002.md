@@ -127,3 +127,38 @@ the canonical row that replaced a drifted pre-sync inbox row — never reports e
 `reclaimed`, and names the deleted old ids nowhere. Each case is RED when its own
 `insertedIds.append(header.id)` is deleted, and the DraftDedup case is RED again when that append is
 rerouted to `reclaimedIds`; until 2026-09-05 either edit passed every test in the tree.
+
+## 2026-09-10 — a SEVENTEENTH channel, `.debug`, and it is the largest writer by far
+
+GitHub `TabMail/tabmail-ios#72`, owner decision 2026-09-10: every console `print` in the `TabMail/`
+target (gated AND ungated) was folded into the persisted log. Detail and site table:
+`Amendments/ios-log-001.md` (2026-09-10).
+
+- **`case debug`, tag `DEBUG`**, sole writer `BackgroundSyncLogger.logDebug(_ message: @autoclosure
+  () -> String)` — gated at the write, autoclosure rendered only when unlocked, the FULLY RENDERED
+  line escaped once in the façade (the `logQueue` precedent), then echoed and appended. Registered
+  in `AppLogStoreTests.debugGatedWriters`, so the four gating tests iterate it; forgery and
+  locked-gate-renders-nothing are pinned by `debugLineCannotForgeAnotherChannel` and
+  `lockedGateNeverRendersDebugMessage`.
+- **Arithmetic:** `AppLogChannel` has **seventeen** cases; the gating split is **5 always-on /
+  12 debug-gated**. "Sixteenth FILE" still counts the fifteen replaced files and is still not to be
+  renumbered.
+- **Exposure (d) is broader again, and this time by KIND, not only by payload.** The `.queue`
+  channel added only class C. `.debug` carries what the former `print` corpus carried: **class A**
+  message content (subjects, sender names, snippets, `CalDAVClient.put`'s ICS body with third-party
+  `ATTENDEE` addresses — see `Amendments/ios-log-003.md`), **class B** account addresses, and
+  **class C** folder names. All of it is written ONLY while debug logging is unlocked by an allowed
+  user (`tabmail.ai` domain plus one team address), and it leaves the device only on that user's
+  explicit App Logs share. This does not re-open the row: the row's trade is about ALWAYS-ON
+  channels, and no always-on writer changed.
+- **Retention isolation, again narrower.** `.debug` has 1,967 call sites against `.sync`'s 135 (`BackgroundSyncLogger.log(`), so
+  for an unlocked user it will dominate `tabmail.log`'s shared 32 MB → 16 MB tail and evict `[ERROR]` / `[AUTH]`
+  history much sooner than before. Same owner stance as 2026-08-25 ("just diagnostics"); no
+  per-channel floor was added. For a locked user nothing changes. The NSE's `nse.log` is a separate
+  file with its own 3 MB cap and no `.debug` writer; its retention does not change.
+- **Line forgery:** whole-line escaping is now closed for `logChatError`, `logQueue` **and
+  `logDebug`** — never "no user-authored text can forge a channel"; the other fourteen channels
+  still leave escaping to their call sites.
+
+Search terms: seventeenth channel; `AppLogChannel.debug`; `DEBUG` tag; `logDebug`; five always-on
+twelve debug-gated; class A now persisted for unlocked users; #72

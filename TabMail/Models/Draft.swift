@@ -523,8 +523,10 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         let candidates = try MessageHeader.fetchAll(
             db, sql: Self.replyTargetLookupSQL, arguments: [accountId, normalized])
         guard candidates.count == 1 else {
-            if candidates.count > 1, DebugModeManager.isLoggingEnabled() {
-                print("[Draft] T5.8 Strategy 2 refused for \(draftKey.prefix(40)) — \(candidates.count)+ rows share this account's RFC identity; no single physical copy is proven")
+            if candidates.count > 1 {
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[Draft] T5.8 Strategy 2 refused for \(draftKey.prefix(40)) — \(candidates.count)+ rows share this account's RFC identity; no single physical copy is proven")
+                }
             }
             return nil
         }

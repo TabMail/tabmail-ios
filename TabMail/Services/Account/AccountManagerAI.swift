@@ -489,7 +489,7 @@ extension AccountManager {
             NotificationCenter.default.post(name: .aiDidFailForMessage, object: current.id)
             return
         }
-        print("[AI] Priority direct path for opened message \(current.messageId)")
+        BackgroundSyncLogger.logDebug("[AI] Priority direct path for opened message \(current.messageId)")
         await processMessage(current, body: body, account: account, target: target)
     }
 
@@ -604,7 +604,7 @@ extension AccountManager {
                         }
 
                         guard let blurb = summary.blurb, !blurb.isEmpty else {
-                            print("[AI] No blurb for direct path \(messageId)")
+                            BackgroundSyncLogger.logDebug("[AI] No blurb for direct path \(messageId)")
                             NotificationCenter.default.post(name: .aiDidFailForMessage, object: headerId)
                             return
                         }
@@ -659,7 +659,7 @@ extension AccountManager {
                         }) ?? .dropped
                         guard outcome == .written else {
                             if DebugModeManager.isLoggingEnabled() {
-                                print("[AI] T4.V7 direct combined write dropped for \(messageId)")
+                                BackgroundSyncLogger.logDebug("[AI] T4.V7 direct combined write dropped for \(messageId)")
                             }
                             await ActiveAIQueue.shared.repopulateFromDatabase()
                             return
@@ -675,9 +675,9 @@ extension AccountManager {
                             try? await self.postReplyNotificationIfNeeded(target: target)
                         }
 
-                        print("[AI] Processed single message \(messageId)")
+                        BackgroundSyncLogger.logDebug("[AI] Processed single message \(messageId)")
                     } catch {
-                        print("[AI] Single message failed for \(messageId): \(error)")
+                        BackgroundSyncLogger.logDebug("[AI] Single message failed for \(messageId): \(error)")
                         NotificationCenter.default.post(name: .aiDidFailForMessage, object: headerId)
                     }
                 } else if !hasExistingAction {
@@ -729,20 +729,20 @@ extension AccountManager {
                                 }
                             guard let written, written.outcome == .written else {
                                 if DebugModeManager.isLoggingEnabled() {
-                                    print("[AI] T4.V7 direct action-only write dropped for \(messageId)")
+                                    BackgroundSyncLogger.logDebug("[AI] T4.V7 direct action-only write dropped for \(messageId)")
                                 }
                                 await ActiveAIQueue.shared.repopulateFromDatabase()
                                 return
                             }
                             let effectiveAction = written.effective
                             if effectiveAction != action {
-                                print("[ReplyDetect] AI direct action-only: reply→none for \(messageId)")
+                                BackgroundSyncLogger.logDebug("[ReplyDetect] AI direct action-only: reply→none for \(messageId)")
                             }
                             NotificationCenter.default.post(name: .messageDataDidChange, object: headerId)
-                            print("[AI] Action-only for single message \(messageId): \(effectiveAction.displayName)")
+                            BackgroundSyncLogger.logDebug("[AI] Action-only for single message \(messageId): \(effectiveAction.displayName)")
                         }
                     } catch {
-                        print("[AI] Action-only failed for single message \(messageId): \(error)")
+                        BackgroundSyncLogger.logDebug("[AI] Action-only failed for single message \(messageId): \(error)")
                     }
                 }
             }()
@@ -789,14 +789,16 @@ extension AccountManager {
                                     if DebugModeManager.isLoggingEnabled() {
                                         print("[AI] Reply precomputed for direct path \(messageId)")
                                     }
-                                } else if DebugModeManager.isLoggingEnabled() {
-                                    print("[AI] Reply filtered (sentinel) for direct path \(messageId)")
+                                } else {
+                                    if DebugModeManager.isLoggingEnabled() {
+                                        print("[AI] Reply filtered (sentinel) for direct path \(messageId)")
+                                    }
                                 }
                             }
                         }) ?? .dropped
                         guard outcome == .written else {
                             if DebugModeManager.isLoggingEnabled() {
-                                print("[AI] T4.V7 direct reply write dropped for \(messageId)")
+                                BackgroundSyncLogger.logDebug("[AI] T4.V7 direct reply write dropped for \(messageId)")
                             }
                             await ActiveAIQueue.shared.repopulateFromDatabase()
                             return
@@ -804,7 +806,7 @@ extension AccountManager {
                         NotificationCenter.default.post(name: .messageDataDidChange, object: headerId)
                     }
                 } catch {
-                    print("[AI] Reply precompute failed for direct path \(messageId): \(error)")
+                    BackgroundSyncLogger.logDebug("[AI] Reply precompute failed for direct path \(messageId): \(error)")
                 }
             }()
 
@@ -824,12 +826,12 @@ extension AccountManager {
     func applyManualTag(_ message: MessageHeader, tag: ActionTag?) async {
         // Block self-sent tagging (matches TB's isInternalSender check)
         guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: message.accountId) }) else {
-            print("[ManualTag] No account for message \(message.messageId)")
+            BackgroundSyncLogger.logDebug("[ManualTag] No account for message \(message.messageId)")
             return
         }
 
         if message.fromAddress.lowercased() == account.emailAddress.lowercased() {
-            print("[ManualTag] Blocking manual tag on self-sent message \(message.messageId)")
+            BackgroundSyncLogger.logDebug("[ManualTag] Blocking manual tag on self-sent message \(message.messageId)")
             return
         }
 
@@ -847,8 +849,8 @@ extension AccountManager {
         let originalAction = previousTag?.rawValue ?? ""
         let userManualTag = tag?.rawValue ?? ""
 
-        if DebugModeManager.isLoggingEnabled() { print("[ManualTag] START messageId=\(messageId) previousTag=\(previousTag?.rawValue ?? "nil") newTag=\(tag?.rawValue ?? "nil") subject=\(subject.prefix(60)) from=\(from.prefix(40))") }
-        if DebugModeManager.isLoggingEnabled() { print("[ManualTag] summaryBlurb=\(summaryBlurb?.prefix(80) ?? "nil") summaryTodos=\(summaryTodos?.prefix(80) ?? "nil")") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[ManualTag] START messageId=\(messageId) previousTag=\(previousTag?.rawValue ?? "nil") newTag=\(tag?.rawValue ?? "nil") subject=\(subject.prefix(60)) from=\(from.prefix(40))") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[ManualTag] summaryBlurb=\(summaryBlurb?.prefix(80) ?? "nil") summaryTodos=\(summaryTodos?.prefix(80) ?? "nil")") }
 
         // A staged-only row (ADR-IOS-049) isn't in GRDB yet — Step 1's
         // fetchOne-guarded write would silently no-op and the user's tag
@@ -877,7 +879,7 @@ extension AccountManager {
                     db: db
                 )
             }
-            print("[ManualTag] Applied \(tag?.displayName ?? "remove") to \(messageId)")
+            BackgroundSyncLogger.logDebug("[ManualTag] Applied \(tag?.displayName ?? "remove") to \(messageId)")
 
             // Step 4: Enqueue auto-update user_action.md for durable retry via BackfillAIQueue.
             // Previously a fire-and-forget LLM call — now persisted to GRDB first so it
@@ -892,9 +894,9 @@ extension AccountManager {
                 let isDemo = await MainActor.run { DemoModeStore.shared.isActive }
                 let exhausted = await MainActor.run { DemoModeStore.shared.isCallBudgetExhausted }
                 if isDemo && exhausted {
-                    print("[ManualTag] Step 4: skip enqueue — demo budget exhausted")
+                    BackgroundSyncLogger.logDebug("[ManualTag] Step 4: skip enqueue — demo budget exhausted")
                 } else {
-                    print("[ManualTag] Step 4: enqueuing actionRefine original=\(originalAction) userTag=\(userManualTag)")
+                    BackgroundSyncLogger.logDebug("[ManualTag] Step 4: enqueuing actionRefine original=\(originalAction) userTag=\(userManualTag)")
                     let snapshot = ActionRefineSnapshot(
                         messageStableId: message.stableId,
                         accountId: accountId,
@@ -906,10 +908,10 @@ extension AccountManager {
                         userManualTag: userManualTag
                     )
                     await BackfillAIQueue.shared.enqueueActionRefine(snapshot)
-                    print("[ManualTag] Step 4: actionRefine enqueued")
+                    BackgroundSyncLogger.logDebug("[ManualTag] Step 4: actionRefine enqueued")
                 }
             } else {
-                print("[ManualTag] Step 4: skipped actionRefine — tag=\(tag?.rawValue ?? "nil") original=\(originalAction) userTag=\(userManualTag)")
+                BackgroundSyncLogger.logDebug("[ManualTag] Step 4: skipped actionRefine — tag=\(tag?.rawValue ?? "nil") original=\(originalAction) userTag=\(userManualTag)")
             }
         }
     }
@@ -973,12 +975,12 @@ extension AccountManager {
             UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [notificationId])
             UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: [notificationId])
             if DebugModeManager.isLoggingEnabled() {
-                print("[AI] Reply notification dropped (identity moved) for \(target.headerId)")
+                BackgroundSyncLogger.logDebug("[AI] Reply notification dropped (identity moved) for \(target.headerId)")
             }
             return
         }
         if DebugModeManager.isLoggingEnabled() {
-            print("[AI] Posted reminder notification for \(target.headerId)")
+            BackgroundSyncLogger.logDebug("[AI] Posted reminder notification for \(target.headerId)")
         }
     }
 }

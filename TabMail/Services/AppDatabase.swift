@@ -314,7 +314,7 @@ final class AppDatabase: Sendable {
         // "did the boundary fire, and how much did it take" when a user reports
         // an action that did not survive an update.
         if DebugModeManager.isLoggingEnabled() {
-            print("[AppDatabase] Release boundary crossed to \(currentRelease) — retired \(retiredRows) previous-release pendingOperation row(s) and marked full sync due")
+            BackgroundSyncLogger.logDebug("[AppDatabase] Release boundary crossed to \(currentRelease) — retired \(retiredRows) previous-release pendingOperation row(s) and marked full sync due")
         }
         return true
     }
@@ -492,7 +492,7 @@ final class AppDatabase: Sendable {
         guard let url = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: "group.ai.tabmail"
         ) else {
-            print("[AppDatabase] App Group container not available — NSE staging DB not created")
+            BackgroundSyncLogger.logDebug("[AppDatabase] App Group container not available — NSE staging DB not created")
             return
         }
         let path = url.appendingPathComponent("nse_staging.sqlite").path
@@ -533,7 +533,7 @@ final class AppDatabase: Sendable {
         // in practice but keeps every main-app connection covered.
         config.observesSuspensionNotifications = true
         guard let db = try? DatabaseQueue(path: path, configuration: config) else {
-            print("[AppDatabase] Failed to open NSE staging DB")
+            BackgroundSyncLogger.logDebug("[AppDatabase] Failed to open NSE staging DB")
             return false
         }
         do {
@@ -688,10 +688,10 @@ final class AppDatabase: Sendable {
                     )
                     """)
             }
-            print("[AppDatabase] NSE staging DB schema ready (v6 — populated flag)")
+            BackgroundSyncLogger.logDebug("[AppDatabase] NSE staging DB schema ready (v6 — populated flag)")
             return true
         } catch {
-            print("[AppDatabase] Failed to create NSE staging DB schema: \(error)")
+            BackgroundSyncLogger.logDebug("[AppDatabase] Failed to create NSE staging DB schema: \(error)")
             return false
         }
     }
@@ -1993,7 +1993,9 @@ final class AppDatabase: Sendable {
         // this catches the historic backlog.
         migrator.registerTimedMigration("v53_backfillIsRepliedFromSentReplies") { db in
             let count = try ReplyParentResolver.runHistoricBackfill(db: db)
-            print("[v53] Backfilled isReplied for \(count) historic parents of Sent replies")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[v53] Backfilled isReplied for \(count) historic parents of Sent replies")
+            }
         }
 
         // v54: Merge fragmented Gmail/Exchange conversations.
@@ -2016,7 +2018,9 @@ final class AppDatabase: Sendable {
         // cases. Realistic email threads converge in 1-3 passes.
         migrator.registerTimedMigration("v54_mergeFragmentedThreads") { db in
             let totalMerged = try ThreadUtils.runFragmentMergeToFixpoint(db: db)
-            print("[v54] Merged \(totalMerged) fragmented thread rows")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[v54] Merged \(totalMerged) fragmented thread rows")
+            }
         }
 
         // v55: Persist agent event calendar provenance so [Event](N) pills in
@@ -2080,7 +2084,9 @@ final class AppDatabase: Sendable {
                 """)
             let healed = db.changesCount
             if healed > 0 {
-                print("[v57] Repaired bodyComplete on \(healed) optimistic Sent placeholders")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[v57] Repaired bodyComplete on \(healed) optimistic Sent placeholders")
+                }
             }
         }
 
@@ -2112,7 +2118,9 @@ final class AppDatabase: Sendable {
                 """)
             let healed = db.changesCount
             if healed > 0 {
-                print("[v58] Resynced tagSortOrder on \(healed) row(s)")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[v58] Resynced tagSortOrder on \(healed) row(s)")
+                }
             }
         }
 
@@ -2127,7 +2135,9 @@ final class AppDatabase: Sendable {
         migrator.registerTimedMigration("v59_rewalkImapArchiveAfterStaleWindowFix") { db in
             let reset = try AppDatabase.rewalkImapArchiveFolders(db)
             if reset > 0 {
-                print("[v59] Reset backfill for \(reset) IMAP archive folder(s) — re-fetching stale-window-deleted mail")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[v59] Reset backfill for \(reset) IMAP archive folder(s) — re-fetching stale-window-deleted mail")
+                }
             }
         }
 

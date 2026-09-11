@@ -14,13 +14,13 @@ struct ReminderAddTool: AgentTool, Sendable {
     func execute(arguments: [String: JSONValue]) async throws -> String {
         // Extract text (required)
         guard case .string(let rawText) = arguments["text"] else {
-            print("[ReminderAddTool] Missing or empty 'text'")
+            BackgroundSyncLogger.logDebug("[ReminderAddTool] Missing or empty 'text'")
             return #"{"error": "missing text"}"#
         }
 
         let text = AIService.normalizeUnicode(rawText).trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else {
-            print("[ReminderAddTool] Empty text after normalization")
+            BackgroundSyncLogger.logDebug("[ReminderAddTool] Empty text after normalization")
             return #"{"error": "missing text"}"#
         }
 
@@ -30,7 +30,7 @@ struct ReminderAddTool: AgentTool, Sendable {
             let trimmed = d.trimmingCharacters(in: .whitespaces)
             let datePattern = /^\d{4}\/\d{2}\/\d{2}$/
             guard trimmed.wholeMatch(of: datePattern) != nil else {
-                print("[ReminderAddTool] Invalid due_date format '\(trimmed)'")
+                BackgroundSyncLogger.logDebug("[ReminderAddTool] Invalid due_date format '\(trimmed)'")
                 return #"{"error": "invalid due_date format, expected YYYY/MM/DD"}"#
             }
             dueDate = trimmed
@@ -44,7 +44,7 @@ struct ReminderAddTool: AgentTool, Sendable {
             let trimmed = t.trimmingCharacters(in: .whitespaces)
             let timePattern = /^\d{2}:\d{2}$/
             guard trimmed.wholeMatch(of: timePattern) != nil else {
-                print("[ReminderAddTool] Invalid due_time format '\(trimmed)'")
+                BackgroundSyncLogger.logDebug("[ReminderAddTool] Invalid due_time format '\(trimmed)'")
                 return #"{"error": "invalid due_time format, expected HH:MM"}"#
             }
             dueTime = trimmed
@@ -54,27 +54,27 @@ struct ReminderAddTool: AgentTool, Sendable {
 
         // Build formatted KB entry (matching TB's formatReminderEntry)
         let entry = formatReminderEntry(text: text, dueDate: dueDate, dueTime: dueTime)
-        print("[ReminderAddTool] Formatted entry='\(entry.prefix(140))' len=\(entry.count)")
+        BackgroundSyncLogger.logDebug("[ReminderAddTool] Formatted entry='\(entry.prefix(140))' len=\(entry.count)")
 
         // Load current KB
         let current = PromptStore.kbTextSnapshot()
 
         let patchText = "ADD\n\(entry)"
         guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText) else {
-            print("[ReminderAddTool] applyKBPatch returned nil")
+            BackgroundSyncLogger.logDebug("[ReminderAddTool] applyKBPatch returned nil")
             return #"{"error": "failed to update knowledge base"}"#
         }
 
         if updated == current {
-            print("[ReminderAddTool] No-op (duplicate)")
+            BackgroundSyncLogger.logDebug("[ReminderAddTool] No-op (duplicate)")
             return "No change (duplicate reminder)."
         }
 
         // Persist — Device Sync triggers automatically
         await MainActor.run { PromptStore.shared.rawKB = updated }
-        print("[ReminderAddTool] Persisted user_kb.md (\(updated.count) chars)")
+        BackgroundSyncLogger.logDebug("[ReminderAddTool] Persisted user_kb.md (\(updated.count) chars)")
 
-        print("[ReminderAddTool] Success")
+        BackgroundSyncLogger.logDebug("[ReminderAddTool] Success")
         // Return JSON matching TB's return format
         let resultDict: [String: Any] = ["ok": true, "reminder": entry]
         return ToolJSON.string(from: resultDict)

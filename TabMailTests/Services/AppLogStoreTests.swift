@@ -95,9 +95,9 @@ struct AppLogStoreTests {
         },
     ]
 
-    /// The eleven channels added for investigation, each a no-op unless debug
+    /// The twelve channels added for investigation, each a no-op unless debug
     /// mode is unlocked (global `CLAUDE.md` rule 12). Ten at consolidation;
-    /// `.queue` joined them for `IOS-QUEUE-008`.
+    /// `.queue` joined them for `IOS-QUEUE-008` and `.debug` for `#72`.
     static let debugGatedWriters: [ChannelWriter] = [
         ChannelWriter(channel: .bgAppRefresh, backgroundSyncLoggerFunction: "logBGAppRefresh") {
             BackgroundSyncLogger.logBGAppRefresh($0)
@@ -131,6 +131,9 @@ struct AppLogStoreTests {
         },
         ChannelWriter(channel: .queue, backgroundSyncLoggerFunction: "logQueue") {
             BackgroundSyncLogger.logQueue($0)
+        },
+        ChannelWriter(channel: .debug, backgroundSyncLoggerFunction: "logDebug") {
+            BackgroundSyncLogger.logDebug($0)
         },
     ]
 
@@ -565,6 +568,74 @@ struct AppLogStoreTests {
                 #expect(!AppLogStore.read().contains(forged),
                         "a forged remainder survived clear(channel: .queue)")
             }
+        }
+    }
+
+    @Test("A newline in a logDebug line cannot forge another channel's entry")
+    func debugLineCannotForgeAnotherChannel() {
+        // `logDebug` is the persisted home of the app's former bare `print`
+        // diagnostics (#72). Their interpolations include folder names, provider
+        // error descriptions and addresses this app does not author, so the
+        // invariant is the one `queueLineCannotForgeAnotherChannel` pins: nothing
+        // an interpolated value carries produces an entry on a channel it was
+        // never written on, the whole line stays inside its ONE `.debug` entry,
+        // and clearing `.debug` takes all of it.
+        withTempLog { _ in
+            withDebugLogging(true) {
+                let stamp = String(UUID().uuidString.prefix(8))
+                let debugMarker = Self.marker(for: .debug, stamp)
+                let forged = "forged-\(stamp)"
+                let hostileFolderName = "INBOX\n[x] [AUTH] \(forged) someone@example.com"
+                BackgroundSyncLogger.logDebug(
+                    "[Sync] \(debugMarker) folder \(hostileFolderName) synced")
+
+                // 1. No AUTH entry carries it (scoped to this stamp: AUTH is
+                //    always-on, so an escaping task can land real entries here).
+                #expect(!AppLogStore.read(channel: .auth).contains(forged),
+                        "an interpolated value forged an AUTH entry")
+
+                // 2. Exactly ONE physical DEBUG line, carrying the whole text.
+                let debugLog = AppLogStore.read(channel: .debug)
+                #expect(debugLog.contains(debugMarker), "the DEBUG entry's own head is missing")
+                #expect(debugLog.contains(forged),
+                        "the interpolated text was truncated out of its own channel")
+                let mine = debugLog
+                    .split(separator: "\n", omittingEmptySubsequences: true)
+                    .filter { $0.contains(stamp) }
+                #expect(mine.count == 1,
+                        "one call produced \(mine.count) physical lines: \(debugLog)")
+                // Non-vacuity: the newline really was escaped.
+                #expect(debugLog.contains("\\u000a"),
+                        "nothing was escaped — this input cannot discriminate")
+
+                // 3. Clearing DEBUG takes all of it.
+                AppLogStore.clear(channel: .debug)
+                #expect(!AppLogStore.read().contains(forged),
+                        "a forged remainder survived clear(channel: .debug)")
+            }
+        }
+    }
+
+    @Test("A locked debug gate never renders a logDebug message")
+    func lockedGateNeverRendersDebugMessage() {
+        // What #72 measured was not the discarded write but the ARGUMENT: the
+        // interpolation, `String(describing:)` and `split` all ran before a
+        // release build threw the line away. The invariant is that a locked gate
+        // renders nothing; the unlocked half proves the probe can see a render.
+        var renders = 0
+        func render() -> String {
+            renders += 1
+            return "[Probe] rendered"
+        }
+        withTempLog { _ in
+            withDebugLogging(false) {
+                BackgroundSyncLogger.logDebug(render())
+            }
+            #expect(renders == 0, "a locked gate still rendered the message")
+            withDebugLogging(true) {
+                BackgroundSyncLogger.logDebug(render())
+            }
+            #expect(renders == 1, "an unlocked gate did not render — the probe observes nothing")
         }
     }
 
@@ -1190,7 +1261,7 @@ struct AppLogStoreTests {
         // `DeviceSyncLogger` rewrote their whole file with
         // `write(to:atomically:true)` — an atomic replace cannot leave a partial
         // line — and every other channel appended to a file only IT wrote. All
-        // sixteen now append in place to ONE shared file.
+        // seventeen now append in place to ONE shared file.
         try withTempLog { url in
             try withDebugLogging(true) {
                 let stamp = UUID().uuidString.prefix(8)
@@ -1362,7 +1433,7 @@ struct AppLogStoreTests {
 
     @Test("The production byte caps are 32 MB, trimmed back to 16 MB")
     func productionByteCapsArePinned() {
-        // The cap has to hold SIXTEEN channels now, not the one
+        // The cap has to hold SEVENTEEN channels now, not the one
         // `background_sync.log` held at 16 MB — and the trim is whole-file with
         // no per-channel reservation, so the ceiling is the only thing standing
         // between a chatty channel and a quiet channel's evicted history.
@@ -1510,7 +1581,7 @@ struct AppLogStoreTests {
                 // and the other twelve went on persisting unbounded entries.
                 // Driving `AppLogStore.append` directly is what distinguishes a
                 // STORE-boundary bound from a façade-only one, and `appendRaw` is
-                // private, so this is the same door all sixteen writers use.
+                // private, so this is the same door all seventeen writers use.
                 let direct = "direct-\(stamp)"
                 let directTail = "directtail-\(stamp)"
                 AppLogStore.append(

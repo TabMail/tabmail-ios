@@ -153,14 +153,14 @@ struct PlanPickerView: View {
                             case .presented:
                                 break
                             case .failed(let error):
-                                print("[PlanPicker] Failed to open subscription management: \(error)")
+                                BackgroundSyncLogger.logDebug("[PlanPicker] Failed to open subscription management: \(error)")
                             }
                             // Refresh entitlements after sheet closes
                             await storeKit.updateCurrentEntitlements()
                             do {
                                 accountInfo = try await backend.fetchAccountInfo()
                             } catch {
-                                print("[PlanPicker] Refresh after manage failed: \(error)")
+                                BackgroundSyncLogger.logDebug("[PlanPicker] Refresh after manage failed: \(error)")
                             }
                         }
                     } label: {
@@ -238,7 +238,7 @@ struct PlanPickerView: View {
             do {
                 accountInfo = try await backend.fetchAccountInfo()
             } catch {
-                print("[PlanPicker] fetchAccountInfo failed: \(error)")
+                BackgroundSyncLogger.logDebug("[PlanPicker] fetchAccountInfo failed: \(error)")
             }
         }
         .onChange(of: scenePhase) { _, newPhase in
@@ -247,7 +247,7 @@ struct PlanPickerView: View {
                     do {
                         accountInfo = try await backend.fetchAccountInfo()
                     } catch {
-                        print("[PlanPicker] Refresh on foreground failed: \(error)")
+                        BackgroundSyncLogger.logDebug("[PlanPicker] Refresh on foreground failed: \(error)")
                     }
                 }
             }
@@ -371,7 +371,7 @@ struct PlanPickerView: View {
             // truth. A later authoritative whoami reconciles if this one raced.
             if let purchased { AISubscriptionGate.shared.refreshAfterLocalPurchase(purchased) }
         } catch {
-            print("[PlanPicker] Purchase failed: \(error)")
+            BackgroundSyncLogger.logDebug("[PlanPicker] Purchase failed: \(error)")
             purchaseError = "Purchase failed. Please try again."
             isPurchasing = false
         }
@@ -397,13 +397,13 @@ struct PlanPickerView: View {
                 let (data, response) = try await URLSession.shared.data(for: request)
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if statusCode == 200 {
-                    print("[PlanPicker] Backend verified purchase successfully")
+                    BackgroundSyncLogger.logDebug("[PlanPicker] Backend verified purchase successfully")
                 } else {
                     let body = String(data: data, encoding: .utf8) ?? ""
-                    print("[PlanPicker] Backend verify-purchase returned \(statusCode): \(body)")
+                    BackgroundSyncLogger.logDebug("[PlanPicker] Backend verify-purchase returned \(statusCode): \(body)")
                 }
             } catch {
-                print("[PlanPicker] Backend verify-purchase failed: \(error)")
+                BackgroundSyncLogger.logDebug("[PlanPicker] Backend verify-purchase failed: \(error)")
             }
         }
     }

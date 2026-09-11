@@ -247,7 +247,7 @@ final class AISubscriptionGate: @unchecked Sendable {
         guard isActive else { return }
         isActive = false
         UserDefaults.standard.set(false, forKey: Self.lastKnownActiveKey)
-        print("[AISubscriptionGate] Gate CLOSED — subscription required")
+        BackgroundSyncLogger.logDebug("[AISubscriptionGate] Gate CLOSED — subscription required")
     }
 
     /// Reopen the gate — called on successful AI response or whoami confirming subscription.
@@ -257,7 +257,7 @@ final class AISubscriptionGate: @unchecked Sendable {
         guard !isActive else { return }
         isActive = true
         UserDefaults.standard.set(true, forKey: Self.lastKnownActiveKey)
-        print("[AISubscriptionGate] Gate OPENED — subscription confirmed")
+        BackgroundSyncLogger.logDebug("[AISubscriptionGate] Gate OPENED — subscription confirmed")
     }
 
     @MainActor

@@ -315,7 +315,7 @@ extension SyncEngine {
             sampled = candidates
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                print("[EpochVerify] \(folderId): sample read failed: \(error) — doing nothing this pass")
+                BackgroundSyncLogger.logDebug("[EpochVerify] \(folderId): sample read failed: \(error) — doing nothing this pass")
             }
             return .unobservable
         }
@@ -329,7 +329,7 @@ extension SyncEngine {
             // The cost of doing nothing is the `IOS-EPOCH-001` accepted window, and
             // it self-heals the moment any row gains an rfc822.
             if DebugModeManager.isLoggingEnabled() {
-                print("[EpochVerify] \(folderId): populated but no row carries an rfc822 Message-ID — cannot verify, leaving the epoch unknown")
+                BackgroundSyncLogger.logDebug("[EpochVerify] \(folderId): populated but no row carries an rfc822 Message-ID — cannot verify, leaving the epoch unknown")
             }
             return .unobservable
         }
@@ -342,7 +342,7 @@ extension SyncEngine {
         } catch {
             // A network/protocol failure is not evidence of anything. Do nothing.
             if DebugModeManager.isLoggingEnabled() {
-                print("[EpochVerify] \(folderId): verification fetch failed: \(error) — doing nothing this pass")
+                BackgroundSyncLogger.logDebug("[EpochVerify] \(folderId): verification fetch failed: \(error) — doing nothing this pass")
             }
             return .unobservable
         }
@@ -350,7 +350,7 @@ extension SyncEngine {
         // ── Step 3: THE ANTI-BRICK. No reported epoch ⇒ no arm, no react, no stamp.
         guard let observedEpoch = fetched.observedEpoch, observedEpoch != 0 else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[EpochVerify] \(folderId): the SELECT that served the sample reported no UIDVALIDITY — leaving the epoch unknown (never quarantine on this leg)")
+                BackgroundSyncLogger.logDebug("[EpochVerify] \(folderId): the SELECT that served the sample reported no UIDVALIDITY — leaving the epoch unknown (never quarantine on this leg)")
             }
             return .unobservable
         }
@@ -409,12 +409,12 @@ extension SyncEngine {
             guard stamped else { return .notApplicable }
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                print("[EpochVerify] \(folderId): stamp write failed: \(error) — the epoch stays unknown; the next pass re-verifies")
+                BackgroundSyncLogger.logDebug("[EpochVerify] \(folderId): stamp write failed: \(error) — the epoch stays unknown; the next pass re-verifies")
             }
             return .unobservable
         }
         if DebugModeManager.isLoggingEnabled() {
-            print("[EpochVerify] \(folderId): verified epoch \(observedEpoch) (agreements=\(agreeing.count) of \(sampled.count) sampled)")
+            BackgroundSyncLogger.logDebug("[EpochVerify] \(folderId): verified epoch \(observedEpoch) (agreements=\(agreeing.count) of \(sampled.count) sampled)")
         }
         return .verified(epoch: observedEpoch)
     }

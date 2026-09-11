@@ -110,7 +110,7 @@ struct MessageDetailView: View {
         self.testBypassesDisclosureOpenAnchorDisarm = testBypassesDisclosureOpenAnchorDisarm
         self._skeletonOverlayVisible = State(initialValue: opensWithSkeletonDwell)
         if DebugModeManager.isLoggingEnabled() {
-            print("[DetailRender] MessageDetailView.init msgId=\(messageId.prefix(40))")
+            BackgroundSyncLogger.logDebug("[DetailRender] MessageDetailView.init msgId=\(messageId.prefix(40))")
         }
     }
 #else
@@ -124,7 +124,7 @@ struct MessageDetailView: View {
         self.opensWithSkeletonDwell = opensWithSkeletonDwell
         self._skeletonOverlayVisible = State(initialValue: opensWithSkeletonDwell)
         if DebugModeManager.isLoggingEnabled() {
-            print("[DetailRender] MessageDetailView.init msgId=\(messageId.prefix(40))")
+            BackgroundSyncLogger.logDebug("[DetailRender] MessageDetailView.init msgId=\(messageId.prefix(40))")
         }
     }
 #endif
@@ -198,7 +198,7 @@ struct MessageDetailView: View {
                     chatExpanded = false
                 }
                 contactComposeRequest = request
-                print("[DynamicIslandChat] Contact pill compose: \(request.to.first ?? "")")
+                BackgroundSyncLogger.logDebug("[DynamicIslandChat] Contact pill compose: \(request.to.first ?? "")")
             }
             .task {
                 // Mark-read runs on its own unstructured Task so that
@@ -266,7 +266,7 @@ struct MessageDetailView: View {
                 if DebugModeManager.isLoggingEnabled() {
                     let branch = viewModel.message != nil ? "content"
                         : (viewModel.messageNotFound ? "notFound" : "skeleton")
-                    print("[DetailRender] bodyContent eval branch=\(branch) vm=\(ObjectIdentifier(viewModel)) vmMsgId=\(viewModel.messageId.prefix(40)) header=\(viewModel.message == nil ? "nil" : "set") body=\(viewModel.messageBody == nil ? "nil" : "set")")
+                    BackgroundSyncLogger.logDebug("[DetailRender] bodyContent eval branch=\(branch) vm=\(ObjectIdentifier(viewModel)) vmMsgId=\(viewModel.messageId.prefix(40)) header=\(viewModel.message == nil ? "nil" : "set") body=\(viewModel.messageBody == nil ? "nil" : "set")")
                 }
             }()
             if let message = viewModel.message {
@@ -360,13 +360,13 @@ struct MessageDetailView: View {
                 if !testBypassesDisclosureOpenAnchorDisarm {
                     openAnchorGate.userTookControl()
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[DetailAnchor] user disclosure disarmed opening anchor card=\(msg.stableId)")
+                        BackgroundSyncLogger.logDebug("[DetailAnchor] user disclosure disarmed opening anchor card=\(msg.stableId)")
                     }
                 }
 #else
                 openAnchorGate.userTookControl()
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[DetailAnchor] user disclosure disarmed opening anchor card=\(msg.stableId)")
+                    BackgroundSyncLogger.logDebug("[DetailAnchor] user disclosure disarmed opening anchor card=\(msg.stableId)")
                 }
 #endif
             }
@@ -419,7 +419,7 @@ struct MessageDetailView: View {
         // first pass and its queued retry, or while thread rows merge in.
         guard openAnchorGate.shouldReanchor(hasLaterMessages: hasLaterMessages) else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[DetailAnchor] skip card=\(stableId) armed=\(openAnchorGate.isArmed) later=\(hasLaterMessages)")
+                BackgroundSyncLogger.logDebug("[DetailAnchor] skip card=\(stableId) armed=\(openAnchorGate.isArmed) later=\(hasLaterMessages)")
             }
             return
         }
@@ -429,7 +429,7 @@ struct MessageDetailView: View {
             proxy.scrollTo(stableId, anchor: .top)
         }
         if DebugModeManager.isLoggingEnabled() {
-            print("[DetailAnchor] scrollTo card=\(stableId) later=\(hasLaterMessages)")
+            BackgroundSyncLogger.logDebug("[DetailAnchor] scrollTo card=\(stableId) later=\(hasLaterMessages)")
         }
     }
 

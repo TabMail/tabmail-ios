@@ -28,7 +28,7 @@ enum CalDAVDiscovery {
                 principalURL = try await discoverPrincipal(baseURL: wellKnownURL, client: client)
             } catch {
                 // Fall back to direct PROPFIND on server URL
-                print("[CalDAVDiscovery] .well-known failed, trying direct PROPFIND: \(error)")
+                BackgroundSyncLogger.logDebug("[CalDAVDiscovery] .well-known failed, trying direct PROPFIND: \(error)")
                 principalURL = try await discoverPrincipal(baseURL: serverURL, client: client)
             }
         }
@@ -36,7 +36,7 @@ enum CalDAVDiscovery {
         // Step 2: Get calendar-home-set from principal
         let calendarHomeURL = try await discoverCalendarHome(principalURL: principalURL, client: client)
 
-        print("[CalDAVDiscovery] principal=\(principalURL), home=\(calendarHomeURL)")
+        BackgroundSyncLogger.logDebug("[CalDAVDiscovery] principal=\(principalURL), home=\(calendarHomeURL)")
         return DiscoveryResult(principalURL: principalURL, calendarHomeURL: calendarHomeURL)
     }
 

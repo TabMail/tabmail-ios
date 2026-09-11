@@ -49,7 +49,7 @@ private struct OrientationLockModifier: ViewModifier {
         scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
             // Failures are non-fatal — system may reject the update if
             // another scene is requesting a conflicting orientation.
-            print("[OrientationLock] requestGeometryUpdate failed: \(error)")
+            BackgroundSyncLogger.logDebug("[OrientationLock] requestGeometryUpdate failed: \(error)")
         }
     }
 }

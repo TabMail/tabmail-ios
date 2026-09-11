@@ -31,8 +31,8 @@ private func previewToast(
     )
     return PendingSendToast(
         pending: pending,
-        onUndo: { print("[Preview] Undo tapped") },
-        onDismiss: { print("[Preview] × tapped") }
+        onUndo: { BackgroundSyncLogger.logDebug("[Preview] Undo tapped") },
+        onDismiss: { BackgroundSyncLogger.logDebug("[Preview] × tapped") }
     )
 }
 

@@ -129,9 +129,9 @@ extension AccountManager {
         )
         if DebugModeManager.isLoggingEnabled() {
             if result.deduped {
-                print("[Outbox] Deduped duplicate send for draftId=\(draftId) → existing outbox id=\(result.outboxId)")
+                BackgroundSyncLogger.logDebug("[Outbox] Deduped duplicate send for draftId=\(draftId) → existing outbox id=\(result.outboxId)")
             } else {
-                print("[Outbox] Queued send to \(draft.to.joined(separator: ", ")) (id: \(result.outboxId))")
+                BackgroundSyncLogger.logDebug("[Outbox] Queued send to \(draft.to.joined(separator: ", ")) (id: \(result.outboxId))")
             }
         }
 
@@ -353,11 +353,11 @@ extension AccountManager {
     /// status transitions can cause double-sends via crash recovery.
     func drainOutbox() async {
         guard !isDrainingOutbox else {
-            print("[Outbox] Skipped drain — already draining")
+            BackgroundSyncLogger.logDebug("[Outbox] Skipped drain — already draining")
             return
         }
         guard NetworkMonitor.checkConnected() else {
-            print("[Outbox] Skipped drain — offline")
+            BackgroundSyncLogger.logDebug("[Outbox] Skipped drain — offline")
             return
         }
         isDrainingOutbox = true
@@ -372,10 +372,10 @@ extension AccountManager {
                     .fetchAll(db)
             }
             for m in stuckMessages {
-                print("[Outbox] Stuck message: id=\(m.id) status=\(m.status) retryCount=\(m.retryCount) sentAt=\(String(describing: m.sentAt)) appendedToSent=\(m.appendedToSent) error=\(m.errorMessage ?? "nil") to=\(m.to)")
+                BackgroundSyncLogger.logDebug("[Outbox] Stuck message: id=\(m.id) status=\(m.status) retryCount=\(m.retryCount) sentAt=\(String(describing: m.sentAt)) appendedToSent=\(m.appendedToSent) error=\(m.errorMessage ?? "nil") to=\(m.to)")
             }
         } catch {
-            print("[Outbox] ERROR: Failed to check outbox state: \(error)")
+            BackgroundSyncLogger.logDebug("[Outbox] ERROR: Failed to check outbox state: \(error)")
         }
 
         // Phase 1: Retry pending Sent folder appends (sent but not yet appended)
@@ -420,7 +420,7 @@ extension AccountManager {
         }
 
         if drainedCount > 0 {
-            print("[Outbox] Drained \(drainedCount) message(s)")
+            BackgroundSyncLogger.logDebug("[Outbox] Drained \(drainedCount) message(s)")
         }
 
         // Schedule a wake-up Task for the earliest still-pending future-hold
@@ -545,7 +545,9 @@ extension AccountManager {
                 // predicate (`drainPendingSentAppends`) and runs as phase 1 of
                 // every drain — before this send phase.
                 guard fetched.sentAt == nil else {
-                    print("[Outbox] Refusing to claim \(fetched.id) — sentAt is already stamped (double-send firewall); Sent-append/finalization recovery owns this row")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Outbox] Refusing to claim \(fetched.id) — sentAt is already stamped (double-send firewall); Sent-append/finalization recovery owns this row")
+                    }
                     return nil
                 }
                 guard fetched.outboxStatus == .queued else {
@@ -575,13 +577,15 @@ extension AccountManager {
                     arguments: [OutboxStatus.sending.rawValue, messageId, fetched.id, OutboxStatus.queued.rawValue]
                 )
                 guard db.changesCount == 1 else {
-                    print("[Outbox] CRITICAL: claim CAS did not transition exactly one row for \(fetched.id) — NOT sending; row left for the next drain")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[Outbox] CRITICAL: claim CAS did not transition exactly one row for \(fetched.id) — NOT sending; row left for the next drain")
+                    }
                     return nil
                 }
                 return (fetched, messageId)
             }
         } catch {
-            print("[Outbox] WARNING: Could not claim \(msg.id): \(error)")
+            BackgroundSyncLogger.logDebug("[Outbox] WARNING: Could not claim \(msg.id): \(error)")
             return nil
         }
     }
@@ -594,13 +598,13 @@ extension AccountManager {
         guard let queue = workQueues[current.accountId] else {
             let requeued = await requeueClaimedOutboxMessage(current.id)
             if !requeued {
-                print("[Outbox] CRITICAL: missing-provider rollback did not transition exactly one row for \(current.id) — a newer durable state won or the write failed")
+                BackgroundSyncLogger.logDebug("[Outbox] CRITICAL: missing-provider rollback did not transition exactly one row for \(current.id) — a newer durable state won or the write failed")
             }
             return
         }
         let provider = queue.provider
 
-        print("[Outbox] Sending message \(current.id) to \(current.to.joined(separator: ", "))")
+        BackgroundSyncLogger.logDebug("[Outbox] Sending message \(current.id) to \(current.to.joined(separator: ", "))")
 
         do {
             let draft: DraftMessage
@@ -609,7 +613,7 @@ extension AccountManager {
             } catch {
                 // Attachment files corrupted/missing — mark as failed, do NOT send
                 // an incomplete email (missing attachments = silent data corruption).
-                print("[Outbox] ERROR: Could not reconstruct draft for \(current.id): \(error)")
+                BackgroundSyncLogger.logDebug("[Outbox] ERROR: Could not reconstruct draft for \(current.id): \(error)")
                 // 🚨 NEVER `try?` ON AN OUTBOX STATE TRANSITION (Outbox rule 2).
                 //
                 // This write is the ONLY thing moving the row off `.sending`, and
@@ -632,10 +636,10 @@ extension AccountManager {
                         )
                     }
                 } catch {
-                    print("[Outbox] CRITICAL: could not mark \(current.id) failed after attachment-load error: \(error) — requeueing so the row stays drainable")
+                    BackgroundSyncLogger.logDebug("[Outbox] CRITICAL: could not mark \(current.id) failed after attachment-load error: \(error) — requeueing so the row stays drainable")
                     let requeued = await requeueClaimedOutboxMessage(current.id)
                     if !requeued {
-                        print("[Outbox] CRITICAL: attachment-failure rollback did not transition exactly one row for \(current.id) — a newer durable state won or the write failed")
+                        BackgroundSyncLogger.logDebug("[Outbox] CRITICAL: attachment-failure rollback did not transition exactly one row for \(current.id) — a newer durable state won or the write failed")
                     }
                 }
                 return
@@ -647,11 +651,11 @@ extension AccountManager {
             draftWithId.messageId = messageId
             let draftToSend = draftWithId
 
-            print("[Outbox] Sending \(current.id) via \(type(of: provider))")
+            BackgroundSyncLogger.logDebug("[Outbox] Sending \(current.id) via \(type(of: provider))")
             try await queue.execute(priority: .userAction) {
                 try await provider.send(draft: draftToSend)
             }
-            print("[Outbox] Send succeeded for \(current.id)")
+            BackgroundSyncLogger.logDebug("[Outbox] Send succeeded for \(current.id)")
 
             // PORT 4651d894b: a send without a truthful durable stamp may not
             // append or finalize. Reconcile accepts a possible resend, never a drop.
@@ -678,10 +682,10 @@ extension AccountManager {
                 // Both send and append succeeded — finalize.
                 await finalizeOutboxMessage(current)
             } else {
-                print("[Outbox] Sent but append to Sent folder pending — will retry (id: \(current.id))")
+                BackgroundSyncLogger.logDebug("[Outbox] Sent but append to Sent folder pending — will retry (id: \(current.id))")
             }
 
-            print("[Outbox] Sent successfully (id: \(current.id))")
+            BackgroundSyncLogger.logDebug("[Outbox] Sent successfully (id: \(current.id))")
         } catch {
             // Send failed — three-tier error classification:
             // 1. Fatal (invalid recipient, message too large): immediately mark 'failed',
@@ -709,16 +713,16 @@ extension AccountManager {
                 }
                 NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
             } catch {
-                print("[Outbox] CRITICAL: Could not update \(current.id) status — stays as 'sending', will be re-queued on restart")
+                BackgroundSyncLogger.logDebug("[Outbox] CRITICAL: Could not update \(current.id) status — stays as 'sending', will be re-queued on restart")
             }
             if isFatal {
-                print("[Outbox] Send failed for \(current.id) (fatal, no retry — requires user action): \(error)")
+                BackgroundSyncLogger.logDebug("[Outbox] Send failed for \(current.id) (fatal, no retry — requires user action): \(error)")
             } else if isTransient {
-                print("[Outbox] Send failed for \(current.id) (transient, will auto-retry on next drain): \(error)")
+                BackgroundSyncLogger.logDebug("[Outbox] Send failed for \(current.id) (transient, will auto-retry on next drain): \(error)")
             } else if shouldAutoRetry {
-                print("[Outbox] Send failed for \(current.id) (permanent retry \(newRetryCount)/3, will auto-retry): \(error)")
+                BackgroundSyncLogger.logDebug("[Outbox] Send failed for \(current.id) (permanent retry \(newRetryCount)/3, will auto-retry): \(error)")
             } else {
-                print("[Outbox] Send failed for \(current.id) after \(newRetryCount) permanent failures — marked as failed: \(error)")
+                BackgroundSyncLogger.logDebug("[Outbox] Send failed for \(current.id) after \(newRetryCount) permanent failures — marked as failed: \(error)")
             }
         }
     }
@@ -746,7 +750,7 @@ extension AccountManager {
                 return db.changesCount == 1
             }
         } catch {
-            print("[Outbox] WARNING: Could not requeue missing-provider claim \(outboxId): \(error)")
+            BackgroundSyncLogger.logDebug("[Outbox] WARNING: Could not requeue missing-provider claim \(outboxId): \(error)")
             return false
         }
     }
@@ -908,7 +912,7 @@ extension AccountManager {
                         _ = try await SearchIndex.shared.updateBodies([(contentKey: ftsInfo.record.contentKey, body: ftsInfo.bodyText)])
                     }
                 } catch {
-                    print("[Outbox] WARNING: FTS indexing failed for sent \(ftsInfo.record.headerId): \(error)")
+                    BackgroundSyncLogger.logDebug("[Outbox] WARNING: FTS indexing failed for sent \(ftsInfo.record.headerId): \(error)")
                 }
                 do {
                     // bodyComplete=1: the body is already persisted locally (MessageBody row
@@ -924,16 +928,16 @@ extension AccountManager {
                         )
                     }
                 } catch {
-                    print("[Outbox] WARNING: headerComplete write failed for sent \(ftsInfo.record.headerId): \(error)")
+                    BackgroundSyncLogger.logDebug("[Outbox] WARNING: headerComplete write failed for sent \(ftsInfo.record.headerId): \(error)")
                 }
             }
 
             // Always post reload notification — UI refreshes regardless of FTS/headerComplete success.
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
-            print("[Outbox] Inserted optimistic Sent header for \(msg.id)")
+            BackgroundSyncLogger.logDebug("[Outbox] Inserted optimistic Sent header for \(msg.id)")
         } catch {
             // Non-fatal — the message will appear after sync
-            print("[Outbox] WARNING: Could not insert optimistic Sent header: \(error)")
+            BackgroundSyncLogger.logDebug("[Outbox] WARNING: Could not insert optimistic Sent header: \(error)")
         }
     }
 
@@ -948,7 +952,7 @@ extension AccountManager {
                 return db.changesCount == 1
             }
         } catch {
-            print("[Outbox] WARNING: Could not stamp sentAt for \(outboxId): \(error)")
+            BackgroundSyncLogger.logDebug("[Outbox] WARNING: Could not stamp sentAt for \(outboxId): \(error)")
             return false
         }
     }
@@ -974,12 +978,12 @@ extension AccountManager {
                     .path
             }
         } catch {
-            print("[Outbox] WARNING: Could not look up Sent folder for \(accountId): \(error)")
+            BackgroundSyncLogger.logDebug("[Outbox] WARNING: Could not look up Sent folder for \(accountId): \(error)")
             return false
         }
 
         guard let sentPath else {
-            print("[Outbox] WARNING: No Sent folder found for account \(accountId)")
+            BackgroundSyncLogger.logDebug("[Outbox] WARNING: No Sent folder found for account \(accountId)")
             // No Sent folder configured — can't append. Mark as appended to avoid
             // blocking the outbox forever. The message was sent via SMTP.
             return await markAppendedToSent(outboxId: outboxId)
@@ -993,7 +997,7 @@ extension AccountManager {
             guard result else { return false }
             return await markAppendedToSent(outboxId: outboxId)
         } catch {
-            print("[Outbox] WARNING: Failed to append to Sent folder for \(outboxId): \(error)")
+            BackgroundSyncLogger.logDebug("[Outbox] WARNING: Failed to append to Sent folder for \(outboxId): \(error)")
             return false
         }
     }
@@ -1010,7 +1014,7 @@ extension AccountManager {
                 return db.changesCount == 1
             }
         } catch {
-            print("[Outbox] WARNING: Could not mark \(outboxId) as appended to Sent: \(error)")
+            BackgroundSyncLogger.logDebug("[Outbox] WARNING: Could not mark \(outboxId) as appended to Sent: \(error)")
             return false
         }
     }
@@ -1027,23 +1031,23 @@ extension AccountManager {
                     .fetchAll(db)
             }
         } catch {
-            print("[Outbox] ERROR: Failed to fetch pending sent appends: \(error)")
+            BackgroundSyncLogger.logDebug("[Outbox] ERROR: Failed to fetch pending sent appends: \(error)")
             return
         }
 
         guard !pendingMessages.isEmpty else { return }
-        print("[Outbox] Retrying \(pendingMessages.count) pending Sent folder appends")
+        BackgroundSyncLogger.logDebug("[Outbox] Retrying \(pendingMessages.count) pending Sent folder appends")
 
         for msg in pendingMessages {
             guard let queue = workQueues[msg.accountId] else {
-                print("[Outbox] No provider for \(msg.accountId) — skipping sent append")
+                BackgroundSyncLogger.logDebug("[Outbox] No provider for \(msg.accountId) — skipping sent append")
                 continue
             }
             let provider = queue.provider
 
             guard let messageId = msg.sentMessageId else {
                 // No Message-ID stored — can't dedup. Mark as appended to unblock.
-                print("[Outbox] WARNING: No sentMessageId for \(msg.id) — marking as appended")
+                BackgroundSyncLogger.logDebug("[Outbox] WARNING: No sentMessageId for \(msg.id) — marking as appended")
                 await markAppendedToSent(outboxId: msg.id)
                 await finalizeOutboxMessage(msg)
                 continue
@@ -1269,7 +1273,7 @@ extension AccountManager {
                 try Self.deleteCompletedSendAtomic(outboxId: msg.id, db: db)
             }
         } catch {
-            print("[Outbox] CRITICAL: atomic finalize failed for \(msg.id); leaving it for reconcile")
+            BackgroundSyncLogger.logDebug("[Outbox] CRITICAL: atomic finalize failed for \(msg.id); leaving it for reconcile")
             return
         }
 
@@ -1289,7 +1293,7 @@ extension AccountManager {
         NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
 
         if let mismatched = disposition.preservedMismatchedDraftId {
-            print("[Outbox] Preserved owner/generation-mismatched Draft \(mismatched)")
+            BackgroundSyncLogger.logDebug("[Outbox] Preserved owner/generation-mismatched Draft \(mismatched)")
         }
 
         if let cleanup = disposition.serverDraftCleanup,
@@ -1345,7 +1349,7 @@ extension AccountManager {
                         }
                     }
                 } catch {
-                    print("[Outbox] Post-send Sent folder sync failed: \(error)")
+                    BackgroundSyncLogger.logDebug("[Outbox] Post-send Sent folder sync failed: \(error)")
                 }
             }
         }
@@ -1452,7 +1456,7 @@ extension AccountManager {
     func reconcileOutbox() async {
         guard !isDrainingOutbox else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Outbox] Skipped reconcile — a drain owns the outbox; a send may be on the wire")
+                BackgroundSyncLogger.logDebug("[Outbox] Skipped reconcile — a drain owns the outbox; a send may be on the wire")
             }
             return
         }
@@ -1505,7 +1509,7 @@ extension AccountManager {
                             arguments: [OutboxStatus.queued.rawValue, message.id])
                     }
                 } catch {
-                    print("[Outbox] CRITICAL: crash-recovery requeue failed for \(message.id): \(error) — row remains .sending and will NOT drain until the next reconcile")
+                    BackgroundSyncLogger.logDebug("[Outbox] CRITICAL: crash-recovery requeue failed for \(message.id): \(error) — row remains .sending and will NOT drain until the next reconcile")
                 }
             }
         }
@@ -1630,16 +1634,16 @@ extension AccountManager {
                 return Set(ids)
             }
         } catch {
-            print("[Outbox] WARNING: Could not fetch outbox IDs for orphan cleanup: \(error)")
+            BackgroundSyncLogger.logDebug("[Outbox] WARNING: Could not fetch outbox IDs for orphan cleanup: \(error)")
             return
         }
 
         let sweep = Self.reclaimUnreferencedAttachmentDirs(baseDir: baseDir, referenced: existingIds)
         for dirName in sweep.reclaimed {
-            print("[Outbox] Cleaning orphaned attachment dir: \(dirName)")
+            BackgroundSyncLogger.logDebug("[Outbox] Cleaning orphaned attachment dir: \(dirName)")
         }
         if DebugModeManager.isLoggingEnabled(), !sweep.deferredInFlight.isEmpty {
-            print("[Outbox] Deferred \(sweep.deferredInFlight.count) unreferenced attachment dir(s) inside the staging grace window")
+            BackgroundSyncLogger.logDebug("[Outbox] Deferred \(sweep.deferredInFlight.count) unreferenced attachment dir(s) inside the staging grace window")
         }
     }
 
@@ -1697,7 +1701,7 @@ extension AccountManager {
             }
             guard admitted else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Outbox] Cannot retry \(messageId) — absent, not failed, or already sent")
+                    BackgroundSyncLogger.logDebug("[Outbox] Cannot retry \(messageId) — absent, not failed, or already sent")
                 }
                 return false
             }
@@ -1705,7 +1709,7 @@ extension AccountManager {
             Task { await self.drainOutbox() }
             return true
         } catch {
-            print("[Outbox] ERROR: Failed to retry \(messageId): \(error)")
+            BackgroundSyncLogger.logDebug("[Outbox] ERROR: Failed to retry \(messageId): \(error)")
             return false
         }
     }
@@ -1750,7 +1754,7 @@ extension AccountManager {
             Task { await self.drainOutbox() }
             return true
         } catch {
-            print("[Outbox] ERROR: Failed to cancel \(messageId): \(error)")
+            BackgroundSyncLogger.logDebug("[Outbox] ERROR: Failed to cancel \(messageId): \(error)")
             return false
         }
     }

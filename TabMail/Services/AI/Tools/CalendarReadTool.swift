@@ -33,11 +33,11 @@ struct CalendarReadTool: AgentTool, Sendable {
         let tz = CalendarToolHelpers.resolveTimeZone(arguments)
         Task { await CalendarToolHelpers.cacheEventDetailsForPills(result.events, calendarNames: result.calendarNames) }
         let output = CalendarToolHelpers.formatGroupedSummary(result.events, calendarNames: result.calendarNames, timeZone: tz)
-        print("[CalendarReadTool] Returning \(result.events.count) events tz=\(tz.identifier)")
+        BackgroundSyncLogger.logDebug("[CalendarReadTool] Returning \(result.events.count) events tz=\(tz.identifier)")
         // Print the exact tool result the LLM will see, so we can tell whether
         // a "day appears empty" complaint is a tool bug (missing rows) or an
         // LLM rendering bug (rows present but not surfaced to the user).
-        print("[CalendarReadTool] tool_result:\n\(output)\n[CalendarReadTool] tool_result_end")
+        BackgroundSyncLogger.logDebug("[CalendarReadTool] tool_result:\n\(output)\n[CalendarReadTool] tool_result_end")
         return output
     }
 }

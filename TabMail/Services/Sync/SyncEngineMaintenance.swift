@@ -17,7 +17,7 @@ extension SyncEngine {
         let totalMB = StorageEstimator.totalSizeMB()
         let budgetMB = StorageEstimator.budgetMB
         let floor = StorageEstimator.floorPerFolder
-        print("[Prune] Over budget (\(String(format: "%.1f", totalMB))MB / \(budgetMB)MB)")
+        BackgroundSyncLogger.logDebug("[Prune] Over budget (\(String(format: "%.1f", totalMB))MB / \(budgetMB)MB)")
 
         let accounts = (try? dbPool.read { db in try Account.fetchAll(db) }) ?? []
         let pruneChunkSize = SyncConfig.pruneChunkSize
@@ -62,7 +62,7 @@ extension SyncEngine {
             }
         }
         if bodiesRemoved > 0 {
-            print("[Prune] Removed \(bodiesRemoved) message bodies")
+            BackgroundSyncLogger.logDebug("[Prune] Removed \(bodiesRemoved) message bodies")
         }
 
         var headersRemoved = 0
@@ -95,7 +95,7 @@ extension SyncEngine {
                             }
                         }
                     } catch {
-                        print("[Prune] Delete failed: \(error)")
+                        BackgroundSyncLogger.logDebug("[Prune] Delete failed: \(error)")
                     }
                     if !chunkIds.isEmpty {
                         // Routed through `MessageContentStore`. The headers were
@@ -127,9 +127,9 @@ extension SyncEngine {
             }
         }
         if headersRemoved > 0 {
-            print("[Prune] Removed \(headersRemoved) message headers")
+            BackgroundSyncLogger.logDebug("[Prune] Removed \(headersRemoved) message headers")
         }
-        print("[Prune] Done — now \(String(format: "%.1f", StorageEstimator.totalSizeMB()))MB")
+        BackgroundSyncLogger.logDebug("[Prune] Done — now \(String(format: "%.1f", StorageEstimator.totalSizeMB()))MB")
     }
 
     /// Nonisolated evict — runs entirely off the main thread.
@@ -273,12 +273,12 @@ extension SyncEngine {
                 evicted += batchResult.evicted
                 skipCount += batchResult.skipped
             } catch {
-                print("[BodyCache] Eviction failed: \(error)")
+                BackgroundSyncLogger.logDebug("[BodyCache] Eviction failed: \(error)")
                 break
             }
         }
         if evicted > 0 {
-            print("[BodyCache] Evicted \(evicted) stale bodies (TTL=\(SyncConfig.bodyCacheTTLHours)h)")
+            BackgroundSyncLogger.logDebug("[BodyCache] Evicted \(evicted) stale bodies (TTL=\(SyncConfig.bodyCacheTTLHours)h)")
         }
     }
 
@@ -305,10 +305,10 @@ extension SyncEngine {
                 return totalTouched
             }
             if touchedCount > 0 {
-                print("[AICache] TTL refresh: touched \(touchedCount) inbox AI cache entries")
+                BackgroundSyncLogger.logDebug("[AICache] TTL refresh: touched \(touchedCount) inbox AI cache entries")
             }
         } catch {
-            print("[AICache] TTL refresh failed: \(error)")
+            BackgroundSyncLogger.logDebug("[AICache] TTL refresh failed: \(error)")
         }
 
         // Purge expired entries
@@ -363,12 +363,12 @@ extension SyncEngine {
                 rescued += batchResult.rescued
                 skipCount += batchResult.rescued
             } catch {
-                print("[AICache] Purge failed: \(error)")
+                BackgroundSyncLogger.logDebug("[AICache] Purge failed: \(error)")
                 break
             }
         }
         if purged > 0 || rescued > 0 {
-            print("[AICache] Purged \(purged) expired entries, rescued \(rescued) still-in-inbox (TTL=\(SyncConfig.aiCacheTTLDays)d)")
+            BackgroundSyncLogger.logDebug("[AICache] Purged \(purged) expired entries, rescued \(rescued) still-in-inbox (TTL=\(SyncConfig.aiCacheTTLDays)d)")
         }
     }
 
@@ -446,13 +446,13 @@ extension SyncEngine {
                 // file — `runBuildDeferredIndexesIfMissing`'s success and
                 // abandoned arms — are gated the same way, including the error arm.
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[CalendarQueue] Retired-op reclaim failed: \(error)")
+                    BackgroundSyncLogger.logDebug("[CalendarQueue] Retired-op reclaim failed: \(error)")
                 }
                 break
             }
         }
         if reclaimed > 0, DebugModeManager.isLoggingEnabled() {
-            print("[CalendarQueue] Reclaimed \(reclaimed) retired calendar ops older than \(SyncConfig.retiredCalendarOpRetentionDays)d")
+            BackgroundSyncLogger.logDebug("[CalendarQueue] Reclaimed \(reclaimed) retired calendar ops older than \(SyncConfig.retiredCalendarOpRetentionDays)d")
         }
     }
 
@@ -539,12 +539,12 @@ extension SyncEngine {
                 }
 
                 cleared += 1
-                print("[StaleTagSweep] Cleared \(tag?.rawValue ?? "?") from \(messageId) in \(folder.name)")
+                BackgroundSyncLogger.logDebug("[StaleTagSweep] Cleared \(tag?.rawValue ?? "?") from \(messageId) in \(folder.name)")
             }
         }
 
         if cleared > 0 {
-            print("[StaleTagSweep] Swept \(cleared) stale tags for \(account.emailAddress)")
+            BackgroundSyncLogger.logDebug("[StaleTagSweep] Swept \(cleared) stale tags for \(account.emailAddress)")
         }
     }
 
@@ -576,20 +576,20 @@ extension SyncEngine {
         do {
             let evicted = try ChatStore.shared.evictInboxSessionsSync(dbPool: dbPool, limit: effectiveInboxLimit)
             if evicted > 0 {
-                print("[ChatEviction] Evicted \(evicted) inbox sessions (limit=\(effectiveInboxLimit))")
+                BackgroundSyncLogger.logDebug("[ChatEviction] Evicted \(evicted) inbox sessions (limit=\(effectiveInboxLimit))")
             }
         } catch {
-            print("[ChatEviction] Inbox session eviction failed: \(error)")
+            BackgroundSyncLogger.logDebug("[ChatEviction] Inbox session eviction failed: \(error)")
         }
 
         // Phase 1: Message-detail sessions — delete sessions whose message left inbox.
         do {
             let evicted = try ChatStore.shared.evictMessageDetailSessionsSync(dbPool: dbPool, limit: msgLimit)
             if evicted > 0 {
-                print("[ChatEviction] Dereferenced \(evicted) message-detail sessions (limit=\(msgLimit))")
+                BackgroundSyncLogger.logDebug("[ChatEviction] Dereferenced \(evicted) message-detail sessions (limit=\(msgLimit))")
             }
         } catch {
-            print("[ChatEviction] Message-detail eviction failed: \(error)")
+            BackgroundSyncLogger.logDebug("[ChatEviction] Message-detail eviction failed: \(error)")
         }
 
         // Phase 2: Compose chat turns — TTL-based deletion. Compose sessions are never
@@ -598,20 +598,20 @@ extension SyncEngine {
         do {
             let evicted = try ChatStore.shared.evictComposeSessionsSync(dbPool: dbPool, ttlDays: composeTTL)
             if evicted > 0 {
-                print("[ChatEviction] Evicted \(evicted) compose sessions (ttl=\(composeTTL) days)")
+                BackgroundSyncLogger.logDebug("[ChatEviction] Evicted \(evicted) compose sessions (ttl=\(composeTTL) days)")
             }
         } catch {
-            print("[ChatEviction] Compose chat session eviction failed: \(error)")
+            BackgroundSyncLogger.logDebug("[ChatEviction] Compose chat session eviction failed: \(error)")
         }
 
         // Phase 3: Compose drafts (DraftStore model eviction)
         do {
             let evicted = try DraftStore.shared.evictSync(dbPool: dbPool, limit: composeLimit)
             if evicted > 0 {
-                print("[ChatEviction] Evicted \(evicted) compose drafts (limit=\(composeLimit))")
+                BackgroundSyncLogger.logDebug("[ChatEviction] Evicted \(evicted) compose drafts (limit=\(composeLimit))")
             }
         } catch {
-            print("[ChatEviction] Compose draft eviction failed: \(error)")
+            BackgroundSyncLogger.logDebug("[ChatEviction] Compose draft eviction failed: \(error)")
         }
 
         // Phase 4: Global turn cap — delete oldest turns first (across all session types).
@@ -621,13 +621,13 @@ extension SyncEngine {
         do {
             let evictedIds = try ChatStore.shared.evictHistoryBeyondCapSync(dbPool: dbPool, maxTurns: effectiveMaxTurns)
             if !evictedIds.isEmpty {
-                print("[ChatEviction] Evicted \(evictedIds.count) turns beyond cap (max=\(effectiveMaxTurns))")
+                BackgroundSyncLogger.logDebug("[ChatEviction] Evicted \(evictedIds.count) turns beyond cap (max=\(effectiveMaxTurns))")
                 Task { @Sendable [evictedIds] in
                     await MemoryIndex.shared.deleteTurns(chatHistoryIds: evictedIds)
                 }
             }
         } catch {
-            print("[ChatEviction] Turn cap eviction failed: \(error)")
+            BackgroundSyncLogger.logDebug("[ChatEviction] Turn cap eviction failed: \(error)")
         }
     }
 
@@ -851,12 +851,12 @@ extension SyncEngine {
                 cancelledWhileQueued.withLock { $0 = true }
             }
             if DebugModeManager.isLoggingEnabled() {
-                print("[Maintenance] built deferred index(es) \(missing.joined(separator: ", ")) in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
+                BackgroundSyncLogger.logDebug("[Maintenance] built deferred index(es) \(missing.joined(separator: ", ")) in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
             }
             return .built
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Maintenance] deferred index build abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms — retrying next pass: \(error)")
+                BackgroundSyncLogger.logDebug("[Maintenance] deferred index build abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms — retrying next pass: \(error)")
             }
             return .abandoned
         }
@@ -1052,12 +1052,12 @@ extension SyncEngine {
             }
             defaults.set(settled, forKey: markerKey)
             if DebugModeManager.isLoggingEnabled() {
-                print("[Maintenance] ANALYZE refreshed query-planner statistics in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms (schema_version \(settled))")
+                BackgroundSyncLogger.logDebug("[Maintenance] ANALYZE refreshed query-planner statistics in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms (schema_version \(settled))")
             }
             return .refreshed
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Maintenance] ANALYZE abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms — statistics stay stale, retrying next pass: \(error)")
+                BackgroundSyncLogger.logDebug("[Maintenance] ANALYZE abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms — statistics stay stale, retrying next pass: \(error)")
             }
             return .abandoned
         }

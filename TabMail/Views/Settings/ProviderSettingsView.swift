@@ -209,7 +209,7 @@ struct BYOKTierRows: View {
         if result.ok {
             liveModelsByProvider[provider] = result.models ?? []
         } else if DebugModeManager.isLoggingEnabled() {
-            print("[BYOK] list-models failed for \(provider): \(result.error_code ?? "?") \(result.error_detail ?? "")")
+            BackgroundSyncLogger.logDebug("[BYOK] list-models failed for \(provider): \(result.error_code ?? "?") \(result.error_detail ?? "")")
         }
     }
 

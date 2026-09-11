@@ -789,7 +789,7 @@ struct SearchView: View {
                 remoteResults: remoteRowsAtFTSPublish
             ) + remoteRowsAtFTSPublish
             if DebugModeManager.isLoggingEnabled() {
-                print("[Search] debounce merge: fts=\(ftsResults.count) →searchResults=\(searchResults.count) +legacyExtras=\(legacyExtras.count) +remote=\(remoteRowsAtFTSPublish.count) ⇒ results=\(results.count) query='\(trimmed.prefix(40))'")
+                BackgroundSyncLogger.logDebug("[Search] debounce merge: fts=\(ftsResults.count) →searchResults=\(searchResults.count) +legacyExtras=\(legacyExtras.count) +remote=\(remoteRowsAtFTSPublish.count) ⇒ results=\(results.count) query='\(trimmed.prefix(40))'")
             }
         }
     }
@@ -1028,9 +1028,9 @@ struct SearchView: View {
         }
 
         if logging {
-            print("[Search] ftsResultsToSearchResults: in=\(ftsResults.count) out=\(resolution.results.count) healedDrift=\(resolution.healedDrift) droppedNoHeader=\(resolution.droppedNoHeader) droppedOutOfScope=\(resolution.droppedOutOfScope) scope=\(scope == nil ? "ALL" : "\(scope!.count) folders")")
+            BackgroundSyncLogger.logDebug("[Search] ftsResultsToSearchResults: in=\(ftsResults.count) out=\(resolution.results.count) healedDrift=\(resolution.healedDrift) droppedNoHeader=\(resolution.droppedNoHeader) droppedOutOfScope=\(resolution.droppedOutOfScope) scope=\(scope == nil ? "ALL" : "\(scope!.count) folders")")
             if !resolution.noHeaderSamples.isEmpty {
-                print("[Search]   noHeader sample FTS headerIds: \(resolution.noHeaderSamples)")
+                BackgroundSyncLogger.logDebug("[Search]   noHeader sample FTS headerIds: \(resolution.noHeaderSamples)")
             }
         }
 
@@ -1440,18 +1440,18 @@ struct SearchView: View {
             // Sharper reason to gate these two: they interpolate `accountEmail`,
             // putting the user's own address into a production device log.
             if DebugModeManager.isLoggingEnabled() {
-                print("[Search] Cancelled/timed out searching \(accountEmail) — treating as empty")
+                BackgroundSyncLogger.logDebug("[Search] Cancelled/timed out searching \(accountEmail) — treating as empty")
             }
             return []
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Search] Error searching \(accountEmail): \(error)")
+                BackgroundSyncLogger.logDebug("[Search] Error searching \(accountEmail): \(error)")
             }
             return []
         }
 
         if DebugModeManager.isLoggingEnabled() {
-            print("[Search] \(accountEmail) \(folderPath.isEmpty ? "account-wide" : "folder=\(folderPath)") returned \(infos.count) results")
+            BackgroundSyncLogger.logDebug("[Search] \(accountEmail) \(folderPath.isEmpty ? "account-wide" : "folder=\(folderPath)") returned \(infos.count) results")
         }
 
         return presentableRemoteResults(

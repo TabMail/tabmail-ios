@@ -161,7 +161,7 @@ enum NotificationActionRouter {
 
     private static func log(_ message: @autoclosure () -> String) {
         guard DebugModeManager.isLoggingEnabled() else { return }
-        print(message())
+        BackgroundSyncLogger.logDebug(message())
     }
 
     /// Durable lookup scoped to the account's inbox — see the enum doc for why.
@@ -519,7 +519,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         let userInfo = notification.request.content.userInfo
         let provider = userInfo["provider"] as? String
         if DebugModeManager.isLoggingEnabled() {
-            print("[NotificationDelegate] willPresent notification: \(notification.request.identifier) provider=\(provider ?? "nil")")
+            BackgroundSyncLogger.logDebug("[NotificationDelegate] willPresent notification: \(notification.request.identifier) provider=\(provider ?? "nil")")
         }
 
         // NSE email pushes: suppress in foreground, trigger sync instead.
@@ -600,7 +600,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     ) {
         let userInfo = response.notification.request.content.userInfo
         if DebugModeManager.isLoggingEnabled() {
-            print("[NotificationDelegate] didReceive notification: \(response.notification.request.identifier)")
+            BackgroundSyncLogger.logDebug("[NotificationDelegate] didReceive notification: \(response.notification.request.identifier)")
         }
 
         handleNotificationResponse(
@@ -983,7 +983,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         if let legacy = UserDefaults.standard.object(forKey: key) as? Bool {
             shared.set(legacy, forKey: key)
             if DebugModeManager.isLoggingEnabled() {
-                print("[AppDelegate] Migrated opt-out flag to shared suite: \(legacy)")
+                BackgroundSyncLogger.logDebug("[AppDelegate] Migrated opt-out flag to shared suite: \(legacy)")
             }
         }
     }

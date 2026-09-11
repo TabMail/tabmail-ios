@@ -87,6 +87,12 @@ not by the author. The honest statement is two-sided:
   count.** Every other "fifteen" here counts the fifteen replaced log FILES, a closed historical set
   that does not grow when a channel is added; the two numbers were equal for exactly as long as no
   channel had been added since consolidation, which is why they are easy to conflate.
+  ⚠️ **2026-09-10: SEVENTEEN, split FIVE always-on to TWELVE debug-gated.** `.debug` (tag `DEBUG`,
+  written only by `BackgroundSyncLogger.logDebug`) is where every former console `print` in the
+  `TabMail/` target went (GitHub `TabMail/tabmail-ios#72`). With 1,967 call sites against `.sync`'s
+  135 it is by far the largest writer, so for an UNLOCKED user it dominates the shared tail and evicts
+  `[ERROR]` / `[AUTH]` history much sooner; for a locked user nothing is written. Same accepted trade,
+  no floor added. Detail: `Companion/Process/Current/KnownIssues/Amendments/ios-log-002.md` (2026-09-10).
 - **Gained: a much larger shared budget**, which for any single channel in ordinary use is more
   headroom than its old per-file cap gave it.
 

@@ -37,10 +37,10 @@ actor BackfillMemoryEmbeddingQueue {
     func enqueue(chatHistoryId: String) {
         let item = Item(chatHistoryId: chatHistoryId)
         guard storage.enqueue(item) else {
-            print("[BackfillMemoryEmbeddingQueue] enqueue DUP id=\(chatHistoryId.prefix(20)) (already queued or in-flight)")
+            BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] enqueue DUP id=\(chatHistoryId.prefix(20)) (already queued or in-flight)")
             return
         }
-        print("[BackfillMemoryEmbeddingQueue] enqueue id=\(chatHistoryId.prefix(20)) (depth=\(storage.count))")
+        BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] enqueue id=\(chatHistoryId.prefix(20)) (depth=\(storage.count))")
         scheduleDispatch()
     }
 
@@ -49,7 +49,7 @@ actor BackfillMemoryEmbeddingQueue {
         let items = chatHistoryIds.map { Item(chatHistoryId: $0) }
         let added = storage.enqueueBatch(items)
         guard added > 0 else { return }
-        print("[BackfillMemoryEmbeddingQueue] Enqueued \(added) items (total: \(storage.count))")
+        BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] Enqueued \(added) items (total: \(storage.count))")
         scheduleDispatch()
     }
 
@@ -65,13 +65,13 @@ actor BackfillMemoryEmbeddingQueue {
         )
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         guard !ids.isEmpty else {
-            print("[BackfillMemoryEmbeddingQueue] Repopulate: 0 items (\(ms)ms)")
+            BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] Repopulate: 0 items (\(ms)ms)")
             return
         }
 
         let added = storage.enqueueBatch(ids.map { Item(chatHistoryId: $0) })
         if added > 0 {
-            print("[BackfillMemoryEmbeddingQueue] Repopulated \(added) items from memory.db in \(ms)ms")
+            BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] Repopulated \(added) items from memory.db in \(ms)ms")
         }
         // Re-kick on every wake — items left pending by a suspend-abandoned cycle
         // (ADR-IOS-046) are already enqueued, so `added` (new rows only) skips them.
@@ -85,7 +85,7 @@ actor BackfillMemoryEmbeddingQueue {
         debounceTask?.cancel()
         debounceTask = nil
         if count > 0 {
-            print("[BackfillMemoryEmbeddingQueue] Cancelled \(count) in-flight items on foreground return")
+            BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] Cancelled \(count) in-flight items on foreground return")
         }
     }
 
@@ -100,7 +100,7 @@ actor BackfillMemoryEmbeddingQueue {
             let now = CFAbsoluteTimeGetCurrent()
             if now - lastHeartbeat >= 5.0 {
                 let elapsed = Int(now - t0)
-                print("[BackfillMemoryEmbeddingQueue] draining... (depth=\(storage.count), active=\(storage.activeJobs), elapsed=\(elapsed)s)")
+                BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] draining... (depth=\(storage.count), active=\(storage.activeJobs), elapsed=\(elapsed)s)")
                 lastHeartbeat = now
             }
         }
@@ -133,7 +133,7 @@ actor BackfillMemoryEmbeddingQueue {
         // would only abort; candidates stay pending and re-dispatch next wake.
         guard !DatabaseSuspension.isSuspended else {
             #if DEBUG
-            print("[BackfillMemoryEmbeddingQueue] DB suspended — abandoning dispatch (ADR-IOS-046)")
+            BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] DB suspended — abandoning dispatch (ADR-IOS-046)")
             #endif
             return
         }
@@ -142,7 +142,7 @@ actor BackfillMemoryEmbeddingQueue {
         guard !candidates.isEmpty else { return }
 
         storage.incrementActiveJobs()
-        print("[BackfillMemoryEmbeddingQueue] Dispatching batch of \(candidates.count) items (pending: \(storage.pendingCount))")
+        BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] Dispatching batch of \(candidates.count) items (pending: \(storage.pendingCount))")
 
         Task { [self] in
             await processBatch(candidates)
@@ -157,7 +157,7 @@ actor BackfillMemoryEmbeddingQueue {
         guard let embeddingService = EmbeddingService.shared else {
             // Mark all items shouldRetry:false so they don't loop; next
             // repopulateFromDatabase re-enqueues from the DB when CoreML loads.
-            print("[BackfillMemoryEmbeddingQueue] processBatch SKIPPING items=\(items.count) (EmbeddingService.shared == nil)")
+            BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] processBatch SKIPPING items=\(items.count) (EmbeddingService.shared == nil)")
             for item in items { storage.batchItemCompleted(item, shouldRetry: false, maxRetries: SyncConfig.maxQueueRetries) }
             storage.decrementActiveJobs()
             return
@@ -201,12 +201,12 @@ actor BackfillMemoryEmbeddingQueue {
                 toStore.append((chatHistoryId: item.chatHistoryId, observedEpoch: entry.indexEpoch, embedding: vec))
             } catch {
                 embedErrorCount += 1
-                print("[BackfillMemoryEmbeddingQueue] Embed failed for \(item.chatHistoryId.prefix(20)): \(error)")
+                BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] Embed failed for \(item.chatHistoryId.prefix(20)): \(error)")
                 _ = storage.batchItemCompleted(item, shouldRetry: true, maxRetries: SyncConfig.maxQueueRetries)
                 localCompleted.append(item)
             }
         }
-        print("[BackfillMemoryEmbeddingQueue] processBatch pre-store items=\(items.count) embedded=\(toStore.count) missing=\(missingCount) empty=\(emptyContentCount) embedErr=\(embedErrorCount)")
+        BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] processBatch pre-store items=\(items.count) embedded=\(toStore.count) missing=\(missingCount) empty=\(emptyContentCount) embedErr=\(embedErrorCount)")
 
         // 3. Bulk-write to memory.db with epoch-stamp race check.
         if !toStore.isEmpty {
@@ -230,7 +230,7 @@ actor BackfillMemoryEmbeddingQueue {
 
         storage.decrementActiveJobs()
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-        print("[BackfillMemoryEmbeddingQueue] Batch done in \(ms)ms")
+        BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] Batch done in \(ms)ms")
 
         // Power-aware inter-batch delay (turbo=0s, normal=3s, low=10s).
         let delay = await BackfillProfile.current().interCycleActiveDelay
@@ -255,7 +255,7 @@ actor BackfillMemoryEmbeddingQueue {
         guard !ids.isEmpty else { return }
         let added = storage.enqueueBatch(ids.map { Item(chatHistoryId: $0) })
         if added > 0 {
-            print("[BackfillMemoryEmbeddingQueue] Drain-time self-repopulate enqueued \(added) items")
+            BackgroundSyncLogger.logDebug("[BackfillMemoryEmbeddingQueue] Drain-time self-repopulate enqueued \(added) items")
             scheduleDispatch()
         }
     }

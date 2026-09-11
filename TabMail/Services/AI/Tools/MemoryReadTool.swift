@@ -52,7 +52,7 @@ struct MemoryReadTool: AgentTool, Sendable {
 
         let toleranceMs = Int64(toleranceMinutes) * 60 * 1000
         let target = Int64(timestampMs)
-        print("[MemoryReadTool] ENTER timestampMs=\(target) toleranceMin=\(toleranceMinutes) maxTurns=\(maxTurns)")
+        BackgroundSyncLogger.logDebug("[MemoryReadTool] ENTER timestampMs=\(target) toleranceMin=\(toleranceMinutes) maxTurns=\(maxTurns)")
 
         let hits = await MemoryIndex.shared.readByTimestamp(
             timestampMs: target,
@@ -62,7 +62,7 @@ struct MemoryReadTool: AgentTool, Sendable {
 
         // TB-parity: empty window returns the literal string, NOT JSON (memory_read.js:63).
         if hits.isEmpty {
-            print("[MemoryReadTool] EMPTY window — returning TB-parity literal")
+            BackgroundSyncLogger.logDebug("[MemoryReadTool] EMPTY window — returning TB-parity literal")
             return "No conversation found around this timestamp."
         }
 
@@ -76,7 +76,7 @@ struct MemoryReadTool: AgentTool, Sendable {
             return "--- \(dateStr) (\(roleTag)) ---\n\(body)"
         }.joined(separator: "\n\n")
 
-        print("[MemoryReadTool] Returning \(hits.count) turns in context window")
+        BackgroundSyncLogger.logDebug("[MemoryReadTool] Returning \(hits.count) turns in context window")
 
         // TB-parity: success returns raw string, NOT JSON (memory_read.js:109).
         return formatted

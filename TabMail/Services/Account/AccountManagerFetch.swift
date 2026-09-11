@@ -199,7 +199,7 @@ extension AccountManager {
         // Debug-gated (rule 12). Pre-existing and ungated until this change: it is a
         // diagnostic, and `folderPath` is a user-authored custom folder name.
         if DebugModeManager.isLoggingEnabled() {
-            print("[FetchBody] Opening: id=\(message.id.prefix(40)) msgId=\(message.messageId.prefix(30)) folder=\(message.folderPath)")
+            BackgroundSyncLogger.logDebug("[FetchBody] Opening: id=\(message.id.prefix(40)) msgId=\(message.messageId.prefix(30)) folder=\(message.folderPath)")
         }
 
         // Body already loaded — nothing to do
@@ -221,7 +221,7 @@ extension AccountManager {
             // Pre-existing and ungated until this change: gating one and leaving the other
             // makes the function read as compliant while it still logs in Release.
             if DebugModeManager.isLoggingEnabled() {
-                print("[MoveTrace] fetchBody — address not corroborated (move in flight), skipping fetch for \(message.id.prefix(40))")
+                BackgroundSyncLogger.logDebug("[MoveTrace] fetchBody — address not corroborated (move in flight), skipping fetch for \(message.id.prefix(40))")
             }
             // The SAME typed case `fetchAttachment` throws for the same condition, so the
             // two mid-move refusals cannot drift apart and a `case ProviderError
@@ -261,7 +261,7 @@ extension AccountManager {
             }) ?? false
             if quarantined {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[FetchBody] Refused — body quarantined (oversized metadata FETCH) for \(message.id.prefix(40))")
+                    BackgroundSyncLogger.logDebug("[FetchBody] Refused — body quarantined (oversized metadata FETCH) for \(message.id.prefix(40))")
                 }
                 throw BodyFetchRefusal.error(
                     BodyFetchRefusal.quarantined, BodyFetchRefusal.quarantinedMessage)
@@ -356,7 +356,7 @@ extension AccountManager {
             } catch let error where attempt == 1 && SyncEngine.isConnectionError(error) {
                 // Pool self-heals: dead connections discarded on checkin(healthy: false),
                 // next checkout creates a fresh one. Retry loop gives the pool a chance.
-                print("[Attachment] connection error, retrying: \(error)")
+                BackgroundSyncLogger.logDebug("[Attachment] connection error, retrying: \(error)")
             }
         }
         throw ProviderError.notConnected // unreachable, satisfies compiler
@@ -394,7 +394,7 @@ extension AccountManager {
                             try await syncEngine.syncFolderMessages(folder: folder, provider: provider)
                         } catch {
                             if SyncEngine.isSelectFailedError(error) {
-                                print("[SyncFolders] SELECT failed for \(folder.name) — skipping")
+                                BackgroundSyncLogger.logDebug("[SyncFolders] SELECT failed for \(folder.name) — skipping")
                                 continue
                             }
                             // 404 during folder sync is transient — e.g., a draft was just
@@ -402,7 +402,7 @@ extension AccountManager {
                             // folder rather than surfacing to the user as a red error banner.
                             if case ProviderError.networkError(let underlying) = error,
                                (underlying as NSError).code == 404 {
-                                print("[SyncFolders] 404 for \(folder.name) — skipping (message likely moved/deleted)")
+                                BackgroundSyncLogger.logDebug("[SyncFolders] 404 for \(folder.name) — skipping (message likely moved/deleted)")
                                 continue
                             }
                             throw error

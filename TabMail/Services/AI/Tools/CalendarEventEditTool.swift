@@ -36,12 +36,12 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         let numericId: Int?
         if let n = Int(rawEventId) {
             guard let realId = await ctx.translator.toRealId(n) else {
-                print("[CalendarEventEditTool] Failed to resolve numeric id \(n)")
+                BackgroundSyncLogger.logDebug("[CalendarEventEditTool] Failed to resolve numeric id \(n)")
                 return #"{"error": "calendar_event_edit failed: no event found for the given event_id. Call calendar_event_read or calendar_search to look up the event again, then retry."}"#
             }
             compoundId = realId
             numericId = n
-            print("[CalendarEventEditTool] Resolved numeric id \(n) → \(realId.prefix(50))...")
+            BackgroundSyncLogger.logDebug("[CalendarEventEditTool] Resolved numeric id \(n) → \(realId.prefix(50))...")
         } else {
             compoundId = rawEventId.trimmingCharacters(in: .whitespaces)
             numericId = nil
@@ -172,7 +172,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // the user would be confirming. Surface a structured error so the agent
         // can re-search (calendar_event_read / calendar_search) and retry.
         guard fetchedEvent != nil else {
-            print("[CalendarEventEditTool] Could not dereference event_id='\(eventId.prefix(50))' (compound='\(compoundId.prefix(50))') — refusing edit")
+            BackgroundSyncLogger.logDebug("[CalendarEventEditTool] Could not dereference event_id='\(eventId.prefix(50))' (compound='\(compoundId.prefix(50))') — refusing edit")
             return ToolJSON.string(from: [
                 "ok": false,
                 "error": "calendar_event_edit failed: could not find event with id '\(compoundId)'. The id may be wrong or the event may have been deleted. Call calendar_event_read or calendar_search to look up the correct event, then retry.",
@@ -277,7 +277,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         )
 
         guard confirmed else {
-            print("[CalendarEventEditTool] User declined edit for event_id=\(eventId)")
+            BackgroundSyncLogger.logDebug("[CalendarEventEditTool] User declined edit for event_id=\(eventId)")
             throw ToolDeclinedError(output: ToolJSON.string(from: [
                 "cancelled": true,
                 "message": "User declined to edit this event.",
@@ -309,7 +309,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         let resolvedTz = CalendarToolHelpers.resolveTimeZone(arguments)
         let touchesDateTime = CalendarToolHelpers.stringArgOpt(arguments, "start_iso") != nil
             || CalendarToolHelpers.stringArgOpt(arguments, "end_iso") != nil
-        print("[CalendarEventEditTool] Queued edit (op: \(op.id), event: \(eventId)) scope=\(resolvedScope)")
+        BackgroundSyncLogger.logDebug("[CalendarEventEditTool] Queued edit (op: \(op.id), event: \(eventId)) scope=\(resolvedScope)")
 
         // Wait briefly for the drain to surface a terminal outcome so the LLM
         // gets ACCURATE feedback in-turn. Without this, the tool returns
@@ -321,7 +321,7 @@ struct CalendarEventEditTool: AgentTool, Sendable {
         // "queued" message so the user is not blocked forever.
         let outcome = await manager.awaitCalendarOpOutcome(opId: op.id, timeoutSeconds: 10.0)
         if case .permanentFailure(let reason) = outcome {
-            print("[CalendarEventEditTool] Permanent failure for op \(op.id): \(reason)")
+            BackgroundSyncLogger.logDebug("[CalendarEventEditTool] Permanent failure for op \(op.id): \(reason)")
             // Flip the confirmation card to its red/⚠ failed state so the user
             // sees the failure inline in chat — not just in the LLM's text
             // follow-up.

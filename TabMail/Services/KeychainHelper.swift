@@ -214,7 +214,7 @@ extension KeychainHelper {
                 ]
                 let addStatus = SecItemAdd(newItem as CFDictionary, nil)
                 if addStatus == errSecSuccess {
-                    print("[Keychain] Migrated \(account) to shared access group")
+                    BackgroundSyncLogger.logDebug("[Keychain] Migrated \(account) to shared access group")
                 }
             }
         }
@@ -244,9 +244,9 @@ extension KeychainHelper {
                 ]
                 _ = SecItemUpdate(exactQuery as CFDictionary, attributes as CFDictionary)
             }
-            print("[Keychain] Migrated non-session items to AfterFirstUnlock + shared access group")
+            BackgroundSyncLogger.logDebug("[Keychain] Migrated non-session items to AfterFirstUnlock + shared access group")
         } else if status != errSecItemNotFound {
-            print("[Keychain] Accessibility migration enumeration status: \(status)")
+            BackgroundSyncLogger.logDebug("[Keychain] Accessibility migration enumeration status: \(status)")
         }
     }
 }

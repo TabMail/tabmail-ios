@@ -81,12 +81,12 @@ actor TabMailTokenCoordinator {
                inFlightGeneration: inFlightRefreshGeneration,
                requestingGeneration: record.generation!
            ) {
-            print("[TabMailToken] Awaiting in-flight refresh...")
+            BackgroundSyncLogger.logDebug("[TabMailToken] Awaiting in-flight refresh...")
             return await existing.value
         }
 
         let generation = record.generation!
-        print("[TabMailToken] Token expired (expiresAt=\(session.expiresAt) now=\(now)), starting refresh...")
+        BackgroundSyncLogger.logDebug("[TabMailToken] Token expired (expiresAt=\(session.expiresAt) now=\(now)), starting refresh...")
 
         let task = Task<RefreshResult, Never> {
             await Self.performRefresh(
@@ -141,7 +141,7 @@ actor TabMailTokenCoordinator {
             return await existing.value
         }
 
-        print("[TabMailToken] Force-refreshing token to pick up updated user_metadata")
+        BackgroundSyncLogger.logDebug("[TabMailToken] Force-refreshing token to pick up updated user_metadata")
 
         let generation = record.generation!
         let task = Task<RefreshResult, Never> {

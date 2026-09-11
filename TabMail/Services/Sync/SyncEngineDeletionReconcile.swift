@@ -383,7 +383,7 @@ extension SyncEngine {
         removeHeadersFromFTS(deletedIds)
         await UnreadCountManager.shared.requestRecount(folderId: folderId)
         if DebugModeManager.isLoggingEnabled() {
-            print("[Reconcile] \(folder.name): removed \(deletedIds.count) server-confirmed deleted messages (\(reason))")
+            BackgroundSyncLogger.logDebug("[Reconcile] \(folder.name): removed \(deletedIds.count) server-confirmed deleted messages (\(reason))")
         }
         BackgroundSyncLogger.log("reconcile[\(reason)]: \(folder.name) removed \(deletedIds.count)")
         return deletedIds.count
@@ -409,7 +409,7 @@ extension SyncEngine {
             }
             guard let inbox else {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[Reconcile] VANISHED for \(accountEmail): no inbox folder resolved — skipping")
+                    BackgroundSyncLogger.logDebug("[Reconcile] VANISHED for \(accountEmail): no inbox folder resolved — skipping")
                 }
                 return
             }
@@ -418,7 +418,7 @@ extension SyncEngine {
             // DB failure (e.g. suspension) — abandon; the Phase 2 count-mismatch
             // trigger re-fires on the next sync pass (ADR-IOS-046).
             if DebugModeManager.isLoggingEnabled() {
-                print("[Reconcile] VANISHED handling failed for \(accountEmail): \(error)")
+                BackgroundSyncLogger.logDebug("[Reconcile] VANISHED handling failed for \(accountEmail): \(error)")
             }
         }
     }
@@ -462,7 +462,7 @@ extension SyncEngine {
             }
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                print("[Reconcile] \(folder.name): snapshot read failed: \(error)")
+                BackgroundSyncLogger.logDebug("[Reconcile] \(folder.name): snapshot read failed: \(error)")
             }
             return
         }
@@ -470,7 +470,7 @@ extension SyncEngine {
 
         let maxDeletions = max(expectedGhosts, 0) + SyncConfig.deletionReconcileCapSlack
         if DebugModeManager.isLoggingEnabled() {
-            print("[Reconcile] \(folder.name): walk START — \(snapshot.uids.count) local UIDs, chunk=\(SyncConfig.deletionReconcileChunkSize), storedUidValidity=\(snapshot.storedValidity.map(String.init) ?? "nil"), deletionCap=\(maxDeletions)")
+            BackgroundSyncLogger.logDebug("[Reconcile] \(folder.name): walk START — \(snapshot.uids.count) local UIDs, chunk=\(SyncConfig.deletionReconcileChunkSize), storedUidValidity=\(snapshot.storedValidity.map(String.init) ?? "nil"), deletionCap=\(maxDeletions)")
         }
 
         let folderPath = folder.path
@@ -498,7 +498,7 @@ extension SyncEngine {
         )
 
         if DebugModeManager.isLoggingEnabled() {
-            print("[Reconcile] \(folder.name): walk DONE — deleted=\(outcome.deletedCount) searchedChunks=\(outcome.searchedChunks) failedChunks=\(outcome.failedChunks) aborted=\(outcome.aborted)\(outcome.abortReason.map { " (\($0))" } ?? "")")
+            BackgroundSyncLogger.logDebug("[Reconcile] \(folder.name): walk DONE — deleted=\(outcome.deletedCount) searchedChunks=\(outcome.searchedChunks) failedChunks=\(outcome.failedChunks) aborted=\(outcome.aborted)\(outcome.abortReason.map { " (\($0))" } ?? "")")
         }
         if outcome.deletedCount > 0 || outcome.aborted {
             BackgroundSyncLogger.log("reconcileWalk: \(folder.name) deleted=\(outcome.deletedCount) failed=\(outcome.failedChunks) aborted=\(outcome.aborted)")

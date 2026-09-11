@@ -564,7 +564,7 @@ struct TabMailSettingsView: View {
             // Tier sections render a "Loading models…" placeholder when nil; a
             // failed fetch just leaves it stuck there. Users can pull-to-retry
             // by closing/reopening Settings. No need to surface this error.
-            print("[BYOK] catalog fetch failed: \(error)")
+            BackgroundSyncLogger.logDebug("[BYOK] catalog fetch failed: \(error)")
         }
     }
 }

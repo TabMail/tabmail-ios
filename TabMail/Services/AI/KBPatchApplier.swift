@@ -18,17 +18,17 @@ enum KBPatchApplier {
         let operations = PatchApplierUtils.parseOperations(patchText, hasActionType: false)
 
         if operations.isEmpty {
-            print("[KBPatchApplier] No valid KB operations found in patch")
+            BackgroundSyncLogger.logDebug("[KBPatchApplier] No valid KB operations found in patch")
             return nil
         }
 
-        print("[KBPatchApplier] Processing \(operations.count) KB operation(s)")
+        BackgroundSyncLogger.logDebug("[KBPatchApplier] Processing \(operations.count) KB operation(s)")
 
         var currentContent = content
         for op in operations {
-            print("[KBPatchApplier] Applying KB \(op.operation): \(op.content.prefix(50))...")
+            BackgroundSyncLogger.logDebug("[KBPatchApplier] Applying KB \(op.operation): \(op.content.prefix(50))...")
             guard let result = applySingleKBOperation(content: currentContent, operation: op.operation, contentText: op.content) else {
-                print("[KBPatchApplier] Failed to apply KB \(op.operation) operation")
+                BackgroundSyncLogger.logDebug("[KBPatchApplier] Failed to apply KB \(op.operation) operation")
                 return nil
             }
             currentContent = result
@@ -43,7 +43,7 @@ enum KBPatchApplier {
     /// Matches TB's `applySingleOperation()` with actionType=null.
     private static func applySingleKBOperation(content: String, operation: String, contentText: String) -> String? {
         guard !contentText.isEmpty else {
-            print("[KBPatchApplier] Empty content text")
+            BackgroundSyncLogger.logDebug("[KBPatchApplier] Empty content text")
             return nil
         }
 
@@ -53,7 +53,7 @@ enum KBPatchApplier {
         if operation == "ADD" {
             // Check for duplicates (with Unicode normalization)
             if PatchApplierUtils.isDuplicate(contentLines: contentLines, normalizedContent: normalizedContent, unicodeNormalize: true) {
-                print("[KBPatchApplier] Duplicate content detected, skipping: \(normalizedContent)")
+                BackgroundSyncLogger.logDebug("[KBPatchApplier] Duplicate content detected, skipping: \(normalizedContent)")
                 return content
             }
 
@@ -68,7 +68,7 @@ enum KBPatchApplier {
                 .lowercased()
                 .replacingOccurrences(of: "\\.$", with: "", options: .regularExpression)
 
-            print("[KBPatchApplier] DEL: looking for '\(normalizedContentForComparison.prefix(80))'")
+            BackgroundSyncLogger.logDebug("[KBPatchApplier] DEL: looking for '\(normalizedContentForComparison.prefix(80))'")
 
             var contentRemoved = false
             for i in 0..<contentLines.count {
@@ -83,14 +83,14 @@ enum KBPatchApplier {
                         let removedLine = contentLines[i]
                         contentLines.remove(at: i)
                         contentRemoved = true
-                        print("[KBPatchApplier] Successfully removed content: \(removedLine)")
+                        BackgroundSyncLogger.logDebug("[KBPatchApplier] Successfully removed content: \(removedLine)")
                         break
                     }
                 }
             }
 
             if !contentRemoved {
-                print("[KBPatchApplier] Content not found for deletion: \(normalizedContent)")
+                BackgroundSyncLogger.logDebug("[KBPatchApplier] Content not found for deletion: \(normalizedContent)")
                 return nil
             }
         }

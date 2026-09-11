@@ -211,13 +211,13 @@ final class UndoService {
             let msgIds = action.messages.map(\.messageId)
             let msgFolderIds = action.messages.map(\.folderId)
             let msgCompositeIds = action.messages.map(\.id)
-            print("[UndoStack] PUSH type=\(action.type) msgIds=\(msgIds) folderId=\(msgFolderIds) compositeIds=\(msgCompositeIds) originalFolderId=\(action.originalFolderId) originalFolderPath=\(action.originalFolderPath) accountId=\(action.accountId) stackSize=\(undoStack.count)→\(undoStack.count + 1)")
+            BackgroundSyncLogger.logDebug("[UndoStack] PUSH type=\(action.type) msgIds=\(msgIds) folderId=\(msgFolderIds) compositeIds=\(msgCompositeIds) originalFolderId=\(action.originalFolderId) originalFolderPath=\(action.originalFolderPath) accountId=\(action.accountId) stackSize=\(undoStack.count)→\(undoStack.count + 1)")
         }
         undoStack.append(action)
         // Evict oldest if over limit
         if undoStack.count > SyncConfig.undoStackMaxSize {
             let evictCount = undoStack.count - SyncConfig.undoStackMaxSize
-            print("[UndoStack] EVICT oldest \(evictCount) actions (stack overflow)")
+            BackgroundSyncLogger.logDebug("[UndoStack] EVICT oldest \(evictCount) actions (stack overflow)")
             undoStack.removeFirst(evictCount)
         }
         // Show toast with auto-dismiss timer
@@ -245,7 +245,7 @@ final class UndoService {
                         .fetchAll(db)
                 }
                 let rowSummary = rows?.map { "id=\($0.id) folderId=\($0.folderId) folderPath=\($0.folderPath)" } ?? ["<fetch failed>"]
-                print("[UndoStack] DB state after push — msgId=\(msgId) rows=[\(rowSummary.joined(separator: ", "))]")
+                BackgroundSyncLogger.logDebug("[UndoStack] DB state after push — msgId=\(msgId) rows=[\(rowSummary.joined(separator: ", "))]")
             }
             let pendingOps = try? dbPool.read { db in
                 try PendingOperation
@@ -253,7 +253,7 @@ final class UndoService {
                     .fetchAll(db)
             }
             let opsSummary = pendingOps?.map { "id=\($0.id.prefix(8)) type=\($0.type.rawValue) status=\($0.status) msgIds=\($0.messageIds)" } ?? ["<fetch failed>"]
-            print("[UndoStack] PendingOps after push — [\(opsSummary.joined(separator: ", "))]")
+            BackgroundSyncLogger.logDebug("[UndoStack] PendingOps after push — [\(opsSummary.joined(separator: ", "))]")
         }
     }
 
@@ -307,7 +307,7 @@ final class UndoService {
                     // `UNGATED BY DECISION` prints in `AccountManagerQueue` sit on
                     // C3 refusal paths, and that carve-out does not reach a success.
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[UndoStack] REKEY member \(record.oldHeaderId) → \(record.newHeaderId)")
+                        BackgroundSyncLogger.logDebug("[UndoStack] REKEY member \(record.oldHeaderId) → \(record.newHeaderId)")
                     }
                 }
             }
@@ -381,7 +381,7 @@ final class UndoService {
         source: UndoInvocationSource = .programmatic
     ) async {
         guard let top = undoStack.last else {
-            print("[UndoStack] UNDO called but stack is empty")
+            BackgroundSyncLogger.logDebug("[UndoStack] UNDO called but stack is empty")
             return
         }
         if DebugModeManager.isLoggingEnabled() {
@@ -390,7 +390,7 @@ final class UndoService {
                 Int(Date().timeIntervalSince(top.timestamp) * 1_000)
             )
             let expectedDescription = expectedActionID?.uuidString ?? "nil"
-            print(
+            BackgroundSyncLogger.logDebug(
                 "[UndoStack] UNDO invoked source=\(source.rawValue) "
                     + "expected=\(expectedDescription) "
                     + "top=\(top.id.uuidString) ageMs=\(ageMilliseconds)"
@@ -398,7 +398,7 @@ final class UndoService {
         }
         if let expectedActionID, top.id != expectedActionID {
             if DebugModeManager.isLoggingEnabled() {
-                print("[UndoStack] Refusing stale Undo control — displayed action changed")
+                BackgroundSyncLogger.logDebug("[UndoStack] Refusing stale Undo control — displayed action changed")
             }
             hideToast()
             return
@@ -507,13 +507,13 @@ final class UndoService {
                     UndoService.shared.finishInProgressCommand(actionID: actionID)
                 }
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[UndoStack] UNDO admitted action=\(actionID) restored=\(restoredIds.count)")
+                    BackgroundSyncLogger.logDebug("[UndoStack] UNDO admitted action=\(actionID) restored=\(restoredIds.count)")
                 }
             }
         }
 
         if DebugModeManager.isLoggingEnabled() {
-            print("[UndoStack] UNDO displayed action=\(actionID) remainingStack=\(undoStack.count)")
+            BackgroundSyncLogger.logDebug("[UndoStack] UNDO displayed action=\(actionID) remainingStack=\(undoStack.count)")
         }
 
         // If more items on the stack, refresh the toast timer
@@ -551,7 +551,7 @@ final class UndoService {
 
     /// Dismiss the undo toast AND clear the entire stack.
     func dismissAll() {
-        print("[UndoStack] DISMISS ALL — clearing \(undoStack.count) actions")
+        BackgroundSyncLogger.logDebug("[UndoStack] DISMISS ALL — clearing \(undoStack.count) actions")
         undoStack.removeAll()
         hideToast()
     }

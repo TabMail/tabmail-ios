@@ -26,17 +26,17 @@ enum ActionPatchApplier {
         let operations = PatchApplierUtils.parseOperations(patchText, hasActionType: true)
 
         guard !operations.isEmpty else {
-            print("[PatchApplier] No valid action operations found in patch")
+            BackgroundSyncLogger.logDebug("[PatchApplier] No valid action operations found in patch")
             return nil
         }
 
-        print("[PatchApplier] Processing \(operations.count) action operation(s)")
+        BackgroundSyncLogger.logDebug("[PatchApplier] Processing \(operations.count) action operation(s)")
 
         var current = content
         for op in operations {
-            print("[PatchApplier] Applying \(op.operation) for \(op.actionType ?? ""): \(String(op.content.prefix(50)))...")
+            BackgroundSyncLogger.logDebug("[PatchApplier] Applying \(op.operation) for \(op.actionType ?? ""): \(String(op.content.prefix(50)))...")
             guard let updated = applySingleOperation(content: current, operation: op.operation, contentText: op.content, actionType: op.actionType ?? "") else {
-                print("[PatchApplier] Failed to apply \(op.operation) operation")
+                BackgroundSyncLogger.logDebug("[PatchApplier] Failed to apply \(op.operation) operation")
                 return nil
             }
             current = updated
@@ -52,12 +52,12 @@ enum ActionPatchApplier {
         // Validate action type
         let validTypes = ["delete", "archive", "reply", "none"]
         guard validTypes.contains(actionType) else {
-            print("[PatchApplier] Invalid action type: \(actionType)")
+            BackgroundSyncLogger.logDebug("[PatchApplier] Invalid action type: \(actionType)")
             return nil
         }
 
         guard !contentText.isEmpty else {
-            print("[PatchApplier] Empty content text")
+            BackgroundSyncLogger.logDebug("[PatchApplier] Empty content text")
             return nil
         }
 
@@ -67,7 +67,7 @@ enum ActionPatchApplier {
         if operation == "ADD" {
             // Check for duplicates
             if PatchApplierUtils.isDuplicate(contentLines: contentLines, normalizedContent: normalizedContent) {
-                print("[PatchApplier] Duplicate content detected, skipping: \(normalizedContent)")
+                BackgroundSyncLogger.logDebug("[PatchApplier] Duplicate content detected, skipping: \(normalizedContent)")
                 return content
             }
 
@@ -82,7 +82,7 @@ enum ActionPatchApplier {
             }
 
             guard sectionIndex >= 0 else {
-                print("[PatchApplier] Section not found: \(sectionHeader)")
+                BackgroundSyncLogger.logDebug("[PatchApplier] Section not found: \(sectionHeader)")
                 return nil
             }
 
@@ -114,13 +114,13 @@ enum ActionPatchApplier {
                 if lineForComparison == normalizedForComparison {
                     contentLines.remove(at: i)
                     contentRemoved = true
-                    print("[PatchApplier] Successfully removed content: \(contentLines.count) lines remaining")
+                    BackgroundSyncLogger.logDebug("[PatchApplier] Successfully removed content: \(contentLines.count) lines remaining")
                     break
                 }
             }
 
             if !contentRemoved {
-                print("[PatchApplier] Content not found for deletion: \(normalizedContent)")
+                BackgroundSyncLogger.logDebug("[PatchApplier] Content not found for deletion: \(normalizedContent)")
                 return nil
             }
         }

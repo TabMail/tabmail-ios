@@ -30,12 +30,12 @@ struct WebReadTool: AgentTool, Sendable {
             return #"{"error": "Only http:// and https:// URLs are supported"}"#
         }
 
-        print("[WebReadTool] Starting fetch for \(urlString)")
+        BackgroundSyncLogger.logDebug("[WebReadTool] Starting fetch for \(urlString)")
 
         // Check robots.txt
         let robotsAllowed = await checkRobotsTxt(url: url)
         if !robotsAllowed {
-            print("[WebReadTool] Access disallowed by robots.txt")
+            BackgroundSyncLogger.logDebug("[WebReadTool] Access disallowed by robots.txt")
             return #"{"error": "Access to this URL is disallowed by the site's robots.txt"}"#
         }
 
@@ -46,7 +46,7 @@ struct WebReadTool: AgentTool, Sendable {
             request.setValue(Config.userAgent, forHTTPHeaderField: "User-Agent")
             (data, response) = try await sharedEphemeralSession.data(for: request)
         } catch {
-            print("[WebReadTool] Fetch failed: \(error)")
+            BackgroundSyncLogger.logDebug("[WebReadTool] Fetch failed: \(error)")
             return ToolJSON.string(from: ["error": "Failed to fetch URL: \(error.localizedDescription)"])
         }
 
@@ -55,7 +55,7 @@ struct WebReadTool: AgentTool, Sendable {
         }
 
         guard httpResponse.statusCode == 200 else {
-            print("[WebReadTool] HTTP error \(httpResponse.statusCode)")
+            BackgroundSyncLogger.logDebug("[WebReadTool] HTTP error \(httpResponse.statusCode)")
             return ToolJSON.string(from: ["error": "HTTP error: \(httpResponse.statusCode)"])
         }
 
@@ -68,18 +68,18 @@ struct WebReadTool: AgentTool, Sendable {
 
         // Truncate if too large
         if content.count > Config.maxContentLength {
-            print("[WebReadTool] Content too large (\(content.count) chars), truncating")
+            BackgroundSyncLogger.logDebug("[WebReadTool] Content too large (\(content.count) chars), truncating")
             content = String(content.prefix(Config.maxContentLength))
         }
 
         // Extract text if HTML
         var text = content
         if contentType.contains("text/html") || contentType.contains("application/xhtml") {
-            print("[WebReadTool] Extracting text from HTML")
+            BackgroundSyncLogger.logDebug("[WebReadTool] Extracting text from HTML")
             text = Self.extractTextFromHTML(content)
         }
 
-        print("[WebReadTool] Successfully fetched content (\(text.count) chars)")
+        BackgroundSyncLogger.logDebug("[WebReadTool] Successfully fetched content (\(text.count) chars)")
 
         // Format response matching TB's web_read output
         var lines: [String] = []
@@ -126,7 +126,7 @@ struct WebReadTool: AgentTool, Sendable {
             return Self.isPathAllowed(robotsTxt: robotsTxt, path: path, userAgent: Config.userAgent)
         } catch {
             // On error, be conservative and allow
-            print("[WebReadTool] robots.txt check failed: \(error), assuming allowed")
+            BackgroundSyncLogger.logDebug("[WebReadTool] robots.txt check failed: \(error), assuming allowed")
             return true
         }
     }

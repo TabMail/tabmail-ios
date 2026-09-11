@@ -53,11 +53,11 @@ struct MemorySearchTool: AgentTool, Sendable {
 
         // Per-user-turn cache keyed on normalized args (matches TB memory_search.js:27-30).
         let cacheKey = MemorySearchCache.makeKey(query: query, fromDate: fromRaw, toDate: toRaw)
-        print("[MemorySearchTool] ENTER q='\(query.prefix(60))' page=\(pageIndex) fromRaw=\(fromRaw ?? "nil") toRaw=\(toRaw ?? "nil") fromDate=\(fromDate.map { "\($0)" } ?? "nil") toDate=\(toDate.map { "\($0)" } ?? "nil") fetchLimit=\(fetchLimit)")
+        BackgroundSyncLogger.logDebug("[MemorySearchTool] ENTER q='\(query.prefix(60))' page=\(pageIndex) fromRaw=\(fromRaw ?? "nil") toRaw=\(toRaw ?? "nil") fromDate=\(fromDate.map { "\($0)" } ?? "nil") toDate=\(toDate.map { "\($0)" } ?? "nil") fetchLimit=\(fetchLimit)")
         var hits: [MemoryHit]
         if let cached = await MemorySearchCache.shared.get(cacheKey) {
             hits = cached
-            print("[MemorySearchTool] CACHE HIT key=\(cacheKey.prefix(120)) hits=\(hits.count)")
+            BackgroundSyncLogger.logDebug("[MemorySearchTool] CACHE HIT key=\(cacheKey.prefix(120)) hits=\(hits.count)")
         } else {
             let fromMs = fromDate.map { Int64($0.timeIntervalSince1970 * 1000) }
             // Date-only "YYYY-MM-DD" → end-of-day inclusive. Without this,
@@ -77,12 +77,12 @@ struct MemorySearchTool: AgentTool, Sendable {
                 toMs: toMs,
                 limit: fetchLimit
             )
-            print("[MemorySearchTool] CACHE MISS — MemoryIndex.search returned \(hits.count) hits")
+            BackgroundSyncLogger.logDebug("[MemorySearchTool] CACHE MISS — MemoryIndex.search returned \(hits.count) hits")
             await MemorySearchCache.shared.set(cacheKey, hits)
         }
 
         if hits.isEmpty {
-            print("[MemorySearchTool] EMPTY result q='\(query.prefix(60))' fromRaw=\(fromRaw ?? "nil") toRaw=\(toRaw ?? "nil") fromDate=\(fromDate.map { "\($0)" } ?? "nil") toDate=\(toDate.map { "\($0)" } ?? "nil")")
+            BackgroundSyncLogger.logDebug("[MemorySearchTool] EMPTY result q='\(query.prefix(60))' fromRaw=\(fromRaw ?? "nil") toRaw=\(toRaw ?? "nil") fromDate=\(fromDate.map { "\($0)" } ?? "nil") toDate=\(toDate.map { "\($0)" } ?? "nil")")
             return #"{"results": "No relevant memories found for this query.", "page": 1, "totalPages": 1, "pageCount": 0, "totalItems": 0}"#
         }
 
@@ -115,7 +115,7 @@ struct MemorySearchTool: AgentTool, Sendable {
         }.joined(separator: "\n\n")
 
         let hint = "Use memory_read with a timestamp value to retrieve the full conversation context (±N turns from that timestamp)."
-        print("[MemorySearchTool] Returning page \(safePage + 1) of \(totalPages) (totalItems=\(hits.count))")
+        BackgroundSyncLogger.logDebug("[MemorySearchTool] Returning page \(safePage + 1) of \(totalPages) (totalItems=\(hits.count))")
 
         var resultDict: [String: Any] = [
             "results": formatted,

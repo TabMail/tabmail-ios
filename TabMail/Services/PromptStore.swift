@@ -434,7 +434,7 @@ final class PromptStore {
         if merged > 0 {
             templates = Array(localMap.values)
         }
-        print("[PromptStore] CRDT template merge: \(merged) adopted from \(incoming.count) incoming (total: \(localMap.count))")
+        BackgroundSyncLogger.logDebug("[PromptStore] CRDT template merge: \(merged) adopted from \(incoming.count) incoming (total: \(localMap.count))")
     }
 
     /// GC deleted template tombstones older than 90 days.
@@ -448,7 +448,7 @@ final class PromptStore {
         }
         let removed = before - templates.count
         if removed > 0 {
-            print("[PromptStore] GC removed \(removed) deleted template tombstones older than \(gcAgeDays) days")
+            BackgroundSyncLogger.logDebug("[PromptStore] GC removed \(removed) deleted template tombstones older than \(gcAgeDays) days")
         }
     }
 
@@ -463,7 +463,7 @@ final class PromptStore {
         // active — it would land in the demo keys and be deleted on exit.
         // Device Sync is disconnected on demo entry, so this is defensive.
         guard !DemoModeStore.isDemoActive else {
-            print("[PromptStore] applySync ignored during demo mode")
+            BackgroundSyncLogger.logDebug("[PromptStore] applySync ignored during demo mode")
             return
         }
         if !skipHistory {
@@ -503,7 +503,7 @@ final class PromptStore {
         rawAction = Defaults.action
         rawKB = Defaults.kb
         templates = Defaults.templates
-        print("[PromptStore] Demo prompt overlay ACTIVE (defaults seeded)")
+        BackgroundSyncLogger.logDebug("[PromptStore] Demo prompt overlay ACTIVE (defaults seeded)")
     }
 
     /// Exit the demo prompt overlay: restore the real values from the real
@@ -523,7 +523,7 @@ final class PromptStore {
             templates = []
         }
         Self.removeDemoOverlayKeys()
-        print("[PromptStore] Demo prompt overlay REMOVED (real prompts restored)")
+        BackgroundSyncLogger.logDebug("[PromptStore] Demo prompt overlay REMOVED (real prompts restored)")
     }
 
     /// Delete the demo overlay UserDefaults keys. Safe to call anytime —
@@ -654,7 +654,7 @@ final class PromptStore {
         }
 
         saveHistory(entries)
-        print("[PromptStore] Migrated \(entries.count) backup(s) to prompt history")
+        BackgroundSyncLogger.logDebug("[PromptStore] Migrated \(entries.count) backup(s) to prompt history")
     }
 }
 

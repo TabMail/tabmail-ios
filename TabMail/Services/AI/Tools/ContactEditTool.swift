@@ -35,7 +35,7 @@ struct ContactEditTool: AgentTool, Sendable {
         let contactId: String
         if let numericId = Int(rawContactId), let realId = await ctx.translator.toRealId(numericId) {
             contactId = realId
-            print("[ContactEditTool] Resolved numeric id \(numericId) → \(realId.prefix(40))...")
+            BackgroundSyncLogger.logDebug("[ContactEditTool] Resolved numeric id \(numericId) → \(realId.prefix(40))...")
         } else {
             contactId = rawContactId.trimmingCharacters(in: .whitespaces)
         }
@@ -94,7 +94,7 @@ struct ContactEditTool: AgentTool, Sendable {
         )
 
         guard confirmed else {
-            print("[ContactEditTool] User declined edit for contact_id=\(contactId)")
+            BackgroundSyncLogger.logDebug("[ContactEditTool] User declined edit for contact_id=\(contactId)")
             throw ToolDeclinedError(output: ToolJSON.string(from: [
                 "cancelled": true,
                 "message": "User declined to edit this contact.",
@@ -165,7 +165,7 @@ struct ContactEditTool: AgentTool, Sendable {
         do {
             try CNContactStoreHelper.updateContact(mutable)
             let updatedName = CNContactStoreHelper.displayName(mutable as CNContact)
-            print("[ContactEditTool] Updated contact_id=\(contactId)")
+            BackgroundSyncLogger.logDebug("[ContactEditTool] Updated contact_id=\(contactId)")
             // Return contact_id so processToolOutputForLLM keeps the numeric mapping fresh
             return [
                 "Contact updated successfully.",

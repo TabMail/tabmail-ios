@@ -88,8 +88,8 @@ struct CalendarSearchTool: AgentTool, Sendable {
             output += "\n\n--- Page \(pageIndex) of \(totalPages) (showing \(pageEvents.count) of \(totalEvents) events) ---"
         }
 
-        print("[CalendarSearchTool] Page \(pageIndex)/\(totalPages) (\(pageEvents.count) events) tz=\(timeZone?.identifier ?? "device")")
-        print("[CalendarSearchTool] tool_result:\n\(output)\n[CalendarSearchTool] tool_result_end")
+        BackgroundSyncLogger.logDebug("[CalendarSearchTool] Page \(pageIndex)/\(totalPages) (\(pageEvents.count) events) tz=\(timeZone?.identifier ?? "device")")
+        BackgroundSyncLogger.logDebug("[CalendarSearchTool] tool_result:\n\(output)\n[CalendarSearchTool] tool_result_end")
         return output
     }
 }

@@ -84,7 +84,7 @@ final class StoreKitManager {
 
     func loadProducts() async {
         productsLoadError = nil
-        print("[StoreKit] Loading products for IDs: \(Self.productIDs)")
+        BackgroundSyncLogger.logDebug("[StoreKit] Loading products for IDs: \(Self.productIDs)")
         do {
             let storeProducts = try await Product.products(for: Self.productIDs)
             // Explicit tier-order sort (Zero → Basic → Pro) so the plan picker
@@ -96,14 +96,14 @@ final class StoreKitManager {
                 return $0.price < $1.price
             }
             if products.isEmpty {
-                print("[StoreKit] Product.products returned empty — products may not be configured in App Store Connect")
+                BackgroundSyncLogger.logDebug("[StoreKit] Product.products returned empty — products may not be configured in App Store Connect")
                 productsLoadError = "No plans available. Products may not be configured in App Store Connect yet."
             } else {
-                print("[StoreKit] Loaded \(products.count) products: \(products.map { "\($0.id) @ \($0.displayPrice)" })")
+                BackgroundSyncLogger.logDebug("[StoreKit] Loaded \(products.count) products: \(products.map { "\($0.id) @ \($0.displayPrice)" })")
                 productsLoadError = nil
             }
         } catch {
-            print("[StoreKit] Failed to load products: \(error)")
+            BackgroundSyncLogger.logDebug("[StoreKit] Failed to load products: \(error)")
             productsLoadError = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : "Failed to load plans: \(error.localizedDescription)"
         }
     }
@@ -113,7 +113,7 @@ final class StoreKitManager {
     /// Purchase a product. Returns the signed transaction JWS on success, nil on cancel/pending.
     func purchase(_ product: Product, userId: String) async throws -> String? {
         guard let uuid = UUID(uuidString: userId) else {
-            print("[StoreKit] Invalid userId for appAccountToken: \(userId.prefix(8))...")
+            BackgroundSyncLogger.logDebug("[StoreKit] Invalid userId for appAccountToken: \(userId.prefix(8))...")
             return nil
         }
 
@@ -124,21 +124,21 @@ final class StoreKitManager {
         switch result {
         case .success(let verification):
             guard case .verified(let transaction) = verification else {
-                print("[StoreKit] Transaction verification failed")
+                BackgroundSyncLogger.logDebug("[StoreKit] Transaction verification failed")
                 return nil
             }
             let jwsRepresentation = verification.jwsRepresentation
             await transaction.finish()
             await updateCurrentEntitlements()
-            print("[StoreKit] Purchase succeeded: \(product.id)")
+            BackgroundSyncLogger.logDebug("[StoreKit] Purchase succeeded: \(product.id)")
             return jwsRepresentation
 
         case .userCancelled:
-            print("[StoreKit] User cancelled purchase")
+            BackgroundSyncLogger.logDebug("[StoreKit] User cancelled purchase")
             return nil
 
         case .pending:
-            print("[StoreKit] Purchase pending (Ask to Buy, etc.)")
+            BackgroundSyncLogger.logDebug("[StoreKit] Purchase pending (Ask to Buy, etc.)")
             return nil
 
         @unknown default:
@@ -153,20 +153,20 @@ final class StoreKitManager {
 
     func restorePurchases() async {
         restoreResult = nil
-        print("[StoreKit] Starting AppStore.sync()...")
+        BackgroundSyncLogger.logDebug("[StoreKit] Starting AppStore.sync()...")
         do {
             try await AppStore.sync()
             await updateCurrentEntitlements()
             if purchasedProductIDs.isEmpty {
                 restoreResult = "No active subscriptions found for this Apple ID."
-                print("[StoreKit] Restore completed — no entitlements found")
+                BackgroundSyncLogger.logDebug("[StoreKit] Restore completed — no entitlements found")
             } else {
                 restoreResult = "Restored: \(activePlan.map { Self.displayPlanName(forTier: $0) } ?? "subscription")"
-                print("[StoreKit] Restore completed — found: \(purchasedProductIDs)")
+                BackgroundSyncLogger.logDebug("[StoreKit] Restore completed — found: \(purchasedProductIDs)")
             }
         } catch {
             restoreResult = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : "Restore failed: \(error.localizedDescription)"
-            print("[StoreKit] Restore failed: \(error)")
+            BackgroundSyncLogger.logDebug("[StoreKit] Restore failed: \(error)")
         }
     }
 
@@ -206,7 +206,7 @@ final class StoreKitManager {
             guard case .verified(let transaction) = result else { continue }
             // Skip expired subscriptions (currentEntitlements can briefly include them)
             if let expirationDate = transaction.expirationDate, expirationDate < Date() {
-                print("[StoreKit] Skipping expired entitlement: \(transaction.productID) expired \(expirationDate)")
+                BackgroundSyncLogger.logDebug("[StoreKit] Skipping expired entitlement: \(transaction.productID) expired \(expirationDate)")
                 continue
             }
             purchased.insert(transaction.productID)
@@ -225,7 +225,7 @@ final class StoreKitManager {
         isAppleSubscriber = !purchased.isEmpty
         activePlan = bestPlan
         subscriptionOwnerUserId = ownerUserId
-        print("[StoreKit] Current entitlements: \(purchased), activePlan: \(bestPlan ?? "none"), owner: \(ownerUserId?.prefix(8) ?? "none")")
+        BackgroundSyncLogger.logDebug("[StoreKit] Current entitlements: \(purchased), activePlan: \(bestPlan ?? "none"), owner: \(ownerUserId?.prefix(8) ?? "none")")
     }
 
     /// Reads Apple's signed renewal information for the current TabMail user.
@@ -248,7 +248,7 @@ final class StoreKitManager {
             statuses = try await subscription.status
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                print("[StoreKit] Could not read subscription renewal status: \(error)")
+                BackgroundSyncLogger.logDebug("[StoreKit] Could not read subscription renewal status: \(error)")
             }
             return .unavailable
         }
@@ -350,7 +350,7 @@ final class StoreKitManager {
                 guard case .verified(let transaction) = result else { continue }
                 await transaction.finish()
                 await self?.updateCurrentEntitlements()
-                print("[StoreKit] Transaction update: \(transaction.productID)")
+                BackgroundSyncLogger.logDebug("[StoreKit] Transaction update: \(transaction.productID)")
             }
         }
     }

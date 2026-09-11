@@ -34,7 +34,7 @@ struct ContactDeleteTool: AgentTool, Sendable {
         let contactId: String
         if let numericId = Int(rawContactId), let realId = await ctx.translator.toRealId(numericId) {
             contactId = realId
-            print("[ContactDeleteTool] Resolved numeric id \(numericId) → \(realId.prefix(40))...")
+            BackgroundSyncLogger.logDebug("[ContactDeleteTool] Resolved numeric id \(numericId) → \(realId.prefix(40))...")
         } else {
             contactId = rawContactId.trimmingCharacters(in: .whitespaces)
         }
@@ -65,7 +65,7 @@ struct ContactDeleteTool: AgentTool, Sendable {
         )
 
         guard confirmed else {
-            print("[ContactDeleteTool] User declined delete for contact_id=\(contactId)")
+            BackgroundSyncLogger.logDebug("[ContactDeleteTool] User declined delete for contact_id=\(contactId)")
             throw ToolDeclinedError(output: ToolJSON.string(from: [
                 "cancelled": true,
                 "message": "User declined to delete this contact.",
@@ -83,7 +83,7 @@ struct ContactDeleteTool: AgentTool, Sendable {
         let mutable = fresh.mutableCopy() as! CNMutableContact
         do {
             try CNContactStoreHelper.deleteContact(mutable)
-            print("[ContactDeleteTool] Deleted contact_id=\(contactId)")
+            BackgroundSyncLogger.logDebug("[ContactDeleteTool] Deleted contact_id=\(contactId)")
             // Return contact_id so processToolOutputForLLM keeps the numeric mapping
             return [
                 "Contact deleted successfully.",

@@ -71,7 +71,7 @@ struct ContactSearchTool: AgentTool, Sendable {
         }
 
         let result = blocks.joined(separator: "\n-----\n")
-        print("[ContactSearchTool] Returning \(contacts.count) contacts for query='\(query)'")
+        BackgroundSyncLogger.logDebug("[ContactSearchTool] Returning \(contacts.count) contacts for query='\(query)'")
         return result
     }
 }

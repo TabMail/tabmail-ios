@@ -28,7 +28,7 @@ extension SyncEngine {
             let lastRun = UserDefaults.standard.double(forKey: key)
             let hourAgo = Date().timeIntervalSince1970 - 3600
             guard lastRun < hourAgo else {
-                print("[SelfHeal] Skipping — last run \(Int(Date().timeIntervalSince1970 - lastRun))s ago")
+                BackgroundSyncLogger.logDebug("[SelfHeal] Skipping — last run \(Int(Date().timeIntervalSince1970 - lastRun))s ago")
                 return
             }
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: key)
@@ -44,7 +44,7 @@ extension SyncEngine {
                     try Folder.filter(Column("accountId") == account.id && Column("path") != "").fetchAll(db)
                 }
             } catch {
-                print("[SelfHeal] Failed to load folders: \(error)")
+                BackgroundSyncLogger.logDebug("[SelfHeal] Failed to load folders: \(error)")
                 return
             }
             syncableFolders = folders.filter { folder in
@@ -53,7 +53,7 @@ extension SyncEngine {
                 folder.isFavorite
             }
         }
-        print("[SelfHeal] Starting for \(account.emailAddress): \(syncableFolders.count) folders")
+        BackgroundSyncLogger.logDebug("[SelfHeal] Starting for \(account.emailAddress): \(syncableFolders.count) folders")
 
         var utcCal = Calendar(identifier: .gregorian)
         utcCal.timeZone = TimeZone(identifier: "UTC")!
@@ -73,12 +73,12 @@ extension SyncEngine {
                 totalRepaired += repaired
             } catch {
                 // Don't abort other folders if one fails
-                print("[SelfHeal] Error for \(folder.name): \(error)")
+                BackgroundSyncLogger.logDebug("[SelfHeal] Error for \(folder.name): \(error)")
             }
         }
 
         if totalRepaired > 0 {
-            print("[SelfHeal] Repaired \(totalRepaired) missing messages for \(account.emailAddress)")
+            BackgroundSyncLogger.logDebug("[SelfHeal] Repaired \(totalRepaired) missing messages for \(account.emailAddress)")
         }
     }
 
@@ -187,7 +187,7 @@ extension SyncEngine {
             // round trip. Fail-closed either way, and identical to the crawl's
             // own decision for the same state.
             if DebugModeManager.isLoggingEnabled() {
-                print("[SelfHeal] \(folder.name) skipped: rows are stamped UIDVALIDITY \(String(describing: storedEpoch)) but this pass observed none")
+                BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name) skipped: rows are stamped UIDVALIDITY \(String(describing: storedEpoch)) but this pass observed none")
             }
             return 0
         case .refuseEpochMismatch:
@@ -205,7 +205,7 @@ extension SyncEngine {
             // about to keep using, and the reaction disconnects the provider before
             // stamping. Refuse here, let the sync path react.
             if DebugModeManager.isLoggingEnabled() {
-                print("[SelfHeal] \(folder.name) skipped: rows belong to UIDVALIDITY \(String(describing: storedEpoch)), server is at \(String(describing: healEpoch))")
+                BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name) skipped: rows belong to UIDVALIDITY \(String(describing: storedEpoch)), server is at \(String(describing: healEpoch))")
             }
             return 0
         }
@@ -244,7 +244,7 @@ extension SyncEngine {
         }
 
         guard !missingUIDs.isEmpty else { return 0 }
-        print("[SelfHeal] \(folder.name): found \(missingUIDs.count) missing UIDs out of \(remoteUIDs.count) remote (last 90 days). Missing: \(missingUIDs.sorted().prefix(20))")
+        BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): found \(missingUIDs.count) missing UIDs out of \(remoteUIDs.count) remote (last 90 days). Missing: \(missingUIDs.sorted().prefix(20))")
 
         // Step 3: Fetch missing headers from IMAP, together with the epoch the
         // SELECTs that served them reported (term 2's left-hand side).
@@ -259,7 +259,7 @@ extension SyncEngine {
         if headers.count < missingUIDs.count {
             let fetched = Set(headers.map(\.messageId))
             let stillMissing = missingUIDs.filter { !fetched.contains(String($0)) }
-            print("[SelfHeal] \(folder.name): IMAP FETCH returned \(headers.count)/\(missingUIDs.count). Permanently missing UIDs: \(stillMissing.sorted().prefix(20))")
+            BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): IMAP FETCH returned \(headers.count)/\(missingUIDs.count). Permanently missing UIDs: \(stillMissing.sorted().prefix(20))")
         }
 
         guard !headers.isEmpty else { return 0 }
@@ -279,7 +279,7 @@ extension SyncEngine {
         // TRANSIENT: the next hourly run re-derives the whole diff.
         guard fetchEpoch == healEpoch else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[SelfHeal] \(folder.name): discarding \(headers.count) fetched headers — served under UIDVALIDITY \(String(describing: fetchEpoch)), this pass gated on \(String(describing: healEpoch))")
+                BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): discarding \(headers.count) fetched headers — served under UIDVALIDITY \(String(describing: fetchEpoch)), this pass gated on \(String(describing: healEpoch))")
             }
             return 0
         }
@@ -315,12 +315,12 @@ extension SyncEngine {
             // re-enqueues. Returning 0 under-reports those rows in the repaired
             // count; under-reporting a repair is the safe direction.
             if DebugModeManager.isLoggingEnabled() {
-                print("[SelfHeal] \(folder.name): insert refused — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: storedEpoch))), \(headers.count) headers discarded")
+                BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): insert refused — the folder no longer holds the UIDVALIDITY this pass premised (\(String(describing: storedEpoch))), \(headers.count) headers discarded")
             }
             return 0
         case .landed(let inserted, let ftsRecords, _):
             if inserted > 0 {
-                print("[SelfHeal] \(folder.name): repaired \(inserted) messages")
+                BackgroundSyncLogger.logDebug("[SelfHeal] \(folder.name): repaired \(inserted) messages")
                 if !ftsRecords.isEmpty {
                     await indexHeadersForFTS(ftsRecords)
                     await BackfillBodyQueue.shared.enqueueItems(

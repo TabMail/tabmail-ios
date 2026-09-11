@@ -62,13 +62,13 @@ struct ChangeSettingTool: AgentTool, Sendable {
         // are outside the demo sandbox — block with a relayable error.
         if DemoModeStore.isDemoActive { return DemoToolGuard.blockedMessage }
         guard case .string(let settingKey) = arguments["setting"] else {
-            print("[ChangeSettingTool] Missing 'setting' argument")
+            BackgroundSyncLogger.logDebug("[ChangeSettingTool] Missing 'setting' argument")
             return ToolJSON.string(from: ["error": "missing 'setting' argument"])
         }
 
         guard let def = Self.settingDefs[settingKey] else {
             let valid = Self.settingDefs.keys.sorted().joined(separator: ", ")
-            print("[ChangeSettingTool] Unknown setting '\(settingKey)'")
+            BackgroundSyncLogger.logDebug("[ChangeSettingTool] Unknown setting '\(settingKey)'")
             return ToolJSON.string(from: ["error": "Unknown setting '\(settingKey)'. Valid: \(valid)"])
         }
 
@@ -90,7 +90,7 @@ struct ChangeSettingTool: AgentTool, Sendable {
                 UserDefaults.standard.set(boolVal, forKey: key)
                 UserDefaults.standard.synchronize()
             }
-            print("[ChangeSettingTool] Set \(settingKey) = \(boolVal) (was \(prev))")
+            BackgroundSyncLogger.logDebug("[ChangeSettingTool] Set \(settingKey) = \(boolVal) (was \(prev))")
 
             resultJSON = ToolJSON.string(from: [
                 "ok": true, "setting": settingKey,
@@ -117,7 +117,7 @@ struct ChangeSettingTool: AgentTool, Sendable {
                 UserDefaults.standard.set(num, forKey: key)
                 UserDefaults.standard.synchronize()
             }
-            print("[ChangeSettingTool] Set \(settingKey) = \(num) (was \(prev))")
+            BackgroundSyncLogger.logDebug("[ChangeSettingTool] Set \(settingKey) = \(num) (was \(prev))")
 
             resultJSON = ToolJSON.string(from: [
                 "ok": true, "setting": settingKey,

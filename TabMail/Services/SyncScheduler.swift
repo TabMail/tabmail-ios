@@ -45,7 +45,7 @@ final class BGTaskContext: @unchecked Sendable {
         cancelQueuesHook = nil
         suspendHook = nil
         #endif
-        print("[BGTaskCtx:\(label)] created on thread \(Thread.current)")
+        BackgroundSyncLogger.logDebug("[BGTaskCtx:\(label)] created on thread \(Thread.current)")
     }
 
     var expired: Bool {
@@ -98,16 +98,16 @@ final class BGTaskContext: @unchecked Sendable {
 
     /// Mark as expired and cancel the processing task (if registered).
     func expire() {
-        print("[BGTaskCtx:\(label)] expire() called on thread \(Thread.current), isMainThread=\(Thread.isMainThread)")
+        BackgroundSyncLogger.logDebug("[BGTaskCtx:\(label)] expire() called on thread \(Thread.current), isMainThread=\(Thread.isMainThread)")
         lock.lock()
         _expired = true
         let task = _task
         lock.unlock()
         if let task {
-            print("[BGTaskCtx:\(label)] cancelling processing task")
+            BackgroundSyncLogger.logDebug("[BGTaskCtx:\(label)] cancelling processing task")
             task.cancel()
         } else {
-            print("[BGTaskCtx:\(label)] expire() but processing task not yet registered")
+            BackgroundSyncLogger.logDebug("[BGTaskCtx:\(label)] expire() but processing task not yet registered")
         }
     }
 
@@ -117,7 +117,7 @@ final class BGTaskContext: @unchecked Sendable {
         _task = task
         let isExpired = _expired
         lock.unlock()
-        print("[BGTaskCtx:\(label)] setTask() called, alreadyExpired=\(isExpired)")
+        BackgroundSyncLogger.logDebug("[BGTaskCtx:\(label)] setTask() called, alreadyExpired=\(isExpired)")
         if isExpired { task.cancel() }
     }
 }
@@ -198,7 +198,7 @@ final class SyncScheduler {
             return false
         }
         BackgroundSyncLogger.log("drainPendingSyncs: START draining \(pending.count) pending: \(pending)")
-        print("[SyncScheduler] Draining \(pending.count) pending sync(s): \(pending)")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] Draining \(pending.count) pending sync(s): \(pending)")
         var anyChanges = false
         for email in pending {
             // Re-check connectivity before each sync — network may drop mid-drain
@@ -709,7 +709,7 @@ final class SyncScheduler {
         }
 
         guard timer == nil else { return }
-        print("[SyncScheduler] Starting foreground polling (every \(Int(foregroundInterval))s)")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] Starting foreground polling (every \(Int(foregroundInterval))s)")
         timer = Timer.scheduledTimer(withTimeInterval: foregroundInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 await self?.poll()
@@ -734,7 +734,7 @@ final class SyncScheduler {
         // frees the task promptly. ADR-IOS-046.
         Task { await manager.syncEngine.cancelMaintenance() }
         BackgroundSyncLogger.log("stopPolling: app going to background (pollActive=\(isPollActive))")
-        print("[SyncScheduler] Stopped polling")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] Stopped polling")
     }
 
     // MARK: - IMAP IDLE (Foreground Only)
@@ -752,7 +752,7 @@ final class SyncScheduler {
                         .fetchAll(db)
                 }
             } catch {
-                print("[SyncScheduler:IDLE] Failed to load IMAP accounts: \(error)")
+                BackgroundSyncLogger.logDebug("[SyncScheduler:IDLE] Failed to load IMAP accounts: \(error)")
                 return
             }
             for account in accounts {
@@ -767,7 +767,7 @@ final class SyncScheduler {
                         // sync path.
                         let uids = uidSet.toArray().map { UInt32($0.value) }
                         if DebugModeManager.isLoggingEnabled() {
-                            print("[SyncScheduler:IDLE] \(email) event: vanished (\(uids.count) UIDs) — targeted delete + syncing")
+                            BackgroundSyncLogger.logDebug("[SyncScheduler:IDLE] \(email) event: vanished (\(uids.count) UIDs) — targeted delete + syncing")
                         }
                         await self.manager.syncEngine.handleVanishedUIDs(accountEmail: email, uids: uids)
                         await self.backgroundPoll(accountEmail: email)
@@ -775,7 +775,7 @@ final class SyncScheduler {
                         // .expunge carries a SEQUENCE number, not a UID — it
                         // cannot be mapped to a local row safely; keep it as a
                         // generic poll trigger (ADR-IOS-051).
-                        print("[SyncScheduler:IDLE] \(email) event: \(event) — syncing")
+                        BackgroundSyncLogger.logDebug("[SyncScheduler:IDLE] \(email) event: \(event) — syncing")
                         await self.backgroundPoll(accountEmail: email)
                     default:
                         break
@@ -783,7 +783,7 @@ final class SyncScheduler {
                 }
             }
             if !accounts.isEmpty {
-                print("[SyncScheduler:IDLE] Started IDLE for \(accounts.count) IMAP account(s)")
+                BackgroundSyncLogger.logDebug("[SyncScheduler:IDLE] Started IDLE for \(accounts.count) IMAP account(s)")
             }
         }
     }
@@ -804,7 +804,7 @@ final class SyncScheduler {
                 guard let provider = await manager.provider(for: account) as? IMAPProvider else { continue }
                 await provider.stopIdle()
             }
-            print("[SyncScheduler:IDLE] Stopped all IDLE sessions")
+            BackgroundSyncLogger.logDebug("[SyncScheduler:IDLE] Stopped all IDLE sessions")
         }
     }
 
@@ -864,7 +864,7 @@ final class SyncScheduler {
         // Don't waste background task budget if no work is in-flight
         let hasWork = isPollActive
         guard hasWork else {
-            print("[SyncScheduler] Grace period skipped — no in-flight work")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] Grace period skipped — no in-flight work")
             return
         }
         BackgroundSyncLogger.log("Grace period REQUESTED")
@@ -875,16 +875,16 @@ final class SyncScheduler {
             if !ended.withLock({ let was = $0; $0 = true; return was }) {
                 let id = bgTaskId.withLock { $0 }
                 UIApplication.shared.endBackgroundTask(id)
-                print("[SyncScheduler] Grace expiration handler fired")
+                BackgroundSyncLogger.logDebug("[SyncScheduler] Grace expiration handler fired")
             }
         }
         bgTaskId.withLock { $0 = taskId }
         guard bgTaskId.withLock({ $0 }) != .invalid else {
-            print("[SyncScheduler] Failed to begin background task for grace period")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] Failed to begin background task for grace period")
             return
         }
         let taskIdValue = bgTaskId.withLock { $0 }.rawValue
-        print("[SyncScheduler] Background grace period started, bgTaskId=\(taskIdValue)")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] Background grace period started, bgTaskId=\(taskIdValue)")
 
         Task { @MainActor in
             // Phase 1: Let in-flight work finish. Poll every 1s until work is done
@@ -892,7 +892,7 @@ final class SyncScheduler {
             while isPollActive {
                 let remaining = UIApplication.shared.backgroundTimeRemaining
                 if remaining < 7 {
-                    print("[SyncScheduler] Grace: stopping early, remaining=\(Int(remaining))s")
+                    BackgroundSyncLogger.logDebug("[SyncScheduler] Grace: stopping early, remaining=\(Int(remaining))s")
                     break
                 }
                 try? await Task.sleep(for: .seconds(1))
@@ -908,7 +908,7 @@ final class SyncScheduler {
             while CFAbsoluteTimeGetCurrent() < holdUntil {
                 let remaining = UIApplication.shared.backgroundTimeRemaining
                 if remaining < 2 {
-                    print("[SyncScheduler] Grace: catch window cut short, remaining=\(Int(remaining))s")
+                    BackgroundSyncLogger.logDebug("[SyncScheduler] Grace: catch window cut short, remaining=\(Int(remaining))s")
                     break
                 }
                 try? await Task.sleep(for: .seconds(0.5))
@@ -917,7 +917,7 @@ final class SyncScheduler {
             if !ended.withLock({ let was = $0; $0 = true; return was }) {
                 let id = bgTaskId.withLock { $0 }
                 UIApplication.shared.endBackgroundTask(id)
-                print("[SyncScheduler] Background grace period ended, bgTaskId=\(id.rawValue)")
+                BackgroundSyncLogger.logDebug("[SyncScheduler] Background grace period ended, bgTaskId=\(id.rawValue)")
             }
         }
     }
@@ -1053,8 +1053,8 @@ final class SyncScheduler {
         let pd3 = CFAbsoluteTimeGetCurrent()
         lastPollTime = Date()
         // Badge + unread counts already updated by UnreadCountManager during sync.
-        print("[SyncScheduler] Post-sync: drain=\(Int((pd1-pd0)*1000))ms outbox=\(Int((pd2-pd1)*1000))ms calendar=\(Int((pd3-pd2)*1000))ms")
-        print("[SyncScheduler] Poll completed at \(Date()) (changes: \(anyChanges))")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] Post-sync: drain=\(Int((pd1-pd0)*1000))ms outbox=\(Int((pd2-pd1)*1000))ms calendar=\(Int((pd3-pd2)*1000))ms")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] Poll completed at \(Date()) (changes: \(anyChanges))")
         BackgroundSyncLogger.log("poll: END (foreground, changes=\(anyChanges))")
 
         // Revalidate AI subscription gate if closed
@@ -1102,7 +1102,7 @@ final class SyncScheduler {
             try BGTaskScheduler.shared.submit(request)
             BackgroundSyncLogger.log("BGAppRefresh SCHEDULED (earliest: +\(intervalMin)min, caller=\(caller))")
             BackgroundSyncLogger.logBGAppRefresh("SCHEDULED (earliest: +\(intervalMin)min, caller=\(caller))")
-            print("[SyncScheduler] Background sync scheduled (\(caller))")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] Background sync scheduled (\(caller))")
 
             // Verify iOS actually has the task pending
             BGTaskScheduler.shared.getPendingTaskRequests { requests in
@@ -1114,7 +1114,7 @@ final class SyncScheduler {
         } catch {
             BackgroundSyncLogger.log("BGAppRefresh SCHEDULE FAILED: \(error) (caller=\(caller))")
             BackgroundSyncLogger.logBGAppRefresh("SCHEDULE FAILED: \(error)")
-            print("[SyncScheduler] Failed to schedule background sync: \(error)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] Failed to schedule background sync: \(error)")
         }
     }
 
@@ -1144,7 +1144,7 @@ final class SyncScheduler {
         installExpirationHandler: (@escaping @Sendable () -> Void) -> Void
     ) {
         let networkConnected = NetworkMonitor.checkConnected()
-        print("[SyncScheduler] handleBackgroundSync() enter, thread=\(Thread.current), isMainThread=\(Thread.isMainThread)")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] handleBackgroundSync() enter, thread=\(Thread.current), isMainThread=\(Thread.isMainThread)")
         BackgroundSyncLogger.log("BGAppRefresh STARTED (network=\(networkConnected))")
         BackgroundSyncLogger.logBGAppRefresh("STARTED (network=\(networkConnected))")
 
@@ -1156,7 +1156,7 @@ final class SyncScheduler {
         // used (property set) then sent (captured in Task) — satisfies
         // Swift 6 region-based "no use after send" rule.
         installExpirationHandler {
-            print("[SyncScheduler] SYNC expiration handler fired, thread=\(Thread.current), isMainThread=\(Thread.isMainThread)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] SYNC expiration handler fired, thread=\(Thread.current), isMainThread=\(Thread.isMainThread)")
             BackgroundSyncLogger.log("BGAppRefresh EXPIRED (iOS killed)")
             BackgroundSyncLogger.logBGAppRefresh("EXPIRED (iOS killed)")
             ctx.expire()
@@ -1181,9 +1181,9 @@ final class SyncScheduler {
                     self.scheduleBackgroundProcessing()
                 }
             }
-            print("[SyncScheduler] SYNC expiration handler done")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] SYNC expiration handler done")
         }
-        print("[SyncScheduler] SYNC expirationHandler set")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] SYNC expirationHandler set")
 
         // BGAppRefreshTask: unified sync startup with budget-limited drain.
         let syncTask = Task { @MainActor in
@@ -1212,7 +1212,7 @@ final class SyncScheduler {
                 finishFailure()
                 return
             }
-            print("[SyncScheduler] SYNC Task body start")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] SYNC Task body start")
             let pollActive = self.isPollActive
             BackgroundSyncLogger.logBGAppRefresh("Task body start (pollActive=\(pollActive), network=\(NetworkMonitor.checkConnected()))")
 
@@ -1220,7 +1220,7 @@ final class SyncScheduler {
             if pollActive {
                 BackgroundSyncLogger.log("BGAppRefresh SKIPPED (foreground poll active)")
                 BackgroundSyncLogger.logBGAppRefresh("SKIPPED (foreground poll active)")
-                print("[SyncScheduler] SYNC skipped — foreground poll active")
+                BackgroundSyncLogger.logDebug("[SyncScheduler] SYNC skipped — foreground poll active")
                 if let success = ctx.complete(success: !Task.isCancelled) {
                     self.scheduleBackgroundSync()
                     if !success { self.scheduleBackgroundProcessing() }
@@ -1239,7 +1239,7 @@ final class SyncScheduler {
             guard connected else {
                 BackgroundSyncLogger.log("BGAppRefresh SKIPPED (no network)")
                 BackgroundSyncLogger.logBGAppRefresh("SKIPPED (no network)")
-                print("[SyncScheduler] SYNC skipped — no network")
+                BackgroundSyncLogger.logDebug("[SyncScheduler] SYNC skipped — no network")
                 if let success = ctx.complete(success: !Task.isCancelled) {
                     self.scheduleBackgroundSync()
                     if !success { self.scheduleBackgroundProcessing() }
@@ -1260,15 +1260,15 @@ final class SyncScheduler {
             let success = !ctx.expired
             BackgroundSyncLogger.log("BGAppRefresh COMPLETED (success=\(success))")
             BackgroundSyncLogger.logBGAppRefresh("COMPLETED (success=\(success))")
-            print("[SyncScheduler] SYNC completing: expired=\(ctx.expired), success=\(success)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] SYNC completing: expired=\(ctx.expired), success=\(success)")
             if ctx.complete(success: !Task.isCancelled) != nil {
                 self.scheduleBackgroundSync() // Re-schedule for next cycle
                 self.scheduleBackgroundProcessing() // Always schedule BGProcessing
             }
-            print("[SyncScheduler] SYNC Task body done")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] SYNC Task body done")
         }
         ctx.setTask(syncTask)
-        print("[SyncScheduler] handleBackgroundSync() exit")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] handleBackgroundSync() exit")
     }
 
     private func performBackgroundRefreshWork() async {
@@ -1306,11 +1306,11 @@ final class SyncScheduler {
             try BGTaskScheduler.shared.submit(request)
             BackgroundSyncLogger.log("BGProcessing SCHEDULED")
             BackgroundSyncLogger.logBGProcessing("SCHEDULED")
-            print("[SyncScheduler] Background processing scheduled")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] Background processing scheduled")
         } catch {
             BackgroundSyncLogger.log("BGProcessing SCHEDULE FAILED: \(error.localizedDescription)")
             BackgroundSyncLogger.logBGProcessing("SCHEDULE FAILED: \(error.localizedDescription)")
-            print("[SyncScheduler] Failed to schedule background processing: \(error)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] Failed to schedule background processing: \(error)")
         }
     }
 
@@ -1330,12 +1330,12 @@ final class SyncScheduler {
         context ctx: BGTaskContext,
         installExpirationHandler: (@escaping @Sendable () -> Void) -> Void
     ) {
-        print("[SyncScheduler] handleBackgroundProcessing() enter, thread=\(Thread.current), isMainThread=\(Thread.isMainThread)")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] handleBackgroundProcessing() enter, thread=\(Thread.current), isMainThread=\(Thread.isMainThread)")
         BackgroundSyncLogger.log("BGProcessing STARTED")
         BackgroundSyncLogger.logBGProcessing("STARTED")
 
         installExpirationHandler {
-            print("[SyncScheduler] PROCESSING expiration handler fired, thread=\(Thread.current), isMainThread=\(Thread.isMainThread)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] PROCESSING expiration handler fired, thread=\(Thread.current), isMainThread=\(Thread.isMainThread)")
             BackgroundSyncLogger.log("BGProcessing EXPIRED (iOS killed)")
             BackgroundSyncLogger.logBGProcessing("EXPIRED (iOS killed)")
             ctx.expire()
@@ -1353,9 +1353,9 @@ final class SyncScheduler {
                     self.scheduleBackgroundProcessing()
                 }
             }
-            print("[SyncScheduler] PROCESSING expiration handler done")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] PROCESSING expiration handler done")
         }
-        print("[SyncScheduler] PROCESSING expirationHandler set")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] PROCESSING expirationHandler set")
 
         // BGProcessingTask = heavy work. Drains body/AI/embedding queues populated
         // by the preceding BGAppRefreshTask or silent push delta sync.
@@ -1386,7 +1386,7 @@ final class SyncScheduler {
                 return
             }
             let taskT0 = CFAbsoluteTimeGetCurrent()
-            print("[SyncScheduler] PROCESSING Task body start")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] PROCESSING Task body start")
             BackgroundSyncLogger.logBGProcessing("Task body start")
 
             // Enable turbo/fast-sync mode — BGProcessing has minutes of budget,
@@ -1408,7 +1408,7 @@ final class SyncScheduler {
             let success = !ctx.expired
             BackgroundSyncLogger.log("BGProcessing COMPLETED in \(totalElapsed)ms (success=\(success))")
             BackgroundSyncLogger.logBGProcessing("COMPLETED in \(totalElapsed)ms (success=\(success))")
-            print("[SyncScheduler] PROCESSING completing in \(totalElapsed)ms: expired=\(ctx.expired), success=\(success)")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] PROCESSING completing in \(totalElapsed)ms: expired=\(ctx.expired), success=\(success)")
             guard let completionSuccess = ctx.complete(success: !Task.isCancelled) else { return }
             if !completionSuccess {
                 self.scheduleBackgroundProcessing()
@@ -1420,10 +1420,10 @@ final class SyncScheduler {
             if await self.backgroundProcessingHasWork() {
                 self.scheduleBackgroundProcessing()
             }
-            print("[SyncScheduler] PROCESSING Task body done")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] PROCESSING Task body done")
         }
         ctx.setTask(processingTask)
-        print("[SyncScheduler] handleBackgroundProcessing() exit")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] handleBackgroundProcessing() exit")
     }
 
     private func performBackgroundProcessingWork() async {
@@ -1452,7 +1452,7 @@ final class SyncScheduler {
     /// NWPathMonitor.pathUpdateHandler can fire multiple times (races with cancel()),
     /// so guard the continuation with a Mutex to prevent double-resume (EXC_BREAKPOINT).
     nonisolated static func isOnWiFi() async -> Bool {
-        print("[SyncScheduler] isOnWiFi() enter")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] isOnWiFi() enter")
         let result: Bool
         do {
             result = try await withTimeout(seconds: SyncConfig.wifiCheckTimeoutSeconds) {
@@ -1461,23 +1461,23 @@ final class SyncScheduler {
                     let monitor = NWPathMonitor(requiredInterfaceType: .wifi)
                     monitor.pathUpdateHandler = { path in
                         let status = path.status
-                        print("[SyncScheduler] WiFi pathUpdate: status=\(status), thread=\(Thread.current)")
+                        BackgroundSyncLogger.logDebug("[SyncScheduler] WiFi pathUpdate: status=\(status), thread=\(Thread.current)")
                         monitor.cancel()
                         if !resumed.withLock({ let was = $0; $0 = true; return was }) {
-                            print("[SyncScheduler] WiFi resuming continuation: satisfied=\(status == .satisfied)")
+                            BackgroundSyncLogger.logDebug("[SyncScheduler] WiFi resuming continuation: satisfied=\(status == .satisfied)")
                             continuation.resume(returning: status == .satisfied)
                         } else {
-                            print("[SyncScheduler] WiFi DUPLICATE callback suppressed")
+                            BackgroundSyncLogger.logDebug("[SyncScheduler] WiFi DUPLICATE callback suppressed")
                         }
                     }
                     monitor.start(queue: DispatchQueue(label: "wifi-check"))
                 }
             }
         } catch {
-            print("[SyncScheduler] WiFi check timed out after \(SyncConfig.wifiCheckTimeoutSeconds)s — assuming not on WiFi")
+            BackgroundSyncLogger.logDebug("[SyncScheduler] WiFi check timed out after \(SyncConfig.wifiCheckTimeoutSeconds)s — assuming not on WiFi")
             return false
         }
-        print("[SyncScheduler] isOnWiFi() = \(result)")
+        BackgroundSyncLogger.logDebug("[SyncScheduler] isOnWiFi() = \(result)")
         return result
     }
 
@@ -1504,7 +1504,7 @@ final class SyncScheduler {
                 gate.applyIfCurrentEpoch(info, fetchedInGeneration: generation)
             }
         } catch {
-            print("[AISubscriptionGate] Revalidation failed: \(error)")
+            BackgroundSyncLogger.logDebug("[AISubscriptionGate] Revalidation failed: \(error)")
         }
     }
 }

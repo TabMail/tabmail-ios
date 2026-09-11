@@ -45,7 +45,7 @@ struct EmailReplyTool: AgentTool, Sendable {
         // Demo boundary (ADR-IOS-038): a demo chat must never reply to a real
         // email (and vice versa) — stale translator IDs can cross the line.
         guard DemoToolGuard.headerAccessible(header) else {
-            print("[EmailReplyTool] Blocked cross-boundary access to \(realId.prefix(30))")
+            BackgroundSyncLogger.logDebug("[EmailReplyTool] Blocked cross-boundary access to \(realId.prefix(30))")
             return ComposeOutcome.failed("Email not found for unique_id \(numericId)").describeForLLM
         }
 
@@ -83,7 +83,7 @@ struct EmailReplyTool: AgentTool, Sendable {
             explicitBody = nil
         }
 
-        print("[EmailReplyTool] Opening reply: numericId=\(numericId) subject=\(header.subject.prefix(40)) request=\(composeRequest != nil) bodyLen=\(explicitBody?.count ?? 0)")
+        BackgroundSyncLogger.logDebug("[EmailReplyTool] Opening reply: numericId=\(numericId) subject=\(header.subject.prefix(40)) request=\(composeRequest != nil) bodyLen=\(explicitBody?.count ?? 0)")
 
         // When a compose instruction is present, run it through performInlineEdit
         // with mode "edit_reply" — matching TB's runComposeEdit() flow.
@@ -111,9 +111,9 @@ struct EmailReplyTool: AgentTool, Sendable {
                 )
                 generatedSubject = result.subject
                 generatedBody = result.body ?? generatedBody
-                print("[EmailReplyTool] AI generated: subject=\(generatedSubject?.prefix(60) ?? "nil") bodyLen=\(generatedBody?.count ?? 0)")
+                BackgroundSyncLogger.logDebug("[EmailReplyTool] AI generated: subject=\(generatedSubject?.prefix(60) ?? "nil") bodyLen=\(generatedBody?.count ?? 0)")
             } catch {
-                print("[EmailReplyTool] performInlineEdit failed: \(error) — opening reply with cached/empty content")
+                BackgroundSyncLogger.logDebug("[EmailReplyTool] performInlineEdit failed: \(error) — opening reply with cached/empty content")
             }
         }
 
@@ -133,7 +133,7 @@ struct EmailReplyTool: AgentTool, Sendable {
             mode: .reply
         )
         if await MainActor.run(body: { ctx.router.recentlySentCompose.isRecentlySent(cacheKey) }) {
-            print("[EmailReplyTool] Skipping duplicate reply for \(header.accountId):\(header.stableId) — recently sent")
+            BackgroundSyncLogger.logDebug("[EmailReplyTool] Skipping duplicate reply for \(header.accountId):\(header.stableId) — recently sent")
             return "Reply to this email was already sent moments ago. No further action needed."
         }
 

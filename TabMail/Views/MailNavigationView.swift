@@ -532,7 +532,7 @@ struct MailNavigationView: View {
             // right after — gives us a tight window of "this selection
             // change is mine, leave it alone."
             if DebugModeManager.isLoggingEnabled() {
-                print("[NavAccount] selection changed \(String(describing: oldValue)) → \(String(describing: newValue))")
+                BackgroundSyncLogger.logDebug("[NavAccount] selection changed \(String(describing: oldValue)) → \(String(describing: newValue))")
             }
             if isHandlingNotificationDeepLink {
                 isHandlingNotificationDeepLink = false
@@ -580,7 +580,7 @@ struct MailNavigationView: View {
             // collapses the chat surface; this one presents the detail sheet.
             guard let templateId = notification.userInfo?["templateId"] as? String else { return }
             templateSheetItem = TemplateSheetItem(id: templateId)
-            print("[MailNavigationView] Template pill Open Template: \(templateId.prefix(30))")
+            BackgroundSyncLogger.logDebug("[MailNavigationView] Template pill Open Template: \(templateId.prefix(30))")
         }
         .sheet(item: $templateSheetItem) { item in
             NavigationStack {
@@ -711,7 +711,7 @@ struct MailNavigationView: View {
                     handleNotificationDeepLink(info)
                 case .inbox:
                     selection = .unified(.inbox)
-                    print("[MailNav] Cold-start deep link: navigating to inbox")
+                    BackgroundSyncLogger.logDebug("[MailNav] Cold-start deep link: navigating to inbox")
                 }
             }
         }
@@ -746,7 +746,7 @@ struct MailNavigationView: View {
         guard let messageId = userInfo?["messageId"] as? String, !messageId.isEmpty else {
             // No messageId → just land in inbox (no detail to open).
             selection = .unified(.inbox)
-            print("[MailNav] Notification deep link: navigating to inbox")
+            BackgroundSyncLogger.logDebug("[MailNav] Notification deep link: navigating to inbox")
             return
         }
 
@@ -802,7 +802,7 @@ struct MailNavigationView: View {
             ? "notifTap: pushed instantly (pending resolve → skeleton) \(messageId.prefix(24))"
             : "notifTap: pushed instantly (staged) \(messageId.prefix(24))")
         selectedMessageId = openId
-        print("[MailNav] Notification deep link: navigating to message \(messageId.prefix(30))")
+        BackgroundSyncLogger.logDebug("[MailNav] Notification deep link: navigating to message \(messageId.prefix(30))")
     }
 
     // MARK: - Helpers
@@ -874,7 +874,7 @@ private struct NavigationNotificationHandlers: ViewModifier {
                 // selection away mid re-render, cancelling the dashboard's
                 // `.task`. Skip the push when the sidebar already shows Account.
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[NavAccount] navigateToAccount → push (selection=\(String(describing: selection)) alreadyPushed=\(pushedShowsAccount))")
+                    BackgroundSyncLogger.logDebug("[NavAccount] navigateToAccount → push (selection=\(String(describing: selection)) alreadyPushed=\(pushedShowsAccount))")
                 }
                 guard selection != .account else { return }
                 pushedShowsAccount = true

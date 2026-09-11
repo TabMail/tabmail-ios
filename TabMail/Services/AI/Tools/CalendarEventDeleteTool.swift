@@ -39,12 +39,12 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
         let numericId: Int?
         if let n = Int(rawEventId) {
             guard let realId = await ctx.translator.toRealId(n) else {
-                print("[CalendarEventDeleteTool] Failed to resolve numeric id \(n)")
+                BackgroundSyncLogger.logDebug("[CalendarEventDeleteTool] Failed to resolve numeric id \(n)")
                 return #"{"error": "calendar_event_delete failed: no event found for the given event_id. Call calendar_event_read or calendar_search to look up the event again, then retry."}"#
             }
             compoundId = realId
             numericId = n
-            print("[CalendarEventDeleteTool] Resolved numeric id \(n) → \(realId.prefix(50))...")
+            BackgroundSyncLogger.logDebug("[CalendarEventDeleteTool] Resolved numeric id \(n) → \(realId.prefix(50))...")
         } else {
             compoundId = rawEventId.trimmingCharacters(in: .whitespaces)
             numericId = nil
@@ -131,7 +131,7 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
         // deleting the wrong or an already-replaced event, is not recoverable at
         // all. Fail closed.
         guard let resolvedEvent = fetchedEvent else {
-            print("[CalendarEventDeleteTool] Could not dereference event_id='\(eventId.prefix(50))' (compound='\(compoundId.prefix(50))') — refusing delete")
+            BackgroundSyncLogger.logDebug("[CalendarEventDeleteTool] Could not dereference event_id='\(eventId.prefix(50))' (compound='\(compoundId.prefix(50))') — refusing delete")
             return ToolJSON.string(from: [
                 "ok": false,
                 "error": "calendar_event_delete failed: could not find event with id '\(compoundId)'. The id may be wrong or the event may have been deleted. Call calendar_event_read or calendar_search to look up the correct event, then retry.",
@@ -161,7 +161,7 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
         )
 
         guard confirmed else {
-            print("[CalendarEventDeleteTool] User declined delete for event_id=\(eventId)")
+            BackgroundSyncLogger.logDebug("[CalendarEventDeleteTool] User declined delete for event_id=\(eventId)")
             throw ToolDeclinedError(output: ToolJSON.string(from: [
                 "cancelled": true,
                 "message": "User declined to delete this event.",
@@ -188,14 +188,14 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
 
         // Evict cached details — event is being deleted
         await ctx.translator.evictEventDetail(realId: compoundId)
-        print("[CalendarEventDeleteTool] Queued delete (op: \(op.id), event: \(eventId))")
+        BackgroundSyncLogger.logDebug("[CalendarEventDeleteTool] Queued delete (op: \(op.id), event: \(eventId))")
 
         // Mirror edit/create: wait briefly for the drain to surface a terminal
         // outcome so a provider-side failure (404, permission denied, etc.)
         // flips the card to its failed state and tells the LLM the truth.
         let outcome = await manager.awaitCalendarOpOutcome(opId: op.id, timeoutSeconds: 10.0)
         if case .permanentFailure(let reason) = outcome {
-            print("[CalendarEventDeleteTool] Permanent failure for op \(op.id): \(reason)")
+            BackgroundSyncLogger.logDebug("[CalendarEventDeleteTool] Permanent failure for op \(op.id): \(reason)")
             await MainActor.run { cardState.failureReason = reason }
             return ToolJSON.string(from: [
                 "ok": false,

@@ -29,7 +29,7 @@ actor KBRefinementService {
     func refineKB(sessionTurns: [ChatTurn]) async {
         // Respect privacy opt-out (matches AIService.disableLLMCalls check)
         guard !AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey) else {
-            print("[KBRefine] Skipped — AI calls disabled (privacy opt-out)")
+            BackgroundSyncLogger.logDebug("[KBRefine] Skipped — AI calls disabled (privacy opt-out)")
             return
         }
 
@@ -41,19 +41,19 @@ actor KBRefinementService {
         // Count exchanges (user+assistant pairs)
         let exchangeCount = meaningful.filter { $0.role == "user" }.count
         guard exchangeCount >= Self.minExchanges else {
-            print("[KBRefine] Only \(exchangeCount) exchanges (min \(Self.minExchanges)), skipping")
+            BackgroundSyncLogger.logDebug("[KBRefine] Only \(exchangeCount) exchanges (min \(Self.minExchanges)), skipping")
             return
         }
 
         // Serialize: skip if already running
         guard !isRunning else {
-            print("[KBRefine] Already running, skipping")
+            BackgroundSyncLogger.logDebug("[KBRefine] Already running, skipping")
             return
         }
         isRunning = true
         defer { isRunning = false }
 
-        print("[KBRefine] Starting KB refinement (\(meaningful.count) messages, \(exchangeCount) exchanges)")
+        BackgroundSyncLogger.logDebug("[KBRefine] Starting KB refinement (\(meaningful.count) messages, \(exchangeCount) exchanges)")
 
         // Build chat history text from session turns (matches TB's format)
         let chatHistory = buildChatHistory(from: meaningful)
@@ -87,15 +87,15 @@ actor KBRefinementService {
             let response = try await backendClient.sendCompletionsDirect(request)
 
             let duration = Date().timeIntervalSince(startTime)
-            print("[KBRefine] Backend responded in \(String(format: "%.1f", duration))s")
+            BackgroundSyncLogger.logDebug("[KBRefine] Backend responded in \(String(format: "%.1f", duration))s")
 
             if let error = response.error, !error.isEmpty {
-                print("[KBRefine] Backend error: \(error)")
+                BackgroundSyncLogger.logDebug("[KBRefine] Backend error: \(error)")
                 return
             }
 
             guard let refinedKB = response.refined_kb else {
-                print("[KBRefine] No refined_kb in response")
+                BackgroundSyncLogger.logDebug("[KBRefine] No refined_kb in response")
                 return
             }
 
@@ -107,11 +107,11 @@ actor KBRefinementService {
             let mergedKB = PromptParser.mergeFlatField(base: currentKB, local: currentKBNow, remote: refinedKB)
 
             if mergedKB == currentKBNow {
-                print("[KBRefine] KB unchanged after 3-way merge")
+                BackgroundSyncLogger.logDebug("[KBRefine] KB unchanged after 3-way merge")
                 return
             }
 
-            print("[KBRefine] KB updated via 3-way merge (\(currentKBNow.count) → \(mergedKB.count) chars)")
+            BackgroundSyncLogger.logDebug("[KBRefine] KB updated via 3-way merge (\(currentKBNow.count) → \(mergedKB.count) chars)")
 
             // Persist merged KB — this triggers Device Sync broadcast + UI reactivity via PromptStore.rawKB didSet.
             // PromptStore.rawKB didSet also triggers reminder re-parse via .onChange(of: rawKB) in DynamicIslandChat,
@@ -122,16 +122,16 @@ actor KBRefinementService {
             // the refine result is expendable.
             await MainActor.run {
                 guard !DemoModeStore.shared.isActive else {
-                    print("[KBRefine] Dropped refine result — demo mode became active mid-flight")
+                    BackgroundSyncLogger.logDebug("[KBRefine] Dropped refine result — demo mode became active mid-flight")
                     return
                 }
                 PromptStore.shared.rawKB = mergedKB
             }
 
-            print("[KBRefine] KB refinement complete (changed=true)")
+            BackgroundSyncLogger.logDebug("[KBRefine] KB refinement complete (changed=true)")
         } catch {
             let duration = Date().timeIntervalSince(startTime)
-            print("[KBRefine] Failed after \(String(format: "%.1f", duration))s: \(error)")
+            BackgroundSyncLogger.logDebug("[KBRefine] Failed after \(String(format: "%.1f", duration))s: \(error)")
         }
     }
 

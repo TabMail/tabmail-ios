@@ -212,7 +212,7 @@ struct ChatHistoryView: View {
                     self.searchResults = searchResults.filter { !exchange.turnIds.contains($0.chatHistoryId) }
                 }
             } catch {
-                print("[ChatHistoryView] Failed to delete exchange: \(error)")
+                BackgroundSyncLogger.logDebug("[ChatHistoryView] Failed to delete exchange: \(error)")
             }
         }
     }
@@ -225,7 +225,7 @@ struct ChatHistoryView: View {
                 hits = []
                 searchResults = nil
             } catch {
-                print("[ChatHistoryView] Failed to clear: \(error)")
+                BackgroundSyncLogger.logDebug("[ChatHistoryView] Failed to clear: \(error)")
             }
         }
     }

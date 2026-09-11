@@ -293,7 +293,7 @@ final class TabMailAuthService: NSObject {
         }
 
         let authURL = components.url!
-        print("[TabMailAuth] Opening \(provider.rawValue) OAuth: \(authURL)")
+        BackgroundSyncLogger.logDebug("[TabMailAuth] Opening \(provider.rawValue) OAuth: \(authURL)")
 
         return try await performWebAuth(url: authURL)
     }
@@ -320,7 +320,7 @@ final class TabMailAuthService: NSObject {
         let body: [String: Any] = ["provider": providerName, "id_token": idToken]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        print("[TabMailAuth] Signing in with \(providerName) id_token")
+        BackgroundSyncLogger.logDebug("[TabMailAuth] Signing in with \(providerName) id_token")
 
         let (data, response) = try await sharedEphemeralSession.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -333,7 +333,7 @@ final class TabMailAuthService: NSObject {
                     ?? errorInfo["error_description"] as? String
                     ?? errorInfo["error"] as? String
                     ?? "Unknown error"
-                print("[TabMailAuth] id_token sign-in failed: \(msg)")
+                BackgroundSyncLogger.logDebug("[TabMailAuth] id_token sign-in failed: \(msg)")
                 throw TabMailAuthError.otpFailed(msg)
             }
             throw TabMailAuthError.otpFailed("Sign in failed (HTTP \(httpResponse.statusCode))")
@@ -358,7 +358,7 @@ final class TabMailAuthService: NSObject {
         // Sync Stripe customer (non-fatal)
         await syncStripeCustomer(accessToken: session.accessToken)
 
-        print("[TabMailAuth] ID token sign-in successful, signed in as: \(session.userEmail)")
+        BackgroundSyncLogger.logDebug("[TabMailAuth] ID token sign-in successful, signed in as: \(session.userEmail)")
         return session
     }
 
@@ -377,20 +377,20 @@ final class TabMailAuthService: NSObject {
         let body: [String: Any] = ["email": email, "create_user": false]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        print("[TabMailAuth] Sending OTP to: \(email)")
+        BackgroundSyncLogger.logDebug("[TabMailAuth] Sending OTP to: \(email)")
 
         let (data, response) = try await sharedEphemeralSession.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw TabMailAuthError.invalidResponse
         }
 
-        print("[TabMailAuth] OTP response: HTTP \(httpResponse.statusCode)")
+        BackgroundSyncLogger.logDebug("[TabMailAuth] OTP response: HTTP \(httpResponse.statusCode)")
         if let bodyStr = String(data: data, encoding: .utf8) {
-            print("[TabMailAuth] OTP response body: \(bodyStr)")
+            BackgroundSyncLogger.logDebug("[TabMailAuth] OTP response body: \(bodyStr)")
         }
 
         if httpResponse.statusCode == 200 {
-            print("[TabMailAuth] OTP sent successfully")
+            BackgroundSyncLogger.logDebug("[TabMailAuth] OTP sent successfully")
             return
         }
 
@@ -423,7 +423,7 @@ final class TabMailAuthService: NSObject {
         let body: [String: Any] = ["email": email, "token": code, "type": "email"]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        print("[TabMailAuth] Verifying OTP for: \(email)")
+        BackgroundSyncLogger.logDebug("[TabMailAuth] Verifying OTP for: \(email)")
 
         let (data, response) = try await sharedEphemeralSession.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -459,7 +459,7 @@ final class TabMailAuthService: NSObject {
         // Sync Stripe customer (non-fatal)
         await syncStripeCustomer(accessToken: session.accessToken)
 
-        print("[TabMailAuth] Email OTP verified, signed in as: \(session.userEmail)")
+        BackgroundSyncLogger.logDebug("[TabMailAuth] Email OTP verified, signed in as: \(session.userEmail)")
         return session
     }
 
@@ -492,7 +492,7 @@ final class TabMailAuthService: NSObject {
         let body: [String: Any] = ["data": metadata]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        print("[TabMailAuth] Updating user metadata")
+        BackgroundSyncLogger.logDebug("[TabMailAuth] Updating user metadata")
 
         let (data, response) = try await sharedEphemeralSession.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -505,13 +505,13 @@ final class TabMailAuthService: NSObject {
                     ?? errorInfo["error_description"] as? String
                     ?? errorInfo["error"] as? String
                     ?? "Unknown error"
-                print("[TabMailAuth] User metadata update failed: \(msg)")
+                BackgroundSyncLogger.logDebug("[TabMailAuth] User metadata update failed: \(msg)")
                 throw TabMailAuthError.otpFailed(msg)
             }
             throw TabMailAuthError.otpFailed("Metadata update failed (HTTP \(httpResponse.statusCode))")
         }
 
-        print("[TabMailAuth] User metadata updated successfully")
+        BackgroundSyncLogger.logDebug("[TabMailAuth] User metadata updated successfully")
     }
 
     // MARK: - Private
@@ -554,7 +554,7 @@ final class TabMailAuthService: NSObject {
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
 
-        print("[TabMailAuth] Signed in as: \(session.userEmail)")
+        BackgroundSyncLogger.logDebug("[TabMailAuth] Signed in as: \(session.userEmail)")
         return session
     }
 
@@ -567,10 +567,10 @@ final class TabMailAuthService: NSObject {
 
             let (_, response) = try await sharedEphemeralSession.data(for: request)
             if let httpResponse = response as? HTTPURLResponse {
-                print("[TabMailAuth] Stripe sync: HTTP \(httpResponse.statusCode)")
+                BackgroundSyncLogger.logDebug("[TabMailAuth] Stripe sync: HTTP \(httpResponse.statusCode)")
             }
         } catch {
-            print("[TabMailAuth] Stripe sync failed (non-fatal): \(error)")
+            BackgroundSyncLogger.logDebug("[TabMailAuth] Stripe sync failed (non-fatal): \(error)")
         }
     }
 }

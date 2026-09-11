@@ -130,7 +130,7 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         )
 
         guard confirmed else {
-            print("[CalendarEventCreateTool] User declined to create event")
+            BackgroundSyncLogger.logDebug("[CalendarEventCreateTool] User declined to create event")
             throw ToolDeclinedError(output: ToolJSON.string(from: [
                 "cancelled": true,
                 "message": "User declined to create this event.",
@@ -184,7 +184,7 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
 
         let title = CalendarToolHelpers.stringArg(arguments, "title")
         let eventTitle = title.isEmpty ? "(No title)" : title
-        print("[CalendarEventCreateTool] Queued create (op: \(op.id))")
+        BackgroundSyncLogger.logDebug("[CalendarEventCreateTool] Queued create (op: \(op.id))")
 
         // Wait briefly for the drain to surface a terminal outcome so the LLM
         // can react in-turn. On permanent failure (HTTP 4xx — e.g. "Missing
@@ -194,7 +194,7 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         let outcome = await manager.awaitCalendarOpOutcome(opId: op.id, timeoutSeconds: 10.0)
         switch outcome {
         case .permanentFailure(let reason):
-            print("[CalendarEventCreateTool] Permanent failure for op \(op.id): \(reason)")
+            BackgroundSyncLogger.logDebug("[CalendarEventCreateTool] Permanent failure for op \(op.id): \(reason)")
             // Flip the confirmation card to its red/⚠ failed state so the user
             // sees the failure inline.
             await MainActor.run { cardState.failureReason = reason }

@@ -52,12 +52,12 @@ struct CalendarEventReadTool: AgentTool, Sendable {
         let numericId: Int?
         if !rawEventId.isEmpty, let n = Int(rawEventId) {
             guard let realId = await ctx.translator.toRealId(n) else {
-                print("[CalendarEventReadTool] Failed to resolve numeric id \(n)")
+                BackgroundSyncLogger.logDebug("[CalendarEventReadTool] Failed to resolve numeric id \(n)")
                 return #"{"error": "no event found for the given event_id. Call calendar_search or calendar_read to look up the event again, then retry."}"#
             }
             compoundId = realId
             numericId = n
-            print("[CalendarEventReadTool] Resolved numeric id \(n) → \(realId.prefix(50))...")
+            BackgroundSyncLogger.logDebug("[CalendarEventReadTool] Resolved numeric id \(n) → \(realId.prefix(50))...")
         } else {
             compoundId = rawEventId
             numericId = nil
@@ -120,7 +120,7 @@ struct CalendarEventReadTool: AgentTool, Sendable {
                 timeZone: tz
             )
         }
-        print("[CalendarEventReadTool] \(matches.count) matches for start_iso=\(startIso)")
+        BackgroundSyncLogger.logDebug("[CalendarEventReadTool] \(matches.count) matches for start_iso=\(startIso)")
         return results.joined(separator: "\n-----\n")
     }
 
@@ -168,6 +168,7 @@ struct CalendarEventReadTool: AgentTool, Sendable {
                         return (event.summary ?? "").isEmpty ? "(No title)" : event.summary!
                     }()
                     let rrule = (event.recurrence ?? []).first(where: { $0.uppercased().hasPrefix("RRULE:") })
+                    BackgroundSyncLogger.logDebug("[CalendarEventReadTool] Direct lookup event_id=\(rawEventId) in account=\(accId)")
                     Task {
                         await ctx.translator.cacheEventDetail(
                             realId: rawEventId, accountId: accId, calendarId: calId, calendarName: calName,
@@ -182,7 +183,6 @@ struct CalendarEventReadTool: AgentTool, Sendable {
                             eventTimeZone: event.start?.timeZone ?? event.end?.timeZone
                         )
                     }
-                    print("[CalendarEventReadTool] Direct lookup event_id=\(rawEventId) in account=\(accId)")
                     return CalendarToolHelpers.formatDetailedEvent(event, accountId: accId, calendarId: calId, accessRole: accessRole, calendarName: calName, timeZone: timeZone)
                 } catch {
                     if !CalendarToolHelpers.isEventNotFoundError(error) {
@@ -211,6 +211,7 @@ struct CalendarEventReadTool: AgentTool, Sendable {
                             return (event.summary ?? "").isEmpty ? "(No title)" : event.summary!
                         }()
                         let rrule = (event.recurrence ?? []).first(where: { $0.uppercased().hasPrefix("RRULE:") })
+                        BackgroundSyncLogger.logDebug("[CalendarEventReadTool] Fallback found event_id=\(rawEventId) in account=\(accId) calendar=\(calendar.id)")
                         Task {
                             await ctx.translator.cacheEventDetail(
                                 realId: rawEventId, accountId: accId, calendarId: calendar.id, calendarName: calendar.summary,
@@ -225,14 +226,13 @@ struct CalendarEventReadTool: AgentTool, Sendable {
                                 eventTimeZone: event.start?.timeZone ?? event.end?.timeZone
                             )
                         }
-                        print("[CalendarEventReadTool] Fallback found event_id=\(rawEventId) in account=\(accId) calendar=\(calendar.id)")
                         return CalendarToolHelpers.formatDetailedEvent(event, accountId: accId, calendarId: calendar.id, accessRole: calendar.accessRole, calendarName: calendar.summary, timeZone: timeZone)
                     } catch {
                         if CalendarToolHelpers.isEventNotFoundError(error) { continue }
                     }
                 }
             } catch {
-                print("[CalendarEventReadTool] listCalendars failed for account \(accId): \(error)")
+                BackgroundSyncLogger.logDebug("[CalendarEventReadTool] listCalendars failed for account \(accId): \(error)")
             }
         }
 

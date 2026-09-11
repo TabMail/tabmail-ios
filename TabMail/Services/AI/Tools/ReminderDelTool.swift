@@ -12,17 +12,17 @@ struct ReminderDelTool: AgentTool, Sendable {
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
         guard case .string(let rawText) = arguments["text"] else {
-            print("[ReminderDelTool] Missing or empty 'text'")
+            BackgroundSyncLogger.logDebug("[ReminderDelTool] Missing or empty 'text'")
             return #"{"error": "missing text"}"#
         }
 
         let text = AIService.normalizeUnicode(rawText).trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else {
-            print("[ReminderDelTool] Empty text after normalization")
+            BackgroundSyncLogger.logDebug("[ReminderDelTool] Empty text after normalization")
             return #"{"error": "missing text"}"#
         }
 
-        print("[ReminderDelTool] Searching for reminder matching '\(text.prefix(140))'")
+        BackgroundSyncLogger.logDebug("[ReminderDelTool] Searching for reminder matching '\(text.prefix(140))'")
 
         // Load current KB
         let current = PromptStore.kbTextSnapshot()
@@ -47,12 +47,12 @@ struct ReminderDelTool: AgentTool, Sendable {
 
         if matches.isEmpty {
             // No KB match — search email-based (message) reminders and snooze if found
-            print("[ReminderDelTool] No KB match, searching message reminders...")
+            BackgroundSyncLogger.logDebug("[ReminderDelTool] No KB match, searching message reminders...")
             return await handleMessageReminderDeletion(text: text, textLower: textLower)
         }
 
         if matches.count > 1 {
-            print("[ReminderDelTool] \(matches.count) matching reminders found, returning list for clarification")
+            BackgroundSyncLogger.logDebug("[ReminderDelTool] \(matches.count) matching reminders found, returning list for clarification")
             // Strip [Reminder] prefix for cleaner display
             let cleaned = matches.map { m in
                 m.replacingOccurrences(of: "^(?:Reminder:\\s*|\\[Reminder\\]\\s*)", with: "", options: .regularExpression)
@@ -66,20 +66,20 @@ struct ReminderDelTool: AgentTool, Sendable {
 
         // Exactly one match — delete it
         let statement = matches[0]
-        print("[ReminderDelTool] Found match, deleting: '\(statement.prefix(140))'")
+        BackgroundSyncLogger.logDebug("[ReminderDelTool] Found match, deleting: '\(statement.prefix(140))'")
 
         let patchText = "DEL\n\(statement)"
         guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText),
               updated != current else {
-            print("[ReminderDelTool] applyKBPatch failed or no change")
+            BackgroundSyncLogger.logDebug("[ReminderDelTool] applyKBPatch failed or no change")
             return #"{"error": "failed to delete reminder from knowledge base"}"#
         }
 
         // Persist
         await MainActor.run { PromptStore.shared.rawKB = updated }
-        print("[ReminderDelTool] Persisted user_kb.md (\(updated.count) chars)")
+        BackgroundSyncLogger.logDebug("[ReminderDelTool] Persisted user_kb.md (\(updated.count) chars)")
 
-        print("[ReminderDelTool] Success")
+        BackgroundSyncLogger.logDebug("[ReminderDelTool] Success")
         let resultDict: [String: Any] = ["ok": true, "removed": statement]
         return ToolJSON.string(from: resultDict)
     }
@@ -96,15 +96,15 @@ struct ReminderDelTool: AgentTool, Sendable {
 
         if messageMatches.count == 1 {
             let reminder = messageMatches[0]
-            print("[ReminderDelTool] Found email-reminder, snoozing: '\(reminder.content.prefix(140))'")
+            BackgroundSyncLogger.logDebug("[ReminderDelTool] Found email-reminder, snoozing: '\(reminder.content.prefix(140))'")
             DisabledRemindersStore.setEnabled(hash: reminder.hash, enabled: false)
-            print("[ReminderDelTool] Success (email-reminder snoozed)")
+            BackgroundSyncLogger.logDebug("[ReminderDelTool] Success (email-reminder snoozed)")
             let resultDict: [String: Any] = ["ok": true, "snoozed": reminder.content, "source": "email"]
             return ToolJSON.string(from: resultDict)
         }
 
         if messageMatches.count > 1 {
-            print("[ReminderDelTool] \(messageMatches.count) matching email-reminders found")
+            BackgroundSyncLogger.logDebug("[ReminderDelTool] \(messageMatches.count) matching email-reminders found")
             let resultDict: [String: Any] = [
                 "error": "Multiple email reminders match '\(text)'. Please be more specific.",
                 "matches": messageMatches.map(\.content),
@@ -112,7 +112,7 @@ struct ReminderDelTool: AgentTool, Sendable {
             return ToolJSON.string(from: resultDict)
         }
 
-        print("[ReminderDelTool] No matching reminder found for '\(text)'")
+        BackgroundSyncLogger.logDebug("[ReminderDelTool] No matching reminder found for '\(text)'")
         return #"{"error": "No reminder found matching '\#(text)'."}"#
     }
 }

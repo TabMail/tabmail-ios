@@ -21,13 +21,13 @@ final class PreviewFreezeGate {
 
     func begin() {
         guard !isFrozen else { return }
-        print("[PreviewFreeze] begin")
+        BackgroundSyncLogger.logDebug("[PreviewFreeze] begin")
         isFrozen = true
     }
 
     func end() {
         guard isFrozen else { return }
-        print("[PreviewFreeze] end")
+        BackgroundSyncLogger.logDebug("[PreviewFreeze] end")
         isFrozen = false
         // Wake any non-Observation consumers (e.g. NotificationCenter-driven VMs)
         // so they can flush buffered work. Observation consumers (SyncStatusObs)
@@ -103,13 +103,13 @@ struct SyncStatusObservationModifier: ViewModifier {
         content
             .task {
                 let id = String(UUID().uuidString.prefix(4))
-                print("[SyncStatusObs:\(tag):\(id)] task START — seeding from current state")
+                BackgroundSyncLogger.logDebug("[SyncStatusObs:\(tag):\(id)] task START — seeding from current state")
                 refresh(id: id, reason: "seed")
                 while !Task.isCancelled {
                     await waitForStatusChange(id: id)
                     refresh(id: id, reason: "wake")
                 }
-                print("[SyncStatusObs:\(tag):\(id)] task END (cancelled=\(Task.isCancelled))")
+                BackgroundSyncLogger.logDebug("[SyncStatusObs:\(tag):\(id)] task END (cancelled=\(Task.isCancelled))")
             }
             // Immediate catch-up refresh on preview-freeze release. Without this we
             // would still catch up via the observation tracker, but only after a
@@ -128,7 +128,7 @@ struct SyncStatusObservationModifier: ViewModifier {
         // QL's UIKit presentation. The waiter below observes `isFrozen` too, so a
         // release will wake us and this refresh will run with current state.
         if PreviewFreezeGate.shared.isFrozen {
-            print("[SyncStatusObs:\(tag):\(id)] refresh(\(reason)) SKIPPED — preview frozen")
+            BackgroundSyncLogger.logDebug("[SyncStatusObs:\(tag):\(id)] refresh(\(reason)) SKIPPED — preview frozen")
             return
         }
         let s = AccountManagerState.shared
@@ -138,7 +138,7 @@ struct SyncStatusObservationModifier: ViewModifier {
         let phaseStr = newPhase.map { String(describing: $0) } ?? "nil"
         let lastStr = newLast.map { "\(Int(Date().timeIntervalSince($0)))s ago" } ?? "nil"
         let changed = (phase != newPhase) || (last != newLast) || (failed != newFailed)
-        print("[SyncStatusObs:\(tag):\(id)] refresh(\(reason)) phase=\(phaseStr) last=\(lastStr) failed=\(newFailed) changed=\(changed)")
+        BackgroundSyncLogger.logDebug("[SyncStatusObs:\(tag):\(id)] refresh(\(reason)) phase=\(phaseStr) last=\(lastStr) failed=\(newFailed) changed=\(changed)")
         phase = newPhase
         last = newLast
         failed = newFailed
@@ -158,7 +158,7 @@ struct SyncStatusObservationModifier: ViewModifier {
                 // catch-up refresh with current state.
                 _ = PreviewFreezeGate.shared.isFrozen
             } onChange: {
-                print("[SyncStatusObs:\(self.tag):\(id)] onChange fired")
+                BackgroundSyncLogger.logDebug("[SyncStatusObs:\(self.tag):\(id)] onChange fired")
                 cont.resume()
             }
         }

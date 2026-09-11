@@ -229,3 +229,32 @@ thing you searched for.
 (`TabMailTests/Views/EmailRenderPipelineTests.swift`) re-derives the set on every run and fails with
 the offending `file:line accessor` triples. It is scoped as a regression guard, not a proof, and its
 doc comment enumerates seven evasion shapes it cannot see. Recorded as `MIS-019` instance 18.
+
+---
+
+## 2026-09-10 — the rule-12 half of the residual record above is closed by #72; the escaping half in `Shared/` is not
+
+GitHub `TabMail/tabmail-ios#72` (owner 2026-09-10) routed every console `print` in the `TabMail/`
+target through `BackgroundSyncLogger.logDebug` — gated inside the façade, `@autoclosure` so a locked
+gate renders nothing, whole-line `escapedForLogLine`, persisted on `AppLogChannel.debug`. Measured at
+the sweep: `IMAPProvider.swift`, `ComposeView.swift` and `GoogleCalendarProvider.swift` carry **zero**
+bare `print`s (109, 34 and 9 `logDebug` calls; `fetchFolders` + `dedupRoles` hold 2 of IMAPProvider's).
+So the §"residual record" rows for `fetchFolders` / `dedupRoles`, the date-parse-failure line,
+`ComposeView` and `GoogleCalendarProvider` are no longer ungated.
+
+**Still true, and not changed by #72:** `IMAPFetchMapping.renderBodyWithEmbeddedHeaders` in `Shared/`
+still prints `part.filename` under `#if DEBUG`, UNESCAPED — `Shared/` compiles into BOTH the app and
+the NSE, which persist to different files (`tabmail.log` through `AppLogStore`, `nse.log` through
+`NSELog` → `NSELogStore`), so it can reach neither process's façade: `BackgroundSyncLogger` and
+`DebugModeManager` are app-only, `NSELog` is NSE-only. (First written as "compiles into the NSE";
+corrected before merge, 2026-09-11.) And §1's shape is unchanged: the three
+`🚨 UNGATED BY DECISION` prints are still bare, still paired with an always-on `logError`.
+
+**§3's lesson was applied, not just cited.** Six console prints inside database contexts carried
+their gate in a branch condition (`if x, <gate> {` ×3, `if <gate>, x {` ×2, `} else if <gate> {`) and
+so read UNGATED to the fail-closed lexer. Five had the gate moved into the body after each arm was
+confirmed log-only. The sixth, `SyncEngineDeltaSync`'s drafts-folder arm
+(`if <gate>, let draftsFolder = … {`), keeps its condition, so `folders.first(where:)` still does not
+run with the gate closed, and gained the canonical gate inside; that arm holds only the print.
+(This paragraph first said five; corrected before merge, 2026-09-10.) Enforcement for the whole target is now `DiagnosticPrintGateTests`; register
+detail is `Companion/Process/Current/KnownIssues/Amendments/ios-log-001.md`.

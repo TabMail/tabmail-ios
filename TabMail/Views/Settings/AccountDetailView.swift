@@ -574,7 +574,7 @@ struct AccountDetailView: View {
                     try Self.resetMessageDataTxn(db, accountId: acctId)
                 }
             } catch {
-                print("[Reset] Account-scoped database reset failed: \(error)")
+                BackgroundSyncLogger.logDebug("[Reset] Account-scoped database reset failed: \(error)")
                 resetError = "TabMail couldn’t delete the local message data. Nothing was removed. Please try again."
                 isResetting = false
                 return
@@ -585,10 +585,10 @@ struct AccountDetailView: View {
                 try await SearchIndex.shared.removeMessagesForAccount(accountId: acctId)
             } catch {
                 derivedCleanupFailed = true
-                print("[Reset] Account-scoped search cleanup failed: \(error)")
+                BackgroundSyncLogger.logDebug("[Reset] Account-scoped search cleanup failed: \(error)")
             }
 
-            print("[Reset] Cleared all message data for \(account.emailAddress)")
+            BackgroundSyncLogger.logDebug("[Reset] Cleared all message data for \(account.emailAddress)")
             await manager.resetBackfill(accountId: acctId)
             reloadFolders()
             _ = try? await manager.syncAccount(account)

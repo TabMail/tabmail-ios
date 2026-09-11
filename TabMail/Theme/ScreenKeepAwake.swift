@@ -19,7 +19,7 @@ enum ScreenKeepAwake {
         count += 1
         UIApplication.shared.isIdleTimerDisabled = true
         if DebugModeManager.isLoggingEnabled() {
-            print("[ScreenKeepAwake] acquire (count=\(count))")
+            BackgroundSyncLogger.logDebug("[ScreenKeepAwake] acquire (count=\(count))")
         }
     }
 
@@ -29,7 +29,7 @@ enum ScreenKeepAwake {
             UIApplication.shared.isIdleTimerDisabled = false
         }
         if DebugModeManager.isLoggingEnabled() {
-            print("[ScreenKeepAwake] release (count=\(count))")
+            BackgroundSyncLogger.logDebug("[ScreenKeepAwake] release (count=\(count))")
         }
     }
 }

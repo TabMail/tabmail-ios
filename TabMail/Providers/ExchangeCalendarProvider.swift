@@ -18,9 +18,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     // MARK: - Calendars
 
     func listCalendars() async throws -> [GCalCalendar] {
-        print("[ExchangeCalendar] listCalendars starting...")
+        BackgroundSyncLogger.logDebug("[ExchangeCalendar] listCalendars starting...")
         let data = try await request(path: "/calendars?$select=id,name,isDefaultCalendar,color")
-        print("[ExchangeCalendar] listCalendars raw: \(String(data: data, encoding: .utf8)?.prefix(500) ?? "nil")")
+        BackgroundSyncLogger.logDebug("[ExchangeCalendar] listCalendars raw: \(String(data: data, encoding: .utf8)?.prefix(500) ?? "nil")")
         let response = try JSONDecoder().decode(MSCalendarListResponse.self, from: data)
         return response.value.map { cal in
             GCalCalendar(
@@ -37,7 +37,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     func primaryCalendarId() async throws -> String {
         let calendars = try await listCalendars()
         let primary = calendars.first(where: { $0.primary == true })?.id ?? "primary"
-        print("[ExchangeCalendar] primaryCalendarId = \(primary)")
+        BackgroundSyncLogger.logDebug("[ExchangeCalendar] primaryCalendarId = \(primary)")
         return primary
     }
 
@@ -84,16 +84,16 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
 
         // Apply query filter client-side if provided (Graph calendarView doesn't support $search)
-        print("[ExchangeCalendar] listEvents endpoint: \(endpoint)")
+        BackgroundSyncLogger.logDebug("[ExchangeCalendar] listEvents endpoint: \(endpoint)")
         let data = try await request(path: endpoint)
-        print("[ExchangeCalendar] listEvents response: \(String(data: data, encoding: .utf8)?.prefix(500) ?? "nil")")
+        BackgroundSyncLogger.logDebug("[ExchangeCalendar] listEvents response: \(String(data: data, encoding: .utf8)?.prefix(500) ?? "nil")")
         let response = try JSONDecoder().decode(MSEventListResponse.self, from: data)
 
         var events = response.value
             .filter { $0.isCancelled != true }
             .filter { e in
                 if isEmptySurfaceEvent(e) {
-                    print("[ExchangeCalendar] dropping empty event id=\(e.id ?? "nil")")
+                    BackgroundSyncLogger.logDebug("[ExchangeCalendar] dropping empty event id=\(e.id ?? "nil")")
                     return false
                 }
                 return true
@@ -189,11 +189,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
         let body = try JSONSerialization.data(withJSONObject: createEventJSON(event))
         if let bodyStr = String(data: body, encoding: .utf8) {
-            print("[ExchangeCalendar] createEvent POST body=\(bodyStr.prefix(4000))")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] createEvent POST body=\(bodyStr.prefix(4000))")
         }
         let data = try await request(path: "\(calPath)/events", method: "POST", body: body)
         if let respStr = String(data: data, encoding: .utf8) {
-            print("[ExchangeCalendar] createEvent response=\(respStr.prefix(4000))")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] createEvent response=\(respStr.prefix(4000))")
         }
         let created = try JSONDecoder().decode(MSEvent.self, from: data)
         return toGCalEvent(created)
@@ -221,11 +221,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // Graph responses are silent on success; without this we can't tell
         // if a wrong-time symptom came from a wrong-time request.
         if let bodyStr = String(data: body, encoding: .utf8) {
-            print("[ExchangeCalendar] updateEvent PATCH body=\(bodyStr.prefix(4000))")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateEvent PATCH body=\(bodyStr.prefix(4000))")
         }
         let data = try await request(path: "/events/\(encodedEventId)", method: "PATCH", body: body)
         if let respStr = String(data: data, encoding: .utf8) {
-            print("[ExchangeCalendar] updateEvent response=\(respStr.prefix(4000))")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateEvent response=\(respStr.prefix(4000))")
         }
         let updated = try JSONDecoder().decode(MSEvent.self, from: data)
         return toGCalEvent(updated)
@@ -237,9 +237,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
         sendUpdates: String = "all"
     ) async throws {
         let encodedEventId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
-        print("[ExchangeCalendar] deleteEvent id=\(eventId)")
+        BackgroundSyncLogger.logDebug("[ExchangeCalendar] deleteEvent id=\(eventId)")
         _ = try await request(path: "/events/\(encodedEventId)", method: "DELETE")
-        print("[ExchangeCalendar] deleteEvent success")
+        BackgroundSyncLogger.logDebug("[ExchangeCalendar] deleteEvent success")
     }
 
     /// Single-occurrence override (this_only): Graph exposes occurrences as
@@ -273,11 +273,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
         instancePatch.recurrence = nil
         let body = try JSONSerialization.data(withJSONObject: toGraphEventJSON(instancePatch))
         if let bodyStr = String(data: body, encoding: .utf8) {
-            print("[ExchangeCalendar] updateOccurrence PATCH body=\(bodyStr.prefix(4000))")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateOccurrence PATCH body=\(bodyStr.prefix(4000))")
         }
         let data = try await request(path: "/events/\(encodedInstanceId)", method: "PATCH", body: body)
         if let respStr = String(data: data, encoding: .utf8) {
-            print("[ExchangeCalendar] updateOccurrence response=\(respStr.prefix(4000))")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateOccurrence response=\(respStr.prefix(4000))")
         }
         let updated = try JSONDecoder().decode(MSEvent.self, from: data)
         return toGCalEvent(updated)
@@ -361,7 +361,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
         let cappedBody = try JSONSerialization.data(withJSONObject: cappedJSON)
         if let bodyStr = String(data: cappedBody, encoding: .utf8) {
-            print("[ExchangeCalendar] splitSeries cap PATCH body=\(bodyStr.prefix(4000))")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries cap PATCH body=\(bodyStr.prefix(4000))")
         }
         let encodedMasterId = try Self.encodedGraphPathSegment(eventId, context: "Graph series master id")
         let capRespData = try await request(path: "/events/\(encodedMasterId)", method: "PATCH", body: cappedBody)
@@ -369,7 +369,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // master's start/end/recurrence after capping, to diagnose visible
         // "occurrence moved to earlier day" symptoms after a split.
         if let capRespStr = String(data: capRespData, encoding: .utf8) {
-            print("[ExchangeCalendar] splitSeries cap PATCH response=\(capRespStr.prefix(4000))")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries cap PATCH response=\(capRespStr.prefix(4000))")
         }
 
         // 2. Build the new series — inherit master + patch overrides + start at splitDate.
@@ -401,11 +401,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
         do {
             let createBody = try JSONSerialization.data(withJSONObject: createJSON)
             if let bodyStr = String(data: createBody, encoding: .utf8) {
-                print("[ExchangeCalendar] splitSeries new-series POST body=\(bodyStr.prefix(4000))")
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries new-series POST body=\(bodyStr.prefix(4000))")
             }
             let data = try await request(path: "\(calPath)/events", method: "POST", body: createBody)
             if let respStr = String(data: data, encoding: .utf8) {
-                print("[ExchangeCalendar] splitSeries new-series response=\(respStr.prefix(4000))")
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries new-series response=\(respStr.prefix(4000))")
             }
             let created = try JSONDecoder().decode(MSEvent.self, from: data)
             return toGCalEvent(created)
@@ -465,20 +465,20 @@ actor ExchangeCalendarProvider: CalendarProvider {
             var revertFailure: Error?
             if let revertBody = try? JSONSerialization.data(withJSONObject: toGraphEventJSON(revertInput)) {
                 if let bodyStr = String(data: revertBody, encoding: .utf8) {
-                    print("[ExchangeCalendar] splitSeries revert PATCH body=\(bodyStr.prefix(4000))")
+                    BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries revert PATCH body=\(bodyStr.prefix(4000))")
                 }
                 do {
                     _ = try await request(path: "/events/\(encodedMasterId)", method: "PATCH", body: revertBody)
                 } catch let revertError {
                     revertFailure = revertError
-                    print("[ExchangeCalendar] splitSeries revert PATCH FAILED: \(revertError)")
+                    BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries revert PATCH FAILED: \(revertError)")
                 }
             } else {
                 // The revert request could not even be built, so the master is
                 // still capped — the same end state as a failed PATCH, and it must
                 // not be reported as a successful rollback.
                 revertFailure = CalendarProviderError.notSupported("the revert payload could not be encoded")
-                print("[ExchangeCalendar] splitSeries revert PATCH body could not be encoded — master left capped")
+                BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries revert PATCH body could not be encoded — master left capped")
             }
             throw GoogleCalendarProvider.splitRollbackError(original: error, revertFailure: revertFailure)
         }
@@ -670,7 +670,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
         // 401 — token expired, force refresh and retry once
         if result.statusCode == 401 {
-            print("[ExchangeCalendar] Token expired, refreshing...")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] Token expired, refreshing...")
             let freshToken = try await accessToken(true)
             let retry = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: freshToken, extraHeaders: headers, logLabel: "ExchangeCalendar")
             // `headers` already carries the local-tz Prefer from the first attempt above.

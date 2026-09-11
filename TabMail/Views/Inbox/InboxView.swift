@@ -311,7 +311,7 @@ struct InboxView: View {
             get: { selectedMessageId },
             set: { newValue in
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[DetailRender] listSelectionBinding.set \(String(describing: selectedMessageId?.prefix(40))) -> \(String(describing: newValue?.prefix(40)))")
+                    BackgroundSyncLogger.logDebug("[DetailRender] listSelectionBinding.set \(String(describing: selectedMessageId?.prefix(40))) -> \(String(describing: newValue?.prefix(40)))")
                 }
                 if let newId = newValue, isDraftsContext {
                     // Capture the header VALUE at tap time. The cover content must
@@ -325,7 +325,7 @@ struct InboxView: View {
                     }) {
                         draftHeaderToOpen = header
                     } else if DebugModeManager.isLoggingEnabled() {
-                        print("[DetailRender] drafts tap: header already gone, not presenting id=\(newId.prefix(40))")
+                        BackgroundSyncLogger.logDebug("[DetailRender] drafts tap: header already gone, not presenting id=\(newId.prefix(40))")
                     }
                 } else {
                     selectedMessageId = newValue
@@ -650,7 +650,7 @@ struct InboxView: View {
             // `pushedMessageId` above (List(selection:) reconciliation revokes
             // foreign selection values during this concurrent collapse animation).
             pushedMessageId = realId
-            print("[DynamicIslandChat] Email pill Open Email: navigating to \(realId.prefix(30))")
+            BackgroundSyncLogger.logDebug("[DynamicIslandChat] Email pill Open Email: navigating to \(realId.prefix(30))")
         }
         .modifier(CollapseChatOnNavigateModifier(chatExpanded: $chatExpanded))
         .onReceive(NotificationCenter.default.publisher(for: .contactPillComposeTapped).receive(on: DispatchQueue.main)) { notification in
@@ -662,7 +662,7 @@ struct InboxView: View {
                 chatExpanded = false
             }
             contactComposeRequest = request
-            print("[DynamicIslandChat] Contact pill compose: \(request.to.first ?? "")")
+            BackgroundSyncLogger.logDebug("[DynamicIslandChat] Contact pill compose: \(request.to.first ?? "")")
         }
         .fullScreenCover(isPresented: contactComposePresented) {
             if let request = contactComposeRequest {
@@ -848,9 +848,9 @@ struct InboxView: View {
         .modifier(StagedRowsReceiver(viewModel: viewModel))
         .onReceive(NotificationCenter.default.publisher(for: .messagesUndone).receive(on: DispatchQueue.main)) { notification in
             if let ids = notification.object as? [String] {
-                print("[MoveTrace] InboxView.messagesUndone — ids=\(ids) dismissedMessages=\(dismissedMessages)")
+                BackgroundSyncLogger.logDebug("[MoveTrace] InboxView.messagesUndone — ids=\(ids) dismissedMessages=\(dismissedMessages)")
                 let missing = ids.filter { id in !viewModel.loadedMessages.contains { $0.id == id } }
-                print("[MoveTrace] InboxView.messagesUndone — missing from loadedMessages=\(missing.count) loadedCount=\(viewModel.loadedMessages.count)")
+                BackgroundSyncLogger.logDebug("[MoveTrace] InboxView.messagesUndone — missing from loadedMessages=\(missing.count) loadedCount=\(viewModel.loadedMessages.count)")
                 // Single animation transaction: insert missing messages first,
                 // then un-dismiss — SwiftUI sees an incremental list change.
                 withAnimation(.easeOut(duration: 0.35)) {
@@ -1687,7 +1687,7 @@ struct InboxView: View {
 
     /// Move a single message to `destinationPath`. Dismisses just that row.
     private func performSingleMove(_ id: String, to destinationPath: String) {
-        print("[MoveTrace] MoveFolderPicker.onMove — id=\(id) dest=\(destinationPath) dismissedMessages.count=\(dismissedMessages.count)")
+        BackgroundSyncLogger.logDebug("[MoveTrace] MoveFolderPicker.onMove — id=\(id) dest=\(destinationPath) dismissedMessages.count=\(dismissedMessages.count)")
         viewModel.beginInteraction()
         // Hide the row only when the move takes it OUT of the folders this list
         // renders. `MoveFolderPicker` excludes the message's DURABLE folder, not its

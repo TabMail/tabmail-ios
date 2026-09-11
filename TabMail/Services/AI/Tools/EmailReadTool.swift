@@ -32,7 +32,7 @@ struct EmailReadTool: AgentTool, Sendable {
         // Resolve numeric ID to real MessageHeader ID
         let translator = ctx.translator
         guard let realId = await translator.toRealId(numericId) else {
-            print("[EmailReadTool] Failed to resolve numeric id \(numericId)")
+            BackgroundSyncLogger.logDebug("[EmailReadTool] Failed to resolve numeric id \(numericId)")
             return #"{"error": "message not found for the given unique_id"}"#
         }
 
@@ -40,14 +40,14 @@ struct EmailReadTool: AgentTool, Sendable {
         guard let header: MessageHeader = try await ctx.db.read({ db in
             try MessageHeader.fetchOne(db, key: realId)
         }) else {
-            print("[EmailReadTool] MessageHeader not found for realId=\(realId)")
+            BackgroundSyncLogger.logDebug("[EmailReadTool] MessageHeader not found for realId=\(realId)")
             return #"{"error": "message not found"}"#
         }
 
         // Demo boundary (ADR-IOS-038): never read across the demo/real line
         // (stale ChatIdTranslator numeric IDs can reference the other side).
         guard DemoToolGuard.headerAccessible(header) else {
-            print("[EmailReadTool] Blocked cross-boundary access to \(realId.prefix(30))")
+            BackgroundSyncLogger.logDebug("[EmailReadTool] Blocked cross-boundary access to \(realId.prefix(30))")
             return #"{"error": "message not found"}"#
         }
 
@@ -92,7 +92,7 @@ struct EmailReadTool: AgentTool, Sendable {
             }
         }
 
-        print("[EmailReadTool] Returning content for numericId=\(numericId) realId=\(realId.prefix(30)) bodyLen=\(bodyText.count)")
+        BackgroundSyncLogger.logDebug("[EmailReadTool] Returning content for numericId=\(numericId) realId=\(realId.prefix(30)) bodyLen=\(bodyText.count)")
         return lines.joined(separator: "\n")
     }
 

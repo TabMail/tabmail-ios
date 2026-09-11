@@ -381,10 +381,10 @@ struct TabMailLoginView: View {
                     email: userInfo.email
                 )
             } else if DebugModeManager.isLoggingEnabled() {
-                print("[Login] Gmail account already configured for \(userInfo.email) — skipping the add-account gate")
+                BackgroundSyncLogger.logDebug("[Login] Gmail account already configured for \(userInfo.email) — skipping the add-account gate")
             }
         } catch {
-            print("[Login] Gmail userInfo fetch failed (user will see AddAccountGeneralView): \(error)")
+            BackgroundSyncLogger.logDebug("[Login] Gmail userInfo fetch failed (user will see AddAccountGeneralView): \(error)")
         }
 
         onSignedIn()
@@ -414,10 +414,10 @@ struct TabMailLoginView: View {
                     email: userInfo.email
                 )
             } else if DebugModeManager.isLoggingEnabled() {
-                print("[Login] Outlook account already configured for \(userInfo.email) — skipping the add-account gate")
+                BackgroundSyncLogger.logDebug("[Login] Outlook account already configured for \(userInfo.email) — skipping the add-account gate")
             }
         } catch {
-            print("[Login] Outlook userInfo fetch failed (user will see AddAccountGeneralView): \(error)")
+            BackgroundSyncLogger.logDebug("[Login] Outlook userInfo fetch failed (user will see AddAccountGeneralView): \(error)")
         }
 
         onSignedIn()

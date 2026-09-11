@@ -366,7 +366,7 @@ final class NavigationStore {
                 self.hasAnyAccount = try Account.filter(Column("isActive") == true).fetchCount(db) > 0
             }
         } catch {
-            print("[NavigationStore] Initial load error: \(error)")
+            BackgroundSyncLogger.logDebug("[NavigationStore] Initial load error: \(error)")
         }
         isInitialLoadComplete = true
 
@@ -514,7 +514,7 @@ final class NavigationStore {
             }
             self.folders = adjusted
         } catch {
-            print("[NavigationStore] Folder refresh error: \(error)")
+            BackgroundSyncLogger.logDebug("[NavigationStore] Folder refresh error: \(error)")
         }
     }
 
@@ -526,7 +526,7 @@ final class NavigationStore {
             }
             self.outboxMessages = outbox
         } catch {
-            print("[NavigationStore] Outbox refresh error: \(error)")
+            BackgroundSyncLogger.logDebug("[NavigationStore] Outbox refresh error: \(error)")
         }
     }
 
@@ -568,7 +568,7 @@ final class NavigationStore {
                 self.hasAnyAccount = bundle.hasAny
                 refreshAppliedGeneration = generation
             } catch {
-                print("[NavigationStore] Refresh error: \(error)")
+                BackgroundSyncLogger.logDebug("[NavigationStore] Refresh error: \(error)")
                 if generation == refreshRequestedGeneration {
                     refreshAppliedGeneration = generation
                 }

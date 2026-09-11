@@ -36,12 +36,12 @@ final class EmbeddingService: @unchecked Sendable {
         guard shared == nil else { return }
 
         guard let tokenizer = WordPieceTokenizer() else {
-            print("[Embedding] tokenizer.json not found in bundle — semantic search disabled")
+            BackgroundSyncLogger.logDebug("[Embedding] tokenizer.json not found in bundle — semantic search disabled")
             return
         }
 
         guard let modelURL = Bundle.main.url(forResource: "AllMiniLML6v2", withExtension: "mlmodelc") else {
-            print("[Embedding] AllMiniLML6v2.mlmodelc not found in bundle — semantic search disabled")
+            BackgroundSyncLogger.logDebug("[Embedding] AllMiniLML6v2.mlmodelc not found in bundle — semantic search disabled")
             return
         }
 
@@ -53,9 +53,9 @@ final class EmbeddingService: @unchecked Sendable {
             _shared.withLock {
                 $0 = EmbeddingService(model: model, tokenizer: tokenizer)
             }
-            print("[Embedding] CoreML model loaded — semantic search enabled")
+            BackgroundSyncLogger.logDebug("[Embedding] CoreML model loaded — semantic search enabled")
         } catch {
-            print("[Embedding] Failed to load CoreML model: \(error) — semantic search disabled")
+            BackgroundSyncLogger.logDebug("[Embedding] Failed to load CoreML model: \(error) — semantic search disabled")
         }
     }
 

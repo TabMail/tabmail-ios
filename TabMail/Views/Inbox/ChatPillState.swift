@@ -64,7 +64,7 @@ final class ChatPillState {
         }
         sessions.removeAll()
         if count > 0 {
-            print("[ChatPillState] Cancelled tasks + removed all \(count) in-memory sessions (demo entry/exit)")
+            BackgroundSyncLogger.logDebug("[ChatPillState] Cancelled tasks + removed all \(count) in-memory sessions (demo entry/exit)")
         }
     }
 
@@ -87,7 +87,7 @@ final class ChatPillState {
             sessions.removeValue(forKey: key)
         }
         if !keysToEvict.isEmpty {
-            print("[ChatPillState] Evicted \(keysToEvict.count) idle in-memory sessions")
+            BackgroundSyncLogger.logDebug("[ChatPillState] Evicted \(keysToEvict.count) idle in-memory sessions")
         }
     }
 

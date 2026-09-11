@@ -397,11 +397,11 @@ struct SettingsView: View {
                         do {
                             try await AccountManager.shared.removeAccount(account)
                         } catch let error as AccountRemovalError {
-                            print("[Settings] Account removal completed with derived cleanup failure: \(error)")
+                            BackgroundSyncLogger.logDebug("[Settings] Account removal completed with derived cleanup failure: \(error)")
                             settingsErrorMessage = error.localizedDescription
                             showSettingsError = true
                         } catch {
-                            print("[Settings] Account removal failed before commit: \(error)")
+                            BackgroundSyncLogger.logDebug("[Settings] Account removal failed before commit: \(error)")
                             settingsErrorMessage = "TabMail couldn’t remove the account’s local data. Nothing was removed. Please try again."
                             showSettingsError = true
                         }
@@ -620,7 +620,7 @@ struct SettingsView: View {
                 try Self.localIndexWipeTxn(db)
             }
         } catch {
-            print("[NukeDB] Authoritative database wipe failed: \(error)")
+            BackgroundSyncLogger.logDebug("[NukeDB] Authoritative database wipe failed: \(error)")
             settingsErrorMessage = "TabMail couldn’t delete the local email data. Nothing was removed. Please try again."
             showSettingsError = true
             return
@@ -632,7 +632,7 @@ struct SettingsView: View {
         do {
             try await MemoryIndex.shared.deleteAllThrowing()
         } catch {
-            print("[NukeDB] Memory index reset failed after GRDB commit: \(error)")
+            BackgroundSyncLogger.logDebug("[NukeDB] Memory index reset failed after GRDB commit: \(error)")
             derivedIndexFailures.append("conversation memory")
         }
         // 3. Reset sync-related UserDefaults
@@ -646,16 +646,16 @@ struct SettingsView: View {
             }
         } catch {
             // Compaction is optional after the authoritative rows are gone.
-            print("[NukeDB] Database compaction deferred: \(error)")
+            BackgroundSyncLogger.logDebug("[NukeDB] Database compaction deferred: \(error)")
         }
-        print("[NukeDB] Deleted all email data from GRDB")
+        BackgroundSyncLogger.logDebug("[NukeDB] Deleted all email data from GRDB")
 
         // 5. Delete FTS database
         do {
             try await SearchIndex.shared.resetAll()
-            print("[NukeDB] Reset FTS database")
+            BackgroundSyncLogger.logDebug("[NukeDB] Reset FTS database")
         } catch {
-            print("[NukeDB] FTS reset failed after GRDB commit: \(error)")
+            BackgroundSyncLogger.logDebug("[NukeDB] FTS reset failed after GRDB commit: \(error)")
             derivedIndexFailures.append("email search")
         }
         if !derivedIndexFailures.isEmpty {
@@ -669,10 +669,10 @@ struct SettingsView: View {
         // removed by the same sweep's filesystem walk. Inline / attachment
         // assets are part of the "cached data" the user just opted to wipe.
         await BodyAssetMaintenance.pruneOrphans()
-        print("[NukeDB] Pruned BodyAssetStore orphans")
+        BackgroundSyncLogger.logDebug("[NukeDB] Pruned BodyAssetStore orphans")
 
         // 6. `defer` restarts sync — fresh backfill from top — on every exit.
-        print("[NukeDB] Sync restarted — backfill will re-walk all folders")
+        BackgroundSyncLogger.logDebug("[NukeDB] Sync restarted — backfill will re-walk all folders")
     }
 
     /// Execute the user-visible local-index deletion as one transaction.
@@ -741,7 +741,7 @@ struct SettingsView: View {
             guard let archivePath = try? await AppDatabase.dbPool.read({ db in
                 try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.archive.rawValue).fetchOne(db)?.path
             }) else {
-                print("[ArchiveOld] No archive folder for account \(accountId)")
+                BackgroundSyncLogger.logDebug("[ArchiveOld] No archive folder for account \(accountId)")
                 continue
             }
             if let first = messages.first {
@@ -769,7 +769,7 @@ struct SettingsView: View {
             totalArchived += messages.count
         }
 
-        print("[ArchiveOld] Archived \(totalArchived) messages older than \(SyncConfig.archiveAgeDays) days")
+        BackgroundSyncLogger.logDebug("[ArchiveOld] Archived \(totalArchived) messages older than \(SyncConfig.archiveAgeDays) days")
 
         // Refresh state
         isLargeInbox = false

@@ -22,7 +22,7 @@ struct EmailRenderTiming: Sendable {
         guard DebugModeManager.isLoggingEnabled() else { return }
         let elapsed = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
         let epoch = Date().timeIntervalSince1970 * 1_000
-        print("[RenderTiming id=\(id) gen=\(generation) native +\(Int(elapsed))ms epochMs=\(Int64(epoch))] \(DebugModeManager.escapedForLogLine(event))")
+        BackgroundSyncLogger.logDebug("[RenderTiming id=\(id) gen=\(generation) native +\(Int(elapsed))ms epochMs=\(Int64(epoch))] \(DebugModeManager.escapedForLogLine(event))")
     }
 }
 
@@ -191,17 +191,17 @@ enum EmailHTMLWrapper {
         let lower = body.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if lower.hasPrefix("<!doctype") || lower.hasPrefix("<html") {
             if DebugModeManager.isLoggingEnabled() {
-                print("[HTMLDebug] wrapHTML: full document detected, inputLen=\(body.count), calling unwrapFullHTMLDocument")
+                BackgroundSyncLogger.logDebug("[HTMLDebug] wrapHTML: full document detected, inputLen=\(body.count), calling unwrapFullHTMLDocument")
             }
             content = unwrapFullHTMLDocument(body)
             if DebugModeManager.isLoggingEnabled() {
-                print("[HTMLDebug] wrapHTML: after unwrap, outputLen=\(content.count), delta=\(body.count - content.count)")
+                BackgroundSyncLogger.logDebug("[HTMLDebug] wrapHTML: after unwrap, outputLen=\(content.count), delta=\(body.count - content.count)")
                 let preview = String(content.prefix(300))
-                print("[HTMLDebug] wrapHTML: unwrapped content preview: \(preview)")
+                BackgroundSyncLogger.logDebug("[HTMLDebug] wrapHTML: unwrapped content preview: \(preview)")
             }
         } else {
             if DebugModeManager.isLoggingEnabled() {
-                print("[HTMLDebug] wrapHTML: fragment mode, inputLen=\(body.count)")
+                BackgroundSyncLogger.logDebug("[HTMLDebug] wrapHTML: fragment mode, inputLen=\(body.count)")
             }
             content = body
         }
@@ -607,9 +607,9 @@ enum EmailHTMLWrapper {
 
         // Remove <!DOCTYPE ...>
         if let range = result.range(of: #"<!DOCTYPE[^>]*>"#, options: [.regularExpression, .caseInsensitive]) {
-            if isDbg { print("[HTMLDebug] unwrap: removing DOCTYPE, len before=\(result.count)") }
+            if isDbg { BackgroundSyncLogger.logDebug("[HTMLDebug] unwrap: removing DOCTYPE, len before=\(result.count)") }
             result.removeSubrange(range)
-            if isDbg { print("[HTMLDebug] unwrap: after DOCTYPE removal, len=\(result.count)") }
+            if isDbg { BackgroundSyncLogger.logDebug("[HTMLDebug] unwrap: after DOCTYPE removal, len=\(result.count)") }
         }
 
         // Convert <html ...> → <div ...> to preserve inline styles (e.g. Outlook's <html style="padding:0;...">)
@@ -638,20 +638,20 @@ enum EmailHTMLWrapper {
                                       options: .caseInsensitive,
                                       range: headStart.upperBound..<result.endIndex) {
             let headContent = String(result[headStart.upperBound..<headEnd.lowerBound])
-            if isDbg { print("[HTMLDebug] unwrap: <head> found, headContent len=\(headContent.count)") }
+            if isDbg { BackgroundSyncLogger.logDebug("[HTMLDebug] unwrap: <head> found, headContent len=\(headContent.count)") }
             var styles = ""
             if let styleRegex = try? NSRegularExpression(pattern: #"<style[^>]*>[\s\S]*?</style>"#, options: .caseInsensitive) {
                 let nsString = headContent as NSString
                 let matches = styleRegex.matches(in: headContent, range: NSRange(location: 0, length: nsString.length))
                 styles = matches.map { nsString.substring(with: $0.range) }.joined(separator: "\n")
-                if isDbg { print("[HTMLDebug] unwrap: extracted \(matches.count) <style> blocks from <head>, total styles len=\(styles.count)") }
+                if isDbg { BackgroundSyncLogger.logDebug("[HTMLDebug] unwrap: extracted \(matches.count) <style> blocks from <head>, total styles len=\(styles.count)") }
             }
             let preNeutLen = styles.count
             styles = Self.neutralizeRootSelectors(styles)
-            if isDbg { print("[HTMLDebug] unwrap: after neutralizeRootSelectors on head styles, len \(preNeutLen)→\(styles.count)") }
+            if isDbg { BackgroundSyncLogger.logDebug("[HTMLDebug] unwrap: after neutralizeRootSelectors on head styles, len \(preNeutLen)→\(styles.count)") }
             let lenBefore = result.count
             result.replaceSubrange(headStart.lowerBound..<headEnd.upperBound, with: styles)
-            if isDbg { print("[HTMLDebug] unwrap: replaced <head>...</head> with styles, len \(lenBefore)→\(result.count)") }
+            if isDbg { BackgroundSyncLogger.logDebug("[HTMLDebug] unwrap: replaced <head>...</head> with styles, len \(lenBefore)→\(result.count)") }
         }
 
         // Remove orphaned <meta> tags (our wrapper provides viewport + CSP)
@@ -662,7 +662,7 @@ enum EmailHTMLWrapper {
         // (via neutralizeCSSRules) without leaking into our wrapper's <body>.
         if let bodyTagRange = result.range(of: #"<body\b[^>]*>"#, options: [.regularExpression, .caseInsensitive]) {
             var bodyTag = String(result[bodyTagRange])
-            if isDbg { print("[HTMLDebug] unwrap: converting <body> → <div>, bodyTag='\(bodyTag)'") }
+            if isDbg { BackgroundSyncLogger.logDebug("[HTMLDebug] unwrap: converting <body> → <div>, bodyTag='\(bodyTag)'") }
             bodyTag = bodyTag.replacingOccurrences(of: #"<body\b"#, with: "<div", options: [.regularExpression, .caseInsensitive])
             if let classRange = bodyTag.range(of: #"class\s*=\s*""#, options: .regularExpression) {
                 bodyTag.insert(contentsOf: "tm-email-body ", at: classRange.upperBound)
@@ -678,10 +678,10 @@ enum EmailHTMLWrapper {
         // Neutralize root selectors in ALL <style> blocks — not just head.
         let preNeutLen = result.count
         result = Self.neutralizeRootSelectors(result)
-        if isDbg { print("[HTMLDebug] unwrap: final neutralizeRootSelectors, len \(preNeutLen)→\(result.count)") }
+        if isDbg { BackgroundSyncLogger.logDebug("[HTMLDebug] unwrap: final neutralizeRootSelectors, len \(preNeutLen)→\(result.count)") }
 
         let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
-        if isDbg { print("[HTMLDebug] unwrap: final trimmed len=\(trimmed.count)") }
+        if isDbg { BackgroundSyncLogger.logDebug("[HTMLDebug] unwrap: final trimmed len=\(trimmed.count)") }
         return trimmed
     }
 
@@ -757,14 +757,14 @@ enum EmailHTMLWrapper {
             if filtered.isEmpty {
                 if isDbg {
                     let preview = String(bodyText.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
-                    print("[HTMLDebug] neutralizeCSSRules: REMOVING rule selector='\(selectorText.trimmingCharacters(in: .whitespacesAndNewlines))' preview='\(preview)'")
+                    BackgroundSyncLogger.logDebug("[HTMLDebug] neutralizeCSSRules: REMOVING rule selector='\(selectorText.trimmingCharacters(in: .whitespacesAndNewlines))' preview='\(preview)'")
                 }
                 let swiftRange = Range(fullRange, in: result)!
                 result.replaceSubrange(swiftRange, with: "")
             } else if filtered != selectors.map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }) {
                 if isDbg {
                     let original = selectors.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                    print("[HTMLDebug] neutralizeCSSRules: REMAPPING selectors from=\(original) to=\(filtered)")
+                    BackgroundSyncLogger.logDebug("[HTMLDebug] neutralizeCSSRules: REMAPPING selectors from=\(original) to=\(filtered)")
                 }
                 let newSelector = filtered.joined(separator: ", ")
                 let swiftRange = Range(selectorRange, in: result)!

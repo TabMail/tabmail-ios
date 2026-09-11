@@ -52,7 +52,7 @@ struct EmailComposeTool: AgentTool, Sendable {
             return ComposeOutcome.failed("recipients parameter is required and must contain at least one recipient").describeForLLM
         }
 
-        if DebugModeManager.isLoggingEnabled() { print("[EmailComposeTool] Opening compose: to=\(to) cc=\(cc) subject=\(subject ?? "(none)") bodyLen=\(body?.count ?? 0) requestLen=\(composeRequest?.count ?? 0)") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] Opening compose: to=\(to) cc=\(cc) subject=\(subject ?? "(none)") bodyLen=\(body?.count ?? 0) requestLen=\(composeRequest?.count ?? 0)") }
 
         // When a compose instruction is present, run it through the backend LLM
         // to generate the actual email content — matching TB's runComposeEdit() flow.
@@ -70,9 +70,9 @@ struct EmailComposeTool: AgentTool, Sendable {
                 )
                 generatedSubject = result.subject ?? generatedSubject
                 generatedBody = result.body ?? generatedBody
-                if DebugModeManager.isLoggingEnabled() { print("[EmailComposeTool] AI generated: subject=\(generatedSubject?.prefix(60) ?? "nil") bodyLen=\(generatedBody?.count ?? 0)") }
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] AI generated: subject=\(generatedSubject?.prefix(60) ?? "nil") bodyLen=\(generatedBody?.count ?? 0)") }
             } catch {
-                print("[EmailComposeTool] performInlineEdit failed: \(error) — opening compose with original content")
+                BackgroundSyncLogger.logDebug("[EmailComposeTool] performInlineEdit failed: \(error) — opening compose with original content")
             }
         }
 
@@ -185,7 +185,7 @@ struct EmailComposeTool: AgentTool, Sendable {
             bodyText: bodyText
         )
 
-        if DebugModeManager.isLoggingEnabled() { print("[EmailComposeTool] runComposeEdit: mode=\(mode) recipients=\(recipients.count) request=\(request.prefix(80))") }
+        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] runComposeEdit: mode=\(mode) recipients=\(recipients.count) request=\(request.prefix(80))") }
 
         return try await AIService.shared.performInlineEdit(
             currentSubject: subject ?? "",

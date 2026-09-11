@@ -309,7 +309,7 @@ private extension AccountDeletionView {
         } catch {
             errorMessage = "We couldn’t confirm subscription status, so deletion wasn’t scheduled. Please try again."
             if DebugModeManager.isLoggingEnabled() {
-                print("[AccountDeletion] Error: \(error)")
+                BackgroundSyncLogger.logDebug("[AccountDeletion] Error: \(error)")
             }
         }
     }
@@ -339,7 +339,7 @@ private extension AccountDeletionView {
     private func presentAppleSubscriptions() async -> Bool {
         let outcome = await StoreKitManager.presentManageSubscriptions()
         if case .failed(let error) = outcome, DebugModeManager.isLoggingEnabled() {
-            print("[AccountDeletion] Failed to open Apple subscriptions: \(error)")
+            BackgroundSyncLogger.logDebug("[AccountDeletion] Failed to open Apple subscriptions: \(error)")
         }
         // Fails closed on both a missing window scene and a thrown presentation
         // error: the deletion gate must not proceed on an unpresented sheet.
@@ -361,7 +361,7 @@ private extension AccountDeletionView {
         DeviceSyncService.shared.disconnect()
 
         if DebugModeManager.isLoggingEnabled() {
-            print("[AccountDeletion] Scoped cleanup complete — email accounts and messages preserved")
+            BackgroundSyncLogger.logDebug("[AccountDeletion] Scoped cleanup complete — email accounts and messages preserved")
         }
 
         return true

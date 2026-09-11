@@ -62,7 +62,7 @@ actor BackendClient {
         let now = Date()
         if now < forbiddenBackoffUntil {
             let remaining = forbiddenBackoffUntil.timeIntervalSince(now)
-            print("[BackendClient] 403 backoff active — \(String(format: "%.0f", remaining))s remaining, skipping request")
+            BackgroundSyncLogger.logDebug("[BackendClient] 403 backoff active — \(String(format: "%.0f", remaining))s remaining, skipping request")
             throw BackendError.forbidden
         }
     }
@@ -75,13 +75,13 @@ actor BackendClient {
             forbiddenBackoffDelay = min(forbiddenBackoffDelay * 2, Self.forbiddenMaxDelay)
         }
         forbiddenBackoffUntil = Date().addingTimeInterval(forbiddenBackoffDelay)
-        print("[BackendClient] 403 received — backing off for \(String(format: "%.0f", forbiddenBackoffDelay))s")
+        BackgroundSyncLogger.logDebug("[BackendClient] 403 received — backing off for \(String(format: "%.0f", forbiddenBackoffDelay))s")
     }
 
     /// Reset 403 backoff on any successful response.
     private func resetForbiddenBackoff() {
         if forbiddenBackoffDelay > 0 {
-            print("[BackendClient] Resetting 403 backoff after successful response")
+            BackgroundSyncLogger.logDebug("[BackendClient] Resetting 403 backoff after successful response")
             forbiddenBackoffDelay = 0
             forbiddenBackoffUntil = .distantPast
         }
@@ -188,7 +188,7 @@ extension BackendClient {
             let (_, response) = try await sharedEphemeralSession.data(for: request)
             return (response as? HTTPURLResponse)?.statusCode == 201
         } catch {
-            print("[BackendClient] reportConcern failed: \(error)")
+            BackgroundSyncLogger.logDebug("[BackendClient] reportConcern failed: \(error)")
             return false
         }
     }
@@ -772,7 +772,7 @@ extension BackendClient {
         try checkForbiddenBackoff()
 
         let (urlRequest, body) = try await makeCompletionsRequest(request)
-        print("[BackendClient] completions request: \(body.count) bytes")
+        BackgroundSyncLogger.logDebug("[BackendClient] completions request: \(body.count) bytes")
         BackgroundSyncLogger.logAIProcessing("[HTTP] request START (completions, \(body.count) bytes)")
 
         let jsonData = try await readSSEStreamIncremental(urlRequest, onSSEEvent: nil, session: longTimeout ? llmLongOpSession : nil)
@@ -783,15 +783,15 @@ extension BackendClient {
             let assistantLen = response.assistant?.count ?? 0
             let thinkingLen = response.thinking?.count ?? 0
             let tokenInfo = response.token_usage.map { "in=\($0.input_tokens) out=\($0.output_tokens) total=\($0.total_tokens)" } ?? "nil"
-            print("[BackendClient] completions response: assistant=\(assistantLen) chars, thinking=\(thinkingLen) chars, tokens=\(tokenInfo)")
+            BackgroundSyncLogger.logDebug("[BackendClient] completions response: assistant=\(assistantLen) chars, thinking=\(thinkingLen) chars, tokens=\(tokenInfo)")
             if assistantLen < 300, let assistant = response.assistant {
-                print("[BackendClient] FULL assistant: \(assistant)")
+                BackgroundSyncLogger.logDebug("[BackendClient] FULL assistant: \(assistant)")
             }
             #endif
             return response
         } catch {
             let raw = String(data: jsonData.prefix(500), encoding: .utf8) ?? "<binary>"
-            print("[BackendClient] Failed to decode completions response: \(error)\n  Raw body (\(jsonData.count) bytes): \(raw)")
+            BackgroundSyncLogger.logDebug("[BackendClient] Failed to decode completions response: \(error)\n  Raw body (\(jsonData.count) bytes): \(raw)")
             throw error
         }
     }
@@ -1006,7 +1006,7 @@ extension BackendClient {
             do {
                 let response = try await sendCompletionsInternal(request)
                 if attempt > 0 {
-                    print("[BackendClient] Succeeded after \(attempt) retries")
+                    BackgroundSyncLogger.logDebug("[BackendClient] Succeeded after \(attempt) retries")
                 }
                 return response
             } catch is CancellationError {
@@ -1016,17 +1016,17 @@ extension BackendClient {
                     // 429 rate limit: retry indefinitely with gentle backoff (matches TB's throttle loop)
                     attempt += 1
                     let delay = min(1.5 * pow(1.5, Double(attempt - 1)) + Double.random(in: 0...0.5), 5.0)
-                    print("[BackendClient] Rate limited, retry #\(attempt) after \(String(format: "%.1f", delay))s")
+                    BackgroundSyncLogger.logDebug("[BackendClient] Rate limited, retry #\(attempt) after \(String(format: "%.1f", delay))s")
                     try await Task.sleep(for: .seconds(delay))
                 } else if error.isRetriable {
                     // Other retriable errors (5xx, 408, 0): retry up to maxRetries
                     attempt += 1
                     guard attempt <= maxRetries else {
-                        print("[BackendClient] Exhausted \(maxRetries) retries: \(error)")
+                        BackgroundSyncLogger.logDebug("[BackendClient] Exhausted \(maxRetries) retries: \(error)")
                         throw error
                     }
                     let delay = min(pow(2.0, Double(attempt - 1)) + Double.random(in: 0...1), maxDelay)
-                    print("[BackendClient] Retry #\(attempt)/\(maxRetries) after \(String(format: "%.1f", delay))s: \(error)")
+                    BackgroundSyncLogger.logDebug("[BackendClient] Retry #\(attempt)/\(maxRetries) after \(String(format: "%.1f", delay))s: \(error)")
                     try await Task.sleep(for: .seconds(delay))
                 } else {
                     throw error
@@ -1036,11 +1036,11 @@ extension BackendClient {
                 BackgroundSyncLogger.logAIProcessing("[HTTP] URLError code=\(error.code.rawValue) (\(error.localizedDescription))")
                 attempt += 1
                 guard attempt <= maxRetries else {
-                    print("[BackendClient] Exhausted \(maxRetries) retries: \(error.localizedDescription)")
+                    BackgroundSyncLogger.logDebug("[BackendClient] Exhausted \(maxRetries) retries: \(error.localizedDescription)")
                     throw error
                 }
                 let delay = min(pow(2.0, Double(attempt - 1)) + Double.random(in: 0...1), maxDelay)
-                print("[BackendClient] Retry #\(attempt)/\(maxRetries) after \(String(format: "%.1f", delay))s: \(error.localizedDescription)")
+                BackgroundSyncLogger.logDebug("[BackendClient] Retry #\(attempt)/\(maxRetries) after \(String(format: "%.1f", delay))s: \(error.localizedDescription)")
                 try await Task.sleep(for: .seconds(delay))
             } catch {
                 throw error
@@ -1157,7 +1157,7 @@ extension BackendClient {
             try Task.checkCancellation()
             round += 1
 
-            print("[BackendClient] Tool round \(round) starting...")
+            BackgroundSyncLogger.logDebug("[BackendClient] Tool round \(round) starting...")
 
             // 429 throttle retry loop (matches TB's throttle loop in llm.js)
             var throttleAttempt = 0
@@ -1179,7 +1179,7 @@ extension BackendClient {
                             onSSEEvent?(.throttled)
                         }
                         let backoff = min(1.5 * pow(1.5, Double(throttleAttempt - 1)) + Double.random(in: 0...0.5), 5.0)
-                        print("[BackendClient] Throttled (429), retry #\(throttleAttempt) after \(String(format: "%.1f", backoff))s")
+                        BackgroundSyncLogger.logDebug("[BackendClient] Throttled (429), retry #\(throttleAttempt) after \(String(format: "%.1f", backoff))s")
                         try await Task.sleep(for: .seconds(backoff))
                         continue
                     }
@@ -1201,17 +1201,17 @@ extension BackendClient {
 
             // If no tool_calls in the final event, we're done — return the response
             guard let toolCalls = finalEvent.tool_calls, !toolCalls.isEmpty else {
-                print("[BackendClient] Round \(round): no tool_calls — done")
+                BackgroundSyncLogger.logDebug("[BackendClient] Round \(round): no tool_calls — done")
                 return Self.responseFromFinalEvent(finalEvent)
             }
 
             // Execute client-side tools
             guard var conversationState = finalEvent.conversation_state else {
-                print("[BackendClient] tool_calls received but no conversation_state — returning as-is")
+                BackgroundSyncLogger.logDebug("[BackendClient] tool_calls received but no conversation_state — returning as-is")
                 return Self.responseFromFinalEvent(finalEvent)
             }
 
-            print("[BackendClient] Round \(round): \(toolCalls.count) tool_calls, harmony_messages=\(conversationState.harmony_messages.count)")
+            BackgroundSyncLogger.logDebug("[BackendClient] Round \(round): \(toolCalls.count) tool_calls, harmony_messages=\(conversationState.harmony_messages.count)")
 
             let toolRegistry = ToolRegistry.shared
             // Lazy boot: register the client-side tool set on first use instead of
@@ -1224,8 +1224,8 @@ extension BackendClient {
                 try Task.checkCancellation()
 
                 let toolName = toolCall.function.name
-                print("[AIChatDebug] Executing client-side tool: \(toolName) (call_id=\(toolCall.id.prefix(8)))")
-                print("[AIChatDebug]   args: \(toolCall.function.arguments.prefix(200))")
+                BackgroundSyncLogger.logDebug("[AIChatDebug] Executing client-side tool: \(toolName) (call_id=\(toolCall.id.prefix(8)))")
+                BackgroundSyncLogger.logDebug("[AIChatDebug]   args: \(toolCall.function.arguments.prefix(200))")
 
                 // Fire tool-started event for client-side tools (matching server-side SSE events)
                 onSSEEvent?(.toolStarted(ToolStatusEvent(
@@ -1279,7 +1279,7 @@ extension BackendClient {
                 byok: request.byok
             )
 
-            print("[BackendClient] Tool round \(round) complete (\(toolResults.count) tools, harmony_messages=\(conversationState.harmony_messages.count))")
+            BackgroundSyncLogger.logDebug("[BackendClient] Tool round \(round) complete (\(toolResults.count) tools, harmony_messages=\(conversationState.harmony_messages.count))")
         }
     }
 
@@ -1309,7 +1309,7 @@ extension BackendClient {
         try checkForbiddenBackoff()
 
         let (urlRequest, body) = try await makeCompletionsRequest(request)
-        print("[BackendClient] completions (streaming) request: \(body.count) bytes")
+        BackgroundSyncLogger.logDebug("[BackendClient] completions (streaming) request: \(body.count) bytes")
         BackgroundSyncLogger.logAIProcessing("[HTTP] request START (streaming, \(body.count) bytes)")
 
         let finalData = try await readSSEStreamIncremental(urlRequest, onSSEEvent: onSSEEvent)
@@ -1329,7 +1329,7 @@ extension BackendClient {
             let isWellFormedJSON = (try? JSONSerialization.jsonObject(with: finalData)) != nil
             #if DEBUG
             let raw = String(data: finalData.prefix(500), encoding: .utf8) ?? "<binary>"
-            print("[BackendClient] final decode failed (wellFormedJSON=\(isWellFormedJSON), \(finalData.count) bytes): \(error)\n  Raw: \(raw)")
+            BackgroundSyncLogger.logDebug("[BackendClient] final decode failed (wellFormedJSON=\(isWellFormedJSON), \(finalData.count) bytes): \(error)\n  Raw: \(raw)")
             #endif
             if isWellFormedJSON {
                 throw error  // complete but wrong shape → surface the real decode error
@@ -1393,14 +1393,14 @@ extension BackendClient {
                 case "tool_started":
                     let dataBytes = dataStr.data(using: .utf8) ?? Data()
                     if let status = try? JSONDecoder().decode(ToolStatusEvent.self, from: dataBytes) {
-                        print("[AIChatDebug] SSE tool_started: \(status.display_label ?? status.tool_name ?? "unknown")")
+                        BackgroundSyncLogger.logDebug("[AIChatDebug] SSE tool_started: \(status.display_label ?? status.tool_name ?? "unknown")")
                         onSSEEvent?(.toolStarted(status))
                     }
 
                 case "tool_completed":
                     let dataBytes = dataStr.data(using: .utf8) ?? Data()
                     if let status = try? JSONDecoder().decode(ToolStatusEvent.self, from: dataBytes) {
-                        print("[AIChatDebug] SSE tool_completed: \(status.display_label ?? status.tool_name ?? "unknown") success=\(status.success ?? true)")
+                        BackgroundSyncLogger.logDebug("[AIChatDebug] SSE tool_completed: \(status.display_label ?? status.tool_name ?? "unknown") success=\(status.success ?? true)")
                         onSSEEvent?(.toolCompleted(status))
                     }
 
@@ -1461,7 +1461,7 @@ extension BackendClient {
         guard !keys.isEmpty else { return nil }
 
         guard let token = await currentAuthToken() else {
-            print("[BackendClient] HTTPS probe skipped — no auth token")
+            BackgroundSyncLogger.logDebug("[BackendClient] HTTPS probe skipped — no auth token")
             return nil
         }
 
@@ -1479,7 +1479,7 @@ extension BackendClient {
             guard let httpResponse = response as? HTTPURLResponse,
                   200..<300 ~= httpResponse.statusCode else {
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-                print("[BackendClient] HTTPS probe HTTP \(code)")
+                BackgroundSyncLogger.logDebug("[BackendClient] HTTPS probe HTTP \(code)")
                 return nil
             }
 
@@ -1488,10 +1488,10 @@ extension BackendClient {
             }
             let probeResponse = try JSONDecoder().decode(ProbeResponse.self, from: data)
             let hitCount = probeResponse.results.count
-            print("[BackendClient] HTTPS probe: \(hitCount) hit(s) for \(keys.count) key(s)")
+            BackgroundSyncLogger.logDebug("[BackendClient] HTTPS probe: \(hitCount) hit(s) for \(keys.count) key(s)")
             return probeResponse.results.isEmpty ? nil : probeResponse.results
         } catch {
-            print("[BackendClient] HTTPS probe error: \(error)")
+            BackgroundSyncLogger.logDebug("[BackendClient] HTTPS probe error: \(error)")
             return nil
         }
     }

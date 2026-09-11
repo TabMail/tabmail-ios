@@ -344,7 +344,7 @@ actor ActiveBodyQueue {
         clearOversizedDurably(accountId: accountId, folderPath: folderPath)
         let removed = before - (oversizedDeferredThisSession.count + isolationPending.count)
         if removed > 0, DebugModeManager.isLoggingEnabled() {
-            print("[ActiveBody] Cleared \(removed) oversized-deferred/isolation key(s) for \(folderPath) after UIDVALIDITY reset")
+            BackgroundSyncLogger.logDebug("[ActiveBody] Cleared \(removed) oversized-deferred/isolation key(s) for \(folderPath) after UIDVALIDITY reset")
         }
     }
 
@@ -367,7 +367,7 @@ actor ActiveBodyQueue {
     /// problem rather than a tidiness one.
     func markOversizedDurably(_ headerId: String) {
         if DebugModeManager.isLoggingEnabled() {
-            print("[ActiveBody] Durably flagging oversized \(headerId.prefix(30))")
+            BackgroundSyncLogger.logDebug("[ActiveBody] Durably flagging oversized \(headerId.prefix(30))")
         }
         enqueueDurableWrite(label: "flag \(headerId.prefix(30))") { db in
             // Both guards — "a proven body always wins" and "the observation must be
@@ -475,7 +475,7 @@ actor ActiveBodyQueue {
             if admit(item) { added += 1 }
         }
         guard added > 0 else { return }
-        print("[ActiveBody] Enqueued \(added) items (total: \(storage.count))")
+        BackgroundSyncLogger.logDebug("[ActiveBody] Enqueued \(added) items (total: \(storage.count))")
         scheduleDispatch()
     }
 
@@ -490,7 +490,7 @@ actor ActiveBodyQueue {
             }
             let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
             guard !items.isEmpty else {
-                print("[ActiveBody] Repopulate: 0 inbox messages need body fetch (\(ms)ms)")
+                BackgroundSyncLogger.logDebug("[ActiveBody] Repopulate: 0 inbox messages need body fetch (\(ms)ms)")
                 return
             }
             var added = 0
@@ -498,11 +498,11 @@ actor ActiveBodyQueue {
                 if admit(item) { added += 1 }
             }
             if added > 0 {
-                print("[ActiveBody] Repopulated \(added) inbox items in \(ms)ms")
+                BackgroundSyncLogger.logDebug("[ActiveBody] Repopulated \(added) inbox items in \(ms)ms")
                 scheduleDispatch()
             }
         } catch {
-            print("[ActiveBody] Repopulate failed: \(error)")
+            BackgroundSyncLogger.logDebug("[ActiveBody] Repopulate failed: \(error)")
         }
     }
 
@@ -522,7 +522,7 @@ actor ActiveBodyQueue {
         connectivityWatchTask = nil
         retryExhaustedThisDrain.removeAll()
         if itemCount > 0 || taskCount > 0 {
-            print("[ActiveBody] Cancelled \(taskCount) batch tasks, \(itemCount) in-flight items")
+            BackgroundSyncLogger.logDebug("[ActiveBody] Cancelled \(taskCount) batch tasks, \(itemCount) in-flight items")
         }
     }
 
@@ -638,7 +638,7 @@ actor ActiveBodyQueue {
 
         let dispatchCount = groupsToDispatch.reduce(0) { $0 + $1.value.count }
         let deferredCount = groupsDeferred.reduce(0) { $0 + $1.value.count }
-        print("[ActiveBody] Dispatching \(dispatchCount) items in \(groupsToDispatch.count) folder groups (deferred=\(deferredCount), activeBatches=\(activeBatchCount))")
+        BackgroundSyncLogger.logDebug("[ActiveBody] Dispatching \(dispatchCount) items in \(groupsToDispatch.count) folder groups (deferred=\(deferredCount), activeBatches=\(activeBatchCount))")
 
         for (key, allItems) in groupsToDispatch {
             guard let provider = providerByAccount[key.accountId] else { continue }
@@ -673,7 +673,7 @@ actor ActiveBodyQueue {
 
             let batchTask = Task { [self] in
                 let t0 = CFAbsoluteTimeGetCurrent()
-                print("[ActiveBody] Batch START: \(itemCount) items in \(key.folderPath)")
+                BackgroundSyncLogger.logDebug("[ActiveBody] Batch START: \(itemCount) items in \(key.folderPath)")
 
                 do {
                     // 1. Batch fetch from provider (single SELECT + bulk BODYSTRUCTURE for IMAP)
@@ -682,7 +682,7 @@ actor ActiveBodyQueue {
                         ids: items.map(\.messageId), folder: key.folderPath
                     )
                     let fetchMs = Int((CFAbsoluteTimeGetCurrent() - tFetch) * 1000)
-                    print("[ActiveBody] Batch FETCH: \(fetched.count)/\(itemCount) succeeded in \(fetchMs)ms")
+                    BackgroundSyncLogger.logDebug("[ActiveBody] Batch FETCH: \(fetched.count)/\(itemCount) succeeded in \(fetchMs)ms")
 
                     // 2. Render + process each result (parallel — renders are independent)
                     let tProcess = CFAbsoluteTimeGetCurrent()
@@ -718,7 +718,7 @@ actor ActiveBodyQueue {
                                     }
                                 }
                             } else {
-                                print("[ActiveBody] Item \(item.messageId) not in batch result — will retry")
+                                BackgroundSyncLogger.logDebug("[ActiveBody] Item \(item.messageId) not in batch result — will retry")
                             }
                         }
                         var collected: [BodyFetchProcessor.ProcessedItem] = []
@@ -747,7 +747,7 @@ actor ActiveBodyQueue {
                     }
 
                     let totalMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
-                    print("[ActiveBody] Batch DONE: \(itemCount) items (\(processedItems.count) with body) in \(totalMs)ms (fetch=\(fetchMs)ms, process=\(processMs)ms)")
+                    BackgroundSyncLogger.logDebug("[ActiveBody] Batch DONE: \(itemCount) items (\(processedItems.count) with body) in \(totalMs)ms (fetch=\(fetchMs)ms, process=\(processMs)ms)")
 
                 } catch {
                     let desc = "\(error)"
@@ -765,7 +765,7 @@ actor ActiveBodyQueue {
                         )
                     } else {
                         // Connection-level error — retry all items
-                        print("[ActiveBody] Batch FAILED for \(key.folderPath): \(error)")
+                        BackgroundSyncLogger.logDebug("[ActiveBody] Batch FAILED for \(key.folderPath): \(error)")
                         for item in items {
                             self.batchItemDone(item: item, shouldRetry: true)
                         }
@@ -856,13 +856,13 @@ actor ActiveBodyQueue {
             let item = items[0]
             if stale {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[ActiveBody] Oversized single item in \(folderPath) raced a UIDVALIDITY reset — NOT deferring stale \(item.headerId.prefix(30)); retrying")
+                    BackgroundSyncLogger.logDebug("[ActiveBody] Oversized single item in \(folderPath) raced a UIDVALIDITY reset — NOT deferring stale \(item.headerId.prefix(30)); retrying")
                 }
                 batchItemDone(item: item, shouldRetry: true)
                 return
             }
             if DebugModeManager.isLoggingEnabled() {
-                print("[ActiveBody] Single item too large in \(folderPath) — deferring \(item.headerId.prefix(30)) in-memory (bodyComplete=0, NOT marked empty)")
+                BackgroundSyncLogger.logDebug("[ActiveBody] Single item too large in \(folderPath) — deferring \(item.headerId.prefix(30)) in-memory (bodyComplete=0, NOT marked empty)")
             }
             oversizedDeferredThisSession.insert(item.headerId)
             isolationPending.remove(item.headerId)   // resolved as the oversized one
@@ -883,9 +883,9 @@ actor ActiveBodyQueue {
             }
             if DebugModeManager.isLoggingEnabled() {
                 if stale {
-                    print("[ActiveBody] PayloadTooLarge for \(folderPath) raced a UIDVALIDITY reset — NOT isolating \(items.count) stale items; retrying")
+                    BackgroundSyncLogger.logDebug("[ActiveBody] PayloadTooLarge for \(folderPath) raced a UIDVALIDITY reset — NOT isolating \(items.count) stale items; retrying")
                 } else {
-                    print("[ActiveBody] PayloadTooLarge for \(folderPath) — isolating \(items.count) items for single-item testing")
+                    BackgroundSyncLogger.logDebug("[ActiveBody] PayloadTooLarge for \(folderPath) — isolating \(items.count) items for single-item testing")
                 }
             }
         }
@@ -926,14 +926,14 @@ actor ActiveBodyQueue {
             // Idempotent fallback for ANY failure (incl. a benign ADR-IOS-041
             // suspension abort — retries next wake).
             if !error.isDatabaseSuspensionAbort {
-                print("[ActiveBody] missFetchCount update failed: \(error) — treating all as retry")
+                BackgroundSyncLogger.logDebug("[ActiveBody] missFetchCount update failed: \(error) — treating all as retry")
             }
             for item in missedItems { self.batchItemDone(item: item, shouldRetry: true) }
             return
         }
 
         for item in partitioned.toRetry {
-            print("[ActiveBody] UID miss \(item.messageId) folder=\(item.folderPath) — retrying")
+            BackgroundSyncLogger.logDebug("[ActiveBody] UID miss \(item.messageId) folder=\(item.folderPath) — retrying")
             self.batchItemDone(item: item, shouldRetry: true)
         }
         for item in partitioned.toConfirm {
@@ -945,7 +945,7 @@ actor ActiveBodyQueue {
             let confirmation = await BackfillBodyQueue.shared.confirmGoneAtThreshold(item: backfillItem, provider: provider)
             switch confirmation {
             case .gone:
-                print("[ActiveBody] CONFIRMED GONE \(item.messageId) folder=\(item.folderPath) — deleting header")
+                BackgroundSyncLogger.logDebug("[ActiveBody] CONFIRMED GONE \(item.messageId) folder=\(item.folderPath) — deleting header")
                 BackgroundSyncLogger.logBackfill("[ActiveBody] CONFIRMED GONE \(item.messageId) folder=\(item.folderPath) — deleting header")
                 await AccountManager.shared.deleteConfirmedGoneHeader(
                     headerId: item.headerId,
@@ -956,7 +956,7 @@ actor ActiveBodyQueue {
                 if let newUID {
                     switch await BackfillBodyQueue.shared.rekeyRemappedHeader(item: backfillItem, newUID: newUID) {
                     case .migrated(let migrated):
-                        print("[ActiveBody] UID remap re-key \(item.messageId)→\(newUID) in \(item.folderPath) — fetching under new UID")
+                        BackgroundSyncLogger.logDebug("[ActiveBody] UID remap re-key \(item.messageId)→\(newUID) in \(item.folderPath) — fetching under new UID")
                         BackgroundSyncLogger.logBackfill("[ActiveBody] UID remap re-key \(item.messageId)→\(newUID) folder=\(item.folderPath)")
                         self.batchItemDone(item: item, shouldRetry: false)
                         let newItem = Item(
@@ -966,14 +966,14 @@ actor ActiveBodyQueue {
                         )
                         if admit(newItem) { scheduleDispatch() }
                     case .duplicateDropped:
-                        print("[ActiveBody] UID remap \(item.messageId)→\(newUID) in \(item.folderPath) — new UID already has a row, old duplicate dropped")
+                        BackgroundSyncLogger.logDebug("[ActiveBody] UID remap \(item.messageId)→\(newUID) in \(item.folderPath) — new UID already has a row, old duplicate dropped")
                         self.batchItemDone(item: item, shouldRetry: false)
                     case .failed:
                         self.batchItemDone(item: item, shouldRetry: true)
                     }
                 } else {
                     // Same UID still present on the server — the miss was transient.
-                    print("[ActiveBody] Threshold reached but \(item.messageId) still at same UID in \(item.folderPath) — transient miss, resetting counter")
+                    BackgroundSyncLogger.logDebug("[ActiveBody] Threshold reached but \(item.messageId) still at same UID in \(item.folderPath) — transient miss, resetting counter")
                     try? await dbPool.write { db in
                         try db.execute(
                             sql: "UPDATE messageHeader SET missFetchCount = 0 WHERE id = ?",
@@ -983,7 +983,7 @@ actor ActiveBodyQueue {
                     self.batchItemDone(item: item, shouldRetry: true)
                 }
             case .cannotConfirm:
-                print("[ActiveBody] Threshold reached for \(item.messageId) but cannot confirm gone — keeping for retry / full-sync")
+                BackgroundSyncLogger.logDebug("[ActiveBody] Threshold reached for \(item.messageId) but cannot confirm gone — keeping for retry / full-sync")
                 self.batchItemDone(item: item, shouldRetry: true)
             }
         }
@@ -1001,11 +1001,11 @@ actor ActiveBodyQueue {
             guard !items.isEmpty else { return }
             let added = admitDrainCandidates(items)
             if added > 0 {
-                print("[ActiveBody] Drain-time self-repopulate enqueued \(added) items")
+                BackgroundSyncLogger.logDebug("[ActiveBody] Drain-time self-repopulate enqueued \(added) items")
                 scheduleDispatch()
             }
         } catch {
-            print("[ActiveBody] Drain-time repopulate failed: \(error)")
+            BackgroundSyncLogger.logDebug("[ActiveBody] Drain-time repopulate failed: \(error)")
         }
     }
 

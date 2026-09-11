@@ -37,7 +37,7 @@ extension AIService {
         await MemorySearchCache.shared.reset()
 
         guard !disableLLMCalls else {
-            print("[AIService] sendChatMessage: SKIP — LLM calls disabled")
+            BackgroundSyncLogger.logDebug("[AIService] sendChatMessage: SKIP — LLM calls disabled")
             return nil
         }
 
@@ -64,7 +64,7 @@ extension AIService {
         // Build reminders JSON from message summaries + KB entries (matching TB's reminderBuilder)
         let reminders = await ReminderBuilder.buildReminderList()
         let remindersJSON = reminders.isEmpty ? "" : await ReminderBuilder.formatRemindersJSON(reminders)
-        print("[AIService] sendChatMessage: \(reminders.count) reminders (\(remindersJSON.count) chars)")
+        BackgroundSyncLogger.logDebug("[AIService] sendChatMessage: \(reminders.count) reminders (\(remindersJSON.count) chars)")
 
         let systemMessage = CompletionsMessage(
             role: "system",
@@ -97,8 +97,8 @@ extension AIService {
         messages.append(contentsOf: historyMessages)
         messages.append(userMessage)
 
-        print("[AIService] sendChatMessage: \(messages.count) messages (system + \(historyMessages.count) session turns + user)")
-        print("[AIService]   userName=\(userName), kbLen=\(kbText.count), userText=\(userText.prefix(60))")
+        BackgroundSyncLogger.logDebug("[AIService] sendChatMessage: \(messages.count) messages (system + \(historyMessages.count) session turns + user)")
+        BackgroundSyncLogger.logDebug("[AIService]   userName=\(userName), kbLen=\(kbText.count), userText=\(userText.prefix(60))")
 
         // Send via completions — server-side tools (search_web, date_to_day) auto-execute in backend
         // Uses Direct variant: agent chat is user-initiated and should not wait behind background AI.
@@ -119,7 +119,7 @@ extension AIService {
         }
 
         if let error = response.error {
-            print("[AIService] sendChatMessage error: \(error)")
+            BackgroundSyncLogger.logDebug("[AIService] sendChatMessage error: \(error)")
             BackgroundSyncLogger.logChatError("Server error: \(error)", userMessage: userText)
             // Refund only when error string indicates transient failure (5xx, demo throttle).
             if inDemo {
@@ -133,7 +133,7 @@ extension AIService {
         }
 
         guard let text = response.assistant, !text.isEmpty else {
-            print("[AIService] sendChatMessage: empty response")
+            BackgroundSyncLogger.logDebug("[AIService] sendChatMessage: empty response")
             BackgroundSyncLogger.logChatError("Empty assistant response from server", userMessage: userText)
             return nil
         }
@@ -141,12 +141,12 @@ extension AIService {
         // Match TB: normalizeUnicode + trim
         let cleaned = Self.normalizeUnicode(text.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !cleaned.isEmpty else {
-            print("[AIService] sendChatMessage: empty response after normalization")
+            BackgroundSyncLogger.logDebug("[AIService] sendChatMessage: empty response after normalization")
             BackgroundSyncLogger.logChatError("Response empty after normalizeUnicode+trim (raw len=\(text.count))", userMessage: userText)
             return nil
         }
-        print("[AIChatDebug] sendChatMessage raw response (\(cleaned.count) chars):")
-        print("[AIChatDebug]   \(cleaned.prefix(300))")
+        BackgroundSyncLogger.logDebug("[AIChatDebug] sendChatMessage raw response (\(cleaned.count) chars):")
+        BackgroundSyncLogger.logDebug("[AIChatDebug]   \(cleaned.prefix(300))")
         return ChatResponse(text: cleaned, thinking: response.thinking)
     }
 
@@ -166,7 +166,7 @@ extension AIService {
         invocation: ToolInvocation = .noninteractive
     ) async throws -> ChatResponse? {
         guard !disableLLMCalls else {
-            print("[AIService] resumeChatMessage: SKIP — LLM calls disabled")
+            BackgroundSyncLogger.logDebug("[AIService] resumeChatMessage: SKIP — LLM calls disabled")
             return nil
         }
         // Demo Mode budget: a resume re-runs the failed round, so it consumes one
@@ -182,7 +182,7 @@ extension AIService {
         // Fresh per-turn pagination cache, matching sendChatMessage.
         await MemorySearchCache.shared.reset()
 
-        print("[AIService] resumeChatMessage: resuming from saved conversation_state")
+        BackgroundSyncLogger.logDebug("[AIService] resumeChatMessage: resuming from saved conversation_state")
         // Refresh client_timestamp_ms: the saved request froze it at the failed
         // round's time, but a delayed retry should let the backend reason about
         // "now" (e.g. "what's on my calendar today"). Reconstructing via init
@@ -209,18 +209,18 @@ extension AIService {
         // Same post-processing as sendChatMessage (kept inline so the demo-budget
         // accounting there stays untouched).
         if let error = response.error {
-            print("[AIService] resumeChatMessage error: \(error)")
+            BackgroundSyncLogger.logDebug("[AIService] resumeChatMessage error: \(error)")
             BackgroundSyncLogger.logChatError("Server error (resume): \(error)", userMessage: "(resumed)")
             throw ChatError.serverError(error)
         }
         guard let text = response.assistant, !text.isEmpty else {
-            print("[AIService] resumeChatMessage: empty response")
+            BackgroundSyncLogger.logDebug("[AIService] resumeChatMessage: empty response")
             BackgroundSyncLogger.logChatError("Empty assistant response from server (resume)", userMessage: "(resumed)")
             return nil
         }
         let cleaned = Self.normalizeUnicode(text.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !cleaned.isEmpty else {
-            print("[AIService] resumeChatMessage: empty response after normalization")
+            BackgroundSyncLogger.logDebug("[AIService] resumeChatMessage: empty response after normalization")
             return nil
         }
         return ChatResponse(text: cleaned, thinking: response.thinking)

@@ -59,7 +59,7 @@ actor MemoryIndex {
         do {
             try initialize()
         } catch {
-            print("[MemoryIndex] Lazy initialization failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] Lazy initialization failed: \(error)")
         }
     }
 
@@ -71,7 +71,7 @@ actor MemoryIndex {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
 
         let dbPath = dir.appendingPathComponent("memory.db").path
-        print("[MemoryIndex] Opening memory database at \(dbPath)")
+        BackgroundSyncLogger.logDebug("[MemoryIndex] Opening memory database at \(dbPath)")
 
         var config = Configuration()
         // Smaller reader pool than SearchIndex (email) — memory search has much
@@ -88,7 +88,9 @@ actor MemoryIndex {
             if let sqliteConn = db.sqliteConnection {
                 let rc = tabmail_register_sqlite_vec_on_db(UnsafeMutableRawPointer(sqliteConn))
                 if rc != 0 /* SQLITE_OK */ {
-                    print("[MemoryIndex] WARNING: sqlite-vec registration returned \(rc)")
+                    if DebugModeManager.isLoggingEnabled() {
+                        print("[MemoryIndex] WARNING: sqlite-vec registration returned \(rc)")
+                    }
                 }
             }
 
@@ -108,7 +110,9 @@ actor MemoryIndex {
         try pool.write { db in
             let currentVersion: Int32 = try Int32.fetchOne(db, sql: "PRAGMA user_version") ?? 0
             if currentVersion < Self.schemaVersion {
-                print("[MemoryIndex] Schema v\(currentVersion) < v\(Self.schemaVersion) — dropping old memory_* tables")
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[MemoryIndex] Schema v\(currentVersion) < v\(Self.schemaVersion) — dropping old memory_* tables")
+                }
                 try db.execute(sql: "DROP TABLE IF EXISTS memory_vec")
                 try db.execute(sql: "DROP TABLE IF EXISTS memory_meta")
                 try db.execute(sql: "DROP TABLE IF EXISTS memory_fts")
@@ -142,15 +146,15 @@ actor MemoryIndex {
                 let breakdown = rows.map { (($0["scope"] as String?) ?? "?", ($0["n"] as Int?) ?? 0) }
                 return (m, f, v, c, breakdown)
             }
-            print("[MemoryIndex] Initialized meta=\(metaC) fts=\(ftsC) vec=\(vecC) embedComplete=\(completeC) scope=\(scopeBreakdown)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] Initialized meta=\(metaC) fts=\(ftsC) vec=\(vecC) embedComplete=\(completeC) scope=\(scopeBreakdown)")
             if vecC > metaC {
-                print("[MemoryIndex] WARNING: vec has \(vecC - metaC) orphan row(s) (vec > meta)")
+                BackgroundSyncLogger.logDebug("[MemoryIndex] WARNING: vec has \(vecC - metaC) orphan row(s) (vec > meta)")
             }
             if ftsC > metaC {
-                print("[MemoryIndex] WARNING: fts has \(ftsC - metaC) orphan row(s) (fts > meta)")
+                BackgroundSyncLogger.logDebug("[MemoryIndex] WARNING: fts has \(ftsC - metaC) orphan row(s) (fts > meta)")
             }
         } catch {
-            print("[MemoryIndex] Count snapshot failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] Count snapshot failed: \(error)")
         }
     }
 
@@ -245,12 +249,12 @@ actor MemoryIndex {
                 try Self.writeTurn(db: db, chatHistoryId: chatHistoryId, sessionId: sessionId, role: role, dateMs: dateMs, text: text)
             }
             let head = String(text.prefix(80)).replacingOccurrences(of: "\n", with: "\\n")
-            print("[MemoryIndex] indexTurn WRITE id=\(chatHistoryId.prefix(20)) sid=\(sessionId?.prefix(30) ?? "nil") role=\(role) chars=\(text.count) head=\(head)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] indexTurn WRITE id=\(chatHistoryId.prefix(20)) sid=\(sessionId?.prefix(30) ?? "nil") role=\(role) chars=\(text.count) head=\(head)")
         } catch {
             // Suspension abort (ADR-IOS-041) is benign — Stage A re-indexes the
             // missing turn on the next wake's set-diff. Don't log it as a failure.
             if !error.isDatabaseSuspensionAbort {
-                print("[MemoryIndex] indexTurn(\(chatHistoryId.prefix(20))) failed: \(error)")
+                BackgroundSyncLogger.logDebug("[MemoryIndex] indexTurn(\(chatHistoryId.prefix(20))) failed: \(error)")
             }
         }
     }
@@ -265,10 +269,10 @@ actor MemoryIndex {
                     try Self.writeTurn(db: db, chatHistoryId: e.chatHistoryId, sessionId: e.sessionId, role: e.role, dateMs: e.dateMs, text: e.text)
                 }
             }
-            print("[MemoryIndex] indexTurns WRITE count=\(entries.count)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] indexTurns WRITE count=\(entries.count)")
         } catch {
             if !error.isDatabaseSuspensionAbort {
-                print("[MemoryIndex] indexTurns(count=\(entries.count)) failed: \(error)")
+                BackgroundSyncLogger.logDebug("[MemoryIndex] indexTurns(count=\(entries.count)) failed: \(error)")
             }
         }
     }
@@ -336,12 +340,12 @@ actor MemoryIndex {
                 try db.execute(sql: "DELETE FROM memory_meta WHERE rowid IN (\(rowidPlaceholders))", arguments: StatementArguments(rowids))
                 try db.execute(sql: "DELETE FROM memory_fts WHERE rowid IN (\(rowidPlaceholders))", arguments: StatementArguments(rowids))
             }
-            print("[MemoryIndex] deleteTurns requested=\(chatHistoryIds.count) deleted=\(deletedCount)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] deleteTurns requested=\(chatHistoryIds.count) deleted=\(deletedCount)")
         } catch {
             // Background-reachable (Stage A orphan prune). A suspension abort
             // (ADR-IOS-041) is benign — the prune re-runs on the next wake.
             if !error.isDatabaseSuspensionAbort {
-                print("[MemoryIndex] deleteTurns failed: \(error)")
+                BackgroundSyncLogger.logDebug("[MemoryIndex] deleteTurns failed: \(error)")
             }
         }
     }
@@ -353,7 +357,7 @@ actor MemoryIndex {
         do {
             try deleteAllThrowing()
         } catch {
-            print("[MemoryIndex] deleteAll failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] deleteAll failed: \(error)")
         }
     }
 
@@ -368,7 +372,7 @@ actor MemoryIndex {
             try db.execute(sql: "DELETE FROM memory_meta")
             try db.execute(sql: "DELETE FROM memory_fts")
         }
-        print("[MemoryIndex] Cleared all memory turns")
+        BackgroundSyncLogger.logDebug("[MemoryIndex] Cleared all memory turns")
     }
 
     /// Purge memory rows whose `sessionId` starts with the given prefix.
@@ -394,9 +398,9 @@ actor MemoryIndex {
                     arguments: [pattern]
                 )
             }
-            print("[MemoryIndex] purgeForSessionPrefix(\(prefix)) done")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] purgeForSessionPrefix(\(prefix)) done")
         } catch {
-            print("[MemoryIndex] purgeForSessionPrefix failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] purgeForSessionPrefix failed: \(error)")
         }
     }
 
@@ -411,10 +415,10 @@ actor MemoryIndex {
             let ids = try dbPool.read { db in
                 try String.fetchAll(db, sql: "SELECT chatHistoryId FROM memory_meta")
             }
-            print("[MemoryIndex] knownChatHistoryIds returning \(ids.count) ids")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] knownChatHistoryIds returning \(ids.count) ids")
             return Set(ids)
         } catch {
-            print("[MemoryIndex] knownChatHistoryIds failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] knownChatHistoryIds failed: \(error)")
             return []
         }
     }
@@ -437,10 +441,10 @@ actor MemoryIndex {
                     """, arguments: [limit])
             }
             let preview = ids.prefix(5).map { $0.prefix(20) }.joined(separator: ",")
-            print("[MemoryIndex] pendingEmbeddingChatHistoryIds(limit=\(limit)) returning \(ids.count) ids [\(preview)\(ids.count > 5 ? ",..." : "")]")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] pendingEmbeddingChatHistoryIds(limit=\(limit)) returning \(ids.count) ids [\(preview)\(ids.count > 5 ? ",..." : "")]")
             return ids
         } catch {
-            print("[MemoryIndex] pendingEmbeddingChatHistoryIds failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] pendingEmbeddingChatHistoryIds failed: \(error)")
             return []
         }
     }
@@ -471,10 +475,10 @@ actor MemoryIndex {
                 return out
             }
             let missing = chatHistoryIds.filter { result[$0] == nil }.count
-            print("[MemoryIndex] ftsContentWithEpochs requested=\(chatHistoryIds.count) returned=\(result.count) missing=\(missing)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] ftsContentWithEpochs requested=\(chatHistoryIds.count) returned=\(result.count) missing=\(missing)")
             return result
         } catch {
-            print("[MemoryIndex] ftsContentWithEpochs failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] ftsContentWithEpochs failed: \(error)")
             return [:]
         }
     }
@@ -522,12 +526,12 @@ actor MemoryIndex {
                     committed.append(pair.chatHistoryId)
                 }
             }
-            print("[MemoryIndex] storeEmbeddings pairs=\(pairs.count) committed=\(committed.count) skippedRace=\(skippedRace.count) missing=\(missing.count)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] storeEmbeddings pairs=\(pairs.count) committed=\(committed.count) skippedRace=\(skippedRace.count) missing=\(missing.count)")
         } catch {
             // Background embedding write. A suspension abort (ADR-IOS-041) is
             // benign — these turns stay embeddingComplete=0 and re-embed next wake.
             if !error.isDatabaseSuspensionAbort {
-                print("[MemoryIndex] storeEmbeddings failed: \(error)")
+                BackgroundSyncLogger.logDebug("[MemoryIndex] storeEmbeddings failed: \(error)")
             }
         }
         return (committed, skippedRace)
@@ -566,7 +570,7 @@ actor MemoryIndex {
                 }
             }
         } catch {
-            print("[MemoryIndex] listTurns failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] listTurns failed: \(error)")
             return []
         }
     }
@@ -638,7 +642,7 @@ actor MemoryIndex {
                 }
             }
         } catch {
-            print("[MemoryIndex] FTS candidate fetch failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] FTS candidate fetch failed: \(error)")
         }
 
         // Vector candidates — query EmbeddingService for query vector; graceful-empty on any failure.
@@ -648,7 +652,7 @@ actor MemoryIndex {
                 let qVec = try embedService.embed(trimmed)
                 vecCandidates = searchVecCandidates(queryEmbedding: qVec, limit: candidateLimit, demoActive: demoActive)
             } catch {
-                print("[MemoryIndex] Query embedding failed: \(error)")
+                BackgroundSyncLogger.logDebug("[MemoryIndex] Query embedding failed: \(error)")
             }
         }
 
@@ -660,11 +664,11 @@ actor MemoryIndex {
             vecTableSize = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memory_vec") ?? -1
             metaTableSize = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memory_meta") ?? -1
         }
-        print("[MemoryIndex] search q='\(trimmed.prefix(60))' ftsMatchArg=\(ftsMatchArg) ftsCands=\(ftsCandidates.count) vecCands=\(vecCandidates.count) vecTableSize=\(vecTableSize) metaTableSize=\(metaTableSize) fromMs=\(fromMs.map(String.init) ?? "nil") toMs=\(toMs.map(String.init) ?? "nil") limit=\(limit) candLimit=\(candidateLimit) embedSvc=\(EmbeddingService.shared != nil)")
+        BackgroundSyncLogger.logDebug("[MemoryIndex] search q='\(trimmed.prefix(60))' ftsMatchArg=\(ftsMatchArg) ftsCands=\(ftsCandidates.count) vecCands=\(vecCandidates.count) vecTableSize=\(vecTableSize) metaTableSize=\(metaTableSize) fromMs=\(fromMs.map(String.init) ?? "nil") toMs=\(toMs.map(String.init) ?? "nil") limit=\(limit) candLimit=\(candidateLimit) embedSvc=\(EmbeddingService.shared != nil)")
 
         // Both-legs-empty short-circuit.
         if ftsCandidates.isEmpty && vecCandidates.isEmpty {
-            print("[MemoryIndex] search RESULT 0 hits (both legs empty)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] search RESULT 0 hits (both legs empty)")
             return []
         }
 
@@ -672,7 +676,7 @@ actor MemoryIndex {
         // backfill, or when EmbeddingService is unavailable).
         if vecCandidates.isEmpty {
             let hits = assembleFTSOnly(Array(ftsCandidates.prefix(limit)))
-            print("[MemoryIndex] search RESULT \(hits.count) hits (FTS-only fallback)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] search RESULT \(hits.count) hits (FTS-only fallback)")
             return hits
         }
 
@@ -685,7 +689,7 @@ actor MemoryIndex {
             textWeight: SearchConfig.memoryTextWeight,
             limit: limit
         )
-        print("[MemoryIndex] search merged=\(merged.count) (hybrid via HybridMerge)")
+        BackgroundSyncLogger.logDebug("[MemoryIndex] search merged=\(merged.count) (hybrid via HybridMerge)")
 
         // Assemble results. FTS hits carry full payload already; vec-only hits need
         // a batched JOIN lookup on rowid.
@@ -733,7 +737,7 @@ actor MemoryIndex {
         let ftsOnlyCount = results.filter { $0.vectorScore == 0 }.count
         let vecOnlyCount = results.filter { $0.textScore == 0 }.count
         let bothCount = results.count - ftsOnlyCount - vecOnlyCount
-        print("[MemoryIndex] search RESULT \(results.count) hits (fts-only=\(ftsOnlyCount) vec-only=\(vecOnlyCount) both=\(bothCount))")
+        BackgroundSyncLogger.logDebug("[MemoryIndex] search RESULT \(results.count) hits (fts-only=\(ftsOnlyCount) vec-only=\(vecOnlyCount) both=\(bothCount))")
         return results
     }
 
@@ -782,7 +786,7 @@ actor MemoryIndex {
                 return out
             }
         } catch {
-            print("[MemoryIndex] fetchMetaForRowids failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] fetchMetaForRowids failed: \(error)")
             return [:]
         }
     }
@@ -819,10 +823,10 @@ actor MemoryIndex {
             }
             let minD = distances.min().map { String(format: "%.3f", $0) } ?? "nil"
             let maxD = distances.max().map { String(format: "%.3f", $0) } ?? "nil"
-            print("[MemoryIndex] searchVecCandidates k=\(limit) returned=\(pairs.count) distRange=[\(minD)…\(maxD)]")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] searchVecCandidates k=\(limit) returned=\(pairs.count) distRange=[\(minD)…\(maxD)]")
             return pairs
         } catch {
-            print("[MemoryIndex] Vec search failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] Vec search failed: \(error)")
             return []
         }
     }
@@ -862,7 +866,7 @@ actor MemoryIndex {
         // Demo isolation: the matched turn (and therefore the session window)
         // must come from the current mode's rows only.
         let scope = Self.demoScopeSQL(demoActive: DemoModeStore.isDemoActive, alias: "memory_meta")
-        print("[MemoryIndex] readByTimestamp target=\(timestampMs) tolMs=\(toleranceMs) maxTurns=\(maxTurns) window=[\(lowerBound), \(upperBound)]")
+        BackgroundSyncLogger.logDebug("[MemoryIndex] readByTimestamp target=\(timestampMs) tolMs=\(toleranceMs) maxTurns=\(maxTurns) window=[\(lowerBound), \(upperBound)]")
 
         do {
             return try dbPool.read { db in
@@ -897,7 +901,7 @@ actor MemoryIndex {
                 }
 
                 guard let matched else {
-                    print("[MemoryIndex] readByTimestamp MATCH none (empty window)")
+                    BackgroundSyncLogger.logDebug("[MemoryIndex] readByTimestamp MATCH none (empty window)")
                     return []
                 }
 
@@ -951,11 +955,11 @@ actor MemoryIndex {
                         finalScore: 0
                     )
                 }
-                print("[MemoryIndex] readByTimestamp MATCH sid=\(matchedSid?.prefix(30) ?? "nil") matchedDate=\(matchedDate) window=\(hits.count) turns")
+                BackgroundSyncLogger.logDebug("[MemoryIndex] readByTimestamp MATCH sid=\(matchedSid?.prefix(30) ?? "nil") matchedDate=\(matchedDate) window=\(hits.count) turns")
                 return hits
             }
         } catch {
-            print("[MemoryIndex] readByTimestamp failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] readByTimestamp failed: \(error)")
             return []
         }
     }

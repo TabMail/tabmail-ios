@@ -79,7 +79,7 @@ actor UnreadCountManager {
         let current = dbPool
         if let pending = pendingPool, pending.pool !== current.pool, !pendingFolderIds.isEmpty {
             #if DEBUG
-            print("[UnreadCount] database changed with \(pendingFolderIds.count) folder id(s) still pending for the previous one — dropping them rather than recomputing them against the wrong DB")
+            BackgroundSyncLogger.logDebug("[UnreadCount] database changed with \(pendingFolderIds.count) folder id(s) still pending for the previous one — dropping them rather than recomputing them against the wrong DB")
             #endif
             pendingFolderIds.removeAll()
         }
@@ -149,7 +149,7 @@ actor UnreadCountManager {
             // counts recompute on the next wake's recount. Don't log it as a
             // failure; only log genuine recount failures.
             if !error.isDatabaseSuspensionAbort {
-                print("[UnreadCount] Recount failed: \(error)")
+                BackgroundSyncLogger.logDebug("[UnreadCount] Recount failed: \(error)")
             }
             return
         }
@@ -202,7 +202,7 @@ actor UnreadCountManager {
             // Mirror to app-group suite so NSE can read the authoritative count
             // as its increment/decrement base (see NSEBadge / NSEState).
             UserDefaults(suiteName: "group.ai.tabmail")?.set(totalUnread, forKey: NSEBadge.badgeCountKey)
-            print("[UnreadCount] Badge set to \(totalUnread)")
+            BackgroundSyncLogger.logDebug("[UnreadCount] Badge set to \(totalUnread)")
             BackgroundSyncLogger.log("badge: \(totalUnread)")
             MergeSurfaceProbe.logSince("badge set to \(totalUnread)")
             // Record the recently-arrived unread inbox messages this count
@@ -214,7 +214,7 @@ actor UnreadCountManager {
             // Suspension aborts (ADR-IOS-041) are benign — the badge re-syncs on
             // the next wake's recount; don't surface them as errors.
             if !error.isDatabaseSuspensionAbort {
-                print("[UnreadCount] Badge update error: \(error)")
+                BackgroundSyncLogger.logDebug("[UnreadCount] Badge update error: \(error)")
             }
         }
     }

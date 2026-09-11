@@ -860,7 +860,7 @@ extension AccountManager {
                 return folderIds
             }
         } catch {
-            print("[Queue] ERROR: markRead write failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Queue] ERROR: markRead write failed: \(error)")
             affectedFolderIds = []
         }
         // Clear delivered notifications for messages the user just read
@@ -913,7 +913,7 @@ extension AccountManager {
                 return folderIds
             }
         } catch {
-            print("[Queue] ERROR: markUnread write failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Queue] ERROR: markUnread write failed: \(error)")
             affectedFolderIds = []
         }
         // Post immediately from actor for responsive sidebar badges, then async recount for accuracy
@@ -1156,7 +1156,9 @@ extension AccountManager {
         // Self-move is a no-op — don't create PendingOperation or touch local state.
         // Happens when archiving from All Mail on Gmail (source=dest=__GMAIL_ALL_MAIL__).
         guard folderPath != destinationPath else {
-            print("[Queue] Skipping no-op move (source==dest): \(folderPath)")
+            if DebugModeManager.isLoggingEnabled() {
+                print("[Queue] Skipping no-op move (source==dest): \(folderPath)")
+            }
             // PROVEN: the row already sits at the requested destination, so the
             // requested end state is already true. Terminal, never retried.
             outcome.set(.terminalStale, ids: msgs.map(\.id))
@@ -1325,7 +1327,9 @@ extension AccountManager {
             destinationPath: destinationPath,
             observedUidValidity: admission.observedUidValidity)
         try queuedOp.insert(db)
-        print("[Queue] Queued \(opType.rawValue) for \(admission.providerIds.count) msgs: \(folderPath) → \(destinationPath) (account: \(accountId))")
+        if DebugModeManager.isLoggingEnabled() {
+            print("[Queue] Queued \(opType.rawValue) for \(admission.providerIds.count) msgs: \(folderPath) → \(destinationPath) (account: \(accountId))")
+        }
         // The local mutation and the durable op are now in the SAME open
         // transaction — that is exactly what `durablyAdmitted` asserts.
         outcome.set(.durablyAdmitted, ids: admittedIds)
@@ -1420,7 +1424,7 @@ extension AccountManager {
                 + "fresh=[\(fresh.map { "\($0.id){\($0.folderPath)}" }.joined(separator: ","))]")
         outcome.set(.retainedForRetry, ids: unresolvedIds.filter { !freshIds.contains($0) })
         if fresh.isEmpty, !remainingMessages.isEmpty {
-            print("[Queue] WARNING: move(to: \(destinationPath)) resolved 0 of \(remainingMessages.count) ids — vanished rows or read failure; nothing queued")
+            BackgroundSyncLogger.logDebug("[Queue] WARNING: move(to: \(destinationPath)) resolved 0 of \(remainingMessages.count) ids — vanished rows or read failure; nothing queued")
         }
         // Same-folder move is a no-op. Drop those messages here — using FRESH
         // data so a stale caller snapshot whose row already sits at the
@@ -1486,7 +1490,7 @@ extension AccountManager {
             deferredSuccessors = written.deferredSuccessors
             outcome.merge(written.admission)
         } catch {
-            print("[Queue] ERROR: move write failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Queue] ERROR: move write failed: \(error)")
             affectedFolderIds = []
             deferredSuccessors = []
             // The transaction rolled back, so NOTHING landed for ANY member —
@@ -1534,7 +1538,7 @@ extension AccountManager {
                 }
             }
         } catch {
-            print("[Queue] ERROR: markFlagged write failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Queue] ERROR: markFlagged write failed: \(error)")
         }
         Task { @MainActor in NotificationCenter.default.post(name: .inboxDataDidChange, object: nil) }
         Task { await drainPendingQueue() }
@@ -1618,12 +1622,12 @@ extension AccountManager {
                 }
             } catch {
                 // A thrown read answers nothing at all — strictly retryable.
-                print("[Queue] ERROR: \(role.rawValue) folder lookup failed for account \(accountId): \(error) — \(accountMessages.count) message(s) skipped")
+                BackgroundSyncLogger.logDebug("[Queue] ERROR: \(role.rawValue) folder lookup failed for account \(accountId): \(error) — \(accountMessages.count) message(s) skipped")
                 outcome.set(.retainedForRetry, ids: accountMessages.map(\.id))
                 continue
             }
             guard let path else {
-                print("[Queue] ERROR: no \(role.rawValue) folder found for account \(accountId) — \(accountMessages.count) message(s) skipped")
+                BackgroundSyncLogger.logDebug("[Queue] ERROR: no \(role.rawValue) folder found for account \(accountId) — \(accountMessages.count) message(s) skipped")
                 outcome.set(.retainedForRetry, ids: accountMessages.map(\.id))
                 continue
             }
@@ -1755,7 +1759,7 @@ extension AccountManager {
                 outcome.set(.terminalStale, ids: provenAbsent)
                 outcome.set(.retainedForRetry, ids: unresolvedIds.subtracting(provenAbsent))
             } catch {
-                print("[Queue] ERROR: performCoordinatedRoleMove(\(role.rawValue)) absence probe failed: \(error) — \(unresolvedIds.count) id(s) retained")
+                BackgroundSyncLogger.logDebug("[Queue] ERROR: performCoordinatedRoleMove(\(role.rawValue)) absence probe failed: \(error) — \(unresolvedIds.count) id(s) retained")
                 outcome.set(.retainedForRetry, ids: unresolvedIds)
             }
         }
@@ -1770,7 +1774,7 @@ extension AccountManager {
         if !preRefusedIds.isEmpty {
             outcome.setIdentityRefused(ids: preRefusedIds)
             Self.announceIdentityRefusedIds(preRefusedIds)
-            print("[Queue] performCoordinatedRoleMove(\(role.rawValue)) refused \(preRefusedIds.count) id(s) at pre-resolve: the row at that address is not the message the caller captured (C3)")
+            BackgroundSyncLogger.logDebug("[Queue] performCoordinatedRoleMove(\(role.rawValue)) refused \(preRefusedIds.count) id(s) at pre-resolve: the row at that address is not the message the caller captured (C3)")
         }
 
         let movable = await messagesNotInRole(identityMatched, role: role)
@@ -1786,7 +1790,7 @@ extension AccountManager {
             // swallows errors to []) would leave no trace anywhere. Vanished/
             // already-in-role ids are legit no-ops; the log is the only failure
             // correlate. T4.V8 additionally returns the typed dispositions above.
-            print("[Queue] performCoordinatedRoleMove(\(role.rawValue)): 0 of \(ids.count) ids actionable after resolve/role filter — nothing to do")
+            BackgroundSyncLogger.logDebug("[Queue] performCoordinatedRoleMove(\(role.rawValue)): 0 of \(ids.count) ids actionable after resolve/role filter — nothing to do")
             return outcome
         }
 
@@ -1808,7 +1812,7 @@ extension AccountManager {
             // T4.V8: this read used to be `try?` → `[:]`, which made a thrown
             // read look exactly like "no account has a role folder" and skipped
             // every id. Nothing was consulted and nothing was decided — retryable.
-            print("[Queue] ERROR: performCoordinatedRoleMove(\(role.rawValue)) role-folder lookup failed: \(error) — \(movable.count) message(s) retained")
+            BackgroundSyncLogger.logDebug("[Queue] ERROR: performCoordinatedRoleMove(\(role.rawValue)) role-folder lookup failed: \(error) — \(movable.count) message(s) retained")
             outcome.set(.retainedForRetry, ids: movable.map(\.id))
             return outcome
         }
@@ -1821,7 +1825,7 @@ extension AccountManager {
         let actionableIds = Set(actionable.map(\.id))
         outcome.set(.retainedForRetry, ids: movableIds.subtracting(actionableIds))
         guard !actionable.isEmpty else {
-            print("[Queue] ERROR: performCoordinatedRoleMove(\(role.rawValue)) — no \(role.rawValue) folder resolved for account(s) \(accountIds.sorted().joined(separator: ",")); \(movable.count) message(s) skipped")
+            BackgroundSyncLogger.logDebug("[Queue] ERROR: performCoordinatedRoleMove(\(role.rawValue)) — no \(role.rawValue) folder resolved for account(s) \(accountIds.sorted().joined(separator: ",")); \(movable.count) message(s) skipped")
             return outcome
         }
 
@@ -1854,7 +1858,7 @@ extension AccountManager {
                 if !freshRefusedIds.isEmpty {
                     queuedOutcome.setIdentityRefused(ids: freshRefusedIds)
                     Self.announceIdentityRefusedIds(freshRefusedIds)
-                    print("[Queue] performCoordinatedRoleMove(\(role.rawValue)) refused \(freshRefusedIds.count) id(s) at execution: the row at that address is not the message the caller captured (C3)")
+                    BackgroundSyncLogger.logDebug("[Queue] performCoordinatedRoleMove(\(role.rawValue)) refused \(freshRefusedIds.count) id(s) at execution: the row at that address is not the message the caller captured (C3)")
                 }
                 let freshMovable = await self.messagesNotInRole(freshMatched, role: role)
                 let freshIds = Set(freshMovable.map(\.id))
@@ -1928,12 +1932,12 @@ extension AccountManager {
                 .fetchAll(db)
         }) ?? []
         let trashFolder = allTrash.first
-        print("[DeleteTrace] \(callSite) — accountId=\(accountId) msgCount=\(messages.count) resolvedTrash=\(trashFolder.map { "id=\($0.id) name=\($0.name) path=\($0.path) role=\($0.role.rawValue)" } ?? "<nil>") trashCandidates=\(allTrash.count)")
+        BackgroundSyncLogger.logDebug("[DeleteTrace] \(callSite) — accountId=\(accountId) msgCount=\(messages.count) resolvedTrash=\(trashFolder.map { "id=\($0.id) name=\($0.name) path=\($0.path) role=\($0.role.rawValue)" } ?? "<nil>") trashCandidates=\(allTrash.count)")
         for f in allTrash {
-            print("[DeleteTrace] trashCandidate: id=\(f.id) name=\(f.name) path=\(f.path)")
+            BackgroundSyncLogger.logDebug("[DeleteTrace] trashCandidate: id=\(f.id) name=\(f.name) path=\(f.path)")
         }
         for m in messages {
-            print("[DeleteTrace] msg: id=\(m.id) folderPath=\(m.folderPath) accountId=\(m.accountId) messageId=\(m.messageId) rfc822=\(m.rfc822MessageId ?? "<nil>") stableId=\(m.stableId)")
+            BackgroundSyncLogger.logDebug("[DeleteTrace] msg: id=\(m.id) folderPath=\(m.folderPath) accountId=\(m.accountId) messageId=\(m.messageId) rfc822=\(m.rfc822MessageId ?? "<nil>") stableId=\(m.stableId)")
         }
     }
 
@@ -2022,7 +2026,7 @@ extension AccountManager {
               let sourcePath = sourcePaths.first,
               let sourceFolderId = sourceFolderIds.first
         else {
-            print("[UndoStack] undoMove refused heterogeneous/duplicate command for account \(accountId)")
+            BackgroundSyncLogger.logDebug("[UndoStack] undoMove refused heterogeneous/duplicate command for account \(accountId)")
             BackgroundSyncLogger.logInbox(
                 "[RoleActionTrace] manager.undoMove phase=refused "
                     + "reason=heterogeneousOrDuplicate account=\(accountId)")
@@ -2095,7 +2099,9 @@ extension AccountManager {
                     if let expected = ExpectedMessageIdentity(
                         capturedRfc822MessageId: member.sourceRfc822MessageId),
                        !expected.matches(row) {
-                        print("[UndoStack] undoMove refused \(member.originalHeaderId): the row at that address is not the message the gesture moved (C3 content witness)")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[UndoStack] undoMove refused \(member.originalHeaderId): the row at that address is not the message the gesture moved (C3 content witness)")
+                        }
                         return UndoMoveWriteResult()
                     }
                     currentRows.append(row)
@@ -2294,7 +2300,7 @@ extension AccountManager {
                 )
             }
         } catch {
-            print("[UndoStack] ERROR: undoMove write failed: \(error)")
+            BackgroundSyncLogger.logDebug("[UndoStack] ERROR: undoMove write failed: \(error)")
             return []
         }
         registerDeferredMoveSuccessors(result.deferredSuccessors)
@@ -2448,7 +2454,7 @@ extension AccountManager {
                         body: ftsInfo.bodyText)])
                 }
             } catch {
-                print("[Queue] WARNING: FTS indexing failed for draft \(ftsInfo.record.headerId): \(error)")
+                BackgroundSyncLogger.logDebug("[Queue] WARNING: FTS indexing failed for draft \(ftsInfo.record.headerId): \(error)")
             }
             try? await dbPool.write { db in
                 try db.execute(
@@ -2459,7 +2465,7 @@ extension AccountManager {
             Task { await drainPendingQueue() }
             return true
         } catch {
-            print("[Queue] ERROR: queueDraftSave failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Queue] ERROR: queueDraftSave failed: \(error)")
             return false
         }
     }
@@ -2608,7 +2614,7 @@ extension AccountManager {
             Task { await drainPendingQueue() }
             return true
         } catch {
-            print("[Queue] ERROR: queueDraftDelete failed: \(error)")
+            BackgroundSyncLogger.logDebug("[Queue] ERROR: queueDraftDelete failed: \(error)")
             return false
         }
     }

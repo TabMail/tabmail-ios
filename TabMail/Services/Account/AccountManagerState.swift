@@ -57,26 +57,30 @@ final class AccountManagerState {
 
     /// Update sync phase for a specific account and recompute aggregate.
     func setSyncPhase(_ phase: SyncPhase?, forAccount accountId: String) {
-        let acc = accountId.split(separator: "@").first.map(String.init) ?? accountId
-        let phaseStr = phase.map { String(describing: $0) } ?? "nil"
-        let oldAgg = syncPhase.map { String(describing: $0) } ?? "nil"
+        // Only the enum is captured before the mutation; the `split` and
+        // `String(describing:)` render inside `logDebug`'s autoclosure, so a
+        // locked gate pays nothing on this main-actor, per-transition path (#72).
+        let oldPhase = syncPhase
         if let phase {
             accountSyncPhases[accountId] = phase
         } else {
             accountSyncPhases.removeValue(forKey: accountId)
         }
         recomputeSyncPhase()
-        let newAgg = syncPhase.map { String(describing: $0) } ?? "nil"
-        print("[SyncPhaseMut] setSyncPhase(\(phaseStr)) acct=\(acc) → agg \(oldAgg)→\(newAgg) (perAccount=\(accountSyncPhases.count))")
+        BackgroundSyncLogger.logDebug("[SyncPhaseMut] setSyncPhase(\(Self.describe(phase))) acct=\(accountId.split(separator: "@").first.map(String.init) ?? accountId) → agg \(Self.describe(oldPhase))→\(Self.describe(syncPhase)) (perAccount=\(accountSyncPhases.count))")
     }
 
     /// Clear all per-account phases (called when sync cycle ends).
     func clearSyncPhases() {
-        let oldAgg = syncPhase.map { String(describing: $0) } ?? "nil"
+        let oldPhase = syncPhase
         let perAccount = accountSyncPhases.count
         accountSyncPhases.removeAll()
         syncPhase = nil
-        print("[SyncPhaseMut] clearSyncPhases() → agg \(oldAgg)→nil (cleared \(perAccount) per-account)")
+        BackgroundSyncLogger.logDebug("[SyncPhaseMut] clearSyncPhases() → agg \(Self.describe(oldPhase))→nil (cleared \(perAccount) per-account)")
+    }
+
+    private static func describe(_ phase: SyncPhase?) -> String {
+        phase.map { String(describing: $0) } ?? "nil"
     }
 
     private func recomputeSyncPhase() {
@@ -103,8 +107,7 @@ final class AccountManagerState {
     /// boot timeline shows EXACTLY when the freshness indicator resets vs. stays stale.
     var lastSyncCompletedAt: Date? {
         didSet {
-            let v = lastSyncCompletedAt.map { "\(Int(Date().timeIntervalSince($0)))s ago" } ?? "nil"
-            print("[SyncPhaseMut] lastSyncCompletedAt = \(v)")
+            BackgroundSyncLogger.logDebug("[SyncPhaseMut] lastSyncCompletedAt = \(lastSyncCompletedAt.map { "\(Int(Date().timeIntervalSince($0)))s ago" } ?? "nil")")
             BootProfiler.mark("✓ 'Updated … ago' RESET (lastSyncCompletedAt = now)")
         }
     }
@@ -113,7 +116,7 @@ final class AccountManagerState {
     /// Reset to false on next successful sync.
     var lastSyncFailed = false {
         didSet {
-            print("[SyncPhaseMut] lastSyncFailed = \(lastSyncFailed)")
+            BackgroundSyncLogger.logDebug("[SyncPhaseMut] lastSyncFailed = \(lastSyncFailed)")
             BootProfiler.mark("'Last updated' subtitle: lastSyncFailed = \(lastSyncFailed)")
         }
     }

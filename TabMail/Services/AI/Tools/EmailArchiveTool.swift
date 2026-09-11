@@ -75,7 +75,7 @@ struct EmailArchiveTool: AgentTool, Sendable {
         )
 
         guard confirmed else {
-            print("[EmailArchiveTool] User declined to archive \(resolved.count) emails")
+            BackgroundSyncLogger.logDebug("[EmailArchiveTool] User declined to archive \(resolved.count) emails")
             throw ToolDeclinedError(output: ToolJSON.string(from: [
                 "cancelled": true,
                 "message": "User declined to archive. This likely means the wrong emails were selected. Use inbox_read to verify the correct emails before retrying.",
@@ -158,7 +158,7 @@ struct EmailArchiveTool: AgentTool, Sendable {
         }
 
         if DebugModeManager.isLoggingEnabled() {
-            print("[EmailArchiveTool] Admitted \(acted.count), pending \(pendingIds.count), terminal \(failedIds.count)")
+            BackgroundSyncLogger.logDebug("[EmailArchiveTool] Admitted \(acted.count), pending \(pendingIds.count), terminal \(failedIds.count)")
         }
 
         return ToolJSON.string(from: result)

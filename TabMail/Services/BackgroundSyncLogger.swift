@@ -281,6 +281,42 @@ enum BackgroundSyncLogger {
         AppLogStore.append(line, channel: .queue)
     }
 
+    // MARK: - General diagnostics (debug-gated)
+
+    /// Append one general diagnostic line — the persisted home of what used to be
+    /// a bare `print("[Tag] …")`.
+    ///
+    /// Before this existed those diagnostics went only to `stdout`, which is
+    /// discarded on a device (there is no `freopen`/`dup2` in this tree), and most
+    /// of them were ungated, so a release build still paid to render every
+    /// interpolation (`TabMail/tabmail-ios#72`). Routing them here makes them
+    /// debug-gated AND readable from an exported `tabmail.log` on device and
+    /// TestFlight.
+    ///
+    /// `@autoclosure` so a closed gate never builds the string: many callers sit on
+    /// the main actor or on per-message sync paths. The caller's message already
+    /// carries its `[Tag]` prefix, so nothing is prepended here.
+    ///
+    /// The WHOLE RENDERED LINE is escaped here, exactly as `logQueue` does: call
+    /// sites interpolate folder names, provider error descriptions, addresses and
+    /// other values this app does not author, and `AppLogStore` is line-oriented,
+    /// so an unescaped newline would forge another channel's entry.
+    ///
+    /// ⚠️ Never call this from inside a database write closure, or from a helper
+    /// that is handed a `Database`: the append is file I/O that no `ROLLBACK`
+    /// retracts, so the line could claim a write that never committed. Gate a
+    /// console `print` there instead, or emit after the write returns.
+    ///
+    /// A no-op unless debug logging is unlocked by an allowed user — it IS live on
+    /// device / TestFlight for such a user (global `CLAUDE.md` rule 12). The guard
+    /// covers the console sink too.
+    static func logDebug(_ message: @autoclosure () -> String) {
+        guard DebugModeManager.isLoggingEnabled() else { return }
+        let line = DebugModeManager.escapedForLogLine(message())
+        print(line)
+        AppLogStore.append(line, channel: .debug)
+    }
+
     // MARK: - Body double-escape detector (pure / ungated — unit-testable)
 
     /// True when `html` is ALREADY double-escaped — it contains `&amp;amp;`,

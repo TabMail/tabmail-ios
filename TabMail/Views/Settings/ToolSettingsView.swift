@@ -116,7 +116,7 @@ struct ContactContainerPickerView: View {
                 selectedId = ""
             }
         } catch {
-            print("[ContactContainerPickerView] Failed to load containers: \(error)")
+            BackgroundSyncLogger.logDebug("[ContactContainerPickerView] Failed to load containers: \(error)")
         }
     }
 }
@@ -304,19 +304,19 @@ final class CalendarPickerModel {
         var outcome = LoadOutcome()
         do {
             outcome.calendars = try await provider.listCalendars()
-            print("[CalendarPickerView] \(emailAddress): loaded \(outcome.calendars.count) calendars (\(outcome.calendars.filter { $0.accessRole == "owner" || $0.accessRole == "writer" }.count) writable)")
+            BackgroundSyncLogger.logDebug("[CalendarPickerView] \(emailAddress): loaded \(outcome.calendars.count) calendars (\(outcome.calendars.filter { $0.accessRole == "owner" || $0.accessRole == "writer" }.count) writable)")
         } catch GoogleCalendarError.missingScope {
             outcome.needsReauth = true
-            print("[CalendarPickerView] \(emailAddress): Google calendar scope not granted")
+            BackgroundSyncLogger.logDebug("[CalendarPickerView] \(emailAddress): Google calendar scope not granted")
         } catch ExchangeCalendarError.missingScope {
             outcome.needsReauth = true
-            print("[CalendarPickerView] \(emailAddress): Exchange calendar scope not granted")
+            BackgroundSyncLogger.logDebug("[CalendarPickerView] \(emailAddress): Exchange calendar scope not granted")
         } catch CalDAVError.authFailed {
             outcome.needsReauth = true
-            print("[CalendarPickerView] \(emailAddress): CalDAV auth failed — needs re-auth")
+            BackgroundSyncLogger.logDebug("[CalendarPickerView] \(emailAddress): CalDAV auth failed — needs re-auth")
         } catch {
             outcome.errorMessage = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : error.userFacingDescription
-            print("[CalendarPickerView] \(emailAddress): failed to fetch calendars: \(error)")
+            BackgroundSyncLogger.logDebug("[CalendarPickerView] \(emailAddress): failed to fetch calendars: \(error)")
         }
         return outcome
     }
@@ -738,7 +738,7 @@ struct CalendarPickerView: View {
             }
             await model.loadData()
         } catch {
-            print("[CalendarPickerView] Re-auth failed for \(account.emailAddress): \(error)")
+            BackgroundSyncLogger.logDebug("[CalendarPickerView] Re-auth failed for \(account.emailAddress): \(error)")
         }
     }
 }

@@ -281,9 +281,9 @@ actor SyncEngine {
         }
         let t6 = CFAbsoluteTimeGetCurrent()
         if includePrune {
-            print("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
+            BackgroundSyncLogger.logDebug("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
         } else {
-            print("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
+            BackgroundSyncLogger.logDebug("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
         }
     }
 
@@ -351,7 +351,7 @@ actor SyncEngine {
             await BodyAssetMaintenance.pruneOrphans()
         }
         let t2 = CFAbsoluteTimeGetCurrent()
-        print("[Sync] BodyAsset maintenance: assetEvict=\(Int((t1-t0)*1000))ms assetSweep=\(Int((t2-t1)*1000))ms")
+        BackgroundSyncLogger.logDebug("[Sync] BodyAsset maintenance: assetEvict=\(Int((t1-t0)*1000))ms assetSweep=\(Int((t2-t1)*1000))ms")
     }
 
     /// Two-tier sync: tries delta sync first (fast), falls back to full sync (robust).
@@ -366,7 +366,7 @@ actor SyncEngine {
     @discardableResult
     func backgroundDeltaSync(account: Account, inboxOnly: Bool = false) async throws -> (changed: Bool, reason: String) {
         guard let queue = workQueues[account.id] else {
-            print("[Sync:bg] No provider for \(account.emailAddress) — skipping")
+            BackgroundSyncLogger.logDebug("[Sync:bg] No provider for \(account.emailAddress) — skipping")
             BackgroundSyncLogger.log("bgDelta: \(account.emailAddress) noProvider")
             return (false, "noProvider")
         }
@@ -405,11 +405,11 @@ actor SyncEngine {
                     _ = try Account.filter(Column("id") == account.id)
                         .updateAll(db, Column("lastSyncedAt").set(to: Date()))
                 }
-                print("[Sync:bg] Delta sync completed for \(account.emailAddress) (changes: \(result.hadChanges))")
+                BackgroundSyncLogger.logDebug("[Sync:bg] Delta sync completed for \(account.emailAddress) (changes: \(result.hadChanges))")
                 await Self.checkpointWALThrottled()
                 return (result.hadChanges, result.hadChanges ? "deltaChanges" : "deltaNoChanges")
             } else {
-                print("[Sync:bg] Delta not ready for \(account.emailAddress) (no cursor or expired) — will full-sync on foreground")
+                BackgroundSyncLogger.logDebug("[Sync:bg] Delta not ready for \(account.emailAddress) (no cursor or expired) — will full-sync on foreground")
                 BackgroundSyncLogger.log("bgDelta: \(account.emailAddress) noCursor")
                 return (false, "noCursor")
             }
@@ -417,7 +417,7 @@ actor SyncEngine {
             if Self.isConnectionError(error) {
                 // Pool self-heals: dead connections discarded on checkin(healthy: false),
                 // next checkout creates a fresh one. Retry without disconnect/reconnect.
-                print("[Sync:bg] Connection error for \(account.emailAddress): \(error) — retrying")
+                BackgroundSyncLogger.logDebug("[Sync:bg] Connection error for \(account.emailAddress): \(error) — retrying")
                 let retry = try await queue.execute(priority: .headerFetch) {
                     try await self.performDeltaSync(account: account, provider: provider, inboxOnly: inboxOnly)
                 }
@@ -426,11 +426,11 @@ actor SyncEngine {
                         _ = try Account.filter(Column("id") == account.id)
                             .updateAll(db, Column("lastSyncedAt").set(to: Date()))
                     }
-                    print("[Sync:bg] Delta sync completed for \(account.emailAddress) after retry (changes: \(retry.hadChanges))")
+                    BackgroundSyncLogger.logDebug("[Sync:bg] Delta sync completed for \(account.emailAddress) after retry (changes: \(retry.hadChanges))")
                     return (retry.hadChanges, retry.hadChanges ? "deltaChanges(retry)" : "deltaNoChanges(retry)")
                 }
             }
-            print("[Sync:bg] Delta sync failed for \(account.emailAddress): \(error) — will full-sync on foreground")
+            BackgroundSyncLogger.logDebug("[Sync:bg] Delta sync failed for \(account.emailAddress): \(error) — will full-sync on foreground")
             BackgroundSyncLogger.log("bgDelta: \(account.emailAddress) ERROR: \(error)")
             if !(error is CancellationError) && !Self.isConnectionError(error) {
                 BackgroundSyncLogger.logError("\(error)", source: "deltaSync:\(account.emailAddress)")
@@ -450,7 +450,7 @@ actor SyncEngine {
     @discardableResult
     func sync(account: Account) async throws -> Bool {
         guard let queue = workQueues[account.id] else {
-            print("[Sync] No provider registered for \(account.emailAddress) — skipping")
+            BackgroundSyncLogger.logDebug("[Sync] No provider registered for \(account.emailAddress) — skipping")
             return false
         }
         let provider = queue.provider
@@ -458,7 +458,7 @@ actor SyncEngine {
         // Skip if this account was synced very recently — prevents redundant syncs
         // from overlapping callers (RootView.task, SyncScheduler, InboxViewModel).
         if let lastSync = account.lastSyncedAt, Date().timeIntervalSince(lastSync) < 15 {
-            print("[Sync] Skipping \(account.emailAddress) — synced \(Int(Date().timeIntervalSince(lastSync)))s ago")
+            BackgroundSyncLogger.logDebug("[Sync] Skipping \(account.emailAddress) — synced \(Int(Date().timeIntervalSince(lastSync)))s ago")
             return false
         }
 
@@ -488,14 +488,14 @@ actor SyncEngine {
                         .updateAll(db, Column("lastSyncedAt").set(to: Date()))
                 }
                 hadChanges = deltaResult.hadChanges
-                print("[Sync] Delta sync completed for \(account.emailAddress) (changes: \(hadChanges))")
+                BackgroundSyncLogger.logDebug("[Sync] Delta sync completed for \(account.emailAddress) (changes: \(hadChanges))")
             }
         } catch {
             deltaSyncError = error
             if Self.isConnectionError(error) {
                 // Pool self-heals: dead connections discarded on checkin(healthy: false),
                 // next checkout creates a fresh one. Retry without disconnect/reconnect.
-                print("[Sync] Delta sync connection error for \(account.emailAddress): \(error) — retrying")
+                BackgroundSyncLogger.logDebug("[Sync] Delta sync connection error for \(account.emailAddress): \(error) — retrying")
                 do {
                     let retryResult = try await queue.execute(priority: .headerFetch) {
                         try await self.performDeltaSync(account: account, provider: provider)
@@ -508,17 +508,17 @@ actor SyncEngine {
                                 .updateAll(db, Column("lastSyncedAt").set(to: Date()))
                         }
                         hadChanges = retryResult.hadChanges
-                        print("[Sync] Delta sync completed for \(account.emailAddress) (after retry, changes: \(hadChanges))")
+                        BackgroundSyncLogger.logDebug("[Sync] Delta sync completed for \(account.emailAddress) (after retry, changes: \(hadChanges))")
                     }
                 } catch {
                     deltaSyncError = error
-                    print("[Sync] Delta sync retry also failed for \(account.emailAddress): \(error)")
+                    BackgroundSyncLogger.logDebug("[Sync] Delta sync retry also failed for \(account.emailAddress): \(error)")
                     if !(error is CancellationError) && !Self.isConnectionError(error) {
                         BackgroundSyncLogger.logError("\(error)", source: "deltaSync:\(account.emailAddress)")
                     }
                 }
             } else {
-                print("[Sync] Delta sync failed for \(account.emailAddress): \(error)")
+                BackgroundSyncLogger.logDebug("[Sync] Delta sync failed for \(account.emailAddress): \(error)")
                 if !(error is CancellationError) {
                     BackgroundSyncLogger.logError("\(error)", source: "deltaSync:\(account.emailAddress)")
                 }
@@ -529,7 +529,7 @@ actor SyncEngine {
         //    NOT a fallback from delta — runs independently regardless of delta success/failure.
         let timeSinceFullSync = account.lastFullSyncAt.map { Date().timeIntervalSince($0) } ?? .infinity
         if timeSinceFullSync >= fullSyncInterval {
-            print("[Sync] Full sync due for \(account.emailAddress) (last: \(timeSinceFullSync.isFinite ? "\(Int(timeSinceFullSync))s" : "never"))...")
+            BackgroundSyncLogger.logDebug("[Sync] Full sync due for \(account.emailAddress) (last: \(timeSinceFullSync.isFinite ? "\(Int(timeSinceFullSync))s" : "never"))...")
             do {
                 try await queue.execute(priority: .headerFetch) {
                     try await self.fullSync(account: account, provider: provider)
@@ -538,7 +538,7 @@ actor SyncEngine {
                 if Self.isConnectionError(error) {
                     // Pool self-heals: dead connections discarded on checkin(healthy: false),
                     // next checkout creates a fresh one. Retry without disconnect/reconnect.
-                    print("[Sync] Connection lost during full sync, retrying...")
+                    BackgroundSyncLogger.logDebug("[Sync] Connection lost during full sync, retrying...")
                     try await queue.execute(priority: .headerFetch) {
                         try await self.fullSync(account: account, provider: provider)
                     }
@@ -562,7 +562,7 @@ actor SyncEngine {
                         Column("lastFullSyncAt").set(to: now)
                     )
             }
-            print("[Sync] Full sync completed for \(account.emailAddress)")
+            BackgroundSyncLogger.logDebug("[Sync] Full sync completed for \(account.emailAddress)")
             hadChanges = true
 
             // Post-full-sync maintenance
@@ -583,7 +583,7 @@ actor SyncEngine {
         }
 
         // 3. Background work — runs after every sync (delta or full)
-        print("[Sync] \(account.emailAddress) calling startBackfill")
+        BackgroundSyncLogger.logDebug("[Sync] \(account.emailAddress) calling startBackfill")
         startBackfill(account: account)
         bulkIndexIfNeeded(account: account)
         backfillFolderIdsIfNeeded()
@@ -700,7 +700,7 @@ actor SyncEngine {
                     // the production-observability channel — the `logError` below is
                     // (file-backed, exported by `DebugLogView`), and it is unchanged.
                     if DebugModeManager.isLoggingEnabled() {
-                        print("[InfiniteScroll] SELECT failed for \(folder.name) — skipping")
+                        BackgroundSyncLogger.logDebug("[InfiniteScroll] SELECT failed for \(folder.name) — skipping")
                     }
                     BackgroundSyncLogger.logError("SELECT failed for \(folder.name): \(error)", source: "infiniteScroll")
                     continue
@@ -798,7 +798,9 @@ actor SyncEngine {
                             tagValue: ActionTag.none.rawValue
                         )
                         try tagOp.insert(db)
-                        print("[ReplyDetect] Scroll insert: reply→none for \(header.messageId) (already replied)")
+                        if DebugModeManager.isLoggingEnabled() {
+                            print("[ReplyDetect] Scroll insert: reply→none for \(header.messageId) (already replied)")
+                        }
                     }
                     try header.save(db)
                     try ThreadUtils.insertMessageReferences(for: header, db: db)
@@ -829,11 +831,11 @@ actor SyncEngine {
             if !newHeaders.isEmpty {
                 await indexHeadersForFTS(newHeaders)
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[InfiniteScroll] \(folder.name): +\(newHeaders.count) of \(found) older messages")
+                    BackgroundSyncLogger.logDebug("[InfiniteScroll] \(folder.name): +\(newHeaders.count) of \(found) older messages")
                 }
             } else if found > 0 {
                 if DebugModeManager.isLoggingEnabled() {
-                    print("[InfiniteScroll] \(folder.name): server returned \(found) records, none materialised — this pull's cursor cannot advance, so paging stops")
+                    BackgroundSyncLogger.logDebug("[InfiniteScroll] \(folder.name): server returned \(found) records, none materialised — this pull's cursor cannot advance, so paging stops")
                 }
             }
             totalNew += newHeaders.count
@@ -866,7 +868,7 @@ actor SyncEngine {
                 }
             }
         } catch {
-            print("[SnippetFill] Update failed: \(error)")
+            BackgroundSyncLogger.logDebug("[SnippetFill] Update failed: \(error)")
             BackgroundSyncLogger.logError("Snippet update failed: \(error)", source: "snippetFill")
         }
     }

@@ -144,7 +144,7 @@ struct RemindersSettingsView: View {
         }
 
         guard let statement = matchedStatement else {
-            print("[RemindersSettings] KB line not found for reminder: \(reminder.content.prefix(80))")
+            BackgroundSyncLogger.logDebug("[RemindersSettings] KB line not found for reminder: \(reminder.content.prefix(80))")
             reminders.remove(at: index)
             return
         }
@@ -152,13 +152,13 @@ struct RemindersSettingsView: View {
         let patchText = "DEL\n\(statement)"
         guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText),
               updated != current else {
-            print("[RemindersSettings] KBPatchApplier DEL failed for: \(statement.prefix(80))")
+            BackgroundSyncLogger.logDebug("[RemindersSettings] KBPatchApplier DEL failed for: \(statement.prefix(80))")
             return
         }
 
         PromptStore.shared.rawKB = updated
         reminders.remove(at: index)
-        print("[RemindersSettings] Deleted KB reminder: \(statement.prefix(80))")
+        BackgroundSyncLogger.logDebug("[RemindersSettings] Deleted KB reminder: \(statement.prefix(80))")
     }
 
 }

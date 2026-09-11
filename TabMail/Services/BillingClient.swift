@@ -248,7 +248,7 @@ actor BillingClient {
             }
             return response
         } catch {
-            print("[RootView] Cancel deletion failed: \(error)")
+            BackgroundSyncLogger.logDebug("[RootView] Cancel deletion failed: \(error)")
             return nil
         }
     }

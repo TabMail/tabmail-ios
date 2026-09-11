@@ -96,7 +96,7 @@ enum BodyAssetMaintenance {
         BodyAssetStore.invalidateUsedBytesCachePublic()
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         let reclaimedMB = Double(startBytes - current) / 1024 / 1024
-        print("[BodyAssetMaintenance] evict(\(reason)): \(victims) messages, \(String(format: "%.1f", reclaimedMB))MB reclaimed in \(ms)ms")
+        BackgroundSyncLogger.logDebug("[BodyAssetMaintenance] evict(\(reason)): \(victims) messages, \(String(format: "%.1f", reclaimedMB))MB reclaimed in \(ms)ms")
         BackgroundSyncLogger.logBackfill("[AssetEvict] \(reason): \(victims) messages, \(String(format: "%.1f", reclaimedMB))MB reclaimed in \(ms)ms (budget=\(budget)MB)")
     }
 
@@ -123,7 +123,7 @@ enum BodyAssetMaintenance {
                     )
                 }
             } catch {
-                print("[BodyAssetMaintenance] dropMessage main-DB write failed for \(contentKey): \(error)")
+                BackgroundSyncLogger.logDebug("[BodyAssetMaintenance] dropMessage main-DB write failed for \(contentKey): \(error)")
                 return 0
             }
         }
@@ -153,7 +153,7 @@ enum BodyAssetMaintenance {
                     )
                 }
             } catch {
-                print("[BodyAssetMaintenance] wipeAll(.inlineImage) main-DB write failed: \(error)")
+                BackgroundSyncLogger.logDebug("[BodyAssetMaintenance] wipeAll(.inlineImage) main-DB write failed: \(error)")
                 return
             }
             BackgroundSyncLogger.logBackfill("[AssetEvict] wipeAll(.inlineImage): \(affected.count) messages' cached bodies dropped")
@@ -281,12 +281,12 @@ enum BodyAssetMaintenance {
                     deleted += 1
                 }
                 if recovered > 0, DebugModeManager.isLoggingEnabled() {
-                    print("[BodyAssetMaintenance] cross-DB sweep: re-keyed \(recovered) moved messages' assets, deleted \(deleted) orphans")
+                    BackgroundSyncLogger.logDebug("[BodyAssetMaintenance] cross-DB sweep: re-keyed \(recovered) moved messages' assets, deleted \(deleted) orphans")
                 }
             } catch {
                 // FAIL-SAFE: a failed read decides nothing. Deleting on an unanswered
                 // question is the one outcome with no path back for the user.
-                print("[BodyAssetMaintenance] cross-DB sweep failed: \(error)")
+                BackgroundSyncLogger.logDebug("[BodyAssetMaintenance] cross-DB sweep failed: \(error)")
             }
         }
 
