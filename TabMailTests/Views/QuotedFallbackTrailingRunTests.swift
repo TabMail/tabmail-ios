@@ -176,6 +176,22 @@ struct QuotedFallbackBoundaryHelperTests {
         #expect(boundary(lines, hasBlockquote: true) == 1)
     }
 
+    @Test("an answer followed by an INDENTED later run is an inline reply too")
+    func inlineCycleWithIndentedLaterRun() {
+        #expect(boundary(["Thanks!", "> a", "> b", "My answer here.", "  > c", "  > d"], hasBlockquote: false) == -1)
+        #expect(boundary(["Thanks!", "> a", "> b", "My answer here.", "  > c", "  > d"], hasBlockquote: true) == 1)
+        #expect(boundary(["Thanks!", "> a", "> b", "", "  > c", "  > d"] + (1...20).map { "Tail \($0)" }) == 1)
+    }
+
+    @Test("a \"-- \" line between interleaved answers does not hide the cycle (TB scans the whole remainder)")
+    func delimiterDoesNotEndTheCycleScan() {
+        // Invariant: interleaved plain-text answers are never hidden, whatever
+        // sits between them — a signature above the remaining quote included.
+        let lines = ["> q1", "> q2", "reply line one", "reply line two", "-- ", "Sig Name", "", "> q3", "> q4", "reply three"]
+        #expect(boundary(lines, hasBlockquote: false) == -1)
+        #expect(boundary(lines, hasBlockquote: true) == 0)
+    }
+
     @Test("blank-separated runs followed by a long non-quoted tail still collapse (any later run accepts, as in TB)")
     func blankSeparatedRunsThenLongTailStillCollapse() {
         let lines = ["Thanks!", "> a", "> b", "", "> c", "> d"] + (1...20).map { "Tail \($0)" }

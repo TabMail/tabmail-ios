@@ -2987,12 +2987,12 @@ enum QuotedFallbackConfig {
 /// before the end of the text or the first non-quoted "-- " signature delimiter
 /// means the ">" block is embedded content (digest excerpt, bottom-posted
 /// reply), not a trailing quote — collapsing from there would hide the message.
-/// A later ">" run ANYWHERE after the run, preceded by an answer-like line
-/// (`inlineAnswerMinLineLength` or more characters; blank lines and 1-char gaps
-/// do not count, as in TB's `detectInlineAnswersInPlainText`), means the message
-/// is an interleaved (inline) reply or a digest embedding several excerpts. A
-/// later ">" run with no answer before it is the same quote continuing and
-/// accepts the run outright (TB `multiLineCheck`), while the scan continues. With a `<blockquote>` present the run is
+/// A later ">" line accepts the run outright (TB `multiLineCheck`). An accepted
+/// run is then checked for an inline-answer cycle over the WHOLE remainder,
+/// including past any "-- " line (TB `detectInlineAnswersInPlainText`): quoted
+/// -> answer-like line (`inlineAnswerMinLineLength` or more characters; blank
+/// lines and 1-char gaps do not count) -> quoted means the message is an
+/// interleaved (inline) reply or a digest embedding several excerpts. With a `<blockquote>` present the run is
 /// ACCEPTED and the caller's blockquote-based trailing-quote logic decides,
 /// exactly as before this rule existed; with `hasBlockquote` false there is no
 /// trailing section to isolate and collapsing from the first run would hide the
@@ -3002,8 +3002,9 @@ enum QuotedFallbackConfig {
 /// stays visible (the sweep collapses everything after the boundary, as it
 /// always has).
 ///
-/// Each run is walked once and each walk is bounded by the gap to the next run,
-/// so a long ">" body stays linear (the TB addon's review measured 17 s for 32k
+/// Each rejected run is walked once and the walk is bounded by the gap to the
+/// next run; the cycle scan runs once, on the first accepted run. A long ">"
+/// body therefore stays linear (the TB addon's review measured 17 s for 32k
 /// quoted lines when every quoted line re-walked the suffix).
 ///
 /// Defined as a top-level JS string so that production (`collapseQuotesJS`)
@@ -3020,29 +3021,33 @@ function findQuotedFallbackBoundary(lines, minRun, maxTrailing, minAnswerLen, ha
         if (!ok) continue;
         var idx = q;
         while (idx < lines.length && isQuoted(lines[idx])) idx++;
+        // 1. Trailing-run acceptance (TB multiLineCheck): a later ">" line
+        //    accepts the run; a non-quoted "-- " ends the count.
         var trailing = 0;
-        var answer = false;
         var accepted = false;
-        var inlineCycle = false;
         for (; idx < lines.length; idx++) {
             var t = (lines[idx] || '').trim();
             if (!t) continue;
-            if (/^>/.test(t)) {
-                // quoted -> answer -> quoted: an interleaved reply (TB cycle check).
-                if (answer) { inlineCycle = true; break; }
-                // A later ">" run with no answer before it (blank / 1-char gaps)
-                // is the same quote continuing: the run is accepted (TB
-                // multiLineCheck) but the scan goes on looking for a cycle.
-                accepted = true;
-                continue;
-            }
+            if (/^>/.test(t)) { accepted = true; break; }
             if (/^--\\s*$/.test(t)) break;
-            if (t.length >= minAnswerLen) answer = true;
             trailing++;
         }
-        if (inlineCycle) return hasBlockquote ? q : -1;
-        if (accepted || trailing <= maxTrailing) return q;
-        q = idx - 1;
+        if (!accepted && trailing > maxTrailing) { q = idx - 1; continue; }
+        // 2. Inline-answer cycle over the WHOLE remainder (TB
+        //    detectInlineAnswersInPlainText): quoted -> answer-like line
+        //    (>= minAnswerLen chars; a "-- " line counts like any other) ->
+        //    quoted means interleaved answers. Runs once, on the accepted run.
+        var answer = false;
+        for (var j = q; j < lines.length; j++) {
+            var u = (lines[j] || '').trim();
+            if (!u) continue;
+            if (/^>/.test(u)) {
+                if (answer) return hasBlockquote ? q : -1;
+            } else if (u.length >= minAnswerLen) {
+                answer = true;
+            }
+        }
+        return q;
     }
     return -1;
 }
