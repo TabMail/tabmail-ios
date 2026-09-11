@@ -92,3 +92,14 @@ branch verified by inspection only — no Linux toolchain here; upstream CI is i
 `fix/rfc2231-extended-parameters` is now four commits ahead of upstream. The deviation to replay on
 the next resync is the WHOLE branch (or upstream's merged version once #233 lands), not the single
 commit named above; the app pin `d87295e` predates the three review fixes.
+
+## Sync executed 2026-09-11 — #233 merged, fork is a pure mirror again
+
+Upstream merged #233 as `124e3cc` (approved at PR head `5e234fd`, five review rounds in all; round 5
+was a missing `import SwiftCross` that compiled only through leaky member visibility). Fork `main`
+reset to `124e3cc`, force-pushed with lease from `d87295e`; **zero deviations** — the resync skill's
+"pure mirror" path applies again. `project.yml` `packages.SwiftMail.revision` → `124e3cc…` for app
+and NSE (PR #156 on tabmail-ios, which also carries the IOS-IMAP-016 record updates). Verified:
+resolved checkout hash, app + NSE build, 175 consumer tests in 7 EML/render suites. Pulled-in
+upstream commits beyond the fix: #234 (test-only). The 2026-09-10 fork-deviation note above is
+superseded.
