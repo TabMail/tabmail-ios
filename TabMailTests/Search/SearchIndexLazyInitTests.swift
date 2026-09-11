@@ -49,15 +49,24 @@ struct SearchIndexLazyInitTests {
         }
         try await index.updateBodies([(headerId: testHeaderId, body: "Lazy init test body content for verification")].map { (contentKey: ContentKey(rawValue: $0.headerId), body: $0.body) })
 
-        // Run test
-        defer {
-            // Always re-initialize and clean up
-            Task {
-                try? await index.initialize()
-                try? await index.removeMessages( contentKeys: [testHeaderId].map(ContentKey.init(rawValue:)))
-            }
+        // Run the test, then clean up BEFORE returning. A cleanup spawned as a
+        // detached `Task` from `defer` can outlive this test and remove the NEXT
+        // test's freshly seeded row (every test here shares `testHeaderId`), which
+        // surfaced under full-suite load as `notInFtsIndex` in the test after it.
+        do {
+            let result = try await body()
+            await cleanUp()
+            return result
+        } catch {
+            await cleanUp()
+            throw error
         }
-        return try await body()
+    }
+
+    /// Always re-initialize and remove the seeded row, awaited by the caller.
+    private func cleanUp() async {
+        try? await index.initialize()
+        try? await index.removeMessages( contentKeys: [testHeaderId].map(ContentKey.init(rawValue:)))
     }
 
     struct TestError: Error {
@@ -105,8 +114,6 @@ struct SearchIndexLazyInitTests {
     @Test("indexHeaders works after closeForNuke")
     func indexHeadersAfterNuke() async throws {
         let extraId = "test_lazy_init:INBOX:2"
-        defer { Task { try? await index.removeMessages( contentKeys: [extraId].map(ContentKey.init(rawValue:))) } }
-
         await index.closeForNuke()
 
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
@@ -117,7 +124,18 @@ struct SearchIndexLazyInitTests {
             from: "a@test.com", to: "b@test.com",
             dateMs: nowMs
         )
-        let inserted = try await index.indexHeaders([record])
+        // Remove the extra row before returning rather than from a detached `Task`,
+        // for the same reason as `withTestData`: a late `removeMessages` runs
+        // `ensureReady` and can re-open the index under the next test's
+        // `closeForNuke` / `isReady == false` check.
+        let inserted: Int
+        do {
+            inserted = try await index.indexHeaders([record])
+        } catch {
+            try? await index.removeMessages( contentKeys: [extraId].map(ContentKey.init(rawValue:)))
+            throw error
+        }
+        try? await index.removeMessages( contentKeys: [extraId].map(ContentKey.init(rawValue:)))
         #expect(inserted == 1, "indexHeaders must work after lazy init")
     }
 
