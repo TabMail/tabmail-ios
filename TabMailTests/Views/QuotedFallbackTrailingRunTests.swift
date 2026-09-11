@@ -33,6 +33,7 @@ struct QuotedFallbackBoundaryHelperTests {
             lines,
             QuotedFallbackConfig.minConsecutiveLines,
             QuotedFallbackConfig.maxTrailingLines,
+            QuotedFallbackConfig.inlineAnswerMinLineLength,
             hasBlockquote,
         ])?.toInt32() ?? -99
     }
@@ -141,14 +142,50 @@ struct QuotedFallbackBoundaryHelperTests {
         #expect(boundary(["> One", "> Two"] + (1...12).map { "Answer line \($0)" } + ["-- ", "Name", "Title"]) == -1)
     }
 
+    @Test("\">\" runs separated only by blank lines are ONE trailing quote, with or without a blockquote")
+    func blankSeparatedRunsAreOneQuote() {
+        // TB parity: the inline-answer cycle needs an answer-like line between
+        // the runs; a blank gap is just paragraph spacing inside the quote.
+        let lines = ["Thanks!", "", "> Para one a", "> Para one b", "", "> Para two a", "> Para two b"]
+        #expect(boundary(lines, hasBlockquote: false) == 2)
+        #expect(boundary(lines, hasBlockquote: true) == 2)
+    }
+
+    @Test("a 1-character gap between \">\" runs is not an answer either")
+    func oneCharGapIsNotAnAnswer() {
+        let lines = ["Thanks!", "> Para one", "> Para one b", "x", "> Para two", "> Para two b"]
+        #expect(boundary(lines, hasBlockquote: false) == 1)
+    }
+
+    @Test("a 2-character line between \">\" runs IS an answer (threshold is exact)")
+    func twoCharGapIsAnAnswer() {
+        let lines = ["Thanks!", "> Q1", "> Q1b", "ok", "> Q2", "> Q2b"]
+        #expect(boundary(lines, hasBlockquote: false) == -1)
+        #expect(boundary(lines, hasBlockquote: true) == 1)
+    }
+
     @Test("processes many short \">\" runs separated by blank lines in bounded time")
     func manyShortRunsAreBounded() {
         var lines = ["Reply."]
         for _ in 0..<16000 { lines += ["> a", "> b", ""] }
         let start = Date()
-        let result = boundary(lines, hasBlockquote: true)
+        let withBQ = boundary(lines, hasBlockquote: true)
+        let withoutBQ = boundary(lines, hasBlockquote: false)
         let elapsed = Date().timeIntervalSince(start)
-        #expect(result == 1)
+        #expect(withBQ == 1)
+        #expect(withoutBQ == 1)
+        #expect(elapsed < 4.0)
+    }
+
+    @Test("a REJECTED long run is walked once: 32k \">\" lines plus a long tail stay bounded")
+    func rejectedLongRunIsWalkedOnce() {
+        // Pins the resume-after-the-run skip: without it every line of the run
+        // re-walks to the tail (quadratic; ~10 s measured).
+        let lines = ["Reply."] + (1...32000).map { "> quoted line \($0)" } + (1...11).map { "Tail \($0)" }
+        let start = Date()
+        let result = boundary(lines, hasBlockquote: false)
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(result == -1)
         #expect(elapsed < 2.0)
     }
 
@@ -166,6 +203,7 @@ struct QuotedFallbackBoundaryHelperTests {
     func configMirrorsTB() {
         #expect(QuotedFallbackConfig.minConsecutiveLines == 2)
         #expect(QuotedFallbackConfig.maxTrailingLines == 10)
+        #expect(QuotedFallbackConfig.inlineAnswerMinLineLength == 2)
     }
 }
 
