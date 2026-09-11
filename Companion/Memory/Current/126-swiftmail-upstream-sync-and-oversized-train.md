@@ -71,3 +71,24 @@ Still required before the pin advances: upstream merge of the fix (or a fork-loc
 - Upstream PR: https://github.com/Cocoanetics/SwiftMail/pull/233 (head `TabMail:fix/rfc2231-extended-parameters`). When it merges, upstream's version of the change supersedes the deviation.
 - `project.yml` `packages.SwiftMail.revision` → `d87295e3e48b014ec7c225a68012186fddaff15a` (app and NSE share it). Resolved checkout proven by `git -C <spm>/checkouts/SwiftMail rev-parse HEAD` before and after the build. App, NSE and TabMailTests built with only the pre-existing `AutoSizingHTMLViewRevealSeedingTests` deprecation warning.
 - The old fork main `3a904d8` (our #215/#216/#219 originals) is gone from the fork; those changes live upstream as #226/#230/#228.
+
+## Upstream PR #233 review rounds (status 2026-09-10)
+
+The maintainer's automated reviewer requested changes three times, every finding on the one
+charset guard in `EMLParser.decodeExtendedBytes` (`EMLParser+RFC2231.swift`): r1 SwiftCross's
+non-Apple `.utf8` PLACEHOLDER for GBK/Big5/EUC-KR/KOI8-R/macintosh was trusted; r2 our UTF-8
+allowlist normalized less than the resolver; r3 the guard also ran on Darwin (rejecting
+CoreFoundation's `unicode-1-1-utf-8`) and a blank charset was decoded as UTF-8 against RFC 2231 §4.
+Rounds 1–3 were pushed with NO review leg of our own (MIS-045 ×5, MIS-005 ×27).
+
+Round 4, head **`9f1a2b6`** (pushed 2026-09-10, threads resolved, summary comment posted): blank
+charset ⇒ US-ASCII bytes only, else nil; the guard is compiled only under SwiftCross's exact
+platform `#if`; on non-Apple the discriminator is `label letters+digits hasPrefix("utf8")`, derived
+from SwiftCross 1.2 `StringEncoding+IANA.swift` (read in `.build/checkouts/SwiftCross`). Reviewed
+before push by a fresh-context Fable-max reviewer (Codex quota out until 2026-09-14). Non-Apple
+branch verified by inspection only — no Linux toolchain here; upstream CI is its first run.
+
+**Fork state:** fork `main` is still `d87295e` (the round-1 commit), and the PR branch
+`fix/rfc2231-extended-parameters` is now four commits ahead of upstream. The deviation to replay on
+the next resync is the WHOLE branch (or upstream's merged version once #233 lands), not the single
+commit named above; the app pin `d87295e` predates the three review fixes.
