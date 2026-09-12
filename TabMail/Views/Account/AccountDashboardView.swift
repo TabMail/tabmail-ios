@@ -18,12 +18,14 @@ struct AccountDashboardView: View {
     @State private var instanceId = String(UUID().uuidString.prefix(6))
     /// Dedup guard for the unstructured initial load (see `.task` comment).
     @State private var loadInFlight = false
-    /// Disables the Sign Out button while `TabMailAuthService.signOut()` is
-    /// awaiting its two bounded push windows (IOS-PUSH-001): the removed-account
-    /// cleanup flush, and then the release handshake that gives up this device's
-    /// worker registration and ends the session server-side. The worst case is
-    /// therefore `signOutCleanupFlushTimeoutSeconds +
-    /// signOutHandshakeTimeoutSeconds`, not the flush bound alone.
+    /// Disables the Sign Out button and shows a progress indicator on it while
+    /// `TabMailAuthService.signOut()` is awaiting its two bounded push windows
+    /// (IOS-PUSH-001): the removed-account cleanup flush, and then the release
+    /// handshake that gives up this device's worker registration and ends the
+    /// session server-side. The worst case is therefore
+    /// `signOutCleanupFlushTimeoutSeconds + signOutHandshakeTimeoutSeconds`,
+    /// not the flush bound alone — long enough that a bare disabled button
+    /// reads as frozen (issue #110), hence the indicator.
     @State private var isSigningOut = false
     @Environment(StoreKitManager.self) private var storeKit
     @Environment(\.scenePhase) private var scenePhase
@@ -263,7 +265,14 @@ struct AccountDashboardView: View {
                                 isSigningOut = false
                             }
                         } label: {
-                            Label("Sign Out of TabMail", systemImage: "rectangle.portrait.and.arrow.right")
+                            HStack(spacing: 6) {
+                                Label("Sign Out of TabMail", systemImage: "rectangle.portrait.and.arrow.right")
+                                if isSigningOut {
+                                    Spacer()
+                                    ProgressView()
+                                        .controlSize(.small)
+                                }
+                            }
                         }
                         .disabled(isSigningOut)
                         .listRowBackground(Palette.boxBg)

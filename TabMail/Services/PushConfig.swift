@@ -136,12 +136,22 @@ enum PushConfig {
     /// `DELETE /register-device`, then GoTrue `POST /auth/v1/logout?scope=local`),
     /// but two client legs are not two units of work: the release does
     /// non-trivial work on the server — removing this install's per-account
-    /// routes, and releasing the durable per-token state behind them — so 5s is
-    /// a best-effort budget that covers the warm case with headroom, not a
-    /// latency guarantee. That is acceptable because the bound fails CLOSED: it
-    /// ends the wait, never the sign-out, which is also why nothing is retried
-    /// or persisted here. The reasoning against a longer bound is the same as
-    /// for the flush above.
+    /// routes, and releasing the durable per-token state behind them — and the
+    /// bearer may first need a token refresh. 10s is a best-effort budget, not
+    /// a latency guarantee. That is acceptable because the bound fails CLOSED:
+    /// it ends the wait, never the sign-out, which is also why nothing is
+    /// retried or persisted here.
+    ///
+    /// Why 10s and not the flush's 5s (issue #110, owner decision 2026-09-03):
+    /// a sign-out a few seconds after a COLD launch competes with startup for
+    /// the network and the main actor, and at 5s the bound expired between the
+    /// two legs — the release landed and the logout was cancelled, leaving the
+    /// server-side session to expire on its own. The warm-app path finished
+    /// both legs inside 5s. Doubling the budget covers the cold case; the
+    /// dashboard shows a progress indicator on the Sign Out control for the
+    /// whole window so the longer wait reads as work in progress rather than
+    /// a frozen button. Seconds beyond that buy little for the same reason as
+    /// the flush above: a network still failing at 10s will not recover by 15s.
     ///
     /// A release that does not finish in time leaves the registration in place
     /// on the worker. On the currently deployed worker the server-side nets that
@@ -151,5 +161,5 @@ enum PushConfig {
     /// staleness sweep is NOT deployed yet — it lands with the push worker's
     /// half of this work, and once deployed it becomes the standing backstop
     /// this bound leans on.
-    static let signOutHandshakeTimeoutSeconds: TimeInterval = 5
+    static let signOutHandshakeTimeoutSeconds: TimeInterval = 10
 }
