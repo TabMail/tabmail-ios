@@ -708,8 +708,12 @@ private struct AccountMismatchBanner: View {
 /// signOutHandshakeTimeoutSeconds`, not the flush bound alone — long enough that
 /// a bare disabled button reads as frozen (issue #110). `isSigningOut` is what
 /// disables the control AND shows its progress indicator for that whole window.
-/// The sign-out call is injectable so a test can host the production button,
-/// hold the call pending, and observe the rendered control in both states.
+/// The button's action is `activate(onLocalFailure:)`, and the sign-out call
+/// is injectable, so a test can host the production button, drive the same
+/// entry point the button does, hold the call pending, and observe the
+/// rendered control in both states. (A hosted SwiftUI button publishes no
+/// accessibility element in the unit-test process, so it cannot be tapped
+/// from a test; the action lives here for that reason.)
 @Observable
 @MainActor
 final class SignOutButtonModel {
@@ -720,33 +724,39 @@ final class SignOutButtonModel {
         self.perform = perform
     }
 
-    /// Runs the sign-out once, holding `isSigningOut` for its whole duration.
-    /// Returns what the sign-out returned: `false` means the local session
-    /// could not be cleared and the caller should show its retry message.
-    func signOut() async -> Bool {
+    /// The Sign Out button's action. Starts the sign-out, holding
+    /// `isSigningOut` for its whole duration; a second activation while one
+    /// is pending is a no-op (the control is also disabled then), because a
+    /// second sign-out would race the first one's handshake for the same
+    /// session. A `false` result means the local session could not be
+    /// cleared: `onLocalFailure` runs so the caller shows its retry message,
+    /// and the control is released for the retry tap.
+    func activate(onLocalFailure: @escaping @MainActor @Sendable () -> Void) {
+        guard !isSigningOut else { return }
         isSigningOut = true
-        defer { isSigningOut = false }
-        return await perform()
+        Task {
+            defer { isSigningOut = false }
+            if !(await perform()) {
+                onLocalFailure()
+            }
+        }
     }
 }
 
 /// The dashboard's "Sign Out of TabMail" control: a destructive button that is
 /// disabled, and shows a progress indicator, while `model.isSigningOut`.
-/// Disabling is what stops a second tap from racing the first tap's handshake
-/// for the same session.
+/// Disabling, together with the model's own no-op on re-activation, is what
+/// stops a second tap from racing the first tap's handshake for the same
+/// session.
 struct SignOutButton: View {
     let model: SignOutButtonModel
     /// Called when the sign-out could not complete locally; the dashboard
     /// shows its retry message and a second tap re-runs the sign-out.
-    let onLocalFailure: () -> Void
+    let onLocalFailure: @MainActor @Sendable () -> Void
 
     var body: some View {
         Button(role: .destructive) {
-            Task {
-                if !(await model.signOut()) {
-                    onLocalFailure()
-                }
-            }
+            model.activate(onLocalFailure: onLocalFailure)
         } label: {
             SignOutButtonLabel(isSigningOut: model.isSigningOut)
         }
