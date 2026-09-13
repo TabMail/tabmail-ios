@@ -559,6 +559,34 @@ struct SignOutHandshakeTests {
         }
     }
 
+    // MARK: - The dashboard's default operation (issue #110)
+    //
+    // `SignOutButtonModel()` with no injected operation is what the dashboard
+    // constructs; its default must be the real `TabMailAuthService.signOut()`.
+    // The control tests all inject a held operation, so without this a default
+    // of `{ true }` — a control that finishes while the session stays alive —
+    // would go unnoticed. Driven through `activate`, the button's entry point.
+
+    @Test("the dashboard's default sign-out operation runs the real handshake and clears the session")
+    func defaultSignOutOperationRunsTheHandshake() async throws {
+        try await withHarness { journal, worker, _ in
+            let model = await SignOutButtonModel()
+            await MainActor.run {
+                model.activate(onLocalFailure: { journal.append("local-failure") })
+            }
+            let finished = try await waitUntil(seconds: signOutHangGuard) {
+                await MainActor.run { !model.isSigningOut }
+            }
+            #expect(finished, "the control must be released once the default operation returns")
+
+            #expect(journal.snapshot() == ["unregister-device:\(testDeviceId)", "logout"],
+                    "the default operation must run the real handshake: release, then logout (journal: \(journal.snapshot()))")
+            #expect(await worker.recordedReleasedDeviceIds() == [testDeviceId])
+            #expect(!TabMailAuthService.hasSession(), "the default operation must clear the local session")
+            #expect(!journal.snapshot().contains("local-failure"), "a successful local completion reports no failure")
+        }
+    }
+
     /// Bounded wait for a state a cancelled-but-still-running leg reaches
     /// asynchronously. Returns the final value so the caller asserts on it
     /// rather than hanging the test process.
