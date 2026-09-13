@@ -60,6 +60,12 @@ struct SignOutHandshakeTests {
         /// succeeding), which is the whole point: it is the one shape that can
         /// walk a post-bound handshake into the logout leg.
         case succeedAfterBound
+        /// Succeeds after a FIXED delay, cancellation-aware: if the bound
+        /// expires first the sleep throws and the release FAILS. Used with a
+        /// literal number of seconds — never one derived from the constant —
+        /// so a shrunken bound at the consumer turns this success into a
+        /// cancellation (issue #110).
+        case succeedAfter(seconds: TimeInterval)
     }
 
     /// What the mocked logout transport does.
@@ -67,6 +73,9 @@ struct SignOutHandshakeTests {
         case respond(statusCode: Int)
         case fail
         case hang
+        /// Responds after a FIXED, cancellation-aware delay (see
+        /// `ReleaseBehavior.succeedAfter`).
+        case respondAfter(seconds: TimeInterval, statusCode: Int)
     }
 
     /// A leg that never completes on its own. `Task.sleep` is cancellation-
@@ -132,6 +141,9 @@ struct SignOutHandshakeTests {
                     seconds: PushConfig.signOutHandshakeTimeoutSeconds + 2
                 )
                 journal.append("unregister-device-succeeded-after-bound")
+            case .succeedAfter(let seconds):
+                try await Task.sleep(for: .seconds(seconds))
+                journal.append("unregister-device-succeeded-after-\(Int(seconds))s")
             }
         }
 
@@ -194,6 +206,15 @@ struct SignOutHandshakeTests {
             case .hang:
                 try await SignOutHandshakeTests.hangUntilCancelled(journal: journal, leg: "logout")
                 let response = HTTPURLResponse(url: url, statusCode: 204, httpVersion: nil, headerFields: nil)!
+                return (Data(), response)
+            case .respondAfter(let seconds, let statusCode):
+                try await withTaskCancellationHandler {
+                    try await Task.sleep(for: .seconds(seconds))
+                } onCancel: {
+                    journal.append("logout-cancelled:session-present=\(TabMailAuthService.hasSession())")
+                }
+                journal.append("logout-responded-after-\(Int(seconds))s")
+                let response = HTTPURLResponse(url: url, statusCode: statusCode, httpVersion: nil, headerFields: nil)!
                 return (Data(), response)
             }
         }
@@ -447,6 +468,94 @@ struct SignOutHandshakeTests {
                     "the slow release must have SUCCEEDED post-bound, or the suppression below is vacuous")
             #expect(journal.logoutRequests().isEmpty,
                     "a handshake the bound already abandoned must not issue its logout afterwards")
+        }
+    }
+
+    // MARK: - Headroom inside the bound (issue #110)
+    //
+    // The bound was raised from 5 s to 10 s because a sign-out shortly after a
+    // cold launch expired it between the two legs. The tests above cannot tell
+    // a 5 s consumer from a 10 s one: immediate legs finish under either, and
+    // the hang / after-bound shapes are cancelled under either. These pin the
+    // OUTCOME the raise buys — slow-but-successful work inside the window still
+    // completes both legs — with FIXED delays that are deliberately NOT derived
+    // from the constant, so shrinking the bound at its consumer turns them red.
+    // The delays are wall-clock; 6 s leaves 4 s of slack under the 10 s bound,
+    // the same margin class the after-bound fixture already relies on.
+
+    @Test("a release that succeeds inside the raised bound still gets its logout")
+    func releaseSucceedingInsideTheBoundStillLogsOut() async throws {
+        try await withHarness(release: .succeedAfter(seconds: 6)) { journal, _, _ in
+            let signedOut = await TabMailAuthService.signOut()
+
+            #expect(signedOut)
+            #expect(journal.snapshot() == [
+                "unregister-device:\(testDeviceId)",
+                "unregister-device-succeeded-after-6s",
+                "logout",
+            ], "a release finishing at 6 s is inside the window: the logout must still follow it (journal: \(journal.snapshot()))")
+            #expect(journal.logoutRequests().count == 1)
+            #expect(!TabMailAuthService.hasSession())
+        }
+    }
+
+    @Test("a logout that responds inside the raised bound completes")
+    func logoutRespondingInsideTheBoundCompletes() async throws {
+        try await withHarness(logout: .respondAfter(seconds: 6, statusCode: 204)) { journal, _, _ in
+            let signedOut = await TabMailAuthService.signOut()
+
+            #expect(signedOut)
+            let entries = journal.snapshot()
+            #expect(entries == [
+                "unregister-device:\(testDeviceId)",
+                "logout",
+                "logout-responded-after-6s",
+            ], "a logout answering at 6 s is inside the window and must be allowed to respond, not cancelled (journal: \(entries))")
+            #expect(!TabMailAuthService.hasSession())
+        }
+    }
+
+    @Test("two slow legs that together fit inside the bound both complete")
+    func twoSlowLegsInsideTheBoundBothComplete() async throws {
+        try await withHarness(
+            release: .succeedAfter(seconds: 3),
+            logout: .respondAfter(seconds: 3, statusCode: 204)
+        ) { journal, _, _ in
+            let signedOut = await TabMailAuthService.signOut()
+
+            #expect(signedOut)
+            let entries = journal.snapshot()
+            #expect(entries == [
+                "unregister-device:\(testDeviceId)",
+                "unregister-device-succeeded-after-3s",
+                "logout",
+                "logout-responded-after-3s",
+            ], "3 s + 3 s is inside the single shared window: both legs must complete (journal: \(entries))")
+            #expect(!TabMailAuthService.hasSession())
+        }
+    }
+
+    // The window is ONE budget shared by both legs, not one per leg. Two 6 s
+    // legs exceed it: the release completes, the logout is entered, and the
+    // bound cancels it while the local session still exists.
+    @Test("the raised bound is one shared budget: two slow legs that exceed it are cut at the second")
+    func twoSlowLegsExceedingTheBoundAreCutAtTheSecond() async throws {
+        try await withHarness(
+            release: .succeedAfter(seconds: 6),
+            logout: .respondAfter(seconds: 6, statusCode: 204)
+        ) { journal, _, _ in
+            let signedOut = await TabMailAuthService.signOut()
+
+            #expect(signedOut)
+            #expect(!TabMailAuthService.hasSession())
+            let entries = journal.snapshot()
+            #expect(entries.contains("unregister-device-succeeded-after-6s"),
+                    "the first slow leg is inside the window and must complete (journal: \(entries))")
+            #expect(entries.contains("logout"), "the logout must have been entered after the release")
+            #expect(entries.contains("logout-cancelled:session-present=true"),
+                    "the second leg overruns the SHARED budget and must be cancelled before the session is cleared (journal: \(entries))")
+            #expect(!entries.contains("logout-responded-after-6s"),
+                    "the budget is not per leg: a second 6 s leg must not be allowed to finish")
         }
     }
 

@@ -265,14 +265,7 @@ struct AccountDashboardView: View {
                                 isSigningOut = false
                             }
                         } label: {
-                            HStack(spacing: 6) {
-                                Label("Sign Out of TabMail", systemImage: "rectangle.portrait.and.arrow.right")
-                                if isSigningOut {
-                                    Spacer()
-                                    ProgressView()
-                                        .controlSize(.small)
-                                }
-                            }
+                            SignOutButtonLabel(isSigningOut: isSigningOut)
                         }
                         .disabled(isSigningOut)
                         .listRowBackground(Palette.boxBg)
@@ -722,6 +715,30 @@ private struct AccountMismatchBanner: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text("We'll review your migration request and get back to you via email.")
+        }
+    }
+}
+
+// MARK: - Sign Out button label
+
+/// The Sign Out control's label: the static label plus, while sign-out is in
+/// flight, a small indeterminate progress indicator (issue #110). Sign-out can
+/// wait through two bounded push windows — the removed-account cleanup flush and
+/// the release handshake — so a merely disabled button reads as frozen; the
+/// indicator is what tells the user the wait is work. Split out as its own view
+/// so a test can host it and assert the indicator's presence in both states.
+struct SignOutButtonLabel: View {
+    let isSigningOut: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Label("Sign Out of TabMail", systemImage: "rectangle.portrait.and.arrow.right")
+            if isSigningOut {
+                Spacer()
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityIdentifier("signOut.progress")
+            }
         }
     }
 }
