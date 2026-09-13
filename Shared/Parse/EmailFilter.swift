@@ -209,40 +209,90 @@ enum EmailFilter {
 
     /// Input Unicode scalars `snippetFromPlainText` reads (and `unwrapMarkdownLinks`
     /// may match within). Scalars, not Characters: a grapheme cluster can carry
-    /// hundreds of combining marks. Comfortably above the longest real tracking URL.
-    static let snippetLinkScanChars = 4_000
+    /// hundreds of combining marks. The window must hold an image-heavy newsletter's
+    /// full run of empty-label tracking links (~180 scalars each; a 37-image mailer
+    /// measured ~6,600) — a link cut at the window edge stops matching and leaks
+    /// raw Markdown into the preview (#162). 32,000 holds ~180 such links, and
+    /// `unwrapMarkdownLinks` is linear in the window, so the cost is a few ms.
+    static let snippetLinkScanChars = 32_000
 
     /// Renders Markdown links as their bare label for SNIPPET display only (#148):
     /// `[label](destination)` → `label`, reversing the escapes `htmlToPlainText`'s
     /// `finishLink` adds (backslash-escaped punctuation, `&amp;`). The stored FTS
     /// text and the agent read path keep the full link; only the preview drops it.
-    /// The pattern IS the grammar: a link sits on one line; a backslash escapes the
-    /// next character on either side (`\]` in labels, `\)` in destinations) but
-    /// never a line break; a destination contains no whitespace (the converter
-    /// percent-encodes it). Anything else — a bare `[note]`, an unterminated
-    /// `[label](…`, `[x] (…)` — is not a link and is copied through unchanged.
-    /// An unescaped `[` cannot appear inside a label (the converter emits `\[`),
-    /// and both groups are possessive, so a run of `[` costs O(n) rather than
-    /// each opener re-scanning to the end of the window. Callers bound the INPUT
-    /// (`snippetLinkScanChars` scalars), so cost is capped.
-    private static let markdownLinkRegex = try! NSRegularExpression(
-        pattern: #"\[((?:\\.|[^\[\]\\\v])*+)\]\((?:\\.|[^)\\\s])*+\)"#)
-    private static let labelEscapeRegex = try! NSRegularExpression(pattern: #"\\(.)"#)
-
+    ///
+    /// The grammar (unchanged since the regex it replaces, whose semantics this
+    /// scanner reproduces exactly — fuzzed against it on 600,000 random strings):
+    /// a link sits on one line; a label is a run of `\x` escape pairs (`x` not a
+    /// line terminator — ICU's seven, VT and FF included) and characters other
+    /// than `[`, `]`, `\` and those same terminators, closed by `]`; `(` follows
+    /// immediately; a destination is a run
+    /// of escape pairs and characters other than `)`, `\` and whitespace, closed
+    /// by `)`. Scanning is leftmost, greedy without backtracking, and resumes
+    /// after a link; anything else — a bare `[note]`, an unterminated `[label](…`,
+    /// `[x] (…)`, a dangling `\` — is not a link and is copied through unchanged.
+    ///
+    /// LINEAR in the input by construction. Two right-to-left passes precompute,
+    /// for every position, where a label scan or a destination scan starting there
+    /// would close (or that it fails); the left-to-right pass then decides each `[`
+    /// in O(1). A regex over the same grammar is quadratic on hostile bodies —
+    /// every `[` in an unclosed run (`[](` × 10,000, or `\[` × 16,000) re-scans the
+    /// same suffix to the window's end: measured 3.5–6.8 s at 32,000 scalars on a
+    /// Mac, on the main actor (#162 review). This scanner: ~2 ms. Callers bound the
+    /// INPUT (`snippetLinkScanChars` scalars).
     static func unwrapMarkdownLinks(_ text: String) -> String {
-        let ns = text as NSString
-        var out = ""
-        var cursor = 0
-        for match in markdownLinkRegex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
-            out += ns.substring(with: NSRange(location: cursor, length: match.range.location - cursor))
-            let label = ns.substring(with: match.range(at: 1))
-            let unescaped = labelEscapeRegex.stringByReplacingMatches(
-                in: label, range: NSRange(location: 0, length: (label as NSString).length), withTemplate: "$1")
-            out += unescaped.replacingOccurrences(of: "&amp;", with: "&")
-            cursor = match.range.location + match.range.length
+        let s = Array(text.unicodeScalars)
+        let n = s.count
+        let fail = -1
+        // labelEnd[j]: index of the `]` a label scan starting at j stops on, or `fail`.
+        // destEnd[j]: index of the `)` a destination scan starting at j stops on, or `fail`.
+        var labelEnd = [Int](repeating: fail, count: n + 1)
+        var destEnd = [Int](repeating: fail, count: n + 1)
+        var j = n - 1
+        while j >= 0 {
+            let v = s[j].value
+            if v == 0x5C { // `\`: an escape pair needs a following non-line-terminator; a dangling `\` fails both scans
+                if j + 1 < n, !isVerticalWhitespaceScalar(s[j + 1].value) {
+                    labelEnd[j] = labelEnd[j + 2]
+                    destEnd[j] = destEnd[j + 2]
+                }
+            } else {
+                labelEnd[j] = v == 0x5D ? j : (v == 0x5B || isVerticalWhitespaceScalar(v)) ? fail : labelEnd[j + 1]
+                destEnd[j] = v == 0x29 ? j : s[j].properties.isWhitespace ? fail : destEnd[j + 1]
+            }
+            j -= 1
         }
-        out += ns.substring(from: cursor)
-        return out
+        var out = String.UnicodeScalarView()
+        out.reserveCapacity(n)
+        var c = 0
+        while c < n {
+            if s[c].value == 0x5B {
+                let k = labelEnd[c + 1]
+                if k != fail, k + 1 < n, s[k + 1].value == 0x28, destEnd[k + 2] != fail {
+                    // A link: emit the label with its escapes reversed, skip the destination.
+                    var label = String.UnicodeScalarView()
+                    var i = c + 1
+                    while i < k {
+                        if s[i].value == 0x5C, i + 1 < k { i += 1 }
+                        label.append(s[i])
+                        i += 1
+                    }
+                    out.append(contentsOf: String(label).replacingOccurrences(of: "&amp;", with: "&").unicodeScalars)
+                    c = destEnd[k + 2] + 1
+                    continue
+                }
+            }
+            out.append(s[c])
+            c += 1
+        }
+        return String(out)
+    }
+
+    /// ICU's line terminators — what `.` refuses and what `\v` matches: LF, VT, FF,
+    /// CR, NEL, LINE SEPARATOR, PARAGRAPH SEPARATOR. One set serves both the
+    /// "an escape never spans a line" rule and the "a label never spans a line" rule.
+    private static func isVerticalWhitespaceScalar(_ v: UInt32) -> Bool {
+        v == 0x0A || v == 0x0B || v == 0x0C || v == 0x0D || v == 0x85 || v == 0x2028 || v == 0x2029
     }
 
     /// Extract plain text from a fetched message body for FTS indexing.

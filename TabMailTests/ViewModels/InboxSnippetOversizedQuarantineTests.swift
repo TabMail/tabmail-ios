@@ -147,6 +147,40 @@ struct InboxSnippetOversizedQuarantineTests {
                 "a derived placeholder snippet is final — the loader must not spend a body fetch on it")
     }
 
+    /// #162: tier 1 derives the preview from the FTS text with the same helper the
+    /// body-fetch writer uses. An image-heavy newsletter's text is a longer run of
+    /// empty-label links than the old scan window held, so the tier-1 snippet was the
+    /// raw link cut at the window edge — and, being non-empty, it was written durably
+    /// and never re-derived. The invariant: the durable snippet is the first sentence.
+    @Test("Tier 1 derives an image-heavy newsletter's preview as its first sentence, never a cut link")
+    @MainActor
+    func tierOneNewsletterSnippetIsTheFirstSentence() async throws {
+        let (_, cleanId, folder, restore) = try makeSwappedDB()
+        defer { restore() }
+
+        let key = ContentKey(rawValue: cleanId)
+        _ = try await SearchIndex.shared.indexHeaders([FTSHeaderRecord(contentKey: key, headerId: cleanId,
+            messageId: "9002", subject: "Clearance", from: "sender@example.com",
+            to: "recipient@example.com", dateMs: Int64(Date().timeIntervalSince1970 * 1000))])
+        let imageLink = "[](https://click.example.com/u/?qs=" + String(repeating: "A", count: 140) + ")"
+        let text = Array(repeating: imageLink, count: 37).joined(separator: "\n") + "\nHidden gems just landed."
+        #expect(text.unicodeScalars.count > 6_000)
+        try await SearchIndex.shared.updateBody(contentKey: key, body: text)
+
+        let provider = MockEmailProvider()
+        await TestProviderRegistry.withRegisteredProvider(accountId: "acc1", provider: provider) {
+            let vm = InboxViewModel(folders: [folder])
+            _ = await vm.runSnippetBatchForTesting([cleanId])
+        }
+        let calls = await provider.callLog.filter { $0.hasPrefix("fetchMessage(") }
+        #expect(!calls.contains { $0.contains("id:9002") }, "tier 1 satisfied the row; no body fetch")
+        let stored = try #require(try await AppDatabase.dbPool.read { db in
+            try MessageHeader.fetchOne(db, key: cleanId)
+        })
+        #expect(stored.snippet == "Hidden gems just landed.")
+        try await SearchIndex.shared.removeMessages(contentKeys: [key])
+    }
+
     /// The eviction fail-safe, at this initiator too. `BodyAssetMaintenance` deletes the
     /// `messageBody` row while leaving `bodyComplete = 1`; a gate keyed on the flag alone
     /// would refuse to re-fetch a message this build has already fetched successfully.
