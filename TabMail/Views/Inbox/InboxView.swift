@@ -80,6 +80,28 @@ enum InboxErrorBanner {
     }
 }
 
+/// Copy for the non-blocking notice shown when a user-initiated Drafts deletion
+/// is refused (#147). The refusal itself is unchanged: `InboxViewModel.delete` /
+/// `deleteThread` fail closed and the view un-hides the row. Before this notice
+/// the row simply reappeared with no explanation.
+///
+/// Pure so the decision is testable without constructing `InboxView`: one
+/// gesture yields at most ONE notice regardless of how many members were
+/// refused, and a refusal outside the Drafts list (no trash folder, lookup
+/// miss) yields none — those paths keep their existing silent un-hide.
+enum DraftDeleteRefusalNotice {
+    /// Plain-language, no identifiers: the draft is still where it was.
+    static let message = "Draft wasn't deleted. It's still in Drafts."
+    /// Brief and self-dismissing; shorter than the agent toast because there is
+    /// nothing to tap through to.
+    static let displayDuration: Duration = .seconds(4)
+
+    static func text(refusedCount: Int, isDraftsContext: Bool) -> String? {
+        guard isDraftsContext, refusedCount > 0 else { return nil }
+        return message
+    }
+}
+
 /// Keeps the already-large InboxView modifier chain below Swift's type-check
 /// limit while applying committed primary-key changes to view-owned bindings.
 /// The model observes the same notification directly for its loaded/pending
@@ -350,6 +372,11 @@ struct InboxView: View {
     @State private var showFilterBar = false
     @State private var agentToast: AgentToastPayload?
     @State private var agentToastDismiss: Task<Void, Never>?
+    /// Non-blocking "draft wasn't deleted" notice (#147). Own state rather than
+    /// `agentToast` because tapping the agent toast deep-links into chat; this one
+    /// only dismisses.
+    @State private var draftRefusalNotice: String?
+    @State private var draftRefusalNoticeDismiss: Task<Void, Never>?
     @State private var agentDraftIdToOpen: String?
     @State private var showAgentDraft = false
     /// Drafts-folder tap target. Setting this presents ComposeView as a
@@ -612,27 +639,23 @@ struct InboxView: View {
                     dismissAgentToast()
                     handleAgentToastTap(payload)
                 } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "wand.and.stars")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundStyle(.primary)
-                        Text(toast.text)
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.85))
-                            .lineLimit(1)
-                        Image(systemName: "xmark")
-                            .font(.caption2)
-                            .foregroundStyle(.white.opacity(0.5))
-                    }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 7)
-                    .background(
-                        Capsule()
-                            .fill(Color(hex: 0x323232))
-                            .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
-                    )
+                    InboxNoticeCapsule(icon: "wand.and.stars", text: toast.text)
                 }
                 .buttonStyle(.plain)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .ignoresSafeArea(.container, edges: .bottom)
+                .padding(.bottom, -12)
+            }
+            // Refused Drafts deletion notice (#147) — same presentation as the
+            // agent toast; tapping only dismisses.
+            if let notice = draftRefusalNotice {
+                Button {
+                    dismissDraftRefusalNotice()
+                } label: {
+                    InboxNoticeCapsule(icon: "exclamationmark.circle", text: notice)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("draft-delete-refused-notice")
                 .transition(.move(edge: .bottom).combined(with: .opacity))
                 .ignoresSafeArea(.container, edges: .bottom)
                 .padding(.bottom, -12)
@@ -1079,6 +1102,31 @@ struct InboxView: View {
         agentToastDismiss = nil
         withAnimation(.easeOut(duration: 0.25)) {
             agentToast = nil
+        }
+    }
+
+    /// One call per refused GESTURE — callers pass the whole refused set, and
+    /// `DraftDeleteRefusalNotice.text` collapses it to a single notice. Re-showing
+    /// on a second refusal restarts the auto-dismiss timer.
+    private func showDraftRefusalNoticeIfNeeded(refusedCount: Int) {
+        guard let text = DraftDeleteRefusalNotice.text(
+            refusedCount: refusedCount, isDraftsContext: isDraftsContext) else { return }
+        draftRefusalNoticeDismiss?.cancel()
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            draftRefusalNotice = text
+        }
+        draftRefusalNoticeDismiss = Task {
+            try? await Task.sleep(for: DraftDeleteRefusalNotice.displayDuration)
+            guard !Task.isCancelled else { return }
+            dismissDraftRefusalNotice()
+        }
+    }
+
+    private func dismissDraftRefusalNotice() {
+        draftRefusalNoticeDismiss?.cancel()
+        draftRefusalNoticeDismiss = nil
+        withAnimation(.easeOut(duration: 0.25)) {
+            draftRefusalNotice = nil
         }
     }
 
@@ -1663,6 +1711,7 @@ struct InboxView: View {
                 BackgroundSyncLogger.logInbox(
                     "[RoleActionTrace] view action=delete surface=tap phase=unhidden "
                         + "id=\(snapshot.id) reason=admissionRefused")
+                showDraftRefusalNoticeIfNeeded(refusedCount: 1)
             }
         }
     }
@@ -1793,6 +1842,7 @@ struct InboxView: View {
                 withAnimation(.easeOut(duration: 0.35)) {
                     dismissedMessages.subtract(skipped)
                 }
+                showDraftRefusalNoticeIfNeeded(refusedCount: skipped.count)
             }
         }
     }
@@ -1856,6 +1906,7 @@ struct InboxView: View {
                     dismissedMessages.subtract(skipped)
                     swipeFadingMessages.subtract(skipped)
                 }
+                showDraftRefusalNoticeIfNeeded(refusedCount: skipped.count)
             }
             viewModel.endInteraction()
         }
@@ -1937,6 +1988,7 @@ struct InboxView: View {
                 BackgroundSyncLogger.logInbox(
                     "[RoleActionTrace] view action=delete surface=swipe phase=unhidden "
                         + "id=\(snapshot.id) reason=admissionRefused")
+                showDraftRefusalNoticeIfNeeded(refusedCount: 1)
             }
             viewModel.endInteraction()
         }
@@ -2112,6 +2164,36 @@ private extension View {
         } else {
             self
         }
+    }
+}
+
+/// The bottom capsule shared by the agent completion toast and the refused
+/// Drafts-deletion notice (#147). Extracted verbatim from the agent toast label
+/// so both notices render identically.
+struct InboxNoticeCapsule: View {
+    let icon: String
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(.primary)
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.85))
+                .lineLimit(1)
+            Image(systemName: "xmark")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.5))
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 7)
+        .background(
+            Capsule()
+                .fill(Color(hex: 0x323232))
+                .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
+        )
     }
 }
 
