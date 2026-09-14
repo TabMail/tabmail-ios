@@ -1839,3 +1839,86 @@ struct CalendarToolHelpersAmPmCueTests {
         #expect(endLine == "end_iso: \(Self.dayKey())T18:00:00")
     }
 }
+
+
+// MARK: - All-day day-key frame tests (#166)
+
+@Suite("CalendarToolHelpers grouped summary all-day day key")
+struct CalendarToolHelpersAllDayDayKeyTests {
+    /// A display zone far west of any plausible device zone, so device-local
+    /// midnight of the date is still the PREVIOUS evening there.
+    private static let farWest = TimeZone(identifier: "Etc/GMT+12")!
+
+    private static func dayDigits(offset: Int) -> String {
+        let day = Calendar(identifier: .gregorian).date(byAdding: .day, value: offset, to: Date())!
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = .current
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.string(from: day)
+    }
+
+    private static func allDay(id: String, title: String, day: String) -> GCalEvent {
+        GCalEvent(
+            id: id, summary: title, location: nil, description: nil,
+            start: GCalDateTime(dateTime: nil, date: day, timeZone: nil),
+            end: GCalDateTime(dateTime: nil, date: day, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: nil, transparency: nil,
+            status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+    }
+
+    @Test("Precondition: the display zone re-keys device-local midnight onto the previous day")
+    func precondition() {
+        let day = Self.dayDigits(offset: 7)
+        let event = Self.allDay(id: "pre", title: "x", day: day)
+        let shifted = EKEventStoreHelper.dayKey(event.startDate!, timeZone: Self.farWest)
+        #expect(shifted != day)
+    }
+
+    @Test("All-day row is grouped under its own calendar date in a western display zone")
+    func allDayKeyedByOwnDate() {
+        let day = Self.dayDigits(offset: 7)
+        let event = Self.allDay(id: "ad", title: "Holiday", day: day)
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [event], timeZone: Self.farWest)
+        let expectedHeader = EKEventStoreHelper.prettyDate(CalendarToolHelpers.allDayAnchor(day, timeZone: Self.farWest)!, timeZone: Self.farWest)
+        let prevDay = Self.dayDigits(offset: 6)
+        let prevHeader = EKEventStoreHelper.prettyDate(CalendarToolHelpers.allDayAnchor(prevDay, timeZone: Self.farWest)!, timeZone: Self.farWest)
+        #expect(output.contains("date: \(expectedHeader)"))
+        #expect(!output.contains("date: \(prevHeader)"))
+        #expect(output.contains("All day: Holiday\tevent_id: ad"))
+    }
+
+    @Test("All-day and timed rows on the same date share one header and the all-day row sorts first")
+    func allDaySortsFirstWithinItsDay() {
+        let day = Self.dayDigits(offset: 7)
+        let allDay = Self.allDay(id: "ad", title: "Holiday", day: day)
+        let timed = GCalEvent(
+            id: "t", summary: "Sync", location: nil, description: nil,
+            start: GCalDateTime(dateTime: "\(day)T10:00:00-12:00", date: nil, timeZone: nil),
+            end: GCalDateTime(dateTime: "\(day)T11:00:00-12:00", date: nil, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: nil, transparency: nil,
+            status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [timed, allDay], timeZone: Self.farWest)
+        #expect(output.components(separatedBy: "date:").count - 1 == 1)
+        let allDayIdx = output.range(of: "All day: Holiday")!.lowerBound
+        let timedIdx = output.range(of: ": Sync")!.lowerBound
+        #expect(allDayIdx < timedIdx)
+    }
+
+    @Test("Timed rows keep the display-zone day key")
+    func timedRowsUnchanged() {
+        let day = Self.dayDigits(offset: 7)
+        let timed = GCalEvent(
+            id: "t", summary: "Sync", location: nil, description: nil,
+            start: GCalDateTime(dateTime: "\(day)T10:00:00-12:00", date: nil, timeZone: nil),
+            end: GCalDateTime(dateTime: "\(day)T11:00:00-12:00", date: nil, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: nil, transparency: nil,
+            status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [timed], timeZone: Self.farWest)
+        let expectedHeader = EKEventStoreHelper.prettyDate(CalendarToolHelpers.allDayAnchor(day, timeZone: Self.farWest)!, timeZone: Self.farWest)
+        #expect(output.contains("date: \(expectedHeader)"))
+    }
+}

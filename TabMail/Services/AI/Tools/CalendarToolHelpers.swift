@@ -296,7 +296,16 @@ enum CalendarToolHelpers {
 
         for entry in events {
             guard let start = entry.event.startDate else { continue }
-            let dk = EKEventStoreHelper.dayKey(start, timeZone: tz)
+            // An all-day DATE is frame-free (#166): key and label its day from the
+            // provider's own digits. `startDate` parses `start.date` as DEVICE-local
+            // midnight, and re-keying that instant in a display zone west of the
+            // device lands the row under the previous day's header — the same
+            // defect `formatDetailedEvent` closed with `allDayNaiveISO`.
+            let allDayDigits: String? = entry.event.isAllDay
+                ? entry.event.start?.date.map { String($0.prefix(10)) }
+                : nil
+            let dk = allDayDigits ?? EKEventStoreHelper.dayKey(start, timeZone: tz)
+            let headerAnchor = allDayDigits.flatMap { Self.allDayAnchor($0, timeZone: tz) } ?? start
 
             let isFreeBusy = (entry.accessRole == Self.freeBusyAccessRole)
             // Suppress recur/free marks on freeBusy rows: the title is already
@@ -355,9 +364,9 @@ enum CalendarToolHelpers {
 
             let dayEntry = DayEntry(
                 dayKey: dk,
-                prettyDate: EKEventStoreHelper.prettyDate(start, timeZone: tz),
+                prettyDate: EKEventStoreHelper.prettyDate(headerAnchor, timeZone: tz),
                 line: line,
-                sortDate: start
+                sortDate: headerAnchor
             )
             dayGroups[dk, default: []].append(dayEntry)
 
@@ -412,6 +421,17 @@ enum CalendarToolHelpers {
         fmt.dateFormat = "HH:mm"
         fmt.timeZone = timeZone
         return "\(fmt.string(from: date)) (\(twelveHourCue(date, timeZone: timeZone)))"
+    }
+
+    /// Midnight of a provider `yyyy-MM-dd` all-day date **in the display zone**,
+    /// so the day header and sort position follow the date's own digits rather
+    /// than the device-local instant `GCalEvent.startDate` produces.
+    static func allDayAnchor(_ dayDigits: String, timeZone: TimeZone) -> Date? {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = timeZone
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.date(from: dayDigits)
     }
 
     /// Legacy overload for callers that don't yet have account/calendar context.
