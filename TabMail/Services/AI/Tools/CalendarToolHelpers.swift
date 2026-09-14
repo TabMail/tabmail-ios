@@ -304,7 +304,6 @@ enum CalendarToolHelpers {
             let allDayDigits: String? = entry.event.isAllDay
                 ? entry.event.start?.date.map { String($0.prefix(10)) }
                 : nil
-            let dk = allDayDigits ?? EKEventStoreHelper.dayKey(start, timeZone: tz)
             let headerAnchor: Date
             if let digits = allDayDigits {
                 // Fail closed on digits the anchor cannot place: falling back to
@@ -315,6 +314,11 @@ enum CalendarToolHelpers {
             } else {
                 headerAnchor = start
             }
+            // One key encoding for every row: the anchor already sits on the
+            // all-day date in the display zone, so it goes through the same
+            // formatter as timed rows (raw provider digits would not match a
+            // locale that formats with non-ASCII numerals).
+            let dk = EKEventStoreHelper.dayKey(headerAnchor, timeZone: tz)
 
             let isFreeBusy = (entry.accessRole == Self.freeBusyAccessRole)
             // Suppress recur/free marks on freeBusy rows: the title is already
@@ -443,7 +447,12 @@ enum CalendarToolHelpers {
         guard parts.count == 3 else { return nil }
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = timeZone
-        return cal.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))
+        guard let anchor = cal.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2])) else { return nil }
+        // A zone that skipped the whole civil date (Samoa, 2011-12-30) yields
+        // the next day here; that is not this date, so there is no anchor.
+        let back = cal.dateComponents([.year, .month, .day], from: anchor)
+        guard back.year == parts[0], back.month == parts[1], back.day == parts[2] else { return nil }
+        return anchor
     }
 
     /// Legacy overload for callers that don't yet have account/calendar context.

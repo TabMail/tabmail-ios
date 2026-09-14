@@ -1879,13 +1879,11 @@ struct CalendarToolHelpersAllDayDayKeyTests {
         )
     }
 
-    @Test("Precondition: the display zone re-keys device-local midnight onto the previous day")
-    func precondition() {
-        let day = Self.dayDigits(offset: 7)
-        let event = Self.allDay(id: "pre", title: "x", day: day)
-        let shifted = EKEventStoreHelper.dayKey(event.startDate!, timeZone: Self.farWest)
-        #expect(shifted != day)
-    }
+    // Host note: `GCalEvent.startDate` parses an all-day date as DEVICE-local
+    // midnight, so which of these fixtures also fail on the pre-fix code depends
+    // on the host zone (the western cases on any device east of Etc/GMT+12, the
+    // eastern ordering case on any device west of Pacific/Kiritimati). The
+    // rendering assertions themselves hold on every host.
 
     @Test("All-day row is grouped under its own calendar date in a western display zone")
     func allDayKeyedByOwnDate() {
@@ -1913,9 +1911,18 @@ struct CalendarToolHelpersAllDayDayKeyTests {
         )
         let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [timed, allDay], timeZone: Self.farWest)
         #expect(output.components(separatedBy: "date:").count - 1 == 1)
-        let allDayIdx = output.range(of: "All day: Holiday")!.lowerBound
-        let timedIdx = output.range(of: ": Sync")!.lowerBound
-        #expect(allDayIdx < timedIdx)
+        Self.expectAllDayFirst(output)
+    }
+
+    /// Both rows present, all-day first; a missing row records a failure
+    /// instead of trapping the test process.
+    private static func expectAllDayFirst(_ output: String, allDay: String = "All day: Holiday", timed: String = ": Sync") {
+        let allDayRange = output.range(of: allDay)
+        let timedRange = output.range(of: timed)
+        #expect(allDayRange != nil)
+        #expect(timedRange != nil)
+        guard let allDayRange, let timedRange else { return }
+        #expect(allDayRange.lowerBound < timedRange.lowerBound)
     }
 
     @Test("Timed rows keep the display-zone day key")
@@ -1963,16 +1970,36 @@ struct CalendarToolHelpersAllDayDayKeyTests {
         let day = Self.dayDigits(offset: 7)
         let allDay = Self.allDay(id: "ad", title: "Holiday", day: day)
         let timed = Self.timed(id: "t", title: "Sync", start: "\(day)T10:00:00+14:00", end: "\(day)T11:00:00+14:00")
-        #expect(allDay.startDate! > timed.startDate!)
         let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [timed, allDay], timeZone: farEast)
         #expect(output.components(separatedBy: "date:").count - 1 == 1)
         #expect(output.contains("date: \(Self.headerFor(day: day, in: farEast))"))
-        let allDayRange = output.range(of: "All day: Holiday")
-        let timedRange = output.range(of: ": Sync")
-        #expect(allDayRange != nil)
-        #expect(timedRange != nil)
-        guard let allDayRange, let timedRange else { return }
-        #expect(allDayRange.lowerBound < timedRange.lowerBound)
+        Self.expectAllDayFirst(output)
+    }
+
+    @Test("An appointment right after the first instant of the day still sorts after the all-day row")
+    func allDayPrecedesEarliestAppointment() {
+        let day = Self.dayDigits(offset: 7)
+        let allDay = Self.allDay(id: "ad", title: "Holiday", day: day)
+        let timed = Self.timed(id: "t", title: "Sync", start: "\(day)T00:30:00-12:00", end: "\(day)T01:00:00-12:00")
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [timed, allDay], timeZone: Self.farWest)
+        #expect(output.components(separatedBy: "date:").count - 1 == 1)
+        Self.expectAllDayFirst(output)
+    }
+
+    @Test("A zone that skipped the whole civil date has no anchor for it, and the row is omitted rather than relabelled")
+    func skippedCivilDateHasNoAnchor() {
+        // Samoa jumped from 2011-12-29 straight to 2011-12-31 (historical fixture: the
+        // date is fixed by the zone's own rules, not by today's clock).
+        let apia = TimeZone(identifier: "Pacific/Apia")!
+        #expect(CalendarToolHelpers.allDayAnchor("2011-12-30", timeZone: apia) == nil)
+        #expect(CalendarToolHelpers.allDayAnchor("2011-12-31", timeZone: apia) != nil)
+        let skipped = Self.allDay(id: "ad", title: "Holiday", day: "2011-12-30")
+        let timed = Self.timed(id: "t", title: "Sync", start: "2011-12-31T10:00:00+14:00", end: "2011-12-31T11:00:00+14:00")
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [skipped, timed], timeZone: apia)
+        #expect(!output.contains("Holiday"))
+        #expect(output.contains(": Sync"))
+        #expect(output.components(separatedBy: "date:").count - 1 == 1)
+        #expect(output.contains("date: \(Self.headerFor(day: "2011-12-31", in: apia))"))
     }
 
     /// The next date, within about a year, on which one of these zones springs
@@ -2017,15 +2044,18 @@ struct CalendarToolHelpersAllDayDayKeyTests {
         let allDay = Self.allDay(id: "ad", title: "Holiday", day: gap.day)
         // A meeting mid-morning of the same date, expressed in the zone's
         // post-transition offset via the zone itself.
-        let tenAm = cal.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2], hour: 10))!
+        // A meeting thirty minutes after the day's first instant (01:00 on a
+        // gap day), so an anchor later than the first instant would sort after it.
+        // Derived from the Calendar, not from the anchor under test.
+        let early = cal.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))!.addingTimeInterval(1800)
         let iso = ISO8601DateFormatter()
-        let timed = Self.timed(id: "t", title: "Sync", start: iso.string(from: tenAm), end: iso.string(from: tenAm.addingTimeInterval(3600)))
+        let timed = Self.timed(id: "t", title: "Sync", start: iso.string(from: early), end: iso.string(from: early.addingTimeInterval(3600)))
         let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [timed, allDay], timeZone: gap.zone)
         let prevDay = Self.dayDigits(offset: -1, from: gap.day)
         #expect(output.contains("date: \(Self.headerFor(day: gap.day, in: gap.zone))"))
         #expect(!output.contains("date: \(Self.headerFor(day: prevDay, in: gap.zone))"))
         #expect(output.components(separatedBy: "date:").count - 1 == 1)
         #expect(output.contains("All day: Holiday\tevent_id: ad"))
-        #expect(output.contains(": Sync"))
+        Self.expectAllDayFirst(output)
     }
 }
