@@ -295,8 +295,32 @@ enum CalendarToolHelpers {
         var seenDays = Set<String>()
 
         for entry in events {
-            guard let start = entry.event.startDate else { continue }
-            let dk = EKEventStoreHelper.dayKey(start, timeZone: tz)
+            // An all-day DATE is frame-free (#166): key and label its day from the
+            // provider's own digits, never from `startDate`. That accessor parses
+            // `start.date` as DEVICE-local midnight, which (a) re-keyed in a display
+            // zone west of the device lands the row under the previous day's header
+            // — the same defect `formatDetailedEvent` closed with `allDayNaiveISO` —
+            // and (b) does not exist at all when the DEVICE zone has no midnight on
+            // that date, so an all-day row must not be gated on it.
+            let allDayDigits: String? = entry.event.isAllDay
+                ? entry.event.start?.date.map { String($0.prefix(10)) }
+                : nil
+            let headerAnchor: Date
+            if let digits = allDayDigits {
+                // Fail closed on digits the anchor cannot place: falling back to
+                // the device instant would hand the group a previous-day header
+                // and mislabel every timed row sharing it.
+                guard let anchor = Self.allDayAnchor(digits, timeZone: tz) else { continue }
+                headerAnchor = anchor
+            } else {
+                guard let start = entry.event.startDate else { continue }
+                headerAnchor = start
+            }
+            // One key encoding for every row: the anchor already sits on the
+            // all-day date in the display zone, so it goes through the same
+            // formatter as timed rows (raw provider digits would not match a
+            // locale that formats with non-ASCII numerals).
+            let dk = EKEventStoreHelper.dayKey(headerAnchor, timeZone: tz)
 
             let isFreeBusy = (entry.accessRole == Self.freeBusyAccessRole)
             // Suppress recur/free marks on freeBusy rows: the title is already
@@ -336,9 +360,9 @@ enum CalendarToolHelpers {
             if entry.event.isAllDay {
                 timeRange = "All day"
             } else if let endDate = entry.event.endDate {
-                timeRange = "\(Self.formatHourWithCue(start, timeZone: tz)) - \(Self.formatHourWithCue(endDate, timeZone: tz))"
+                timeRange = "\(Self.formatHourWithCue(headerAnchor, timeZone: tz)) - \(Self.formatHourWithCue(endDate, timeZone: tz))"
             } else {
-                timeRange = EKEventStoreHelper.toNaiveISO(start, timeZone: tz)
+                timeRange = EKEventStoreHelper.toNaiveISO(headerAnchor, timeZone: tz)
             }
 
             let title: String
@@ -355,9 +379,9 @@ enum CalendarToolHelpers {
 
             let dayEntry = DayEntry(
                 dayKey: dk,
-                prettyDate: EKEventStoreHelper.prettyDate(start, timeZone: tz),
+                prettyDate: EKEventStoreHelper.prettyDate(headerAnchor, timeZone: tz),
                 line: line,
-                sortDate: start
+                sortDate: headerAnchor
             )
             dayGroups[dk, default: []].append(dayEntry)
 
@@ -412,6 +436,25 @@ enum CalendarToolHelpers {
         fmt.dateFormat = "HH:mm"
         fmt.timeZone = timeZone
         return "\(fmt.string(from: date)) (\(twelveHourCue(date, timeZone: timeZone)))"
+    }
+
+    /// The first instant of a provider `yyyy-MM-dd` all-day date **in the
+    /// display zone**, so the day header and sort position follow the date's
+    /// own digits rather than the device-local instant `GCalEvent.startDate`
+    /// produces. Built from calendar components, not parsed as "00:00:00":
+    /// zones that spring forward AT midnight (Havana, Santiago, Asunción…) have
+    /// no midnight on the transition day and a wall-clock parse returns nil.
+    static func allDayAnchor(_ dayDigits: String, timeZone: TimeZone) -> Date? {
+        let parts = dayDigits.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        guard let anchor = cal.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2])) else { return nil }
+        // A zone that skipped the whole civil date (Samoa, 2011-12-30) yields
+        // the next day here; that is not this date, so there is no anchor.
+        let back = cal.dateComponents([.year, .month, .day], from: anchor)
+        guard back.year == parts[0], back.month == parts[1], back.day == parts[2] else { return nil }
+        return anchor
     }
 
     /// Legacy overload for callers that don't yet have account/calendar context.

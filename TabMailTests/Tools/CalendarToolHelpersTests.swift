@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import GRDB
 @testable import TabMail
 
 @Suite("CalendarToolHelpers Argument Parsing")
@@ -1837,5 +1838,424 @@ struct CalendarToolHelpersAmPmCueTests {
         // Both fields must be present AND exactly naive ISO — no cue text on either.
         #expect(startLine == "start_iso: \(Self.dayKey())T17:00:00")
         #expect(endLine == "end_iso: \(Self.dayKey())T18:00:00")
+    }
+}
+
+
+// MARK: - All-day day-key frame tests (#166)
+
+@Suite("CalendarToolHelpers grouped summary all-day day key")
+struct CalendarToolHelpersAllDayDayKeyTests {
+    /// A display zone far west of any plausible device zone, so device-local
+    /// midnight of the date is still the PREVIOUS evening there.
+    fileprivate static let farWest = TimeZone(identifier: "Etc/GMT+12")!
+
+    fileprivate static func dayDigits(offset: Int) -> String {
+        let day = Calendar(identifier: .gregorian).date(byAdding: .day, value: offset, to: Date())!
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = .current
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.string(from: day)
+    }
+
+    /// Calendar-date arithmetic on digits alone (no zone, no instant).
+    fileprivate static func dayDigits(offset: Int, from day: String) -> String {
+        let parts = day.split(separator: "-").map { Int($0)! }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let base = cal.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))!
+        let moved = cal.date(byAdding: .day, value: offset, to: base)!
+        let c = cal.dateComponents([.year, .month, .day], from: moved)
+        return String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!)
+    }
+
+    private static func allDay(id: String, title: String, day: String) -> GCalEvent {
+        GCalEvent(
+            id: id, summary: title, location: nil, description: nil,
+            start: GCalDateTime(dateTime: nil, date: day, timeZone: nil),
+            end: GCalDateTime(dateTime: nil, date: day, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: nil, transparency: nil,
+            status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+    }
+
+    // Host note: `GCalEvent.startDate` parses an all-day date as DEVICE-local
+    // midnight, so which of these fixtures also fail on the pre-fix code depends
+    // on the host zone (the western cases on any device east of Etc/GMT+12, the
+    // eastern ordering case on any device west of Pacific/Kiritimati). The
+    // rendering assertions themselves hold on every host.
+
+    @Test("All-day row is grouped under its own calendar date in a western display zone")
+    func allDayKeyedByOwnDate() {
+        let day = Self.dayDigits(offset: 7)
+        let event = Self.allDay(id: "ad", title: "Holiday", day: day)
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [event], timeZone: Self.farWest)
+        let expectedHeader = Self.headerFor(day: day, in: Self.farWest)
+        let prevDay = Self.dayDigits(offset: 6)
+        let prevHeader = Self.headerFor(day: prevDay, in: Self.farWest)
+        #expect(output.contains("date: \(expectedHeader)"))
+        #expect(!output.contains("date: \(prevHeader)"))
+        #expect(output.contains("All day: Holiday\tevent_id: ad"))
+    }
+
+    @Test("All-day and timed rows on the same date share one header and the all-day row sorts first")
+    func allDaySortsFirstWithinItsDay() {
+        let day = Self.dayDigits(offset: 7)
+        let allDay = Self.allDay(id: "ad", title: "Holiday", day: day)
+        let timed = GCalEvent(
+            id: "t", summary: "Sync", location: nil, description: nil,
+            start: GCalDateTime(dateTime: "\(day)T10:00:00-12:00", date: nil, timeZone: nil),
+            end: GCalDateTime(dateTime: "\(day)T11:00:00-12:00", date: nil, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: nil, transparency: nil,
+            status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [timed, allDay], timeZone: Self.farWest)
+        #expect(output.components(separatedBy: "date:").count - 1 == 1)
+        Self.expectAllDayFirst(output)
+    }
+
+    /// Both rows present, all-day first; a missing row records a failure
+    /// instead of trapping the test process.
+    private static func expectAllDayFirst(_ output: String, allDay: String = "All day: Holiday", timed: String = ": Sync") {
+        let allDayRange = output.range(of: allDay)
+        let timedRange = output.range(of: timed)
+        #expect(allDayRange != nil)
+        #expect(timedRange != nil)
+        guard let allDayRange, let timedRange else { return }
+        #expect(allDayRange.lowerBound < timedRange.lowerBound)
+    }
+
+    @Test("Timed rows keep the display-zone day key")
+    func timedRowsUnchanged() {
+        let day = Self.dayDigits(offset: 7)
+        let timed = GCalEvent(
+            id: "t", summary: "Sync", location: nil, description: nil,
+            start: GCalDateTime(dateTime: "\(day)T10:00:00-12:00", date: nil, timeZone: nil),
+            end: GCalDateTime(dateTime: "\(day)T11:00:00-12:00", date: nil, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: nil, transparency: nil,
+            status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [timed], timeZone: Self.farWest)
+        let expectedHeader = Self.headerFor(day: day, in: Self.farWest)
+        #expect(output.contains("date: \(expectedHeader)"))
+    }
+
+    /// Header text for a calendar date derived WITHOUT the anchor under test:
+    /// noon of that date in the display zone always exists.
+    fileprivate static func headerFor(day: String, in tz: TimeZone) -> String {
+        let parts = day.split(separator: "-").map { Int($0)! }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
+        let noon = cal.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2], hour: 12))!
+        return EKEventStoreHelper.prettyDate(noon, timeZone: tz)
+    }
+
+    private static func timed(id: String, title: String, start: String, end: String) -> GCalEvent {
+        GCalEvent(
+            id: id, summary: title, location: nil, description: nil,
+            start: GCalDateTime(dateTime: start, date: nil, timeZone: nil),
+            end: GCalDateTime(dateTime: end, date: nil, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: nil, transparency: nil,
+            status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+    }
+
+    @Test("Eastern display zone: the all-day row still sorts before a timed row whose instant precedes device midnight")
+    func allDaySortsFirstInEasternDisplayZone() {
+        // Pacific/Kiritimati is UTC+14, east of every device zone, so the
+        // device-local midnight `startDate` yields for the all-day date is
+        // LATER than a 10:00 meeting that day in the display zone. Sorting by
+        // that instant (the pre-fix sort key) puts the meeting first.
+        let farEast = TimeZone(identifier: "Pacific/Kiritimati")!
+        let day = Self.dayDigits(offset: 7)
+        let allDay = Self.allDay(id: "ad", title: "Holiday", day: day)
+        let timed = Self.timed(id: "t", title: "Sync", start: "\(day)T10:00:00+14:00", end: "\(day)T11:00:00+14:00")
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [timed, allDay], timeZone: farEast)
+        #expect(output.components(separatedBy: "date:").count - 1 == 1)
+        #expect(output.contains("date: \(Self.headerFor(day: day, in: farEast))"))
+        Self.expectAllDayFirst(output)
+    }
+
+    @Test("An appointment right after the first instant of the day still sorts after the all-day row")
+    func allDayPrecedesEarliestAppointment() {
+        let day = Self.dayDigits(offset: 7)
+        let allDay = Self.allDay(id: "ad", title: "Holiday", day: day)
+        let timed = Self.timed(id: "t", title: "Sync", start: "\(day)T00:30:00-12:00", end: "\(day)T01:00:00-12:00")
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [timed, allDay], timeZone: Self.farWest)
+        #expect(output.components(separatedBy: "date:").count - 1 == 1)
+        Self.expectAllDayFirst(output)
+    }
+
+    @Test("A zone that skipped the whole civil date has no anchor for it, and the row is omitted rather than relabelled")
+    func skippedCivilDateHasNoAnchor() {
+        // Samoa jumped from 2011-12-29 straight to 2011-12-31 (historical fixture: the
+        // date is fixed by the zone's own rules, not by today's clock).
+        let apia = TimeZone(identifier: "Pacific/Apia")!
+        #expect(CalendarToolHelpers.allDayAnchor("2011-12-30", timeZone: apia) == nil)
+        #expect(CalendarToolHelpers.allDayAnchor("2011-12-31", timeZone: apia) != nil)
+        let skipped = Self.allDay(id: "ad", title: "Holiday", day: "2011-12-30")
+        let timed = Self.timed(id: "t", title: "Sync", start: "2011-12-31T10:00:00+14:00", end: "2011-12-31T11:00:00+14:00")
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [skipped, timed], timeZone: apia)
+        #expect(!output.contains("Holiday"))
+        #expect(output.contains(": Sync"))
+        #expect(output.components(separatedBy: "date:").count - 1 == 1)
+        #expect(output.contains("date: \(Self.headerFor(day: "2011-12-31", in: apia))"))
+    }
+
+    /// The next date, within about a year, on which one of these zones springs
+    /// forward AT local midnight, so "yyyy-MM-dd 00:00:00" does not exist there.
+    private static func nextMidnightGap() -> (zone: TimeZone, day: String)? {
+        let zones = ["America/Havana", "America/Santiago", "America/Asuncion", "Asia/Beirut"].compactMap { TimeZone(identifier: $0) }
+        let probe = DateFormatter()
+        probe.locale = Locale(identifier: "en_US_POSIX")
+        probe.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        for offset in 1...400 {
+            let day = Self.dayDigits(offset: offset)
+            for zone in zones {
+                probe.timeZone = zone
+                if probe.date(from: "\(day)T00:00:00") == nil { return (zone, day) }
+            }
+        }
+        return nil
+    }
+
+    @Test("A display zone with no midnight on the date keeps both rows under that date")
+    func midnightGapKeepsRowsUnderTheirOwnDate() {
+        // The anchor assertion is the load-bearing one: a wall-clock parse of
+        // "00:00:00" returns nil on the transition day and the old fallback
+        // then keyed the group off the DEVICE instant. The rendered-output
+        // assertions below hold on any device zone; they only also fail on
+        // the old code when the device zone is east of the display zone.
+        guard let gap = Self.nextMidnightGap() else {
+            Issue.record("no zone in the fixture list springs forward at midnight within 400 days")
+            return
+        }
+        let parts = gap.day.split(separator: "-").map { Int($0)! }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = gap.zone
+        // Every valid calendar date has an anchor in every zone, and it lies
+        // ON that date there even when the date has no midnight.
+        let anchor = CalendarToolHelpers.allDayAnchor(gap.day, timeZone: gap.zone)
+        #expect(anchor != nil)
+        if let anchor {
+            let c = cal.dateComponents([.year, .month, .day], from: anchor)
+            #expect([c.year, c.month, c.day] == parts.map { Optional($0) })
+        }
+        let allDay = Self.allDay(id: "ad", title: "Holiday", day: gap.day)
+        // A meeting mid-morning of the same date, expressed in the zone's
+        // post-transition offset via the zone itself.
+        // A meeting thirty minutes after the day's first instant (01:00 on a
+        // gap day), so an anchor later than the first instant would sort after it.
+        // Derived from the Calendar, not from the anchor under test.
+        let early = cal.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))!.addingTimeInterval(1800)
+        let iso = ISO8601DateFormatter()
+        let timed = Self.timed(id: "t", title: "Sync", start: iso.string(from: early), end: iso.string(from: early.addingTimeInterval(3600)))
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [timed, allDay], timeZone: gap.zone)
+        let prevDay = Self.dayDigits(offset: -1, from: gap.day)
+        #expect(output.contains("date: \(Self.headerFor(day: gap.day, in: gap.zone))"))
+        #expect(!output.contains("date: \(Self.headerFor(day: prevDay, in: gap.zone))"))
+        #expect(output.components(separatedBy: "date:").count - 1 == 1)
+        #expect(output.contains("All day: Holiday\tevent_id: ad"))
+        Self.expectAllDayFirst(output)
+    }
+
+    @Test("Production tuple overload: compound ids, one header, all-day row first")
+    func productionOverloadKeepsAllDayUnderItsDate() {
+        let day = Self.dayDigits(offset: 7)
+        let allDay = Self.allDay(id: "ad", title: "Holiday", day: day)
+        let timed = Self.timed(id: "t", title: "Sync", start: "\(day)T10:00:00-12:00", end: "\(day)T11:00:00-12:00")
+        let rows: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)] = [
+            (event: timed, accountId: "acct", calendarId: "cal", accessRole: "owner"),
+            (event: allDay, accountId: "acct", calendarId: "cal", accessRole: "owner"),
+        ]
+        let output = CalendarToolHelpers.formatGroupedSummary(rows, timeZone: Self.farWest)
+        let prevDay = Self.dayDigits(offset: 6)
+        #expect(output.contains("date: \(Self.headerFor(day: day, in: Self.farWest))"))
+        #expect(!output.contains("date: \(Self.headerFor(day: prevDay, in: Self.farWest))"))
+        #expect(output.contains("timezone: \(Self.farWest.identifier)"))
+        #expect(output.components(separatedBy: "date:").count - 1 == 1)
+        #expect(output.contains("All day: Holiday\tevent_id: acct:ad"))
+        #expect(output.contains(": Sync\tevent_id: acct:t"))
+        Self.expectAllDayFirst(output)
+    }
+
+    @Test("The provider date is fixed; every display zone labels the all-day row with that date")
+    func displayZoneMatrixKeepsTheProviderDate() {
+        let day = Self.dayDigits(offset: 7)
+        let prevDay = Self.dayDigits(offset: 6)
+        let nextDay = Self.dayDigits(offset: 8)
+        let event = Self.allDay(id: "ad", title: "Holiday", day: day)
+        let zones = ["Etc/GMT+12", "America/Vancouver", "UTC", "Asia/Kathmandu", "Pacific/Kiritimati"]
+            .compactMap { TimeZone(identifier: $0) }
+        #expect(zones.count == 5)
+        for zone in zones {
+            let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [event], timeZone: zone)
+            #expect(output.contains("date: \(Self.headerFor(day: day, in: zone))"), "\(zone.identifier)")
+            #expect(!output.contains("date: \(Self.headerFor(day: prevDay, in: zone))"), "\(zone.identifier)")
+            #expect(!output.contains("date: \(Self.headerFor(day: nextDay, in: zone))"), "\(zone.identifier)")
+            #expect(output.contains("All day: Holiday\tevent_id: ad"), "\(zone.identifier)")
+        }
+    }
+
+    @Test("Malformed or non-existent DATE digits have no anchor and are omitted without disturbing the neighbouring row")
+    func malformedDateDigitsAreOmitted() {
+        let day = Self.dayDigits(offset: 7)
+        // The CalDAV ICS parser turns `DTSTART;VALUE=DATE:abcdefgh` into
+        // `abcd-ef-gh` (a failed parse still yields eight characters).
+        // `0000-01-01` round-trips as year 1 (fails only the year check) and
+        // `0001-00-01` as month 12 of the prior year (fails only the month check),
+        // so each comparison in the anchor's round-trip guard has its own witness.
+        let malformed = ["abcd-ef-gh", "", "2026", "2026-13-05", "2026-02-30", "2026-00-10", "0000-01-01", "0001-00-01"]
+        for digits in malformed {
+            #expect(CalendarToolHelpers.allDayAnchor(digits, timeZone: Self.farWest) == nil, "\(digits)")
+            let bad = Self.allDay(id: "bad", title: "Broken", day: digits)
+            let good = Self.allDay(id: "ad", title: "Holiday", day: day)
+            let rows: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)] = [
+                (event: bad, accountId: "acct", calendarId: "cal", accessRole: "owner"),
+                (event: good, accountId: "acct", calendarId: "cal", accessRole: "owner"),
+            ]
+            let output = CalendarToolHelpers.formatGroupedSummary(rows, timeZone: Self.farWest)
+            #expect(!output.contains("Broken"), "\(digits)")
+            #expect(output.components(separatedBy: "date:").count - 1 == 1, "\(digits)")
+            #expect(output.contains("date: \(Self.headerFor(day: day, in: Self.farWest))"), "\(digits)")
+            #expect(output.contains("All day: Holiday\tevent_id: acct:ad"), "\(digits)")
+        }
+        // Positive control for the guard under test.
+        #expect(CalendarToolHelpers.allDayAnchor(day, timeZone: Self.farWest) != nil)
+    }
+
+    @Test("The day key is Gregorian ASCII: the anchor keys to the provider's own digits and matches a timed instant on that date")
+    func dayKeyIsGregorianAscii() {
+        // Both row kinds go through `EKEventStoreHelper.dayKey`; a device
+        // locale with its own numerals or calendar must not split one date
+        // into two groups, so the key is pinned to `yyyy-MM-dd` ASCII.
+        let day = Self.dayDigits(offset: 7)
+        let zones = ["Etc/GMT+12", "Asia/Kathmandu", "Pacific/Kiritimati"].compactMap { TimeZone(identifier: $0) }
+        #expect(zones.count == 3)
+        for zone in zones {
+            guard let anchor = CalendarToolHelpers.allDayAnchor(day, timeZone: zone) else {
+                Issue.record("no anchor in \(zone.identifier)")
+                continue
+            }
+            let key = EKEventStoreHelper.dayKey(anchor, timeZone: zone)
+            #expect(key == day, "\(zone.identifier)")
+            #expect(key.unicodeScalars.allSatisfy { $0.isASCII }, "\(zone.identifier)")
+            #expect(EKEventStoreHelper.dayKey(anchor.addingTimeInterval(10 * 3600), timeZone: zone) == key, "\(zone.identifier)")
+        }
+    }
+}
+
+/// The demo provider is the one in-process WRITER of `GCalDateTime.date`, so
+/// its output — not a hand-built fixture — is what the grouped summary must
+/// place. Installs `AppDatabase.shared`, hence `.serialized`.
+@Suite("CalendarToolHelpers all-day rows from the demo writer", .serialized)
+struct CalendarToolHelpersDemoAllDayWriterTests {
+    /// Gregorian UTC midnight of `yyyy-MM-dd`, built from components — no
+    /// DateFormatter, so it cannot share a calendar mistake with the codec.
+    private static func gregorianUtcMidnightMs(_ day: String) -> Int64 {
+        let parts = day.split(separator: "-").map { Int($0)! }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let date = cal.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))!
+        return Int64(date.timeIntervalSince1970 * 1000)
+    }
+
+    private func install() throws -> (DatabasePool, URL, AppDatabase?) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("demo-allday-writer-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let saved = current
+            current = appDatabase
+            return saved
+        }
+        return (pool, directory, previous)
+    }
+
+    @Test("An all-day event the demo provider wrote is emitted as Gregorian ASCII digits and keyed under its own date")
+    func demoAllDayRowKeepsItsDate() async throws {
+        let fixture = try install()
+        defer {
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        let farWest = CalendarToolHelpersAllDayDayKeyTests.farWest
+        let day = CalendarToolHelpersAllDayDayKeyTests.dayDigits(offset: 7)
+        let prevDay = CalendarToolHelpersAllDayDayKeyTests.dayDigits(offset: 6)
+        let nextDay = CalendarToolHelpersAllDayDayKeyTests.dayDigits(offset: 8)
+
+        let provider = DemoCalendarProvider(accountId: "demo-acct")
+        var input = GCalEventInput()
+        input.summary = "Holiday"
+        input.startDate = day
+        input.endDate = nextDay
+        let created = try await provider.createEvent(calendarId: "primary", event: input, sendUpdates: "none")
+        // Provider DATE contract: the digits that went in come back unchanged.
+        // A device-locale formatter would answer in the device calendar and
+        // numerals, which the date-only consumers cannot place.
+        #expect(created.start?.date == day)
+        #expect(created.end?.date == nextDay)
+        #expect(created.isAllDay)
+
+        // Independent oracle on the DURABLE instants: a parser and writer that
+        // share a wrong calendar round-trip the text perfectly while storing a
+        // different century, so the stored ms are checked against Gregorian
+        // UTC midnight built without either formatter.
+        let expectedStartMs = Self.gregorianUtcMidnightMs(day)
+        let expectedEndMs = Self.gregorianUtcMidnightMs(nextDay)
+        let stored = try await fixture.0.read { db -> (Int64, Int64)? in
+            try Row.fetchOne(db, sql: "SELECT startMs, endMs FROM demoCalendarEvent WHERE id = ?", arguments: [created.id])
+                .map { ($0["startMs"], $0["endMs"]) }
+        }
+        #expect(stored?.0 == expectedStartMs)
+        #expect(stored?.1 == expectedEndMs)
+
+        // A bounded window on that Gregorian day, as calendar_read supplies,
+        // must find the row; a window a week earlier must not.
+        let windowMin = Date(timeIntervalSince1970: TimeInterval(expectedStartMs) / 1000)
+        let windowMax = Date(timeIntervalSince1970: TimeInterval(expectedEndMs) / 1000)
+        let listed = try await provider.listEvents(
+            calendarId: "primary", timeMin: windowMin, timeMax: windowMax, query: nil,
+            singleEvents: true, maxResults: 10, orderBy: "startTime")
+        #expect(listed.count == 1)
+        let earlier = try await provider.listEvents(
+            calendarId: "primary", timeMin: windowMin.addingTimeInterval(-7 * 86_400),
+            timeMax: windowMax.addingTimeInterval(-7 * 86_400), query: nil,
+            singleEvents: true, maxResults: 10, orderBy: "startTime")
+        #expect(earlier.isEmpty)
+        guard listed.count == 1 else { return }
+        let row = listed[0]
+        #expect(row.start?.date == day)
+
+        // The shared parser also serves updateEvent: move the event a day and
+        // re-check the durable instant against the independent oracle.
+        var moved = input
+        moved.startDate = nextDay
+        moved.endDate = CalendarToolHelpersAllDayDayKeyTests.dayDigits(offset: 9)
+        let updated = try await provider.updateEvent(calendarId: "primary", eventId: created.id ?? "", event: moved, sendUpdates: "none")
+        #expect(updated.start?.date == nextDay)
+        #expect(updated.end?.date == moved.endDate)
+        let storedAfter = try await fixture.0.read { db -> (Int64, Int64)? in
+            try Row.fetchOne(db, sql: "SELECT startMs, endMs FROM demoCalendarEvent WHERE id = ?", arguments: [created.id])
+                .map { ($0["startMs"], $0["endMs"]) }
+        }
+        // Both endpoints moved: an update that kept the earlier end would let
+        // the older create beat the newer move.
+        #expect(storedAfter?.0 == expectedEndMs)
+        #expect(storedAfter?.1 == Self.gregorianUtcMidnightMs(moved.endDate!))
+
+        let output = CalendarToolHelpers.formatGroupedSummary(
+            [(event: row, accountId: "demo-acct", calendarId: "primary", accessRole: "owner")],
+            timeZone: farWest)
+        #expect(output.contains("date: \(CalendarToolHelpersAllDayDayKeyTests.headerFor(day: day, in: farWest))"))
+        #expect(!output.contains("date: \(CalendarToolHelpersAllDayDayKeyTests.headerFor(day: prevDay, in: farWest))"))
+        #expect(output.components(separatedBy: "date:").count - 1 == 1)
+        #expect(output.contains("All day: Holiday\tevent_id: demo-acct:\(row.id ?? "")"))
     }
 }

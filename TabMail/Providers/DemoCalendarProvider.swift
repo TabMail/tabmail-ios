@@ -183,7 +183,13 @@ actor DemoCalendarProvider: CalendarProvider {
         let isAllDay = row.allDay != 0
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
+        // `GCalDateTime.date` is a provider DATE (RFC 5545 §3.3.4): Gregorian,
+        // ASCII digits. A DateFormatter left on the device locale renders the
+        // device calendar and numerals (Buddhist years, Arabic-Indic digits),
+        // which the date-only consumers cannot place (#166).
         let dayFormatter = DateFormatter()
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.calendar = Calendar(identifier: .gregorian)
         dayFormatter.dateFormat = "yyyy-MM-dd"
         dayFormatter.timeZone = TimeZone(identifier: "UTC")
 
@@ -217,7 +223,11 @@ actor DemoCalendarProvider: CalendarProvider {
     private static func parseDateInput(_ input: GCalEventInput) -> (startMs: Int64, endMs: Int64, allDay: Bool) {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        // Parse the caller's Gregorian ASCII DATE on every device locale (the
+        // writer above pins the same contract).
         let dayFormatter = DateFormatter()
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.calendar = Calendar(identifier: .gregorian)
         dayFormatter.dateFormat = "yyyy-MM-dd"
         dayFormatter.timeZone = TimeZone(identifier: "UTC")
 
