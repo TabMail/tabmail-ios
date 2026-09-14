@@ -1721,3 +1721,91 @@ struct EventPillAttendeeParsingTests {
         #expect(CalendarToolHelpers.eventPillAttendees(fromArguments: [:]).isEmpty)
     }
 }
+
+// MARK: - AM/PM cue tests (#99, TB parity #31)
+
+@Suite("CalendarToolHelpers grouped summary AM/PM cues")
+struct CalendarToolHelpersAmPmCueTests {
+    private static let utc = TimeZone(identifier: "UTC")!
+
+    /// A day a week from now, rendered as `yyyy-MM-dd` in UTC, so the
+    /// fixtures never go stale (no hardcoded dates).
+    private static func dayKey() -> String {
+        let day = Calendar(identifier: .gregorian).date(byAdding: .day, value: 7, to: Date())!
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = utc
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.string(from: day)
+    }
+
+    private static func timed(id: String, title: String, start: String, end: String) -> GCalEvent {
+        let d = dayKey()
+        return GCalEvent(
+            id: id, summary: title, location: nil, description: nil,
+            start: GCalDateTime(dateTime: "\(d)T\(start)Z", date: nil, timeZone: nil),
+            end: GCalDateTime(dateTime: "\(d)T\(end)Z", date: nil, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: nil, transparency: nil,
+            status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+    }
+
+    @Test("Morning entry keeps the 24-hour value and adds an a.m. cue")
+    func morningCue() {
+        let event = Self.timed(id: "am", title: "Early run", start: "05:00:00", end: "06:00:00")
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [event], timeZone: Self.utc)
+        #expect(output.contains("05:00 (5 a.m.) - 06:00 (6 a.m.): Early run\tevent_id: am"))
+        #expect(output.contains("timezone: \(Self.utc.identifier)"))
+    }
+
+    @Test("Evening entry keeps the 24-hour value and adds a p.m. cue with minutes")
+    func eveningCue() {
+        let event = Self.timed(id: "pm", title: "Dinner", start: "17:30:00", end: "18:00:00")
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [event], timeZone: Self.utc)
+        #expect(output.contains("17:30 (5:30 p.m.) - 18:00 (6 p.m.): Dinner\tevent_id: pm"))
+    }
+
+    @Test("All-day entry rendering is unchanged and carries no clock cue")
+    func allDayUnchanged() {
+        let d = Self.dayKey()
+        let event = GCalEvent(
+            id: "ad", summary: "Holiday", location: nil, description: nil,
+            start: GCalDateTime(dateTime: nil, date: d, timeZone: nil),
+            end: GCalDateTime(dateTime: nil, date: d, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: nil, transparency: nil,
+            status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+        let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [event], timeZone: Self.utc)
+        #expect(output.contains("All day: Holiday\tevent_id: ad"))
+        #expect(!output.contains("a.m."))
+        #expect(!output.contains("p.m."))
+    }
+
+    @Test("Cue maps midnight and noon onto 12 a.m. / 12 p.m. and honours the zone")
+    func cueBoundaries() {
+        let d = Self.dayKey()
+        let iso = DateFormatter()
+        iso.locale = Locale(identifier: "en_US_POSIX")
+        iso.timeZone = Self.utc
+        iso.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        let midnight = iso.date(from: "\(d)T00:00:00")!
+        let noon = iso.date(from: "\(d)T12:00:00")!
+        let lateEvening = iso.date(from: "\(d)T23:59:00")!
+        #expect(CalendarToolHelpers.twelveHourCue(midnight, timeZone: Self.utc) == "12 a.m.")
+        #expect(CalendarToolHelpers.twelveHourCue(noon, timeZone: Self.utc) == "12 p.m.")
+        #expect(CalendarToolHelpers.twelveHourCue(lateEvening, timeZone: Self.utc) == "11:59 p.m.")
+        #expect(CalendarToolHelpers.formatHourWithCue(midnight, timeZone: Self.utc) == "00:00 (12 a.m.)")
+        // 12:00 UTC is 05:00 in UTC-7, so the cue must follow the zone the 24-hour value is in.
+        let minusSeven = TimeZone(secondsFromGMT: -7 * 3600)!
+        #expect(CalendarToolHelpers.formatHourWithCue(noon, timeZone: minusSeven) == "05:00 (5 a.m.)")
+    }
+
+    @Test("Detailed start_iso / end_iso stay naive ISO with no cue text")
+    func detailedIsoUntouched() {
+        let event = Self.timed(id: "iso", title: "Sync", start: "17:00:00", end: "18:00:00")
+        let output = CalendarToolHelpers.formatDetailedEvent(event, timeZone: Self.utc)
+        let startLine = output.split(separator: "\n").first { $0.hasPrefix("start_iso:") }.map(String.init) ?? ""
+        #expect(startLine == "start_iso: \(Self.dayKey())T17:00:00")
+        #expect(!output.contains("(5 p.m.)"))
+    }
+}
