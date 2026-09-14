@@ -2103,7 +2103,10 @@ struct CalendarToolHelpersAllDayDayKeyTests {
         let day = Self.dayDigits(offset: 7)
         // The CalDAV ICS parser turns `DTSTART;VALUE=DATE:abcdefgh` into
         // `abcd-ef-gh` (a failed parse still yields eight characters).
-        let malformed = ["abcd-ef-gh", "", "2026", "2026-13-05", "2026-02-30", "2026-00-10"]
+        // `0000-01-01` round-trips as year 1 (fails only the year check) and
+        // `0001-00-01` as month 12 of the prior year (fails only the month check),
+        // so each comparison in the anchor's round-trip guard has its own witness.
+        let malformed = ["abcd-ef-gh", "", "2026", "2026-13-05", "2026-02-30", "2026-00-10", "0000-01-01", "0001-00-01"]
         for digits in malformed {
             #expect(CalendarToolHelpers.allDayAnchor(digits, timeZone: Self.farWest) == nil, "\(digits)")
             let bad = Self.allDay(id: "bad", title: "Broken", day: digits)
@@ -2237,10 +2240,15 @@ struct CalendarToolHelpersDemoAllDayWriterTests {
         moved.endDate = CalendarToolHelpersAllDayDayKeyTests.dayDigits(offset: 9)
         let updated = try await provider.updateEvent(calendarId: "primary", eventId: created.id ?? "", event: moved, sendUpdates: "none")
         #expect(updated.start?.date == nextDay)
-        let storedAfter = try await fixture.0.read { db -> Int64? in
-            try Row.fetchOne(db, sql: "SELECT startMs FROM demoCalendarEvent WHERE id = ?", arguments: [created.id]).map { $0["startMs"] }
+        #expect(updated.end?.date == moved.endDate)
+        let storedAfter = try await fixture.0.read { db -> (Int64, Int64)? in
+            try Row.fetchOne(db, sql: "SELECT startMs, endMs FROM demoCalendarEvent WHERE id = ?", arguments: [created.id])
+                .map { ($0["startMs"], $0["endMs"]) }
         }
-        #expect(storedAfter == expectedEndMs)
+        // Both endpoints moved: an update that kept the earlier end would let
+        // the older create beat the newer move.
+        #expect(storedAfter?.0 == expectedEndMs)
+        #expect(storedAfter?.1 == Self.gregorianUtcMidnightMs(moved.endDate!))
 
         let output = CalendarToolHelpers.formatGroupedSummary(
             [(event: row, accountId: "demo-acct", calendarId: "primary", accessRole: "owner")],
