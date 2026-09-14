@@ -17,6 +17,7 @@ flips, or give a test seam a default that differs from production's initial valu
 · **make a processing/queue policy visible by hiding or replacing UI in the same change → MIS-IOS-018.**
 · **write `AppLogStore.append(` anywhere but `BackgroundSyncLogger`/`DeviceSyncLogger`/`AuthDiagnostics`, or reuse an existing channel's tag "so the lines interleave" → MIS-IOS-019.**
 · **fix a finding phrased "at symbol X", or reach for the retained shape when a reviewer wrote a "deletion-first answer" → MIS-IOS-020.**
+· **raise a "arbitrary" size/window/scan constant because it is too small → MIS-IOS-024.**
 
 ## Data integrity — the irreversible ones
 
@@ -42,6 +43,7 @@ flips, or give a test seam a default that differs from production's initial valu
 - **[MIS-IOS-020](Companion/Mistakes/Active/MIS-IOS-020-fixed-the-one-site-the-finding-named-and-built-the-retained-shape.md)** — fixed the ONE symbol a finding named (`R4-RS-1`, `ef81ee3e5`) and never censused the class; round 5 found the identical rollback-survives-the-line mechanism at **eleven** more sites. **Census the MECHANISM, not the symbol; price DELETION first.** (×1)
 - **[MIS-IOS-022](Companion/Mistakes/Active/MIS-IOS-022-replaced-a-splitting-mechanism-and-left-its-loop-under-the-old-aggregate-deadline.md)** — deleted the queue's batch-**splitting** arm and left the per-member loop under the same 15 s `withTimeout` it had been escaping, so `requeueOrRetain` repeats the same prefix and the last member is **never sent** — **starvation = the wedge corollary**. ⛔ ×2: `ProviderMemberLoopBudget`'s elapsed-time margin starved identically. **Settle ONE member per attempt.** (×2)
 - **[MIS-IOS-023](Companion/Mistakes/Active/MIS-IOS-023-wrote-a-new-call-over-the-one-the-path-already-owed.md)** — **wrote a new call over the one that path already owed, and the diff GREW so nothing looked lost**: the promoted `retirePartiallyCompletedOp` never called `recordMembersThatEnteredInbox`, with **NO call-site count drop (5 base, 5 candidate)**. **A count census reads CLEAN when a NEW path is promoted without acquiring the call its predecessors owed.** (×2)
+- **[MIS-IOS-024](Companion/Mistakes/Active/MIS-IOS-024-widened-a-bound-without-asking-what-it-bounded.md)** — **widened a scan window (`snippetLinkScanChars` 4,000 → 32,000) on a happy-path benchmark without asking what the bound was protecting**: the regex behind `unwrapMarkdownLinks` was quadratic on unclosed `[](` / `\[` runs (3.5–6.8 s on the main actor at the new window); two cap-inside-the-regex patches each broke a valid link (MIS-005 ×28) before the construct was replaced by a linear scanner (#162, PR #163). Benchmark the ADVERSARIAL input in terms of the limit; worse than linear ⇒ replace the algorithm, never tune caps. (×1)
 
 ## Build & test ops
 

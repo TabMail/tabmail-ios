@@ -148,6 +148,36 @@ struct EmailFilterTests {
         #expect(EmailFilter.snippetFromPlainText("[notice](x\\\nACTION) tail") == "[notice](x\\ ACTION) tail")
     }
 
+    @Test("a link never spans a line terminator, escaped or not, in label or destination",
+          arguments: ["\n", "\u{0B}", "\u{0C}", "\r", "\u{85}", "\u{2028}", "\u{2029}"])
+    func snippetLinkNeverSpansALineTerminator(terminator: String) {
+        // ICU's `.` refuses all seven line terminators (VT and FF included), so a
+        // backslash before one is a dangling escape, not an escape pair; and a label
+        // may not contain one at all. Either way the bracketed prose is not a link
+        // and is copied through — whitespace collapsed to a space by the snippet —
+        // and a valid link that follows still unwraps.
+        for esc in ["", "\\"] {
+            let destination = "[notice](x\(esc)\(terminator)ACTION) [ok](https://example.com/y) tail"
+            #expect(EmailFilter.snippetFromPlainText(destination) == "[notice](x\(esc) ACTION) ok tail")
+            let label = "[no\(esc)\(terminator)tice](https://example.com/x) [ok](https://example.com/y) tail"
+            #expect(EmailFilter.snippetFromPlainText(label) == "[no\(esc) tice](https://example.com/x) ok tail")
+        }
+        // Positive controls: escaped punctuation and horizontal whitespace are fine inside a label.
+        #expect(EmailFilter.snippetFromPlainText("[a\\]b\tc](https://example.com/x) tail") == "a]b c tail")
+        // …and an ESCAPED horizontal space or tab is a valid escape pair on either side
+        // (only the line terminators above are refused after a backslash).
+        for horizontal in [" ", "\t"] {
+            #expect(EmailFilter.snippetFromPlainText("[no\\\(horizontal)tice](https://example.com/x) tail") == "no tice tail")
+            #expect(EmailFilter.snippetFromPlainText("[notice](x\\\(horizontal)ACTION) tail") == "notice tail")
+        }
+        // A label that closes at the very end of the input, or exactly at the scan
+        // window's last scalar with its destination beyond it, is not a link and must
+        // not read past the end.
+        #expect(EmailFilter.snippetFromPlainText("[note]") == "[note]")
+        let atEdge = "[" + String(repeating: "a", count: EmailFilter.snippetLinkScanChars - 2) + "](https://example.com/x)"
+        #expect(EmailFilter.snippetFromPlainText(atEdge).hasPrefix("[aaaa"))
+    }
+
     @Test("snippetFromPlainText never reads a link past its scan window")
     func snippetLinkScanIsBounded() {
         // A `[` whose closing `](…)` lies beyond the window must be treated as
@@ -162,7 +192,7 @@ struct EmailFilterTests {
         _ = EmailFilter.snippetFromPlainText(body)
         #expect(Date().timeIntervalSince(start) < 2)
         // The window is bounded in SCALARS, not Characters: a link that sits
-        // within 4,000 Characters but past 4,000 scalars stays raw.
+        // within the window's Character count but past its scalar count stays raw.
         let cluster = "a" + String(repeating: "\u{0301}", count: EmailFilter.snippetLinkScanChars - 2)
         let pastWindow = EmailFilter.snippetFromPlainText(cluster + " [x](https://example.com)")
         #expect(!pastWindow.contains("x"))
@@ -180,6 +210,69 @@ struct EmailFilterTests {
         let opened = EmailFilter.snippetFromPlainText(openers)
         #expect(Date().timeIntervalSince(start3) < 0.25)
         #expect(opened.hasPrefix("[["))
+    }
+
+    @Test("a newsletter's run of empty-label tracking links never leaks a cut link into the preview")
+    func snippetSurvivesLongRunOfImageLinks() {
+        // A 37-image mailer converts to ~6,600 scalars of `[](tracking-url)` before
+        // its first sentence. The scan window must hold that whole run: a link cut
+        // at the window edge stops matching and the raw `[](https://…` fragment
+        // became the preview (#162).
+        let destination = "https://click.example.com/u/?qs=" + String(repeating: "A", count: 140)
+        let imageLink = "[](\(destination))"
+        #expect(imageLink.unicodeScalars.count > 170)
+        let run = Array(repeating: imageLink, count: 37).joined(separator: "\n")
+        #expect(run.unicodeScalars.count > 6_000)
+        let text = run + "\nYou are receiving this email because you signed up."
+        #expect(EmailFilter.snippetFromPlainText(text) == "You are receiving this email because you signed up.")
+        // The same shape near the window's capacity: 150 links fit; the sentence still previews.
+        let bigRun = Array(repeating: imageLink, count: 150).joined(separator: "\n")
+        #expect(bigRun.unicodeScalars.count < EmailFilter.snippetLinkScanChars)
+        #expect(EmailFilter.snippetFromPlainText(bigRun + "\nTail sentence.") == "Tail sentence.")
+    }
+
+    @Test("complete links of any length inside the window unwrap; never-closing links stay within the cost bound")
+    func snippetLongLinksUnwrapAndUnterminatedLinksStayBounded() {
+        // The converter (`htmlToPlainText`) puts no length limit on a label or a
+        // destination, so neither may the snippet's link grammar: a 2,200-scalar
+        // redirect URL or a long label is still one link and previews as its label.
+        let longDestination = "https://example.com/r?" + String(repeating: "a", count: 2_200)
+        #expect(EmailFilter.snippetFromPlainText("[Continue](\(longDestination)) Next sentence.") == "Continue Next sentence.")
+        #expect(EmailFilter.snippetFromPlainText("[](\(longDestination)) Tail sentence.") == "Tail sentence.")
+        let longLabel = String(repeating: "word ", count: 500)
+        #expect(EmailFilter.snippetFromPlainText("[\(longLabel)](https://example.com/x)").hasPrefix("word word word"))
+        #expect(!EmailFilter.snippetFromPlainText("[\(longLabel)](https://example.com/x)").contains("]("))
+        let entityLabel = "Terms &amp; conditions " + String(repeating: "x", count: 2_100)
+        #expect(EmailFilter.snippetFromPlainText("[\(entityLabel)](https://example.com/t)").hasPrefix("Terms & conditions xxx"))
+        // Never-closing links must be LINEAR in the window, not quadratic: with a
+        // grammar that only knows complete links, every opener re-scans the same
+        // unclosed destination to the window's end — measured 3.5 s for a dense
+        // `[](` run and 0.6 s for the URL-shaped one at 32,000 scalars on a Mac.
+        // The densest shapes are the worst case, so they are the fixtures; the
+        // budget is the same one the opener-run check above uses.
+        // Every opener in these runs starts a scan that fails; the unclosed
+        // DESTINATION shapes and the unclosed LABEL shapes (an escaped-bracket run,
+        // and a label the converter cut before its `]`) are the worst cases.
+        let dense: [(String, String)] = [
+            ("[](", String(repeating: "[](", count: EmailFilter.snippetLinkScanChars / 3)),
+            ("[x](", String(repeating: "[x](", count: EmailFilter.snippetLinkScanChars / 4)),
+            ("[x](https://e.com/", String(repeating: "[x](https://e.com/", count: EmailFilter.snippetLinkScanChars / 18)),
+            ("\\[", String(repeating: "\\[", count: EmailFilter.snippetLinkScanChars / 2)),
+            ("[a\\]", String(repeating: "[a\\]", count: EmailFilter.snippetLinkScanChars / 4)),
+        ]
+        for (unit, body) in dense {
+            let start = Date()
+            let result = EmailFilter.snippetFromPlainText(body)
+            #expect(Date().timeIntervalSince(start) < 0.25, "unclosed \(unit) run must stay linear")
+            #expect(result.hasPrefix(unit + unit), "an unclosed run is not a link and is copied through")
+        }
+        // An unclosed link followed by a real link on the same line: the unclosed
+        // one is copied through and the link that follows it still unwraps — even
+        // when the later link begins INSIDE the failed destination and its label
+        // carries the whitespace that ended that destination.
+        #expect(EmailFilter.snippetFromPlainText("[a](x [b](https://example.com/y) tail") == "[a](x b tail")
+        #expect(EmailFilter.snippetFromPlainText("[a](x[b](https://example.com/y) tail") == "a tail")
+        #expect(EmailFilter.snippetFromPlainText("[a](x[b c](y) tail") == "[a](xb c tail")
     }
 
     @Test("image-only mail previews as the no-text placeholder, never as an empty snippet")

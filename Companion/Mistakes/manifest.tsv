@@ -22,3 +22,4 @@ MIS-IOS-020	Active	design-process	medium (wasted rounds)	1	Active/MIS-IOS-020-fi
 MIS-IOS-021	Active	data-integrity	high (destructive widening)	1	Active/MIS-IOS-021-unified-two-look-alike-classifiers-and-widened-the-narrower-gate.md	I unified two look-alike classifiers into one helper, and silently widened the narrower gate
 MIS-IOS-022	Active	data-integrity	critical (wedged intention)	2	Active/MIS-IOS-022-replaced-a-splitting-mechanism-and-left-its-loop-under-the-old-aggregate-deadline.md	I bounded an unbounded REQUEST with a margin measured in elapsed TIME
 MIS-IOS-023	Active	data-integrity	critical (dropped intention - latent)	2	Active/MIS-IOS-023-wrote-a-new-call-over-the-one-the-path-already-owed.md	I wrote a new call over the one that path already owed
+MIS-IOS-024	Active	design-process	medium (three review rounds)	1	Active/MIS-IOS-024-widened-a-bound-without-asking-what-it-bounded.md	I widened a bound without asking what the bound was protecting

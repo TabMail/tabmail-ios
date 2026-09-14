@@ -162,6 +162,17 @@ struct StagedSetRepostSuppressionTests {
         #expect(absentBody == "Plain & simple")
     }
 
+    @Test("staged display snippet: an image-heavy newsletter's staged text previews its first sentence (#162)")
+    func displaySnippetSurvivesLongRunOfImageLinks() {
+        // Same converter output a linked-image run produces, longer than the old
+        // 4,000-scalar window; the staged preview must be the sentence, not a cut link.
+        let imageLink = "[](https://click.example.com/u/?qs=" + String(repeating: "A", count: 140) + ")"
+        let text = Array(repeating: imageLink, count: 37).joined(separator: "\n") + "\nHidden gems just landed."
+        #expect(text.unicodeScalars.count > 6_000)
+        let s = NSEDataBridge.stagedDisplaySnippet(providerSnippet: "provider text", textContent: text)
+        #expect(s == "Hidden gems just landed.")
+    }
+
     @Test("drained set resets the memo — a later identical re-stage posts again")
     func drainResets() {
         let memo = Mutex<[StagedInboxRow]>([])
