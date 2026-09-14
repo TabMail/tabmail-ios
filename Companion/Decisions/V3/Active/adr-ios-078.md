@@ -106,7 +106,8 @@ within that directive's intent and are explicitly surfaced for owner veto.
     (`MessageDetailViewModel.loadBody` sees `isQueuedOrInFlight` and polls), the body lands via the
     background queue's DEFAULT (gated) `flushBatch`, and the poll's `adoptReadyBody` displays it
     without re-triggering AI — that residual is the coordinator-deferred body-arrival auto-trigger
-    below, Retry-recoverable. The failure bubble's Retry is a real processing path for out-of-window
+    below, Retry-recoverable *(closed 2026-09-14, iOS #67 — see the amendment at the end of this
+    ADR; the poll's adoption sites now call the same exempt direct path)*. The failure bubble's Retry is a real processing path for out-of-window
     opens **once the body is durable**. *(It read "in every state" until 2026-08-20, iOS #66 — false
     for the same reason as the staged clause above: `SummaryBubbleView`'s Retry calls
     `processOpenedMessage`, which no-ops while the `MessageBody` row does not yet exist. Retry after
@@ -167,7 +168,8 @@ within that directive's intent and are explicitly surfaced for owner veto.
   arrival-origin event and plumbing the exemption through: that is a behaviour change, it widens the
   door toward the install flood this ADR exists to keep shut, and it was explicitly declined.
 - **Deferred (coordinator-ruled follow-up): the body-arrival auto-trigger for the background-queue
-  poll path.** When a manual open finds its body already owned by `ActiveBodyQueue`
+  poll path.** *(CLOSED 2026-09-14, iOS #67 — the text below is kept as history; see the amendment
+  at the end of this ADR.)* When a manual open finds its body already owned by `ActiveBodyQueue`
   (`loadBody` → `isQueuedOrInFlight` → `startBodyPoll`), the body is written by the background
   queue's gated `flushBatch` and the poll's `adoptReadyBody` displays it WITHOUT re-triggering AI —
   so an out-of-window open in this state gets no summary until the user taps Retry (or reopens once
@@ -205,7 +207,8 @@ within that directive's intent and are explicitly surfaced for owner veto.
   this change has one shape: **for an out-of-window row, exempt AI work can fail to be scheduled or
   can be discarded before it runs — never silently wrong, never durable, and always repairable by
   one user gesture** (reopen or Retry, both of which re-enter the exempt direct path). The known
-  instances at this writing are the deferred body-arrival auto-trigger, the `.dropped`-fallback
+  instances at this writing are the deferred body-arrival auto-trigger *(closed 2026-09-14,
+  iOS #67)*, the `.dropped`-fallback
   rediscovery, the `replacePending` in-flight exclusion, and this queue-cancellation loss. That
   list is explicitly NON-EXHAUSTIVE: an earlier revision asserted "exactly three" and the round-8
   review immediately falsified it by finding a fourth. Judge any newly-discovered case against the
@@ -228,3 +231,23 @@ presentation gate in the same class as the demo-consent check — not an eligibi
 not narrow this ADR: processing, caching and the never-gate-existing-content-by-processing-policy
 rule are untouched, and re-enabling the toggle renders the retained summaries immediately.
 Thunderbird's counterpart is a Settings → Appearance toggle only (tabmail-thunderbird #34).
+
+**Amendment 2026-09-14 (iOS #67).** The deferred body-arrival auto-trigger is closed. The audit the
+deferral asked for was run: the `IOS-BODY-004` wrong-message holes were in recovery code that
+**guessed a replacement row by matching** (account-wide, then folder-scoped, on `rfc822MessageId`)
+after the primary key vanished. `AccountManager.processOpenedMessage` does no matching — it uses
+nothing from its argument but the id, re-captures body, header and `AIWriteTarget` from the durable
+row at that id in one read, and writes only through `aiGuardedHeaderWrite`, which refuses on drift.
+So the third manual-open arm now does what the first two already did:
+`MessageDetailViewModel.processOpenedMessageAfterPollAdoption` calls the exempt direct path at both
+of `startBodyPoll`'s adoption sites, keyed on the id the body was adopted under (a header re-resolved
+across the await, or still missing on a cancelled-open recovery, skips rather than processing a
+different identity). Nothing else changes: no queue plumbing, no durable state, the poll's recovery
+logic and the `DO NOT RE-ADD` guard on `IOS-BODY-004` are untouched, and the sweep stays
+window-bounded. In-window rows in this state can now be offered by both the queue and the direct
+path — the same already-accepted overlap `loadBody`'s cache-hit arm has always had, bounded by the
+executor's existing-summary short-circuit and the AI cache. The residual invariant above loses one
+known instance; the `.dropped`-fallback rediscovery, the `replacePending` in-flight exclusion and
+the queue-cancellation loss stand. Pinned by `PollAdoptionAITriggerTests` (real
+`loadBody` → `isQueuedOrInFlight` → poll arm; an impostor sharing the opened row's
+`rfc822MessageId` and subject stays untouched).

@@ -1028,6 +1028,42 @@ final class MessageDetailViewModel {
         }
     }
 
+    /// AI trigger for a body the poll ADOPTED rather than fetched (iOS #67).
+    ///
+    /// `loadBody` already calls `processOpenedMessage` on its two body-present
+    /// arms (durable cache hit, staged snapshot), and the open's OWN fetch
+    /// enqueues window-exempt inside `flushBatch`. The third arm — the body
+    /// landing through `ActiveBodyQueue`'s DEFAULT (gated) flush while this
+    /// view polls — displayed the body without any AI trigger, so an
+    /// out-of-window Inbox open in that state got no summary until Retry or
+    /// reopen (ADR-IOS-078's deferred body-arrival auto-trigger). This is the
+    /// same direct, ephemeral, window-exempt path the other two arms use,
+    /// applied at the poll's adoption sites.
+    ///
+    /// Identity: `processOpenedMessage` uses nothing from `msg` except its id
+    /// and re-captures body, header and `AIWriteTarget` from the durable row at
+    /// that id; the write itself goes through `aiGuardedHeaderWrite`, which
+    /// refuses on drift. No row is ever found by matching, so the `IOS-BODY-004`
+    /// wrong-message hazard (recovery that GUESSED a replacement row) does not
+    /// apply here. `adoptedId` is the key the body was just read under; the
+    /// header may have been (re)resolved across that await, so a mismatch
+    /// skips rather than processing a different identity. A nil header
+    /// (cancelled-open recovery still pending) also skips — that state is the
+    /// NSE deep-link path, whose merge already enqueues exempt.
+    ///
+    /// Internal (not `private`) so `PollAdoptionAITriggerTests` can pin the two
+    /// refusals directly — the header-changed-across-the-await and nil-header
+    /// states have no deterministic production-path driver. Same class as the
+    /// other ungated seams here: no input reaches the network, no production
+    /// caller outside this file.
+    @MainActor
+    func processOpenedMessageAfterPollAdoption(adoptedId: String) {
+        guard let msg = message, msg.id == adoptedId else { return }
+        manager.enqueueWriteFromSynchronousContext { [manager] in
+            await manager.processOpenedMessage(msg)
+        }
+    }
+
     /// Poll for MessageBody while body is missing. First checks DB (catches cases
     /// where a background path wrote the body), then re-attempts a server fetch.
     /// Primary scenario: app resumed from background with stale IMAP connection —
@@ -1059,8 +1095,10 @@ final class MessageDetailViewModel {
                 // still-staged, ADR-IOS-049) before loadBody's task got cancelled
                 // by the inbox-reload/nav churn and deferred here — adopt it NOW
                 // instead of waiting on the first 2s tick.
+                let entryRid = self.resolvedId
                 if await self.adoptReadyBody(source: "poll IMMEDIATE check") {
                     self.loadThreadMessagesAsync()
+                    self.processOpenedMessageAfterPollAdoption(adoptedId: entryRid)
                     if self.message != nil { return }
                     // Body adopted but the header is still missing (cancelled
                     // non-staged open): fall into the loop, which keeps
@@ -1096,6 +1134,7 @@ final class MessageDetailViewModel {
                 // durable miss must fall through so hasBody/FTS/AI get a real body.
                 if await self.adoptReadyBody(source: "poll (DB, 2s cadence)", allowStagedFallback: false) {
                     self.loadThreadMessagesAsync()
+                    self.processOpenedMessageAfterPollAdoption(adoptedId: rid)
                     return
                 }
                 // `adoptReadyBody` returns false EITHER on a durable miss OR because

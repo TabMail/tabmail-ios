@@ -88,7 +88,8 @@ which is the thing to check — not the count: **for an out-of-window row, exemp
 be scheduled or be discarded before it runs; never silently wrong, never durable, always repairable
 by one gesture** (reopen/Retry re-enter the exempt direct path). Known instances at this writing,
 explicitly NON-EXHAUSTIVE: (1) the coordinator-deferred body-arrival auto-trigger for the
-background-queue poll arm (`startBodyPoll` → `adoptReadyBody`, `IOS-BODY-004`); (2) the re-key
+background-queue poll arm (`startBodyPoll` → `adoptReadyBody`, `IOS-BODY-004`) *(closed
+2026-09-14, iOS #67 — see the amendment at the end of this record)*; (2) the re-key
 `.dropped` fallback's `repopulateFromDatabase()` rediscovery, window-bounded and therefore a no-op
 for an out-of-window row — newly reachable since the exemption (round-7 review); (3) the in-flight
 exclusion of `QueueStorage.replacePending`, where an exempt offer colliding with an already-in-flight
@@ -103,7 +104,8 @@ or relaunch redrive for derived work — the 2026-08-19 exemptions are deliberat
 (enqueue-time flag on an in-memory job; a relaunch re-discovers work through the bounded sweep
 only).
 
-**Deferred sub-case (coordinator-ruled follow-up, round-2 review 2026-08-19):** the *body-arrival
+**Deferred sub-case (coordinator-ruled follow-up, round-2 review 2026-08-19)** *(CLOSED 2026-09-14,
+iOS #67 — kept as history; see the amendment at the end of this record)*: the *body-arrival
 auto-trigger* for a manual open whose body is already owned by `ActiveBodyQueue`. In that state
 `MessageDetailViewModel.loadBody` sees `isQueuedOrInFlight` and polls; the body lands via the
 background queue's DEFAULT (gated) `flushBatch` and `startBodyPoll`'s `adoptReadyBody` displays it
@@ -136,3 +138,14 @@ every other residual here — do NOT build a redrive or widen the sweep for it.)
 body-arrival auto-trigger; action chain dedupe;
 `v85_addDirectAIPending`; `v86_retireDirectAIOnInboxRoleExit`; `v87_retireDirectAIPending`;
 PR #39; large inbox; AI work suppressed
+
+## Amendment 2026-09-14 (iOS #67) — the background-queue poll arm is now exempt too
+
+Residual (1) / the deferred sub-case above is closed. The deferral's own condition — "needs its own
+audit and tests" — was met: the `IOS-BODY-004` C3 holes came from recovery that GUESSED a replacement
+row by `rfc822MessageId` matching; `processOpenedMessage` never matches, re-captures identity from the
+durable row at the adopted id, and writes only through the guarded header write. So
+`MessageDetailViewModel.processOpenedMessageAfterPollAdoption` now calls that same exempt direct path
+at both `startBodyPoll` adoption sites (ADR-IOS-078 amendment 2026-09-14). No queue plumbing, no
+durable state, no sweep widening. Pinned by `PollAdoptionAITriggerTests`. The residual invariant is
+unchanged; its known instances are now (2), (3) and (4).

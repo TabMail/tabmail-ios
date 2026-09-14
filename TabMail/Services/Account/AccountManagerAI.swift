@@ -423,12 +423,13 @@ extension AccountManager {
         // a not-yet-fetched body is covered by the open's OWN fetch (`fetchBody` →
         // `fetchAndProcess(aiWindowExempt: true)`), a STAGED body by the NSE merge's
         // own `windowExempt: true` enqueue, and the `ActiveBodyQueue`-owned poll arm
-        // (`loadBody` → `isQueuedOrInFlight` → `startBodyPoll` → `adoptReadyBody`) is
-        // the coordinator-DEFERRED body-arrival auto-trigger — that one gets no AI
-        // until the body lands durably and the user reopens or taps Retry. Accepted
-        // per ADR-IOS-078's residual invariant: fail-closed, non-durable, one-gesture
-        // recoverable. Do NOT widen the sweep to "fix" it — `repopulationCandidates`
-        // is window-bounded on purpose (the install-flood door).
+        // (`loadBody` → `isQueuedOrInFlight` → `startBodyPoll` → `adoptReadyBody`)
+        // by `MessageDetailViewModel.processOpenedMessageAfterPollAdoption`, which
+        // calls THIS function on the adopted id once the poll adopts a durable body
+        // (iOS #67, 2026-09-14 — until then that arm was the coordinator-DEFERRED
+        // body-arrival auto-trigger and got no AI until Retry/reopen). Do NOT widen
+        // the sweep for any of these — `repopulationCandidates` is window-bounded
+        // on purpose (the install-flood door).
         let opened = (try? await dbPool.read { db -> OpenedAIProcessingSnapshot? in
             try OpenedAIProcessingSnapshot.capture(headerId: message.id, db: db)
         }) ?? nil
