@@ -50,10 +50,15 @@ struct CoreTranslationTests {
     @Test("already-numeric realId returns as-is (identity guard)")
     func numericRealIdReturnsAsIs() async {
         let translator = ChatIdTranslator.createIsolated()
-        let result = await translator.toNumericId("42")
-        #expect(result == 42)
+        // The translator lazily loads every mapping persisted in the shared
+        // GRDB store, so a small id like 42 is claimed by an earlier run's
+        // mapping on a long-lived simulator and the "no mapping" assertion
+        // below reads that row instead. Use an id no run can have allocated.
+        let numeric = 900_000_000_042
+        let result = await translator.toNumericId(String(numeric))
+        #expect(result == numeric)
         // Should NOT create a mapping
-        let realId = await translator.toRealId(42)
+        let realId = await translator.toRealId(numeric)
         #expect(realId == nil)
     }
 
