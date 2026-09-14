@@ -1815,6 +1815,18 @@ struct CalendarToolHelpersAmPmCueTests {
         #expect(CalendarToolHelpers.formatHourWithCue(noon, timeZone: minusSeven) == "05:00 (5 a.m.)")
     }
 
+    @Test("Grouped rows carry both endpoints in the requested non-UTC zone, cue included")
+    func groupedRowsFollowRequestedZone() {
+        // 05:00Z–06:00Z in a fractional-offset zone (+05:45) is 10:45–11:45, so
+        // both the hour and the minute of each endpoint prove the forwarded zone.
+        let kathmandu = TimeZone(identifier: "Asia/Kathmandu")!
+        let event = Self.timed(id: "ktm", title: "Standup", start: "05:00:00", end: "06:00:00")
+        let output = CalendarToolHelpers.formatGroupedSummary([(event: event, accountId: "acct-a", calendarId: "cal-a", accessRole: nil)], timeZone: kathmandu)
+        #expect(output.contains("timezone: \(kathmandu.identifier)"))
+        #expect(output.contains("10:45 (10:45 a.m.) - 11:45 (11:45 a.m.): Standup"))
+        #expect(!output.contains("05:00 (5 a.m.)"))
+    }
+
     @Test("Detailed start_iso / end_iso stay naive ISO with no cue text")
     func detailedIsoUntouched() {
         let event = Self.timed(id: "iso", title: "Sync", start: "17:00:00", end: "18:00:00")
