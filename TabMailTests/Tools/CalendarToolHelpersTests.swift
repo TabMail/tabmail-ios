@@ -1765,6 +1765,21 @@ struct CalendarToolHelpersAmPmCueTests {
         #expect(output.contains("17:30 (5:30 p.m.) - 18:00 (6 p.m.): Dinner\tevent_id: pm"))
     }
 
+    @Test("Single-digit minutes are zero-padded in the cue on a real tuple entry")
+    func singleDigitMinutePadding() {
+        let d = Self.dayKey()
+        let event = GCalEvent(
+            id: "pad", summary: "Standup", location: nil, description: nil,
+            start: GCalDateTime(dateTime: "\(d)T17:03:00Z", date: nil, timeZone: nil),
+            end: GCalDateTime(dateTime: "\(d)T17:09:00Z", date: nil, timeZone: nil),
+            attendees: nil, organizer: nil, recurrence: nil, transparency: nil,
+            status: nil, htmlLink: nil, created: nil, updated: nil
+        )
+        let entries: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)] = [(event, "acct-a", "cal-a", nil)]
+        let output = CalendarToolHelpers.formatGroupedSummary(entries, timeZone: Self.utc)
+        #expect(output.contains("17:03 (5:03 p.m.) - 17:09 (5:09 p.m.): Standup"))
+    }
+
     @Test("All-day entry rendering is unchanged and carries no clock cue")
     func allDayUnchanged() {
         let d = Self.dayKey()
@@ -1804,8 +1819,11 @@ struct CalendarToolHelpersAmPmCueTests {
     func detailedIsoUntouched() {
         let event = Self.timed(id: "iso", title: "Sync", start: "17:00:00", end: "18:00:00")
         let output = CalendarToolHelpers.formatDetailedEvent(event, timeZone: Self.utc)
-        let startLine = output.split(separator: "\n").first { $0.hasPrefix("start_iso:") }.map(String.init) ?? ""
+        let lines = output.split(separator: "\n").map(String.init)
+        let startLine = lines.first { $0.hasPrefix("start_iso:") } ?? ""
+        let endLine = lines.first { $0.hasPrefix("end_iso:") } ?? ""
+        // Both fields must be present AND exactly naive ISO — no cue text on either.
         #expect(startLine == "start_iso: \(Self.dayKey())T17:00:00")
-        #expect(!output.contains("(5 p.m.)"))
+        #expect(endLine == "end_iso: \(Self.dayKey())T18:00:00")
     }
 }

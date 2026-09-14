@@ -105,6 +105,55 @@ struct CoreTranslationTests {
         #expect(!rendered.contains("(↻"), "rendered chip leaked recurrence marker: \(rendered)")
     }
 
+    @Test("event chip title survives the formatter's real timed, recurring, free/busy and all-day rows")
+    func eventChipTitleFromRealFormatterOutput() async {
+        // Joint producer/consumer test: feed ACTUAL formatGroupedSummary output
+        // (not a handwritten copy of its shape) through processToolOutputForLLM
+        // and assert the pill title for every row kind. A prefix regex in the
+        // translator once rejected cued timed rows and every pill became "Event".
+        let day = Calendar(identifier: .gregorian).date(byAdding: .day, value: 7, to: Date())!
+        let dayFmt = DateFormatter()
+        dayFmt.locale = Locale(identifier: "en_US_POSIX")
+        dayFmt.timeZone = TimeZone(identifier: "UTC")
+        dayFmt.dateFormat = "yyyy-MM-dd"
+        let d = dayFmt.string(from: day)
+        func mk(_ id: String, _ title: String, start: String?, end: String?, date: String? = nil, recurrence: [String]? = nil, transparency: String? = nil) -> GCalEvent {
+            GCalEvent(id: id, summary: title, location: nil, description: nil,
+                      start: GCalDateTime(dateTime: start, date: date, timeZone: nil),
+                      end: GCalDateTime(dateTime: end, date: date, timeZone: nil),
+                      attendees: nil, organizer: nil, recurrence: recurrence, transparency: transparency,
+                      status: nil, htmlLink: nil, created: nil, updated: nil)
+        }
+        let timedId = "evt-timed-\(UUID().uuidString)"
+        let recurId = "evt-recur-\(UUID().uuidString)"
+        let freeId = "evt-free-\(UUID().uuidString)"
+        let allDayId = "evt-allday-\(UUID().uuidString)"
+        let events: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)] = [
+            (mk(timedId, "Early run", start: "\(d)T05:03:00Z", end: "\(d)T06:00:00Z"), "acct-a", "cal-a", nil),
+            (mk(recurId, "Weekly: planning", start: "\(d)T17:00:00Z", end: "\(d)T18:00:00Z", recurrence: ["RRULE:FREQ=WEEKLY"]), "acct-a", "cal-a", nil),
+            (mk(freeId, "Focus", start: "\(d)T14:00:00Z", end: "\(d)T16:00:00Z", transparency: "transparent"), "acct-a", "cal-a", nil),
+            (mk(allDayId, "Holiday", start: nil, end: nil, date: d), "acct-a", "cal-a", nil),
+        ]
+        let output = CalendarToolHelpers.formatGroupedSummary(events, timeZone: TimeZone(identifier: "UTC"))
+        #expect(output.contains("05:03 (5:03 a.m.) - 06:00 (6 a.m.): Early run"))
+
+        let translator = ChatIdTranslator.createIsolated()
+        let translated = await translator.processToolOutputForLLM(output)
+        // The cue text must survive ID translation untouched.
+        #expect(translated.contains("05:03 (5:03 a.m.) - 06:00 (6 a.m.): Early run"))
+        for (realId, expectedTitle) in [
+            (CompoundEventId.make(accountId: "acct-a", eventId: timedId), "Early run"),
+            (CompoundEventId.make(accountId: "acct-a", eventId: recurId), "Weekly: planning"),
+            (CompoundEventId.make(accountId: "acct-a", eventId: freeId), "Focus"),
+            (CompoundEventId.make(accountId: "acct-a", eventId: allDayId), "Holiday"),
+        ] {
+            let numericId = await translator.toNumericId(realId)
+            let rendered = await translator.processResponseForDisplay("[Event](\(numericId))")
+            #expect(rendered.contains("[📅 \(expectedTitle)](tabmail://event/\(numericId))"), "row for \(expectedTitle): \(rendered)")
+            #expect(!rendered.contains("a.m.") && !rendered.contains("p.m.") && !rendered.contains("(↻") && !rendered.contains("[free]"), "pill leaked clock/marker text: \(rendered)")
+        }
+    }
+
     @Test("event chip title strips bare (↻) marker — back-compat")
     func eventChipStripsBareRecurrenceMarker() async {
         let translator = ChatIdTranslator.createIsolated()
