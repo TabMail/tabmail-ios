@@ -45,7 +45,12 @@ struct ServerDraftCloseTestScene: View {
                         }
                         return nil
                     })
-                    .safeAreaInset(edge: ProcessInfo.processInfo.arguments.contains("--draft-delete-ui-test") ? .bottom : .top) {
+                    // The refused-deletion notice (#147) extends into the bottom
+                    // safe area, exactly where a bottom control bar would sit on
+                    // top of it and swallow the dismissing tap — so the refused
+                    // fixture keeps the bar at the top.
+                    .safeAreaInset(edge: ProcessInfo.processInfo.arguments.contains("--draft-delete-ui-test")
+                                   && !Self.refusedFixture ? .bottom : .top) {
                         VStack {
                             HStack {
                                 Button("Open push") {
@@ -77,7 +82,8 @@ struct ServerDraftCloseTestScene: View {
                 let fixtureRow = Self.row
                 let deleteFixture = ProcessInfo.processInfo.arguments.contains("--draft-delete-ui-test")
                 let deleteRows = deleteFixture ? Self.deleteRows(
-                    thread: ProcessInfo.processInfo.arguments.contains("--draft-delete-thread")) : []
+                    thread: ProcessInfo.processInfo.arguments.contains("--draft-delete-thread"),
+                    refused: Self.refusedFixture) : []
                 try await AppDatabase.dbPool.write { db in
                     // Each launch owns only this synthetic account's fixture rows.
                     try Draft.filter(Column("accountId") == accountID).deleteAll(db)
@@ -111,7 +117,19 @@ struct ServerDraftCloseTestScene: View {
         }
     }
 
-    private static func deleteRows(thread: Bool) -> [(Draft, MessageHeader)] {
+    /// `--draft-delete-refused` keys every Drafts header on a STALE epoch, so
+    /// `InboxViewModel.deleteDraftMessage` finds no placeholder match for the
+    /// draft's current epoch and fails closed (#147). This is the real-world
+    /// shape a reopened draft leaves behind, not an invented one.
+    private static var refusedFixture: Bool {
+        ProcessInfo.processInfo.arguments.contains("--draft-delete-refused")
+    }
+
+    private static func headerEpoch(draftId: String, current: String?, refused: Bool) -> String? {
+        refused ? "stale-\(draftId)" : current
+    }
+
+    private static func deleteRows(thread: Bool, refused: Bool) -> [(Draft, MessageHeader)] {
         let ids = thread ? ["target", "child", "bystander"] : ["target", "bystander"]
         return ids.enumerated().map { index, id in
             let date = Date().addingTimeInterval(Double(-60 * index))
@@ -126,7 +144,8 @@ struct ServerDraftCloseTestScene: View {
             draft.instanceEpoch = "generation-\(id)"
             var header = row.toMessageHeader()
             header.messageId = PendingOperation.draftPlaceholderMessageId(
-                draftId: id, instanceEpoch: draft.instanceEpoch)
+                draftId: id, instanceEpoch: headerEpoch(
+                    draftId: id, current: draft.instanceEpoch, refused: refused))
             header.id = "\(accountID):Drafts:\(header.messageId)"
             header.subject = subject
             header.snippet = "Authored \(id)"
@@ -147,7 +166,9 @@ struct ServerDraftCloseTestScene: View {
                     let expectedHeaders = Set(drafts.map {
                         PendingOperation.draftPlaceholderHeaderPK(
                             accountId: Self.accountID, draftsFolderPath: "Drafts",
-                            draftId: $0.id, instanceEpoch: $0.instanceEpoch)
+                            draftId: $0.id, instanceEpoch: Self.headerEpoch(
+                                draftId: $0.id, current: $0.instanceEpoch,
+                                refused: Self.refusedFixture))
                     })
                     let intact = Set(headers.map(\.id)) == expectedHeaders
                         && headers.allSatisfy { $0.folderPath == "Drafts" && !$0.isInInbox }
