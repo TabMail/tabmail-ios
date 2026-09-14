@@ -37,10 +37,11 @@ final class DraftSwipeDeleteUITests: XCTestCase {
         let notice = app.buttons[Self.noticeIdentifier]
         XCTAssertTrue(notice.waitForExistence(timeout: 5))
         XCTAssertEqual(app.buttons.matching(identifier: Self.noticeIdentifier).count, 1)
-        // Tapping the notice dismisses it (before its own timer would).
+        // Tapping the notice dismisses it. The window is deliberately SHORTER
+        // than DraftDeleteRefusalNotice.displayDuration (6s) so a dead tap
+        // handler cannot pass on automatic expiry — the reviewer's oracle escape.
         notice.tap()
-        expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: notice)
-        waitForExpectations(timeout: 5)
+        XCTAssertTrue(notice.waitForNonExistence(timeout: 2))
         // The row is back, and the draft rows are untouched.
         XCTAssertTrue(app.staticTexts["Draft close fixture"].firstMatch.waitForExistence(timeout: 5))
         app.buttons["Check rows"].tap()
@@ -62,6 +63,34 @@ final class DraftSwipeDeleteUITests: XCTestCase {
         // Untouched, it dismisses itself.
         expectation(for: NSPredicate(format: "exists == false"), evaluatedWith: notice)
         waitForExpectations(timeout: 10)
+    }
+
+    func testSecondRefusalReplacesTheNoticeAndOutlivesTheFirstDeadline() {
+        let app = launch(refused: true)
+        defer { app.terminate() }
+        let notice = app.buttons[Self.noticeIdentifier]
+        var row = app.staticTexts["Draft close fixture"].firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        fullSwipe(row, in: app)
+        XCTAssertTrue(notice.waitForExistence(timeout: 5))
+        // Retry while the first notice is still up: the row is back, so swipe
+        // it again. Observing the notice right before the swipe bounds the
+        // gap to well under the first notice's 6s deadline (the XCUITest
+        // gesture itself takes ~1.5s to reach the full-swipe threshold).
+        row = app.staticTexts["Draft close fixture"].firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        XCTAssertTrue(notice.exists)
+        fullSwipe(row, in: app)
+        XCTAssertTrue(notice.waitForExistence(timeout: 5))
+        XCTAssertEqual(app.buttons.matching(identifier: Self.noticeIdentifier).count, 1)
+        // The FIRST gesture's timer must not take the SECOND gesture's notice
+        // down: it has to survive past where the first deadline falls, while
+        // the window stays well inside the second notice's own lifetime.
+        XCTAssertFalse(notice.waitForNonExistence(timeout: 2))
+        // …and then expire on its own.
+        XCTAssertTrue(notice.waitForNonExistence(timeout: 10))
+        app.buttons["Check rows"].tap()
+        XCTAssertTrue(app.staticTexts["Remaining: bystander,target"].waitForExistence(timeout: 5))
     }
 
     private static let noticeIdentifier = "draft-delete-refused-notice"

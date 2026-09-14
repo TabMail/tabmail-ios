@@ -45,7 +45,12 @@ struct ServerDraftCloseTestScene: View {
                         }
                         return nil
                     })
-                    .safeAreaInset(edge: ProcessInfo.processInfo.arguments.contains("--draft-delete-ui-test") ? .bottom : .top) {
+                    // The refused-deletion notice (#147) extends into the bottom
+                    // safe area, exactly where a bottom control bar would sit on
+                    // top of it and swallow the dismissing tap — so the refused
+                    // fixture keeps the bar at the top.
+                    .safeAreaInset(edge: ProcessInfo.processInfo.arguments.contains("--draft-delete-ui-test")
+                                   && !Self.refusedFixture ? .bottom : .top) {
                         VStack {
                             HStack {
                                 Button("Open push") {

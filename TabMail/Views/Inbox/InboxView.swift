@@ -93,8 +93,10 @@ enum DraftDeleteRefusalNotice {
     /// Plain-language, no identifiers: the draft is still where it was.
     static let message = "Draft wasn't deleted. It's still in Drafts."
     /// Brief and self-dismissing; shorter than the agent toast because there is
-    /// nothing to tap through to.
-    static let displayDuration: Duration = .seconds(4)
+    /// nothing to tap through to, but long enough that a retry while the notice
+    /// is up (a second refusal replacing the first) is observable in the UI
+    /// tests, whose gestures and queries each cost about a second.
+    static let displayDuration: Duration = .seconds(6)
 
     static func text(refusedCount: Int, isDraftsContext: Bool) -> String? {
         guard isDraftsContext, refusedCount > 0 else { return nil }
