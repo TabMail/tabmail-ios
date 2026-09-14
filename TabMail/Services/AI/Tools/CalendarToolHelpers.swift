@@ -305,7 +305,16 @@ enum CalendarToolHelpers {
                 ? entry.event.start?.date.map { String($0.prefix(10)) }
                 : nil
             let dk = allDayDigits ?? EKEventStoreHelper.dayKey(start, timeZone: tz)
-            let headerAnchor = allDayDigits.flatMap { Self.allDayAnchor($0, timeZone: tz) } ?? start
+            let headerAnchor: Date
+            if let digits = allDayDigits {
+                // Fail closed on digits the anchor cannot place: falling back to
+                // the device instant would hand the group a previous-day header
+                // and mislabel every timed row sharing it.
+                guard let anchor = Self.allDayAnchor(digits, timeZone: tz) else { continue }
+                headerAnchor = anchor
+            } else {
+                headerAnchor = start
+            }
 
             let isFreeBusy = (entry.accessRole == Self.freeBusyAccessRole)
             // Suppress recur/free marks on freeBusy rows: the title is already
@@ -423,15 +432,18 @@ enum CalendarToolHelpers {
         return "\(fmt.string(from: date)) (\(twelveHourCue(date, timeZone: timeZone)))"
     }
 
-    /// Midnight of a provider `yyyy-MM-dd` all-day date **in the display zone**,
-    /// so the day header and sort position follow the date's own digits rather
-    /// than the device-local instant `GCalEvent.startDate` produces.
+    /// The first instant of a provider `yyyy-MM-dd` all-day date **in the
+    /// display zone**, so the day header and sort position follow the date's
+    /// own digits rather than the device-local instant `GCalEvent.startDate`
+    /// produces. Built from calendar components, not parsed as "00:00:00":
+    /// zones that spring forward AT midnight (Havana, Santiago, Asunción…) have
+    /// no midnight on the transition day and a wall-clock parse returns nil.
     static func allDayAnchor(_ dayDigits: String, timeZone: TimeZone) -> Date? {
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.timeZone = timeZone
-        fmt.dateFormat = "yyyy-MM-dd"
-        return fmt.date(from: dayDigits)
+        let parts = dayDigits.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        return cal.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))
     }
 
     /// Legacy overload for callers that don't yet have account/calendar context.
