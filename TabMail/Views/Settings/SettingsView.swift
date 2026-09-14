@@ -9,6 +9,10 @@ import UIKit
 struct SettingsView: View {
     @Environment(NavigationStore.self) private var navigationStore
     @Environment(\.scenePhase) private var scenePhase
+    /// Push is delivered through the TabMail push worker, which needs a
+    /// TabMail session to register the device. Without one the controls are
+    /// greyed out (#109) — the same gate that hides AI features elsewhere.
+    @Environment(\.hasTabMailSession) private var hasTabMailSession
     @State private var accountToDelete: Account?
     @State private var settingsErrorMessage = ""
     @State private var showSettingsError = false
@@ -126,7 +130,14 @@ struct SettingsView: View {
             }
 
             Section("Push Notifications") {
+                if !hasTabMailSession {
+                    Label("Push notifications need a TabMail sign-in", systemImage: "person.crop.circle.badge.exclamationmark")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Toggle("Enable Inbox Push Notifications", isOn: $pushEnabled)
+                    .disabled(!hasTabMailSession)
                     .onChange(of: pushEnabled) { oldValue, newValue in
                         // Only act on USER-DRIVEN transitions, not on programmatic
                         // writes (e.g. disableNSEGlobally writing false after a
@@ -202,6 +213,7 @@ struct SettingsView: View {
                                 .foregroundStyle(Palette.textMuted)
                         }
                     }
+                    .disabled(!hasTabMailSession)
                 }
 
                 Text("When enabled, new emails will be delivered immediately as push notifications — TabMail will still analyze and deliver non-important emails passively in your notification center and only buzz you for the important ones.")

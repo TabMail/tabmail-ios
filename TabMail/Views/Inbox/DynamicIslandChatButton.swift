@@ -876,7 +876,7 @@ struct DynamicIslandChat: View {
             Image(systemName: "person.crop.circle.badge.exclamationmark")
                 .font(.body)
                 .foregroundStyle(.secondary)
-            Text("Sign in to TabMail for AI features")
+            Text("Sign in to TabMail for AI features and push notifications")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
