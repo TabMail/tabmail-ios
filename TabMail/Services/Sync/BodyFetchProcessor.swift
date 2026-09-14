@@ -753,10 +753,12 @@ enum BodyFetchProcessor {
     /// SCOPE — this exempts the open that performs its OWN fetch; it is NOT
     /// "exempt in every body state". When `ActiveBodyQueue` already owns the
     /// fetch (`MessageDetailViewModel.loadBody` sees `isQueuedOrInFlight` and
-    /// polls), the body lands via the DEFAULT gated flush above and
-    /// `startBodyPoll`'s `adoptReadyBody` displays it without re-triggering AI.
-    /// That residual is the coordinator-deferred body-arrival auto-trigger,
-    /// Retry-recoverable — see ADR-IOS-078 and the IOS-AI-004 amendment.
+    /// polls), the body lands via the DEFAULT gated flush above, and the AI
+    /// trigger for that arm lives in the view model instead:
+    /// `MessageDetailViewModel.processOpenedMessageAfterPollAdoption` calls the
+    /// exempt direct path on the adopted id (iOS #67, 2026-09-14). Until then
+    /// that arm was the coordinator-deferred body-arrival auto-trigger — see
+    /// ADR-IOS-078 and the IOS-AI-004 amendment.
     static func flushBatch(_ items: [ProcessedItem], enableAI: Bool, aiWindowExempt: Bool = false) async {
         guard !items.isEmpty else { return }
         let t0 = CFAbsoluteTimeGetCurrent()
