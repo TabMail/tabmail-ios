@@ -748,10 +748,17 @@ actor ChatIdTranslator {
                     let afterTab = String(tabParts[1])
                     if afterTab.hasPrefix("event_id: ") {
                         let realId = String(afterTab.dropFirst("event_id: ".count)).trimmingCharacters(in: .whitespaces)
-                        // Extract title: strip time prefix, then strip markers
-                        let timePrefixPattern = /^(?:All day|\d{2}:\d{2}\s*-\s*\d{2}:\d{2}|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}):\s+/
-                        if let match = beforeTab.firstMatch(of: timePrefixPattern) {
-                            var title = String(beforeTab[match.range.upperBound...])
+                        // Extract title: everything after the formatter's `: `
+                        // separator that closes the time prefix ("All day: ",
+                        // "05:00 (5 a.m.) - 06:00 (6 a.m.): ", "<naive ISO>: ").
+                        // No clock grammar is duplicated here: a prefix regex
+                        // silently rejected every timed row once the formatter
+                        // gained AM/PM cues, and the pill fell back to "Event".
+                        // Time prefixes never contain ": " themselves (their
+                        // colons are followed by digits), so the FIRST ": " is
+                        // always the separator, even for a title containing ": ".
+                        if let sep = beforeTab.range(of: ": ") {
+                            var title = String(beforeTab[sep.upperBound...])
                             // Strip the recurrence marker — both the bare `(↻)`
                             // and the richer `(↻ RRULE:…)` form added in v1.5.21
                             // so the LLM can reason about edit_scope. The chip

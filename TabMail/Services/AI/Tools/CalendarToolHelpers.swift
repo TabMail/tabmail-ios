@@ -336,10 +336,7 @@ enum CalendarToolHelpers {
             if entry.event.isAllDay {
                 timeRange = "All day"
             } else if let endDate = entry.event.endDate {
-                let fmt = DateFormatter()
-                fmt.dateFormat = "HH:mm"
-                fmt.timeZone = tz
-                timeRange = "\(fmt.string(from: start)) - \(fmt.string(from: endDate))"
+                timeRange = "\(Self.formatHourWithCue(start, timeZone: tz)) - \(Self.formatHourWithCue(endDate, timeZone: tz))"
             } else {
                 timeRange = EKEventStoreHelper.toNaiveISO(start, timeZone: tz)
             }
@@ -386,6 +383,35 @@ enum CalendarToolHelpers {
         }
 
         return output.joined(separator: "\n\n")
+    }
+
+    /// Explicit 12-hour cue for a timed grouped-summary entry — `"5 a.m."`,
+    /// `"5:30 p.m."`, `"12 a.m."` for midnight, `"12 p.m."` for noon. Locale-
+    /// independent by construction (hand-built from calendar components, not
+    /// `DateFormatter`'s `h a`, whose meridiem symbols vary per locale). Must
+    /// stay byte-for-byte aligned with TB `formatTwelveHourCue` in
+    /// `chat/tools/calendar_search.js` (#99 / TB #31).
+    static func twelveHourCue(_ date: Date, timeZone: TimeZone) -> String {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = timeZone
+        let comps = cal.dateComponents([.hour, .minute], from: date)
+        let hours24 = comps.hour ?? 0
+        let minutes = comps.minute ?? 0
+        let meridiem = hours24 < 12 ? "a.m." : "p.m."
+        let h12 = hours24 % 12 == 0 ? 12 : hours24 % 12
+        let mm = minutes == 0 ? "" : ":" + String(format: "%02d", minutes)
+        return "\(h12)\(mm) \(meridiem)"
+    }
+
+    /// `"05:00 (5 a.m.)"` — the 24-hour value stays the primary token (the
+    /// `timezone:` header still governs it); the parenthetical exists because
+    /// the LLM has misread bare 24-hour ranges as the wrong half of the day.
+    static func formatHourWithCue(_ date: Date, timeZone: TimeZone) -> String {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "HH:mm"
+        fmt.timeZone = timeZone
+        return "\(fmt.string(from: date)) (\(twelveHourCue(date, timeZone: timeZone)))"
     }
 
     /// Legacy overload for callers that don't yet have account/calendar context.
