@@ -4,7 +4,8 @@
 
 import SwiftUI
 
-/// Reusable prompt encouraging the user to sign in to TabMail for AI features.
+/// Reusable prompt encouraging the user to sign in to TabMail for AI features
+/// and push notifications.
 /// Presents `TabMailLoginView` as a sheet when tapped.
 struct TabMailSignInPrompt: View {
     @State private var showLogin = false
@@ -14,7 +15,7 @@ struct TabMailSignInPrompt: View {
         Button {
             showLogin = true
         } label: {
-            Label("Sign in for AI features", systemImage: "sparkles")
+            Label("Sign in for AI features and push notifications", systemImage: "sparkles")
         }
         .sheet(isPresented: $showLogin) {
             TabMailLoginView {

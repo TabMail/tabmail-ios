@@ -618,7 +618,7 @@ struct RootView: View {
         .alert("Signed Out", isPresented: $showSignedOutAlert) {
             Button("OK") {}
         } message: {
-            Text("You have been signed out of TabMail. Your email accounts and messages remain on this device. Sign in again to use AI features.")
+            Text("You have been signed out of TabMail. Your email accounts and messages remain on this device. Sign in again to use AI features and push notifications.")
         }
         .onReceive(NotificationCenter.default.publisher(for: .tabMailAccountGone).receive(on: DispatchQueue.main)) { _ in
             if DebugModeManager.isLoggingEnabled() {
