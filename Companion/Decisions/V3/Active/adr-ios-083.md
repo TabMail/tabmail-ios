@@ -44,3 +44,11 @@ the local authored Draft using its complete folder/UID/UIDVALIDITY address and
 instance generation. The writer rechecks the address before committing. A fresh
 reply then has no saved body to restore and can offer the parent's cached reply
 as an unaccepted suggestion again; the cached suggestion itself is preserved.
+
+**Follow-up (#147, 2026-09-14):** a refused user-initiated Drafts deletion now shows a brief,
+non-blocking bottom notice ("Draft wasn't deleted. It's still in Drafts.") — one per gesture, never
+outside the Drafts list, never on success. The refusal, row restoration, ownership checks and the
+deletion pipeline are unchanged; the notice is transient view state only (`DraftDeleteRefusalNotice`,
+`InboxView.showDraftRefusalNoticeIfNeeded`). The real-view UI harness (`ServerDraftCloseTestScene`
+`--draft-delete-refused`, `DraftSwipeDeleteUITests`) pins delivery, tap dismissal, auto-expiry and
+replacement by a second refusal.
