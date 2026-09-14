@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import GRDB
 @testable import TabMail
 
 @Suite("CalendarToolHelpers Argument Parsing")
@@ -1847,9 +1848,9 @@ struct CalendarToolHelpersAmPmCueTests {
 struct CalendarToolHelpersAllDayDayKeyTests {
     /// A display zone far west of any plausible device zone, so device-local
     /// midnight of the date is still the PREVIOUS evening there.
-    private static let farWest = TimeZone(identifier: "Etc/GMT+12")!
+    fileprivate static let farWest = TimeZone(identifier: "Etc/GMT+12")!
 
-    private static func dayDigits(offset: Int) -> String {
+    fileprivate static func dayDigits(offset: Int) -> String {
         let day = Calendar(identifier: .gregorian).date(byAdding: .day, value: offset, to: Date())!
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
@@ -1859,7 +1860,7 @@ struct CalendarToolHelpersAllDayDayKeyTests {
     }
 
     /// Calendar-date arithmetic on digits alone (no zone, no instant).
-    private static func dayDigits(offset: Int, from day: String) -> String {
+    fileprivate static func dayDigits(offset: Int, from day: String) -> String {
         let parts = day.split(separator: "-").map { Int($0)! }
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC")!
@@ -1942,7 +1943,7 @@ struct CalendarToolHelpersAllDayDayKeyTests {
 
     /// Header text for a calendar date derived WITHOUT the anchor under test:
     /// noon of that date in the display zone always exists.
-    private static func headerFor(day: String, in tz: TimeZone) -> String {
+    fileprivate static func headerFor(day: String, in tz: TimeZone) -> String {
         let parts = day.split(separator: "-").map { Int($0)! }
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = tz
@@ -2057,5 +2058,108 @@ struct CalendarToolHelpersAllDayDayKeyTests {
         #expect(output.components(separatedBy: "date:").count - 1 == 1)
         #expect(output.contains("All day: Holiday\tevent_id: ad"))
         Self.expectAllDayFirst(output)
+    }
+
+    @Test("Production tuple overload: compound ids, one header, all-day row first")
+    func productionOverloadKeepsAllDayUnderItsDate() {
+        let day = Self.dayDigits(offset: 7)
+        let allDay = Self.allDay(id: "ad", title: "Holiday", day: day)
+        let timed = Self.timed(id: "t", title: "Sync", start: "\(day)T10:00:00-12:00", end: "\(day)T11:00:00-12:00")
+        let rows: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)] = [
+            (event: timed, accountId: "acct", calendarId: "cal", accessRole: "owner"),
+            (event: allDay, accountId: "acct", calendarId: "cal", accessRole: "owner"),
+        ]
+        let output = CalendarToolHelpers.formatGroupedSummary(rows, timeZone: Self.farWest)
+        let prevDay = Self.dayDigits(offset: 6)
+        #expect(output.contains("date: \(Self.headerFor(day: day, in: Self.farWest))"))
+        #expect(!output.contains("date: \(Self.headerFor(day: prevDay, in: Self.farWest))"))
+        #expect(output.contains("timezone: \(Self.farWest.identifier)"))
+        #expect(output.components(separatedBy: "date:").count - 1 == 1)
+        #expect(output.contains("All day: Holiday\tevent_id: acct:ad"))
+        #expect(output.contains(": Sync\tevent_id: acct:t"))
+        Self.expectAllDayFirst(output)
+    }
+
+    @Test("The provider date is fixed; every display zone labels the all-day row with that date")
+    func displayZoneMatrixKeepsTheProviderDate() {
+        let day = Self.dayDigits(offset: 7)
+        let prevDay = Self.dayDigits(offset: 6)
+        let nextDay = Self.dayDigits(offset: 8)
+        let event = Self.allDay(id: "ad", title: "Holiday", day: day)
+        let zones = ["Etc/GMT+12", "America/Vancouver", "UTC", "Asia/Kathmandu", "Pacific/Kiritimati"]
+            .compactMap { TimeZone(identifier: $0) }
+        #expect(zones.count == 5)
+        for zone in zones {
+            let output = CalendarToolHelpers.formatGroupedSummary(gcalEvents: [event], timeZone: zone)
+            #expect(output.contains("date: \(Self.headerFor(day: day, in: zone))"), "\(zone.identifier)")
+            #expect(!output.contains("date: \(Self.headerFor(day: prevDay, in: zone))"), "\(zone.identifier)")
+            #expect(!output.contains("date: \(Self.headerFor(day: nextDay, in: zone))"), "\(zone.identifier)")
+            #expect(output.contains("All day: Holiday\tevent_id: ad"), "\(zone.identifier)")
+        }
+    }
+}
+
+/// The demo provider is the one in-process WRITER of `GCalDateTime.date`, so
+/// its output — not a hand-built fixture — is what the grouped summary must
+/// place. Installs `AppDatabase.shared`, hence `.serialized`.
+@Suite("CalendarToolHelpers all-day rows from the demo writer", .serialized)
+struct CalendarToolHelpersDemoAllDayWriterTests {
+    private func install() throws -> (DatabasePool, URL, AppDatabase?) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("demo-allday-writer-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let saved = current
+            current = appDatabase
+            return saved
+        }
+        return (pool, directory, previous)
+    }
+
+    @Test("An all-day event the demo provider wrote is emitted as Gregorian ASCII digits and keyed under its own date")
+    func demoAllDayRowKeepsItsDate() async throws {
+        let fixture = try install()
+        defer {
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        let farWest = CalendarToolHelpersAllDayDayKeyTests.farWest
+        let day = CalendarToolHelpersAllDayDayKeyTests.dayDigits(offset: 7)
+        let prevDay = CalendarToolHelpersAllDayDayKeyTests.dayDigits(offset: 6)
+        let nextDay = CalendarToolHelpersAllDayDayKeyTests.dayDigits(offset: 8)
+
+        let provider = DemoCalendarProvider(accountId: "demo-acct")
+        var input = GCalEventInput()
+        input.summary = "Holiday"
+        input.startDate = day
+        input.endDate = nextDay
+        let created = try await provider.createEvent(calendarId: "primary", event: input, sendUpdates: "none")
+        // Provider DATE contract: the digits that went in come back unchanged.
+        // A device-locale formatter would answer in the device calendar and
+        // numerals, which the date-only consumers cannot place.
+        #expect(created.start?.date == day)
+        #expect(created.end?.date == nextDay)
+        #expect(created.isAllDay)
+
+        let listed = try await provider.listEvents(
+            calendarId: "primary", timeMin: nil, timeMax: nil, query: nil,
+            singleEvents: true, maxResults: 10, orderBy: "startTime")
+        #expect(listed.count == 1)
+        guard listed.count == 1 else { return }
+        let row = listed[0]
+        #expect(row.start?.date == day)
+
+        let output = CalendarToolHelpers.formatGroupedSummary(
+            [(event: row, accountId: "demo-acct", calendarId: "primary", accessRole: "owner")],
+            timeZone: farWest)
+        #expect(output.contains("date: \(CalendarToolHelpersAllDayDayKeyTests.headerFor(day: day, in: farWest))"))
+        #expect(!output.contains("date: \(CalendarToolHelpersAllDayDayKeyTests.headerFor(day: prevDay, in: farWest))"))
+        #expect(output.components(separatedBy: "date:").count - 1 == 1)
+        #expect(output.contains("All day: Holiday\tevent_id: demo-acct:\(row.id ?? "")"))
     }
 }

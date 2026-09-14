@@ -295,12 +295,13 @@ enum CalendarToolHelpers {
         var seenDays = Set<String>()
 
         for entry in events {
-            guard let start = entry.event.startDate else { continue }
             // An all-day DATE is frame-free (#166): key and label its day from the
-            // provider's own digits. `startDate` parses `start.date` as DEVICE-local
-            // midnight, and re-keying that instant in a display zone west of the
-            // device lands the row under the previous day's header — the same
-            // defect `formatDetailedEvent` closed with `allDayNaiveISO`.
+            // provider's own digits, never from `startDate`. That accessor parses
+            // `start.date` as DEVICE-local midnight, which (a) re-keyed in a display
+            // zone west of the device lands the row under the previous day's header
+            // — the same defect `formatDetailedEvent` closed with `allDayNaiveISO` —
+            // and (b) does not exist at all when the DEVICE zone has no midnight on
+            // that date, so an all-day row must not be gated on it.
             let allDayDigits: String? = entry.event.isAllDay
                 ? entry.event.start?.date.map { String($0.prefix(10)) }
                 : nil
@@ -312,6 +313,7 @@ enum CalendarToolHelpers {
                 guard let anchor = Self.allDayAnchor(digits, timeZone: tz) else { continue }
                 headerAnchor = anchor
             } else {
+                guard let start = entry.event.startDate else { continue }
                 headerAnchor = start
             }
             // One key encoding for every row: the anchor already sits on the
@@ -358,9 +360,9 @@ enum CalendarToolHelpers {
             if entry.event.isAllDay {
                 timeRange = "All day"
             } else if let endDate = entry.event.endDate {
-                timeRange = "\(Self.formatHourWithCue(start, timeZone: tz)) - \(Self.formatHourWithCue(endDate, timeZone: tz))"
+                timeRange = "\(Self.formatHourWithCue(headerAnchor, timeZone: tz)) - \(Self.formatHourWithCue(endDate, timeZone: tz))"
             } else {
-                timeRange = EKEventStoreHelper.toNaiveISO(start, timeZone: tz)
+                timeRange = EKEventStoreHelper.toNaiveISO(headerAnchor, timeZone: tz)
             }
 
             let title: String
