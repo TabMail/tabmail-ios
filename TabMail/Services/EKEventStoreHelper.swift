@@ -179,8 +179,13 @@ enum EKEventStoreHelper {
     }
 
     /// Format a date as a day key "YYYY-MM-DD" in the specified timezone.
+    /// A grouping KEY, never display text: pinned to Gregorian ASCII so rows
+    /// keyed from a provider DATE and rows keyed from an instant coalesce on
+    /// every device locale (#166).
     static func dayKey(_ date: Date, timeZone: TimeZone) -> String {
         let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.calendar = Calendar(identifier: .gregorian)
         fmt.dateFormat = "yyyy-MM-dd"
         fmt.timeZone = timeZone
         return fmt.string(from: date)

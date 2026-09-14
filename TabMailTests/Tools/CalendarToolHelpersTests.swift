@@ -2097,6 +2097,50 @@ struct CalendarToolHelpersAllDayDayKeyTests {
             #expect(output.contains("All day: Holiday\tevent_id: ad"), "\(zone.identifier)")
         }
     }
+
+    @Test("Malformed or non-existent DATE digits have no anchor and are omitted without disturbing the neighbouring row")
+    func malformedDateDigitsAreOmitted() {
+        let day = Self.dayDigits(offset: 7)
+        // The CalDAV ICS parser turns `DTSTART;VALUE=DATE:abcdefgh` into
+        // `abcd-ef-gh` (a failed parse still yields eight characters).
+        let malformed = ["abcd-ef-gh", "", "2026", "2026-13-05", "2026-02-30", "2026-00-10"]
+        for digits in malformed {
+            #expect(CalendarToolHelpers.allDayAnchor(digits, timeZone: Self.farWest) == nil, "\(digits)")
+            let bad = Self.allDay(id: "bad", title: "Broken", day: digits)
+            let good = Self.allDay(id: "ad", title: "Holiday", day: day)
+            let rows: [(event: GCalEvent, accountId: String, calendarId: String, accessRole: String?)] = [
+                (event: bad, accountId: "acct", calendarId: "cal", accessRole: "owner"),
+                (event: good, accountId: "acct", calendarId: "cal", accessRole: "owner"),
+            ]
+            let output = CalendarToolHelpers.formatGroupedSummary(rows, timeZone: Self.farWest)
+            #expect(!output.contains("Broken"), "\(digits)")
+            #expect(output.components(separatedBy: "date:").count - 1 == 1, "\(digits)")
+            #expect(output.contains("date: \(Self.headerFor(day: day, in: Self.farWest))"), "\(digits)")
+            #expect(output.contains("All day: Holiday\tevent_id: acct:ad"), "\(digits)")
+        }
+        // Positive control for the guard under test.
+        #expect(CalendarToolHelpers.allDayAnchor(day, timeZone: Self.farWest) != nil)
+    }
+
+    @Test("The day key is Gregorian ASCII: the anchor keys to the provider's own digits and matches a timed instant on that date")
+    func dayKeyIsGregorianAscii() {
+        // Both row kinds go through `EKEventStoreHelper.dayKey`; a device
+        // locale with its own numerals or calendar must not split one date
+        // into two groups, so the key is pinned to `yyyy-MM-dd` ASCII.
+        let day = Self.dayDigits(offset: 7)
+        let zones = ["Etc/GMT+12", "Asia/Kathmandu", "Pacific/Kiritimati"].compactMap { TimeZone(identifier: $0) }
+        #expect(zones.count == 3)
+        for zone in zones {
+            guard let anchor = CalendarToolHelpers.allDayAnchor(day, timeZone: zone) else {
+                Issue.record("no anchor in \(zone.identifier)")
+                continue
+            }
+            let key = EKEventStoreHelper.dayKey(anchor, timeZone: zone)
+            #expect(key == day, "\(zone.identifier)")
+            #expect(key.unicodeScalars.allSatisfy { $0.isASCII }, "\(zone.identifier)")
+            #expect(EKEventStoreHelper.dayKey(anchor.addingTimeInterval(10 * 3600), timeZone: zone) == key, "\(zone.identifier)")
+        }
+    }
 }
 
 /// The demo provider is the one in-process WRITER of `GCalDateTime.date`, so
@@ -2104,6 +2148,16 @@ struct CalendarToolHelpersAllDayDayKeyTests {
 /// place. Installs `AppDatabase.shared`, hence `.serialized`.
 @Suite("CalendarToolHelpers all-day rows from the demo writer", .serialized)
 struct CalendarToolHelpersDemoAllDayWriterTests {
+    /// Gregorian UTC midnight of `yyyy-MM-dd`, built from components — no
+    /// DateFormatter, so it cannot share a calendar mistake with the codec.
+    private static func gregorianUtcMidnightMs(_ day: String) -> Int64 {
+        let parts = day.split(separator: "-").map { Int($0)! }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let date = cal.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))!
+        return Int64(date.timeIntervalSince1970 * 1000)
+    }
+
     private func install() throws -> (DatabasePool, URL, AppDatabase?) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("demo-allday-writer-\(UUID().uuidString)", isDirectory: true)
@@ -2146,13 +2200,47 @@ struct CalendarToolHelpersDemoAllDayWriterTests {
         #expect(created.end?.date == nextDay)
         #expect(created.isAllDay)
 
+        // Independent oracle on the DURABLE instants: a parser and writer that
+        // share a wrong calendar round-trip the text perfectly while storing a
+        // different century, so the stored ms are checked against Gregorian
+        // UTC midnight built without either formatter.
+        let expectedStartMs = Self.gregorianUtcMidnightMs(day)
+        let expectedEndMs = Self.gregorianUtcMidnightMs(nextDay)
+        let stored = try await fixture.0.read { db -> (Int64, Int64)? in
+            try Row.fetchOne(db, sql: "SELECT startMs, endMs FROM demoCalendarEvent WHERE id = ?", arguments: [created.id])
+                .map { ($0["startMs"], $0["endMs"]) }
+        }
+        #expect(stored?.0 == expectedStartMs)
+        #expect(stored?.1 == expectedEndMs)
+
+        // A bounded window on that Gregorian day, as calendar_read supplies,
+        // must find the row; a window a week earlier must not.
+        let windowMin = Date(timeIntervalSince1970: TimeInterval(expectedStartMs) / 1000)
+        let windowMax = Date(timeIntervalSince1970: TimeInterval(expectedEndMs) / 1000)
         let listed = try await provider.listEvents(
-            calendarId: "primary", timeMin: nil, timeMax: nil, query: nil,
+            calendarId: "primary", timeMin: windowMin, timeMax: windowMax, query: nil,
             singleEvents: true, maxResults: 10, orderBy: "startTime")
         #expect(listed.count == 1)
+        let earlier = try await provider.listEvents(
+            calendarId: "primary", timeMin: windowMin.addingTimeInterval(-7 * 86_400),
+            timeMax: windowMax.addingTimeInterval(-7 * 86_400), query: nil,
+            singleEvents: true, maxResults: 10, orderBy: "startTime")
+        #expect(earlier.isEmpty)
         guard listed.count == 1 else { return }
         let row = listed[0]
         #expect(row.start?.date == day)
+
+        // The shared parser also serves updateEvent: move the event a day and
+        // re-check the durable instant against the independent oracle.
+        var moved = input
+        moved.startDate = nextDay
+        moved.endDate = CalendarToolHelpersAllDayDayKeyTests.dayDigits(offset: 9)
+        let updated = try await provider.updateEvent(calendarId: "primary", eventId: created.id ?? "", event: moved, sendUpdates: "none")
+        #expect(updated.start?.date == nextDay)
+        let storedAfter = try await fixture.0.read { db -> Int64? in
+            try Row.fetchOne(db, sql: "SELECT startMs FROM demoCalendarEvent WHERE id = ?", arguments: [created.id]).map { $0["startMs"] }
+        }
+        #expect(storedAfter == expectedEndMs)
 
         let output = CalendarToolHelpers.formatGroupedSummary(
             [(event: row, accountId: "demo-acct", calendarId: "primary", accessRole: "owner")],
