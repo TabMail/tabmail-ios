@@ -18,13 +18,8 @@ struct AccountDashboardView: View {
     @State private var instanceId = String(UUID().uuidString.prefix(6))
     /// Dedup guard for the unstructured initial load (see `.task` comment).
     @State private var loadInFlight = false
-    /// Disables the Sign Out button while `TabMailAuthService.signOut()` is
-    /// awaiting its two bounded push windows (IOS-PUSH-001): the removed-account
-    /// cleanup flush, and then the release handshake that gives up this device's
-    /// worker registration and ends the session server-side. The worst case is
-    /// therefore `signOutCleanupFlushTimeoutSeconds +
-    /// signOutHandshakeTimeoutSeconds`, not the flush bound alone.
-    @State private var isSigningOut = false
+    /// Owns the Sign Out control's in-flight state; see `SignOutButtonModel`.
+    @State private var signOutModel = SignOutButtonModel()
     @Environment(StoreKitManager.self) private var storeKit
     @Environment(\.scenePhase) private var scenePhase
 
@@ -248,24 +243,9 @@ struct AccountDashboardView: View {
                     // banner exit is the canonical (and only) demo-exit path;
                     // sign-out from inside demo doesn't make sense.
                     if !DemoModeStore.shared.isActive {
-                        Button(role: .destructive) {
-                            // `signOut()` can wait briefly for a removed-account
-                            // cleanup flush and then for its device-release
-                            // handshake (IOS-PUSH-001), so it is async and the
-                            // button must not accept a second tap meanwhile —
-                            // a second sign-out would race the first one's
-                            // handshake for the same session.
-                            isSigningOut = true
-                            Task {
-                                if !(await TabMailAuthService.signOut()) {
-                                    errorMessage = "Couldn’t finish signing out locally. Please try again."
-                                }
-                                isSigningOut = false
-                            }
-                        } label: {
-                            Label("Sign Out of TabMail", systemImage: "rectangle.portrait.and.arrow.right")
+                        SignOutButton(model: signOutModel) {
+                            errorMessage = "Couldn’t finish signing out locally. Please try again."
                         }
-                        .disabled(isSigningOut)
                         .listRowBackground(Palette.boxBg)
                     }
                 }
@@ -713,6 +693,97 @@ private struct AccountMismatchBanner: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text("We'll review your migration request and get back to you via email.")
+        }
+    }
+}
+
+// MARK: - Sign Out button
+
+/// In-flight state of the Sign Out control, plus the call it guards.
+///
+/// `TabMailAuthService.signOut()` can wait through two bounded push windows
+/// (IOS-PUSH-001): the removed-account cleanup flush, then the release handshake
+/// that gives up this device's worker registration and ends the session
+/// server-side. The worst case is `signOutCleanupFlushTimeoutSeconds +
+/// signOutHandshakeTimeoutSeconds`, not the flush bound alone — long enough that
+/// a bare disabled button reads as frozen (issue #110). `isSigningOut` is what
+/// disables the control AND shows its progress indicator for that whole window.
+/// The button's action is `activate(onLocalFailure:)`, and the sign-out call
+/// is injectable, so a test can host the production button, drive the same
+/// entry point the button does, hold the call pending, and observe the
+/// rendered control in both states. (A hosted SwiftUI button publishes no
+/// accessibility element in the unit-test process, so it cannot be tapped
+/// from a test; the action lives here for that reason.)
+@Observable
+@MainActor
+final class SignOutButtonModel {
+    private(set) var isSigningOut = false
+    private let perform: @MainActor () async -> Bool
+
+    init(perform: @escaping @MainActor () async -> Bool = { await TabMailAuthService.signOut() }) {
+        self.perform = perform
+    }
+
+    /// The Sign Out button's action. Starts the sign-out, holding
+    /// `isSigningOut` for its whole duration; a second activation while one
+    /// is pending is a no-op (the control is also disabled then), because a
+    /// second sign-out would race the first one's handshake for the same
+    /// session. A `false` result means the local session could not be
+    /// cleared: `onLocalFailure` runs so the caller shows its retry message,
+    /// and the control is released for the retry tap.
+    func activate(onLocalFailure: @escaping @MainActor @Sendable () -> Void) {
+        guard !isSigningOut else { return }
+        isSigningOut = true
+        Task {
+            defer { isSigningOut = false }
+            if !(await perform()) {
+                onLocalFailure()
+            }
+        }
+    }
+}
+
+/// The dashboard's "Sign Out of TabMail" control: a destructive button that is
+/// disabled, and shows a progress indicator, while `model.isSigningOut`.
+/// Disabling, together with the model's own no-op on re-activation, is what
+/// stops a second tap from racing the first tap's handshake for the same
+/// session.
+struct SignOutButton: View {
+    let model: SignOutButtonModel
+    /// Called when the sign-out could not complete locally; the dashboard
+    /// shows its retry message and a second tap re-runs the sign-out.
+    let onLocalFailure: @MainActor @Sendable () -> Void
+
+    var body: some View {
+        Button(role: .destructive) {
+            model.activate(onLocalFailure: onLocalFailure)
+        } label: {
+            SignOutButtonLabel(isSigningOut: model.isSigningOut)
+        }
+        .disabled(model.isSigningOut)
+    }
+}
+
+// MARK: - Sign Out button label
+
+/// The Sign Out control's label: the static label plus, while sign-out is in
+/// flight, a small indeterminate progress indicator (issue #110). Sign-out can
+/// wait through two bounded push windows — the removed-account cleanup flush and
+/// the release handshake — so a merely disabled button reads as frozen; the
+/// indicator is what tells the user the wait is work. Split out as its own view
+/// so a test can host it and assert the indicator's presence in both states.
+struct SignOutButtonLabel: View {
+    let isSigningOut: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Label("Sign Out of TabMail", systemImage: "rectangle.portrait.and.arrow.right")
+            if isSigningOut {
+                Spacer()
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityIdentifier("signOut.progress")
+            }
         }
     }
 }

@@ -30,6 +30,16 @@ struct PushConfigTests {
         #expect(PushConfig.silentPushDeadlineSeconds == 25)
     }
 
+    /// Issue #110: at 5s the handshake's bound expired between its two legs on
+    /// a sign-out shortly after a cold launch, cancelling the server-side logout.
+    /// The owner's decision is 10s; anything below the flush bound would be a
+    /// regression to that state.
+    @Test("signOutHandshakeTimeoutSeconds is 10 (cold-launch headroom, issue #110)")
+    func signOutHandshakeBoundIs10() {
+        #expect(PushConfig.signOutHandshakeTimeoutSeconds == 10)
+        #expect(PushConfig.signOutHandshakeTimeoutSeconds >= PushConfig.signOutCleanupFlushTimeoutSeconds)
+    }
+
     @Test("UserDefaults keys are unique")
     func uniqueKeys() {
         let keys = [PushConfig.deviceIdKey, PushConfig.lastDeviceTokenKey, PushConfig.registeredEmailsKey]
