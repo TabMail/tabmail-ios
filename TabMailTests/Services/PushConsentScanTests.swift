@@ -175,6 +175,40 @@ struct PushConsentScanTests {
         }
     }
 
+    @Test("Sign-in restore surfaces missing consent: the banner post arrives from restorePushRegistrationAfterSignIn itself")
+    func signInRestoreRunsTheConsentScan() async throws {
+        // Sign-out erases this device's classifier consents on the worker
+        // together with its installation, so the same user signing back in
+        // finds every push account `missing`. The scans fired on the sign-in
+        // transition race the re-registration and answer 409 (suppressed as
+        // unknown), so the sign-in restore path must run the scan itself once
+        // the subscribe is done — otherwise nothing surfaces the banner until
+        // the next scene-phase foreground pass. No TabMail session is installed
+        // here, so `subscribeAllAccounts` returns on its no-session guard
+        // without any live worker traffic; the only observable is the post.
+        let mock = MockConsentChecker()
+        mock.outcomes = [
+            "gone@gmail.com":   .gmail(.success(.missing)),
+            "gone@outlook.com": .outlook(.success(.missing)),
+        ]
+        try await withHarness(
+            accounts: [
+                ("gone@gmail.com", .gmail),
+                ("gone@outlook.com", .outlook),
+            ],
+            mock: mock
+        ) {
+            #expect(!TabMailAuthService.hasSession(),
+                    "the restore path must stay on its no-session subscribe guard")
+            let emails = try await observePost {
+                await TabMailAuthService.restorePushRegistrationAfterSignIn()
+            }
+            #expect(emails != nil, "the sign-in restore must run the consent scan and post its result")
+            guard let emails else { return }
+            #expect(Set(emails) == Set(["gone@gmail.com", "gone@outlook.com"]))
+        }
+    }
+
     @Test("Mixed statuses → only error/missing accounts land in banner")
     func mixedStatuses() async throws {
         let mock = MockConsentChecker()

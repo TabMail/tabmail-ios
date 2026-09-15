@@ -683,8 +683,9 @@ final class SyncScheduler {
                 fgStep("syncStartup returned")
                 BootProfiler.mark("startForegroundPolling: syncStartup returned (herd spawned)")
                 // Re-subscribe push on foreground return.
-                // subscribeAllAccounts() calls registerDeviceWithWorker() internally at the end,
-                // so no separate registerDeviceWithWorker() call needed here.
+                // subscribeAllAccounts() does NOT call registerDeviceWithWorker():
+                // the worker's `/subscribe` claims the installation itself, so no
+                // separate registerDeviceWithWorker() call is needed here.
                 // This also keeps the nse-vs-silent registration in sync with iOS
                 // notification settings: subscribeAccount reads visualAlertsEnabled()
                 // live, and settings can only change while the app is backgrounded,
