@@ -6,6 +6,7 @@ import Testing
 import Foundation
 import GRDB
 import Synchronization
+import UserNotifications
 @testable import TabMail
 
 /// Unit tests for `PushNotificationService.checkPushConsentStatusForForeground`.
@@ -175,37 +176,106 @@ struct PushConsentScanTests {
         }
     }
 
-    @Test("Sign-in restore surfaces missing consent: the banner post arrives from restorePushRegistrationAfterSignIn itself")
-    func signInRestoreRunsTheConsentScan() async throws {
+    /// Worker double for the sign-in restore. It answers the consent probe the
+    /// way the real worker does around a fresh sign-in: the installation is
+    /// gone until `/subscribe` recreates it, so a probe that lands first fails
+    /// (the worker's 409), and one that lands afterwards reports `missing`.
+    /// "Has `/subscribe` landed" is read off the fake transport's request log.
+    final class InstallationGatedChecker: PushConsentChecking, @unchecked Sendable {
+        enum ProbeError: Error { case installationNotClaimed }
+        var expectedDeviceId = ""
+
+        private func status(deviceId: String) throws -> PushClient.PushConsentStatus {
+            #expect(!deviceId.isEmpty && deviceId == expectedDeviceId)
+            let subscribed = PushRequestProtocol.observed().contains { $0.path == "/subscribe" }
+            guard subscribed else { throw ProbeError.installationNotClaimed }
+            return .missing
+        }
+
+        func getGmailConsentStatus(userEmail: String, deviceId: String) async throws -> PushClient.PushConsentStatus {
+            try status(deviceId: deviceId)
+        }
+
+        func getOutlookConsentStatus(userEmail: String, deviceId: String) async throws -> PushClient.PushConsentStatus {
+            try status(deviceId: deviceId)
+        }
+    }
+
+    private struct VisibleSettings: NotificationSettingsProviding {
+        func currentVisibility() async -> NotificationVisibilitySnapshot {
+            NotificationVisibilitySnapshot(authorizationStatus: .authorized, alertSetting: .enabled,
+                lockScreenSetting: .enabled, notificationCenterSetting: .enabled)
+        }
+    }
+
+    @Test("Sign-in restore surfaces missing consent once the installation is back: the scan runs after the subscribe")
+    func signInRestoreScansAfterTheSubscribe() async throws {
         // Sign-out erases this device's classifier consents on the worker
-        // together with its installation, so the same user signing back in
-        // finds every push account `missing`. The scans fired on the sign-in
-        // transition race the re-registration and answer 409 (suppressed as
-        // unknown), so the sign-in restore path must run the scan itself once
-        // the subscribe is done — otherwise nothing surfaces the banner until
-        // the next scene-phase foreground pass. No TabMail session is installed
-        // here, so `subscribeAllAccounts` returns on its no-session guard
-        // without any live worker traffic; the only observable is the post.
-        let mock = MockConsentChecker()
-        mock.outcomes = [
-            "gone@gmail.com":   .gmail(.success(.missing)),
-            "gone@outlook.com": .outlook(.success(.missing)),
-        ]
-        try await withHarness(
-            accounts: [
-                ("gone@gmail.com", .gmail),
-                ("gone@outlook.com", .outlook),
-            ],
-            mock: mock
-        ) {
-            #expect(!TabMailAuthService.hasSession(),
-                    "the restore path must stay on its no-session subscribe guard")
-            let emails = try await observePost {
-                await TabMailAuthService.restorePushRegistrationAfterSignIn()
+        // together with its installation. The scans fired on the sign-in
+        // transition race the re-registration: a probe that reaches the worker
+        // before `/subscribe` has recreated the installation answers 409, which
+        // the first-scan safety suppresses as "unknown", and nothing surfaces
+        // the banner until the next scene-phase foreground pass. The invariant
+        // pinned here is the user-visible one: a completed, authenticated
+        // restore exposes the missing consent by itself. The checker models the
+        // worker, so removing the subscribe, removing the scan, or running the
+        // scan before the subscribe all leave the banner unposted.
+        let checker = InstallationGatedChecker()
+        try await withHarness(accounts: [("gone@gmail.com", .gmail)], mock: MockConsentChecker()) {
+            let previousSession = await MainActor.run { TabMailSessionStore.shared.loadActiveSession()?.data }
+            let previousDemo = await MainActor.run { DemoModeStore.shared.isActive }
+            let standard = UserDefaults.standard
+            let previousToken = standard.object(forKey: PushConfig.lastDeviceTokenKey)
+            let previousDeviceId = standard.object(forKey: PushConfig.deviceIdKey)
+            let sessionData = try JSONSerialization.data(withJSONObject: [
+                "access_token": "synthetic-worker-token", "refresh_token": "synthetic-refresh-token",
+                "expires_at": Int(Date().addingTimeInterval(86400).timeIntervalSince1970),
+                "user": ["id": "22222222-2222-4222-8222-222222222222", "email": "session@example.com"],
+            ])
+            try await MainActor.run {
+                _ = try TabMailSessionStore.shared.installNewSession(sessionData)
+                DemoModeStore.shared.isActive = false
             }
-            #expect(emails != nil, "the sign-in restore must run the consent scan and post its result")
-            guard let emails else { return }
-            #expect(Set(emails) == Set(["gone@gmail.com", "gone@outlook.com"]))
+            standard.set("apns-device-token", forKey: PushConfig.lastDeviceTokenKey)
+            standard.set("test-device", forKey: PushConfig.deviceIdKey)
+            #expect(TabMailAuthService.hasSession(), "the restore must run as a signed-in user")
+
+            PushRequestProtocol.reset()
+            let config = URLSessionConfiguration.ephemeral
+            config.protocolClasses = [PushRequestProtocol.self]
+            let session = URLSession(configuration: config)
+            let client = PushClient(baseURL: URL(string: "https://push.example.test")!, session: session,
+                authTokenProvider: { "synthetic-worker-token" })
+            let service = PushNotificationService(pushClient: client, subscriptionAccessToken: { _ in "synthetic-provider-token" })
+            await service._setNotificationSettingsProviderForTesting(VisibleSettings())
+            checker.expectedDeviceId = await service.deviceId
+            await service._setConsentCheckerForTesting(checker)
+
+            let outcome: Result<[String]?, Error>
+            do {
+                outcome = .success(try await observePost {
+                    await TabMailAuthService.restorePushRegistrationAfterSignIn(service: service)
+                })
+            } catch {
+                outcome = .failure(error)
+            }
+
+            session.invalidateAndCancel()
+            if let previousToken { standard.set(previousToken, forKey: PushConfig.lastDeviceTokenKey) }
+            else { standard.removeObject(forKey: PushConfig.lastDeviceTokenKey) }
+            if let previousDeviceId { standard.set(previousDeviceId, forKey: PushConfig.deviceIdKey) }
+            else { standard.removeObject(forKey: PushConfig.deviceIdKey) }
+            await MainActor.run {
+                _ = TabMailAuthService.completeSession(mode: .deactivate, notify: false)
+                if let previousSession { _ = try? TabMailSessionStore.shared.installNewSession(previousSession) }
+                DemoModeStore.shared.isActive = previousDemo
+            }
+
+            let subscribes = PushRequestProtocol.observed().filter { $0.path == "/subscribe" }
+            #expect(subscribes.count == 1, "the restore must recreate the installation through /subscribe")
+            let emails = try outcome.get()
+            #expect(emails == ["gone@gmail.com"],
+                    "a completed sign-in restore must surface the missing consent without another foreground pass")
         }
     }
 

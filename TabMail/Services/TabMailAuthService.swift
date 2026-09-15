@@ -284,9 +284,12 @@ final class TabMailAuthService: NSObject {
     /// sign-in at 04:19 first showed the banner after the 04:30 foreground
     /// return). Running it here, once the installation is back, makes the
     /// banner appear within seconds of sign-in instead.
-    static func restorePushRegistrationAfterSignIn() async {
-        await PushNotificationService.shared.subscribeAllAccounts()
-        await PushNotificationService.shared.checkPushConsentStatusForForeground()
+    ///
+    /// `service` is a test seam: the suite drives the same two calls through a
+    /// service wired to a fake worker so the order is observable.
+    static func restorePushRegistrationAfterSignIn(service: PushNotificationService = .shared) async {
+        await service.subscribeAllAccounts()
+        await service.checkPushConsentStatusForForeground()
     }
 
     // MARK: - OAuth Providers
