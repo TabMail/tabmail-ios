@@ -1536,8 +1536,11 @@ struct PlannerStatisticsRefreshTests {
         try insertHeaders(fixture.pool, accountId: "acc1", count: 4, from: 0)
         // Checkpoint so the read-only connection below sees the committed rows
         // without needing to write the WAL.
-        _ = try fixture.pool.writeWithoutTransaction { db in
-            try Row.fetchOne(db, sql: "PRAGMA wal_checkpoint(TRUNCATE)")
+        // `execute`, awaited: the checkpoint's result row is unused, and Xcode
+        // 27's Swift resolves this call inside an async test to the async
+        // overload, which requires a `Sendable` result — a GRDB `Row` is not.
+        try await fixture.pool.writeWithoutTransaction { db in
+            try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
         }
 
         var readOnlyConfiguration = Configuration()

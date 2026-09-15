@@ -742,7 +742,10 @@ final class SyncScheduler {
     /// Start IMAP IDLE on all IMAP/iCloud providers' primary connections.
     /// IDLE runs on the primary (action) connection — no extra connections needed.
     func startImapIdle() {
-        Task {
+        // `[self]` spelled out: the Task always held `self` strongly, and Xcode
+        // 27's Swift warns when the `[weak self]` IDLE handler below differs
+        // from an outer capture that is only implicit.
+        Task { [self] in
             let accounts: [Account]
             do {
                 accounts = try await AppDatabase.dbPool.read { db in

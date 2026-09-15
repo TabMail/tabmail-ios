@@ -50,7 +50,7 @@ The sibling components are open source too:
 
 Requirements:
 
-- **Xcode 16+** (iOS 26 SDK)
+- **Xcode 27+** (iOS 26 SDK; Xcode 27.0 is the toolchain the suite is verified on)
 - **[XcodeGen](https://github.com/yonaskolb/XcodeGen)** — `brew install xcodegen`.
   The `.xcodeproj` is generated from [`project.yml`](./project.yml) and is not
   committed.

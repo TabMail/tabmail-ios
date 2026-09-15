@@ -697,14 +697,19 @@ struct GlobalFifoExecutorTests {
         let f = try fixture(accountId: "fifo-schema", provider: .gmail)
         defer { finish(f) }
 
-        let column = try f.pool.read { db -> Row? in
-            try Row.fetchOne(
+        // Read the two scalars out inside the closure: a GRDB `Row` is not
+        // `Sendable`, and returning one from a read inside an async test makes
+        // Xcode 27's Swift resolve to the async overload and refuse to compile.
+        let column = try await f.pool.read { db -> (notNull: Int?, defaultValue: String?)? in
+            guard let row = try Row.fetchOne(
                 db, sql: "SELECT * FROM pragma_table_info('pendingOperation') WHERE name = 'queuePosition'")
+            else { return nil }
+            return (row["notnull"] as Int?, row["dflt_value"] as String?)
         }
         #expect(column != nil, "the effective schema has no queuePosition column")
         guard let column else { return }
-        #expect(column["notnull"] as Int? == 1, "queuePosition must be NOT NULL")
-        #expect(column["dflt_value"] as String? == nil,
+        #expect(column.notNull == 1, "queuePosition must be NOT NULL")
+        #expect(column.defaultValue == nil,
                 "queuePosition must have NO default — a zero default is exactly the silent admission the spec forbids")
 
         let indexed = try await f.pool.read { db in
