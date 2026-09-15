@@ -271,8 +271,25 @@ final class TabMailAuthService: NSObject {
     /// every sign-in completion posts through. Best-effort and unawaited by the
     /// UI: `subscribeAllAccounts()` already swallows its own failures, and the
     /// next foreground pass repeats it.
-    static func restorePushRegistrationAfterSignIn() async {
-        await PushNotificationService.shared.subscribeAllAccounts()
+    ///
+    /// The consent scan runs AFTER the subscribe, and that order is the point.
+    /// Sign-out erases this device's classifier consents on the worker along
+    /// with its installation, so the scan is what surfaces the "Fix Smart
+    /// Notifications" banner on the way back in. The scan that RootView and
+    /// MailNavigationView fire on the sign-in transition itself races the
+    /// re-registration: it reaches the worker before `/subscribe` has
+    /// recreated the installation, every probe answers 409, and the scan
+    /// suppresses the banner as "unknown". Nothing else re-ran it until the
+    /// next scene-phase foreground pass (observed 2026-09-14: a sign-out →
+    /// sign-in at 04:19 first showed the banner after the 04:30 foreground
+    /// return). Running it here, once the installation is back, makes the
+    /// banner appear within seconds of sign-in instead.
+    ///
+    /// `service` is a test seam: the suite drives the same two calls through a
+    /// service wired to a fake worker so the order is observable.
+    static func restorePushRegistrationAfterSignIn(service: PushNotificationService = .shared) async {
+        await service.subscribeAllAccounts()
+        await service.checkPushConsentStatusForForeground()
     }
 
     // MARK: - OAuth Providers
