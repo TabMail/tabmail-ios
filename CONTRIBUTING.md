@@ -35,7 +35,7 @@ concurrency.
 
 Requirements:
 
-- Xcode 16 or newer (iOS 26 SDK)
+- Xcode 27 or newer (iOS 26 SDK; Xcode 27.0 is the toolchain the suite is verified on)
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`) —
   the Xcode project is generated from `project.yml` and is not committed.
 

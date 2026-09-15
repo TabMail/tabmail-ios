@@ -98,7 +98,7 @@ actor PriorityGate {
         await shared.begin()
         await DatabaseWriteQueue.shared.enterPrivileged()
         do {
-            let result = try await PriorityGate.$inPrivilegedContext.withValue(true, operation: body)
+            let result = try await PriorityGate.$inPrivilegedContext.withValue(true) { try await body() }
             await DatabaseWriteQueue.shared.exitPrivileged()
             await shared.end()
             return result
@@ -115,14 +115,14 @@ actor PriorityGate {
     /// used by both the on-demand fetch and the backfill queue; the drain loops).
     /// NOTE: task-locals do NOT cross `Task.detached`; tag inside the detached body.
     static func background<T>(_ body: () async throws -> T) async rethrows -> T {
-        try await PriorityGate.$writePriorityOverride.withValue(.background, operation: body)
+        try await PriorityGate.$writePriorityOverride.withValue(.background) { try await body() }
     }
 
     /// Run `body`'s DB writes at `.normal` (foreground inbox catch-up). Used to
     /// tag delta/full sync above the deep background queues without giving it its
     /// own pool.
     static func normal<T>(_ body: () async throws -> T) async rethrows -> T {
-        try await PriorityGate.$writePriorityOverride.withValue(.normal, operation: body)
+        try await PriorityGate.$writePriorityOverride.withValue(.normal) { try await body() }
     }
 }
 

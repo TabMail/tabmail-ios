@@ -205,7 +205,20 @@ struct WriteTierRoutingTests {
         if processed == nil {
             Issue.record("a successful body publication must return its processed row")
         }
-        let state = try AppDatabase.rawPool.read { db -> (MessageBody?, Row?) in
+        // The header columns are read into a `Sendable` struct inside the
+        // closure: a GRDB `Row` is not `Sendable`, and returning one from a read
+        // inside an async test makes Xcode 27's Swift resolve to the async
+        // overload and refuse to compile.
+        struct HeaderState: Sendable {
+            let bodyComplete: Int?
+            let bodyEmptyConfirmed: Int?
+            let emptyFetchCount: Int?
+            let embeddingComplete: Int?
+            let summaryBlurb: String?
+            let actionTag: String?
+            let tagSortOrder: Int?
+        }
+        let state = try await AppDatabase.rawPool.read { db -> (MessageBody?, HeaderState?) in
             let body = try MessageBody.fetchOne(db, key: header.id)
             let row = try Row.fetchOne(
                 db,
@@ -215,16 +228,20 @@ struct WriteTierRoutingTests {
                     FROM messageHeader WHERE id = ?
                 """,
                 arguments: [header.id])
-            return (body, row)
+            return (body, row.map { HeaderState(
+                bodyComplete: $0["bodyComplete"], bodyEmptyConfirmed: $0["bodyEmptyConfirmed"],
+                emptyFetchCount: $0["emptyFetchCount"], embeddingComplete: $0["embeddingComplete"],
+                summaryBlurb: $0["summaryBlurb"], actionTag: $0["actionTag"],
+                tagSortOrder: $0["tagSortOrder"]) })
         }
         #expect(state.0?.htmlContent == "<p>Tier test body</p>")
-        #expect((state.1?["bodyComplete"] as Int?) == 0)
-        #expect((state.1?["bodyEmptyConfirmed"] as Int?) == 0)
-        #expect((state.1?["emptyFetchCount"] as Int?) == 0)
-        #expect((state.1?["embeddingComplete"] as Int?) == 0)
-        #expect((state.1?["summaryBlurb"] as String?) == nil)
-        #expect((state.1?["actionTag"] as String?) == nil)
-        #expect((state.1?["tagSortOrder"] as Int?) == 99)
+        #expect(state.1?.bodyComplete == 0)
+        #expect(state.1?.bodyEmptyConfirmed == 0)
+        #expect(state.1?.emptyFetchCount == 0)
+        #expect(state.1?.embeddingComplete == 0)
+        #expect(state.1?.summaryBlurb == nil)
+        #expect(state.1?.actionTag == nil)
+        #expect(state.1?.tagSortOrder == 99)
     }
 
     @Test("A failed body-cache write stays retryable and produces no FTS candidate")

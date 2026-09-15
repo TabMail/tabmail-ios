@@ -7,7 +7,7 @@ options:
   bundleIdPrefix: ai.tabmail
   deploymentTarget:
     iOS: "26.0"
-  xcodeVersion: "16.0"
+  xcodeVersion: "27.0"
   generateEmptyDirectories: true
   groupSortPosition: top
 
