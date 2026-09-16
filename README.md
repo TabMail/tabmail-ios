@@ -16,6 +16,12 @@ SwiftUI app built for iOS 26 with Swift 6 strict concurrency.
 
 ---
 
+## See it in action
+
+[![Watch TabMail for Thunderbird and iOS](https://i.ytimg.com/vi/HqdtQyMsKh4/maxresdefault.jpg)](https://youtu.be/HqdtQyMsKh4)
+
+[Watch the demo on YouTube](https://youtu.be/HqdtQyMsKh4) · [Explore TabMail](https://tabmail.ai)
+
 ## What's open, what's hosted
 
 This repository is the **complete iOS client** — the full app, notification
