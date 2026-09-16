@@ -408,9 +408,11 @@ extension SyncEngine {
                     let oldestDate = try await pool.read { db in
                         try Date.fetchOne(db,
                             MessageHeader
-                                .select(Column("date"))
+                                // Provider order: this anchor feeds Gmail
+                                // `before:` cutoffs, which filter by `internalDate`.
+                                .select(Column("providerDate"))
                                 .filter(Column("folderId") == folder.id)
-                                .order(Column("date").desc)
+                                .order(Column("providerDate").desc)
                                 .limit(1, offset: SyncConfig.syncMessageLimit - 1)
                         )
                     }
@@ -1003,8 +1005,16 @@ extension SyncEngine {
                 return uid >= floorUID && !remoteIds.contains(row.messageId)
             }
         case .date:
-            guard let floorDate = fetched.map(\.date).min() else { return [] }
-            return candidates.filter { $0.date >= floorDate && !remoteIds.contains($0.messageId) }
+            // PROVIDER ORDER, not display order. Gmail pages by `internalDate`,
+            // and on Gmail `date` is the top `Received:` timestamp, which can
+            // sit WEEKS after `internalDate` for Google-relayed mail. A window
+            // keyed on `date` would admit a row whose arrival date is inside
+            // the window but whose `internalDate` is below the page's floor —
+            // absent from the page for that reason alone — and delete it. Same
+            // decorrelation ADR-IOS-042 keys IMAP by UID for. Graph's
+            // `receivedDateTime` is both keys, so nothing changes there.
+            guard let floorDate = fetched.map(\.providerOrderDate).min() else { return [] }
+            return candidates.filter { $0.providerDate >= floorDate && !remoteIds.contains($0.messageId) }
         }
     }
 
@@ -1408,9 +1418,11 @@ extension SyncEngine {
                         candidates = []  // no parseable UID floor → delete nothing (safe)
                     }
                 case .date:
-                    if let fetchCutoff = messages.map(\.date).min() {
+                    // `providerDate`, not `date` — the page is ordered by the
+                    // provider's key; see `selectStaleHeaders` `.date` arm.
+                    if let fetchCutoff = messages.map(\.providerOrderDate).min() {
                         candidates = try MessageHeader
-                            .filter(Column("folderId") == folderId && Column("date") >= fetchCutoff)
+                            .filter(Column("folderId") == folderId && Column("providerDate") >= fetchCutoff)
                             .fetchAll(db)
                     } else {
                         candidates = []
@@ -1505,6 +1517,7 @@ extension SyncEngine {
                     migrated.isRead = match.isRead
                     migrated.isFlagged = match.isFlagged
                     migrated.date = match.date
+                    migrated.providerDate = match.providerOrderDate
                 }
                 // SHARED WITH THE DRAIN. `MessageHeaderRekey.apply` is this
                 // block's own sequence, extracted verbatim so the drain can run
@@ -1734,6 +1747,7 @@ extension SyncEngine {
                         }
                     }
                     existing.date = info.date
+                    existing.providerDate = info.providerOrderDate
                     existing.from = info.from
                     existing.fromAddress = info.fromAddress
                     existing.to = info.to
@@ -1795,7 +1809,8 @@ extension SyncEngine {
                     folderId: folderId,
                     accountId: accountId,
                     folderPath: folderPath,
-                    isInInbox: isInInbox
+                    isInInbox: isInInbox,
+                    providerDate: info.providerOrderDate
                 )
                 header.rfc822MessageId = info.rfc822MessageId
                 header.observedUidValidity = sourceBoundEpoch
@@ -2162,6 +2177,7 @@ extension SyncEngine {
                     orphaned.isRead = header.isRead
                     orphaned.isFlagged = header.isFlagged
                     orphaned.date = header.date
+                    orphaned.providerDate = header.providerDate
                     orphaned.from = header.from
                     orphaned.fromAddress = header.fromAddress
                     orphaned.to = header.to

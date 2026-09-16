@@ -1250,3 +1250,79 @@ struct V87DirectAIRetirementTests {
         #expect(applied.contains("v87_retireDirectAIPending"))
     }
 }
+
+// MARK: - v90 — messageHeader.providerDate
+
+/// `v91_addMessageHeaderProviderDate` adds the provider-order key beside the
+/// display `date`. The invariant it must establish for every PRE-EXISTING row is
+/// `providerDate == date` — that is exactly the value the `.date` stale window
+/// compared before the column existed, so an upgraded database keeps deleting
+/// and keeping the same rows it did the day before. A column that stayed at its
+/// epoch-zero default would put every legacy row BELOW every floor: never stale,
+/// never reclaimed.
+@Suite("Migration v91 — messageHeader.providerDate")
+struct MessageHeaderProviderDateMigrationTests {
+    private static func makeDatabase(upTo migration: String) throws -> DatabaseQueue {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: migration)
+        return db
+    }
+
+    @Test("v91 backfills providerDate = date for every existing row and adds the folder index")
+    func backfillsProviderDateFromDate() throws {
+        let db = try Self.makeDatabase(upTo: "v90_addPendingOperationQueuePosition")
+        try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        try TestDatabase.insertFolder(db)
+        let dateA = Date().addingTimeInterval(-3 * 86_400)
+        let dateB = Date().addingTimeInterval(-40 * 86_400)
+        let rows: [(String, Date)] = [("acc1:INBOX:1", dateA), ("acc1:INBOX:2", dateB)]
+        try db.write { conn in
+            for (id, date) in rows {
+                try conn.execute(sql: """
+                    INSERT INTO messageHeader
+                        (id, folderId, accountId, folderPath, isInInbox, messageId,
+                         subject, `from`, fromAddress, `to`, date, snippet, isRead,
+                         actionTag, tagSortOrder)
+                    VALUES (?, 'acc1:INBOX', 'acc1', 'INBOX', 1, ?, 'subject',
+                            'sender@example.com', 'sender@example.com',
+                            'recipient@example.com', ?, 'snippet', 0, NULL, 99)
+                    """, arguments: [id, id, date])
+            }
+        }
+
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: "v91_addMessageHeaderProviderDate")
+
+        let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(messageHeader)") }
+        let column = try #require(columns.first { ($0["name"] as String) == "providerDate" })
+        #expect((column["notnull"] as Int) == 1)
+
+        // Compare the raw stored strings: `date` and `providerDate` were written
+        // through the same GRDB datetime encoding, so a byte-equal copy is the
+        // strongest statement of "the window compares what it compared before".
+        let mismatched = try db.read {
+            try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM messageHeader WHERE providerDate IS NOT date")
+        }
+        #expect(mismatched == 0)
+        let decoded = try db.read {
+            try MessageHeader.order(Column("id")).fetchAll($0)
+        }
+        #expect(decoded.count == 2)
+        guard decoded.count == 2 else { return }
+        #expect(abs(decoded[0].providerDate.timeIntervalSince(dateA)) < 1)
+        #expect(abs(decoded[1].providerDate.timeIntervalSince(dateB)) < 1)
+
+        let hasIndex = try db.read {
+            try Bool.fetchOne($0, sql: """
+                SELECT COUNT(*) > 0 FROM sqlite_master
+                WHERE type = 'index' AND name = 'messageHeader_folderId_providerDate'
+                """)
+        }
+        #expect(hasIndex == true)
+    }
+}

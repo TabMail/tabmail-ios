@@ -220,7 +220,8 @@ extension SyncEngine {
                                 folderId: folder.id,
                                 accountId: folder.accountId,
                                 folderPath: folder.path,
-                                isInInbox: folder.role == .inbox
+                                isInInbox: folder.role == .inbox,
+                                providerDate: info.providerOrderDate
                             )
                             header.rfc822MessageId = info.rfc822MessageId
                             header.inReplyTo = info.inReplyTo
@@ -289,6 +290,7 @@ extension SyncEngine {
                                 orphaned.isRead = header.isRead
                                 orphaned.isFlagged = header.isFlagged
                                 orphaned.date = header.date
+                            orphaned.providerDate = header.providerDate
                                 orphaned.from = header.from
                                 orphaned.fromAddress = header.fromAddress
                                 orphaned.to = header.to
@@ -649,7 +651,8 @@ extension SyncEngine {
                             folderId: folder.id,
                             accountId: folder.accountId,
                             folderPath: folder.path,
-                            isInInbox: folder.role == .inbox
+                            isInInbox: folder.role == .inbox,
+                            providerDate: info.providerOrderDate
                         )
                         header.rfc822MessageId = info.rfc822MessageId
                         header.referencesJSON = MessageHeader.encodeReferences(info.references)
@@ -709,6 +712,7 @@ extension SyncEngine {
                             orphaned.isRead = header.isRead
                             orphaned.isFlagged = header.isFlagged
                             orphaned.date = header.date
+                            orphaned.providerDate = header.providerDate
                             orphaned.from = header.from
                             orphaned.fromAddress = header.fromAddress
                             orphaned.to = header.to

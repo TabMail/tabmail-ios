@@ -32,6 +32,7 @@ enum NSEStagingDB {
         config.busyMode = .timeout(NSEConfig.stagingDBBusyTimeoutSeconds)
         guard let queue = try? DatabaseQueue(path: url.path, configuration: config) else { return nil }
         ensureObservedUidValidityColumn(db: queue)
+        ensureProviderDateColumn(db: queue)
         return queue
     }
 
@@ -72,7 +73,7 @@ enum NSEStagingDB {
     /// pre-upgrade one and would silently launder an unproven UID into the
     /// merge. A failure here fails this push's staging write instead, which the
     /// next push retries (the NSE is best-effort by policy).
-    private static func ensureObservedUidValidityColumn(db: DatabaseQueue) {
+    static func ensureObservedUidValidityColumn(db: DatabaseQueue) {
         do {
             try db.write { db in
                 guard try db.tableExists("nse_processed_message") else { return }
@@ -87,6 +88,29 @@ enum NSEStagingDB {
             }
         } catch {
             NSELog.error("ensureObservedUidValidityColumn failed: \(error)")
+        }
+    }
+
+    /// Add `nse_processed_message.providerDate` (Gmail's `internalDate`, the
+    /// provider's order key — see `NSEMessageMetadata.providerDate`) when the
+    /// column is missing. Same shape and same reasoning as
+    /// `ensureObservedUidValidityColumn`: the main app's `AppDatabase` adds the
+    /// column too, and whichever process opens the staging DB first wins.
+    static func ensureProviderDateColumn(db: DatabaseQueue) {
+        do {
+            try db.write { db in
+                guard try db.tableExists("nse_processed_message") else { return }
+                let columns = Set(
+                    try Row.fetchAll(db, sql: "PRAGMA table_info(nse_processed_message)")
+                        .map { $0["name"] as String }
+                )
+                guard !columns.contains("providerDate") else { return }
+                try db.execute(
+                    sql: "ALTER TABLE nse_processed_message ADD COLUMN providerDate REAL"
+                )
+            }
+        } catch {
+            NSELog.error("ensureProviderDateColumn failed: \(error)")
         }
     }
 
@@ -237,7 +261,7 @@ enum NSEStagingDB {
                      summaryBlurb, summaryTodos, actionTag, reminderDate, reminderTime, reminderContent,
                      processedAt, historyId, aiCompleted, notified,
                      htmlContent, textContent, attachmentsJSON, icsText, hasUnresolvedCIDs,
-                     observedUidValidity, populated)
+                     observedUidValidity, providerDate, populated)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?,
@@ -245,7 +269,7 @@ enum NSEStagingDB {
                             ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?,
                             ?, ?, ?, ?, ?,
-                            ?, 1)
+                            ?, ?, 1)
                     """, arguments: [
                         // `folderPath` stores the provider-canonical folder path
                         // (Gmail: "INBOX"; Graph: parentFolderId; IMAP: "INBOX").
@@ -279,7 +303,8 @@ enum NSEStagingDB {
                         // row's folder (nil for Gmail/Graph and whenever the
                         // server reported none) — see
                         // `NSEMessageMetadata.observedUidValidity`.
-                        message.observedUidValidity
+                        message.observedUidValidity,
+                        message.providerDate?.timeIntervalSince1970
                     ])
             }
             if refused {
@@ -448,9 +473,10 @@ enum NSEStagingDB {
                      folderPath, subject, senderName, senderEmail, snippet, date,
                      toRaw, ccRaw, bccRaw, replyToRaw, inReplyTo, referencesJSON,
                      isRead, isFlagged, hasAttachments, providerLabelsJSON,
-                     isReplied, isForwarded, processedAt, historyId, observedUidValidity, populated)
+                     isReplied, isForwarded, processedAt, historyId, observedUidValidity,
+                     providerDate, populated)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                     ON CONFLICT(id) DO UPDATE SET
                         accountEmail = excluded.accountEmail, provider = excluded.provider,
                         rfc822MessageId = excluded.rfc822MessageId, threadId = excluded.threadId,
@@ -464,7 +490,8 @@ enum NSEStagingDB {
                         providerLabelsJSON = excluded.providerLabelsJSON,
                         isReplied = excluded.isReplied, isForwarded = excluded.isForwarded,
                         historyId = excluded.historyId,
-                        observedUidValidity = excluded.observedUidValidity, populated = 1
+                        observedUidValidity = excluded.observedUidValidity,
+                        providerDate = excluded.providerDate, populated = 1
                     """, arguments: [
                         id, accountId, accountEmail, provider, message.messageId,
                         message.rfc822MessageId, message.threadId, message.folderPath,
@@ -476,7 +503,8 @@ enum NSEStagingDB {
                         message.hasAttachments ? 1 : 0, providerLabelsJSON,
                         message.isReplied ? 1 : 0, message.isForwarded ? 1 : 0,
                         Date().timeIntervalSince1970, historyId,
-                        message.observedUidValidity
+                        message.observedUidValidity,
+                        message.providerDate?.timeIntervalSince1970
                     ])
             }
         } catch {

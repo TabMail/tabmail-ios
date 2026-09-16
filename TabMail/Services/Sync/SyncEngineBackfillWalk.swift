@@ -1731,7 +1731,8 @@ extension SyncEngine {
                         let oldestDate: Date? = try? await dbPool.read { db in
                             try Date.fetchOne(db,
                                 MessageHeader
-                                    .select(min(Column("date")))
+                                    // Provider order — feeds the age cutoff Gmail evaluates by `internalDate`.
+                                    .select(min(Column("providerDate")))
                                     .filter(Column("folderId") == folder.id && pageIds.contains(Column("messageId")))
                             )
                         }
@@ -1895,10 +1896,10 @@ extension SyncEngine {
                 BackgroundSyncLogger.logDebug("[Backfill] \(folder.name) fetched \(headers.count) older messages")
 
                 // Update oldestSyncedDate from oldest fetched message
-                if let oldest = headers.min(by: { $0.date < $1.date }) {
+                if let oldest = headers.min(by: { $0.providerOrderDate < $1.providerOrderDate }) {
                     try await AppDatabase.backgroundPool.write { db in
                         _ = try Folder.filter(Column("id") == folder.id)
-                            .updateAll(db, Column("oldestSyncedDate").set(to: oldest.date))
+                            .updateAll(db, Column("oldestSyncedDate").set(to: oldest.providerOrderDate))
                     }
                 }
 

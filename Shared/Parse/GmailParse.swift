@@ -19,7 +19,7 @@ enum GmailParse {
               internalDateMs > 0 else {
             return nil
         }
-        let date = Date(timeIntervalSince1970: TimeInterval(internalDateMs) / 1000)
+        let internalDate = Date(timeIntervalSince1970: TimeInterval(internalDateMs) / 1000)
 
         let payload = json["payload"] as? [String: Any] ?? [:]
         let headers = payload["headers"] as? [[String: Any]] ?? []
@@ -32,6 +32,21 @@ enum GmailParse {
             }
             return nil
         }
+
+        // DISPLAY DATE = the top `Received:` header, i.e. the final hop, which on
+        // Gmail is Google's own MX stamping the moment it accepted the message.
+        // RFC 5322 §3.6.7 has each relay PREPEND its trace line, so the first
+        // `Received` in header order IS the last hop; `payload.headers` has been
+        // observed in wire order, though Google does not document that ordering.
+        // Google documents `internalDate` as that same acceptance time for
+        // SMTP-received mail, but it is not: mail Google generates or relays
+        // itself (its own DMARC reports, list traffic) carries the sender's
+        // `Date:` there, and Gmail's UI sorts by it — a list message can sit
+        // eight weeks below the day it arrived. FALLBACK (owner-approved, 2026-09-16):
+        // no `Received:` at all, or one whose tail does not parse, keeps
+        // `internalDate` — never `Date()`, which would make an old message the
+        // newest thing in the Inbox (`IOS-DATE-001`).
+        let date = header("Received").flatMap { EmailDateParsing.receivedHeaderDate($0) } ?? internalDate
 
         // RFC 2047-decode the Subject. The Gmail REST API does not document
         // whether it decodes encoded-words in `payload.headers[].value`, so we
@@ -83,7 +98,12 @@ enum GmailParse {
             // uses this as folderPath so MessageHeader.id matches what the
             // main-app sync layer produces for the same message. Nil for
             // non-inbox messages (merge layer decides folder).
-            folderPath: labelIds.contains("INBOX") ? "INBOX" : nil
+            folderPath: labelIds.contains("INBOX") ? "INBOX" : nil,
+            // Gmail's own order key — what `messages.list`, `after:`/`before:`
+            // and the `.date` stale window reason in. ALWAYS set here, even
+            // when it equals `date`, so a Gmail row never reaches sync with
+            // "same as date" implied by absence.
+            providerDate: internalDate
         )
     }
 

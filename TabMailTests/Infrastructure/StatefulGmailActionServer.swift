@@ -19,15 +19,27 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         let rfc822MessageId: String
         let providerMessageId: String
         let labels: Set<String>
+        /// The `internalDate` the metadata GET serves and the key `/messages`
+        /// lists by (newest first) and evaluates `before:` against — the real
+        /// API's order. Nil serves "now".
+        let internalDate: Date?
+        /// Raw `Received:` header values, final hop first, served ONLY when the
+        /// metadata GET asks for `metadataHeaders=Received` (the real API
+        /// returns only the requested headers under `format=metadata`).
+        let received: [String]
 
         init(
             rfc822MessageId: String,
             providerMessageId: String,
-            labels: Set<String>
+            labels: Set<String>,
+            internalDate: Date? = nil,
+            received: [String] = []
         ) {
             self.rfc822MessageId = rfc822MessageId
             self.providerMessageId = providerMessageId
             self.labels = labels
+            self.internalDate = internalDate
+            self.received = received
         }
     }
 
@@ -52,6 +64,8 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         let rfc822MessageId: String
         let providerMessageId: String
         var labels: Set<String>
+        var internalDate: Date? = nil
+        var received: [String] = []
     }
 
     /// Which injected failure (if any) `/messages/{id}/modify` must serve for
@@ -155,18 +169,28 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     let http = FakeHTTP.Scenario()
     private let state: StateBox
 
+    /// System labels (`INBOX`, `SENT`, …) served by `/labels` with
+    /// `type: system`, so `GmailProvider.fetchFolders` — and therefore a real
+    /// `fullSync` — sees the folders a test seeded. Empty by default: the
+    /// action-drain tests never list folders.
+    private let systemLabels: [String]
+
     init(
         messages: [Seed],
         userLabels: [String: String] = [:],
-        createdLabelId: String? = nil
+        createdLabelId: String? = nil,
+        systemLabels: [String] = []
     ) {
+        self.systemLabels = systemLabels
         state = StateBox(State(
             messagesByProviderId: Dictionary(
                 uniqueKeysWithValues: messages.map {
                     ($0.providerMessageId, Message(
                         rfc822MessageId: $0.rfc822MessageId,
                         providerMessageId: $0.providerMessageId,
-                        labels: $0.labels
+                        labels: $0.labels,
+                        internalDate: $0.internalDate,
+                        received: $0.received
                     ))
                 }
             ),
@@ -439,8 +463,11 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     }
 
     private func registerRoutes() {
-        http.register(path: "/labels", method: "GET") { [state] _ in
-            let labels = state.value.withLock { model in
+        http.register(path: "/labels", method: "GET") { [state, systemLabels] _ in
+            let system = systemLabels.map {
+                ["id": $0, "name": $0, "type": "system", "messagesTotal": 0, "messagesUnread": 0] as [String: Any]
+            }
+            let labels = system + state.value.withLock { model in
                 model.userLabels
                     .sorted { $0.key < $1.key }
                     .map { id, name in
@@ -488,12 +515,26 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             }
             let message = state.value.withLock { $0.messagesByProviderId[providerId] }
             guard let message else { return .status(404) }
-            return Self.metadataResponse(message)
+            let requestedHeaders = (URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+                .queryItems ?? [])
+                .filter { $0.name == "metadataHeaders" }
+                .compactMap { $0.value?.lowercased() }
+            return Self.metadataResponse(message, requestedHeaders: Set(requestedHeaders))
         }
         http.register(path: "/messages", method: "GET") { [state] request in
             let components = URLComponents(url: request.url, resolvingAgainstBaseURL: false)
             let queryItems = components?.queryItems ?? []
-            let query = queryItems.first(where: { $0.name == "q" })?.value ?? ""
+            let rawQuery = queryItems.first(where: { $0.name == "q" })?.value ?? ""
+            // `before:<epoch>` is evaluated against `internalDate`, as Gmail does;
+            // the token is removed so the remaining query compares as before.
+            let beforeEpoch = rawQuery
+                .split(separator: " ")
+                .first { $0.hasPrefix("before:") }
+                .flatMap { Double($0.dropFirst("before:".count)) }
+            let query = rawQuery
+                .split(separator: " ")
+                .filter { !$0.hasPrefix("before:") }
+                .joined(separator: " ")
             let label = queryItems.first(where: { $0.name == "labelIds" })?.value
             let includeSpamTrash = queryItems.first(where: { $0.name == "includeSpamTrash" })?.value == "true"
             let maxResults = queryItems.first(where: { $0.name == "maxResults" })?.value
@@ -526,6 +567,10 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                         if !includeSpamTrash, !message.labels.isDisjoint(with: ["TRASH", "SPAM"]) {
                             return false
                         }
+                        if let beforeEpoch {
+                            let internalEpoch = (message.internalDate ?? Date()).timeIntervalSince1970
+                            guard internalEpoch < beforeEpoch else { return false }
+                        }
                         if let rfc822MessageId = actionRFC {
                             let isExactMatch = message.rfc822MessageId == rfc822MessageId
                             let isDecoyMatch = model.substringDecoyMatches[message.providerMessageId] == rfc822MessageId
@@ -537,7 +582,14 @@ final class StatefulGmailActionServer: @unchecked Sendable {
                         return query == GmailProvider.allMailExclusionQuery
                             && Self.satisfiesQueryExclusions(query, labels: message.labels)
                     }
-                    .sorted { $0.providerMessageId < $1.providerMessageId }
+                    // Real order: `internalDate` descending; the id is only a
+                    // tiebreak so seeds without a date keep the old stable order.
+                    .sorted {
+                        let lhs = $0.internalDate ?? .distantPast
+                        let rhs = $1.internalDate ?? .distantPast
+                        if lhs != rhs { return lhs > rhs }
+                        return $0.providerMessageId < $1.providerMessageId
+                    }
                     .prefix(maxResults)
                     .map { ["id": $0.providerMessageId, "threadId": "thread-\($0.providerMessageId)"] }
             }
@@ -652,21 +704,29 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         return true
     }
 
-    private static func metadataResponse(_ message: Message) -> FakeHTTP.CannedResponse {
-        let nowMs = String(Int64(Date().timeIntervalSince1970 * 1_000))
+    private static func metadataResponse(
+        _ message: Message, requestedHeaders: Set<String> = []
+    ) -> FakeHTTP.CannedResponse {
+        let internalMs = String(Int64((message.internalDate ?? Date()).timeIntervalSince1970 * 1_000))
+        var headers: [[String: String]] = message.received.map { ["name": "Received", "value": $0] }
+        headers += [
+            ["name": "Message-ID", "value": "<\(message.rfc822MessageId)>"],
+            ["name": "Subject", "value": "Stateful action message"],
+            ["name": "From", "value": "sender@example.com"],
+            ["name": "To", "value": "recipient@example.com"],
+        ]
+        // `format=metadata` + `metadataHeaders=…` returns ONLY the named headers.
+        if !requestedHeaders.isEmpty {
+            headers = headers.filter { requestedHeaders.contains($0["name"]!.lowercased()) }
+        }
         let object: [String: Any] = [
             "id": message.providerMessageId,
             "threadId": "thread-\(message.providerMessageId)",
             "labelIds": Array(message.labels).sorted(),
-            "internalDate": nowMs,
+            "internalDate": internalMs,
             "payload": [
                 "mimeType": "text/plain",
-                "headers": [
-                    ["name": "Message-ID", "value": "<\(message.rfc822MessageId)>"],
-                    ["name": "Subject", "value": "Stateful action message"],
-                    ["name": "From", "value": "sender@example.com"],
-                    ["name": "To", "value": "recipient@example.com"],
-                ],
+                "headers": headers,
                 "body": ["size": 0, "data": ""],
             ],
         ]

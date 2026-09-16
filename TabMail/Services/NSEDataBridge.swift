@@ -3669,6 +3669,11 @@ enum NSEDataBridge {
         /// every pre-existing `StagedMessage(...)` construction site (merge helpers
         /// and their tests) compiles unchanged.
         var observedUidValidity: Int? = nil
+        /// Gmail's `internalDate` (the provider's order key) as staged by the NSE;
+        /// nil for IMAP/Graph rows and for rows staged before the column existed,
+        /// both meaning "same as `date`". Same `var`-with-default contract as
+        /// `observedUidValidity`.
+        var providerDate: Double? = nil
     }
 
     /// Body of the "insert new MessageHeader from NSE staging" branch of
@@ -3713,6 +3718,10 @@ enum NSEDataBridge {
             accountId: msg.accountId, folderPath: msg.folderPath
         )
         let msgDate = msg.date.map { Date(timeIntervalSince1970: $0) } ?? Date()
+        // Provider order key for the `.date` stale window: Gmail stages its
+        // `internalDate` here; nil (IMAP/Graph, or a pre-column row) means the
+        // display date IS the provider's key, exactly as sync writes it.
+        let providerDate = msg.providerDate.map { Date(timeIntervalSince1970: $0) }
         var header = MessageHeader(
             messageId: msg.messageId,
             subject: msg.subject,
@@ -3729,7 +3738,8 @@ enum NSEDataBridge {
             folderId: folderId,
             accountId: msg.accountId,
             folderPath: msg.folderPath,
-            isInInbox: true
+            isInInbox: true,
+            providerDate: providerDate
         )
         header.rfc822MessageId = msg.rfc822MessageId
         // The epoch under which the NSE's own live SELECT observed this UID.
@@ -4029,6 +4039,7 @@ extension NSEDataBridge.StagedMessage {
         // same "tolerate a column this DB may not have yet" contract the
         // `folderPath`/`folderId` fallback just below already relies on.
         let observedEpoch: Int? = row["observedUidValidity"]
+        let providerDate: Double? = row["providerDate"]
         self.init(
             id: row["id"],
             accountId: row["accountId"],
@@ -4074,7 +4085,8 @@ extension NSEDataBridge.StagedMessage {
             attachmentsJSON: row["attachmentsJSON"],
             icsText: row["icsText"],
             hasUnresolvedCIDs: (row["hasUnresolvedCIDs"] as Int? ?? 0) == 1,
-            observedUidValidity: observedEpoch
+            observedUidValidity: observedEpoch,
+            providerDate: providerDate
         )
     }
 

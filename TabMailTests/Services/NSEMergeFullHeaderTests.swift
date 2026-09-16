@@ -53,9 +53,10 @@ struct NSEMergeFullHeaderTests {
         aiCompleted: Bool = false,
         htmlContent: String? = nil,
         textContent: String? = nil,
-        summaryBlurb: String? = nil
+        summaryBlurb: String? = nil,
+        providerDate: Double? = nil
     ) -> NSEDataBridge.StagedMessage {
-        NSEDataBridge.StagedMessage(
+        var row = NSEDataBridge.StagedMessage(
             id: "acc1:\(messageId)",
             accountId: "acc1",
             accountEmail: "user@gmail.com",
@@ -85,6 +86,32 @@ struct NSEMergeFullHeaderTests {
             htmlContent: htmlContent, textContent: textContent, attachmentsJSON: nil,
             icsText: nil, hasUnresolvedCIDs: false
         )
+        row.providerDate = providerDate
+        return row
+    }
+
+    // MARK: - providerDate (Gmail's internalDate) carry
+
+    /// A pushed Gmail row must land with the SAME `providerDate` sync would write
+    /// for it (`internalDate`), because that column — not the Received-derived
+    /// display `date` — is what the `.date` stale window compares. A row that
+    /// merged with `providerDate == date` while its `internalDate` sits weeks
+    /// below the page floor would be inside the window yet absent from every
+    /// page, and the next full sync would delete it.
+    @Test("staged providerDate is written to MessageHeader.providerDate; nil means providerDate == date")
+    func providerDateCarry() throws {
+        let db = try makeDB()
+        let internalDate = Date().addingTimeInterval(-55 * 86_400).timeIntervalSince1970
+        let withKey = staged(messageId: "gm-1", providerDate: internalDate)
+        let (_, idWithKey) = try insert(withKey, into: db)
+        let headerWithKey = try #require(try db.read { try MessageHeader.fetchOne($0, key: idWithKey) })
+        #expect(abs(headerWithKey.providerDate.timeIntervalSince1970 - internalDate) < 1)
+        #expect(abs(headerWithKey.date.timeIntervalSince1970 - 1_710_000_000) < 1)
+
+        let withoutKey = staged(messageId: "gm-2", providerDate: nil)
+        let (_, idWithoutKey) = try insert(withoutKey, into: db)
+        let headerWithoutKey = try #require(try db.read { try MessageHeader.fetchOne($0, key: idWithoutKey) })
+        #expect(headerWithoutKey.providerDate == headerWithoutKey.date)
     }
 
     private func insert(

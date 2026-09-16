@@ -379,14 +379,18 @@ struct DatabaseIndexTests {
         #expect(try Self.fullIndexStatRows(db).isEmpty,
                 "the stale-plan witness requires migration-left statistics with no stat row for any FULL index on messageHeader")
         // (label, production SQL, the low-selectivity index the UNHINTED form takes
-        // in this regime). The measured competing index differs by query scope.
+        // in this regime). The measured competing index differs by query scope:
+        // folder-scoped statements walk `messageHeader_folderId_providerDate`
+        // since migration v91 added it (the planner picks the newest
+        // `folderId`-prefixed index for a folder equality probe); the walk, not
+        // the index name, is the defect this control reproduces.
         let productionStatements: [(String, String, String)] = [
             ("durable fallback", DurableIdentityLookup.rfc822FallbackSQL,
              "messageHeader_accountId_messageId"),
             ("moved-inbox AI target", AccountManager.inboxEntryAITargetSQL,
              "messageHeader_accountId_messageId"),
             ("optimistic dedup", SyncEngine.optimisticDedupSQL,
-             "messageHeader_folderId_uidInt"),
+             "messageHeader_folderId_providerDate"),
             ("reply parent lookup", ReplyParentResolver.parentLookupSQL(count: 3),
              "messageHeader_accountId_messageId"),
             ("reply target lookup", Draft.replyTargetLookupSQL,
@@ -394,7 +398,7 @@ struct DatabaseIndexTests {
             ("agent-toast stable-id lookup", InboxView.stableIdRfcLookupSQL,
              "messageHeader_accountId_messageId"),
             ("optimistic sent existence probe", AccountManager.optimisticSentDedupSQL,
-             "messageHeader_folderId_uidInt"),
+             "messageHeader_folderId_providerDate"),
         ]
 
         for (label, production, staleIndex) in productionStatements {
@@ -459,6 +463,46 @@ struct DatabaseIndexTests {
                 JOIN sqlite_master m ON m.name = s.idx AND m.type = 'index'
                 WHERE s.tbl = 'messageHeader' AND m.sql NOT LIKE '% WHERE %'
                 """)
+        }
+    }
+
+    /// 🚨 ADR-IOS-084 — INVARIANT: **the provider-order reads are bounded by an
+    /// index, never by the folder.** The `.date` stale window
+    /// (`runSyncMessages`: `folderId = ? AND providerDate >= ?`) must SEEK a
+    /// `providerDate` range, and the two anchor reads (`fullSync`'s Nth-newest
+    /// `ORDER BY providerDate DESC … OFFSET`, `fetchOlderMessages`' oldest
+    /// `ORDER BY providerDate ASC LIMIT 1`) must satisfy their ORDER BY from an
+    /// index prefix — `USE TEMP B-TREE FOR ORDER BY` means SQLite sorted
+    /// everything the folder predicate admitted. Asserted on bounded ACCESS,
+    /// not on the index's name. TWO-SIDED (MIS-030): with the `providerDate`
+    /// term stripped from the v91 index (a `(folderId)`-only index of the same
+    /// name — the regression that keeps the existence check green), the same
+    /// statements lose the range seek and gain the whole-folder sort.
+    @Test("ADR-IOS-084 — provider-order window and anchors seek providerDate, never sort or scan the folder")
+    func providerDateReadsAreIndexBounded() throws {
+        let db = try TestDatabase.make()
+        let window = "SELECT * FROM messageHeader WHERE folderId = ? AND providerDate >= ?"
+        let nthNewest = "SELECT providerDate FROM messageHeader WHERE folderId = ? ORDER BY providerDate DESC LIMIT 1 OFFSET 49"
+        let oldest = "SELECT * FROM messageHeader WHERE folderId = ? ORDER BY providerDate ASC LIMIT 1"
+
+        let w = try plan(db, window)
+        #expect(w.contains("providerDate>"), "the .date stale window must seek a providerDate range, not filter a folder scan: \(w)")
+        for (label, sql) in [("nth-newest anchor", nthNewest), ("oldest anchor", oldest)] {
+            let p = try plan(db, sql)
+            #expect(!p.contains("USE TEMP B-TREE FOR ORDER BY"), "\(label) sorted the whole folder: \(p)")
+            #expect(p.contains("SEARCH"), "\(label) must seek, not scan: \(p)")
+        }
+
+        // Control: same index NAME, providerDate term dropped.
+        try db.write { conn in
+            try conn.execute(sql: "DROP INDEX messageHeader_folderId_providerDate")
+            try conn.execute(sql: "CREATE INDEX messageHeader_folderId_providerDate ON messageHeader(folderId)")
+        }
+        let wPre = try plan(db, window)
+        #expect(!wPre.contains("providerDate>"), "the control must lose the range seek, or the assertion above pins nothing: \(wPre)")
+        for sql in [nthNewest, oldest] {
+            let p = try plan(db, sql)
+            #expect(p.contains("USE TEMP B-TREE FOR ORDER BY"), "the control must exhibit the whole-folder sort: \(p)")
         }
     }
 

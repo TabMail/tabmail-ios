@@ -665,13 +665,15 @@ actor SyncEngine {
             guard let queue = workQueues[folder.accountId] else { continue }
             let provider = queue.provider
 
-            // Find oldest date
+            // Find the oldest PROVIDER-ORDER date: this becomes a Gmail
+            // `before:` / Graph `receivedDateTime lt` cutoff, both of which the
+            // provider evaluates in its own key, not our arrival `date`.
             let oldestDate: Date = try await dbPool.read { db in
                 try MessageHeader
                     .filter(Column("folderId") == folder.id)
-                    .order(Column("date").asc)
+                    .order(Column("providerDate").asc)
                     .limit(1)
-                    .fetchOne(db)?.date ?? Date()
+                    .fetchOne(db)?.providerDate ?? Date()
             }
 
             let pageLimit = SyncConfig.infiniteScrollFetchLimit
@@ -761,7 +763,8 @@ actor SyncEngine {
                         folderId: folder.id,
                         accountId: folder.accountId,
                         folderPath: folder.path,
-                        isInInbox: folder.role == .inbox
+                        isInInbox: folder.role == .inbox,
+                        providerDate: info.providerOrderDate
                     )
                     header.rfc822MessageId = info.rfc822MessageId
                     header.observedUidValidity = sourceBoundEpoch
