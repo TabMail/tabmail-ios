@@ -20,6 +20,8 @@ SwiftUI app built for iOS 26 with Swift 6 strict concurrency.
 
 https://github.com/user-attachments/assets/79c13db9-d4c6-4802-8634-3ab1f4ce63a4
 
+Can't see the video? [Watch it on YouTube](https://youtube.com/shorts/Jy6vMbTQx0Y).
+
 [Explore TabMail](https://tabmail.ai)
 
 ## What's open, what's hosted
