@@ -629,6 +629,11 @@ final class AppDatabase: Sendable {
                     // 0 default. Merge SELECTs `WHERE populated=1` so half-written
                     // lease placeholders never become zombie MessageHeaders.
                     "populated INTEGER NOT NULL DEFAULT 0",
+                    // v7 (2026-09-16): Gmail's provider order key (`internalDate`)
+                    // staged beside the Received-derived `date`, so a pushed row
+                    // lands with the same `providerDate` sync would write and the
+                    // `.date` stale window never sees an epoch-zero placeholder.
+                    "providerDate REAL",
                 ] {
                     do {
                         try db.execute(sql: "ALTER TABLE nse_processed_message ADD COLUMN \(col)")
@@ -2267,7 +2272,7 @@ final class AppDatabase: Sendable {
             }
         }
 
-        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v90 RANGE ─────────────────────
+        // ── FOREIGN-KEY CHECK MODE FOR THE v68…v91 RANGE ─────────────────────
         //
         // `registerTimedMigration`'s DEFAULT stays `.deferred` and is NOT
         // changed. v1…v67 have never been adjudicated for `.immediate` safety,
@@ -2348,6 +2353,9 @@ final class AppDatabase: Sendable {
         //   • v89 — one `CREATE TABLE appReleaseStamp`. A brand-new table with no
         //     FK of its own and nothing referencing it, so it writes no key of
         //     either kind and nothing can cascade to or from it.
+        //   • v91 — `ALTER TABLE messageHeader ADD COLUMN providerDate` + one
+        //     `UPDATE` + one index. Pure column addition on a table whose FKs are
+        //     untouched; nothing cascades and nothing needs repair.
         //   • v90 — `DROP TABLE pendingOperation` + recreate + one index. Same
         //     argument as `v74`: that table declares no FK and NOTHING references
         //     it, so neither the implicit delete `DROP TABLE` performs under
@@ -2364,8 +2372,8 @@ final class AppDatabase: Sendable {
         //     house pattern, and the snapshots taken before either drop are what make
         //     the body safe.
         //
-        // ⚑ AMENDED 2026-08-06, RANGE RE-DERIVED AT R17-6 AND AGAIN WHEN `v90`
-        // LANDED — **EVERY MIGRATION IN v68…v90 NOW RUNS `.immediate`, so this
+        // ⚑ AMENDED 2026-08-06, RANGE RE-DERIVED AT R17-6, AGAIN WHEN `v90`
+        // LANDED, AND AGAIN AT `v91` — **EVERY MIGRATION IN v68…v91 NOW RUNS `.immediate`, so this
         // range runs ZERO whole-database
         // foreign-key checks.** The range is an OPEN interval that moves with the
         // top of the chain, so it is re-derived rather than restated (`MIS-031` — a
@@ -4175,6 +4183,42 @@ final class AppDatabase: Sendable {
             try db.create(
                 index: "pendingOperation_queuePosition",
                 on: "pendingOperation", columns: ["queuePosition"])
+        }
+
+        // `providerDate` — the key the PROVIDER orders and windows by, kept
+        // beside the display/sort `date` now that Gmail's `date` is the top
+        // `Received:` timestamp rather than `internalDate`. Gmail's `internalDate`
+        // is the authored `Date:` for Google-generated and Google-relayed mail
+        // (measured: a list message can carry an `internalDate` eight weeks before
+        // the day the mailbox accepted it), so
+        // it cannot be what the inbox sorts by — but it IS what Gmail's paging,
+        // `before:`/`after:` filters and history evaluate, so every stale-window
+        // floor and backfill cutoff must keep using it or the `.date` stale arm
+        // deletes rows the page never returned. IMAP and Graph write the same
+        // value into both columns.
+        //
+        // NOT NULL with an epoch-zero default rather than nullable: a nullable
+        // column would make every `>= floor` comparison in the stale window
+        // silently skip a NULL row (SQL three-valued logic), i.e. fail OPEN
+        // toward deletion. The UPDATE that follows makes every existing row
+        // converge on `date`, which is exactly what the old code compared.
+        // Convergence: a fresh install (v1…v91 in order) and an upgraded DB
+        // (skip to v91) both end with `providerDate == date` for every
+        // pre-existing row and the same `(folderId, providerDate)` index.
+        migrator.registerTimedMigration(
+            "v91_addMessageHeaderProviderDate", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "providerDate", .datetime)
+                    .notNull()
+                    .defaults(to: Date(timeIntervalSince1970: 0))
+            }
+            try db.execute(sql: "UPDATE messageHeader SET providerDate = date")
+            try db.create(
+                index: "messageHeader_folderId_providerDate",
+                on: "messageHeader",
+                columns: ["folderId", "providerDate"]
+            )
         }
     }
 

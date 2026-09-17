@@ -117,4 +117,12 @@ struct NSEMessageMetadata: Sendable {
     /// that default, letting the two non-IMAP construction sites
     /// (`GmailNSEClient`, `OutlookNSEClient`) compile unchanged.
     var observedUidValidity: Int? = nil
+
+    /// The provider's own order key when it differs from `date` — Gmail's
+    /// `internalDate` (see `MessageMetadata.providerDate`). Nil means "same as
+    /// `date`", which is what IMAP and Graph stage. Merged into
+    /// `MessageHeader.providerDate` so the pushed row sits inside the same
+    /// stale window sync would compute for it. `var` with a default for the
+    /// same memberwise-initializer reason as `observedUidValidity`.
+    var providerDate: Date? = nil
 }

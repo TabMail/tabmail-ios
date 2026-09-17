@@ -89,6 +89,8 @@ struct MessageHeaderInfo: Sendable {
     let cc: String
     let bcc: String
     let replyTo: String?
+    /// DISPLAY and sort date — when the receiving server accepted the message
+    /// (IMAP `INTERNALDATE`, Graph `receivedDateTime`, Gmail top `Received:`).
     let date: Date
     let snippet: String
     let isRead: Bool
@@ -97,6 +99,15 @@ struct MessageHeaderInfo: Sendable {
     let isReplied: Bool
     let isForwarded: Bool
     let actionTag: ActionTag?
+    /// The provider's OWN order key when it differs from `date` — Gmail's
+    /// `internalDate`, which `messages.list`, `after:`/`before:` and the `.date`
+    /// stale window all reason in and which is NOT arrival time for
+    /// Google-generated or Google-relayed mail (`MessageMetadata.providerDate`).
+    /// Nil means "same as `date`": IMAP and Graph order by their receipt field.
+    /// Sync arithmetic reads `providerOrderDate`, never this raw optional.
+    var providerDate: Date? = nil
+    /// The key sync windows and backfill cutoffs must use — see `providerDate`.
+    var providerOrderDate: Date { providerDate ?? date }
     /// User label IDs extracted during message parse (Gmail: label IDs, IMAP: custom keywords).
     /// Excludes tm_* labels (handled by ActionTag) and system labels.
     /// Empty for providers that don't support labels.

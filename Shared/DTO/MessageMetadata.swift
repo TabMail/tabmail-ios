@@ -19,6 +19,9 @@ struct MessageMetadata: Sendable {
     let bcc: [EmailAddress]
     let replyTo: EmailAddress?
     let subject: String
+    /// The DISPLAY and sort date: when the receiving server accepted the
+    /// message. IMAP `INTERNALDATE`, Graph `receivedDateTime`, and on Gmail
+    /// the top `Received:` header's timestamp (see `providerDate`).
     let date: Date
     let snippet: String
     let isRead: Bool
@@ -36,6 +39,16 @@ struct MessageMetadata: Sendable {
     /// Optional only because legacy Gmail paths that don't parse it default
     /// to `"INBOX"` at the boundary. NSE callers should pass a value.
     let folderPath: String?
+    /// The key the PROVIDER orders and windows by, when it differs from
+    /// `date`. Gmail lists, pages, `after:`/`before:`-filters and history by
+    /// `internalDate`, which is NOT the arrival time for Google-generated or
+    /// Google-relayed mail — measured: a list message can carry an `internalDate`
+    /// eight weeks before the day the mailbox accepted it. `date` therefore comes from
+    /// the top `Received:` header while THIS carries `internalDate`, so sync
+    /// arithmetic (stale windows, backfill cutoffs) keeps using the provider's
+    /// own order. Nil means "same as `date`" — true for IMAP and Graph, whose
+    /// receipt field IS their order key.
+    var providerDate: Date? = nil
 }
 
 struct EmailAddress: Sendable, Equatable {

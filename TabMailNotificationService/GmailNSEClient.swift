@@ -134,7 +134,7 @@ enum GmailNSEClient {
             let rawCc = GmailParse.rawHeader(json, name: "Cc") ?? ""
             let rawBcc = GmailParse.rawHeader(json, name: "Bcc") ?? ""
             let rawReplyTo = GmailParse.rawHeader(json, name: "Reply-To")
-            return NSEMessageMetadata(
+            var staged = NSEMessageMetadata(
                 messageId: meta.providerMessageId,
                 threadId: meta.threadId,
                 rfc822MessageId: meta.rfc822MessageId,
@@ -164,6 +164,8 @@ enum GmailNSEClient {
                 // if labels were missing in the response.
                 folderPath: meta.folderPath ?? "INBOX"
             )
+            staged.providerDate = meta.providerDate
+            return staged
         } catch {
             NSELog.step("NSE fetchSingleMessage failed for \(messageId): \(String(describing: error))")
             return nil

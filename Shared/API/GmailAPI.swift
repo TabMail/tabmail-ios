@@ -33,6 +33,11 @@ enum GmailAPI {
         + "&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Bcc"
         + "&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=Reply-To"
         + "&metadataHeaders=Message-Id&metadataHeaders=In-Reply-To&metadataHeaders=References"
+        // `Received` is the display-date source on Gmail: `internalDate` is
+        // the authored `Date:` for mail Google generates or relays itself
+        // (its own DMARC reports, list traffic), which sorts new arrivals
+        // weeks deep. See `GmailParse.parseMessage`.
+        + "&metadataHeaders=Received"
 
     /// `?format=full` query (no metadataHeaders filter — format=full returns
     /// the complete MIME tree). Stored as a constant for symmetry with

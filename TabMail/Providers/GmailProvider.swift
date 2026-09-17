@@ -1640,6 +1640,7 @@ actor GmailProvider: EmailProvider {
             isReplied: false,
             isForwarded: false,
             actionTag: nil,
+            providerDate: metadata.providerDate,
             userLabelIds: userLabelCatalog.extractUserLabelIds(from: metadata.providerLabels),
             userLabelIdsAreAuthoritative: userLabelCatalog.isAuthoritative
         )

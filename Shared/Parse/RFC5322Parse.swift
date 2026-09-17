@@ -99,6 +99,8 @@ enum RFC5322Parse {
             "d MMM yyyy HH:mm:ss Z",
             "EEE, d MMM yyyy HH:mm:ss ZZZZ",
             "EEE, d MMM yyyy HH:mm Z",
+            // RFC 5322 §3.3: `day-of-week` and `second` are BOTH optional.
+            "d MMM yyyy HH:mm Z",
         ]
         let df = DateFormatter()
         df.locale = Locale(identifier: "en_US_POSIX")

@@ -316,15 +316,15 @@ enum ScreenshotMode {
                             INSERT INTO messageHeader (
                                 id, folderId, accountId, folderPath, isInInbox,
                                 messageId, subject, "from", fromAddress, "to",
-                                date, snippet, isRead, isFlagged, hasAttachments,
+                                date, providerDate, snippet, isRead, isFlagged, hasAttachments,
                                 actionTag, tagSortOrder,
                                 summaryBlurb, summaryTodos, reminderContent, cachedReply
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                         arguments: [
                             headerId, inboxFolderId, accountId, "INBOX", true,
                             msg.messageId, msg.subject, msg.from, msg.fromAddress, "alex@tabmail.ai",
-                            msgDate, msg.snippet, msg.isRead, false, msg.hasAttachments,
+                            msgDate, msgDate, msg.snippet, msg.isRead, false, msg.hasAttachments,
                             msg.actionTag, msg.tagSortOrder,
                             msg.summaryBlurb, msg.summaryTodos, msg.reminderContent, msg.cachedReply
                         ]

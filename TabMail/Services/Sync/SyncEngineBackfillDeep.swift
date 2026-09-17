@@ -524,7 +524,8 @@ extension SyncEngine {
                                 folderId: folderId,
                                 accountId: accountId,
                                 folderPath: folderPath,
-                                isInInbox: isInInbox
+                                isInInbox: isInInbox,
+                                providerDate: info.providerOrderDate
                             )
                             header.rfc822MessageId = info.rfc822MessageId
                             header.observedUidValidity = sourceBoundEpoch

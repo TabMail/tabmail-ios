@@ -128,7 +128,17 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     var cc: String = ""
     var bcc: String = ""
     var replyTo: String?
+    /// DISPLAY and sort date: when the receiving server accepted the message.
+    /// Every inbox/folder `ORDER BY date` and the keyset cursor read THIS.
     var date: Date
+    /// The provider's own order key (migration `v90`). Equal to `date` on IMAP
+    /// and Graph; on Gmail it is `internalDate`, which can be weeks older than
+    /// the arrival `date` for Google-generated or Google-relayed mail. The
+    /// `.date` stale window and every Gmail `before:`/`after:` cutoff read
+    /// THIS, never `date` — a window keyed on the arrival date would mark a
+    /// row the newest-by-`internalDate` page never returned as stale and
+    /// delete it (the ADR-IOS-042 shape, on Gmail). Display never reads it.
+    var providerDate: Date
     var snippet: String
     var isRead: Bool
     var isFlagged: Bool
@@ -460,7 +470,8 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
         folderId: String,
         accountId: String,
         folderPath: String,
-        isInInbox: Bool
+        isInInbox: Bool,
+        providerDate: Date? = nil
     ) {
         self.id = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: messageId)
         self.folderId = folderId
@@ -473,6 +484,9 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
         self.fromAddress = fromAddress
         self.to = to
         self.date = date
+        // Nil = "same as date" (IMAP, Graph, local placeholders). Sync passes
+        // `info.providerOrderDate` so Gmail rows carry `internalDate` here.
+        self.providerDate = providerDate ?? date
         self.snippet = snippet
         self.isRead = false
         self.isFlagged = false
