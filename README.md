@@ -18,7 +18,7 @@ SwiftUI app built for iOS 26 with Swift 6 strict concurrency.
 
 ## See it in action
 
-https://github.com/user-attachments/assets/0c68b7af-41d0-44f5-8476-4ac11a7ea0db
+https://github.com/user-attachments/assets/2fcc146d-3886-400a-a3cf-5caec4150b1f
 
 [Explore TabMail](https://tabmail.ai)
 
