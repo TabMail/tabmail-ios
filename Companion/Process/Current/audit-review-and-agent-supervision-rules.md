@@ -10,12 +10,6 @@ this text lived in `tabmail-ios/CLAUDE.md`.
 
 ## Audit, Review, and Agent-Supervision Rules
 
-> **Role assignment lives in the global `../CLAUDE.md` § "Common Cross-Model Workflow" and is
-> deliberately model-agnostic: whichever model owns the main session is the coordinator, and a
-> fresh-context Codex reviewer is the independent read-only vetter.** Nothing below re-assigns that role. These are
-> the iOS-specific process rules, each learned from a concrete failure in this repo; read
-> "coordinator" and "reviewer" as the global file defines them.
-
 **A1. SEARCH THE PREVIOUS RELEASE FIRST. AUTHOR ONLY IF ITS ARCHITECTURE IS INAPPLICABLE OR NONEXISTENT.** For ANY fix, the first move is `git show <release-tag>:<path>` on the code that **owns** the problem. Authoring is the FALLBACK, not the default. The order is:
 
 1. Find how the shipped release handled this problem. It is proven-adequate — smoke-tested by the owner and real users. That is empirical evidence no on-paper reasoning outranks.
@@ -87,7 +81,12 @@ this text lived in `tabmail-ios/CLAUDE.md`.
      appended RULES begin, not the boundary of the provenance claim. Establish any individual
      line's origin by diffing against `git show 115eb85d2:<this file>`, never by which side of the
      marker it falls on. Stated as an invariant on purpose — it stays true as further amendments
-     land, above or below, without needing to be restated. -->
+     land, above or below, without needing to be restated.
+     Sole exception: the extraction's role-assignment blockquote under the section heading (pointing
+     at the retired root § "Common Cross-Model Workflow") was reworded on 2026-09-07 and removed at
+     the owner's direction on 2026-09-25. Reviewer and role routing live in the root
+     `tabmail-review` skill and `model-tier-and-agent-role-routing.md`; the original text stays in
+     `git show 115eb85d2:<this file>`. -->
 
 **A14. A REVIEWER THAT REFUSES DID NOT REVIEW — the leg is ABSENT, and the round is simply a one-model round.** (Owner, 2026-08-12.) Codex over-refuses on security-adjacent code — auth, crypto, parsing untrusted input, anything that pattern-matches as offensive security — and answers with `ERROR: This content was flagged for possible cybersecurity risk`. **A refusal is not a finding and not a clean pass.** Never report "Codex flagged a security problem" when Codex actually declined; never count the leg as clean; never let it block the gate.
 
