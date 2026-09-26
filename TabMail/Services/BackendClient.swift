@@ -194,6 +194,49 @@ extension BackendClient {
     }
 }
 
+// MARK: - Dictation
+
+extension BackendClient {
+    /// Transcribes one dictation recording (16 kHz mono WAV) via `POST /dictation/transcribe`
+    /// (OpenRouter speech-to-text behind it; the backend stores neither audio nor text).
+    /// Same request as TabMail Voice's `TranscriptionClient`.
+    func transcribeDictation(wav: Data) async throws -> String {
+        var request = URLRequest(url: baseURL.appending(path: DictationConfig.transcribePath))
+        request.httpMethod = "POST"
+        request.timeoutInterval = DictationConfig.transcriptionRequestTimeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("ios", forHTTPHeaderField: "X-Client-Type")
+        request.setValue(Self.clientVersion, forHTTPHeaderField: "X-Client-Version")
+        if let token = await currentAuthToken() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        request.httpBody = try JSONEncoder().encode(TranscriptionBody(audio: wav.base64EncodedString(), format: "wav"))
+
+        let (data, response) = try await llmSession.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw DictationError.invalidResponse }
+        guard http.statusCode == 200 else {
+            throw DictationError(status: http.statusCode, code: (try? JSONDecoder().decode(TranscriptionErrorBody.self, from: data))?.error)
+        }
+        guard let result = try? JSONDecoder().decode(TranscriptionResult.self, from: data) else {
+            throw DictationError.invalidResponse
+        }
+        return result.text
+    }
+
+    private struct TranscriptionBody: Encodable {
+        let audio: String
+        let format: String
+    }
+
+    private struct TranscriptionResult: Decodable {
+        let text: String
+    }
+
+    private struct TranscriptionErrorBody: Decodable {
+        let error: String?
+    }
+}
+
 // MARK: - Completions API (summary/action generation)
 
 /// Flexible coding key for dynamic JSON encoding.

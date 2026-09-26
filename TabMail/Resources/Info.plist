@@ -81,9 +81,7 @@
 	<key>NSContactsUsageDescription</key>
 	<string>TabMail uses your contacts to suggest recipients when composing emails.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>TabMail uses the microphone for voice dictation in the chat assistant.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>TabMail uses speech recognition to transcribe voice messages for the chat assistant.</string>
+	<string>TabMail uses the microphone for voice dictation in the chat assistant. Your recording is sent to TabMail to be transcribed and is not stored.</string>
 	<key>TabMailProtocolVersion</key>
 	<string>$(TABMAIL_PROTOCOL_VERSION)</string>
 	<key>UIApplicationSceneManifest</key>

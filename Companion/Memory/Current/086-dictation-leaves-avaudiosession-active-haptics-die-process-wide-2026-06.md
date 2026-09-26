@@ -8,3 +8,5 @@
 - Not unit-tested (hardware; simulator doesn't reproduce haptic muting) — verify on device: dictate in chat → stop → tap a tag in inbox → haptic fires.
 
 ---
+
+- **Update 2026-09-26 (ADR-IOS-085):** `SpeechRecognizer` is gone; chat-pill dictation now records through `Services/Dictation/MicrophoneCapture.swift`, which activates the session in `start` and deactivates it in `teardownOnQueue` on every exit (stop, failed start). Both run on one serial queue, so a stop always follows the start it races; no generation counter is needed there. The invariant is unchanged: no recording-capable session outlives a dictation. `DictationControllerTests` pin that the capture is stopped after every path (success, failure, cancel).

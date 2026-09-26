@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import SwiftUI
-import Speech
 import TipKit
 
 /// Expandable chat pill. Collapsed: small floating capsule.
@@ -43,7 +42,8 @@ struct DynamicIslandChat: View {
     @Environment(\.hasTabMailSession) private var hasTabMailSession
     @State private var inputText = ""
     @State private var inputSelection: TextSelection?
-    @State private var speechRecognizer = SpeechRecognizer()
+    @State private var dictation = DictationController()
+    private let networkMonitor = NetworkMonitor.shared
     @State private var autoStartTask: Task<Void, Never>?
     @State private var workingStatus = ""
     @State private var statusQueue: [String] = []
@@ -392,7 +392,7 @@ struct DynamicIslandChat: View {
         // Keep the screen from auto-locking while the user is engaged with the
         // agent: pill expanded, agent working (incl. background sessions — same
         // scope as the wand glow), or dictation listening.
-        .keepScreenAwake(while: isExpanded || isWorking || ActiveAgentTracker.shared.anyWorking || speechRecognizer.isRecording)
+        .keepScreenAwake(while: isExpanded || isWorking || ActiveAgentTracker.shared.anyWorking || dictation.isActive)
         .onChange(of: isExpanded) { _, expanded in
             autoStartTask?.cancel()
             autoStartTask = nil
@@ -564,24 +564,20 @@ struct DynamicIslandChat: View {
                 }
 
                 if autoDictation {
-                    // Pre-request permissions immediately (dialog shows during animation)
-                    speechRecognizer.requestPermissions()
-                    // Start dictation after animation fully settles + permissions resolve.
-                    // Task is stored so collapse cancels it (prevents double beginRecording).
+                    // Start dictation after the animation fully settles.
+                    // Task is stored so collapse cancels it (prevents a double start).
                     autoStartTask = Task {
                         try? await Task.sleep(for: .milliseconds(800))
                         guard !Task.isCancelled, isExpanded, !isTextFieldFocused else { return }
-                        let prefix = inputText.trimmingCharacters(in: .whitespaces).isEmpty ? "" : inputText.trimmingCharacters(in: .whitespacesAndNewlines) + " "
-                        speechRecognizer.start { transcript in
-                            inputText = prefix + transcript
-                        }
+                        startDictation()
                     }
                 } else if !dictationPromptShown {
                     dictationPromptShown = true
                     showDictationPrompt = true
                 }
             } else {
-                speechRecognizer.stop()
+                // Collapsing ends the recording; its text is still appended to the input.
+                dictation.finish()
                 isTextFieldFocused = false
                 // Start the 30s idle timer from when chat closes —
                 // but only if agent is NOT working (WIP responses don't count as idle).
@@ -595,7 +591,7 @@ struct DynamicIslandChat: View {
         .onChange(of: isTextFieldFocused) { _, focused in
             isInputFocused = focused
             if focused {
-                speechRecognizer.stop()
+                dictation.finish()
             }
         }
         .onChange(of: isWorking) { wasWorking, nowWorking in
@@ -617,7 +613,7 @@ struct DynamicIslandChat: View {
                 }
                 return
             }
-            guard !speechRecognizer.isRecording else {
+            guard !dictation.isActive else {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[DynamicIslandChat] dictation-auto-restart: skip — already recording")
                 }
@@ -635,13 +631,10 @@ struct DynamicIslandChat: View {
                     }
                     return
                 }
-                let prefix = inputText.trimmingCharacters(in: .whitespaces).isEmpty ? "" : inputText.trimmingCharacters(in: .whitespacesAndNewlines) + " "
                 if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[DynamicIslandChat] dictation-auto-restart: calling speechRecognizer.start")
+                    BackgroundSyncLogger.logDebug("[DynamicIslandChat] dictation-auto-restart: calling startDictation")
                 }
-                speechRecognizer.start { transcript in
-                    inputText = prefix + transcript
-                }
+                startDictation()
             }
         }
         .task {
@@ -690,10 +683,9 @@ struct DynamicIslandChat: View {
             // (2026-07-08: mic kept recording under a dismissed compose cover).
             autoStartTask?.cancel()
             autoStartTask = nil
-            // Unconditional: stop() is idempotent when idle, and its generation
-            // bump also invalidates an in-flight beginRecording (a start racing
-            // this disappear) before it can commit the mic.
-            speechRecognizer.stop()
+            // Unconditional: cancel() is a no-op when idle, and discards a
+            // recording or transcription in progress (nowhere left to append it).
+            dictation.cancel()
             // No eager cancellation for any session type:
             // - Inbox: pill stays mounted, N/A
             // - Message-detail: user can navigate back to see the result
@@ -704,14 +696,10 @@ struct DynamicIslandChat: View {
         .alert("Auto-Enable Dictation", isPresented: $showDictationPrompt) {
             Button("Enable") {
                 autoDictation = true
-                speechRecognizer.requestPermissions()
                 autoStartTask = Task {
                     try? await Task.sleep(for: .milliseconds(800))
                     guard !Task.isCancelled, isExpanded, !isTextFieldFocused else { return }
-                    let prefix = inputText.trimmingCharacters(in: .whitespaces).isEmpty ? "" : inputText.trimmingCharacters(in: .whitespacesAndNewlines) + " "
-                    speechRecognizer.start { transcript in
-                        inputText = prefix + transcript
-                    }
+                    startDictation()
                 }
             }
             Button("No Thanks", role: .cancel) { }
@@ -748,53 +736,29 @@ struct DynamicIslandChat: View {
     private var expandedInputBar: some View {
         HStack(spacing: 10) {
             Button {
-                if speechRecognizer.isRecording {
-                    speechRecognizer.stop()
-                } else {
-                    isTextFieldFocused = false
-                    let prefix = inputText.trimmingCharacters(in: .whitespaces).isEmpty ? "" : inputText.trimmingCharacters(in: .whitespacesAndNewlines) + " "
-                    speechRecognizer.start { transcript in
-                        inputText = prefix + transcript
-                    }
+                switch dictation.phase {
+                case .listening: dictation.finish()
+                case .idle, .failed: startDictation()
+                case .transcribing: break
                 }
             } label: {
-                Image(systemName: speechRecognizer.isRecording ? "mic.fill" : "mic")
+                Image(systemName: micSymbol)
                     .contentTransition(.symbolEffect(.replace))
                     .font(.title3)
-                    .foregroundStyle(speechRecognizer.isRecording ? .red : Theme.accent)
+                    .foregroundStyle(dictation.phase == .listening ? .red : Theme.accent)
                     .frame(width: 28, height: 28)
             }
-            .disabled(isWorking)
+            // Dictation is transcribed on the backend: off without a connection.
+            .disabled(isWorking || dictation.phase == .transcribing || (!dictation.isActive && !networkMonitor.isConnected))
+            .accessibilityLabel(dictation.phase == .listening ? "Stop dictation" : "Dictate")
 
-            if speechRecognizer.isRecording {
-                // Dictation mode: use ScrollView+Text because an unfocused TextField
-                // ignores selection changes and won't scroll to show new text.
-                // Tap anywhere to stop dictation and switch to keyboard editing.
-                ScrollViewReader { proxy in
-                    ScrollView(.vertical, showsIndicators: false) {
-                        Text(inputText)
-                            .frame(maxWidth: .infinity, minHeight: 22, alignment: .leading)
-                            .id("dictationEnd")
-                    }
-                    .scrollBounceBehavior(.basedOnSize)
+            if dictation.phase != .idle {
+                // Dictating: the waveform pill takes the text field's place, as TabMail Voice's
+                // overlay. Tap it to stop listening; the text is appended when it comes back.
+                DictationPillView(controller: dictation)
                     .contentShape(Rectangle())
-                    .onTapGesture {
-                        speechRecognizer.stop()
-                        isTextFieldFocused = true
-                        Task { @MainActor in
-                            try? await Task.sleep(for: .milliseconds(150))
-                            inputSelection = .init(insertionPoint: inputText.endIndex)
-                        }
-                    }
-                    .onChange(of: inputText) {
-                        withAnimation(.easeOut(duration: 0.1)) {
-                            proxy.scrollTo("dictationEnd", anchor: .bottom)
-                        }
-                    }
-                }
-                .frame(maxHeight: 140)
-                .fixedSize(horizontal: false, vertical: true)
-                .transition(.identity)
+                    .onTapGesture { dictation.finish() }
+                    .transition(.identity)
             } else {
                 TextField(isComposeMode ? "Describe your edit..." : "Type or speak...", text: $inputText, selection: $inputSelection, axis: .vertical)
                     .textFieldStyle(.plain)
@@ -853,7 +817,6 @@ struct DynamicIslandChat: View {
             } else {
                 // Normal send button
                 Button {
-                    speechRecognizer.stop()
                     sendMessage()
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
@@ -933,16 +896,6 @@ struct DynamicIslandChat: View {
         }
         .onChange(of: isWorking) {
             scrollPosition.scrollTo(edge: .bottom)
-        }
-        .onChange(of: inputText) {
-            // Dictation grows the input bar, shrinking the scroll view.
-            // Defer scroll so layout settles before repositioning.
-            if speechRecognizer.isRecording {
-                Task { @MainActor in
-                    try? await Task.sleep(for: .milliseconds(50))
-                    scrollPosition.scrollTo(edge: .bottom)
-                }
-            }
         }
     }
 
@@ -1248,10 +1201,44 @@ struct DynamicIslandChat: View {
             hasUnacknowledgedFailure: gate.hasUnacknowledgedFailure) == .ready
     }
 
+    private var micSymbol: String {
+        if dictation.phase == .listening { return "mic.fill" }
+        return networkMonitor.isConnected ? "mic" : "mic.slash"
+    }
+
+    /// What the dictation's cleanup reads as the screen, captured when it starts: what the pill
+    /// is about, the chat so far, and the input field it appends to.
+    private var dictationContext: DictationContext {
+        if isComposeMode {
+            let header = [draftSubject.map { "Subject: \($0)" }, draftBody].compactMap { $0 }.filter { !$0.isEmpty }
+            return .chatPill(title: "Edit draft", header: header, messages: chatMessages, input: inputText)
+        }
+        if let message {
+            let header = ["From: \(message.from)", "Subject: \(message.subject)", message.snippet].filter { !$0.isEmpty }
+            return .chatPill(title: message.subject, header: header, messages: chatMessages, input: inputText)
+        }
+        return .chatPill(title: "Chat", header: [], messages: chatMessages, input: inputText)
+    }
+
+    private func startDictation() {
+        isTextFieldFocused = false
+        dictation.start(context: dictationContext) { text in
+            inputText = DictationController.appending(text, to: inputText)
+            inputSelection = .init(insertionPoint: inputText.endIndex)
+            // The appended text grows the input bar, shrinking the scroll view.
+            // Defer the scroll so layout settles before repositioning.
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(50))
+                scrollPosition.scrollTo(edge: .bottom)
+            }
+        }
+    }
+
     private var canSend: Bool {
         hasTabMailSession
             && !inputText.trimmingCharacters(in: .whitespaces).isEmpty
             && !isWorking
+            && !dictation.isActive
             && (!isComposeMode || (composeMutationAllowed && composeAttachmentSnapshotReady))
     }
 
