@@ -81,6 +81,12 @@ of the input when it comes back, and the contextual cleanup runs.
   seconds of audio (backend ADR-022), so a longer recording may fail to transcribe in both apps.
 - Collapsing the pill ends the recording and still appends its text; the pill disappearing
   discards it.
+- Untested by owner decision (2026-09-27, stage-2 review TC2/TC3): the real
+  `MicrophoneCapture` session, engine and permission path runs only on a device (the tests use a
+  fake capture, as TabMail Voice's do; a seam for it would be production code for tests only), and
+  the pill's own wiring (text appended to the input, collapse finishes, leaving cancels, sending
+  waits) is pinned by source fences (`ChatPillDictationWiringTests`) rather than hosted-view tests,
+  which would need the controller injected into the chat pill view.
 - The dictation code logs lengths, durations and error types only, never the transcript or the
   audio. (The existing `#if DEBUG` short-reply log in `BackendClient`'s completions decoding
   prints a short cleaned dictation in debug builds, as it does any short completion.)

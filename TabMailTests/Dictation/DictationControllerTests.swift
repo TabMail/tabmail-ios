@@ -397,6 +397,33 @@ struct DictationControllerTests {
         #expect(!capture.isRunning)
     }
 
+    /// Cancelled during the release tail (the mic still open for the last word) and a new
+    /// dictation started: the first one's delayed completion never stops, uploads or ends the
+    /// second, which records until it is finished and then delivers only its own text.
+    @Test func aDictationCancelledInItsReleaseTailNeverTouchesTheNext() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture)
+
+        await dictate(controller, capture: capture)
+        #expect(controller.phase == .transcribing)
+        controller.cancel()
+        controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
+        await waitUntil { capture.starts == 2 && capture.isRunning }
+        #expect(capture.starts == 2)
+
+        // Well past the first dictation's release tail.
+        try? await Task.sleep(for: DictationConfig.releaseTailDuration * 3)
+        #expect(controller.phase == .listening)
+        #expect(capture.isRunning)
+        #expect(recorded.uploads.withLock { $0.isEmpty })
+
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+        #expect(recorded.uploads.withLock { $0.count } == 1)
+        #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
+        #expect(!capture.isRunning)
+    }
+
     @Test func anotherDictationCanStartAfterAFailure() async {
         let capture = FakeCapture()
         let controller = controller(capture: capture, transcript: { " " })
