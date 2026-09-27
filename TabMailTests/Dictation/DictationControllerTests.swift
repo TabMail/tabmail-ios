@@ -70,6 +70,8 @@ private final class FakeCapture: AudioCapturing, @unchecked Sendable {
 /// What the dictations in one test uploaded, sent for cleanup, and appended.
 private final class Recorded: Sendable {
     let uploads = Mutex<[Data]>([])
+    /// The `language` sent with each upload (nil: none).
+    let languages = Mutex<[String?]>([])
     let cleanups = Mutex<[CompletionsRequest]>([])
     let texts = Mutex<[String]>([])
 }
@@ -122,6 +124,7 @@ struct DictationControllerTests {
         capture: any AudioCapturing = FakeCapture(),
         online: Bool = true,
         optedOut: @escaping @MainActor () -> Bool = { false },
+        language: @escaping @MainActor () -> String? = { nil },
         microphoneAccess: @escaping @MainActor () async -> Bool = { true },
         transcript: @escaping @Sendable () async throws -> String = { "ask jordan about the road map" },
         cleaned: @escaping @Sendable () async throws -> CompletionsResponse = {
@@ -135,8 +138,10 @@ struct DictationControllerTests {
             requestMicrophoneAccess: microphoneAccess,
             isOnline: { online },
             isOptedOutOfAI: optedOut,
-            transcribe: { wav in
+            dictationLanguage: language,
+            transcribe: { wav, language in
                 recorded.uploads.withLock { $0.append(wav) }
+                recorded.languages.withLock { $0.append(language) }
                 return try await transcript()
             },
             complete: { request in
@@ -237,6 +242,43 @@ struct DictationControllerTests {
         await waitUntil { capture.starts == 1 }
         #expect(capture.starts == 1)
         controller.cancel()
+    }
+
+    /// The language is read once, when the dictation starts: the badge and the upload agree, and
+    /// a Settings change mid-dictation applies from the next one.
+    @Test func theLanguageAtTheStartIsShownAndSent() async {
+        let capture = FakeCapture()
+        let setting = Mutex<String?>("ko")
+        let controller = controller(capture: capture, language: { setting.withLock { $0 } })
+
+        controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
+        #expect(controller.language == "ko")
+        await waitUntil { controller.isHearing }
+        setting.withLock { $0 = "en" }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+        #expect(recorded.languages.withLock { $0 } == ["ko"])
+        #expect(controller.language == "ko")
+
+        controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
+        #expect(controller.language == "en")
+        await waitUntil { capture.starts == 2 }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+        #expect(recorded.languages.withLock { $0 } == ["ko", "en"])
+        #expect(recorded.texts.withLock { $0.count } == 2)
+    }
+
+    /// Without a language (no two-letter code), none is sent: the backend's default model.
+    @Test func withoutALanguageNoneIsSent() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, language: { nil })
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase == .idle }
+
+        #expect(controller.language == nil)
+        #expect(recorded.languages.withLock { $0 } == [nil])
     }
 
     @Test func withoutMicrophoneAccessNothingIsRecorded() async {
@@ -547,7 +589,7 @@ struct DictationOptOutFlagTests {
             capture: capture,
             requestMicrophoneAccess: { true },
             isOnline: { true },
-            transcribe: { wav in
+            transcribe: { wav, _ in
                 recorded.uploads.withLock { $0.append(wav) }
                 return "ask jordan"
             },
@@ -625,5 +667,127 @@ struct DictationOptOutFlagTests {
 
         let collapse = try slice(source, from: "// Collapsing ends the recording", to: "isTextFieldFocused = false")
         #expect(collapse.contains("dictation.finish()"))
+    }
+
+    /// The Settings menu writes the key the controller reads, the listening pill shows the
+    /// dictation's language, and the mic points to the menu once a dictation has landed.
+    @Test func theLanguageMenuAndItsTipAreWired() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let settings = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Settings/TabMailSettingsView.swift"), encoding: .utf8)
+        #expect(settings.contains("@AppStorage(DictationLanguage.settingKey) private var dictationLanguage = DictationLanguage.automatic"))
+        #expect(settings.contains("Picker(selection: $dictationLanguage)"))
+        #expect(settings.contains("ForEach(DictationLanguage.choices(), id: \\.self)"))
+
+        let pill = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Inbox/DictationPillView.swift"), encoding: .utf8)
+        #expect(pill.contains("Pill(mode: mode, level: controller.level, language: controller.language)"))
+        let waveform = try slice(pill, from: "default:\n                    if let language {", to: "Waveform(level: level)")
+        #expect(waveform.contains("LanguageBadge(code: language)"))
+
+        let source = try pillSource()
+        #expect(source.contains(".popoverTip(DictationLanguageTip(), arrowEdge: .bottom)"))
+        let start = try slice(source, from: "private func startDictation()", to: "private var canSend: Bool")
+        #expect(start.contains("DictationLanguageTip.dictationCompleted.donate()"))
+    }
+}
+
+/// The Settings choice, as the controller reads it by default: `DictationLanguage.settingKey` in
+/// the standard defaults, which Settings' Dictation Language menu writes.
+@MainActor
+@Suite(.serialized, .processGlobalState)
+struct DictationLanguageSettingTests {
+    private func withSetting(_ value: String?, _ body: () async -> Void) async {
+        let defaults = UserDefaults.standard
+        let previous = defaults.object(forKey: DictationLanguage.settingKey)
+        defer {
+            if let previous {
+                defaults.set(previous, forKey: DictationLanguage.settingKey)
+            } else {
+                defaults.removeObject(forKey: DictationLanguage.settingKey)
+            }
+        }
+        if let value {
+            defaults.set(value, forKey: DictationLanguage.settingKey)
+        } else {
+            defaults.removeObject(forKey: DictationLanguage.settingKey)
+        }
+        await body()
+    }
+
+    @Test func theChosenLanguageIsSentWithTheRecording() async {
+        await withSetting("ko") {
+            let capture = FakeCapture()
+            let languages = Mutex<[String?]>([])
+            let controller = DictationController(
+                capture: capture,
+                requestMicrophoneAccess: { true },
+                isOnline: { true },
+                isOptedOutOfAI: { false },
+                transcribe: { _, language in
+                    languages.withLock { $0.append(language) }
+                    return "annyeong"
+                },
+                complete: { _ in CompletionsResponse(assistant: "Annyeong.", token_usage: nil, error: nil) }
+            )
+
+            controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { _ in }
+            #expect(controller.language == "ko")
+            let deadline = ContinuousClock.now + .seconds(5)
+            while capture.starts == 0, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+            controller.finish()
+            while controller.phase != .idle, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+
+            #expect(languages.withLock { $0 } == ["ko"])
+        }
+    }
+
+    @Test func automaticIsTheIPhonesLanguage() async {
+        await withSetting(nil) {
+            #expect(DictationLanguage.current() == DictationLanguage.code(forPreferredLanguages: Locale.preferredLanguages))
+        }
+        await withSetting(DictationLanguage.automatic) {
+            #expect(DictationLanguage.current() == DictationLanguage.code(forPreferredLanguages: Locale.preferredLanguages))
+        }
+        await withSetting("th") {
+            #expect(DictationLanguage.current() == "th")
+        }
+    }
+}
+
+struct DictationLanguageTests {
+    @Test(arguments: [
+        (["ko-KR", "en-US"], "ko"),
+        (["en-US"], "en"),
+        (["zh-Hans-CN"], "zh"),
+        (["pt_BR"], "pt"),
+        (["EN"], "en"),
+        (["yue-Hant-HK", "en-US"], nil),
+        (["fil-PH"], nil),
+        ([], nil),
+    ] as [([String], String?)])
+    func theFirstPreferredLanguageIsReducedToItsTwoLetterCode(languages: [String], expected: String?) {
+        #expect(DictationLanguage.code(forPreferredLanguages: languages) == expected)
+    }
+
+    @Test func automaticFollowsThePreferredLanguagesAndAChoiceOverridesThem() {
+        #expect(DictationLanguage.resolve(setting: DictationLanguage.automatic, preferredLanguages: ["ko-KR"]) == "ko")
+        #expect(DictationLanguage.resolve(setting: DictationLanguage.automatic, preferredLanguages: ["yue-HK"]) == nil)
+        #expect(DictationLanguage.resolve(setting: "ru", preferredLanguages: ["ko-KR"]) == "ru")
+    }
+
+    /// Settings offers exactly the backend's languages (backend ADR-024), each once, by name.
+    @Test func settingsOffersTheBackendsLanguagesByName() {
+        let locale = Locale(identifier: "en_US")
+        let choices = DictationLanguage.choices(locale: locale)
+        #expect(choices.count == 30)
+        #expect(Set(choices) == Set(DictationConfig.dictationLanguages))
+        #expect(Set(choices).count == choices.count)
+        #expect(choices.allSatisfy { $0.count == 2 && $0 == $0.lowercased() })
+        #expect(Set(["en", "ko", "ja", "ru", "th"]).isSubset(of: Set(choices)))
+        let names = choices.map { DictationLanguage.name(of: $0, locale: locale) }
+        #expect(names == names.sorted { $0.localizedStandardCompare($1) == .orderedAscending })
+        #expect(DictationLanguage.name(of: "ko", locale: locale) == "Korean")
     }
 }

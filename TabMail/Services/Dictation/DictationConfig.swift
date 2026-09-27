@@ -50,6 +50,13 @@ enum DictationConfig {
     static let transcriptionRequestTimeout: TimeInterval = 45
     /// Longest the cleanup may take (seconds); past it the transcript is used as heard.
     static let cleanupTimeout: TimeInterval = 3
+    /// The languages the backend transcribes (backend ADR-024, `src/config/transcription.json`):
+    /// its default model's 18, then the 12 it routes to a second model. Settings offers these;
+    /// keep them in step with the backend.
+    static let dictationLanguages = [
+        "en", "es", "fr", "de", "it", "pt", "ar", "da", "nl", "fi", "he", "hi", "ja", "zh", "no", "sv", "tr", "vi",
+        "cs", "el", "fa", "hu", "id", "ko", "mk", "ms", "pl", "ro", "ru", "th",
+    ]
 
     // MARK: Screen context for the cleanup
 
@@ -96,6 +103,13 @@ enum DictationConfig {
     static let meterBarSpacing: CGFloat = 3
     static let meterMinBarHeight: CGFloat = 3
     static let meterMaxBarHeight: CGFloat = 18
+    /// The listening pill's height: the waveform between the pill's vertical padding.
+    static let listeningPillHeight = max(pillHeight, meterMaxBarHeight + 2 * pillVerticalPadding)
+    /// The language badge left of the waveform: a circle as tall as the waveform, so the pill keeps
+    /// its height, inset so it is concentric with the pill's rounded end.
+    static let languageBadgeDiameter: CGFloat = meterMaxBarHeight
+    static let languageBadgeInset: CGFloat = (listeningPillHeight - languageBadgeDiameter) / 2
+    static let languageBadgeFontSize: CGFloat = 8
     /// Bar height follows level^exponent (< 1 lifts quieter speech), times the gain.
     static let waveformLevelExponent: Double = 1
     static let waveformGain: Double = 1

@@ -19,7 +19,7 @@ struct BackendClientDictationTests {
             return .json(raw: #"{"text":"ask jordan about the road map"}"#)
         }
 
-        let text = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav)
+        let text = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: nil)
 
         #expect(text == "ask jordan about the road map")
         let request = try #require(seen.withLock { $0 })
@@ -27,7 +27,24 @@ struct BackendClientDictationTests {
         #expect(request.header("X-Client-Type") == "ios")
         #expect(request.header("Content-Type") == "application/json")
         let body = try #require(request.body.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: String] })
+        // No language: the key is left out (the backend's default model).
         #expect(body == ["audio": wav.base64EncodedString(), "format": "wav"])
+    }
+
+    /// The language picks the backend's speech-to-text model (backend ADR-024).
+    @Test func sendsTheLanguageWithTheRecording() async throws {
+        let http = FakeHTTP.Scenario()
+        let seen = Mutex<FakeHTTP.Request?>(nil)
+        http.register(path: "/dictation/transcribe", method: "POST") { request in
+            seen.withLock { $0 = request }
+            return .json(raw: #"{"text":"annyeong"}"#)
+        }
+
+        _ = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: "ko")
+
+        let request = try #require(seen.withLock { $0 })
+        let body = try #require(request.body.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: String] })
+        #expect(body == ["audio": wav.base64EncodedString(), "format": "wav", "language": "ko"])
     }
 
     @Test(arguments: [
@@ -45,7 +62,7 @@ struct BackendClientDictationTests {
         http.register(path: "/dictation/transcribe", method: "POST", response: .json(raw: body, statusCode: status))
 
         await #expect(throws: expected) {
-            _ = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav)
+            _ = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: nil)
         }
     }
 }

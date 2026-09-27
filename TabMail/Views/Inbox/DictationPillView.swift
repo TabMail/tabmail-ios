@@ -5,9 +5,10 @@
 import SwiftUI
 
 /// Shown in the chat pill's input field while dictating, as TabMail Voice's overlay: a warm-up
-/// swirl until audio arrives, then a waveform pill following the voice, a circle with a spinning
-/// rim while transcribing, and a message when the dictation fails. The views and their numbers
-/// are copied from TabMail Voice (`OverlayPanel.swift`).
+/// swirl until audio arrives, then a waveform pill following the voice (with the dictation's
+/// language in a small circle at its left end), a circle with a spinning rim while transcribing,
+/// and a message when the dictation fails. The views and their numbers are copied from TabMail
+/// Voice (`OverlayPanel.swift`).
 struct DictationPillView: View {
     let controller: DictationController
 
@@ -34,7 +35,7 @@ struct DictationPillView: View {
                     .frame(height: DictationConfig.swirlCanvasHeight)
                     .transition(.opacity)
             case .listening, .transcribing, .message:
-                Pill(mode: mode, level: controller.level)
+                Pill(mode: mode, level: controller.level, language: controller.language)
                     .transition(.scale(scale: DictationConfig.pillAppearScale).combined(with: .opacity))
             }
         }
@@ -47,7 +48,8 @@ struct DictationPillView: View {
     private var accessibilityLabel: String {
         switch mode {
         case .hidden: ""
-        case .swirl, .listening: "Listening"
+        case .swirl, .listening:
+            controller.language.map { "Listening in \(DictationLanguage.name(of: $0))" } ?? "Listening"
         case .transcribing: "Transcribing"
         case .message(let text): text
         }
@@ -56,6 +58,8 @@ struct DictationPillView: View {
     private struct Pill: View {
         let mode: Mode
         let level: Float
+        /// The language the dictation is transcribed in, shown while listening; nil shows none.
+        let language: String?
 
         private var isThinking: Bool { mode == .transcribing }
 
@@ -75,10 +79,14 @@ struct DictationPillView: View {
                         .lineLimit(DictationConfig.pillMaxTextLines)
                         .fixedSize(horizontal: false, vertical: true)
                 default:
+                    if let language {
+                        LanguageBadge(code: language)
+                    }
                     Waveform(level: level)
                 }
             }
-            .padding(.horizontal, isThinking ? 0 : DictationConfig.pillHorizontalPadding)
+            .padding(.leading, leadingPadding)
+            .padding(.trailing, isThinking ? 0 : DictationConfig.pillHorizontalPadding)
             .padding(.vertical, isThinking ? 0 : DictationConfig.pillVerticalPadding)
             .frame(minHeight: DictationConfig.pillHeight)
             // A capsule while one line tall; a rounded rectangle for longer messages, and a
@@ -94,7 +102,31 @@ struct DictationPillView: View {
             .shadow(color: Brand.purple.opacity(DictationConfig.pillGlowOpacity), radius: DictationConfig.pillGlowRadius)
         }
 
+        /// The language badge sits in the pill's rounded end, centred on its curve.
+        private var leadingPadding: CGFloat {
+            if isThinking { return 0 }
+            if case .message = mode { return DictationConfig.pillHorizontalPadding }
+            return language == nil ? DictationConfig.pillHorizontalPadding : DictationConfig.languageBadgeInset
+        }
+
         private static let shape = RoundedRectangle(cornerRadius: DictationConfig.pillHeight / 2, style: .continuous)
+    }
+}
+
+/// The dictation's language in a small circle at the pill's left end, as its ISO code (`KO`), as in
+/// TabMail Voice.
+private struct LanguageBadge: View {
+    let code: String
+
+    var body: some View {
+        Text(code.uppercased())
+            .font(.system(size: DictationConfig.languageBadgeFontSize, weight: .semibold))
+            .foregroundStyle(Brand.gradient)
+            .frame(width: DictationConfig.languageBadgeDiameter, height: DictationConfig.languageBadgeDiameter)
+            .overlay {
+                Circle().strokeBorder(Brand.gradient, lineWidth: DictationConfig.pillBorderWidth)
+            }
+            .fixedSize()
     }
 }
 

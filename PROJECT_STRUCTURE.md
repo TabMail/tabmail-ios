@@ -56,7 +56,7 @@ tabmail-ios/
 │   │   ├── SyncEngine.swift         # Email sync orchestration
 │   │   ├── SyncScheduler.swift      # Background sync scheduling
 │   │   ├── UndoService.swift        # Undo/redo
-│   │   └── Dictation/               # Chat-pill dictation (ADR-IOS-085): TabMail Voice's backend STT + cleanup
+│   │   └── Dictation/               # Chat-pill dictation (ADR-IOS-085): TabMail Voice's backend STT + cleanup, dictation language
 │   │
 │   ├── ViewModels/              # MVVM state management
 │   │   ├── InboxViewModel.swift

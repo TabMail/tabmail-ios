@@ -37,6 +37,17 @@ of the input when it comes back, and the contextual cleanup runs.
    (iOS memory 086); all session and engine work is on one serial queue, which also orders a
    stop after the start it races.
 6. `SpeechRecognizer` and the speech-recognition permission string are removed.
+7. Each recording carries its language (added 2026-09-26, after backend ADR-024 made the backend
+   pick the speech-to-text model by it: Korean and 11 others go to a model that covers them).
+   TabMail Voice sends the keyboard's language (ADR-DESK-019); the pill hides the keyboard while
+   dictating, so iOS uses a Settings choice instead (`DictationLanguage`, TabMail Settings →
+   Dictation Language, the backend's 30 languages by name). Automatic, the default, is the
+   iPhone's first preferred language reduced to its two-letter code; none is sent without one.
+   The controller reads it once when the dictation starts, so the badge and the request agree
+   and a change mid-dictation applies from the next one. The listening pill shows it as Voice
+   does, a small `KO` circle left of the waveform; `DictationLanguageTip` on the mic, after the
+   first dictation lands, says where to change it (owner, 2026-09-26: a tooltip pointing to a
+   Settings menu).
 
 **Consequences:**
 
@@ -48,6 +59,13 @@ of the input when it comes back, and the contextual cleanup runs.
   across the whole OpenRouter account, and the configured model's one endpoint is on the public
   ZDR list (backend ADR-022). Owner calls: users who consented before this change see no new
   notice; the App Store privacy label may need "Audio Data" declared.
+- The language picks a model; each model still detects what is spoken within the languages it
+  covers (backend ADR-024), so English said with Korean chosen is still written as English. A
+  language outside the backend's list goes to its default model, as with no language. The
+  backend's list is copied into `DictationConfig.dictationLanguages`; a new pair there needs the
+  same line here to appear in Settings. Deploy order: backend ADR-024 before an iOS build that
+  sends `language` (the previous backend forwarded it to AssemblyAI, which lacks Korean and the
+  other paired languages).
 - The auto-dictation preference (auto-start on expand, the first-run "Auto-Enable Dictation"
   prompt, restart after each agent turn) is kept as it was; each auto-start now records for
   backend transcription.

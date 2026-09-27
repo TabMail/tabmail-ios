@@ -24,16 +24,21 @@ final class DictationController {
     private(set) var level: Float = 0
     /// True once the microphone delivers audio; until then the pill shows its warm-up swirl.
     private(set) var isHearing = false
+    /// The language this dictation is transcribed in, read once when it starts so the pill's badge
+    /// and the request always agree (`DictationLanguage`). Nil: none sent, no badge.
+    private(set) var language: String?
 
     /// Recording or transcribing: the microphone button stops (or waits for) this dictation.
     var isActive: Bool { phase == .listening || phase == .transcribing }
 
-    typealias Transcribe = @Sendable (Data) async throws -> String
+    /// The recording (WAV) and its language → the transcript.
+    typealias Transcribe = @Sendable (Data, String?) async throws -> String
 
     @ObservationIgnored private let capture: any AudioCapturing
     @ObservationIgnored private let requestMicrophoneAccess: @MainActor () async -> Bool
     @ObservationIgnored private let isOnline: @MainActor () -> Bool
     @ObservationIgnored private let isOptedOutOfAI: @MainActor () -> Bool
+    @ObservationIgnored private let dictationLanguage: @MainActor () -> String?
     @ObservationIgnored private let transcribeAudio: Transcribe
     @ObservationIgnored private let complete: DictationCleanup.Complete
     @ObservationIgnored private let cleanupTimeout: TimeInterval
@@ -56,6 +61,7 @@ final class DictationController {
         isOnline: @escaping @MainActor () -> Bool = { NetworkMonitor.shared.isConnected },
         // Settings' "Opt Out of AI" (also set by declining AI consent), as every AI call reads it.
         isOptedOutOfAI: @escaping @MainActor () -> Bool = { AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey) },
+        dictationLanguage: @escaping @MainActor () -> String? = { DictationLanguage.current() },
         transcribe: Transcribe? = nil,
         complete: DictationCleanup.Complete? = nil,
         cleanupTimeout: TimeInterval = DictationConfig.cleanupTimeout,
@@ -65,7 +71,8 @@ final class DictationController {
         self.requestMicrophoneAccess = requestMicrophoneAccess
         self.isOnline = isOnline
         self.isOptedOutOfAI = isOptedOutOfAI
-        self.transcribeAudio = transcribe ?? { try await AccountManager.shared.backendClient.transcribeDictation(wav: $0) }
+        self.dictationLanguage = dictationLanguage
+        self.transcribeAudio = transcribe ?? { try await AccountManager.shared.backendClient.transcribeDictation(wav: $0, language: $1) }
         // Direct: a user waiting on their dictation doesn't queue behind background AI work.
         self.complete = complete ?? { try await AccountManager.shared.backendClient.sendCompletionsDirect($0) }
         self.cleanupTimeout = cleanupTimeout
@@ -101,6 +108,7 @@ final class DictationController {
         envelope = LevelEnvelope()
         level = 0
         isHearing = false
+        language = dictationLanguage()
         phase = .listening
         startTask = Task { [weak self] in
             guard let self else { return }
@@ -114,7 +122,7 @@ final class DictationController {
             }
             self.beginRecording(generation: current)
         }
-        BackgroundSyncLogger.logDebug("[Dictation] listening (generation \(current))")
+        BackgroundSyncLogger.logDebug("[Dictation] listening (generation \(current), language \(language ?? "none"))")
     }
 
     private func beginRecording(generation current: Int) {
@@ -153,12 +161,13 @@ final class DictationController {
 
         // Keep the microphone open briefly after the tap so the last word isn't clipped.
         let current = generation
+        let language = language
         phase = .transcribing
         level = 0
         transcriptionTask = Task { [weak self] in
             try? await Task.sleep(for: DictationConfig.releaseTailDuration)
             guard !Task.isCancelled, let self, self.generation == current else { return }
-            await self.completeRecording(generation: current)
+            await self.completeRecording(language: language, generation: current)
         }
     }
 
@@ -177,7 +186,7 @@ final class DictationController {
         fail(Self.microphoneFailedMessage)
     }
 
-    private func completeRecording(generation current: Int) async {
+    private func completeRecording(language: String?, generation current: Int) async {
         capture.stop()
         guard let recorder else { return }
 
@@ -200,13 +209,13 @@ final class DictationController {
             fail(Self.nothingHeardMessage)
             return
         }
-        await transcribe(WAVEncoder.encode(pcm16Mono: recording.pcm, sampleRate: recording.sampleRate), generation: current)
+        await transcribe(WAVEncoder.encode(pcm16Mono: recording.pcm, sampleRate: recording.sampleRate), language: language, generation: current)
     }
 
-    private func transcribe(_ wav: Data, generation current: Int) async {
+    private func transcribe(_ wav: Data, language: String?, generation current: Int) async {
         BackgroundSyncLogger.logDebug("[Dictation] uploading \(wav.count) bytes")
         do {
-            let transcript = try await transcribeAudio(wav).trimmingCharacters(in: .whitespacesAndNewlines)
+            let transcript = try await transcribeAudio(wav, language).trimmingCharacters(in: .whitespacesAndNewlines)
             guard generation == current, !Task.isCancelled else { return }
             BackgroundSyncLogger.logDebug("[Dictation] transcript ready (\(transcript.count) chars)")
             guard !transcript.isEmpty else {

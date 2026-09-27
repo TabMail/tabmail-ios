@@ -752,6 +752,7 @@ struct DynamicIslandChat: View {
             // Dictation is transcribed on the AI backend: off without a connection or opted out of AI.
             .disabled(isWorking || dictation.phase == .transcribing || (!dictation.isActive && !canDictate))
             .accessibilityLabel(dictation.phase == .listening ? "Stop dictation" : "Dictate")
+            .popoverTip(DictationLanguageTip(), arrowEdge: .bottom)
 
             if dictation.phase != .idle {
                 // Dictating: the waveform pill takes the text field's place, as TabMail Voice's
@@ -1236,6 +1237,7 @@ struct DynamicIslandChat: View {
         dictation.start(context: dictationContext, canUseAI: canUseAI) { text in
             inputText = DictationController.appending(text, to: inputText)
             inputSelection = .init(insertionPoint: inputText.endIndex)
+            Task { await DictationLanguageTip.dictationCompleted.donate() }
             // The appended text grows the input bar, shrinking the scroll view.
             // Defer the scroll so layout settles before repositioning.
             Task { @MainActor in
