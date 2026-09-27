@@ -33,6 +33,7 @@ final class DictationController {
     @ObservationIgnored private let capture: any AudioCapturing
     @ObservationIgnored private let requestMicrophoneAccess: @MainActor () async -> Bool
     @ObservationIgnored private let isOnline: @MainActor () -> Bool
+    @ObservationIgnored private let isOptedOutOfAI: @MainActor () -> Bool
     @ObservationIgnored private let transcribeAudio: Transcribe
     @ObservationIgnored private let complete: DictationCleanup.Complete
     @ObservationIgnored private let cleanupTimeout: TimeInterval
@@ -53,6 +54,8 @@ final class DictationController {
         capture: any AudioCapturing = MicrophoneCapture(),
         requestMicrophoneAccess: @escaping @MainActor () async -> Bool = DictationController.requestMicrophoneAccess,
         isOnline: @escaping @MainActor () -> Bool = { NetworkMonitor.shared.isConnected },
+        // Settings' "Opt Out of AI" (also set by declining AI consent), as every AI call reads it.
+        isOptedOutOfAI: @escaping @MainActor () -> Bool = { AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey) },
         transcribe: Transcribe? = nil,
         complete: DictationCleanup.Complete? = nil,
         cleanupTimeout: TimeInterval = DictationConfig.cleanupTimeout,
@@ -61,6 +64,7 @@ final class DictationController {
         self.capture = capture
         self.requestMicrophoneAccess = requestMicrophoneAccess
         self.isOnline = isOnline
+        self.isOptedOutOfAI = isOptedOutOfAI
         self.transcribeAudio = transcribe ?? { try await AccountManager.shared.backendClient.transcribeDictation(wav: $0) }
         // Direct: a user waiting on their dictation doesn't queue behind background AI work.
         self.complete = complete ?? { try await AccountManager.shared.backendClient.sendCompletionsDirect($0) }
@@ -70,17 +74,18 @@ final class DictationController {
 
     /// Starts listening. `context` is what the user sees now (the cleanup reads it); `onText`
     /// receives the cleaned-up dictation. Needs AI access (`canUseAI`: a TabMail session and an
-    /// active subscription, as the pill's input bar requires) and a connection: the audio is
-    /// transcribed on the backend.
+    /// active subscription, as the pill's input bar requires), AI not opted out, and a
+    /// connection: the audio and the screen text go to the AI backend.
     func start(context: DictationContext, canUseAI: Bool, onText: @escaping @MainActor (String) -> Void) {
         switch phase {
         case .idle, .failed: break
         case .listening, .transcribing: return
         }
         // Without AI access the pill shows sign-in or subscribe instead of the input bar: nothing
-        // would show the recording, and the backend would refuse it.
-        guard canUseAI else {
-            BackgroundSyncLogger.logDebug("[Dictation] not started: no AI access")
+        // would show the recording, and the backend would refuse it. Opted out of AI, nothing may
+        // be sent to the AI backend at all.
+        guard canUseAI, !isOptedOutOfAI() else {
+            BackgroundSyncLogger.logDebug("[Dictation] not started: no AI access or AI opted out")
             return
         }
         guard isOnline() else {

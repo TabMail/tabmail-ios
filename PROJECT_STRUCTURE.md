@@ -55,7 +55,7 @@ tabmail-ios/
 │   │   ├── KeychainHelper.swift     # Secure credential storage
 │   │   ├── SyncEngine.swift         # Email sync orchestration
 │   │   ├── SyncScheduler.swift      # Background sync scheduling
-│   │   └── UndoService.swift        # Undo/redo
+│   │   ├── UndoService.swift        # Undo/redo
 │   │   └── Dictation/               # Chat-pill dictation (ADR-IOS-085): TabMail Voice's backend STT + cleanup
 │   │
 │   ├── ViewModels/              # MVVM state management

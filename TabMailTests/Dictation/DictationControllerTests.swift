@@ -74,14 +74,54 @@ private final class Recorded: Sendable {
     let texts = Mutex<[String]>([])
 }
 
+/// A microphone whose first start is slow and completes only when `failFirst` is called (a
+/// device that takes long to fail); later starts run as `FakeCapture`'s do.
+private final class LateFailCapture: AudioCapturing, @unchecked Sendable {
+    private struct State {
+        var starts = 0
+        var isRunning = false
+        var firstCompletion: (@Sendable ((any Error)?) -> Void)?
+    }
+
+    private let state = Mutex(State())
+
+    var starts: Int { state.withLock { $0.starts } }
+    var isRunning: Bool { state.withLock { $0.isRunning } }
+
+    func start(onBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void, completion: @escaping @Sendable ((any Error)?) -> Void) {
+        let isFirst = state.withLock { state in
+            state.starts += 1
+            if state.starts == 1 { state.firstCompletion = completion }
+            return state.starts == 1
+        }
+        guard !isFirst else { return }
+        state.withLock { $0.isRunning = true }
+        onBuffer(FakeCapture.speech())
+        completion(nil)
+    }
+
+    func stop() {
+        state.withLock { $0.isRunning = false }
+    }
+
+    func failFirst(_ error: any Error) {
+        let completion = state.withLock { state in
+            defer { state.firstCompletion = nil }
+            return state.firstCompletion
+        }
+        completion?(error)
+    }
+}
+
 @MainActor
 struct DictationControllerTests {
     private let context = DictationContext(windowTitle: "Chat", screenText: "Me: hi\n» ‸")
     private let recorded = Recorded()
 
     private func controller(
-        capture: FakeCapture = FakeCapture(),
+        capture: any AudioCapturing = FakeCapture(),
         online: Bool = true,
+        optedOut: @escaping @MainActor () -> Bool = { false },
         microphoneAccess: @escaping @MainActor () async -> Bool = { true },
         transcript: @escaping @Sendable () async throws -> String = { "ask jordan about the road map" },
         cleaned: @escaping @Sendable () async throws -> CompletionsResponse = {
@@ -94,6 +134,7 @@ struct DictationControllerTests {
             capture: capture,
             requestMicrophoneAccess: microphoneAccess,
             isOnline: { online },
+            isOptedOutOfAI: optedOut,
             transcribe: { wav in
                 recorded.uploads.withLock { $0.append(wav) }
                 return try await transcript()
@@ -176,6 +217,28 @@ struct DictationControllerTests {
         controller.cancel()
     }
 
+    /// Opted out of AI (Settings, or AI consent declined): nothing is recorded, and neither the
+    /// audio nor the screen text is sent.
+    @Test func optedOutOfAINothingIsRecordedOrSent() async {
+        let capture = FakeCapture()
+        let optedOut = Mutex(true)
+        let controller = controller(capture: capture, optedOut: { optedOut.withLock { $0 } })
+
+        controller.start(context: context, canUseAI: true) { _ in Issue.record("no text when opted out") }
+        #expect(controller.phase == .idle)
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(capture.starts == 0)
+        #expect(recorded.uploads.withLock { $0.isEmpty })
+        #expect(recorded.cleanups.withLock { $0.isEmpty })
+        // The same controller records once the opt-out is cleared.
+        optedOut.withLock { $0 = false }
+        controller.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { capture.starts == 1 }
+        #expect(capture.starts == 1)
+        controller.cancel()
+    }
+
     @Test func withoutMicrophoneAccessNothingIsRecorded() async {
         let capture = FakeCapture()
         let controller = controller(capture: capture, microphoneAccess: { false })
@@ -245,6 +308,8 @@ struct DictationControllerTests {
         (DictationError(status: 400, code: "audio_too_large") as any Error, "That recording was too long to transcribe."),
         (DictationError(status: 500, code: nil) as any Error, DictationController.failedMessage),
         (URLError(.notConnectedToInternet) as any Error, DictationController.offlineMessage),
+        (URLError(.networkConnectionLost) as any Error, DictationController.offlineMessage),
+        (URLError(.dataNotAllowed) as any Error, DictationController.offlineMessage),
         (URLError(.timedOut) as any Error, DictationController.failedMessage),
     ])
     func aFailedTranscriptionSaysWhy(error: any Error, message: String) async {
@@ -384,6 +449,71 @@ struct DictationControllerTests {
         #expect(!capture.isRunning)
         #expect(recorded.uploads.withLock { $0.isEmpty })
         #expect(recorded.texts.withLock { $0.isEmpty })
+    }
+
+    /// A transcription cancelled by the user throws (URLSession does on cancel); its late error
+    /// must not end or fail the dictation started after it.
+    @Test func aCancelledTranscriptionsErrorNeverEndsTheNextDictation() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, transcript: {
+            try await Task.sleep(for: .milliseconds(500))
+            return "too late"
+        })
+
+        await dictate(controller, capture: capture)
+        await waitUntil { recorded.uploads.withLock { !$0.isEmpty } }
+        controller.cancel()
+        controller.start(context: context, canUseAI: true) { _ in Issue.record("the second dictation was not finished") }
+        await waitUntil { capture.starts == 2 }
+        try? await Task.sleep(for: .milliseconds(300))
+
+        #expect(controller.phase == .listening)
+        #expect(capture.isRunning)
+        controller.cancel()
+    }
+
+    /// A superseded start's late microphone failure must not end the dictation started after it.
+    @Test func aStaleMicrophoneFailureNeverEndsTheNextDictation() async {
+        let capture = LateFailCapture()
+        let controller = controller(capture: capture)
+
+        controller.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { capture.starts == 1 }
+        controller.cancel()
+        controller.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { capture.starts == 2 }
+        capture.failFirst(MicrophoneCapture.CaptureError.noInputDevice)
+        try? await Task.sleep(for: .milliseconds(300))
+
+        #expect(controller.phase == .listening)
+        #expect(capture.isRunning)
+        controller.cancel()
+    }
+
+    /// The microphone is off while the recording uploads, not held open for the whole request.
+    @Test func theMicrophoneIsReleasedBeforeTheUpload() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, transcript: {
+            try? await Task.sleep(for: .milliseconds(300))
+            return "hello"
+        })
+
+        await dictate(controller, capture: capture)
+        await waitUntil { recorded.uploads.withLock { !$0.isEmpty } }
+
+        #expect(!capture.isRunning)
+        await waitUntil { controller.phase == .idle }
+    }
+
+    /// A failure message clears after `errorDisplayDuration`, giving the text field back.
+    @Test func aFailureMessageClearsAndGivesTheFieldBack() async {
+        let controller = controller(online: false)
+
+        controller.start(context: context, canUseAI: true) { _ in }
+        #expect(controller.phase == .failed(DictationController.offlineMessage))
+        await waitUntil { controller.phase == .idle }
+
+        #expect(controller.phase == .idle)
     }
 
     @Test func appendsToTheEndOfTheInputASpaceApart() {

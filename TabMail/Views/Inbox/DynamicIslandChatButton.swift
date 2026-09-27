@@ -44,6 +44,7 @@ struct DynamicIslandChat: View {
     @State private var inputSelection: TextSelection?
     @State private var dictation = DictationController()
     private let networkMonitor = NetworkMonitor.shared
+    @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
     @State private var autoStartTask: Task<Void, Never>?
     @State private var workingStatus = ""
     @State private var statusQueue: [String] = []
@@ -748,8 +749,8 @@ struct DynamicIslandChat: View {
                     .foregroundStyle(dictation.phase == .listening ? .red : Theme.accent)
                     .frame(width: 28, height: 28)
             }
-            // Dictation is transcribed on the backend: off without a connection.
-            .disabled(isWorking || dictation.phase == .transcribing || (!dictation.isActive && !networkMonitor.isConnected))
+            // Dictation is transcribed on the AI backend: off without a connection or opted out of AI.
+            .disabled(isWorking || dictation.phase == .transcribing || (!dictation.isActive && !canDictate))
             .accessibilityLabel(dictation.phase == .listening ? "Stop dictation" : "Dictate")
 
             if dictation.phase != .idle {
@@ -1203,7 +1204,12 @@ struct DynamicIslandChat: View {
 
     private var micSymbol: String {
         if dictation.phase == .listening { return "mic.fill" }
-        return networkMonitor.isConnected ? "mic" : "mic.slash"
+        return canDictate ? "mic" : "mic.slash"
+    }
+
+    /// Whether the mic can start a dictation (the pill shows it only with AI access).
+    private var canDictate: Bool {
+        networkMonitor.isConnected && !optOutAllAI
     }
 
     /// What the dictation's cleanup reads as the screen, captured when it starts: what the pill
@@ -1221,6 +1227,9 @@ struct DynamicIslandChat: View {
     }
 
     private func startDictation() {
+        // Auto-start follows the mic button: while it is off, nothing starts (and no error
+        // replaces the text field on every expand).
+        guard canDictate else { return }
         isTextFieldFocused = false
         // The same gate that shows the input bar (and so the mic and the waveform) in the body.
         let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive

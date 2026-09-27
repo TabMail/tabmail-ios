@@ -27,10 +27,12 @@ of the input when it comes back, and the contextual cleanup runs.
    latest chat turns, and the input field as a `» ` line with the caret `‸` at its end.
 4. `DictationController.start` refuses to start without AI access (a TabMail session and an
    active subscription, the gate that shows the pill's input bar; TabMail Voice likewise refuses
-   when signed out) and offline (`NetworkMonitor`). This covers the auto-start paths (auto-dictation
+   when signed out or without consent), when opted out of AI (`AIService.optOutAllAIKey`, set by
+   Settings' "Opt Out of AI" and by declining AI consent, as every AI call honours), and offline
+   (`NetworkMonitor`). This covers the auto-start paths (auto-dictation
    on expand, and after each agent turn), which would otherwise record with no visible waveform.
-   The pill disables the mic button while offline and idle; a recording already in progress can
-   still be stopped.
+   The pill turns the mic button off (`mic.slash`, disabled) while offline or opted out, and
+   auto-start then does nothing; a recording already in progress can still be stopped.
 5. `MicrophoneCapture` activates the audio session per dictation and deactivates it on every exit
    (iOS memory 086); all session and engine work is on one serial queue, which also orders a
    stop after the start it races.
@@ -58,4 +60,6 @@ of the input when it comes back, and the contextual cleanup runs.
   upload limit).
 - Collapsing the pill ends the recording and still appends its text; the pill disappearing
   discards it.
-- Logs carry lengths, durations and error types only, never the transcript or the audio.
+- The dictation code logs lengths, durations and error types only, never the transcript or the
+  audio. (The existing `#if DEBUG` short-reply log in `BackendClient`'s completions decoding
+  prints a short cleaned dictation in debug builds, as it does any short completion.)
