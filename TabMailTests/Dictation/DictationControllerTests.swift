@@ -523,3 +523,107 @@ struct DictationControllerTests {
         #expect(DictationController.appending("second line", to: "first line\n") == "first line second line")
     }
 }
+
+/// The production opt-out reader: Settings' "Opt Out of AI" (and declining AI consent) writes the
+/// App Group flag, and a controller built without an injected reader must honour it.
+@MainActor
+@Suite(.serialized, .processGlobalState)
+struct DictationOptOutFlagTests {
+    @Test func theSettingsOptOutStopsDictationBeforeTheMicrophone() async {
+        let store = AIService.optOutStore
+        let previous = store.object(forKey: AIService.optOutAllAIKey)
+        defer {
+            if let previous {
+                store.set(previous, forKey: AIService.optOutAllAIKey)
+            } else {
+                store.removeObject(forKey: AIService.optOutAllAIKey)
+            }
+        }
+        AIService.writeOptOutFlag(true)
+
+        let capture = FakeCapture()
+        let recorded = Recorded()
+        let controller = DictationController(
+            capture: capture,
+            requestMicrophoneAccess: { true },
+            isOnline: { true },
+            transcribe: { wav in
+                recorded.uploads.withLock { $0.append(wav) }
+                return "ask jordan"
+            },
+            complete: { request in
+                recorded.cleanups.withLock { $0.append(request) }
+                return CompletionsResponse(assistant: "Ask Jordan.", token_usage: nil, error: nil)
+            }
+        )
+
+        controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { _ in
+            Issue.record("no text when opted out")
+        }
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(controller.phase == .idle)
+        #expect(capture.starts == 0)
+        #expect(recorded.uploads.withLock { $0.isEmpty })
+        #expect(recorded.cleanups.withLock { $0.isEmpty })
+    }
+}
+
+/// The chat pill's own wiring of the dictation gates, which the controller tests cannot reach:
+/// the pill passes AI access, turns the mic off while offline or opted out, and never lets a
+/// recording outlive it.
+@Suite struct ChatPillDictationWiringTests {
+    private static let pillPath = "TabMail/Views/Inbox/DynamicIslandChatButton.swift"
+
+    private func pillSource() throws -> String {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        return try String(contentsOf: projectRoot.appendingPathComponent(Self.pillPath), encoding: .utf8)
+    }
+
+    /// The source between `start` and the next occurrence of `end` after it.
+    private func slice(_ source: String, from start: String, to end: String) throws -> Substring {
+        let startRange = try #require(source.range(of: start))
+        let endRange = try #require(source.range(of: end, range: startRange.upperBound..<source.endIndex))
+        return source[startRange.lowerBound..<endRange.lowerBound]
+    }
+
+    /// AI access is the gate that shows the input bar (a session, then a subscription), so an
+    /// auto-start never records behind the sign-in or subscribe bar.
+    @Test func dictationStartsWithTheInputBarsAIAccessGate() throws {
+        let source = try pillSource()
+        let body = try slice(source, from: "if !hasTabMailSession {", to: "expandedInputBar")
+        #expect(body.contains("} else if !AISubscriptionGate.shared.isActive {"))
+
+        let start = try slice(source, from: "private func startDictation()", to: "private var canSend: Bool")
+        #expect(start.contains("guard canDictate else { return }"))
+        #expect(start.contains("let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive"))
+        #expect(start.contains("dictation.start(context: dictationContext, canUseAI: canUseAI)"))
+    }
+
+    /// The mic is off offline and when opted out of AI, reading the same App Group flag Settings
+    /// writes; a recording in progress can still be stopped.
+    @Test func theMicIsOffOfflineAndWhenOptedOut() throws {
+        let source = try pillSource()
+        #expect(source.contains("@AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI"))
+        let canDictate = try slice(source, from: "private var canDictate: Bool {", to: "}")
+        #expect(canDictate.contains("networkMonitor.isConnected && !optOutAllAI"))
+        #expect(source.contains(".disabled(isWorking || dictation.phase == .transcribing || (!dictation.isActive && !canDictate))"))
+    }
+
+    /// A recording never outlives the pill, and a message can't be sent over a dictation still
+    /// on its way into the input.
+    @Test func recordingNeverOutlivesThePill() throws {
+        let source = try pillSource()
+        let disappear = try slice(source, from: ".onDisappear {", to: "// No eager cancellation")
+        #expect(disappear.contains("dictation.cancel()"))
+
+        let canSend = try slice(source, from: "private var canSend: Bool {", to: "private func sendMessage()")
+        #expect(canSend.contains("&& !dictation.isActive"))
+
+        let collapse = try slice(source, from: "// Collapsing ends the recording", to: "isTextFieldFocused = false")
+        #expect(collapse.contains("dictation.finish()"))
+    }
+}

@@ -42,10 +42,12 @@ of the input when it comes back, and the contextual cleanup runs.
 
 - Audio leaves the device. The backend stores and logs neither audio nor text (root ADR-004;
   backend ADR-022); the microphone permission string says so, and the AI consent screen lists
-  voice recordings among the data sent. Owner calls: OpenRouter applies no per-request
-  zero-retention filter to transcription, so upstream retention rests on its account-level
-  privacy settings (backend ADR-022 asks for them to be verified); users who consented before
-  this change see no new notice; the App Store privacy label may need "Audio Data" declared.
+  voice recordings among the data sent. The consent screen's "Zero retention" and "Not used
+  for training" claims hold for recordings: OpenRouter applies no per-request zero-retention
+  filter to transcription, but the owner confirmed on 2026-09-25 that zero retention is enforced
+  across the whole OpenRouter account, and the configured model's one endpoint is on the public
+  ZDR list (backend ADR-022). Owner calls: users who consented before this change see no new
+  notice; the App Store privacy label may need "Audio Data" declared.
 - The auto-dictation preference (auto-start on expand, the first-run "Auto-Enable Dictation"
   prompt, restart after each agent turn) is kept as it was; each auto-start now records for
   backend transcription.
@@ -57,7 +59,8 @@ of the input when it comes back, and the contextual cleanup runs.
 - A failed cleanup never costs the dictation: the transcript is appended as heard. A failed
   transcription loses that recording (as in Voice; no retry queue).
 - Recording stops and is sent at `maxRecordingDuration` (5 minutes, under the backend's 10 MiB
-  upload limit).
+  upload limit), as in Voice. The transcription model's API is described as taking up to 120
+  seconds of audio (backend ADR-022), so a longer recording may fail to transcribe in both apps.
 - Collapsing the pill ends the recording and still appends its text; the pill disappearing
   discards it.
 - The dictation code logs lengths, durations and error types only, never the transcript or the
