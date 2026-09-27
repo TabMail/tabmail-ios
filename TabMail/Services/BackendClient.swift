@@ -108,53 +108,6 @@ actor BackendClient {
             return nil
         }
     }
-
-    struct ChatRequest: Encodable {
-        let message: String
-        let context: MessageContext?
-        let conversationId: String?
-    }
-
-    struct MessageContext: Encodable {
-        let messageId: String
-        let subject: String
-        let from: String
-        let snippet: String
-    }
-
-    struct ChatResponse: Decodable {
-        let reply: String
-        let toolCalls: [ToolCall]?
-        let conversationId: String
-    }
-
-    struct ToolCall: Decodable {
-        let name: String
-        let arguments: [String: String]
-    }
-
-    func sendChat(_ request: ChatRequest) async throws -> ChatResponse {
-        var urlRequest = URLRequest(url: baseURL.appending(path: "/v1/chat"))
-        urlRequest.httpMethod = "POST"
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        urlRequest.setValue("ios", forHTTPHeaderField: "X-Client-Type")
-        urlRequest.setValue(Self.clientVersion, forHTTPHeaderField: "X-Client-Version")
-        if let token = await currentAuthToken() {
-            urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
-
-        urlRequest.httpBody = try JSONEncoder().encode(request)
-
-        let (data, response) = try await sharedEphemeralSession.data(for: urlRequest)
-        guard let httpResponse = response as? HTTPURLResponse,
-              200..<300 ~= httpResponse.statusCode else {
-            throw BackendError.requestFailed(
-                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
-            )
-        }
-
-        return try JSONDecoder().decode(ChatResponse.self, from: data)
-    }
 }
 
 // MARK: - Report Concern

@@ -21,13 +21,16 @@ of the input when it comes back, and the contextual cleanup runs.
    `DictationCleanup` sends the same prompt and variables.
 2. Transcription goes through `BackendClient.transcribeDictation` (the app's auth token,
    `X-Client-Type: ios`); the cleanup through `sendCompletionsDirect` with tools and web search
-   off. The prompt lives in the backend's `common/` prompts, so iOS resolves it with no backend
-   change.
+   off. The backend already serves the prompt to iOS clients, so it needs no change.
 3. The "screen" the cleanup reads is the chat pill, captured when the dictation starts: what the
    pill is about (the email's sender, subject and snippet, or the draft's subject and body), the
    latest chat turns, and the input field as a `» ` line with the caret `‸` at its end.
-4. `DictationController.start` refuses to start offline (`NetworkMonitor`); the pill disables the
-   mic button while offline and idle. A recording already in progress can still be stopped.
+4. `DictationController.start` refuses to start without AI access (a TabMail session and an
+   active subscription, the gate that shows the pill's input bar; TabMail Voice likewise refuses
+   when signed out) and offline (`NetworkMonitor`). This covers the auto-start paths (auto-dictation
+   on expand, and after each agent turn), which would otherwise record with no visible waveform.
+   The pill disables the mic button while offline and idle; a recording already in progress can
+   still be stopped.
 5. `MicrophoneCapture` activates the audio session per dictation and deactivates it on every exit
    (iOS memory 086); all session and engine work is on one serial queue, which also orders a
    stop after the start it races.
@@ -36,8 +39,14 @@ of the input when it comes back, and the contextual cleanup runs.
 **Consequences:**
 
 - Audio leaves the device. The backend stores and logs neither audio nor text (root ADR-004;
-  backend ADR-022). The microphone permission string says so. The App Store privacy label may
-  need "Audio Data" declared; that is an owner call.
+  backend ADR-022); the microphone permission string says so, and the AI consent screen lists
+  voice recordings among the data sent. Owner calls: OpenRouter applies no per-request
+  zero-retention filter to transcription, so upstream retention rests on its account-level
+  privacy settings (backend ADR-022 asks for them to be verified); users who consented before
+  this change see no new notice; the App Store privacy label may need "Audio Data" declared.
+- The auto-dictation preference (auto-start on expand, the first-run "Auto-Enable Dictation"
+  prompt, restart after each agent turn) is kept as it was; each auto-start now records for
+  backend transcription.
 - No live transcript while speaking: the text arrives in one piece after the tap (upload +
   model time, plus up to `cleanupTimeout` = 3 s for the cleanup).
 - Dictation needs a TabMail sign-in and an active subscription; it counts toward usage like

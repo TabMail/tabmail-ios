@@ -43,6 +43,15 @@ private final class FakeCapture: AudioCapturing, @unchecked Sendable {
         state.withLock { $0.isRunning = false }
     }
 
+    /// Audio at a sample rate no converter accepts: the recording fails.
+    static func unconvertible() -> AVAudioPCMBuffer {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 1, channels: 1)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1)!
+        buffer.frameLength = 1
+        buffer.floatChannelData![0][0] = 0.5
+        return buffer
+    }
+
     /// A tenth of a second of a 440 Hz tone at 48 kHz, as a microphone delivers it.
     static func speech() -> AVAudioPCMBuffer {
         let sampleRate = 48_000.0
@@ -77,7 +86,8 @@ struct DictationControllerTests {
         transcript: @escaping @Sendable () async throws -> String = { "ask jordan about the road map" },
         cleaned: @escaping @Sendable () async throws -> CompletionsResponse = {
             CompletionsResponse(assistant: "Ask Jordan about the roadmap.", token_usage: nil, error: nil)
-        }
+        },
+        maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration
     ) -> DictationController {
         let recorded = recorded
         return DictationController(
@@ -91,7 +101,8 @@ struct DictationControllerTests {
             complete: { request in
                 recorded.cleanups.withLock { $0.append(request) }
                 return try await cleaned()
-            }
+            },
+            maxRecordingDuration: maxRecordingDuration
         )
     }
 
@@ -105,7 +116,7 @@ struct DictationControllerTests {
     /// Starts, waits for the microphone, and taps stop.
     private func dictate(_ controller: DictationController, capture: FakeCapture) async {
         let recorded = recorded
-        controller.start(context: context) { text in recorded.texts.withLock { $0.append(text) } }
+        controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
         await waitUntil { capture.starts == 1 }
         controller.finish()
     }
@@ -114,7 +125,7 @@ struct DictationControllerTests {
         let capture = FakeCapture()
         let controller = controller(capture: capture)
 
-        controller.start(context: context) { text in recorded.texts.withLock { $0.append(text) } }
+        controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
         #expect(controller.phase == .listening)
         await waitUntil { controller.isHearing }
         controller.finish()
@@ -139,17 +150,37 @@ struct DictationControllerTests {
         let capture = FakeCapture()
         let controller = controller(capture: capture, online: false)
 
-        controller.start(context: context) { _ in Issue.record("no text offline") }
+        controller.start(context: context, canUseAI: true) { _ in Issue.record("no text offline") }
 
         #expect(controller.phase == .failed(DictationController.offlineMessage))
         #expect(capture.starts == 0)
+    }
+
+    /// Without AI access the pill shows sign-in or subscribe, not the waveform: an auto-start must
+    /// not record unseen, and nothing is uploaded.
+    @Test func withoutAIAccessNothingIsRecorded() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture)
+
+        controller.start(context: context, canUseAI: false) { _ in Issue.record("no text without AI access") }
+        #expect(controller.phase == .idle)
+        #expect(!controller.isActive)
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(capture.starts == 0)
+        #expect(recorded.uploads.withLock { $0.isEmpty })
+        // The same controller records once AI access is there.
+        controller.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { capture.starts == 1 }
+        #expect(capture.starts == 1)
+        controller.cancel()
     }
 
     @Test func withoutMicrophoneAccessNothingIsRecorded() async {
         let capture = FakeCapture()
         let controller = controller(capture: capture, microphoneAccess: { false })
 
-        controller.start(context: context) { _ in Issue.record("no text without the microphone") }
+        controller.start(context: context, canUseAI: true) { _ in Issue.record("no text without the microphone") }
         await waitUntil { controller.phase != .listening }
 
         #expect(controller.phase == .failed(DictationController.microphoneDeniedMessage))
@@ -164,7 +195,7 @@ struct DictationControllerTests {
             return true
         })
 
-        controller.start(context: context) { _ in Issue.record("nothing was recorded") }
+        controller.start(context: context, canUseAI: true) { _ in Issue.record("nothing was recorded") }
         controller.finish()
         #expect(controller.phase == .idle)
         try? await Task.sleep(for: .milliseconds(400))
@@ -177,7 +208,7 @@ struct DictationControllerTests {
         let capture = FakeCapture(startError: MicrophoneCapture.CaptureError.noInputDevice)
         let controller = controller(capture: capture)
 
-        controller.start(context: context) { _ in Issue.record("no text without audio") }
+        controller.start(context: context, canUseAI: true) { _ in Issue.record("no text without audio") }
         await waitUntil { controller.phase != .listening }
 
         #expect(controller.phase == .failed(DictationController.microphoneFailedMessage))
@@ -266,10 +297,93 @@ struct DictationControllerTests {
         await waitUntil { controller.phase != .transcribing }
         #expect(controller.phase == .failed(DictationController.nothingHeardMessage))
 
-        controller.start(context: context) { _ in }
+        controller.start(context: context, canUseAI: true) { _ in }
 
         #expect(controller.phase == .listening)
         controller.cancel()
+    }
+
+    /// Cancelled while listening (the pill went away): the microphone and its audio session are
+    /// released and nothing is sent.
+    @Test func cancellingWhileListeningReleasesTheMicrophone() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture)
+
+        controller.start(context: context, canUseAI: true) { _ in Issue.record("nothing is appended after a cancel") }
+        await waitUntil { capture.isRunning }
+        #expect(capture.isRunning)
+        controller.cancel()
+
+        #expect(controller.phase == .idle)
+        #expect(!capture.isRunning)
+        try? await Task.sleep(for: DictationConfig.releaseTailDuration * 2)
+        #expect(recorded.uploads.withLock { $0.isEmpty })
+    }
+
+    /// An auto-start racing a tap: the second start is ignored, so only one microphone runs.
+    @Test func aSecondStartWhileListeningIsIgnored() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture)
+
+        controller.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { capture.starts == 1 }
+        controller.start(context: context, canUseAI: true) { _ in Issue.record("the second start never records") }
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(capture.starts == 1)
+        #expect(controller.phase == .listening)
+        controller.cancel()
+    }
+
+    /// A dictation cancelled during its cleanup never lands in the one started after it: an older
+    /// dictation must not append to, or end, a newer one.
+    @Test func aSupersededCleanupNeverLandsInTheNextDictation() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, cleaned: {
+            try? await Task.sleep(for: .milliseconds(300))
+            return CompletionsResponse(assistant: "Too late.", token_usage: nil, error: nil)
+        })
+
+        await dictate(controller, capture: capture)
+        await waitUntil { recorded.cleanups.withLock { !$0.isEmpty } }
+        controller.cancel()
+        controller.start(context: context, canUseAI: true) { _ in Issue.record("the second dictation was not finished") }
+        await waitUntil { capture.starts == 2 }
+        try? await Task.sleep(for: .milliseconds(600))
+
+        #expect(recorded.texts.withLock { $0.isEmpty })
+        #expect(controller.phase == .listening)
+        #expect(capture.isRunning)
+        controller.cancel()
+    }
+
+    /// At the upload cap the recording is sent rather than dropped. (Whole seconds: the recorder,
+    /// copied from TabMail Voice, sizes its cap from the duration's seconds component.)
+    @Test func theMaximumDurationSendsTheRecording() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, maxRecordingDuration: .seconds(1))
+
+        controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
+        await waitUntil { controller.phase == .transcribing }
+        #expect(controller.phase == .transcribing)
+        await waitUntil { controller.phase == .idle }
+
+        #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
+        #expect(recorded.uploads.withLock { $0.count } == 1)
+        #expect(!capture.isRunning)
+    }
+
+    @Test func audioThatCannotBeRecordedFailsAndReleasesTheMicrophone() async {
+        let capture = FakeCapture(buffer: FakeCapture.unconvertible())
+        let controller = controller(capture: capture)
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase != .transcribing }
+
+        #expect(controller.phase == .failed(DictationController.recordingFailedMessage))
+        #expect(!capture.isRunning)
+        #expect(recorded.uploads.withLock { $0.isEmpty })
+        #expect(recorded.texts.withLock { $0.isEmpty })
     }
 
     @Test func appendsToTheEndOfTheInputASpaceApart() {

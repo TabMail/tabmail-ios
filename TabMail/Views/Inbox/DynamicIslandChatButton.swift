@@ -1222,7 +1222,9 @@ struct DynamicIslandChat: View {
 
     private func startDictation() {
         isTextFieldFocused = false
-        dictation.start(context: dictationContext) { text in
+        // The same gate that shows the input bar (and so the mic and the waveform) in the body.
+        let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive
+        dictation.start(context: dictationContext, canUseAI: canUseAI) { text in
             inputText = DictationController.appending(text, to: inputText)
             inputSelection = .init(insertionPoint: inputText.endIndex)
             // The appended text grows the input bar, shrinking the scroll view.

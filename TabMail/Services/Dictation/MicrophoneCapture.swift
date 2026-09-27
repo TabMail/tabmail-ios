@@ -68,7 +68,8 @@ final class MicrophoneCapture: AudioCapturing {
                 self.audio.withLock { $0.running = engine }
                 completion(nil)
             } catch {
-                self.handler.withLock { $0 = nil }
+                // The handler stays: a newer start may already have replaced it, and the owner's
+                // stop() (every failed start ends in one) clears it.
                 self.teardownOnQueue()
                 completion(error)
             }

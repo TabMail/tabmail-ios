@@ -36,6 +36,7 @@ final class DictationController {
     @ObservationIgnored private let transcribeAudio: Transcribe
     @ObservationIgnored private let complete: DictationCleanup.Complete
     @ObservationIgnored private let cleanupTimeout: TimeInterval
+    @ObservationIgnored private let maxRecordingDuration: Duration
 
     // Per-dictation state. `generation` invalidates callbacks from a superseded dictation.
     @ObservationIgnored private var generation = 0
@@ -54,7 +55,8 @@ final class DictationController {
         isOnline: @escaping @MainActor () -> Bool = { NetworkMonitor.shared.isConnected },
         transcribe: Transcribe? = nil,
         complete: DictationCleanup.Complete? = nil,
-        cleanupTimeout: TimeInterval = DictationConfig.cleanupTimeout
+        cleanupTimeout: TimeInterval = DictationConfig.cleanupTimeout,
+        maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration
     ) {
         self.capture = capture
         self.requestMicrophoneAccess = requestMicrophoneAccess
@@ -63,15 +65,23 @@ final class DictationController {
         // Direct: a user waiting on their dictation doesn't queue behind background AI work.
         self.complete = complete ?? { try await AccountManager.shared.backendClient.sendCompletionsDirect($0) }
         self.cleanupTimeout = cleanupTimeout
+        self.maxRecordingDuration = maxRecordingDuration
     }
 
     /// Starts listening. `context` is what the user sees now (the cleanup reads it); `onText`
-    /// receives the cleaned-up dictation. Needs a connection: the audio is transcribed on the
-    /// backend.
-    func start(context: DictationContext, onText: @escaping @MainActor (String) -> Void) {
+    /// receives the cleaned-up dictation. Needs AI access (`canUseAI`: a TabMail session and an
+    /// active subscription, as the pill's input bar requires) and a connection: the audio is
+    /// transcribed on the backend.
+    func start(context: DictationContext, canUseAI: Bool, onText: @escaping @MainActor (String) -> Void) {
         switch phase {
         case .idle, .failed: break
         case .listening, .transcribing: return
+        }
+        // Without AI access the pill shows sign-in or subscribe instead of the input bar: nothing
+        // would show the recording, and the backend would refuse it.
+        guard canUseAI else {
+            BackgroundSyncLogger.logDebug("[Dictation] not started: no AI access")
+            return
         }
         guard isOnline() else {
             fail(Self.offlineMessage)
@@ -103,7 +113,7 @@ final class DictationController {
     }
 
     private func beginRecording(generation current: Int) {
-        let recorder = AudioRecorder()
+        let recorder = AudioRecorder(maxDuration: maxRecordingDuration)
         self.recorder = recorder
         capture.start(
             onBuffer: { [weak self] buffer in
@@ -117,8 +127,9 @@ final class DictationController {
             }
         )
         // Past the upload cap, stop and send what was said rather than silently dropping audio.
+        let cap = maxRecordingDuration
         maxDurationTask = Task { [weak self] in
-            try? await Task.sleep(for: DictationConfig.maxRecordingDuration)
+            try? await Task.sleep(for: cap)
             guard !Task.isCancelled, let self, self.generation == current else { return }
             BackgroundSyncLogger.logDebug("[Dictation] max duration reached; finishing")
             self.finish()

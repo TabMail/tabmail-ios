@@ -85,6 +85,9 @@ enum DictationConfig {
     static let swirlGatherSeconds: Double = 0.3
     static let swirlRevolutionsPerSecond: Double = 1.4
     static let swirlParticleSize: Double = 5
+    /// The outermost particle's size and opacity, as a share of the innermost's (full) ones.
+    static let swirlOuterParticleScale: Double = 0.5
+    static let swirlOuterParticleOpacity: Double = 0.35
     /// Height the swirl is drawn in, inside the input bar.
     static let swirlCanvasHeight: CGFloat = 44
     /// Number of bars in the pill's waveform.
@@ -100,6 +103,8 @@ enum DictationConfig {
     static let waveformIdleLevel: Double = 0.05
     /// Each bar's ripple speed differs by up to this fraction, so the motion looks organic.
     static let waveformSpeedVariance: Double = 0.2
+    /// Phase step (radians per bar) that spreads the speed variance across the bars.
+    static let waveformSpeedPhaseStep: Double = 1.7
     /// Outer bars reach this fraction of the centre bar's height.
     static let meterEdgeBarWeight: Double = 0.45
     /// Travelling ripple across the bars (radians per second, radians per bar, share of height).

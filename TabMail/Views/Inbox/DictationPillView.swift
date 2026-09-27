@@ -136,8 +136,8 @@ private struct GatheringSwirl: View {
                     // Each particle trails slightly further out, so the ring reads as a spiral.
                     let r = radius * (1 + fraction * DictationConfig.swirlSpiralSpread)
                     let point = CGPoint(x: centre.x + cos(angle) * r, y: centre.y + sin(angle) * r)
-                    let dot = DictationConfig.swirlParticleSize * (0.5 + 0.5 * (1 - fraction))
-                    context.opacity = 0.35 + 0.65 * (1 - fraction)
+                    let dot = DictationConfig.swirlParticleSize * Self.blend(DictationConfig.swirlOuterParticleScale, fraction)
+                    context.opacity = Self.blend(DictationConfig.swirlOuterParticleOpacity, fraction)
                     context.fill(
                         Path(ellipseIn: CGRect(x: point.x - dot / 2, y: point.y - dot / 2, width: dot, height: dot)),
                         with: .color(Brand.colour(at: fraction))
@@ -146,6 +146,11 @@ private struct GatheringSwirl: View {
             }
         }
         .onAppear { start = Date() }
+    }
+
+    /// 1 for the innermost particle (`fraction` 0), falling linearly towards `outer`.
+    private static func blend(_ outer: Double, _ fraction: Double) -> Double {
+        outer + (1 - outer) * (1 - fraction)
     }
 }
 
@@ -199,7 +204,7 @@ private struct Waveform: View {
         let distance = abs(Double(index) - centre) / max(centre, 1)
         let weight = 1 - distance * (1 - DictationConfig.meterEdgeBarWeight)
         // Each bar ripples at its own speed, so the motion reads as a voice rather than a meter.
-        let speed = DictationConfig.waveformRippleSpeed * (1 + DictationConfig.waveformSpeedVariance * sin(Double(index) * 1.7))
+        let speed = DictationConfig.waveformRippleSpeed * (1 + DictationConfig.waveformSpeedVariance * sin(Double(index) * DictationConfig.waveformSpeedPhaseStep))
         let ripple = (sin(time * speed - Double(index) * DictationConfig.waveformRipplePhase) + 1) / 2
         let voice = pow(Double(level), DictationConfig.waveformLevelExponent) * DictationConfig.waveformGain
             * weight * (1 - DictationConfig.waveformRippleDepth + DictationConfig.waveformRippleDepth * ripple)
