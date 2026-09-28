@@ -46,8 +46,6 @@ struct DynamicIslandChat: View {
     private let networkMonitor = NetworkMonitor.shared
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
     @State private var autoStartTask: Task<Void, Never>?
-    /// Send was tapped while dictating: the dictation's text is sent as soon as it lands.
-    @State private var sendWhenDictated = false
     @State private var workingStatus = ""
     @State private var statusQueue: [String] = []
     @State private var statusTickTask: Task<Void, Never>?
@@ -591,11 +589,6 @@ struct DynamicIslandChat: View {
                 hasLoadedHistory = false
             }
         }
-        .onChange(of: dictation.isActive) { _, active in
-            // A dictation that ended without text sends nothing. On success the text has already
-            // been delivered (and sent) by the time this runs.
-            if !active { sendWhenDictated = false }
-        }
         .onChange(of: isTextFieldFocused) { _, focused in
             isInputFocused = focused
             if focused {
@@ -691,7 +684,6 @@ struct DynamicIslandChat: View {
             // (2026-07-08: mic kept recording under a dismissed compose cover).
             autoStartTask?.cancel()
             autoStartTask = nil
-            sendWhenDictated = false
             // Unconditional: cancel() is a no-op when idle, and discards a
             // recording or transcription in progress (nowhere left to append it).
             dictation.cancel()
@@ -802,6 +794,23 @@ struct DynamicIslandChat: View {
                         .frame(width: 44, height: 44)
                         .contentShape(Rectangle())
                 }
+            } else if dictation.phase == .listening {
+                // While dictating, send becomes stop: it finishes the dictation (the text is
+                // appended, not sent), as the mic button does.
+                Button {
+                    dictation.finish()
+                } label: {
+                    Image(systemName: "stop.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(Theme.accent)
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Stop dictation")
+            } else if dictation.phase == .transcribing {
+                ProgressView()
+                    .frame(width: 44, height: 44)
+                    .accessibilityLabel("Transcribing")
             } else if !isWorking && (pendingResumeRequest != nil || lastFailedMessage != nil) && isOnLiveSession && inputText.trimmingCharacters(in: .whitespaces).isEmpty {
                 // Retry button. Reverts to the send button as soon as the user types
                 // (the `inputText.isEmpty` gate above). Routes to the right path:
@@ -831,21 +840,15 @@ struct DynamicIslandChat: View {
             } else {
                 // Normal send button
                 Button {
-                    if dictation.isActive {
-                        // Send finishes the dictation first; its text, if any, is sent when it lands.
-                        sendWhenDictated = true
-                        dictation.finish()
-                    } else {
-                        sendMessage()
-                    }
+                    sendMessage()
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.title2)
-                        .foregroundStyle(canTapSend ? Theme.accent : .secondary.opacity(0.3))
+                        .foregroundStyle(canSend ? Theme.accent : .secondary.opacity(0.3))
                         .frame(width: 44, height: 44)
                         .contentShape(Rectangle())
                 }
-                .disabled(!canTapSend)
+                .disabled(!canSend)
             }
         }
         .padding(.horizontal, 14)
@@ -1255,10 +1258,6 @@ struct DynamicIslandChat: View {
             inputText = DictationController.appending(text, to: inputText)
             inputSelection = .init(insertionPoint: inputText.endIndex)
             Task { await DictationLanguageTip.dictationCompleted.donate() }
-            if sendWhenDictated {
-                sendWhenDictated = false
-                if canSend { sendMessage() }
-            }
             // The appended text grows the input bar, shrinking the scroll view.
             // Defer the scroll so layout settles before repositioning.
             Task { @MainActor in
@@ -1274,11 +1273,6 @@ struct DynamicIslandChat: View {
             && !isWorking
             && !dictation.isActive
             && (!isComposeMode || (composeMutationAllowed && composeAttachmentSnapshotReady))
-    }
-
-    /// While dictating, send stays available: it finishes the dictation, then sends its text.
-    private var canTapSend: Bool {
-        canSend || (dictation.isActive && hasTabMailSession && !isWorking)
     }
 
     private func sendMessage() {

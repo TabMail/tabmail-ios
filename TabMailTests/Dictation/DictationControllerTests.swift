@@ -9,8 +9,8 @@ import SwiftUI
 import Testing
 @testable import TabMail
 
-/// A microphone that delivers one prepared buffer (or none) when started. Tracks whether it is
-/// running, so tests can pin that every dictation releases it.
+/// A microphone that delivers prepared buffers (or none), in order, when started. Tracks whether
+/// it is running, so tests can pin that every dictation releases it.
 private final class FakeCapture: AudioCapturing, @unchecked Sendable {
     private struct State {
         var starts = 0
@@ -18,11 +18,15 @@ private final class FakeCapture: AudioCapturing, @unchecked Sendable {
     }
 
     private let state = Mutex(State())
-    let buffer: AVAudioPCMBuffer?
+    let buffers: [AVAudioPCMBuffer]
     let startError: (any Error)?
 
-    init(buffer: AVAudioPCMBuffer? = FakeCapture.speech(), startError: (any Error)? = nil) {
-        self.buffer = buffer
+    convenience init(buffer: AVAudioPCMBuffer? = FakeCapture.speech(), startError: (any Error)? = nil) {
+        self.init(buffers: buffer.map { [$0] } ?? [], startError: startError)
+    }
+
+    init(buffers: [AVAudioPCMBuffer], startError: (any Error)? = nil) {
+        self.buffers = buffers
         self.startError = startError
     }
 
@@ -36,7 +40,7 @@ private final class FakeCapture: AudioCapturing, @unchecked Sendable {
             return
         }
         state.withLock { $0.isRunning = true }
-        if let buffer { onBuffer(buffer) }
+        for buffer in buffers { onBuffer(buffer) }
         completion(nil)
     }
 
@@ -61,8 +65,9 @@ private final class FakeCapture: AudioCapturing, @unchecked Sendable {
         return buffer
     }
 
-    /// `seconds` of a 440 Hz tone at 16 kHz, in one buffer.
-    static func tone(seconds: Double) -> AVAudioPCMBuffer {
+    /// `seconds` of a 440 Hz tone at 16 kHz, in one buffer. Quiet (`amplitude` 0.01, about
+    /// −43 dB), it plays a room's noise.
+    static func tone(seconds: Double, amplitude: Float = 0.5) -> AVAudioPCMBuffer {
         let sampleRate = 16_000.0
         let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
         let frames = AVAudioFrameCount(sampleRate * seconds)
@@ -70,7 +75,7 @@ private final class FakeCapture: AudioCapturing, @unchecked Sendable {
         buffer.frameLength = frames
         let data = buffer.floatChannelData![0]
         for frame in 0..<Int(frames) {
-            data[frame] = 0.5 * sin(2 * .pi * 440 * Float(frame) / Float(sampleRate))
+            data[frame] = amplitude * sin(2 * .pi * 440 * Float(frame) / Float(sampleRate))
         }
         return buffer
     }
@@ -97,6 +102,71 @@ private final class Recorded: Sendable {
     let languages = Mutex<[String?]>([])
     let cleanups = Mutex<[CompletionsRequest]>([])
     let texts = Mutex<[String]>([])
+}
+
+/// Hears speech in the buffers `hears` accepts, calling back at once as the classifier would.
+/// `finish` reports whether it heard any, or, `hearsWhenFlushed`, a word the classifier only
+/// catches in its last window.
+private final class FakeSpeechDetector: SpeechDetecting, @unchecked Sendable {
+    private let heard = Mutex(false)
+    private let hears: @Sendable (AVAudioPCMBuffer) -> Bool
+    private let hearsWhenFlushed: Bool
+    private let onSpeech: @Sendable () -> Void
+
+    private init(hears: @escaping @Sendable (AVAudioPCMBuffer) -> Bool, hearsWhenFlushed: Bool, onSpeech: @escaping @Sendable () -> Void) {
+        self.hears = hears
+        self.hearsWhenFlushed = hearsWhenFlushed
+        self.onSpeech = onSpeech
+    }
+
+    func analyze(_ buffer: AVAudioPCMBuffer) {
+        guard hears(buffer) else { return }
+        let isFirst = heard.withLock { heard in
+            defer { heard = true }
+            return !heard
+        }
+        if isFirst { onSpeech() }
+    }
+
+    func finish() async -> Bool {
+        if hearsWhenFlushed { heard.withLock { $0 = true } }
+        return heard.withLock { $0 }
+    }
+
+    static func make(
+        hearsWhenFlushed: Bool = false,
+        hears: @escaping @Sendable (AVAudioPCMBuffer) -> Bool
+    ) -> DictationController.MakeSpeechDetector {
+        { onSpeech, _ in FakeSpeechDetector(hears: hears, hearsWhenFlushed: hearsWhenFlushed, onSpeech: onSpeech) }
+    }
+
+    /// Hears any buffer louder than a room (the tests' `speech()` and full tones).
+    static func hearing() -> DictationController.MakeSpeechDetector {
+        make { MicrophoneCapture.decibels(of: $0) > roomDecibels }
+    }
+
+    /// Never hears speech: someone who says nothing.
+    static func deaf() -> DictationController.MakeSpeechDetector {
+        make { _ in false }
+    }
+
+    /// Louder than `FakeCapture.tone(amplitude: 0.01)`, quieter than any voice the tests play.
+    static let roomDecibels: Float = -30
+}
+
+/// A speech detector that can't run: it fails on the first buffer.
+private final class BrokenSpeechDetector: SpeechDetecting, @unchecked Sendable {
+    private let onFailure: @Sendable (any Error) -> Void
+
+    init(onFailure: @escaping @Sendable (any Error) -> Void) {
+        self.onFailure = onFailure
+    }
+
+    func analyze(_ buffer: AVAudioPCMBuffer) {
+        onFailure(URLError(.cannotDecodeRawData))
+    }
+
+    func finish() async -> Bool { false }
 }
 
 /// A microphone whose first start is slow and completes only when `failFirst` is called (a
@@ -153,7 +223,8 @@ struct DictationControllerTests {
         cleaned: @escaping @Sendable () async throws -> CompletionsResponse = {
             CompletionsResponse(assistant: "Ask Jordan about the roadmap.", token_usage: nil, error: nil)
         },
-        maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration
+        maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration,
+        speechDetector: @escaping DictationController.MakeSpeechDetector = FakeSpeechDetector.hearing()
     ) -> DictationController {
         let recorded = recorded
         return DictationController(
@@ -167,6 +238,7 @@ struct DictationControllerTests {
                 recorded.languages.withLock { $0.append(language) }
                 return try await transcript()
             },
+            speechDetector: speechDetector,
             complete: { request in
                 recorded.cleanups.withLock { $0.append(request) }
                 return try await cleaned()
@@ -196,7 +268,7 @@ struct DictationControllerTests {
 
         controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
         #expect(controller.phase == .listening)
-        await waitUntil { controller.isHearing }
+        await waitUntil { controller.hasHeardSpeech }
         controller.finish()
         #expect(controller.phase == .transcribing)
         await waitUntil { controller.phase == .idle }
@@ -276,7 +348,7 @@ struct DictationControllerTests {
 
         controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
         #expect(controller.language == "ko")
-        await waitUntil { controller.isHearing }
+        await waitUntil { controller.hasHeardSpeech }
         setting.withLock { $0 = "en" }
         controller.finish()
         await waitUntil { controller.phase == .idle }
@@ -354,23 +426,6 @@ struct DictationControllerTests {
         #expect(recorded.uploads.withLock { $0.isEmpty })
         #expect(recorded.texts.withLock { $0.isEmpty })
         #expect(!capture.isRunning)
-    }
-
-    /// The text arrives with the dictation already over, so the pill's send-after-dictation can
-    /// send it from the callback (sending is refused while a dictation is active).
-    @Test func theTextArrivesOnceTheDictationHasEnded() async {
-        let capture = FakeCapture()
-        let controller = controller(capture: capture)
-        var activeAtDelivery: [Bool] = []
-
-        controller.start(context: context, canUseAI: true) { _ in
-            activeAtDelivery.append(controller.isActive)
-        }
-        await waitUntil { capture.starts == 1 }
-        controller.finish()
-        await waitUntil { controller.phase == .idle }
-
-        #expect(activeAtDelivery == [false])
     }
 
     @Test func anEmptyTranscriptIsNotAppended() async {
@@ -483,25 +538,104 @@ struct DictationControllerTests {
         #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
     }
 
-    /// The waveform stays at rest until real sound arrives: the microphone's start-up silence
-    /// doesn't move it; a voice does.
-    @Test func theWaveformWaitsForRealSound() async {
-        let silent = FakeCapture(buffer: FakeCapture.silence())
-        let quiet = controller(capture: silent)
-        quiet.start(context: context, canUseAI: true) { _ in }
-        await waitUntil { silent.starts == 1 }
+    /// The waveform lies flat until speech is heard: neither the microphone's start-up silence
+    /// nor the room's noise moves it; a voice does.
+    @Test func theWaveformLiesFlatUntilSpeechIsHeard() async {
+        // A room whose noise rises: it would move an ungated waveform.
+        let room = FakeCapture(buffers: [FakeCapture.silence(), FakeCapture.tone(seconds: 0.5, amplitude: 0.005), FakeCapture.tone(seconds: 0.5, amplitude: 0.01)])
+        let waiting = controller(capture: room)
+        waiting.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { room.starts == 1 }
         try? await Task.sleep(for: .milliseconds(200))
-        #expect(quiet.phase == .listening)
-        #expect(!quiet.isHearing)
-        #expect(quiet.level == 0)
-        quiet.cancel()
+        #expect(waiting.phase == .listening)
+        #expect(!waiting.hasHeardSpeech)
+        #expect(waiting.level == 0)
+        waiting.cancel()
 
-        let speaking = FakeCapture()
+        let speaking = FakeCapture(buffers: [FakeCapture.tone(seconds: 1, amplitude: 0.01), FakeCapture.speech(), FakeCapture.speech()])
         let heard = controller(capture: speaking)
         heard.start(context: context, canUseAI: true) { _ in }
-        await waitUntil { heard.isHearing }
-        #expect(heard.isHearing)
+        await waitUntil { heard.level > 0 }
+        #expect(heard.hasHeardSpeech)
+        #expect(heard.level > 0)
         heard.cancel()
+    }
+
+    /// Someone who says nothing sends nothing: stopping a dictation that never heard speech
+    /// uploads nothing, appends nothing, and releases the microphone.
+    @Test func nothingIsSentWithoutSpeech() async {
+        let capture = FakeCapture(buffer: FakeCapture.tone(seconds: 1, amplitude: 0.01))
+        let controller = controller(capture: capture, speechDetector: FakeSpeechDetector.deaf())
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase == .idle }
+
+        #expect(controller.phase == .idle)
+        #expect(recorded.uploads.withLock { $0.isEmpty })
+        #expect(recorded.cleanups.withLock { $0.isEmpty })
+        #expect(recorded.texts.withLock { $0.isEmpty })
+        #expect(!capture.isRunning)
+    }
+
+    /// Waiting for speech has no time limit: the recording cap only starts once someone speaks,
+    /// so background noise never uses it up (owner, 2026-09-28).
+    @Test func aDictationWaitsForSpeechWithoutALimit() async {
+        let capture = FakeCapture(buffer: FakeCapture.tone(seconds: 1, amplitude: 0.01))
+        let controller = controller(capture: capture, maxRecordingDuration: .seconds(1), speechDetector: FakeSpeechDetector.deaf())
+
+        controller.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { capture.starts == 1 }
+        try? await Task.sleep(for: .milliseconds(1_500))
+
+        #expect(controller.phase == .listening)
+        #expect(capture.isRunning)
+        controller.cancel()
+    }
+
+    /// A word said just before stop, too late for the classifier to call it while listening, is
+    /// still heard in its last window and sent.
+    @Test func aWordJustBeforeStopIsStillSent() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, speechDetector: FakeSpeechDetector.make(hearsWhenFlushed: true) { _ in false })
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase == .idle }
+
+        #expect(recorded.uploads.withLock { $0.count } == 1)
+        #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
+    }
+
+    /// The moment before speech is recorded, so the first word isn't clipped, and counts toward
+    /// the recording cap.
+    @Test func theMomentBeforeSpeechIsKeptAndCounted() async throws {
+        let capture = FakeCapture(buffers: [FakeCapture.tone(seconds: 5, amplitude: 0.01), FakeCapture.speech()])
+        let controller = controller(capture: capture, maxRecordingDuration: .seconds(3))
+
+        controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
+        await waitUntil { capture.starts == 1 }
+        let heard = ContinuousClock.now
+        await waitUntil { controller.phase != .listening }
+        // The cap's remaining second, not all three.
+        #expect(ContinuousClock.now - heard < .milliseconds(2_500))
+        await waitUntil { controller.phase == .idle }
+
+        let wav = try #require(recorded.uploads.withLock { $0.first })
+        let seconds = Double(wav.count - WAVEncoder.headerSize) / Double(MemoryLayout<Int16>.size) / DictationConfig.recordingSampleRate
+        // The two seconds held before the voice, then the voice's tenth of a second.
+        #expect(abs(seconds - 2.1) < 0.02)
+    }
+
+    /// A speech detector that can't run ends the dictation quietly, releasing the microphone.
+    @Test func aSpeechDetectorThatCannotRunEndsTheDictation() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, speechDetector: { _, onFailure in BrokenSpeechDetector(onFailure: onFailure) })
+
+        controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
+        await waitUntil { controller.phase == .idle }
+
+        #expect(controller.phase == .idle)
+        #expect(!capture.isRunning)
+        #expect(recorded.uploads.withLock { $0.isEmpty })
     }
 
     /// A recording is never longer than the transcription model takes (120 s, backend ADR-022),
@@ -528,6 +662,7 @@ struct DictationControllerTests {
                 recorded.uploads.withLock { $0.append(wav) }
                 return "a long dictation"
             },
+            speechDetector: FakeSpeechDetector.hearing(),
             complete: { _ in CompletionsResponse(assistant: "A long dictation.", token_usage: nil, error: nil) }
         )
 
@@ -832,28 +967,22 @@ struct DictationOptOutFlagTests {
         #expect(DictationConfig.dimmedInputOpacity > 0 && DictationConfig.dimmedInputOpacity < 0.5)
     }
 
-    /// Send while dictating finishes the dictation, then sends its text once it lands; a
-    /// dictation that brings back nothing sends nothing, and nothing carries over to the next.
-    @Test func sendFinishesTheDictationThenSendsItsText() throws {
+    /// While dictating, send becomes a stop button that finishes the dictation (its text is
+    /// appended, not sent); while the words are transcribed, a spinner; then send again.
+    @Test func whileDictatingSendIsStopThenASpinner() throws {
         let source = try pillSource()
-        let send = try slice(source, from: "// Normal send button", to: ".disabled(!canTapSend)")
-        #expect(send.contains("if dictation.isActive {"))
-        #expect(send.contains("sendWhenDictated = true\n                        dictation.finish()\n                    } else {\n                        sendMessage()"))
-        #expect(send.contains(".foregroundStyle(canTapSend ? Theme.accent : .secondary.opacity(0.3))"))
-        let canTapSend = try slice(source, from: "private var canTapSend: Bool {", to: "private func sendMessage()")
-        #expect(canTapSend.contains("canSend || (dictation.isActive && hasTabMailSession && !isWorking)"))
-
-        let start = String(try slice(source, from: "private func startDictation()", to: "private var canSend: Bool"))
-        let onText = try slice(start, from: "{ text in", to: "scrollPosition.scrollTo(edge: .bottom)")
-        let appended = try #require(onText.range(of: "inputText = DictationController.appending(text, to: inputText)"))
-        let sent = try #require(onText.range(of: "if sendWhenDictated {\n                sendWhenDictated = false\n                if canSend { sendMessage() }"))
-        #expect(appended.upperBound <= sent.lowerBound)
-
-        let ended = try slice(source, from: ".onChange(of: dictation.isActive) {", to: ".onChange(of: isTextFieldFocused)")
-        #expect(ended.contains("if !active { sendWhenDictated = false }"))
-        let disappear = try slice(source, from: ".onDisappear {", to: "// No eager cancellation")
-        #expect(disappear.contains("sendWhenDictated = false"))
-        #expect(source.components(separatedBy: "sendWhenDictated = true").count == 2)
+        let listening = try slice(source, from: "} else if dictation.phase == .listening {", to: "} else if dictation.phase == .transcribing {")
+        #expect(listening.contains("Button {\n                    dictation.finish()\n                } label: {"))
+        #expect(listening.contains("Image(systemName: \"stop.circle.fill\")"))
+        #expect(listening.contains(".foregroundStyle(Theme.accent)"))
+        #expect(!listening.contains("sendMessage()"))
+        let transcribing = try slice(source, from: "} else if dictation.phase == .transcribing {", to: "} else if !isWorking && (pendingResumeRequest != nil")
+        #expect(transcribing.contains("ProgressView()"))
+        #expect(!transcribing.contains("Button"))
+        // Send itself stays off while a dictation is on its way into the input (`canSend`).
+        let send = try slice(source, from: "// Normal send button", to: ".disabled(!canSend)")
+        #expect(send.contains("Button {\n                    sendMessage()\n                }"))
+        #expect(source.components(separatedBy: "Image(systemName: \"stop.circle.fill\")").count == 3)
     }
 
     /// A recording never outlives the pill, and a message can't be sent over a dictation still
@@ -916,7 +1045,8 @@ struct DictationOptOutFlagTests {
         let pill = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Inbox/DictationPillView.swift"), encoding: .utf8)
         #expect(!pill.contains("controller.language"))
         #expect(!pill.contains("Badge"))
-        #expect(pill.contains("Waveform(level: controller.level)"))
+        #expect(pill.contains("Waveform(level: controller.level, isFlat: controller.phase == .listening && !controller.hasHeardSpeech)"))
+        #expect(pill.contains("guard !isFlat else { return DictationConfig.meterMinBarHeight }"))
         #expect(pill.contains(".accessibilityElement(children: .ignore)\n            .accessibilityLabel(accessibilityLabel)"))
 
         let source = try pillSource()
@@ -947,6 +1077,7 @@ struct DictationWaveformTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
             transcribe: { _, _ in try await Task.sleep(for: .seconds(60)); return "" },
+            speechDetector: FakeSpeechDetector.hearing(),
             complete: { _ in CompletionsResponse(assistant: "", token_usage: nil, error: nil) }
         )
         controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { _ in }
@@ -1023,6 +1154,7 @@ struct DictationLanguageSettingTests {
                     languages.withLock { $0.append(language) }
                     return "annyeong"
                 },
+                speechDetector: FakeSpeechDetector.hearing(),
                 complete: { _ in CompletionsResponse(assistant: "Annyeong.", token_usage: nil, error: nil) }
             )
 
@@ -1063,6 +1195,7 @@ struct DictationLanguageSettingTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
             transcribe: DictationController.backendTranscription(BackendClient(llmSession: http.session)),
+            speechDetector: FakeSpeechDetector.hearing(),
             complete: { request in
                 let message = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request.messages.first)) as? [String: String]
                 cleanupInput.withLock { $0 = message?["dictation"] }

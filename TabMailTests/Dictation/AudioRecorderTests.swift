@@ -109,10 +109,34 @@ struct DictationAudioRecorderTests {
     /// Audio past the cap is dropped (and flagged), keeping uploads under the backend limit.
     @Test func stopsAtTheMaximumDuration() throws {
         let recorder = AudioRecorder(maxDuration: .seconds(1))
+        recorder.keepFromNow()
         feed(recorder, sine(seconds: 2))
         let recording = try recorder.finish()
         #expect(recording.truncated)
         #expect(recording.pcm.count == 16_000 * MemoryLayout<Int16>.size)
+    }
+
+    /// Until speech is heard only the moment before it is held, so a dictation waiting in a
+    /// noisy room records nothing more; once heard, everything is kept, that moment first.
+    @Test func holdsOnlyTheMomentBeforeSpeech() throws {
+        let recorder = AudioRecorder(preRoll: .seconds(2))
+        feed(recorder, sine(seconds: 5))
+        #expect(abs(try recorder.finish().duration - 2) < 0.01)
+        #expect(!(try recorder.finish().truncated))
+
+        let held = recorder.keepFromNow()
+        #expect(abs(held / .seconds(1) - 2) < 0.01)
+        feed(recorder, sine(seconds: 3))
+        #expect(abs(try recorder.finish().duration - 5) < 0.01)
+    }
+
+    /// Holding is bounded by the cap too: a moment before speech never outgrows a recording.
+    @Test func theMomentBeforeSpeechNeverExceedsTheCap() throws {
+        let recorder = AudioRecorder(maxDuration: .seconds(1), preRoll: .seconds(2))
+        feed(recorder, sine(seconds: 3))
+        let recording = try recorder.finish()
+        #expect(abs(recording.duration - 1) < 0.01)
+        #expect(!recording.truncated)
     }
 
     @Test func emptyRecording() throws {

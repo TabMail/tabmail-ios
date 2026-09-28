@@ -6,10 +6,11 @@
 import Foundation
 import Observation
 
-/// Drives one chat-pill dictation at a time: record → transcribe on the backend → clean up the
-/// transcript with what was on screen → hand the text back to be appended to the input field.
-/// The same flow as TabMail Voice's `DictationController`, started and finished by the mic
-/// button instead of a held key.
+/// Drives one chat-pill dictation at a time: wait for speech → record → transcribe on the backend
+/// → clean up the transcript with what was on screen → hand the text back to be appended to the
+/// input field. The same flow as TabMail Voice's `DictationController`, started and finished by
+/// the mic button instead of a held key, and recording only once speech is heard (a held key
+/// already says someone is speaking; an auto-started mic doesn't).
 @MainActor
 @Observable
 final class DictationController {
@@ -21,8 +22,10 @@ final class DictationController {
 
     private(set) var phase: Phase = .idle
     private(set) var level: Float = 0
-    /// True once the microphone delivers real sound; until then the waveform stays at rest.
-    private(set) var isHearing = false
+    /// True once speech is heard. Until then the dictation waits: nothing is recorded but the
+    /// moment before speech (`speechPreRollDuration`), the recording cap hasn't started, and the
+    /// waveform lies flat.
+    private(set) var hasHeardSpeech = false
     /// The language this dictation is transcribed in, read once when it starts: a Settings change
     /// mid-dictation applies to the next one (`DictationLanguage`). Nil: none sent.
     private(set) var language: String?
@@ -32,6 +35,12 @@ final class DictationController {
 
     /// The recording (WAV) and its language → the transcript.
     typealias Transcribe = @Sendable (Data, String?) async throws -> String
+    /// A speech detector for one dictation, given what to call when it hears speech and when it
+    /// can't run.
+    typealias MakeSpeechDetector = @MainActor (
+        _ onSpeech: @escaping @Sendable () -> Void,
+        _ onFailure: @escaping @Sendable (any Error) -> Void
+    ) -> any SpeechDetecting
 
     @ObservationIgnored private let capture: any AudioCapturing
     @ObservationIgnored private let requestMicrophoneAccess: @MainActor () async -> Bool
@@ -39,6 +48,7 @@ final class DictationController {
     @ObservationIgnored private let isOptedOutOfAI: @MainActor () -> Bool
     @ObservationIgnored private let dictationLanguage: @MainActor () -> String?
     @ObservationIgnored private let transcribeAudio: Transcribe
+    @ObservationIgnored private let makeSpeechDetector: MakeSpeechDetector
     @ObservationIgnored private let complete: DictationCleanup.Complete
     @ObservationIgnored private let cleanupTimeout: TimeInterval
     @ObservationIgnored private let maxRecordingDuration: Duration
@@ -47,6 +57,7 @@ final class DictationController {
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var envelope = LevelEnvelope()
     @ObservationIgnored private var recorder: AudioRecorder?
+    @ObservationIgnored private var speechDetector: (any SpeechDetecting)?
     @ObservationIgnored private var context: DictationContext?
     @ObservationIgnored private var onText: (@MainActor (String) -> Void)?
     @ObservationIgnored private var startTask: Task<Void, Never>?
@@ -61,6 +72,7 @@ final class DictationController {
         isOptedOutOfAI: @escaping @MainActor () -> Bool = { AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey) },
         dictationLanguage: @escaping @MainActor () -> String? = { DictationLanguage.current() },
         transcribe: Transcribe? = nil,
+        speechDetector: @escaping MakeSpeechDetector = { SoundClassifierSpeechDetector(onSpeech: $0, onFailure: $1) },
         complete: DictationCleanup.Complete? = nil,
         cleanupTimeout: TimeInterval = DictationConfig.cleanupTimeout,
         maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration
@@ -71,6 +83,7 @@ final class DictationController {
         self.isOptedOutOfAI = isOptedOutOfAI
         self.dictationLanguage = dictationLanguage
         self.transcribeAudio = transcribe ?? Self.backendTranscription(AccountManager.shared.backendClient)
+        self.makeSpeechDetector = speechDetector
         // Direct: a user waiting on their dictation doesn't queue behind background AI work.
         self.complete = complete ?? { try await AccountManager.shared.backendClient.sendCompletionsDirect($0) }
         self.cleanupTimeout = cleanupTimeout
@@ -111,7 +124,7 @@ final class DictationController {
         self.onText = onText
         envelope = LevelEnvelope()
         level = 0
-        isHearing = false
+        hasHeardSpeech = false
         language = dictationLanguage()
         phase = .listening
         startTask = Task { [weak self] in
@@ -131,8 +144,20 @@ final class DictationController {
     private func beginRecording(generation current: Int) {
         let recorder = AudioRecorder(maxDuration: maxRecordingDuration)
         self.recorder = recorder
+        let detector = makeSpeechDetector(
+            { [weak self] in
+                // Straight from the detector, so no audio arriving in the meantime is trimmed.
+                let held = recorder.keepFromNow()
+                Task { @MainActor [weak self] in self?.speechHeard(held: held, generation: current) }
+            },
+            { [weak self] error in
+                Task { @MainActor [weak self] in self?.microphoneFailed(error, generation: current) }
+            }
+        )
+        speechDetector = detector
         capture.start(
             onBuffer: { [weak self] buffer in
+                detector.analyze(buffer)
                 recorder.append(buffer)
                 let decibels = MicrophoneCapture.decibels(of: buffer)
                 Task { @MainActor [weak self] in self?.updateLevel(decibels: decibels, generation: current) }
@@ -142,8 +167,16 @@ final class DictationController {
                 Task { @MainActor [weak self] in self?.microphoneFailed(error, generation: current) }
             }
         )
+    }
+
+    /// Speech arrived: the recording runs from here, the moment before it included.
+    private func speechHeard(held: Duration, generation current: Int) {
+        guard generation == current, phase == .listening, !hasHeardSpeech else { return }
+        hasHeardSpeech = true
+        BackgroundSyncLogger.logDebug("[Dictation] recording from speech (\(held) before it kept)")
         // At the recording cap, stop and send what was said rather than silently dropping audio.
-        let cap = maxRecordingDuration
+        // The audio held from before speech counts toward it.
+        let cap = max(maxRecordingDuration - held, .zero)
         maxDurationTask = Task { [weak self] in
             try? await Task.sleep(for: cap)
             guard !Task.isCancelled, let self, self.generation == current else { return }
@@ -191,6 +224,17 @@ final class DictationController {
     private func completeRecording(language: String?, generation current: Int) async {
         capture.stop()
         guard let recorder else { return }
+        if !hasHeardSpeech {
+            // Stopped before speech was heard: a short word just before the tap may still be in
+            // the classifier's last window. Nothing heard at all: nothing is sent.
+            let heard = await speechDetector?.finish() ?? false
+            guard generation == current, !Task.isCancelled else { return }
+            guard heard else {
+                BackgroundSyncLogger.logDebug("[Dictation] no speech heard; nothing sent")
+                fail()
+                return
+            }
+        }
 
         let recording: AudioRecorder.Recording
         do {
@@ -203,8 +247,8 @@ final class DictationController {
         BackgroundSyncLogger.logDebug("[Dictation] recorded \(recording.duration)s, peak \(recording.peakLevel), truncated \(recording.truncated)")
 
         // No loudness gate: on quiet microphones speech sits only a few dB above the room noise,
-        // so any level threshold rejects real speech. The model decides; an empty transcript ends
-        // the dictation below.
+        // so any level threshold rejects real speech. The speech classifier started the
+        // recording; the model decides the words, and an empty transcript ends the dictation below.
         guard !recording.pcm.isEmpty else {
             fail()
             return
@@ -240,11 +284,12 @@ final class DictationController {
 
     private func updateLevel(decibels: Float, generation: Int) {
         guard generation == self.generation, phase == .listening else { return }
-        // The device delivers digital silence while it starts; the waveform appears with the
-        // first real signal.
-        if !isHearing, decibels > DictationConfig.silenceDecibels { isHearing = true }
-        guard isHearing else { return }
+        // The device delivers digital silence while it starts: it says nothing about the room.
+        guard decibels > DictationConfig.silenceDecibels else { return }
+        // The room's noise still sets the envelope's floor, but the waveform stays flat until
+        // speech is heard.
         let newLevel = envelope.level(forDecibels: decibels)
+        guard hasHeardSpeech else { return }
         let rate = newLevel > level ? DictationConfig.levelAttack : DictationConfig.levelRelease
         level += (newLevel - level) * rate
     }
@@ -264,9 +309,10 @@ final class DictationController {
         maxDurationTask?.cancel()
         maxDurationTask = nil
         recorder = nil
+        speechDetector = nil
         context = nil
         onText = nil
-        isHearing = false
+        hasHeardSpeech = false
         level = 0
     }
 

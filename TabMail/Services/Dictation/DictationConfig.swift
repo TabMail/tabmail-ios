@@ -44,6 +44,26 @@ enum DictationConfig {
     /// Also well under the backend's 10 MiB upload limit (~3.8 MB at 16 kHz 16-bit mono).
     static let maxRecordingDuration: Duration = .seconds(120)
 
+    // MARK: Speech detection
+
+    /// Nothing is recorded, and `maxRecordingDuration` doesn't start, until Apple's on-device
+    /// sound classifier hears speech: background noise alone never records (owner, 2026-09-28).
+    /// Its analysis window (seconds; the classifier allows 0.5–15, default 3). Measured
+    /// 2026-09-28 on synthetic speech: at this window, speech was heard within a second of it
+    /// starting.
+    static let speechDetectionWindow: Double = 0.975
+    /// `CMTime` timescale for the window (units per second).
+    static let speechDetectionTimescale: Int32 = 1000
+    /// The classifier's speech classes that start the recording. Not "babble": a crowd in the
+    /// background.
+    static let speechClassifications = ["speech", "whispering", "shout"]
+    /// Confidence (0…1) that counts as speech. Measured 2026-09-28: speech 20 dB quieter than
+    /// normal inside noise scored ≥ 0.91; white noise ≤ 0.20 and mains hum ≤ 0.03.
+    static let speechConfidence: Double = 0.5
+    /// Audio kept from before speech is heard, so the first word isn't clipped while the
+    /// classifier makes up its mind. Counts toward `maxRecordingDuration`.
+    static let speechPreRollDuration: Duration = .seconds(2)
+
     // MARK: Backend
 
     static let transcribePath = "/dictation/transcribe"

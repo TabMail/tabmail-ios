@@ -57,11 +57,26 @@ of the input when it comes back, and the contextual cleanup runs.
    to be complicated"). The first build copied Voice's overlay whole: a waveform pill that
    replaced the field, the language badge, and error messages in the pill for 3 s.
    The waveform is drawn in the app's accent colour (owner, 2026-09-28; Voice's blue → purple
-   brand gradient looked wrong in the pill).
-9. The send button stays enabled while dictating (owner, 2026-09-28): tapping it finishes the
-   dictation as the mic button does, then sends the input once the text is appended. A
-   dictation that brings back nothing just ends; nothing is sent, and the pending send never
-   carries over to a later dictation.
+   brand gradient looked wrong in the pill). It lies flat while the dictation waits for speech
+   (decision 10).
+9. While listening, the send button becomes a stop button (`stop.circle.fill`, accent): it
+   finishes the dictation as the mic button does, and the text is appended, not sent. While the
+   words are transcribed it is a spinner; then it is send again (owner, 2026-09-28: "it
+   shouldn't be considered cancel, just showing that the dictation finishes"; a spinner gives
+   loading feedback). This replaced, the same day, a send button that finished the dictation and
+   then sent its text.
+10. A dictation records only once speech is heard (owner, 2026-09-28: someone saying nothing,
+   or background noise alone, shouldn't use up the recording time). Until then it waits
+   silently, with no time limit: the mic is on, the waveform flat, and only the latest
+   `speechPreRollDuration` (2 s) of audio is held, so the first word isn't clipped. Speech is
+   told from noise by Apple's on-device sound classifier (`SoundClassifierSpeechDetector`,
+   SoundAnalysis `version1`, the speech/whispering/shout classes, confidence ≥ 0.5 over ~1 s
+   windows), not by loudness: TabMail Voice's ADR-DESK-005 found no level threshold that keeps
+   quiet speech and drops a room's noise. `maxRecordingDuration` counts from speech, the held
+   moment included. Stopping before speech was heard asks the classifier about its last window
+   (a word said just before the tap) and otherwise ends quietly, sending nothing. TabMail Voice
+   has no such wait: a held key already says someone is speaking, while the pill's mic is also
+   started automatically (on expand, after each agent turn).
 
 **Consequences:**
 
@@ -88,8 +103,14 @@ of the input when it comes back, and the contextual cleanup runs.
   50-call budget (ADR-IOS-038); the backend's per-token demo rate limit still applies.
   Accepted by the owner (2026-09-27): the calls are small.
 - The auto-dictation preference (auto-start on expand, the first-run "Auto-Enable Dictation"
-  prompt, restart after each agent turn) is kept as it was; each auto-start now records for
-  backend transcription.
+  prompt, restart after each agent turn) is kept as it was; each auto-start now waits for
+  speech, then records for backend transcription. A dictation nobody speaks into waits with no
+  time limit (owner, 2026-09-28, over a 60 s limit): the microphone stays on and the screen
+  awake until someone speaks, the mic or stop is tapped, or the pill closes.
+- Speech detection is only as good as the classifier. Measured 2026-09-28 on synthetic
+  speech: speech 20 dB quieter than normal inside noise scored ≥ 0.91, white noise ≤ 0.20 and
+  mains hum ≤ 0.03. Someone else talking nearby (a TV, a conversation) is speech to it and
+  starts the recording; crowd "babble" doesn't. Unverified on a device's real microphone.
 - No live transcript while speaking: the text arrives in one piece after the tap (upload +
   model time, plus up to `cleanupTimeout` = 3 s for the cleanup). Accepted by the owner
   (2026-09-27).
@@ -98,7 +119,7 @@ of the input when it comes back, and the contextual cleanup runs.
   shows nothing (decision 8); the reason is in the debug log only.
 - A failed cleanup never costs the dictation: the transcript is appended as heard. A failed
   transcription loses that recording (as in Voice; no retry queue).
-- Recording stops and is sent at `maxRecordingDuration`, 120 seconds: the most audio the
+- Recording stops and is sent at `maxRecordingDuration`, 120 seconds from speech (decision 10): the most audio the
   default transcription model takes (AssemblyAI's Sync API, backend ADR-022); the model for the
   other languages (backend ADR-024) takes longer, so 120 s is the stricter limit. Voice's 5 minutes is a bug
   (owner, 2026-09-27), to be fixed there separately; until then the two apps differ here.
@@ -108,13 +129,14 @@ of the input when it comes back, and the contextual cleanup runs.
   `MicrophoneCapture` session, engine and permission path runs only on a device (the tests use a
   fake capture, as TabMail Voice's do; a seam for it would be production code for tests only), and
   the pill's own wiring (text appended to the input, collapse finishes, leaving cancels, send
-  finishes the dictation and then sends) is pinned by source fences (`ChatPillDictationWiringTests`) rather than hosted-view tests,
+  becomes stop, then a spinner) is pinned by source fences (`ChatPillDictationWiringTests`) rather than hosted-view tests,
   which would need the controller injected into the chat pill view. The same fences pin the
   Settings language menu's row tags and the language tip's rules, one-time display, retirement on
   a choice and donation after a completed dictation: TipKit's datastore is configured by the app
   that hosts the tests and cannot be reset after that, so a tip's lifecycle cannot be run twice
   in one process (no TabMail tip has a behavioural test). What the menu stores, the language on
-  the backend request, and the waveform's VoiceOver label are tested behaviourally.
+  the backend request, and the waveform's VoiceOver label are tested behaviourally, as is the
+  real classifier: it hears a synthesised sentence and not white noise or mains hum.
 - The dictation code logs lengths, durations and error types only, never the transcript or the
   audio. (The existing `#if DEBUG` short-reply log in `BackendClient`'s completions decoding
   prints a short cleaned dictation in debug builds, as it does any short completion.)

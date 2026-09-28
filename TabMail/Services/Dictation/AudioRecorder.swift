@@ -6,6 +6,7 @@ import AVFoundation
 import os
 
 /// Accumulates one dictation as 16 kHz mono 16-bit PCM, ready to wrap in a WAV and upload.
+/// Until `keepFromNow` (speech heard), only the latest `preRoll` of audio is held.
 ///
 /// `append` is called on the audio render thread; all state is behind one lock, so appends are
 /// serialised and `finish` sees every buffer appended before it.
@@ -33,6 +34,7 @@ final class AudioRecorder: Sendable {
         var firstBufferAt: ContinuousClock.Instant?
         var truncated = false
         var firstError: (any Error)?
+        var isHoldingPreRoll = true
     }
 
     enum RecorderError: Error {
@@ -41,15 +43,28 @@ final class AudioRecorder: Sendable {
 
     let outputFormat: AVAudioFormat
     private let maxFrames: Int
+    private let preRollFrames: Int
     private let state = OSAllocatedUnfairLock<State>(uncheckedState: State())
 
     init(
         sampleRate: Double = DictationConfig.recordingSampleRate,
-        maxDuration: Duration = DictationConfig.maxRecordingDuration
+        maxDuration: Duration = DictationConfig.maxRecordingDuration,
+        preRoll: Duration = DictationConfig.speechPreRollDuration
     ) {
         // Force-unwrap: a 16-bit integer mono format is always constructible.
         outputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: sampleRate, channels: 1, interleaved: true)!
         maxFrames = Int(Double(maxDuration.components.seconds) * sampleRate)
+        preRollFrames = min(Int(Double(preRoll.components.seconds) * sampleRate), maxFrames)
+    }
+
+    /// Speech was heard: from now on everything is kept (up to `maxDuration`), after the audio
+    /// already held. Returns how much was held.
+    @discardableResult
+    func keepFromNow() -> Duration {
+        state.withLockUnchecked { state in
+            state.isHoldingPreRoll = false
+            return .seconds(Double(state.pcm.count / MemoryLayout<Int16>.size) / outputFormat.sampleRate)
+        }
     }
 
     /// Converts and appends one captured buffer. Safe to call from the audio thread.
@@ -121,6 +136,14 @@ final class AudioRecorder: Sendable {
 
     private func appendSamples(of buffer: AVAudioPCMBuffer, to state: inout State) {
         guard let samples = buffer.int16ChannelData?[0] else { return }
+        if state.isHoldingPreRoll {
+            // Only the latest `preRoll` is held (never more than the cap). A fresh Data rather
+            // than a slice: the recording's indices stay zero-based.
+            state.pcm.append(UnsafeBufferPointer(start: samples, count: Int(buffer.frameLength)))
+            let held = preRollFrames * MemoryLayout<Int16>.size
+            if state.pcm.count > held { state.pcm = Data(state.pcm.suffix(held)) }
+            return
+        }
         let recordedFrames = state.pcm.count / MemoryLayout<Int16>.size
         let room = maxFrames - recordedFrames
         let frames = min(Int(buffer.frameLength), room)
