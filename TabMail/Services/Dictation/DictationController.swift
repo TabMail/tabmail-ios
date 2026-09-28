@@ -72,11 +72,17 @@ final class DictationController {
         self.isOnline = isOnline
         self.isOptedOutOfAI = isOptedOutOfAI
         self.dictationLanguage = dictationLanguage
-        self.transcribeAudio = transcribe ?? { try await AccountManager.shared.backendClient.transcribeDictation(wav: $0, language: $1) }
+        self.transcribeAudio = transcribe ?? Self.backendTranscription(AccountManager.shared.backendClient)
         // Direct: a user waiting on their dictation doesn't queue behind background AI work.
         self.complete = complete ?? { try await AccountManager.shared.backendClient.sendCompletionsDirect($0) }
         self.cleanupTimeout = cleanupTimeout
         self.maxRecordingDuration = maxRecordingDuration
+    }
+
+    /// The transcription on the TabMail backend: the recording with its language, which picks the
+    /// speech-to-text model (backend ADR-024).
+    static func backendTranscription(_ client: BackendClient) -> Transcribe {
+        { wav, language in try await client.transcribeDictation(wav: wav, language: language) }
     }
 
     /// Starts listening. `context` is what the user sees now (the cleanup reads it); `onText`

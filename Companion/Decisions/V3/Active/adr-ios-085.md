@@ -95,7 +95,12 @@ of the input when it comes back, and the contextual cleanup runs.
   fake capture, as TabMail Voice's do; a seam for it would be production code for tests only), and
   the pill's own wiring (text appended to the input, collapse finishes, leaving cancels, sending
   waits) is pinned by source fences (`ChatPillDictationWiringTests`) rather than hosted-view tests,
-  which would need the controller injected into the chat pill view.
+  which would need the controller injected into the chat pill view. The same fences pin the
+  Settings language menu's row tags and the language tip's rules, one-time display, retirement on
+  a choice and donation after a completed dictation: TipKit's datastore is configured by the app
+  that hosts the tests and cannot be reset after that, so a tip's lifecycle cannot be run twice
+  in one process (no TabMail tip has a behavioural test). What the menu stores, the language on
+  the backend request, and the pill's badge and VoiceOver label are tested behaviourally.
 - The dictation code logs lengths, durations and error types only, never the transcript or the
   audio. (The existing `#if DEBUG` short-reply log in `BackendClient`'s completions decoding
   prints a short cleaned dictation in debug builds, as it does any short completion.)

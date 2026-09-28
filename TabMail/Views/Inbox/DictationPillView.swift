@@ -16,7 +16,7 @@ struct DictationPillView: View {
         case hidden, swirl, listening, transcribing, message(String)
     }
 
-    private var mode: Mode {
+    var mode: Mode {
         switch controller.phase {
         case .idle: .hidden
         case .listening: controller.isHearing ? .listening : .swirl
@@ -45,7 +45,8 @@ struct DictationPillView: View {
         .accessibilityLabel(accessibilityLabel)
     }
 
-    private var accessibilityLabel: String {
+    /// What VoiceOver reads for the pill.
+    var accessibilityLabel: String {
         switch mode {
         case .hidden: ""
         case .swirl, .listening:
@@ -115,11 +116,14 @@ struct DictationPillView: View {
 
 /// The dictation's language in a small circle at the pill's left end, as its ISO code (`KO`), as in
 /// TabMail Voice.
-private struct LanguageBadge: View {
+struct LanguageBadge: View {
     let code: String
 
+    /// The code as shown: `ko` → "KO".
+    var title: String { code.uppercased() }
+
     var body: some View {
-        Text(code.uppercased())
+        Text(title)
             .font(.system(size: DictationConfig.languageBadgeFontSize, weight: .semibold))
             .foregroundStyle(Brand.gradient)
             .frame(width: DictationConfig.languageBadgeDiameter, height: DictationConfig.languageBadgeDiameter)

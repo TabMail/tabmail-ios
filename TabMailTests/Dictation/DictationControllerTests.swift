@@ -5,6 +5,7 @@
 @preconcurrency import AVFoundation
 import Foundation
 import Synchronization
+import SwiftUI
 import Testing
 @testable import TabMail
 
@@ -775,16 +776,92 @@ struct DictationOptOutFlagTests {
         #expect(settings.contains("@AppStorage(DictationLanguage.settingKey) private var dictationLanguage = DictationLanguage.automatic"))
         #expect(settings.contains("Picker(selection: $dictationLanguage)"))
         #expect(settings.contains("ForEach(DictationLanguage.choices(), id: \\.self)"))
+        // Each row is tagged with the value it stores: its own code, or Automatic's.
+        let menu = try slice(settings, from: "Picker(selection: $dictationLanguage) {", to: "} label: {")
+        #expect(menu.contains("Text(automaticDictationLanguageLabel).tag(DictationLanguage.automatic)"))
+        #expect(menu.contains("Text(DictationLanguage.name(of: code)).tag(code)"))
+        #expect(menu.components(separatedBy: ".tag(").count == 3)
+        // Choosing a language retires the tip that points to the menu.
+        let change = try slice(settings, from: ".onChange(of: dictationLanguage) {", to: "}")
+        #expect(change.contains("DictationLanguageTip().invalidate(reason: .actionPerformed)"))
+
+        // The tip shows once, after the first dictation that came back, and only after onboarding.
+        let tips = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Components/AppTips.swift"), encoding: .utf8)
+        let tip = try slice(tips, from: "struct DictationLanguageTip: Tip {", to: "// MARK: - Settings Tips")
+        #expect(tip.contains("#Rule(Self.dictationCompleted) { $0.donations.count >= 1 }"))
+        #expect(tip.contains("#Rule(OnboardingTipGate.$onboardingComplete) { $0 == true }"))
+        #expect(tip.contains("MaxDisplayCount(1)"))
+        #expect(tip.components(separatedBy: "#Rule(").count == 3)
 
         let pill = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Inbox/DictationPillView.swift"), encoding: .utf8)
         #expect(pill.contains("Pill(mode: mode, level: controller.level, language: controller.language)"))
         let waveform = try slice(pill, from: "default:\n                    if let language {", to: "Waveform(level: level)")
         #expect(waveform.contains("LanguageBadge(code: language)"))
+        let badge = try slice(pill, from: "struct LanguageBadge: View {", to: ".font(")
+        #expect(badge.contains("Text(title)"))
 
         let source = try pillSource()
         #expect(source.contains(".popoverTip(DictationLanguageTip(), arrowEdge: .bottom)"))
-        let start = try slice(source, from: "private func startDictation()", to: "private var canSend: Bool")
-        #expect(start.contains("DictationLanguageTip.dictationCompleted.donate()"))
+        // Donated only from the text callback, which a dictation calls once its text is back.
+        let beforeStart = try slice(source, from: "private func startDictation()", to: "dictation.start(context:")
+        #expect(!beforeStart.contains("donate()"))
+        let onText = try slice(source, from: "dictation.start(context: dictationContext, canUseAI: canUseAI) { text in", to: "private var canSend: Bool")
+        #expect(onText.contains("DictationLanguageTip.dictationCompleted.donate()"))
+        #expect(source.components(separatedBy: "dictationCompleted.donate()").count == 2)
+    }
+}
+
+/// What the pill shows and VoiceOver reads while listening: the language the dictation started
+/// with, or none.
+@MainActor
+struct DictationPillLanguageTests {
+    private func listening(language: String?) async -> (DictationController, FakeCapture) {
+        let capture = FakeCapture()
+        let controller = DictationController(
+            capture: capture,
+            requestMicrophoneAccess: { true },
+            isOnline: { true },
+            isOptedOutOfAI: { false },
+            dictationLanguage: { language },
+            transcribe: { _, _ in try await Task.sleep(for: .seconds(60)); return "" },
+            complete: { _ in CompletionsResponse(assistant: "", token_usage: nil, error: nil) }
+        )
+        controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { _ in }
+        return (controller, capture)
+    }
+
+    private func waitUntil(_ condition: @MainActor () -> Bool) async {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition(), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    @Test(arguments: ["ko", "th"])
+    func theLanguageIsShownAndRead(code: String) async throws {
+        let (controller, _) = await listening(language: code)
+        let name = try #require(Locale.current.localizedString(forLanguageCode: code))
+        let pill = DictationPillView(controller: controller)
+        // Warming up, then hearing: both read the language.
+        #expect(pill.mode == .swirl)
+        #expect(pill.accessibilityLabel == "Listening in \(name)")
+        await waitUntil { controller.isHearing }
+        #expect(pill.mode == .listening)
+        #expect(pill.accessibilityLabel == "Listening in \(name)")
+        #expect(LanguageBadge(code: try #require(controller.language)).title == code.uppercased())
+
+        controller.finish()
+        #expect(pill.accessibilityLabel == "Transcribing")
+        controller.cancel()
+    }
+
+    @Test func withoutALanguageNoneIsRead() async {
+        let (controller, _) = await listening(language: nil)
+        let pill = DictationPillView(controller: controller)
+        await waitUntil { controller.isHearing }
+        #expect(controller.language == nil)
+        #expect(pill.accessibilityLabel == "Listening")
+        controller.cancel()
     }
 }
 
@@ -838,6 +915,66 @@ struct DictationLanguageSettingTests {
         }
     }
 
+    /// The production transcription carries the dictation's language to the backend request, and
+    /// its text comes back as the dictation; without a language, none is sent.
+    @Test(arguments: [("ko", "annyeong"), (nil, "hello")] as [(String?, String)])
+    func theBackendRequestCarriesTheDictationsLanguage(language: String?, transcript: String) async throws {
+        let http = FakeHTTP.Scenario()
+        let bodies = Mutex<[[String: String]]>([])
+        http.register(path: "/dictation/transcribe", method: "POST") { request in
+            let body = request.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] }
+            bodies.withLock { $0.append(body ?? [:]) }
+            return .json(raw: #"{"text":"\#(transcript)"}"#)
+        }
+        let capture = FakeCapture()
+        let cleanupInput = Mutex<String?>(nil)
+        let texts = Mutex<[String]>([])
+        let controller = DictationController(
+            capture: capture,
+            requestMicrophoneAccess: { true },
+            isOnline: { true },
+            isOptedOutOfAI: { false },
+            dictationLanguage: { language },
+            transcribe: DictationController.backendTranscription(BackendClient(llmSession: http.session)),
+            complete: { request in
+                let message = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request.messages.first)) as? [String: String]
+                cleanupInput.withLock { $0 = message?["dictation"] }
+                return CompletionsResponse(assistant: "Cleaned.", token_usage: nil, error: nil)
+            }
+        )
+
+        controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { text in
+            texts.withLock { $0.append(text) }
+        }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while capture.starts == 0, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+        controller.finish()
+        while controller.phase != .idle, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+
+        let body = try #require(bodies.withLock { $0.first })
+        #expect(bodies.withLock { $0.count } == 1)
+        #expect(body["language"] == language)
+        #expect(body.keys.contains("language") == (language != nil))
+        #expect(body["format"] == "wav")
+        #expect(cleanupInput.withLock { $0 } == transcript)
+        #expect(texts.withLock { $0 } == ["Cleaned."])
+    }
+
+    /// Settings' menu stores its choice through `@AppStorage` under the key the controller reads:
+    /// Korean is sent as `ko`, and Automatic goes back to the iPhone's language.
+    @Test func theMenusStoredChoiceIsTheLanguageSent() async {
+        await withSetting(nil) {
+            let stored = AppStorage(wrappedValue: DictationLanguage.automatic, DictationLanguage.settingKey)
+            #expect(DictationLanguage.current() == DictationLanguage.code(forPreferredLanguages: Locale.preferredLanguages))
+            stored.wrappedValue = "ko"
+            #expect(DictationLanguage.current() == "ko")
+            // A new view reads the same choice.
+            #expect(AppStorage(wrappedValue: DictationLanguage.automatic, DictationLanguage.settingKey).wrappedValue == "ko")
+            stored.wrappedValue = DictationLanguage.automatic
+            #expect(DictationLanguage.current() == DictationLanguage.code(forPreferredLanguages: Locale.preferredLanguages))
+        }
+    }
+
     @Test func automaticIsTheIPhonesLanguage() async {
         await withSetting(nil) {
             #expect(DictationLanguage.current() == DictationLanguage.code(forPreferredLanguages: Locale.preferredLanguages))
@@ -874,13 +1011,16 @@ struct DictationLanguageTests {
 
     /// Settings offers exactly the backend's languages (backend ADR-024), each once, by name.
     @Test func settingsOffersTheBackendsLanguagesByName() {
+        // Written out from backend ADR-024, not read from the app's config: the default model's 18
+        // languages, then the 12 paired with another model.
+        let backendLanguages: Set<String> = [
+            "en", "es", "fr", "de", "it", "pt", "ar", "da", "nl", "fi", "he", "hi", "ja", "zh", "no", "sv", "tr", "vi",
+            "cs", "el", "fa", "hu", "id", "ko", "mk", "ms", "pl", "ro", "ru", "th",
+        ]
         let locale = Locale(identifier: "en_US")
         let choices = DictationLanguage.choices(locale: locale)
-        #expect(choices.count == 30)
-        #expect(Set(choices) == Set(DictationConfig.dictationLanguages))
-        #expect(Set(choices).count == choices.count)
-        #expect(choices.allSatisfy { $0.count == 2 && $0 == $0.lowercased() })
-        #expect(Set(["en", "ko", "ja", "ru", "th"]).isSubset(of: Set(choices)))
+        #expect(choices.count == backendLanguages.count)
+        #expect(Set(choices) == backendLanguages)
         let names = choices.map { DictationLanguage.name(of: $0, locale: locale) }
         #expect(names == names.sorted { $0.localizedStandardCompare($1) == .orderedAscending })
         #expect(DictationLanguage.name(of: "ko", locale: locale) == "Korean")
