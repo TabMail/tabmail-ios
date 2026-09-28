@@ -39,7 +39,8 @@ enum DictationConfig {
     /// isn't clipped.
     static let releaseTailDuration: Duration = .milliseconds(300)
     /// Recording stops and is sent automatically at this length: the most audio the backend's
-    /// speech-to-text model takes (AssemblyAI's Sync API, up to 120 seconds; backend ADR-022).
+    /// default speech-to-text model takes (AssemblyAI's Sync API, up to 120 seconds; backend
+    /// ADR-022). The model for the other languages (backend ADR-024) takes longer.
     /// Also well under the backend's 10 MiB upload limit (~3.8 MB at 16 kHz 16-bit mono).
     static let maxRecordingDuration: Duration = .seconds(120)
 

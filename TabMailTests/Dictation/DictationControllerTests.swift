@@ -549,7 +549,7 @@ struct DictationControllerTests {
         controller.cancel()
     }
 
-    /// At the upload cap the recording is sent rather than dropped. (Whole seconds: the recorder,
+    /// At the recording cap the recording is sent rather than dropped. (Whole seconds: the recorder,
     /// copied from TabMail Voice, sizes its cap from the duration's seconds component.)
     @Test func theMaximumDurationSendsTheRecording() async {
         let capture = FakeCapture()

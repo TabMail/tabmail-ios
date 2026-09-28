@@ -85,7 +85,8 @@ of the input when it comes back, and the contextual cleanup runs.
 - A failed cleanup never costs the dictation: the transcript is appended as heard. A failed
   transcription loses that recording (as in Voice; no retry queue).
 - Recording stops and is sent at `maxRecordingDuration`, 120 seconds: the most audio the
-  transcription model takes (AssemblyAI's Sync API, backend ADR-022). Voice's 5 minutes is a bug
+  default transcription model takes (AssemblyAI's Sync API, backend ADR-022); the model for the
+  other languages (backend ADR-024) takes longer, so 120 s is the stricter limit. Voice's 5 minutes is a bug
   (owner, 2026-09-27), to be fixed there separately; until then the two apps differ here.
 - Collapsing the pill ends the recording and still appends its text; the pill disappearing
   discards it.

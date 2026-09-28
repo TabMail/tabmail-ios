@@ -139,7 +139,7 @@ final class DictationController {
                 Task { @MainActor [weak self] in self?.microphoneFailed(error, generation: current) }
             }
         )
-        // Past the upload cap, stop and send what was said rather than silently dropping audio.
+        // At the recording cap, stop and send what was said rather than silently dropping audio.
         let cap = maxRecordingDuration
         maxDurationTask = Task { [weak self] in
             try? await Task.sleep(for: cap)
