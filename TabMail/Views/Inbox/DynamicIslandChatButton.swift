@@ -763,6 +763,8 @@ struct DynamicIslandChat: View {
                 .frame(minHeight: dictation.isActive ? DictationConfig.meterMaxBarHeight : nil)
                 .opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)
                 .allowsHitTesting(!dictation.isActive)
+                // VoiceOver reads the waveform instead of the dimmed field.
+                .accessibilityHidden(dictation.isActive)
                 .overlay {
                     if dictation.isActive {
                         DictationPillView(controller: dictation)
@@ -1230,8 +1232,7 @@ struct DynamicIslandChat: View {
     }
 
     private func startDictation() {
-        // Auto-start follows the mic button: while it is off, nothing starts (and no error
-        // replaces the text field on every expand).
+        // Auto-start follows the mic button: while it is off, nothing starts.
         guard canDictate else { return }
         isTextFieldFocused = false
         // The same gate that shows the input bar (and so the mic and the waveform) in the body.

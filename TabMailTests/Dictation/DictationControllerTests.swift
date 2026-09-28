@@ -267,8 +267,8 @@ struct DictationControllerTests {
         controller.cancel()
     }
 
-    /// The language is read once, when the dictation starts: the badge and the upload agree, and
-    /// a Settings change mid-dictation applies from the next one.
+    /// The language is read once, when the dictation starts: a Settings change mid-dictation
+    /// applies from the next one.
     @Test func theLanguageAtTheStartIsShownAndSent() async {
         let capture = FakeCapture()
         let setting = Mutex<String?>("ko")
@@ -466,8 +466,8 @@ struct DictationControllerTests {
         #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
     }
 
-    /// The warm-up swirl stays until real sound arrives: the microphone's start-up silence shows
-    /// no waveform; a voice does.
+    /// The waveform stays at rest until real sound arrives: the microphone's start-up silence
+    /// doesn't move it; a voice does.
     @Test func theWaveformWaitsForRealSound() async {
         let silent = FakeCapture(buffer: FakeCapture.silence())
         let quiet = controller(capture: silent)
@@ -535,6 +535,32 @@ struct DictationControllerTests {
 
         #expect(controller.phase == .listening)
         controller.cancel()
+    }
+
+    /// A failed dictation leaves nothing behind for the next: stopping the next one before the
+    /// microphone answers records and uploads nothing, rather than resending the failed recording.
+    @Test func aFailureLeavesNothingForTheNextDictation() async {
+        let capture = FakeCapture()
+        let accessRequests = Mutex(0)
+        let controller = controller(capture: capture, microphoneAccess: {
+            let request = accessRequests.withLock { $0 += 1; return $0 }
+            if request > 1 { try? await Task.sleep(for: .milliseconds(200)) }
+            return true
+        }, transcript: { " " })
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase != .transcribing }
+        #expect(controller.phase == .idle)
+        #expect(recorded.uploads.withLock { $0.count } == 1)
+
+        controller.start(context: context, canUseAI: true) { _ in Issue.record("nothing was recorded") }
+        controller.finish()
+        #expect(controller.phase == .idle)
+        try? await Task.sleep(for: .milliseconds(400))
+
+        #expect(controller.phase == .idle)
+        #expect(recorded.uploads.withLock { $0.count } == 1)
+        #expect(capture.starts == 1)
+        #expect(!capture.isRunning)
     }
 
     /// Cancelled while listening (the pill went away): the microphone and its audio session are
@@ -776,8 +802,12 @@ struct DictationOptOutFlagTests {
     @Test func theWaveformDimsTheInputInPlace() throws {
         let source = try pillSource()
         let field = String(try slice(source, from: "TextField(isComposeMode ?", to: "if isWorking {"))
-        #expect(field.contains(".opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)"))
-        #expect(field.contains(".allowsHitTesting(!dictation.isActive)"))
+        // The field dims and ignores touches beneath the overlay, which stays full strength and
+        // tappable: both modifiers come before it.
+        let beneath = try slice(field, from: "TextField(isComposeMode ?", to: ".overlay {")
+        #expect(beneath.contains(".opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)"))
+        #expect(beneath.contains(".allowsHitTesting(!dictation.isActive)"))
+        #expect(beneath.contains(".accessibilityHidden(dictation.isActive)"))
         let overlay = try slice(field, from: ".overlay {", to: ".onTapGesture { dictation.finish() }")
         #expect(overlay.contains("if dictation.isActive {\n                        DictationPillView(controller: dictation)"))
         #expect(source.components(separatedBy: "DictationPillView(").count == 2)

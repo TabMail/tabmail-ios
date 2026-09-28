@@ -203,8 +203,8 @@ final class DictationController {
         BackgroundSyncLogger.logDebug("[Dictation] recorded \(recording.duration)s, peak \(recording.peakLevel), truncated \(recording.truncated)")
 
         // No loudness gate: on quiet microphones speech sits only a few dB above the room noise,
-        // so any level threshold rejects real speech. The model decides; an empty transcript is
-        // reported below.
+        // so any level threshold rejects real speech. The model decides; an empty transcript ends
+        // the dictation below.
         guard !recording.pcm.isEmpty else {
             fail()
             return
