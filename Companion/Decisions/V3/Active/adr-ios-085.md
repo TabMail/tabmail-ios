@@ -56,6 +56,12 @@ of the input when it comes back, and the contextual cleanup runs.
    comes back (owner, 2026-09-28, after trying the first build on a device: "we don't want this
    to be complicated"). The first build copied Voice's overlay whole: a waveform pill that
    replaced the field, the language badge, and error messages in the pill for 3 s.
+   The waveform is drawn in the app's accent colour (owner, 2026-09-28; Voice's blue → purple
+   brand gradient looked wrong in the pill).
+9. The send button stays enabled while dictating (owner, 2026-09-28): tapping it finishes the
+   dictation as the mic button does, then sends the input once the text is appended. A
+   dictation that brings back nothing just ends; nothing is sent, and the pending send never
+   carries over to a later dictation.
 
 **Consequences:**
 
@@ -101,8 +107,8 @@ of the input when it comes back, and the contextual cleanup runs.
 - Untested by owner decision (2026-09-27, stage-2 review TC2/TC3): the real
   `MicrophoneCapture` session, engine and permission path runs only on a device (the tests use a
   fake capture, as TabMail Voice's do; a seam for it would be production code for tests only), and
-  the pill's own wiring (text appended to the input, collapse finishes, leaving cancels, sending
-  waits) is pinned by source fences (`ChatPillDictationWiringTests`) rather than hosted-view tests,
+  the pill's own wiring (text appended to the input, collapse finishes, leaving cancels, send
+  finishes the dictation and then sends) is pinned by source fences (`ChatPillDictationWiringTests`) rather than hosted-view tests,
   which would need the controller injected into the chat pill view. The same fences pin the
   Settings language menu's row tags and the language tip's rules, one-time display, retirement on
   a choice and donation after a completed dictation: TipKit's datastore is configured by the app

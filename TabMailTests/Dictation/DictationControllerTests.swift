@@ -356,6 +356,23 @@ struct DictationControllerTests {
         #expect(!capture.isRunning)
     }
 
+    /// The text arrives with the dictation already over, so the pill's send-after-dictation can
+    /// send it from the callback (sending is refused while a dictation is active).
+    @Test func theTextArrivesOnceTheDictationHasEnded() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture)
+        var activeAtDelivery: [Bool] = []
+
+        controller.start(context: context, canUseAI: true) { _ in
+            activeAtDelivery.append(controller.isActive)
+        }
+        await waitUntil { capture.starts == 1 }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(activeAtDelivery == [false])
+    }
+
     @Test func anEmptyTranscriptIsNotAppended() async {
         let capture = FakeCapture()
         let controller = controller(capture: capture, transcript: { " \n" })
@@ -813,6 +830,30 @@ struct DictationOptOutFlagTests {
         #expect(source.components(separatedBy: "DictationPillView(").count == 2)
         #expect(source.components(separatedBy: "TextField(").count == 2)
         #expect(DictationConfig.dimmedInputOpacity > 0 && DictationConfig.dimmedInputOpacity < 0.5)
+    }
+
+    /// Send while dictating finishes the dictation, then sends its text once it lands; a
+    /// dictation that brings back nothing sends nothing, and nothing carries over to the next.
+    @Test func sendFinishesTheDictationThenSendsItsText() throws {
+        let source = try pillSource()
+        let send = try slice(source, from: "// Normal send button", to: ".disabled(!canTapSend)")
+        #expect(send.contains("if dictation.isActive {"))
+        #expect(send.contains("sendWhenDictated = true\n                        dictation.finish()\n                    } else {\n                        sendMessage()"))
+        #expect(send.contains(".foregroundStyle(canTapSend ? Theme.accent : .secondary.opacity(0.3))"))
+        let canTapSend = try slice(source, from: "private var canTapSend: Bool {", to: "private func sendMessage()")
+        #expect(canTapSend.contains("canSend || (dictation.isActive && hasTabMailSession && !isWorking)"))
+
+        let start = String(try slice(source, from: "private func startDictation()", to: "private var canSend: Bool"))
+        let onText = try slice(start, from: "{ text in", to: "scrollPosition.scrollTo(edge: .bottom)")
+        let appended = try #require(onText.range(of: "inputText = DictationController.appending(text, to: inputText)"))
+        let sent = try #require(onText.range(of: "if sendWhenDictated {\n                sendWhenDictated = false\n                if canSend { sendMessage() }"))
+        #expect(appended.upperBound <= sent.lowerBound)
+
+        let ended = try slice(source, from: ".onChange(of: dictation.isActive) {", to: ".onChange(of: isTextFieldFocused)")
+        #expect(ended.contains("if !active { sendWhenDictated = false }"))
+        let disappear = try slice(source, from: ".onDisappear {", to: "// No eager cancellation")
+        #expect(disappear.contains("sendWhenDictated = false"))
+        #expect(source.components(separatedBy: "sendWhenDictated = true").count == 2)
     }
 
     /// A recording never outlives the pill, and a message can't be sent over a dictation still

@@ -28,14 +28,6 @@ struct DictationPillView: View {
     }
 }
 
-/// The waveform uses only the TabMail icon's colours: blue → purple.
-private enum Brand {
-    static let gradient = LinearGradient(
-        colors: [Color(red: 0, green: 0x91 / 255, blue: 1), Color(red: 0x7B / 255, green: 0, blue: 1)],
-        startPoint: .leading, endPoint: .trailing
-    )
-}
-
 /// Voice waveform: bars follow the incoming sound level with a travelling ripple.
 private struct Waveform: View {
     let level: Float
@@ -46,7 +38,7 @@ private struct Waveform: View {
             HStack(spacing: DictationConfig.meterBarSpacing) {
                 ForEach(0..<DictationConfig.meterBarCount, id: \.self) { index in
                     Capsule()
-                        .fill(Brand.gradient)
+                        .fill(Theme.accent)
                         .frame(width: DictationConfig.meterBarWidth, height: barHeight(index, time: time))
                 }
             }
