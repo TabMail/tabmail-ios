@@ -473,6 +473,15 @@ struct DictationControllerTests {
         heard.cancel()
     }
 
+    /// A recording is never longer than the transcription model takes (120 s, backend ADR-022),
+    /// and stays under the backend's 10 MiB upload limit.
+    @Test func noRecordingOutlastsWhatTheModelTranscribes() {
+        #expect(DictationConfig.maxRecordingDuration <= .seconds(120))
+        #expect(DictationConfig.maxRecordingDuration > .zero)
+        let bytes = Int(DictationConfig.maxRecordingDuration.components.seconds) * Int(DictationConfig.recordingSampleRate) * MemoryLayout<Int16>.size
+        #expect(bytes < 10 * 1024 * 1024)
+    }
+
     @Test func anotherDictationCanStartAfterAFailure() async {
         let capture = FakeCapture()
         let controller = controller(capture: capture, transcript: { " " })

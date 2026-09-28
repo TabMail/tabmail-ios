@@ -38,9 +38,10 @@ enum DictationConfig {
     /// Recording continues this long after the mic button is tapped to stop, so the last word
     /// isn't clipped.
     static let releaseTailDuration: Duration = .milliseconds(300)
-    /// Recording stops and is sent automatically at this length. Must stay under the backend's
-    /// upload limit (10 MiB): 5 minutes of 16 kHz 16-bit mono is ~9.6 MB.
-    static let maxRecordingDuration: Duration = .seconds(300)
+    /// Recording stops and is sent automatically at this length: the most audio the backend's
+    /// speech-to-text model takes (AssemblyAI's Sync API, up to 120 seconds; backend ADR-022).
+    /// Also well under the backend's 10 MiB upload limit (~3.8 MB at 16 kHz 16-bit mono).
+    static let maxRecordingDuration: Duration = .seconds(120)
 
     // MARK: Backend
 

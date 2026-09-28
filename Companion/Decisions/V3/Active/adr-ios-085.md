@@ -57,28 +57,36 @@ of the input when it comes back, and the contextual cleanup runs.
   for training" claims hold for recordings: OpenRouter applies no per-request zero-retention
   filter to transcription, but the owner confirmed on 2026-09-25 that zero retention is enforced
   across the whole OpenRouter account, and the configured model's one endpoint is on the public
-  ZDR list (backend ADR-022). Owner calls: users who consented before this change see no new
-  notice; the App Store privacy label may need "Audio Data" declared.
+  ZDR list (backend ADR-022). Users who consented before this change see no new notice in the
+  app: the change is already announced (owner, 2026-09-27). The App Store privacy label gains no
+  "Audio Data" entry (owner, 2026-09-27): Apple counts data as collected only when it is kept
+  longer than it takes to serve the request, and the recording is transcribed and dropped, with
+  zero retention at every provider. Storing or logging recordings anywhere would change that.
 - The language picks a model; each model still detects what is spoken within the languages it
   covers (backend ADR-024), so English said with Korean chosen is still written as English. A
   language outside the backend's list goes to its default model, as with no language. The
   backend's list is copied into `DictationConfig.dictationLanguages`; a new pair there needs the
   same line here to appear in Settings. Deploy order: backend ADR-024 before an iOS build that
   sends `language` (the previous backend forwarded it to AssemblyAI, which lacks Korean and the
-  other paired languages).
+  other paired languages). Met: dev and prod were deployed from a backend `main` containing
+  ADR-024 on 2026-09-27.
+- In demo mode, dictation's transcription and cleanup calls do not count against the demo's
+  50-call budget (ADR-IOS-038); the backend's per-token demo rate limit still applies.
+  Accepted by the owner (2026-09-27): the calls are small.
 - The auto-dictation preference (auto-start on expand, the first-run "Auto-Enable Dictation"
   prompt, restart after each agent turn) is kept as it was; each auto-start now records for
   backend transcription.
 - No live transcript while speaking: the text arrives in one piece after the tap (upload +
-  model time, plus up to `cleanupTimeout` = 3 s for the cleanup).
+  model time, plus up to `cleanupTimeout` = 3 s for the cleanup). Accepted by the owner
+  (2026-09-27).
 - Dictation needs a TabMail sign-in and an active subscription; it counts toward usage like
   every AI request. Errors (subscription, rate limit, too long, offline) show in the pill for
   `errorDisplayDuration`.
 - A failed cleanup never costs the dictation: the transcript is appended as heard. A failed
   transcription loses that recording (as in Voice; no retry queue).
-- Recording stops and is sent at `maxRecordingDuration` (5 minutes, under the backend's 10 MiB
-  upload limit), as in Voice. The transcription model's API is described as taking up to 120
-  seconds of audio (backend ADR-022), so a longer recording may fail to transcribe in both apps.
+- Recording stops and is sent at `maxRecordingDuration`, 120 seconds: the most audio the
+  transcription model takes (AssemblyAI's Sync API, backend ADR-022). Voice's 5 minutes is a bug
+  (owner, 2026-09-27), to be fixed there separately; until then the two apps differ here.
 - Collapsing the pill ends the recording and still appends its text; the pill disappearing
   discards it.
 - Untested by owner decision (2026-09-27, stage-2 review TC2/TC3): the real
