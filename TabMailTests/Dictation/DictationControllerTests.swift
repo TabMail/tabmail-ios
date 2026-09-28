@@ -61,6 +61,20 @@ private final class FakeCapture: AudioCapturing, @unchecked Sendable {
         return buffer
     }
 
+    /// `seconds` of a 440 Hz tone at 16 kHz, in one buffer.
+    static func tone(seconds: Double) -> AVAudioPCMBuffer {
+        let sampleRate = 16_000.0
+        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
+        let frames = AVAudioFrameCount(sampleRate * seconds)
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+        buffer.frameLength = frames
+        let data = buffer.floatChannelData![0]
+        for frame in 0..<Int(frames) {
+            data[frame] = 0.5 * sin(2 * .pi * 440 * Float(frame) / Float(sampleRate))
+        }
+        return buffer
+    }
+
     /// A tenth of a second of a 440 Hz tone at 48 kHz, as a microphone delivers it.
     static func speech() -> AVAudioPCMBuffer {
         let sampleRate = 48_000.0
@@ -483,6 +497,34 @@ struct DictationControllerTests {
         #expect(bytes < 10 * 1024 * 1024)
     }
 
+    /// A controller built as the app builds it (no cap passed in) sends at most 120 s of audio,
+    /// however long the microphone ran, and still delivers the text.
+    @Test func theAppsControllerSendsAtMostWhatTheModelTranscribes() async throws {
+        let capture = FakeCapture(buffer: FakeCapture.tone(seconds: 121))
+        let recorded = recorded
+        let controller = DictationController(
+            capture: capture,
+            requestMicrophoneAccess: { true },
+            isOnline: { true },
+            isOptedOutOfAI: { false },
+            dictationLanguage: { nil },
+            transcribe: { wav, _ in
+                recorded.uploads.withLock { $0.append(wav) }
+                return "a long dictation"
+            },
+            complete: { _ in CompletionsResponse(assistant: "A long dictation.", token_usage: nil, error: nil) }
+        )
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase == .idle }
+
+        let wav = try #require(recorded.uploads.withLock { $0.first })
+        // 120 s of 16 kHz 16-bit mono, and the header: 3,840,044 bytes.
+        #expect(wav.count == WAVEncoder.headerSize + 120 * 16_000 * MemoryLayout<Int16>.size)
+        #expect(!capture.isRunning)
+        #expect(recorded.texts.withLock { $0 } == ["A long dictation."])
+    }
+
     @Test func anotherDictationCanStartAfterAFailure() async {
         let capture = FakeCapture()
         let controller = controller(capture: capture, transcript: { " " })
@@ -801,6 +843,8 @@ struct DictationOptOutFlagTests {
         #expect(pill.contains("Pill(mode: mode, level: controller.level, language: controller.language)"))
         let waveform = try slice(pill, from: "default:\n                    if let language {", to: "Waveform(level: level)")
         #expect(waveform.contains("LanguageBadge(code: language)"))
+        // VoiceOver reads the label `DictationPillLanguageTests` checks.
+        #expect(pill.contains(".accessibilityElement(children: .ignore)\n        .accessibilityLabel(accessibilityLabel)"))
         let badge = try slice(pill, from: "struct LanguageBadge: View {", to: ".font(")
         #expect(badge.contains("Text(title)"))
 
@@ -934,6 +978,11 @@ struct DictationLanguageSettingTests {
         http.register(path: "/dictation/transcribe", method: "POST") { request in
             let body = request.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] }
             bodies.withLock { $0.append(body ?? [:]) }
+            // Like the backend, only a recording gets a transcript.
+            let audio = body?["audio"].flatMap { Data(base64Encoded: $0) } ?? Data()
+            guard audio.count > WAVEncoder.headerSize, audio.prefix(4) == Data("RIFF".utf8) else {
+                return .json(raw: #"{"error":"invalid_audio"}"#, statusCode: 400)
+            }
             return .json(raw: #"{"text":"\#(transcript)"}"#)
         }
         let capture = FakeCapture()
@@ -966,6 +1015,10 @@ struct DictationLanguageSettingTests {
         #expect(body["language"] == language)
         #expect(body.keys.contains("language") == (language != nil))
         #expect(body["format"] == "wav")
+        // The recording itself: a WAV carrying the tone the microphone gave.
+        let audio = try #require(body["audio"].flatMap { Data(base64Encoded: $0) })
+        #expect(audio.prefix(4) == Data("RIFF".utf8))
+        #expect(audio.count > WAVEncoder.headerSize)
         #expect(cleanupInput.withLock { $0 } == transcript)
         #expect(texts.withLock { $0 } == ["Cleaned."])
     }
