@@ -52,6 +52,14 @@ private final class FakeCapture: AudioCapturing, @unchecked Sendable {
         return buffer
     }
 
+    /// A tenth of a second of digital silence at 48 kHz, as a microphone delivers while it starts.
+    static func silence() -> AVAudioPCMBuffer {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4_800)!
+        buffer.frameLength = 4_800
+        return buffer
+    }
+
     /// A tenth of a second of a 440 Hz tone at 48 kHz, as a microphone delivers it.
     static func speech() -> AVAudioPCMBuffer {
         let sampleRate = 48_000.0
@@ -424,6 +432,47 @@ struct DictationControllerTests {
         #expect(!capture.isRunning)
     }
 
+    /// A start while the last dictation is still transcribing (auto-start on re-expanding the pill
+    /// during the upload) is ignored: the dictation in progress is never replaced or dropped.
+    @Test func aStartWhileTranscribingNeverReplacesIt() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, transcript: {
+            try? await Task.sleep(for: .milliseconds(300))
+            return "ask jordan about the road map"
+        })
+
+        await dictate(controller, capture: capture)
+        #expect(controller.phase == .transcribing)
+        controller.start(context: context, canUseAI: true) { _ in Issue.record("the ignored start delivers nothing") }
+        #expect(controller.phase == .transcribing)
+        await waitUntil { controller.phase == .idle }
+
+        #expect(capture.starts == 1)
+        #expect(recorded.uploads.withLock { $0.count } == 1)
+        #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
+    }
+
+    /// The warm-up swirl stays until real sound arrives: the microphone's start-up silence shows
+    /// no waveform; a voice does.
+    @Test func theWaveformWaitsForRealSound() async {
+        let silent = FakeCapture(buffer: FakeCapture.silence())
+        let quiet = controller(capture: silent)
+        quiet.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { silent.starts == 1 }
+        try? await Task.sleep(for: .milliseconds(200))
+        #expect(quiet.phase == .listening)
+        #expect(!quiet.isHearing)
+        #expect(quiet.level == 0)
+        quiet.cancel()
+
+        let speaking = FakeCapture()
+        let heard = controller(capture: speaking)
+        heard.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { heard.isHearing }
+        #expect(heard.isHearing)
+        heard.cancel()
+    }
+
     @Test func anotherDictationCanStartAfterAFailure() async {
         let capture = FakeCapture()
         let controller = controller(capture: capture, transcript: { " " })
@@ -694,6 +743,16 @@ struct DictationOptOutFlagTests {
 
         let collapse = try slice(source, from: "// Collapsing ends the recording", to: "isTextFieldFocused = false")
         #expect(collapse.contains("dictation.finish()"))
+    }
+
+    /// The "screen" the cleanup reads (ADR-IOS-085 decision 3): the draft's subject and body, or
+    /// the email's sender, subject and snippet, with the chat and the input.
+    @Test func theCleanupReadsWhatThePillIsAbout() throws {
+        let source = try pillSource()
+        let context = try slice(source, from: "private var dictationContext: DictationContext {", to: "private func startDictation()")
+        #expect(context.contains(#"[draftSubject.map { "Subject: \($0)" }, draftBody]"#))
+        #expect(context.contains(#"["From: \(message.from)", "Subject: \(message.subject)", message.snippet]"#))
+        #expect(context.components(separatedBy: "messages: chatMessages, input: inputText").count == 4)
     }
 
     /// The Settings menu writes the key the controller reads, the listening pill shows the
