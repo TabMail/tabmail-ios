@@ -772,6 +772,10 @@ struct DictationOptOutFlagTests {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+        // The app's controller transcribes through the factory `theBackendRequestCarriesTheDictationsLanguage` tests.
+        let controller = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationController.swift"), encoding: .utf8)
+        #expect(controller.contains("self.transcribeAudio = transcribe ?? Self.backendTranscription(AccountManager.shared.backendClient)"))
+
         let settings = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Settings/TabMailSettingsView.swift"), encoding: .utf8)
         #expect(settings.contains("@AppStorage(DictationLanguage.settingKey) private var dictationLanguage = DictationLanguage.automatic"))
         #expect(settings.contains("Picker(selection: $dictationLanguage)"))
@@ -805,8 +809,13 @@ struct DictationOptOutFlagTests {
         // Donated only from the text callback, which a dictation calls once its text is back.
         let beforeStart = try slice(source, from: "private func startDictation()", to: "dictation.start(context:")
         #expect(!beforeStart.contains("donate()"))
-        let onText = try slice(source, from: "dictation.start(context: dictationContext, canUseAI: canUseAI) { text in", to: "private var canSend: Bool")
+        let start = String(try slice(source, from: "private func startDictation()", to: "private var canSend: Bool"))
+        let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI) { text in", to: "scrollPosition.scrollTo(edge: .bottom)")
         #expect(onText.contains("DictationLanguageTip.dictationCompleted.donate()"))
+        // Nothing after the callback's last statement donates either.
+        let pieces = start.components(separatedBy: "scrollPosition.scrollTo(edge: .bottom)")
+        #expect(pieces.count == 2)
+        #expect(pieces.last?.contains("donate()") == false)
         #expect(source.components(separatedBy: "dictationCompleted.donate()").count == 2)
     }
 }
@@ -859,6 +868,7 @@ struct DictationPillLanguageTests {
         let (controller, _) = await listening(language: nil)
         let pill = DictationPillView(controller: controller)
         await waitUntil { controller.isHearing }
+        #expect(pill.mode == .listening)
         #expect(controller.language == nil)
         #expect(pill.accessibilityLabel == "Listening")
         controller.cancel()
