@@ -739,7 +739,7 @@ struct DynamicIslandChat: View {
             Button {
                 switch dictation.phase {
                 case .listening: dictation.finish()
-                case .idle, .failed: startDictation()
+                case .idle: startDictation()
                 case .transcribing: break
                 }
             } label: {
@@ -754,20 +754,22 @@ struct DynamicIslandChat: View {
             .accessibilityLabel(dictation.phase == .listening ? "Stop dictation" : "Dictate")
             .popoverTip(DictationLanguageTip(), arrowEdge: .bottom)
 
-            if dictation.phase != .idle {
-                // Dictating: the waveform pill takes the text field's place, as TabMail Voice's
-                // overlay. Tap it to stop listening; the text is appended when it comes back.
-                DictationPillView(controller: dictation)
-                    .contentShape(Rectangle())
-                    .onTapGesture { dictation.finish() }
-                    .transition(.identity)
-            } else {
-                TextField(isComposeMode ? "Describe your edit..." : "Type or speak...", text: $inputText, selection: $inputSelection, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...6)
-                    .focused($isTextFieldFocused)
-                    .transition(.identity)
-            }
+            // Dictating: the field's text dims behind the waveform. Tap it to stop listening; the
+            // text is appended when it comes back.
+            TextField(isComposeMode ? "Describe your edit..." : "Type or speak...", text: $inputText, selection: $inputSelection, axis: .vertical)
+                .textFieldStyle(.plain)
+                .lineLimit(1...6)
+                .focused($isTextFieldFocused)
+                .frame(minHeight: dictation.isActive ? DictationConfig.meterMaxBarHeight : nil)
+                .opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)
+                .allowsHitTesting(!dictation.isActive)
+                .overlay {
+                    if dictation.isActive {
+                        DictationPillView(controller: dictation)
+                            .contentShape(Rectangle())
+                            .onTapGesture { dictation.finish() }
+                    }
+                }
 
             if isWorking {
                 // Stop button — handle stop entirely here (not in Task catch)

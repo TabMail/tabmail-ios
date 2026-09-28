@@ -17,15 +17,14 @@ final class DictationController {
         case idle
         case listening
         case transcribing
-        case failed(String)
     }
 
     private(set) var phase: Phase = .idle
     private(set) var level: Float = 0
-    /// True once the microphone delivers audio; until then the pill shows its warm-up swirl.
+    /// True once the microphone delivers real sound; until then the waveform stays at rest.
     private(set) var isHearing = false
-    /// The language this dictation is transcribed in, read once when it starts so the pill's badge
-    /// and the request always agree (`DictationLanguage`). Nil: none sent, no badge.
+    /// The language this dictation is transcribed in, read once when it starts: a Settings change
+    /// mid-dictation applies to the next one (`DictationLanguage`). Nil: none sent.
     private(set) var language: String?
 
     /// Recording or transcribing: the microphone button stops (or waits for) this dictation.
@@ -53,7 +52,6 @@ final class DictationController {
     @ObservationIgnored private var startTask: Task<Void, Never>?
     @ObservationIgnored private var maxDurationTask: Task<Void, Never>?
     @ObservationIgnored private var transcriptionTask: Task<Void, Never>?
-    @ObservationIgnored private var failureResetTask: Task<Void, Never>?
 
     init(
         capture: any AudioCapturing = MicrophoneCapture(),
@@ -91,7 +89,7 @@ final class DictationController {
     /// connection: the audio and the screen text go to the AI backend.
     func start(context: DictationContext, canUseAI: Bool, onText: @escaping @MainActor (String) -> Void) {
         switch phase {
-        case .idle, .failed: break
+        case .idle: break
         case .listening, .transcribing: return
         }
         // Without AI access the pill shows sign-in or subscribe instead of the input bar: nothing
@@ -101,12 +99,12 @@ final class DictationController {
             BackgroundSyncLogger.logDebug("[Dictation] not started: no AI access or AI opted out")
             return
         }
+        // The mic is off offline; an auto-start that races a lost connection does nothing.
         guard isOnline() else {
-            fail(Self.offlineMessage)
+            BackgroundSyncLogger.logDebug("[Dictation] not started: offline")
             return
         }
 
-        failureResetTask?.cancel()
         generation += 1
         let current = generation
         self.context = context
@@ -122,8 +120,7 @@ final class DictationController {
             guard self.generation == current, !Task.isCancelled else { return }
             guard granted else {
                 BackgroundSyncLogger.logDebug("[Dictation] microphone access not granted")
-                self.teardown()
-                self.fail(Self.microphoneDeniedMessage)
+                self.fail()
                 return
             }
             self.beginRecording(generation: current)
@@ -188,8 +185,7 @@ final class DictationController {
         guard generation == current else { return }
         BackgroundSyncLogger.logDebug("[Dictation] microphone start failed: \(error)")
         generation += 1
-        teardown()
-        fail(Self.microphoneFailedMessage)
+        fail()
     }
 
     private func completeRecording(language: String?, generation current: Int) async {
@@ -201,8 +197,7 @@ final class DictationController {
             recording = try recorder.finish()
         } catch {
             BackgroundSyncLogger.logDebug("[Dictation] recording failed: \(type(of: error))")
-            teardown()
-            fail(Self.recordingFailedMessage)
+            fail()
             return
         }
         BackgroundSyncLogger.logDebug("[Dictation] recorded \(recording.duration)s, peak \(recording.peakLevel), truncated \(recording.truncated)")
@@ -211,8 +206,7 @@ final class DictationController {
         // so any level threshold rejects real speech. The model decides; an empty transcript is
         // reported below.
         guard !recording.pcm.isEmpty else {
-            teardown()
-            fail(Self.nothingHeardMessage)
+            fail()
             return
         }
         await transcribe(WAVEncoder.encode(pcm16Mono: recording.pcm, sampleRate: recording.sampleRate), language: language, generation: current)
@@ -225,8 +219,7 @@ final class DictationController {
             guard generation == current, !Task.isCancelled else { return }
             BackgroundSyncLogger.logDebug("[Dictation] transcript ready (\(transcript.count) chars)")
             guard !transcript.isEmpty else {
-                teardown()
-                fail(Self.nothingHeardMessage)
+                fail()
                 return
             }
             let text = await DictationCleanup.cleanUp(
@@ -241,8 +234,7 @@ final class DictationController {
         } catch {
             guard generation == current, !Task.isCancelled else { return }
             BackgroundSyncLogger.logDebug("[Dictation] transcription failed: \(error)")
-            teardown()
-            fail(Self.message(for: error))
+            fail()
         }
     }
 
@@ -278,37 +270,16 @@ final class DictationController {
         level = 0
     }
 
-    private func fail(_ message: String) {
-        phase = .failed(message)
-        failureResetTask?.cancel()
-        failureResetTask = Task { [weak self] in
-            try? await Task.sleep(for: DictationConfig.errorDisplayDuration)
-            guard !Task.isCancelled, let self, case .failed = self.phase else { return }
-            self.phase = .idle
-        }
+    /// A failed dictation ends quietly: nothing is appended and the input field comes back.
+    private func fail() {
+        teardown()
+        phase = .idle
     }
 
     /// The input field once a dictation is appended to its end, a space apart.
     nonisolated static func appending(_ dictation: String, to input: String) -> String {
         let existing = input.trimmingCharacters(in: .whitespacesAndNewlines)
         return existing.isEmpty ? dictation : existing + " " + dictation
-    }
-
-    // MARK: Messages (one or two lines of the pill)
-
-    nonisolated static let nothingHeardMessage = "Didn't catch that. Try again."
-    nonisolated static let offlineMessage = "Dictation needs an internet connection."
-    nonisolated static let microphoneDeniedMessage = "Allow microphone access in Settings to dictate."
-    nonisolated static let microphoneFailedMessage = "Couldn't start the microphone."
-    nonisolated static let recordingFailedMessage = "Couldn't record audio."
-    nonisolated static let failedMessage = "Dictation failed. Please try again."
-
-    nonisolated static func message(for error: any Error) -> String {
-        if let error = error as? DictationError, let description = error.errorDescription { return description }
-        if let error = error as? URLError, [.notConnectedToInternet, .networkConnectionLost, .dataNotAllowed].contains(error.code) {
-            return offlineMessage
-        }
-        return failedMessage
     }
 
     static func requestMicrophoneAccess() async -> Bool {
@@ -321,8 +292,8 @@ final class DictationController {
     }
 }
 
-/// A failed `POST /dictation/transcribe`, with the message the pill shows for it.
-enum DictationError: LocalizedError, Equatable {
+/// A failed `POST /dictation/transcribe`.
+enum DictationError: Error, Equatable {
     case unauthorized
     case subscriptionRequired
     case accountSetupRequired
@@ -342,19 +313,6 @@ enum DictationError: LocalizedError, Equatable {
         case (429, _): .rateLimited
         case (400, "audio_too_large"): .recordingTooLong
         default: .failed(status: status)
-        }
-    }
-
-    var errorDescription: String? {
-        switch self {
-        case .unauthorized: "Your TabMail session has ended. Sign in again."
-        case .subscriptionRequired: "Dictation needs an active TabMail subscription."
-        case .accountSetupRequired: "Finish setting up your TabMail account at tabmail.ai."
-        case .accessDenied: "This account can't use this TabMail server."
-        case .rateLimited: "Too many dictations right now. Try again in a moment."
-        case .recordingTooLong: "That recording was too long to transcribe."
-        case .failed: DictationController.failedMessage
-        case .invalidResponse: "TabMail returned an unexpected response."
         }
     }
 }

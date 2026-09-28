@@ -221,7 +221,7 @@ struct DictationControllerTests {
 
         controller.start(context: context, canUseAI: true) { _ in Issue.record("no text offline") }
 
-        #expect(controller.phase == .failed(DictationController.offlineMessage))
+        #expect(controller.phase == .idle)
         #expect(capture.starts == 0)
     }
 
@@ -311,7 +311,7 @@ struct DictationControllerTests {
         controller.start(context: context, canUseAI: true) { _ in Issue.record("no text without the microphone") }
         await waitUntil { controller.phase != .listening }
 
-        #expect(controller.phase == .failed(DictationController.microphoneDeniedMessage))
+        #expect(controller.phase == .idle)
         #expect(capture.starts == 0)
     }
 
@@ -339,7 +339,7 @@ struct DictationControllerTests {
         controller.start(context: context, canUseAI: true) { _ in Issue.record("no text without audio") }
         await waitUntil { controller.phase != .listening }
 
-        #expect(controller.phase == .failed(DictationController.microphoneFailedMessage))
+        #expect(controller.phase == .idle)
         #expect(!capture.isRunning)
     }
 
@@ -350,7 +350,7 @@ struct DictationControllerTests {
         await dictate(controller, capture: capture)
         await waitUntil { controller.phase != .transcribing }
 
-        #expect(controller.phase == .failed(DictationController.nothingHeardMessage))
+        #expect(controller.phase == .idle)
         #expect(recorded.uploads.withLock { $0.isEmpty })
         #expect(recorded.texts.withLock { $0.isEmpty })
         #expect(!capture.isRunning)
@@ -363,28 +363,27 @@ struct DictationControllerTests {
         await dictate(controller, capture: capture)
         await waitUntil { controller.phase != .transcribing }
 
-        #expect(controller.phase == .failed(DictationController.nothingHeardMessage))
+        #expect(controller.phase == .idle)
         #expect(recorded.texts.withLock { $0.isEmpty })
         #expect(recorded.cleanups.withLock { $0.isEmpty })
     }
 
+    /// A failed transcription shows nothing: the input field comes back as it was.
     @Test(arguments: [
-        (DictationError.subscriptionRequired as any Error, "Dictation needs an active TabMail subscription."),
-        (DictationError(status: 400, code: "audio_too_large") as any Error, "That recording was too long to transcribe."),
-        (DictationError(status: 500, code: nil) as any Error, DictationController.failedMessage),
-        (URLError(.notConnectedToInternet) as any Error, DictationController.offlineMessage),
-        (URLError(.networkConnectionLost) as any Error, DictationController.offlineMessage),
-        (URLError(.dataNotAllowed) as any Error, DictationController.offlineMessage),
-        (URLError(.timedOut) as any Error, DictationController.failedMessage),
+        DictationError.subscriptionRequired as any Error,
+        DictationError(status: 400, code: "audio_too_large") as any Error,
+        DictationError(status: 500, code: nil) as any Error,
+        URLError(.notConnectedToInternet) as any Error,
+        URLError(.timedOut) as any Error,
     ])
-    func aFailedTranscriptionSaysWhy(error: any Error, message: String) async {
+    func aFailedTranscriptionEndsQuietly(error: any Error) async {
         let capture = FakeCapture()
         let controller = controller(capture: capture, transcript: { throw error })
 
         await dictate(controller, capture: capture)
         await waitUntil { controller.phase != .transcribing }
 
-        #expect(controller.phase == .failed(message))
+        #expect(controller.phase == .idle)
         #expect(recorded.texts.withLock { $0.isEmpty })
         #expect(!capture.isRunning)
     }
@@ -530,7 +529,7 @@ struct DictationControllerTests {
         let controller = controller(capture: capture, transcript: { " " })
         await dictate(controller, capture: capture)
         await waitUntil { controller.phase != .transcribing }
-        #expect(controller.phase == .failed(DictationController.nothingHeardMessage))
+        #expect(controller.phase == .idle)
 
         controller.start(context: context, canUseAI: true) { _ in }
 
@@ -615,7 +614,7 @@ struct DictationControllerTests {
         await dictate(controller, capture: capture)
         await waitUntil { controller.phase != .transcribing }
 
-        #expect(controller.phase == .failed(DictationController.recordingFailedMessage))
+        #expect(controller.phase == .idle)
         #expect(!capture.isRunning)
         #expect(recorded.uploads.withLock { $0.isEmpty })
         #expect(recorded.texts.withLock { $0.isEmpty })
@@ -673,17 +672,6 @@ struct DictationControllerTests {
 
         #expect(!capture.isRunning)
         await waitUntil { controller.phase == .idle }
-    }
-
-    /// A failure message clears after `errorDisplayDuration`, giving the text field back.
-    @Test func aFailureMessageClearsAndGivesTheFieldBack() async {
-        let controller = controller(online: false)
-
-        controller.start(context: context, canUseAI: true) { _ in }
-        #expect(controller.phase == .failed(DictationController.offlineMessage))
-        await waitUntil { controller.phase == .idle }
-
-        #expect(controller.phase == .idle)
     }
 
     @Test func appendsToTheEndOfTheInputASpaceApart() {
@@ -783,6 +771,20 @@ struct DictationOptOutFlagTests {
         #expect(source.contains(".disabled(isWorking || dictation.phase == .transcribing || (!dictation.isActive && !canDictate))"))
     }
 
+    /// While dictating, the input field stays in place with its text dimmed behind the waveform,
+    /// can't be edited, and a tap on it stops listening; otherwise nothing covers it.
+    @Test func theWaveformDimsTheInputInPlace() throws {
+        let source = try pillSource()
+        let field = String(try slice(source, from: "TextField(isComposeMode ?", to: "if isWorking {"))
+        #expect(field.contains(".opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)"))
+        #expect(field.contains(".allowsHitTesting(!dictation.isActive)"))
+        let overlay = try slice(field, from: ".overlay {", to: ".onTapGesture { dictation.finish() }")
+        #expect(overlay.contains("if dictation.isActive {\n                        DictationPillView(controller: dictation)"))
+        #expect(source.components(separatedBy: "DictationPillView(").count == 2)
+        #expect(source.components(separatedBy: "TextField(").count == 2)
+        #expect(DictationConfig.dimmedInputOpacity > 0 && DictationConfig.dimmedInputOpacity < 0.5)
+    }
+
     /// A recording never outlives the pill, and a message can't be sent over a dictation still
     /// on its way into the input.
     @Test func recordingNeverOutlivesThePill() throws {
@@ -807,8 +809,8 @@ struct DictationOptOutFlagTests {
         #expect(context.components(separatedBy: "messages: chatMessages, input: inputText").count == 4)
     }
 
-    /// The Settings menu writes the key the controller reads, the listening pill shows the
-    /// dictation's language, and the mic points to the menu once a dictation has landed.
+    /// The Settings menu writes the key the controller reads, the waveform shows no language, and
+    /// the mic points to the menu once a dictation has landed.
     @Test func theLanguageMenuAndItsTipAreWired() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -839,14 +841,12 @@ struct DictationOptOutFlagTests {
         #expect(tip.contains("MaxDisplayCount(1)"))
         #expect(tip.components(separatedBy: "#Rule(").count == 3)
 
+        // The waveform shows no language; VoiceOver reads the label `DictationWaveformTests` checks.
         let pill = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Inbox/DictationPillView.swift"), encoding: .utf8)
-        #expect(pill.contains("Pill(mode: mode, level: controller.level, language: controller.language)"))
-        let waveform = try slice(pill, from: "default:\n                    if let language {", to: "Waveform(level: level)")
-        #expect(waveform.contains("LanguageBadge(code: language)"))
-        // VoiceOver reads the label `DictationPillLanguageTests` checks.
-        #expect(pill.contains(".accessibilityElement(children: .ignore)\n        .accessibilityLabel(accessibilityLabel)"))
-        let badge = try slice(pill, from: "struct LanguageBadge: View {", to: ".font(")
-        #expect(badge.contains("Text(title)"))
+        #expect(!pill.contains("controller.language"))
+        #expect(!pill.contains("Badge"))
+        #expect(pill.contains("Waveform(level: controller.level)"))
+        #expect(pill.contains(".accessibilityElement(children: .ignore)\n            .accessibilityLabel(accessibilityLabel)"))
 
         let source = try pillSource()
         #expect(source.contains(".popoverTip(DictationLanguageTip(), arrowEdge: .bottom)"))
@@ -864,15 +864,14 @@ struct DictationOptOutFlagTests {
     }
 }
 
-/// What the pill shows and VoiceOver reads while listening: the language the dictation started
-/// with, or none.
+/// What the waveform reads to VoiceOver: listening, then transcribing, never the language.
 @MainActor
-struct DictationPillLanguageTests {
-    private func listening(language: String?) async -> (DictationController, FakeCapture) {
+struct DictationWaveformTests {
+    private func listening(language: String?, microphoneAccess: Bool = true) -> (DictationController, FakeCapture) {
         let capture = FakeCapture()
         let controller = DictationController(
             capture: capture,
-            requestMicrophoneAccess: { true },
+            requestMicrophoneAccess: { microphoneAccess },
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
@@ -890,32 +889,30 @@ struct DictationPillLanguageTests {
         }
     }
 
-    @Test(arguments: ["ko", "th"])
-    func theLanguageIsShownAndRead(code: String) async throws {
-        let (controller, _) = await listening(language: code)
-        let name = try #require(Locale.current.localizedString(forLanguageCode: code))
-        let pill = DictationPillView(controller: controller)
-        // Warming up, then hearing: both read the language.
-        #expect(pill.mode == .swirl)
-        #expect(pill.accessibilityLabel == "Listening in \(name)")
-        await waitUntil { controller.isHearing }
-        #expect(pill.mode == .listening)
-        #expect(pill.accessibilityLabel == "Listening in \(name)")
-        #expect(LanguageBadge(code: try #require(controller.language)).title == code.uppercased())
+    @Test(arguments: ["ko", nil] as [String?])
+    func itReadsListeningThenTranscribing(language: String?) async {
+        let (controller, capture) = listening(language: language)
+        let waveform = DictationPillView(controller: controller)
+        #expect(controller.language == language)
+        #expect(waveform.accessibilityLabel == "Listening")
+        await waitUntil { capture.starts == 1 }
+        #expect(waveform.accessibilityLabel == "Listening")
 
         controller.finish()
-        #expect(pill.accessibilityLabel == "Transcribing")
+        #expect(controller.phase == .transcribing)
+        #expect(waveform.accessibilityLabel == "Transcribing")
         controller.cancel()
+        #expect(waveform.accessibilityLabel == "")
     }
 
-    @Test func withoutALanguageNoneIsRead() async {
-        let (controller, _) = await listening(language: nil)
-        let pill = DictationPillView(controller: controller)
-        await waitUntil { controller.isHearing }
-        #expect(pill.mode == .listening)
-        #expect(controller.language == nil)
-        #expect(pill.accessibilityLabel == "Listening")
-        controller.cancel()
+    /// A failed dictation leaves nothing on screen: it isn't active, so the input field doesn't
+    /// dim or show the waveform.
+    @Test func aFailureLeavesNothingShown() async {
+        let (controller, _) = listening(language: "ko", microphoneAccess: false)
+        await waitUntil { controller.phase != .listening }
+        #expect(controller.phase == .idle)
+        #expect(!controller.isActive)
+        #expect(DictationPillView(controller: controller).accessibilityLabel == "")
     }
 }
 

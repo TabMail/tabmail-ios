@@ -70,52 +70,22 @@ enum DictationConfig {
     /// input only; nothing is stored.
     static let contextMaxScreenChars = 20_000
 
-    // MARK: Waveform pill
+    // MARK: Waveform
 
-    static let pillFontSize: CGFloat = 13
-    static let pillHeight: CGFloat = 26
-    static let pillHorizontalPadding: CGFloat = 14
-    /// Keeps text off the pill's rounded top and bottom when a message wraps.
-    static let pillVerticalPadding: CGFloat = 5
-    static let pillContentSpacing: CGFloat = 8
-    static let pillMaxTextLines = 3
-    static let pillBorderWidth: CGFloat = 1
-    static let pillGlowOpacity: Double = 0.35
-    static let pillGlowRadius: CGFloat = 8
-    /// The pill grows out of the swirl from this fraction of its size.
-    static let pillAppearScale: CGFloat = 0.2
-    static let pillSpringResponse: Double = 0.25
-    static let pillSpringDamping: Double = 0.75
-    /// Warm-up swirl: particles spiral from `swirlStartRadius` to `swirlOrbitRadius`.
-    static let swirlParticleCount = 14
-    static let swirlStartRadius: Double = 36
-    static let swirlOrbitRadius: Double = 7
-    static let swirlSpiralSpread: Double = 0.6
-    static let swirlGatherSeconds: Double = 0.3
-    static let swirlRevolutionsPerSecond: Double = 1.4
-    static let swirlParticleSize: Double = 5
-    /// The outermost particle's size and opacity, as a share of the innermost's (full) ones.
-    static let swirlOuterParticleScale: Double = 0.5
-    static let swirlOuterParticleOpacity: Double = 0.35
-    /// Height the swirl is drawn in, inside the input bar.
-    static let swirlCanvasHeight: CGFloat = 44
-    /// Number of bars in the pill's waveform.
+    /// While dictating, the input field's text stays faintly visible behind the waveform, at this
+    /// opacity.
+    static let dimmedInputOpacity: Double = 0.15
+    /// Number of bars in the waveform.
     static let meterBarCount = 9
     static let meterBarWidth: CGFloat = 3
     static let meterBarSpacing: CGFloat = 3
     static let meterMinBarHeight: CGFloat = 3
     static let meterMaxBarHeight: CGFloat = 18
-    /// The listening pill's height: the waveform between the pill's vertical padding.
-    static let listeningPillHeight = max(pillHeight, meterMaxBarHeight + 2 * pillVerticalPadding)
-    /// The language badge left of the waveform: a circle as tall as the waveform, so the pill keeps
-    /// its height, inset so it is concentric with the pill's rounded end.
-    static let languageBadgeDiameter: CGFloat = meterMaxBarHeight
-    static let languageBadgeInset: CGFloat = (listeningPillHeight - languageBadgeDiameter) / 2
-    static let languageBadgeFontSize: CGFloat = 8
     /// Bar height follows level^exponent (< 1 lifts quieter speech), times the gain.
     static let waveformLevelExponent: Double = 1
     static let waveformGain: Double = 1
-    /// The bars always ripple this much (0…1) while listening, so the pill looks alive between words.
+    /// The bars always ripple this much (0…1), so the waveform looks alive between words and while
+    /// the words are transcribed.
     static let waveformIdleLevel: Double = 0.05
     /// Each bar's ripple speed differs by up to this fraction, so the motion looks organic.
     static let waveformSpeedVariance: Double = 0.2
@@ -127,16 +97,4 @@ enum DictationConfig {
     static let waveformRippleSpeed: Double = 9
     static let waveformRipplePhase: Double = 0.7
     static let waveformRippleDepth: Double = 0.25
-    /// While transcribing, the pill is a circle with a gradient arc circling its rim.
-    static let thinkingRimWidth: CGFloat = 2.5
-    static let thinkingArcFraction: CGFloat = 0.7
-    static let thinkingRevolutionsPerSecond: Double = 1.2
-    static let thinkingTrackOpacity: Double = 0.2
-    /// The arc runs from blue to this point on the blue → purple gradient: the full purple end
-    /// reads reddish on the spinning arc.
-    static let thinkingArcEndColour: Double = 0.6
-    /// Pill fill: a soft off-white (pure white glared).
-    static let pillFillWhite: Double = 0.96
-    /// How long an error message stays in the input bar.
-    static let errorDisplayDuration: Duration = .seconds(3)
 }

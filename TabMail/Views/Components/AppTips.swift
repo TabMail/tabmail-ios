@@ -259,7 +259,7 @@ struct DictationLanguageTip: Tip {
     static let dictationCompleted = Event(id: "dictationCompleted")
 
     var title: Text { Text("Dictation Language") }
-    var message: Text? { Text("The badge by the waveform shows the language TabMail listens for. Choose another in TabMail Settings → Dictation Language.\u{00A0}") }
+    var message: Text? { Text("Dictation listens for your iPhone's language. To dictate in another, choose it in TabMail Settings → Dictation Language.\u{00A0}") }
     var image: Image? { Image(systemName: "globe") }
 
     var rules: [Rule] {

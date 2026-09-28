@@ -43,11 +43,19 @@ of the input when it comes back, and the contextual cleanup runs.
    dictating, so iOS uses a Settings choice instead (`DictationLanguage`, TabMail Settings →
    Dictation Language, the backend's 30 languages by name). Automatic, the default, is the
    iPhone's first preferred language reduced to its two-letter code; none is sent without one.
-   The controller reads it once when the dictation starts, so the badge and the request agree
-   and a change mid-dictation applies from the next one. The listening pill shows it as Voice
-   does, a small `KO` circle left of the waveform; `DictationLanguageTip` on the mic, after the
-   first dictation lands, says where to change it (owner, 2026-09-26: a tooltip pointing to a
-   Settings menu).
+   The controller reads it once when the dictation starts, so a change mid-dictation applies from
+   the next one. `DictationLanguageTip` on the mic, after the first dictation lands, says where
+   to change it (owner, 2026-09-26: a tooltip pointing to a Settings menu). The language is not
+   shown while dictating (decision 8; it was first shown as Voice does, a small `KO` circle left
+   of the waveform).
+8. While dictating, the input field stays where it is with its text dimmed to a faint hint
+   (`DictationConfig.dimmedInputOpacity`), and TabMail Voice's waveform is laid over it
+   (`DictationPillView`): following the voice while listening, rippling at rest while the words
+   are transcribed. Tapping it stops listening. Nothing else is shown: no pill shape, warm-up
+   swirl or spinning circle, no language, and no message when a dictation fails; the field just
+   comes back (owner, 2026-09-28, after trying the first build on a device: "we don't want this
+   to be complicated"). The first build copied Voice's overlay whole: a waveform pill that
+   replaced the field, the language badge, and error messages in the pill for 3 s.
 
 **Consequences:**
 
@@ -80,8 +88,8 @@ of the input when it comes back, and the contextual cleanup runs.
   model time, plus up to `cleanupTimeout` = 3 s for the cleanup). Accepted by the owner
   (2026-09-27).
 - Dictation needs a TabMail sign-in and an active subscription; it counts toward usage like
-  every AI request. Errors (subscription, rate limit, too long, offline) show in the pill for
-  `errorDisplayDuration`.
+  every AI request. A failure (subscription, rate limit, too long, no speech, microphone denied)
+  shows nothing (decision 8); the reason is in the debug log only.
 - A failed cleanup never costs the dictation: the transcript is appended as heard. A failed
   transcription loses that recording (as in Voice; no retry queue).
 - Recording stops and is sent at `maxRecordingDuration`, 120 seconds: the most audio the
@@ -100,7 +108,7 @@ of the input when it comes back, and the contextual cleanup runs.
   a choice and donation after a completed dictation: TipKit's datastore is configured by the app
   that hosts the tests and cannot be reset after that, so a tip's lifecycle cannot be run twice
   in one process (no TabMail tip has a behavioural test). What the menu stores, the language on
-  the backend request, and the pill's badge and VoiceOver label are tested behaviourally.
+  the backend request, and the waveform's VoiceOver label are tested behaviourally.
 - The dictation code logs lengths, durations and error types only, never the transcript or the
   audio. (The existing `#if DEBUG` short-reply log in `BackendClient`'s completions decoding
   prints a short cleaned dictation in debug builds, as it does any short completion.)
