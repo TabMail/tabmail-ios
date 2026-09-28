@@ -55,7 +55,8 @@ tabmail-ios/
 │   │   ├── KeychainHelper.swift     # Secure credential storage
 │   │   ├── SyncEngine.swift         # Email sync orchestration
 │   │   ├── SyncScheduler.swift      # Background sync scheduling
-│   │   └── UndoService.swift        # Undo/redo
+│   │   ├── UndoService.swift        # Undo/redo
+│   │   └── Dictation/               # Chat-pill dictation (ADR-IOS-085): TabMail Voice's backend STT + cleanup, dictation language
 │   │
 │   ├── ViewModels/              # MVVM state management
 │   │   ├── InboxViewModel.swift
@@ -98,7 +99,7 @@ tabmail-ios/
 │       └── Assets.xcassets/     # Icons, logos, colors
 │
 └── TabMailTests/                # 400+ test files (Swift Testing), grouped by area:
-    ├── Models/  Providers/  Services/  Search/  Tools/  ViewModels/  Views/
+    ├── Models/  Providers/  Services/  Search/  Tools/  ViewModels/  Views/  Dictation/
     ├── AI/  Auth/  Config/  Database/  Demo/  E2E/  NSE/  Notifications/  Queues/
     ├── Helpers/  Infrastructure/  Mocks/   # test scaffolding (fakes, mocks)
     └── Fixtures/                           # provider response fixtures (+ README.md)

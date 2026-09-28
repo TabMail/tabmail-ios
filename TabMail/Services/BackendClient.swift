@@ -108,53 +108,6 @@ actor BackendClient {
             return nil
         }
     }
-
-    struct ChatRequest: Encodable {
-        let message: String
-        let context: MessageContext?
-        let conversationId: String?
-    }
-
-    struct MessageContext: Encodable {
-        let messageId: String
-        let subject: String
-        let from: String
-        let snippet: String
-    }
-
-    struct ChatResponse: Decodable {
-        let reply: String
-        let toolCalls: [ToolCall]?
-        let conversationId: String
-    }
-
-    struct ToolCall: Decodable {
-        let name: String
-        let arguments: [String: String]
-    }
-
-    func sendChat(_ request: ChatRequest) async throws -> ChatResponse {
-        var urlRequest = URLRequest(url: baseURL.appending(path: "/v1/chat"))
-        urlRequest.httpMethod = "POST"
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        urlRequest.setValue("ios", forHTTPHeaderField: "X-Client-Type")
-        urlRequest.setValue(Self.clientVersion, forHTTPHeaderField: "X-Client-Version")
-        if let token = await currentAuthToken() {
-            urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
-
-        urlRequest.httpBody = try JSONEncoder().encode(request)
-
-        let (data, response) = try await sharedEphemeralSession.data(for: urlRequest)
-        guard let httpResponse = response as? HTTPURLResponse,
-              200..<300 ~= httpResponse.statusCode else {
-            throw BackendError.requestFailed(
-                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
-            )
-        }
-
-        return try JSONDecoder().decode(ChatResponse.self, from: data)
-    }
 }
 
 // MARK: - Report Concern
@@ -191,6 +144,52 @@ extension BackendClient {
             BackgroundSyncLogger.logDebug("[BackendClient] reportConcern failed: \(error)")
             return false
         }
+    }
+}
+
+// MARK: - Dictation
+
+extension BackendClient {
+    /// Transcribes one dictation recording (16 kHz mono WAV) via `POST /dictation/transcribe`
+    /// (OpenRouter speech-to-text behind it; the backend stores neither audio nor text).
+    /// Same request as TabMail Voice's `TranscriptionClient`. `language` (ISO-639-1) picks the
+    /// backend's speech-to-text model (backend ADR-024); nil sends none (the default model).
+    func transcribeDictation(wav: Data, language: String?) async throws -> String {
+        var request = URLRequest(url: baseURL.appending(path: DictationConfig.transcribePath))
+        request.httpMethod = "POST"
+        request.timeoutInterval = DictationConfig.transcriptionRequestTimeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("ios", forHTTPHeaderField: "X-Client-Type")
+        request.setValue(Self.clientVersion, forHTTPHeaderField: "X-Client-Version")
+        if let token = await currentAuthToken() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        request.httpBody = try JSONEncoder().encode(TranscriptionBody(audio: wav.base64EncodedString(), format: "wav", language: language))
+
+        let (data, response) = try await llmSession.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw DictationError.invalidResponse }
+        guard http.statusCode == 200 else {
+            throw DictationError(status: http.statusCode, code: (try? JSONDecoder().decode(TranscriptionErrorBody.self, from: data))?.error)
+        }
+        guard let result = try? JSONDecoder().decode(TranscriptionResult.self, from: data) else {
+            throw DictationError.invalidResponse
+        }
+        return result.text
+    }
+
+    private struct TranscriptionBody: Encodable {
+        let audio: String
+        let format: String
+        /// Left out when nil.
+        let language: String?
+    }
+
+    private struct TranscriptionResult: Decodable {
+        let text: String
+    }
+
+    private struct TranscriptionErrorBody: Decodable {
+        let error: String?
     }
 }
 

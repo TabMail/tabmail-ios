@@ -253,6 +253,25 @@ struct ChatForkTip: Tip {
     }
 }
 
+/// Shown on the chat pill's mic after the first dictation lands: the badge by the waveform is the
+/// language dictation listens for, and TabMail Settings chooses it.
+struct DictationLanguageTip: Tip {
+    static let dictationCompleted = Event(id: "dictationCompleted")
+
+    var title: Text { Text("Dictation Language") }
+    var message: Text? { Text("Dictation listens for your iPhone's language. To dictate in another, choose it in TabMail Settings → Dictation Language.\u{00A0}") }
+    var image: Image? { Image(systemName: "globe") }
+
+    var rules: [Rule] {
+        #Rule(Self.dictationCompleted) { $0.donations.count >= 1 }
+        #Rule(OnboardingTipGate.$onboardingComplete) { $0 == true }
+    }
+
+    var options: [any TipOption] {
+        MaxDisplayCount(1)
+    }
+}
+
 // MARK: - Settings Tips
 
 /// Shown once on first visit to prompt settings pages (Composition, Templates, Action Rules).

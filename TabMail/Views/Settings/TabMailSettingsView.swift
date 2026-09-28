@@ -4,6 +4,7 @@
 
 import SwiftUI
 import Combine
+import TipKit
 
 struct TabMailSettingsView: View {
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
@@ -11,6 +12,7 @@ struct TabMailSettingsView: View {
     @AppStorage(ChatPillState.maxSessionsKey) private var maxChatSessions = ChatPillState.defaultMaxSessions
     @AppStorage(ChatPillState.maxMemoryTurnsKey) private var maxMemoryTurns = ChatPillState.defaultMaxMemoryTurns
     @AppStorage(ChatPillState.autoDictationKey) private var autoDictation = false
+    @AppStorage(DictationLanguage.settingKey) private var dictationLanguage = DictationLanguage.automatic
     @AppStorage(AccountManager.markReadOnArchiveDeleteKey) private var markReadOnArchiveDelete = true
     @AppStorage(SummaryBubbleView.showAISummariesKey) private var showAISummaries = true
     @AppStorage(ProactiveNotifyService.enabledKey) private var proactiveEnabled = true
@@ -33,6 +35,12 @@ struct TabMailSettingsView: View {
     static let pendingScrollAIProviderKey = "pending_scroll_ai_provider"
     /// ScrollViewReader anchor for the "AI Provider" section.
     private static let aiProviderAnchorID = "aiProviderSection"
+
+    /// "Automatic", naming the iPhone's language dictation then listens for.
+    private var automaticDictationLanguageLabel: String {
+        DictationLanguage.resolve(setting: DictationLanguage.automatic)
+            .map { "Automatic (\(DictationLanguage.name(of: $0)))" } ?? "Automatic"
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -268,6 +276,29 @@ struct TabMailSettingsView: View {
                         Image(systemName: "mic")
                             .foregroundStyle(.primary)
                     }
+                }
+
+                Picker(selection: $dictationLanguage) {
+                    Text(automaticDictationLanguageLabel).tag(DictationLanguage.automatic)
+                    ForEach(DictationLanguage.choices(), id: \.self) { code in
+                        Text(DictationLanguage.name(of: code)).tag(code)
+                    }
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Dictation Language")
+                            Text("The language you speak when dictating")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "globe")
+                            .foregroundStyle(.primary)
+                    }
+                }
+                .pickerStyle(.menu)
+                .onChange(of: dictationLanguage) {
+                    DictationLanguageTip().invalidate(reason: .actionPerformed)
                 }
 
                 Toggle(isOn: $markReadOnArchiveDelete) {
