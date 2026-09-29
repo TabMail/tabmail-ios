@@ -1918,8 +1918,16 @@ struct DynamicIslandChat: View {
     /// The label a running tool shows: the event's `display_label` (a server tool's comes from the
     /// backend, e.g. "Searching the web: <query>"; a client tool's from `ToolRegistry.activityLabel`),
     /// as Thunderbird's chat shows them (ADR-IOS-008), then the tool's name, then a generic one.
-    static func toolStatusLabel(_ status: ToolStatusEvent) -> String {
-        status.display_label ?? status.tool_name ?? "Processing"
+    /// A finished tool shows `idleLabel`; any other event leaves the status as it is (nil).
+    static func statusLabel(for event: CompletionsSSEEvent, idleLabel: String) -> String? {
+        switch event {
+        case .toolStarted(let status):
+            status.display_label ?? status.tool_name ?? "Processing"
+        case .toolCompleted:
+            idleLabel
+        default:
+            nil
+        }
     }
 
     /// Minimum time (seconds) each status is displayed before the next one takes over.
@@ -1937,16 +1945,14 @@ struct DynamicIslandChat: View {
         return { @Sendable event in
             Task { @MainActor in
                 switch event {
-                case .toolStarted(let status):
-                    enqueueStatus(Self.toolStatusLabel(status))
-                case .toolCompleted:
-                    enqueueStatus(idleLabel)
                 case .throttled:
                     isThrottled = true
                 case .throttleEnded:
                     isThrottled = false
                 default:
-                    break
+                    if let label = Self.statusLabel(for: event, idleLabel: idleLabel) {
+                        enqueueStatus(label)
+                    }
                 }
             }
         }

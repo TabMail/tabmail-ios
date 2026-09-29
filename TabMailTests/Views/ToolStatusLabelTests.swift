@@ -16,31 +16,45 @@ struct ToolStatusLabelTests {
 
     private static let primer = ":" + String(repeating: " ", count: 600) + "\n\n"
 
+    private static let idle = "Thinking..."
+
     private func status(label: String?, name: String?) -> ToolStatusEvent {
         ToolStatusEvent(execution_id: "execution-1", call_id: "call-1", display_label: label, tool_name: name,
                         success: nil, elapsed_ms: nil, error: nil, result: nil)
     }
 
+    /// What the chat shows for a tool that starts running.
+    private func shown(label: String?, name: String?) -> String? {
+        DynamicIslandChat.statusLabel(for: .toolStarted(status(label: label, name: name)), idleLabel: Self.idle)
+    }
+
     @Test("the backend's label wins over the tool's name")
     func backendLabelWins() {
-        #expect(DynamicIslandChat.toolStatusLabel(status(label: "Searching the web: launch plan", name: "search_web"))
-                == "Searching the web: launch plan")
-        #expect(DynamicIslandChat.toolStatusLabel(status(label: "Checking day of week…", name: "date_to_day"))
-                == "Checking day of week…")
+        #expect(shown(label: "Searching the web: launch plan", name: "search_web") == "Searching the web: launch plan")
+        #expect(shown(label: "Checking day of week…", name: "date_to_day") == "Checking day of week…")
     }
 
     @Test("without a label, the tool's name, and without either, a generic label")
     func fallbacks() {
-        #expect(DynamicIslandChat.toolStatusLabel(status(label: nil, name: "search_web")) == "search_web")
-        #expect(DynamicIslandChat.toolStatusLabel(status(label: nil, name: nil)) == "Processing")
+        #expect(shown(label: nil, name: "search_web") == "search_web")
+        #expect(shown(label: nil, name: nil) == "Processing")
+    }
+
+    @Test("a finished tool shows the idle label, and other events leave the status alone")
+    func otherEvents() {
+        let finished = status(label: "Searching the web: launch plan", name: "search_web")
+        #expect(DynamicIslandChat.statusLabel(for: .toolCompleted(finished), idleLabel: Self.idle) == Self.idle)
+        #expect(DynamicIslandChat.statusLabel(for: .toolFailed(finished), idleLabel: Self.idle) == nil)
+        #expect(DynamicIslandChat.statusLabel(for: .keepalive, idleLabel: Self.idle) == nil)
     }
 
     @Test("every client tool has a readable label, and nothing else does")
     func everyClientToolLabelled() {
         let names = Set(ToolRegistry.makeDefaultTools().map(\.name))
-        #expect(ToolRegistry.labelledToolNames == names)
+        #expect(Set(ToolRegistry.activityLabels.keys) == names)
         let raw = names.filter { ToolRegistry.activityLabel(for: $0) == $0 }.sorted()
         #expect(raw.isEmpty, "client tools shown by their raw name: \(raw)")
+        #expect(ToolRegistry.activityLabel(for: "not_a_tool") == "not_a_tool")
     }
 
     @Test("a client tool the agent runs shows its label in the chat, not its name")
@@ -74,7 +88,9 @@ struct ToolStatusLabelTests {
         guard statuses.count == 2 else { return }
         for status in statuses {
             #expect(status.tool_name == "inbox_read")
-            #expect(DynamicIslandChat.toolStatusLabel(status) == "Reading inbox")
+            #expect(status.display_label == "Reading inbox")
         }
+        let shown = events.withLock { $0 }.compactMap { DynamicIslandChat.statusLabel(for: $0, idleLabel: Self.idle) }
+        #expect(shown == ["Reading inbox", Self.idle])
     }
 }

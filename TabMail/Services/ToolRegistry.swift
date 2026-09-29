@@ -123,9 +123,10 @@ actor ToolRegistry {
     }
 
     /// What the chat shows while a client-side tool runs (e.g., "inbox_read" → "Reading inbox"),
-    /// matching TB's `getToolActivityLabel()` in `core.js`. The backend labels its own tools
-    /// (`display_label`); these are ours, one per tool in `makeDefaultTools()`.
-    private nonisolated static let activityLabels: [String: String] = [
+    /// the counterpart of TB's `getToolActivityLabel()` in `core.js` (TB's wording differs, and
+    /// some of its labels name the arguments). The backend labels its own tools (`display_label`);
+    /// these are ours, one per tool in `makeDefaultTools()`.
+    nonisolated static let activityLabels: [String: String] = [
         "inbox_read": "Reading inbox",
         "email_read": "Reading email",
         "email_search": "Searching emails",
@@ -167,9 +168,6 @@ actor ToolRegistry {
     nonisolated static func activityLabel(for name: String) -> String {
         activityLabels[name] ?? name
     }
-
-    /// The tools that have a chat label (tests check it is every tool).
-    nonisolated static var labelledToolNames: Set<String> { Set(activityLabels.keys) }
 
     /// Look up a tool by name.
     func tool(named name: String) -> (any AgentTool)? {
