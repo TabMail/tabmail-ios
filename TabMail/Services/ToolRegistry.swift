@@ -122,6 +122,53 @@ actor ToolRegistry {
         ]
     }
 
+    /// What the chat shows while a client-side tool runs (e.g., "inbox_read" → "Reading inbox"),
+    /// the counterpart of TB's `getToolActivityLabel()` in `core.js` (TB's wording differs, and
+    /// some of its labels name the arguments). The backend labels its own tools (`display_label`);
+    /// these are ours, one per tool in `makeDefaultTools()`.
+    nonisolated static let activityLabels: [String: String] = [
+        "inbox_read": "Reading inbox",
+        "email_read": "Reading email",
+        "email_search": "Searching emails",
+        "email_compose": "Composing email",
+        "email_reply": "Composing reply",
+        "email_forward": "Forwarding email",
+        "email_archive": "Archiving emails",
+        "email_delete": "Deleting emails",
+        "email_open": "Opening email",
+        "memory_search": "Searching memory",
+        "memory_read": "Reading memory",
+        "web_read": "Reading webpage",
+        "calendar_read": "Reading calendar",
+        "calendar_search": "Searching calendar",
+        "calendar_event_read": "Reading event",
+        "calendar_event_create": "Creating event",
+        "calendar_event_edit": "Editing event",
+        "calendar_event_delete": "Deleting event",
+        "contacts_search": "Searching contacts",
+        "contacts_add": "Adding contact",
+        "contacts_edit": "Editing contact",
+        "contacts_delete": "Deleting contact",
+        "kb_add": "Saving to knowledge base",
+        "kb_del": "Removing from knowledge base",
+        "reminder_add": "Setting reminder",
+        "reminder_del": "Removing reminder",
+        "template_read": "Reading template",
+        "template_create": "Creating template",
+        "template_edit": "Editing template",
+        "template_delete": "Deleting template",
+        "template_share": "Sharing template",
+        "template_search": "Searching templates",
+        "template_download": "Downloading template",
+        "template_toggle": "Toggling template",
+        "change_setting": "Updating setting",
+    ]
+
+    /// The chat label for a client-side tool; its name if it has none.
+    nonisolated static func activityLabel(for name: String) -> String {
+        activityLabels[name] ?? name
+    }
+
     /// Look up a tool by name.
     func tool(named name: String) -> (any AgentTool)? {
         tools[name]
