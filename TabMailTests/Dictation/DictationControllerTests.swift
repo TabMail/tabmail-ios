@@ -1014,6 +1014,28 @@ struct DictationControllerTests {
         #expect(ContinuousClock.now - started < .seconds(5))
     }
 
+    /// Cancelled while its terms are still being picked (the pill went away): the recording is not
+    /// uploaded.
+    @Test func aDictationCancelledWhileItsTermsArePickedUploadsNothing() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, emailBody: { _ in
+            try? await Task.sleep(for: .seconds(30))
+            return nil
+        })
+        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
+        let recorded = recorded
+        controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
+        await waitUntil { capture.starts == 1 }
+        controller.finish()
+        // The recording is complete (the microphone stopped) and waits for its terms.
+        await waitUntil { capture.starts == 1 && !capture.isRunning }
+        controller.cancel()
+        try? await Task.sleep(for: .seconds(DictationConfig.contextTermsWait * 3))
+
+        #expect(recorded.uploads.withLock { $0.isEmpty })
+        #expect(recorded.texts.withLock { $0.isEmpty })
+    }
+
     /// With learning on at the start, the field the text landed in is watched, and the user's
     /// respelling in it is learned when the input is sent.
     @Test func learnsTheUsersCorrectionOfTheText() async throws {
@@ -1536,5 +1558,37 @@ struct DictationLanguageTests {
         let names = choices.map { DictationLanguage.name(of: $0, locale: locale) }
         #expect(names == names.sorted { $0.localizedStandardCompare($1) == .orderedAscending })
         #expect(DictationLanguage.name(of: "ko", locale: locale) == "Korean")
+    }
+}
+
+/// The app's own read of the email's body for its terms: from the search index, under the key the
+/// content stores write it under; none for an email not there.
+@Suite(.serialized, .processGlobalState)
+struct DictationEmailBodyTests {
+    @Test func readsTheEmailsBodyFromTheSearchIndex() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let accountId = "dictation-body-\(UUID().uuidString)"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        let header = MessageHeader(messageId: "42", subject: "Plans",
+            from: "Sender", fromAddress: "sender@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "", folderId: "\(accountId):INBOX",
+            accountId: accountId, folderPath: "INBOX", isInInbox: true)
+        try await pool.write { db in try header.insert(db) }
+        let key = try #require(try await pool.read { db in try MessageContentStore.capture(header, db: db)?.contentKey })
+        let index = SearchIndex.shared
+        _ = try await index.indexHeaders([FTSHeaderRecord(contentKey: key, headerId: header.id,
+            messageId: header.messageId, subject: header.subject, from: header.fromAddress,
+            to: header.to, dateMs: Int64(header.date.timeIntervalSince1970 * 1000))])
+        #expect(await DictationController.storedEmailBody(headerId: header.id) == nil)
+
+        try await index.updateBody(contentKey: key, body: "Meet Xyvora at Brevalle Labs.")
+
+        #expect(await DictationController.storedEmailBody(headerId: header.id) == "Meet Xyvora at Brevalle Labs.")
+        #expect(await DictationController.storedEmailBody(headerId: "\(accountId):INBOX:999") == nil)
     }
 }

@@ -86,11 +86,7 @@ final class DictationController {
         isOptedOutOfAI: @escaping @MainActor () -> Bool = { AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey) },
         dictationLanguage: @escaping @MainActor () -> String? = { DictationLanguage.current() },
         dictionary: @escaping @MainActor () -> DictationDictionary.Snapshot = { DictationDictionary.shared.snapshot },
-        emailBody: @escaping EmailBody = { headerId in
-            let key = try? await AppDatabase.rawPool.read { db in try DictationController.contentKey(headerId: headerId, db: db) }
-            guard let key = key ?? nil else { return nil }
-            return try? SearchIndex.shared.bodyText(contentKey: key)
-        },
+        emailBody: @escaping EmailBody = { await DictationController.storedEmailBody(headerId: $0) },
         corrections: DictationCorrectionWatch? = DictationCorrectionWatch { DictationDictionary.shared.learn($0) },
         transcribe: Transcribe? = nil,
         speechDetector: @escaping MakeSpeechDetector = { SoundClassifierSpeechDetector(onSpeech: $0, onFailure: $1) },
@@ -182,6 +178,14 @@ final class DictationController {
     nonisolated static func contentKey(headerId: String, db: Database) throws -> ContentKey? {
         guard let header = try MessageHeader.fetchOne(db, key: headerId) else { return nil }
         return try MessageContentStore.capture(header, db: db)?.contentKey
+    }
+
+    /// The body of the email `headerId` as the search index holds it; nil when it isn't there (not
+    /// indexed yet, or gone).
+    nonisolated static func storedEmailBody(headerId: String) async -> String? {
+        let key = try? await AppDatabase.rawPool.read { db in try contentKey(headerId: headerId, db: db) }
+        guard let key = key ?? nil else { return nil }
+        return try? await SearchIndex.shared.bodyText(contentKey: key)
     }
 
     /// The terms of what the dictation is about (`DictationContextTerms`): from the context, and

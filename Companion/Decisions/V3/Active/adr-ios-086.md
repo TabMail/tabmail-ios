@@ -18,7 +18,8 @@ on the device rather than a model).
 **Decision:**
 
 1. `DictationDictionary` keeps the user's words (`{word, learned}`) in UserDefaults on this device,
-   with TabMail Voice's rules: a word is trimmed, its spaces collapsed, refused when empty, over
+   with TabMail Voice's rules: a word is trimmed, its spaces (the backend's: Unicode's and
+   U+FEFF) collapsed, refused when empty, over
    `dictionaryWordMaxChars` (UTF-16, as the backend counts) or `dictionaryWordMaxWords`, or holding
    a control character or `<` `>`; a word already there in any case is not added twice but takes
    the spelling typed, the user's latest, and a learned one becomes typed. It holds at most `dictionaryMaxEntries` = 100,
@@ -73,7 +74,8 @@ on the device rather than a model).
 - The picking is heuristic: a capitalised ordinary word mid-sentence ("Monday", "Paris") is sent
   too, which is harmless, since a phrase list only biases the model toward a spelling; a name at a
   sentence's start alone is missed unless it also appears elsewhere.
-- A body not yet indexed, or a read slower than 0.2 s, just sends the other terms.
+- A body not yet indexed just sends the other terms; a body read slower than 0.2 s sends no email
+  terms at all (they are picked together), only the dictionary words.
 - A lowercase term heard right at its start but wrong at its end ("kubctl" for "kubectl") is not
   learned; the user adds it by hand.
 - 200 terms of up to 6 words could exceed AssemblyAI's 1,000-word `keyterms_prompt` total; the

@@ -36,6 +36,8 @@ struct DictationContextTermsTests {
     @Test func runsOfCapitalsAreKeptTogether() {
         #expect(terms("From: Kaelthorne Drake") == ["Kaelthorne Drake"])
         #expect(terms("I met Kaelthorne, Drake and Xyvora.") == ["Kaelthorne", "Drake", "Xyvora"])
+        #expect(terms("Thanks Xyvora [Brevalle Labs] shipped it") == ["Xyvora", "Brevalle Labs"])
+        #expect(terms("met Xyvora (Brevalle Labs) and cc Kaelthorne \"Drake\" today") == ["Xyvora", "Brevalle Labs", "Kaelthorne", "Drake"])
         let heading = terms("see the Quarterly Planning Review Notes Brevalle Engineering Staff")
         #expect(heading.contains("Brevalle") && heading.contains("Quarterly") && !heading.contains { $0.contains(" ") })
     }

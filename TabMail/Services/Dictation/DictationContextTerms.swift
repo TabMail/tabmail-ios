@@ -39,6 +39,8 @@ enum DictationContextTerms {
             var sentenceStart = true
             for token in line.split(whereSeparator: \.isWhitespace) {
                 let word = trimmed(token)
+                // Punctuation before a word ends a run too ("Jordan (Brevalle Labs)").
+                if !token.hasPrefix(word) { endRun() }
                 if isTerm(word, raw: token, sentenceStart: sentenceStart) {
                     run.append(word)
                 } else {

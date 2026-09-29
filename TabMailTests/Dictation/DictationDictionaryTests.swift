@@ -56,6 +56,8 @@ struct DictationDictionaryTests {
     @Test(arguments: [
         "", "   ", String(repeating: "x", count: DictationConfig.dictionaryWordMaxChars + 1),
         "one two three four five six seven", "Xy<vora", "Xy>vora", "Xy\u{7}vora", "Xy\u{7F}vora", "Xy\u{9F}vora",
+        // U+FEFF is a space to the backend (JavaScript's `\s` and `trim`): nothing, or a seventh word.
+        "\u{FEFF}", "one two three four five six\u{FEFF}seven",
     ])
     func refuses(_ word: String) {
         let dictionary = DictationDictionary(defaults: defaults)
@@ -78,7 +80,9 @@ struct DictationDictionaryTests {
         dictionary.add("  Kaelthorne \n  Drake ")
         // A next-line character is a line break too: collapsed, not refused as a control.
         dictionary.add("Brevalle\u{85}Labs")
-        #expect(dictionary.entries.map(\.word) == ["Kaelthorne Drake", "Brevalle Labs"])
+        // So is U+FEFF, as the backend counts it.
+        dictionary.add("\u{FEFF}Xyvora\u{FEFF}Quill\u{FEFF}")
+        #expect(dictionary.entries.map(\.word) == ["Kaelthorne Drake", "Brevalle Labs", "Xyvora Quill"])
     }
 
     /// Half the words sent with a dictation: the other half is picked from its context.
