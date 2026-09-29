@@ -1915,9 +1915,9 @@ struct DynamicIslandChat: View {
 
     // MARK: - Agent chat (non-compose mode) — uses completions API matching TB's agentConverse
 
-    /// The label a running server tool shows: the backend's own (`display_label`, e.g. "Searching the
-    /// web: <query>"), as Thunderbird's chat shows it (ADR-IOS-008), then the tool's name, then a
-    /// generic one.
+    /// The label a running tool shows: the event's `display_label` (a server tool's comes from the
+    /// backend, e.g. "Searching the web: <query>"; a client tool's from `ToolRegistry.activityLabel`),
+    /// as Thunderbird's chat shows them (ADR-IOS-008), then the tool's name, then a generic one.
     static func toolStatusLabel(_ status: ToolStatusEvent) -> String {
         status.display_label ?? status.tool_name ?? "Processing"
     }
