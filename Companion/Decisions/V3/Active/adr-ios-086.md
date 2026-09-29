@@ -47,7 +47,8 @@ on the device rather than a model).
    `DictationCorrectionWatch` reads that field every `correctionPollInterval` (0.5 s) for
    `correctionWatchDuration` (30 s). An edit that has stayed one interval, or the input as it is
    sent, is compared with the field as the dictation left it by `DictationCorrections`, TabMail
-   Voice's `learnedCorrections` ported rule for rule: only an edit within the dictated text, not a
+   Voice's `learnedCorrections` ported rule for rule (its approach is OpenWhispr's `correctionLearner`,
+   MIT, https://github.com/OpenWhispr/openwhispr, credited in the source; no code copied): only an edit within the dictated text, not a
    rewrite of over `correctionMaxChangedShare` of its words, not a different word
    (`correctionMaxEditShare`), not another form of a lowercase word (only its end changed past
    `correctionMinStemShare` of its start: "report" → "reports", "send" → "sent"; a capitalised name
