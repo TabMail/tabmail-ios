@@ -34,7 +34,7 @@ final class DictationController {
     /// Recording or transcribing: the microphone button stops (or waits for) this dictation.
     var isActive: Bool { phase == .listening || phase == .transcribing }
 
-    /// The recording (WAV), its language, the words to spell as given and the cleanup's variables →
+    /// The recording (FLAC), its language, the words to spell as given and the cleanup's variables →
     /// the transcript and its cleaned-up text.
     typealias Transcribe = @Sendable (Data, String?, [String], [String: String]) async throws -> DictationTranscription
     /// The plain-text body of an email (its `messageHeader.id`), for terms; nil without one.
@@ -108,8 +108,8 @@ final class DictationController {
     /// speech-to-text model (backend ADR-024), the words to spell as given (backend ADR-025), and the
     /// cleanup's variables, for the cleanup the backend runs in the same request (backend ADR-027).
     static func backendTranscription(_ client: BackendClient) -> Transcribe {
-        { wav, language, vocabulary, cleanup in
-            try await client.transcribeDictation(wav: wav, language: language, vocabulary: vocabulary, cleanup: cleanup)
+        { flac, language, vocabulary, cleanup in
+            try await client.transcribeDictation(flac: flac, language: language, vocabulary: vocabulary, cleanup: cleanup)
         }
     }
 
@@ -313,17 +313,17 @@ final class DictationController {
             fail()
             return
         }
-        await transcribe(WAVEncoder.encode(pcm16Mono: recording.pcm, sampleRate: recording.sampleRate), language: language, generation: current)
+        await transcribe(FLACEncoder.encode(pcm16Mono: recording.pcm, sampleRate: recording.sampleRate), language: language, generation: current)
     }
 
-    private func transcribe(_ wav: Data, language: String?, generation current: Int) async {
+    private func transcribe(_ flac: Data, language: String?, generation current: Int) async {
         let words = dictionaryWords
         let terms = await contextTerms()
         guard generation == current, !Task.isCancelled else { return }
         let cleanup = DictationCleanup.variables(context: context ?? DictationContext(windowTitle: "", screenText: ""), dictionary: words)
-        BackgroundSyncLogger.logDebug("[Dictation] uploading \(wav.count) bytes, \(words.count) dictionary word(s), \(terms.count) term(s)")
+        BackgroundSyncLogger.logDebug("[Dictation] uploading \(flac.count) bytes of FLAC, \(words.count) dictionary word(s), \(terms.count) term(s)")
         do {
-            let transcription = try await transcribeAudio(wav, language, words + terms, cleanup)
+            let transcription = try await transcribeAudio(flac, language, words + terms, cleanup)
             guard generation == current, !Task.isCancelled else { return }
             let transcript = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
             BackgroundSyncLogger.logDebug("[Dictation] transcript ready (\(transcript.count) chars)")

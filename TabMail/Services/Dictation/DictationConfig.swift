@@ -32,9 +32,14 @@ enum DictationConfig {
     static let levelAttack: Float = 0.7
     /// …and this much when it falls, so the waveform jumps with the voice and settles gently.
     static let levelRelease: Float = 0.25
-    /// Upload format: 16 kHz mono 16-bit PCM WAV — what Whisper-class models consume natively,
-    /// at ~32 KB per second of speech.
+    /// Recording format: 16 kHz mono 16-bit PCM — what Whisper-class models consume natively,
+    /// at ~32 KB per second of speech. Uploaded as FLAC (`FLACEncoder`), lossless at about half that.
     static let recordingSampleRate: Double = 16_000
+    /// Samples per FLAC frame, and the finest the Rice residual coding splits a frame (2^order
+    /// partitions). As TabMail Voice's `flacBlockSize` and `flacMaxPartitionOrder`: the same
+    /// recording encodes to the same bytes on both.
+    static let flacBlockSize = 4_096
+    static let flacMaxPartitionOrder = 6
     /// Recording continues this long after the mic button is tapped to stop, so the last word
     /// isn't clipped.
     static let releaseTailDuration: Duration = .milliseconds(300)

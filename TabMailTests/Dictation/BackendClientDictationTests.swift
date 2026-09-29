@@ -9,9 +9,9 @@ import Testing
 
 /// `POST /dictation/transcribe`: the request TabMail Voice sends, from the iOS client.
 struct BackendClientDictationTests {
-    private let wav = WAVEncoder.encode(pcm16Mono: Data(repeating: 1, count: 320), sampleRate: 16_000)
+    private let flac = FLACEncoder.encode(pcm16Mono: Data(repeating: 1, count: 320), sampleRate: 16_000)
 
-    @Test func postsTheRecordingAsBase64WAVAndReturnsTheText() async throws {
+    @Test func postsTheRecordingAsBase64FLACAndReturnsTheText() async throws {
         let http = FakeHTTP.Scenario()
         let seen = Mutex<FakeHTTP.Request?>(nil)
         http.register(path: "/dictation/transcribe", method: "POST") { request in
@@ -19,7 +19,7 @@ struct BackendClientDictationTests {
             return .json(raw: #"{"text":"ask jordan about the road map"}"#)
         }
 
-        let transcription = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: nil, vocabulary: [])
+        let transcription = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: nil, vocabulary: [])
 
         // No cleanup asked for, none returned.
         #expect(transcription == DictationTranscription(text: "ask jordan about the road map", cleanedText: nil))
@@ -29,7 +29,7 @@ struct BackendClientDictationTests {
         #expect(request.header("Content-Type") == "application/json")
         let body = try #require(request.body.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: String] })
         // No language: the key is left out (the backend's default model).
-        #expect(body == ["audio": wav.base64EncodedString(), "format": "wav"])
+        #expect(body == ["audio": flac.base64EncodedString(), "format": "flac"])
     }
 
     /// The language picks the backend's speech-to-text model (backend ADR-024).
@@ -41,11 +41,11 @@ struct BackendClientDictationTests {
             return .json(raw: #"{"text":"annyeong"}"#)
         }
 
-        _ = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: "ko", vocabulary: [])
+        _ = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: "ko", vocabulary: [])
 
         let request = try #require(seen.withLock { $0 })
         let body = try #require(request.body.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: String] })
-        #expect(body == ["audio": wav.base64EncodedString(), "format": "wav", "language": "ko"])
+        #expect(body == ["audio": flac.base64EncodedString(), "format": "flac", "language": "ko"])
     }
 
     /// The words to spell as given go with the recording (ADR-IOS-086, backend ADR-025), in order;
@@ -58,7 +58,7 @@ struct BackendClientDictationTests {
             return .json(raw: #"{"text":"ask Xyvora"}"#)
         }
 
-        _ = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: nil, vocabulary: ["Xyvora", "Kaelthorne Drake"])
+        _ = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: nil, vocabulary: ["Xyvora", "Kaelthorne Drake"])
 
         let request = try #require(seen.withLock { $0 })
         let body = try #require(request.body.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: Any] })
@@ -77,7 +77,7 @@ struct BackendClientDictationTests {
         }
         let cleanup = DictationCleanup.variables(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), dictionary: ["Xyvora"])
 
-        let transcription = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: nil, vocabulary: [], cleanup: cleanup)
+        let transcription = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: nil, vocabulary: [], cleanup: cleanup)
 
         #expect(transcription == DictationTranscription(text: "ask jordan", cleanedText: "Ask Jordan."))
         let request = try #require(seen.withLock { $0 })
@@ -96,7 +96,7 @@ struct BackendClientDictationTests {
         http.register(path: "/dictation/transcribe", method: "POST", response: .json(raw: raw))
         let cleanup = DictationCleanup.variables(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), dictionary: [])
 
-        let transcription = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: nil, vocabulary: [], cleanup: cleanup)
+        let transcription = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: nil, vocabulary: [], cleanup: cleanup)
 
         #expect(transcription == DictationTranscription(text: "ask jordan", cleanedText: cleanedText))
     }
@@ -117,7 +117,7 @@ struct BackendClientDictationTests {
         http.register(path: "/dictation/transcribe", method: "POST", response: .json(raw: body, statusCode: status))
 
         await #expect(throws: expected) {
-            _ = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: nil, vocabulary: [])
+            _ = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: nil, vocabulary: [])
         }
     }
 }
@@ -126,7 +126,7 @@ struct BackendClientDictationTests {
 /// backend refuses it otherwise (`requireAuth`), so the endpoint here does the same.
 @Suite(.serialized, .processGlobalState)
 struct BackendClientDictationAuthTests {
-    private let wav = WAVEncoder.encode(pcm16Mono: Data(repeating: 1, count: 320), sampleRate: 16_000)
+    private let flac = FLACEncoder.encode(pcm16Mono: Data(repeating: 1, count: 320), sampleRate: 16_000)
     private static let accessToken = "dictation-test-access"
 
     @MainActor
@@ -167,12 +167,12 @@ struct BackendClientDictationAuthTests {
         let outcome: Result<Void, any Error>
         do {
             try await MainActor.run { try installSession() }
-            #expect(try await client.transcribeDictation(wav: wav, language: nil, vocabulary: []) .text == "ask jordan")
+            #expect(try await client.transcribeDictation(flac: flac, language: nil, vocabulary: []) .text == "ask jordan")
 
             // Signed out, no token is sent and the refusal reads as an ended session.
             _ = await MainActor.run { TabMailAuthService.completeSession(mode: .deactivate, notify: false) }
             await #expect(throws: DictationError.unauthorized) {
-                _ = try await client.transcribeDictation(wav: wav, language: nil, vocabulary: [])
+                _ = try await client.transcribeDictation(flac: flac, language: nil, vocabulary: [])
             }
             outcome = .success(())
         } catch {

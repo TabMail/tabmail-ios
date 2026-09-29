@@ -187,3 +187,28 @@ for the cleanup.
   and non-string), `DictationCleanupTests` (variables, each within the limit, cut between characters, what is pasted), and
   `DictationControllerTests` (the variables go with the upload; `""`, blank and missing
   `cleaned_text` append the transcript; the production factory sends `cleanup`).
+
+**Amendment 2026-09-29 — the recording uploads as FLAC, not WAV (TabMail Voice ADR-DESK-039).**
+Owner, 2026-09-29: dictation took two to three seconds from the end of speech to the text, and the
+raw WAV upload was one of the measured steps; the fix applies to iOS as well as Voice.
+
+- `FLACEncoder.encode(pcm16Mono:sampleRate:)` replaces `WAVEncoder` (removed): lossless FLAC
+  (RFC 9639), one frame per `DictationConfig.flacBlockSize` (4,096) samples, each frame's subframe the
+  smallest of constant, verbatim and the fixed predictors of order 0–4 with partitioned Rice
+  residuals (`flacMaxPartitionOrder` 6). It is Voice's encoder, choice for choice, so the same
+  recording encodes to the same bytes on both; the request sends `format: "flac"`, which the backend
+  already accepted. Speech encodes to about half of WAV's size.
+- iOS encodes once when the recording finishes, where Voice encodes each frame as the audio
+  arrives. On iOS the recorder trims its pre-roll until speech is heard and `append` runs on the
+  capture callback under the recorder's lock, so encoding while recording would add work there for
+  a few milliseconds' gain. Measured on a Mac (the golden signal, 7 s): 3 ms optimised, 26 ms in a
+  debug build, against about 90 ms of upload saved per 7 s. The per-sample loops use unsafe buffers,
+  `while` loops and non-copyable helpers because debug builds took 250 ms per 7 s without them.
+- The upload's size limit is unchanged: FLAC's worst case (verbatim frames) is PCM plus a few bytes
+  per frame, so `noRecordingOutlastsWhatTheModelTranscribes`' PCM bound still holds.
+- Tests: `FLACEncoderTests` round-trips speech-like audio, silence, loud noise, a full-scale square
+  wave, one sample, a block and a block and one through `FLACTestDecoder` (an independent decoder
+  checking every CRC) and through Core Audio's own FLAC decoder, and pins the SHA-256 of the stream
+  the reference `flac` decoder accepted, the hash Voice's `test/flac.test.ts` pins.
+  `DictationControllerTests` and `BackendClientDictationTests` decode the upload instead of reading
+  a WAV header.

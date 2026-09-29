@@ -254,8 +254,8 @@ struct DictationControllerTests {
             dictionary: dictionary,
             emailBody: emailBody,
             corrections: corrections,
-            transcribe: { wav, language, vocabulary, cleanup in
-                recorded.uploads.withLock { $0.append(wav) }
+            transcribe: { flac, language, vocabulary, cleanup in
+                recorded.uploads.withLock { $0.append(flac) }
                 recorded.languages.withLock { $0.append(language) }
                 recorded.vocabularies.withLock { $0.append(vocabulary) }
                 recorded.cleanups.withLock { $0.append(cleanup) }
@@ -294,10 +294,11 @@ struct DictationControllerTests {
 
         #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
         #expect(!capture.isRunning)
-        // The upload is a WAV of what was recorded.
-        let wav = try #require(recorded.uploads.withLock { $0.first })
-        #expect(String(decoding: wav.prefix(4), as: UTF8.self) == "RIFF")
-        #expect(wav.count > WAVEncoder.headerSize)
+        // The upload is a FLAC of what was recorded.
+        let flac = try #require(recorded.uploads.withLock { $0.first })
+        let decoded = try FLACTestDecoder.decode(flac)
+        #expect(decoded.sampleRate == Int(DictationConfig.recordingSampleRate))
+        #expect(decoded.totalSamples > 0)
         // One request: the recording went with what was on screen when the dictation started, for
         // the cleanup the backend runs on its transcript.
         #expect(recorded.cleanups.withLock { $0 } == [[
@@ -661,8 +662,8 @@ struct DictationControllerTests {
         #expect(ContinuousClock.now - heard < .milliseconds(2_500))
         await waitUntil { controller.phase == .idle }
 
-        let wav = try #require(recorded.uploads.withLock { $0.first })
-        let seconds = Double(wav.count - WAVEncoder.headerSize) / Double(MemoryLayout<Int16>.size) / DictationConfig.recordingSampleRate
+        let flac = try #require(recorded.uploads.withLock { $0.first })
+        let seconds = Double(try FLACTestDecoder.decode(flac).totalSamples) / DictationConfig.recordingSampleRate
         // The two seconds held before the voice, then the voice's tenth of a second.
         #expect(abs(seconds - 2.1) < 0.02)
     }
@@ -700,8 +701,8 @@ struct DictationControllerTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
-            transcribe: { wav, _, _, _ in
-                recorded.uploads.withLock { $0.append(wav) }
+            transcribe: { flac, _, _, _ in
+                recorded.uploads.withLock { $0.append(flac) }
                 return DictationTranscription(text: "a long dictation", cleanedText: "A long dictation.")
             },
             speechDetector: FakeSpeechDetector.hearing()
@@ -710,9 +711,9 @@ struct DictationControllerTests {
         await dictate(controller, capture: capture)
         await waitUntil { controller.phase == .idle }
 
-        let wav = try #require(recorded.uploads.withLock { $0.first })
-        // 120 s of 16 kHz 16-bit mono, and the header: 3,840,044 bytes.
-        #expect(wav.count == WAVEncoder.headerSize + 120 * 16_000 * MemoryLayout<Int16>.size)
+        let flac = try #require(recorded.uploads.withLock { $0.first })
+        // 120 s of 16 kHz mono.
+        #expect(try FLACTestDecoder.decode(flac).totalSamples == 120 * 16_000)
         #expect(!capture.isRunning)
         #expect(recorded.texts.withLock { $0 } == ["A long dictation."])
     }
@@ -1144,8 +1145,8 @@ struct DictationOptOutFlagTests {
             capture: capture,
             requestMicrophoneAccess: { true },
             isOnline: { true },
-            transcribe: { wav, _, _, cleanup in
-                recorded.uploads.withLock { $0.append(wav) }
+            transcribe: { flac, _, _, cleanup in
+                recorded.uploads.withLock { $0.append(flac) }
                 recorded.cleanups.withLock { $0.append(cleanup) }
                 return DictationTranscription(text: "ask jordan", cleanedText: "Ask Jordan.")
             }
@@ -1484,7 +1485,7 @@ struct DictationLanguageSettingTests {
             let body = request.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             // Like the backend, only a recording gets a transcript.
             let audio = (body?["audio"] as? String).flatMap { Data(base64Encoded: $0) } ?? Data()
-            guard audio.count > WAVEncoder.headerSize, audio.prefix(4) == Data("RIFF".utf8) else {
+            guard (try? FLACTestDecoder.decode(audio))?.totalSamples ?? 0 > 0 else {
                 return .json(raw: #"{"error":"invalid_audio"}"#, statusCode: 400)
             }
             return .json(raw: #"{"text":"\#(transcript)","cleaned_text":"Cleaned.","duration_seconds":1}"#)
@@ -1513,11 +1514,10 @@ struct DictationLanguageSettingTests {
         let body = try #require(bodies.withLock { $0.first }.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: Any] })
         #expect(body["language"] as? String == language)
         #expect(body.keys.contains("language") == (language != nil))
-        #expect(body["format"] as? String == "wav")
-        // The recording itself: a WAV carrying the tone the microphone gave.
+        #expect(body["format"] as? String == "flac")
+        // The recording itself: a FLAC carrying the audio the microphone gave.
         let audio = try #require((body["audio"] as? String).flatMap { Data(base64Encoded: $0) })
-        #expect(audio.prefix(4) == Data("RIFF".utf8))
-        #expect(audio.count > WAVEncoder.headerSize)
+        #expect(try FLACTestDecoder.decode(audio).totalSamples > 0)
         // The cleanup goes in the same request (backend ADR-027).
         #expect(body["cleanup"] as? [String: String] == DictationCleanup.variables(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), dictionary: []))
         #expect(texts.withLock { $0 } == ["Cleaned."])
