@@ -428,6 +428,23 @@ struct DictationControllerTests {
         #expect(!capture.isRunning)
     }
 
+    /// The text arrives with the dictation already over, so the pill's send-after-dictation can
+    /// send it from the callback (sending is refused while a dictation is active).
+    @Test func theTextArrivesOnceTheDictationHasEnded() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture)
+        var activeAtDelivery: [Bool] = []
+
+        controller.start(context: context, canUseAI: true) { _ in
+            activeAtDelivery.append(controller.isActive)
+        }
+        await waitUntil { capture.starts == 1 }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(activeAtDelivery == [false])
+    }
+
     @Test func anEmptyTranscriptIsNotAppended() async {
         let capture = FakeCapture()
         let controller = controller(capture: capture, transcript: { " \n" })
@@ -967,22 +984,39 @@ struct DictationOptOutFlagTests {
         #expect(DictationConfig.dimmedInputOpacity > 0 && DictationConfig.dimmedInputOpacity < 0.5)
     }
 
-    /// While dictating, send becomes a stop button that finishes the dictation (its text is
-    /// appended, not sent); while the words are transcribed, a spinner; then send again.
-    @Test func whileDictatingSendIsStopThenASpinner() throws {
+    /// While listening, send finishes the dictation, then sends its text once it lands; a
+    /// dictation that brings back nothing sends nothing, and nothing carries over to the next.
+    /// While the words are transcribed, the button is a spinner. A pending retry doesn't take
+    /// the slot while dictating.
+    @Test func sendFinishesTheDictationThenSendsItsText() throws {
         let source = try pillSource()
-        let listening = try slice(source, from: "} else if dictation.phase == .listening {", to: "} else if dictation.phase == .transcribing {")
-        #expect(listening.contains("Button {\n                    dictation.finish()\n                } label: {"))
-        #expect(listening.contains("Image(systemName: \"stop.circle.fill\")"))
-        #expect(listening.contains(".foregroundStyle(Theme.accent)"))
-        #expect(!listening.contains("sendMessage()"))
-        let transcribing = try slice(source, from: "} else if dictation.phase == .transcribing {", to: "} else if !isWorking && (pendingResumeRequest != nil")
-        #expect(transcribing.contains("ProgressView()"))
+        let send = try slice(source, from: "// Normal send button", to: ".disabled(!canTapSend)")
+        #expect(send.contains("if dictation.phase == .listening {"))
+        #expect(send.contains("sendWhenDictated = true\n                        dictation.finish()\n                    } else {\n                        sendMessage()"))
+        #expect(send.contains(".foregroundStyle(canTapSend ? Theme.accent : .secondary.opacity(0.3))"))
+        let canTapSend = try slice(source, from: "private var canTapSend: Bool {", to: "private func sendMessage()")
+        #expect(canTapSend.contains("canSend || (dictation.phase == .listening && hasTabMailSession && !isWorking && composeReadyToSend)"))
+        let composeReady = try slice(source, from: "private var composeReadyToSend: Bool {", to: "private var canTapSend: Bool")
+        #expect(composeReady.contains("!isComposeMode || (composeMutationAllowed && composeAttachmentSnapshotReady)"))
+        // While dictating, the slot is send even after a failed turn: retry doesn't take it over.
+        #expect(source.contains("} else if !isWorking && !dictation.isActive && (pendingResumeRequest != nil || lastFailedMessage != nil)"))
+        #expect(!source.contains("Image(systemName: \"stop.circle.fill\")\n                        .font(.title2)\n                        .foregroundStyle(Theme.accent)"))
+
+        let transcribing = try slice(source, from: "} else if dictation.phase == .transcribing {", to: "} else if !isWorking && !dictation.isActive && (pendingResumeRequest != nil")
+        #expect(transcribing.contains("DictationSpinner()"))
         #expect(!transcribing.contains("Button"))
-        // Send itself stays off while a dictation is on its way into the input (`canSend`).
-        let send = try slice(source, from: "// Normal send button", to: ".disabled(!canSend)")
-        #expect(send.contains("Button {\n                    sendMessage()\n                }"))
-        #expect(source.components(separatedBy: "Image(systemName: \"stop.circle.fill\")").count == 3)
+
+        let start = String(try slice(source, from: "private func startDictation()", to: "private var canSend: Bool"))
+        let onText = try slice(start, from: "{ text in", to: "scrollPosition.scrollTo(edge: .bottom)")
+        let appended = try #require(onText.range(of: "inputText = DictationController.appending(text, to: inputText)"))
+        let sent = try #require(onText.range(of: "if sendWhenDictated {\n                sendWhenDictated = false\n                if canSend { sendMessage() }"))
+        #expect(appended.upperBound <= sent.lowerBound)
+
+        let ended = try slice(source, from: ".onChange(of: dictation.isActive) {", to: ".onChange(of: isTextFieldFocused)")
+        #expect(ended.contains("if !active { sendWhenDictated = false }"))
+        let disappear = try slice(source, from: ".onDisappear {", to: "// No eager cancellation")
+        #expect(disappear.contains("sendWhenDictated = false"))
+        #expect(source.components(separatedBy: "sendWhenDictated = true").count == 2)
     }
 
     /// A recording never outlives the pill, and a message can't be sent over a dictation still

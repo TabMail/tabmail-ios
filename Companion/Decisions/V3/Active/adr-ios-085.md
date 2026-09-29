@@ -24,7 +24,10 @@ of the input when it comes back, and the contextual cleanup runs.
    off. The backend already serves the prompt to iOS clients, so it needs no change.
 3. The "screen" the cleanup reads is the chat pill, captured when the dictation starts: what the
    pill is about (the email's sender, subject and snippet, or the draft's subject and body), the
-   latest chat turns, and the input field as a `» ` line with the caret `‸` at its end.
+   latest chat turns, and the input field as a `» ` line with the caret `‸` at its end. Only
+   the last `contextMaxScreenChars` = 500 characters, ending at the caret, are sent, and the
+   cleanup gets `cleanupTimeout` = 1.5 s (owner, 2026-09-28, as TabMail Voice's a78baba: the
+   cleanup is a light pass and more context slows it; was 20,000 characters and 3 s).
 4. `DictationController.start` refuses to start without AI access (a TabMail session and an
    active subscription, the gate that shows the pill's input bar; TabMail Voice likewise refuses
    when signed out or without consent), when opted out of AI (`AIService.optOutAllAIKey`, set by
@@ -59,12 +62,17 @@ of the input when it comes back, and the contextual cleanup runs.
    The waveform is drawn in the app's accent colour (owner, 2026-09-28; Voice's blue → purple
    brand gradient looked wrong in the pill). It lies flat while the dictation waits for speech
    (decision 10).
-9. While listening, the send button becomes a stop button (`stop.circle.fill`, accent): it
-   finishes the dictation as the mic button does, and the text is appended, not sent. While the
-   words are transcribed it is a spinner; then it is send again (owner, 2026-09-28: "it
-   shouldn't be considered cancel, just showing that the dictation finishes"; a spinner gives
-   loading feedback). This replaced, the same day, a send button that finished the dictation and
-   then sent its text.
+9. While listening, the send button stays send: tapping it finishes the dictation, then sends
+   the input once the text is appended. A dictation that brings back nothing just ends; nothing
+   is sent, and the pending send never carries over to a later dictation. The mic button (and
+   a tap on the waveform) finishes without sending. While the words are transcribed the send
+   button is TabMail Voice's thinking spinner (`DictationSpinner`: a faint track with a blue →
+   purple arc circling it, Voice's numbers; owner, 2026-09-28: loading feedback, "our own
+   spinner, like the TabMail Voice spinner"); a send tapped earlier goes out when the text
+   lands. History, all 2026-09-28: first a send button that finished and sent;
+   then a stop button that only finished ("stop only"), with the spinner; after trying it on a
+   device the owner found stop-then-send clunky and returned to finish-and-send, keeping the
+   spinner.
 10. A dictation records only once speech is heard (owner, 2026-09-28: someone saying nothing,
    or background noise alone, shouldn't use up the recording time). Until then it waits
    silently, with no time limit: the mic is on, the waveform flat, and only the latest
@@ -112,7 +120,7 @@ of the input when it comes back, and the contextual cleanup runs.
   mains hum ≤ 0.03. Someone else talking nearby (a TV, a conversation) is speech to it and
   starts the recording; crowd "babble" doesn't. Unverified on a device's real microphone.
 - No live transcript while speaking: the text arrives in one piece after the tap (upload +
-  model time, plus up to `cleanupTimeout` = 3 s for the cleanup). Accepted by the owner
+  model time, plus up to `cleanupTimeout` = 1.5 s for the cleanup). Accepted by the owner
   (2026-09-27).
 - Dictation needs a TabMail sign-in and an active subscription; it counts toward usage like
   every AI request. A failure (subscription, rate limit, too long, no speech, microphone denied)
@@ -129,7 +137,7 @@ of the input when it comes back, and the contextual cleanup runs.
   `MicrophoneCapture` session, engine and permission path runs only on a device (the tests use a
   fake capture, as TabMail Voice's do; a seam for it would be production code for tests only), and
   the pill's own wiring (text appended to the input, collapse finishes, leaving cancels, send
-  becomes stop, then a spinner) is pinned by source fences (`ChatPillDictationWiringTests`) rather than hosted-view tests,
+  finishes the dictation and then sends, a spinner while transcribing) is pinned by source fences (`ChatPillDictationWiringTests`) rather than hosted-view tests,
   which would need the controller injected into the chat pill view. The same fences pin the
   Settings language menu's row tags and the language tip's rules, one-time display, retirement on
   a choice and donation after a completed dictation: TipKit's datastore is configured by the app

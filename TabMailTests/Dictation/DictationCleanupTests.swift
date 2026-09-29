@@ -59,6 +59,17 @@ struct DictationContextTests {
         #expect(context.screenText.count == DictationConfig.contextMaxScreenChars)
         #expect(context.screenText.hasSuffix("\n» hello‸"))
     }
+
+    /// Owner, 2026-09-28, as in TabMail Voice: the cleanup is a light pass, so it gets only about
+    /// a paragraph before the caret and at most 1.5 s.
+    @Test func theCleanupStaysLight() {
+        let draft = String(repeating: "Quarterly numbers are in. ", count: 200)
+        let context = DictationContext.chatPill(title: "Edit draft", header: ["Subject: Update", draft], messages: [], input: "hello")
+
+        #expect(context.screenText.count <= 500)
+        #expect(context.screenText.hasSuffix("\n» hello‸"))
+        #expect(DictationConfig.cleanupTimeout <= 1.5)
+    }
 }
 
 struct DictationCleanupTests {
