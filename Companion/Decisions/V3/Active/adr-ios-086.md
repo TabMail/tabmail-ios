@@ -19,7 +19,8 @@ on the device rather than a model).
 
 1. `DictationDictionary` keeps the user's words (`{word, learned}`) in UserDefaults on this device,
    with TabMail Voice's rules: a word is trimmed, its spaces (the backend's: Unicode's and
-   U+FEFF) collapsed, refused when empty, over
+   U+FEFF, found scalar by scalar, since a prepend mark such as U+0600 hides the space after it
+   inside one grapheme) collapsed, refused when empty, over
    `dictionaryWordMaxChars` (UTF-16, as the backend counts) or `dictionaryWordMaxWords`, or holding
    a control character or `<` `>`; a word already there in any case is not added twice but takes
    the spelling typed, the user's latest, and a learned one becomes typed. It holds at most `dictionaryMaxEntries` = 100,

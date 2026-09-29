@@ -123,4 +123,53 @@ struct DictationDictionaryTests {
         defaults.set(Data("not json".utf8), forKey: DictationDictionary.entriesKey)
         #expect(DictationDictionary(defaults: defaults).entries.isEmpty)
     }
+
+    /// The backend's count (JavaScript's `trim` and split on `\s+`), scalar by scalar: its white
+    /// space is these, and no other.
+    private static let backendSpaces: Set<Unicode.Scalar> = Set(
+        ["\u{9}", "\u{A}", "\u{B}", "\u{C}", "\u{D}", "\u{20}", "\u{A0}", "\u{1680}", "\u{2028}", "\u{2029}",
+         "\u{202F}", "\u{205F}", "\u{3000}", "\u{FEFF}"] + (0x2000...0x200A).compactMap(Unicode.Scalar.init)
+    )
+
+    private static func backendWords(_ word: String) -> [String] {
+        word.unicodeScalars.split { backendSpaces.contains($0) }.map { String($0) }
+    }
+
+    /// Whatever the client takes, typed, learned or picked, the backend takes as it was counted: as
+    /// many words, none empty; else it refuses the whole dictation.
+    @Test(arguments: [
+        "A\u{600} B\u{600} C\u{600} D\u{600} E\u{600} F\u{600} G", "\u{600} ", "Xyvora\u{6DD} Quill",
+        "\u{FEFF}", "one\u{FEFF}two three four five six", "Brevalle\u{85}Labs", "Kaelthorne\u{3000}Drake",
+    ])
+    func whatIsTakenTheBackendCountsTheSame(raw: String) {
+        let dictionary = DictationDictionary(defaults: defaults)
+        let picked = DictationContextTerms.terms(in: "met \(raw) today", excluding: [], max: DictationConfig.contextTermsMax)
+        for word in [DictationDictionary.word(raw)].compactMap({ $0 }) + picked {
+            let counted = Self.backendWords(word)
+            #expect(!counted.isEmpty && counted.count <= DictationConfig.dictionaryWordMaxWords, "\(word.unicodeScalars.map { String($0.value, radix: 16) })")
+            // As many as the client joined with spaces (scalars: a space can join the mark before it).
+            #expect(counted.count == word.unicodeScalars.split(separator: " ").count)
+        }
+        if dictionary.add(raw) == .added {
+            #expect(dictionary.entries.allSatisfy { Self.backendWords($0.word).count <= DictationConfig.dictionaryWordMaxWords })
+        }
+    }
+
+    /// Settings: a word added empties the field; one refused stays, with the reason.
+    @Test func settingsAddsOrSaysWhy() {
+        let dictionary = DictationDictionary(defaults: defaults)
+        #expect(DictationDictionaryView.submit("Xyvora", to: dictionary) == ("", nil))
+        #expect(DictationDictionaryView.submit("Xy<vora", to: dictionary) == ("Xy<vora", DictationDictionaryView.invalidMessage))
+        for index in 1..<DictationConfig.dictionaryMaxEntries { dictionary.add("Word\(index)") }
+        #expect(DictationDictionaryView.submit("Brevalle", to: dictionary) == ("Brevalle", DictationDictionaryView.fullMessage))
+        #expect(dictionary.entries.count == DictationConfig.dictionaryMaxEntries)
+    }
+
+    /// Settings: swiping rows away removes their words, and only those.
+    @Test func settingsRemovesTheRowsSwipedAway() {
+        let dictionary = DictationDictionary(defaults: defaults)
+        ["Xyvora", "Brevalle", "Quill", "Kaelthorne"].forEach { dictionary.add($0) }
+        DictationDictionaryView.remove(at: IndexSet([1, 3]), from: dictionary)
+        #expect(dictionary.entries.map(\.word) == ["Xyvora", "Quill"])
+    }
 }

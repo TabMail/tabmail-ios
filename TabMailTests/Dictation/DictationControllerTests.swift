@@ -948,7 +948,7 @@ struct DictationControllerTests {
             dictionary: { .init(words: ["Xyvora"], learnsWords: false) },
             emailBody: { id in
                 bodies.withLock { $0.append(id) }
-                return "We met the team at Brevalle Labs yesterday."
+                return "We met Xyvora and the team at Brevalle Labs yesterday."
             }
         )
         let context = DictationContext.chatPill(title: "Chat", header: ["From: Kaelthorne Drake"], messages: [], input: "", emailId: "email-1")
@@ -958,6 +958,8 @@ struct DictationControllerTests {
         #expect(bodies.withLock { $0 } == ["email-1"])
         let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
         #expect(vocabulary.first == "Xyvora")
+        // A dictionary word in the context is sent once.
+        #expect(vocabulary.count == 3)
         #expect(Set(vocabulary) == ["Xyvora", "Kaelthorne Drake", "Brevalle Labs"])
         let message = try #require(recorded.cleanups.withLock { $0.first?.messages.first })
         let vars = try JSONSerialization.jsonObject(with: JSONEncoder().encode(message)) as? [String: String]
@@ -1277,6 +1279,18 @@ struct DictationOptOutFlagTests {
         #expect(context.contains(#"[draftSubject.map { "Subject: \($0)" }, draftBody]"#))
         #expect(context.contains(#"["From: \(message.from)", "Subject: \(message.subject)", message.snippet]"#))
         #expect(context.components(separatedBy: "messages: chatMessages, input: inputText").count == 4)
+    }
+
+    /// The app's controller reads the email's body from the search index
+    /// (`readsTheEmailsBodyFromTheSearchIndex`) and learns corrections into the dictionary.
+    @Test func theAppsControllerReadsBodiesAndLearnsIntoTheDictionary() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let controller = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationController.swift"), encoding: .utf8)
+        #expect(controller.contains("emailBody: @escaping EmailBody = { await DictationController.storedEmailBody(headerId: $0) },"))
+        #expect(controller.contains("corrections: DictationCorrectionWatch? = DictationCorrectionWatch { DictationDictionary.shared.learn($0) },"))
     }
 
     /// The Settings menu writes the key the controller reads, the waveform shows no language, and

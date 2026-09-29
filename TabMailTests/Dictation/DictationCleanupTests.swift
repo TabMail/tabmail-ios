@@ -37,6 +37,22 @@ struct DictationContextTests {
         """)
     }
 
+    /// The terms are picked from all of the pill, uncut: its title, the email's header, the chat and
+    /// the input, past the cleanup's window.
+    @Test func theTermsAreFromAllOfThePillUncut() {
+        let long = String(repeating: "and so on ", count: DictationConfig.contextMaxScreenChars / 5)
+        let context = DictationContext.chatPill(
+            title: "Planning with Xyvora",
+            header: ["From: Kaelthorne Drake"],
+            messages: [message(.user, "ask Brevalle " + long)],
+            input: "cc Quill"
+        )
+
+        #expect(DictationContextTerms.terms(in: context.termsText, excluding: [], max: DictationConfig.contextTermsMax)
+            .sorted() == ["Brevalle", "Kaelthorne Drake", "Quill", "Xyvora"])
+        #expect(!context.screenText.contains("Brevalle"))
+    }
+
     @Test func anEmptyInputIsStillTheFieldWithItsCaret() {
         let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "")
         #expect(context.screenText == "» ‸")

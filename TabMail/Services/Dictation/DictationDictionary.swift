@@ -97,10 +97,12 @@ final class DictationDictionary {
     /// `raw` as a dictionary word, its spaces collapsed; nil when it is empty, too long, of too many
     /// words, or has a character the backend refuses (a control character, or `<` `>`, which the
     /// speech providers refuse and which could close the cleanup prompt's dictionary block). Spaces
-    /// are the backend's, JavaScript's `\s`: Unicode's, and U+FEFF, which Swift doesn't count; else a
-    /// word of U+FEFF alone, or one more word than it counts, is sent and fails the dictation.
+    /// are the backend's, JavaScript's `\s`, found scalar by scalar as it does: Unicode's, and
+    /// U+FEFF, which Swift doesn't count. A grapheme hides a space joined to the mark before it
+    /// (U+0600 and its kind prepend), so words are not split by character; else a word of U+FEFF
+    /// alone, or one more word than the backend counts, is sent and fails the dictation.
     nonisolated static func word(_ raw: String) -> String? {
-        let parts = raw.split { $0.isWhitespace || $0 == "\u{FEFF}" }
+        let parts = raw.unicodeScalars.split { $0.properties.isWhitespace || $0 == "\u{FEFF}" }.map { String($0) }
         let word = parts.joined(separator: " ")
         guard !word.isEmpty, word.utf16.count <= DictationConfig.dictionaryWordMaxChars,
               parts.count <= DictationConfig.dictionaryWordMaxWords,

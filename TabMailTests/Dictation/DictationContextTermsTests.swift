@@ -24,6 +24,8 @@ struct DictationContextTermsTests {
         #expect(terms("Tomorrow works. Friday works too? Maybe ask Xyvora.") == ["Xyvora"])
         #expect(terms("Tomorrow works\nFriday too") == [])
         #expect(terms("It works.\" Friday too") == [])
+        // A bullet or a dash is not a word: the sentence still starts after it.
+        #expect(terms("- Review the launch\n• Tomorrow we ship\nDone. — Monday works") == [])
     }
 
     /// A capital inside a word marks a term wherever it is: "TabMail", "OKR", "iOS".

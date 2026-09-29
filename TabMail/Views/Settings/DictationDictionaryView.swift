@@ -52,10 +52,7 @@ struct DictationDictionaryView: View {
                             }
                         }
                     }
-                    .onDelete { offsets in
-                        let words = offsets.map { dictionary.entries[$0].word }
-                        words.forEach(dictionary.remove)
-                    }
+                    .onDelete { Self.remove(at: $0, from: dictionary) }
                 }
 
                 Section {
@@ -75,14 +72,21 @@ struct DictationDictionaryView: View {
     }
 
     private func add() {
-        switch dictionary.add(newWord) {
-        case .added:
-            newWord = ""
-            refusal = nil
-        case .invalid:
-            refusal = Self.invalidMessage
-        case .full:
-            refusal = Self.fullMessage
+        (newWord, refusal) = Self.submit(newWord, to: dictionary)
+    }
+
+    /// What submitting `word` leaves in the field and under it: the field emptied once the word is
+    /// added; else the word kept, with why it wasn't.
+    static func submit(_ word: String, to dictionary: DictationDictionary) -> (draft: String, refusal: String?) {
+        switch dictionary.add(word) {
+        case .added: ("", nil)
+        case .invalid: (word, invalidMessage)
+        case .full: (word, fullMessage)
         }
+    }
+
+    /// Removes the rows at `offsets` of the list, by their words.
+    static func remove(at offsets: IndexSet, from dictionary: DictationDictionary) {
+        offsets.map { dictionary.entries[$0].word }.forEach(dictionary.remove)
     }
 }
