@@ -155,8 +155,12 @@ extension BackendClient {
     /// Same request as TabMail Voice's `TranscriptionClient`. `language` (ISO-639-1) picks the
     /// backend's speech-to-text model (backend ADR-024); nil sends none (the default model).
     /// `vocabulary`: words to spell as given (the user's dictionary and the terms of what the
-    /// dictation is about, ADR-IOS-086; backend ADR-025); none sends none.
-    func transcribeDictation(wav: Data, language: String?, vocabulary: [String]) async throws -> String {
+    /// dictation is about, ADR-IOS-086; backend ADR-025); none sends none. `cleanup`: the cleanup
+    /// prompt's variables (`DictationCleanup.variables`); the backend then cleans up the transcript in
+    /// the same request (backend ADR-027) and answers `cleaned_text` too. Nil sends none.
+    func transcribeDictation(
+        wav: Data, language: String?, vocabulary: [String], cleanup: [String: String]? = nil
+    ) async throws -> DictationTranscription {
         var request = URLRequest(url: baseURL.appending(path: DictationConfig.transcribePath))
         request.httpMethod = "POST"
         request.timeoutInterval = DictationConfig.transcriptionRequestTimeout
@@ -167,7 +171,8 @@ extension BackendClient {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
         request.httpBody = try JSONEncoder().encode(TranscriptionBody(
-            audio: wav.base64EncodedString(), format: "wav", language: language, vocabulary: vocabulary.isEmpty ? nil : vocabulary
+            audio: wav.base64EncodedString(), format: "wav", language: language, vocabulary: vocabulary.isEmpty ? nil : vocabulary,
+            cleanup: cleanup
         ))
 
         let (data, response) = try await llmSession.data(for: request)
@@ -178,7 +183,7 @@ extension BackendClient {
         guard let result = try? JSONDecoder().decode(TranscriptionResult.self, from: data) else {
             throw DictationError.invalidResponse
         }
-        return result.text
+        return DictationTranscription(text: result.text, cleanedText: result.cleaned_text)
     }
 
     private struct TranscriptionBody: Encodable {
@@ -188,10 +193,14 @@ extension BackendClient {
         let language: String?
         /// Left out when nil.
         let vocabulary: [String]?
+        /// Left out when nil.
+        let cleanup: [String: String]?
     }
 
     private struct TranscriptionResult: Decodable {
         let text: String
+        /// Only with `cleanup`, from a backend that runs it (ADR-027); `""` when the cleanup failed.
+        let cleaned_text: String?
     }
 
     private struct TranscriptionErrorBody: Decodable {

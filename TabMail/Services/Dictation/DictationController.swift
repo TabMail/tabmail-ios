@@ -7,9 +7,9 @@ import Foundation
 import GRDB
 import Observation
 
-/// Drives one chat-pill dictation at a time: wait for speech → record → transcribe on the backend
-/// → clean up the transcript with what was on screen → hand the text back to be appended to the
-/// input field. The same flow as TabMail Voice's `DictationController`, started and finished by
+/// Drives one chat-pill dictation at a time: wait for speech → record → transcribe on the backend,
+/// which cleans up the transcript with what was on screen in the same request → hand the text back
+/// to be appended to the input field. The same flow as TabMail Voice's `DictationController`, started and finished by
 /// the mic button instead of a held key, and recording only once speech is heard (a held key
 /// already says someone is speaking; an auto-started mic doesn't).
 @MainActor
@@ -34,8 +34,9 @@ final class DictationController {
     /// Recording or transcribing: the microphone button stops (or waits for) this dictation.
     var isActive: Bool { phase == .listening || phase == .transcribing }
 
-    /// The recording (WAV), its language and the words to spell as given → the transcript.
-    typealias Transcribe = @Sendable (Data, String?, [String]) async throws -> String
+    /// The recording (WAV), its language, the words to spell as given and the cleanup's variables →
+    /// the transcript and its cleaned-up text.
+    typealias Transcribe = @Sendable (Data, String?, [String], [String: String]) async throws -> DictationTranscription
     /// The plain-text body of an email (its `messageHeader.id`), for terms; nil without one.
     typealias EmailBody = @Sendable (String) async -> String?
     /// A speech detector for one dictation, given what to call when it hears speech and when it
@@ -55,8 +56,6 @@ final class DictationController {
     @ObservationIgnored private let corrections: DictationCorrectionWatch?
     @ObservationIgnored private let transcribeAudio: Transcribe
     @ObservationIgnored private let makeSpeechDetector: MakeSpeechDetector
-    @ObservationIgnored private let complete: DictationCleanup.Complete
-    @ObservationIgnored private let cleanupTimeout: TimeInterval
     @ObservationIgnored private let maxRecordingDuration: Duration
 
     // Per-dictation state. `generation` invalidates callbacks from a superseded dictation.
@@ -90,8 +89,6 @@ final class DictationController {
         corrections: DictationCorrectionWatch? = DictationCorrectionWatch { DictationDictionary.shared.learn($0) },
         transcribe: Transcribe? = nil,
         speechDetector: @escaping MakeSpeechDetector = { SoundClassifierSpeechDetector(onSpeech: $0, onFailure: $1) },
-        complete: DictationCleanup.Complete? = nil,
-        cleanupTimeout: TimeInterval = DictationConfig.cleanupTimeout,
         maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration
     ) {
         self.capture = capture
@@ -104,16 +101,16 @@ final class DictationController {
         self.corrections = corrections
         self.transcribeAudio = transcribe ?? Self.backendTranscription(AccountManager.shared.backendClient)
         self.makeSpeechDetector = speechDetector
-        // Direct: a user waiting on their dictation doesn't queue behind background AI work.
-        self.complete = complete ?? { try await AccountManager.shared.backendClient.sendCompletionsDirect($0) }
-        self.cleanupTimeout = cleanupTimeout
         self.maxRecordingDuration = maxRecordingDuration
     }
 
     /// The transcription on the TabMail backend: the recording with its language, which picks the
-    /// speech-to-text model (backend ADR-024), and the words to spell as given (backend ADR-025).
+    /// speech-to-text model (backend ADR-024), the words to spell as given (backend ADR-025), and the
+    /// cleanup's variables, for the cleanup the backend runs in the same request (backend ADR-027).
     static func backendTranscription(_ client: BackendClient) -> Transcribe {
-        { wav, language, vocabulary in try await client.transcribeDictation(wav: wav, language: language, vocabulary: vocabulary) }
+        { wav, language, vocabulary, cleanup in
+            try await client.transcribeDictation(wav: wav, language: language, vocabulary: vocabulary, cleanup: cleanup)
+        }
     }
 
     /// Starts listening. `context` is what the user sees now (the cleanup reads it); `onText`
@@ -323,20 +320,18 @@ final class DictationController {
         let words = dictionaryWords
         let terms = await contextTerms()
         guard generation == current, !Task.isCancelled else { return }
+        let cleanup = DictationCleanup.variables(context: context ?? DictationContext(windowTitle: "", screenText: ""), dictionary: words)
         BackgroundSyncLogger.logDebug("[Dictation] uploading \(wav.count) bytes, \(words.count) dictionary word(s), \(terms.count) term(s)")
         do {
-            let transcript = try await transcribeAudio(wav, language, words + terms).trimmingCharacters(in: .whitespacesAndNewlines)
+            let transcription = try await transcribeAudio(wav, language, words + terms, cleanup)
             guard generation == current, !Task.isCancelled else { return }
+            let transcript = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
             BackgroundSyncLogger.logDebug("[Dictation] transcript ready (\(transcript.count) chars)")
             guard !transcript.isEmpty else {
                 fail()
                 return
             }
-            let text = await DictationCleanup.cleanUp(
-                transcript, context: context ?? DictationContext(windowTitle: "", screenText: ""),
-                dictionary: words, complete: complete, timeout: cleanupTimeout
-            )
-            guard generation == current, !Task.isCancelled else { return }
+            let text = DictationCleanup.pasted(transcript: transcript, cleanedText: transcription.cleanedText)
             let deliver = onText
             let input = learnsWords ? readInput : nil
             teardown()
