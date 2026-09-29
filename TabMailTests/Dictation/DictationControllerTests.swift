@@ -966,6 +966,32 @@ struct DictationControllerTests {
         #expect(vars?["dictionary"] == "Xyvora")
     }
 
+    /// A full dictionary and an email of more terms than the context's half: the dictionary whole,
+    /// then the context's first `contextTermsMax` terms, never more words than the backend takes.
+    @Test func sendsAtMostTheContextsHalfOfTerms() async throws {
+        let capture = FakeCapture()
+        func name(_ prefix: String, _ i: Int) -> String {
+            let letters = Array("abcdefghijklmnopqrstuvwxyz")
+            return prefix + String(letters[i / letters.count]) + String(letters[i % letters.count])
+        }
+        let words = (0..<DictationConfig.dictionaryMaxEntries).map { name("Qor", $0) }
+        let terms = (0..<DictationConfig.contextTermsMax + 50).map { name("Xyv", $0) }
+        let controller = controller(
+            capture: capture,
+            dictionary: { .init(words: words, learnsWords: false) },
+            emailBody: { _ in "ask " + terms.joined(separator: " and ") + " today" }
+        )
+        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
+
+        await dictate(controller, capture: capture, context: context)
+
+        let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
+        #expect(vocabulary.count == DictationConfig.dictionaryMaxEntries + DictationConfig.contextTermsMax)
+        guard vocabulary.count == DictationConfig.dictionaryMaxEntries + DictationConfig.contextTermsMax else { return }
+        #expect(Array(vocabulary.prefix(DictationConfig.dictionaryMaxEntries)) == words)
+        #expect(Array(vocabulary.suffix(DictationConfig.contextTermsMax)) == Array(terms.prefix(DictationConfig.contextTermsMax)))
+    }
+
     /// With no dictionary and nothing to pick, no words are sent.
     @Test func withoutWordsNoneAreSent() async throws {
         let capture = FakeCapture()
