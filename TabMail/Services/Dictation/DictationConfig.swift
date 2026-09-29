@@ -70,8 +70,9 @@ enum DictationConfig {
     /// The backend prompt that fixes recognition errors in a transcript using what is on screen.
     static let cleanupPrompt = "system_prompt_dictate_cleanup"
     static let transcriptionRequestTimeout: TimeInterval = 45
-    /// Longest the cleanup may take (seconds); past it the transcript is used as heard.
-    static let cleanupTimeout: TimeInterval = 3
+    /// Longest the cleanup may take (seconds); past it the transcript is used as heard. Owner,
+    /// 2026-09-28: 1.5 s at most (was 3 s), as in TabMail Voice: the cleanup is a light pass.
+    static let cleanupTimeout: TimeInterval = 1.5
     /// The languages the backend transcribes (backend ADR-024, `src/config/transcription.json`):
     /// its default model's 18, then the 12 it routes to a second model. Settings offers these;
     /// keep them in step with the backend.
@@ -86,9 +87,11 @@ enum DictationConfig {
     static let contextAppName = "TabMail"
     /// Most recent chat turns included in the screen text.
     static let contextMaxChatMessages = 20
-    /// Longest screen text sent (characters, the most recent kept). Bounds the cleanup model's
-    /// input only; nothing is stored.
-    static let contextMaxScreenChars = 20_000
+    /// Longest screen text sent (characters, the most recent kept, ending at the caret: about a
+    /// paragraph). Owner, 2026-09-28: as in TabMail Voice, the cleanup gets only the text around
+    /// the caret, since more context slows it (was 20,000). Bounds the cleanup model's input
+    /// only; nothing is stored.
+    static let contextMaxScreenChars = 500
 
     // MARK: Waveform
 
@@ -117,4 +120,17 @@ enum DictationConfig {
     static let waveformRippleSpeed: Double = 9
     static let waveformRipplePhase: Double = 0.7
     static let waveformRippleDepth: Double = 0.25
+
+    // MARK: Transcribing spinner
+
+    /// While the words are transcribed, the send button is TabMail Voice's thinking spinner
+    /// (`apps/desktop/src/core/config.ts`): a faint track with a blue → purple arc circling it.
+    static let spinnerDiameter: CGFloat = 24
+    static let thinkingRimWidth: CGFloat = 2.5
+    static let thinkingArcFraction: CGFloat = 0.7
+    static let thinkingRevolutionsPerSecond: Double = 1.2
+    static let thinkingTrackOpacity: Double = 0.2
+    /// The arc runs from blue to this point on the blue → purple gradient: the full purple end
+    /// reads reddish on the spinning arc.
+    static let thinkingArcEndColour: Double = 0.6
 }

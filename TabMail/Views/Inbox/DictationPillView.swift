@@ -28,6 +28,44 @@ struct DictationPillView: View {
     }
 }
 
+/// TabMail Voice's thinking spinner (`SpinningRim` in its overlay): a faint track with a
+/// gradient arc circling it, in the icon's blue → purple.
+struct DictationSpinner: View {
+    var body: some View {
+        TimelineView(.animation) { timeline in
+            let turns = timeline.date.timeIntervalSinceReferenceDate * DictationConfig.thinkingRevolutionsPerSecond
+            ZStack {
+                Circle()
+                    .stroke(Self.colour(at: 0).opacity(DictationConfig.thinkingTrackOpacity), lineWidth: DictationConfig.thinkingRimWidth)
+                Circle()
+                    .trim(from: 0, to: DictationConfig.thinkingArcFraction)
+                    .stroke(
+                        AngularGradient(
+                            colors: [Self.colour(at: 0).opacity(0), Self.colour(at: 0), Self.colour(at: DictationConfig.thinkingArcEndColour)],
+                            center: .center,
+                            startAngle: .zero, endAngle: .degrees(360 * DictationConfig.thinkingArcFraction)
+                        ),
+                        style: StrokeStyle(lineWidth: DictationConfig.thinkingRimWidth, lineCap: .round)
+                    )
+                    .rotationEffect(.degrees(360 * turns.truncatingRemainder(dividingBy: 1)))
+            }
+            .padding(DictationConfig.thinkingRimWidth / 2)
+        }
+        .frame(width: DictationConfig.spinnerDiameter, height: DictationConfig.spinnerDiameter)
+    }
+
+    /// A point on the TabMail icon's blue → purple gradient (0 = blue, 1 = purple).
+    private static func colour(at fraction: Double) -> Color {
+        let blue = (red: 0.0, green: 0x91 / 255.0, blue: 1.0)
+        let purple = (red: 0x7B / 255.0, green: 0.0, blue: 1.0)
+        return Color(
+            red: blue.red + (purple.red - blue.red) * fraction,
+            green: blue.green + (purple.green - blue.green) * fraction,
+            blue: blue.blue + (purple.blue - blue.blue) * fraction
+        )
+    }
+}
+
 /// Voice waveform: bars follow the incoming sound level with a travelling ripple, or lie flat.
 private struct Waveform: View {
     let level: Float
