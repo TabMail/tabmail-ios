@@ -32,6 +32,8 @@ struct ToolStatusLabelTests {
     func backendLabelWins() {
         #expect(shown(label: "Searching the web: launch plan", name: "search_web") == "Searching the web: launch plan")
         #expect(shown(label: "Checking day of week…", name: "date_to_day") == "Checking day of week…")
+        // Without the name, as backends that predate naming tools in every build send it.
+        #expect(shown(label: "Searching the web: launch plan", name: nil) == "Searching the web: launch plan")
     }
 
     @Test("without a label, the tool's name, and without either, a generic label")
