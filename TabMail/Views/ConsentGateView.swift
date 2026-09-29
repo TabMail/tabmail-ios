@@ -22,7 +22,7 @@ struct ConsentGateView: View {
     @State private var errorMessage: String?
 
     /// Legal document version — matches web's `public-config.js` LEGAL_VERSION_ISO
-    private let legalVersion = "2026-01-19"
+    private let legalVersion = "2026-09-29"
 
     private var canContinue: Bool {
         confirmedAge && agreedToTerms
