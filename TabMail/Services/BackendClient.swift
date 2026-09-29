@@ -154,7 +154,9 @@ extension BackendClient {
     /// (OpenRouter speech-to-text behind it; the backend stores neither audio nor text).
     /// Same request as TabMail Voice's `TranscriptionClient`. `language` (ISO-639-1) picks the
     /// backend's speech-to-text model (backend ADR-024); nil sends none (the default model).
-    func transcribeDictation(wav: Data, language: String?) async throws -> String {
+    /// `vocabulary`: words to spell as given (the user's dictionary and the terms of what the
+    /// dictation is about, ADR-IOS-086; backend ADR-025); none sends none.
+    func transcribeDictation(wav: Data, language: String?, vocabulary: [String]) async throws -> String {
         var request = URLRequest(url: baseURL.appending(path: DictationConfig.transcribePath))
         request.httpMethod = "POST"
         request.timeoutInterval = DictationConfig.transcriptionRequestTimeout
@@ -164,7 +166,9 @@ extension BackendClient {
         if let token = await currentAuthToken() {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
-        request.httpBody = try JSONEncoder().encode(TranscriptionBody(audio: wav.base64EncodedString(), format: "wav", language: language))
+        request.httpBody = try JSONEncoder().encode(TranscriptionBody(
+            audio: wav.base64EncodedString(), format: "wav", language: language, vocabulary: vocabulary.isEmpty ? nil : vocabulary
+        ))
 
         let (data, response) = try await llmSession.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw DictationError.invalidResponse }
@@ -182,6 +186,8 @@ extension BackendClient {
         let format: String
         /// Left out when nil.
         let language: String?
+        /// Left out when nil.
+        let vocabulary: [String]?
     }
 
     private struct TranscriptionResult: Decodable {

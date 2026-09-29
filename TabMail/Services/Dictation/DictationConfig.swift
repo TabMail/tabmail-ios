@@ -81,6 +81,50 @@ enum DictationConfig {
         "cs", "el", "fa", "hu", "id", "ko", "mk", "ms", "pl", "ro", "ru", "th",
     ]
 
+    // MARK: Dictionary (ADR-IOS-086)
+
+    /// The words sent with each dictation: the backend takes at most 200 (backend ADR-025), half
+    /// from the user's dictionary, which holds at most this many so all of them are always sent…
+    static let dictionaryMaxEntries = 100
+    /// …and half picked from what the dictation is about (`DictationContextTerms`).
+    static let contextTermsMax = 100
+    /// Longest a transcription waits for the context terms (seconds), which are picked while the
+    /// user speaks; past it the transcription goes without them.
+    static let contextTermsWait: TimeInterval = 0.2
+    /// Each word is at most this many characters (UTF-16 code units, as the backend counts them)
+    /// and this many space-separated words. As TabMail Voice's.
+    static let dictionaryWordMaxChars = 50
+    static let dictionaryWordMaxWords = 6
+    /// After a dictation lands in the input field, the field is read this often, for this long, to
+    /// learn the user's corrections to it. A correction counts once the field has not changed for
+    /// one interval, or when the input is sent.
+    static let correctionPollInterval: Duration = .milliseconds(500)
+    static let correctionWatchDuration: Duration = .seconds(30)
+    /// A correction is learned only if it changed at most this share of the dictation's words (more
+    /// is a rewrite), and it respells a word rather than replacing it: the edit distance between the
+    /// heard and the corrected spelling is at most this share of the longer ("Zivora" → "Xyvora" is
+    /// 2 of 6).
+    static let correctionMaxChangedShare = 0.5
+    static let correctionMaxEditShare = 0.65
+    /// A lowercase correction that keeps at least this share of the shorter spelling's start,
+    /// changing only its end, is another form of the same word ("report" → "reports", "send" →
+    /// "sent"), not learned.
+    static let correctionMinStemShare = 0.5
+    /// A corrected word shorter than this (characters) is not learned.
+    static let correctionMinWordLength = 3
+    /// Everyday English words, never learned: replacing one with another ("then" → "than") is a
+    /// change of wording, not a name or term to spell. TabMail Voice's list.
+    static let correctionCommonWords: Set<String> = Set("""
+        about after again also always another any are around back because been before being best better
+        between both but came can come could day did does done down each even every few find first for from
+        get give going good got great had has have her here him his how into its just keep know last left
+        like little long look made make many may might more most much must never new next not now off okay
+        old once one only other our out over own put said same saw say see she should since some still
+        such take than that the their them then there these they thing think this those though thought
+        through too two under until upon use very want was way well went were what when where which while
+        who why will with work would yes yet you your
+        """.split(whereSeparator: \.isWhitespace).map(String.init))
+
     // MARK: Screen context for the cleanup
 
     /// The app name the cleanup prompt is told the user is dictating into.

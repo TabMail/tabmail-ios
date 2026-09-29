@@ -4,6 +4,7 @@
 
 @preconcurrency import AVFoundation
 import Foundation
+import GRDB
 import Observation
 
 /// Drives one chat-pill dictation at a time: wait for speech → record → transcribe on the backend
@@ -33,8 +34,10 @@ final class DictationController {
     /// Recording or transcribing: the microphone button stops (or waits for) this dictation.
     var isActive: Bool { phase == .listening || phase == .transcribing }
 
-    /// The recording (WAV) and its language → the transcript.
-    typealias Transcribe = @Sendable (Data, String?) async throws -> String
+    /// The recording (WAV), its language and the words to spell as given → the transcript.
+    typealias Transcribe = @Sendable (Data, String?, [String]) async throws -> String
+    /// The plain-text body of an email (its `messageHeader.id`), for terms; nil without one.
+    typealias EmailBody = @Sendable (String) async -> String?
     /// A speech detector for one dictation, given what to call when it hears speech and when it
     /// can't run.
     typealias MakeSpeechDetector = @MainActor (
@@ -47,6 +50,9 @@ final class DictationController {
     @ObservationIgnored private let isOnline: @MainActor () -> Bool
     @ObservationIgnored private let isOptedOutOfAI: @MainActor () -> Bool
     @ObservationIgnored private let dictationLanguage: @MainActor () -> String?
+    @ObservationIgnored private let dictionary: @MainActor () -> DictationDictionary.Snapshot
+    @ObservationIgnored private let emailBody: EmailBody
+    @ObservationIgnored private let corrections: DictationCorrectionWatch?
     @ObservationIgnored private let transcribeAudio: Transcribe
     @ObservationIgnored private let makeSpeechDetector: MakeSpeechDetector
     @ObservationIgnored private let complete: DictationCleanup.Complete
@@ -60,6 +66,14 @@ final class DictationController {
     @ObservationIgnored private var speechDetector: (any SpeechDetecting)?
     @ObservationIgnored private var context: DictationContext?
     @ObservationIgnored private var onText: (@MainActor (String) -> Void)?
+    /// The dictionary at the start (ADR-IOS-086): its words go with the dictation, and it says
+    /// whether the user's corrections of the text are learned.
+    @ObservationIgnored private var dictionaryWords: [String] = []
+    @ObservationIgnored private var learnsWords = false
+    /// The field the text is appended to, read to learn the user's corrections.
+    @ObservationIgnored private var readInput: (@MainActor () -> String)?
+    /// Picks the terms of what the dictation is about while the user speaks.
+    @ObservationIgnored private var termsTask: Task<[String], Never>?
     @ObservationIgnored private var startTask: Task<Void, Never>?
     @ObservationIgnored private var maxDurationTask: Task<Void, Never>?
     @ObservationIgnored private var transcriptionTask: Task<Void, Never>?
@@ -71,6 +85,9 @@ final class DictationController {
         // Settings' "Opt Out of AI" (also set by declining AI consent), as every AI call reads it.
         isOptedOutOfAI: @escaping @MainActor () -> Bool = { AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey) },
         dictationLanguage: @escaping @MainActor () -> String? = { DictationLanguage.current() },
+        dictionary: @escaping @MainActor () -> DictationDictionary.Snapshot = { DictationDictionary.shared.snapshot },
+        emailBody: @escaping EmailBody = { await DictationController.storedEmailBody(headerId: $0) },
+        corrections: DictationCorrectionWatch? = DictationCorrectionWatch { DictationDictionary.shared.learn($0) },
         transcribe: Transcribe? = nil,
         speechDetector: @escaping MakeSpeechDetector = { SoundClassifierSpeechDetector(onSpeech: $0, onFailure: $1) },
         complete: DictationCleanup.Complete? = nil,
@@ -82,6 +99,9 @@ final class DictationController {
         self.isOnline = isOnline
         self.isOptedOutOfAI = isOptedOutOfAI
         self.dictationLanguage = dictationLanguage
+        self.dictionary = dictionary
+        self.emailBody = emailBody
+        self.corrections = corrections
         self.transcribeAudio = transcribe ?? Self.backendTranscription(AccountManager.shared.backendClient)
         self.makeSpeechDetector = speechDetector
         // Direct: a user waiting on their dictation doesn't queue behind background AI work.
@@ -91,16 +111,20 @@ final class DictationController {
     }
 
     /// The transcription on the TabMail backend: the recording with its language, which picks the
-    /// speech-to-text model (backend ADR-024).
+    /// speech-to-text model (backend ADR-024), and the words to spell as given (backend ADR-025).
     static func backendTranscription(_ client: BackendClient) -> Transcribe {
-        { wav, language in try await client.transcribeDictation(wav: wav, language: language) }
+        { wav, language, vocabulary in try await client.transcribeDictation(wav: wav, language: language, vocabulary: vocabulary) }
     }
 
     /// Starts listening. `context` is what the user sees now (the cleanup reads it); `onText`
     /// receives the cleaned-up dictation. Needs AI access (`canUseAI`: a TabMail session and an
     /// active subscription, as the pill's input bar requires), AI not opted out, and a
-    /// connection: the audio and the screen text go to the AI backend.
-    func start(context: DictationContext, canUseAI: Bool, onText: @escaping @MainActor (String) -> Void) {
+    /// connection: the audio and the screen text go to the AI backend. `input` reads the field the
+    /// text is appended to, to learn the user's corrections of it (ADR-IOS-086).
+    func start(
+        context: DictationContext, canUseAI: Bool, input: (@MainActor () -> String)? = nil,
+        onText: @escaping @MainActor (String) -> Void
+    ) {
         switch phase {
         case .idle: break
         case .listening, .transcribing: return
@@ -118,10 +142,17 @@ final class DictationController {
             return
         }
 
+        // The next dictation's text is not the last one's correction.
+        corrections?.stop()
         generation += 1
         let current = generation
         self.context = context
         self.onText = onText
+        let dictionary = dictionary()
+        dictionaryWords = dictionary.words
+        learnsWords = dictionary.learnsWords
+        readInput = input
+        termsTask = Self.pickTerms(context: context, excluding: dictionary.words, emailBody: emailBody)
         envelope = LevelEnvelope()
         level = 0
         hasHeardSpeech = false
@@ -139,6 +170,38 @@ final class DictationController {
             self.beginRecording(generation: current)
         }
         BackgroundSyncLogger.logDebug("[Dictation] listening (generation \(current), language \(language ?? "none"))")
+    }
+
+    /// The search index's key for the email `headerId`: the one the content stores write its body
+    /// under (`MessageContentStore.capture`), which follows the content-key migration; never built
+    /// from the header's id. Nil for an email or account no longer there.
+    nonisolated static func contentKey(headerId: String, db: Database) throws -> ContentKey? {
+        guard let header = try MessageHeader.fetchOne(db, key: headerId) else { return nil }
+        return try MessageContentStore.capture(header, db: db)?.contentKey
+    }
+
+    /// The body of the email `headerId` as the search index holds it; nil when it isn't there (not
+    /// indexed yet, or gone).
+    nonisolated static func storedEmailBody(headerId: String) async -> String? {
+        let key = try? await AppDatabase.rawPool.read { db in try contentKey(headerId: headerId, db: db) }
+        guard let key = key ?? nil else { return nil }
+        return try? await SearchIndex.shared.bodyText(contentKey: key)
+    }
+
+    /// The terms of what the dictation is about (`DictationContextTerms`): from the context, and
+    /// the email's body when there is one, read on this device. Only the terms are sent.
+    private static func pickTerms(context: DictationContext, excluding: [String], emailBody: @escaping EmailBody) -> Task<[String], Never> {
+        Task.detached(priority: .userInitiated) {
+            let body = if let emailId = context.emailId { await emailBody(emailId) } else { String?.none }
+            let text = [context.termsText, body].compactMap { $0 }.joined(separator: "\n")
+            return DictationContextTerms.terms(in: text, excluding: excluding, max: DictationConfig.contextTermsMax)
+        }
+    }
+
+    /// The terms, if they are picked within `contextTermsWait`; else none.
+    private func contextTerms() async -> [String] {
+        guard let termsTask else { return [] }
+        return (try? await withTimeout(seconds: DictationConfig.contextTermsWait) { await termsTask.value }) ?? []
     }
 
     private func beginRecording(generation current: Int) {
@@ -257,9 +320,12 @@ final class DictationController {
     }
 
     private func transcribe(_ wav: Data, language: String?, generation current: Int) async {
-        BackgroundSyncLogger.logDebug("[Dictation] uploading \(wav.count) bytes")
+        let words = dictionaryWords
+        let terms = await contextTerms()
+        guard generation == current, !Task.isCancelled else { return }
+        BackgroundSyncLogger.logDebug("[Dictation] uploading \(wav.count) bytes, \(words.count) dictionary word(s), \(terms.count) term(s)")
         do {
-            let transcript = try await transcribeAudio(wav, language).trimmingCharacters(in: .whitespacesAndNewlines)
+            let transcript = try await transcribeAudio(wav, language, words + terms).trimmingCharacters(in: .whitespacesAndNewlines)
             guard generation == current, !Task.isCancelled else { return }
             BackgroundSyncLogger.logDebug("[Dictation] transcript ready (\(transcript.count) chars)")
             guard !transcript.isEmpty else {
@@ -268,13 +334,15 @@ final class DictationController {
             }
             let text = await DictationCleanup.cleanUp(
                 transcript, context: context ?? DictationContext(windowTitle: "", screenText: ""),
-                complete: complete, timeout: cleanupTimeout
+                dictionary: words, complete: complete, timeout: cleanupTimeout
             )
             guard generation == current, !Task.isCancelled else { return }
             let deliver = onText
+            let input = learnsWords ? readInput : nil
             teardown()
             phase = .idle
             deliver?(text)
+            if let input { corrections?.watch(pasted: text, field: input) }
         } catch {
             guard generation == current, !Task.isCancelled else { return }
             BackgroundSyncLogger.logDebug("[Dictation] transcription failed: \(error)")
@@ -312,6 +380,9 @@ final class DictationController {
         speechDetector = nil
         context = nil
         onText = nil
+        readInput = nil
+        termsTask?.cancel()
+        termsTask = nil
         hasHeardSpeech = false
         level = 0
     }
@@ -320,6 +391,16 @@ final class DictationController {
     private func fail() {
         teardown()
         phase = .idle
+    }
+
+    /// The input is being sent: its last correction is compared, and the watch ends.
+    func inputSent(_ input: String) {
+        corrections?.finish(field: input)
+    }
+
+    /// The pill is going away: nothing more is learned from its field.
+    func stopLearning() {
+        corrections?.stop()
     }
 
     /// The input field once a dictation is appended to its end, a space apart.

@@ -4,6 +4,7 @@
 
 @preconcurrency import AVFoundation
 import Foundation
+import GRDB
 import Synchronization
 import SwiftUI
 import Testing
@@ -100,6 +101,8 @@ private final class Recorded: Sendable {
     let uploads = Mutex<[Data]>([])
     /// The `language` sent with each upload (nil: none).
     let languages = Mutex<[String?]>([])
+    /// The words sent to spell as given with each upload (ADR-IOS-086).
+    let vocabularies = Mutex<[[String]]>([])
     let cleanups = Mutex<[CompletionsRequest]>([])
     let texts = Mutex<[String]>([])
 }
@@ -208,6 +211,18 @@ private final class LateFailCapture: AudioCapturing, @unchecked Sendable {
     }
 }
 
+/// The chat pill's input field, as the tests edit it.
+@MainActor
+private final class InputField {
+    var text = ""
+}
+
+/// The words a correction watch learned, one list per learning.
+@MainActor
+private final class LearnedWords {
+    var words: [[String]] = []
+}
+
 @MainActor
 struct DictationControllerTests {
     private let context = DictationContext(windowTitle: "Chat", screenText: "Me: hi\n» ‸")
@@ -224,7 +239,10 @@ struct DictationControllerTests {
             CompletionsResponse(assistant: "Ask Jordan about the roadmap.", token_usage: nil, error: nil)
         },
         maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration,
-        speechDetector: @escaping DictationController.MakeSpeechDetector = FakeSpeechDetector.hearing()
+        speechDetector: @escaping DictationController.MakeSpeechDetector = FakeSpeechDetector.hearing(),
+        dictionary: @escaping @MainActor () -> DictationDictionary.Snapshot = { .init(words: [], learnsWords: false) },
+        emailBody: @escaping DictationController.EmailBody = { _ in nil },
+        corrections: DictationCorrectionWatch? = nil
     ) -> DictationController {
         let recorded = recorded
         return DictationController(
@@ -233,9 +251,13 @@ struct DictationControllerTests {
             isOnline: { online },
             isOptedOutOfAI: optedOut,
             dictationLanguage: language,
-            transcribe: { wav, language in
+            dictionary: dictionary,
+            emailBody: emailBody,
+            corrections: corrections,
+            transcribe: { wav, language, vocabulary in
                 recorded.uploads.withLock { $0.append(wav) }
                 recorded.languages.withLock { $0.append(language) }
+                recorded.vocabularies.withLock { $0.append(vocabulary) }
                 return try await transcript()
             },
             speechDetector: speechDetector,
@@ -675,7 +697,7 @@ struct DictationControllerTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
-            transcribe: { wav, _ in
+            transcribe: { wav, _, _ in
                 recorded.uploads.withLock { $0.append(wav) }
                 return "a long dictation"
             },
@@ -875,6 +897,230 @@ struct DictationControllerTests {
         #expect(DictationController.appending("see you then", to: "Thanks, ") == "Thanks, see you then")
         #expect(DictationController.appending("second line", to: "first line\n") == "first line second line")
     }
+
+    // MARK: - The dictionary (ADR-IOS-086)
+
+    /// Starts with `context`, waits for the microphone, and taps stop; the text lands in `field`.
+    private func dictate(_ controller: DictationController, capture: FakeCapture, context: DictationContext, field: InputField? = nil) async {
+        let recorded = recorded
+        let starts = capture.starts
+        var input: (@MainActor () -> String)?
+        if let field { input = { field.text } }
+        controller.start(context: context, canUseAI: true, input: input) { text in
+            recorded.texts.withLock { $0.append(text) }
+            if let field { field.text = DictationController.appending(text, to: field.text) }
+        }
+        await waitUntil { capture.starts == starts + 1 }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+    }
+
+    /// The email's body is read from the search index under the key the content stores write it
+    /// under (`MessageContentStore.capture`), for any provider, so the read follows the content-key
+    /// migration; none for an email no longer there.
+    @Test func theEmailsBodyIsReadUnderItsContentKey() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "imap1", provider: .imap)
+        try TestDatabase.insertAccount(db, id: "gmail1", email: "other@example.com", provider: .gmail)
+        try TestDatabase.insertFolder(db, accountId: "imap1")
+        try TestDatabase.insertFolder(db, accountId: "gmail1")
+        let imap = try TestDatabase.insertMessageHeader(db, messageId: "42", folderId: "imap1:INBOX", accountId: "imap1", rfc822MessageId: "<note-1@example.com>")
+        let gmail = try TestDatabase.insertMessageHeader(db, messageId: "18c2f", folderId: "gmail1:INBOX", accountId: "gmail1")
+
+        try db.read { db in
+            for header in [imap, gmail] {
+                let key = try DictationController.contentKey(headerId: header.id, db: db)
+                #expect(key != nil)
+                #expect(try key == MessageContentStore.capture(header, db: db)?.contentKey)
+            }
+            #expect(try DictationController.contentKey(headerId: "imap1:INBOX:999", db: db) == nil)
+        }
+    }
+
+    /// The recording goes with the user's dictionary and the terms of what the dictation is about,
+    /// the email's body among it; the cleanup gets the dictionary alone (it reads the screen
+    /// itself).
+    @Test func sendsTheDictionaryAndTheContextsTerms() async throws {
+        let capture = FakeCapture()
+        let bodies = Mutex<[String]>([])
+        let controller = controller(
+            capture: capture,
+            dictionary: { .init(words: ["Xyvora"], learnsWords: false) },
+            emailBody: { id in
+                bodies.withLock { $0.append(id) }
+                return "We met Xyvora and the team at Brevalle Labs yesterday."
+            }
+        )
+        let context = DictationContext.chatPill(title: "Chat", header: ["From: Kaelthorne Drake"], messages: [], input: "", emailId: "email-1")
+
+        await dictate(controller, capture: capture, context: context)
+
+        #expect(bodies.withLock { $0 } == ["email-1"])
+        let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
+        #expect(vocabulary.first == "Xyvora")
+        // A dictionary word in the context is sent once.
+        #expect(vocabulary.count == 3)
+        #expect(Set(vocabulary) == ["Xyvora", "Kaelthorne Drake", "Brevalle Labs"])
+        let message = try #require(recorded.cleanups.withLock { $0.first?.messages.first })
+        let vars = try JSONSerialization.jsonObject(with: JSONEncoder().encode(message)) as? [String: String]
+        #expect(vars?["dictionary"] == "Xyvora")
+    }
+
+    /// A full dictionary and an email of more terms than the context's half: the dictionary whole,
+    /// then the context's first `contextTermsMax` terms, never more words than the backend takes.
+    @Test func sendsAtMostTheContextsHalfOfTerms() async throws {
+        let capture = FakeCapture()
+        func name(_ prefix: String, _ i: Int) -> String {
+            let letters = Array("abcdefghijklmnopqrstuvwxyz")
+            return prefix + String(letters[i / letters.count]) + String(letters[i % letters.count])
+        }
+        let words = (0..<DictationConfig.dictionaryMaxEntries).map { name("Qor", $0) }
+        let terms = (0..<DictationConfig.contextTermsMax + 50).map { name("Xyv", $0) }
+        let controller = controller(
+            capture: capture,
+            dictionary: { .init(words: words, learnsWords: false) },
+            emailBody: { _ in "ask " + terms.joined(separator: " and ") + " today" }
+        )
+        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
+
+        await dictate(controller, capture: capture, context: context)
+
+        let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
+        #expect(vocabulary.count == DictationConfig.dictionaryMaxEntries + DictationConfig.contextTermsMax)
+        guard vocabulary.count == DictationConfig.dictionaryMaxEntries + DictationConfig.contextTermsMax else { return }
+        #expect(Array(vocabulary.prefix(DictationConfig.dictionaryMaxEntries)) == words)
+        #expect(Array(vocabulary.suffix(DictationConfig.contextTermsMax)) == Array(terms.prefix(DictationConfig.contextTermsMax)))
+    }
+
+    /// With no dictionary and nothing to pick, no words are sent.
+    @Test func withoutWordsNoneAreSent() async throws {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture)
+
+        await dictate(controller, capture: capture, context: context)
+
+        #expect(recorded.vocabularies.withLock { $0 } == [[]])
+        let message = try #require(recorded.cleanups.withLock { $0.first?.messages.first })
+        let vars = try JSONSerialization.jsonObject(with: JSONEncoder().encode(message)) as? [String: String]
+        #expect(vars?["dictionary"] == "")
+    }
+
+    /// The dictionary is read when the dictation starts: a word added meanwhile goes with the next.
+    @Test func theDictionaryIsTheOneAtTheStart() async throws {
+        let capture = FakeCapture()
+        let words = Mutex(["Xyvora"])
+        let controller = controller(capture: capture, dictionary: { .init(words: words.withLock { $0 }, learnsWords: false) })
+
+        controller.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { capture.starts == 1 }
+        words.withLock { $0 = ["Xyvora", "Brevalle"] }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+        await dictate(controller, capture: capture, context: context)
+
+        #expect(recorded.vocabularies.withLock { $0 } == [["Xyvora"], ["Xyvora", "Brevalle"]])
+    }
+
+    /// Terms not picked within `contextTermsWait` are left out; the dictation goes on without them.
+    @Test func slowTermsDoNotHoldUpTheDictation() async throws {
+        let capture = FakeCapture()
+        let controller = controller(
+            capture: capture,
+            dictionary: { .init(words: ["Xyvora"], learnsWords: false) },
+            emailBody: { _ in
+                try? await Task.sleep(for: .seconds(30))
+                return "Brevalle Labs"
+            }
+        )
+        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
+        let started = ContinuousClock.now
+
+        await dictate(controller, capture: capture, context: context)
+
+        #expect(recorded.vocabularies.withLock { $0 } == [["Xyvora"]])
+        #expect(recorded.texts.withLock { $0 }.count == 1)
+        #expect(ContinuousClock.now - started < .seconds(5))
+    }
+
+    /// Cancelled while its terms are still being picked (the pill went away): the recording is not
+    /// uploaded.
+    @Test func aDictationCancelledWhileItsTermsArePickedUploadsNothing() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, emailBody: { _ in
+            try? await Task.sleep(for: .seconds(30))
+            return nil
+        })
+        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
+        let recorded = recorded
+        controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
+        await waitUntil { capture.starts == 1 }
+        controller.finish()
+        // The recording is complete (the microphone stopped) and waits for its terms.
+        await waitUntil { capture.starts == 1 && !capture.isRunning }
+        controller.cancel()
+        try? await Task.sleep(for: .seconds(DictationConfig.contextTermsWait * 3))
+
+        #expect(recorded.uploads.withLock { $0.isEmpty })
+        #expect(recorded.texts.withLock { $0.isEmpty })
+    }
+
+    /// With learning on at the start, the field the text landed in is watched, and the user's
+    /// respelling in it is learned when the input is sent.
+    @Test func learnsTheUsersCorrectionOfTheText() async throws {
+        let capture = FakeCapture()
+        let learned = LearnedWords()
+        let watch = DictationCorrectionWatch(learn: { learned.words.append($0) }, interval: .seconds(3600), duration: .seconds(7200))
+        let controller = controller(
+            capture: capture,
+            transcript: { "ask zivora about the roadmap" },
+            cleaned: { CompletionsResponse(assistant: "Ask Zivora about the roadmap today.", token_usage: nil, error: nil) },
+            dictionary: { .init(words: [], learnsWords: true) },
+            corrections: watch
+        )
+        let field = InputField()
+        field.text = "Hi."
+
+        await dictate(controller, capture: capture, context: context, field: field)
+
+        #expect(field.text == "Hi. Ask Zivora about the roadmap today.")
+        #expect(watch.isWatching)
+        field.text = "Hi. Ask Xyvora about the roadmap today."
+        controller.inputSent(field.text)
+        #expect(learned.words == [["Xyvora"]])
+        #expect(!watch.isWatching)
+    }
+
+    /// Learning switched off at the start: the field is not watched.
+    @Test func withLearningOffNothingIsWatched() async throws {
+        let capture = FakeCapture()
+        let watch = DictationCorrectionWatch(learn: { _ in Issue.record("nothing learned") }, interval: .seconds(3600))
+        let controller = controller(capture: capture, dictionary: { .init(words: [], learnsWords: false) }, corrections: watch)
+
+        await dictate(controller, capture: capture, context: context, field: InputField())
+
+        #expect(recorded.texts.withLock { $0 }.count == 1)
+        #expect(!watch.isWatching)
+    }
+
+    /// The next dictation's start ends the last one's watch, so its text is never taken for a
+    /// correction; so does the pill going away.
+    @Test func theNextDictationAndThePillGoingAwayEndTheWatch() async throws {
+        let capture = FakeCapture()
+        let watch = DictationCorrectionWatch(learn: { _ in }, interval: .seconds(3600))
+        let controller = controller(capture: capture, dictionary: { .init(words: [], learnsWords: true) }, corrections: watch)
+        let field = InputField()
+
+        await dictate(controller, capture: capture, context: context, field: field)
+        #expect(watch.isWatching)
+        controller.start(context: context, canUseAI: true) { _ in }
+        #expect(!watch.isWatching)
+        controller.cancel()
+
+        await dictate(controller, capture: capture, context: context, field: field)
+        #expect(watch.isWatching)
+        controller.stopLearning()
+        #expect(!watch.isWatching)
+    }
 }
 
 /// The production opt-out reader: Settings' "Opt Out of AI" (and declining AI consent) writes the
@@ -900,7 +1146,7 @@ struct DictationOptOutFlagTests {
             capture: capture,
             requestMicrophoneAccess: { true },
             isOnline: { true },
-            transcribe: { wav, _ in
+            transcribe: { wav, _, _ in
                 recorded.uploads.withLock { $0.append(wav) }
                 return "ask jordan"
             },
@@ -953,7 +1199,25 @@ struct DictationOptOutFlagTests {
         let start = try slice(source, from: "private func startDictation()", to: "private var canSend: Bool")
         #expect(start.contains("guard canDictate else { return }"))
         #expect(start.contains("let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive"))
-        #expect(start.contains("dictation.start(context: dictationContext, canUseAI: canUseAI)"))
+        #expect(start.contains("dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText })"))
+    }
+
+    /// The dictionary (ADR-IOS-086): the terms are picked from the email the pill is about too; the
+    /// input as sent is compared for corrections before it is cleared; the pill going away ends the
+    /// watch; Settings › Personalization opens the dictionary.
+    @Test func theDictionaryIsWiredIntoThePill() throws {
+        let source = try pillSource()
+        #expect(source.contains("return .chatPill(title: message.subject, header: header, messages: chatMessages, input: inputText, emailId: message.id)"))
+        let send = try slice(source, from: "private func sendMessage()", to: "Task { @MainActor in")
+        #expect(send.contains("dictation.inputSent(inputText)\n        inputText = \"\""))
+        let disappear = try slice(source, from: ".onDisappear {", to: "// No eager cancellation")
+        #expect(disappear.contains("dictation.cancel()\n            dictation.stopLearning()"))
+
+        let projectRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let settings = try String(contentsOf: projectRoot.appendingPathComponent("TabMail/Views/Settings/TabMailSettingsView.swift"), encoding: .utf8)
+        let personalization = try slice(settings, from: "Section(\"Personalization\") {", to: "// BYOK tier configuration")
+        #expect(personalization.contains("DictationDictionaryView()"))
+        #expect(personalization.contains("Text(\"Voice Dictation Dictionary\")"))
     }
 
     /// The mic is off offline and when opted out of AI, reading the same App Group flag Settings
@@ -1043,6 +1307,18 @@ struct DictationOptOutFlagTests {
         #expect(context.components(separatedBy: "messages: chatMessages, input: inputText").count == 4)
     }
 
+    /// The app's controller reads the email's body from the search index
+    /// (`readsTheEmailsBodyFromTheSearchIndex`) and learns corrections into the dictionary.
+    @Test func theAppsControllerReadsBodiesAndLearnsIntoTheDictionary() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let controller = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationController.swift"), encoding: .utf8)
+        #expect(controller.contains("emailBody: @escaping EmailBody = { await DictationController.storedEmailBody(headerId: $0) },"))
+        #expect(controller.contains("corrections: DictationCorrectionWatch? = DictationCorrectionWatch { DictationDictionary.shared.learn($0) },"))
+    }
+
     /// The Settings menu writes the key the controller reads, the waveform shows no language, and
     /// the mic points to the menu once a dictation has landed.
     @Test func theLanguageMenuAndItsTipAreWired() throws {
@@ -1089,7 +1365,7 @@ struct DictationOptOutFlagTests {
         let beforeStart = try slice(source, from: "private func startDictation()", to: "dictation.start(context:")
         #expect(!beforeStart.contains("donate()"))
         let start = String(try slice(source, from: "private func startDictation()", to: "private var canSend: Bool"))
-        let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI) { text in", to: "scrollPosition.scrollTo(edge: .bottom)")
+        let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in", to: "scrollPosition.scrollTo(edge: .bottom)")
         #expect(onText.contains("DictationLanguageTip.dictationCompleted.donate()"))
         // Nothing after the callback's last statement donates either.
         let pieces = start.components(separatedBy: "scrollPosition.scrollTo(edge: .bottom)")
@@ -1110,7 +1386,7 @@ struct DictationWaveformTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
-            transcribe: { _, _ in try await Task.sleep(for: .seconds(60)); return "" },
+            transcribe: { _, _, _ in try await Task.sleep(for: .seconds(60)); return "" },
             speechDetector: FakeSpeechDetector.hearing(),
             complete: { _ in CompletionsResponse(assistant: "", token_usage: nil, error: nil) }
         )
@@ -1184,7 +1460,7 @@ struct DictationLanguageSettingTests {
                 requestMicrophoneAccess: { true },
                 isOnline: { true },
                 isOptedOutOfAI: { false },
-                transcribe: { _, language in
+                transcribe: { _, language, _ in
                     languages.withLock { $0.append(language) }
                     return "annyeong"
                 },
@@ -1322,5 +1598,37 @@ struct DictationLanguageTests {
         let names = choices.map { DictationLanguage.name(of: $0, locale: locale) }
         #expect(names == names.sorted { $0.localizedStandardCompare($1) == .orderedAscending })
         #expect(DictationLanguage.name(of: "ko", locale: locale) == "Korean")
+    }
+}
+
+/// The app's own read of the email's body for its terms: from the search index, under the key the
+/// content stores write it under; none for an email not there.
+@Suite(.serialized, .processGlobalState)
+struct DictationEmailBodyTests {
+    @Test func readsTheEmailsBodyFromTheSearchIndex() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let accountId = "dictation-body-\(UUID().uuidString)"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        let header = MessageHeader(messageId: "42", subject: "Plans",
+            from: "Sender", fromAddress: "sender@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "", folderId: "\(accountId):INBOX",
+            accountId: accountId, folderPath: "INBOX", isInInbox: true)
+        try await pool.write { db in try header.insert(db) }
+        let key = try #require(try await pool.read { db in try MessageContentStore.capture(header, db: db)?.contentKey })
+        let index = SearchIndex.shared
+        _ = try await index.indexHeaders([FTSHeaderRecord(contentKey: key, headerId: header.id,
+            messageId: header.messageId, subject: header.subject, from: header.fromAddress,
+            to: header.to, dateMs: Int64(header.date.timeIntervalSince1970 * 1000))])
+        #expect(await DictationController.storedEmailBody(headerId: header.id) == nil)
+
+        try await index.updateBody(contentKey: key, body: "Meet Xyvora at Brevalle Labs.")
+
+        #expect(await DictationController.storedEmailBody(headerId: header.id) == "Meet Xyvora at Brevalle Labs.")
+        #expect(await DictationController.storedEmailBody(headerId: "\(accountId):INBOX:999") == nil)
     }
 }

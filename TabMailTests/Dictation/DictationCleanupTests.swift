@@ -37,6 +37,22 @@ struct DictationContextTests {
         """)
     }
 
+    /// The terms are picked from all of the pill, uncut: its title, the email's header, the chat and
+    /// the input, past the cleanup's window.
+    @Test func theTermsAreFromAllOfThePillUncut() {
+        let long = String(repeating: "and so on ", count: DictationConfig.contextMaxScreenChars / 5)
+        let context = DictationContext.chatPill(
+            title: "Planning with Xyvora",
+            header: ["From: Kaelthorne Drake"],
+            messages: [message(.user, "ask Brevalle " + long)],
+            input: "cc Quill"
+        )
+
+        #expect(DictationContextTerms.terms(in: context.termsText, excluding: [], max: DictationConfig.contextTermsMax)
+            .sorted() == ["Brevalle", "Kaelthorne Drake", "Quill", "Xyvora"])
+        #expect(!context.screenText.contains("Brevalle"))
+    }
+
     @Test func anEmptyInputIsStillTheFieldWithItsCaret() {
         let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "")
         #expect(context.screenText == "» ‸")
@@ -77,7 +93,10 @@ struct DictationCleanupTests {
     private let context = DictationContext(windowTitle: "Chat", screenText: "» ‸")
 
     @Test func sendsTheDictationWithWhereItGoesAndWhatIsOnScreen() throws {
-        let message = DictationCleanup.message(dictation: "quarterly road map", context: DictationContext(windowTitle: "Weekly sync", screenText: "Me: hi\n» ‸"))
+        let message = DictationCleanup.message(
+            dictation: "quarterly road map", context: DictationContext(windowTitle: "Weekly sync", screenText: "Me: hi\n» ‸"),
+            dictionary: ["Xyvora", "Kaelthorne Drake"]
+        )
 
         #expect(message.role == "system")
         // The backend's prompt name, spelled out: comparing with the config would pass a typo.
@@ -92,12 +111,14 @@ struct DictationCleanupTests {
             "terminal_program": "",
             "window_title": "Weekly sync",
             "screen_text": "Me: hi\n» ‸",
+            // The user's dictionary, one word per line (ADR-IOS-086).
+            "dictionary": "Xyvora\nKaelthorne Drake",
         ])
     }
 
     @Test func usesTheCleanedUpTextAndAsksWithoutToolsOrWebSearch() async throws {
         let sent = Mutex<CompletionsRequest?>(nil)
-        let text = await DictationCleanup.cleanUp(transcript, context: context) { request in
+        let text = await DictationCleanup.cleanUp(transcript, context: context, dictionary: []) { request in
             sent.withLock { $0 = request }
             return CompletionsResponse(assistant: " Ask Jordan about the roadmap.\n", token_usage: nil, error: nil)
         }
@@ -117,12 +138,12 @@ struct DictationCleanupTests {
         CompletionsResponse(assistant: nil, token_usage: nil, error: nil),
     ])
     func aReplyWithoutTextUsesTheTranscriptAsHeard(response: CompletionsResponse) async {
-        let text = await DictationCleanup.cleanUp(transcript, context: context) { _ in response }
+        let text = await DictationCleanup.cleanUp(transcript, context: context, dictionary: []) { _ in response }
         #expect(text == transcript)
     }
 
     @Test func aFailedCleanupUsesTheTranscriptAsHeard() async {
-        let text = await DictationCleanup.cleanUp(transcript, context: context) { _ in
+        let text = await DictationCleanup.cleanUp(transcript, context: context, dictionary: []) { _ in
             throw BackendError.requestFailed(statusCode: 500)
         }
         #expect(text == transcript)
@@ -132,7 +153,7 @@ struct DictationCleanupTests {
     @Test func aCleanupPastItsTimeoutUsesTheTranscriptAsHeard() async {
         let clock = ContinuousClock()
         let started = clock.now
-        let text = await DictationCleanup.cleanUp(transcript, context: context, complete: { _ in
+        let text = await DictationCleanup.cleanUp(transcript, context: context, dictionary: [], complete: { _ in
             try await Task.sleep(for: .seconds(5))
             return CompletionsResponse(assistant: "Ask Jordan about the roadmap.", token_usage: nil, error: nil)
         }, timeout: 0.2)

@@ -2,7 +2,9 @@
 
 **Class:** testing
 **Severity:** high
-**First seen:** 2026 · **Recurrences:** 6 (**6: two serialized runs compiled the selected test
+**First seen:** 2026 · **Recurrences:** 7 (**7, 2026-09-29: four new test files written after the
+last `./Scripts/xcodegen.sh` (it ran when the production files were added); 7 of 11 selected suites
+ran — caught by checking each selected suite by NAME in the log, not by the failing result**; **6: two serialized runs compiled the selected test
 target but executed zero tests and stalled waiting for workers because the copied ignored
 `TabMail.xcodeproj` omitted the existing test file; the by-name selector was exact, but target
 membership was false**; **5: the BUILD failed on a peer session's `build.db` lock and
