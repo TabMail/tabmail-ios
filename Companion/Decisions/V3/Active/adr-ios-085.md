@@ -1,6 +1,6 @@
 ## ADR-IOS-085: Chat-Pill Dictation Uses TabMail Voice's Backend Speech-to-Text and Cleanup
 
-**Status:** Active (2026-09-26)
+**Status:** Active (2026-09-26; amended 2026-09-29: the cleanup runs in the transcription request)
 
 **Context:** The chat pill dictated with Apple's on-device `SFSpeechRecognizer`
 (`SpeechRecognizer.swift`): live partial transcripts streamed into the input field while the
@@ -18,16 +18,20 @@ of the input when it comes back, and the contextual cleanup runs.
    `AudioRecorder` (16 kHz mono Int16), `WAVEncoder`, `LevelEnvelope` and the waveform numbers
    are copies (only the license header and the logger call differ); `DictationController` is Voice's state machine without the
    push-to-talk arming (the mic button toggles: tap to listen, tap again to transcribe);
-   `DictationCleanup` sends the same prompt and variables.
+   `DictationCleanup` builds the same prompt variables.
 2. Transcription goes through `BackendClient.transcribeDictation` (the app's auth token,
-   `X-Client-Type: ios`); the cleanup through `sendCompletionsDirect` with tools and web search
-   off. The backend already serves the prompt to iOS clients, so it needs no change.
+   `X-Client-Type: ios`), and the cleanup rides in the same request (amendment 2026-09-29 below):
+   the recording carries `cleanup`, the prompt's variables (`DictationCleanup.variables`), and the
+   backend answers `cleaned_text` beside the transcript. ~~The cleanup through
+   `sendCompletionsDirect` with tools and web search off. The backend already serves the prompt to
+   iOS clients, so it needs no change.~~ (2026-09-26 to 2026-09-29.)
 3. The "screen" the cleanup reads is the chat pill, captured when the dictation starts: what the
    pill is about (the email's sender, subject and snippet, or the draft's subject and body), the
    latest chat turns, and the input field as a `» ` line with the caret `‸` at its end. Only
    the last `contextMaxScreenChars` = 500 characters, ending at the caret, are sent, and the
-   cleanup gets `cleanupTimeout` = 1.5 s (owner, 2026-09-28, as TabMail Voice's a78baba: the
-   cleanup is a light pass and more context slows it; was 20,000 characters and 3 s).
+   cleanup gets 1.5 s (owner, 2026-09-28, as TabMail Voice's a78baba: the cleanup is a light pass
+   and more context slows it; was 20,000 characters and 3 s). Since 2026-09-29 the backend
+   enforces the 1.5 s (its `cleanup.timeoutMs`); the app's `cleanupTimeout` is gone.
 4. `DictationController.start` refuses to start without AI access (a TabMail session and an
    active subscription, the gate that shows the pill's input bar; TabMail Voice likewise refuses
    when signed out or without consent), when opted out of AI (`AIService.optOutAllAIKey`, set by
@@ -120,7 +124,7 @@ of the input when it comes back, and the contextual cleanup runs.
   mains hum ≤ 0.03. Someone else talking nearby (a TV, a conversation) is speech to it and
   starts the recording; crowd "babble" doesn't. Unverified on a device's real microphone.
 - No live transcript while speaking: the text arrives in one piece after the tap (upload +
-  model time, plus up to `cleanupTimeout` = 1.5 s for the cleanup). Accepted by the owner
+  model time, plus up to the backend's 1.5 s cleanup deadline). Accepted by the owner
   (2026-09-27).
 - Dictation needs a TabMail sign-in and an active subscription; it counts toward usage like
   every AI request. A failure (subscription, rate limit, too long, no speech, microphone denied)
@@ -146,5 +150,40 @@ of the input when it comes back, and the contextual cleanup runs.
   the backend request, and the waveform's VoiceOver label are tested behaviourally, as is the
   real classifier: it hears a synthesised sentence and not white noise or mains hum.
 - The dictation code logs lengths, durations and error types only, never the transcript or the
-  audio. (The existing `#if DEBUG` short-reply log in `BackendClient`'s completions decoding
-  prints a short cleaned dictation in debug builds, as it does any short completion.)
+  audio. (Until 2026-09-29 the existing `#if DEBUG` short-reply log in `BackendClient`'s
+  completions decoding printed a short cleaned dictation in debug builds, as it does any short
+  completion; the cleanup no longer goes through that decoding.)
+
+**Amendment 2026-09-29 — the cleanup runs in the transcription request (backend ADR-027).**
+Owner, 2026-09-29: the transcription and its cleanup are one backend call on every client ("iOS
+should change to a single call as well"), and the backend enforces the cleanup deadline. Each
+dictation paid a second gateway pass (JWT, entitlement, quota, throttle) and a second round trip
+for the cleanup.
+
+- `transcribeDictation(wav:language:vocabulary:cleanup:)` sends `cleanup` (`app_name` "TabMail",
+  `web_host` and `terminal_program` empty, `window_title`, `screen_text`, `dictionary`) and returns
+  `DictationTranscription { text, cleanedText }`. A `cleaned_text` that isn't a string is an
+  invalid response.
+- The controller trims `text` (empty: nothing appended, as before), then appends
+  `DictationCleanup.pasted`: the cleaned text, trimmed, or the transcript as heard when
+  `cleaned_text` is `""` (the backend's cleanup failed, was refused, or ran past its deadline) or
+  missing.
+- `DictationCleanup.cleanUp`, the completions request and `DictationConfig.cleanupTimeout` /
+  `cleanupPrompt` are removed. `transcriptionRequestTimeout` (45 s) now covers the cleanup too.
+- Deploy order: backend ADR-027 first. An older backend ignores `cleanup` and answers no
+  `cleaned_text`, so this build then appends the transcript uncleaned; it never fails the
+  dictation. Released builds keep working against the new backend, which answers them exactly as
+  before.
+- Every field is cut to the backend's per-field limit (`DictationConfig.cleanupFieldMaxUTF16`,
+  20,000 UTF-16 code units, its `cleanup.maxFieldChars`), between characters: the title keeps its
+  start, the screen text its end, at the caret. Over the limit the backend refuses the whole
+  request, the transcription included, and the title is the email's subject, which its sender
+  chooses: an uncut one could make every dictation in that email's chat fail silently. The cut
+  bounds the cleanup model's input only.
+- The screen and dictionary now go with the audio even when the transcript comes back empty (the
+  backend then runs no cleanup), where before they were sent only with a non-empty transcript.
+  They were already sent to the same backend for every dictation that produced text.
+- Tests: `BackendClientDictationTests` (the `cleanup` body, `cleaned_text` as sent, `""`, missing
+  and non-string), `DictationCleanupTests` (variables, each within the limit, cut between characters, what is pasted), and
+  `DictationControllerTests` (the variables go with the upload; `""`, blank and missing
+  `cleaned_text` append the transcript; the production factory sends `cleanup`).

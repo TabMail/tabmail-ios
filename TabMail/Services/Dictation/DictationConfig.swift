@@ -67,12 +67,9 @@ enum DictationConfig {
     // MARK: Backend
 
     static let transcribePath = "/dictation/transcribe"
-    /// The backend prompt that fixes recognition errors in a transcript using what is on screen.
-    static let cleanupPrompt = "system_prompt_dictate_cleanup"
+    /// Covers the upload, the transcription and the cleanup the backend runs in the same request
+    /// under its own deadline (backend ADR-027; owner, 2026-09-28: 1.5 s at most).
     static let transcriptionRequestTimeout: TimeInterval = 45
-    /// Longest the cleanup may take (seconds); past it the transcript is used as heard. Owner,
-    /// 2026-09-28: 1.5 s at most (was 3 s), as in TabMail Voice: the cleanup is a light pass.
-    static let cleanupTimeout: TimeInterval = 1.5
     /// The languages the backend transcribes (backend ADR-024, `src/config/transcription.json`):
     /// its default model's 18, then the 12 it routes to a second model. Settings offers these;
     /// keep them in step with the backend.
@@ -136,6 +133,10 @@ enum DictationConfig {
     /// the caret, since more context slows it (was 20,000). Bounds the cleanup model's input
     /// only; nothing is stored.
     static let contextMaxScreenChars = 500
+    /// The backend's limit on each cleanup field (its `transcription.json` `cleanup.maxFieldChars`,
+    /// ADR-027), in UTF-16 code units. Over it the backend refuses the whole request, the
+    /// transcription included, so every field is cut to it (`DictationCleanup.variables`).
+    static let cleanupFieldMaxUTF16 = 20_000
 
     // MARK: Waveform
 

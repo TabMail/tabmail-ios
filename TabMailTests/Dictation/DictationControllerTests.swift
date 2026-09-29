@@ -96,14 +96,15 @@ private final class FakeCapture: AudioCapturing, @unchecked Sendable {
     }
 }
 
-/// What the dictations in one test uploaded, sent for cleanup, and appended.
+/// What the dictations in one test uploaded, sent with it for the cleanup, and appended.
 private final class Recorded: Sendable {
     let uploads = Mutex<[Data]>([])
     /// The `language` sent with each upload (nil: none).
     let languages = Mutex<[String?]>([])
     /// The words sent to spell as given with each upload (ADR-IOS-086).
     let vocabularies = Mutex<[[String]]>([])
-    let cleanups = Mutex<[CompletionsRequest]>([])
+    /// The cleanup's variables sent with each upload (backend ADR-027).
+    let cleanups = Mutex<[[String: String]]>([])
     let texts = Mutex<[String]>([])
 }
 
@@ -235,9 +236,8 @@ struct DictationControllerTests {
         language: @escaping @MainActor () -> String? = { nil },
         microphoneAccess: @escaping @MainActor () async -> Bool = { true },
         transcript: @escaping @Sendable () async throws -> String = { "ask jordan about the road map" },
-        cleaned: @escaping @Sendable () async throws -> CompletionsResponse = {
-            CompletionsResponse(assistant: "Ask Jordan about the roadmap.", token_usage: nil, error: nil)
-        },
+        /// The backend's `cleaned_text`: `""` when its cleanup failed, nil from a backend without it.
+        cleaned: @escaping @Sendable () async -> String? = { "Ask Jordan about the roadmap." },
         maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration,
         speechDetector: @escaping DictationController.MakeSpeechDetector = FakeSpeechDetector.hearing(),
         dictionary: @escaping @MainActor () -> DictationDictionary.Snapshot = { .init(words: [], learnsWords: false) },
@@ -254,17 +254,14 @@ struct DictationControllerTests {
             dictionary: dictionary,
             emailBody: emailBody,
             corrections: corrections,
-            transcribe: { wav, language, vocabulary in
+            transcribe: { wav, language, vocabulary, cleanup in
                 recorded.uploads.withLock { $0.append(wav) }
                 recorded.languages.withLock { $0.append(language) }
                 recorded.vocabularies.withLock { $0.append(vocabulary) }
-                return try await transcript()
+                recorded.cleanups.withLock { $0.append(cleanup) }
+                return DictationTranscription(text: try await transcript(), cleanedText: await cleaned())
             },
             speechDetector: speechDetector,
-            complete: { request in
-                recorded.cleanups.withLock { $0.append(request) }
-                return try await cleaned()
-            },
             maxRecordingDuration: maxRecordingDuration
         )
     }
@@ -301,11 +298,16 @@ struct DictationControllerTests {
         let wav = try #require(recorded.uploads.withLock { $0.first })
         #expect(String(decoding: wav.prefix(4), as: UTF8.self) == "RIFF")
         #expect(wav.count > WAVEncoder.headerSize)
-        // The cleanup got the transcript and what was on screen when the dictation started.
-        let message = try #require(recorded.cleanups.withLock { $0.first?.messages.first })
-        let vars = try JSONSerialization.jsonObject(with: JSONEncoder().encode(message)) as? [String: String]
-        #expect(vars?["dictation"] == "ask jordan about the road map")
-        #expect(vars?["screen_text"] == "Me: hi\n» ‸")
+        // One request: the recording went with what was on screen when the dictation started, for
+        // the cleanup the backend runs on its transcript.
+        #expect(recorded.cleanups.withLock { $0 } == [[
+            "app_name": "TabMail",
+            "web_host": "",
+            "terminal_program": "",
+            "window_title": "Chat",
+            "screen_text": "Me: hi\n» ‸",
+            "dictionary": "",
+        ]])
     }
 
     /// Dictation is transcribed on the backend: offline, nothing is recorded.
@@ -476,7 +478,6 @@ struct DictationControllerTests {
 
         #expect(controller.phase == .idle)
         #expect(recorded.texts.withLock { $0.isEmpty })
-        #expect(recorded.cleanups.withLock { $0.isEmpty })
     }
 
     /// A failed transcription shows nothing: the input field comes back as it was.
@@ -499,10 +500,13 @@ struct DictationControllerTests {
         #expect(!capture.isRunning)
     }
 
-    /// A failed cleanup never costs the dictation: the transcript is appended as heard.
-    @Test func aFailedCleanupAppendsTheTranscriptAsHeard() async {
+    /// A failed cleanup never costs the dictation: the transcript is appended as heard. The backend
+    /// answers `""` when its cleanup failed or ran past its deadline; one without the cleanup
+    /// (backend ADR-027 not deployed) answers no `cleaned_text`.
+    @Test(arguments: ["", " \n", nil] as [String?])
+    func aFailedCleanupAppendsTheTranscriptAsHeard(cleaned: String?) async {
         let capture = FakeCapture()
-        let controller = controller(capture: capture, cleaned: { throw BackendError.requestFailed(statusCode: 0) })
+        let controller = controller(capture: capture, cleaned: { cleaned })
 
         await dictate(controller, capture: capture)
         await waitUntil { controller.phase == .idle }
@@ -525,7 +529,6 @@ struct DictationControllerTests {
         try? await Task.sleep(for: .milliseconds(600))
 
         #expect(recorded.texts.withLock { $0.isEmpty })
-        #expect(recorded.cleanups.withLock { $0.isEmpty })
         #expect(controller.phase == .idle)
         #expect(!capture.isRunning)
     }
@@ -697,12 +700,11 @@ struct DictationControllerTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
-            transcribe: { wav, _, _ in
+            transcribe: { wav, _, _, _ in
                 recorded.uploads.withLock { $0.append(wav) }
-                return "a long dictation"
+                return DictationTranscription(text: "a long dictation", cleanedText: "A long dictation.")
             },
-            speechDetector: FakeSpeechDetector.hearing(),
-            complete: { _ in CompletionsResponse(assistant: "A long dictation.", token_usage: nil, error: nil) }
+            speechDetector: FakeSpeechDetector.hearing()
         )
 
         await dictate(controller, capture: capture)
@@ -786,13 +788,13 @@ struct DictationControllerTests {
         controller.cancel()
     }
 
-    /// A dictation cancelled during its cleanup never lands in the one started after it: an older
-    /// dictation must not append to, or end, a newer one.
+    /// A dictation cancelled while the backend transcribes and cleans it up never lands in the one
+    /// started after it: an older dictation must not append to, or end, a newer one.
     @Test func aSupersededCleanupNeverLandsInTheNextDictation() async {
         let capture = FakeCapture()
         let controller = controller(capture: capture, cleaned: {
             try? await Task.sleep(for: .milliseconds(300))
-            return CompletionsResponse(assistant: "Too late.", token_usage: nil, error: nil)
+            return "Too late."
         })
 
         await dictate(controller, capture: capture)
@@ -938,8 +940,8 @@ struct DictationControllerTests {
     }
 
     /// The recording goes with the user's dictionary and the terms of what the dictation is about,
-    /// the email's body among it; the cleanup gets the dictionary alone (it reads the screen
-    /// itself).
+    /// the email's body among it; the cleanup's variables carry the dictionary alone (it reads the
+    /// screen itself).
     @Test func sendsTheDictionaryAndTheContextsTerms() async throws {
         let capture = FakeCapture()
         let bodies = Mutex<[String]>([])
@@ -961,9 +963,7 @@ struct DictationControllerTests {
         // A dictionary word in the context is sent once.
         #expect(vocabulary.count == 3)
         #expect(Set(vocabulary) == ["Xyvora", "Kaelthorne Drake", "Brevalle Labs"])
-        let message = try #require(recorded.cleanups.withLock { $0.first?.messages.first })
-        let vars = try JSONSerialization.jsonObject(with: JSONEncoder().encode(message)) as? [String: String]
-        #expect(vars?["dictionary"] == "Xyvora")
+        #expect(recorded.cleanups.withLock { $0.first?["dictionary"] } == "Xyvora")
     }
 
     /// A full dictionary and an email of more terms than the context's half: the dictionary whole,
@@ -1000,9 +1000,7 @@ struct DictationControllerTests {
         await dictate(controller, capture: capture, context: context)
 
         #expect(recorded.vocabularies.withLock { $0 } == [[]])
-        let message = try #require(recorded.cleanups.withLock { $0.first?.messages.first })
-        let vars = try JSONSerialization.jsonObject(with: JSONEncoder().encode(message)) as? [String: String]
-        #expect(vars?["dictionary"] == "")
+        #expect(recorded.cleanups.withLock { $0.first?["dictionary"] } == "")
     }
 
     /// The dictionary is read when the dictation starts: a word added meanwhile goes with the next.
@@ -1073,7 +1071,7 @@ struct DictationControllerTests {
         let controller = controller(
             capture: capture,
             transcript: { "ask zivora about the roadmap" },
-            cleaned: { CompletionsResponse(assistant: "Ask Zivora about the roadmap today.", token_usage: nil, error: nil) },
+            cleaned: { "Ask Zivora about the roadmap today." },
             dictionary: { .init(words: [], learnsWords: true) },
             corrections: watch
         )
@@ -1146,13 +1144,10 @@ struct DictationOptOutFlagTests {
             capture: capture,
             requestMicrophoneAccess: { true },
             isOnline: { true },
-            transcribe: { wav, _, _ in
+            transcribe: { wav, _, _, cleanup in
                 recorded.uploads.withLock { $0.append(wav) }
-                return "ask jordan"
-            },
-            complete: { request in
-                recorded.cleanups.withLock { $0.append(request) }
-                return CompletionsResponse(assistant: "Ask Jordan.", token_usage: nil, error: nil)
+                recorded.cleanups.withLock { $0.append(cleanup) }
+                return DictationTranscription(text: "ask jordan", cleanedText: "Ask Jordan.")
             }
         )
 
@@ -1386,9 +1381,8 @@ struct DictationWaveformTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
-            transcribe: { _, _, _ in try await Task.sleep(for: .seconds(60)); return "" },
-            speechDetector: FakeSpeechDetector.hearing(),
-            complete: { _ in CompletionsResponse(assistant: "", token_usage: nil, error: nil) }
+            transcribe: { _, _, _, _ in try await Task.sleep(for: .seconds(60)); return DictationTranscription(text: "", cleanedText: nil) },
+            speechDetector: FakeSpeechDetector.hearing()
         )
         controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { _ in }
         return (controller, capture)
@@ -1460,12 +1454,11 @@ struct DictationLanguageSettingTests {
                 requestMicrophoneAccess: { true },
                 isOnline: { true },
                 isOptedOutOfAI: { false },
-                transcribe: { _, language, _ in
+                transcribe: { _, language, _, _ in
                     languages.withLock { $0.append(language) }
-                    return "annyeong"
+                    return DictationTranscription(text: "annyeong", cleanedText: "Annyeong.")
                 },
-                speechDetector: FakeSpeechDetector.hearing(),
-                complete: { _ in CompletionsResponse(assistant: "Annyeong.", token_usage: nil, error: nil) }
+                speechDetector: FakeSpeechDetector.hearing()
             )
 
             controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { _ in }
@@ -1479,24 +1472,24 @@ struct DictationLanguageSettingTests {
         }
     }
 
-    /// The production transcription carries the dictation's language to the backend request, and
-    /// its text comes back as the dictation; without a language, none is sent.
+    /// The production transcription carries the dictation's language and the cleanup's variables to
+    /// the backend request, and the cleaned-up text it answers comes back as the dictation; without
+    /// a language, none is sent.
     @Test(arguments: [("ko", "annyeong"), (nil, "hello")] as [(String?, String)])
     func theBackendRequestCarriesTheDictationsLanguage(language: String?, transcript: String) async throws {
         let http = FakeHTTP.Scenario()
-        let bodies = Mutex<[[String: String]]>([])
+        let bodies = Mutex<[Data]>([])
         http.register(path: "/dictation/transcribe", method: "POST") { request in
-            let body = request.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: String] }
-            bodies.withLock { $0.append(body ?? [:]) }
+            bodies.withLock { $0.append(request.body ?? Data()) }
+            let body = request.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             // Like the backend, only a recording gets a transcript.
-            let audio = body?["audio"].flatMap { Data(base64Encoded: $0) } ?? Data()
+            let audio = (body?["audio"] as? String).flatMap { Data(base64Encoded: $0) } ?? Data()
             guard audio.count > WAVEncoder.headerSize, audio.prefix(4) == Data("RIFF".utf8) else {
                 return .json(raw: #"{"error":"invalid_audio"}"#, statusCode: 400)
             }
-            return .json(raw: #"{"text":"\#(transcript)"}"#)
+            return .json(raw: #"{"text":"\#(transcript)","cleaned_text":"Cleaned.","duration_seconds":1}"#)
         }
         let capture = FakeCapture()
-        let cleanupInput = Mutex<String?>(nil)
         let texts = Mutex<[String]>([])
         let controller = DictationController(
             capture: capture,
@@ -1505,12 +1498,7 @@ struct DictationLanguageSettingTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
             transcribe: DictationController.backendTranscription(BackendClient(llmSession: http.session)),
-            speechDetector: FakeSpeechDetector.hearing(),
-            complete: { request in
-                let message = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request.messages.first)) as? [String: String]
-                cleanupInput.withLock { $0 = message?["dictation"] }
-                return CompletionsResponse(assistant: "Cleaned.", token_usage: nil, error: nil)
-            }
+            speechDetector: FakeSpeechDetector.hearing()
         )
 
         controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { text in
@@ -1521,16 +1509,17 @@ struct DictationLanguageSettingTests {
         controller.finish()
         while controller.phase != .idle, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(10)) }
 
-        let body = try #require(bodies.withLock { $0.first })
         #expect(bodies.withLock { $0.count } == 1)
-        #expect(body["language"] == language)
+        let body = try #require(bodies.withLock { $0.first }.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: Any] })
+        #expect(body["language"] as? String == language)
         #expect(body.keys.contains("language") == (language != nil))
-        #expect(body["format"] == "wav")
+        #expect(body["format"] as? String == "wav")
         // The recording itself: a WAV carrying the tone the microphone gave.
-        let audio = try #require(body["audio"].flatMap { Data(base64Encoded: $0) })
+        let audio = try #require((body["audio"] as? String).flatMap { Data(base64Encoded: $0) })
         #expect(audio.prefix(4) == Data("RIFF".utf8))
         #expect(audio.count > WAVEncoder.headerSize)
-        #expect(cleanupInput.withLock { $0 } == transcript)
+        // The cleanup goes in the same request (backend ADR-027).
+        #expect(body["cleanup"] as? [String: String] == DictationCleanup.variables(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), dictionary: []))
         #expect(texts.withLock { $0 } == ["Cleaned."])
     }
 

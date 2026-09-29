@@ -19,9 +19,10 @@ struct BackendClientDictationTests {
             return .json(raw: #"{"text":"ask jordan about the road map"}"#)
         }
 
-        let text = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: nil, vocabulary: [])
+        let transcription = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: nil, vocabulary: [])
 
-        #expect(text == "ask jordan about the road map")
+        // No cleanup asked for, none returned.
+        #expect(transcription == DictationTranscription(text: "ask jordan about the road map", cleanedText: nil))
         let request = try #require(seen.withLock { $0 })
         #expect(request.url.path == "/dictation/transcribe")
         #expect(request.header("X-Client-Type") == "ios")
@@ -65,6 +66,41 @@ struct BackendClientDictationTests {
         #expect(body["vocabulary"] as? [String] == ["Xyvora", "Kaelthorne Drake"])
     }
 
+    /// The cleanup's variables go as `cleanup`, and the backend cleans up the transcript in the same
+    /// request (backend ADR-027): its `cleaned_text` comes back beside the transcript.
+    @Test func sendsTheCleanupAndReturnsTheCleanedUpText() async throws {
+        let http = FakeHTTP.Scenario()
+        let seen = Mutex<FakeHTTP.Request?>(nil)
+        http.register(path: "/dictation/transcribe", method: "POST") { request in
+            seen.withLock { $0 = request }
+            return .json(raw: #"{"text":"ask jordan","cleaned_text":"Ask Jordan.","duration_seconds":1}"#)
+        }
+        let cleanup = DictationCleanup.variables(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), dictionary: ["Xyvora"])
+
+        let transcription = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: nil, vocabulary: [], cleanup: cleanup)
+
+        #expect(transcription == DictationTranscription(text: "ask jordan", cleanedText: "Ask Jordan."))
+        let request = try #require(seen.withLock { $0 })
+        let body = try #require(request.body.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: Any] })
+        #expect(Set(body.keys) == ["audio", "format", "cleanup"])
+        #expect(body["cleanup"] as? [String: String] == cleanup)
+    }
+
+    /// A failed cleanup is `""`, not missing; an old backend, which ignores `cleanup`, answers none.
+    @Test(arguments: [
+        (#"{"text":"ask jordan","cleaned_text":""}"#, ""),
+        (#"{"text":"ask jordan"}"#, nil),
+    ] as [(String, String?)])
+    func theCleanedTextIsAsTheBackendAnswers(raw: String, cleanedText: String?) async throws {
+        let http = FakeHTTP.Scenario()
+        http.register(path: "/dictation/transcribe", method: "POST", response: .json(raw: raw))
+        let cleanup = DictationCleanup.variables(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), dictionary: [])
+
+        let transcription = try await BackendClient(llmSession: http.session).transcribeDictation(wav: wav, language: nil, vocabulary: [], cleanup: cleanup)
+
+        #expect(transcription == DictationTranscription(text: "ask jordan", cleanedText: cleanedText))
+    }
+
     @Test(arguments: [
         (401, #"{"error":"invalid_token"}"#, DictationError.unauthorized),
         (402, #"{"error":"no_active_subscription"}"#, DictationError.subscriptionRequired),
@@ -74,6 +110,7 @@ struct BackendClientDictationTests {
         (400, #"{"error":"audio_too_large"}"#, DictationError.recordingTooLong),
         (502, "", DictationError.failed(status: 502)),
         (200, #"{"transcript":"wrong shape"}"#, DictationError.invalidResponse),
+        (200, #"{"text":"ask jordan","cleaned_text":7}"#, DictationError.invalidResponse),
     ])
     func anErrorResponseSaysWhatWentWrong(status: Int, body: String, expected: DictationError) async {
         let http = FakeHTTP.Scenario()
@@ -130,7 +167,7 @@ struct BackendClientDictationAuthTests {
         let outcome: Result<Void, any Error>
         do {
             try await MainActor.run { try installSession() }
-            #expect(try await client.transcribeDictation(wav: wav, language: nil, vocabulary: []) == "ask jordan")
+            #expect(try await client.transcribeDictation(wav: wav, language: nil, vocabulary: []) .text == "ask jordan")
 
             // Signed out, no token is sent and the refusal reads as an ended session.
             _ = await MainActor.run { TabMailAuthService.completeSession(mode: .deactivate, notify: false) }

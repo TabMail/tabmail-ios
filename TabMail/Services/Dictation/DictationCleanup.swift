@@ -41,53 +41,68 @@ struct DictationContext: Sendable, Equatable {
 
 /// The backend pass over a transcript: with what was on screen when the dictation started, it
 /// fixes speech-recognition errors (names and terms shown on screen, capitalisation that doesn't
-/// fit where the text lands) and changes nothing else. The instructions live in the backend
-/// prompt `DictationConfig.cleanupPrompt`, shared with TabMail Voice.
+/// fit where the text lands) and changes nothing else. It runs in the transcription request
+/// (backend ADR-027), under the backend's deadline, with the prompt `system_prompt_dictate_cleanup`
+/// shared with TabMail Voice.
 enum DictationCleanup {
-    typealias Complete = @Sendable (CompletionsRequest) async throws -> CompletionsResponse
+    /// The prompt's variables other than the transcript, sent as the transcription's `cleanup`.
+    /// Fields that don't apply on iOS are sent empty; the prompt reads an empty field as unknown.
+    /// `dictionary`: the user's words, one per line (ADR-IOS-086).
+    static func variables(context: DictationContext, dictionary: [String]) -> [String: String] {
+        [
+            "app_name": DictationConfig.contextAppName,
+            "web_host": "",
+            "terminal_program": "",
+            "window_title": withinLimit(context.windowTitle),
+            "screen_text": withinLimit(context.screenText, keepingEnd: true),
+            "dictionary": withinLimit(dictionary.joined(separator: "\n")),
+        ]
+    }
 
-    /// The transcript with its recognition errors fixed. When the cleanup fails for any reason,
-    /// including no reply within `timeout` seconds, the transcript as heard: a failed cleanup
-    /// never costs the user their dictation.
-    static func cleanUp(
-        _ transcript: String, context: DictationContext, dictionary: [String], complete: @escaping Complete,
-        timeout: TimeInterval = DictationConfig.cleanupTimeout
-    ) async -> String {
-        let request = CompletionsRequest(
-            messages: [message(dictation: transcript, context: context, dictionary: dictionary)],
-            client_timezone: TimeZone.current.identifier,
-            disable_tools: true,
-            web_search_enabled: false
-        )
-        let clock = ContinuousClock()
-        let started = clock.now
-        do {
-            let response = try await withTimeout(seconds: timeout) { try await complete(request) }
-            let text = (response.assistant ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            // The prompt never removes dictated words, so an empty reply is a malfunction.
-            guard response.error == nil, !text.isEmpty else {
-                BackgroundSyncLogger.logDebug("[Dictation] cleanup returned no text (error=\(response.error != nil)); using the transcript as heard")
-                return transcript
+    /// `value` within the backend's limit on a cleanup field (`cleanupFieldMaxUTF16`), cut between
+    /// characters: its start, or with `keepingEnd` its end (the screen text ends at the caret).
+    /// The window title is the email's subject, which its sender chooses; over the limit the
+    /// backend would refuse the dictation itself. Bounds the cleanup model's input only.
+    private static func withinLimit(_ value: String, keepingEnd: Bool = false) -> String {
+        let limit = DictationConfig.cleanupFieldMaxUTF16
+        guard value.utf16.count > limit else { return value }
+        var kept = 0
+        if keepingEnd {
+            var start = value.endIndex
+            for index in value.indices.reversed() {
+                kept += value[index].utf16.count
+                guard kept <= limit else { break }
+                start = index
             }
-            BackgroundSyncLogger.logDebug("[Dictation] cleaned up in \(clock.now - started) (\(transcript.count) → \(text.count) chars, screen text \(context.screenText.count) chars)")
-            return text
-        } catch {
-            BackgroundSyncLogger.logDebug("[Dictation] cleanup failed after \(clock.now - started): \(type(of: error)); using the transcript as heard")
+            return String(value[start...])
+        }
+        var end = value.startIndex
+        for index in value.indices {
+            kept += value[index].utf16.count
+            guard kept <= limit else { break }
+            end = value.index(after: index)
+        }
+        return String(value[..<end])
+    }
+
+    /// The text appended: the cleaned-up transcript, or the transcript as heard when the cleanup
+    /// came back empty (it failed, or ran past the backend's deadline) or didn't run (a backend
+    /// without ADR-027 answers no `cleaned_text`). A failed cleanup never costs the user their
+    /// dictation.
+    static func pasted(transcript: String, cleanedText: String?) -> String {
+        let cleaned = (cleanedText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else {
+            BackgroundSyncLogger.logDebug("[Dictation] no cleaned text (\(cleanedText == nil ? "none returned" : "empty")); using the transcript as heard")
             return transcript
         }
+        BackgroundSyncLogger.logDebug("[Dictation] cleaned up (\(transcript.count) → \(cleaned.count) chars)")
+        return cleaned
     }
+}
 
-    /// The prompt and its variables. Fields that don't apply on iOS are sent empty; the prompt
-    /// reads an empty field as unknown. `dictionary`: the user's words, one per line (ADR-IOS-086).
-    static func message(dictation: String, context: DictationContext, dictionary: [String]) -> CompletionsMessage {
-        CompletionsMessage(role: "system", content: DictationConfig.cleanupPrompt, vars: [
-            "dictation": .string(dictation),
-            "app_name": .string(DictationConfig.contextAppName),
-            "web_host": .string(""),
-            "terminal_program": .string(""),
-            "window_title": .string(context.windowTitle),
-            "screen_text": .string(context.screenText),
-            "dictionary": .string(dictionary.joined(separator: "\n")),
-        ])
-    }
+/// `POST /dictation/transcribe`'s answer: the transcript, and with a `cleanup` sent, the cleaned-up
+/// text (`""` when the cleanup failed; nil from a backend that doesn't run it).
+struct DictationTranscription: Sendable, Equatable {
+    let text: String
+    let cleanedText: String?
 }
