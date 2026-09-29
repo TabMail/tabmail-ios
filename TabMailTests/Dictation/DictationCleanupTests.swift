@@ -126,6 +126,15 @@ struct DictationCleanupTests {
         }
     }
 
+    /// A title one code unit over the limit keeps exactly the limit, its start.
+    @Test func aTitleOverTheLimitKeepsExactlyTheLimit() {
+        let limit = DictationConfig.cleanupFieldMaxUTF16
+        let variables = DictationCleanup.variables(
+            context: DictationContext(windowTitle: String(repeating: "t", count: limit + 1), screenText: ""), dictionary: []
+        )
+        #expect(variables["window_title"] == String(repeating: "t", count: limit))
+    }
+
     @Test func aFieldAtTheLimitIsSentWhole() {
         let limit = DictationConfig.cleanupFieldMaxUTF16
         let title = String(repeating: "t", count: limit)
