@@ -111,6 +111,22 @@ struct TabMailSettingsView: View {
                     }
                 }
 
+                NavigationLink {
+                    DictationDictionaryView()
+                } label: {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Voice Dictation Dictionary")
+                            Text("Names and terms spelled your way")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "character.book.closed")
+                            .foregroundStyle(.primary)
+                    }
+                }
+
             }
 
             // BYOK tier configuration — single "AI Provider" section with

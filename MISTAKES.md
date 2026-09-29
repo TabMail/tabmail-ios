@@ -18,6 +18,7 @@ flips, or give a test seam a default that differs from production's initial valu
 · **write `AppLogStore.append(` anywhere but `BackgroundSyncLogger`/`DeviceSyncLogger`/`AuthDiagnostics`, or reuse an existing channel's tag "so the lines interleave" → MIS-IOS-019.**
 · **fix a finding phrased "at symbol X", or reach for the retained shape when a reviewer wrote a "deletion-first answer" → MIS-IOS-020.**
 · **raise a "arbitrary" size/window/scan constant because it is too small → MIS-IOS-024.**
+· **call a key/id wrong from a remembered keying fact before reading the function that mints it, or write `ContentKey(rawValue: header.id)` → MIS-IOS-025.**
 
 ## Data integrity — the irreversible ones
 
@@ -44,11 +45,12 @@ flips, or give a test seam a default that differs from production's initial valu
 - **[MIS-IOS-022](Companion/Mistakes/Active/MIS-IOS-022-replaced-a-splitting-mechanism-and-left-its-loop-under-the-old-aggregate-deadline.md)** — deleted the queue's batch-**splitting** arm and left the per-member loop under the same 15 s `withTimeout` it had been escaping, so `requeueOrRetain` repeats the same prefix and the last member is **never sent** — **starvation = the wedge corollary**. ⛔ ×2: `ProviderMemberLoopBudget`'s elapsed-time margin starved identically. **Settle ONE member per attempt.** (×2)
 - **[MIS-IOS-023](Companion/Mistakes/Active/MIS-IOS-023-wrote-a-new-call-over-the-one-the-path-already-owed.md)** — **wrote a new call over the one that path already owed, and the diff GREW so nothing looked lost**: the promoted `retirePartiallyCompletedOp` never called `recordMembersThatEnteredInbox`, with **NO call-site count drop (5 base, 5 candidate)**. **A count census reads CLEAN when a NEW path is promoted without acquiring the call its predecessors owed.** (×2)
 - **[MIS-IOS-024](Companion/Mistakes/Active/MIS-IOS-024-widened-a-bound-without-asking-what-it-bounded.md)** — **widened a scan window (`snippetLinkScanChars` 4,000 → 32,000) on a happy-path benchmark without asking what the bound was protecting**: the regex behind `unwrapMarkdownLinks` was quadratic on unclosed `[](` / `\[` runs (3.5–6.8 s on the main actor at the new window); two cap-inside-the-regex patches each broke a valid link (MIS-005 ×28) before the construct was replaced by a linear scanner (#162, PR #163). Benchmark the ADVERSARIAL input in terms of the limit; worse than linear ⇒ replace the algorithm, never tune caps. (×1)
+- **[MIS-IOS-025](Companion/Mistakes/Active/MIS-IOS-025-read-a-content-store-with-a-header-id.md)** — **declared `ContentKey(rawValue: message.id)` a missing-body bug from the "FTS is RFC-keyed" note without reading `ContentKey.forHeader`**, which is Stage B (== header id; RFC tail only at E1); my own proving test failed. Read the mint before calling a key wrong; still read content stores via `MessageContentStore.capture`. (×1)
 
 ## Build & test ops
 
 - **[MIS-IOS-005](Companion/Mistakes/Active/MIS-IOS-005-bare-xcodegen-broke-nse-signing.md)** — ran bare `xcodegen generate`; literal `${DEVELOPMENT_TEAM}` → NSE never launches → smart push silently dies while background push still works. (×2)
-- **[MIS-IOS-006](Companion/Mistakes/Active/MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md)** — recorded a baseline from a stale `.xctest`; a new file is not in the target until `./Scripts/xcodegen.sh` runs, and a peer build holding `build.db` makes `test-without-building` measure the PREVIOUS bundle. **Verify new tests by NAME; gate on `TEST BUILD SUCCEEDED`.** (×6)
+- **[MIS-IOS-006](Companion/Mistakes/Active/MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md)** — recorded a baseline from a stale `.xctest`; a new file is not in the target until `./Scripts/xcodegen.sh` runs, and a peer build holding `build.db` makes `test-without-building` measure the PREVIOUS bundle. **Verify new tests by NAME; gate on `TEST BUILD SUCCEEDED`.** (×7)
 - **[MIS-IOS-014](Companion/Mistakes/Active/MIS-IOS-014-wrote-a-red-first-proof-that-could-not-run-red.md)** — wrote a red-first proof that **could not run red**: a fixture SIZED in situ went NEGATIVE once the inverted code bisected to 0, and `String(repeating:count:)` **TRAPS**, burying 101 real failures. **`Fatal error`, or >1 `Test run with` line, = not evidence.** (×1)
 
 ## Companion tree — the proof that stopped running

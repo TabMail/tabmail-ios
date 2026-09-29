@@ -695,6 +695,7 @@ struct DynamicIslandChat: View {
             // Unconditional: cancel() is a no-op when idle, and discards a
             // recording or transcription in progress (nowhere left to append it).
             dictation.cancel()
+            dictation.stopLearning()
             // No eager cancellation for any session type:
             // - Inbox: pill stays mounted, N/A
             // - Message-detail: user can navigate back to see the result
@@ -1244,7 +1245,7 @@ struct DynamicIslandChat: View {
         }
         if let message {
             let header = ["From: \(message.from)", "Subject: \(message.subject)", message.snippet].filter { !$0.isEmpty }
-            return .chatPill(title: message.subject, header: header, messages: chatMessages, input: inputText)
+            return .chatPill(title: message.subject, header: header, messages: chatMessages, input: inputText, emailId: message.id)
         }
         return .chatPill(title: "Chat", header: [], messages: chatMessages, input: inputText)
     }
@@ -1255,7 +1256,7 @@ struct DynamicIslandChat: View {
         isTextFieldFocused = false
         // The same gate that shows the input bar (and so the mic and the waveform) in the body.
         let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive
-        dictation.start(context: dictationContext, canUseAI: canUseAI) { text in
+        dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in
             inputText = DictationController.appending(text, to: inputText)
             inputSelection = .init(insertionPoint: inputText.endIndex)
             Task { await DictationLanguageTip.dictationCompleted.donate() }
@@ -1307,6 +1308,8 @@ struct DynamicIslandChat: View {
         // isWorking changes trigger a parent re-render whose .animation()
         // modifier can leak into child views, briefly persisting the old text.
         isTextFieldFocused = false
+        // The input as sent is the last word on a correction of a dictation in it (ADR-IOS-086).
+        dictation.inputSent(inputText)
         inputText = ""
         inputSelection = .init(insertionPoint: "".startIndex)
 

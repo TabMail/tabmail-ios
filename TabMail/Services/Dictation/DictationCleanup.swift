@@ -12,10 +12,15 @@ struct DictationContext: Sendable, Equatable {
     /// for the field being dictated into, `‸` at the caret (the end of the field: dictation
     /// is appended there).
     var screenText: String
+    /// All of it, uncut and without the markers, where the terms sent with the dictation are picked
+    /// (`DictationContextTerms`).
+    var termsText = ""
+    /// The email the pill is about (its `messageHeader.id`): its body is read for terms too.
+    var emailId: String?
 
-    /// The chat pill: what it is about (`header`, e.g. the email on screen), the latest chat
-    /// turns, and the input field with the caret at its end.
-    static func chatPill(title: String, header: [String], messages: [ChatMessage], input: String) -> DictationContext {
+    /// The chat pill: what it is about (`header`, e.g. the email on screen, and `emailId`, that
+    /// email), the latest chat turns, and the input field with the caret at its end.
+    static func chatPill(title: String, header: [String], messages: [ChatMessage], input: String, emailId: String? = nil) -> DictationContext {
         let turns = messages.suffix(DictationConfig.contextMaxChatMessages).compactMap { message -> String? in
             switch message.role {
             case .user: "Me: \(message.content)"
@@ -27,7 +32,10 @@ struct DictationContext: Sendable, Equatable {
         let text = (header + turns + field).joined(separator: "\n")
         // Bounds the cleanup model's input only (its context window); the most recent text,
         // ending at the caret, is kept. Nothing is stored.
-        return DictationContext(windowTitle: title, screenText: String(text.suffix(DictationConfig.contextMaxScreenChars)))
+        return DictationContext(
+            windowTitle: title, screenText: String(text.suffix(DictationConfig.contextMaxScreenChars)),
+            termsText: ([title] + header + turns + [input]).joined(separator: "\n"), emailId: emailId
+        )
     }
 }
 
@@ -42,11 +50,11 @@ enum DictationCleanup {
     /// including no reply within `timeout` seconds, the transcript as heard: a failed cleanup
     /// never costs the user their dictation.
     static func cleanUp(
-        _ transcript: String, context: DictationContext, complete: @escaping Complete,
+        _ transcript: String, context: DictationContext, dictionary: [String], complete: @escaping Complete,
         timeout: TimeInterval = DictationConfig.cleanupTimeout
     ) async -> String {
         let request = CompletionsRequest(
-            messages: [message(dictation: transcript, context: context)],
+            messages: [message(dictation: transcript, context: context, dictionary: dictionary)],
             client_timezone: TimeZone.current.identifier,
             disable_tools: true,
             web_search_enabled: false
@@ -70,8 +78,8 @@ enum DictationCleanup {
     }
 
     /// The prompt and its variables. Fields that don't apply on iOS are sent empty; the prompt
-    /// reads an empty field as unknown.
-    static func message(dictation: String, context: DictationContext) -> CompletionsMessage {
+    /// reads an empty field as unknown. `dictionary`: the user's words, one per line (ADR-IOS-086).
+    static func message(dictation: String, context: DictationContext, dictionary: [String]) -> CompletionsMessage {
         CompletionsMessage(role: "system", content: DictationConfig.cleanupPrompt, vars: [
             "dictation": .string(dictation),
             "app_name": .string(DictationConfig.contextAppName),
@@ -79,6 +87,7 @@ enum DictationCleanup {
             "terminal_program": .string(""),
             "window_title": .string(context.windowTitle),
             "screen_text": .string(context.screenText),
+            "dictionary": .string(dictionary.joined(separator: "\n")),
         ])
     }
 }
