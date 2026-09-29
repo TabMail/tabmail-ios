@@ -1918,48 +1918,20 @@ struct DynamicIslandChat: View {
 
     // MARK: - Agent chat (non-compose mode) — uses completions API matching TB's agentConverse
 
-    /// Human-readable label for a tool name (e.g., "inbox_read" → "Reading inbox").
-    private static let toolDisplayLabels: [String: String] = [
-        "inbox_read": "Reading inbox",
-        "email_read": "Reading email",
-        "email_search": "Searching emails",
-        "email_compose": "Composing email",
-        "email_reply": "Composing reply",
-        "email_forward": "Forwarding email",
-        "email_archive": "Archiving emails",
-        "email_delete": "Deleting emails",
-        "memory_search": "Searching memory",
-        "memory_read": "Reading memory",
-        "search_web": "Searching web",
-        "web_read": "Reading webpage",
-        "date_to_day": "Checking date",
-        "calendar_read": "Reading calendar",
-        "calendar_search": "Searching calendar",
-        "calendar_event_read": "Reading event",
-        "calendar_event_create": "Creating event",
-        "calendar_event_edit": "Editing event",
-        "calendar_event_delete": "Deleting event",
-        "contacts_search": "Searching contacts",
-        "contacts_add": "Adding contact",
-        "contacts_edit": "Editing contact",
-        "contacts_delete": "Deleting contact",
-        "kb_add": "Saving to knowledge base",
-        "kb_del": "Removing from knowledge base",
-        "reminder_add": "Setting reminder",
-        "reminder_del": "Removing reminder",
-        "task_add": "Setting scheduled task",
-        "task_del": "Removing scheduled task",
-        "task_edit": "Updating scheduled task",
-        "template_read": "Reading template",
-        "template_create": "Creating template",
-        "template_edit": "Editing template",
-        "template_delete": "Deleting template",
-        "template_share": "Sharing template",
-        "template_search": "Searching templates",
-        "template_download": "Downloading template",
-        "template_toggle": "Toggling template",
-        "change_setting": "Updating setting",
-    ]
+    /// The label a running tool shows: the event's `display_label` (a server tool's comes from the
+    /// backend, e.g. "Searching the web: <query>"; a client tool's from `ToolRegistry.activityLabel`),
+    /// as Thunderbird's chat shows them (ADR-IOS-008), then the tool's name, then a generic one.
+    /// A finished tool shows `idleLabel`; any other event leaves the status as it is (nil).
+    static func statusLabel(for event: CompletionsSSEEvent, idleLabel: String) -> String? {
+        switch event {
+        case .toolStarted(let status):
+            status.display_label ?? status.tool_name ?? "Processing"
+        case .toolCompleted:
+            idleLabel
+        default:
+            nil
+        }
+    }
 
     /// Minimum time (seconds) each status is displayed before the next one takes over.
     private static let statusTickInterval: TimeInterval = 2.0
@@ -1976,20 +1948,14 @@ struct DynamicIslandChat: View {
         return { @Sendable event in
             Task { @MainActor in
                 switch event {
-                case .toolStarted(let status):
-                    let label = status.tool_name.flatMap { Self.toolDisplayLabels[$0] }
-                        ?? status.display_label
-                        ?? status.tool_name
-                        ?? "Processing"
-                    enqueueStatus(label)
-                case .toolCompleted:
-                    enqueueStatus(idleLabel)
                 case .throttled:
                     isThrottled = true
                 case .throttleEnded:
                     isThrottled = false
                 default:
-                    break
+                    if let label = Self.statusLabel(for: event, idleLabel: idleLabel) {
+                        enqueueStatus(label)
+                    }
                 }
             }
         }

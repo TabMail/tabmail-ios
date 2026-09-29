@@ -1237,7 +1237,7 @@ extension BackendClient {
                 // Fire tool-started event for client-side tools (matching server-side SSE events)
                 onSSEEvent?(.toolStarted(ToolStatusEvent(
                     execution_id: nil, call_id: toolCall.id,
-                    display_label: toolName, tool_name: toolName,
+                    display_label: ToolRegistry.activityLabel(for: toolName), tool_name: toolName,
                     success: nil, elapsed_ms: nil, error: nil, result: nil
                 )))
 
@@ -1256,7 +1256,7 @@ extension BackendClient {
                 // Fire tool-completed event for client-side tools
                 onSSEEvent?(.toolCompleted(ToolStatusEvent(
                     execution_id: nil, call_id: toolCall.id,
-                    display_label: toolName, tool_name: toolName,
+                    display_label: ToolRegistry.activityLabel(for: toolName), tool_name: toolName,
                     success: result.ok, elapsed_ms: nil, error: nil, result: nil
                 )))
 
