@@ -174,10 +174,16 @@ for the cleanup.
   `cleaned_text`, so this build then appends the transcript uncleaned; it never fails the
   dictation. Released builds keep working against the new backend, which answers them exactly as
   before.
+- Every field is cut to the backend's per-field limit (`DictationConfig.cleanupFieldMaxUTF16`,
+  20,000 UTF-16 code units, its `cleanup.maxFieldChars`), between characters: the title keeps its
+  start, the screen text its end, at the caret. Over the limit the backend refuses the whole
+  request, the transcription included, and the title is the email's subject, which its sender
+  chooses: an uncut one could make every dictation in that email's chat fail silently. The cut
+  bounds the cleanup model's input only.
 - The screen and dictionary now go with the audio even when the transcript comes back empty (the
   backend then runs no cleanup), where before they were sent only with a non-empty transcript.
   They were already sent to the same backend for every dictation that produced text.
 - Tests: `BackendClientDictationTests` (the `cleanup` body, `cleaned_text` as sent, `""`, missing
-  and non-string), `DictationCleanupTests` (variables, what is pasted), and
+  and non-string), `DictationCleanupTests` (variables, each within the limit, cut between characters, what is pasted), and
   `DictationControllerTests` (the variables go with the upload; `""`, blank and missing
   `cleaned_text` append the transcript; the production factory sends `cleanup`).

@@ -53,10 +53,36 @@ enum DictationCleanup {
             "app_name": DictationConfig.contextAppName,
             "web_host": "",
             "terminal_program": "",
-            "window_title": context.windowTitle,
-            "screen_text": context.screenText,
-            "dictionary": dictionary.joined(separator: "\n"),
+            "window_title": withinLimit(context.windowTitle),
+            "screen_text": withinLimit(context.screenText, keepingEnd: true),
+            "dictionary": withinLimit(dictionary.joined(separator: "\n")),
         ]
+    }
+
+    /// `value` within the backend's limit on a cleanup field (`cleanupFieldMaxUTF16`), cut between
+    /// characters: its start, or with `keepingEnd` its end (the screen text ends at the caret).
+    /// The window title is the email's subject, which its sender chooses; over the limit the
+    /// backend would refuse the dictation itself. Bounds the cleanup model's input only.
+    private static func withinLimit(_ value: String, keepingEnd: Bool = false) -> String {
+        let limit = DictationConfig.cleanupFieldMaxUTF16
+        guard value.utf16.count > limit else { return value }
+        var kept = 0
+        if keepingEnd {
+            var start = value.endIndex
+            for index in value.indices.reversed() {
+                kept += value[index].utf16.count
+                guard kept <= limit else { break }
+                start = index
+            }
+            return String(value[start...])
+        }
+        var end = value.startIndex
+        for index in value.indices {
+            kept += value[index].utf16.count
+            guard kept <= limit else { break }
+            end = value.index(after: index)
+        }
+        return String(value[..<end])
     }
 
     /// The text appended: the cleaned-up transcript, or the transcript as heard when the cleanup

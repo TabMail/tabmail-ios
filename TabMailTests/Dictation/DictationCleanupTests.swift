@@ -108,6 +108,46 @@ struct DictationCleanupTests {
         ])
     }
 
+    /// The backend refuses the whole dictation when a cleanup field is over its limit (ADR-027),
+    /// counted in UTF-16 code units. The window title is the email's subject, which its sender
+    /// chooses, so every field is cut to the limit, between characters: a title keeps its start,
+    /// the screen text its end, where the caret is.
+    @Test func everyFieldStaysWithinTheBackendsLimit() {
+        let limit = DictationConfig.cleanupFieldMaxUTF16
+        // An emoji is two code units: one straddling the limit is left out whole.
+        let title = String(repeating: "t", count: limit - 1) + "😀" + "tail"
+        let screen = "head" + "😀" + String(repeating: "s", count: limit - 1) + "‸"
+        let variables = DictationCleanup.variables(context: DictationContext(windowTitle: title, screenText: screen), dictionary: [])
+
+        #expect(variables["window_title"] == String(repeating: "t", count: limit - 1))
+        #expect(variables["screen_text"] == String(repeating: "s", count: limit - 1) + "‸")
+        for (key, value) in variables {
+            #expect(value.utf16.count <= limit, "\(key)")
+        }
+    }
+
+    @Test func aFieldAtTheLimitIsSentWhole() {
+        let limit = DictationConfig.cleanupFieldMaxUTF16
+        let title = String(repeating: "t", count: limit)
+        let screen = String(repeating: "s", count: limit - 1) + "‸"
+        let variables = DictationCleanup.variables(context: DictationContext(windowTitle: title, screenText: screen), dictionary: [])
+
+        #expect(variables["window_title"] == title)
+        #expect(variables["screen_text"] == screen)
+    }
+
+    /// The pill's screen text is cut to `contextMaxScreenChars` characters, but a character can be
+    /// many code units: 500 letters with 40 combining marks each are 20,500.
+    @Test func aScreenOfLongCharactersStaysWithinTheLimit() {
+        let heavy = "a" + String(repeating: "\u{0301}", count: 40)
+        let context = DictationContext.chatPill(title: heavy, header: [String(repeating: heavy, count: DictationConfig.contextMaxScreenChars)], messages: [], input: "")
+        #expect(context.screenText.utf16.count > DictationConfig.cleanupFieldMaxUTF16)
+
+        let variables = DictationCleanup.variables(context: context, dictionary: [])
+        #expect(variables.values.allSatisfy { $0.utf16.count <= DictationConfig.cleanupFieldMaxUTF16 })
+        #expect(variables["screen_text"]?.hasSuffix("» ‸") == true)
+    }
+
     @Test func appendsTheCleanedUpTextTrimmed() {
         #expect(DictationCleanup.pasted(transcript: transcript, cleanedText: " Ask Jordan about the roadmap.\n") == "Ask Jordan about the roadmap.")
     }

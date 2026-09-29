@@ -133,6 +133,10 @@ enum DictationConfig {
     /// the caret, since more context slows it (was 20,000). Bounds the cleanup model's input
     /// only; nothing is stored.
     static let contextMaxScreenChars = 500
+    /// The backend's limit on each cleanup field (its `transcription.json` `cleanup.maxFieldChars`,
+    /// ADR-027), in UTF-16 code units. Over it the backend refuses the whole request, the
+    /// transcription included, so every field is cut to it (`DictationCleanup.variables`).
+    static let cleanupFieldMaxUTF16 = 20_000
 
     // MARK: Waveform
 
