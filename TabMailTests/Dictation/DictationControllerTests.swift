@@ -1564,7 +1564,9 @@ struct DictationOptOutFlagTests {
         #expect(!pill.contains("Badge"))
         #expect(pill.contains("Waveform(level: controller.level, isFlat: controller.phase == .listening && !controller.hasHeardSpeech)"))
         #expect(pill.contains("guard !isFlat else { return DictationConfig.meterMinBarHeight }"))
-        #expect(pill.contains(".accessibilityElement(children: .ignore)\n            .accessibilityLabel(accessibilityLabel)"))
+        #expect(pill.contains(".accessibilityElement(children: .ignore)\n        .accessibilityLabel(accessibilityLabel)"))
+        // While a transcription is tried again, the note takes the waveform's place.
+        #expect(pill.contains("if controller.isRetrying {\n                Text(Self.retryingMessage)"))
 
         let source = try pillSource()
         #expect(source.contains(".popoverTip(DictationLanguageTip(), arrowEdge: .bottom)"))
@@ -1620,6 +1622,34 @@ struct DictationWaveformTests {
         controller.finish()
         #expect(controller.phase == .transcribing)
         #expect(waveform.accessibilityLabel == "Transcribing")
+        controller.cancel()
+        #expect(waveform.accessibilityLabel == "")
+    }
+
+    /// While a transcription the server failed is tried again, VoiceOver reads the note the pill
+    /// shows; cancelled, nothing.
+    @Test func itReadsTheRetryingNoteWhileItRetries() async {
+        let capture = FakeCapture()
+        let controller = DictationController(
+            capture: capture,
+            requestMicrophoneAccess: { true },
+            isOnline: { true },
+            isOptedOutOfAI: { false },
+            dictationLanguage: { nil },
+            transcribe: { _, _, _, _ in throw DictationError(status: 502, code: "transcription_failed") },
+            warmUp: {},
+            transcriptionRetryDelays: [.seconds(60)],
+            speechDetector: FakeSpeechDetector.hearing()
+        )
+        controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { _ in }
+        let waveform = DictationPillView(controller: controller)
+        await waitUntil { capture.starts == 1 }
+        controller.finish()
+        #expect(waveform.accessibilityLabel == "Transcribing")
+
+        await waitUntil { controller.isRetrying }
+        #expect(controller.phase == .transcribing)
+        #expect(waveform.accessibilityLabel == DictationPillView.retryingMessage)
         controller.cancel()
         #expect(waveform.accessibilityLabel == "")
     }
