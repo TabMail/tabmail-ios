@@ -212,3 +212,32 @@ raw WAV upload was one of the measured steps; the fix applies to iOS as well as 
   the reference `flac` decoder accepted, the hash Voice's `test/flac.test.ts` pins.
   `DictationControllerTests` and `BackendClientDictationTests` decode the upload instead of reading
   a WAV header.
+
+**Amendment 2026-09-29 — warm-up at the tap, and a server error tried again (TabMail Voice ADR-DESK-039).**
+Owner, 2026-09-29: "also the warmup and retry there as well".
+
+- Warm-up: when a dictation starts listening, `BackendClient.warmUpDictation` sends `GET /whoami`
+  (`DictationConfig.warmUpPath`) over `llmSession`, the session the transcription uses, with the
+  signed-in session's token. The connection is then open, the token fetched (refreshed if due) and
+  the backend's sign-in and entitlement caches warm by the time the recording is sent. It is best
+  effort and never waited for; its answer is not read; signed out, nothing is sent. A dictation that
+  does not start (offline, no AI access, opted out of AI) sends none. On a new account the request
+  can start the signup trial, as any authenticated request can; such a user has already asked to
+  dictate with AI.
+- Retry: a transcription that failed on the server's side, a 5xx other than a 504 or a connection
+  that dropped or could not be made (`DictationController.isServerError`), is sent again, the same recording, after
+  500 ms and then 1.5 s (`transcriptionRetryDelays`). Meanwhile the waveform gives way to
+  "Server error, retrying…" (`DictationPillView.retryingMessage`, Voice's wording), the one note
+  this pill shows, until a retry answers; any other failure still ends silently. Not retried: a
+  timeout (the request may still be running on the server), the backend's own 504 (it already
+  waited 30 s for the speech model; retrying would hold the field for 1.5 minutes), 4xx refusals (401, 402, 403, 429, 400) and an unreadable answer.
+  A dictation cancelled while it waits, or whose server error arrives after a cancel, sends nothing
+  more. A retry after an answer lost in transit can count one dictation twice against the quota.
+- The release tail stays 300 ms: the owner asked for the warm-up and the retry on iOS.
+- Tests: `DictationControllerTests` (each 5xx and a dropped or failed connection retried with the
+  same upload and the note shown only while it retries, gone when the text is appended; three
+  failures end quietly; each delay waited; refusals, a timeout and a 504 sent once; a cancel during the wait, or before a server error
+  arrives, sends nothing more; the warm-up sent once when listening starts and before the upload,
+  none for a dictation that does not start, and one that never answers holds nothing up;
+  `isServerError` table), `BackendClientDictationAuthTests` (the warm-up goes over the
+  transcription's session with the token; signed out, nothing).

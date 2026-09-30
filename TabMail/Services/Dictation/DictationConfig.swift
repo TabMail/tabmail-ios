@@ -72,6 +72,13 @@ enum DictationConfig {
     // MARK: Backend
 
     static let transcribePath = "/dictation/transcribe"
+    /// Requested when the mic is tapped (TabMail Voice ADR-DESK-039), so the connection, the sign-in
+    /// token and the backend's per-request caches are warm by the time the recording is sent.
+    static let warmUpPath = "/whoami"
+    static let warmUpRequestTimeout: TimeInterval = 10
+    /// A transcription the server failed (a 5xx) or whose connection dropped is tried again after
+    /// each of these, so the user need not say it again. As TabMail Voice's.
+    static let transcriptionRetryDelays: [Duration] = [.milliseconds(500), .milliseconds(1_500)]
     /// Covers the upload, the transcription and the cleanup the backend runs in the same request
     /// under its own deadline (backend ADR-027; owner, 2026-09-28: 1.5 s at most).
     static let transcriptionRequestTimeout: TimeInterval = 45

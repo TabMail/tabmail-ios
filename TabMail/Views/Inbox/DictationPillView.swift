@@ -7,15 +7,28 @@ import SwiftUI
 /// Laid over the chat pill's input field while dictating (the field's text dims behind it): TabMail
 /// Voice's waveform, flat while it waits for speech, following the voice once someone speaks, and
 /// rippling at rest while the words are transcribed. Nothing else: no language, and nothing when a dictation fails (the field simply
-/// comes back). The waveform and its numbers are copied from TabMail Voice (`OverlayPanel.swift`).
+/// comes back), but a note while a transcription the server failed is tried again. The waveform and its numbers are copied from TabMail Voice (`OverlayPanel.swift`).
 struct DictationPillView: View {
     let controller: DictationController
 
+    /// Shown while the transcription is tried again (`DictationController.isRetrying`). As TabMail
+    /// Voice's pill.
+    static let retryingMessage = "Server error, retrying…"
+
     var body: some View {
-        Waveform(level: controller.level, isFlat: controller.phase == .listening && !controller.hasHeardSpeech)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(accessibilityLabel)
+        Group {
+            if controller.isRetrying {
+                Text(Self.retryingMessage)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            } else {
+                Waveform(level: controller.level, isFlat: controller.phase == .listening && !controller.hasHeardSpeech)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
     }
 
     /// What VoiceOver reads for the waveform.
@@ -23,7 +36,7 @@ struct DictationPillView: View {
         switch controller.phase {
         case .idle: ""
         case .listening: "Listening"
-        case .transcribing: "Transcribing"
+        case .transcribing: controller.isRetrying ? Self.retryingMessage : "Transcribing"
         }
     }
 }

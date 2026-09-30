@@ -30,6 +30,8 @@ final class DictationController {
     /// The language this dictation is transcribed in, read once when it starts: a Settings change
     /// mid-dictation applies to the next one (`DictationLanguage`). Nil: none sent.
     private(set) var language: String?
+    /// The transcription failed on the server's side and is being tried again: the field says so.
+    private(set) var isRetrying = false
 
     /// Recording or transcribing: the microphone button stops (or waits for) this dictation.
     var isActive: Bool { phase == .listening || phase == .transcribing }
@@ -37,6 +39,8 @@ final class DictationController {
     /// The recording (FLAC), its language, the words to spell as given and the cleanup's variables →
     /// the transcript and its cleaned-up text.
     typealias Transcribe = @Sendable (Data, String?, [String], [String: String]) async throws -> DictationTranscription
+    /// Warms the backend for the transcription to come (`BackendClient.warmUpDictation`).
+    typealias WarmUp = @Sendable () async -> Void
     /// The plain-text body of an email (its `messageHeader.id`), for terms; nil without one.
     typealias EmailBody = @Sendable (String) async -> String?
     /// A speech detector for one dictation, given what to call when it hears speech and when it
@@ -55,6 +59,8 @@ final class DictationController {
     @ObservationIgnored private let emailBody: EmailBody
     @ObservationIgnored private let corrections: DictationCorrectionWatch?
     @ObservationIgnored private let transcribeAudio: Transcribe
+    @ObservationIgnored private let warmUp: WarmUp
+    @ObservationIgnored private let transcriptionRetryDelays: [Duration]
     @ObservationIgnored private let makeSpeechDetector: MakeSpeechDetector
     @ObservationIgnored private let maxRecordingDuration: Duration
 
@@ -88,6 +94,8 @@ final class DictationController {
         emailBody: @escaping EmailBody = { await DictationController.storedEmailBody(headerId: $0) },
         corrections: DictationCorrectionWatch? = DictationCorrectionWatch { DictationDictionary.shared.learn($0) },
         transcribe: Transcribe? = nil,
+        warmUp: WarmUp? = nil,
+        transcriptionRetryDelays: [Duration] = DictationConfig.transcriptionRetryDelays,
         speechDetector: @escaping MakeSpeechDetector = { SoundClassifierSpeechDetector(onSpeech: $0, onFailure: $1) },
         maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration
     ) {
@@ -100,6 +108,8 @@ final class DictationController {
         self.emailBody = emailBody
         self.corrections = corrections
         self.transcribeAudio = transcribe ?? Self.backendTranscription(AccountManager.shared.backendClient)
+        self.warmUp = warmUp ?? Self.backendWarmUp(AccountManager.shared.backendClient)
+        self.transcriptionRetryDelays = transcriptionRetryDelays
         self.makeSpeechDetector = speechDetector
         self.maxRecordingDuration = maxRecordingDuration
     }
@@ -111,6 +121,10 @@ final class DictationController {
         { flac, language, vocabulary, cleanup in
             try await client.transcribeDictation(flac: flac, language: language, vocabulary: vocabulary, cleanup: cleanup)
         }
+    }
+
+    nonisolated static func backendWarmUp(_ client: BackendClient) -> WarmUp {
+        { await client.warmUpDictation() }
     }
 
     /// Starts listening. `context` is what the user sees now (the cleanup reads it); `onText`
@@ -155,6 +169,9 @@ final class DictationController {
         hasHeardSpeech = false
         language = dictationLanguage()
         phase = .listening
+        // Best effort, never waited for: the dictation goes on whatever it answers.
+        let warmUp = warmUp
+        Task { await warmUp() }
         startTask = Task { [weak self] in
             guard let self else { return }
             let granted = await self.requestMicrophoneAccess()
@@ -323,7 +340,7 @@ final class DictationController {
         let cleanup = DictationCleanup.variables(context: context ?? DictationContext(windowTitle: "", screenText: ""), dictionary: words)
         BackgroundSyncLogger.logDebug("[Dictation] uploading \(flac.count) bytes of FLAC, \(words.count) dictionary word(s), \(terms.count) term(s)")
         do {
-            let transcription = try await transcribeAudio(flac, language, words + terms, cleanup)
+            let transcription = try await transcribeRetrying(flac, language, words + terms, cleanup, generation: current)
             guard generation == current, !Task.isCancelled else { return }
             let transcript = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
             BackgroundSyncLogger.logDebug("[Dictation] transcript ready (\(transcript.count) chars)")
@@ -343,6 +360,45 @@ final class DictationController {
             BackgroundSyncLogger.logDebug("[Dictation] transcription failed: \(error)")
             fail()
         }
+    }
+
+    /// Makes the transcription request, and makes it again after a server error (a 5xx other than
+    /// the backend's own timeout: the speech model behind it was rate limited or failed) or a dropped
+    /// connection, once after each of `transcriptionRetryDelays`, so the user need not say it again;
+    /// `isRetrying` says so while it waits and tries, until a retry answers. Any other failure (signed out, over quota, a refused request, a timeout) fails at
+    /// once. As TabMail Voice's `transcribeRetrying` (ADR-DESK-039).
+    private func transcribeRetrying(
+        _ flac: Data, _ language: String?, _ vocabulary: [String], _ cleanup: [String: String], generation current: Int
+    ) async throws -> DictationTranscription {
+        var retry = 0
+        while true {
+            do {
+                // The note goes once a retry answers: `transcribe` tears down, resetting
+                // `isRetrying`, with no suspension between.
+                return try await transcribeAudio(flac, language, vocabulary, cleanup)
+            } catch {
+                guard retry < transcriptionRetryDelays.count, Self.isServerError(error), generation == current, !Task.isCancelled else {
+                    throw error
+                }
+                let delay = transcriptionRetryDelays[retry]
+                retry += 1
+                BackgroundSyncLogger.logDebug("[Dictation] transcription failed (\(error)); retrying in \(delay)")
+                isRetrying = true
+                try await Task.sleep(for: delay)
+            }
+        }
+    }
+
+    /// The status the backend answers when the speech model did not answer in time.
+    nonisolated private static let gatewayTimeoutStatus = 504
+
+    /// A failure on the server's side, worth trying again: a 5xx, or a connection that dropped or
+    /// could not be made. Not a timeout: the request may still be running on the server. Nor a 504,
+    /// the backend's own timeout: it already waited for the speech model.
+    nonisolated static func isServerError(_ error: any Error) -> Bool {
+        if case .failed(let status) = error as? DictationError { return status >= 500 && status != gatewayTimeoutStatus }
+        guard let error = error as? URLError else { return false }
+        return error.code != .timedOut && error.code != .cancelled
     }
 
     private func updateLevel(decibels: Float, generation: Int) {
@@ -379,6 +435,7 @@ final class DictationController {
         termsTask?.cancel()
         termsTask = nil
         hasHeardSpeech = false
+        isRetrying = false
         level = 0
     }
 

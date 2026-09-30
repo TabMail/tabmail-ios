@@ -183,4 +183,39 @@ struct BackendClientDictationAuthTests {
 
         #expect(bearers.withLock { $0 } == ["Bearer \(Self.accessToken)", nil])
     }
+
+    /// The warm-up (TabMail Voice ADR-DESK-039): `GET /whoami` with the signed-in session's token,
+    /// over the session the transcription uses, so its connection is the one warmed. Signed out,
+    /// nothing is sent. Its answer is never read: a refusal changes nothing.
+    @Test func theWarmUpGoesOverTheTranscriptionsSession() async throws {
+        #expect(await MainActor.run { !DemoModeStore.shared.isActive })
+        let previous = await MainActor.run { TabMailSessionStore.shared.loadActiveSession()?.data }
+        let http = FakeHTTP.Scenario()
+        let seen = Mutex<[FakeHTTP.Request]>([])
+        http.register(path: DictationConfig.warmUpPath, method: "GET") { request in
+            seen.withLock { $0.append(request) }
+            return .json(raw: #"{"error":"invalid_token"}"#, statusCode: 401)
+        }
+        let warmUp = DictationController.backendWarmUp(BackendClient(llmSession: http.session))
+
+        let outcome: Result<Void, any Error>
+        do {
+            try await MainActor.run { try installSession() }
+            await warmUp()
+            _ = await MainActor.run { TabMailAuthService.completeSession(mode: .deactivate, notify: false) }
+            await warmUp()
+            outcome = .success(())
+        } catch {
+            outcome = .failure(error)
+        }
+        try await MainActor.run { try restoreSession(previous) }
+        try outcome.get()
+
+        let requests = seen.withLock { $0 }
+        #expect(requests.count == 1)
+        guard requests.count == 1 else { return }
+        #expect(requests[0].url.path == DictationConfig.warmUpPath)
+        #expect(requests[0].header("Authorization") == "Bearer \(Self.accessToken)")
+        #expect(requests[0].header("X-Client-Type") == "ios")
+    }
 }

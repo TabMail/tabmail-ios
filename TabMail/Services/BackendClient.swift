@@ -186,6 +186,27 @@ extension BackendClient {
         return DictationTranscription(text: result.text, cleanedText: result.cleaned_text)
     }
 
+    /// Warms the dictation's path to the backend when the mic is tapped (TabMail Voice
+    /// ADR-DESK-039): `GET /whoami` over the session the transcription uses, so its connection is
+    /// open, with the signed-in session's token, fetched (refreshed if due) now rather than after
+    /// the recording, so the backend's sign-in and entitlement caches are warm. Best effort: the
+    /// answer is not read, and without a session nothing is sent.
+    func warmUpDictation() async {
+        guard let token = await currentAuthToken() else { return }
+        var request = URLRequest(url: baseURL.appending(path: DictationConfig.warmUpPath))
+        request.httpMethod = "GET"
+        request.timeoutInterval = DictationConfig.warmUpRequestTimeout
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("ios", forHTTPHeaderField: "X-Client-Type")
+        request.setValue(Self.clientVersion, forHTTPHeaderField: "X-Client-Version")
+        do {
+            let (_, response) = try await llmSession.data(for: request)
+            BackgroundSyncLogger.logDebug("[Dictation] warm-up answered \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+        } catch {
+            BackgroundSyncLogger.logDebug("[Dictation] warm-up failed: \(type(of: error))")
+        }
+    }
+
     private struct TranscriptionBody: Encodable {
         let audio: String
         let format: String
