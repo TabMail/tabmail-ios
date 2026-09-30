@@ -5,7 +5,7 @@
 import AVFoundation
 import os
 
-/// Accumulates one dictation as 16 kHz mono 16-bit PCM, ready to wrap in a WAV and upload.
+/// Accumulates one dictation as 16 kHz mono 16-bit PCM, ready to encode as FLAC and upload.
 /// Until `keepFromNow` (speech heard), only the latest `preRoll` of audio is held.
 ///
 /// `append` is called on the audio render thread; all state is behind one lock, so appends are

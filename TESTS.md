@@ -79,3 +79,19 @@ real mailbox is usable, and checks that the fixture rows remain intact. Failure
 cases also verify that Try Again invokes the injected dependency again. The
 resolver seam is a Debug-only environment value, defaulting to nil. These are
 mailbox-presentation integration tests, not provider-resolution integration tests.
+
+## Dictation upload — one bitstream pinned in two repositories
+
+`FLACEncoderTests.writesTheStreamTheReferenceDecoderWasCheckedAgainst` pins the SHA-256 of the FLAC
+stream for a deterministic speech-like signal; TabMail Voice's `apps/desktop/test/flac.test.ts`
+pins the same hash for the same signal, which the reference `flac` decoder accepted. The signal is
+computed in doubles with JavaScript's rounding so both produce identical samples. A change to either
+encoder's choices fails its own suite, and the two apps keep uploading the same bytes. Losslessness
+is checked by two independent decoders: `FLACTestDecoder` (every CRC checked) and Core Audio.
+`decodesToTheSameSamplesWhateverLengthTheLastFrameIs` sweeps every last-frame length 1–40 and 127,
+255, 1001, alone and after a full block, over noise, a tone (a high predictor order) and quiet audio
+with a full-scale burst and a step (the largest Rice parameter): each of the encoder's predictor-order,
+partition-order and Rice-parameter guards, removed, fails it (a trap or a stream that does not
+decode to the samples). The size tests hold digital silence to a few bytes a frame (the constant
+subframe) and full-scale audio to its PCM plus a frame's overhead (the verbatim fallback the upload's
+size bound rests on).

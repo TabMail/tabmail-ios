@@ -150,7 +150,7 @@ extension BackendClient {
 // MARK: - Dictation
 
 extension BackendClient {
-    /// Transcribes one dictation recording (16 kHz mono WAV) via `POST /dictation/transcribe`
+    /// Transcribes one dictation recording (16 kHz mono FLAC) via `POST /dictation/transcribe`
     /// (OpenRouter speech-to-text behind it; the backend stores neither audio nor text).
     /// Same request as TabMail Voice's `TranscriptionClient`. `language` (ISO-639-1) picks the
     /// backend's speech-to-text model (backend ADR-024); nil sends none (the default model).
@@ -159,7 +159,7 @@ extension BackendClient {
     /// prompt's variables (`DictationCleanup.variables`); the backend then cleans up the transcript in
     /// the same request (backend ADR-027) and answers `cleaned_text` too. Nil sends none.
     func transcribeDictation(
-        wav: Data, language: String?, vocabulary: [String], cleanup: [String: String]? = nil
+        flac: Data, language: String?, vocabulary: [String], cleanup: [String: String]? = nil
     ) async throws -> DictationTranscription {
         var request = URLRequest(url: baseURL.appending(path: DictationConfig.transcribePath))
         request.httpMethod = "POST"
@@ -171,7 +171,7 @@ extension BackendClient {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
         request.httpBody = try JSONEncoder().encode(TranscriptionBody(
-            audio: wav.base64EncodedString(), format: "wav", language: language, vocabulary: vocabulary.isEmpty ? nil : vocabulary,
+            audio: flac.base64EncodedString(), format: "flac", language: language, vocabulary: vocabulary.isEmpty ? nil : vocabulary,
             cleanup: cleanup
         ))
 
@@ -184,6 +184,27 @@ extension BackendClient {
             throw DictationError.invalidResponse
         }
         return DictationTranscription(text: result.text, cleanedText: result.cleaned_text)
+    }
+
+    /// Warms the dictation's path to the backend when the mic is tapped (TabMail Voice
+    /// ADR-DESK-039): `GET /whoami` over the session the transcription uses, so its connection is
+    /// open, with the signed-in session's token, fetched (refreshed if due) now rather than after
+    /// the recording, so the backend's sign-in and entitlement caches are warm. Best effort: the
+    /// answer is not read, and without a session nothing is sent.
+    func warmUpDictation() async {
+        guard let token = await currentAuthToken() else { return }
+        var request = URLRequest(url: baseURL.appending(path: DictationConfig.warmUpPath))
+        request.httpMethod = "GET"
+        request.timeoutInterval = DictationConfig.warmUpRequestTimeout
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("ios", forHTTPHeaderField: "X-Client-Type")
+        request.setValue(Self.clientVersion, forHTTPHeaderField: "X-Client-Version")
+        do {
+            let (_, response) = try await llmSession.data(for: request)
+            BackgroundSyncLogger.logDebug("[Dictation] warm-up answered \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+        } catch {
+            BackgroundSyncLogger.logDebug("[Dictation] warm-up failed: \(type(of: error))")
+        }
     }
 
     private struct TranscriptionBody: Encodable {

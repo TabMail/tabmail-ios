@@ -32,9 +32,14 @@ enum DictationConfig {
     static let levelAttack: Float = 0.7
     /// …and this much when it falls, so the waveform jumps with the voice and settles gently.
     static let levelRelease: Float = 0.25
-    /// Upload format: 16 kHz mono 16-bit PCM WAV — what Whisper-class models consume natively,
-    /// at ~32 KB per second of speech.
+    /// Recording format: 16 kHz mono 16-bit PCM — what Whisper-class models consume natively,
+    /// at ~32 KB per second of speech. Uploaded as FLAC (`FLACEncoder`), lossless at about half that.
     static let recordingSampleRate: Double = 16_000
+    /// Samples per FLAC frame, and the finest the Rice residual coding splits a frame (2^order
+    /// partitions). As TabMail Voice's `flacBlockSize` and `flacMaxPartitionOrder`: the same
+    /// recording encodes to the same bytes on both.
+    static let flacBlockSize = 4_096
+    static let flacMaxPartitionOrder = 6
     /// Recording continues this long after the mic button is tapped to stop, so the last word
     /// isn't clipped.
     static let releaseTailDuration: Duration = .milliseconds(300)
@@ -67,6 +72,13 @@ enum DictationConfig {
     // MARK: Backend
 
     static let transcribePath = "/dictation/transcribe"
+    /// Requested when the mic is tapped (TabMail Voice ADR-DESK-039), so the connection, the sign-in
+    /// token and the backend's per-request caches are warm by the time the recording is sent.
+    static let warmUpPath = "/whoami"
+    static let warmUpRequestTimeout: TimeInterval = 10
+    /// A transcription the server failed (a 5xx) or whose connection dropped is tried again after
+    /// each of these, so the user need not say it again. As TabMail Voice's.
+    static let transcriptionRetryDelays: [Duration] = [.milliseconds(500), .milliseconds(1_500)]
     /// Covers the upload, the transcription and the cleanup the backend runs in the same request
     /// under its own deadline (backend ADR-027; owner, 2026-09-28: 1.5 s at most).
     static let transcriptionRequestTimeout: TimeInterval = 45

@@ -96,6 +96,12 @@ private final class FakeCapture: AudioCapturing, @unchecked Sendable {
     }
 }
 
+/// The controller under test, for a transcription stub that reads or cancels it.
+@MainActor
+private final class ControllerRef {
+    weak var controller: DictationController?
+}
+
 /// What the dictations in one test uploaded, sent with it for the cleanup, and appended.
 private final class Recorded: Sendable {
     let uploads = Mutex<[Data]>([])
@@ -106,6 +112,8 @@ private final class Recorded: Sendable {
     /// The cleanup's variables sent with each upload (backend ADR-027).
     let cleanups = Mutex<[[String: String]]>([])
     let texts = Mutex<[String]>([])
+    /// Warm-ups sent (`DictationController.WarmUp`).
+    let warmUps = Mutex(0)
 }
 
 /// Hears speech in the buffers `hears` accepts, calling back at once as the classifier would.
@@ -242,7 +250,9 @@ struct DictationControllerTests {
         speechDetector: @escaping DictationController.MakeSpeechDetector = FakeSpeechDetector.hearing(),
         dictionary: @escaping @MainActor () -> DictationDictionary.Snapshot = { .init(words: [], learnsWords: false) },
         emailBody: @escaping DictationController.EmailBody = { _ in nil },
-        corrections: DictationCorrectionWatch? = nil
+        corrections: DictationCorrectionWatch? = nil,
+        warmUp: DictationController.WarmUp? = nil,
+        retryDelays: [Duration] = [.milliseconds(1), .milliseconds(1)]
     ) -> DictationController {
         let recorded = recorded
         return DictationController(
@@ -254,13 +264,15 @@ struct DictationControllerTests {
             dictionary: dictionary,
             emailBody: emailBody,
             corrections: corrections,
-            transcribe: { wav, language, vocabulary, cleanup in
-                recorded.uploads.withLock { $0.append(wav) }
+            transcribe: { flac, language, vocabulary, cleanup in
+                recorded.uploads.withLock { $0.append(flac) }
                 recorded.languages.withLock { $0.append(language) }
                 recorded.vocabularies.withLock { $0.append(vocabulary) }
                 recorded.cleanups.withLock { $0.append(cleanup) }
                 return DictationTranscription(text: try await transcript(), cleanedText: await cleaned())
             },
+            warmUp: warmUp ?? { recorded.warmUps.withLock { $0 += 1 } },
+            transcriptionRetryDelays: retryDelays,
             speechDetector: speechDetector,
             maxRecordingDuration: maxRecordingDuration
         )
@@ -294,10 +306,11 @@ struct DictationControllerTests {
 
         #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
         #expect(!capture.isRunning)
-        // The upload is a WAV of what was recorded.
-        let wav = try #require(recorded.uploads.withLock { $0.first })
-        #expect(String(decoding: wav.prefix(4), as: UTF8.self) == "RIFF")
-        #expect(wav.count > WAVEncoder.headerSize)
+        // The upload is a FLAC of what was recorded.
+        let flac = try #require(recorded.uploads.withLock { $0.first })
+        let decoded = try FLACTestDecoder.decode(flac)
+        #expect(decoded.sampleRate == Int(DictationConfig.recordingSampleRate))
+        #expect(decoded.totalSamples > 0)
         // One request: the recording went with what was on screen when the dictation started, for
         // the cleanup the backend runs on its transcript.
         #expect(recorded.cleanups.withLock { $0 } == [[
@@ -480,13 +493,18 @@ struct DictationControllerTests {
         #expect(recorded.texts.withLock { $0.isEmpty })
     }
 
-    /// A failed transcription shows nothing: the input field comes back as it was.
+    /// A failed transcription shows nothing: the input field comes back as it was. Refused by the
+    /// backend (signed out, no subscription, over quota, a bad request) or timed out, here or at the
+    /// backend (its 504: it already waited for the speech model), it is not tried again.
     @Test(arguments: [
+        DictationError.unauthorized as any Error,
         DictationError.subscriptionRequired as any Error,
+        DictationError(status: 429, code: "rate_limited") as any Error,
         DictationError(status: 400, code: "audio_too_large") as any Error,
-        DictationError(status: 500, code: nil) as any Error,
-        URLError(.notConnectedToInternet) as any Error,
+        DictationError(status: 400, code: "invalid_request") as any Error,
+        DictationError.invalidResponse as any Error,
         URLError(.timedOut) as any Error,
+        DictationError(status: 504, code: "transcription_timeout") as any Error,
     ])
     func aFailedTranscriptionEndsQuietly(error: any Error) async {
         let capture = FakeCapture()
@@ -497,7 +515,196 @@ struct DictationControllerTests {
 
         #expect(controller.phase == .idle)
         #expect(recorded.texts.withLock { $0.isEmpty })
+        #expect(recorded.uploads.withLock { $0.count } == 1)
+        #expect(!controller.isRetrying)
         #expect(!capture.isRunning)
+    }
+
+    // MARK: Server errors are tried again (TabMail Voice ADR-DESK-039)
+
+    /// A transcription the server failed (a 5xx) or whose connection dropped is sent again, the
+    /// same recording, the field saying so meanwhile; the retry's text is appended.
+    @Test(arguments: [
+        DictationError(status: 500, code: nil) as any Error,
+        DictationError(status: 502, code: "transcription_failed") as any Error,
+        DictationError(status: 503, code: "transcription_unavailable") as any Error,
+        URLError(.networkConnectionLost) as any Error,
+        URLError(.notConnectedToInternet) as any Error,
+    ])
+    func aServerErrorIsTriedAgain(error: any Error) async throws {
+        let capture = FakeCapture()
+        let attempts = Mutex(0)
+        let retryingSeen = Mutex<[Bool]>([])
+        let ref = ControllerRef()
+        let controller = controller(capture: capture, transcript: {
+            let attempt = attempts.withLock { $0 += 1; return $0 }
+            let retrying = await MainActor.run { ref.controller?.isRetrying ?? false }
+            retryingSeen.withLock { $0.append(retrying) }
+            if attempt == 1 { throw error }
+            return "ask jordan about the road map"
+        })
+        ref.controller = controller
+        let recorded = recorded
+        let retryingAtInsert = Mutex<[Bool]>([])
+
+        controller.start(context: context, canUseAI: true) { text in
+            retryingAtInsert.withLock { $0.append(controller.isRetrying) }
+            recorded.texts.withLock { $0.append(text) }
+        }
+        await waitUntil { capture.starts == 1 }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
+        // Nothing is being tried again while the text goes in.
+        #expect(retryingAtInsert.withLock { $0 } == [false])
+        let uploads = recorded.uploads.withLock { $0 }
+        #expect(uploads.count == 2)
+        guard uploads.count == 2 else { return }
+        #expect(uploads[1] == uploads[0])
+        // The retry was sent while the field said so; once it answered, the note went away.
+        #expect(retryingSeen.withLock { $0 } == [false, true])
+        #expect(!controller.isRetrying)
+    }
+
+    @Test func aTranscriptionFailingEveryRetryEndsQuietly() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, transcript: { throw DictationError(status: 502, code: "transcription_failed") })
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase == .idle }
+
+        #expect(controller.phase == .idle)
+        #expect(recorded.uploads.withLock { $0.count } == 1 + DictationConfig.transcriptionRetryDelays.count)
+        #expect(recorded.texts.withLock { $0.isEmpty })
+        #expect(!controller.isRetrying)
+    }
+
+    @Test func eachRetryWaitsItsDelay() async {
+        let capture = FakeCapture()
+        let times = Mutex<[ContinuousClock.Instant]>([])
+        let controller = controller(capture: capture, transcript: {
+            times.withLock { $0.append(.now) }
+            throw DictationError(status: 503, code: nil)
+        }, retryDelays: [.milliseconds(150), .milliseconds(300)])
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase == .idle }
+
+        let sent = times.withLock { $0 }
+        #expect(sent.count == 3)
+        guard sent.count == 3 else { return }
+        #expect(sent[1] - sent[0] >= .milliseconds(150))
+        #expect(sent[2] - sent[1] >= .milliseconds(300))
+    }
+
+    /// Cancelled while it waits to try again: nothing more is sent or appended.
+    @Test func aDictationCancelledWhileItWaitsToRetrySendsNothingMore() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, transcript: { throw DictationError(status: 502, code: nil) }, retryDelays: [.milliseconds(300)])
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.isRetrying }
+        #expect(controller.isRetrying)
+        controller.cancel()
+        try? await Task.sleep(for: .milliseconds(600))
+
+        #expect(recorded.uploads.withLock { $0.count } == 1)
+        #expect(recorded.texts.withLock { $0.isEmpty })
+        #expect(controller.phase == .idle)
+        #expect(!controller.isRetrying)
+    }
+
+    /// The server's error can still arrive after the dictation was cancelled: it is not tried again,
+    /// and the field never says it is.
+    @Test func aServerErrorAnsweredAfterACancelIsNotTriedAgain() async {
+        let capture = FakeCapture()
+        let retryingSeen = Mutex(false)
+        let ref = ControllerRef()
+        let controller = controller(capture: capture, transcript: {
+            await MainActor.run { ref.controller?.cancel() }
+            throw DictationError(status: 502, code: nil)
+        })
+        ref.controller = controller
+
+        await dictate(controller, capture: capture)
+        await waitUntil { recorded.uploads.withLock { !$0.isEmpty } && controller.phase == .idle }
+        // A retry would be sent after its 1 ms delay: watch well past it.
+        for _ in 0..<20 {
+            if controller.isRetrying { retryingSeen.withLock { $0 = true } }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(recorded.uploads.withLock { $0.count } == 1)
+        #expect(recorded.texts.withLock { $0.isEmpty })
+        #expect(!retryingSeen.withLock { $0 })
+        #expect(!controller.isRetrying)
+        #expect(controller.phase == .idle)
+    }
+
+    nonisolated static let serverErrors: [(any Error, Bool)] = [
+        (DictationError(status: 500, code: nil), true),
+        (DictationError(status: 599, code: nil), true),
+        (DictationError(status: 503, code: nil), true),
+        (DictationError(status: 504, code: "transcription_timeout"), false),
+        (DictationError(status: 499, code: nil), false),
+        (DictationError.rateLimited, false),
+        (DictationError.unauthorized, false),
+        (DictationError.invalidResponse, false),
+        (URLError(.networkConnectionLost), true),
+        (URLError(.cannotConnectToHost), true),
+        (URLError(.timedOut), false),
+        (URLError(.cancelled), false),
+        (CancellationError(), false),
+    ]
+
+    @Test(arguments: serverErrors)
+    func whatCountsAsAServerError(error: any Error, retried: Bool) {
+        #expect(DictationController.isServerError(error) == retried)
+    }
+
+    // MARK: The warm-up (TabMail Voice ADR-DESK-039)
+
+    /// The mic's tap warms the backend at once, before the recording is sent, once per dictation.
+    @Test func theWarmUpIsSentWhenListeningStarts() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, transcript: {
+            #expect(self.recorded.warmUps.withLock { $0 } == 1)
+            return "ask jordan about the road map"
+        })
+
+        controller.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { recorded.warmUps.withLock { $0 } == 1 }
+        #expect(recorded.warmUps.withLock { $0 } == 1)
+        await waitUntil { capture.starts == 1 }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(recorded.warmUps.withLock { $0 } == 1)
+        #expect(recorded.uploads.withLock { $0.count } == 1)
+    }
+
+    /// Not started (offline, no AI access, opted out of AI): nothing is warmed.
+    @Test(arguments: [(false, true, false), (true, false, false), (true, true, true)])
+    func aDictationThatDoesNotStartWarmsNothing(online: Bool, canUseAI: Bool, optedOut: Bool) async {
+        let controller = controller(online: online, optedOut: { optedOut })
+
+        controller.start(context: context, canUseAI: canUseAI) { _ in }
+        try? await Task.sleep(for: .milliseconds(50))
+
+        #expect(controller.phase == .idle)
+        #expect(recorded.warmUps.withLock { $0 } == 0)
+    }
+
+    /// The dictation never waits for the warm-up: one that never answers leaves it as it was.
+    @Test func aWarmUpThatNeverAnswersHoldsNothingUp() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, warmUp: { try? await Task.sleep(for: .seconds(60)) })
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase == .idle }
+
+        #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
     }
 
     /// A failed cleanup never costs the dictation: the transcript is appended as heard. The backend
@@ -661,8 +868,8 @@ struct DictationControllerTests {
         #expect(ContinuousClock.now - heard < .milliseconds(2_500))
         await waitUntil { controller.phase == .idle }
 
-        let wav = try #require(recorded.uploads.withLock { $0.first })
-        let seconds = Double(wav.count - WAVEncoder.headerSize) / Double(MemoryLayout<Int16>.size) / DictationConfig.recordingSampleRate
+        let flac = try #require(recorded.uploads.withLock { $0.first })
+        let seconds = Double(try FLACTestDecoder.decode(flac).totalSamples) / DictationConfig.recordingSampleRate
         // The two seconds held before the voice, then the voice's tenth of a second.
         #expect(abs(seconds - 2.1) < 0.02)
     }
@@ -700,19 +907,20 @@ struct DictationControllerTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
-            transcribe: { wav, _, _, _ in
-                recorded.uploads.withLock { $0.append(wav) }
+            transcribe: { flac, _, _, _ in
+                recorded.uploads.withLock { $0.append(flac) }
                 return DictationTranscription(text: "a long dictation", cleanedText: "A long dictation.")
             },
+            warmUp: {},
             speechDetector: FakeSpeechDetector.hearing()
         )
 
         await dictate(controller, capture: capture)
         await waitUntil { controller.phase == .idle }
 
-        let wav = try #require(recorded.uploads.withLock { $0.first })
-        // 120 s of 16 kHz 16-bit mono, and the header: 3,840,044 bytes.
-        #expect(wav.count == WAVEncoder.headerSize + 120 * 16_000 * MemoryLayout<Int16>.size)
+        let flac = try #require(recorded.uploads.withLock { $0.first })
+        // 120 s of 16 kHz mono.
+        #expect(try FLACTestDecoder.decode(flac).totalSamples == 120 * 16_000)
         #expect(!capture.isRunning)
         #expect(recorded.texts.withLock { $0 } == ["A long dictation."])
     }
@@ -1144,11 +1352,12 @@ struct DictationOptOutFlagTests {
             capture: capture,
             requestMicrophoneAccess: { true },
             isOnline: { true },
-            transcribe: { wav, _, _, cleanup in
-                recorded.uploads.withLock { $0.append(wav) }
+            transcribe: { flac, _, _, cleanup in
+                recorded.uploads.withLock { $0.append(flac) }
                 recorded.cleanups.withLock { $0.append(cleanup) }
                 return DictationTranscription(text: "ask jordan", cleanedText: "Ask Jordan.")
-            }
+            },
+            warmUp: { recorded.warmUps.withLock { $0 += 1 } }
         )
 
         controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { _ in
@@ -1160,6 +1369,7 @@ struct DictationOptOutFlagTests {
         #expect(capture.starts == 0)
         #expect(recorded.uploads.withLock { $0.isEmpty })
         #expect(recorded.cleanups.withLock { $0.isEmpty })
+        #expect(recorded.warmUps.withLock { $0 } == 0)
     }
 }
 
@@ -1324,6 +1534,8 @@ struct DictationOptOutFlagTests {
         // The app's controller transcribes through the factory `theBackendRequestCarriesTheDictationsLanguage` tests.
         let controller = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationController.swift"), encoding: .utf8)
         #expect(controller.contains("self.transcribeAudio = transcribe ?? Self.backendTranscription(AccountManager.shared.backendClient)"))
+        // …and warms through the factory `theWarmUpGoesOverTheTranscriptionsSession` tests.
+        #expect(controller.contains("self.warmUp = warmUp ?? Self.backendWarmUp(AccountManager.shared.backendClient)"))
 
         let settings = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Settings/TabMailSettingsView.swift"), encoding: .utf8)
         #expect(settings.contains("@AppStorage(DictationLanguage.settingKey) private var dictationLanguage = DictationLanguage.automatic"))
@@ -1352,7 +1564,9 @@ struct DictationOptOutFlagTests {
         #expect(!pill.contains("Badge"))
         #expect(pill.contains("Waveform(level: controller.level, isFlat: controller.phase == .listening && !controller.hasHeardSpeech)"))
         #expect(pill.contains("guard !isFlat else { return DictationConfig.meterMinBarHeight }"))
-        #expect(pill.contains(".accessibilityElement(children: .ignore)\n            .accessibilityLabel(accessibilityLabel)"))
+        #expect(pill.contains(".accessibilityElement(children: .ignore)\n        .accessibilityLabel(accessibilityLabel)"))
+        // While a transcription is tried again, the note takes the waveform's place.
+        #expect(pill.contains("if controller.isRetrying {\n                Text(Self.retryingMessage)"))
 
         let source = try pillSource()
         #expect(source.contains(".popoverTip(DictationLanguageTip(), arrowEdge: .bottom)"))
@@ -1382,6 +1596,7 @@ struct DictationWaveformTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
             transcribe: { _, _, _, _ in try await Task.sleep(for: .seconds(60)); return DictationTranscription(text: "", cleanedText: nil) },
+            warmUp: {},
             speechDetector: FakeSpeechDetector.hearing()
         )
         controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { _ in }
@@ -1407,6 +1622,34 @@ struct DictationWaveformTests {
         controller.finish()
         #expect(controller.phase == .transcribing)
         #expect(waveform.accessibilityLabel == "Transcribing")
+        controller.cancel()
+        #expect(waveform.accessibilityLabel == "")
+    }
+
+    /// While a transcription the server failed is tried again, VoiceOver reads the note the pill
+    /// shows; cancelled, nothing.
+    @Test func itReadsTheRetryingNoteWhileItRetries() async {
+        let capture = FakeCapture()
+        let controller = DictationController(
+            capture: capture,
+            requestMicrophoneAccess: { true },
+            isOnline: { true },
+            isOptedOutOfAI: { false },
+            dictationLanguage: { nil },
+            transcribe: { _, _, _, _ in throw DictationError(status: 502, code: "transcription_failed") },
+            warmUp: {},
+            transcriptionRetryDelays: [.seconds(60)],
+            speechDetector: FakeSpeechDetector.hearing()
+        )
+        controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { _ in }
+        let waveform = DictationPillView(controller: controller)
+        await waitUntil { capture.starts == 1 }
+        controller.finish()
+        #expect(waveform.accessibilityLabel == "Transcribing")
+
+        await waitUntil { controller.isRetrying }
+        #expect(controller.phase == .transcribing)
+        #expect(waveform.accessibilityLabel == DictationPillView.retryingMessage)
         controller.cancel()
         #expect(waveform.accessibilityLabel == "")
     }
@@ -1458,6 +1701,7 @@ struct DictationLanguageSettingTests {
                     languages.withLock { $0.append(language) }
                     return DictationTranscription(text: "annyeong", cleanedText: "Annyeong.")
                 },
+                warmUp: {},
                 speechDetector: FakeSpeechDetector.hearing()
             )
 
@@ -1484,7 +1728,7 @@ struct DictationLanguageSettingTests {
             let body = request.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             // Like the backend, only a recording gets a transcript.
             let audio = (body?["audio"] as? String).flatMap { Data(base64Encoded: $0) } ?? Data()
-            guard audio.count > WAVEncoder.headerSize, audio.prefix(4) == Data("RIFF".utf8) else {
+            guard (try? FLACTestDecoder.decode(audio))?.totalSamples ?? 0 > 0 else {
                 return .json(raw: #"{"error":"invalid_audio"}"#, statusCode: 400)
             }
             return .json(raw: #"{"text":"\#(transcript)","cleaned_text":"Cleaned.","duration_seconds":1}"#)
@@ -1498,6 +1742,7 @@ struct DictationLanguageSettingTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
             transcribe: DictationController.backendTranscription(BackendClient(llmSession: http.session)),
+            warmUp: {},
             speechDetector: FakeSpeechDetector.hearing()
         )
 
@@ -1513,11 +1758,10 @@ struct DictationLanguageSettingTests {
         let body = try #require(bodies.withLock { $0.first }.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: Any] })
         #expect(body["language"] as? String == language)
         #expect(body.keys.contains("language") == (language != nil))
-        #expect(body["format"] as? String == "wav")
-        // The recording itself: a WAV carrying the tone the microphone gave.
+        #expect(body["format"] as? String == "flac")
+        // The recording itself: a FLAC carrying the audio the microphone gave.
         let audio = try #require((body["audio"] as? String).flatMap { Data(base64Encoded: $0) })
-        #expect(audio.prefix(4) == Data("RIFF".utf8))
-        #expect(audio.count > WAVEncoder.headerSize)
+        #expect(try FLACTestDecoder.decode(audio).totalSamples > 0)
         // The cleanup goes in the same request (backend ADR-027).
         #expect(body["cleanup"] as? [String: String] == DictationCleanup.variables(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), dictionary: []))
         #expect(texts.withLock { $0 } == ["Cleaned."])
