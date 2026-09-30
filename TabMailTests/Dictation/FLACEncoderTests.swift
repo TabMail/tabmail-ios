@@ -31,6 +31,27 @@ struct FLACEncoderTests {
         }
     }
 
+    /// A pure tone, which a high predictor order codes best.
+    static func tone(_ count: Int) -> [Int16] {
+        (0..<count).map { Int16(jsRound(9_000 * sin(2 * Double.pi * 440 * Double($0) / 16_000))) }
+    }
+
+    /// Quiet audio with a full-scale burst in the middle and a step near the end: the burst's
+    /// partition needs the largest Rice parameter, while the quiet rest keeps a predictor cheaper
+    /// than verbatim. The step wraps where it meets the burst, as Voice's `Int16Array` does.
+    static func burstAndStep(_ count: Int) -> [Int16] {
+        var samples = noise(count, amplitude: 30, seed: 5)
+        let burst = count / 2
+        for index in burst..<min(count, burst + 64) { samples[index] = index % 2 == 0 ? .max : .min }
+        for index in (count * 3 / 4)..<count { samples[index] &+= 12_000 }
+        return samples
+    }
+
+    /// The stream header ("fLaC" and the STREAMINFO block), and a generous bound on a frame's own
+    /// header and footer.
+    private static let streamHeaderBytes = 42
+    private static let frameOverheadBytes = 16
+
     /// JavaScript's `Math.round`: halves round up.
     private static func jsRound(_ value: Double) -> Double {
         let down = value.rounded(.down)
@@ -62,6 +83,43 @@ struct FLACEncoderTests {
         #expect(decoded.pcm == Self.pcm(samples))
         #expect(decoded.totalSamples == samples.count)
         #expect(decoded.sampleRate == 16_000)
+    }
+
+    /// A recording can end on any sample, so the last frame can be any length: every short one,
+    /// and a few odd longer ones, alone and after a full block, over noise, a tone and a burst with
+    /// a step (each takes a different coding path).
+    @Test(arguments: ["noise", "a tone", "quiet audio with a full-scale burst and a step"])
+    func decodesToTheSameSamplesWhateverLengthTheLastFrameIs(_ signal: String) throws {
+        let tails = Array(1...40) + [127, 255, 1_001]
+        for tail in tails {
+            for count in [tail, Self.block + tail] {
+                let samples = switch signal {
+                case "noise": Self.noise(count, amplitude: 2_000, seed: 11)
+                case "a tone": Self.tone(count)
+                default: Self.burstAndStep(count)
+                }
+                let decoded = try FLACTestDecoder.decode(encode(samples))
+                #expect(decoded.pcm == Self.pcm(samples), "\(count) samples")
+            }
+        }
+    }
+
+    /// Silence is a constant subframe: a few bytes a frame, not a sample's worth each.
+    @Test func digitalSilenceCostsAFewBytesAFrame() {
+        let frames = 5
+        let size = encode([Int16](repeating: 0, count: frames * Self.block)).count
+        #expect(size <= Self.streamHeaderBytes + frames * Self.frameOverheadBytes)
+    }
+
+    /// A frame no predictor shrinks is sent verbatim, so no stream is much larger than its PCM (the
+    /// upload's size bound rests on this, ADR-IOS-085).
+    @Test(arguments: [
+        ("full-scale noise", noise(3 * block + 5, amplitude: 32_767, seed: 3)),
+        ("a full-scale square wave", (0..<(3 * block + 5)).map { $0 % 2 == 0 ? Int16.max : Int16.min }),
+    ] as [(String, [Int16])])
+    func fullScaleAudioIsNoLargerThanItsPCMAndAFramesOverhead(_ name: String, samples: [Int16]) {
+        let frames = (samples.count + Self.block - 1) / Self.block
+        #expect(encode(samples).count <= samples.count * 2 + Self.streamHeaderBytes + frames * Self.frameOverheadBytes)
     }
 
     @Test func anEmptyRecordingIsAValidStreamOfNoSamples() throws {
