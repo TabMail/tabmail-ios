@@ -65,13 +65,28 @@ struct DictationAudioRecorderTests {
         return (samples.reduce(0) { $0 + $1 * $1 } / Double(samples.count)).squareRoot()
     }
 
-    /// The upload is the sound that was recorded: a tone keeps its loudness through the resampler
-    /// (a sine's RMS is its amplitude / √2), and silence stays silent.
+    /// The 16-bit samples of little-endian PCM.
+    private func samples(_ pcm: Data) -> [Int16] {
+        var samples = [Int16](repeating: 0, count: pcm.count / 2)
+        _ = samples.withUnsafeMutableBytes { pcm.copyBytes(to: $0) }
+        return samples
+    }
+
+    private func peak(_ pcm: Data) -> Int {
+        samples(pcm).reduce(0) { max($0, abs(Int($1))) }
+    }
+
+    /// The loudest sample `normalizePeak` aims for: −3 dBFS.
+    private let targetPeak = Int((Double(Int16.max) * pow(10, DictationConfig.normalizedPeakDecibels / 20)).rounded())
+
+    /// The upload is the sound that was recorded: a tone louder than the normalised peak keeps its
+    /// loudness through the resampler (a sine's RMS is its amplitude / √2), and silence stays silent.
     @Test func theRecordingCarriesTheSoundItWasGiven() throws {
         let tone = AudioRecorder()
-        feed(tone, sine(seconds: 1, amplitude: 0.5))
-        let toneRMS = rms(try tone.finish().pcm)
-        #expect(abs(toneRMS - 0.5 / 2.0.squareRoot()) < 0.05)
+        feed(tone, sine(seconds: 1, amplitude: 0.8))
+        let toneRecording = try tone.finish()
+        #expect(toneRecording.gain == 1)
+        #expect(abs(rms(toneRecording.pcm) - 0.8 / 2.0.squareRoot()) < 0.05)
 
         let silence = AudioRecorder()
         feed(silence, sine(seconds: 1, amplitude: 0))
@@ -79,6 +94,43 @@ struct DictationAudioRecorderTests {
         // A second of audio was recorded (within the resampler's latency), all of it silent.
         #expect(abs(silentRecording.duration - 1) < 0.01)
         #expect(rms(silentRecording.pcm) < 0.001)
+        #expect(silentRecording.gain == 1)
+    }
+
+    /// Quiet microphones: the upload's loudest sample sits at −3 dBFS whatever the microphone gave,
+    /// the whole recording scaled by one gain so its shape is unchanged.
+    @Test func uploadsAQuietRecordingPeakNormalisedToMinus3dBFS() throws {
+        let recorder = AudioRecorder()
+        recorder.keepFromNow()
+        feed(recorder, sine(seconds: 1, amplitude: 0.05)) // −26 dBFS
+        let recording = try recorder.finish()
+
+        #expect(peak(recording.pcm) == targetPeak)
+        #expect(abs(20 * log10(recording.gain) - 23) < 0.5)
+        #expect(abs(rms(recording.pcm) - Double(targetPeak) / Double(Int16.max) / 2.0.squareRoot()) < 0.05)
+        // What is uploaded: the FLAC of exactly these samples.
+        let flac = FLACEncoder.encode(pcm16Mono: recording.pcm, sampleRate: recording.sampleRate)
+        #expect(try FLACTestDecoder.decode(flac).pcm == recording.pcm)
+    }
+
+    /// Near-silence is raised by at most 30 dB, not into full-scale noise.
+    @Test func boostsByAtMostTheMaximumGain() throws {
+        let recorder = AudioRecorder()
+        recorder.keepFromNow()
+        feed(recorder, sine(seconds: 1, amplitude: 0.001)) // −60 dBFS
+        let recording = try recorder.finish()
+
+        #expect(abs(20 * log10(recording.gain) - DictationConfig.maxNormalizationGainDecibels) < 1e-9)
+        #expect(peak(recording.pcm) < targetPeak / 10)
+    }
+
+    /// Negative and positive samples scale alike (the loudest may be either sign).
+    @Test func normalizePeakScalesBothSignsByOneGain() {
+        let pcm = [Int16(0), 1_000, -2_000, 500].withUnsafeBytes { Data($0) }
+        let normalized = AudioRecorder.normalizePeak(pcm)
+        let gain = normalized.gain
+        #expect(abs(gain - Double(targetPeak) / 2_000) < 0.01)
+        #expect(samples(normalized.pcm) == [0, Int16((1_000 * gain).rounded()), Int16(-targetPeak), Int16((500 * gain).rounded())])
     }
 
     /// Every channel reaches the mono upload: a voice on either side of a stereo interface is heard.

@@ -5,17 +5,20 @@
 import AVFoundation
 import os
 
-/// Accumulates one dictation as 16 kHz mono 16-bit PCM, ready to encode as FLAC and upload.
+/// Accumulates one dictation as 16 kHz mono 16-bit PCM, ready to encode as FLAC and upload;
+/// `finish` peak-normalises it (`normalizePeak`).
 /// Until `keepFromNow` (speech heard), only the latest `preRoll` of audio is held.
 ///
 /// `append` is called on the audio render thread; all state is behind one lock, so appends are
 /// serialised and `finish` sees every buffer appended before it.
 final class AudioRecorder: Sendable {
     struct Recording: Sendable {
-        /// Little-endian 16-bit mono PCM samples.
+        /// Little-endian 16-bit mono PCM samples, peak-normalised (`normalizePeak`).
         let pcm: Data
         let sampleRate: Double
-        /// Loudest buffer's level on the waveform's 0…1 scale.
+        /// The gain `normalizePeak` applied (1 when none).
+        let gain: Double
+        /// Loudest buffer's level on the waveform's 0…1 scale, as captured (before `gain`).
         let peakLevel: Float
         /// When the microphone delivered its first buffer (nil if it never did).
         let firstBufferAt: ContinuousClock.Instant?
@@ -85,18 +88,41 @@ final class AudioRecorder: Sendable {
         }
     }
 
-    /// Everything recorded so far. Throws the first conversion error, if one occurred.
+    /// Everything recorded so far, peak-normalised. Throws the first conversion error, if one
+    /// occurred.
     func finish() throws -> Recording {
-        try state.withLockUnchecked { state in
+        let (pcm, peakLevel, firstBufferAt, truncated) = try state.withLockUnchecked { state in
             if let error = state.firstError { throw error }
-            return Recording(
-                pcm: state.pcm,
-                sampleRate: outputFormat.sampleRate,
-                peakLevel: state.peakLevel,
-                firstBufferAt: state.firstBufferAt,
-                truncated: state.truncated
-            )
+            return (state.pcm, state.peakLevel, state.firstBufferAt, state.truncated)
         }
+        // Outside the lock: the audio thread keeps appending meanwhile.
+        let normalized = Self.normalizePeak(pcm)
+        return Recording(
+            pcm: normalized.pcm,
+            sampleRate: outputFormat.sampleRate,
+            gain: normalized.gain,
+            peakLevel: peakLevel,
+            firstBufferAt: firstBufferAt,
+            truncated: truncated
+        )
+    }
+
+    /// Scales 16-bit mono PCM so its loudest sample sits at `DictationConfig.normalizedPeakDecibels`,
+    /// boosting by at most `DictationConfig.maxNormalizationGainDecibels` and never cutting (peak
+    /// normalisation, one gain for the whole recording). As TabMail Voice's `normalizePeak`.
+    static func normalizePeak(_ pcm: Data) -> (pcm: Data, gain: Double) {
+        var samples = [Int16](repeating: 0, count: pcm.count / MemoryLayout<Int16>.size)
+        _ = samples.withUnsafeMutableBytes { pcm.copyBytes(to: $0) }
+        let peak = samples.reduce(0) { max($0, abs(Int($1))) }
+        guard peak > 0 else { return (pcm, 1) }
+        let target = Double(Int16.max) * pow(10, DictationConfig.normalizedPeakDecibels / 20)
+        let gain = min(target / Double(peak), pow(10, DictationConfig.maxNormalizationGainDecibels / 20))
+        guard gain > 1 else { return (pcm, 1) }
+        // No clamp needed: every scaled sample is at most the target.
+        for index in samples.indices {
+            samples[index] = Int16((Double(samples[index]) * gain).rounded())
+        }
+        return (samples.withUnsafeBytes { Data($0) }, gain)
     }
 
     private func convert(_ buffer: AVAudioPCMBuffer, state: inout State) throws -> AVAudioPCMBuffer {

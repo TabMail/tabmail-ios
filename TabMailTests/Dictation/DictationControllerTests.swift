@@ -306,11 +306,14 @@ struct DictationControllerTests {
 
         #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
         #expect(!capture.isRunning)
-        // The upload is a FLAC of what was recorded.
+        // The upload is a FLAC of what was recorded, peak-normalised: its loudest sample at −3 dBFS.
         let flac = try #require(recorded.uploads.withLock { $0.first })
         let decoded = try FLACTestDecoder.decode(flac)
         #expect(decoded.sampleRate == Int(DictationConfig.recordingSampleRate))
         #expect(decoded.totalSamples > 0)
+        var uploaded = [Int16](repeating: 0, count: decoded.pcm.count / 2)
+        _ = uploaded.withUnsafeMutableBytes { decoded.pcm.copyBytes(to: $0) }
+        #expect(uploaded.reduce(0) { max($0, abs(Int($1))) } == Int((Double(Int16.max) * pow(10, DictationConfig.normalizedPeakDecibels / 20)).rounded()))
         // One request: the recording went with what was on screen when the dictation started, for
         // the cleanup the backend runs on its transcript.
         #expect(recorded.cleanups.withLock { $0 } == [[

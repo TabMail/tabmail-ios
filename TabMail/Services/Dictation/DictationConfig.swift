@@ -35,6 +35,15 @@ enum DictationConfig {
     /// Recording format: 16 kHz mono 16-bit PCM — what Whisper-class models consume natively,
     /// at ~32 KB per second of speech. Uploaded as FLAC (`FLACEncoder`), lossless at about half that.
     static let recordingSampleRate: Double = 16_000
+    /// Before upload the recording is scaled so its loudest sample sits this far below full scale
+    /// (dB; peak normalisation, `AudioRecorder.normalizePeak`), leaving headroom so nothing clips.
+    /// As TabMail Voice's `normalizedPeakDecibels` (its ADR-DESK-040): measured 2026-09-29 on
+    /// recordings peaking at −22 to −29 dBFS, the backend's model made 9.5 % word errors at −3 dBFS
+    /// against 11.0 % unscaled.
+    static let normalizedPeakDecibels: Double = -3
+    /// The most `normalizePeak` boosts (dB), so near-silence isn't raised into loud noise. It never
+    /// cuts a louder recording.
+    static let maxNormalizationGainDecibels: Double = 30
     /// Samples per FLAC frame, and the finest the Rice residual coding splits a frame (2^order
     /// partitions). As TabMail Voice's `flacBlockSize` and `flacMaxPartitionOrder`: the same
     /// recording encodes to the same bytes on both.
