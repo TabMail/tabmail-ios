@@ -241,3 +241,17 @@ Owner, 2026-09-29: "also the warmup and retry there as well".
   none for a dictation that does not start, and one that never answers holds nothing up;
   `isServerError` table), `BackendClientDictationAuthTests` (the warm-up goes over the
   transcription's session with the token; signed out, nothing).
+
+**Amendment 2026-09-29 — the recording is peak-normalised before upload (owner).** As TabMail
+Voice's ADR-DESK-040: `AudioRecorder.finish` scales the whole recording by one gain so its loudest
+sample sits at `DictationConfig.normalizedPeakDecibels` (−3 dBFS), boosting by at most
+`maxNormalizationGainDecibels` (30 dB) and never cutting (`AudioRecorder.normalizePeak`). Measured
+2026-09-29 (`tabmail-voice/Scripts/stt-compare`, 10 recordings peaking at −22 to −29 dBFS, 3 runs
+each, word error rate after the Whisper English normaliser): MAI-Transcribe-2 made 9.5 % errors at
+−3 dBFS against 11.0 % as recorded; a Whisper Large V3 host that dropped quiet speech went from 79 %
+to 19 %. The FLAC was already encoded after the recording ends, so this adds no stage, only the
+scaling pass. `Recording.peakLevel` stays the level as captured; the debug log adds the gain. One loud
+click sets the gain, so a recording with a click louder than the speech is boosted less.
+- Tests: `DictationAudioRecorderTests` (a quiet recording's loudest sample at −3 dBFS, the FLAC the
+  same samples; near-silence boosted by at most 30 dB; a louder tone and digital silence unchanged;
+  both signs scaled by one gain), `DictationControllerTests` › the upload's loudest sample at −3 dBFS.

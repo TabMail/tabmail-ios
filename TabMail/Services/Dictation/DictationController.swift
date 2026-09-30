@@ -321,7 +321,7 @@ final class DictationController {
             fail()
             return
         }
-        BackgroundSyncLogger.logDebug("[Dictation] recorded \(recording.duration)s, peak \(recording.peakLevel), truncated \(recording.truncated)")
+        BackgroundSyncLogger.logDebug("[Dictation] recorded \(recording.duration)s, peak \(recording.peakLevel), gain \(20 * log10(recording.gain)) dB, truncated \(recording.truncated)")
 
         // No loudness gate: on quiet microphones speech sits only a few dB above the room noise,
         // so any level threshold rejects real speech. The speech classifier started the
