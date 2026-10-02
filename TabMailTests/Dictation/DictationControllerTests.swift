@@ -1199,16 +1199,17 @@ struct DictationControllerTests {
         #expect(recorded.cleanups.withLock { $0.first?["dictionary"] } == "Xyvora")
     }
 
-    /// A full dictionary and an email of more terms than the context's share: the dictionary whole,
-    /// then the context's first `contextTermsMax` terms, never more words than the backend takes.
-    @Test func sendsAtMostTheContextsShareOfTerms() async throws {
+    /// An email of more terms than the backend takes: the dictionary whole, then the context's
+    /// first terms filling the rest of the 200, all of them with no dictionary (owner, 2026-10-02).
+    @Test(arguments: [0, 1, DictationConfig.dictionaryMaxEntries])
+    func theContextsTermsFillTheRestOfTheVocabulary(dictionaryCount: Int) async throws {
         let capture = FakeCapture()
         func name(_ prefix: String, _ i: Int) -> String {
             let letters = Array("abcdefghijklmnopqrstuvwxyz")
             return prefix + String(letters[i / letters.count]) + String(letters[i % letters.count])
         }
-        let words = (0..<DictationConfig.dictionaryMaxEntries).map { name("Qor", $0) }
-        let terms = (0..<DictationConfig.contextTermsMax + 50).map { name("Xyv", $0) }
+        let words = (0..<dictionaryCount).map { name("Qor", $0) }
+        let terms = (0..<DictationConfig.vocabularyMaxTerms + 1).map { name("Xyv", $0) }
         let controller = controller(
             capture: capture,
             dictionary: { .init(words: words, learnsWords: false) },
@@ -1219,10 +1220,7 @@ struct DictationControllerTests {
         await dictate(controller, capture: capture, context: context)
 
         let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
-        #expect(vocabulary.count == DictationConfig.dictionaryMaxEntries + DictationConfig.contextTermsMax)
-        guard vocabulary.count == DictationConfig.dictionaryMaxEntries + DictationConfig.contextTermsMax else { return }
-        #expect(Array(vocabulary.prefix(DictationConfig.dictionaryMaxEntries)) == words)
-        #expect(Array(vocabulary.suffix(DictationConfig.contextTermsMax)) == Array(terms.prefix(DictationConfig.contextTermsMax)))
+        #expect(vocabulary == words + terms.prefix(DictationConfig.vocabularyMaxTerms - dictionaryCount))
     }
 
     /// With no dictionary and nothing to pick, no words are sent.

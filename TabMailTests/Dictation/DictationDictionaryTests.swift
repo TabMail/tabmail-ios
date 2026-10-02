@@ -85,12 +85,11 @@ struct DictationDictionaryTests {
         #expect(dictionary.entries.map(\.word) == ["Kaelthorne Drake", "Brevalle Labs", "Xyvora Quill"])
     }
 
-    /// Owner, 2026-10-02: of the 200 words the backend takes with a dictation, 50 are picked from
-    /// its context and 150 are the dictionary's, at most 100 of them typed; learned words fill the
-    /// rest, all 150 when none is typed.
+    /// Owner, 2026-10-02: of the 200 words the backend takes with a dictation, the dictionary's
+    /// come first, at most 150, at most 100 of them typed; learned words fill the rest, all 150 when
+    /// none is typed; the context's terms fill what the dictionary leaves.
     @Test func holdsTheWordsSentBesideTheContextsAtMost100Typed() {
-        #expect([DictationConfig.dictionaryMaxEntries, DictationConfig.dictionaryMaxTypedWords, DictationConfig.contextTermsMax] as [Int] == [150, 100, 50])
-        #expect(DictationConfig.dictionaryMaxEntries + DictationConfig.contextTermsMax == 200)
+        #expect([DictationConfig.vocabularyMaxTerms, DictationConfig.dictionaryMaxEntries, DictationConfig.dictionaryMaxTypedWords] as [Int] == [200, 150, 100])
         let dictionary = DictationDictionary(defaults: defaults)
         let learned = (0..<DictationConfig.dictionaryMaxEntries).map { "Learned\($0)" }
         #expect(dictionary.learn(learned).count == DictationConfig.dictionaryMaxEntries)
@@ -288,7 +287,7 @@ struct DictationDictionaryTests {
     ])
     func whatIsTakenTheBackendCountsTheSame(raw: String) {
         let dictionary = DictationDictionary(defaults: defaults)
-        let picked = DictationContextTerms.terms(in: "met \(raw) today", excluding: [], max: DictationConfig.contextTermsMax)
+        let picked = DictationContextTerms.terms(in: "met \(raw) today", excluding: [], max: DictationConfig.vocabularyMaxTerms)
         for word in [DictationDictionary.word(raw)].compactMap({ $0 }) + picked {
             let counted = Self.backendWords(word)
             #expect(!counted.isEmpty && counted.count <= DictationConfig.dictionaryWordMaxWords, "\(word.unicodeScalars.map { String($0.value, radix: 16) })")

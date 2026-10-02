@@ -47,7 +47,7 @@ struct DictationContextTests {
             input: "cc Quill"
         )
 
-        #expect(DictationContextTerms.terms(in: context.termsText, excluding: [], max: DictationConfig.contextTermsMax)
+        #expect(DictationContextTerms.terms(in: context.termsText, excluding: [], max: DictationConfig.vocabularyMaxTerms)
             .sorted() == ["Brevalle", "Kaelthorne Drake", "Quill", "Xyvora"])
         #expect(!context.screenText.contains("Brevalle"))
     }
