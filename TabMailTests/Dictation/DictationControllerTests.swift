@@ -798,11 +798,15 @@ struct DictationControllerTests {
     /// dictation waiting for speech never looks stuck (owner, 2026-10-02); the microphone's
     /// start-up silence alone doesn't move it. Only the recording waits for speech.
     @Test func theWaveformMovesBeforeSpeechIsHeard() async {
-        let starting = FakeCapture(buffers: [FakeCapture.silence(), FakeCapture.silence()])
+        // The device's start-up silence, then a steady room: the silence must not set the floor, or
+        // the room's first noise would stand far above it and fill the waveform.
+        let steadyRoom = FakeCapture.tone(seconds: 0.5, amplitude: 0.01)
+        let starting = FakeCapture(buffers: [FakeCapture.silence(), FakeCapture.silence(), steadyRoom, steadyRoom])
         let silent = controller(capture: starting)
         silent.start(context: context, canUseAI: true) { _ in }
         await waitUntil { starting.starts == 1 }
         try? await Task.sleep(for: .milliseconds(200))
+        #expect(!silent.hasHeardSpeech)
         #expect(silent.level == 0)
         silent.cancel()
 
