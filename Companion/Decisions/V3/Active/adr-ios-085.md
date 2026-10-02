@@ -267,9 +267,10 @@ the start. What decision 10 decides is unchanged: the recording, its cap and the
 the sound classifier to hear speech, and a dictation that never hears any sends nothing.
 - The waveform now moves with a room's noise before anyone speaks; `LevelEnvelope` adapts to that
   noise as it does on TabMail Voice, so a steady hum settles rather than holding the bars high.
-- Tests: `DictationControllerTests.theWaveformMovesBeforeSpeechIsHeard` (start-up silence leaves
-  `level` 0; a rising room noise moves it with no speech heard), and the pill's source fence (no
-  flat state, no `hasHeardSpeech` in the pill).
+- Tests: `DictationControllerTests.theWaveformMovesBeforeSpeechIsHeard` (start-up silence then a
+  steady room leaves `level` 0, so the silence never sets the floor; a rising room noise moves it with
+  no speech heard), and the pill's source fence (no flat state; the pill reads `hasHeardSpeech` only
+  for the waveform's colour, below).
 
 **Amendment 2026-10-02 (later) — purple says it is listening, and retrying (owner).** "When it actually
 starts to listen, the waveform color could turn from blue to a little bit more purple, our theme
