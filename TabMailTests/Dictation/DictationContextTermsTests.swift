@@ -66,6 +66,8 @@ struct DictationContextTermsTests {
         #expect(terms(text) == ["Xyvora", "Brevalle", "Kaelthorne"])
         #expect(terms(text, excluding: ["xyvora"]) == ["Brevalle", "Kaelthorne"])
         #expect(terms(text, max: 1) == ["Xyvora"])
+        // A dictionary word in the context takes none of the room: the cap counts only the terms sent.
+        #expect(terms(text, excluding: ["xyvora"], max: 2) == ["Brevalle", "Kaelthorne"])
     }
 
     @Test func picksInAnyScript() {
