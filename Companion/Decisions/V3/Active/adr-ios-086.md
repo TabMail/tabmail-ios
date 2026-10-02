@@ -122,3 +122,14 @@ every new word, so learning stopped for good, silently, once 100 words were in.
 - A learned word can drop out with no notice but the debug log's, which doesn't name it.
 - The dictionary is rewritten in UserDefaults after a dictation that holds one of its words.
 - Fewer context terms (50, was 100): the most frequent are kept.
+
+**Amendment 2026-10-02 (later) — the context's terms fill what the dictionary leaves.** Owner: "if the
+user dictionaries and the learn dictionary is less than the 150, we should definitely send more than
+the 50 bound … we send basically as many phrases or words as possible" (TabMail Voice's ADR-DESK-038
+amendment of the same date). `DictationConfig.contextTermsMax` (50) is gone:
+`DictationConfig.vocabularyMaxTerms` (200, the backend's limit) less the dictionary's words snapshotted
+at the dictation's start is how many terms `DictationContextTerms` may pick, so a dictation sends up
+to 200 words whatever the dictionary holds: all 200 from the context with no dictionary, at least 50
+beside a full one (`dictionaryMaxEntries` stays 150, all of it always sent, first).
+- Consequence: an email with many names sends a longer list than before; the measured 200 real words
+  or names did not blunt the speech model, and an email with fewer sends just those.

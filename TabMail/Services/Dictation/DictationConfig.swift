@@ -103,13 +103,14 @@ enum DictationConfig {
 
     /// The words sent with each dictation: the backend takes at most 200 (backend ADR-025), and the
     /// speech model heeds a list of 200 real words or names (measured 2026-10-02 in TabMail Voice's
-    /// `Scripts/stt-compare/vocabulary_limit.py`). 150 are the user's dictionary, which holds at
-    /// most this many so all of them are always sent: at most 100 typed, learned words in the rest,
-    /// all 150 when none is typed (owner, 2026-10-02; TabMail Voice's ADR-DESK-038)…
+    /// `Scripts/stt-compare/vocabulary_limit.py`). The user's dictionary goes first, at most 150
+    /// words, all of them always sent: at most 100 typed, learned words in the rest, all 150 when
+    /// none is typed; the terms picked from what the dictation is about (`DictationContextTerms`)
+    /// fill the rest, at least 50 and all 200 when the dictionary is empty, so every dictation sends
+    /// as many as it can (owner, 2026-10-02; TabMail Voice's ADR-DESK-038).
+    static let vocabularyMaxTerms = 200
     static let dictionaryMaxEntries = 150
     static let dictionaryMaxTypedWords = 100
-    /// …and 50 are picked from what the dictation is about (`DictationContextTerms`).
-    static let contextTermsMax = 50
     /// Longest a transcription waits for the context terms (seconds), which are picked while the
     /// user speaks; past it the transcription goes without them.
     static let contextTermsWait: TimeInterval = 0.2

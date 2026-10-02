@@ -9,7 +9,7 @@ import Testing
 /// The names and terms picked from what a dictation is about (ADR-IOS-086), sent with it beside the
 /// user's dictionary.
 struct DictationContextTermsTests {
-    private func terms(_ text: String, excluding: [String] = [], max: Int = DictationConfig.contextTermsMax) -> [String] {
+    private func terms(_ text: String, excluding: [String] = [], max: Int = DictationConfig.vocabularyMaxTerms) -> [String] {
         DictationContextTerms.terms(in: text, excluding: excluding, max: max)
     }
 
@@ -66,7 +66,6 @@ struct DictationContextTermsTests {
         #expect(terms(text) == ["Xyvora", "Brevalle", "Kaelthorne"])
         #expect(terms(text, excluding: ["xyvora"]) == ["Brevalle", "Kaelthorne"])
         #expect(terms(text, max: 1) == ["Xyvora"])
-        #expect(DictationConfig.contextTermsMax == 50)
     }
 
     @Test func picksInAnyScript() {

@@ -207,12 +207,13 @@ final class DictationController {
     }
 
     /// The terms of what the dictation is about (`DictationContextTerms`): from the context, and
-    /// the email's body when there is one, read on this device. Only the terms are sent.
+    /// the email's body when there is one, read on this device; as many as the vocabulary has room
+    /// for beside the dictionary's words. Only the terms are sent.
     private static func pickTerms(context: DictationContext, excluding: [String], emailBody: @escaping EmailBody) -> Task<[String], Never> {
         Task.detached(priority: .userInitiated) {
             let body = if let emailId = context.emailId { await emailBody(emailId) } else { String?.none }
             let text = [context.termsText, body].compactMap { $0 }.joined(separator: "\n")
-            return DictationContextTerms.terms(in: text, excluding: excluding, max: DictationConfig.contextTermsMax)
+            return DictationContextTerms.terms(in: text, excluding: excluding, max: DictationConfig.vocabularyMaxTerms - excluding.count)
         }
     }
 
