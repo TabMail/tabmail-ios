@@ -4,7 +4,7 @@
 
 ## Companion Files
 
-**Loading rule lives in the root `../CLAUDE.md` § Companion Routing (owner 2026-09-09).** ALWAYS LOADED in full: `../CLAUDE.md`, `../PROJECT_STRUCTURE.md`, `../NEXT_UP.md`, this file, and this project's `PROJECT_STRUCTURE.md`. SEARCH-ONLY (`rg -ni`, read every hit in full, never read whole): the `PROJECT_MEMORY.md`, `DECISIONS.md`, `MISTAKES.md` indexes at root and here, and every `Companion/` tree. Update the routed detail plus its index line when you learn something durable.
+**Loading rule lives in the root `../CLAUDE.md` § Companion Routing (owner 2026-09-09).** ALWAYS LOADED in full: `../CLAUDE.md`, `../PROJECT_STRUCTURE.md`, this file, and this project's `PROJECT_STRUCTURE.md`. SEARCH-ONLY (`rg -ni`, read every hit in full, never read whole): the `PROJECT_MEMORY.md`, `DECISIONS.md`, `MISTAKES.md` indexes at root and here, and every `Companion/` tree. Update the routed detail plus its index line when you learn something durable.
 
 **Global (parent directory):**
 - **`../CLAUDE.md`** — Global rules that apply to all subprojects.
