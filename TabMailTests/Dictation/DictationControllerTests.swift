@@ -794,18 +794,26 @@ struct DictationControllerTests {
         #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
     }
 
-    /// The waveform lies flat until speech is heard: neither the microphone's start-up silence
-    /// nor the room's noise moves it; a voice does.
-    @Test func theWaveformLiesFlatUntilSpeechIsHeard() async {
-        // A room whose noise rises: it would move an ungated waveform.
+    /// The waveform follows the microphone from its first real sound, speech or not, so a
+    /// dictation waiting for speech never looks stuck (owner, 2026-10-02); the microphone's
+    /// start-up silence alone doesn't move it. Only the recording waits for speech.
+    @Test func theWaveformMovesBeforeSpeechIsHeard() async {
+        let starting = FakeCapture(buffers: [FakeCapture.silence(), FakeCapture.silence()])
+        let silent = controller(capture: starting)
+        silent.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { starting.starts == 1 }
+        try? await Task.sleep(for: .milliseconds(200))
+        #expect(silent.level == 0)
+        silent.cancel()
+
+        // A room whose noise rises: not speech, but the waveform moves with it.
         let room = FakeCapture(buffers: [FakeCapture.silence(), FakeCapture.tone(seconds: 0.5, amplitude: 0.005), FakeCapture.tone(seconds: 0.5, amplitude: 0.01)])
         let waiting = controller(capture: room)
         waiting.start(context: context, canUseAI: true) { _ in }
-        await waitUntil { room.starts == 1 }
-        try? await Task.sleep(for: .milliseconds(200))
+        await waitUntil { waiting.level > 0 }
         #expect(waiting.phase == .listening)
         #expect(!waiting.hasHeardSpeech)
-        #expect(waiting.level == 0)
+        #expect(waiting.level > 0)
         waiting.cancel()
 
         let speaking = FakeCapture(buffers: [FakeCapture.tone(seconds: 1, amplitude: 0.01), FakeCapture.speech(), FakeCapture.speech()])
@@ -815,6 +823,26 @@ struct DictationControllerTests {
         #expect(heard.hasHeardSpeech)
         #expect(heard.level > 0)
         heard.cancel()
+    }
+
+    /// Speech heard turns the waveform from the accent blue to purple, a sign it is listening; a
+    /// retry after a server error moves the spinner's track and arc toward purple (owner, 2026-10-02).
+    @Test func theWaveformTurnsPurpleOnSpeechAndTheSpinnerWhileRetrying() {
+        let purple = DictationSpinner.colour(at: DictationConfig.waveformVoicedColour)
+        #expect(DictationPillView.waveformColour(hasVoice: false) == Theme.accent)
+        #expect(DictationPillView.waveformColour(hasVoice: true) == purple)
+        #expect(purple != Theme.accent)
+
+        let shift = DictationConfig.thinkingRetryColourShift
+        let resting = DictationSpinner.colours(isRetrying: false)
+        let retrying = DictationSpinner.colours(isRetrying: true)
+        #expect(resting.track == DictationSpinner.colour(at: 0))
+        #expect(resting.arc.start == DictationSpinner.colour(at: 0))
+        #expect(resting.arc.end == DictationSpinner.colour(at: DictationConfig.thinkingArcEndColour))
+        #expect(retrying.track == DictationSpinner.colour(at: shift))
+        #expect(retrying.arc.start == DictationSpinner.colour(at: shift))
+        #expect(retrying.arc.end == DictationSpinner.colour(at: DictationConfig.thinkingArcEndColour + shift))
+        #expect(shift > 0)
     }
 
     /// Someone who says nothing sends nothing: stopping a dictation that never heard speech
@@ -1495,7 +1523,7 @@ struct DictationOptOutFlagTests {
         #expect(!source.contains("Image(systemName: \"stop.circle.fill\")\n                        .font(.title2)\n                        .foregroundStyle(Theme.accent)"))
 
         let transcribing = try slice(source, from: "} else if dictation.phase == .transcribing {", to: "} else if !isWorking && !dictation.isActive && (pendingResumeRequest != nil")
-        #expect(transcribing.contains("DictationSpinner()"))
+        #expect(transcribing.contains("DictationSpinner(isRetrying: dictation.isRetrying)"))
         #expect(!transcribing.contains("Button"))
 
         let start = String(try slice(source, from: "private func startDictation()", to: "private var canSend: Bool"))
@@ -1586,8 +1614,12 @@ struct DictationOptOutFlagTests {
         let pill = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Inbox/DictationPillView.swift"), encoding: .utf8)
         #expect(!pill.contains("controller.language"))
         #expect(!pill.contains("Badge"))
-        #expect(pill.contains("Waveform(level: controller.level, isFlat: controller.phase == .listening && !controller.hasHeardSpeech)"))
-        #expect(pill.contains("guard !isFlat else { return DictationConfig.meterMinBarHeight }"))
+        // The waveform always moves: it is never held flat while the dictation waits for speech;
+        // speech heard only turns it purple.
+        #expect(pill.contains("Waveform(level: controller.level, colour: Self.waveformColour(hasVoice: controller.hasHeardSpeech))"))
+        #expect(pill.components(separatedBy: "hasHeardSpeech").count == 2)
+        #expect(!pill.contains("return DictationConfig.meterMinBarHeight"))
+        #expect(pill.contains(".fill(colour)"))
         #expect(pill.contains(".accessibilityElement(children: .ignore)\n        .accessibilityLabel(accessibilityLabel)"))
         // While a transcription is tried again, the note takes the waveform's place.
         #expect(pill.contains("if controller.isRetrying {\n                Text(Self.retryingMessage)"))

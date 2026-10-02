@@ -24,8 +24,7 @@ final class DictationController {
     private(set) var phase: Phase = .idle
     private(set) var level: Float = 0
     /// True once speech is heard. Until then the dictation waits: nothing is recorded but the
-    /// moment before speech (`speechPreRollDuration`), the recording cap hasn't started, and the
-    /// waveform lies flat.
+    /// moment before speech (`speechPreRollDuration`), and the recording cap hasn't started.
     private(set) var hasHeardSpeech = false
     /// The language this dictation is transcribed in, read once when it starts: a Settings change
     /// mid-dictation applies to the next one (`DictationLanguage`). Nil: none sent.
@@ -411,10 +410,10 @@ final class DictationController {
         guard generation == self.generation, phase == .listening else { return }
         // The device delivers digital silence while it starts: it says nothing about the room.
         guard decibels > DictationConfig.silenceDecibels else { return }
-        // The room's noise still sets the envelope's floor, but the waveform stays flat until
-        // speech is heard.
+        // The waveform follows the microphone from its first real sound, speech or not, as TabMail
+        // Voice's does, so a dictation waiting for speech never looks stuck; only the recording
+        // waits for speech (owner, 2026-10-02).
         let newLevel = envelope.level(forDecibels: decibels)
-        guard hasHeardSpeech else { return }
         let rate = newLevel > level ? DictationConfig.levelAttack : DictationConfig.levelRelease
         level += (newLevel - level) * rate
     }

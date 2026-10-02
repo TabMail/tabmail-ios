@@ -804,7 +804,7 @@ struct DynamicIslandChat: View {
                         .contentShape(Rectangle())
                 }
             } else if dictation.phase == .transcribing {
-                DictationSpinner()
+                DictationSpinner(isRetrying: dictation.isRetrying)
                     .frame(width: 44, height: 44)
                     .accessibilityLabel("Transcribing")
             } else if !isWorking && !dictation.isActive && (pendingResumeRequest != nil || lastFailedMessage != nil) && isOnLiveSession && inputText.trimmingCharacters(in: .whitespaces).isEmpty {
