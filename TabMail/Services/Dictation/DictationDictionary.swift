@@ -8,7 +8,9 @@ import Observation
 /// The user's dictation dictionary (ADR-IOS-086): names and terms spelled their way, typed in
 /// Settings or learned from their own corrections of a dictation. Sent with every dictation, to the
 /// transcription and the cleanup, so they come out right. Kept on this device only, in
-/// UserDefaults, and not synced. The same rules as TabMail Voice's (ADR-DESK-038).
+/// UserDefaults, and not synced. The same rules as TabMail Voice's (ADR-DESK-038): at most
+/// `dictionaryMaxEntries` words, `dictionaryMaxTypedWords` of them typed; learned words fill the
+/// rest, the one used least recently making way for a new one.
 @MainActor
 @Observable
 final class DictationDictionary {
@@ -16,6 +18,24 @@ final class DictationDictionary {
         var word: String
         /// Learned from a correction rather than typed.
         var learned: Bool
+        /// The entry's latest use (added, typed or learned again, or in a dictation's text), larger
+        /// the more recent: a count, not a time, so a clock set back can't reorder it. A full
+        /// dictionary drops the learned word of the smallest for a new one.
+        var lastUsed: Int
+
+        init(word: String, learned: Bool, lastUsed: Int) {
+            self.word = word
+            self.learned = learned
+            self.lastUsed = lastUsed
+        }
+
+        /// An entry stored before `lastUsed` was kept, or with an invalid one, reads as never used.
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            word = try container.decode(String.self, forKey: .word)
+            learned = try container.decode(Bool.self, forKey: .learned)
+            lastUsed = max((try? container.decodeIfPresent(Int.self, forKey: .lastUsed)) ?? 0, 0)
+        }
     }
 
     /// What one dictation uses, read when it starts: a change mid-dictation applies to the next.
@@ -53,40 +73,90 @@ final class DictationDictionary {
         Snapshot(words: entries.map(\.word), learnsWords: learnsWords)
     }
 
-    /// Adds a typed word. One already there, whatever its case, is not added twice but takes the
-    /// spelling typed, the user's latest; a learned one typed again becomes typed.
+    /// Adds a typed word, refused (`full`) at `dictionaryMaxTypedWords` typed words. One already
+    /// there, whatever its case, is not added twice but takes the spelling typed, the user's latest;
+    /// a learned one typed again becomes typed, so it is refused at the cap too. A full dictionary
+    /// drops the learned word used least recently for a new one.
     @discardableResult
     func add(_ raw: String) -> AddResult {
         guard let word = Self.word(raw) else { return .invalid }
+        let use = nextUse
+        let typedFull = entries.count(where: { !$0.learned }) >= DictationConfig.dictionaryMaxTypedWords
         if let existing = entries.firstIndex(where: { Self.isSameWord($0.word, word) }) {
-            entries[existing] = Entry(word: word, learned: false)
+            if entries[existing].learned && typedFull { return .full }
+            entries[existing] = Entry(word: word, learned: false, lastUsed: use)
         } else {
-            guard entries.count < DictationConfig.dictionaryMaxEntries else { return .full }
-            entries.append(Entry(word: word, learned: false))
+            guard !typedFull, makeRoom(before: use) else { return .full }
+            entries.append(Entry(word: word, learned: false, lastUsed: use))
         }
         save()
         return .added
     }
 
-    /// Adds words learned from a correction: those not already there, up to the limit. Returns the
-    /// ones added.
+    /// Adds words learned from a correction, those not already there; a full dictionary drops the
+    /// learned word used least recently for each, never one learned in the same call. One already
+    /// there counts as used, marked before any is added so that no new word drops it, wherever it
+    /// comes in `words`. Returns the ones added.
     @discardableResult
     func learn(_ words: [String]) -> [String] {
-        var added: [String] = []
+        let use = nextUse
+        var fresh: [String] = []
+        var changed = false
         for raw in words {
-            guard let word = Self.word(raw), entries.count < DictationConfig.dictionaryMaxEntries,
-                  !entries.contains(where: { Self.isSameWord($0.word, word) }) else { continue }
-            entries.append(Entry(word: word, learned: true))
+            guard let word = Self.word(raw) else { continue }
+            if let existing = entries.firstIndex(where: { Self.isSameWord($0.word, word) }) {
+                guard entries[existing].lastUsed != use else { continue }
+                entries[existing].lastUsed = use
+                changed = true
+            } else {
+                fresh.append(word)
+            }
+        }
+        var added: [String] = []
+        for word in fresh {
+            guard !entries.contains(where: { Self.isSameWord($0.word, word) }), makeRoom(before: use) else { continue }
+            entries.append(Entry(word: word, learned: true, lastUsed: use))
             added.append(word)
         }
-        if !added.isEmpty { save() }
+        if changed || !added.isEmpty { save() }
         return added
+    }
+
+    /// Marks the words found in a dictation's `texts` (the transcript, and the text it pasted) as
+    /// used now, whatever their case, so a full dictionary keeps them over the learned words not
+    /// used since. A word inside a longer one counts ("TabMail" in "TabMail's"): the scripts without
+    /// spaces between words have no edge to look for.
+    func use(_ texts: [String]) {
+        let said = texts.joined(separator: "\n").lowercased()
+        let use = nextUse
+        var changed = false
+        for index in entries.indices where said.contains(entries[index].word.lowercased()) {
+            entries[index].lastUsed = use
+            changed = true
+        }
+        if changed { save() }
     }
 
     /// Removes the entry spelled exactly `word`.
     func remove(_ word: String) {
         entries.removeAll { $0.word == word }
         save()
+    }
+
+    /// The `lastUsed` of a use now: after every entry's.
+    private var nextUse: Int {
+        (entries.map(\.lastUsed).max() ?? 0) + 1
+    }
+
+    /// Makes room for one more word: true when there was room, or after dropping the learned word
+    /// used least recently before `use` (the earliest of a tie); false when there is none to drop.
+    private func makeRoom(before use: Int) -> Bool {
+        guard entries.count >= DictationConfig.dictionaryMaxEntries else { return true }
+        let learned = entries.indices.filter { entries[$0].learned && entries[$0].lastUsed < use }
+        guard let dropped = learned.min(by: { entries[$0].lastUsed < entries[$1].lastUsed }) else { return false }
+        entries.remove(at: dropped)
+        BackgroundSyncLogger.logDebug("[Dictation] dictionary full; dropped the learned word used least recently")
+        return true
     }
 
     private func save() {
@@ -117,7 +187,7 @@ final class DictationDictionary {
     }
 
     /// A stored list read back: valid entries only, the first of any two that are the same word, at
-    /// most `dictionaryMaxEntries`.
+    /// most `dictionaryMaxEntries`. One without a valid `lastUsed` reads as never used.
     nonisolated static func stored(_ data: Data?) -> [Entry] {
         guard let data, let decoded = try? JSONDecoder().decode([Entry].self, from: data) else { return [] }
         var entries: [Entry] = []

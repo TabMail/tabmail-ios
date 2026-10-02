@@ -5,15 +5,16 @@
 import SwiftUI
 
 /// Settings › Personalization › Voice Dictation Dictionary (ADR-IOS-086): the words and names the
-/// user wants dictation to spell their way, typed here or learned from their corrections.
+/// user wants dictation to spell their way, typed here or learned from their corrections: the typed
+/// ones first, then the learned ones, each alphabetically.
 struct DictationDictionaryView: View {
     @State private var dictionary = DictationDictionary.shared
     @State private var newWord = ""
     @State private var refusal: String?
 
     static let invalidMessage = "A word or name of up to \(DictationConfig.dictionaryWordMaxWords) words, without < or >."
-    static let fullMessage = "The dictionary holds \(DictationConfig.dictionaryMaxEntries) words. Remove one to add another."
-    static let learningNote = "For \(Int(DictationConfig.correctionWatchDuration.components.seconds)) seconds after a dictation, TabMail watches the chat field it went into. When you correct how a word or name was spelled, the new spelling is added here. The field's text stays on this iPhone."
+    static let fullMessage = "You can add up to \(DictationConfig.dictionaryMaxTypedWords) words. Remove one to add another."
+    static let learningNote = "For \(Int(DictationConfig.correctionWatchDuration.components.seconds)) seconds after a dictation, TabMail watches the chat field it went into. When you correct how a word or name was spelled, the new spelling is added here. Learned words fill the room your own words leave, up to \(DictationConfig.dictionaryMaxEntries) in all, and the one used least recently makes way for a new one. The field's text stays on this iPhone."
 
     var body: some View {
         Form {
@@ -42,7 +43,7 @@ struct DictationDictionaryView: View {
                         Text("No words yet.")
                             .foregroundStyle(.secondary)
                     }
-                    ForEach(dictionary.entries, id: \.word) { entry in
+                    ForEach(Self.shown(dictionary.entries), id: \.word) { entry in
                         HStack {
                             Text(entry.word)
                             if entry.learned {
@@ -85,8 +86,17 @@ struct DictationDictionaryView: View {
         }
     }
 
-    /// Removes the rows at `offsets` of the list, by their words.
+    /// The entries as listed: the typed ones, then the learned ones, each alphabetically.
+    static func shown(_ entries: [DictationDictionary.Entry]) -> [DictationDictionary.Entry] {
+        let byWord = { (first: DictationDictionary.Entry, second: DictationDictionary.Entry) in
+            first.word.localizedCompare(second.word) == .orderedAscending
+        }
+        return entries.filter { !$0.learned }.sorted(by: byWord) + entries.filter(\.learned).sorted(by: byWord)
+    }
+
+    /// Removes the rows at `offsets` of the list as shown, by their words.
     static func remove(at offsets: IndexSet, from dictionary: DictationDictionary) {
-        offsets.map { dictionary.entries[$0].word }.forEach(dictionary.remove)
+        let rows = shown(dictionary.entries)
+        offsets.map { rows[$0].word }.forEach(dictionary.remove)
     }
 }

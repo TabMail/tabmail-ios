@@ -66,7 +66,7 @@ struct DictationContextTermsTests {
         #expect(terms(text) == ["Xyvora", "Brevalle", "Kaelthorne"])
         #expect(terms(text, excluding: ["xyvora"]) == ["Brevalle", "Kaelthorne"])
         #expect(terms(text, max: 1) == ["Xyvora"])
-        #expect(DictationConfig.contextTermsMax == 100)
+        #expect(DictationConfig.contextTermsMax == 50)
     }
 
     @Test func picksInAnyScript() {

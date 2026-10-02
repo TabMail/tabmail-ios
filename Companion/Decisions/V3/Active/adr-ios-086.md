@@ -86,3 +86,39 @@ on the device rather than a model).
 - The pill's wiring (the email id, the send, the pill going away) and the Settings row are pinned by
   source fences (`ChatPillDictationWiringTests`), as the rest of the pill's dictation wiring is
   (ADR-IOS-085).
+
+**Amendment 2026-10-02 — 150 dictionary words (100 typed at most) and 50 context terms; a full
+dictionary keeps learning, dropping the learned word used least recently.** Owner, for TabMail Voice
+and then "the iOS app should also have the same" (TabMail Voice's ADR-DESK-038 amendment of the same
+date): at the cap, auto-learned words keep updating, the learned word *used* least recently giving
+way, by a count of each word's last use rather than a time; 50 of the 200 words sent kept for the
+context's terms and 150 for the dictionary, the typed words taking precedence up to 100 (refused past
+that, the user asked to remove one), the learned words in the rest, all 150 when none is typed; a
+learned word dropped with no notice; Settings listing the typed words, then the learned ones, each
+alphabetically. Before, the dictionary and the context had 100 each, and a full dictionary refused
+every new word, so learning stopped for good, silently, once 100 words were in.
+- Measured first, in TabMail Voice's `Scripts/stt-compare/vocabulary_limit.py` (OpenRouter,
+  MAI-Transcribe 2, a spoken made-up name as the canary): 200 terms are taken and 201 refused; 200 real
+  English words or 200 Korean names still spell the canary right. Only lists of made-up,
+  similar-sounding names lost it early, which no budget fixes; the budget stays the backend's 200.
+- `DictationConfig.dictionaryMaxEntries` 150 + `contextTermsMax` 50 = 200; `dictionaryMaxTypedWords`
+  100. `DictationDictionary.add` refuses (`full`) a new word, or a learned word typed again, at the
+  typed cap; a typed word typed again takes the spelling typed.
+- `Entry.lastUsed`, a count (larger is more recent): a word's last use is its adding, its typing or
+  learning again, or a dictation whose transcript or cleaned-up text holds it
+  (`DictationDictionary.use`, called by `DictationController` once a non-empty transcript of the
+  current dictation comes back). A word counts whatever its case, inside a longer word too (a script
+  without spaces has no word edge). An entry stored before `lastUsed`, or with an invalid one, reads
+  as never used.
+- A new word at `dictionaryMaxEntries`, learned or typed (below the typed cap), takes the place of
+  the learned word of the smallest `lastUsed` (the earliest of a tie), never one learned in the same
+  correction nor one the same correction respells again (`learn` marks those used before adding any).
+  A typed word is never dropped.
+- `DictationDictionaryView.shown`: the typed words, then the learned ones, each by
+  `localizedCompare`; swipe to delete removes the rows as shown. The learning note says learned words
+  fill the room the typed ones leave, up to 150, the one used least recently making way.
+
+**Consequences (amendment):**
+- A learned word can drop out with no notice but the debug log's, which doesn't name it.
+- The dictionary is rewritten in UserDefaults after a dictation that holds one of its words.
+- Fewer context terms (50, was 100): the most frequent are kept.
