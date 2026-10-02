@@ -129,7 +129,7 @@ the 50 bound … we send basically as many phrases or words as possible" (TabMai
 amendment of the same date). `DictationConfig.contextTermsMax` (50) is gone:
 `DictationConfig.vocabularyMaxTerms` (200, the backend's limit) less the dictionary's words snapshotted
 at the dictation's start is how many terms `DictationContextTerms` may pick, so a dictation sends up
-to 200 words whatever the dictionary holds: all 200 from the context with no dictionary, at least 50
+to 200 words whatever the dictionary holds: all 200 from the context with no dictionary, room for at least 50
 beside a full one (`dictionaryMaxEntries` stays 150, all of it always sent, first).
 - Consequence: an email with many names sends a longer list than before; the measured 200 real words
   or names did not blunt the speech model, and an email with fewer sends just those.

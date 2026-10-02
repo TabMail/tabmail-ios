@@ -106,8 +106,8 @@ enum DictationConfig {
     /// `Scripts/stt-compare/vocabulary_limit.py`). The user's dictionary goes first, at most 150
     /// words, all of them always sent: at most 100 typed, learned words in the rest, all 150 when
     /// none is typed; the terms picked from what the dictation is about (`DictationContextTerms`)
-    /// fill the rest, at least 50 and all 200 when the dictionary is empty, so every dictation sends
-    /// as many as it can (owner, 2026-10-02; TabMail Voice's ADR-DESK-038).
+    /// fill the rest, room for at least 50 and all 200 when the dictionary is empty, so every
+    /// dictation sends as many as it can (owner, 2026-10-02; TabMail Voice's ADR-DESK-038).
     static let vocabularyMaxTerms = 200
     static let dictionaryMaxEntries = 150
     static let dictionaryMaxTypedWords = 100
