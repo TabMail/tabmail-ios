@@ -149,7 +149,9 @@ struct DictationDictionaryTests {
 
     @Test func aWordLearnedAgainCountsAsUsed() {
         let dictionary = full(typed: 0)
-        dictionary.learn(["LEARNED0"])
+        #expect(dictionary.learn(["LEARNED0"]) == [])
+        // Learning nothing new still keeps the use across a launch.
+        #expect(DictationDictionary(defaults: defaults).entries.first == .init(word: "learned0", learned: true, lastUsed: DictationConfig.dictionaryMaxEntries + 1))
         dictionary.learn(["Xyvora"])
         let words = dictionary.entries.map(\.word)
         #expect(words.contains("learned0") && !words.contains("learned1"))
