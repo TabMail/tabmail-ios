@@ -5,7 +5,7 @@
 import SwiftUI
 
 /// Laid over the chat pill's input field while dictating (the field's text dims behind it): TabMail
-/// Voice's waveform, flat while it waits for speech, following the voice once someone speaks, and
+/// Voice's waveform, following the microphone's sound from the start, speech or not, and
 /// rippling at rest while the words are transcribed. Nothing else: no language, and nothing when a dictation fails (the field simply
 /// comes back), but a note while a transcription the server failed is tried again. The waveform and its numbers are copied from TabMail Voice (`OverlayPanel.swift`).
 struct DictationPillView: View {
@@ -23,12 +23,18 @@ struct DictationPillView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             } else {
-                Waveform(level: controller.level, isFlat: controller.phase == .listening && !controller.hasHeardSpeech)
+                Waveform(level: controller.level, colour: Self.waveformColour(hasVoice: controller.hasHeardSpeech))
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
+    }
+
+    /// The waveform's colour: the accent blue while the dictation waits for speech, purple once
+    /// speech is heard, a sign it is listening (owner, 2026-10-02).
+    static func waveformColour(hasVoice: Bool) -> Color {
+        hasVoice ? DictationSpinner.colour(at: DictationConfig.waveformVoicedColour) : Theme.accent
     }
 
     /// What VoiceOver reads for the waveform.
@@ -42,19 +48,23 @@ struct DictationPillView: View {
 }
 
 /// TabMail Voice's thinking spinner (`SpinningRim` in its overlay): a faint track with a
-/// gradient arc circling it, in the icon's blue → purple.
+/// gradient arc circling it, in the icon's blue → purple; both moved toward purple while a server
+/// error is tried again.
 struct DictationSpinner: View {
+    var isRetrying = false
+
     var body: some View {
+        let colours = Self.colours(isRetrying: isRetrying)
         TimelineView(.animation) { timeline in
             let turns = timeline.date.timeIntervalSinceReferenceDate * DictationConfig.thinkingRevolutionsPerSecond
             ZStack {
                 Circle()
-                    .stroke(Self.colour(at: 0).opacity(DictationConfig.thinkingTrackOpacity), lineWidth: DictationConfig.thinkingRimWidth)
+                    .stroke(colours.track.opacity(DictationConfig.thinkingTrackOpacity), lineWidth: DictationConfig.thinkingRimWidth)
                 Circle()
                     .trim(from: 0, to: DictationConfig.thinkingArcFraction)
                     .stroke(
                         AngularGradient(
-                            colors: [Self.colour(at: 0).opacity(0), Self.colour(at: 0), Self.colour(at: DictationConfig.thinkingArcEndColour)],
+                            colors: [colours.arc.start.opacity(0), colours.arc.start, colours.arc.end],
                             center: .center,
                             startAngle: .zero, endAngle: .degrees(360 * DictationConfig.thinkingArcFraction)
                         ),
@@ -67,8 +77,15 @@ struct DictationSpinner: View {
         .frame(width: DictationConfig.spinnerDiameter, height: DictationConfig.spinnerDiameter)
     }
 
+    /// The track's colour and the arc's two ends: from blue, or `thinkingRetryColourShift` toward
+    /// purple while retrying.
+    static func colours(isRetrying: Bool) -> (track: Color, arc: (start: Color, end: Color)) {
+        let shift = isRetrying ? DictationConfig.thinkingRetryColourShift : 0
+        return (colour(at: shift), (colour(at: shift), colour(at: DictationConfig.thinkingArcEndColour + shift)))
+    }
+
     /// A point on the TabMail icon's blue → purple gradient (0 = blue, 1 = purple).
-    private static func colour(at fraction: Double) -> Color {
+    static func colour(at fraction: Double) -> Color {
         let blue = (red: 0.0, green: 0x91 / 255.0, blue: 1.0)
         let purple = (red: 0x7B / 255.0, green: 0.0, blue: 1.0)
         return Color(
@@ -79,10 +96,10 @@ struct DictationSpinner: View {
     }
 }
 
-/// Voice waveform: bars follow the incoming sound level with a travelling ripple, or lie flat.
+/// Voice waveform: bars follow the incoming sound level with a travelling ripple.
 private struct Waveform: View {
     let level: Float
-    let isFlat: Bool
+    let colour: Color
 
     var body: some View {
         TimelineView(.animation) { timeline in
@@ -90,16 +107,16 @@ private struct Waveform: View {
             HStack(spacing: DictationConfig.meterBarSpacing) {
                 ForEach(0..<DictationConfig.meterBarCount, id: \.self) { index in
                     Capsule()
-                        .fill(Theme.accent)
+                        .fill(colour)
                         .frame(width: DictationConfig.meterBarWidth, height: barHeight(index, time: time))
                 }
             }
             .frame(height: DictationConfig.meterMaxBarHeight)
         }
+        .animation(.easeInOut(duration: DictationConfig.waveformColourTransition), value: colour)
     }
 
     private func barHeight(_ index: Int, time: TimeInterval) -> CGFloat {
-        guard !isFlat else { return DictationConfig.meterMinBarHeight }
         let count = DictationConfig.meterBarCount
         let centre = Double(count - 1) / 2
         let distance = abs(Double(index) - centre) / max(centre, 1)

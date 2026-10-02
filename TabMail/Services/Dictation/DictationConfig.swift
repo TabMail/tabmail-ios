@@ -181,6 +181,11 @@ enum DictationConfig {
     /// The bars always ripple this much (0…1), so the waveform looks alive between words and while
     /// the words are transcribed.
     static let waveformIdleLevel: Double = 0.05
+    /// The bars are the app's accent blue while the dictation waits for speech, and ease to this
+    /// point on the TabMail icon's blue → purple gradient (`DictationSpinner.colour`) over this
+    /// many seconds once speech is heard: a sign it is listening (owner, 2026-10-02).
+    static let waveformVoicedColour: Double = 1
+    static let waveformColourTransition: Double = 0.4
     /// Each bar's ripple speed differs by up to this fraction, so the motion looks organic.
     static let waveformSpeedVariance: Double = 0.2
     /// Phase step (radians per bar) that spreads the speed variance across the bars.
@@ -204,4 +209,8 @@ enum DictationConfig {
     /// The arc runs from blue to this point on the blue → purple gradient: the full purple end
     /// reads reddish on the spinning arc.
     static let thinkingArcEndColour: Double = 0.6
+    /// While a transcription is tried again after a server error, the arc and its track move
+    /// this far along the gradient toward purple, a hint of the retry (owner, 2026-10-02; as
+    /// TabMail Voice's `thinkingRetryColorShift`).
+    static let thinkingRetryColourShift: Double = 0.3
 }

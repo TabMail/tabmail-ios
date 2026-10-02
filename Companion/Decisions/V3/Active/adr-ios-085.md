@@ -255,3 +255,33 @@ click sets the gain, so a recording with a click louder than the speech is boost
 - Tests: `DictationAudioRecorderTests` (a quiet recording's loudest sample at −3 dBFS, the FLAC the
   same samples; near-silence boosted by at most 30 dB; a louder tone and digital silence unchanged;
   both signs scaled by one gain), `DictationControllerTests` › the upload's loudest sample at −3 dBFS.
+
+**Amendment 2026-10-02 — the waveform always moves; only the recording waits for speech (owner).**
+Owner, after using it: the waveform lying flat until speech is heard "feels like the app is stuck";
+"the waveform should always be moving. The suppression of the non-speech at the beginning should
+just happen under the hood." Decisions 8 and 10 no longer hold the waveform flat:
+`DictationController.updateLevel` feeds `level` from the microphone's first real sound (above
+`silenceDecibels`, so a device's start-up digital silence still shows nothing), speech or not, as
+TabMail Voice's waveform does; `DictationPillView` draws `Waveform(level:)` with its idle ripple from
+the start. What decision 10 decides is unchanged: the recording, its cap and the upload still wait for
+the sound classifier to hear speech, and a dictation that never hears any sends nothing.
+- The waveform now moves with a room's noise before anyone speaks; `LevelEnvelope` adapts to that
+  noise as it does on TabMail Voice, so a steady hum settles rather than holding the bars high.
+- Tests: `DictationControllerTests.theWaveformMovesBeforeSpeechIsHeard` (start-up silence leaves
+  `level` 0; a rising room noise moves it with no speech heard), and the pill's source fence (no
+  flat state, no `hasHeardSpeech` in the pill).
+
+**Amendment 2026-10-02 (later) — purple says it is listening, and retrying (owner).** "When it actually
+starts to listen, the waveform color could turn from blue to a little bit more purple, our theme
+color", for TabMail Voice and iOS alike; and while a server error is tried again, "the circle that
+rotates turns a little bit purple". On iOS "listening" is the sound classifier hearing speech
+(decision 10): the bars are the app's accent blue while the dictation waits for it and ease
+(`waveformColourTransition`, 0.4 s) to `waveformVoicedColour`, the TabMail icon's purple, once
+`hasHeardSpeech` (`DictationPillView.waveformColour`). While `isRetrying`, `DictationSpinner`'s track
+and arc move `thinkingRetryColourShift` (0.3) along the blue → purple gradient
+(`DictationSpinner.colours`); iOS shows its retry note at once, so the shift goes with it. TabMail
+Voice's ADR-DESK-006 and ADR-DESK-039 amendments of the same date do the same (its "voice" is a
+loudness cue, having no wait for speech).
+- Tests: `DictationControllerTests.theWaveformTurnsPurpleOnSpeechAndTheSpinnerWhileRetrying`, and the
+  pill's and the send slot's source fences (`Waveform(level:colour:)` from `hasHeardSpeech`,
+  `DictationSpinner(isRetrying: dictation.isRetrying)`).
