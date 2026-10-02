@@ -112,6 +112,8 @@ private final class Recorded: Sendable {
     /// The cleanup's variables sent with each upload (backend ADR-027).
     let cleanups = Mutex<[[String: String]]>([])
     let texts = Mutex<[String]>([])
+    /// The texts each dictation marked the dictionary's words used in (`DictationDictionary.use`).
+    let used = Mutex<[[String]]>([])
     /// Warm-ups sent (`DictationController.WarmUp`).
     let warmUps = Mutex(0)
 }
@@ -264,6 +266,7 @@ struct DictationControllerTests {
             dictionary: dictionary,
             emailBody: emailBody,
             corrections: corrections,
+            useWords: { texts in recorded.used.withLock { $0.append(texts) } },
             transcribe: { flac, language, vocabulary, cleanup in
                 recorded.uploads.withLock { $0.append(flac) }
                 recorded.languages.withLock { $0.append(language) }
@@ -494,6 +497,7 @@ struct DictationControllerTests {
 
         #expect(controller.phase == .idle)
         #expect(recorded.texts.withLock { $0.isEmpty })
+        #expect(recorded.used.withLock { $0.isEmpty })
     }
 
     /// A failed transcription shows nothing: the input field comes back as it was. Refused by the
@@ -1016,6 +1020,7 @@ struct DictationControllerTests {
         try? await Task.sleep(for: .milliseconds(600))
 
         #expect(recorded.texts.withLock { $0.isEmpty })
+        #expect(recorded.used.withLock { $0.isEmpty })
         #expect(controller.phase == .listening)
         #expect(capture.isRunning)
         controller.cancel()
@@ -1150,6 +1155,23 @@ struct DictationControllerTests {
         }
     }
 
+    /// The dictionary's words in the transcript and the cleaned-up text are marked used, so a full
+    /// dictionary keeps them over the learned words not used since; only the transcript when no
+    /// cleanup came back.
+    @Test(arguments: [
+        (String?.some("Ask Jordan about the roadmap."), ["ask jordan about the road map", "Ask Jordan about the roadmap."]),
+        (nil, ["ask jordan about the road map"]),
+    ])
+    func marksTheWordsOfTheDictationUsed(cleaned: String?, used: [String]) async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, cleaned: { cleaned })
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase == .idle }
+
+        #expect(recorded.used.withLock { $0 } == [used])
+    }
+
     /// The recording goes with the user's dictionary and the terms of what the dictation is about,
     /// the email's body among it; the cleanup's variables carry the dictionary alone (it reads the
     /// screen itself).
@@ -1177,9 +1199,9 @@ struct DictationControllerTests {
         #expect(recorded.cleanups.withLock { $0.first?["dictionary"] } == "Xyvora")
     }
 
-    /// A full dictionary and an email of more terms than the context's half: the dictionary whole,
+    /// A full dictionary and an email of more terms than the context's share: the dictionary whole,
     /// then the context's first `contextTermsMax` terms, never more words than the backend takes.
-    @Test func sendsAtMostTheContextsHalfOfTerms() async throws {
+    @Test func sendsAtMostTheContextsShareOfTerms() async throws {
         let capture = FakeCapture()
         func name(_ prefix: String, _ i: Int) -> String {
             let letters = Array("abcdefghijklmnopqrstuvwxyz")
@@ -1525,6 +1547,7 @@ struct DictationOptOutFlagTests {
         let controller = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationController.swift"), encoding: .utf8)
         #expect(controller.contains("emailBody: @escaping EmailBody = { await DictationController.storedEmailBody(headerId: $0) },"))
         #expect(controller.contains("corrections: DictationCorrectionWatch? = DictationCorrectionWatch { DictationDictionary.shared.learn($0) },"))
+        #expect(controller.contains("useWords: @escaping @MainActor ([String]) -> Void = { DictationDictionary.shared.use($0) },"))
     }
 
     /// The Settings menu writes the key the controller reads, the waveform shows no language, and

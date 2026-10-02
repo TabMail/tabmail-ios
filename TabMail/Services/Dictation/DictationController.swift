@@ -58,6 +58,8 @@ final class DictationController {
     @ObservationIgnored private let dictionary: @MainActor () -> DictationDictionary.Snapshot
     @ObservationIgnored private let emailBody: EmailBody
     @ObservationIgnored private let corrections: DictationCorrectionWatch?
+    /// Marks the dictionary's words found in a dictation's text used (`DictationDictionary.use`).
+    @ObservationIgnored private let useWords: @MainActor ([String]) -> Void
     @ObservationIgnored private let transcribeAudio: Transcribe
     @ObservationIgnored private let warmUp: WarmUp
     @ObservationIgnored private let transcriptionRetryDelays: [Duration]
@@ -93,6 +95,7 @@ final class DictationController {
         dictionary: @escaping @MainActor () -> DictationDictionary.Snapshot = { DictationDictionary.shared.snapshot },
         emailBody: @escaping EmailBody = { await DictationController.storedEmailBody(headerId: $0) },
         corrections: DictationCorrectionWatch? = DictationCorrectionWatch { DictationDictionary.shared.learn($0) },
+        useWords: @escaping @MainActor ([String]) -> Void = { DictationDictionary.shared.use($0) },
         transcribe: Transcribe? = nil,
         warmUp: WarmUp? = nil,
         transcriptionRetryDelays: [Duration] = DictationConfig.transcriptionRetryDelays,
@@ -107,6 +110,7 @@ final class DictationController {
         self.dictionary = dictionary
         self.emailBody = emailBody
         self.corrections = corrections
+        self.useWords = useWords
         self.transcribeAudio = transcribe ?? Self.backendTranscription(AccountManager.shared.backendClient)
         self.warmUp = warmUp ?? Self.backendWarmUp(AccountManager.shared.backendClient)
         self.transcriptionRetryDelays = transcriptionRetryDelays
@@ -348,6 +352,7 @@ final class DictationController {
                 fail()
                 return
             }
+            useWords([transcript] + [transcription.cleanedText].compactMap { $0 })
             let text = DictationCleanup.pasted(transcript: transcript, cleanedText: transcription.cleanedText)
             let deliver = onText
             let input = learnsWords ? readInput : nil

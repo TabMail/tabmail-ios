@@ -29,7 +29,7 @@ struct DictationDictionaryTests {
         dictionary.learnsWords = false
 
         let relaunched = DictationDictionary(defaults: defaults)
-        #expect(relaunched.entries == [.init(word: "Xyvora", learned: false), .init(word: "Kaelthorne Drake", learned: true)])
+        #expect(relaunched.entries == [.init(word: "Xyvora", learned: false, lastUsed: 1), .init(word: "Kaelthorne Drake", learned: true, lastUsed: 2)])
         #expect(relaunched.snapshot == .init(words: ["Xyvora", "Kaelthorne Drake"], learnsWords: false))
     }
 
@@ -47,10 +47,10 @@ struct DictationDictionaryTests {
         let dictionary = DictationDictionary(defaults: defaults)
         dictionary.learn(["Tabmail"])
         #expect(dictionary.add("TabMail") == .added)
-        #expect(dictionary.entries == [.init(word: "TabMail", learned: false)])
+        #expect(dictionary.entries == [.init(word: "TabMail", learned: false, lastUsed: 2)])
         dictionary.add("XyVora")
         #expect(dictionary.add("Xyvora") == .added)
-        #expect(dictionary.entries == [.init(word: "TabMail", learned: false), .init(word: "Xyvora", learned: false)])
+        #expect(dictionary.entries == [.init(word: "TabMail", learned: false, lastUsed: 2), .init(word: "Xyvora", learned: false, lastUsed: 4)])
     }
 
     @Test(arguments: [
@@ -85,16 +85,152 @@ struct DictationDictionaryTests {
         #expect(dictionary.entries.map(\.word) == ["Kaelthorne Drake", "Brevalle Labs", "Xyvora Quill"])
     }
 
-    /// Half the words sent with a dictation: the other half is picked from its context.
-    @Test func holdsAtMostItsHalfOfTheWordsSent() {
-        let dictionary = DictationDictionary(defaults: defaults)
-        for index in 0..<DictationConfig.dictionaryMaxEntries { dictionary.add("Word\(index)") }
-        #expect(dictionary.add("Xyvora") == .full)
-        #expect(dictionary.learn(["Brevalle"]) == [])
-        // A word already there is still made typed when full.
-        #expect(dictionary.add("word0") == .added)
-        #expect(dictionary.entries.count == DictationConfig.dictionaryMaxEntries)
+    /// Owner, 2026-10-02: of the 200 words the backend takes with a dictation, 50 are picked from
+    /// its context and 150 are the dictionary's, at most 100 of them typed; learned words fill the
+    /// rest, all 150 when none is typed.
+    @Test func holdsTheWordsSentBesideTheContextsAtMost100Typed() {
+        #expect([DictationConfig.dictionaryMaxEntries, DictationConfig.dictionaryMaxTypedWords, DictationConfig.contextTermsMax] as [Int] == [150, 100, 50])
         #expect(DictationConfig.dictionaryMaxEntries + DictationConfig.contextTermsMax == 200)
+        let dictionary = DictationDictionary(defaults: defaults)
+        let learned = (0..<DictationConfig.dictionaryMaxEntries).map { "Learned\($0)" }
+        #expect(dictionary.learn(learned).count == DictationConfig.dictionaryMaxEntries)
+        #expect(dictionary.learn(["Xyvora"]) == ["Xyvora"])
+        #expect(dictionary.entries.count == DictationConfig.dictionaryMaxEntries)
+        for index in 0..<DictationConfig.dictionaryMaxTypedWords { #expect(dictionary.add("Typed\(index)") == .added) }
+        #expect(dictionary.add("Brevalle") == .full)
+        #expect(dictionary.entries.count == DictationConfig.dictionaryMaxEntries)
+        #expect(dictionary.entries.count(where: { !$0.learned }) == DictationConfig.dictionaryMaxTypedWords)
+        #expect(dictionary.entries.count(where: \.learned) == DictationConfig.dictionaryMaxEntries - DictationConfig.dictionaryMaxTypedWords)
+    }
+
+    /// At the cap a learned word typed again would be one more typed word: refused, and it stays
+    /// learned. A typed word typed again adds none: it takes the spelling typed.
+    @Test func refusesALearnedWordTypedAgainAtTheTypedCap() {
+        let dictionary = DictationDictionary(defaults: defaults)
+        dictionary.learn(["Xyvora"])
+        for index in 0..<DictationConfig.dictionaryMaxTypedWords { dictionary.add("Typed\(index)") }
+        #expect(dictionary.add("XYVORA") == .full)
+        #expect(dictionary.entries.first == .init(word: "Xyvora", learned: true, lastUsed: 1))
+        #expect(dictionary.add("TYPED0") == .added)
+        #expect(dictionary.entries.dropFirst().first == .init(word: "TYPED0", learned: false, lastUsed: DictationConfig.dictionaryMaxTypedWords + 2))
+        dictionary.remove("Typed1")
+        #expect(dictionary.add("xyvora") == .added)
+        #expect(dictionary.entries.first == .init(word: "xyvora", learned: false, lastUsed: DictationConfig.dictionaryMaxTypedWords + 3))
+    }
+
+    // MARK: When full (owner, 2026-10-02): a new word, learned or typed (below the typed cap), takes
+    // the place of the learned word used least recently (not the one learned first); a typed word is
+    // never dropped.
+
+    /// A dictionary of `typed` typed words, then learned ones, each used once, in order.
+    private func full(typed: Int) -> DictationDictionary {
+        let dictionary = DictationDictionary(defaults: defaults)
+        for index in 0..<typed { dictionary.add("typed\(index)") }
+        for index in typed..<DictationConfig.dictionaryMaxEntries { dictionary.learn(["learned\(index)"]) }
+        #expect(dictionary.entries.count == DictationConfig.dictionaryMaxEntries)
+        return dictionary
+    }
+
+    @Test func aLearnedWordTakesThePlaceOfTheLearnedWordUsedLeastRecently() {
+        let dictionary = full(typed: 10)
+        // The oldest learned word, used in a dictation since: the next oldest goes instead.
+        dictionary.use(["she said learned10 twice"])
+        #expect(dictionary.learn(["Xyvora"]) == ["Xyvora"])
+        let words = dictionary.entries.map(\.word)
+        #expect(words.count == DictationConfig.dictionaryMaxEntries)
+        #expect(words.contains("learned10") && !words.contains("learned11"))
+        #expect(words.last == "Xyvora")
+        // Next goes the one after it; learned10 and Xyvora, used later, stay.
+        dictionary.learn(["Kaelthorne Drake"])
+        let after = dictionary.entries.map(\.word)
+        #expect(!after.contains("learned12"))
+        #expect(["learned10", "Xyvora", "Kaelthorne Drake"].allSatisfy(after.contains))
+    }
+
+    @Test func aWordLearnedAgainCountsAsUsed() {
+        let dictionary = full(typed: 0)
+        dictionary.learn(["LEARNED0"])
+        dictionary.learn(["Xyvora"])
+        let words = dictionary.entries.map(\.word)
+        #expect(words.contains("learned0") && !words.contains("learned1"))
+    }
+
+    @Test func aTypedWordTakesThePlaceOfTheLearnedWordUsedLeastRecently() {
+        let dictionary = full(typed: 10)
+        dictionary.use(["learned10"])
+        #expect(dictionary.add("Xyvora") == .added)
+        let words = dictionary.entries.map(\.word)
+        #expect(words.count == DictationConfig.dictionaryMaxEntries)
+        #expect(words.contains("learned10") && !words.contains("learned11"))
+        #expect(dictionary.entries.last == .init(word: "Xyvora", learned: false, lastUsed: DictationConfig.dictionaryMaxEntries + 2))
+    }
+
+    /// At the typed cap a typed word is refused; learning goes on in the learned words' room, and
+    /// however much is learned, no typed word is dropped.
+    @Test func neverDropsATypedWord() {
+        let dictionary = full(typed: DictationConfig.dictionaryMaxTypedWords)
+        #expect(dictionary.add("Xyvora") == .full)
+        let learned = (0..<DictationConfig.dictionaryMaxEntries).map { "later\($0)" }
+        for word in learned { #expect(dictionary.learn([word]) == [word]) }
+        let words = dictionary.entries.map(\.word)
+        #expect(words.count == DictationConfig.dictionaryMaxEntries)
+        #expect(Array(words.prefix(DictationConfig.dictionaryMaxTypedWords)) == (0..<DictationConfig.dictionaryMaxTypedWords).map { "typed\($0)" })
+        #expect(Array(words.dropFirst(DictationConfig.dictionaryMaxTypedWords)) == Array(learned.suffix(DictationConfig.dictionaryMaxEntries - DictationConfig.dictionaryMaxTypedWords)))
+    }
+
+    /// A correction that respells a word already there and a new one: the word already there is
+    /// used now, so the new one never drops it, whichever comes first in the correction.
+    @Test(arguments: [true, false])
+    func keepsAWordLearnedAgainInTheSameCorrection(newFirst: Bool) {
+        // With the typed words at their cap: the learned word used least recently, then the next.
+        let oldest = "learned\(DictationConfig.dictionaryMaxTypedWords)"
+        let next = "learned\(DictationConfig.dictionaryMaxTypedWords + 1)"
+        let dictionary = full(typed: DictationConfig.dictionaryMaxTypedWords)
+        #expect(dictionary.learn(newFirst ? ["Xyvora", oldest] : [oldest, "Xyvora"]) == ["Xyvora"])
+        let words = dictionary.entries.map(\.word)
+        #expect(words.contains(oldest) && !words.contains(next))
+        #expect(dictionary.entries.first { $0.word == oldest }?.lastUsed == DictationConfig.dictionaryMaxEntries + 1)
+    }
+
+    /// A typed word respelled in a correction counts as used, beside a new word learned.
+    @Test func marksATypedWordUsedInTheSameCorrectionAsANewWord() {
+        let dictionary = full(typed: DictationConfig.dictionaryMaxTypedWords)
+        #expect(dictionary.learn(["Xyvora", "typed0"]) == ["Xyvora"])
+        #expect(dictionary.entries.first == .init(word: "typed0", learned: false, lastUsed: DictationConfig.dictionaryMaxEntries + 1))
+    }
+
+    /// Words learned together don't push each other out: once every learned word there is one of
+    /// them, the next is not learned.
+    @Test func doesNotDropAWordLearnedInTheSameCorrection() {
+        let dictionary = full(typed: DictationConfig.dictionaryMaxTypedWords)
+        let room = DictationConfig.dictionaryMaxEntries - DictationConfig.dictionaryMaxTypedWords
+        let correction = (0...room).map { "new\($0)" }
+        #expect(dictionary.learn(correction) == Array(correction.prefix(room)))
+        #expect(Array(dictionary.entries.map(\.word).dropFirst(DictationConfig.dictionaryMaxTypedWords)) == Array(correction.prefix(room)))
+    }
+
+    /// Of learned words never used since they were stored (`lastUsed` 0), the earliest goes first.
+    @Test func dropsTheEarliestOfWordsUsedAsLongAgo() throws {
+        let stored = (0..<DictationConfig.dictionaryMaxEntries).map { ["word": "word\($0)", "learned": true] as [String: Any] }
+        defaults.set(try JSONSerialization.data(withJSONObject: stored), forKey: DictationDictionary.entriesKey)
+        let dictionary = DictationDictionary(defaults: defaults)
+        dictionary.learn(["Xyvora"])
+        #expect(dictionary.entries.first?.word == "word1")
+        #expect(dictionary.entries.last?.word == "Xyvora")
+    }
+
+    /// A dictation's text marks the words in it used, typed or learned, whatever their case, a word
+    /// inside a longer one too (scripts without spaces have no word edge); only a change is written.
+    @Test func marksTheWordsInADictationsTextUsed() {
+        let dictionary = DictationDictionary(defaults: defaults)
+        dictionary.add("TabMail")
+        dictionary.learn(["탭메일"])
+        dictionary.learn(["Xyvora"])
+        dictionary.learn(["Brevalle"])
+        dictionary.use(["send it with tabmail's", "탭메일로 보내 XYVORACORP"])
+        #expect(dictionary.entries.map(\.lastUsed) == [5, 5, 5, 4])
+        dictionary.use(["nothing here"])
+        #expect(DictationDictionary(defaults: defaults).entries.map(\.lastUsed) == [5, 5, 5, 4])
     }
 
     @Test func removesAWordByItsSpelling() {
@@ -108,17 +244,24 @@ struct DictationDictionaryTests {
     }
 
     /// Whatever is stored, only valid entries are read back: no duplicates, no word the backend
-    /// refuses, at most the limit.
+    /// refuses, at most the limit. One stored before `lastUsed` was kept, or with an invalid one,
+    /// reads as never used.
     @Test func readsBackOnlyValidEntries() throws {
-        let stored: [DictationDictionary.Entry] = [
-            .init(word: "Xyvora", learned: false), .init(word: "XYVORA", learned: true), .init(word: "Xy<vora", learned: false),
-            .init(word: " Brevalle", learned: false), .init(word: "Brevalle", learned: true),
-        ] + (0..<DictationConfig.dictionaryMaxEntries).map { .init(word: "Word\($0)", learned: false) }
-        defaults.set(try JSONEncoder().encode(stored), forKey: DictationDictionary.entriesKey)
+        let stored: [[String: Any]] = [
+            ["word": "Xyvora", "learned": false], ["word": "XYVORA", "learned": true], ["word": "Xy<vora", "learned": false],
+            ["word": " Brevalle", "learned": false], ["word": "Brevalle", "learned": true, "lastUsed": 7],
+            ["word": "Zivora", "learned": true, "lastUsed": -1], ["word": "Ostrava", "learned": true, "lastUsed": "7"],
+            ["word": "Quill", "learned": true, "lastUsed": 1.5],
+        ] + (0..<DictationConfig.dictionaryMaxEntries).map { ["word": "Word\($0)", "learned": false] }
+        defaults.set(try JSONSerialization.data(withJSONObject: stored), forKey: DictationDictionary.entriesKey)
 
         let entries = DictationDictionary(defaults: defaults).entries
         #expect(entries.count == DictationConfig.dictionaryMaxEntries)
-        #expect(Array(entries.prefix(3)) == [.init(word: "Xyvora", learned: false), .init(word: "Brevalle", learned: true), .init(word: "Word0", learned: false)])
+        #expect(Array(entries.prefix(6)) == [
+            .init(word: "Xyvora", learned: false, lastUsed: 0), .init(word: "Brevalle", learned: true, lastUsed: 7),
+            .init(word: "Zivora", learned: true, lastUsed: 0), .init(word: "Ostrava", learned: true, lastUsed: 0),
+            .init(word: "Quill", learned: true, lastUsed: 0), .init(word: "Word0", learned: false, lastUsed: 0),
+        ])
 
         defaults.set(Data("not json".utf8), forKey: DictationDictionary.entriesKey)
         #expect(DictationDictionary(defaults: defaults).entries.isEmpty)
@@ -160,16 +303,45 @@ struct DictationDictionaryTests {
         let dictionary = DictationDictionary(defaults: defaults)
         #expect(DictationDictionaryView.submit("Xyvora", to: dictionary) == ("", nil))
         #expect(DictationDictionaryView.submit("Xy<vora", to: dictionary) == ("Xy<vora", DictationDictionaryView.invalidMessage))
-        for index in 1..<DictationConfig.dictionaryMaxEntries { dictionary.add("Word\(index)") }
+        for index in 1..<DictationConfig.dictionaryMaxTypedWords { dictionary.add("Word\(index)") }
         #expect(DictationDictionaryView.submit("Brevalle", to: dictionary) == ("Brevalle", DictationDictionaryView.fullMessage))
-        #expect(dictionary.entries.count == DictationConfig.dictionaryMaxEntries)
+        #expect(DictationDictionaryView.fullMessage == "You can add up to 100 words. Remove one to add another.")
+        #expect(dictionary.entries.count == DictationConfig.dictionaryMaxTypedWords)
     }
 
-    /// Settings: swiping rows away removes their words, and only those.
+    /// Settings lists the typed words first, then the learned ones, each alphabetically whatever
+    /// the case (owner, 2026-10-02), neither in the order added nor by last use.
+    @Test func settingsListsTypedThenLearnedEachAlphabetically() {
+        let dictionary = DictationDictionary(defaults: defaults)
+        dictionary.learn(["TabMail"])
+        dictionary.add("Xyvora")
+        dictionary.learn(["Brevalle"])
+        dictionary.add("Kaelthorne Drake")
+        dictionary.learn(["ostrava"])
+        dictionary.add("zivora")
+        dictionary.add("Aldrin")
+        dictionary.use(["zivora"])
+        #expect(DictationDictionaryView.shown(dictionary.entries).map(\.word) == ["Aldrin", "Kaelthorne Drake", "Xyvora", "zivora", "Brevalle", "ostrava", "TabMail"])
+    }
+
+    /// Settings lists the rows as `shown` orders them, the order a swipe's offsets are read in.
+    @Test func settingsListsTheRowsAsShown() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let view = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Settings/DictationDictionaryView.swift"), encoding: .utf8)
+        #expect(view.contains("ForEach(Self.shown(dictionary.entries), id: \\.word) { entry in"))
+        #expect(view.contains(".onDelete { Self.remove(at: $0, from: dictionary) }"))
+    }
+
+    /// Settings: swiping rows away removes their words, and only those, as the rows are listed.
     @Test func settingsRemovesTheRowsSwipedAway() {
         let dictionary = DictationDictionary(defaults: defaults)
         ["Xyvora", "Brevalle", "Quill", "Kaelthorne"].forEach { dictionary.add($0) }
-        DictationDictionaryView.remove(at: IndexSet([1, 3]), from: dictionary)
-        #expect(dictionary.entries.map(\.word) == ["Xyvora", "Quill"])
+        dictionary.learn(["Aldrin"])
+        // Listed: Brevalle, Kaelthorne, Quill, Xyvora, then Aldrin (learned).
+        DictationDictionaryView.remove(at: IndexSet([1, 3, 4]), from: dictionary)
+        #expect(dictionary.entries.map(\.word) == ["Brevalle", "Quill"])
     }
 }
