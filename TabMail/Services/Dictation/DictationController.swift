@@ -29,8 +29,14 @@ final class DictationController {
     /// The language this dictation is transcribed in, read once when it starts: a Settings change
     /// mid-dictation applies to the next one (`DictationLanguage`). Nil: none sent.
     private(set) var language: String?
-    /// The transcription failed on the server's side and is being tried again: the field says so.
+    /// The transcription failed on the server's side and is being tried again: the spinner turns
+    /// toward purple at once (owner, 2026-10-02).
     private(set) var isRetrying = false
+    /// The retries have gone on for `transcriptionRetryNoticeDelay` since the first failure: the
+    /// field says "Server error, retrying…" until a retry answers. One that answers sooner shows
+    /// nothing but a dictation taking a moment longer (owner, 2026-10-02; as TabMail Voice's
+    /// ADR-DESK-039).
+    private(set) var showsRetryNote = false
 
     /// Recording or transcribing: the microphone button stops (or waits for) this dictation.
     var isActive: Bool { phase == .listening || phase == .transcribing }
@@ -62,6 +68,7 @@ final class DictationController {
     @ObservationIgnored private let transcribeAudio: Transcribe
     @ObservationIgnored private let warmUp: WarmUp
     @ObservationIgnored private let transcriptionRetryDelays: [Duration]
+    @ObservationIgnored private let transcriptionRetryNoticeDelay: Duration
     @ObservationIgnored private let makeSpeechDetector: MakeSpeechDetector
     @ObservationIgnored private let maxRecordingDuration: Duration
 
@@ -82,6 +89,8 @@ final class DictationController {
     @ObservationIgnored private var termsTask: Task<[String], Never>?
     @ObservationIgnored private var startTask: Task<Void, Never>?
     @ObservationIgnored private var maxDurationTask: Task<Void, Never>?
+    /// Shows the retry note once `transcriptionRetryNoticeDelay` has passed since the first failure.
+    @ObservationIgnored private var retryNoteTask: Task<Void, Never>?
     @ObservationIgnored private var transcriptionTask: Task<Void, Never>?
 
     init(
@@ -98,6 +107,7 @@ final class DictationController {
         transcribe: Transcribe? = nil,
         warmUp: WarmUp? = nil,
         transcriptionRetryDelays: [Duration] = DictationConfig.transcriptionRetryDelays,
+        transcriptionRetryNoticeDelay: Duration = DictationConfig.transcriptionRetryNoticeDelay,
         speechDetector: @escaping MakeSpeechDetector = { SoundClassifierSpeechDetector(onSpeech: $0, onFailure: $1) },
         maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration
     ) {
@@ -113,6 +123,7 @@ final class DictationController {
         self.transcribeAudio = transcribe ?? Self.backendTranscription(AccountManager.shared.backendClient)
         self.warmUp = warmUp ?? Self.backendWarmUp(AccountManager.shared.backendClient)
         self.transcriptionRetryDelays = transcriptionRetryDelays
+        self.transcriptionRetryNoticeDelay = transcriptionRetryNoticeDelay
         self.makeSpeechDetector = speechDetector
         self.maxRecordingDuration = maxRecordingDuration
     }
@@ -370,7 +381,8 @@ final class DictationController {
     /// Makes the transcription request, and makes it again after a server error (a 5xx other than
     /// the backend's own timeout: the speech model behind it was rate limited or failed) or a dropped
     /// connection, once after each of `transcriptionRetryDelays`, so the user need not say it again;
-    /// `isRetrying` says so while it waits and tries, until a retry answers. Any other failure (signed out, over quota, a refused request, a timeout) fails at
+    /// `isRetrying` says so while it waits and tries, until a retry answers, and `showsRetryNote` once
+    /// that has gone on for `transcriptionRetryNoticeDelay`. Any other failure (signed out, over quota, a refused request, a timeout) fails at
     /// once. As TabMail Voice's `transcribeRetrying` (ADR-DESK-039).
     private func transcribeRetrying(
         _ flac: Data, _ language: String?, _ vocabulary: [String], _ cleanup: [String: String], generation current: Int
@@ -379,7 +391,7 @@ final class DictationController {
         while true {
             do {
                 // The note goes once a retry answers: `transcribe` tears down, resetting
-                // `isRetrying`, with no suspension between.
+                // `isRetrying` and `showsRetryNote`, with no suspension between.
                 return try await transcribeAudio(flac, language, vocabulary, cleanup)
             } catch {
                 guard retry < transcriptionRetryDelays.count, Self.isServerError(error), generation == current, !Task.isCancelled else {
@@ -389,6 +401,14 @@ final class DictationController {
                 retry += 1
                 BackgroundSyncLogger.logDebug("[Dictation] transcription failed (\(error)); retrying in \(delay)")
                 isRetrying = true
+                if retryNoteTask == nil {
+                    let noticeDelay = transcriptionRetryNoticeDelay
+                    retryNoteTask = Task { [weak self] in
+                        try? await Task.sleep(for: noticeDelay)
+                        guard let self, !Task.isCancelled, self.generation == current, self.isRetrying else { return }
+                        self.showsRetryNote = true
+                    }
+                }
                 try await Task.sleep(for: delay)
             }
         }
@@ -441,6 +461,9 @@ final class DictationController {
         termsTask = nil
         hasHeardSpeech = false
         isRetrying = false
+        retryNoteTask?.cancel()
+        retryNoteTask = nil
+        showsRetryNote = false
         level = 0
     }
 

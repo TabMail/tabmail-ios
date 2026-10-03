@@ -88,6 +88,9 @@ enum DictationConfig {
     /// A transcription the server failed (a 5xx) or whose connection dropped is tried again after
     /// each of these, so the user need not say it again. As TabMail Voice's.
     static let transcriptionRetryDelays: [Duration] = [.milliseconds(500), .milliseconds(1_500)]
+    /// How long after the first server error the field says it is retrying; the spinner turns toward
+    /// purple at once. As TabMail Voice's `transcriptionRetryNoticeDelay` (owner, 2026-10-02).
+    static let transcriptionRetryNoticeDelay: Duration = .seconds(2)
     /// Covers the upload, the transcription and the cleanup the backend runs in the same request
     /// under its own deadline (backend ADR-027; owner, 2026-09-28: 1.5 s at most).
     static let transcriptionRequestTimeout: TimeInterval = 45

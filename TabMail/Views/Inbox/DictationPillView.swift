@@ -11,13 +11,13 @@ import SwiftUI
 struct DictationPillView: View {
     let controller: DictationController
 
-    /// Shown while the transcription is tried again (`DictationController.isRetrying`). As TabMail
-    /// Voice's pill.
+    /// Shown once the transcription has been tried again for a while (`DictationController.
+    /// showsRetryNote`). As TabMail Voice's pill.
     static let retryingMessage = "Server error, retrying…"
 
     var body: some View {
         Group {
-            if controller.isRetrying {
+            if controller.showsRetryNote {
                 Text(Self.retryingMessage)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -43,7 +43,7 @@ struct DictationPillView: View {
         switch controller.phase {
         case .idle: ""
         case .listening: "Listening"
-        case .transcribing: controller.isRetrying ? Self.retryingMessage : "Transcribing"
+        case .transcribing: controller.showsRetryNote ? Self.retryingMessage : "Transcribing"
         }
     }
 }
