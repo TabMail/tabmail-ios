@@ -144,7 +144,7 @@ struct AttachmentReadPdfTool: AgentTool, Sendable {
             BackgroundSyncLogger.logDebug("[AttachmentReadPdfTool] Download failed for \(realId.prefix(30)) section=\(DebugModeManager.escapedForLogLine(attachment.section)): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
             return Self.error("could not download the attachment")
         }
-        // The listed size is the server's figure; the bytes are the authority.
+        // The listed size is only advisory (IMAP lists 0); the downloaded bytes are the authority.
         if data.count > Config.maxFileBytes {
             return Self.error(Self.tooLarge(data.count))
         }
@@ -163,6 +163,9 @@ struct AttachmentReadPdfTool: AgentTool, Sendable {
             return Self.error("the PDF is password-protected, so its text cannot be read")
         case .malformed:
             return Self.error("the file is not a readable PDF (it is damaged or not really a PDF)")
+        case .tooLarge:
+            // iOS only: TB's pdf.js has no such cap (IOS-AI-010).
+            return Self.error("the PDF is too large or complex to read safely")
         case .timeout:
             return Self.error("reading the PDF took too long and was stopped")
         case .pastEnd(let totalPages):
@@ -283,6 +286,7 @@ struct AttachmentReadPdfTool: AgentTool, Sendable {
         case .ok: return "ok"
         case .encrypted: return "encrypted"
         case .malformed: return "malformed"
+        case .tooLarge: return "too_large"
         case .timeout: return "timeout"
         case .pastEnd: return "past_end"
         }

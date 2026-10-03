@@ -23,8 +23,10 @@ the owner chose the cap without decryption, with this case recorded as a known i
   The tool stores nothing (ADR-004), and the chat request is not replayed on relaunch.
 - **Recovery:** relaunch. The same file triggers again only if the user asks again.
 - **Not affected:** user-password PDFs (refused as encrypted before parsing), unencrypted PDFs (the
-  pre-check covers them), and the per-page text cap (`PDFPageGlyphCounter` reads decrypted
-  content through CoreGraphics, so encryption does not bypass it).
+  pre-check counts every stream CoreGraphics decodes and refuses a layout it cannot follow; the
+  round-2 review's five bypasses, such as a 9-byte decoy object header inside a string, were
+  closed on 2026-10-03), and the per-page text cap (`PDFPageGlyphCounter` reads decrypted content
+  through CoreGraphics, so encryption does not bypass it).
 
 ## Remedy if reopened
 
@@ -41,5 +43,6 @@ jetsam; memory
 
 ## Related
 
-Memory topic `131-pdf-attachment-text-tool-pdfkit.md` (measurements and design);
+IOS-AI-010 (image streams are counted too); memory topic `131-pdf-attachment-text-tool-pdfkit.md`
+(measurements and design);
 `PDFStreamBudgetTests`; tabmail-ios#189

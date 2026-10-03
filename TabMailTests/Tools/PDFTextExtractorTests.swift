@@ -178,12 +178,12 @@ struct PDFTextExtractorTests {
         #expect(await extract(Data()) == .malformed)
     }
 
-    @Test("A truncated PDF never crashes and is reported as malformed or read")
+    @Test("A truncated PDF never crashes and is refused or read")
     func truncated() async {
         let full = PDFFixtures.make([.text("Alpha"), .text("Bravo")])
         let outcome = await extract(full.prefix(full.count / 2))
         switch outcome {
-        case .malformed, .ok: break
+        case .malformed, .tooLarge, .ok: break
         default: Issue.record("unexpected outcome \(outcome)")
         }
     }
@@ -203,12 +203,12 @@ struct PDFTextExtractorTests {
 
     // MARK: - Memory bounds
 
-    @Test("A file whose streams inflate past the cap is malformed; the same file without it is read")
+    @Test("A file whose streams inflate past the cap is too large; the same file without it is read")
     func decompressionBomb() async throws {
         let document = PDFFixtures.make([.text("Alpha")])
         let bomb = PDFFixtures.streamObject(900, dictionary: "<< /Filter /FlateDecode >>", data: PDFFixtures.flateZeros(2_000_000))
         let capped = limits(streamCaps: PDFStreamBudget.Caps(streamBytes: 1_000_000, totalBytes: 10_000_000))
-        #expect(await extract(document + bomb, limits: capped) == .malformed)
+        #expect(await extract(document + bomb, limits: capped) == .tooLarge)
         let result = try #require(pages(await extract(document, limits: capped)))
         #expect(result.pages.first?.text == "Alpha")
     }
@@ -231,5 +231,23 @@ struct PDFTextExtractorTests {
     func timeout() async {
         let data = PDFFixtures.make([.text("Alpha")])
         #expect(await extract(data, limits: limits(timeout: .zero)) == .timeout)
+    }
+
+    @Test("A deadline that passes while a page's text is counted stops the read with a timeout")
+    func deadlineWhileCounting() throws {
+        // Twenty million operators take the counter a large fraction of a second; inflating the
+        // stream and opening the file take a few milliseconds. Read directly, without the
+        // `withTimeout` that would report the timeout on its own.
+        func object(_ number: Int, _ body: String) -> Data { Data("\(number) 0 obj\n\(body)\nendobj\n".utf8) }
+        let content = PDFFixtures.flate(Data(String(repeating: "q Q ", count: 10_000_000).utf8))
+        let data = PDFFixtures.document([
+            object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>"),
+            PDFFixtures.streamObject(4, dictionary: "<< /Filter /FlateDecode >>", data: content),
+        ])
+        let outcome = PDFTextExtractor.readPages(
+            data: data, startPage: 1, endPage: nil, limits: limits(), deadline: .now + .milliseconds(200))
+        #expect(outcome == .timeout)
     }
 }

@@ -61,29 +61,54 @@ So two checks run before PDFKit sees anything:
 - `PDFStreamBudget` is a pypdf-style decompression cap, the standard fix (pypdf
   CVE-2025-55197, 75 MB per stream; PDFium caps at 1 GiB).
   - It finds every `N G obj` in the raw bytes and lexes each object's dictionary separately, up
-    to the next header, so an unclosed string or a fake `endstream` cannot hide a later object.
+    to the next header, so the walk stays linear and a fake `endstream` cannot hide a later
+    object. A dictionary still open at the next header is refused: an unclosed string, or a
+    header inside a string or comment, means the walk cannot tell which object the following
+    bytes belong to (a 9-byte `/X (9 0 obj)` decoy once hid a 300 MB `/ToUnicode` map, 1.19 GB
+    RSS).
+  - A final linear sweep refuses any `stream` keyword after `>>` (or after a line holding a `%`,
+    which may start a comment) that no counted object claimed, such as one whose header is glued
+    to the previous byte (`x4 0 obj`): CoreGraphics reaches it through the xref, the walk does not.
+  - After `stream`, CoreGraphics skips whatever else is on the line (spaces, a comment, any
+    token) and the data starts after its end of line (CR LF, LF or CR); a second EOL is data.
+    Measured 2026-10-03; the walk does the same.
   - It reads the top-level `/Filter`, resolving `#xx` name escapes.
   - It undoes ASCII85/ASCIIHex layers, which Illustrator writes as `[/ASCII85Decode /FlateDecode]`.
   - It counts Flate, LZW and RunLength output with counting-only decoders, each fed the rest of
     the file and stopping where its data ends, so `/Length` is never trusted.
   - Caps: 75 MB per stream and 256 MB in total (the total is needed because CoreGraphics keeps
-    decoded maps). A refused file is `.malformed`.
+    decoded maps). A refused file is `.tooLarge`: "the PDF is too large or complex to read
+    safely", an iOS-only message (TB's pdf.js has no such cap).
+  - **Known false refusal (IOS-AI-010, owner-accepted 2026-10-03):** image streams count too,
+    though `page.string` never decodes them, so valid PDFs with large lossless (Flate) images are
+    refused. Skipping `/Subtype /Image` alone is unsafe: CoreGraphics still decodes a
+    `/ToUnicode` map labelled as an image (923 MB).
   - It refuses two expanding filters in one chain, an expanding filter behind an image codec, and
-    an indirect `/Filter`.
+    an indirect `/Filter` or `/Filter` array entry (CoreGraphics follows `[5 0 R]`). With
+    duplicate `/Filter` keys CoreGraphics uses the last, as the walk does.
   - **Known gap:** streams in owner-password-encrypted PDFs are ciphertext and count as nothing.
     Closing it needs RC4/AES; the owner chose the cap without decryption on 2026-10-03.
 - `PDFPageGlyphCounter` adds up the bytes of strings drawn by `Tj`, `'`, `"` and `TJ`, including
-  nested forms (depth 4, at most 2,000 invocations), using `CGPDFScanner`. It decodes no fonts
-  and stops at the cap (200,000 bytes, about 86 MB in PDFKit). A page over the cap is left out
-  as `unreadable` without calling `page.string`.
+  every invocation of a form, using `CGPDFScanner`. It decodes no fonts and stops at the cap
+  (200,000 bytes, about 86 MB in PDFKit). A page over the cap, or nesting forms deeper than 4, is
+  left out as `unreadable` without calling `page.string`.
+  - Every invocation counts, because PDFKit lays out every one: an earlier 2,000-invocation cap
+    stopped counting silently, and 10,000 invocations of a 100-character form (1 KB of PDF) took
+    PDFKit to 329 MB. A fail-closed invocation cap is no answer either: a real page in the
+    460-PDF sample drew forms 89,744 times, and 9 of its 5,973 pages passed 2,000. One million
+    invocations of an empty form take the counter 2.7 s at 7 MB, so the deadline bounds the work.
+  - Depth 4 never tripped on the sample, and it stops a self-drawing form.
+  Both `CGPDFContentStreamCreate…` results must be released (`CGPDFContentStreamRelease`; not
+  CF-bridged, so ARC does not), or each page and form leaks about 170 B.
 
 A basic CGPDFScanner text extractor was prototyped and dropped. Apple's own PDF writer omits
 `/ToUnicode` for some CID fonts (CJK fallback fonts in `UIGraphicsPDFRenderer` output), and only
 PDFKit recovers that text, from the embedded font program. The extractor also still needed
 `CGPDFStreamCopyData` for every CMap.
 
-Validation without false positives: 400 PDFs shipped with macOS and Xcode, and 60 large
-real-world PDFs (up to 4,053 pages and 69 MB), all passed both checks in at most 0.5 s.
+Validation: 400 PDFs shipped with macOS and Xcode, and 60 large real-world PDFs (up to 4,053
+pages and 69 MB), all passed both checks in at most 0.5 s, before and after the round-2 fixes.
+That sample has no large lossless images, so it did not show the IOS-AI-010 false refusal.
 - **Encrypted PDFs:** `isLocked` is true only when a user password is needed. An owner-only PDF
   opens and is read, which matches pdf.js.
 
@@ -96,5 +121,8 @@ through `PDFFixtures.raw`/`streamObject`). No real document is committed. The bo
 small caps, so each case is a few KB. They are two-sided: the same generated document without
 the bomb must still read under the same caps.
 
-The demo boundary (`DemoToolGuard.headerAccessible`) has no dedicated test: toggling the global
-`DemoModeStore` would race other suites.
+The demo boundary (`DemoToolGuard.headerAccessible`) is tested in normal mode only, with a header
+whose `accountId` is `DemoSeed.demoAccountId`, on the first read and after a body load: toggling
+the global `DemoModeStore` would race other suites. The bypass tests in `PDFStreamBudgetTests`
+use CoreGraphics' own decode (`CGPDFStreamCopyData`) as the oracle; keep the `CGPDFPage` alive
+while reading its dictionary, which does not retain it.

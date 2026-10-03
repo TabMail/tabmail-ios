@@ -45,10 +45,50 @@ struct PDFPageGlyphCounterTests {
         #expect(check(page, 14) == .overBudget)
     }
 
+    @Test("Every invocation of a form counts, however many there are")
+    func manyFormInvocations() throws {
+        // 3,000 invocations of a 5-byte form: 15,000 bytes.
+        let page = try page(content: String(repeating: "/Fm1 Do ", count: 3_000), form: "BT (abcde) Tj ET")
+        #expect(check(page, 15_000) == .withinBudget)
+        #expect(check(page, 14_999) == .overBudget)
+    }
+
+    @Test("Forms nested deeper than the counter follows are over budget")
+    func formsNestedTooDeep() throws {
+        let limit = PDFPageGlyphCounter.Bounds.maxFormDepth
+        #expect(check(try nestedForms(limit), 1_000_000) == .withinBudget)
+        #expect(check(try nestedForms(limit + 1), 1_000_000) == .overBudget)
+    }
+
+    /// A page drawing form 1, which draws form 2, and so on to form `depth`, which draws text.
+    private func nestedForms(_ depth: Int) throws -> CGPDFPage {
+        func object(_ number: Int, _ body: String) -> Data { Data("\(number) 0 obj\n\(body)\nendobj\n".utf8) }
+        var objects = [
+            object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Fm1 5 0 R >> >> /Contents 4 0 R >>"),
+            PDFFixtures.streamObject(4, dictionary: "<< /Length 7 >>", data: Data("/Fm1 Do".utf8)),
+        ]
+        for level in 1...depth {
+            let number = 4 + level
+            let content = level == depth ? "BT (a) Tj ET" : "/Fm1 Do"
+            let resources = level == depth ? "" : "/Resources << /XObject << /Fm1 \(number + 1) 0 R >> >> "
+            objects.append(PDFFixtures.streamObject(
+                number, dictionary: "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] \(resources)/Length \(content.utf8.count) >>",
+                data: Data(content.utf8)))
+        }
+        let provider = try #require(CGDataProvider(data: PDFFixtures.document(objects) as CFData))
+        return try #require(CGPDFDocument(provider)?.page(at: 1))
+    }
+
     @Test("A passed deadline stops the count")
     func deadline() throws {
         let page = try page(content: String(repeating: "q Q ", count: 600))
         #expect(check(page, 1_000, deadline: .now - .seconds(1)) == .timedOut)
         #expect(check(page, 1_000) == .withinBudget)
+        // A page too short to reach the in-scan check is still not counted after the deadline.
+        let short = try self.page(content: "BT (a) Tj ET")
+        #expect(check(short, 1_000, deadline: .now - .seconds(1)) == .timedOut)
+        #expect(check(short, 1_000) == .withinBudget)
     }
 }

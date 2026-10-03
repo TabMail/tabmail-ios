@@ -126,10 +126,14 @@ enum PDFStreamBudget {
     // MARK: - Walking the file
 
     /// Finds every `N G obj`, reads the object's dictionary up to the next object header, and
-    /// counts the stream that follows it. Lexing each object on its own means a malformed object
-    /// (an unclosed string, a fake `endstream` inside stream data) cannot hide the next one.
+    /// counts the stream that follows it. Lexing each object on its own keeps the walk linear; a
+    /// dictionary that runs into the next header (an unclosed string, or a header inside a string or
+    /// comment) is refused, because the walk cannot tell which object the bytes after it belong to.
     /// Each decoder is given the rest of the file and stops where its own data ends, as CoreGraphics
     /// does, so a stream's extent never depends on `/Length` or on finding `endstream`.
+    ///
+    /// A final sweep refuses the file when a `stream` keyword CoreGraphics would read belongs to no
+    /// object the walk counted, such as one whose header CoreGraphics finds and this walk does not.
     private struct Walker {
         let bytes: UnsafeBufferPointer<UInt8>
         let caps: Caps
@@ -137,12 +141,19 @@ enum PDFStreamBudget {
 
         mutating func run() -> Verdict {
             let headers = objectHeaders()
+            var counted = Set<Int>()
             var total = 0
             for (offset, header) in headers.enumerated() {
                 if ContinuousClock.now >= deadline || Task.isCancelled { return .timedOut }
                 let limit = offset + 1 < headers.count ? headers[offset + 1].start : bytes.count
                 var lexer = Lexer(bytes: bytes, index: header.bodyStart, limit: limit)
-                guard let stream = lexer.streamAfterDictionary() else { continue }
+                let stream: Lexer.Stream
+                switch lexer.streamAfterDictionary() {
+                case .none: continue
+                case .runsIntoNextObject: return .overBudget
+                case .stream(let found): stream = found
+                }
+                counted.insert(stream.keyword)
                 let rest = UnsafeBufferPointer(rebasing: bytes[stream.dataStart...])
                 let cap = min(caps.streamBytes, caps.totalBytes - total)
                 let decoded: Int?
@@ -156,6 +167,41 @@ enum PDFStreamBudget {
                     return ContinuousClock.now >= deadline || Task.isCancelled ? .timedOut : .overBudget
                 }
                 total += decoded
+            }
+            return sweepForUncountedStreams(counted)
+        }
+
+        /// One pass over the file for `stream` keywords CoreGraphics would read: the token
+        /// `stream` after a dictionary's `>>`, with only whitespace or comments between. Whether a
+        /// `%` starts a comment depends on string context this pass does not track, so a keyword
+        /// whose line before it holds a `%` is taken as possibly following `>>`.
+        private func sweepForUncountedStreams(_ counted: Set<Int>) -> Verdict {
+            let keyword = Array("stream".utf8)
+            var lineStart = 0
+            var lastPercent = -1
+            var lastToken = -1
+            var lastTokenAfterPercent = false
+            var index = 0
+            while index < bytes.count {
+                if index & 0xFFFFF == 0, ContinuousClock.now >= deadline || Task.isCancelled { return .timedOut }
+                let byte = bytes[index]
+                if byte == 0x0A || byte == 0x0D {
+                    lineStart = index + 1
+                } else if byte == UInt8(ascii: "%") {
+                    lastPercent = index
+                } else if byte == keyword[0], index + keyword.count <= bytes.count,
+                          bytes[index..<(index + keyword.count)].elementsEqual(keyword),
+                          index == 0 || PDFSyntax.isWhitespace(bytes[index - 1]) || PDFSyntax.isDelimiter(bytes[index - 1]),
+                          index + keyword.count == bytes.count || PDFSyntax.isWhitespace(bytes[index + keyword.count])
+                            || PDFSyntax.isDelimiter(bytes[index + keyword.count]) {
+                    let afterDictionary = lastToken >= 1 && bytes[lastToken] == UInt8(ascii: ">") && bytes[lastToken - 1] == UInt8(ascii: ">")
+                    if afterDictionary || lastTokenAfterPercent, !counted.contains(index) { return .overBudget }
+                }
+                if !PDFSyntax.isWhitespace(byte) {
+                    lastToken = index
+                    lastTokenAfterPercent = lastPercent >= lineStart
+                }
+                index += 1
             }
             return .withinBudget
         }
@@ -199,13 +245,24 @@ enum PDFStreamBudget {
 
         struct Stream {
             let filters: [String]
+            /// The filter, or an entry of its array, is not a name (an indirect reference).
             let indirect: Bool
+            /// Where the `stream` keyword starts.
+            let keyword: Int
             let dataStart: Int
         }
 
-        mutating func streamAfterDictionary() -> Stream? {
+        enum Parse {
+            case stream(Stream)
+            /// Not a dictionary followed by `stream`.
+            case none
+            /// The dictionary is still open at the next object header.
+            case runsIntoNextObject
+        }
+
+        mutating func streamAfterDictionary() -> Parse {
             skipWhitespaceAndComments()
-            guard startsWith("<<") else { return nil }
+            guard startsWith("<<") else { return .none }
             index += 2
             var depth = 1
             var filters: [String] = []
@@ -214,7 +271,7 @@ enum PDFStreamBudget {
             var inFilterArray = false
             while depth > 0 {
                 skipWhitespaceAndComments()
-                guard index < limit else { return nil }
+                guard index < limit else { return .runsIntoNextObject }
                 let byte = bytes[index]
                 if startsWith("<<") {
                     index += 2
@@ -253,16 +310,21 @@ enum PDFStreamBudget {
                     let start = index
                     let token = word()
                     if index == start { index += 1 }
-                    // A number where the filter belongs starts an indirect reference.
-                    if expectingFilter, depth == 1, let first = token.first, first.isNumber { indirect = true }
+                    // A number where the filter, or an entry of its array, belongs starts an
+                    // indirect reference, which CoreGraphics follows.
+                    if (expectingFilter || inFilterArray), depth == 1, let first = token.first, first.isNumber { indirect = true }
                     expectingFilter = false
                 }
             }
             skipWhitespaceAndComments()
-            guard word() == "stream" else { return nil }
+            let keyword = index
+            guard word() == "stream" else { return .none }
+            // CoreGraphics skips whatever else is on the keyword's line; the data starts after
+            // its end of line (CR LF, LF or CR).
+            while index < bytes.count, bytes[index] != 0x0A, bytes[index] != 0x0D { index += 1 }
             if index < bytes.count, bytes[index] == 0x0D { index += 1 }
-            if index < bytes.count, bytes[index] == 0x0A { index += 1 }
-            return Stream(filters: filters, indirect: indirect, dataStart: min(index, bytes.count))
+            if index < bytes.count, bytes[index] == 0x0A, bytes[index - 1] != 0x0A { index += 1 }
+            return .stream(Stream(filters: filters, indirect: indirect, keyword: keyword, dataStart: min(index, bytes.count)))
         }
 
         private func startsWith(_ text: String) -> Bool {

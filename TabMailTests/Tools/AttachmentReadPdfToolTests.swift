@@ -14,6 +14,8 @@ struct AttachmentReadPdfToolTests {
     /// Records which attachment sections were downloaded and serves bytes per section.
     final class FakeServer: Sendable {
         let fetched = Mutex<[String]>([])
+        /// The folder of the message row each download was given.
+        let fetchedFolders = Mutex<[String]>([])
         let bodyLoads = Mutex(0)
         private let bytes: [String: Data]
         private let failing: Bool
@@ -24,8 +26,9 @@ struct AttachmentReadPdfToolTests {
         }
 
         var fetcher: AttachmentReadPdfTool.AttachmentFetcher {
-            { [self] _, attachment in
+            { [self] header, attachment in
                 fetched.withLock { $0.append(attachment.section) }
+                fetchedFolders.withLock { $0.append(header.folderId) }
                 if failing { throw ProviderError.notConnected }
                 return bytes[attachment.section] ?? Data()
             }
@@ -53,13 +56,17 @@ struct AttachmentReadPdfToolTests {
         try db.write { try body.insert($0) }
     }
 
-    /// A message with numeric id 42 whose body lists `attachments` (no body row when nil).
-    private func makeFixture(attachments: [AttachmentInfo]?) async throws -> Fixture {
+    /// A message with numeric id 42 whose body lists `attachments` (no body row when nil), in
+    /// account `accountId`. The demo account and its inbox exist either way.
+    private func makeFixture(attachments: [AttachmentInfo]?, accountId: String = "acc1") async throws -> Fixture {
         let db = try TestDatabase.make()
         let translator = MockChatIdTranslator()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "77", subject: "Invoice")
+        try TestDatabase.insertAccount(db, id: DemoSeed.demoAccountId, email: "demo@example.com")
+        try TestDatabase.insertFolder(db, accountId: DemoSeed.demoAccountId)
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "77", subject: "Invoice", folderId: "\(accountId):INBOX", accountId: accountId)
         if let attachments {
             try Self.insertBody(db, headerId: header.id, attachments: attachments)
         }
@@ -347,7 +354,7 @@ struct AttachmentReadPdfToolTests {
         #expect(try errorMessage(result) == "the file is not a readable PDF (it is damaged or not really a PDF)")
     }
 
-    @Test("A decompression bomb is refused as not a readable PDF; the same PDF without it is read")
+    @Test("A decompression bomb is refused as too large to read safely; the same PDF without it is read")
     func decompressionBomb() async throws {
         let document = PDFFixtures.make([.text("Alpha")])
         let bomb = PDFFixtures.streamObject(900, dictionary: "<< /Filter /FlateDecode >>", data: PDFFixtures.flateZeros(2_000_000))
@@ -358,7 +365,7 @@ struct AttachmentReadPdfToolTests {
         let reader = tool(fixture, FakeServer(["2": document + bomb, "3": document]), limits: capped)
 
         let refused = try await reader.execute(arguments: ["unique_id": .int(42), "attachment_name": .string("bomb.pdf")])
-        #expect(try errorMessage(refused) == "the file is not a readable PDF (it is damaged or not really a PDF)")
+        #expect(try errorMessage(refused) == "the PDF is too large or complex to read safely")
         let read = try await reader.execute(arguments: ["unique_id": .int(42), "attachment_name": .string("plain.pdf")])
         #expect(read.contains("[page 1]\nAlpha"))
     }
@@ -431,6 +438,24 @@ struct AttachmentReadPdfToolTests {
         #expect(result.contains("Loaded later"))
     }
 
+    @Test("The download uses the message row as it is after the body loads")
+    func downloadUsesRereadRow() async throws {
+        let fixture = try await makeFixture(attachments: nil)
+        let db = fixture.db
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+        let server = FakeServer(["2": PDFFixtures.make([.text("Moved")])])
+        let reader = tool(fixture, server, loadBody: { header in
+            try Self.insertBody(db, headerId: header.id, attachments: [AttachmentInfo(
+                filename: "moved.pdf", contentType: "application/pdf", section: "2", size: 100, encoding: nil)])
+            try await db.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET folderId = 'acc1:Archive', folderPath = 'Archive' WHERE id = ?",
+                               arguments: [header.id])
+            }
+        })
+        #expect(try await reader.execute(arguments: ["unique_id": .int(42)]).contains("Moved"))
+        #expect(server.fetchedFolders.withLock { $0 } == ["acc1:Archive"])
+    }
+
     @Test("A message that disappears while its body loads is not found")
     func headerGoneAfterBodyLoad() async throws {
         let fixture = try await makeFixture(attachments: nil)
@@ -438,6 +463,37 @@ struct AttachmentReadPdfToolTests {
         let server = FakeServer()
         let reader = tool(fixture, server, loadBody: { header in
             try await db.write { db -> Void in try MessageHeader.filter(key: header.id).deleteAll(db) }
+        })
+        #expect(try errorMessage(try await reader.execute(arguments: ["unique_id": .int(42)])) == "message not found")
+        #expect(server.fetched.withLock { $0 }.isEmpty)
+    }
+
+    // MARK: - Demo boundary
+
+    @Test("A demo message is not read outside demo mode")
+    func demoMessageRefused() async throws {
+        #expect(!DemoModeStore.isDemoActive)
+        let server = FakeServer(["2": PDFFixtures.make([.text("Demo text")])])
+        let demo = try await makeFixture(attachments: [pdf("2", "demo.pdf")], accountId: DemoSeed.demoAccountId)
+        #expect(try errorMessage(try await tool(demo, server).execute(arguments: ["unique_id": .int(42)])) == "message not found")
+        #expect(server.fetched.withLock { $0 }.isEmpty)
+
+        let real = try await makeFixture(attachments: [pdf("2", "real.pdf")])
+        #expect(try await tool(real, server).execute(arguments: ["unique_id": .int(42)]).contains("Demo text"))
+    }
+
+    @Test("A message that becomes a demo row while its body loads is not read")
+    func demoAfterBodyLoad() async throws {
+        let fixture = try await makeFixture(attachments: nil)
+        let db = fixture.db
+        let server = FakeServer(["2": PDFFixtures.make([.text("Demo text")])])
+        let reader = tool(fixture, server, loadBody: { header in
+            try Self.insertBody(db, headerId: header.id, attachments: [AttachmentInfo(
+                filename: "demo.pdf", contentType: "application/pdf", section: "2", size: 100, encoding: nil)])
+            try await db.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET accountId = ?, folderId = ? WHERE id = ?",
+                               arguments: [DemoSeed.demoAccountId, "\(DemoSeed.demoAccountId):INBOX", header.id])
+            }
         })
         #expect(try errorMessage(try await reader.execute(arguments: ["unique_id": .int(42)])) == "message not found")
         #expect(server.fetched.withLock { $0 }.isEmpty)

@@ -12,7 +12,10 @@ import Foundation
 /// stays under 10 MB), so only pages PDFKit can afford reach it.
 ///
 /// It adds up the bytes of every string a text-showing operator draws, including in nested forms.
-/// A character is one or two bytes, so the count is an upper bound on the characters.
+/// A character is one or two bytes, so the count is an upper bound on the characters. Every
+/// invocation of a form counts, as PDFKit lays out every one (a real page drew forms 89,744
+/// times); the deadline bounds the work. A page nesting forms deeper than the counter follows is
+/// over budget.
 final class PDFPageGlyphCounter {
 
     enum Verdict: Equatable {
@@ -21,18 +24,20 @@ final class PDFPageGlyphCounter {
         case timedOut
     }
 
-    private enum Bounds {
+    enum Bounds {
         static let maxFormDepth = 4
-        static let maxFormInvocations = 2_000
         /// How many operator callbacks pass between deadline checks.
         static let deadlineCheckInterval = 256
     }
 
     static func check(_ page: CGPDFPage, maxBytes: Int, deadline: ContinuousClock.Instant) -> Verdict {
+        if ContinuousClock.now >= deadline || Task.isCancelled { return .timedOut }
         let counter = PDFPageGlyphCounter(maxBytes: maxBytes, deadline: deadline)
-        _ = counter.run(CGPDFContentStreamCreateWithPage(page))
+        let content = CGPDFContentStreamCreateWithPage(page)
+        defer { CGPDFContentStreamRelease(content) }
+        _ = counter.run(content)
         if counter.timedOut { return .timedOut }
-        return counter.bytes > maxBytes ? .overBudget : .withinBudget
+        return counter.bytes > maxBytes || counter.formsTooDeep ? .overBudget : .withinBudget
     }
 
     private let maxBytes: Int
@@ -41,7 +46,8 @@ final class PDFPageGlyphCounter {
     private var timedOut = false
     private var callbacksSinceCheck = 0
     private var formDepth = 0
-    private var formInvocations = 0
+    /// Set when a form is nested deeper than `Bounds.maxFormDepth`; its text is then not counted.
+    private var formsTooDeep = false
 
     private init(maxBytes: Int, deadline: ContinuousClock.Instant) {
         self.maxBytes = maxBytes
@@ -92,14 +98,14 @@ final class PDFPageGlyphCounter {
     private static func enter(_ scanner: CGPDFScannerRef, _ info: UnsafeMutableRawPointer?) -> PDFPageGlyphCounter? {
         guard let info else { return nil }
         let counter = Unmanaged<PDFPageGlyphCounter>.fromOpaque(info).takeUnretainedValue()
-        if !counter.timedOut, counter.bytes <= counter.maxBytes {
+        if !counter.timedOut, !counter.formsTooDeep, counter.bytes <= counter.maxBytes {
             counter.callbacksSinceCheck += 1
             if counter.callbacksSinceCheck >= Bounds.deadlineCheckInterval {
                 counter.callbacksSinceCheck = 0
                 if ContinuousClock.now >= counter.deadline || Task.isCancelled { counter.timedOut = true }
             }
         }
-        if counter.timedOut || counter.bytes > counter.maxBytes {
+        if counter.timedOut || counter.formsTooDeep || counter.bytes > counter.maxBytes {
             CGPDFScannerStop(scanner)
             return nil
         }
@@ -112,19 +118,23 @@ final class PDFPageGlyphCounter {
     }
 
     private func drawForm(named name: UnsafePointer<CChar>, from content: CGPDFContentStreamRef) {
-        guard formDepth < Bounds.maxFormDepth, formInvocations < Bounds.maxFormInvocations,
-              let object = CGPDFContentStreamGetResource(content, "XObject", name) else { return }
+        guard let object = CGPDFContentStreamGetResource(content, "XObject", name) else { return }
         var stream: CGPDFStreamRef?
         guard CGPDFObjectGetValue(object, .stream, &stream), let stream,
               let dictionary = CGPDFStreamGetDictionary(stream) else { return }
         var subtype: UnsafePointer<CChar>?
         guard CGPDFDictionaryGetName(dictionary, "Subtype", &subtype), let subtype,
               strcmp(subtype, "Form") == 0 else { return }
+        guard formDepth < Bounds.maxFormDepth else {
+            formsTooDeep = true
+            return
+        }
         var resources: CGPDFDictionaryRef?
         if !CGPDFDictionaryGetDictionary(dictionary, "Resources", &resources) { resources = nil }
-        formInvocations += 1
         formDepth += 1
         defer { formDepth -= 1 }
-        _ = run(CGPDFContentStreamCreateWithStream(stream, resources ?? dictionary, content))
+        let formContent = CGPDFContentStreamCreateWithStream(stream, resources ?? dictionary, content)
+        defer { CGPDFContentStreamRelease(formContent) }
+        _ = run(formContent)
     }
 }

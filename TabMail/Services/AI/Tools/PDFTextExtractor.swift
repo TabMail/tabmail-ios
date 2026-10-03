@@ -65,6 +65,10 @@ enum PDFTextExtractor {
         case ok(Pages)
         case encrypted
         case malformed
+        /// `PDFStreamBudget` refused the file: its streams decode past the caps, or are laid out
+        /// in a way the check cannot follow. Image streams count too, so some valid image-heavy
+        /// PDFs land here (IOS-AI-010).
+        case tooLarge
         case timeout
         case pastEnd(totalPages: Int)
     }
@@ -91,9 +95,10 @@ enum PDFTextExtractor {
     /// so every call makes progress. The cap bounds what reaches the model's context window;
     /// nothing is stored either way.
     ///
-    /// Returns `.malformed` for a file `PDFStreamBudget` refuses, and `.timeout` once
+    /// Returns `.tooLarge` for a file `PDFStreamBudget` refuses, and `.timeout` once
     /// `limits.timeout` has passed (`withTimeout`). PDFKit cannot be interrupted inside a call, so
-    /// the abandoned work stops at its next page boundary; the two checks stop at the deadline.
+    /// the abandoned work stops at its next page, whose `PDFPageGlyphCounter` check sees the
+    /// deadline; the two checks also stop at the deadline while they run.
     static func extract(data: Data, startPage: Int, endPage: Int?, limits: Limits) async -> Outcome {
         let deadline = ContinuousClock.now + limits.timeout
         let seconds = Double(limits.timeout.components.seconds)
@@ -108,15 +113,12 @@ enum PDFTextExtractor {
         }
     }
 
-    private static func readPages(
+    static func readPages(
         data: Data, startPage: Int, endPage: Int?, limits: Limits, deadline: ContinuousClock.Instant
     ) -> Outcome {
-        let pastDeadline = { Task.isCancelled || ContinuousClock.now >= deadline }
-        if pastDeadline() { return .timeout }
-
         switch PDFStreamBudget.check(data, caps: limits.streamCaps, deadline: deadline) {
         case .withinBudget: break
-        case .overBudget: return .malformed
+        case .overBudget: return .tooLarge
         case .timedOut: return .timeout
         }
 
@@ -137,7 +139,6 @@ enum PDFTextExtractor {
         var stoppedAt: Int?
 
         for pageNumber in startPage...lastRequested {
-            if pastDeadline() { return .timeout }
             let pdfPage = document.page(at: pageNumber - 1)
             var text = ""
             var unreadable = true
