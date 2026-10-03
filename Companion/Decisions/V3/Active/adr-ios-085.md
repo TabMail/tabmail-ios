@@ -301,9 +301,9 @@ the waveform's place only once the retries have gone on for `transcriptionRetryN
 that error (`DictationController.showsRetryNote`, read by the pill and its VoiceOver label). A retry that
 answers sooner shows no note; a dictation that answers, fails or is cancelled clears both. This replaces
 the "iOS shows its retry note at once" of the amendment above and the "Meanwhile the waveform gives way
-to" of the retry decision: with the 500 ms and 1.5 s retry delays, the note now comes up only if the
-second retry is still running.
+to" of the retry decision: with the 500 ms and 1.5 s retry delays, the note comes up only if the
+retries are still going 2 s after the first error, typically while waiting to send the second retry.
 - Tests: `DictationControllerTests.theRetryNoteWaitsItsNoticeDelaySinceTheFirstFailure`,
-  `aRetryAnsweringBeforeTheNoticeDelayShowsNoNote`, `itReadsTheRetryingNoteWhileItRetries` (VoiceOver
+  `theRetryNoteCountsFromTheFirstFailureNotTheLatest`, `aRetryAnsweringBeforeTheNoticeDelayShowsNoNote`, `itReadsTheRetryingNoteWhileItRetries` (VoiceOver
   reads "Transcribing" until the note shows), and the pill's source fence (`showsRetryNote`, never
   `isRetrying`).

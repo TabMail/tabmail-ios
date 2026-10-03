@@ -652,6 +652,27 @@ struct DictationControllerTests {
         #expect(!controller.isRetrying)
     }
 
+    /// The notice delay counts from the first failure, not the latest: retries failing closer together
+    /// than it still bring the note up, rather than restarting its clock each time (with the 500 ms and
+    /// 1.5 s delays, a restarted clock would let a real outage end before the note ever shows).
+    @Test func theRetryNoteCountsFromTheFirstFailureNotTheLatest() async {
+        let capture = FakeCapture()
+        let sent = Mutex(0)
+        let controller = controller(capture: capture, transcript: {
+            sent.withLock { $0 += 1 }
+            throw DictationError(status: 503, code: nil)
+        }, retryDelays: Array(repeating: .milliseconds(150), count: 6), retryNoticeDelay: .milliseconds(400))
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.showsRetryNote || controller.phase == .idle }
+
+        #expect(controller.showsRetryNote)
+        #expect(controller.isRetrying)
+        // Up before the retries ran out.
+        #expect(sent.withLock { $0 } < 7)
+        controller.cancel()
+    }
+
     /// A retry that answers before `transcriptionRetryNoticeDelay` shows no note: only the spinner
     /// said anything went wrong.
     @Test func aRetryAnsweringBeforeTheNoticeDelayShowsNoNote() async {

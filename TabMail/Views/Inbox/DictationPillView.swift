@@ -7,7 +7,8 @@ import SwiftUI
 /// Laid over the chat pill's input field while dictating (the field's text dims behind it): TabMail
 /// Voice's waveform, following the microphone's sound from the start, speech or not, and
 /// rippling at rest while the words are transcribed. Nothing else: no language, and nothing when a dictation fails (the field simply
-/// comes back), but a note while a transcription the server failed is tried again. The waveform and its numbers are copied from TabMail Voice (`OverlayPanel.swift`).
+/// comes back), but a note once a transcription the server failed has been tried again for
+/// `transcriptionRetryNoticeDelay` (`DictationController.showsRetryNote`). The waveform and its numbers are copied from TabMail Voice (`OverlayPanel.swift`).
 struct DictationPillView: View {
     let controller: DictationController
 
