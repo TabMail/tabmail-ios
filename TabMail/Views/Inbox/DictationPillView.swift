@@ -31,10 +31,11 @@ struct DictationPillView: View {
         .accessibilityLabel(accessibilityLabel)
     }
 
-    /// The waveform's colour: the accent blue while the dictation waits for speech, purple once
+    /// The waveform's colour: washed out while the dictation waits for speech, vivid once
     /// speech is heard, a sign it is listening (owner, 2026-10-02).
     static func waveformColour(hasVoice: Bool) -> Color {
-        hasVoice ? DictationSpinner.colour(at: DictationConfig.waveformVoicedColour) : Theme.accent
+        let colour = hasVoice ? DictationConfig.waveformVoicedColour : DictationConfig.waveformWaitingColour
+        return Color(red: colour.red, green: colour.green, blue: colour.blue)
     }
 
     /// What VoiceOver reads for the waveform.

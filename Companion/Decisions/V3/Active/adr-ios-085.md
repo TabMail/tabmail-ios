@@ -283,6 +283,12 @@ and arc move `thinkingRetryColourShift` (0.3) along the blue → purple gradient
 (`DictationSpinner.colours`); iOS shows its retry note at once, so the shift goes with it. TabMail
 Voice's ADR-DESK-006 and ADR-DESK-039 amendments of the same date do the same (its "voice" is a
 loudness cue, having no wait for speech).
-- Tests: `DictationControllerTests.theWaveformTurnsPurpleOnSpeechAndTheSpinnerWhileRetrying`, and the
+*(Later, owner 2026-10-02: the purple was replaced, first by a muted crimson ("more red and more
+professional … not just pure red"), which was "a little bit too red"; from a page of candidates the
+owner chose "the gray to iOS system blue". The bars are now a washed-out grey-blue,
+`waveformWaitingColour` #9DB3C9, while the dictation waits for speech, and ease to a vivid iOS system
+blue, `waveformVoicedColour` #0A84FF, once it is heard, on iOS and TabMail Voice alike. Nothing else
+changes; the spinner keeps its shift toward purple while retrying.)*
+- Tests: `DictationControllerTests.theWaveformTakesItsRecordingColourOnSpeechAndTheSpinnerPurpleWhileRetrying`, and the
   pill's and the send slot's source fences (`Waveform(level:colour:)` from `hasHeardSpeech`,
   `DictationSpinner(isRetrying: dictation.isRetrying)`).

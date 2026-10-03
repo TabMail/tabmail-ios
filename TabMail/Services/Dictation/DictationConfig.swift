@@ -181,10 +181,13 @@ enum DictationConfig {
     /// The bars always ripple this much (0…1), so the waveform looks alive between words and while
     /// the words are transcribed.
     static let waveformIdleLevel: Double = 0.05
-    /// The bars are the app's accent blue while the dictation waits for speech, and ease to this
-    /// point on the TabMail icon's blue → purple gradient (`DictationSpinner.colour`) over this
-    /// many seconds once speech is heard: a sign it is listening (owner, 2026-10-02).
-    static let waveformVoicedColour: Double = 1
+    /// The bars are a washed-out grey-blue (#9DB3C9) while the dictation waits for speech, and ease
+    /// to a vivid iOS system blue (#0A84FF) over `waveformColourTransition` once speech is heard: a
+    /// sign it is recording (owner, 2026-10-02, chosen from a page of candidates; was the accent blue
+    /// throughout, then purple). Red, green and blue, 0–1. As TabMail Voice's `waveformWaitingColor`
+    /// and `waveformVoicedColor`.
+    static let waveformWaitingColour = (red: 0x9D / 255.0, green: 0xB3 / 255.0, blue: 0xC9 / 255.0)
+    static let waveformVoicedColour = (red: 0x0A / 255.0, green: 0x84 / 255.0, blue: 0xFF / 255.0)
     static let waveformColourTransition: Double = 0.4
     /// Each bar's ripple speed differs by up to this fraction, so the motion looks organic.
     static let waveformSpeedVariance: Double = 0.2
