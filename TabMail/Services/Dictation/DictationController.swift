@@ -503,6 +503,9 @@ final class DictationController {
 
     /// The status the backend answers when the speech model did not answer in time.
     nonisolated private static let gatewayTimeoutStatus = 504
+    /// The status the backend answers when the speech model's rate limit outlasted its own retries
+    /// (`transcription_rate_limited`, backend ADR-022).
+    nonisolated private static let speechModelRateLimitedStatus = 429
 
     /// A failure on the server's side, worth trying again: a 5xx, or a connection that dropped or
     /// could not be made. Not a timeout: the request may still be running on the server. Nor a 504,
@@ -513,10 +516,13 @@ final class DictationController {
         return error.code != .timedOut && error.code != .cancelled
     }
 
-    /// The backend gave up waiting for the speech model: a chunk sent while the user dictates is
-    /// tried again after one (ADR-IOS-087), as nobody waits for it yet.
-    nonisolated static func isGatewayTimeout(_ error: any Error) -> Bool {
-        error as? DictationError == .failed(status: gatewayTimeoutStatus)
+    /// The backend gave up on the speech model after waiting for it: its timeout (504), or the
+    /// model's rate limit outlasting the backend's own 30 s of retries (429
+    /// `transcription_rate_limited`, backend ADR-022). One recording is not tried again (it already
+    /// waited); a long dictation's chunk is (ADR-IOS-087).
+    nonisolated static func backendWaited(_ error: any Error) -> Bool {
+        let error = error as? DictationError
+        return error == .failed(status: gatewayTimeoutStatus) || error == .failed(status: speechModelRateLimitedStatus)
     }
 
     private func updateLevel(decibels: Float, generation: Int) {
@@ -612,6 +618,9 @@ enum DictationError: Error, Equatable {
         case (402, _): .subscriptionRequired
         case (403, "consent_required"): .accountSetupRequired
         case (403, _): .accessDenied
+        // The speech model's rate limit, which the backend already retried for its 30 s window
+        // (backend ADR-022): its failure, not this account's limit.
+        case (429, "transcription_rate_limited"): .failed(status: status)
         case (429, _): .rateLimited
         case (400, "audio_too_large"): .recordingTooLong
         default: .failed(status: status)

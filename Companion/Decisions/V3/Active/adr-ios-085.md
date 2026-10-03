@@ -338,3 +338,9 @@ refused about one try in three as rate limited, in bursts of seconds; two tries 
 outlast one. `transcriptionRetryDelays` is now 0.5, 1.5, 3, 5, 10, 10, 15 and 15 s, about a minute in
 all, as TabMail Voice's (ADR-DESK-039 amendment); the retry note still shows from 2 s and cancel ends it
 at once. A recording's 504 is still not retried; a long dictation's chunk retries it (ADR-IOS-087).
+*(Later the same day: the backend now retries the speech model's own 429 for its 30 s window and then
+answers 429 `transcription_rate_limited`, where it answered 502 (backend ADR-022). `DictationError` reads
+that code as `.failed(status: 429)`, a failure of the speech model, not the account's limit (the
+account's 429s stay `.rateLimited`). Like a 504, the backend already waited, so a recording does not
+try it again; a long dictation's chunk does (`DictationController.backendWaited`, ADR-IOS-087), as
+TabMail Voice.)*

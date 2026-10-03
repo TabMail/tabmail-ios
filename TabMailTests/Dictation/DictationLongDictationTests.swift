@@ -73,6 +73,10 @@ private final class ChunkBackend: Sendable {
         case gatewayTimeout
         case connectionLost
         case refused
+        /// The speech model's rate limit, past the backend's own retries.
+        case speechModelRateLimited
+        /// This account's own rate limit.
+        case accountRateLimited
         /// Never answers until cancelled.
         case never
     }
@@ -128,6 +132,8 @@ private final class ChunkBackend: Sendable {
         case .gatewayTimeout: throw DictationError.failed(status: 504)
         case .connectionLost: throw URLError(.networkConnectionLost)
         case .refused: throw DictationError(status: 400, code: nil)
+        case .speechModelRateLimited: throw DictationError(status: 429, code: "transcription_rate_limited")
+        case .accountRateLimited: throw DictationError(status: 429, code: "rate_limited")
         case .never:
             try await Task.sleep(for: .seconds(3_600))
             throw CancellationError()
@@ -435,13 +441,13 @@ struct DictationLongDictationTests {
     }
 
     /// While the user is still dictating, a chunk that fails on the server's side, drops its
-    /// connection or times out on the backend is tried again, with no retry state shown: nobody waits
-    /// for it yet.
+    /// connection, times out on the backend or is rate limited by the speech model is tried again,
+    /// with no retry state shown: nobody waits for it yet.
     @Test func aChunkFailingWhileRecordingIsTriedAgainUntilItAnswers() async {
         let capture = SpeakingCapture()
         let backend = ChunkBackend { index, attempt in
             guard index == 0 else { return .part }
-            return [.serverError, .connectionLost, .gatewayTimeout, .serverError, .serverError][safe: attempt] ?? .part
+            return [.serverError, .connectionLost, .gatewayTimeout, .speechModelRateLimited, .serverError][safe: attempt] ?? .part
         }
         let controller = controller(capture, backend)
         await start(controller, capture)
@@ -530,11 +536,14 @@ struct DictationLongDictationTests {
         #expect(backend.inFlight == 0)
     }
 
-    /// The last chunk is sent at the release, so the backend's own timeout on it comes after the
-    /// release: it is tried again, as while recording (owner, 2026-10-03: "we should not lose the end").
-    @Test func theLastChunkTimingOutOnTheBackendAfterTheReleaseIsTriedAgainAndTheEndIsPasted() async {
+    /// The last chunk is sent at the release, so the backend's own timeout on it, or the speech
+    /// model's rate limit outlasting the backend's retries, comes after the release: it is tried
+    /// again, as while recording (owner, 2026-10-03: "we should not lose the end").
+    @Test(arguments: [false, true])
+    func theLastChunkFailingOnTheBackendAfterTheReleaseIsTriedAgainAndTheEndIsPasted(rateLimited: Bool) async {
         let capture = SpeakingCapture()
-        let backend = ChunkBackend { index, attempt in index == 1 && attempt < 2 ? .gatewayTimeout : .part }
+        let failure: ChunkBackend.Reply = rateLimited ? .speechModelRateLimited : .gatewayTimeout
+        let backend = ChunkBackend { index, attempt in index == 1 && attempt < 2 ? failure : .part }
         let controller = controller(capture, backend)
         await start(controller, capture)
 
@@ -544,6 +553,26 @@ struct DictationLongDictationTests {
 
         #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
         #expect(backend.attempts == [1, 3])
+    }
+
+    /// While the user dictates, a refused chunk, or one over this account's own rate limit, gives up
+    /// at once: only the server's side failing is tried again.
+    @Test(arguments: [false, true])
+    func aChunkRefusedWhileRecordingIsNotTriedAgain(rateLimited: Bool) async {
+        let capture = SpeakingCapture()
+        let failure: ChunkBackend.Reply = rateLimited ? .accountRateLimited : .refused
+        let backend = ChunkBackend { index, _ in index == 0 ? failure : .part }
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 27, 12, 4)
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(backend.attempts.first == 1)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(backend.attempts.first == 1)
+        #expect(pasted.texts.withLock { $0 }.isEmpty)
     }
 
     /// The provider's rate limits come in bursts of seconds: the last tries after the release span

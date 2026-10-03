@@ -107,6 +107,8 @@ struct BackendClientDictationTests {
         (403, #"{"error":"consent_required"}"#, DictationError.accountSetupRequired),
         (403, #"{"error":"forbidden"}"#, DictationError.accessDenied),
         (429, #"{"error":"rate_limited"}"#, DictationError.rateLimited),
+        // The speech model's rate limit outlasting the backend's retries: not this account's limit.
+        (429, #"{"error":"transcription_rate_limited"}"#, DictationError.failed(status: 429)),
         (400, #"{"error":"audio_too_large"}"#, DictationError.recordingTooLong),
         (502, "", DictationError.failed(status: 502)),
         (200, #"{"transcript":"wrong shape"}"#, DictationError.invalidResponse),

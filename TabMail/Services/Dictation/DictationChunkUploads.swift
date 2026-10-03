@@ -96,12 +96,13 @@ final class DictationChunkUploads {
 
     /// Makes a chunk's request until it answers (owner, 2026-10-03: "retries should keep on happening
     /// until the final give up"). While the user is still dictating, a server error, a dropped
-    /// connection or the backend's own timeout is tried again after each of `chunkRetryDelays`, the
-    /// last repeating, for as long as the dictation goes on: nobody waits for it yet. From the
-    /// release, it gets `lastRetryDelays` more tries on the same failures, with the pill's retry
-    /// state: the last chunk is sent at the release, so its backend timeout comes after it (owner,
-    /// 2026-10-03: "we should not lose the end"). Any other failure (signed out, over quota, a
-    /// refused request) gives up at once.
+    /// connection, the backend's own timeout or the speech model's rate limit (`backendWaited`) is
+    /// tried again after each of `chunkRetryDelays`, the last repeating, for as long as the
+    /// dictation goes on: nobody waits for it yet. From the release, it gets `lastRetryDelays` more
+    /// tries on the same failures, with the pill's retry state: the last chunk is sent at the
+    /// release, so its backend timeout comes after it (owner, 2026-10-03: "we should not lose the
+    /// end"). Any other failure (signed out, over quota or the
+    /// account's own rate limit, a refused request) gives up at once.
     private func send(_ index: Int, encode: @escaping @Sendable () -> Data) async -> Result<DictationTranscription, any Error> {
         let flac = await Task.detached(priority: .userInitiated) { encode() }.value
         let upload = await upload.value
@@ -115,7 +116,7 @@ final class DictationChunkUploads {
                 return .success(try await transcribe(flac, upload.language, upload.vocabulary, upload.cleanup))
             } catch {
                 guard !Task.isCancelled else { return .failure(error) }
-                let isRetryable = DictationController.isServerError(error) || DictationController.isGatewayTimeout(error)
+                let isRetryable = DictationController.isServerError(error) || DictationController.backendWaited(error)
                 if !isReleased {
                     guard isRetryable,
                           let delay = waited < chunkRetryDelays.count ? chunkRetryDelays[waited] : chunkRetryDelays.last else {

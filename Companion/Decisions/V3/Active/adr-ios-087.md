@@ -57,14 +57,15 @@ the backend answers any provider failure 502, which the apps retry.
    came before (the user leaning back) once read as silence and its chunks went unsent and lost
    (found in TabMail Voice's review, 2026-10-03). Before, a chunk with no speech was not sent, and
    the last only when nothing else was.
-5. **Retries.** While the user dictates, a chunk failing with a server error, a dropped connection or
-   the backend's own timeout (504) is tried again after each of `chunkRetryDelays` (1, 2, 5, 10 s,
-   the last repeating), showing nothing. The release cuts any such wait short; from then on a chunk
+5. **Retries.** While the user dictates, a chunk failing with a server error, a dropped connection,
+   the backend's own timeout (504) or the speech model's rate limit outlasting the backend's own 30 s
+   of retries (429 `transcription_rate_limited`, backend ADR-022; `backendWaited`) is tried again
+   after each of `chunkRetryDelays` (1, 2, 5, 10 s, the last repeating), showing nothing. The release cuts any such wait short; from then on a chunk
    gets `transcriptionRetryDelays` more tries (about a minute, ADR-IOS-085 amendment 2026-10-03) on
-   the same failures, a 504 included, under the pill's retry state (`isRetrying`, then
+   the same failures, a 504 and that 429 included, under the pill's retry state (`isRetrying`, then
    `showsRetryNote`): the last chunk is sent at the release, so its backend timeout comes after it
-   (owner: "we should not lose the end"). Anything else (signed out, over quota, a refused request)
-   gives up at once.
+   (owner: "we should not lose the end"). Anything else (signed out, over quota or the account's own
+   rate limit, a refused request) gives up at once.
 6. **What is pasted.** The chunks' texts in order up to the first chunk that gave up; the chunks
    after it are cancelled. The first chunk giving up pastes nothing, as one recording's failure does.
    iOS says nothing about a missing end: dictation failures are silent (ADR-IOS-085 decision 8);
@@ -93,7 +94,9 @@ the backend answers any provider failure 502, which the apps retry.
   `DictationLongDictationTests` (order and cleanup, overlap join, retries while recording, last tries
   with the retry state, prefix delivery, first chunk lost, cancel, a quiet last chunk sent too, a
   seeded fuzz over random failures; and, from review: the words around a long silence, a soft
-  stretch after loud speech sent and pasted, a steady sound sent in every chunk, each chunk's
+  stretch after loud speech sent and pasted, a steady sound sent in every chunk, the speech
+  model's 429 retried while recording and after the release, a refused chunk or the account's own
+  429 given up at once, each chunk's
   language and words, each
   chunk peak-normalised on its own, no request after a cancel during a retry wait or the upload's
   preparation), `DictationAudioRecorderTests.chunksAreCutAtThePauseCountingTheAudioHeldBeforeSpeech`, and `DictationControllerTests.noUploadOutlastsWhatTheModelTranscribes` /
