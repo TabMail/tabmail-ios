@@ -52,11 +52,46 @@ enum DictationConfig {
     /// Recording continues this long after the mic button is tapped to stop, so the last word
     /// isn't clipped.
     static let releaseTailDuration: Duration = .milliseconds(300)
-    /// Recording stops and is sent automatically at this length: the most audio the backend's
-    /// default speech-to-text model takes (AssemblyAI's Sync API, up to 120 seconds; backend
-    /// ADR-022). The model for the other languages (backend ADR-024) takes longer.
-    /// Also well under the backend's 10 MiB upload limit (~3.8 MB at 16 kHz 16-bit mono).
-    static let maxRecordingDuration: Duration = .seconds(120)
+    /// Recording stops and is sent automatically at this length, counted from speech. A dictation
+    /// longer than `chunkMaxDuration` is cut into chunks, each under the 120 seconds the backend
+    /// transcribes at once (backend ADR-022), so this is not the backend's limit (ADR-IOS-087; was
+    /// 120 seconds). As TabMail Voice's (ADR-DESK-048).
+    static let maxRecordingDuration: Duration = .seconds(600)
+
+    // MARK: Long dictations (ADR-IOS-087, TabMail Voice ADR-DESK-048)
+
+    /// The chunker reads the recording's loudness in frames this long.
+    static let chunkFrameDuration: Duration = .milliseconds(20)
+    /// A frame quieter than this fraction of the way from the recording's room level to its voice
+    /// level is quiet. The levels are the recording's own: these percentiles of its frames' loudness.
+    static let chunkPauseLevel: Double = 0.3
+    static let chunkFloorPercentile: Double = 0.1
+    static let chunkSpeechPercentile: Double = 0.9
+    /// The voice level is taken over frames at least this many dB above the room's, so a long
+    /// silence doesn't drag it down to the room's.
+    static let chunkMinimumRange: Double = 3
+    /// A quiet run shorter than this (between syllables and words) counts as speech.
+    static let chunkSpeechGap: Duration = .milliseconds(300)
+    /// A chunk is cut in the middle of a pause this long (owner, 2026-10-03: "a second pause")…
+    static let chunkPauseDuration: Duration = .seconds(1)
+    /// …once it holds this much speech (owner, 2026-10-03: "only after 10s+").
+    static let chunkMinimumSpeech: Duration = .seconds(10)
+    /// With no pause, a chunk is cut at this length, under the 120 seconds the backend transcribes.
+    static let chunkMaxDuration: Duration = .seconds(105)
+    /// A forced cut lands on the quietest window this long in the chunk's last `chunkForcedCutSearch`.
+    static let chunkForcedCutWindow: Duration = .milliseconds(300)
+    static let chunkForcedCutSearch: Duration = .seconds(5)
+    /// After a forced cut, the next chunk starts this much speech earlier, at most `chunkMaxOverlap`
+    /// earlier, so the words at the cut are heard whole in one of the two.
+    static let chunkOverlapSpeech: Duration = .seconds(15)
+    static let chunkMaxOverlap: Duration = .seconds(30)
+    /// A chunk failing while the user still dictates is tried again after each of these, the last
+    /// repeating, until the release; then it gets `transcriptionRetryDelays`.
+    static let chunkRetryDelays: [Duration] = [.seconds(1), .seconds(2), .seconds(5), .seconds(10)]
+    /// Overlapping chunks' texts are matched within this many words of the seam…
+    static let chunkOverlapSearchWords = 80
+    /// …on a run of at least this many words; with no such run they are joined whole.
+    static let chunkOverlapMinimumRun = 3
 
     // MARK: Speech detection
 

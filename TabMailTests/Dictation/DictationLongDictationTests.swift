@@ -1,0 +1,463 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+@preconcurrency import AVFoundation
+import Foundation
+import Synchronization
+import Testing
+@testable import TabMail
+
+/// A microphone the test speaks into: `feed` delivers audio as buffers, when the test says.
+private final class SpeakingCapture: AudioCapturing, @unchecked Sendable {
+    private struct State {
+        var starts = 0
+        var isRunning = false
+        var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+    }
+
+    private let state = Mutex(State())
+
+    var starts: Int { state.withLock { $0.starts } }
+    var isRunning: Bool { state.withLock { $0.isRunning } }
+
+    func start(onBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void, completion: @escaping @Sendable ((any Error)?) -> Void) {
+        state.withLock { state in
+            state.starts += 1
+            state.isRunning = true
+            state.onBuffer = onBuffer
+        }
+        completion(nil)
+    }
+
+    func stop() {
+        state.withLock { state in
+            state.isRunning = false
+            state.onBuffer = nil
+        }
+    }
+
+    func feed(_ samples: [Float]) {
+        guard let onBuffer = state.withLock({ $0.onBuffer }) else { return }
+        for buffer in DictationTestAudio.buffers(samples) { onBuffer(buffer) }
+    }
+}
+
+/// Hears speech in any buffer louder than a room, at once.
+private final class LoudnessSpeechDetector: SpeechDetecting, @unchecked Sendable {
+    private let heard = Mutex(false)
+    private let onSpeech: @Sendable () -> Void
+
+    init(onSpeech: @escaping @Sendable () -> Void) {
+        self.onSpeech = onSpeech
+    }
+
+    func analyze(_ buffer: AVAudioPCMBuffer) {
+        guard MicrophoneCapture.decibels(of: buffer) > -30 else { return }
+        let isFirst = heard.withLock { heard in
+            defer { heard = true }
+            return !heard
+        }
+        if isFirst { onSpeech() }
+    }
+
+    func finish() async -> Bool { heard.withLock { $0 } }
+}
+
+/// The backend, answering each chunk as the test says. A chunk is told apart by its audio: the
+/// first upload of new audio is the next chunk, a repeat is a retry of one.
+private final class ChunkBackend: Sendable {
+    enum Reply: Sendable {
+        case part
+        case serverError
+        case gatewayTimeout
+        case connectionLost
+        case refused
+        /// Never answers until cancelled.
+        case never
+    }
+
+    private struct State {
+        var chunks: [Data] = []
+        var attempts: [Int] = []
+        var inFlight = 0
+        var cleanups: [[String: String]] = []
+    }
+
+    private let state = Mutex(State())
+    /// The reply to chunk `index`'s `attempt`th try (from 0).
+    let reply: @Sendable (_ index: Int, _ attempt: Int) -> Reply
+
+    init(reply: @escaping @Sendable (_ index: Int, _ attempt: Int) -> Reply = { _, _ in .part }) {
+        self.reply = reply
+    }
+
+    /// Chunks sent so far, and how many tries each took.
+    var sent: Int { state.withLock { $0.chunks.count } }
+    var attempts: [Int] { state.withLock { $0.attempts } }
+    var inFlight: Int { state.withLock { $0.inFlight } }
+    var cleanups: [[String: String]] { state.withLock { $0.cleanups } }
+    var chunks: [Data] { state.withLock { $0.chunks } }
+
+    func transcribe(_ flac: Data, cleanup: [String: String]) async throws -> DictationTranscription {
+        let (index, attempt) = state.withLock { state in
+            let index = state.chunks.firstIndex(of: flac) ?? {
+                state.chunks.append(flac)
+                state.attempts.append(0)
+                return state.chunks.count - 1
+            }()
+            defer { state.attempts[index] += 1 }
+            state.inFlight += 1
+            state.cleanups.append(cleanup)
+            return (index, state.attempts[index])
+        }
+        defer { state.withLock { $0.inFlight -= 1 } }
+        // A moment on the network, so requests overlap the recording and each other.
+        try await Task.sleep(for: .milliseconds(5))
+        switch reply(index, attempt) {
+        case .part: return DictationTranscription(text: "raw \(index)", cleanedText: "Part \(index).")
+        case .serverError: throw DictationError.failed(status: 502)
+        case .gatewayTimeout: throw DictationError.failed(status: 504)
+        case .connectionLost: throw URLError(.networkConnectionLost)
+        case .refused: throw DictationError(status: 400, code: nil)
+        case .never:
+            try await Task.sleep(for: .seconds(3_600))
+            throw CancellationError()
+        }
+    }
+}
+
+/// The texts the dictations in one test pasted.
+private final class Pasted: Sendable {
+    let texts = Mutex<[String]>([])
+}
+
+/// A long dictation on iOS (ADR-IOS-087): cut into chunks as it is recorded, each sent at once with
+/// its own cleanup, retried while the user goes on, and the text the chunks' in order up to the
+/// first that gave up. As TabMail Voice's long-dictation tests (ADR-DESK-048).
+@MainActor
+struct DictationLongDictationTests {
+    private typealias Audio = DictationTestAudio
+    private let context = DictationContext(windowTitle: "Chat", screenText: "Me: hi\n» ‸")
+    private let pasted = Pasted()
+
+    private func controller(
+        _ capture: SpeakingCapture,
+        _ backend: ChunkBackend,
+        chunkRetryDelays: [Duration] = [.milliseconds(1)],
+        retryDelays: [Duration] = [.milliseconds(1), .milliseconds(1)],
+        retryNoticeDelay: Duration = .seconds(60)
+    ) -> DictationController {
+        DictationController(
+            capture: capture,
+            requestMicrophoneAccess: { true },
+            isOnline: { true },
+            isOptedOutOfAI: { false },
+            dictationLanguage: { nil },
+            dictionary: { .init(words: [], learnsWords: false) },
+            emailBody: { _ in nil },
+            corrections: nil,
+            useWords: { _ in },
+            transcribe: { flac, _, _, cleanup in try await backend.transcribe(flac, cleanup: cleanup) },
+            warmUp: {},
+            transcriptionRetryDelays: retryDelays,
+            transcriptionRetryNoticeDelay: retryNoticeDelay,
+            chunkRetryDelays: chunkRetryDelays,
+            speechDetector: { onSpeech, _ in LoudnessSpeechDetector(onSpeech: onSpeech) }
+        )
+    }
+
+    private func waitUntil(_ condition: @MainActor () -> Bool) async {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while !condition(), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    private func start(_ controller: DictationController, _ capture: SpeakingCapture) async {
+        let pasted = pasted
+        controller.start(context: context, canUseAI: true) { text in pasted.texts.withLock { $0.append(text) } }
+        await waitUntil { capture.starts == 1 }
+    }
+
+    /// Speaks for `seconds` each, a 1.5 s pause after all but the last: one chunk each (all at
+    /// least `chunkMinimumSpeech` long but the last). Each pause's chunk is sent before the user
+    /// goes on, as seconds of speech apart would have it, so the backend sees the chunks in order.
+    private func speak(_ capture: SpeakingCapture, _ backend: ChunkBackend, seed: UInt32, _ seconds: Double...) async {
+        var random = Audio.Random(seed: seed)
+        for (index, length) in seconds.enumerated() {
+            let isLast = index == seconds.count - 1
+            capture.feed(Audio.speech(length, &random) + (isLast ? [] : Audio.room(1.5, &random)))
+            if !isLast { await waitUntil { backend.sent == index + 1 } }
+        }
+    }
+
+    @Test func chunksAreSentWhileRecordingAndJoinedInOrderEachWithItsCleanup() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 1, 12, 12, 5)
+        // The first two were sent while the user was still speaking.
+        await waitUntil { backend.attempts.count == 2 && backend.inFlight == 0 }
+        #expect(backend.sent == 2)
+        #expect(controller.phase == .listening)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1. Part 2."])
+        #expect(backend.sent == 3)
+        // Each chunk went with the dictation's cleanup.
+        #expect(backend.cleanups.count == 3)
+        #expect(backend.cleanups.allSatisfy { $0["window_title"] == "Chat" && $0["screen_text"] == "Me: hi\n» ‸" })
+        #expect(!capture.isRunning)
+        // Every upload is a chunk, none the whole recording.
+        let lengths = backend.chunks.compactMap { try? FLACTestDecoder.decode($0).totalSamples }
+        #expect(lengths.count == 3)
+        #expect(lengths.allSatisfy { $0 < Int(25 * Audio.rate) })
+    }
+
+    @Test func aChunkCutWithNoPauseOverlapsTheNextAndTheirSharedWordsAreKeptOnce() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let replies = Mutex<[Int: String]>([
+            0: "We should ship the release on Friday because the tests are gre",
+            1: "release on Friday because the tests are green and the notes are ready.",
+        ])
+        let controller = DictationController(
+            capture: capture,
+            requestMicrophoneAccess: { true },
+            isOnline: { true },
+            isOptedOutOfAI: { false },
+            dictationLanguage: { nil },
+            dictionary: { .init(words: [], learnsWords: false) },
+            emailBody: { _ in nil },
+            corrections: nil,
+            useWords: { _ in },
+            transcribe: { flac, _, _, cleanup in
+                let index = (try await backend.transcribe(flac, cleanup: cleanup)).text == "raw 0" ? 0 : 1
+                return DictationTranscription(text: replies.withLock { $0[index] ?? "" }, cleanedText: nil)
+            },
+            warmUp: {},
+            speechDetector: { onSpeech, _ in LoudnessSpeechDetector(onSpeech: onSpeech) }
+        )
+        await start(controller, capture)
+
+        var random = Audio.Random(seed: 2)
+        capture.feed(Audio.speech(130, &random))
+        await waitUntil { backend.sent == 1 }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(backend.sent == 2)
+        #expect(pasted.texts.withLock { $0 } == ["We should ship the release on Friday because the tests are green and the notes are ready."])
+    }
+
+    /// While the user is still dictating, a chunk that fails on the server's side, drops its
+    /// connection or times out on the backend is tried again, with no retry state shown: nobody waits
+    /// for it yet.
+    @Test func aChunkFailingWhileRecordingIsTriedAgainUntilItAnswers() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, attempt in
+            guard index == 0 else { return .part }
+            return [.serverError, .connectionLost, .gatewayTimeout, .serverError, .serverError][safe: attempt] ?? .part
+        }
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 3, 12, 5)
+        await waitUntil { backend.attempts.first == 6 && backend.inFlight == 0 }
+        #expect(backend.attempts == [6])
+        #expect(!controller.isRetrying)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
+    }
+
+    /// At the release, a chunk still failing stops waiting and gets its last tries at once, as one
+    /// recording does, with the retry state shown.
+    @Test func atTheReleaseAChunkStillFailingGetsItsLastTriesWithTheRetryState() async {
+        let capture = SpeakingCapture()
+        let released = Mutex(false)
+        let backend = ChunkBackend { index, _ in
+            guard index == 0 else { return .part }
+            return released.withLock { $0 } ? .part : .serverError
+        }
+        // A wait while recording far longer than the test: only the release ends it.
+        let controller = controller(capture, backend, chunkRetryDelays: [.seconds(3_600)], retryDelays: [.milliseconds(200)], retryNoticeDelay: .milliseconds(1))
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 4, 12, 5)
+        await waitUntil { backend.attempts.first == 1 && backend.inFlight == 0 }
+        // Still failing at the release: the waiting chunk is tried at once, fails, and is retried
+        // after `retryDelays` under the retry state.
+        controller.finish()
+        await waitUntil { controller.isRetrying }
+        #expect(controller.isRetrying)
+        await waitUntil { controller.showsRetryNote }
+        #expect(controller.showsRetryNote)
+        released.withLock { $0 = true }
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
+        #expect(!controller.isRetrying)
+        #expect(!controller.showsRetryNote)
+    }
+
+    /// Only the chunks before the first that gave up are pasted (owner, 2026-10-03: "paste only the
+    /// up to successful part"): the ones after it are not, even when they answered.
+    @Test func onlyTheChunksBeforeTheFirstThatGaveUpArePasted() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, _ in index == 2 ? .refused : .part }
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 5, 12, 12, 12, 5)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
+        await waitUntil { backend.inFlight == 0 }
+        #expect(backend.inFlight == 0)
+    }
+
+    /// After the release, a chunk whose last tries all fail gives up too: what came before it is
+    /// pasted, and the requests after it are cancelled.
+    @Test func aChunkWhoseLastTriesFailEndsTheTextThereAndLaterRequestsStop() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, _ in
+            switch index {
+            case 1: .serverError
+            case 2: .never
+            default: .part
+            }
+        }
+        // Chunk 1 waits out the recording; chunk 2 never answers.
+        let controller = controller(capture, backend, chunkRetryDelays: [.seconds(3_600)])
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 6, 12, 12, 12, 5)
+        await waitUntil { backend.sent == 3 }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 } == ["Part 0."])
+        // Chunk 1: the try that failed while recording, one at the release and one per retry delay.
+        #expect(backend.attempts.dropFirst().first == 4)
+        await waitUntil { backend.inFlight == 0 }
+        #expect(backend.inFlight == 0)
+    }
+
+    /// The first chunk giving up loses the dictation, as one recording's failure does: nothing is
+    /// pasted, whatever came after.
+    @Test func theFirstChunkGivingUpPastesNothing() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, _ in index == 0 ? .refused : .part }
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 7, 12, 12, 5)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 }.isEmpty)
+        #expect(!capture.isRunning)
+    }
+
+    /// Cancelled while recording, or while the chunks are still transcribed: nothing is pasted, and
+    /// every request stops.
+    @Test(arguments: [false, true])
+    func aCancelledLongDictationPastesNothingAndStopsItsRequests(afterRelease: Bool) async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { _, _ in .never }
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 8, 12, 12, 5)
+        await waitUntil { backend.inFlight == 2 }
+        if afterRelease {
+            controller.finish()
+            await waitUntil { backend.inFlight == 3 }
+        }
+        controller.cancel()
+        await waitUntil { backend.inFlight == 0 }
+
+        #expect(backend.inFlight == 0)
+        #expect(controller.phase == .idle)
+        #expect(pasted.texts.withLock { $0 }.isEmpty)
+        #expect(!capture.isRunning)
+    }
+
+    /// The last chunk is the quiet after a pause: it is not sent, so no quiet is boosted into words.
+    @Test func aLastChunkWithNoSpeechIsNotSent() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        var random = Audio.Random(seed: 9)
+        capture.feed(Audio.speech(12, &random) + Audio.room(5, &random))
+        await waitUntil { backend.sent == 1 }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(backend.sent == 1)
+        #expect(pasted.texts.withLock { $0 } == ["Part 0."])
+    }
+
+    /// Seeded random long dictations against a backend that fails at random: the text is always the
+    /// chunks' in order up to the first that gave up, nothing stays in flight, and the microphone
+    /// is released.
+    @Test(arguments: UInt32(1)...UInt32(8))
+    func randomLongDictationsPasteThePrefixUpToTheFirstChunkThatGaveUp(seed: UInt32) async {
+        var random = Audio.Random(seed: seed &* 7_919)
+        let replies: [[ChunkBackend.Reply]] = (0..<12).map { _ in
+            (0..<6).map { _ in
+                switch random.next() {
+                case ..<0.55: .part
+                case ..<0.7: .serverError
+                case ..<0.8: .connectionLost
+                case ..<0.9: .gatewayTimeout
+                default: .refused
+                }
+            }
+        }
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, attempt in replies[safe: index]?[safe: attempt] ?? .part }
+        let controller = controller(capture, backend, chunkRetryDelays: [.milliseconds(Int(random.next() * 5))])
+        await start(controller, capture)
+
+        let segments = 2 + Int(random.next() * 5)
+        for index in 0..<segments {
+            let isLast = index == segments - 1
+            let pause = 1.2 + random.next()
+            capture.feed(Audio.speech(10.5 + random.next() * 4, &random) + (isLast ? [] : Audio.room(pause, &random)))
+            if !isLast { await waitUntil { backend.sent == index + 1 } }
+        }
+        // Released at once or after some of the chunks answered.
+        try? await Task.sleep(for: .milliseconds(Int(random.next() * 3) * 20))
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+        await waitUntil { backend.inFlight == 0 }
+
+        // The chunk's outcome: the tries before the release go on until anything but a server
+        // error, a dropped connection or the backend's timeout; the order of the release decides
+        // the rest, so the oracle reads which tries were made.
+        let attempts = backend.attempts
+        let gaveUp = attempts.indices.first { index in
+            let last = replies[safe: index]?[safe: attempts[index] - 1] ?? .part
+            return last != .part
+        }
+        let expected = (0..<(gaveUp ?? attempts.count)).map { "Part \($0)." }.joined(separator: " ")
+        #expect(pasted.texts.withLock { $0 } == (expected.isEmpty ? [] : [expected]), "seed \(seed), attempts \(attempts)")
+        #expect(backend.inFlight == 0)
+        #expect(!capture.isRunning)
+        #expect(controller.phase == .idle)
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
+}
