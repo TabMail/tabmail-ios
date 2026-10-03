@@ -72,6 +72,13 @@ enum DictationConfig {
     static let chunkMinimumRange: Double = 3
     /// A quiet run shorter than this (between syllables and words) counts as speech.
     static let chunkSpeechGap: Duration = .milliseconds(300)
+    /// A louder stretch no longer than this inside a pause is the room's noise (a click, the room's
+    /// own swing) and leaves the pause going: on a quiet microphone the room's frames reach a few dB
+    /// over the quiet line, so the owner's real pauses of a second or two had no second of frames all
+    /// under it (2026-10-03: 80–90% quiet, the rest a frame or two at a time) and were never cut at.
+    /// Kept to a plosive's burst, shorter than any vowel, as a cut must be in a pause for sure (owner,
+    /// 2026-10-03: "really high precision, even if some recall could be lower").
+    static let chunkPauseBlip: Duration = .milliseconds(40)
     /// A chunk is cut in the middle of a pause this long (owner, 2026-10-03: "a second pause")…
     static let chunkPauseDuration: Duration = .seconds(1)
     /// …once it holds this much speech (owner, 2026-10-03: "only after 10s+").

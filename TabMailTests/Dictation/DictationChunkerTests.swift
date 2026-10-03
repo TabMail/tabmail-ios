@@ -101,6 +101,29 @@ struct DictationChunkerTests {
         expectCovers(audio, cuts, last)
     }
 
+    /// On a quiet microphone the room's own noise pokes over the quiet line a frame or two at a time
+    /// all through a pause (the owner's recording, 2026-10-03, was never cut): such blips leave the
+    /// pause going, and a louder stretch just past `chunkPauseBlip` ends it, as a syllable does.
+    @Test(arguments: [true, false])
+    func aPauseWithBlipsOfTheRoomInItIsCutAtOnlyWhileTheyAreShort(short: Bool) {
+        var random = Audio.Random(seed: 12)
+        let blip = seconds(DictationConfig.chunkPauseBlip + (short ? .zero : DictationConfig.chunkFrameDuration * 2))
+        var audio = speech(12, &random)
+        for _ in 0..<8 { audio += room(0.25, &random) + speech(blip, &random) }
+        audio += room(0.25, &random) + speech(5, &random)
+        let pauseStart = Int(12 * rate)
+        let (cuts, last) = chunk(audio)
+        if short {
+            #expect(cuts.count == 1)
+            guard cuts.count == 1 else { return }
+            #expect(cuts[0].end > pauseStart)
+            #expect(cuts[0].end < pauseStart + Int(2.5 * rate))
+        } else {
+            #expect(cuts.isEmpty)
+        }
+        expectCovers(audio, cuts, last)
+    }
+
     /// With no pause at all, a chunk is cut at `chunkMaxDuration`, and the next starts about
     /// `chunkOverlapSpeech` of speech earlier, so the cut's words are heard whole in one of them.
     @Test func speechWithNoPauseIsCutAtTheMaximumLengthTheNextChunkOverlappingIt() throws {

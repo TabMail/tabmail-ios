@@ -21,7 +21,8 @@ struct DictationChunkCut: Sendable, Equatable {
 /// against the recording's own levels, never a fixed one: the quiet end of its frames
 /// (`chunkFloorPercentile`) is the room, the loud end (`chunkSpeechPercentile`) the voice, and a
 /// frame below `chunkPauseLevel` of the way from one to the other is quiet; a run of quiet frames
-/// shorter than `chunkSpeechGap` (between syllables and words) counts as speech. On quiet
+/// shorter than `chunkSpeechGap` (between syllables and words) counts as speech, as louder frames no
+/// longer than `chunkPauseBlip` inside a quiet stretch (the room's noise) count as quiet. On quiet
 /// microphones speech stands only a few dB above the room, which only levels taken from the
 /// recording itself can tell apart.
 ///
@@ -51,6 +52,7 @@ final class DictationChunker {
     private let forcedSearchFrames: Int
     private let forcedWindowFrames: Int
     private let gapFrames: Int
+    private let blipFrames: Int
     /// Each whole frame's loudness (dB), from the start of the recording.
     private var decibels: [Double] = []
     private var histogram = [Int](repeating: 0, count: DictationChunker.binCount)
@@ -60,7 +62,10 @@ final class DictationChunker {
     private var chunkStart = 0
     private var chunkOverlapped = false
     private var speechFrames = 0
+    /// The quiet stretch the chunk ends on so far, with any blips inside it, and the louder frames
+    /// since its last quiet one: a blip yet, or speech once longer than `chunkPauseBlip`.
     private var quietRun = 0
+    private var loudRun = 0
     private var cuts = 0
 
     init(sampleRate: Double = DictationConfig.recordingSampleRate) {
@@ -76,6 +81,7 @@ final class DictationChunker {
         forcedSearchFrames = frames(DictationConfig.chunkForcedCutSearch)
         forcedWindowFrames = frames(DictationConfig.chunkForcedCutWindow)
         gapFrames = frames(DictationConfig.chunkSpeechGap)
+        blipFrames = frames(DictationConfig.chunkPauseBlip)
     }
 
     /// Reads the next samples of the recording (16-bit, as captured, before any normalisation) and
@@ -109,14 +115,7 @@ final class DictationChunker {
         histogram[Self.bin(of: loudness)] += 1
 
         let quiet = loudness < pauseLevel()
-        if quiet {
-            quietRun += 1
-        } else {
-            // A gap between syllables or words is part of the speech; a longer quiet is not.
-            if quietRun < gapFrames { speechFrames += quietRun }
-            quietRun = 0
-            speechFrames += 1
-        }
+        count(quiet: quiet)
         let frameEnd = decibels.count * frameLength
         if quiet, quietRun >= pauseFrames, speechFrames >= minimumSpeechFrames {
             // The middle of the pause so far: half its quiet ends this chunk, half starts the next.
@@ -175,16 +174,26 @@ final class DictationChunker {
         let level = pauseLevel()
         speechFrames = 0
         quietRun = 0
-        for frame in (chunkStart / frameLength)..<decibels.count {
-            if decibels[frame] < level {
-                quietRun += 1
-                continue
-            }
-            if quietRun < gapFrames { speechFrames += quietRun }
-            quietRun = 0
-            speechFrames += 1
-        }
+        loudRun = 0
+        for frame in (chunkStart / frameLength)..<decibels.count { count(quiet: decibels[frame] < level) }
         return chunk
+    }
+
+    /// Counts the next frame into the chunk's speech or the quiet it ends on.
+    private func count(quiet: Bool) {
+        if quiet {
+            // A blip inside the quiet was the room's: the quiet goes on through it.
+            quietRun += loudRun + 1
+            loudRun = 0
+            return
+        }
+        loudRun += 1
+        if quietRun > 0, loudRun <= blipFrames { return }
+        // Speech: a gap between syllables or words before it is part of the speech; a longer quiet is not.
+        if quietRun < gapFrames { speechFrames += quietRun }
+        speechFrames += loudRun
+        quietRun = 0
+        loudRun = 0
     }
 
     /// The loudness below which a frame is quiet: `chunkPauseLevel` of the way from the recording's

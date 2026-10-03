@@ -25,7 +25,14 @@ the backend answers any provider failure 502, which the apps retry.
    reads each 20 ms frame's loudness against the recording's own levels: the room is its 10th
    percentile, the voice the 90th percentile of frames at least 3 dB above the room, and a frame
    below 0.3 of the way from one to the other is quiet; a quiet run under 300 ms (between syllables
-   and words) counts as speech.
+   and words) counts as speech, and louder frames no longer than `chunkPauseBlip` (40 ms) inside a
+   quiet run count as quiet. Later note (2026-10-03): the owner's real 32 s test dictation on
+   TabMail Voice, with several 1–2 s pauses after 10 s+ of speech, was never cut under the first,
+   all-frames-quiet rule; its pauses were 80–90% quiet, the room's noise poking 0–4 dB over the line
+   a frame or two at a time. The tolerance is a plosive's burst, shorter than any vowel, so a cut
+   still lands only in a pause (owner: "really high precision, even if some recall could be
+   lower"); with it that recording is cut at 13.5 s and 27.4 s, both inside its pauses
+   (ADR-DESK-048).
    - **A pause:** once a chunk holds `chunkMinimumSpeech` (10 s) of speech, it is cut in the middle of
      the next `chunkPauseDuration` (1 s) of quiet. Nothing overlaps. The levels are relative, so
      speech much softer than what came before, with few frames at the room's level, can read as
@@ -94,7 +101,8 @@ the backend answers any provider failure 502, which the apps retry.
   one recording's silence).
 - `DictationController` is past 500 lines (620); the chunk logic lives in `DictationChunkUploads`,
   `DictationChunker` and `DictationChunkJoin`.
-- Tests: `DictationChunkerTests` and `DictationChunkJoinTests` (ported from Voice),
+- Tests: `DictationChunkerTests` (including `aPauseWithBlipsOfTheRoomInItIsCutAtOnlyWhileTheyAreShort`:
+  40 ms room blips in a pause are cut at, 80 ms ones are not) and `DictationChunkJoinTests` (ported from Voice),
   `DictationLongDictationTests` (order and cleanup, overlap join, retries while recording, last tries
   with the retry state, prefix delivery, first chunk lost, cancel, a quiet last chunk sent too, a
   seeded fuzz over random failures; and, from review: the words around a long silence, a soft
