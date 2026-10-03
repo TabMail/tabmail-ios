@@ -307,3 +307,20 @@ retries are still going 2 s after the first error, typically while waiting to se
   `theRetryNoteCountsFromTheFirstFailureNotTheLatest`, `aRetryAnsweringBeforeTheNoticeDelayShowsNoNote`, `itReadsTheRetryingNoteWhileItRetries` (VoiceOver
   reads "Transcribing" until the note shows), and the pill's source fence (`showsRetryNote`, never
   `isRetrying`).
+
+**Amendment 2026-10-03 — the retry is fuchsia, faded in; dictation's colours in `Palette` (owner).**
+The spinner's shift toward purple while retrying was too close to blue to notice; from a page of
+candidates the owner chose fuchsia, to fade in "just like the voice" (the waveform's 0.4 s ease), with
+"the transition time … a variable configured globally", and asked for a palette file on iOS and TabMail
+Voice "similarly to Thunderbird, so that we can actually adjust the colors easily from the palette".
+iOS already had one, `Theme/Palette.swift` (modelled on Thunderbird's `palette.data.json`); dictation's
+colours move into it: `brandBlue`/`brandPurple` (the spinner's gradient), `waveformWaiting`/
+`waveformVoiced` (were `DictationConfig.waveformWaitingColour`/`waveformVoicedColour`), and
+`retryArcStart` #C026D3 → `retryArcEnd` #E0399E. `DictationConfig.colourTransition` (0.4 s, renamed
+from `waveformColourTransition`) is how long every dictation colour change eases. While `isRetrying`,
+`DictationSpinner` fades from its brand layer to its retry layer (track in the start colour), two layers
+circling together whose opacities ease over `colourTransition`, and back when a retry answers;
+`thinkingRetryColourShift` is gone. As TabMail Voice's ADR-DESK-048 (its new `src/core/palette.ts`).
+- Tests: `DictationControllerTests.theWaveformTakesItsRecordingColourOnSpeechAndTheSpinnerTheRetryColoursWhileRetrying`
+  (the retry's colours by hex, unlike the resting ones), and the pill's source fence (both layers'
+  opacity eased over `colourTransition`, as the waveform's colour).

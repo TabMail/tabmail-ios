@@ -35,8 +35,7 @@ struct DictationPillView: View {
     /// The waveform's colour: washed out while the dictation waits for speech, vivid once
     /// speech is heard, a sign it is listening (owner, 2026-10-02).
     static func waveformColour(hasVoice: Bool) -> Color {
-        let colour = hasVoice ? DictationConfig.waveformVoicedColour : DictationConfig.waveformWaitingColour
-        return Color(red: colour.red, green: colour.green, blue: colour.blue)
+        hasVoice ? Palette.waveformVoiced : Palette.waveformWaiting
     }
 
     /// What VoiceOver reads for the waveform.
@@ -50,51 +49,58 @@ struct DictationPillView: View {
 }
 
 /// TabMail Voice's thinking spinner (`SpinningRim` in its overlay): a faint track with a
-/// gradient arc circling it, in the icon's blue → purple; both moved toward purple while a server
-/// error is tried again.
+/// gradient arc circling it, in the icon's blue → purple; while a server error is tried again,
+/// both fade to the retry's colours (`Palette.retryArcStart` → `Palette.retryArcEnd`). The two sets
+/// of colours are two layers circling together, one fading out as the other fades in over
+/// `DictationConfig.colourTransition`, as TabMail Voice draws it.
 struct DictationSpinner: View {
     var isRetrying = false
 
     var body: some View {
-        let colours = Self.colours(isRetrying: isRetrying)
         TimelineView(.animation) { timeline in
             let turns = timeline.date.timeIntervalSinceReferenceDate * DictationConfig.thinkingRevolutionsPerSecond
             ZStack {
-                Circle()
-                    .stroke(colours.track.opacity(DictationConfig.thinkingTrackOpacity), lineWidth: DictationConfig.thinkingRimWidth)
-                Circle()
-                    .trim(from: 0, to: DictationConfig.thinkingArcFraction)
-                    .stroke(
-                        AngularGradient(
-                            colors: [colours.arc.start.opacity(0), colours.arc.start, colours.arc.end],
-                            center: .center,
-                            startAngle: .zero, endAngle: .degrees(360 * DictationConfig.thinkingArcFraction)
-                        ),
-                        style: StrokeStyle(lineWidth: DictationConfig.thinkingRimWidth, lineCap: .round)
-                    )
-                    .rotationEffect(.degrees(360 * turns.truncatingRemainder(dividingBy: 1)))
+                Self.layer(Self.colours(isRetrying: false), turns: turns)
+                    .animation(.easeInOut(duration: DictationConfig.colourTransition)) { $0.opacity(isRetrying ? 0 : 1) }
+                Self.layer(Self.colours(isRetrying: true), turns: turns)
+                    .animation(.easeInOut(duration: DictationConfig.colourTransition)) { $0.opacity(isRetrying ? 1 : 0) }
             }
             .padding(DictationConfig.thinkingRimWidth / 2)
         }
         .frame(width: DictationConfig.spinnerDiameter, height: DictationConfig.spinnerDiameter)
     }
 
-    /// The track's colour and the arc's two ends: from blue, or `thinkingRetryColourShift` toward
-    /// purple while retrying.
+    /// One set of the spinner's colours: its track and its arc, `turns` round.
+    private static func layer(_ colours: (track: Color, arc: (start: Color, end: Color)), turns: Double) -> some View {
+        ZStack {
+            Circle()
+                .stroke(colours.track.opacity(DictationConfig.thinkingTrackOpacity), lineWidth: DictationConfig.thinkingRimWidth)
+            Circle()
+                .trim(from: 0, to: DictationConfig.thinkingArcFraction)
+                .stroke(
+                    AngularGradient(
+                        colors: [colours.arc.start.opacity(0), colours.arc.start, colours.arc.end],
+                        center: .center,
+                        startAngle: .zero, endAngle: .degrees(360 * DictationConfig.thinkingArcFraction)
+                    ),
+                    style: StrokeStyle(lineWidth: DictationConfig.thinkingRimWidth, lineCap: .round)
+                )
+                .rotationEffect(.degrees(360 * turns.truncatingRemainder(dividingBy: 1)))
+        }
+    }
+
+    /// The track's colour and the arc's two ends: the brand blue → purple, or the retry's colours
+    /// while retrying.
     static func colours(isRetrying: Bool) -> (track: Color, arc: (start: Color, end: Color)) {
-        let shift = isRetrying ? DictationConfig.thinkingRetryColourShift : 0
-        return (colour(at: shift), (colour(at: shift), colour(at: DictationConfig.thinkingArcEndColour + shift)))
+        if isRetrying {
+            return (Palette.retryArcStart, (Palette.retryArcStart, Palette.retryArcEnd))
+        }
+        return (colour(at: 0), (colour(at: 0), colour(at: DictationConfig.thinkingArcEndColour)))
     }
 
     /// A point on the TabMail icon's blue → purple gradient (0 = blue, 1 = purple).
     static func colour(at fraction: Double) -> Color {
-        let blue = (red: 0.0, green: 0x91 / 255.0, blue: 1.0)
-        let purple = (red: 0x7B / 255.0, green: 0.0, blue: 1.0)
-        return Color(
-            red: blue.red + (purple.red - blue.red) * fraction,
-            green: blue.green + (purple.green - blue.green) * fraction,
-            blue: blue.blue + (purple.blue - blue.blue) * fraction
-        )
+        Palette.brandBlue.mix(with: Palette.brandPurple, by: fraction, in: .device)
     }
 }
 
@@ -115,7 +121,7 @@ private struct Waveform: View {
             }
             .frame(height: DictationConfig.meterMaxBarHeight)
         }
-        .animation(.easeInOut(duration: DictationConfig.waveformColourTransition), value: colour)
+        .animation(.easeInOut(duration: DictationConfig.colourTransition), value: colour)
     }
 
     private func barHeight(_ index: Int, time: TimeInterval) -> CGFloat {

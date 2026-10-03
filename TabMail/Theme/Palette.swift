@@ -39,6 +39,21 @@ enum Palette {
 
     // MARK: - Link
     static let link = Color(light: Color(hex: 0x0060DF), dark: Color(hex: 0x0A84FF))
+
+    // MARK: - Dictation (as TabMail Voice's `src/core/palette.ts`)
+    /// The TabMail icon's gradient, blue → purple: the transcribing spinner's arc.
+    static let brandBlue = Color(hex: 0x0091FF)
+    static let brandPurple = Color(hex: 0x7B00FF)
+    /// The waveform: a washed-out grey-blue while the dictation waits for speech, then a vivid iOS
+    /// system blue once speech is heard, a sign it is recording (owner, 2026-10-02, chosen from a page
+    /// of candidates; was the accent blue throughout, then purple, then a muted crimson).
+    static let waveformWaiting = Color(hex: 0x9DB3C9)
+    static let waveformVoiced = Color(hex: 0x0A84FF)
+    /// The spinner's arc while a server error is tried again, from its start to its end, and its
+    /// track in the start colour: fuchsia, so the retry shows (owner, 2026-10-03, chosen from a page of
+    /// candidates; was the brand gradient moved 0.3 toward purple, too close to blue to notice).
+    static let retryArcStart = Color(hex: 0xC026D3)
+    static let retryArcEnd = Color(hex: 0xE0399E)
 }
 
 // MARK: - Color Extensions
