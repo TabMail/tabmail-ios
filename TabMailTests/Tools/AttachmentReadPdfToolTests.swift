@@ -91,6 +91,26 @@ struct AttachmentReadPdfToolTests {
         #expect(try errorMessage(result) == "invalid or missing unique_id")
     }
 
+    @Test("A numeric unique_id too large for an Int is rejected, not trapped on")
+    func hugeNumericId() async throws {
+        let fixture = try await makeFixture(attachments: [])
+        let reader = tool(fixture, FakeServer())
+        for value: JSONValue in [.double(1e20), .double(-1e300), .double(42.5)] {
+            let result = try await reader.execute(arguments: ["unique_id": value])
+            #expect(try errorMessage(result) == "invalid or missing unique_id")
+        }
+    }
+
+    @Test("A unique_id whose message row is gone is not found")
+    func headerMissing() async throws {
+        let fixture = try await makeFixture(attachments: [])
+        let translator = MockChatIdTranslator()
+        await translator.seed(7, realId: "acc1:INBOX:missing")
+        let ctx = ToolContext(db: fixture.db, translator: translator)
+        let reader = AttachmentReadPdfTool(context: ctx, fetchAttachment: FakeServer().fetcher, loadBody: { _ in })
+        #expect(try errorMessage(try await reader.execute(arguments: ["unique_id": .int(7)])) == "message not found")
+    }
+
     @Test("Unknown unique_id is not found")
     func unknownId() async throws {
         let fixture = try await makeFixture(attachments: [])
@@ -299,6 +319,18 @@ struct AttachmentReadPdfToolTests {
         #expect(try errorMessage(result) == "the PDF is too large to read (25.0 MB; the limit is 25.0 MB)")
     }
 
+    @Test("A file of exactly the size limit is downloaded and parsed, not refused as too large")
+    func exactlyAtSizeLimit() async throws {
+        let limit = AttachmentReadPdfTool.Config.maxFileBytes
+        var exact = Data("%PDF-1.7\n".utf8)
+        exact.append(Data(count: limit - exact.count))
+        let fixture = try await makeFixture(attachments: [pdf("2", "edge.pdf", size: limit)])
+        let server = FakeServer(["2": exact])
+        let result = try await tool(fixture, server).execute(arguments: ["unique_id": .int(42)])
+        #expect(server.fetched.withLock { $0 } == ["2"])
+        #expect(try errorMessage(result) == "the file is not a readable PDF (it is damaged or not really a PDF)")
+    }
+
     @Test("A failed download is reported")
     func downloadFails() async throws {
         let fixture = try await makeFixture(attachments: [pdf("2", "a.pdf")])
@@ -312,6 +344,40 @@ struct AttachmentReadPdfToolTests {
     func notAPdf() async throws {
         let fixture = try await makeFixture(attachments: [pdf("2", "fake.pdf")])
         let result = try await tool(fixture, FakeServer(["2": Data("PK\u{03}\u{04}zip".utf8)])).execute(arguments: ["unique_id": .int(42)])
+        #expect(try errorMessage(result) == "the file is not a readable PDF (it is damaged or not really a PDF)")
+    }
+
+    @Test("A decompression bomb is refused as not a readable PDF; the same PDF without it is read")
+    func decompressionBomb() async throws {
+        let document = PDFFixtures.make([.text("Alpha")])
+        let bomb = PDFFixtures.streamObject(900, dictionary: "<< /Filter /FlateDecode >>", data: PDFFixtures.flateZeros(2_000_000))
+        let fixture = try await makeFixture(attachments: [pdf("2", "bomb.pdf"), pdf("3", "plain.pdf")])
+        let capped = PDFTextExtractor.Limits(
+            maxPages: 20, maxOutputChars: 100_000, timeout: .seconds(20),
+            streamCaps: PDFStreamBudget.Caps(streamBytes: 1_000_000, totalBytes: 10_000_000))
+        let reader = tool(fixture, FakeServer(["2": document + bomb, "3": document]), limits: capped)
+
+        let refused = try await reader.execute(arguments: ["unique_id": .int(42), "attachment_name": .string("bomb.pdf")])
+        #expect(try errorMessage(refused) == "the file is not a readable PDF (it is damaged or not really a PDF)")
+        let read = try await reader.execute(arguments: ["unique_id": .int(42), "attachment_name": .string("plain.pdf")])
+        #expect(read.contains("[page 1]\nAlpha"))
+    }
+
+    @Test("A page drawing more text than the cap is reported as unreadable")
+    func pageTextCap() async throws {
+        let data = PDFFixtures.make([.text("Alpha"), .text(String(repeating: "Bravo ", count: 20))])
+        let fixture = try await makeFixture(attachments: [pdf("2", "dense.pdf")])
+        let capped = PDFTextExtractor.Limits(maxPages: 20, maxOutputChars: 100_000, timeout: .seconds(20), maxPageTextBytes: 50)
+        let result = try await tool(fixture, FakeServer(["2": data]), limits: capped).execute(arguments: ["unique_id": .int(42)])
+        #expect(result.contains("[page 1]\nAlpha\n[page 2]\n(this page could not be read)"))
+    }
+
+    @Test("A PDF header past the signature window is refused before parsing")
+    func headerPastWindow() async throws {
+        var data = Data(repeating: UInt8(ascii: "x"), count: AttachmentReadPdfTool.Config.signatureScanBytes)
+        data.append(PDFFixtures.make([.text("Hidden behind junk")]))
+        let fixture = try await makeFixture(attachments: [pdf("2", "junk.pdf")])
+        let result = try await tool(fixture, FakeServer(["2": data])).execute(arguments: ["unique_id": .int(42)])
         #expect(try errorMessage(result) == "the file is not a readable PDF (it is damaged or not really a PDF)")
     }
 
@@ -365,6 +431,18 @@ struct AttachmentReadPdfToolTests {
         #expect(result.contains("Loaded later"))
     }
 
+    @Test("A message that disappears while its body loads is not found")
+    func headerGoneAfterBodyLoad() async throws {
+        let fixture = try await makeFixture(attachments: nil)
+        let db = fixture.db
+        let server = FakeServer()
+        let reader = tool(fixture, server, loadBody: { header in
+            try await db.write { db -> Void in try MessageHeader.filter(key: header.id).deleteAll(db) }
+        })
+        #expect(try errorMessage(try await reader.execute(arguments: ["unique_id": .int(42)])) == "message not found")
+        #expect(server.fetched.withLock { $0 }.isEmpty)
+    }
+
     @Test("A body that cannot be loaded means the attachments cannot be listed")
     func bodyLoadFails() async throws {
         let fixture = try await makeFixture(attachments: nil)
@@ -383,5 +461,15 @@ struct AttachmentReadPdfToolTests {
     func registered() {
         #expect(ToolRegistry.makeDefaultTools().contains { $0.name == "attachment_read_pdf" })
         #expect(ToolRegistry.activityLabel(for: "attachment_read_pdf") == "Reading PDF")
+    }
+
+    /// The backend offers `attachment_read_pdf` only to clients whose `X-Client-Version` is
+    /// 1.9.0 or later (`common/attachment_read_pdf-v1.9.0.json`). That header is the protocol
+    /// version, not the marketing version.
+    @Test("The app advertises a protocol version that is offered the tool")
+    func advertisesToolVersion() throws {
+        let parts = BackendClient.clientVersion.split(separator: ".").map { Int($0) ?? 0 }
+        try #require(parts.count == 3)
+        #expect(parts.lexicographicallyPrecedes([1, 9, 0]) == false)
     }
 }

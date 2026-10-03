@@ -23,6 +23,13 @@ struct AttachmentReadPdfTool: AgentTool, Sendable {
         static let parseTimeout: Duration = .seconds(20)
         /// How far into the file the "%PDF-" header may sit (readers tolerate leading junk).
         static let signatureScanBytes = 1024
+        /// Decompression caps checked before PDFKit opens the file (`PDFStreamBudget`). Per stream
+        /// as pypdf (75 MB); in total because CoreGraphics keeps decoded font maps.
+        static let maxDecodedStreamBytes = 75_000_000
+        static let maxDecodedTotalBytes = 256_000_000
+        /// Drawn-string bytes a page may have before PDFKit lays it out, at ~430 bytes per
+        /// character (`PDFPageGlyphCounter`): at most ~86 MB for one page.
+        static let maxPageTextBytes = 200_000
     }
 
     typealias AttachmentFetcher = @Sendable (MessageHeader, AttachmentInfo) async throws -> Data
@@ -59,8 +66,8 @@ struct AttachmentReadPdfTool: AgentTool, Sendable {
             numericId = n
         } else if case .string(let s) = arguments["unique_id"], let n = Int(s) {
             numericId = n
-        } else if case .double(let d) = arguments["unique_id"] {
-            numericId = Int(d)
+        } else if case .double(let d) = arguments["unique_id"], let n = Int(exactly: d) {
+            numericId = n
         } else {
             return Self.error("invalid or missing unique_id")
         }

@@ -4,14 +4,17 @@
 
 import Foundation
 import PDFKit
-import Synchronization
 
 /// Bounded, text-only PDF extraction for `AttachmentReadPdfTool`, mirroring TB's
 /// `chat/modules/pdfText.js`. PDFKit is used only for `PDFDocument(data:)` and each page's
 /// `string`: nothing is rendered, and PDF scripts and form actions are never run.
 ///
-/// Parsing runs in a detached task, off the main actor and off `ToolRegistry`'s actor, so a heavy
-/// PDF cannot stall the UI or other tools.
+/// PDFKit has no memory bound of its own, so two checks run before it: `PDFStreamBudget` refuses
+/// a file whose streams would decompress past a cap (decompression bombs), and
+/// `PDFPageGlyphCounter` leaves out a page that draws more text than PDFKit can lay out cheaply.
+///
+/// Parsing runs in its own task (`withTimeout`), off the main actor and off `ToolRegistry`'s actor,
+/// so a heavy PDF cannot stall the UI or other tools.
 enum PDFTextExtractor {
 
     struct Limits: Sendable {
@@ -19,12 +22,30 @@ enum PDFTextExtractor {
         /// Counted in UTF-16 code units, like TB (JavaScript string length).
         let maxOutputChars: Int
         let timeout: Duration
+        let streamCaps: PDFStreamBudget.Caps
+        /// Bytes of drawn strings a page may have before it is left out (see `PDFPageGlyphCounter`).
+        let maxPageTextBytes: Int
+
+        init(
+            maxPages: Int, maxOutputChars: Int, timeout: Duration,
+            streamCaps: PDFStreamBudget.Caps = PDFStreamBudget.Caps(
+                streamBytes: AttachmentReadPdfTool.Config.maxDecodedStreamBytes,
+                totalBytes: AttachmentReadPdfTool.Config.maxDecodedTotalBytes),
+            maxPageTextBytes: Int = AttachmentReadPdfTool.Config.maxPageTextBytes
+        ) {
+            self.maxPages = maxPages
+            self.maxOutputChars = maxOutputChars
+            self.timeout = timeout
+            self.streamCaps = streamCaps
+            self.maxPageTextBytes = maxPageTextBytes
+        }
     }
 
     struct Page: Sendable, Equatable {
         let page: Int
         let text: String
-        /// PDFKit returned no page object for this index.
+        /// PDFKit returned no page object for this index, or the page draws more text than
+        /// `Limits.maxPageTextBytes` and was left out.
         let unreadable: Bool
         /// The page's full length when it was cut at the output limit; nil otherwise.
         let cutFrom: Int?
@@ -70,40 +91,34 @@ enum PDFTextExtractor {
     /// so every call makes progress. The cap bounds what reaches the model's context window;
     /// nothing is stored either way.
     ///
-    /// Returns `.timeout` once `limits.timeout` has passed. PDFKit cannot be interrupted inside a
-    /// call, so the abandoned work stops at its next page boundary.
+    /// Returns `.malformed` for a file `PDFStreamBudget` refuses, and `.timeout` once
+    /// `limits.timeout` has passed (`withTimeout`). PDFKit cannot be interrupted inside a call, so
+    /// the abandoned work stops at its next page boundary; the two checks stop at the deadline.
     static func extract(data: Data, startPage: Int, endPage: Int?, limits: Limits) async -> Outcome {
         let deadline = ContinuousClock.now + limits.timeout
-        return await withCheckedContinuation { continuation in
-            let once = ResumeOnce(continuation)
-            let timer = Task.detached {
-                do { try await Task.sleep(until: deadline, clock: .continuous) } catch { return }
-                once.resume(.timeout)
+        let seconds = Double(limits.timeout.components.seconds)
+            + Double(limits.timeout.components.attoseconds) / 1e18
+        do {
+            return try await withTimeout(seconds: seconds) {
+                readPages(data: data, startPage: startPage, endPage: endPage, limits: limits, deadline: deadline)
             }
-            Task.detached(priority: .userInitiated) {
-                let outcome = readPages(data: data, startPage: startPage, endPage: endPage,
-                                        limits: limits, deadline: deadline)
-                timer.cancel()
-                once.resume(outcome)
-            }
-        }
-    }
-
-    private final class ResumeOnce: Sendable {
-        private let continuation: Mutex<CheckedContinuation<Outcome, Never>?>
-        init(_ continuation: CheckedContinuation<Outcome, Never>) {
-            self.continuation = Mutex(continuation)
-        }
-        func resume(_ outcome: Outcome) {
-            continuation.withLock { $0.take() }?.resume(returning: outcome)
+        } catch {
+            // `readPages` does not throw, so the only error is `TimeoutError`.
+            return .timeout
         }
     }
 
     private static func readPages(
         data: Data, startPage: Int, endPage: Int?, limits: Limits, deadline: ContinuousClock.Instant
     ) -> Outcome {
-        let pastDeadline = { ContinuousClock.now >= deadline }
+        let pastDeadline = { Task.isCancelled || ContinuousClock.now >= deadline }
         if pastDeadline() { return .timeout }
+
+        switch PDFStreamBudget.check(data, caps: limits.streamCaps, deadline: deadline) {
+        case .withinBudget: break
+        case .overBudget: return .malformed
+        case .timedOut: return .timeout
+        }
 
         guard let document = PDFDocument(data: data) else { return .malformed }
         // `isLocked` stays true only when a non-empty user password is needed; a PDF with just an
@@ -124,20 +139,32 @@ enum PDFTextExtractor {
         for pageNumber in startPage...lastRequested {
             if pastDeadline() { return .timeout }
             let pdfPage = document.page(at: pageNumber - 1)
-            let text = normalize(pdfPage?.string ?? "")
+            var text = ""
+            var unreadable = true
+            if let pageRef = pdfPage?.pageRef {
+                switch PDFPageGlyphCounter.check(pageRef, maxBytes: limits.maxPageTextBytes, deadline: deadline) {
+                case .withinBudget:
+                    text = normalize(pdfPage?.string ?? "")
+                    unreadable = false
+                case .overBudget:
+                    break
+                case .timedOut:
+                    return .timeout
+                }
+            }
             let length = text.utf16.count
 
             if usedChars + length > limits.maxOutputChars {
                 if pages.isEmpty {
                     pages.append(Page(page: pageNumber, text: cut(text, toUTF16Length: limits.maxOutputChars),
-                                      unreadable: pdfPage == nil, cutFrom: length))
+                                      unreadable: unreadable, cutFrom: length))
                     cutPage = pageNumber
                 } else {
                     stoppedAt = pageNumber
                 }
                 break
             }
-            pages.append(Page(page: pageNumber, text: text, unreadable: pdfPage == nil, cutFrom: nil))
+            pages.append(Page(page: pageNumber, text: text, unreadable: unreadable, cutFrom: nil))
             usedChars += length
         }
 

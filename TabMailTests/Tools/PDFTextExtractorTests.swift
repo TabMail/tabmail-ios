@@ -9,8 +9,13 @@ import Foundation
 @Suite("PDFTextExtractor")
 struct PDFTextExtractorTests {
 
-    private func limits(maxPages: Int = 20, maxOutputChars: Int = 100_000, timeout: Duration = .seconds(20)) -> PDFTextExtractor.Limits {
-        PDFTextExtractor.Limits(maxPages: maxPages, maxOutputChars: maxOutputChars, timeout: timeout)
+    private func limits(maxPages: Int = 20, maxOutputChars: Int = 100_000, timeout: Duration = .seconds(20),
+                        streamCaps: PDFStreamBudget.Caps? = nil, maxPageTextBytes: Int? = nil) -> PDFTextExtractor.Limits {
+        let defaults = PDFTextExtractor.Limits(maxPages: maxPages, maxOutputChars: maxOutputChars, timeout: timeout)
+        return PDFTextExtractor.Limits(
+            maxPages: maxPages, maxOutputChars: maxOutputChars, timeout: timeout,
+            streamCaps: streamCaps ?? defaults.streamCaps,
+            maxPageTextBytes: maxPageTextBytes ?? defaults.maxPageTextBytes)
     }
 
     private func extract(_ data: Data, start: Int = 1, end: Int? = nil,
@@ -128,6 +133,16 @@ struct PDFTextExtractorTests {
         #expect(used <= 15)
     }
 
+    @Test("Pages that end exactly at the text limit are kept whole")
+    func exactlyAtOutputLimit() async throws {
+        let data = PDFFixtures.make([.text("Alpha"), .text("Bravo"), .text("Charlie")])
+        let result = try #require(pages(await extract(data, limits: limits(maxOutputChars: 10))))
+        #expect(result.pages.map(\.text) == ["Alpha", "Bravo"])
+        #expect(result.cutPage == nil)
+        #expect(result.stoppedAtOutputLimit)
+        #expect(result.nextStartPage == 3)
+    }
+
     @Test("A first page longer than the limit is cut so the call still makes progress")
     func cutsFirstPage() async throws {
         let long = String(repeating: "Lorem ipsum dolor sit amet ", count: 20)
@@ -184,6 +199,30 @@ struct PDFTextExtractorTests {
         let data = PDFFixtures.make([.text("Restricted but readable")], ownerPassword: "owner-pass")
         let result = try #require(pages(await extract(data)))
         #expect(result.pages.first?.text.contains("Restricted but readable") == true)
+    }
+
+    // MARK: - Memory bounds
+
+    @Test("A file whose streams inflate past the cap is malformed; the same file without it is read")
+    func decompressionBomb() async throws {
+        let document = PDFFixtures.make([.text("Alpha")])
+        let bomb = PDFFixtures.streamObject(900, dictionary: "<< /Filter /FlateDecode >>", data: PDFFixtures.flateZeros(2_000_000))
+        let capped = limits(streamCaps: PDFStreamBudget.Caps(streamBytes: 1_000_000, totalBytes: 10_000_000))
+        #expect(await extract(document + bomb, limits: capped) == .malformed)
+        let result = try #require(pages(await extract(document, limits: capped)))
+        #expect(result.pages.first?.text == "Alpha")
+    }
+
+    @Test("A page drawing more text than the cap is left out as unreadable; other pages are read")
+    func pageTextCap() async throws {
+        let data = PDFFixtures.make([.text("Alpha"), .text(String(repeating: "Bravo ", count: 20)), .text("Charlie")])
+        let result = try #require(pages(await extract(data, limits: limits(maxPageTextBytes: 50))))
+        #expect(result.pages.map(\.text) == ["Alpha", "", "Charlie"])
+        #expect(result.pages.map(\.unreadable) == [false, true, false])
+        #expect(result.nextStartPage == nil)
+
+        let uncapped = try #require(pages(await extract(data)))
+        #expect(uncapped.pages.allSatisfy { !$0.unreadable })
     }
 
     // MARK: - Deadline

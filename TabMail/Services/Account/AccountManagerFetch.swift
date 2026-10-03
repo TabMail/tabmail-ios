@@ -290,9 +290,10 @@ extension AccountManager {
             item: item,
             provider: queue.provider,
             enableAI: true,
-            // Every caller of `fetchBody` is a user-driven detail-view path
-            // (open, poll, pull-to-refresh, thread load), so this producer is
-            // user intent by construction: the AI enqueue it triggers is
+            // Every caller of `fetchBody` is user-driven: the detail-view paths
+            // (open, poll, pull-to-refresh, thread load) and the chat agent's
+            // `attachment_read_pdf`, run when the user asks about that message.
+            // So this producer is user intent by construction: the AI enqueue it triggers is
             // window-exempt (ADR-IOS-078 pathway regating — the deferred-body
             // half of the manual-open exemption).
             aiWindowExempt: true,
