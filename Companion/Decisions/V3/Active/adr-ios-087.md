@@ -53,9 +53,11 @@ the backend answers any provider failure 502, which the apps retry.
 5. **Retries.** While the user dictates, a chunk failing with a server error, a dropped connection or
    the backend's own timeout (504) is tried again after each of `chunkRetryDelays` (1, 2, 5, 10 s,
    the last repeating), showing nothing. The release cuts any such wait short; from then on a chunk
-   gets `transcriptionRetryDelays` more tries on a server error, as one recording does, under the
-   pill's retry state (`isRetrying`, then `showsRetryNote`). Anything else (signed out, over quota, a
-   refused request) gives up at once.
+   gets `transcriptionRetryDelays` more tries (about a minute, ADR-IOS-085 amendment 2026-10-03) on
+   the same failures, a 504 included, under the pill's retry state (`isRetrying`, then
+   `showsRetryNote`): the last chunk is sent at the release, so its backend timeout comes after it
+   (owner: "we should not lose the end"). Anything else (signed out, over quota, a refused request)
+   gives up at once.
 6. **What is pasted.** The chunks' texts in order up to the first chunk that gave up; the chunks
    after it are cancelled. The first chunk giving up pastes nothing, as one recording's failure does.
    iOS says nothing about a missing end: dictation failures are silent (ADR-IOS-085 decision 8);
@@ -72,8 +74,8 @@ the backend answers any provider failure 502, which the apps retry.
   earlier chunks were transcribed while the user spoke.
 - A cancelled long dictation has already sent its earlier chunks (as Voice).
 - A forced, overlapped seam with no shared run of words may repeat a few words; none are lost (owner).
-- A rate-limit burst after the release can still lose the end of the dictation once the last tries
-  run out (open: whether to lengthen the after-release retries, asked 2026-10-03).
+- A rate-limit burst after the release loses the end of the dictation only if it outlasts the last
+  tries, about a minute (owner, 2026-10-03: "we definitely need more retries"; they were 2 s).
 - Synthetic constant sound (one steady tone) has no frame above the room level and counts as no
   speech: its chunks are not sent, only the last. Speech always varies; the tests use speech-like
   audio.

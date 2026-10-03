@@ -578,13 +578,14 @@ struct DictationControllerTests {
 
     @Test func aTranscriptionFailingEveryRetryEndsQuietly() async {
         let capture = FakeCapture()
-        let controller = controller(capture: capture, transcript: { throw DictationError(status: 502, code: "transcription_failed") })
+        let retryDelays: [Duration] = [.milliseconds(1), .milliseconds(1)]
+        let controller = controller(capture: capture, transcript: { throw DictationError(status: 502, code: "transcription_failed") }, retryDelays: retryDelays)
 
         await dictate(controller, capture: capture)
         await waitUntil { controller.phase == .idle }
 
         #expect(controller.phase == .idle)
-        #expect(recorded.uploads.withLock { $0.count } == 1 + DictationConfig.transcriptionRetryDelays.count)
+        #expect(recorded.uploads.withLock { $0.count } == 1 + retryDelays.count)
         #expect(recorded.texts.withLock { $0.isEmpty })
         #expect(!controller.isRetrying)
     }

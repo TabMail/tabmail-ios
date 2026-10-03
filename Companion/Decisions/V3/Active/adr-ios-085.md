@@ -331,3 +331,10 @@ circling together whose opacities ease over `colourTransition`, and back when a 
 A dictation longer than one upload is cut into chunks as it is recorded, each sent at once with its own
 cleanup and retried while the user speaks; the text is the chunks' in order up to the first that gave
 up. No upload is longer than the 120 s the model takes. Failures stay silent (decision 8).
+
+**Amendment 2026-10-03 — more and longer retries (owner).** *"We definitely need more retries …
+lengthen them, and we should not lose the end."* Measured the same day, the speech model's provider
+refused about one try in three as rate limited, in bursts of seconds; two tries 2 s apart could not
+outlast one. `transcriptionRetryDelays` is now 0.5, 1.5, 3, 5, 10, 10, 15 and 15 s, about a minute in
+all, as TabMail Voice's (ADR-DESK-039 amendment); the retry note still shows from 2 s and cancel ends it
+at once. A recording's 504 is still not retried; a long dictation's chunk retries it (ADR-IOS-087).

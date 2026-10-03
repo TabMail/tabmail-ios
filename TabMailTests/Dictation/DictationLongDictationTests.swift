@@ -350,6 +350,30 @@ struct DictationLongDictationTests {
         #expect(backend.inFlight == 0)
     }
 
+    /// The last chunk is sent at the release, so the backend's own timeout on it comes after the
+    /// release: it is tried again, as while recording (owner, 2026-10-03: "we should not lose the end").
+    @Test func theLastChunkTimingOutOnTheBackendAfterTheReleaseIsTriedAgainAndTheEndIsPasted() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, attempt in index == 1 && attempt < 2 ? .gatewayTimeout : .part }
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 10, 12, 4)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
+        #expect(backend.attempts == [1, 3])
+    }
+
+    /// The provider's rate limits come in bursts of seconds: the last tries after the release span
+    /// about a minute (owner, 2026-10-03: "we definitely need more retries … we should not lose the end").
+    @Test func theLastTriesAfterTheReleaseOutlastABurstOfRateLimits() {
+        let total = DictationConfig.transcriptionRetryDelays.reduce(Duration.zero, +)
+        #expect(total >= .seconds(45))
+        #expect(DictationConfig.transcriptionRetryDelays.count >= 6)
+    }
+
     /// The first chunk giving up loses the dictation, as one recording's failure does: nothing is
     /// pasted, whatever came after.
     @Test func theFirstChunkGivingUpPastesNothing() async {
