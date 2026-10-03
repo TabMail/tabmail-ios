@@ -82,6 +82,8 @@ private final class ChunkBackend: Sendable {
         var attempts: [Int] = []
         var inFlight = 0
         var cleanups: [[String: String]] = []
+        var languages: [String?] = []
+        var vocabularies: [[String]] = []
     }
 
     private let state = Mutex(State())
@@ -97,9 +99,13 @@ private final class ChunkBackend: Sendable {
     var attempts: [Int] { state.withLock { $0.attempts } }
     var inFlight: Int { state.withLock { $0.inFlight } }
     var cleanups: [[String: String]] { state.withLock { $0.cleanups } }
+    var languages: [String?] { state.withLock { $0.languages } }
+    var vocabularies: [[String]] { state.withLock { $0.vocabularies } }
+    /// Every request made, retries included.
+    var requests: Int { state.withLock { $0.cleanups.count } }
     var chunks: [Data] { state.withLock { $0.chunks } }
 
-    func transcribe(_ flac: Data, cleanup: [String: String]) async throws -> DictationTranscription {
+    func transcribe(_ flac: Data, language: String? = nil, vocabulary: [String] = [], cleanup: [String: String]) async throws -> DictationTranscription {
         let (index, attempt) = state.withLock { state in
             let index = state.chunks.firstIndex(of: flac) ?? {
                 state.chunks.append(flac)
@@ -109,6 +115,8 @@ private final class ChunkBackend: Sendable {
             defer { state.attempts[index] += 1 }
             state.inFlight += 1
             state.cleanups.append(cleanup)
+            state.languages.append(language)
+            state.vocabularies.append(vocabulary)
             return (index, state.attempts[index])
         }
         defer { state.withLock { $0.inFlight -= 1 } }
@@ -146,19 +154,22 @@ struct DictationLongDictationTests {
         _ backend: ChunkBackend,
         chunkRetryDelays: [Duration] = [.milliseconds(1)],
         retryDelays: [Duration] = [.milliseconds(1), .milliseconds(1)],
-        retryNoticeDelay: Duration = .seconds(60)
+        retryNoticeDelay: Duration = .seconds(60),
+        language: String? = nil,
+        words: [String] = [],
+        emailBody: @escaping DictationController.EmailBody = { _ in nil }
     ) -> DictationController {
         DictationController(
             capture: capture,
             requestMicrophoneAccess: { true },
             isOnline: { true },
             isOptedOutOfAI: { false },
-            dictationLanguage: { nil },
-            dictionary: { .init(words: [], learnsWords: false) },
-            emailBody: { _ in nil },
+            dictationLanguage: { language },
+            dictionary: { .init(words: words, learnsWords: false) },
+            emailBody: emailBody,
             corrections: nil,
             useWords: { _ in },
-            transcribe: { flac, _, _, cleanup in try await backend.transcribe(flac, cleanup: cleanup) },
+            transcribe: { flac, language, vocabulary, cleanup in try await backend.transcribe(flac, language: language, vocabulary: vocabulary, cleanup: cleanup) },
             warmUp: {},
             transcriptionRetryDelays: retryDelays,
             transcriptionRetryNoticeDelay: retryNoticeDelay,
@@ -291,6 +302,131 @@ struct DictationLongDictationTests {
 
         #expect(backend.sent == 2)
         #expect(pasted.texts.withLock { $0 } == [replies.joined(separator: " ")])
+    }
+
+    /// Every chunk goes with the dictation's language and its dictionary's words, as one recording
+    /// does: a long dictation in another language is not heard as English.
+    @Test func everyChunkGoesWithTheDictationsLanguageAndWords() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let controller = controller(capture, backend, language: "de", words: ["Zyxwordx"])
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 21, 12, 4)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(backend.sent == 2)
+        #expect(backend.languages == ["de", "de"])
+        #expect(backend.vocabularies.allSatisfy { $0.contains("Zyxwordx") })
+        #expect(backend.vocabularies.count == 2)
+    }
+
+    /// A long silence while recording (the user away) is cut into chunks that are not sent: quiet
+    /// boosted by the normalisation can be heard as words.
+    @Test func chunksCutFromALongSilenceWhileRecordingAreNotSent() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        var random = Audio.Random(seed: 22)
+        capture.feed(Audio.speech(12, &random) + Audio.room(1.5, &random) + Audio.room(120, &random) + Audio.speech(5, &random))
+        await waitUntil { backend.sent == 1 }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(backend.sent == 2)
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
+    }
+
+    /// With no chunk holding speech (a steady sound has no voice above its room), the last chunk is
+    /// sent anyway: the model decides, as for one recording.
+    @Test func withNoChunkHoldingSpeechTheLastIsSentAnyway() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        let rate = DictationConfig.recordingSampleRate
+        let seconds = Double(DictationConfig.chunkMaxDuration.components.seconds) + 10
+        capture.feed((0..<Int(seconds * rate)).map { Float(0.25 * sin(2 * Double.pi * 220 * Double($0) / rate)) })
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(backend.sent == 1)
+        #expect(pasted.texts.withLock { $0 } == ["Part 0."])
+    }
+
+    /// Each chunk is raised to the same peak on its own (ADR-IOS-085's −3 dBFS amendment): a quiet
+    /// stretch is not left quiet beside a loud one.
+    @Test func eachChunkIsPeakNormalisedOnItsOwn() async throws {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        var random = Audio.Random(seed: 23)
+        capture.feed(Audio.speech(12, &random, amplitude: 0.1) + Audio.room(1.5, &random))
+        await waitUntil { backend.sent == 1 }
+        capture.feed(Audio.speech(4, &random, amplitude: 0.4))
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        let chunks = backend.chunks
+        #expect(chunks.count == 2)
+        let target = Int((Double(Int16.max) * pow(10, DictationConfig.normalizedPeakDecibels / 20)).rounded())
+        for flac in chunks {
+            let pcm = try FLACTestDecoder.decode(flac).pcm
+            let peak = pcm.withUnsafeBytes { $0.bindMemory(to: Int16.self).reduce(0) { max($0, abs(Int($1))) } }
+            #expect(abs(peak - target) <= 1)
+        }
+    }
+
+    /// Cancelled while a chunk waits to be tried again: no request is made after the cancel.
+    @Test func noRequestIsMadeAfterACancelWhileAChunkWaitsToBeTriedAgain() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { _, _ in .serverError }
+        let controller = controller(capture, backend, chunkRetryDelays: [.seconds(3_600)])
+        await start(controller, capture)
+
+        var random = Audio.Random(seed: 24)
+        capture.feed(Audio.speech(12, &random) + Audio.room(1.5, &random) + Audio.speech(3, &random))
+        await waitUntil { backend.requests == 1 && backend.inFlight == 0 }
+        try? await Task.sleep(for: .milliseconds(100))
+        #expect(backend.requests == 1)
+        controller.cancel()
+        try? await Task.sleep(for: .milliseconds(500))
+
+        #expect(backend.requests == 1)
+        #expect(pasted.texts.withLock { $0 }.isEmpty)
+    }
+
+    /// Cancelled while the first chunk's upload is still prepared (the email's terms are read): it is
+    /// never sent.
+    @Test func noRequestIsMadeAfterACancelWhileTheChunksUploadIsPrepared() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let reading = Mutex(false)
+        let controller = controller(capture, backend, emailBody: { _ in
+            reading.withLock { $0 = true }
+            try? await Task.sleep(for: .seconds(30))
+            return nil
+        })
+        let pasted = pasted
+        controller.start(context: DictationContext(windowTitle: "Chat", screenText: "Me: hi\n» ‸", emailId: "email-1"), canUseAI: true) { text in pasted.texts.withLock { $0.append(text) } }
+        await waitUntil { capture.starts == 1 }
+
+        var random = Audio.Random(seed: 25)
+        capture.feed(Audio.speech(12, &random) + Audio.room(1.5, &random) + Audio.speech(1, &random))
+        await waitUntil { reading.withLock { $0 } }
+        try? await Task.sleep(for: .milliseconds(60))
+        #expect(backend.requests == 0)
+        controller.cancel()
+        try? await Task.sleep(for: .milliseconds(600))
+
+        #expect(backend.requests == 0)
+        #expect(pasted.texts.withLock { $0 }.isEmpty)
     }
 
     /// While the user is still dictating, a chunk that fails on the server's side, drops its

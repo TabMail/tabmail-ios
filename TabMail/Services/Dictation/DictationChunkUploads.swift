@@ -113,6 +113,8 @@ final class DictationChunkUploads {
     private func send(_ index: Int, encode: @escaping @Sendable () -> Data) async -> Result<DictationTranscription, any Error> {
         let flac = await Task.detached(priority: .userInitiated) { encode() }.value
         let upload = await upload.value
+        // Cancelled while the chunk was encoded or its upload prepared: nothing is sent.
+        guard !Task.isCancelled else { return .failure(CancellationError()) }
         BackgroundSyncLogger.logDebug("[Dictation] uploading chunk \(index) (\(flac.count) bytes of FLAC)")
         var waited = 0
         var lastTries = 0
@@ -134,6 +136,8 @@ final class DictationChunkUploads {
                     waits[index] = wait
                     await withTaskCancellationHandler { await wait.value } onCancel: { wait.cancel() }
                     waits[index] = nil
+                    // The release cuts the wait short and the chunk is tried at once; a cancel ends it.
+                    guard !Task.isCancelled else { return .failure(CancellationError()) }
                     continue
                 }
                 guard lastTries < lastRetryDelays.count, isRetryable else {

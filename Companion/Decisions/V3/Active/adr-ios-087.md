@@ -65,7 +65,9 @@ the backend answers any provider failure 502, which the apps retry.
    after it are cancelled. The first chunk giving up pastes nothing, as one recording's failure does.
    iOS says nothing about a missing end: dictation failures are silent (ADR-IOS-085 decision 8);
    the reason is in the debug log. (TabMail Voice shows a note.)
-7. **Cancel** (or the pill going away) cancels every chunk request and wait; nothing is pasted.
+7. **Cancel** (or the pill going away) cancels every chunk request and wait; nothing is pasted, and
+   no request is made after it (a chunk checks for the cancel after its upload is prepared and after
+   each retry wait, as TabMail Voice does).
 8. **Consent and privacy:** unchanged. The audio was already sent to the AI backend at the tap; it
    now leaves in parts while the user speaks, and nothing more is kept (zero retention, ADR-004).
    iOS's AI consent covers voice recordings (ADR-IOS-085), so no new notice is shown on iOS; TabMail
@@ -87,7 +89,10 @@ the backend answers any provider failure 502, which the apps retry.
 - Tests: `DictationChunkerTests` and `DictationChunkJoinTests` (ported from Voice),
   `DictationLongDictationTests` (order and cleanup, overlap join, retries while recording, last tries
   with the retry state, prefix delivery, first chunk lost, cancel, silent last chunk, a seeded fuzz
-  over random failures), and `DictationControllerTests.noUploadOutlastsWhatTheModelTranscribes` /
+  over random failures; and, from review: the words around a long silence, silent chunks cut while
+  recording not sent, the last sent when none held speech, each chunk's language and words, each
+  chunk peak-normalised on its own, no request after a cancel during a retry wait or the upload's
+  preparation), `DictationAudioRecorderTests.chunksAreCutAtThePauseCountingTheAudioHeldBeforeSpeech`, and `DictationControllerTests.noUploadOutlastsWhatTheModelTranscribes` /
   `theAppsControllerSendsALongDictationInChunksTheModelTranscribes`. Five mutants (failed chunks
   skipped, the release not ending waits, 504 not retried while recording, a silent last chunk sent,
   cancel not stopping requests) each fail at least one of them.
