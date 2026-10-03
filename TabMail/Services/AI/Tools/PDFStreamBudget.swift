@@ -70,12 +70,19 @@ enum PDFStreamBudget {
             } else if expander == nil, !blocked, let text = textFilter(named: name) {
                 textLayers.append(text)
             } else if expander == nil {
-                // An image codec or similar: CoreGraphics does not decode it to read text, and
-                // nothing after it can be counted.
+                // An image codec or similar, which nothing after can be counted behind. CoreGraphics
+                // decodes it to read text only for a stream a font reaches, and
+                // `PDFPageGlyphCounter` refuses a font reaching a stream `counts` rejects.
                 blocked = true
             }
         }
         return .count(textLayers: textLayers, expander: expander)
+    }
+
+    /// Whether this check counts all that CoreGraphics decodes from a stream with these filters.
+    static func counts(filters: [String]) -> Bool {
+        filters.allSatisfy { expander(named: $0) != nil || textFilter(named: $0) != nil }
+            && plan(filters: filters, indirect: false) != .refuse
     }
 
     private static func expander(named name: String) -> Expander? {

@@ -225,6 +225,16 @@ struct PDFTextExtractorTests {
         #expect(uncapped.pages.allSatisfy { !$0.unreadable })
     }
 
+    @Test("A page whose font reaches a CCITT map is left out as unreadable before PDFKit decodes it")
+    func fontReachingCCITTMap() async throws {
+        let ccitt = PDFPageGlyphCounterTests.ccitt
+        let bomb = PDFPageGlyphCounterTests.fontDocument(.toUnicode, filter: ccitt.filter, data: ccitt.data)
+        let refused = try #require(pages(await extract(bomb)))
+        #expect(refused.pages.map(\.unreadable) == [true])
+        let control = try #require(pages(await extract(PDFPageGlyphCounterTests.fontDocument(.toUnicode))))
+        #expect(control.pages.map(\.unreadable) == [false])
+    }
+
     // MARK: - Deadline
 
     @Test("A passed deadline returns timeout")

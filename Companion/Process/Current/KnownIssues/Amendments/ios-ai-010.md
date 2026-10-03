@@ -15,7 +15,8 @@ read safely", while the Thunderbird add-on (pdf.js) reads its text.
 Measured by the round-2 review: one page with a 5100×5100 lossless RGB image (78 MB decoded, a
 0.36 MB file) is refused, and so are 15 pages each with a 2600×2600 lossless image (304 MB in
 total). PDFKit reads either at about 73 MB. JPEG (`DCTDecode`), JPEG 2000, JBIG2 and CCITT images
-are not counted, so typical scans and photos are not affected. Roughly 17 full-screen Retina
+are not counted, so typical scans and photos are not affected. CoreGraphics decodes such a stream
+to read text only when a font reaches it, and `PDFPageGlyphCounter` leaves that page out instead. Roughly 17 full-screen Retina
 screenshots stored losslessly pass the total cap.
 
 Asked to choose between this honest refusal and exempting image streams (which needs a

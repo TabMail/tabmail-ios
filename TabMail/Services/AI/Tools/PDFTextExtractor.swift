@@ -11,7 +11,8 @@ import PDFKit
 ///
 /// PDFKit has no memory bound of its own, so two checks run before it: `PDFStreamBudget` refuses
 /// a file whose streams would decompress past a cap (decompression bombs), and
-/// `PDFPageGlyphCounter` leaves out a page that draws more text than PDFKit can lay out cheaply.
+/// `PDFPageGlyphCounter` leaves out a page that draws more text than PDFKit can lay out cheaply,
+/// or whose fonts reach a stream the budget cannot count.
 ///
 /// Parsing runs in its own task (`withTimeout`), off the main actor and off `ToolRegistry`'s actor,
 /// so a heavy PDF cannot stall the UI or other tools.

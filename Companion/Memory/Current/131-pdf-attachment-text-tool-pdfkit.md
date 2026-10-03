@@ -98,6 +98,21 @@ So two checks run before PDFKit sees anything:
     460-PDF sample drew forms 89,744 times, and 9 of its 5,973 pages passed 2,000. One million
     invocations of an empty form take the counter 2.7 s at 7 MB, so the deadline bounds the work.
   - Depth 4 never tripped on the sample, and it stops a self-drawing form.
+  - **Fonts (round-3 review, 2026-10-03).** It also follows every font the page selects (`Tf`, or
+    an `ExtGState` `/Font`) through CoreGraphics' dictionaries, decoding nothing, and leaves the
+    page out when the font reaches a stream whose filters `PDFStreamBudget.counts` rejects
+    (CCITT, JBIG2, DCT, JPX, `/Crypt`, an unknown name, a `/Filter` that is not names). The
+    pre-check leaves image codecs uncounted, and CoreGraphics decodes such a stream whole when a
+    font reaches it: a 5 KB CCITT `/ToUnicode` map decoding to 40 MB took `page.string` to
+    212 MB, and a variant with more code words pegged a core for about 400 s (the review's
+    measurement), which the deadline cannot stop. Measured roles that decode: `/ToUnicode`,
+    `/FontFile2` (83 MB), a stream `/Encoding` CMap, `/CIDToGIDMap`, a Type 3 font's resources,
+    and a font set by `gs`. Not decoded: a font in the resources that no operator selects, an
+    annotation's appearance, and an image a Type 3 glyph draws, so an image entry of an
+    `/XObject` dictionary is not followed (in any other role it is checked, as labels lie). Each
+    dictionary is followed once per role (a font dictionary that is also an `/XObject`
+    dictionary is still checked as a font), and a font reaching deeper than 16 objects is left
+    out. On the 460-PDF sample (11,267 pages) no page was left out.
   Both `CGPDFContentStreamCreate…` results must be released (`CGPDFContentStreamRelease`; not
   CF-bridged, so ARC does not), or each page and form leaks about 170 B.
 
@@ -109,6 +124,7 @@ PDFKit recovers that text, from the embedded font program. The extractor also st
 Validation: 400 PDFs shipped with macOS and Xcode, and 60 large real-world PDFs (up to 4,053
 pages and 69 MB), all passed both checks in at most 0.5 s, before and after the round-2 fixes.
 That sample has no large lossless images, so it did not show the IOS-AI-010 false refusal.
+The font check (round-3 fix) left out none of its 11,267 pages.
 - **Encrypted PDFs:** `isLocked` is true only when a user password is needed. An owner-only PDF
   opens and is read, which matches pdf.js.
 
