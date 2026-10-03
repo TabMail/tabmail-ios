@@ -76,6 +76,23 @@ struct DictationChunkJoinTests {
         #expect(join(paused(left), overlapping(right)) == "\(left) \(right)")
     }
 
+    @Test func anOverlapIsMatchedOnlyNearTheSeamInTheLaterTextToo() {
+        let filler = (0..<DictationConfig.chunkOverlapSearchWords).map { "f\($0)" }.joined(separator: " ")
+        // The shared words sit further than `chunkOverlapSearchWords` from the start of the later text.
+        let left = "we start with red green blue"
+        let right = "\(filler) red green blue again"
+        #expect(join(paused(left), overlapping(right)) == "\(left) \(right)")
+    }
+
+    /// A chunk overlaps only the one just before it. After an empty one (a long silence not sent, or
+    /// nothing heard), matching it against an earlier chunk's words would cut out the speech between.
+    @Test(arguments: ["", "  ", "…"])
+    func aChunkOverlappingAnEmptyOneIsJoinedWholeNotMatchedAgainstTheChunkBeforeThat(empty: String) {
+        let first = "I think that one of the main points is the travel cost and the hotel."
+        let last = "Okay, back again. I think that one of the main points we missed is staffing."
+        #expect(join(paused(first), overlapping(empty), overlapping(last)) == "\(first) \(last)")
+    }
+
     @Test func anOverlapAndAnEllipsisTogetherTheEllipsisGoesThenTheWordsAreMatched() {
         #expect(join(paused("we will meet on the second floor..."), overlapping("…on the second floor at noon")) == "we will meet on the second floor at noon")
     }

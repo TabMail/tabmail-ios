@@ -38,7 +38,10 @@ the backend answers any provider failure 502, which the apps retry.
    scripts written without spaces; an overlapped seam is joined at the longest run of at least
    `chunkOverlapMinimumRun` (3) words, compared in lower case with letters and digits only, within
    `chunkOverlapSearchWords` (80) of the seam, the run kept once; with no such run the two are joined
-   whole. Each side is cut at a word's place in its own text, so line breaks stay.
+   whole. Each side is cut at a word's place in its own text, so line breaks stay. A chunk overlaps
+   only the one just before it: after an empty or unsent one (a long silence) it is joined whole, or
+   matching it against an earlier chunk's words would cut out the speech between them (found in
+   review, 2026-10-03; the controller hands the join every part, empty ones included).
 3. **The recorder cuts as it records.** `AudioRecorder` feeds the chunker from `keepFromNow` (speech
    heard), the held pre-roll first, so the chunker's sample indices are the kept recording's. Each cut
    waits with its samples in `takeChunks`, and `onChunk` (on the audio thread) wakes the controller.

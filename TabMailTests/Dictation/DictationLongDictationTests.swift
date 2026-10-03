@@ -254,6 +254,45 @@ struct DictationLongDictationTests {
         #expect(pasted.texts.withLock { $0 } == ["We should ship the release on Friday because the tests are green and the notes are ready."])
     }
 
+    /// A long silence (the user away) cuts chunks with no speech in them, which are not sent; the
+    /// chunk after them overlaps a silent one, not the speech before the silence, so no word on either
+    /// side of the silence is lost however the two texts read.
+    @Test func theWordsOnBothSidesOfALongSilenceAreAllPasted() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let replies = [
+            "We should meet next week to talk about the budget. I think that one of the main points is the travel cost and the hotel.",
+            "Okay, back again. I think that one of the main points we missed is staffing, so let us add it.",
+        ]
+        let controller = DictationController(
+            capture: capture,
+            requestMicrophoneAccess: { true },
+            isOnline: { true },
+            isOptedOutOfAI: { false },
+            dictationLanguage: { nil },
+            dictionary: { .init(words: [], learnsWords: false) },
+            emailBody: { _ in nil },
+            corrections: nil,
+            useWords: { _ in },
+            transcribe: { flac, _, _, cleanup in
+                let index = (try await backend.transcribe(flac, cleanup: cleanup)).text == "raw 0" ? 0 : 1
+                return DictationTranscription(text: replies[index], cleanedText: replies[index])
+            },
+            warmUp: {},
+            speechDetector: { onSpeech, _ in LoudnessSpeechDetector(onSpeech: onSpeech) }
+        )
+        await start(controller, capture)
+
+        var random = Audio.Random(seed: 20)
+        capture.feed(Audio.speech(12, &random) + Audio.room(1.5, &random) + Audio.room(240, &random) + Audio.speech(5, &random))
+        await waitUntil { backend.sent == 1 }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(backend.sent == 2)
+        #expect(pasted.texts.withLock { $0 } == [replies.joined(separator: " ")])
+    }
+
     /// While the user is still dictating, a chunk that fails on the server's side, drops its
     /// connection or times out on the backend is tried again, with no retry state shown: nobody waits
     /// for it yet.

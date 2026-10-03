@@ -436,11 +436,12 @@ final class DictationController {
         uploads.add(last, send: last.hasSpeech || !uploads.hasSent) { FLACEncoder.encode(pcm16Mono: pcm, sampleRate: sampleRate) }
         let (parts, lost) = await uploads.release()
         guard generation == current, !Task.isCancelled else { return }
-        let heard = parts.compactMap { part -> (text: String, cleanedText: String?, overlapped: Bool)? in
-            let text = part.transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return text.isEmpty ? nil : (text, part.transcription.cleanedText, part.overlapped)
+        // Every part, empty ones too: an overlapped chunk is joined to the one just before it only.
+        let texts = parts.map { part in
+            (text: part.transcription.text.trimmingCharacters(in: .whitespacesAndNewlines), cleanedText: part.transcription.cleanedText, overlapped: part.overlapped)
         }
-        let transcript = DictationChunkJoin.join(heard.map { .init(text: $0.text, overlapped: $0.overlapped) })
+        let heard = texts.filter { !$0.text.isEmpty }
+        let transcript = DictationChunkJoin.join(texts.map { .init(text: $0.text, overlapped: $0.overlapped) })
         BackgroundSyncLogger.logDebug("[Dictation] transcript ready (\(transcript.count) chars, \(parts.count) of \(last.index + 1) chunks)")
         if let lost { BackgroundSyncLogger.logDebug("[Dictation] chunk \(parts.count) gave up (\(lost)); only the chunks before it are kept") }
         guard !transcript.isEmpty else {
@@ -448,7 +449,7 @@ final class DictationController {
             return
         }
         useWords(heard.flatMap { [$0.text] + [$0.cleanedText].compactMap { $0 } })
-        deliver(DictationChunkJoin.join(heard.map { .init(text: DictationCleanup.pasted(transcript: $0.text, cleanedText: $0.cleanedText), overlapped: $0.overlapped) }))
+        deliver(DictationChunkJoin.join(texts.map { .init(text: $0.text.isEmpty ? "" : DictationCleanup.pasted(transcript: $0.text, cleanedText: $0.cleanedText), overlapped: $0.overlapped) }))
     }
 
     /// Ends the dictation with its text, appended to the input field.

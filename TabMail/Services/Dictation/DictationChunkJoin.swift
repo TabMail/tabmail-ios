@@ -14,7 +14,9 @@ import Foundation
 ///   end of that one: the two are joined where their words first run together for at least
 ///   `chunkOverlapMinimumRun` words, the run kept once. With no such run they are joined whole
 ///   (owner, 2026-10-03: "better than losing things"): a few words may repeat, none are lost.
-/// - An empty chunk adds nothing. Nothing else is changed: no capital is lowered, no punctuation added.
+/// - An empty chunk adds nothing, and the chunk after it is joined whole: it overlaps only the empty
+///   one, so matching it against an earlier chunk's words would cut out the speech between them.
+///   Nothing else is changed: no capital is lowered, no punctuation added.
 enum DictationChunkJoin {
     /// One chunk's text, and whether its audio started inside the chunk before it
     /// (`DictationChunkCut.overlapped`).
@@ -25,16 +27,19 @@ enum DictationChunkJoin {
 
     static func join(_ parts: [Part]) -> String {
         var joined = ""
+        var previousHeard = false
         for part in parts {
             var text = part.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !joined.isEmpty { text = text.replacing(leadingEllipsis, with: "") }
+            let overlapsJoined = part.overlapped && previousHeard
+            previousHeard = !text.isEmpty
             if text.isEmpty { continue }
             if joined.isEmpty {
                 joined = text
                 continue
             }
             joined = joined.replacing(trailingEllipsis, with: "")
-            joined = part.overlapped ? joinOverlapping(joined, text) : joinedWith(joined, text)
+            joined = overlapsJoined ? joinOverlapping(joined, text) : joinedWith(joined, text)
         }
         return joined
     }
