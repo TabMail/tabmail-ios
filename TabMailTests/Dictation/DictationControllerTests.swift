@@ -913,25 +913,26 @@ struct DictationControllerTests {
     }
 
     /// Speech heard turns the waveform from a washed-out grey-blue (#9DB3C9) to a vivid iOS system
-    /// blue (#0A84FF), a sign it is recording; a retry after a server error moves the spinner's track
-    /// and arc toward purple (owner, 2026-10-02).
-    @Test func theWaveformTakesItsRecordingColourOnSpeechAndTheSpinnerPurpleWhileRetrying() {
-        let waiting = Color(red: 0x9D / 255.0, green: 0xB3 / 255.0, blue: 0xC9 / 255.0)
-        let recording = Color(red: 0x0A / 255.0, green: 0x84 / 255.0, blue: 0xFF / 255.0)
+    /// blue (#0A84FF), a sign it is recording (owner, 2026-10-02); a retry after a server error shows
+    /// the spinner's track and arc in fuchsia (#C026D3 → #E0399E) instead of the brand blue → purple
+    /// (owner, 2026-10-03).
+    @Test func theWaveformTakesItsRecordingColourOnSpeechAndTheSpinnerTheRetryColoursWhileRetrying() {
+        let waiting = Color(hex: 0x9DB3C9)
+        let recording = Color(hex: 0x0A84FF)
         #expect(DictationPillView.waveformColour(hasVoice: false) == waiting)
         #expect(DictationPillView.waveformColour(hasVoice: true) == recording)
         #expect(waiting != recording)
 
-        let shift = DictationConfig.thinkingRetryColourShift
         let resting = DictationSpinner.colours(isRetrying: false)
         let retrying = DictationSpinner.colours(isRetrying: true)
         #expect(resting.track == DictationSpinner.colour(at: 0))
         #expect(resting.arc.start == DictationSpinner.colour(at: 0))
         #expect(resting.arc.end == DictationSpinner.colour(at: DictationConfig.thinkingArcEndColour))
-        #expect(retrying.track == DictationSpinner.colour(at: shift))
-        #expect(retrying.arc.start == DictationSpinner.colour(at: shift))
-        #expect(retrying.arc.end == DictationSpinner.colour(at: DictationConfig.thinkingArcEndColour + shift))
-        #expect(shift > 0)
+        #expect(retrying.track == Color(hex: 0xC026D3))
+        #expect(retrying.arc.start == Color(hex: 0xC026D3))
+        #expect(retrying.arc.end == Color(hex: 0xE0399E))
+        #expect(retrying.arc.start != resting.arc.start)
+        #expect(retrying.arc.end != resting.arc.end)
     }
 
     /// Someone who says nothing sends nothing: stopping a dictation that never heard speech
@@ -1710,6 +1711,11 @@ struct DictationOptOutFlagTests {
         #expect(!pill.contains("return DictationConfig.meterMinBarHeight"))
         #expect(pill.contains(".fill(colour)"))
         #expect(pill.contains(".accessibilityElement(children: .ignore)\n        .accessibilityLabel(accessibilityLabel)"))
+        // Every colour change eases over the one `colourTransition`: the waveform's, and the
+        // spinner's two layers of colour, fading into and out of the retry's.
+        #expect(pill.contains(".animation(.easeInOut(duration: DictationConfig.colourTransition), value: colour)"))
+        #expect(pill.contains("Self.layer(Self.colours(isRetrying: false), turns: turns)\n                    .animation(.easeInOut(duration: DictationConfig.colourTransition)) { $0.opacity(isRetrying ? 0 : 1) }"))
+        #expect(pill.contains("Self.layer(Self.colours(isRetrying: true), turns: turns)\n                    .animation(.easeInOut(duration: DictationConfig.colourTransition)) { $0.opacity(isRetrying ? 1 : 0) }"))
         // Once a transcription has been tried again for a while, the note takes the waveform's place.
         #expect(pill.contains("if controller.showsRetryNote {\n                Text(Self.retryingMessage)"))
         #expect(!pill.contains("controller.isRetrying"))

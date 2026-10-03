@@ -184,14 +184,11 @@ enum DictationConfig {
     /// The bars always ripple this much (0…1), so the waveform looks alive between words and while
     /// the words are transcribed.
     static let waveformIdleLevel: Double = 0.05
-    /// The bars are a washed-out grey-blue (#9DB3C9) while the dictation waits for speech, and ease
-    /// to a vivid iOS system blue (#0A84FF) over `waveformColourTransition` once speech is heard: a
-    /// sign it is recording (owner, 2026-10-02, chosen from a page of candidates; was the accent blue
-    /// throughout, then purple). Red, green and blue, 0–1. As TabMail Voice's `waveformWaitingColor`
-    /// and `waveformVoicedColor`.
-    static let waveformWaitingColour = (red: 0x9D / 255.0, green: 0xB3 / 255.0, blue: 0xC9 / 255.0)
-    static let waveformVoicedColour = (red: 0x0A / 255.0, green: 0x84 / 255.0, blue: 0xFF / 255.0)
-    static let waveformColourTransition: Double = 0.4
+    /// Every colour change in dictation eases over this long, in seconds: the waveform's, from
+    /// `Palette.waveformWaiting` to `Palette.waveformVoiced` once speech is heard, and the spinner's,
+    /// to and from its retry colours (owner, 2026-10-03: "the transition time should be a variable
+    /// configured globally"). As TabMail Voice's `colorTransitionSeconds`.
+    static let colourTransition: Double = 0.4
     /// Each bar's ripple speed differs by up to this fraction, so the motion looks organic.
     static let waveformSpeedVariance: Double = 0.2
     /// Phase step (radians per bar) that spreads the speed variance across the bars.
@@ -213,10 +210,8 @@ enum DictationConfig {
     static let thinkingRevolutionsPerSecond: Double = 1.2
     static let thinkingTrackOpacity: Double = 0.2
     /// The arc runs from blue to this point on the blue → purple gradient: the full purple end
-    /// reads reddish on the spinning arc.
+    /// reads reddish on the spinning arc. While a transcription is tried again after a server
+    /// error, the arc and its track fade to `Palette.retryArcStart` → `Palette.retryArcEnd`, a sign
+    /// of the retry (owner, 2026-10-02; as TabMail Voice).
     static let thinkingArcEndColour: Double = 0.6
-    /// While a transcription is tried again after a server error, the arc and its track move
-    /// this far along the gradient toward purple, a hint of the retry (owner, 2026-10-02; as
-    /// TabMail Voice's `thinkingRetryColorShift`).
-    static let thinkingRetryColourShift: Double = 0.3
 }
