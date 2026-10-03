@@ -829,13 +829,15 @@ struct DictationControllerTests {
         heard.cancel()
     }
 
-    /// Speech heard turns the waveform from the accent blue to purple, a sign it is listening; a
-    /// retry after a server error moves the spinner's track and arc toward purple (owner, 2026-10-02).
-    @Test func theWaveformTurnsPurpleOnSpeechAndTheSpinnerWhileRetrying() {
-        let purple = DictationSpinner.colour(at: DictationConfig.waveformVoicedColour)
-        #expect(DictationPillView.waveformColour(hasVoice: false) == Theme.accent)
-        #expect(DictationPillView.waveformColour(hasVoice: true) == purple)
-        #expect(purple != Theme.accent)
+    /// Speech heard turns the waveform from a washed-out grey-blue (#9DB3C9) to a vivid iOS system
+    /// blue (#0A84FF), a sign it is recording; a retry after a server error moves the spinner's track
+    /// and arc toward purple (owner, 2026-10-02).
+    @Test func theWaveformTakesItsRecordingColourOnSpeechAndTheSpinnerPurpleWhileRetrying() {
+        let waiting = Color(red: 0x9D / 255.0, green: 0xB3 / 255.0, blue: 0xC9 / 255.0)
+        let recording = Color(red: 0x0A / 255.0, green: 0x84 / 255.0, blue: 0xFF / 255.0)
+        #expect(DictationPillView.waveformColour(hasVoice: false) == waiting)
+        #expect(DictationPillView.waveformColour(hasVoice: true) == recording)
+        #expect(waiting != recording)
 
         let shift = DictationConfig.thinkingRetryColourShift
         let resting = DictationSpinner.colours(isRetrying: false)
@@ -1619,7 +1621,7 @@ struct DictationOptOutFlagTests {
         #expect(!pill.contains("controller.language"))
         #expect(!pill.contains("Badge"))
         // The waveform always moves: it is never held flat while the dictation waits for speech;
-        // speech heard only turns it purple.
+        // speech heard only gives it its recording colour.
         #expect(pill.contains("Waveform(level: controller.level, colour: Self.waveformColour(hasVoice: controller.hasHeardSpeech))"))
         #expect(pill.components(separatedBy: "hasHeardSpeech").count == 2)
         #expect(!pill.contains("return DictationConfig.meterMinBarHeight"))
