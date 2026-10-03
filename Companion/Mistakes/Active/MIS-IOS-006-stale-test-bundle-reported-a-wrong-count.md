@@ -2,7 +2,10 @@
 
 **Class:** testing
 **Severity:** high
-**First seen:** 2026 · **Recurrences:** 7 (**7, 2026-09-29: four new test files written after the
+**First seen:** 2026 · **Recurrences:** 8 (**8, 2026-10-02: my test run and a peer reviewer's ran
+on the SAME simulator `-destination id=` at once, each with its own `-derivedDataPath`: mine reported
+"24 tests in 4 suites" where 73 run, plus an unrelated failure and a 600 s simulator-diagnostics
+timeout; the reviewer's first run died "Test crashed with signal kill" — caught by the count**; **7, 2026-09-29: four new test files written after the
 last `./Scripts/xcodegen.sh` (it ran when the production files were added); 7 of 11 selected suites
 ran — caught by checking each selected suite by NAME in the log, not by the failing result**; **6: two serialized runs compiled the selected test
 target but executed zero tests and stalled waiting for workers because the copied ignored
@@ -161,6 +164,22 @@ old tracked test file. By-name verification proves execution only after workers 
 stalls waiting for workers or reports zero, inspect target membership before changing selectors or
 retrying the same project.
 
+
+## Instance 8 (2026-10-02, waveform colour + retry-note trains) — separate derivedData, shared SIMULATOR
+
+A colour change's dictation suites and a fresh-context reviewer's mutation runs went out together,
+each correctly in its own worktree with its own `-derivedDataPath`, but both with
+`-destination 'id=0AC4ED11-…'`: one simulator. My run printed `✔ Test run with 24 tests in 4 suites
+passed` where those suites run 73, `Failing tests: DictationControllerTests.sendsTheDictionaryAnd…`
+(untouched code), and `Timed out after 600.0 seconds while waiting for a response from the
+simulator`; the reviewer's first run crashed "with signal kill before establishing connection".
+Rerun alone on another simulator: 73 of 73, no failure.
+
+**The tell:** *two `xcodebuild test` jobs are in flight and I have not checked which simulator each
+names.* Disjoint worktrees and derivedData paths felt like isolation; the simulator is a third shared
+resource. **Countermeasure:** give every concurrent test job its own simulator (`xcrun simctl list
+devices available`) and name it in the reviewer's brief; read a count short of the census as a
+collision first, never as a pass.
 ---
 
 ## Pre-compaction index line (verbatim, 2026-08-13, pass 4)
