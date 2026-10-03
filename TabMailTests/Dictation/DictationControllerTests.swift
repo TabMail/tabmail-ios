@@ -254,7 +254,8 @@ struct DictationControllerTests {
         emailBody: @escaping DictationController.EmailBody = { _ in nil },
         corrections: DictationCorrectionWatch? = nil,
         warmUp: DictationController.WarmUp? = nil,
-        retryDelays: [Duration] = [.milliseconds(1), .milliseconds(1)]
+        retryDelays: [Duration] = [.milliseconds(1), .milliseconds(1)],
+        retryNoticeDelay: Duration = DictationConfig.transcriptionRetryNoticeDelay
     ) -> DictationController {
         let recorded = recorded
         return DictationController(
@@ -276,6 +277,7 @@ struct DictationControllerTests {
             },
             warmUp: warmUp ?? { recorded.warmUps.withLock { $0 += 1 } },
             transcriptionRetryDelays: retryDelays,
+            transcriptionRetryNoticeDelay: retryNoticeDelay,
             speechDetector: speechDetector,
             maxRecordingDuration: maxRecordingDuration
         )
@@ -620,6 +622,66 @@ struct DictationControllerTests {
         #expect(recorded.texts.withLock { $0.isEmpty })
         #expect(controller.phase == .idle)
         #expect(!controller.isRetrying)
+    }
+
+    /// The spinner turns purple at the first server error; the note waits until the retries have gone
+    /// on for `transcriptionRetryNoticeDelay` since it, and goes when the dictation ends (owner,
+    /// 2026-10-02; as TabMail Voice's ADR-DESK-039).
+    @Test func theRetryNoteWaitsItsNoticeDelaySinceTheFirstFailure() async {
+        let capture = FakeCapture()
+        let sent = Mutex<[ContinuousClock.Instant]>([])
+        let controller = controller(capture: capture, transcript: {
+            sent.withLock { $0.append(.now) }
+            throw DictationError(status: 503, code: nil)
+        }, retryDelays: [.milliseconds(100), .milliseconds(600)], retryNoticeDelay: .milliseconds(300))
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.isRetrying }
+        #expect(controller.isRetrying)
+        #expect(!controller.showsRetryNote)
+        await waitUntil { controller.showsRetryNote }
+        let noteAt = ContinuousClock.now
+        #expect(controller.showsRetryNote)
+        #expect(controller.isRetrying)
+        let first = sent.withLock { $0.first }
+        #expect(first.map { noteAt - $0 >= .milliseconds(300) } == true)
+
+        await waitUntil { controller.phase == .idle }
+        #expect(sent.withLock { $0.count } == 3)
+        #expect(!controller.showsRetryNote)
+        #expect(!controller.isRetrying)
+    }
+
+    /// A retry that answers before `transcriptionRetryNoticeDelay` shows no note: only the spinner
+    /// said anything went wrong.
+    @Test func aRetryAnsweringBeforeTheNoticeDelayShowsNoNote() async {
+        let capture = FakeCapture()
+        let attempts = Mutex(0)
+        let noteSeen = Mutex(false)
+        let retryingSeen = Mutex(false)
+        let ref = ControllerRef()
+        let controller = controller(capture: capture, transcript: {
+            let attempt = attempts.withLock { $0 += 1; return $0 }
+            if attempt == 1 { throw DictationError(status: 502, code: nil) }
+            await MainActor.run {
+                if ref.controller?.isRetrying == true { retryingSeen.withLock { $0 = true } }
+                if ref.controller?.showsRetryNote == true { noteSeen.withLock { $0 = true } }
+            }
+            return "ask jordan about the road map"
+        }, retryDelays: [.milliseconds(1)], retryNoticeDelay: .milliseconds(400))
+        ref.controller = controller
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase == .idle }
+        // Past the notice delay: the note never comes up for a dictation already answered.
+        for _ in 0..<60 {
+            if controller.showsRetryNote { noteSeen.withLock { $0 = true } }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(recorded.texts.withLock { $0 } == ["Ask Jordan about the roadmap."])
+        #expect(retryingSeen.withLock { $0 })
+        #expect(!noteSeen.withLock { $0 })
     }
 
     /// The server's error can still arrive after the dictation was cancelled: it is not tried again,
@@ -1627,8 +1689,9 @@ struct DictationOptOutFlagTests {
         #expect(!pill.contains("return DictationConfig.meterMinBarHeight"))
         #expect(pill.contains(".fill(colour)"))
         #expect(pill.contains(".accessibilityElement(children: .ignore)\n        .accessibilityLabel(accessibilityLabel)"))
-        // While a transcription is tried again, the note takes the waveform's place.
-        #expect(pill.contains("if controller.isRetrying {\n                Text(Self.retryingMessage)"))
+        // Once a transcription has been tried again for a while, the note takes the waveform's place.
+        #expect(pill.contains("if controller.showsRetryNote {\n                Text(Self.retryingMessage)"))
+        #expect(!pill.contains("controller.isRetrying"))
 
         let source = try pillSource()
         #expect(source.contains(".popoverTip(DictationLanguageTip(), arrowEdge: .bottom)"))
@@ -1701,6 +1764,7 @@ struct DictationWaveformTests {
             transcribe: { _, _, _, _ in throw DictationError(status: 502, code: "transcription_failed") },
             warmUp: {},
             transcriptionRetryDelays: [.seconds(60)],
+            transcriptionRetryNoticeDelay: .milliseconds(300),
             speechDetector: FakeSpeechDetector.hearing()
         )
         controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { _ in }
@@ -1711,6 +1775,8 @@ struct DictationWaveformTests {
 
         await waitUntil { controller.isRetrying }
         #expect(controller.phase == .transcribing)
+        #expect(waveform.accessibilityLabel == "Transcribing")
+        await waitUntil { controller.showsRetryNote }
         #expect(waveform.accessibilityLabel == DictationPillView.retryingMessage)
         controller.cancel()
         #expect(waveform.accessibilityLabel == "")

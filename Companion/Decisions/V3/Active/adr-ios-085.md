@@ -292,3 +292,18 @@ changes; the spinner keeps its shift toward purple while retrying.)*
 - Tests: `DictationControllerTests.theWaveformTakesItsRecordingColourOnSpeechAndTheSpinnerPurpleWhileRetrying`, and the
   pill's and the send slot's source fences (`Waveform(level:colour:)` from `hasHeardSpeech`,
   `DictationSpinner(isRetrying: dictation.isRetrying)`).
+
+**Amendment 2026-10-02 (latest) — the retry note waits 2 s; the purple says it first (owner).** "The
+iOS app should also behave similarly. The purple circle should indicate there is an issue. And a
+two-second delay until it shows the server message." As TabMail Voice's ADR-DESK-039: at the first
+server error `isRetrying` turns the spinner toward purple at once, and "Server error, retrying…" takes
+the waveform's place only once the retries have gone on for `transcriptionRetryNoticeDelay` (2 s) since
+that error (`DictationController.showsRetryNote`, read by the pill and its VoiceOver label). A retry that
+answers sooner shows no note; a dictation that answers, fails or is cancelled clears both. This replaces
+the "iOS shows its retry note at once" of the amendment above and the "Meanwhile the waveform gives way
+to" of the retry decision: with the 500 ms and 1.5 s retry delays, the note now comes up only if the
+second retry is still running.
+- Tests: `DictationControllerTests.theRetryNoteWaitsItsNoticeDelaySinceTheFirstFailure`,
+  `aRetryAnsweringBeforeTheNoticeDelayShowsNoNote`, `itReadsTheRetryingNoteWhileItRetries` (VoiceOver
+  reads "Transcribing" until the note shows), and the pill's source fence (`showsRetryNote`, never
+  `isRetrying`).
