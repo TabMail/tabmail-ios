@@ -27,7 +27,11 @@ the backend answers any provider failure 502, which the apps retry.
    below 0.3 of the way from one to the other is quiet; a quiet run under 300 ms (between syllables
    and words) counts as speech.
    - **A pause:** once a chunk holds `chunkMinimumSpeech` (10 s) of speech, it is cut in the middle of
-     the next `chunkPauseDuration` (1 s) of quiet. Nothing overlaps.
+     the next `chunkPauseDuration` (1 s) of quiet. Nothing overlaps. The levels are relative, so
+     speech much softer than what came before, with few frames at the room's level, can read as
+     quiet: a pause cut can land in it and split a word or two, with no overlap to recover them
+     (reproduced with synthetic audio in TabMail Voice's review, 2026-10-03). Every chunk is still
+     sent.
    - **No pause:** a chunk reaching `chunkMaxDuration` (105 s) is cut at the quietest
      `chunkForcedCutWindow` (300 ms) of its last `chunkForcedCutSearch` (5 s); the next starts
      `chunkOverlapSpeech` (15 s) of speech earlier, at most `chunkMaxOverlap` (30 s), and is marked

@@ -26,7 +26,10 @@ struct DictationChunkCut: Sendable, Equatable {
 /// recording itself can tell apart.
 ///
 /// - **A pause:** once a chunk holds `chunkMinimumSpeech` of speech, it is cut in the middle of the
-///   next `chunkPauseDuration` of quiet. No word crosses a pause, so nothing overlaps.
+///   next `chunkPauseDuration` of quiet. No word crosses a pause, so nothing overlaps. Speech much
+///   softer than what came before, with few frames at the room's level, can read as quiet: a cut
+///   there may split a word or two (found in TabMail Voice's review, 2026-10-03; the chunk is still
+///   sent).
 /// - **No pause:** a chunk that reaches `chunkMaxDuration` is cut anyway, at the quietest
 ///   `chunkForcedCutWindow` of its last `chunkForcedCutSearch`, and the next chunk starts
 ///   `chunkOverlapSpeech` of speech earlier (at most `chunkMaxOverlap` earlier).

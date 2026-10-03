@@ -68,6 +68,14 @@ struct DictationChunkJoinTests {
         #expect(join(paused(left), overlapping(right)) == "Dear team,\n\nThe launch moved to next week because the build is late and QA needs two more days.")
     }
 
+    /// A forced cut comes after about 105 s of speech, so the earlier text is far longer than the
+    /// window searched for the overlap: the words before the window are all kept.
+    @Test func anOverlapJoinKeepsAllOfALongEarlierTextBeforeTheWindowSearched() {
+        let filler = (0..<(DictationConfig.chunkOverlapSearchWords * 2 + 40)).map { "word\($0)" }.joined(separator: " ")
+        let earlier = "\(filler) and then we agreed to ship the beta on Fri"
+        #expect(join(paused(earlier), overlapping("we agreed to ship the beta on Friday after the review.")) == "\(filler) and then we agreed to ship the beta on Friday after the review.")
+    }
+
     @Test func anOverlapIsMatchedOnlyNearTheSeam() {
         let filler = (0..<DictationConfig.chunkOverlapSearchWords).map { "f\($0)" }.joined(separator: " ")
         // The shared words sit further than `chunkOverlapSearchWords` from the end of the earlier text.
