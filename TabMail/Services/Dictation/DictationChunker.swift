@@ -14,8 +14,6 @@ struct DictationChunkCut: Sendable, Equatable {
     /// so both hold the same `chunkOverlapSpeech` of speech, which the join keeps once
     /// (`DictationChunkJoin`).
     let overlapped: Bool
-    /// Whether any of its frames stood above the recording's pause level.
-    let hasSpeech: Bool
 }
 
 /// Where a long recording is cut into chunks, as it is recorded (ADR-IOS-087; TabMail Voice's
@@ -99,7 +97,7 @@ final class DictationChunker {
     func finish(totalSamples: Int) -> DictationChunkCut? {
         guard cuts > 0 else { return nil }
         // The frame not yet whole is part of the last chunk; its loudness is not needed.
-        return DictationChunkCut(index: cuts, start: chunkStart, end: totalSamples, overlapped: chunkOverlapped, hasSpeech: speechFrames > 0)
+        return DictationChunkCut(index: cuts, start: chunkStart, end: totalSamples, overlapped: chunkOverlapped)
     }
 
     /// Takes the next whole frame; returns the chunk it completes, if any.
@@ -166,7 +164,7 @@ final class DictationChunker {
     /// Ends the current chunk at sample `end`; the next starts at `nextStart`, or at `end` when nil
     /// (no overlap).
     private func cut(end: Int, nextStart: Int?) -> DictationChunkCut {
-        let chunk = DictationChunkCut(index: cuts, start: chunkStart, end: end, overlapped: chunkOverlapped, hasSpeech: speechFrames > 0)
+        let chunk = DictationChunkCut(index: cuts, start: chunkStart, end: end, overlapped: chunkOverlapped)
         cuts += 1
         chunkStart = nextStart ?? end
         chunkOverlapped = nextStart != nil

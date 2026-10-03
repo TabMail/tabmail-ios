@@ -29,8 +29,6 @@ final class DictationChunkUploads {
     private struct Job {
         let index: Int
         let overlapped: Bool
-        /// False for a chunk with no speech, not sent: its text is empty.
-        let sent: Bool
         let outcome: Task<Result<DictationTranscription, any Error>, Never>
     }
 
@@ -61,19 +59,13 @@ final class DictationChunkUploads {
         self.onLastRetry = onLastRetry
     }
 
-    /// Whether any chunk was sent.
-    var hasSent: Bool { jobs.contains { $0.sent } }
-
-    /// Sends a chunk, its FLAC from `encode` (run off the main actor), unless not `send`: a chunk
-    /// with no speech in it (a long silence) is not sent, so no quiet is boosted into words.
-    func add(_ cut: DictationChunkCut, send: Bool, encode: @escaping @Sendable () -> Data) {
-        BackgroundSyncLogger.logDebug("[Dictation] chunk \(cut.index) cut: samples \(cut.start)..<\(cut.end)\(cut.overlapped ? ", overlapping the one before" : "")\(cut.hasSpeech ? "" : ", no speech")")
-        let outcome: Task<Result<DictationTranscription, any Error>, Never> = if send {
-            Task { await self.send(cut.index, encode: encode) }
-        } else {
-            Task { .success(DictationTranscription(text: "", cleanedText: nil)) }
-        }
-        jobs.append(Job(index: cut.index, overlapped: cut.overlapped, sent: send, outcome: outcome))
+    /// Sends a chunk, its FLAC from `encode` (run off the main actor). Every chunk is sent, a
+    /// silent-sounding one too: the model decides, as for one recording (owner, 2026-10-03: no
+    /// loudness gate, so soft speech is never dropped).
+    func add(_ cut: DictationChunkCut, encode: @escaping @Sendable () -> Data) {
+        BackgroundSyncLogger.logDebug("[Dictation] chunk \(cut.index) cut: samples \(cut.start)..<\(cut.end)\(cut.overlapped ? ", overlapping the one before" : "")")
+        let outcome = Task { await self.send(cut.index, encode: encode) }
+        jobs.append(Job(index: cut.index, overlapped: cut.overlapped, outcome: outcome))
     }
 
     /// The user released: chunks still failing get their last tries at once. Returns the chunks'

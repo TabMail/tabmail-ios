@@ -39,7 +39,7 @@ the backend answers any provider failure 502, which the apps retry.
    `chunkOverlapMinimumRun` (3) words, compared in lower case with letters and digits only, within
    `chunkOverlapSearchWords` (80) of the seam, the run kept once; with no such run the two are joined
    whole. Each side is cut at a word's place in its own text, so line breaks stay. A chunk overlaps
-   only the one just before it: after an empty or unsent one (a long silence) it is joined whole, or
+   only the one just before it: after an empty one (a long silence) it is joined whole, or
    matching it against an earlier chunk's words would cut out the speech between them (found in
    review, 2026-10-03; the controller hands the join every part, empty ones included).
 3. **The recorder cuts as it records.** `AudioRecorder` feeds the chunker from `keepFromNow` (speech
@@ -51,8 +51,12 @@ the backend answers any provider failure 502, which the apps retry.
 4. **`DictationChunkUploads`** sends each chunk at once (FLAC-encoded off the main actor) with what
    every upload of the dictation sends, prepared once with the first chunk: the language, the
    dictionary's words and the context's terms, and the cleanup's variables (each chunk gets its own
-   cleanup, backend ADR-027). A chunk with no speech in it (a long silence) is not sent; the last
-   is sent unless it holds no speech and another chunk was sent.
+   cleanup, backend ADR-027). **Every chunk is sent**, one the chunker heard no speech in too: the
+   model decides, as for one recording, with no loudness gate (owner, 2026-10-03, "send every
+   chunk"). Loudness is read against the recording's own levels, so speech much softer than what
+   came before (the user leaning back) once read as silence and its chunks went unsent and lost
+   (found in TabMail Voice's review, 2026-10-03). Before, a chunk with no speech was not sent, and
+   the last only when nothing else was.
 5. **Retries.** While the user dictates, a chunk failing with a server error, a dropped connection or
    the backend's own timeout (504) is tried again after each of `chunkRetryDelays` (1, 2, 5, 10 s,
    the last repeating), showing nothing. The release cuts any such wait short; from then on a chunk
@@ -81,18 +85,18 @@ the backend answers any provider failure 502, which the apps retry.
 - A forced, overlapped seam with no shared run of words may repeat a few words; none are lost (owner).
 - A rate-limit burst after the release loses the end of the dictation only if it outlasts the last
   tries, about a minute (owner, 2026-10-03: "we definitely need more retries"; they were 2 s).
-- Synthetic constant sound (one steady tone) has no frame above the room level and counts as no
-  speech: its chunks are not sent, only the last. Speech always varies; the tests use speech-like
-  audio.
-- `DictationController` is past 500 lines (622); the chunk logic lives in `DictationChunkUploads`,
+- A long silence costs one request per 105 s, and the model may hear a stray word in it (as in
+  one recording's silence).
+- `DictationController` is past 500 lines (620); the chunk logic lives in `DictationChunkUploads`,
   `DictationChunker` and `DictationChunkJoin`.
 - Tests: `DictationChunkerTests` and `DictationChunkJoinTests` (ported from Voice),
   `DictationLongDictationTests` (order and cleanup, overlap join, retries while recording, last tries
-  with the retry state, prefix delivery, first chunk lost, cancel, silent last chunk, a seeded fuzz
-  over random failures; and, from review: the words around a long silence, silent chunks cut while
-  recording not sent, the last sent when none held speech, each chunk's language and words, each
+  with the retry state, prefix delivery, first chunk lost, cancel, a quiet last chunk sent too, a
+  seeded fuzz over random failures; and, from review: the words around a long silence, a soft
+  stretch after loud speech sent and pasted, a steady sound sent in every chunk, each chunk's
+  language and words, each
   chunk peak-normalised on its own, no request after a cancel during a retry wait or the upload's
   preparation), `DictationAudioRecorderTests.chunksAreCutAtThePauseCountingTheAudioHeldBeforeSpeech`, and `DictationControllerTests.noUploadOutlastsWhatTheModelTranscribes` /
   `theAppsControllerSendsALongDictationInChunksTheModelTranscribes`. Five mutants (failed chunks
-  skipped, the release not ending waits, 504 not retried while recording, a silent last chunk sent,
+  skipped, the release not ending waits, 504 not retried while recording, a silent chunk not sent,
   cancel not stopping requests) each fail at least one of them.

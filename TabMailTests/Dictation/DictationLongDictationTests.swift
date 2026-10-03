@@ -265,9 +265,9 @@ struct DictationLongDictationTests {
         #expect(pasted.texts.withLock { $0 } == ["We should ship the release on Friday because the tests are green and the notes are ready."])
     }
 
-    /// A long silence (the user away) cuts chunks with no speech in them, which are not sent; the
-    /// chunk after them overlaps a silent one, not the speech before the silence, so no word on either
-    /// side of the silence is lost however the two texts read.
+    /// A long silence (the user away) cuts chunks the model hears nothing in; the chunk after them
+    /// overlaps an empty one, not the speech before the silence, so it is joined whole and no word
+    /// on either side of the silence is lost however the two texts read.
     @Test func theWordsOnBothSidesOfALongSilenceAreAllPasted() async {
         let capture = SpeakingCapture()
         let backend = ChunkBackend()
@@ -286,8 +286,9 @@ struct DictationLongDictationTests {
             corrections: nil,
             useWords: { _ in },
             transcribe: { flac, _, _, cleanup in
-                let index = (try await backend.transcribe(flac, cleanup: cleanup)).text == "raw 0" ? 0 : 1
-                return DictationTranscription(text: replies[index], cleanedText: replies[index])
+                let index = Int((try await backend.transcribe(flac, cleanup: cleanup)).text.dropFirst("raw ".count)) ?? 0
+                let reply = index == 0 ? replies[0] : index == 3 ? replies[1] : ""
+                return DictationTranscription(text: reply, cleanedText: reply)
             },
             warmUp: {},
             speechDetector: { onSpeech, _ in LoudnessSpeechDetector(onSpeech: onSpeech) }
@@ -296,11 +297,11 @@ struct DictationLongDictationTests {
 
         var random = Audio.Random(seed: 20)
         capture.feed(Audio.speech(12, &random) + Audio.room(1.5, &random) + Audio.room(240, &random) + Audio.speech(5, &random))
-        await waitUntil { backend.sent == 1 }
+        await waitUntil { backend.sent == 3 }
         controller.finish()
         await waitUntil { controller.phase == .idle }
 
-        #expect(backend.sent == 2)
+        #expect(backend.sent == 4)
         #expect(pasted.texts.withLock { $0 } == [replies.joined(separator: " ")])
     }
 
@@ -322,27 +323,30 @@ struct DictationLongDictationTests {
         #expect(backend.vocabularies.count == 2)
     }
 
-    /// A long silence while recording (the user away) is cut into chunks that are not sent: quiet
-    /// boosted by the normalisation can be heard as words.
-    @Test func chunksCutFromALongSilenceWhileRecordingAreNotSent() async {
+    /// Speech much softer than the speech before it (the user leaning back, or speaking low) is
+    /// still sent and pasted: no chunk is judged by its loudness alone (owner, 2026-10-03).
+    @Test func aSoftStretchAfterLoudSpeechIsSentAndPastedWithTheRest() async {
         let capture = SpeakingCapture()
         let backend = ChunkBackend()
         let controller = controller(capture, backend)
         await start(controller, capture)
 
+        // 30 s close to the microphone, a pause, two minutes 28 dB softer (still well above the
+        // room), a pause, and 12 s close again.
         var random = Audio.Random(seed: 22)
-        capture.feed(Audio.speech(12, &random) + Audio.room(1.5, &random) + Audio.room(120, &random) + Audio.speech(5, &random))
-        await waitUntil { backend.sent == 1 }
+        capture.feed(Audio.speech(30, &random) + Audio.room(1.5, &random) + Audio.speech(120, &random, amplitude: 0.01) + Audio.room(1.5, &random) + Audio.speech(12, &random))
+        await waitUntil { backend.sent >= 2 }
         controller.finish()
         await waitUntil { controller.phase == .idle }
 
-        #expect(backend.sent == 2)
-        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
+        let sent = backend.sent
+        #expect(sent >= 3)
+        #expect(pasted.texts.withLock { $0 } == [(0..<sent).map { "Part \($0)." }.joined(separator: " ")])
     }
 
-    /// With no chunk holding speech (a steady sound has no voice above its room), the last chunk is
-    /// sent anyway: the model decides, as for one recording.
-    @Test func withNoChunkHoldingSpeechTheLastIsSentAnyway() async {
+    /// A steady sound with no voice above its room is sent in every chunk, as one recording is:
+    /// the model decides.
+    @Test func aSteadySoundIsSentInEveryChunk() async {
         let capture = SpeakingCapture()
         let backend = ChunkBackend()
         let controller = controller(capture, backend)
@@ -351,11 +355,12 @@ struct DictationLongDictationTests {
         let rate = DictationConfig.recordingSampleRate
         let seconds = Double(DictationConfig.chunkMaxDuration.components.seconds) + 10
         capture.feed((0..<Int(seconds * rate)).map { Float(0.25 * sin(2 * Double.pi * 220 * Double($0) / rate)) })
+        await waitUntil { backend.sent == 1 }
         controller.finish()
         await waitUntil { controller.phase == .idle }
 
-        #expect(backend.sent == 1)
-        #expect(pasted.texts.withLock { $0 } == ["Part 0."])
+        #expect(backend.sent == 2)
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
     }
 
     /// Each chunk is raised to the same peak on its own (ADR-IOS-085's −3 dBFS amendment): a quiet
@@ -589,8 +594,8 @@ struct DictationLongDictationTests {
         #expect(!capture.isRunning)
     }
 
-    /// The last chunk is the quiet after a pause: it is not sent, so no quiet is boosted into words.
-    @Test func aLastChunkWithNoSpeechIsNotSent() async {
+    /// The last chunk is the quiet after a pause: it is sent too, and the model decides.
+    @Test func aLastChunkOfQuietAfterAPauseIsSentToo() async {
         let capture = SpeakingCapture()
         let backend = ChunkBackend()
         let controller = controller(capture, backend)
@@ -602,8 +607,8 @@ struct DictationLongDictationTests {
         controller.finish()
         await waitUntil { controller.phase == .idle }
 
-        #expect(backend.sent == 1)
-        #expect(pasted.texts.withLock { $0 } == ["Part 0."])
+        #expect(backend.sent == 2)
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
     }
 
     /// Seeded random long dictations against a backend that fails at random: the text is always the

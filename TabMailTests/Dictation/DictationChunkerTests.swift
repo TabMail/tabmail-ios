@@ -84,8 +84,7 @@ struct DictationChunkerTests {
         #expect(cut.end > pauseStart)
         #expect(cut.end < pauseStart + Int(1.5 * rate))
         #expect(!cut.overlapped)
-        #expect(cut.hasSpeech)
-        #expect(last == DictationChunkCut(index: 1, start: cut.end, end: audio.count, overlapped: false, hasSpeech: true))
+        #expect(last == DictationChunkCut(index: 1, start: cut.end, end: audio.count, overlapped: false))
         expectCovers(audio, cuts, last)
     }
 
@@ -133,16 +132,13 @@ struct DictationChunkerTests {
         #expect(end <= dipAt + 0.4)
     }
 
-    /// A long silence (the user away) is still cut within the maximum length, its chunks marked as
-    /// holding no speech.
-    @Test func aLongSilenceIsCutWithinTheMaximumLengthWithNoSpeechInIt() {
+    /// A long silence (the user away) is still cut within the maximum length.
+    @Test func aLongSilenceIsCutWithinTheMaximumLength() {
         var random = Audio.Random(seed: 6)
         let audio = speech(12, &random) + room(1.5, &random) + room(240, &random) + speech(5, &random)
         let (cuts, last) = chunk(audio)
         expectCovers(audio, cuts, last)
-        #expect(cuts.first?.hasSpeech == true)
-        #expect(cuts.dropFirst().allSatisfy { !$0.hasSpeech })
-        #expect(last?.hasSpeech == true)
+        #expect(cuts.count >= 3)
     }
 
     @Test func aRecordingOfNothingButTheRoomIsCutWithinTheMaximumLengthToo() {

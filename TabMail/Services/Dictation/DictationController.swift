@@ -290,13 +290,13 @@ final class DictationController {
     }
 
     /// The recorder cut chunks off a long dictation (ADR-IOS-087): each is sent at once, with its
-    /// cleanup, while the user goes on, unless it holds no speech (a long silence).
+    /// cleanup, while the user goes on.
     private func chunksCut(generation current: Int) {
         guard generation == current, let recorder else { return }
         let sampleRate = recorder.outputFormat.sampleRate
         for chunk in recorder.takeChunks() {
             let pcm = chunk.pcm
-            uploads(generation: current).add(chunk.cut, send: chunk.cut.hasSpeech) {
+            uploads(generation: current).add(chunk.cut) {
                 FLACEncoder.encode(pcm16Mono: AudioRecorder.normalizePeak(pcm).pcm, sampleRate: sampleRate)
             }
         }
@@ -420,10 +420,9 @@ final class DictationController {
         }
     }
 
-    /// The release of a dictation cut into chunks: the last one is sent (unless it holds no speech,
-    /// the quiet after a pause, and another chunk was sent), the chunks still failing get their last
-    /// tries, and the text is the chunks' in order up to the first that gave up (owner, 2026-10-03:
-    /// "paste only the up to successful part"). The first giving up loses the dictation, as one
+    /// The release of a dictation cut into chunks: the last one is sent, the chunks still failing
+    /// get their last tries, and the text is the chunks' in order up to the first that gave up
+    /// (owner, 2026-10-03: "paste only the up to successful part"). The first giving up loses the dictation, as one
     /// recording's failure does; nothing says the end is missing (ADR-IOS-085: no failure messages).
     private func transcribeChunks(last: DictationChunkCut, recording: AudioRecorder.Recording, generation current: Int) async {
         // The chunks cut since the recorder last said so.
@@ -431,9 +430,7 @@ final class DictationController {
         let uploads = uploads(generation: current)
         let pcm = recording.pcm
         let sampleRate = recording.sampleRate
-        // With nothing sent (no chunk held speech), the last is sent anyway: the model decides, as
-        // for one recording (no loudness gate).
-        uploads.add(last, send: last.hasSpeech || !uploads.hasSent) { FLACEncoder.encode(pcm16Mono: pcm, sampleRate: sampleRate) }
+        uploads.add(last) { FLACEncoder.encode(pcm16Mono: pcm, sampleRate: sampleRate) }
         let (parts, lost) = await uploads.release()
         guard generation == current, !Task.isCancelled else { return }
         // Every part, empty ones too: an overlapped chunk is joined to the one just before it only.
