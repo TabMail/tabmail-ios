@@ -458,6 +458,9 @@ final class DictationController {
         uploads.add(last) { FLACEncoder.encode(pcm16Mono: pcm, sampleRate: sampleRate) }
         let (parts, lost) = await uploads.release()
         guard generation == current, !Task.isCancelled else { return }
+        // Every chunk has answered or given up: nothing is retrying while the text is polished (as
+        // TabMail Voice's, whose retry note ends once the chunks are in).
+        endRetrying()
         // Every part, empty ones too: an overlapped chunk is joined to the one just before it only.
         let texts = parts.map { part in
             (text: part.transcription.text.trimmingCharacters(in: .whitespacesAndNewlines), cleanedText: part.transcription.cleanedText, overlapped: part.overlapped)
@@ -617,11 +620,16 @@ final class DictationController {
         termsTask?.cancel()
         termsTask = nil
         hasHeardSpeech = false
+        endRetrying()
+        level = 0
+    }
+
+    /// Nothing is being tried again: the retry state and its note end.
+    private func endRetrying() {
         isRetrying = false
         retryNoteTask?.cancel()
         retryNoteTask = nil
         showsRetryNote = false
-        level = 0
     }
 
     /// A failed dictation ends quietly: nothing is appended and the input field comes back.

@@ -71,11 +71,6 @@ final class DictationChunkUploads {
     /// The user released: chunks still failing get their last tries at once. Returns the chunks'
     /// transcriptions in order up to the first that gave up, and why it did (nil: none did). The
     /// chunks after it are no longer needed and are cancelled.
-    /// The cleanup's variables every chunk went with.
-    func cleanup() async -> [String: String] {
-        await upload.value.cleanup
-    }
-
     func release() async -> (parts: [Part], lost: (any Error)?) {
         isReleased = true
         for wait in waits.values { wait.cancel() }
@@ -90,6 +85,11 @@ final class DictationChunkUploads {
             }
         }
         return (parts, nil)
+    }
+
+    /// The cleanup's variables every chunk went with.
+    func cleanup() async -> [String: String] {
+        await upload.value.cleanup
     }
 
     /// The dictation ended: every request and wait stops.

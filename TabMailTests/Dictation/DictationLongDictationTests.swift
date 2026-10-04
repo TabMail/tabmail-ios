@@ -725,6 +725,29 @@ struct DictationLongDictationTests {
         #expect(!controller.showsRetryNote)
     }
 
+    /// Once every chunk has answered, nothing is retrying: the retry state and its note end before
+    /// the polish, not after it (as TabMail Voice's).
+    @Test func theRetryStateEndsOnceTheChunksAnswerNotAfterThePolish() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, attempt in index == 1 && attempt == 0 ? .serverError : .part }
+        let polisher = Polisher(.never)
+        let controller = controller(capture, backend, retryDelays: [.milliseconds(300)], retryNoticeDelay: .milliseconds(1), polisher: polisher, polishTimeout: .seconds(60))
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 52, 12, 5)
+        controller.finish()
+        await waitUntil { controller.showsRetryNote }
+        #expect(controller.isRetrying)
+        #expect(controller.showsRetryNote)
+        await waitUntil { polisher.calls.count == 1 }
+
+        #expect(polisher.calls.count == 1)
+        #expect(!controller.isRetrying)
+        #expect(!controller.showsRetryNote)
+        controller.cancel()
+        await waitUntil { polisher.wasCancelled }
+    }
+
     /// Cancelled while a chunk waits for one of its last tries after the release: no request is made
     /// after it (decision 7).
     @Test func noRequestIsMadeAfterACancelWhileAChunkWaitsForALastTry() async {
