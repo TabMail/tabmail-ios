@@ -124,6 +124,29 @@ struct DictationChunkerTests {
         expectCovers(audio, cuts, last)
     }
 
+    /// The blips count toward the pause's second: a pause just over `chunkPauseDuration` in all,
+    /// whose quiet frames alone fall short of it, is cut at (the owner's pauses were about 85% quiet
+    /// frames).
+    @Test func aPausesBlipsCountTowardItsSecond() {
+        var random = Audio.Random(seed: 13)
+        let blip = seconds(DictationConfig.chunkPauseBlip)
+        var pause: [Int16] = []
+        for _ in 0..<4 { pause += room(0.2, &random) + speech(blip, &random, amplitude: 0.9) }
+        pause += room(0.1, &random)
+        let pauseDuration = seconds(DictationConfig.chunkPauseDuration) * rate
+        let quiet = Double(pause.count) - 4 * blip * rate
+        #expect(Double(pause.count) > pauseDuration)
+        #expect(quiet < pauseDuration)
+        let pauseStart = Int(12 * rate)
+        let audio = speech(12, &random) + pause + speech(5, &random)
+        let (cuts, last) = chunk(audio)
+        #expect(cuts.count == 1)
+        guard cuts.count == 1 else { return }
+        #expect(cuts[0].end > pauseStart)
+        #expect(cuts[0].end < pauseStart + pause.count)
+        expectCovers(audio, cuts, last)
+    }
+
     /// With no pause at all, a chunk is cut at `chunkMaxDuration`, and the next starts about
     /// `chunkOverlapSpeech` of speech earlier, so the cut's words are heard whole in one of them.
     @Test func speechWithNoPauseIsCutAtTheMaximumLengthTheNextChunkOverlappingIt() throws {

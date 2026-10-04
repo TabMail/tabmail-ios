@@ -53,6 +53,8 @@ struct DictationChunkJoinTests {
         let left = "Then we talked about the budget, and the plan for. Next"
         let right = "About the budget and the plan for next quarter."
         #expect(join(paused(left), overlapping(right)) == "Then we talked about the budget and the plan for next quarter.")
+        // The only run of three words or more is the same only ignoring case.
+        #expect(join(paused("we met the Team Lead on Monday"), overlapping("The team lead on Monday said yes.")) == "we met the team lead on Monday said yes.")
     }
 
     /// A later chunk's text starts with a capital, as any text does, though its first words are
