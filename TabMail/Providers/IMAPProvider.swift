@@ -6046,22 +6046,37 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// recipient it cannot read as a single mailbox fails the send as
     /// `SMTPError.invalidEmailAddress`, which the outbox treats as fatal, so the
     /// message stays visible for the user to fix.
+    ///
+    /// BCC recipients are SMTP envelope recipients only: SwiftMail adds them to
+    /// RCPT TO and writes no `Bcc` header, so neither the delivered message nor
+    /// the Sent copy names them.
     static func buildEmail(from draft: DraftMessage, senderEmail: String) throws -> Email {
         buildEmail(
             from: draft, senderEmail: senderEmail,
             recipients: try sendableRecipients(draft.to),
-            ccRecipients: try sendableRecipients(draft.cc)
+            ccRecipients: try sendableRecipients(draft.cc),
+            bccRecipients: try sendableRecipients(draft.bcc)
         )
     }
 
-    /// Build the Email saveDraft() appends. Recipients are kept as typed: a draft
-    /// may hold an address the user has not finished, and saving it must not fail.
+    /// Build the Email saveDraft() appends. A recipient SwiftMail's parser reads
+    /// as one mailbox is written in that form (`Bob <bob@example.com>` stays a
+    /// name and an address); anything else is kept as typed, because a draft may
+    /// hold an address the user has not finished and saving it must not fail.
     static func buildDraftEmail(from draft: DraftMessage, senderEmail: String) -> Email {
         buildEmail(
             from: draft, senderEmail: senderEmail,
-            recipients: draft.to.map { SwiftMail.EmailAddress(address: $0) },
-            ccRecipients: draft.cc.map { SwiftMail.EmailAddress(address: $0) }
+            recipients: draftRecipients(draft.to),
+            ccRecipients: draftRecipients(draft.cc),
+            bccRecipients: []
         )
+    }
+
+    private static func draftRecipients(_ recipients: [String]) -> [SwiftMail.EmailAddress] {
+        recipients.map { recipient in
+            if case .mailbox(let mailbox)? = AddressListEntry(recipient) { return mailbox }
+            return SwiftMail.EmailAddress(address: recipient)
+        }
     }
 
     /// Each recipient as SwiftMail's parser reads it; throws on the first one that
@@ -6079,7 +6094,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         from draft: DraftMessage,
         senderEmail: String,
         recipients: [SwiftMail.EmailAddress],
-        ccRecipients: [SwiftMail.EmailAddress]
+        ccRecipients: [SwiftMail.EmailAddress],
+        bccRecipients: [SwiftMail.EmailAddress]
     ) -> Email {
         let smtpAttachments: [Attachment]? = draft.attachments.isEmpty ? nil : draft.attachments.map {
             Attachment(filename: $0.filename, mimeType: $0.mimeType, data: $0.data)
@@ -6088,6 +6104,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             sender: SwiftMail.EmailAddress(address: senderEmail),
             recipients: recipients,
             ccRecipients: ccRecipients,
+            bccRecipients: bccRecipients,
             // Own the complete outbound Subject boundary before handing it to
             // SwiftMail. The app encoder preserves literal RFC 2047-shaped text,
             // controls, Unicode, and the 75-octet word limit; its ASCII result makes

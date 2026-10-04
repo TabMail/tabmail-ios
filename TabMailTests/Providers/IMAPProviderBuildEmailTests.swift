@@ -210,12 +210,40 @@ struct IMAPProviderBuildEmailTests {
         }
     }
 
-    @Test("A saved draft keeps its recipients as typed")
-    func draftKeepsRecipientsAsTyped() {
-        let draft = DraftMessage(to: ["not an address"], cc: ["taro.@example.com"], subject: "Hi")
+    @Test("A saved draft keeps a recipient SwiftMail cannot read as typed")
+    func draftKeepsUnreadableRecipientsAsTyped() {
+        let draft = DraftMessage(to: ["not an address"], cc: ["foo@@example.com"], subject: "Hi")
         let email = IMAPProvider.buildDraftEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.recipients.map(\.address) == ["not an address"])
-        #expect(email.ccRecipients.map(\.address) == ["taro.@example.com"])
+        #expect(email.ccRecipients.map(\.address) == ["foo@@example.com"])
+    }
+
+    /// A pasted group or address list is not one mailbox; saving only its first
+    /// member would silently drop the rest from the server's draft copy.
+    @Test("A saved draft keeps a group or several addresses in one token as typed")
+    func draftKeepsMultiMailboxTokensAsTyped() {
+        let group = "Team: a@example.com, b@example.com;"
+        let list = "a@example.com, b@example.com"
+        let draft = DraftMessage(to: [group], cc: [list], subject: "Hi")
+        let email = IMAPProvider.buildDraftEmail(from: draft, senderEmail: "me@test.com")
+        #expect(email.recipients.map(\.address) == [group])
+        #expect(email.ccRecipients.map(\.address) == [list])
+    }
+
+    /// Another client resuming the draft must read a name and an address, not
+    /// one encoded word holding the whole text.
+    @Test("A saved draft writes a name-and-address recipient as a name-addr")
+    func draftWritesNamedRecipientAsNameAddr() throws {
+        let draft = DraftMessage(to: ["Bob <bob@example.com>"], cc: ["ann@example.com"], subject: "Hi")
+        let email = IMAPProvider.buildDraftEmail(from: draft, senderEmail: "me@test.com")
+        #expect(email.recipients.map(\.address) == ["bob@example.com"])
+        #expect(email.recipients.map(\.name) == ["Bob"])
+        let toLine = try #require(
+            email.constructContent().components(separatedBy: "\r\n").first { $0.hasPrefix("To: ") }
+        )
+        #expect(toLine.contains("<bob@example.com>"))
+        #expect(!toLine.contains("=?"))
+        #expect(email.ccRecipients.map(\.address) == ["ann@example.com"])
     }
 
     @Test("Builds email with basic to-only draft")
@@ -262,19 +290,37 @@ struct IMAPProviderBuildEmailTests {
         #expect(email.ccRecipients[1].address == "cc2@test.com")
     }
 
-    @Test("Builds email with BCC recipients — BCC not set on Email (handled by SMTP)")
-    func withBCC() throws {
+    /// SwiftMail's send addresses RCPT TO to `allRecipients`, so a BCC recipient
+    /// missing there is never delivered; one named in the content is exposed.
+    @Test("BCC recipients are sent to but never named in the message")
+    func bccRecipientsAreSentButNotNamed() throws {
         let draft = DraftMessage(
-            to: ["to@test.com"],
-            bcc: ["bcc@secret.com"],
+            to: ["to@example.com"],
+            cc: ["cc@example.com"],
+            bcc: ["hidden@example.com", "Hidden Two <hidden2@example.com>"],
             subject: "With BCC"
         )
-        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
-        // DraftMessage.bcc is not mapped to Email.bccRecipients in buildEmail
-        // (BCC is handled at the SMTP transport layer, not in the email content)
-        // Verify the email was built without error
-        #expect(email.recipients.count == 1)
-        #expect(email.subject == "With BCC")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@example.com")
+        #expect(email.bccRecipients.map(\.address) == ["hidden@example.com", "hidden2@example.com"])
+        #expect(email.allRecipients.map(\.address)
+            == ["to@example.com", "cc@example.com", "hidden@example.com", "hidden2@example.com"])
+
+        let content = email.constructContent()
+        #expect(content.contains("to@example.com"))
+        #expect(content.contains("cc@example.com"))
+        #expect(!content.contains("hidden"))
+        #expect(!content.lowercased().contains("\r\nbcc:"))
+    }
+
+    @Test("A BCC recipient SwiftMail cannot read fails the send as fatal")
+    func unreadableBccFailsSendFatally() {
+        let draft = DraftMessage(to: ["ann@example.com"], bcc: ["not an address"], subject: "Hi")
+        do {
+            _ = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@example.com")
+            Issue.record("an unreadable BCC recipient was accepted for sending")
+        } catch {
+            #expect(AccountManager.isFatalSendError(error))
+        }
     }
 
     @Test("Builds email with both CC and to recipients")
