@@ -225,6 +225,13 @@ struct PDFTextExtractorTests {
         #expect(uncapped.pages.allSatisfy { !$0.unreadable })
     }
 
+    @Test("A document whose title has a percent sign and then the word stream is read")
+    func percentAndStreamInTitle() async throws {
+        let titled = PDFFixtures.make([.text("Alpha")], title: "Revenue grew 12% in each stream")
+        let result = try #require(pages(await extract(titled)))
+        #expect(result.pages.map(\.text) == ["Alpha"])
+    }
+
     @Test("A page whose font reaches a CCITT map is left out as unreadable before PDFKit decodes it")
     func fontReachingCCITTMap() async throws {
         let ccitt = PDFPageGlyphCounterTests.ccitt

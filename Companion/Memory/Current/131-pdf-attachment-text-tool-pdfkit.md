@@ -66,8 +66,10 @@ So two checks run before PDFKit sees anything:
     header inside a string or comment, means the walk cannot tell which object the following
     bytes belong to (a 9-byte `/X (9 0 obj)` decoy once hid a 300 MB `/ToUnicode` map, 1.19 GB
     RSS).
-  - A final linear sweep refuses any `stream` keyword after `>>` (or after a line holding a `%`,
-    which may start a comment) that no counted object claimed, such as one whose header is glued
+  - A final linear sweep refuses any `stream` keyword after `>>` (or first on its line after a
+    line holding a `%`, which may start a comment) that no counted object claimed. A `%` earlier
+    on the keyword's own line does not count: refusing it rejected valid files whose title or
+    text reads "12% … stream" (round-4 review), such as one whose header is glued
     to the previous byte (`x4 0 obj`): CoreGraphics reaches it through the xref, the walk does not.
   - After `stream`, CoreGraphics skips whatever else is on the line (spaces, a comment, any
     token) and the data starts after its end of line (CR LF, LF or CR); a second EOL is data.

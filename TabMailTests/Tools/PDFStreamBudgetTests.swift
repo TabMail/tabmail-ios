@@ -189,6 +189,16 @@ struct PDFStreamBudgetTests {
         #expect(check(file, stream: 1, total: 1) == .withinBudget)
     }
 
+    @Test("A percent sign before the word stream on the same line is not taken for a comment hiding a stream")
+    func percentBeforeStreamOnOneLine() {
+        let file = PDFFixtures.raw([
+            Data("1 0 obj\n<< /Title (Revenue grew 12% in each stream) >>\nendobj\n".utf8),
+            PDFFixtures.streamObject(2, dictionary: "<< >>", data: Data("BT (Revenue grew 12% in each stream) Tj ET\n".utf8)),
+        ])
+        #expect(check(file, stream: 1, total: 1) == .withinBudget)
+        // A percent sign on the line before still counts: see `Trick.headerGluedAndCommentBeforeKeyword`.
+    }
+
     // MARK: - Filters
 
     @Test("ASCII encodings in front of Flate are undone and the Flate output counted")
@@ -227,6 +237,83 @@ struct PDFStreamBudgetTests {
         // Each run repeats one byte 128 times.
         #expect(check(PDFFixtures.raw([PDFFixtures.streamObject(1, dictionary: dictionary, data: runs(7))])) == .withinBudget)
         #expect(check(PDFFixtures.raw([PDFFixtures.streamObject(1, dictionary: dictionary, data: runs(8))])) == .overBudget)
+    }
+
+    /// A one-page file whose content stream is `data` under `filter`, so CoreGraphics' decode of
+    /// the page contents is the oracle for the count.
+    private static func contents(filter: String, data: Data) -> Data {
+        func object(_ number: Int, _ body: String) -> Data { Data("\(number) 0 obj\n\(body)\nendobj\n".utf8) }
+        return PDFFixtures.document([
+            object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>"),
+            PDFFixtures.streamObject(4, dictionary: "<< /Length \(data.count) /Filter \(filter) >>", data: data),
+        ])
+    }
+
+    /// Counted exactly: within a cap of `count` bytes, over a cap of one byte less.
+    private func countsExactly(_ data: Data, _ count: Int) -> Bool {
+        check(data, stream: count, total: count) == .withinBudget && check(data, stream: count - 1, total: count) == .overBudget
+    }
+
+    /// Bytes from a fixed four-letter alphabet, varied enough that LZW codes grow past 10 bits.
+    private static func letters(_ count: Int) -> [UInt8] {
+        var seed: UInt32 = 1
+        return (0..<count).map { _ in
+            seed = seed &* 1_103_515_245 &+ 12_345
+            return UInt8(ascii: "a") + UInt8((seed >> 16) % 4)
+        }
+    }
+
+    @Test("LZW dictionary entries count at their full length, with codes wider than 9 bits")
+    func lzwDictionaryHits() throws {
+        let plain = Self.letters(6_000)
+        let encoded = Self.lzwEncode(plain)
+        #expect(encoded.width >= 11)
+        let data = Self.contents(filter: "/LZWDecode", data: encoded.data)
+        #expect(try Self.decodedByCoreGraphics(data) == plain.count)
+        #expect(countsExactly(data, plain.count))
+    }
+
+    @Test("RunLength literal and repeat runs both count")
+    func runLengthLiteralRuns() throws {
+        let literal = Array("Hello, world".utf8)
+        let encoded = Data([UInt8(literal.count - 1)] + literal + [UInt8(257 - 100), UInt8(ascii: "x")] + [0, UInt8(ascii: "!")] + [128])
+        let data = Self.contents(filter: "/RunLengthDecode", data: encoded)
+        #expect(try Self.decodedByCoreGraphics(data) == 113)
+        #expect(countsExactly(data, 113))
+    }
+
+    @Test("Two ASCII layers in front of Flate are both undone")
+    func stackedAsciiLayers() throws {
+        let data = Self.contents(filter: "[/ASCIIHexDecode /ASCII85Decode /FlateDecode]", data: Self.hex(Self.base85(PDFFixtures.flateZeros(3_000))))
+        #expect(try Self.decodedByCoreGraphics(data) == 3_000)
+        #expect(countsExactly(data, 3_000))
+    }
+
+    @Test("Counting stops where the data stops decoding")
+    func countingStopsAtUndecodableData() {
+        func codes(_ list: [Int]) -> Data { Self.lzwPack(list.map { ($0, 9) }) }
+        // An LZW code past the next free entry, and data with no end-of-data code, end the count.
+        #expect(Self.lzwCount(codes([256, 65, 66, 300, 67, 257])) == 2)
+        #expect(Self.lzwCount(codes([256, 65, 66])) == 2)
+        // ASCII85 stops at a character outside its alphabet.
+        let base85 = Self.base85(Data(repeating: 0x41, count: 8)).dropLast(2) + Data("v".utf8) + Self.base85(Data(count: 8))
+        #expect(countsExactly(PDFFixtures.raw([PDFFixtures.streamObject(1, dictionary: "<< /Filter /ASCII85Decode >>", data: base85)]), 8))
+    }
+
+    @Test("Inflating stops at a deadline that passes mid-stream")
+    func inflateDeadline() {
+        let zeros = PDFFixtures.flateZeros(20_000_000)
+        zeros.withUnsafeBytes { raw in
+            let body = raw.bindMemory(to: UInt8.self)
+            #expect(PDFStreamBudget.Counting.inflated(body, cap: .max, deadline: .now - .seconds(1)) == nil)
+            #expect(PDFStreamBudget.Counting.inflated(body, cap: .max, deadline: .now + .seconds(20)) == 20_000_000)
+        }
+    }
+
+    private static func lzwCount(_ data: Data) -> Int? {
+        data.withUnsafeBytes { PDFStreamBudget.Counting.lzw($0.bindMemory(to: UInt8.self), cap: .max) }
     }
 
     @Test("Filter chains the check cannot follow are refused; others are planned")
@@ -268,6 +355,49 @@ struct PDFStreamBudgetTests {
             index += 4
         }
         return Data((out + "~>").utf8)
+    }
+
+    /// Packs LZW codes, each with its bit width, most significant bit first.
+    private static func lzwPack(_ codes: [(code: Int, width: Int)]) -> Data {
+        var out: [UInt8] = []
+        var buffer = 0
+        var bits = 0
+        for (code, width) in codes {
+            buffer = buffer << width | code
+            bits += width
+            while bits >= 8 {
+                out.append(UInt8((buffer >> (bits - 8)) & 0xFF))
+                bits -= 8
+            }
+            buffer &= (1 << bits) - 1
+        }
+        if bits > 0 { out.append(UInt8((buffer << (8 - bits)) & 0xFF)) }
+        return Data(out)
+    }
+
+    /// LZW as PDF writes it by default (`/EarlyChange 1`): a code widens once the next free entry
+    /// reaches the current width's range. Returns the data and the widest code used.
+    private static func lzwEncode(_ input: [UInt8]) -> (data: Data, width: Int) {
+        var table = Dictionary(uniqueKeysWithValues: (0..<256).map { ([UInt8($0)], $0) })
+        var next = 258
+        var width = 9
+        var codes: [(code: Int, width: Int)] = [(256, width)]
+        var word: [UInt8] = []
+        for byte in input {
+            let extended = word + [byte]
+            if table[extended] != nil {
+                word = extended
+                continue
+            }
+            codes.append((table[word] ?? 0, width))
+            table[extended] = next
+            next += 1
+            if next >= 1 << width, width < 12 { width += 1 }
+            word = [byte]
+        }
+        if !word.isEmpty { codes.append((table[word] ?? 0, width)) }
+        codes.append((257, width))
+        return (lzwPack(codes), width)
     }
 
     /// `n` LZW codes (9 bits each, after a clear) decoding to 1 + 2 + … + n bytes, then end-of-data.

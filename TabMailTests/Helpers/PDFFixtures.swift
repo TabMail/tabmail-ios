@@ -19,11 +19,12 @@ enum PDFFixtures {
 
     static let pageBounds = CGRect(x: 0, y: 0, width: 612, height: 792)
 
-    static func make(_ pages: [Page], userPassword: String? = nil, ownerPassword: String? = nil) -> Data {
+    static func make(_ pages: [Page], userPassword: String? = nil, ownerPassword: String? = nil, title: String? = nil) -> Data {
         let format = UIGraphicsPDFRendererFormat()
         var info: [String: Any] = [:]
         if let userPassword { info[kCGPDFContextUserPassword as String] = userPassword }
         if let ownerPassword { info[kCGPDFContextOwnerPassword as String] = ownerPassword }
+        if let title { info[kCGPDFContextTitle as String] = title }
         format.documentInfo = info
 
         let renderer = UIGraphicsPDFRenderer(bounds: pageBounds, format: format)

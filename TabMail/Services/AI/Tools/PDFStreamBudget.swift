@@ -181,7 +181,9 @@ enum PDFStreamBudget {
         /// One pass over the file for `stream` keywords CoreGraphics would read: the token
         /// `stream` after a dictionary's `>>`, with only whitespace or comments between. Whether a
         /// `%` starts a comment depends on string context this pass does not track, so a keyword
-        /// whose line before it holds a `%` is taken as possibly following `>>`.
+        /// first on its line, after a line holding a `%`, is taken as possibly following `>>`. A
+        /// `%` earlier on the keyword's own line cannot hide a `>>`: either it starts a comment, and
+        /// the keyword is comment text, or it is in a string, and the token before is not `>>`.
         private func sweepForUncountedStreams(_ counted: Set<Int>) -> Verdict {
             let keyword = Array("stream".utf8)
             var lineStart = 0
@@ -202,7 +204,7 @@ enum PDFStreamBudget {
                           index + keyword.count == bytes.count || PDFSyntax.isWhitespace(bytes[index + keyword.count])
                             || PDFSyntax.isDelimiter(bytes[index + keyword.count]) {
                     let afterDictionary = lastToken >= 1 && bytes[lastToken] == UInt8(ascii: ">") && bytes[lastToken - 1] == UInt8(ascii: ">")
-                    if afterDictionary || lastTokenAfterPercent, !counted.contains(index) { return .overBudget }
+                    if afterDictionary || (lastTokenAfterPercent && lastToken < lineStart), !counted.contains(index) { return .overBudget }
                 }
                 if !PDFSyntax.isWhitespace(byte) {
                     lastToken = index
