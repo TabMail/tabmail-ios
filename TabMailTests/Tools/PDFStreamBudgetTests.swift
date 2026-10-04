@@ -275,6 +275,33 @@ struct PDFStreamBudgetTests {
         #expect(countsExactly(data, plain.count))
     }
 
+    @Test("LZW written with /EarlyChange 0 counts at its full length")
+    func lzwLateChange() throws {
+        let plain = Self.letters(6_000)
+        let encoded = Self.lzwEncode(plain, earlyChange: false)
+        #expect(encoded.width >= 11)
+        #expect(encoded.data != Self.lzwEncode(plain).data)
+        let data = Self.contents(filter: "/LZWDecode /DecodeParms << /EarlyChange 0 >>", data: encoded.data)
+        #expect(try Self.decodedByCoreGraphics(data) == plain.count)
+        #expect(countsExactly(data, plain.count))
+    }
+
+    @Test("LZW counts toward the file total at its full length under either /EarlyChange")
+    func lzwTotalEitherSetting() {
+        // Each setting's decoder stops early on the other's data, so the stream cap alone cannot
+        // tell which count is used; the total can.
+        let plain = Self.letters(6_000)
+        for earlyChange in [true, false] {
+            let lzw = Self.lzwEncode(plain, earlyChange: earlyChange).data
+            let data = PDFFixtures.raw([
+                PDFFixtures.streamObject(1, dictionary: "<< /Length \(lzw.count) /Filter /LZWDecode >>", data: lzw),
+                PDFFixtures.streamObject(2, dictionary: "<< /Length 0 /Filter /FlateDecode >>", data: PDFFixtures.flateZeros(1_000)),
+            ])
+            #expect(check(data, stream: 6_000, total: 7_000) == .withinBudget, "\(earlyChange)")
+            #expect(check(data, stream: 6_000, total: 6_999) == .overBudget, "\(earlyChange)")
+        }
+    }
+
     @Test("RunLength literal and repeat runs both count")
     func runLengthLiteralRuns() throws {
         let literal = Array("Hello, world".utf8)
@@ -376,8 +403,9 @@ struct PDFStreamBudgetTests {
     }
 
     /// LZW as PDF writes it by default (`/EarlyChange 1`): a code widens once the next free entry
-    /// reaches the current width's range. Returns the data and the widest code used.
-    private static func lzwEncode(_ input: [UInt8]) -> (data: Data, width: Int) {
+    /// reaches the current width's range; with `earlyChange: false` (`/EarlyChange 0`) it widens
+    /// one code later. Returns the data and the widest code used.
+    private static func lzwEncode(_ input: [UInt8], earlyChange: Bool = true) -> (data: Data, width: Int) {
         var table = Dictionary(uniqueKeysWithValues: (0..<256).map { ([UInt8($0)], $0) })
         var next = 258
         var width = 9
@@ -392,7 +420,7 @@ struct PDFStreamBudgetTests {
             codes.append((table[word] ?? 0, width))
             table[extended] = next
             next += 1
-            if next >= 1 << width, width < 12 { width += 1 }
+            if next - (earlyChange ? 0 : 1) >= 1 << width, width < 12 { width += 1 }
             word = [byte]
         }
         if !word.isEmpty { codes.append((table[word] ?? 0, width)) }

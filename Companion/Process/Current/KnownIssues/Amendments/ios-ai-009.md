@@ -23,9 +23,10 @@ the owner chose the cap without decryption, with this case recorded as a known i
   The tool stores nothing (ADR-004), and the chat request is not replayed on relaunch.
 - **Recovery:** relaunch. The same file triggers again only if the user asks again.
 - **Not affected:** user-password PDFs (refused as encrypted before parsing), unencrypted PDFs (the
-  pre-check counts every stream CoreGraphics decodes and refuses a layout it cannot follow; the
+  pre-check counts every stream it can decode and refuses a layout it cannot follow, and the page
+  stream check leaves out a page reaching a stream under a filter it cannot count; the
   round-2 review's five bypasses, such as a 9-byte decoy object header inside a string, were
-  closed on 2026-10-03), and the per-page text cap and font check (`PDFPageGlyphCounter` reads
+  closed on 2026-10-03), and the per-page text cap and page stream check (`PDFPageGlyphCounter` reads
   decrypted content and dictionaries through CoreGraphics, so encryption does not bypass them).
 
 ## Remedy if reopened

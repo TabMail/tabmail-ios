@@ -17,13 +17,15 @@ import Foundation
 /// times); the deadline bounds the work. A page nesting forms deeper than the counter follows is
 /// over budget.
 ///
-/// It also checks every font the page selects (`Tf`, or an `ExtGState` font). To lay out text,
-/// CoreGraphics decodes each stream a selected font reaches whole, whatever its filter: the
-/// `/ToUnicode` map, the font program, an `/Encoding` CMap, a `/CIDToGIDMap`, the resources of a
-/// Type 3 font. `PDFStreamBudget` counts only the filters it can decode, so a 5 KB CCITT
-/// `/ToUnicode` map decoding to 40 MB took `PDFPage.string` to 212 MB. No font needs an image
-/// codec, so a font reaching a stream the budget does not count is over budget. An image a
-/// Type 3 glyph draws is not decoded to read text (measured), so it is not followed.
+/// Before scanning, it checks that every stream the page's `/Contents`, `/Resources` and `/Group`
+/// reach has filters `PDFStreamBudget` counts. That budget leaves image codecs (CCITT, JBIG2,
+/// DCT, JPX) uncounted, so scanned PDFs are not refused, yet CoreGraphics decodes such a stream
+/// whole, and cannot be interrupted, wherever it is not an image: as page content or a form (a
+/// 100 KB file reached 845 MB), as a colour space's ICC profile or lookup table, or as a font's
+/// `/ToUnicode` map or program (a 5 KB CCITT map took `PDFPage.string` to 212 MB). No such role
+/// needs an image codec, so a page reaching one is over budget. An image XObject is the one
+/// stream skipped, as reading text never decodes it (measured): an entry of an `/XObject`
+/// dictionary that says `/Subtype /Image`. Anywhere else a stream is checked, as labels lie.
 final class PDFPageGlyphCounter {
 
     enum Verdict: Equatable {
@@ -34,8 +36,9 @@ final class PDFPageGlyphCounter {
 
     enum Bounds {
         static let maxFormDepth = 4
-        /// How deep the objects a font reaches are followed; a deeper font is over budget.
-        static let maxFontDepth = 16
+        /// How deep the objects a page reaches are followed; a deeper page is over budget. Real
+        /// pages nest transparency groups through soft masks well past 16 levels.
+        static let maxObjectDepth = 64
         /// How many operator callbacks pass between deadline checks.
         static let deadlineCheckInterval = 256
     }
@@ -43,11 +46,12 @@ final class PDFPageGlyphCounter {
     static func check(_ page: CGPDFPage, maxBytes: Int, deadline: ContinuousClock.Instant) -> Verdict {
         if ContinuousClock.now >= deadline || Task.isCancelled { return .timedOut }
         let counter = PDFPageGlyphCounter(maxBytes: maxBytes, deadline: deadline)
+        if !counter.reachesOnlyCountedStreams(page) { return counter.timedOut ? .timedOut : .overBudget }
         let content = CGPDFContentStreamCreateWithPage(page)
         defer { CGPDFContentStreamRelease(content) }
         _ = counter.run(content)
         if counter.timedOut { return .timedOut }
-        return counter.bytes > maxBytes || counter.formsTooDeep || counter.uncountedFont ? .overBudget : .withinBudget
+        return counter.bytes > maxBytes || counter.formsTooDeep ? .overBudget : .withinBudget
     }
 
     private let maxBytes: Int
@@ -58,8 +62,6 @@ final class PDFPageGlyphCounter {
     private var formDepth = 0
     /// Set when a form is nested deeper than `Bounds.maxFormDepth`; its text is then not counted.
     private var formsTooDeep = false
-    /// Set when a selected font reaches a stream `PDFStreamBudget` does not count.
-    private var uncountedFont = false
     /// The dictionaries already followed, each in the role it was followed in, as an image is
     /// skipped in one role and not in another.
     private var checked: Set<Checked> = []
@@ -102,30 +104,9 @@ final class PDFPageGlyphCounter {
             guard CGPDFScannerPopName(scanner, &name), let name else { return }
             counter.drawForm(named: name, from: CGPDFScannerGetContentStream(scanner))
         }
-        CGPDFOperatorTableSetCallback(table, "Tf") { scanner, info in
-            guard let counter = enter(scanner, info) else { return }
-            var size: CGPDFReal = 0
-            var name: UnsafePointer<CChar>?
-            guard CGPDFScannerPopNumber(scanner, &size), CGPDFScannerPopName(scanner, &name), let name,
-                  let font = CGPDFContentStreamGetResource(CGPDFScannerGetContentStream(scanner), "Font", name) else { return }
-            counter.checkFont(font, scanner)
-        }
-        CGPDFOperatorTableSetCallback(table, "gs") { scanner, info in
-            guard let counter = enter(scanner, info) else { return }
-            var name: UnsafePointer<CChar>?
-            guard CGPDFScannerPopName(scanner, &name), let name,
-                  let object = CGPDFContentStreamGetResource(CGPDFScannerGetContentStream(scanner), "ExtGState", name) else { return }
-            var state: CGPDFDictionaryRef?
-            var font: CGPDFArrayRef?
-            var fontObject: CGPDFObjectRef?
-            guard CGPDFObjectGetValue(object, .dictionary, &state), let state,
-                  CGPDFDictionaryGetArray(state, "Font", &font), let font,
-                  CGPDFArrayGetObject(font, 0, &fontObject), let fontObject else { return }
-            counter.checkFont(fontObject, scanner)
-        }
         // Common operators that draw no text are registered only so a page made of millions of
         // them still reaches the deadline check.
-        for name in ["q", "Q", "cm", "m", "l", "c", "re", "h", "f", "F", "f*", "S", "s", "n", "W", "BT", "ET", "Td", "TD", "Tm", "T*"] {
+        for name in ["q", "Q", "cm", "m", "l", "c", "re", "h", "f", "F", "f*", "S", "s", "n", "W", "BT", "ET", "Td", "TD", "Tm", "T*", "Tf", "gs"] {
             CGPDFOperatorTableSetCallback(table, name) { scanner, info in _ = enter(scanner, info) }
         }
         return table
@@ -134,10 +115,10 @@ final class PDFPageGlyphCounter {
     private static func enter(_ scanner: CGPDFScannerRef, _ info: UnsafeMutableRawPointer?) -> PDFPageGlyphCounter? {
         guard let info else { return nil }
         let counter = Unmanaged<PDFPageGlyphCounter>.fromOpaque(info).takeUnretainedValue()
-        if !counter.timedOut, !counter.formsTooDeep, !counter.uncountedFont, counter.bytes <= counter.maxBytes {
+        if !counter.timedOut, !counter.formsTooDeep, counter.bytes <= counter.maxBytes {
             counter.tick()
         }
-        if counter.timedOut || counter.formsTooDeep || counter.uncountedFont || counter.bytes > counter.maxBytes {
+        if counter.timedOut || counter.formsTooDeep || counter.bytes > counter.maxBytes {
             CGPDFScannerStop(scanner)
             return nil
         }
@@ -153,11 +134,26 @@ final class PDFPageGlyphCounter {
         }
     }
 
-    private func checkFont(_ font: CGPDFObjectRef, _ scanner: CGPDFScannerRef) {
-        if !reachesOnlyCountedStreams(font, depth: 0, role: .other) {
-            if !timedOut { uncountedFont = true }
-            CGPDFScannerStop(scanner)
+    /// Whether every stream the page's content, resources (its own, or the nearest ancestor's)
+    /// and transparency group reach has filters `PDFStreamBudget` counts.
+    private func reachesOnlyCountedStreams(_ page: CGPDFPage) -> Bool {
+        guard let pageDictionary = page.dictionary else { return true }
+        for key in ["Contents", "Group"] {
+            var object: CGPDFObjectRef?
+            if CGPDFDictionaryGetObject(pageDictionary, key, &object), let object,
+               !reachesOnlyCountedStreams(object, depth: 0, role: .other) { return false }
         }
+        var node = pageDictionary
+        for _ in 0...Bounds.maxObjectDepth {
+            var resources: CGPDFObjectRef?
+            if CGPDFDictionaryGetObject(node, "Resources", &resources), let resources {
+                return reachesOnlyCountedStreams(resources, depth: 0, role: .other)
+            }
+            var parent: CGPDFDictionaryRef?
+            guard CGPDFDictionaryGetDictionary(node, "Parent", &parent), let parent else { return true }
+            node = parent
+        }
+        return false
     }
 
     /// Where an object sits: images are skipped only as the entries of an `/XObject` dictionary.
@@ -173,10 +169,10 @@ final class PDFPageGlyphCounter {
     }
 
     /// Whether every stream `object` reaches has filters `PDFStreamBudget` counts. Each dictionary
-    /// is followed once per role; past `Bounds.maxFontDepth`, or the deadline, the answer is no.
+    /// is followed once per role; past `Bounds.maxObjectDepth`, or the deadline, the answer is no.
     private func reachesOnlyCountedStreams(_ object: CGPDFObjectRef, depth: Int, role: Role) -> Bool {
         tick()
-        guard !timedOut, depth <= Bounds.maxFontDepth else { return false }
+        guard !timedOut, depth <= Bounds.maxObjectDepth else { return false }
         var dictionary: CGPDFDictionaryRef?
         var stream: CGPDFStreamRef?
         var array: CGPDFArrayRef?

@@ -51,8 +51,9 @@ jetsam kill, not a catchable error:
   maps on one page reached 1.56 GB.
   - `CGPDFStreamCopyData` behaves the same, and CoreGraphics repairs a false `/Length` (a stream
     declaring 100 bytes still inflated 1 GB).
-  - Content streams are the exception: `CGPDFScanner` decodes them incrementally (9 MB on a 1 GB
-    flate bomb).
+  - Flate content streams are the exception: `CGPDFScanner` decodes them incrementally (9 MB on
+    a 1 GB flate bomb). A content stream or form under an image codec (CCITT) is decoded whole:
+    a 100 KB file reached 845 MB (round-4 review).
   - `CGPDFScanner` cannot read a CMap: `CGPDFOperatorTableSetCallback` refuses non-operator
     keywords such as `endbfchar`, and the scan clears the operand stack when it ends.
 
@@ -115,6 +116,21 @@ So two checks run before PDFKit sees anything:
     dictionary is followed once per role (a font dictionary that is also an `/XObject`
     dictionary is still checked as a font), and a font reaching deeper than 16 objects is left
     out. On the 460-PDF sample (11,267 pages) no page was left out.
+  - **Every stream the page reaches (round-4 review, 2026-10-03), replacing the font check.**
+    The round-4 review found the same CCITT bypass outside fonts: as page `/Contents` or a form
+    (845 MB from a 100 KB file), and as an `ICCBased` or `Indexed` colour space a `cs` or an
+    inline image's `/CS` selects. Following operators one role at a time kept missing roles, so
+    the counter now walks, before scanning, every object reachable from the page's `/Contents`,
+    `/Group` and nearest `/Resources` (inherited through `/Parent`), and leaves the page out
+    when any stream has filters `PDFStreamBudget.counts` rejects. The one stream skipped is an
+    entry of an `/XObject` dictionary with `/Subtype /Image` (an image drawn by `Do` is not
+    decoded to read text, measured; Type 3 glyph images included). It deliberately also refuses
+    roles CoreGraphics was measured not to decode when reading text (a font no operator
+    selects, stroke colour spaces, shading functions, `/Properties`): following the invariant
+    rather than the measured list is what stops the next missed role. Each dictionary is walked
+    once per role, and a page reaching deeper than 64 objects is left out (16 falsely refused
+    3 of 400 Xcode icon PDFs, which nest soft-mask groups). On the 460-PDF sample (11,267
+    pages) no page was left out, and every CCITT probe that decodes was.
   Both `CGPDFContentStreamCreate…` results must be released (`CGPDFContentStreamRelease`; not
   CF-bridged, so ARC does not), or each page and form leaks about 170 B.
 
@@ -126,7 +142,8 @@ PDFKit recovers that text, from the embedded font program. The extractor also st
 Validation: 400 PDFs shipped with macOS and Xcode, and 60 large real-world PDFs (up to 4,053
 pages and 69 MB), all passed both checks in at most 0.5 s, before and after the round-2 fixes.
 That sample has no large lossless images, so it did not show the IOS-AI-010 false refusal.
-The font check (round-3 fix) left out none of its 11,267 pages.
+The font check (round-3 fix) and the page stream check that replaced it (round-4 fix) left out
+none of its 11,267 pages.
 - **Encrypted PDFs:** `isLocked` is true only when a user password is needed. An owner-only PDF
   opens and is read, which matches pdf.js.
 

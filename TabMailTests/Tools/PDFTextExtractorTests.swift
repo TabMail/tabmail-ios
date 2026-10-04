@@ -232,14 +232,21 @@ struct PDFTextExtractorTests {
         #expect(result.pages.map(\.text) == ["Alpha"])
     }
 
-    @Test("A page whose font reaches a CCITT map is left out as unreadable before PDFKit decodes it")
-    func fontReachingCCITTMap() async throws {
+    @Test("A page reaching a CCITT stream as a font map, content or colour space is left out as unreadable before PDFKit decodes it")
+    func pageReachingCCITTStream() async throws {
         let ccitt = PDFPageGlyphCounterTests.ccitt
-        let bomb = PDFPageGlyphCounterTests.fontDocument(.toUnicode, filter: ccitt.filter, data: ccitt.data)
-        let refused = try #require(pages(await extract(bomb)))
-        #expect(refused.pages.map(\.unreadable) == [true])
-        let control = try #require(pages(await extract(PDFPageGlyphCounterTests.fontDocument(.toUnicode))))
-        #expect(control.pages.map(\.unreadable) == [false])
+        let bombs = [PDFPageGlyphCounterTests.fontDocument(.toUnicode, filter: ccitt.filter, data: ccitt.data)]
+            + [.contents, .form, .iccColorSpace].map { PDFPageGlyphCounterTests.pageDocument($0, filter: ccitt.filter, data: ccitt.data) }
+        for bomb in bombs {
+            let refused = try #require(pages(await extract(bomb)))
+            #expect(refused.pages.map(\.unreadable) == [true])
+        }
+        let controls = [PDFPageGlyphCounterTests.fontDocument(.toUnicode)]
+            + [.contents, .form, .iccColorSpace].map { PDFPageGlyphCounterTests.pageDocument($0) }
+        for control in controls {
+            let read = try #require(pages(await extract(control)))
+            #expect(read.pages.map(\.unreadable) == [false])
+        }
     }
 
     // MARK: - Deadline
@@ -248,6 +255,24 @@ struct PDFTextExtractorTests {
     func timeout() async {
         let data = PDFFixtures.make([.text("Alpha")])
         #expect(await extract(data, limits: limits(timeout: .zero)) == .timeout)
+    }
+
+    @Test("A deadline that passes inside PDFKit's read of a page returns timeout without waiting for it")
+    func deadlineInsidePDFKit() async {
+        // 190,000 glyphs are under the per-page cap, and counting them takes well under a
+        // millisecond; PDFKit takes most of a second to read them, cannot be interrupted, and no
+        // later check sees the deadline, so only `withTimeout` reports it.
+        func object(_ number: Int, _ body: String) -> Data { Data("\(number) 0 obj\n\(body)\nendobj\n".utf8) }
+        let content = Data("BT /F1 1 Tf 0 0 Td (\(String(repeating: "a", count: 190_000))) Tj ET".utf8)
+        let data = PDFFixtures.document([
+            object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"),
+            PDFFixtures.streamObject(4, dictionary: "<< /Length \(content.count) >>", data: content),
+            object(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+        ])
+        #expect(await extract(data, limits: limits(timeout: .milliseconds(200))) == .timeout)
+        #expect(pages(await extract(data)) != nil)
     }
 
     @Test("A deadline that passes while a page's text is counted stops the read with a timeout")

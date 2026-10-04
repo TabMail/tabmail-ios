@@ -70,9 +70,9 @@ enum PDFStreamBudget {
             } else if expander == nil, !blocked, let text = textFilter(named: name) {
                 textLayers.append(text)
             } else if expander == nil {
-                // An image codec or similar, which nothing after can be counted behind. CoreGraphics
-                // decodes it to read text only for a stream a font reaches, and
-                // `PDFPageGlyphCounter` refuses a font reaching a stream `counts` rejects.
+                // An image codec or similar, which nothing after can be counted behind. Reading
+                // text decodes it only where it is not an image, and `PDFPageGlyphCounter` leaves
+                // out a page whose content or resources reach a stream `counts` rejects.
                 blocked = true
             }
         }

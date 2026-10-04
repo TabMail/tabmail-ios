@@ -108,14 +108,16 @@ struct AttachmentReadPdfToolTests {
         }
     }
 
-    @Test("A unique_id whose message row is gone is not found")
+    @Test("A unique_id, an integer or a whole-number double, whose message row is gone is not found")
     func headerMissing() async throws {
         let fixture = try await makeFixture(attachments: [])
         let translator = MockChatIdTranslator()
         await translator.seed(7, realId: "acc1:INBOX:missing")
         let ctx = ToolContext(db: fixture.db, translator: translator)
         let reader = AttachmentReadPdfTool(context: ctx, fetchAttachment: FakeServer().fetcher, loadBody: { _ in })
-        #expect(try errorMessage(try await reader.execute(arguments: ["unique_id": .int(7)])) == "message not found")
+        for value: JSONValue in [.int(7), .double(7)] {
+            #expect(try errorMessage(try await reader.execute(arguments: ["unique_id": value])) == "message not found")
+        }
     }
 
     @Test("Unknown unique_id is not found")
