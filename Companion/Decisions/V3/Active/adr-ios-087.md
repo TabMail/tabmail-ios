@@ -138,7 +138,8 @@ the backend answers any provider failure 502, which the apps retry.
   preparation; the polish pasted with the prompt's variables, each fallback, a cancel during it, a
   polish answering after a cancel leaving the next dictation alone, and no polish for one chunk; and,
   from a later review: the retry state ending before the polish, a chunk refused or over the
-  account's own rate limit after the release not tried again; a test's polish is always injected, so
+  account's own rate limit after the release not tried again, the chunks after one that gave up
+  stopped before the polish; a test's polish is always injected, so
   no test reaches the backend),
   `BackendClientDictationTests.thePolishSendsTheCleanupPromptWithTheJoinedTextAndReturnsItsReply`
   (the polish request at the HTTP boundary: prompt, variables, no tools, no web search),

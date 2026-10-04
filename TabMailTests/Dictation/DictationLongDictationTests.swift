@@ -862,6 +862,36 @@ struct DictationLongDictationTests {
         #expect(backend.inFlight == 0)
     }
 
+    /// The chunks after one that gave up are stopped at the release, not at the end: while what came
+    /// before it is polished, a later chunk still failing on the server's side makes no more requests
+    /// and brings back no retry state.
+    @Test func theChunksAfterOneThatGaveUpStopBeforeThePolish() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, _ in
+            switch index {
+            case 2: .refused
+            case 3: .serverError
+            default: .part
+            }
+        }
+        let polisher = Polisher(.never)
+        let controller = controller(capture, backend, retryDelays: Array(repeating: .milliseconds(40), count: 60), retryNoticeDelay: .milliseconds(1), polisher: polisher, polishTimeout: .seconds(60))
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 5, 12, 12, 12, 5)
+        controller.finish()
+        await waitUntil { polisher.calls.count == 1 }
+
+        #expect(polisher.calls.count == 1)
+        let made = backend.requests
+        try? await Task.sleep(for: .milliseconds(600))
+        #expect(backend.requests == made)
+        #expect(!controller.isRetrying)
+        #expect(!controller.showsRetryNote)
+        controller.cancel()
+        await waitUntil { polisher.wasCancelled }
+    }
+
     /// The last chunk is sent at the release, so the backend's own timeout on it, or the speech
     /// model's rate limit outlasting the backend's retries, comes after the release: it is tried
     /// again, as while recording (owner, 2026-10-03: "we should not lose the end").
