@@ -74,12 +74,12 @@ the backend answers any provider failure 502, which the apps retry.
    (found in TabMail Voice's review, 2026-10-03). Before, a chunk with no speech was not sent, and
    the last only when nothing else was.
 5. **Retries.** While the user dictates, a chunk failing with a server error, a dropped connection,
-   the backend's own timeout (504) or the speech model's rate limit outlasting the backend's own 30 s
+   the backend's own timeout (504) or the speech model's rate limit outlasting the backend's own 10 s
    of retries (429 `transcription_rate_limited`, backend ADR-022; `isServerError`, the 504 `backendTimedOut`) is tried again
    after each of `chunkRetryDelays` (1, 2, 5, 10 s, the last repeating), showing nothing. The release cuts any such wait short; from then on a chunk
    gets `transcriptionRetryDelays` more tries (about a minute of waits, ADR-IOS-085 amendment
-   2026-10-03; each try that the backend holds for its whole 30 s window, a 504 or that 429, adds its
-   30 s, so a chunk failing that way every time keeps the pill transcribing for up to about 5.5
+   2026-10-03; each try that the backend holds, up to 30 s for a 504 and about 10 s for that 429, adds
+   that time, so a chunk failing that way every time keeps the pill transcribing for up to about 5.5
    minutes, 9 tries × 30 s plus the waits, until the user closes the pill; found in review,
    2026-10-03) on
    the same failures, a 504 and that 429 included, under the pill's retry state (`isRetrying`, then
