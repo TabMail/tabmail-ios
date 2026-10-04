@@ -14,6 +14,7 @@ private final class SpeakingCapture: AudioCapturing, @unchecked Sendable {
         var starts = 0
         var isRunning = false
         var onBuffer: (@Sendable (AVAudioPCMBuffer) -> Void)?
+        var deliveredOnStop: [Float] = []
     }
 
     private let state = Mutex(State())
@@ -31,10 +32,18 @@ private final class SpeakingCapture: AudioCapturing, @unchecked Sendable {
     }
 
     func stop() {
+        // A tap callback already running still delivers its audio as the microphone stops.
+        let (onBuffer, samples) = state.withLock { ($0.onBuffer, $0.deliveredOnStop) }
+        if let onBuffer { for buffer in DictationTestAudio.buffers(samples) { onBuffer(buffer) } }
         state.withLock { state in
             state.isRunning = false
             state.onBuffer = nil
         }
+    }
+
+    /// Audio the microphone delivers as it stops.
+    func deliverOnStop(_ samples: [Float]) {
+        state.withLock { $0.deliveredOnStop = samples }
     }
 
     func feed(_ samples: [Float]) {
@@ -163,7 +172,8 @@ struct DictationLongDictationTests {
         retryNoticeDelay: Duration = .seconds(60),
         language: String? = nil,
         words: [String] = [],
-        emailBody: @escaping DictationController.EmailBody = { _ in nil }
+        emailBody: @escaping DictationController.EmailBody = { _ in nil },
+        useWords: @escaping @MainActor ([String]) -> Void = { _ in }
     ) -> DictationController {
         DictationController(
             capture: capture,
@@ -174,7 +184,7 @@ struct DictationLongDictationTests {
             dictionary: { .init(words: words, learnsWords: false) },
             emailBody: emailBody,
             corrections: nil,
-            useWords: { _ in },
+            useWords: useWords,
             transcribe: { flac, language, vocabulary, cleanup in try await backend.transcribe(flac, language: language, vocabulary: vocabulary, cleanup: cleanup) },
             warmUp: {},
             transcriptionRetryDelays: retryDelays,
@@ -327,6 +337,64 @@ struct DictationLongDictationTests {
         #expect(backend.languages == ["de", "de"])
         #expect(backend.vocabularies.allSatisfy { $0.contains("Zyxwordx") })
         #expect(backend.vocabularies.count == 2)
+    }
+
+    /// Every chunk goes with the context's terms, as one recording does (ADR-IOS-086).
+    @Test func everyChunkGoesWithTheContextsTerms() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let controller = controller(capture, backend, emailBody: { _ in "We met the team at Brevalle Labs yesterday." })
+        let pasted = pasted
+        controller.start(context: DictationContext(windowTitle: "Chat", screenText: "Me: hi\n» ‸", emailId: "email-1"), canUseAI: true) { text in pasted.texts.withLock { $0.append(text) } }
+        await waitUntil { capture.starts == 1 }
+
+        await speak(capture, backend, seed: 43, 12, 4)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(backend.vocabularies.count == 2)
+        #expect(backend.vocabularies.allSatisfy { $0.contains("Brevalle Labs") })
+    }
+
+    /// A long dictation marks what its chunks heard as used, for the dictionary's learned words, as
+    /// one recording does (ADR-IOS-086).
+    @Test func aLongDictationMarksWhatItHeardAsUsed() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let used = Mutex<[[String]]>([])
+        let controller = controller(capture, backend, useWords: { texts in used.withLock { $0.append(texts) } })
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 44, 12, 4)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
+        #expect(used.withLock { $0 } == [["raw 0", "Part 0.", "raw 1", "Part 1."]])
+    }
+
+    /// The last audio, delivered as the microphone stops, can complete a pause and cut a chunk whose
+    /// task is queued behind the release: the release takes it up, so its words are pasted too.
+    @Test func aChunkCutAsTheMicrophoneStopsIsPasted() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 45, 12, 12)
+        var random = Audio.Random(seed: 46)
+        // A pause not yet a second long, completed by the audio delivered as the microphone stops.
+        capture.feed(Audio.room(0.9, &random))
+        capture.deliverOnStop(Audio.room(0.2, &random))
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(backend.sent == 3)
+        // The backend numbers parts as their requests arrive, and the chunk cut as the microphone
+        // stops can be sent after the last one: every part is pasted, each once.
+        let texts = pasted.texts.withLock { $0 }
+        #expect(texts.count == 1)
+        #expect((texts.first ?? "").components(separatedBy: ". ").map { $0.hasSuffix(".") ? String($0.dropLast()) : $0 }.sorted() == ["Part 0", "Part 1", "Part 2"])
     }
 
     /// Speech much softer than the speech before it (the user leaning back, or speaking low) is
@@ -490,6 +558,53 @@ struct DictationLongDictationTests {
         #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
         #expect(!controller.isRetrying)
         #expect(!controller.showsRetryNote)
+    }
+
+    /// Cancelled while a chunk waits for one of its last tries after the release: no request is made
+    /// after it (decision 7).
+    @Test func noRequestIsMadeAfterACancelWhileAChunkWaitsForALastTry() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { _, _ in .serverError }
+        let controller = controller(capture, backend, retryDelays: [.seconds(3_600)])
+        await start(controller, capture)
+
+        var random = Audio.Random(seed: 47)
+        capture.feed(Audio.speech(12, &random) + Audio.room(1.5, &random) + Audio.speech(3, &random))
+        await waitUntil { backend.requests >= 1 }
+        controller.finish()
+        await waitUntil { controller.isRetrying && backend.inFlight == 0 }
+        try? await Task.sleep(for: .milliseconds(100))
+        let made = backend.requests
+        controller.cancel()
+        try? await Task.sleep(for: .milliseconds(500))
+
+        #expect(backend.requests == made)
+        #expect(pasted.texts.withLock { $0 }.isEmpty)
+    }
+
+    /// Cancelled with the first chunk's text in hand and a later one still running, and a new
+    /// dictation started at once: the old one's release ends without touching the new one, and its
+    /// text is never pasted (an older action never overrides a newer one).
+    @Test func aCancelledLongDictationNeverEndsTheNextOne() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, _ in index == 0 ? .part : .never }
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 48, 12, 5)
+        await waitUntil { backend.attempts.first == 1 && backend.inFlight == 0 }
+        controller.finish()
+        await waitUntil { backend.inFlight == 1 }
+        controller.cancel()
+        let pasted = pasted
+        controller.start(context: context, canUseAI: true) { text in pasted.texts.withLock { $0.append(text) } }
+        await waitUntil { capture.starts == 2 }
+        try? await Task.sleep(for: .milliseconds(300))
+
+        #expect(controller.phase != .idle)
+        #expect(capture.isRunning)
+        #expect(pasted.texts.withLock { $0 }.isEmpty)
+        controller.cancel()
     }
 
     /// Only the chunks before the first that gave up are pasted (owner, 2026-10-03: "paste only the

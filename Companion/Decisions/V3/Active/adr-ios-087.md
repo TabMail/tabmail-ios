@@ -75,7 +75,11 @@ the backend answers any provider failure 502, which the apps retry.
    the backend's own timeout (504) or the speech model's rate limit outlasting the backend's own 30 s
    of retries (429 `transcription_rate_limited`, backend ADR-022; `backendWaited`) is tried again
    after each of `chunkRetryDelays` (1, 2, 5, 10 s, the last repeating), showing nothing. The release cuts any such wait short; from then on a chunk
-   gets `transcriptionRetryDelays` more tries (about a minute, ADR-IOS-085 amendment 2026-10-03) on
+   gets `transcriptionRetryDelays` more tries (about a minute of waits, ADR-IOS-085 amendment
+   2026-10-03; each try that the backend holds for its whole 30 s window, a 504 or that 429, adds its
+   30 s, so a chunk failing that way every time keeps the pill transcribing for up to about 5.5
+   minutes, 9 tries × 30 s plus the waits, until the user closes the pill; found in review,
+   2026-10-03) on
    the same failures, a 504 and that 429 included, under the pill's retry state (`isRetrying`, then
    `showsRetryNote`): the last chunk is sent at the release, so its backend timeout comes after it
    (owner: "we should not lose the end"). Anything else (signed out, over quota or the account's own
@@ -99,7 +103,8 @@ the backend answers any provider failure 502, which the apps retry.
 - A cancelled long dictation has already sent its earlier chunks (as Voice).
 - A forced, overlapped seam with no shared run of words may repeat a few words; none are lost (owner).
 - A rate-limit burst after the release loses the end of the dictation only if it outlasts the last
-  tries, about a minute (owner, 2026-10-03: "we definitely need more retries"; they were 2 s).
+  tries, about a minute of waits plus up to 30 s per try the backend holds (owner, 2026-10-03: "we
+  definitely need more retries"; they were 2 s).
 - A long silence costs one request per 105 s, and the model may hear a stray word in it (as in
   one recording's silence).
 - `DictationController` is past 500 lines (620); the chunk logic lives in `DictationChunkUploads`,

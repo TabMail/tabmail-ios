@@ -128,8 +128,8 @@ enum DictationConfig {
     static let warmUpPath = "/whoami"
     static let warmUpRequestTimeout: TimeInterval = 10
     /// A transcription the server failed (a 5xx) or whose connection dropped is tried again after
-    /// each of these, so the user need not say it again. As TabMail Voice's. About a minute in all
-    /// (owner, 2026-10-03: "we definitely need more retries … we should not lose the end"): the
+    /// each of these, so the user need not say it again. As TabMail Voice's. About a minute of waits in all,
+    /// plus each try's own time, up to the backend's 30 s window when it times out (owner, 2026-10-03: "we definitely need more retries … we should not lose the end"): the
     /// provider's rate limits come in bursts of seconds.
     static let transcriptionRetryDelays: [Duration] = [
         .milliseconds(500), .milliseconds(1_500), .seconds(3), .seconds(5), .seconds(10), .seconds(10), .seconds(15), .seconds(15),
