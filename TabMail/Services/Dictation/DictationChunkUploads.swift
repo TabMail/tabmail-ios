@@ -101,7 +101,7 @@ final class DictationChunkUploads {
 
     /// Makes a chunk's request until it answers (owner, 2026-10-03: "retries should keep on happening
     /// until the final give up"). While the user is still dictating, a server error, a dropped
-    /// connection, the backend's own timeout or the speech model's rate limit (`backendWaited`) is
+    /// connection, the speech model's rate limit, or the backend's own timeout (`backendTimedOut`) is
     /// tried again after each of `chunkRetryDelays`, the last repeating, for as long as the
     /// dictation goes on: nobody waits for it yet. From the release, it gets `lastRetryDelays` more
     /// tries on the same failures, with the pill's retry state: the last chunk is sent at the
@@ -121,7 +121,7 @@ final class DictationChunkUploads {
                 return .success(try await transcribe(flac, upload.language, upload.vocabulary, upload.cleanup))
             } catch {
                 guard !Task.isCancelled else { return .failure(error) }
-                let isRetryable = DictationController.isServerError(error) || DictationController.backendWaited(error)
+                let isRetryable = DictationController.isServerError(error) || DictationController.backendTimedOut(error)
                 if !isReleased {
                     guard isRetryable,
                           let delay = waited < chunkRetryDelays.count ? chunkRetryDelays[waited] : chunkRetryDelays.last else {

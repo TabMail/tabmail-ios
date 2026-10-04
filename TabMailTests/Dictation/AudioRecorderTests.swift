@@ -171,11 +171,16 @@ struct DictationAudioRecorderTests {
     /// Until speech is heard only the moment before it is held, so a dictation waiting in a
     /// noisy room records nothing more; once heard, everything is kept, that moment first.
     @Test func holdsOnlyTheMomentBeforeSpeech() throws {
+        // Waiting: only the last 2 s of 5 are held.
+        let waiting = AudioRecorder(preRoll: .seconds(2))
+        feed(waiting, sine(seconds: 5))
+        let wait = try waiting.finish()
+        #expect(abs(wait.duration - 2) < 0.01)
+        #expect(!wait.truncated)
+
+        // Heard: that moment, then everything after it.
         let recorder = AudioRecorder(preRoll: .seconds(2))
         feed(recorder, sine(seconds: 5))
-        #expect(abs(try recorder.finish().duration - 2) < 0.01)
-        #expect(!(try recorder.finish().truncated))
-
         let held = recorder.keepFromNow()
         #expect(abs(held / .seconds(1) - 2) < 0.01)
         feed(recorder, sine(seconds: 3))
@@ -208,6 +213,23 @@ struct DictationAudioRecorderTests {
         let recording = try recorder.finish()
         #expect(recording.lastChunk?.start == chunk.cut.end)
         #expect(recording.lastChunk?.index == 1)
+    }
+
+    /// The microphone can still deliver a buffer as it stops: once finished, the recorder takes no
+    /// more audio, so nothing after the last chunk is cut and sent.
+    @Test func audioArrivingAfterTheFinishIsNotRecordedAndCutsNoChunk() throws {
+        let recorder = AudioRecorder(preRoll: .seconds(2))
+        var random = DictationTestAudio.Random(seed: 7)
+        recorder.keepFromNow()
+        for buffer in DictationTestAudio.buffers(DictationTestAudio.speech(12, &random)) { recorder.append(buffer) }
+        let recorded = try recorder.finish().duration
+
+        // Enough for a cut, had it been recorded: a pause after 12 s of speech, then more speech.
+        let late = DictationTestAudio.room(1.5, &random) + DictationTestAudio.speech(2, &random)
+        for buffer in DictationTestAudio.buffers(late) { recorder.append(buffer) }
+
+        #expect(recorder.takeChunks().isEmpty)
+        #expect(try recorder.finish().duration == recorded)
     }
 
     /// Holding is bounded by the cap too: a moment before speech never outgrows a recording.

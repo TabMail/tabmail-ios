@@ -49,6 +49,9 @@ final class AudioRecorder: Sendable {
         var peakLevel: Float = 0
         var firstBufferAt: ContinuousClock.Instant?
         var truncated = false
+        /// `finish` was called: a buffer the microphone still delivers as it stops is not the
+        /// dictation's, and must cut no chunk after the last.
+        var finished = false
         var firstError: (any Error)?
         var isHoldingPreRoll = true
         /// Reads what is kept, from `keepFromNow` on; its sample indices are `pcm`'s.
@@ -109,6 +112,7 @@ final class AudioRecorder: Sendable {
         let level = MicrophoneCapture.level(of: buffer)
         let now = ContinuousClock.now
         let cut = state.withLockUnchecked { state in
+            guard !state.finished else { return false }
             if state.firstBufferAt == nil { state.firstBufferAt = now }
             guard state.firstError == nil, !state.truncated else { return false }
             state.peakLevel = max(state.peakLevel, level)
@@ -128,13 +132,14 @@ final class AudioRecorder: Sendable {
     /// occurred.
     func finish() throws -> Recording {
         let (pcm, peakLevel, firstBufferAt, truncated, lastChunk) = try state.withLockUnchecked { state in
+            state.finished = true
             if let error = state.firstError { throw error }
             let samples = state.pcm.count / MemoryLayout<Int16>.size
             let lastChunk = state.isHoldingPreRoll ? nil : state.chunker.finish(totalSamples: samples)
             let pcm = lastChunk.map { Self.samples($0.start..<$0.end, of: state.pcm) } ?? state.pcm
             return (pcm, state.peakLevel, state.firstBufferAt, state.truncated, lastChunk)
         }
-        // Outside the lock: the audio thread keeps appending meanwhile.
+        // Outside the lock: nothing is appended once finished.
         let normalized = Self.normalizePeak(pcm)
         return Recording(
             pcm: normalized.pcm,
