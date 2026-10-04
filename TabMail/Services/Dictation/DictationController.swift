@@ -45,6 +45,9 @@ final class DictationController {
     /// The recording (FLAC), its language, the words to spell as given and the cleanup's variables →
     /// the transcript and its cleaned-up text.
     typealias Transcribe = @Sendable (Data, String?, [String], [String: String]) async throws -> DictationTranscription
+    /// Runs the cleanup prompt over a long dictation's joined text, with the cleanup's variables, and
+    /// returns its reply (`BackendClient.sendCompletionsDirect`).
+    typealias Polish = @Sendable (String, [String: String]) async throws -> String
     /// Warms the backend for the transcription to come (`BackendClient.warmUpDictation`).
     typealias WarmUp = @Sendable () async -> Void
     /// The plain-text body of an email (its `messageHeader.id`), for terms; nil without one.
@@ -68,6 +71,8 @@ final class DictationController {
     @ObservationIgnored private let useWords: @MainActor ([String]) -> Void
     @ObservationIgnored private let transcribeAudio: Transcribe
     @ObservationIgnored private let warmUp: WarmUp
+    @ObservationIgnored private let polish: Polish
+    @ObservationIgnored private let chunkPolishTimeout: Duration
     @ObservationIgnored private let transcriptionRetryDelays: [Duration]
     @ObservationIgnored private let transcriptionRetryNoticeDelay: Duration
     @ObservationIgnored private let chunkRetryDelays: [Duration]
@@ -110,6 +115,8 @@ final class DictationController {
         useWords: @escaping @MainActor ([String]) -> Void = { DictationDictionary.shared.use($0) },
         transcribe: Transcribe? = nil,
         warmUp: WarmUp? = nil,
+        polish: Polish? = nil,
+        chunkPolishTimeout: Duration = DictationConfig.chunkPolishTimeout,
         transcriptionRetryDelays: [Duration] = DictationConfig.transcriptionRetryDelays,
         transcriptionRetryNoticeDelay: Duration = DictationConfig.transcriptionRetryNoticeDelay,
         chunkRetryDelays: [Duration] = DictationConfig.chunkRetryDelays,
@@ -127,6 +134,8 @@ final class DictationController {
         self.useWords = useWords
         self.transcribeAudio = transcribe ?? Self.backendTranscription(AccountManager.shared.backendClient)
         self.warmUp = warmUp ?? Self.backendWarmUp(AccountManager.shared.backendClient)
+        self.polish = polish ?? Self.backendPolish(AccountManager.shared.backendClient)
+        self.chunkPolishTimeout = chunkPolishTimeout
         self.transcriptionRetryDelays = transcriptionRetryDelays
         self.transcriptionRetryNoticeDelay = transcriptionRetryNoticeDelay
         self.chunkRetryDelays = chunkRetryDelays
@@ -140,6 +149,22 @@ final class DictationController {
     static func backendTranscription(_ client: BackendClient) -> Transcribe {
         { flac, language, vocabulary, cleanup in
             try await client.transcribeDictation(flac: flac, language: language, vocabulary: vocabulary, cleanup: cleanup)
+        }
+    }
+
+    /// The polish on the TabMail backend: the cleanup prompt at `POST /completions/chat`, as the app
+    /// sent its cleanup before the backend ran it in the transcription request.
+    static func backendPolish(_ client: BackendClient) -> Polish {
+        { text, cleanup in
+            let vars = cleanup.mapValues { JSONValue.string($0) }.merging(["dictation": .string(text)]) { $1 }
+            let request = CompletionsRequest(
+                messages: [CompletionsMessage(role: "system", content: DictationConfig.cleanupPrompt, vars: vars)],
+                client_timezone: TimeZone.current.identifier,
+                disable_tools: true,
+                web_search_enabled: false
+            )
+            // Direct: a user waiting on their dictation doesn't queue behind background AI work.
+            return try await client.sendCompletionsDirect(request).assistant ?? ""
         }
     }
 
@@ -446,7 +471,38 @@ final class DictationController {
             return
         }
         useWords(heard.flatMap { [$0.text] + [$0.cleanedText].compactMap { $0 } })
-        deliver(DictationChunkJoin.join(texts.map { .init(text: $0.text.isEmpty ? "" : DictationCleanup.pasted(transcript: $0.text, cleanedText: $0.cleanedText), overlapped: $0.overlapped) }))
+        let joined = DictationChunkJoin.join(texts.map { .init(text: $0.text.isEmpty ? "" : DictationCleanup.pasted(transcript: $0.text, cleanedText: $0.cleanedText), overlapped: $0.overlapped) })
+        // One chunk already had its whole cleanup.
+        let text = parts.count > 1 ? await polished(joined, cleanup: await uploads.cleanup()) : joined
+        guard generation == current, !Task.isCancelled else { return }
+        deliver(text)
+    }
+
+    /// A long dictation's joined text (its chunks' cleanups), polished as a whole by the cleanup
+    /// prompt if that answers within `chunkPolishTimeout` (owner, 2026-10-03: "a final polished pass
+    /// if time permits"), as TabMail Voice's: the chunks' seams read as one text. Else, or when it
+    /// fails or comes back empty, `text` as it is: a failed polish never costs the user their
+    /// dictation, as a failed cleanup doesn't.
+    private func polished(_ text: String, cleanup: [String: String]) async -> String {
+        let polish = polish
+        let timeout = chunkPolishTimeout
+        let clock = ContinuousClock()
+        let started = clock.now
+        do {
+            let reply = try await withTimeout(seconds: Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18) {
+                try await polish(text, cleanup)
+            }
+            let polishedText = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !polishedText.isEmpty else {
+                BackgroundSyncLogger.logDebug("[Dictation] polish came back empty; pasting the chunks' cleanups")
+                return text
+            }
+            BackgroundSyncLogger.logDebug("[Dictation] polished in \(clock.now - started) (\(text.count) → \(polishedText.count) chars)")
+            return polishedText
+        } catch {
+            BackgroundSyncLogger.logDebug("[Dictation] polish \(error is TimeoutError ? "ran out of time" : "failed (\(type(of: error)))") after \(clock.now - started); pasting the chunks' cleanups")
+            return text
+        }
     }
 
     /// Ends the dictation with its text, appended to the input field.

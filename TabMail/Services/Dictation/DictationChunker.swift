@@ -17,7 +17,7 @@ struct DictationChunkCut: Sendable, Equatable {
 }
 
 /// Where a long recording is cut into chunks, as it is recorded (ADR-IOS-087; TabMail Voice's
-/// `Chunker`, ADR-DESK-048, rule for rule). It reads the loudness of each `chunkFrameDuration` frame
+/// `Chunker`, ADR-DESK-049, rule for rule). It reads the loudness of each `chunkFrameDuration` frame
 /// against the recording's own levels, never a fixed one: the quiet end of its frames
 /// (`chunkFloorPercentile`) is the room, the loud end (`chunkSpeechPercentile`) the voice, and a
 /// frame below `chunkPauseLevel` of the way from one to the other is quiet; a run of quiet frames

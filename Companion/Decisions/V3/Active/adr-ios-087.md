@@ -5,7 +5,7 @@
 **Context:** A chat-pill dictation stopped at 120 s of speech (ADR-IOS-085 decision 10): the most
 audio the backend's transcription model takes in one request (backend ADR-022). TabMail Voice had the
 same limit and lifts it by cutting a long dictation into chunks (tabmail-voice issue #1,
-ADR-DESK-048). Owner, 2026-10-03: cut at pauses, and only once a chunk holds 10 s or more of speech;
+ADR-DESK-049). Owner, 2026-10-03: cut at pauses, and only once a chunk holds 10 s or more of speech;
 with no pause, cut at about 2 minutes anyway, the next chunk overlapping it by 15 s of speech, the two
 texts merged on their repeated words, "and if no repeated words are found just join them. It's better
 than losing things"; each chunk is a whole request with its own cleanup, sent in parallel and in the
@@ -32,7 +32,7 @@ the backend answers any provider failure 502, which the apps retry.
    a frame or two at a time. The tolerance is a plosive's burst, shorter than any vowel, so a cut
    still lands only in a pause (owner: "really high precision, even if some recall could be
    lower"); with it that recording is cut at 13.5 s and 27.4 s, both inside its pauses
-   (ADR-DESK-048).
+   (ADR-DESK-049).
    - **A pause:** once a chunk holds `chunkMinimumSpeech` (10 s) of speech, it is cut in the middle of
      the next `chunkPauseDuration` (1 s) of quiet. Nothing overlaps. The levels are relative, so
      speech much softer than what came before, with few frames at the room's level, can read as
@@ -88,13 +88,24 @@ the backend answers any provider failure 502, which the apps retry.
    after it are cancelled. The first chunk giving up pastes nothing, as one recording's failure does.
    iOS says nothing about a missing end: dictation failures are silent (ADR-IOS-085 decision 8);
    the reason is in the debug log. (TabMail Voice shows a note.)
+   **The polish** (owner, 2026-10-03: "one final cleanup pass after the full dictation, even in the
+   chunked case… a little bit wasteful, but nice to have"; "a final polished pass if time permits…
+   not longer than 5 seconds"; "this should not change any of the backend mechanisms"): a text of
+   two chunks or more (their cleanups, joined) goes once more through the same cleanup prompt,
+   `DictationConfig.cleanupPrompt`, which the app calls itself at `POST /completions/chat`
+   (`BackendClient.sendCompletionsDirect`, as before the cleanup moved into the transcription
+   request), with the dictation's cleanup variables and the joined text as its `dictation`. Its reply
+   is pasted if it comes within `chunkPolishTimeout` (5 s) of the chunks being in; one that fails,
+   comes back empty or runs out of time (cancelled) leaves the joined text to be pasted, as a failed
+   cleanup leaves the transcript. One chunk left before a chunk that gave up already had its whole
+   cleanup and is not polished; a single recording never is. As TabMail Voice's.
 7. **Cancel** (or the pill going away) cancels every chunk request and wait; nothing is pasted, and
    no request is made after it (a chunk checks for the cancel after its upload is prepared and after
    each retry wait, as TabMail Voice does).
 8. **Consent and privacy:** unchanged. The audio was already sent to the AI backend at the tap; it
    now leaves in parts while the user speaks, and nothing more is kept (zero retention, ADR-004).
    iOS's AI consent covers voice recordings (ADR-IOS-085), so no new notice is shown on iOS; TabMail
-   Voice shows its existing users a one-time What's New notice (ADR-DESK-048).
+   Voice shows its existing users a one-time What's New tip under the pill (ADR-DESK-049).
 
 **Consequences:**
 
@@ -105,6 +116,10 @@ the backend answers any provider failure 502, which the apps retry.
 - A rate-limit burst after the release loses the end of the dictation only if it outlasts the last
   tries, about a minute of waits plus up to 30 s per try the backend holds (owner, 2026-10-03: "we
   definitely need more retries"; they were 2 s).
+- The cleanup sees one chunk at a time, so a sentence cut at a forced cut is cleaned in two halves;
+  the polish reads the whole text if it can within 5 s, at the cost of one more completions request
+  per long dictation and up to 5 s more at the spinner. A dictation of several minutes may run out of
+  time and keep its chunks' cleanups.
 - A long silence costs one request per 105 s, and the model may hear a stray word in it (as in
   one recording's silence).
 - `DictationController` is past 500 lines (620); the chunk logic lives in `DictationChunkUploads`,
@@ -119,7 +134,9 @@ the backend answers any provider failure 502, which the apps retry.
   429 given up at once, each chunk's
   language and words, each
   chunk peak-normalised on its own, no request after a cancel during a retry wait or the upload's
-  preparation), `DictationAudioRecorderTests.chunksAreCutAtThePauseCountingTheAudioHeldBeforeSpeech`, and `DictationControllerTests.noUploadOutlastsWhatTheModelTranscribes` /
+  preparation; the polish pasted with the prompt's variables, each fallback, a cancel during it, a
+  polish answering after a cancel leaving the next dictation alone, and no polish for one chunk),
+  `DictationAudioRecorderTests.chunksAreCutAtThePauseCountingTheAudioHeldBeforeSpeech`, and `DictationControllerTests.noUploadOutlastsWhatTheModelTranscribes` /
   `theAppsControllerSendsALongDictationInChunksTheModelTranscribes`. Five mutants (failed chunks
   skipped, the release not ending waits, 504 not retried while recording, a silent chunk not sent,
   cancel not stopping requests) each fail at least one of them.

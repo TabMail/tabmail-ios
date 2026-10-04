@@ -55,10 +55,10 @@ enum DictationConfig {
     /// Recording stops and is sent automatically at this length, counted from speech. A dictation
     /// longer than `chunkMaxDuration` is cut into chunks, each under the 120 seconds the backend
     /// transcribes at once (backend ADR-022), so this is not the backend's limit (ADR-IOS-087; was
-    /// 120 seconds). As TabMail Voice's (ADR-DESK-048).
+    /// 120 seconds). As TabMail Voice's (ADR-DESK-049).
     static let maxRecordingDuration: Duration = .seconds(600)
 
-    // MARK: Long dictations (ADR-IOS-087, TabMail Voice ADR-DESK-048)
+    // MARK: Long dictations (ADR-IOS-087, TabMail Voice ADR-DESK-049)
 
     /// The chunker reads the recording's loudness in frames this long.
     static let chunkFrameDuration: Duration = .milliseconds(20)
@@ -99,6 +99,14 @@ enum DictationConfig {
     static let chunkOverlapSearchWords = 80
     /// …on a run of at least this many words; with no such run they are joined whole.
     static let chunkOverlapMinimumRun = 3
+    /// A long dictation's joined text is polished once more as a whole if that takes no longer than
+    /// this after the chunks are in; else the chunks' own cleanups are pasted as they are (owner,
+    /// 2026-10-03: "a final polished pass if time permits… not longer than 5 seconds"). As TabMail
+    /// Voice's.
+    static let chunkPolishTimeout: Duration = .seconds(5)
+    /// The backend's cleanup prompt: the backend runs it in the transcription request, and the app
+    /// itself over a long dictation's joined text (`POST /completions/chat`, its `dictation` variable).
+    static let cleanupPrompt = "system_prompt_dictate_cleanup"
 
     // MARK: Speech detection
 

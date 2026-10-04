@@ -4,7 +4,7 @@
 
 import Foundation
 
-/// A long dictation's chunks (ADR-IOS-087; TabMail Voice's ADR-DESK-048): each is sent as it is cut,
+/// A long dictation's chunks (ADR-IOS-087; TabMail Voice's ADR-DESK-049): each is sent as it is cut,
 /// with its own cleanup, while the user goes on, and tried again while the user is still dictating;
 /// at the release, the chunks still failing get their last tries, and the dictation's text is the
 /// chunks' in order up to the first that gave up (owner, 2026-10-03: "paste only the up to
@@ -71,6 +71,11 @@ final class DictationChunkUploads {
     /// The user released: chunks still failing get their last tries at once. Returns the chunks'
     /// transcriptions in order up to the first that gave up, and why it did (nil: none did). The
     /// chunks after it are no longer needed and are cancelled.
+    /// The cleanup's variables every chunk went with.
+    func cleanup() async -> [String: String] {
+        await upload.value.cleanup
+    }
+
     func release() async -> (parts: [Part], lost: (any Error)?) {
         isReleased = true
         for wait in waits.values { wait.cancel() }

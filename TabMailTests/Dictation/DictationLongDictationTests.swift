@@ -150,6 +150,59 @@ private final class ChunkBackend: Sendable {
     }
 }
 
+/// The polish of a long dictation's joined text: answers each with `reply`, and records what it was
+/// given. `.held` answers only once `answer()` is called, even after a cancel.
+private final class Polisher: Sendable {
+    enum Reply: Sendable {
+        case text(String)
+        case failure
+        /// Never answers until cancelled.
+        case never
+        case held(String)
+    }
+
+    private struct State {
+        var calls: [(text: String, cleanup: [String: String])] = []
+        var cancelled = false
+        var answered = false
+    }
+
+    private let state = Mutex(State())
+    let reply: Reply
+
+    init(_ reply: Reply = .failure) {
+        self.reply = reply
+    }
+
+    var calls: [(text: String, cleanup: [String: String])] { state.withLock { $0.calls } }
+    var wasCancelled: Bool { state.withLock { $0.cancelled } }
+
+    func answer() {
+        state.withLock { $0.answered = true }
+    }
+
+    func polish(_ text: String, cleanup: [String: String]) async throws -> String {
+        state.withLock { $0.calls.append((text, cleanup)) }
+        switch reply {
+        case .text(let reply):
+            return reply
+        case .failure:
+            throw DictationError.failed(status: 500)
+        case .never:
+            do {
+                try await Task.sleep(for: .seconds(3_600))
+            } catch {
+                state.withLock { $0.cancelled = true }
+                throw error
+            }
+            throw CancellationError()
+        case .held(let reply):
+            while !state.withLock({ $0.answered }) { await Task.yield() }
+            return reply
+        }
+    }
+}
+
 /// The texts the dictations in one test pasted.
 private final class Pasted: Sendable {
     let texts = Mutex<[String]>([])
@@ -157,7 +210,7 @@ private final class Pasted: Sendable {
 
 /// A long dictation on iOS (ADR-IOS-087): cut into chunks as it is recorded, each sent at once with
 /// its own cleanup, retried while the user goes on, and the text the chunks' in order up to the
-/// first that gave up. As TabMail Voice's long-dictation tests (ADR-DESK-048).
+/// first that gave up. As TabMail Voice's long-dictation tests (ADR-DESK-049).
 @MainActor
 struct DictationLongDictationTests {
     private typealias Audio = DictationTestAudio
@@ -173,7 +226,9 @@ struct DictationLongDictationTests {
         language: String? = nil,
         words: [String] = [],
         emailBody: @escaping DictationController.EmailBody = { _ in nil },
-        useWords: @escaping @MainActor ([String]) -> Void = { _ in }
+        useWords: @escaping @MainActor ([String]) -> Void = { _ in },
+        polisher: Polisher = Polisher(),
+        polishTimeout: Duration = .seconds(5)
     ) -> DictationController {
         DictationController(
             capture: capture,
@@ -187,6 +242,8 @@ struct DictationLongDictationTests {
             useWords: useWords,
             transcribe: { flac, language, vocabulary, cleanup in try await backend.transcribe(flac, language: language, vocabulary: vocabulary, cleanup: cleanup) },
             warmUp: {},
+            polish: { text, cleanup in try await polisher.polish(text, cleanup: cleanup) },
+            chunkPolishTimeout: polishTimeout,
             transcriptionRetryDelays: retryDelays,
             transcriptionRetryNoticeDelay: retryNoticeDelay,
             chunkRetryDelays: chunkRetryDelays,
@@ -243,6 +300,114 @@ struct DictationLongDictationTests {
         let lengths = backend.chunks.compactMap { try? FLACTestDecoder.decode($0).totalSamples }
         #expect(lengths.count == 3)
         #expect(lengths.allSatisfy { $0 < Int(25 * Audio.rate) })
+    }
+
+    /// Owner, 2026-10-03: "a final polished pass if time permits". Once its chunks are in, their
+    /// cleanups, joined, go through the cleanup prompt once more as a whole, with the dictation's
+    /// cleanup variables, and its reply is pasted. As TabMail Voice's.
+    @Test func aLongDictationIsPolishedAsAWholeAndThePolishIsPasted() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let polisher = Polisher(.text("Part zero, part one and part two."))
+        let controller = controller(capture, backend, words: ["Xyvora"], polisher: polisher)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 50, 12, 12, 5)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 } == ["Part zero, part one and part two."])
+        let calls = polisher.calls
+        #expect(calls.count == 1)
+        guard calls.count == 1 else { return }
+        #expect(calls[0].text == "Part 0. Part 1. Part 2.")
+        #expect(calls[0].cleanup == backend.cleanups.first)
+        #expect(calls[0].cleanup["dictionary"] == "Xyvora")
+    }
+
+    /// The polish is only if time permits: one that fails, comes back empty or takes longer than
+    /// `chunkPolishTimeout` leaves the chunks' cleanups, joined, to be pasted, and the dictation
+    /// ends as ever. One running out of time is cancelled.
+    @Test(arguments: [Polisher.Reply.failure, .text(" "), .never])
+    fileprivate func aPolishThatFailsLeavesTheChunksCleanupsPasted(reply: Polisher.Reply) async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let polisher = Polisher(reply)
+        let controller = controller(capture, backend, polisher: polisher, polishTimeout: .milliseconds(200))
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 51, 12, 12, 5)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1. Part 2."])
+        #expect(polisher.calls.count == 1)
+        if case .never = reply {
+            await waitUntil { polisher.wasCancelled }
+            #expect(polisher.wasCancelled)
+        }
+    }
+
+    /// A cancel while the polish runs ends the dictation: nothing is pasted, and the polish stops.
+    @Test func aLongDictationCancelledWhileItIsPolishedPastesNothing() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let polisher = Polisher(.never)
+        let controller = controller(capture, backend, polisher: polisher, polishTimeout: .seconds(60))
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 52, 12, 5)
+        controller.finish()
+        await waitUntil { polisher.calls.count == 1 }
+        controller.cancel()
+        await waitUntil { polisher.wasCancelled }
+
+        #expect(polisher.wasCancelled)
+        #expect(controller.phase == .idle)
+        #expect(pasted.texts.withLock { $0 }.isEmpty)
+    }
+
+    /// A polish that answers only after its dictation was cancelled, with the next one already
+    /// listening, never pastes or ends that one.
+    @Test func aPolishAnsweringAfterACancelNeverEndsTheNextDictation() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let polisher = Polisher(.held("Late."))
+        let controller = controller(capture, backend, polisher: polisher, polishTimeout: .seconds(60))
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 53, 12, 5)
+        controller.finish()
+        await waitUntil { polisher.calls.count == 1 }
+        controller.cancel()
+        let pasted = pasted
+        controller.start(context: context, canUseAI: true) { text in pasted.texts.withLock { $0.append(text) } }
+        await waitUntil { capture.starts == 2 }
+        polisher.answer()
+        try? await Task.sleep(for: .milliseconds(300))
+
+        #expect(controller.phase == .listening)
+        #expect(pasted.texts.withLock { $0 }.isEmpty)
+        controller.cancel()
+    }
+
+    /// One chunk left before a chunk that gave up already had its whole cleanup: it is not polished.
+    /// Two or more are.
+    @Test(arguments: [1, 2])
+    func onlyAPrefixOfTwoChunksOrMoreIsPolished(refusedChunk: Int) async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, _ in index == refusedChunk ? .refused : .part }
+        let polisher = Polisher()
+        let controller = controller(capture, backend, polisher: polisher)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 54, 12, 12, 5)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        let expected = (0..<refusedChunk).map { "Part \($0)." }.joined(separator: " ")
+        #expect(pasted.texts.withLock { $0 } == [expected])
+        #expect(polisher.calls.map(\.text) == (refusedChunk > 1 ? [expected] : []))
     }
 
     @Test func aChunkCutWithNoPauseOverlapsTheNextAndTheirSharedWordsAreKeptOnce() async {

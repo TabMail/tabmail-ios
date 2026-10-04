@@ -5,7 +5,7 @@
 import Foundation
 
 /// A long dictation's text, from its chunks' texts in order (ADR-IOS-087; TabMail Voice's
-/// `joinChunkTexts`, ADR-DESK-048, rule for rule).
+/// `joinChunkTexts`, ADR-DESK-049, rule for rule).
 ///
 /// - An ellipsis where two chunks meet is taken out (owner, 2026-10-03): it is the pause the cut fell
 ///   in, not the speaker's. One inside a chunk stays.
