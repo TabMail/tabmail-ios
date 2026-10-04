@@ -19,6 +19,7 @@ flips, or give a test seam a default that differs from production's initial valu
 · **fix a finding phrased "at symbol X", or reach for the retained shape when a reviewer wrote a "deletion-first answer" → MIS-IOS-020.**
 · **raise a "arbitrary" size/window/scan constant because it is too small → MIS-IOS-024.**
 · **call a key/id wrong from a remembered keying fact before reading the function that mints it, or write `ContentKey(rawValue: header.id)` → MIS-IOS-025.**
+· **write a `finish`/`cancel` that "releases" an object by nilling a property while a `Task`/`await` elsewhere still calls it → MIS-IOS-026.**
 
 ## Data integrity — the irreversible ones
 
@@ -46,6 +47,7 @@ flips, or give a test seam a default that differs from production's initial valu
 - **[MIS-IOS-023](Companion/Mistakes/Active/MIS-IOS-023-wrote-a-new-call-over-the-one-the-path-already-owed.md)** — **wrote a new call over the one that path already owed, and the diff GREW so nothing looked lost**: the promoted `retirePartiallyCompletedOp` never called `recordMembersThatEnteredInbox`, with **NO call-site count drop (5 base, 5 candidate)**. **A count census reads CLEAN when a NEW path is promoted without acquiring the call its predecessors owed.** (×2)
 - **[MIS-IOS-024](Companion/Mistakes/Active/MIS-IOS-024-widened-a-bound-without-asking-what-it-bounded.md)** — **widened a scan window (`snippetLinkScanChars` 4,000 → 32,000) on a happy-path benchmark without asking what the bound was protecting**: the regex behind `unwrapMarkdownLinks` was quadratic on unclosed `[](` / `\[` runs (3.5–6.8 s on the main actor at the new window); two cap-inside-the-regex patches each broke a valid link (MIS-005 ×28) before the construct was replaced by a linear scanner (#162, PR #163). Benchmark the ADVERSARIAL input in terms of the limit; worse than linear ⇒ replace the algorithm, never tune caps. (×1)
 - **[MIS-IOS-025](Companion/Mistakes/Active/MIS-IOS-025-read-a-content-store-with-a-header-id.md)** — **declared `ContentKey(rawValue: message.id)` a missing-body bug from the "FTS is RFC-keyed" note without reading `ContentKey.forHeader`**, which is Stage B (== header id; RFC tail only at E1); my own proving test failed. Read the mint before calling a key wrong; still read content stores via `MessageContentStore.capture`. (×1)
+- **[MIS-IOS-026](Companion/Mistakes/Active/MIS-IOS-026-released-a-reference-while-an-await-still-held-the-object.md)** — **"released" `PDFTextHost`'s web view by nilling `self.webView` while `Task { await readPages(webView) }` still awaited `callAsyncJavaScript` on it**: the web view outlived a cancel by 9 s and a wedged page forever; fixed with a `[weak self]` completion handler; tell = a teardown that clears a property while a pending await/closure owns the object; test with a weak ref that must go nil
 
 ## Build & test ops
 

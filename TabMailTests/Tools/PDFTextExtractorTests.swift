@@ -4,18 +4,14 @@
 
 import Testing
 import Foundation
+import Synchronization
 @testable import TabMail
 
 @Suite("PDFTextExtractor")
 struct PDFTextExtractorTests {
 
-    private func limits(maxPages: Int = 20, maxOutputChars: Int = 100_000, timeout: Duration = .seconds(20),
-                        streamCaps: PDFStreamBudget.Caps? = nil, maxPageTextBytes: Int? = nil) -> PDFTextExtractor.Limits {
-        let defaults = PDFTextExtractor.Limits(maxPages: maxPages, maxOutputChars: maxOutputChars, timeout: timeout)
-        return PDFTextExtractor.Limits(
-            maxPages: maxPages, maxOutputChars: maxOutputChars, timeout: timeout,
-            streamCaps: streamCaps ?? defaults.streamCaps,
-            maxPageTextBytes: maxPageTextBytes ?? defaults.maxPageTextBytes)
+    private func limits(maxPages: Int = 20, maxOutputChars: Int = 100_000, timeout: Duration = .seconds(20)) -> PDFTextExtractor.Limits {
+        PDFTextExtractor.Limits(maxPages: maxPages, maxOutputChars: maxOutputChars, timeout: timeout)
     }
 
     private func extract(_ data: Data, start: Int = 1, end: Int? = nil,
@@ -157,17 +153,36 @@ struct PDFTextExtractorTests {
         #expect(result.nextStartPage == 2)
     }
 
-    @Test("Cutting never splits a surrogate pair and counts UTF-16 units")
-    func cutKeepsScalarsWhole() {
-        #expect(PDFTextExtractor.cut("ab😀cd", toUTF16Length: 3) == "ab")
-        #expect(PDFTextExtractor.cut("ab😀cd", toUTF16Length: 4) == "ab😀")
-        #expect(PDFTextExtractor.cut("abc", toUTF16Length: 5) == "abc")
-        #expect(PDFTextExtractor.cut("abcdef", toUTF16Length: 4) == "abcd")
+    @Test("A cut first page keeps a character outside the BMP whole and counts UTF-16 units")
+    func cutKeepsScalarsWhole() async throws {
+        // U+2000B is two UTF-16 units; a cut after "ab" plus one unit would split it.
+        let data = PDFFixtures.make([.text("ab\u{2000B}cdefgh")])
+        let whole = try #require(pages(await extract(data)))
+        try #require(whole.pages.first?.text == "ab\u{2000B}cdefgh")
+
+        let three = try #require(pages(await extract(data, limits: limits(maxOutputChars: 3))))
+        #expect(three.pages.first?.text == "ab")
+        #expect(three.pages.first?.cutFrom == 10)
+        let four = try #require(pages(await extract(data, limits: limits(maxOutputChars: 4))))
+        #expect(four.pages.first?.text == "ab\u{2000B}")
     }
 
-    @Test("Normalising unifies line breaks, drops spaces before them and trims")
-    func normalize() {
-        #expect(PDFTextExtractor.normalize("  one  \r\ntwo\t\rthree \n\n") == "one\ntwo\nthree")
+    @Test("A valid PDF with a large lossless image is read: the image is never decoded for text")
+    func largeLosslessImage() async throws {
+        // A 5100 x 5100 RGB image, 78 MB once inflated, about 77 KB as stored. Before ADR-IOS-088
+        // the pre-check refused such a PDF (IOS-AI-010); pdf.js reads only the text layer.
+        let image = PDFFixtures.flateZeros(5100 * 5100 * 3)
+        let content = Data("q 612 0 0 792 0 0 cm /Im1 Do Q BT /F1 12 Tf 72 700 Td (Alpha) Tj ET".utf8)
+        let data = PDFFixtures.document([
+            PDFFixtures.object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            PDFFixtures.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            PDFFixtures.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>"),
+            PDFFixtures.streamObject(4, dictionary: "<< /Length \(content.count) >>", data: content),
+            PDFFixtures.object(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            PDFFixtures.streamObject(6, dictionary: "<< /Type /XObject /Subtype /Image /Width 5100 /Height 5100 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length \(image.count) /Filter /FlateDecode >>", data: image),
+        ])
+        let result = try #require(pages(await extract(data)))
+        #expect(result.pages.map(\.text) == ["Alpha"])
     }
 
     // MARK: - Bad input
@@ -183,7 +198,7 @@ struct PDFTextExtractorTests {
         let full = PDFFixtures.make([.text("Alpha"), .text("Bravo")])
         let outcome = await extract(full.prefix(full.count / 2))
         switch outcome {
-        case .malformed, .tooLarge, .ok: break
+        case .malformed, .failed, .ok: break
         default: Issue.record("unexpected outcome \(outcome)")
         }
     }
@@ -201,52 +216,54 @@ struct PDFTextExtractorTests {
         #expect(result.pages.first?.text.contains("Restricted but readable") == true)
     }
 
-    // MARK: - Memory bounds
-
-    @Test("A file whose streams inflate past the cap is too large; the same file without it is read")
-    func decompressionBomb() async throws {
-        let document = PDFFixtures.make([.text("Alpha")])
-        let bomb = PDFFixtures.streamObject(900, dictionary: "<< /Filter /FlateDecode >>", data: PDFFixtures.flateZeros(2_000_000))
-        let capped = limits(streamCaps: PDFStreamBudget.Caps(streamBytes: 1_000_000, totalBytes: 10_000_000))
-        #expect(await extract(document + bomb, limits: capped) == .tooLarge)
-        let result = try #require(pages(await extract(document, limits: capped)))
-        #expect(result.pages.first?.text == "Alpha")
+    @Test("A page pdf.js cannot read is unreadable, and the document still opens")
+    func unreadablePage() async throws {
+        // The page tree names itself as its own kid: pdf.js counts one page and fails to load it.
+        let data = PDFFixtures.document([
+            PDFFixtures.object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            PDFFixtures.object(2, "<< /Type /Pages /Kids [2 0 R] /Count 1 >>"),
+        ])
+        let result = try #require(pages(await extract(data)))
+        #expect(result.totalPages == 1)
+        #expect(result.pages.map(\.unreadable) == [true])
+        #expect(result.pages.map(\.text) == [""])
     }
 
-    @Test("A page drawing more text than the cap is left out as unreadable; other pages are read")
-    func pageTextCap() async throws {
-        let data = PDFFixtures.make([.text("Alpha"), .text(String(repeating: "Bravo ", count: 20)), .text("Charlie")])
-        let result = try #require(pages(await extract(data, limits: limits(maxPageTextBytes: 50))))
-        #expect(result.pages.map(\.text) == ["Alpha", "", "Charlie"])
-        #expect(result.pages.map(\.unreadable) == [false, true, false])
-        #expect(result.nextStartPage == nil)
+    // MARK: - Isolation
 
-        let uncapped = try #require(pages(await extract(data)))
-        #expect(uncapped.pages.allSatisfy { !$0.unreadable })
-    }
+    @Test("A decompression bomb is read in the WebContent process: the app's own memory stays flat")
+    func decompressionBombStaysOutOfTheApp() async throws {
+        // A /ToUnicode map that maps "A" to "Z" after 200 MB of padding, about 200 KB compressed.
+        // "Zlpha" proves pdf.js inflated and read all of it; before ADR-IOS-088, CoreGraphics
+        // inflated such a map inside the app.
+        let mapped = try #require(pages(await extract(PDFFixtures.textDocument("Alpha", toUnicode: Self.aToZ(padding: 0)))))
+        #expect(mapped.pages.map(\.text) == ["Zlpha"])
+        let bomb = PDFFixtures.textDocument("Alpha", toUnicode: Self.aToZ(padding: 200_000_000))
 
-    @Test("A document whose title has a percent sign and then the word stream is read")
-    func percentAndStreamInTitle() async throws {
-        let titled = PDFFixtures.make([.text("Alpha")], title: "Revenue grew 12% in each stream")
-        let result = try #require(pages(await extract(titled)))
-        #expect(result.pages.map(\.text) == ["Alpha"])
-    }
-
-    @Test("A page reaching a CCITT stream as a font map, content or colour space is left out as unreadable before PDFKit decodes it")
-    func pageReachingCCITTStream() async throws {
-        let ccitt = PDFPageGlyphCounterTests.ccitt
-        let bombs = [PDFPageGlyphCounterTests.fontDocument(.toUnicode, filter: ccitt.filter, data: ccitt.data)]
-            + [.contents, .form, .iccColorSpace].map { PDFPageGlyphCounterTests.pageDocument($0, filter: ccitt.filter, data: ccitt.data) }
-        for bomb in bombs {
-            let refused = try #require(pages(await extract(bomb)))
-            #expect(refused.pages.map(\.unreadable) == [true])
+        let before = PDFFixtures.footprint()
+        let peak = Peak()
+        let sampler = Task {
+            while !Task.isCancelled {
+                peak.record(PDFFixtures.footprint())
+                try? await Task.sleep(for: .milliseconds(20))
+            }
         }
-        let controls = [PDFPageGlyphCounterTests.fontDocument(.toUnicode)]
-            + [.contents, .form, .iccColorSpace].map { PDFPageGlyphCounterTests.pageDocument($0) }
-        for control in controls {
-            let read = try #require(pages(await extract(control)))
-            #expect(read.pages.map(\.unreadable) == [false])
-        }
+        let outcome = await extract(bomb)
+        sampler.cancel()
+        let read = try #require(pages(outcome))
+        #expect(read.pages.map(\.text) == ["Zlpha"])
+        #expect(peak.value - before < 64 * 1024 * 1024, "app footprint grew \(peak.value - before) bytes")
+    }
+
+    /// A flate-filtered CMap mapping byte 0x41 ("A") to "Z", after `padding` spaces.
+    private static func aToZ(padding: Int) -> Data {
+        let map = """
+            /CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /AtoZ def
+            1 begincodespacerange <00> <FF> endcodespacerange
+            1 beginbfchar <41> <005A> endbfchar
+            endcmap CMapName currentdict /CMap defineresource pop end end
+            """
+        return PDFFixtures.flate(Data(repeating: UInt8(ascii: " "), count: padding) + Data(map.utf8))
     }
 
     // MARK: - Deadline
@@ -257,39 +274,18 @@ struct PDFTextExtractorTests {
         #expect(await extract(data, limits: limits(timeout: .zero)) == .timeout)
     }
 
-    @Test("A deadline that passes inside PDFKit's read of a page returns timeout without waiting for it")
-    func deadlineInsidePDFKit() async {
-        // 190,000 glyphs are under the per-page cap, and counting them takes well under a
-        // millisecond; PDFKit takes most of a second to read them, cannot be interrupted, and no
-        // later check sees the deadline, so only `withTimeout` reports it.
-        func object(_ number: Int, _ body: String) -> Data { Data("\(number) 0 obj\n\(body)\nendobj\n".utf8) }
-        let content = Data("BT /F1 1 Tf 0 0 Td (\(String(repeating: "a", count: 190_000))) Tj ET".utf8)
-        let data = PDFFixtures.document([
-            object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
-            object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"),
-            PDFFixtures.streamObject(4, dictionary: "<< /Length \(content.count) >>", data: content),
-            object(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
-        ])
-        #expect(await extract(data, limits: limits(timeout: .milliseconds(200))) == .timeout)
-        #expect(pages(await extract(data)) != nil)
+    @Test("A deadline that passes while pdf.js is busy in one step returns timeout without waiting for it")
+    func deadlineWhileParsing() async {
+        let data = PDFFixtures.slowDocument()
+        let start = ContinuousClock.now
+        #expect(await extract(data, limits: limits(timeout: .milliseconds(500))) == .timeout)
+        #expect(ContinuousClock.now - start < .milliseconds(500) + AttachmentReadPdfTool.Config.hostTeardownGrace)
     }
+}
 
-    @Test("A deadline that passes while a page's text is counted stops the read with a timeout")
-    func deadlineWhileCounting() throws {
-        // Twenty million operators take the counter a large fraction of a second; inflating the
-        // stream and opening the file take a few milliseconds. Read directly, without the
-        // `withTimeout` that would report the timeout on its own.
-        func object(_ number: Int, _ body: String) -> Data { Data("\(number) 0 obj\n\(body)\nendobj\n".utf8) }
-        let content = PDFFixtures.flate(Data(String(repeating: "q Q ", count: 10_000_000).utf8))
-        let data = PDFFixtures.document([
-            object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
-            object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>"),
-            PDFFixtures.streamObject(4, dictionary: "<< /Filter /FlateDecode >>", data: content),
-        ])
-        let outcome = PDFTextExtractor.readPages(
-            data: data, startPage: 1, endPage: nil, limits: limits(), deadline: .now + .milliseconds(200))
-        #expect(outcome == .timeout)
-    }
+/// The largest value recorded, shared with the sampling task.
+private final class Peak: Sendable {
+    private let state = Mutex<UInt64>(0)
+    func record(_ value: UInt64) { state.withLock { $0 = max($0, value) } }
+    var value: UInt64 { state.withLock { $0 } }
 }

@@ -1,4 +1,90 @@
-# `attachment_read_pdf`: PDF attachment text for the chat agent (PDFKit)
+# `attachment_read_pdf`: PDF attachment text for the chat agent (pdf.js; PDFKit until 2026-10-04)
+
+> **Current shape (2026-10-04, ADR-IOS-088): the tool reads PDFs with the bundled pdf.js in a hidden
+> web view, as the Thunderbird add-on does.** `PDFStreamBudget` and `PDFPageGlyphCounter` are
+> deleted, and IOS-AI-009 and IOS-AI-010 are resolved. Everything after "History" below is the
+> PDFKit design, kept because its measurements explain why PDFKit was dropped. The filename keeps
+> "pdfkit" so existing links stay valid.
+
+## Current shape
+
+- `TabMail/Vendor/pdfjs/`: pdfjs-dist 6.3.289 legacy build, `cmaps/` and `LICENSE`, byte-identical
+  to the add-on's `chat/libs/pdfjs/` and to the npm tarball (SHA-256 checked 2026-10-04). A folder
+  reference in `project.yml`, excluded from the `TabMail` source glob, so `cmaps/` stays a
+  directory in the bundle (`pdfjs/cmaps/…`). Upgrade both apps together; the
+  `tabmail-vulnerability-scan` skill checks the version against GHSA and OSV.
+- `TabMail/Resources/pdf-text-host.html` and `pdf-text-host.mjs`: the page. The `.mjs` is a port of
+  the add-on's `chat/modules/pdfText.js` (`extractPdfText`, `readPages`, the page text join, the
+  surrogate-safe cut); keep the two in step. Its one entry point is
+  the exported `extractPdfText(range, limits)`, which never rejects.
+  - **Two WebKit differences from the add-on (measured 2026-10-04, iOS 26.5 simulator):**
+    `didFinish` fires before a module script's imports have loaded (`pdf.min.mjs` was requested
+    after it), so a `<script type="module">` that sets a global is not ready when the host calls
+    in; the host instead runs `await import("./pdf-text-host.mjs")` inside `callAsyncJavaScript`,
+    which waits for the module graph. And pdf.js 6.3.289's `getTextContent()` iterates a
+    `ReadableStream` with `for await`, which this WebKit cannot do ("undefined is not a
+    function"; the legacy build does not polyfill it), so `textContentOf` reads
+    `page.streamTextContent()` with a reader. A third dependency: the page's origin is the tuple
+    origin `tabmail-pdf://local` (measured; the URL standard gives a custom scheme an opaque
+    origin), which is what lets pdf.js start a real `Worker` it can terminate at the deadline
+    rather than a blob wrapper or a main-thread fake worker. Check all three on every pdf.js upgrade.
+- `PDFTextHost` (`@MainActor`): one `WKWebView` per call, `WKWebsiteDataStore.nonPersistent()`,
+  scheme `tabmail-pdf://local/` serving `/host.html`, `/pdf-text-host.mjs`, `/pdfjs/…` (a path that
+  leaves the directory is refused) and the PDF bytes at `/document`, which the page fetches. It
+  calls the entry point with `callAsyncJavaScript` once the page finishes loading, maps the
+  result object (`outcome(from:)`; any other shape is `.failed`), and releases the web view. The
+  call's completion handler holds neither the web view nor the host, so releasing it deallocates
+  the web view (and ends its WebContent process) even while the page is still working. Until
+  2026-10-04 a `Task` held the web view across the call, so after a cancel or a backstop timeout
+  it lived on until the page answered (measured 9.36 s), or forever if the page never did.
+  - `webViewWebContentProcessDidTerminate` (pdf.js ran WebContent out of memory) → `.failed`, and
+    the tool says "the PDF could not be read", TB's wording for its own `FAILED`.
+  - pdf.js stops itself at `parseTimeout` by terminating its worker. If the page has not answered
+    `hostTeardownGrace` (5 s) later, the host releases the web view and returns `.timeout`. A
+    cancelled caller gets `.failed` at once, and the web view is released at the same moment.
+  - Navigation to anything but the host page is cancelled. `PDFTextHost.contentSecurityPolicy`
+    allows script, worker and fetch from `tabmail-pdf:` only and no eval. It is sent as a response
+    header on every scheme response, not a `<meta>`, because a worker takes its policy from its own
+    script's response: a page `<meta>` left the pdf.js worker, where the PDF is parsed, with none.
+- `PDFTextExtractor` keeps the types (`Limits` is now just pages, characters and timeout) and
+  `hasPdfSignature`; `extract` calls `PDFTextHost.extract`. Outcomes: `ok`, `encrypted`,
+  `malformed`, `failed`, `timeout`, `pastEnd`; `tooLarge` is gone.
+  `AttachmentReadPdfTool.message(for:startPage:)` holds the error text for each.
+
+## pdf.js compared with PDFKit (measured 2026-10-04)
+
+On PDFs that CoreGraphics writes (macOS `CGContext` PDF, the same writer as `UIGraphicsPDFRenderer`):
+
+- **CJK without `/ToUnicode`:** Hiragino and Apple SD Gothic Neo subsets carry no map; pdf.js
+  recovers their text as PDFKit does. This was the reason a CGPDFScanner extractor was dropped in
+  the PDFKit design, and it does not apply to pdf.js.
+- **Where pdf.js trusts a map PDFKit repairs:** PingFang's `/ToUnicode` maps `日` and `文` to the
+  Kangxi radicals U+2F47 and U+2F42, which pdf.js returns; one system-font Cyrillic `к` came out as
+  `ĸ` (U+0138); after Korean text, Latin text in a Helvetica fallback subset lost `Ü` and `ö`.
+  Plain Latin, Greek, Cyrillic, Hebrew and Arabic in Helvetica, Times, Arial, Georgia, SF, Menlo
+  and Avenir match PDFKit (pdf.js orders right-to-left runs differently within a line).
+- A page tree that names itself (`/Kids [2 0 R]` on the `/Pages` node) opens with one page that
+  fails to load: the page is `unreadable`, the call still succeeds. The tests use it as their
+  unreadable-page fixture.
+- Text in a fixture must stay on the page: pdf.js drops text past the page edge (add-on memory
+  topic 039).
+
+## Tests
+
+`PDFTextExtractorTests` (end to end through the web view, including a valid PDF with a 78 MB
+lossless image that must be read, the IOS-AI-010 case), `PDFTextHostTests` (process termination,
+cancellation before and during a read with the web view deallocated, the backstop against a
+page whose main thread is wedged, the sandbox boundaries probed from inside the page: memory-only
+store, containment, no other scheme, no eval, the worker's policy header, navigation refused;
+result mapping) and `AttachmentReadPdfToolTests`. Each call
+starts a web view, so these suites are slower than pure unit tests. The isolation test reads a
+`/ToUnicode` map that maps "A" to "Z" after 200 MB of padding (about 200 KB compressed): the
+text "Zlpha" proves pdf.js inflated all of it, and the app's own `phys_footprint`, sampled every
+20 ms, must stay within 64 MB. Two-sided: the same file through in-process PDFKit grew the app by
+383 MB (measured 2026-10-04). A map of zero bytes is no bomb test: pdf.js skips NULs as
+whitespace and returned in about 2 s, so a deadline-based assertion was vacuous.
+
+## History: the PDFKit design (2026-10-03, replaced by ADR-IOS-088)
 
 Added 2026-10-03 for tabmail-ios#189, mirroring tabmail-thunderbird#112. The backend offers the
 schema from `common/attachment_read_pdf-v1.9.0.json`, so only 1.9.0+ clients see it; the TB and iOS
