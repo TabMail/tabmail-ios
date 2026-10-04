@@ -231,10 +231,9 @@ enum NSEIMAPConnection {
         folderPath: String,
         observedUidValidity: Int?
     ) -> NSEMessageMetadata? {
-        // Sender — SwiftMail's `info.from` is a raw RFC5322 string like
-        // `"Alice" <alice@example.com>`. Use shared EmailAddress.parse.
-        let fromStr = info.from ?? ""
-        let from = EmailAddress.parse(fromStr)
+        // Sender — the same mapping the main-app sync uses, so the NSE row and
+        // the synced row list the same sender.
+        let from = IMAPFetchMapping.sender(from: info) ?? EmailAddress(name: "", email: "")
         let senderName = from.name.isEmpty ? from.email : from.name
         let senderEmail = from.email
 
@@ -256,15 +255,13 @@ enum NSEIMAPConnection {
         // PromptVariables.summaryVariables path doesn't see nil.
         let snippet = ""
 
-        // Recipient strings: match `IMAPProvider.buildMessageHeaderInfo`'s
-        // `info.to.joined(separator: ", ")` format exactly so sync's UPDATE
-        // branch doesn't produce a write delta against the NSE row. SwiftMail
-        // exposes `info.replyTo` only since the Dec-2025 fork bump; earlier
-        // callers (main-app IMAP builder, line 1872) hardcoded nil, so keep
-        // that parity until main-app wires replyTo up.
-        let to = info.to.joined(separator: ", ")
-        let cc = info.cc.joined(separator: ", ")
-        let bcc = info.bcc.joined(separator: ", ")
+        // Recipient strings: the same `IMAPFetchMapping.addressField` the
+        // main-app `IMAPProvider.mapMessageInfo` writes, so sync's UPDATE branch
+        // doesn't produce a write delta against the NSE row. The main-app IMAP
+        // builder leaves replyTo nil, so keep that parity until it wires replyTo up.
+        let to = IMAPFetchMapping.addressField(info.toAddresses)
+        let cc = IMAPFetchMapping.addressField(info.ccAddresses)
+        let bcc = IMAPFetchMapping.addressField(info.bccAddresses)
 
         return NSEMessageMetadata(
             messageId: messageId,

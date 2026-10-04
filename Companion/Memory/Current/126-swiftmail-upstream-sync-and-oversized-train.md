@@ -103,3 +103,45 @@ and NSE (PR #159 on tabmail-ios; the earlier record-only update landed as PR #15
 resolved checkout hash, app + NSE build, 175 consumer tests in 7 EML/render suites. Pulled-in
 upstream commits beyond the fix: #234 (test-only). The 2026-09-10 fork-deviation note above is
 superseded.
+
+## Sync executed 2026-10-04 — nine upstream commits adopted, two fork deviations
+
+**Fork `main` = `585127337b829747521164a2f4c99c0807dfa902`** = upstream `b45ab8c` + two deviations,
+fast-forwarded from `124e3cc`. App and NSE pin the same revision in `project.yml`. Identify each
+deviation by its subject, not its hash; the next resync replays them until upstream merges them, then
+drops them:
+
+1. "Decode gb2312, GBK and EUC-KR mail with their superset charsets" — upstream PR
+   [#248](https://github.com/Cocoanetics/SwiftMail/pull/248), head `TabMail:fix/mime-charset-supersets`
+   (`34b6fa5`). Adds `String.Encoding(mimeCharset:)`; see memory 132.
+2. "Pair each embedded message with the message/rfc822 part that carries it" — upstream PR
+   [#249](https://github.com/Cocoanetics/SwiftMail/pull/249), head `TabMail:feat/embedded-message-parts` (`c9a2499`). Adds
+   `Message.embeddedMessagesWithParts` → `EmbeddedMessage {part, message}`.
+
+Upstream commits pulled in: #236 (ENABLE/QRESYNC), #237 (Outlook `.msg`), #239, #241, #242, #244,
+#245/#246 (structured addresses), #247. The two that break the app's contract:
+
+- **#237 `ownParts`**: `bodies`, `cids` and `attachments` now exclude parts under message/rfc822.
+  `IMAPFetchMapping.renderBodyWithEmbeddedHeaders` renders own bodies and then one `EmlMarker` per
+  carried message from `embeddedMessagesWithParts` (recursive, so a forward inside a forward renders
+  once, inside its parent's block); `extractInlineImages` reads `message.parts`, so forwarded inline
+  images still resolve. A nested pair's `part.section` is relative to its parent message.
+  **Nested `.eml` attachment indexes cannot shift**: `EMLParser` recurses only into `multipart/*`,
+  never into message/rfc822, so for an EML-parsed message `ownParts == parts`
+  (`EmlParsingTests.nestedIndexesStableAcrossForwardedMessage`).
+- **#245/#246 addresses**: `MessageInfo.from`/`to`/… are computed RFC 5322 text; the structured
+  `fromAddresses`/`toAddresses`/`ccAddresses`/`bccAddresses` are `[AddressListEntry]`
+  (`.mailbox`, `.group`, `.invalid`). Owner decisions 2026-10-03:
+  - Sender = first mailbox of `fromAddresses`; no valid mailbox → the raw From text as the name,
+    empty address (`IMAPFetchMapping.sender(from:)`, main app and NSE).
+  - To/Cc/Bcc stored one entry per mailbox, groups flattened, invalid entries kept visible
+    (`IMAPFetchMapping.addressField`); `isValidEmailAddress` requires `AddressListEntry` to read a
+    `.mailbox`, so invalid entries are never offered for reply-all.
+  - Send normalises recipients through SwiftMail's parser (`IMAPProvider.sendableRecipients`);
+    unparseable text throws `SMTPError.invalidEmailAddress` (fatal send error), no fallback. Drafts
+    keep recipients as typed.
+- **C1 note above is superseded**: SwiftMail now decodes encoded display names itself, so the
+  `RFC5322Parse.decodeRFC2047` calls in `EmlParsing.parse` were deleted (owner decision D).
+- **BCC is dropped on send** (pre-existing, found during this sync): `IMAPProvider.buildEmail` never
+  sets `Email.bccRecipients`, which SwiftMail's SMTP send uses for RCPT TO. Immediate follow-up PR;
+  the existing `withBCC` test pins the wrong behaviour.

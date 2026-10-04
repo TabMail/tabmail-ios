@@ -33,7 +33,9 @@ struct NSEMainAppIMAPParityTests {
             uid: uid.map { UID(UInt32($0)) },
             subject: "Parity",
             from: "sender@example.com",
-            to: ["a@x.com", "b@x.com"],
+            // A named mailbox and a group: the stored field differs from
+            // SwiftMail's header text, so the expectations below tell them apart.
+            to: ["Ann <a@x.com>", "Team: b@x.com, e@x.com;"],
             cc: ["c@x.com"],
             bcc: ["d@x.com"],
             date: Date(timeIntervalSince1970: 1_710_000_000),
@@ -89,10 +91,16 @@ struct NSEMainAppIMAPParityTests {
         // hasAttachments — predicate parity with IMAPProvider.mapMessageInfo.
         #expect(IMAPFetchMapping.hasAttachments(from: info))
 
-        // Recipient joining parity with IMAPProvider.mapMessageInfo.
-        #expect(info.to.joined(separator: ", ") == "a@x.com, b@x.com")
-        #expect(info.cc.joined(separator: ", ") == "c@x.com")
-        #expect(info.bcc.joined(separator: ", ") == "d@x.com")
+        // Sender and recipient fields — both sites store `sender(from:)` and
+        // `addressField`, never SwiftMail's header text (`info.to`).
+        let sender = IMAPFetchMapping.sender(from: info)
+        #expect(sender?.name == "sender@example.com")
+        #expect(sender?.email == "sender@example.com")
+        let to = IMAPFetchMapping.addressField(info.toAddresses)
+        #expect(to == "\"Ann\" <a@x.com>, b@x.com, e@x.com")
+        #expect(to != info.to.joined(separator: ", "))
+        #expect(IMAPFetchMapping.addressField(info.ccAddresses) == "c@x.com")
+        #expect(IMAPFetchMapping.addressField(info.bccAddresses) == "d@x.com")
 
         // Flags — mirrors IMAPProvider.mapMessageInfo.
         #expect(info.flags.contains(.seen))

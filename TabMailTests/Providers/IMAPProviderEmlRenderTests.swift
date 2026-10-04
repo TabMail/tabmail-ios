@@ -465,6 +465,166 @@ struct EmlRenderTests {
         #expect(!stripped.contains("tm-eml-section"))
     }
 
+    // MARK: - Messages carried inside carried messages
+
+    /// The flat BODYSTRUCTURE of a message that forwards `outer.eml`, which in
+    /// turn forwards `inner.eml`. Every body is distinct text so each can be
+    /// counted.
+    private func makeForwardInsideForwardParts() -> [MessagePart] {
+        [
+            makeTextPlainPart(section: "1", text: "Main body"),
+            makeRfc822Part(section: "2", filename: "outer.eml", subject: "Outer subject"),
+            makeTextHtmlPart(section: "2.1", html: "<p>outer html</p>"),
+            makeRfc822Part(section: "2.2", filename: "inner.eml", subject: "Inner subject"),
+            makeTextHtmlPart(section: "2.2.1", html: "<p>inner html</p>"),
+        ]
+    }
+
+    private func occurrences(of needle: String, in haystack: String) -> Int {
+        haystack.components(separatedBy: needle).count - 1
+    }
+
+    /// Each carried message renders exactly once, the inner one inside the outer
+    /// one's marker under its own header block. The preview sheet shows only a
+    /// top-level marker, so a marker of the inner message's own would be
+    /// unreachable, and its body used to appear twice in the stored blob.
+    @Test("A message forwarded inside a forwarded one renders once, inside its parent's marker")
+    func forwardInsideForwardRendersOnceInsideParent() throws {
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(
+            message: makeMessage(parts: makeForwardInsideForwardParts()), type: "text/html"
+        ))
+
+        #expect(occurrences(of: "class=\"tm-eml-section\"", in: result) == 1)
+        #expect(result.contains("data-filename=\"outer.eml\""))
+        #expect(result.contains("data-part-section=\"2\""))
+        #expect(!result.contains("data-filename=\"inner.eml\""))
+        #expect(occurrences(of: "outer html", in: result) == 1)
+        #expect(occurrences(of: "inner html", in: result) == 1)
+
+        // The inner message sits inside the outer marker, after the outer body,
+        // under its own header block.
+        let stripped = EmailFilter.stripEmbeddedEmlSections(result)
+        #expect(!stripped.contains("inner html"))
+        #expect(!stripped.contains("Inner subject"))
+        let outerBody = try #require(result.range(of: "outer html"))
+        let innerHeader = try #require(result.range(of: "<b>inner.eml</b>"))
+        let innerBody = try #require(result.range(of: "inner html"))
+        #expect(outerBody.lowerBound < innerHeader.lowerBound)
+        #expect(innerHeader.lowerBound < innerBody.lowerBound)
+        #expect(result.contains("Inner subject"))
+
+        // Promoted main text still leads.
+        let main = try #require(result.range(of: "Main body"))
+        #expect(main.lowerBound < outerBody.lowerBound)
+    }
+
+    @Test("A forward three deep renders each body once, nested in order, under one marker")
+    func forwardThreeDeepRendersOnceInOrder() throws {
+        let parts = [
+            makeTextHtmlPart(section: "1", html: "<p>Main body</p>"),
+            makeRfc822Part(section: "2", filename: "outer.eml", subject: "Outer subject"),
+            makeTextHtmlPart(section: "2.1", html: "<p>outer html</p>"),
+            makeRfc822Part(section: "2.2", filename: "middle.eml", subject: "Middle subject"),
+            makeTextHtmlPart(section: "2.2.1", html: "<p>middle html</p>"),
+            makeRfc822Part(section: "2.2.2", filename: "inner.eml", subject: "Inner subject"),
+            makeTextHtmlPart(section: "2.2.2.1", html: "<p>inner html</p>"),
+        ]
+        let html = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(
+            message: makeMessage(parts: parts), type: "text/html"
+        ))
+        #expect(occurrences(of: "class=\"tm-eml-section\"", in: html) == 1)
+        for body in ["outer html", "middle html", "inner html"] {
+            #expect(occurrences(of: body, in: html) == 1, "\(body)")
+        }
+        let outer = try #require(html.range(of: "outer html"))
+        let middleHeader = try #require(html.range(of: "<b>middle.eml</b>"))
+        let middle = try #require(html.range(of: "middle html"))
+        let innerHeader = try #require(html.range(of: "<b>inner.eml</b>"))
+        let inner = try #require(html.range(of: "inner html"))
+        #expect(outer.lowerBound < middleHeader.lowerBound)
+        #expect(middleHeader.lowerBound < middle.lowerBound)
+        #expect(middle.lowerBound < innerHeader.lowerBound)
+        #expect(innerHeader.lowerBound < inner.lowerBound)
+
+        let plainParts = [
+            makeTextPlainPart(section: "1", text: "Main body"),
+            makeRfc822Part(section: "2", filename: "outer.eml", subject: "Outer subject"),
+            makeTextPlainPart(section: "2.1", text: "outer text"),
+            makeRfc822Part(section: "2.2", filename: "middle.eml", subject: "Middle subject"),
+            makeTextPlainPart(section: "2.2.1", text: "middle text"),
+            makeRfc822Part(section: "2.2.2", filename: "inner.eml", subject: "Inner subject"),
+            makeTextPlainPart(section: "2.2.2.1", text: "inner text"),
+        ]
+        let plain = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(
+            message: makeMessage(parts: plainParts), type: "text/plain"
+        ))
+        for body in ["outer text", "middle text", "inner text", "Inner subject"] {
+            #expect(occurrences(of: body, in: plain) == 1, "\(body)")
+        }
+        let middleText = try #require(plain.range(of: "middle text"))
+        let innerSubject = try #require(plain.range(of: "Inner subject"))
+        #expect(middleText.lowerBound < innerSubject.lowerBound)
+    }
+
+    @Test("Plain text: a forward inside a forward gets both header blocks, each body once")
+    func forwardInsideForwardPlainText() throws {
+        let parts = [
+            makeTextPlainPart(section: "1", text: "Main body"),
+            makeRfc822Part(section: "2", filename: "outer.eml", subject: "Outer subject"),
+            makeTextPlainPart(section: "2.1", text: "outer text"),
+            makeRfc822Part(section: "2.2", filename: "inner.eml", subject: "Inner subject"),
+            makeTextPlainPart(section: "2.2.1", text: "inner text"),
+        ]
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(
+            message: makeMessage(parts: parts), type: "text/plain"
+        ))
+
+        #expect(occurrences(of: "outer text", in: result) == 1)
+        #expect(occurrences(of: "inner text", in: result) == 1)
+        #expect(occurrences(of: "--- outer.eml ---", in: result) == 1)
+        #expect(occurrences(of: "--- inner.eml ---", in: result) == 1)
+        let order = ["Main body", "--- outer.eml ---", "Subject: Outer subject", "outer text",
+                     "--- inner.eml ---", "Subject: Inner subject", "inner text"]
+        let positions = try order.map { try #require(result.range(of: $0)).lowerBound }
+        #expect(positions == positions.sorted())
+    }
+
+    /// An outer forward with no HTML of its own still gets a marker when the
+    /// message it forwards has HTML — the inner HTML is what the preview shows.
+    @Test("A forward whose only HTML is a nested forward's still gets its marker")
+    func forwardWithOnlyNestedHtmlGetsMarker() throws {
+        let parts = [
+            makeTextHtmlPart(section: "1", html: "<p>Main</p>"),
+            makeRfc822Part(section: "2", filename: "outer.eml"),
+            makeTextPlainPart(section: "2.1", text: "outer text only"),
+            makeRfc822Part(section: "2.2", filename: "inner.eml"),
+            makeTextHtmlPart(section: "2.2.1", html: "<p>inner html</p>"),
+        ]
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(
+            message: makeMessage(parts: parts), type: "text/html"
+        ))
+        #expect(occurrences(of: "class=\"tm-eml-section\"", in: result) == 1)
+        #expect(result.contains("data-filename=\"outer.eml\""))
+        #expect(occurrences(of: "inner html", in: result) == 1)
+        #expect(result.contains("<b>inner.eml</b>"))
+    }
+
+    /// A forwarded HTML body references its own inline images by `cid:`, and it is
+    /// rendered into the same body — so its images must be collected too.
+    @Test("Inline images of a forwarded message are extracted with the rest")
+    func inlineImagesIncludeForwardedMessages() {
+        let image = Data([0x89, 0x50, 0x4E, 0x47])
+        let parts = [
+            makeTextHtmlPart(section: "1.1", html: "<img src=\"cid:own@example.com\">"),
+            MessagePart(sectionString: "1.2", contentType: "image/png", contentId: "<own@example.com>", data: image),
+            makeRfc822Part(section: "2", filename: "fwd.eml"),
+            makeTextHtmlPart(section: "2.1.1", html: "<img src=\"cid:fwd@example.com\">"),
+            MessagePart(sectionString: "2.1.2", contentType: "image/png", contentId: "<fwd@example.com>", data: image),
+        ]
+        let images = IMAPFetchMapping.extractInlineImages(message: makeMessage(parts: parts), maxInlineImages: 10)
+        #expect(images.map(\.contentId) == ["own@example.com", "fwd@example.com"])
+    }
+
     @Test("Top-level HTML exists — no text/plain prepend occurs")
     func topLevelHtmlExists() {
         // Main has HTML — no need to prepend text/plain

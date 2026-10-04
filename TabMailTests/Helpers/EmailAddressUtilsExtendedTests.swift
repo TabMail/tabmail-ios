@@ -89,6 +89,21 @@ struct BuildReplyAllRecipientsTests {
         return account
     }
 
+    /// An IMAP address field keeps invalid entries so the user still sees them
+    /// (`IMAPFetchMapping.addressStrings`); reply-all must never offer one.
+    @Test("Invalid entries in To and Cc are never offered")
+    func invalidEntriesNeverOffered() {
+        let me = makeAccount(email: "me@example.com")
+        let msg = makeHeader(
+            from: "sender@example.com",
+            to: "ann@example.com, foo@@example.com",
+            cc: "bob@example.com, x@@y.example.com"
+        )
+        let result = buildReplyAllRecipients(for: msg, allAccounts: [me])
+        #expect(result.to == ["sender@example.com", "ann@example.com"])
+        #expect(result.cc == ["bob@example.com"])
+    }
+
     @Test("Filters out single account email from To")
     func filtersSingleAccountFromTo() {
         let me = makeAccount(email: "me@example.com")
@@ -297,5 +312,21 @@ struct IsValidEmailAddressTests {
     @Test("International domain passes")
     func internationalDomain() {
         #expect(isValidEmailAddress("user@münchen.de"))
+    }
+
+    /// What reply-all offers, the send path must accept: both read the address
+    /// with SwiftMail's parser.
+    @Test("Text SwiftMail does not read as one mailbox is rejected")
+    func unparseableTextRejected() {
+        #expect(!isValidEmailAddress("foo@@example.com"))
+        #expect(!isValidEmailAddress("a@example.com b@example.com"))
+    }
+
+    @Test("Every address valid here is one the send path's parser accepts (SMTP RCPT validation is stricter)")
+    func validMeansSendable() throws {
+        for address in ["user@example.com", "user+tag@example.com", "user@münchen.de", "taro.@example.com"] {
+            #expect(isValidEmailAddress(address))
+            #expect(try IMAPProvider.sendableRecipients([address]).count == 1)
+        }
     }
 }

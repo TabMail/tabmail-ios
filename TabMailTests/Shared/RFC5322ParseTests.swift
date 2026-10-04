@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import SwiftMail
 @testable import TabMail
 
 /// Validates `Shared/Parse/RFC5322Parse.buildMetadata` — the IMAP-side parser
@@ -175,5 +176,33 @@ struct RFC5322ParseTests {
         // Only inter-encoded-word whitespace is dropped; spacing around plain
         // text must survive.
         #expect(RFC5322Parse.decodeRFC2047("=?UTF-8?B?5pel?= and =?UTF-8?B?5pys?=") == "日 and 本")
+    }
+
+    // MARK: - decodeRFC2047 charsets
+
+    /// A subject labelled `gb2312` whose first word carries the GBK en dash
+    /// `A8 43`, which strict GB2312 lacks ("Report – draft" / " for review").
+    /// Strict decoding left the whole first encoded-word on screen.
+    private static let gb2312SubjectWithGBKDash =
+        "=?gb2312?B?UmVwb3J0IKhDIGRyYWZ0?=\r\n =?gb2312?B?IGZvciByZXZpZXc=?="
+
+    @Test("A gb2312 subject carrying a GBK character decodes on both the Gmail and IMAP paths")
+    func rfc2047GB2312SubjectWithGBKCharacter() {
+        let expected = "Report \u{2013} draft for review"
+        // Gmail path.
+        #expect(RFC5322Parse.decodeRFC2047(Self.gb2312SubjectWithGBKDash) == expected)
+        // IMAP path: SwiftMail decodes the ENVELOPE subject itself.
+        #expect(Self.gb2312SubjectWithGBKDash.decodeMIMEHeader() == expected)
+    }
+
+    @Test("decodeRFC2047 decodes each encoded-word in the charset it names")
+    func rfc2047HonorsDeclaredCharset() {
+        // "中文" in GB2312.
+        #expect(RFC5322Parse.decodeRFC2047("=?gb2312?B?1tDOxA==?=") == "中文")
+        // "똠방": `8C 63` exists only in Windows-949, the superset of EUC-KR.
+        #expect(RFC5322Parse.decodeRFC2047("=?euc-kr?B?jGO55g==?=") == "똠방")
+        // Curly quotes are `93`/`94` in Windows-1252.
+        #expect(RFC5322Parse.decodeRFC2047("=?windows-1252?Q?=93quoted=94?=") == "\u{201C}quoted\u{201D}")
+        #expect(RFC5322Parse.decodeRFC2047("=?ISO-8859-1?Q?caf=E9?=") == "café")
     }
 }

@@ -23,8 +23,8 @@ import Foundation
 ///   • Gmail   → raw RFC 2822 header value (`"Name" <a@b>, "N" <c@d>`).
 ///   • Outlook → email-only comma list (`a@b, c@d`) — `GraphAPI` only exposes
 ///     parsed addresses, not raw headers.
-///   • IMAP    → SwiftMail `info.to` joined with `", "` (already raw per
-///     RFC 5322 ENVELOPE).
+///   • IMAP    → `IMAPFetchMapping.addressField` over SwiftMail's structured
+///     `toAddresses` (`"Name" <a@b>, c@d`, groups flattened to members).
 struct NSEMessageMetadata: Sendable {
     let messageId: String
     let threadId: String?
