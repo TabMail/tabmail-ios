@@ -563,25 +563,26 @@ final class DictationController {
     /// The status the backend answers when the speech model did not answer in time.
     nonisolated private static let gatewayTimeoutStatus = 504
     /// The status the backend answers when the speech model's rate limit outlasted its own retries
-    /// (`transcription_rate_limited`, backend ADR-022).
+    /// (`transcription_rate_limited`, backend ADR-022; it answered 502 before 2026-10-03).
     nonisolated private static let speechModelRateLimitedStatus = 429
 
-    /// A failure on the server's side, worth trying again: a 5xx, or a connection that dropped or
-    /// could not be made. Not a timeout: the request may still be running on the server. Nor a 504,
-    /// the backend's own timeout: it already waited for the speech model.
+    /// A failure on the server's side, worth trying again: a 5xx, the speech model's rate limit
+    /// (which the backend answered as a 502 before it began retrying it itself, and which one
+    /// recording was always tried again on), or a connection that dropped or could not be made. Not a
+    /// timeout: the request may still be running on the server. Nor a 504, the backend's own
+    /// timeout: it already waited for the speech model.
     nonisolated static func isServerError(_ error: any Error) -> Bool {
-        if case .failed(let status) = error as? DictationError { return status >= 500 && status != gatewayTimeoutStatus }
+        if case .failed(let status) = error as? DictationError {
+            return (status >= 500 && status != gatewayTimeoutStatus) || status == speechModelRateLimitedStatus
+        }
         guard let error = error as? URLError else { return false }
         return error.code != .timedOut && error.code != .cancelled
     }
 
-    /// The backend gave up on the speech model after waiting for it: its timeout (504), or the
-    /// model's rate limit outlasting the backend's own 30 s of retries (429
-    /// `transcription_rate_limited`, backend ADR-022). One recording is not tried again (it already
-    /// waited); a long dictation's chunk is (ADR-IOS-087).
-    nonisolated static func backendWaited(_ error: any Error) -> Bool {
-        let error = error as? DictationError
-        return error == .failed(status: gatewayTimeoutStatus) || error == .failed(status: speechModelRateLimitedStatus)
+    /// The backend gave up waiting for the speech model (504). One recording is not tried again (it
+    /// already waited); a long dictation's chunk is (ADR-IOS-087).
+    nonisolated static func backendTimedOut(_ error: any Error) -> Bool {
+        (error as? DictationError) == .failed(status: gatewayTimeoutStatus)
     }
 
     private func updateLevel(decibels: Float, generation: Int) {

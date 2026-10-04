@@ -504,8 +504,7 @@ struct DictationControllerTests {
 
     /// A failed transcription shows nothing: the input field comes back as it was. Refused by the
     /// backend (signed out, no subscription, over quota, a bad request) or timed out, here or at the
-    /// backend (its 504: it already waited for the speech model), or rate limited by the speech model
-    /// past the backend's own 30 s of retries, it is not tried again.
+    /// backend (its 504: it already waited for the speech model), it is not tried again.
     @Test(arguments: [
         DictationError.unauthorized as any Error,
         DictationError.subscriptionRequired as any Error,
@@ -515,7 +514,6 @@ struct DictationControllerTests {
         DictationError.invalidResponse as any Error,
         URLError(.timedOut) as any Error,
         DictationError(status: 504, code: "transcription_timeout") as any Error,
-        DictationError(status: 429, code: "transcription_rate_limited") as any Error,
     ])
     func aFailedTranscriptionEndsQuietly(error: any Error) async {
         let capture = FakeCapture()
@@ -538,6 +536,9 @@ struct DictationControllerTests {
     @Test(arguments: [
         DictationError(status: 500, code: nil) as any Error,
         DictationError(status: 502, code: "transcription_failed") as any Error,
+        // The speech model's rate limit outlasting the backend's own retries: answered as a 502, and
+        // tried again, until the backend began retrying it itself (2026-10-03).
+        DictationError(status: 429, code: "transcription_rate_limited") as any Error,
         DictationError(status: 503, code: "transcription_unavailable") as any Error,
         URLError(.networkConnectionLost) as any Error,
         URLError(.notConnectedToInternet) as any Error,

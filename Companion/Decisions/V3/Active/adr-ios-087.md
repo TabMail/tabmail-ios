@@ -61,7 +61,9 @@ the backend answers any provider failure 502, which the apps retry.
    waits with its samples in `takeChunks`, and `onChunk` (on the audio thread) wakes the controller.
    `finish` returns the last chunk (`Recording.lastChunk`), its samples normalised on their own as
    `Recording.pcm`; each chunk is peak-normalised on its own (`normalizePeak`). The cap is
-   `maxRecordingDuration` = 10 minutes (was 120 s).
+   `maxRecordingDuration` = 10 minutes (was 120 s). Nothing is recorded once `finish` is called
+   (2026-10-04, from review; owner: "guard ios"): the tap can still deliver a buffer as the
+   microphone stops, which could have cut and sent a chunk after the last.
 4. **`DictationChunkUploads`** sends each chunk at once (FLAC-encoded off the main actor) with what
    every upload of the dictation sends, prepared once with the first chunk: the language, the
    dictionary's words and the context's terms, and the cleanup's variables (each chunk gets its own
@@ -73,7 +75,7 @@ the backend answers any provider failure 502, which the apps retry.
    the last only when nothing else was.
 5. **Retries.** While the user dictates, a chunk failing with a server error, a dropped connection,
    the backend's own timeout (504) or the speech model's rate limit outlasting the backend's own 30 s
-   of retries (429 `transcription_rate_limited`, backend ADR-022; `backendWaited`) is tried again
+   of retries (429 `transcription_rate_limited`, backend ADR-022; `isServerError`, the 504 `backendTimedOut`) is tried again
    after each of `chunkRetryDelays` (1, 2, 5, 10 s, the last repeating), showing nothing. The release cuts any such wait short; from then on a chunk
    gets `transcriptionRetryDelays` more tries (about a minute of waits, ADR-IOS-085 amendment
    2026-10-03; each try that the backend holds for its whole 30 s window, a 504 or that 429, adds its

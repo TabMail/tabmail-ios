@@ -344,3 +344,8 @@ that code as `.failed(status: 429)`, a failure of the speech model, not the acco
 account's 429s stay `.rateLimited`). Like a 504, the backend already waited, so a recording does not
 try it again; a long dictation's chunk does (`DictationController.backendWaited`, ADR-IOS-087), as
 TabMail Voice.)*
+*(2026-10-04, owner: "retry should not have changed". That made a recording stop retrying what it had
+always retried: the speech model's rate limit, answered as a 502 until the backend began retrying it
+itself. A recording tries that 429 again as it did the 502 (`isServerError`); only its 504 is still
+not retried (`backendTimedOut`, formerly `backendWaited`). A long dictation's chunk retries both, as
+before. As TabMail Voice.)*
