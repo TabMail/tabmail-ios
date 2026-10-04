@@ -22,6 +22,11 @@ final class PDFTextHost: NSObject, WKNavigationDelegate {
     static let scheme = "tabmail-pdf"
     private static let host = "local"
     private static let pageURL = URL(string: "\(scheme)://\(host)/host.html")!
+    /// Sent with every response, so it governs both the page and the pdf.js worker (a worker
+    /// takes its policy from its own script's response, not from the page): scripts, the worker
+    /// and fetches come from this scheme only, and nothing can be evaluated from a string.
+    static let contentSecurityPolicy =
+        "default-src 'none'; script-src \(scheme):; worker-src \(scheme):; connect-src \(scheme):; base-uri 'none'; form-action 'none'"
 
     private let document: Data
     private let startPage: Int
@@ -81,22 +86,28 @@ final class PDFTextHost: NSObject, WKNavigationDelegate {
 
     /// Imports `pdf-text-host.mjs` and calls it. The import, not `didFinish`, is what waits for
     /// pdf.js: WebKit reports the page finished before a module's imports have loaded (measured
-    /// 2026-10-04: `pdf.min.mjs` was requested after `didFinish`).
-    private func readPages(_ webView: WKWebView) async {
+    /// 2026-10-04: `pdf.min.mjs` was requested after `didFinish`). The completion handler holds
+    /// neither the web view nor the host, so `finish` releases the web view, and with it the
+    /// WebContent process, even while the page is still working or will never answer.
+    private func readPages() {
+        guard let webView else { return }
         let range: [String: Any] = ["startPage": startPage, "endPage": endPage.map { $0 as Any } ?? NSNull()]
         let limits: [String: Any] = [
             "maxPages": self.limits.maxPages,
             "maxOutputChars": self.limits.maxOutputChars,
             "timeoutMs": Int(self.limits.timeout / .milliseconds(1)),
         ]
-        do {
-            let value = try await webView.callAsyncJavaScript(
-                "const host = await import(\"./pdf-text-host.mjs\"); return await host.extractPdfText(range, limits)",
-                arguments: ["range": range, "limits": limits], contentWorld: .page)
-            finish(Self.outcome(from: value))
-        } catch {
-            BackgroundSyncLogger.logDebug("[PDFTextHost] Page call failed: \(String(describing: error))")
-            finish(.failed)
+        webView.callAsyncJavaScript(
+            "const host = await import(\"./pdf-text-host.mjs\"); return await host.extractPdfText(range, limits)",
+            arguments: ["range": range, "limits": limits], in: nil, in: .page
+        ) { [weak self] result in
+            switch result {
+            case .success(let value):
+                self?.finish(Self.outcome(from: value))
+            case .failure(let error):
+                BackgroundSyncLogger.logDebug("[PDFTextHost] Page call failed: \(String(describing: error))")
+                self?.finish(.failed)
+            }
         }
     }
 
@@ -160,7 +171,7 @@ final class PDFTextHost: NSObject, WKNavigationDelegate {
     // MARK: - WKNavigationDelegate
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        Task { await readPages(webView) }
+        readPages()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: any Error) {
@@ -206,7 +217,10 @@ final class PDFTextHost: NSObject, WKNavigationDelegate {
             }
             guard let response = HTTPURLResponse(
                 url: url, statusCode: 200, httpVersion: "HTTP/1.1",
-                headerFields: ["Content-Type": type, "Content-Length": String(data.count)])
+                headerFields: [
+                    "Content-Type": type, "Content-Length": String(data.count),
+                    "Content-Security-Policy": PDFTextHost.contentSecurityPolicy,
+                ])
             else {
                 urlSchemeTask.didFailWithError(URLError(.cannotParseResponse))
                 return

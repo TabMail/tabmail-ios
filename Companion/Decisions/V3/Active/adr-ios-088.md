@@ -31,14 +31,17 @@ and add it to the vulnerability scan (both skill copies) to keep watch on it.
    `for await` a `ReadableStream`, which `getTextContent()` does).
 3. Everything is served from the app's `tabmail-pdf://local/` scheme: the page, the script,
    the pdf.js directory (no path leaves it), and the PDF bytes as data at `/document`, which the
-   page fetches; the PDF is never navigated to. The page's CSP allows scripts, the worker and
-   fetches from that scheme only; navigation to anything but the host page is cancelled.
+   page fetches; the PDF is never navigated to. Every response carries a Content-Security-Policy
+   header allowing scripts, the worker and fetches from that scheme only, and no eval; a header
+   rather than a page `<meta>`, because the pdf.js worker takes its policy from its own script's
+   response. Navigation to anything but the host page is cancelled.
 4. pdf.js parses in WebKit's WebContent process. If the PDF exhausts memory there, that process
    ends, `webViewWebContentProcessDidTerminate` fires, and the call returns `.failed` ("the PDF
    could not be read", the add-on's wording); the app keeps running. pdf.js stops itself at the
    deadline by terminating its worker, as in the add-on; `PDFTextHost` additionally releases the
    web view `hostTeardownGrace` after the deadline if the page has not answered, and at once when
-   the caller is cancelled.
+   the caller is cancelled. Nothing but the host holds the web view while the page works, so
+   releasing it deallocates the web view and ends its process even if the page never answers.
 5. `PDFStreamBudget`, `PDFPageGlyphCounter`, their tests and the `.tooLarge` outcome are deleted.
    IOS-AI-009 and IOS-AI-010 are resolved: no pre-check exists to be bypassed or to refuse.
 
@@ -57,7 +60,9 @@ and add it to the vulnerability scan (both skill copies) to keep watch on it.
   system-font Cyrillic `к` came out as `ĸ`; and Latin text in a Helvetica fallback subset after
   Korean text lost two accented letters. The add-on has the same behaviour.
 - **Backgrounding:** WebKit suspends the WebContent process while the app is suspended, so a read
-  started just before the user leaves the app finishes, or times out, when they return.
+  started just before the user leaves the app finishes, or times out, when they return. If the
+  system ends the suspended WebContent process instead, the read reports "the PDF could not be
+  read" for a cause that is not the file's; asking again reads it.
 
 **Alternatives rejected:** keep PDFKit with the guards (each review round found a new bypass, and
 the two known gaps stayed open); run PDFKit in an app extension for process isolation (no

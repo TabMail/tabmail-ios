@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import WebKit
 @testable import TabMail
 
 @Suite("PDFTextHost")
@@ -12,11 +13,29 @@ struct PDFTextHostTests {
 
     private let limits = PDFTextExtractor.Limits(maxPages: 20, maxOutputChars: 100_000, timeout: .seconds(20))
 
-    private func startedHost() async -> (PDFTextHost, Task<PDFTextExtractor.Outcome, Never>) {
-        let host = PDFTextHost(document: PDFFixtures.make([.text("Alpha")]), startPage: 1, endPage: nil, limits: limits)
+    private static let pageURL = URL(string: "\(PDFTextHost.scheme)://local/host.html")!
+
+    private func startedHost(
+        _ document: Data = PDFFixtures.make([.text("Alpha")]), limits: PDFTextExtractor.Limits? = nil
+    ) async -> (PDFTextHost, Task<PDFTextExtractor.Outcome, Never>) {
+        let host = PDFTextHost(document: document, startPage: 1, endPage: nil, limits: limits ?? self.limits)
         let run = Task { await host.run() }
         while host.webView == nil { await Task.yield() }
         return (host, run)
+    }
+
+    /// Waits until the host page has loaded; the read itself has then started or is about to.
+    private func loaded(_ webView: WKWebView?) async throws {
+        while webView?.isLoading == true { try await Task.sleep(for: .milliseconds(10)) }
+    }
+
+    /// Waits up to `limit` for `webView` to be deallocated: its WebContent process goes with it.
+    private func released(_ webView: () -> WKWebView?, within limit: Duration = .seconds(2)) async -> Bool {
+        let start = ContinuousClock.now
+        while webView() != nil, ContinuousClock.now - start < limit {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return webView() == nil
     }
 
     @Test("The WebContent process ending mid-read fails the call and releases the web view")
@@ -34,6 +53,76 @@ struct PDFTextHostTests {
         run.cancel()
         #expect(await run.value == .failed)
         #expect(host.webView == nil)
+    }
+
+    @Test("A caller cancelled mid-read gets an answer at once, and the web view is deallocated, not left to the page")
+    func cancelledWhileReading() async throws {
+        let (host, run) = await startedHost(PDFFixtures.slowDocument())
+        weak let webView = host.webView
+        try await loaded(webView)
+        // A page that is busy and will not answer: only the host can end the web view's life.
+        webView?.evaluateJavaScript("for (;;) {}", in: nil, in: .defaultClient) { _ in }
+        run.cancel()
+        #expect(await run.value == .failed)
+        #expect(await released { webView })
+    }
+
+    @Test("A page that never answers is released at the deadline plus the grace, and the call times out", .timeLimit(.minutes(1)))
+    func pageNeverAnswers() async throws {
+        let timeout = Duration.seconds(1)
+        let start = ContinuousClock.now
+        let (host, run) = await startedHost(
+            PDFFixtures.slowDocument(), limits: PDFTextExtractor.Limits(maxPages: 20, maxOutputChars: 100_000, timeout: timeout))
+        weak let webView = host.webView
+        try await loaded(webView)
+        // Wedge the page's main thread: pdf.js's own deadline (a timer there) and its answer can
+        // no longer run, so only the host's backstop can end the call.
+        webView?.evaluateJavaScript("for (;;) {}", in: nil, in: .defaultClient) { _ in }
+        #expect(await run.value == .timeout)
+        #expect(ContinuousClock.now - start >= timeout + AttachmentReadPdfTool.Config.hostTeardownGrace)
+        #expect(host.webView == nil)
+        #expect(await released { webView })
+    }
+
+    @Test("The page stays inside its sandbox: memory-only storage, the pdf.js directory only, no other origin, no eval, no navigation")
+    func boundaries() async throws {
+        let (host, run) = await startedHost(PDFFixtures.slowDocument())
+        let webView = try #require(host.webView)
+        try await loaded(webView)
+        #expect(!webView.configuration.websiteDataStore.isPersistent)
+
+        let probe = try await webView.callAsyncJavaScript("""
+            const status = async (url) => { try { return (await fetch(url)).status } catch { return -1 } };
+            let evalRefused = false;
+            try { eval("1") } catch (e) { evalRefused = e instanceof EvalError }
+            const worker = await fetch("./pdfjs/pdf.worker.min.mjs");
+            return {
+                pdfjs: await status("./pdfjs/pdf.min.mjs"),
+                parentOfPdfjs: await status("./pdfjs/..%2Fpdf-text-host.mjs"),
+                appBundle: await status("./pdfjs/..%2FInfo.plist"),
+                unknownPath: await status("./Info.plist"),
+                otherScheme: await status("data:text/plain,x"),
+                evalRefused,
+                workerPolicy: worker.headers.get("content-security-policy"),
+            }
+            """, contentWorld: .page) as? [String: Any]
+        #expect(probe?["pdfjs"] as? Int == 200)
+        // pdf-text-host.mjs and Info.plist exist in the app bundle, one level above pdfjs/.
+        #expect(probe?["parentOfPdfjs"] as? Int == -1)
+        #expect(probe?["appBundle"] as? Int == -1)
+        #expect(probe?["unknownPath"] as? Int == -1)
+        // A data: URL needs no network: only the policy can refuse it.
+        #expect(probe?["otherScheme"] as? Int == -1)
+        #expect(probe?["evalRefused"] as? Bool == true)
+        #expect(probe?["workerPolicy"] as? String == PDFTextHost.contentSecurityPolicy)
+
+        _ = try await webView.callAsyncJavaScript(
+            "location.href = \"\(PDFTextHost.scheme)://local/document\"", contentWorld: .page)
+        try await Task.sleep(for: .seconds(2))
+        #expect(webView.url == Self.pageURL)
+
+        run.cancel()
+        #expect(await run.value == .failed)
     }
 
     @Test("A host that is left alone reads the page and releases the web view")

@@ -89,6 +89,18 @@ enum PDFFixtures {
         return document(objects)
     }
 
+    /// One page whose content stream is ten million operators, one flate stream that takes
+    /// pdf.js seconds to scan: a read that stays busy well past a short deadline.
+    static func slowDocument() -> Data {
+        let content = flate(Data(String(repeating: "q Q ", count: 10_000_000).utf8))
+        return document([
+            object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>"),
+            streamObject(4, dictionary: "<< /Filter /FlateDecode >>", data: content),
+        ])
+    }
+
     /// This process's memory footprint (`phys_footprint`, what jetsam counts), in bytes.
     static func footprint() -> UInt64 {
         var info = task_vm_info_data_t()

@@ -4,11 +4,11 @@
    - file, You can obtain one at https://mozilla.org/MPL/2.0/. -->
 <!-- The page PDFTextHost loads in its hidden web view. PDFTextHost then imports
      pdf-text-host.mjs, which loads the bundled pdf.js from the app's own scheme; the PDF itself is
-     data, never a document. -->
+     data, never a document. The Content-Security-Policy arrives as a response header
+     (PDFTextHost.contentSecurityPolicy), so it covers the pdf.js worker as well. -->
 <html>
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src tabmail-pdf:; worker-src tabmail-pdf:; connect-src tabmail-pdf:; base-uri 'none'; form-action 'none'">
 </head>
 <body></body>
 </html>

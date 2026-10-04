@@ -24,19 +24,28 @@
     which waits for the module graph. And pdf.js 6.3.289's `getTextContent()` iterates a
     `ReadableStream` with `for await`, which this WebKit cannot do ("undefined is not a
     function"; the legacy build does not polyfill it), so `textContentOf` reads
-    `page.streamTextContent()` with a reader. Check both on every pdf.js upgrade.
+    `page.streamTextContent()` with a reader. A third dependency: the page's origin is the tuple
+    origin `tabmail-pdf://local` (measured; the URL standard gives a custom scheme an opaque
+    origin), which is what lets pdf.js start a real `Worker` it can terminate at the deadline
+    rather than a blob wrapper or a main-thread fake worker. Check all three on every pdf.js upgrade.
 - `PDFTextHost` (`@MainActor`): one `WKWebView` per call, `WKWebsiteDataStore.nonPersistent()`,
   scheme `tabmail-pdf://local/` serving `/host.html`, `/pdf-text-host.mjs`, `/pdfjs/…` (a path that
   leaves the directory is refused) and the PDF bytes at `/document`, which the page fetches. It
   calls the entry point with `callAsyncJavaScript` once the page finishes loading, maps the
-  result object (`outcome(from:)`; any other shape is `.failed`), and releases the web view.
+  result object (`outcome(from:)`; any other shape is `.failed`), and releases the web view. The
+  call's completion handler holds neither the web view nor the host, so releasing it deallocates
+  the web view (and ends its WebContent process) even while the page is still working. Until
+  2026-10-04 a `Task` held the web view across the call, so after a cancel or a backstop timeout
+  it lived on until the page answered (measured 9.36 s), or forever if the page never did.
   - `webViewWebContentProcessDidTerminate` (pdf.js ran WebContent out of memory) → `.failed`, and
     the tool says "the PDF could not be read", TB's wording for its own `FAILED`.
   - pdf.js stops itself at `parseTimeout` by terminating its worker. If the page has not answered
     `hostTeardownGrace` (5 s) later, the host releases the web view and returns `.timeout`. A
-    cancelled caller gets `.failed` at once.
-  - Navigation to anything but the host page is cancelled; the page CSP allows script, worker and
-    fetch from `tabmail-pdf:` only.
+    cancelled caller gets `.failed` at once, and the web view is released at the same moment.
+  - Navigation to anything but the host page is cancelled. `PDFTextHost.contentSecurityPolicy`
+    allows script, worker and fetch from `tabmail-pdf:` only and no eval. It is sent as a response
+    header on every scheme response, not a `<meta>`, because a worker takes its policy from its own
+    script's response: a page `<meta>` left the pdf.js worker, where the PDF is parsed, with none.
 - `PDFTextExtractor` keeps the types (`Limits` is now just pages, characters and timeout) and
   `hasPdfSignature`; `extract` calls `PDFTextHost.extract`. Outcomes: `ok`, `encrypted`,
   `malformed`, `failed`, `timeout`, `pastEnd`; `tooLarge` is gone.
@@ -62,8 +71,12 @@ On PDFs that CoreGraphics writes (macOS `CGContext` PDF, the same writer as `UIG
 
 ## Tests
 
-`PDFTextExtractorTests` (end to end through the web view), `PDFTextHostTests` (process
-termination, cancellation, release, result mapping) and `AttachmentReadPdfToolTests`. Each call
+`PDFTextExtractorTests` (end to end through the web view, including a valid PDF with a 78 MB
+lossless image that must be read, the IOS-AI-010 case), `PDFTextHostTests` (process termination,
+cancellation before and during a read with the web view deallocated, the backstop against a
+page whose main thread is wedged, the sandbox boundaries probed from inside the page: memory-only
+store, containment, no other scheme, no eval, the worker's policy header, navigation refused;
+result mapping) and `AttachmentReadPdfToolTests`. Each call
 starts a web view, so these suites are slower than pure unit tests. The isolation test reads a
 `/ToUnicode` map that maps "A" to "Z" after 200 MB of padding (about 200 KB compressed): the
 text "Zlpha" proves pdf.js inflated all of it, and the app's own `phys_footprint`, sampled every

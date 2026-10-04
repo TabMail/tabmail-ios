@@ -9,7 +9,8 @@
 // same pdf.js build and options, same limits, outcomes and page text. Change both together, or the
 // model sees two different tools under one name. Only the text layer is read: no rendering, no
 // fonts, no forms or XFA, and no scripting (that lives in pdf.js's viewer sandbox, which is not
-// bundled). pdf.js 6 has no eval path, and the page's CSP forbids eval.
+// bundled). pdf.js 6 has no eval path, and the CSP PDFTextHost sends with every response forbids eval
+// in the page and in the worker.
 
 import * as pdfjs from "./pdfjs/pdf.min.mjs";
 

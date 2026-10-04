@@ -167,6 +167,24 @@ struct PDFTextExtractorTests {
         #expect(four.pages.first?.text == "ab\u{2000B}")
     }
 
+    @Test("A valid PDF with a large lossless image is read: the image is never decoded for text")
+    func largeLosslessImage() async throws {
+        // A 5100 x 5100 RGB image, 78 MB once inflated, about 77 KB as stored. Before ADR-IOS-088
+        // the pre-check refused such a PDF (IOS-AI-010); pdf.js reads only the text layer.
+        let image = PDFFixtures.flateZeros(5100 * 5100 * 3)
+        let content = Data("q 612 0 0 792 0 0 cm /Im1 Do Q BT /F1 12 Tf 72 700 Td (Alpha) Tj ET".utf8)
+        let data = PDFFixtures.document([
+            PDFFixtures.object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            PDFFixtures.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            PDFFixtures.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 4 0 R >>"),
+            PDFFixtures.streamObject(4, dictionary: "<< /Length \(content.count) >>", data: content),
+            PDFFixtures.object(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            PDFFixtures.streamObject(6, dictionary: "<< /Type /XObject /Subtype /Image /Width 5100 /Height 5100 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length \(image.count) /Filter /FlateDecode >>", data: image),
+        ])
+        let result = try #require(pages(await extract(data)))
+        #expect(result.pages.map(\.text) == ["Alpha"])
+    }
+
     // MARK: - Bad input
 
     @Test("Bytes with a PDF header but no document are malformed")
@@ -258,14 +276,7 @@ struct PDFTextExtractorTests {
 
     @Test("A deadline that passes while pdf.js is busy in one step returns timeout without waiting for it")
     func deadlineWhileParsing() async {
-        // Ten million operators in one flate content stream take pdf.js seconds to scan.
-        let content = PDFFixtures.flate(Data(String(repeating: "q Q ", count: 10_000_000).utf8))
-        let data = PDFFixtures.document([
-            PDFFixtures.object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
-            PDFFixtures.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
-            PDFFixtures.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>"),
-            PDFFixtures.streamObject(4, dictionary: "<< /Filter /FlateDecode >>", data: content),
-        ])
+        let data = PDFFixtures.slowDocument()
         let start = ContinuousClock.now
         #expect(await extract(data, limits: limits(timeout: .milliseconds(500))) == .timeout)
         #expect(ContinuousClock.now - start < .milliseconds(500) + AttachmentReadPdfTool.Config.hostTeardownGrace)
