@@ -48,7 +48,10 @@ the backend answers any provider failure 502, which the apps retry.
    where two meet is removed (one inside a chunk stays); a pause seam is a space, or none between
    scripts written without spaces; an overlapped seam is joined at the longest run of at least
    `chunkOverlapMinimumRun` (3) words, compared in lower case with letters and digits only, within
-   `chunkOverlapSearchWords` (80) of the seam, the run kept once; with no such run the two are joined
+   `chunkOverlapSearchWords` (80) of the seam, the run kept once: its first word as the earlier
+   chunk wrote it, the rest as the later one did (later note, 2026-10-03: the owner's TabMail Voice
+   smoke test pasted "you can Test the" at every overlap seam, a chunk's text starting with a
+   capital as any text does; "capitalization mid breaks"); with no such run the two are joined
    whole. Each side is cut at a word's place in its own text, so line breaks stay. A chunk overlaps
    only the one just before it: after an empty one (a long silence) it is joined whole, or
    matching it against an earlier chunk's words would cut out the speech between them (found in

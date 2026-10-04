@@ -12,7 +12,9 @@ import Foundation
 /// - Chunks cut at a pause are joined with a space, or none between scripts written without spaces.
 /// - A chunk that starts inside the one before it (no pause to cut at) holds the same speech as the
 ///   end of that one: the two are joined where their words first run together for at least
-///   `chunkOverlapMinimumRun` words, the run kept once. With no such run they are joined whole
+///   `chunkOverlapMinimumRun` words, the run kept once: its first word as the earlier chunk wrote
+///   it, mid-sentence, since a chunk's first word comes capitalised as the start of its text (owner,
+///   2026-10-03: "capitalization mid breaks"), the rest as the later one did. With no such run they are joined whole
 ///   (owner, 2026-10-03: "better than losing things"): a few words may repeat, none are lost.
 /// - An empty chunk adds nothing, and the chunk after it is joined whole: it overlaps only the empty
 ///   one, so matching it against an earlier chunk's words would cut out the speech between them.
@@ -68,9 +70,10 @@ enum DictationChunkJoin {
         unspacedScript.firstMatch(in: character, range: NSRange(character.startIndex..., in: character)) != nil
     }
 
-    /// `left` and `right`, which both hold the speech around a cut, joined at the start of the longest
-    /// run of words the end of one and the start of the other share. Each side is cut at a word's
-    /// place in its own text, so its line breaks and spacing stay as they were.
+    /// `left` and `right`, which both hold the speech around a cut, joined on the longest run of words
+    /// the end of one and the start of the other share: `left` up to the run's first word, `right`
+    /// from its second. Each side is cut at a word's place in its own text, so its line breaks and
+    /// spacing stay as they were.
     private static func joinOverlapping(_ left: String, _ right: String) -> String {
         let leftWords = left.ranges(of: /\S+/)
         let rightWords = Array(right.ranges(of: /\S+/).prefix(DictationConfig.chunkOverlapSearchWords))
@@ -82,8 +85,10 @@ enum DictationChunkJoin {
             return joinedWith(left, right)
         }
         BackgroundSyncLogger.logDebug("[Dictation] overlapping chunks joined on a run of \(run.length) words")
-        let leftEnd = leftWords[leftFrom + run.left].lowerBound
-        let rightStart = rightWords[run.right].lowerBound
+        // A run holds at least `chunkOverlapMinimumRun` (more than one) words, so both have a second word.
+        let leftNext = leftFrom + run.left + 1
+        let leftEnd = leftNext < leftWords.count ? leftWords[leftNext].lowerBound : left.endIndex
+        let rightStart = run.right + 1 < rightWords.count ? rightWords[run.right + 1].lowerBound : right.endIndex
         return joinedWith(String(left[..<leftEnd]).trimmingCharacters(in: .whitespacesAndNewlines), String(right[rightStart...]))
     }
 

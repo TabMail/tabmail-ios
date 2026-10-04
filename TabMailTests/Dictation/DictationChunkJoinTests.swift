@@ -52,7 +52,17 @@ struct DictationChunkJoinTests {
     @Test func theOverlapMatchIgnoresTheCapitalsAndPunctuationACutChanges() {
         let left = "Then we talked about the budget, and the plan for. Next"
         let right = "About the budget and the plan for next quarter."
-        #expect(join(paused(left), overlapping(right)) == "Then we talked About the budget and the plan for next quarter.")
+        #expect(join(paused(left), overlapping(right)) == "Then we talked about the budget and the plan for next quarter.")
+    }
+
+    /// A later chunk's text starts with a capital, as any text does, though its first words are
+    /// mid-sentence: the shared run starts as the earlier chunk wrote it (owner, 2026-10-03:
+    /// "capitalization mid breaks"), and a name keeps its capital, as both wrote it.
+    @Test func anOverlapJoinKeepsTheEarlierTextsCaseWhereTheLaterOneStarts() {
+        let left = "I want to read something long again so that you can test the forced"
+        let right = "Something long again so that you can test the forced cuts and how well it does."
+        #expect(join(paused(left), overlapping(right)) == "I want to read something long again so that you can test the forced cuts and how well it does.")
+        #expect(join(paused("we asked Robin about the budget for next"), overlapping("Robin about the budget for next quarter.")) == "we asked Robin about the budget for next quarter.")
     }
 
     @Test func overlappingChunksWithNoSharedRunAreJoinedWhole() {
