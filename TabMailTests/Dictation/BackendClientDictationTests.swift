@@ -107,6 +107,8 @@ struct BackendClientDictationTests {
         (403, #"{"error":"consent_required"}"#, DictationError.accountSetupRequired),
         (403, #"{"error":"forbidden"}"#, DictationError.accessDenied),
         (429, #"{"error":"rate_limited"}"#, DictationError.rateLimited),
+        // The speech model's rate limit outlasting the backend's retries: not this account's limit.
+        (429, #"{"error":"transcription_rate_limited"}"#, DictationError.failed(status: 429)),
         (400, #"{"error":"audio_too_large"}"#, DictationError.recordingTooLong),
         (502, "", DictationError.failed(status: 502)),
         (200, #"{"transcript":"wrong shape"}"#, DictationError.invalidResponse),
@@ -119,6 +121,33 @@ struct BackendClientDictationTests {
         await #expect(throws: expected) {
             _ = try await BackendClient(llmSession: http.session).transcribeDictation(flac: flac, language: nil, vocabulary: [])
         }
+    }
+
+    /// A long dictation's polish (ADR-IOS-087): the cleanup prompt at `POST /completions/chat`, with
+    /// the dictation's cleanup variables and the joined text as its `dictation`, no tools and no web
+    /// search. Its reply is the assistant's text.
+    @Test func thePolishSendsTheCleanupPromptWithTheJoinedTextAndReturnsItsReply() async throws {
+        let http = FakeHTTP.Scenario()
+        let seen = Mutex<FakeHTTP.Request?>(nil)
+        // The SSE primer the backend sends first, then the final event.
+        let stream = ":" + String(repeating: " ", count: 600) + "\n\n" + "event: final\ndata: {\"assistant\":\"Part one and part two.\"}\n\n"
+        http.register(path: "/completions/chat", method: "POST") { request in
+            seen.withLock { $0 = request }
+            return .bytes(Data(stream.utf8), contentType: "text/event-stream")
+        }
+        let polish = await DictationController.backendPolish(BackendClient(llmSession: http.session))
+
+        let reply = try await polish("Part one. Part two.", ["app_name": "Chat", "dictionary": "Xyvora"])
+
+        #expect(reply == "Part one and part two.")
+        let request = try #require(seen.withLock { $0 })
+        let body = try #require(request.body.flatMap { try JSONSerialization.jsonObject(with: $0) as? [String: Any] })
+        let messages = try #require(body["messages"] as? [[String: Any]])
+        try #require(messages.count == 1)
+        let message = try #require(messages[0] as? [String: String])
+        #expect(message == ["role": "system", "content": "system_prompt_dictate_cleanup", "app_name": "Chat", "dictionary": "Xyvora", "dictation": "Part one. Part two."])
+        #expect(body["disable_tools"] as? Bool == true)
+        #expect(body["web_search_enabled"] as? Bool == false)
     }
 }
 

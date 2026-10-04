@@ -135,6 +135,8 @@ of the input when it comes back, and the contextual cleanup runs.
   default transcription model takes (AssemblyAI's Sync API, backend ADR-022); the model for the
   other languages (backend ADR-024) takes longer, so 120 s is the stricter limit. Voice's 5 minutes is a bug
   (owner, 2026-09-27), to be fixed there separately; until then the two apps differ here.
+  *(Superseded 2026-10-03 by ADR-IOS-087: a dictation runs up to 10 minutes, sent in chunks each within
+  the 120 s the model takes; see the amendment at the end.)*
 - Collapsing the pill ends the recording and still appends its text; the pill disappearing
   discards it.
 - Untested by owner decision (2026-09-27, stage-2 review TC2/TC3): the real
@@ -324,3 +326,21 @@ circling together whose opacities ease over `colourTransition`, and back when a 
 - Tests: `DictationControllerTests.theWaveformTakesItsRecordingColourOnSpeechAndTheSpinnerTheRetryColoursWhileRetrying`
   (the retry's colours by hex, unlike the resting ones), and the pill's source fence (both layers'
   opacity eased over `colourTransition`, as the waveform's colour).
+
+**Amendment 2026-10-03 — long dictations (owner; ADR-IOS-087).** `maxRecordingDuration` is 10 minutes.
+A dictation longer than one upload is cut into chunks as it is recorded, each sent at once with its own
+cleanup and retried while the user speaks; the text is the chunks' in order up to the first that gave
+up. No upload is longer than the 120 s the model takes. Failures stay silent (decision 8).
+
+**Amendment 2026-10-03 — more and longer retries (owner).** *"We definitely need more retries …
+lengthen them, and we should not lose the end."* Measured the same day, the speech model's provider
+refused about one try in three as rate limited, in bursts of seconds; two tries 2 s apart could not
+outlast one. `transcriptionRetryDelays` is now 0.5, 1.5, 3, 5, 10, 10, 15 and 15 s, about a minute in
+all, as TabMail Voice's (ADR-DESK-039 amendment); the retry note still shows from 2 s and cancel ends it
+at once. A recording's 504 is still not retried; a long dictation's chunk retries it (ADR-IOS-087).
+*(Later the same day: the backend now retries the speech model's own 429 for its 30 s window and then
+answers 429 `transcription_rate_limited`, where it answered 502 (backend ADR-022). `DictationError` reads
+that code as `.failed(status: 429)`, a failure of the speech model, not the account's limit (the
+account's 429s stay `.rateLimited`). Like a 504, the backend already waited, so a recording does not
+try it again; a long dictation's chunk does (`DictationController.backendWaited`, ADR-IOS-087), as
+TabMail Voice.)*

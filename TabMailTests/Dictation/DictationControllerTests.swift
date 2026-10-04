@@ -504,7 +504,8 @@ struct DictationControllerTests {
 
     /// A failed transcription shows nothing: the input field comes back as it was. Refused by the
     /// backend (signed out, no subscription, over quota, a bad request) or timed out, here or at the
-    /// backend (its 504: it already waited for the speech model), it is not tried again.
+    /// backend (its 504: it already waited for the speech model), or rate limited by the speech model
+    /// past the backend's own 30 s of retries, it is not tried again.
     @Test(arguments: [
         DictationError.unauthorized as any Error,
         DictationError.subscriptionRequired as any Error,
@@ -514,6 +515,7 @@ struct DictationControllerTests {
         DictationError.invalidResponse as any Error,
         URLError(.timedOut) as any Error,
         DictationError(status: 504, code: "transcription_timeout") as any Error,
+        DictationError(status: 429, code: "transcription_rate_limited") as any Error,
     ])
     func aFailedTranscriptionEndsQuietly(error: any Error) async {
         let capture = FakeCapture()
@@ -578,13 +580,14 @@ struct DictationControllerTests {
 
     @Test func aTranscriptionFailingEveryRetryEndsQuietly() async {
         let capture = FakeCapture()
-        let controller = controller(capture: capture, transcript: { throw DictationError(status: 502, code: "transcription_failed") })
+        let retryDelays: [Duration] = [.milliseconds(1), .milliseconds(1)]
+        let controller = controller(capture: capture, transcript: { throw DictationError(status: 502, code: "transcription_failed") }, retryDelays: retryDelays)
 
         await dictate(controller, capture: capture)
         await waitUntil { controller.phase == .idle }
 
         #expect(controller.phase == .idle)
-        #expect(recorded.uploads.withLock { $0.count } == 1 + DictationConfig.transcriptionRetryDelays.count)
+        #expect(recorded.uploads.withLock { $0.count } == 1 + retryDelays.count)
         #expect(recorded.texts.withLock { $0.isEmpty })
         #expect(!controller.isRetrying)
     }
@@ -1012,19 +1015,23 @@ struct DictationControllerTests {
         #expect(recorded.uploads.withLock { $0.isEmpty })
     }
 
-    /// A recording is never longer than the transcription model takes (120 s, backend ADR-022),
-    /// and stays under the backend's 10 MiB upload limit.
-    @Test func noRecordingOutlastsWhatTheModelTranscribes() {
-        #expect(DictationConfig.maxRecordingDuration <= .seconds(120))
+    /// No upload is longer than the transcription model takes (120 s, backend ADR-022) or over the
+    /// backend's 10 MiB upload limit: a dictation longer than that goes in chunks of at most
+    /// `chunkMaxDuration` (ADR-IOS-087), the overlap a chunk starts with inside it.
+    @Test func noUploadOutlastsWhatTheModelTranscribes() {
+        #expect(DictationConfig.chunkMaxDuration <= .seconds(120))
+        #expect(DictationConfig.chunkOverlapSpeech <= DictationConfig.chunkMaxOverlap)
+        #expect(DictationConfig.chunkMaxOverlap < DictationConfig.chunkMaxDuration)
         #expect(DictationConfig.maxRecordingDuration > .zero)
-        let bytes = Int(DictationConfig.maxRecordingDuration.components.seconds) * Int(DictationConfig.recordingSampleRate) * MemoryLayout<Int16>.size
+        let bytes = Int(DictationConfig.chunkMaxDuration.components.seconds) * Int(DictationConfig.recordingSampleRate) * MemoryLayout<Int16>.size
         #expect(bytes < 10 * 1024 * 1024)
     }
 
-    /// A controller built as the app builds it (no cap passed in) sends at most 120 s of audio,
-    /// however long the microphone ran, and still delivers the text.
-    @Test func theAppsControllerSendsAtMostWhatTheModelTranscribes() async throws {
-        let capture = FakeCapture(buffer: FakeCapture.tone(seconds: 121))
+    /// A controller built as the app builds it (no cap passed in) sends a dictation longer than the
+    /// model transcribes at once in chunks, none over 120 s, and still delivers its text once.
+    @Test func theAppsControllerSendsALongDictationInChunksTheModelTranscribes() async throws {
+        var random = DictationTestAudio.Random(seed: 1)
+        let capture = FakeCapture(buffers: DictationTestAudio.buffers(DictationTestAudio.speech(121, &random)))
         let recorded = recorded
         let controller = DictationController(
             capture: capture,
@@ -1037,15 +1044,19 @@ struct DictationControllerTests {
                 return DictationTranscription(text: "a long dictation", cleanedText: "A long dictation.")
             },
             warmUp: {},
+            // No polish request: the chunks are what is tested, never the backend.
+            polish: { text, _ in text },
             speechDetector: FakeSpeechDetector.hearing()
         )
 
         await dictate(controller, capture: capture)
         await waitUntil { controller.phase == .idle }
 
-        let flac = try #require(recorded.uploads.withLock { $0.first })
-        // 120 s of 16 kHz mono.
-        #expect(try FLACTestDecoder.decode(flac).totalSamples == 120 * 16_000)
+        let lengths = try recorded.uploads.withLock { $0 }.map { try FLACTestDecoder.decode($0).totalSamples }
+        // 121 s with no pause: cut once, near `chunkMaxDuration`, the second chunk overlapping it.
+        #expect(lengths.count == 2)
+        #expect(lengths.allSatisfy { $0 <= 120 * 16_000 })
+        #expect(lengths.reduce(0, +) > 121 * 16_000)
         #expect(!capture.isRunning)
         #expect(recorded.texts.withLock { $0 } == ["A long dictation."])
     }

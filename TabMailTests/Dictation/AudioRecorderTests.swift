@@ -182,6 +182,34 @@ struct DictationAudioRecorderTests {
         #expect(abs(try recorder.finish().duration - 5) < 0.01)
     }
 
+    /// The audio held before speech is the start of what is kept, for the chunker too
+    /// (ADR-IOS-087): a pause cut falls inside the pause as recorded, not a pre-roll earlier,
+    /// mid-word; each chunk holds its own samples, and the recording ends with the last.
+    @Test func chunksAreCutAtThePauseCountingTheAudioHeldBeforeSpeech() throws {
+        let recorder = AudioRecorder(preRoll: .seconds(2))
+        var random = DictationTestAudio.Random(seed: 1)
+        let rate = DictationConfig.recordingSampleRate
+        for buffer in DictationTestAudio.buffers(DictationTestAudio.room(2, &random)) { recorder.append(buffer) }
+        recorder.keepFromNow()
+        let spoken = DictationTestAudio.speech(12, &random) + DictationTestAudio.room(1.5, &random) + DictationTestAudio.speech(3, &random)
+        for buffer in DictationTestAudio.buffers(spoken) { recorder.append(buffer) }
+
+        let chunks = recorder.takeChunks()
+        #expect(chunks.count == 1)
+        guard chunks.count == 1, let chunk = chunks.first else { return }
+        // The pause runs from 14 s (2 s held, then 12 s of speech) to 15.5 s of what is kept.
+        let pauseStart = 14 * rate
+        #expect(chunk.cut.start == 0)
+        #expect(Double(chunk.cut.end) > pauseStart)
+        #expect(Double(chunk.cut.end) < pauseStart + 1.5 * rate)
+        #expect(chunk.pcm.count == (chunk.cut.end - chunk.cut.start) * MemoryLayout<Int16>.size)
+        #expect(recorder.takeChunks().isEmpty)
+
+        let recording = try recorder.finish()
+        #expect(recording.lastChunk?.start == chunk.cut.end)
+        #expect(recording.lastChunk?.index == 1)
+    }
+
     /// Holding is bounded by the cap too: a moment before speech never outgrows a recording.
     @Test func theMomentBeforeSpeechNeverExceedsTheCap() throws {
         let recorder = AudioRecorder(maxDuration: .seconds(1), preRoll: .seconds(2))

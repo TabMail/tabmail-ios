@@ -11,7 +11,8 @@ import Observation
 /// which cleans up the transcript with what was on screen in the same request → hand the text back
 /// to be appended to the input field. The same flow as TabMail Voice's `DictationController`, started and finished by
 /// the mic button instead of a held key, and recording only once speech is heard (a held key
-/// already says someone is speaking; an auto-started mic doesn't).
+/// already says someone is speaking; an auto-started mic doesn't). A long dictation is cut into
+/// chunks as it is recorded, each sent at once (`DictationChunkUploads`, ADR-IOS-087).
 @MainActor
 @Observable
 final class DictationController {
@@ -44,6 +45,9 @@ final class DictationController {
     /// The recording (FLAC), its language, the words to spell as given and the cleanup's variables →
     /// the transcript and its cleaned-up text.
     typealias Transcribe = @Sendable (Data, String?, [String], [String: String]) async throws -> DictationTranscription
+    /// Runs the cleanup prompt over a long dictation's joined text, with the cleanup's variables, and
+    /// returns its reply (`BackendClient.sendCompletionsDirect`).
+    typealias Polish = @Sendable (String, [String: String]) async throws -> String
     /// Warms the backend for the transcription to come (`BackendClient.warmUpDictation`).
     typealias WarmUp = @Sendable () async -> Void
     /// The plain-text body of an email (its `messageHeader.id`), for terms; nil without one.
@@ -67,8 +71,11 @@ final class DictationController {
     @ObservationIgnored private let useWords: @MainActor ([String]) -> Void
     @ObservationIgnored private let transcribeAudio: Transcribe
     @ObservationIgnored private let warmUp: WarmUp
+    @ObservationIgnored private let polish: Polish
+    @ObservationIgnored private let chunkPolishTimeout: Duration
     @ObservationIgnored private let transcriptionRetryDelays: [Duration]
     @ObservationIgnored private let transcriptionRetryNoticeDelay: Duration
+    @ObservationIgnored private let chunkRetryDelays: [Duration]
     @ObservationIgnored private let makeSpeechDetector: MakeSpeechDetector
     @ObservationIgnored private let maxRecordingDuration: Duration
 
@@ -92,6 +99,8 @@ final class DictationController {
     /// Shows the retry note once `transcriptionRetryNoticeDelay` has passed since the first failure.
     @ObservationIgnored private var retryNoteTask: Task<Void, Never>?
     @ObservationIgnored private var transcriptionTask: Task<Void, Never>?
+    /// A long dictation's chunks, sent as they are cut; nil until the first is.
+    @ObservationIgnored private var chunks: DictationChunkUploads?
 
     init(
         capture: any AudioCapturing = MicrophoneCapture(),
@@ -106,8 +115,11 @@ final class DictationController {
         useWords: @escaping @MainActor ([String]) -> Void = { DictationDictionary.shared.use($0) },
         transcribe: Transcribe? = nil,
         warmUp: WarmUp? = nil,
+        polish: Polish? = nil,
+        chunkPolishTimeout: Duration = DictationConfig.chunkPolishTimeout,
         transcriptionRetryDelays: [Duration] = DictationConfig.transcriptionRetryDelays,
         transcriptionRetryNoticeDelay: Duration = DictationConfig.transcriptionRetryNoticeDelay,
+        chunkRetryDelays: [Duration] = DictationConfig.chunkRetryDelays,
         speechDetector: @escaping MakeSpeechDetector = { SoundClassifierSpeechDetector(onSpeech: $0, onFailure: $1) },
         maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration
     ) {
@@ -122,8 +134,11 @@ final class DictationController {
         self.useWords = useWords
         self.transcribeAudio = transcribe ?? Self.backendTranscription(AccountManager.shared.backendClient)
         self.warmUp = warmUp ?? Self.backendWarmUp(AccountManager.shared.backendClient)
+        self.polish = polish ?? Self.backendPolish(AccountManager.shared.backendClient)
+        self.chunkPolishTimeout = chunkPolishTimeout
         self.transcriptionRetryDelays = transcriptionRetryDelays
         self.transcriptionRetryNoticeDelay = transcriptionRetryNoticeDelay
+        self.chunkRetryDelays = chunkRetryDelays
         self.makeSpeechDetector = speechDetector
         self.maxRecordingDuration = maxRecordingDuration
     }
@@ -134,6 +149,22 @@ final class DictationController {
     static func backendTranscription(_ client: BackendClient) -> Transcribe {
         { flac, language, vocabulary, cleanup in
             try await client.transcribeDictation(flac: flac, language: language, vocabulary: vocabulary, cleanup: cleanup)
+        }
+    }
+
+    /// The polish on the TabMail backend: the cleanup prompt at `POST /completions/chat`, as the app
+    /// sent its cleanup before the backend ran it in the transcription request.
+    static func backendPolish(_ client: BackendClient) -> Polish {
+        { text, cleanup in
+            let vars = cleanup.mapValues { JSONValue.string($0) }.merging(["dictation": .string(text)]) { $1 }
+            let request = CompletionsRequest(
+                messages: [CompletionsMessage(role: "system", content: DictationConfig.cleanupPrompt, vars: vars)],
+                client_timezone: TimeZone.current.identifier,
+                disable_tools: true,
+                web_search_enabled: false
+            )
+            // Direct: a user waiting on their dictation doesn't queue behind background AI work.
+            return try await client.sendCompletionsDirect(request).assistant ?? ""
         }
     }
 
@@ -229,12 +260,18 @@ final class DictationController {
 
     /// The terms, if they are picked within `contextTermsWait`; else none.
     private func contextTerms() async -> [String] {
+        await Self.terms(from: termsTask)
+    }
+
+    nonisolated private static func terms(from termsTask: Task<[String], Never>?) async -> [String] {
         guard let termsTask else { return [] }
         return (try? await withTimeout(seconds: DictationConfig.contextTermsWait) { await termsTask.value }) ?? []
     }
 
     private func beginRecording(generation current: Int) {
-        let recorder = AudioRecorder(maxDuration: maxRecordingDuration)
+        let recorder = AudioRecorder(maxDuration: maxRecordingDuration) { [weak self] in
+            Task { @MainActor [weak self] in self?.chunksCut(generation: current) }
+        }
         self.recorder = recorder
         let detector = makeSpeechDetector(
             { [weak self] in
@@ -275,6 +312,38 @@ final class DictationController {
             BackgroundSyncLogger.logDebug("[Dictation] max duration reached; finishing")
             self.finish()
         }
+    }
+
+    /// The recorder cut chunks off a long dictation (ADR-IOS-087): each is sent at once, with its
+    /// cleanup, while the user goes on.
+    private func chunksCut(generation current: Int) {
+        guard generation == current, let recorder else { return }
+        let sampleRate = recorder.outputFormat.sampleRate
+        for chunk in recorder.takeChunks() {
+            let pcm = chunk.pcm
+            uploads(generation: current).add(chunk.cut) {
+                FLACEncoder.encode(pcm16Mono: AudioRecorder.normalizePeak(pcm).pcm, sampleRate: sampleRate)
+            }
+        }
+    }
+
+    /// This dictation's chunk uploads, made with its first chunk: every chunk goes with the same
+    /// language, words and cleanup, prepared once.
+    private func uploads(generation current: Int) -> DictationChunkUploads {
+        if let chunks { return chunks }
+        let words = dictionaryWords
+        let language = language
+        let termsTask = termsTask
+        let cleanup = DictationCleanup.variables(context: context ?? DictationContext(windowTitle: "", screenText: ""), dictionary: words)
+        let uploads = DictationChunkUploads(
+            transcribe: transcribeAudio,
+            upload: Task { DictationChunkUploads.Upload(language: language, vocabulary: words + (await Self.terms(from: termsTask)), cleanup: cleanup) },
+            chunkRetryDelays: chunkRetryDelays,
+            lastRetryDelays: transcriptionRetryDelays,
+            onLastRetry: { [weak self] in self?.noteRetrying(generation: current) }
+        )
+        chunks = uploads
+        return uploads
     }
 
     /// Stops listening and transcribes what was said.
@@ -336,7 +405,11 @@ final class DictationController {
             fail()
             return
         }
-        BackgroundSyncLogger.logDebug("[Dictation] recorded \(recording.duration)s, peak \(recording.peakLevel), gain \(20 * log10(recording.gain)) dB, truncated \(recording.truncated)")
+        BackgroundSyncLogger.logDebug("[Dictation] recorded \(recording.duration)s\(recording.lastChunk.map { " (last chunk \($0.index))" } ?? ""), peak \(recording.peakLevel), gain \(20 * log10(recording.gain)) dB, truncated \(recording.truncated)")
+        if let last = recording.lastChunk {
+            await transcribeChunks(last: last, recording: recording, generation: current)
+            return
+        }
 
         // No loudness gate: on quiet microphones speech sits only a few dB above the room noise,
         // so any level threshold rejects real speech. The speech classifier started the
@@ -364,18 +437,85 @@ final class DictationController {
                 return
             }
             useWords([transcript] + [transcription.cleanedText].compactMap { $0 })
-            let text = DictationCleanup.pasted(transcript: transcript, cleanedText: transcription.cleanedText)
-            let deliver = onText
-            let input = learnsWords ? readInput : nil
-            teardown()
-            phase = .idle
-            deliver?(text)
-            if let input { corrections?.watch(pasted: text, field: input) }
+            deliver(DictationCleanup.pasted(transcript: transcript, cleanedText: transcription.cleanedText))
         } catch {
             guard generation == current, !Task.isCancelled else { return }
             BackgroundSyncLogger.logDebug("[Dictation] transcription failed: \(error)")
             fail()
         }
+    }
+
+    /// The release of a dictation cut into chunks: the last one is sent, the chunks still failing
+    /// get their last tries, and the text is the chunks' in order up to the first that gave up
+    /// (owner, 2026-10-03: "paste only the up to successful part"). The first giving up loses the dictation, as one
+    /// recording's failure does; nothing says the end is missing (ADR-IOS-085: no failure messages).
+    private func transcribeChunks(last: DictationChunkCut, recording: AudioRecorder.Recording, generation current: Int) async {
+        // The chunks cut since the recorder last said so.
+        chunksCut(generation: current)
+        let uploads = uploads(generation: current)
+        let pcm = recording.pcm
+        let sampleRate = recording.sampleRate
+        uploads.add(last) { FLACEncoder.encode(pcm16Mono: pcm, sampleRate: sampleRate) }
+        let (parts, lost) = await uploads.release()
+        guard generation == current, !Task.isCancelled else { return }
+        // Every chunk has answered or given up: nothing is retrying while the text is polished (as
+        // TabMail Voice's, whose retry note ends once the chunks are in).
+        endRetrying()
+        // Every part, empty ones too: an overlapped chunk is joined to the one just before it only.
+        let texts = parts.map { part in
+            (text: part.transcription.text.trimmingCharacters(in: .whitespacesAndNewlines), cleanedText: part.transcription.cleanedText, overlapped: part.overlapped)
+        }
+        let heard = texts.filter { !$0.text.isEmpty }
+        let transcript = DictationChunkJoin.join(texts.map { .init(text: $0.text, overlapped: $0.overlapped) })
+        BackgroundSyncLogger.logDebug("[Dictation] transcript ready (\(transcript.count) chars, \(parts.count) of \(last.index + 1) chunks)")
+        if let lost { BackgroundSyncLogger.logDebug("[Dictation] chunk \(parts.count) gave up (\(lost)); only the chunks before it are kept") }
+        guard !transcript.isEmpty else {
+            fail()
+            return
+        }
+        useWords(heard.flatMap { [$0.text] + [$0.cleanedText].compactMap { $0 } })
+        let joined = DictationChunkJoin.join(texts.map { .init(text: $0.text.isEmpty ? "" : DictationCleanup.pasted(transcript: $0.text, cleanedText: $0.cleanedText), overlapped: $0.overlapped) })
+        // One chunk already had its whole cleanup.
+        let text = parts.count > 1 ? await polished(joined, cleanup: await uploads.cleanup()) : joined
+        guard generation == current, !Task.isCancelled else { return }
+        deliver(text)
+    }
+
+    /// A long dictation's joined text (its chunks' cleanups), polished as a whole by the cleanup
+    /// prompt if that answers within `chunkPolishTimeout` (owner, 2026-10-03: "a final polished pass
+    /// if time permits"), as TabMail Voice's: the chunks' seams read as one text. Else, or when it
+    /// fails or comes back empty, `text` as it is: a failed polish never costs the user their
+    /// dictation, as a failed cleanup doesn't.
+    private func polished(_ text: String, cleanup: [String: String]) async -> String {
+        let polish = polish
+        let timeout = chunkPolishTimeout
+        let clock = ContinuousClock()
+        let started = clock.now
+        do {
+            let reply = try await withTimeout(seconds: Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18) {
+                try await polish(text, cleanup)
+            }
+            let polishedText = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !polishedText.isEmpty else {
+                BackgroundSyncLogger.logDebug("[Dictation] polish came back empty; pasting the chunks' cleanups")
+                return text
+            }
+            BackgroundSyncLogger.logDebug("[Dictation] polished in \(clock.now - started) (\(text.count) → \(polishedText.count) chars)")
+            return polishedText
+        } catch {
+            BackgroundSyncLogger.logDebug("[Dictation] polish \(error is TimeoutError ? "ran out of time" : "failed (\(type(of: error)))") after \(clock.now - started); pasting the chunks' cleanups")
+            return text
+        }
+    }
+
+    /// Ends the dictation with its text, appended to the input field.
+    private func deliver(_ text: String) {
+        let deliver = onText
+        let input = learnsWords ? readInput : nil
+        teardown()
+        phase = .idle
+        deliver?(text)
+        if let input { corrections?.watch(pasted: text, field: input) }
     }
 
     /// Makes the transcription request, and makes it again after a server error (a 5xx other than
@@ -400,22 +540,31 @@ final class DictationController {
                 let delay = transcriptionRetryDelays[retry]
                 retry += 1
                 BackgroundSyncLogger.logDebug("[Dictation] transcription failed (\(error)); retrying in \(delay)")
-                isRetrying = true
-                if retryNoteTask == nil {
-                    let noticeDelay = transcriptionRetryNoticeDelay
-                    retryNoteTask = Task { [weak self] in
-                        try? await Task.sleep(for: noticeDelay)
-                        guard let self, !Task.isCancelled, self.generation == current, self.isRetrying else { return }
-                        self.showsRetryNote = true
-                    }
-                }
+                noteRetrying(generation: current)
                 try await Task.sleep(for: delay)
             }
         }
     }
 
+    /// A transcription (or a chunk of one, after the release) failed on the server's side and is
+    /// tried again: `isRetrying` at once, and `showsRetryNote` after `transcriptionRetryNoticeDelay`.
+    private func noteRetrying(generation current: Int) {
+        guard generation == current else { return }
+        isRetrying = true
+        guard retryNoteTask == nil else { return }
+        let noticeDelay = transcriptionRetryNoticeDelay
+        retryNoteTask = Task { [weak self] in
+            try? await Task.sleep(for: noticeDelay)
+            guard let self, !Task.isCancelled, self.generation == current, self.isRetrying else { return }
+            self.showsRetryNote = true
+        }
+    }
+
     /// The status the backend answers when the speech model did not answer in time.
     nonisolated private static let gatewayTimeoutStatus = 504
+    /// The status the backend answers when the speech model's rate limit outlasted its own retries
+    /// (`transcription_rate_limited`, backend ADR-022).
+    nonisolated private static let speechModelRateLimitedStatus = 429
 
     /// A failure on the server's side, worth trying again: a 5xx, or a connection that dropped or
     /// could not be made. Not a timeout: the request may still be running on the server. Nor a 504,
@@ -424,6 +573,15 @@ final class DictationController {
         if case .failed(let status) = error as? DictationError { return status >= 500 && status != gatewayTimeoutStatus }
         guard let error = error as? URLError else { return false }
         return error.code != .timedOut && error.code != .cancelled
+    }
+
+    /// The backend gave up on the speech model after waiting for it: its timeout (504), or the
+    /// model's rate limit outlasting the backend's own 30 s of retries (429
+    /// `transcription_rate_limited`, backend ADR-022). One recording is not tried again (it already
+    /// waited); a long dictation's chunk is (ADR-IOS-087).
+    nonisolated static func backendWaited(_ error: any Error) -> Bool {
+        let error = error as? DictationError
+        return error == .failed(status: gatewayTimeoutStatus) || error == .failed(status: speechModelRateLimitedStatus)
     }
 
     private func updateLevel(decibels: Float, generation: Int) {
@@ -453,6 +611,8 @@ final class DictationController {
         maxDurationTask?.cancel()
         maxDurationTask = nil
         recorder = nil
+        chunks?.cancel()
+        chunks = nil
         speechDetector = nil
         context = nil
         onText = nil
@@ -460,11 +620,16 @@ final class DictationController {
         termsTask?.cancel()
         termsTask = nil
         hasHeardSpeech = false
+        endRetrying()
+        level = 0
+    }
+
+    /// Nothing is being tried again: the retry state and its note end.
+    private func endRetrying() {
         isRetrying = false
         retryNoteTask?.cancel()
         retryNoteTask = nil
         showsRetryNote = false
-        level = 0
     }
 
     /// A failed dictation ends quietly: nothing is appended and the input field comes back.
@@ -517,6 +682,9 @@ enum DictationError: Error, Equatable {
         case (402, _): .subscriptionRequired
         case (403, "consent_required"): .accountSetupRequired
         case (403, _): .accessDenied
+        // The speech model's rate limit, which the backend already retried for its 30 s window
+        // (backend ADR-022): its failure, not this account's limit.
+        case (429, "transcription_rate_limited"): .failed(status: status)
         case (429, _): .rateLimited
         case (400, "audio_too_large"): .recordingTooLong
         default: .failed(status: status)

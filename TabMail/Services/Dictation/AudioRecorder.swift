@@ -7,13 +7,16 @@ import os
 
 /// Accumulates one dictation as 16 kHz mono 16-bit PCM, ready to encode as FLAC and upload;
 /// `finish` peak-normalises it (`normalizePeak`).
-/// Until `keepFromNow` (speech heard), only the latest `preRoll` of audio is held.
+/// Until `keepFromNow` (speech heard), only the latest `preRoll` of audio is held. From then on a
+/// long recording is cut into chunks as it goes (`DictationChunker`, ADR-IOS-087): each is handed out
+/// by `takeChunks` (`onChunk` says one is waiting), and `finish` returns the last.
 ///
 /// `append` is called on the audio render thread; all state is behind one lock, so appends are
 /// serialised and `finish` sees every buffer appended before it.
 final class AudioRecorder: Sendable {
     struct Recording: Sendable {
-        /// Little-endian 16-bit mono PCM samples, peak-normalised (`normalizePeak`).
+        /// Little-endian 16-bit mono PCM samples, peak-normalised (`normalizePeak`): the whole
+        /// recording, or, when it was cut into chunks, the last chunk's (`lastChunk`).
         let pcm: Data
         let sampleRate: Double
         /// The gain `normalizePeak` applied (1 when none).
@@ -24,10 +27,20 @@ final class AudioRecorder: Sendable {
         let firstBufferAt: ContinuousClock.Instant?
         /// True when recording hit `maxFrames` and later audio was dropped.
         let truncated: Bool
+        /// The last chunk, from the last cut to the end, when the recording was cut into chunks
+        /// (ADR-IOS-087); nil when it is one upload.
+        let lastChunk: DictationChunkCut?
 
         var duration: TimeInterval {
             Double(pcm.count / MemoryLayout<Int16>.size) / sampleRate
         }
+    }
+
+    /// A chunk cut off a long recording: its samples as captured, not yet normalised.
+    struct Chunk: Sendable {
+        let cut: DictationChunkCut
+        /// Little-endian 16-bit mono PCM samples.
+        let pcm: Data
     }
 
     private struct State {
@@ -38,6 +51,10 @@ final class AudioRecorder: Sendable {
         var truncated = false
         var firstError: (any Error)?
         var isHoldingPreRoll = true
+        /// Reads what is kept, from `keepFromNow` on; its sample indices are `pcm`'s.
+        var chunker = DictationChunker()
+        /// Chunks cut and not yet taken (`takeChunks`), in order.
+        var chunks: [Chunk] = []
     }
 
     enum RecorderError: Error {
@@ -48,12 +65,16 @@ final class AudioRecorder: Sendable {
     private let maxFrames: Int
     private let preRollFrames: Int
     private let state = OSAllocatedUnfairLock<State>(uncheckedState: State())
+    /// Called, on the audio thread, when a chunk is cut and waiting in `takeChunks`.
+    private let onChunk: (@Sendable () -> Void)?
 
     init(
         sampleRate: Double = DictationConfig.recordingSampleRate,
         maxDuration: Duration = DictationConfig.maxRecordingDuration,
-        preRoll: Duration = DictationConfig.speechPreRollDuration
+        preRoll: Duration = DictationConfig.speechPreRollDuration,
+        onChunk: (@Sendable () -> Void)? = nil
     ) {
+        self.onChunk = onChunk
         // Force-unwrap: a 16-bit integer mono format is always constructible.
         outputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: sampleRate, channels: 1, interleaved: true)!
         maxFrames = Int(Double(maxDuration.components.seconds) * sampleRate)
@@ -64,9 +85,22 @@ final class AudioRecorder: Sendable {
     /// already held. Returns how much was held.
     @discardableResult
     func keepFromNow() -> Duration {
-        state.withLockUnchecked { state in
+        let (held, cut) = state.withLockUnchecked { state in
             state.isHoldingPreRoll = false
-            return .seconds(Double(state.pcm.count / MemoryLayout<Int16>.size) / outputFormat.sampleRate)
+            // The held audio is the start of what is kept: the chunker reads it first.
+            let held = state.pcm
+            let cut = held.withUnsafeBytes { Self.chunk($0.bindMemory(to: Int16.self), state: &state) }
+            return (Duration.seconds(Double(state.pcm.count / MemoryLayout<Int16>.size) / outputFormat.sampleRate), cut)
+        }
+        if cut { onChunk?() }
+        return held
+    }
+
+    /// The chunks cut since the last call, in order (ADR-IOS-087).
+    func takeChunks() -> [Chunk] {
+        state.withLockUnchecked { state in
+            defer { state.chunks = [] }
+            return state.chunks
         }
     }
 
@@ -74,26 +108,31 @@ final class AudioRecorder: Sendable {
     func append(_ buffer: AVAudioPCMBuffer) {
         let level = MicrophoneCapture.level(of: buffer)
         let now = ContinuousClock.now
-        state.withLockUnchecked { state in
+        let cut = state.withLockUnchecked { state in
             if state.firstBufferAt == nil { state.firstBufferAt = now }
-            guard state.firstError == nil, !state.truncated else { return }
+            guard state.firstError == nil, !state.truncated else { return false }
             state.peakLevel = max(state.peakLevel, level)
             do {
                 let converted = try convert(buffer, state: &state)
-                appendSamples(of: converted, to: &state)
+                return appendSamples(of: converted, to: &state)
             } catch {
                 BackgroundSyncLogger.logDebug("[Dictation] AudioRecorder: conversion failed: \(type(of: error))")
                 state.firstError = error
+                return false
             }
         }
+        if cut { onChunk?() }
     }
 
     /// Everything recorded so far, peak-normalised. Throws the first conversion error, if one
     /// occurred.
     func finish() throws -> Recording {
-        let (pcm, peakLevel, firstBufferAt, truncated) = try state.withLockUnchecked { state in
+        let (pcm, peakLevel, firstBufferAt, truncated, lastChunk) = try state.withLockUnchecked { state in
             if let error = state.firstError { throw error }
-            return (state.pcm, state.peakLevel, state.firstBufferAt, state.truncated)
+            let samples = state.pcm.count / MemoryLayout<Int16>.size
+            let lastChunk = state.isHoldingPreRoll ? nil : state.chunker.finish(totalSamples: samples)
+            let pcm = lastChunk.map { Self.samples($0.start..<$0.end, of: state.pcm) } ?? state.pcm
+            return (pcm, state.peakLevel, state.firstBufferAt, state.truncated, lastChunk)
         }
         // Outside the lock: the audio thread keeps appending meanwhile.
         let normalized = Self.normalizePeak(pcm)
@@ -103,8 +142,25 @@ final class AudioRecorder: Sendable {
             gain: normalized.gain,
             peakLevel: peakLevel,
             firstBufferAt: firstBufferAt,
-            truncated: truncated
+            truncated: truncated,
+            lastChunk: lastChunk
         )
+    }
+
+    /// The chunker reads `samples`, the next of the recording; the chunks it cuts wait in
+    /// `state.chunks`. True when it cut any.
+    private static func chunk(_ samples: UnsafeBufferPointer<Int16>, state: inout State) -> Bool {
+        let cuts = state.chunker.append(samples)
+        for cut in cuts {
+            state.chunks.append(Chunk(cut: cut, pcm: Self.samples(cut.start..<cut.end, of: state.pcm)))
+        }
+        return !cuts.isEmpty
+    }
+
+    /// Samples `range` of 16-bit PCM, as a fresh zero-based Data.
+    private static func samples(_ range: Range<Int>, of pcm: Data) -> Data {
+        let size = MemoryLayout<Int16>.size
+        return Data(pcm[(pcm.startIndex + range.lowerBound * size)..<(pcm.startIndex + range.upperBound * size)])
     }
 
     /// Scales 16-bit mono PCM so its loudest sample sits at `DictationConfig.normalizedPeakDecibels`,
@@ -160,22 +216,25 @@ final class AudioRecorder: Sendable {
         return output
     }
 
-    private func appendSamples(of buffer: AVAudioPCMBuffer, to state: inout State) {
-        guard let samples = buffer.int16ChannelData?[0] else { return }
+    /// Appends the buffer's samples; true when they completed a chunk (`takeChunks`).
+    private func appendSamples(of buffer: AVAudioPCMBuffer, to state: inout State) -> Bool {
+        guard let samples = buffer.int16ChannelData?[0] else { return false }
         if state.isHoldingPreRoll {
             // Only the latest `preRoll` is held (never more than the cap). A fresh Data rather
             // than a slice: the recording's indices stay zero-based.
             state.pcm.append(UnsafeBufferPointer(start: samples, count: Int(buffer.frameLength)))
             let held = preRollFrames * MemoryLayout<Int16>.size
             if state.pcm.count > held { state.pcm = Data(state.pcm.suffix(held)) }
-            return
+            return false
         }
         let recordedFrames = state.pcm.count / MemoryLayout<Int16>.size
         let room = maxFrames - recordedFrames
         let frames = min(Int(buffer.frameLength), room)
         if frames < Int(buffer.frameLength) { state.truncated = true }
-        guard frames > 0 else { return }
-        state.pcm.append(UnsafeBufferPointer(start: samples, count: frames))
+        guard frames > 0 else { return false }
+        let kept = UnsafeBufferPointer(start: samples, count: frames)
+        state.pcm.append(kept)
+        return Self.chunk(kept, state: &state)
     }
 }
 
