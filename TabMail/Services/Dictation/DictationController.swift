@@ -683,7 +683,7 @@ enum DictationError: Error, Equatable {
         case (402, _): .subscriptionRequired
         case (403, "consent_required"): .accountSetupRequired
         case (403, _): .accessDenied
-        // The speech model's rate limit, which the backend already retried for its 30 s window
+        // The speech model's rate limit, which the backend already retried for its 10 s window
         // (backend ADR-022): its failure, not this account's limit.
         case (429, "transcription_rate_limited"): .failed(status: status)
         case (429, _): .rateLimited
