@@ -1044,6 +1044,8 @@ struct DictationControllerTests {
                 return DictationTranscription(text: "a long dictation", cleanedText: "A long dictation.")
             },
             warmUp: {},
+            // No polish request: the chunks are what is tested, never the backend.
+            polish: { text, _ in text },
             speechDetector: FakeSpeechDetector.hearing()
         )
 

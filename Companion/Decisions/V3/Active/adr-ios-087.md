@@ -81,7 +81,8 @@ the backend answers any provider failure 502, which the apps retry.
    minutes, 9 tries × 30 s plus the waits, until the user closes the pill; found in review,
    2026-10-03) on
    the same failures, a 504 and that 429 included, under the pill's retry state (`isRetrying`, then
-   `showsRetryNote`): the last chunk is sent at the release, so its backend timeout comes after it
+   `showsRetryNote`), which ends once every chunk has answered or given up, before the polish (as
+   TabMail Voice's; found in review, 2026-10-03): the last chunk is sent at the release, so its backend timeout comes after it
    (owner: "we should not lose the end"). Anything else (signed out, over quota or the account's own
    rate limit, a refused request) gives up at once.
 6. **What is pasted.** The chunks' texts in order up to the first chunk that gave up; the chunks
@@ -135,7 +136,12 @@ the backend answers any provider failure 502, which the apps retry.
   language and words, each
   chunk peak-normalised on its own, no request after a cancel during a retry wait or the upload's
   preparation; the polish pasted with the prompt's variables, each fallback, a cancel during it, a
-  polish answering after a cancel leaving the next dictation alone, and no polish for one chunk),
+  polish answering after a cancel leaving the next dictation alone, and no polish for one chunk; and,
+  from a later review: the retry state ending before the polish, a chunk refused or over the
+  account's own rate limit after the release not tried again; a test's polish is always injected, so
+  no test reaches the backend),
+  `BackendClientDictationTests.thePolishSendsTheCleanupPromptWithTheJoinedTextAndReturnsItsReply`
+  (the polish request at the HTTP boundary: prompt, variables, no tools, no web search),
   `DictationAudioRecorderTests.chunksAreCutAtThePauseCountingTheAudioHeldBeforeSpeech`, and `DictationControllerTests.noUploadOutlastsWhatTheModelTranscribes` /
   `theAppsControllerSendsALongDictationInChunksTheModelTranscribes`. Five mutants (failed chunks
   skipped, the release not ending waits, 504 not retried while recording, a silent chunk not sent,

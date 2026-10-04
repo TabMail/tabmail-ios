@@ -432,6 +432,8 @@ struct DictationLongDictationTests {
                 return DictationTranscription(text: replies.withLock { $0[index] ?? "" }, cleanedText: nil)
             },
             warmUp: {},
+            // The polish hands the joined text back: the join is what is tested, never the backend.
+            polish: { text, _ in text },
             speechDetector: { onSpeech, _ in LoudnessSpeechDetector(onSpeech: onSpeech) }
         )
         await start(controller, capture)
@@ -472,6 +474,8 @@ struct DictationLongDictationTests {
                 return DictationTranscription(text: reply, cleanedText: reply)
             },
             warmUp: {},
+            // The polish hands the joined text back: the join is what is tested, never the backend.
+            polish: { text, _ in text },
             speechDetector: { onSpeech, _ in LoudnessSpeechDetector(onSpeech: onSpeech) }
         )
         await start(controller, capture)
@@ -746,6 +750,25 @@ struct DictationLongDictationTests {
         #expect(!controller.showsRetryNote)
         controller.cancel()
         await waitUntil { polisher.wasCancelled }
+    }
+
+    /// After the release, as while recording, a refused chunk or one over this account's own rate
+    /// limit gives up at once: only the server's side failing gets the last tries.
+    @Test(arguments: [false, true])
+    func aChunkRefusedAfterTheReleaseIsNotTriedAgain(rateLimited: Bool) async {
+        let capture = SpeakingCapture()
+        let failure: ChunkBackend.Reply = rateLimited ? .accountRateLimited : .refused
+        let backend = ChunkBackend { index, _ in index == 1 ? failure : .part }
+        let controller = controller(capture, backend)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 53, 12, 4)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+        try? await Task.sleep(for: .milliseconds(100))
+
+        #expect(backend.attempts == [1, 1])
+        #expect(pasted.texts.withLock { $0 } == ["Part 0."])
     }
 
     /// Cancelled while a chunk waits for one of its last tries after the release: no request is made

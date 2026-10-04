@@ -33,6 +33,9 @@ struct DictationChunkJoinTests {
     @Test func anEmptyOrEllipsisOnlyChunkAddsNothingAndLeavesNoDoubleSpace() {
         #expect(join(paused("One."), paused("   "), paused("…"), paused("Two.")) == "One. Two.")
         #expect(join(paused(""), paused("Only this.")) == "Only this.")
+        // A first chunk of only an ellipsis (a silence the model heard as a pause) leaves no leading space.
+        #expect(join(paused("…"), paused("Two.")) == "Two.")
+        #expect(join(paused("..."), overlapping("Two.")) == "Two.")
     }
 
     @Test func scriptsWrittenWithoutSpacesAreJoinedWithoutOne() {
