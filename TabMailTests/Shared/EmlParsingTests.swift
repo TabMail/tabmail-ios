@@ -255,6 +255,69 @@ struct EmlParsingTests {
         #expect(EmlParsing.nestedBytes(rawBytes: raw, index: -1) == nil)
     }
 
+    /// A nested attachment is stored as `<parent>|eml-nested|<index>` and resolved
+    /// at tap time by position in the list `parse` returned when the body was
+    /// rendered — possibly under an older SwiftMail. A SwiftMail update that
+    /// changes that list for the same bytes re-points every stored index after the
+    /// change at a DIFFERENT attachment. This pins the list for the shape most
+    /// exposed to it: an `.eml` forwarding a message that carries its own
+    /// attachment, followed by a sibling. The forwarded message is one opaque
+    /// attachment; nothing inside it is listed. If this goes red on a SwiftMail
+    /// bump, stored nested sections must be invalidated before the bump ships.
+    @Test("Nested attachment positions are stable: a forwarded message is one opaque entry")
+    func nestedIndexesStableAcrossForwardedMessage() throws {
+        let outer = "----=_OUTER"
+        let inner = "----=_INNER"
+        let rfc822 = """
+        From: a@example.com\r
+        To: x@example.com\r
+        Subject: Forwards a message with an attachment\r
+        Date: Wed, 2 Oct 2025 01:50:00 +0000\r
+        MIME-Version: 1.0\r
+        Content-Type: multipart/mixed; boundary="\(outer)"\r
+        \r
+        --\(outer)\r
+        Content-Type: text/plain; charset=utf-8\r
+        \r
+        body text\r
+        --\(outer)\r
+        Content-Type: message/rfc822\r
+        Content-Disposition: attachment; filename="forwarded.eml"\r
+        \r
+        From: b@example.com\r
+        Subject: Inner\r
+        MIME-Version: 1.0\r
+        Content-Type: multipart/mixed; boundary="\(inner)"\r
+        \r
+        --\(inner)\r
+        Content-Type: text/plain; charset=utf-8\r
+        \r
+        inner body\r
+        --\(inner)\r
+        Content-Type: application/octet-stream\r
+        Content-Disposition: attachment; filename="inner.bin"\r
+        \r
+        INNER-PAYLOAD-BYTES\r
+        --\(inner)--\r
+        --\(outer)\r
+        Content-Type: application/octet-stream\r
+        Content-Disposition: attachment; filename="sibling.bin"\r
+        \r
+        SIBLING-PAYLOAD-BYTES\r
+        --\(outer)--\r
+        """
+        let raw = Data(rfc822.utf8)
+
+        let parsed = try #require(EmlParsing.parse(rawBytes: raw))
+        #expect(parsed.nested.map(\.filename) == ["forwarded.eml", "sibling.bin"])
+
+        let forwarded = try #require(EmlParsing.nestedBytes(rawBytes: raw, index: 0))
+        #expect(String(data: forwarded, encoding: .utf8)?.contains("INNER-PAYLOAD-BYTES") ?? false)
+        let sibling = try #require(EmlParsing.nestedBytes(rawBytes: raw, index: 1))
+        #expect(String(data: sibling, encoding: .utf8)?.contains("SIBLING-PAYLOAD-BYTES") ?? false)
+        #expect(EmlParsing.nestedBytes(rawBytes: raw, index: 2) == nil)
+    }
+
     @Test("Envelope round-trips through EmlMarker.build + parser")
     func roundTripThroughMarker() throws {
         let rfc822 = """

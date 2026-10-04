@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftMail
 
 /// Pure RFC 5322 header parsing utilities for IMAP-fetched messages.
 /// Mirror of `GmailParse` / `GraphParse` for the IMAP code path — produces
@@ -113,8 +114,9 @@ enum RFC5322Parse {
     }
 
     /// Decode RFC 2047 encoded-word headers: `=?UTF-8?B?...?=` / `=?UTF-8?Q?...?=`.
-    /// Minimal implementation — handles the common UTF-8 B/Q encodings seen in
-    /// email Subject/From headers. Non-encoded content passes through unchanged.
+    /// The charset resolves through the same `String.Encoding(mimeCharset:)`
+    /// SwiftMail's IMAP decoder uses, so a `gb2312` word carrying GBK
+    /// characters decodes here too. Non-encoded content passes through unchanged.
     static func decodeRFC2047(_ s: String) -> String {
         guard s.contains("=?") else { return s }
         let regex = try? NSRegularExpression(pattern: "=\\?([^?]+)\\?([BQbq])\\?([^?]*)\\?=",
@@ -143,7 +145,7 @@ enum RFC5322Parse {
             let charsetName = ns.substring(with: m.range(at: 1))
             let enc = ns.substring(with: m.range(at: 2)).uppercased()
             let payload = ns.substring(with: m.range(at: 3))
-            let charset = charsetFor(charsetName)
+            let charset = String.Encoding(mimeCharset: charsetName) ?? .utf8
             if enc == "B", let data = Data(base64Encoded: payload),
                let decoded = String(data: data, encoding: charset) {
                 out += decoded
@@ -164,16 +166,6 @@ enum RFC5322Parse {
             out += ns.substring(with: NSRange(location: cursor, length: ns.length - cursor))
         }
         return out
-    }
-
-    private static func charsetFor(_ name: String) -> String.Encoding {
-        switch name.uppercased() {
-        case "UTF-8", "UTF8": return .utf8
-        case "ISO-8859-1", "LATIN1": return .isoLatin1
-        case "US-ASCII", "ASCII": return .ascii
-        case "UTF-16": return .utf16
-        default: return .utf8
-        }
     }
 
     private static func decodeQuotedPrintable(_ s: String, encoding: String.Encoding) -> String? {

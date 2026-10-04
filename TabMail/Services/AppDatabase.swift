@@ -586,7 +586,7 @@ final class AppDatabase: Sendable {
                 // placeholder leaked in.
                 //   • to/cc/bcc/replyTo — raw per-provider format (Gmail = raw
                 //     RFC 2822 header, Graph = email-only comma list, IMAP =
-                //     SwiftMail `info.to` joined with ", ").
+                //     `IMAPFetchMapping.addressField`).
                 //   • inReplyTo + referencesJSON — enables the MessageReference
                 //     junction insert in merge so thread continuity works
                 //     before sync materializes.

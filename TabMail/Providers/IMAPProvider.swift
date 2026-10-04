@@ -3652,17 +3652,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
 
         // Extract CID inline images — data is already fetched by SwiftMail.
-        // Use decodedData() to handle content transfer encoding (base64, quoted-printable)
-        // before we re-encode as data: URI in AccountManagerFetch.
-        let inlineImages: [InlineImage] = message.cids.prefix(SyncConfig.maxInlineImages).compactMap { part in
-            guard let rawId = part.contentId, let data = part.decodedData() else { return nil }
-            // Strip angle brackets + whitespace: "< image001@host >" → "image001@host"
-            let contentId = rawId.trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !contentId.isEmpty else { return nil }
-            return InlineImage(contentId: contentId, contentType: part.contentType, data: data)
-        }
+        let inlineImages: [InlineImage] = IMAPFetchMapping
+            .extractInlineImages(message: message, maxInlineImages: SyncConfig.maxInlineImages)
+            .map { InlineImage(contentId: $0.contentId, contentType: $0.contentType, data: $0.data) }
 
         // Extract ICS calendar data from already-fetched parts (avoids re-fetch in renderBody)
         let icsData: Data? = message.parts.first(where: {
@@ -3687,8 +3679,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let rfc822Parts = message.parts.filter { $0.contentType.lowercased().hasPrefix("message/rfc822") }
         if !rfc822Parts.isEmpty {
             if DebugModeManager.isLoggingEnabled() {
+                // `bodies` is the message's OWN bodies: those of a carried
+                // message sit under its rfc822 section and are not listed here.
                 let bodyParts = message.bodies
-                BackgroundSyncLogger.logDebug("[EmlRender] Message has \(rfc822Parts.count) rfc822 part(s), \(bodyParts.count) body parts:")
+                BackgroundSyncLogger.logDebug("[EmlRender] Message has \(rfc822Parts.count) rfc822 part(s), \(bodyParts.count) own body parts:")
                 for part in bodyParts {
                     BackgroundSyncLogger.logDebug("[EmlRender]   section=\(part.section.description) type=\(DebugModeManager.escapedForLogLine(part.contentType)) len=\(part.textContent?.count ?? 0)")
                 }
@@ -5577,6 +5571,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     func send(draft: DraftMessage) async throws {
         try await withTimeout(seconds: SyncConfig.smtpSendTimeoutSeconds) {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[SMTP] Sending via \(self.smtpHost):\(self.smtpPort) from=\(self.senderEmail) to=\(draft.to) attachments=\(draft.attachments.count)") }
+            // Built before connecting: a recipient SwiftMail cannot read fails the
+            // send without opening a connection.
+            let email = try Self.buildEmail(from: draft, senderEmail: self.senderEmail)
             let smtpServer = SMTPServer(host: self.smtpHost, port: self.smtpPort)
             do {
                 try await smtpServer.connect()
@@ -5589,8 +5586,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 throw Self.mapTransportSecurityFailure(error, host: self.smtpHost)
             }
             try await smtpServer.login(username: self.username, password: self.password)
-
-            let email = Self.buildEmail(from: draft, senderEmail: self.senderEmail)
 
             do {
                 try await smtpServer.sendEmail(email)
@@ -5619,7 +5614,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 return true
             }
 
-            let email = Self.buildEmail(from: draft, senderEmail: senderAddr)
+            let email = try Self.buildEmail(from: draft, senderEmail: senderAddr)
             _ = try await server.append(email: email, to: sentFolderPath, flags: [.seen], internalDate: Date())
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] Appended sent message \(messageId) to \(sentFolderPath)") }
             return true
@@ -5678,7 +5673,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // APPEND new draft with \Draft + \Seen flags (drafts are never "unread").
             // PORT 4d34ee864/82c9ce5: APPENDUID is the exact attempt-correlated
             // identity and always wins over a mailbox search.
-            let email = Self.buildEmail(from: draft, senderEmail: senderAddr)
+            let email = Self.buildDraftEmail(from: draft, senderEmail: senderAddr)
             let appendResult = try await server.append(
                 email: email, to: draftsFolderPath,
                 flags: [.draft, .seen], internalDate: Date())
@@ -6042,15 +6037,57 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    /// Build an Email object from a DraftMessage. Shared between send() and appendToSentFolder().
-    static func buildEmail(from draft: DraftMessage, senderEmail: String) -> Email {
+    /// Build the Email that send() sends and appendToSentFolder() files.
+    ///
+    /// Every recipient is read by SwiftMail's address parser and written in the
+    /// form it reads (`taro.@example.com` becomes `"taro."@example.com`).
+    /// SwiftMail's RCPT TO validation is stricter still: it rejects quoted local
+    /// parts and non-ASCII domains, which also fail the send as fatal. A
+    /// recipient it cannot read as a single mailbox fails the send as
+    /// `SMTPError.invalidEmailAddress`, which the outbox treats as fatal, so the
+    /// message stays visible for the user to fix.
+    static func buildEmail(from draft: DraftMessage, senderEmail: String) throws -> Email {
+        buildEmail(
+            from: draft, senderEmail: senderEmail,
+            recipients: try sendableRecipients(draft.to),
+            ccRecipients: try sendableRecipients(draft.cc)
+        )
+    }
+
+    /// Build the Email saveDraft() appends. Recipients are kept as typed: a draft
+    /// may hold an address the user has not finished, and saving it must not fail.
+    static func buildDraftEmail(from draft: DraftMessage, senderEmail: String) -> Email {
+        buildEmail(
+            from: draft, senderEmail: senderEmail,
+            recipients: draft.to.map { SwiftMail.EmailAddress(address: $0) },
+            ccRecipients: draft.cc.map { SwiftMail.EmailAddress(address: $0) }
+        )
+    }
+
+    /// Each recipient as SwiftMail's parser reads it; throws on the first one that
+    /// is not exactly one mailbox.
+    static func sendableRecipients(_ recipients: [String]) throws -> [SwiftMail.EmailAddress] {
+        try recipients.map { recipient in
+            guard case .mailbox(let mailbox)? = AddressListEntry(recipient) else {
+                throw SMTPError.invalidEmailAddress(recipient)
+            }
+            return mailbox
+        }
+    }
+
+    private static func buildEmail(
+        from draft: DraftMessage,
+        senderEmail: String,
+        recipients: [SwiftMail.EmailAddress],
+        ccRecipients: [SwiftMail.EmailAddress]
+    ) -> Email {
         let smtpAttachments: [Attachment]? = draft.attachments.isEmpty ? nil : draft.attachments.map {
             Attachment(filename: $0.filename, mimeType: $0.mimeType, data: $0.data)
         }
         var email = Email(
             sender: SwiftMail.EmailAddress(address: senderEmail),
-            recipients: draft.to.map { SwiftMail.EmailAddress(address: $0) },
-            ccRecipients: draft.cc.map { SwiftMail.EmailAddress(address: $0) },
+            recipients: recipients,
+            ccRecipients: ccRecipients,
             // Own the complete outbound Subject boundary before handing it to
             // SwiftMail. The app encoder preserves literal RFC 2047-shaped text,
             // controls, Unicode, and the 75-octet word limit; its ASCII result makes
@@ -6744,10 +6781,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// failures: if the date is broken, other fields are likely broken too. Next
     /// fetch cycle will retry — by then the server should have indexed the message.
     private func mapMessageInfo(_ info: MessageInfo) -> MessageHeaderInfo? {
-        // Shared parser — same From-header handling as Gmail/Graph/future NSE
-        // IMAP. Returns ("name", "email") for "Name <email>", ("addr", "addr")
-        // for bare addresses.
-        let from = info.from.map { EmailAddress.parse($0) }
+        // Shared with the NSE (`NSEIMAPConnection.mapInfoToMetadata`), so both
+        // targets list a message under the same sender.
+        let from = IMAPFetchMapping.sender(from: info)
             ?? EmailAddress(name: "Unknown", email: "")
         let fromName = from.name
         let fromAddr = from.email
@@ -6802,9 +6838,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             subject: subject,
             from: fromName,
             fromAddress: fromAddr,
-            to: info.to.joined(separator: ", "),
-            cc: info.cc.joined(separator: ", "),
-            bcc: info.bcc.joined(separator: ", "),
+            to: IMAPFetchMapping.addressField(info.toAddresses),
+            cc: IMAPFetchMapping.addressField(info.ccAddresses),
+            bcc: IMAPFetchMapping.addressField(info.bccAddresses),
             replyTo: nil,
             date: date,
             snippet: "",
@@ -6951,19 +6987,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     static let embeddedDateFormatter = EmlMarker.dateFormatter
 
     static func embeddedHeadersHtml(_ info: MessageInfo, filename: String?) -> String {
-        let envelope = EmlMarker.Envelope(
-            subject: info.subject, from: info.from, date: info.date,
-            to: info.to, cc: info.cc
-        )
-        return EmlMarker.embeddedHeadersHtml(envelope: envelope, filename: filename)
+        EmlMarker.embeddedHeadersHtml(envelope: IMAPFetchMapping.envelope(of: info), filename: filename)
     }
 
     static func embeddedHeadersPlainText(_ info: MessageInfo, filename: String?) -> String {
-        let envelope = EmlMarker.Envelope(
-            subject: info.subject, from: info.from, date: info.date,
-            to: info.to, cc: info.cc
-        )
-        return EmlMarker.embeddedHeadersPlainText(envelope: envelope, filename: filename)
+        EmlMarker.embeddedHeadersPlainText(envelope: IMAPFetchMapping.envelope(of: info), filename: filename)
     }
 
     static func extractBodyContent(from html: String) -> String {

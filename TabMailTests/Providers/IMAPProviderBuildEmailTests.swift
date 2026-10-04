@@ -60,9 +60,9 @@ struct IMAPProviderBuildEmailTests {
     /// library must not emit an unencoded control character in a header regardless of
     /// caller) — `IOS-IMAP-016`, and that PR goes to Cocoanetics, not the fork.
     @Test("A control-bearing subject is encoded before SwiftMail sees it")
-    func controlBearingSubjectEncodedAtBoundary() {
+    func controlBearingSubjectEncodedAtBoundary() throws {
         let injected = "Fwd: Hi\r\nBcc: attacker@evil.example"
-        let email = IMAPProvider.buildEmail(
+        let email = try IMAPProvider.buildEmail(
             from: DraftMessage(to: ["alice@example.com"], subject: injected, body: "body"),
             senderEmail: "sender@example.com"
         )
@@ -78,9 +78,9 @@ struct IMAPProviderBuildEmailTests {
     }
 
     @Test("Final IMAP emitter preserves a literal RFC 2047-shaped subject")
-    func literalEncodedWordShapeRoundTripsThroughFinalEmitter() {
+    func literalEncodedWordShapeRoundTripsThroughFinalEmitter() throws {
         let subject = "Re: =?UTF-8?B?SGVsbG8=?= explained"
-        let email = IMAPProvider.buildEmail(
+        let email = try IMAPProvider.buildEmail(
             from: DraftMessage(to: ["alice@example.com"], subject: subject, body: "body"),
             senderEmail: "sender@example.com"
         )
@@ -101,7 +101,7 @@ struct IMAPProviderBuildEmailTests {
     }
 
     @Test("Final IMAP emitter protects complete substrings consumed by SwiftMail")
-    func decoderConsumableSubstringsRoundTripThroughFinalEmitter() {
+    func decoderConsumableSubstringsRoundTripThroughFinalEmitter() throws {
         let validWord = "=?UTF-8?B?SGVsbG8=?="
         let subjects = ["prefix\(validWord)", "Re: \(validWord)suffix", "=?="]
 
@@ -110,7 +110,7 @@ struct IMAPProviderBuildEmailTests {
                 #expect(subject.decodeMIMEHeader() != subject,
                         "the raw compatibility control must be consumed before protection")
             }
-            let email = IMAPProvider.buildEmail(
+            let email = try IMAPProvider.buildEmail(
                 from: DraftMessage(to: ["alice@example.com"], subject: subject, body: "body"),
                 senderEmail: "sender@example.com"
             )
@@ -130,10 +130,10 @@ struct IMAPProviderBuildEmailTests {
     }
 
     @Test("Final IMAP emitter keeps every encoded-word within 75 octets")
-    func scalarBoundaryKeepsFinalEmitterWithinEncodedWordLimit() {
+    func scalarBoundaryKeepsFinalEmitterWithinEncodedWordLimit() throws {
         let subject = "a" + String(repeating: "\u{0301}", count: 23)
             + String(repeating: "b", count: 50)
-        let email = IMAPProvider.buildEmail(
+        let email = try IMAPProvider.buildEmail(
             from: DraftMessage(to: ["alice@example.com"], subject: subject, body: "body"),
             senderEmail: "sender@example.com"
         )
@@ -163,15 +163,15 @@ struct IMAPProviderBuildEmailTests {
     /// benign ASCII subject stays literal, and an ordinary non-ASCII subject is
     /// byte-identical to what SwiftMail previously produced on its own.
     @Test("Pre-encoding leaves benign and non-ASCII subjects behaving as before")
-    func preEncodingDoesNotChangeNormalMail() {
-        let ascii = IMAPProvider.buildEmail(
+    func preEncodingDoesNotChangeNormalMail() throws {
+        let ascii = try IMAPProvider.buildEmail(
             from: DraftMessage(to: ["alice@example.com"], subject: "Q3 numbers (final)", body: "b"),
             senderEmail: "sender@example.com"
         )
         #expect(ascii.subject == "Q3 numbers (final)")
 
         let korean = "회의 일정 안내"
-        let nonASCII = IMAPProvider.buildEmail(
+        let nonASCII = try IMAPProvider.buildEmail(
             from: DraftMessage(to: ["alice@example.com"], subject: korean, body: "b"),
             senderEmail: "sender@example.com"
         )
@@ -183,14 +183,49 @@ struct IMAPProviderBuildEmailTests {
 
     // MARK: - Basic construction
 
+    // MARK: - Recipients
+
+    @Test("Recipients go out in the form SwiftMail's parser reads")
+    func recipientsNormalisedByParser() throws {
+        let draft = DraftMessage(to: ["taro.@example.com"], cc: [".taro@example.com"], subject: "Hi")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        #expect(email.recipients.map(\.address) == [#""taro."@example.com"#])
+        #expect(email.ccRecipients.map(\.address) == [#"".taro"@example.com"#])
+    }
+
+    /// The send must fail where the user can see it — a fatal outbox error,
+    /// never a silent send to a different or mangled address.
+    @Test("A recipient SwiftMail cannot read fails the send as fatal")
+    func unreadableRecipientFailsSendFatally() {
+        for draft in [
+            DraftMessage(to: ["ann@example.com", "not an address"], subject: "Hi"),
+            DraftMessage(to: ["ann@example.com"], cc: ["foo@@example.com"], subject: "Hi")
+        ] {
+            do {
+                _ = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+                Issue.record("an unreadable recipient was accepted for sending")
+            } catch {
+                #expect(AccountManager.isFatalSendError(error))
+            }
+        }
+    }
+
+    @Test("A saved draft keeps its recipients as typed")
+    func draftKeepsRecipientsAsTyped() {
+        let draft = DraftMessage(to: ["not an address"], cc: ["taro.@example.com"], subject: "Hi")
+        let email = IMAPProvider.buildDraftEmail(from: draft, senderEmail: "me@test.com")
+        #expect(email.recipients.map(\.address) == ["not an address"])
+        #expect(email.ccRecipients.map(\.address) == ["taro.@example.com"])
+    }
+
     @Test("Builds email with basic to-only draft")
-    func basicToOnly() {
+    func basicToOnly() throws {
         let draft = DraftMessage(
             to: ["alice@example.com"],
             subject: "Hello",
             body: "Plain text body"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "sender@example.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "sender@example.com")
         #expect(email.sender.address == "sender@example.com")
         #expect(email.recipients.count == 1)
         #expect(email.recipients[0].address == "alice@example.com")
@@ -200,12 +235,12 @@ struct IMAPProviderBuildEmailTests {
     }
 
     @Test("Builds email with multiple to recipients")
-    func multipleToRecipients() {
+    func multipleToRecipients() throws {
         let draft = DraftMessage(
             to: ["a@test.com", "b@test.com", "c@test.com"],
             subject: "Multi"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.recipients.count == 3)
         #expect(email.recipients[0].address == "a@test.com")
         #expect(email.recipients[1].address == "b@test.com")
@@ -215,26 +250,26 @@ struct IMAPProviderBuildEmailTests {
     // MARK: - CC and BCC
 
     @Test("Builds email with CC recipients")
-    func withCC() {
+    func withCC() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             cc: ["cc1@test.com", "cc2@test.com"],
             subject: "With CC"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.ccRecipients.count == 2)
         #expect(email.ccRecipients[0].address == "cc1@test.com")
         #expect(email.ccRecipients[1].address == "cc2@test.com")
     }
 
     @Test("Builds email with BCC recipients — BCC not set on Email (handled by SMTP)")
-    func withBCC() {
+    func withBCC() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             bcc: ["bcc@secret.com"],
             subject: "With BCC"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         // DraftMessage.bcc is not mapped to Email.bccRecipients in buildEmail
         // (BCC is handled at the SMTP transport layer, not in the email content)
         // Verify the email was built without error
@@ -243,13 +278,13 @@ struct IMAPProviderBuildEmailTests {
     }
 
     @Test("Builds email with both CC and to recipients")
-    func ccAndTo() {
+    func ccAndTo() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             cc: ["cc@test.com"],
             subject: "Both"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.recipients.count == 1)
         #expect(email.ccRecipients.count == 1)
         #expect(email.allRecipients.count >= 2)
@@ -258,27 +293,27 @@ struct IMAPProviderBuildEmailTests {
     // MARK: - HTML vs plain text body
 
     @Test("Plain text draft sets textBody and nil htmlBody")
-    func plainTextBody() {
+    func plainTextBody() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "Plain",
             body: "Just text",
             isHTML: false
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.textBody == "Just text")
         #expect(email.htmlBody == nil)
     }
 
     @Test("HTML draft sets htmlBody and derives textBody from HTML")
-    func htmlBody() {
+    func htmlBody() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "HTML",
             body: "<p>Hello</p>",
             isHTML: true
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.htmlBody == "<p>Hello</p>")
         // textBody is derived from HTML via htmlToPlainText — should contain "Hello"
         #expect(email.textBody.contains("Hello"))
@@ -286,7 +321,7 @@ struct IMAPProviderBuildEmailTests {
     }
 
     @Test("HTML body with complex markup preserved")
-    func complexHtmlBody() {
+    func complexHtmlBody() throws {
         let html = "<html><body><h1>Title</h1><p>Content with <b>bold</b> and <a href=\"https://example.com\">link</a></p></body></html>"
         let draft = DraftMessage(
             to: ["to@test.com"],
@@ -294,80 +329,80 @@ struct IMAPProviderBuildEmailTests {
             body: html,
             isHTML: true
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.htmlBody == html)
     }
 
     // MARK: - In-Reply-To header
 
     @Test("Sets In-Reply-To header when inReplyTo is present")
-    func withInReplyTo() {
+    func withInReplyTo() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "Re: Hello",
             body: "Reply body",
             inReplyTo: "<original-msg-id@example.com>"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.additionalHeaders?["In-Reply-To"] == "<original-msg-id@example.com>")
     }
 
     @Test("No In-Reply-To header when inReplyTo is nil")
-    func withoutInReplyTo() {
+    func withoutInReplyTo() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "New message"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.additionalHeaders?["In-Reply-To"] == nil)
     }
 
     // MARK: - References header
 
     @Test("Sets References header from references array")
-    func withReferences() {
+    func withReferences() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "Re: Thread",
             body: "Reply",
             references: ["<msg1@example.com>", "<msg2@example.com>"]
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.additionalHeaders?["References"] == "<msg1@example.com> <msg2@example.com>")
     }
 
     @Test("No References header when references array is empty")
-    func emptyReferences() {
+    func emptyReferences() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "New"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.additionalHeaders?["References"] == nil)
     }
 
     @Test("Single reference joined without trailing space")
-    func singleReference() {
+    func singleReference() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "Re: Single",
             references: ["<only-ref@example.com>"]
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.additionalHeaders?["References"] == "<only-ref@example.com>")
     }
 
     // MARK: - Both In-Reply-To and References
 
     @Test("Sets both In-Reply-To and References headers together")
-    func inReplyToAndReferences() {
+    func inReplyToAndReferences() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "Re: Thread",
             inReplyTo: "<parent@example.com>",
             references: ["<root@example.com>", "<parent@example.com>"]
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.additionalHeaders?["In-Reply-To"] == "<parent@example.com>")
         #expect(email.additionalHeaders?["References"] == "<root@example.com> <parent@example.com>")
     }
@@ -375,85 +410,85 @@ struct IMAPProviderBuildEmailTests {
     // MARK: - No additional headers
 
     @Test("additionalHeaders is nil when no threading headers")
-    func noAdditionalHeaders() {
+    func noAdditionalHeaders() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "Simple"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.additionalHeaders == nil)
     }
 
     // MARK: - Subject encoding
 
     @Test("Subject with Unicode characters preserved")
-    func unicodeSubject() {
+    func unicodeSubject() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "Rendezvous: cafe discussion"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.subject == "Rendezvous: cafe discussion")
     }
 
     @Test("Subject with Japanese characters preserved")
-    func japaneseSubject() {
+    func japaneseSubject() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "Meeting agenda"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.subject == "Meeting agenda")
     }
 
     @Test("Subject with emoji preserved")
-    func emojiSubject() {
+    func emojiSubject() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "Hello World"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.subject.contains("Hello"))
     }
 
     @Test("Empty subject preserved")
-    func emptySubject() {
+    func emptySubject() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: ""
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.subject == "")
     }
 
     // MARK: - Message ID
 
     @Test("Pre-generated messageId set on email")
-    func withMessageId() {
+    func withMessageId() throws {
         var draft = DraftMessage(
             to: ["to@test.com"],
             subject: "With ID"
         )
         draft.messageId = "<unique-id-123@tabmail.ai>"
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.messageID != nil)
         #expect(email.messageID?.description == "<unique-id-123@tabmail.ai>")
     }
 
     @Test("No messageId when draft.messageId is nil")
-    func withoutMessageId() {
+    func withoutMessageId() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "No ID"
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.messageID == nil)
     }
 
     // MARK: - Attachments
 
     @Test("Attachments mapped from DraftAttachment to SwiftMail Attachment")
-    func withAttachments() {
+    func withAttachments() throws {
         let attachment = DraftAttachment(
             filename: "report.pdf",
             mimeType: "application/pdf",
@@ -464,25 +499,25 @@ struct IMAPProviderBuildEmailTests {
             subject: "With attachment",
             attachments: [attachment]
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.attachments?.count == 1)
         #expect(email.attachments?[0].filename == "report.pdf")
         #expect(email.attachments?[0].mimeType == "application/pdf")
     }
 
     @Test("No attachments when draft has empty attachments array")
-    func emptyAttachments() {
+    func emptyAttachments() throws {
         let draft = DraftMessage(
             to: ["to@test.com"],
             subject: "No attachments",
             attachments: []
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.attachments == nil)
     }
 
     @Test("Multiple attachments all mapped")
-    func multipleAttachments() {
+    func multipleAttachments() throws {
         let attachments = [
             DraftAttachment(filename: "a.pdf", mimeType: "application/pdf", data: Data([1])),
             DraftAttachment(filename: "b.png", mimeType: "image/png", data: Data([2])),
@@ -493,7 +528,7 @@ struct IMAPProviderBuildEmailTests {
             subject: "Multi attach",
             attachments: attachments
         )
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.attachments?.count == 3)
         #expect(email.attachments?[0].filename == "a.pdf")
         #expect(email.attachments?[1].filename == "b.png")
@@ -503,25 +538,25 @@ struct IMAPProviderBuildEmailTests {
     // MARK: - Sender
 
     @Test("Sender email address correctly set")
-    func senderAddress() {
+    func senderAddress() throws {
         let draft = DraftMessage(to: ["to@test.com"], subject: "Test")
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "my-email@domain.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "my-email@domain.com")
         #expect(email.sender.address == "my-email@domain.com")
     }
 
     // MARK: - Empty recipients
 
     @Test("Empty to array produces empty recipients")
-    func emptyTo() {
+    func emptyTo() throws {
         let draft = DraftMessage(to: [], subject: "No recipients")
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.recipients.isEmpty)
     }
 
     @Test("Empty cc array produces empty ccRecipients")
-    func emptyCc() {
+    func emptyCc() throws {
         let draft = DraftMessage(to: ["to@test.com"], cc: [], subject: "No CC")
-        let email = IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
+        let email = try IMAPProvider.buildEmail(from: draft, senderEmail: "me@test.com")
         #expect(email.ccRecipients.isEmpty)
     }
 }

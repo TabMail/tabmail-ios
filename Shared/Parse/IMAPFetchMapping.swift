@@ -31,6 +31,67 @@ enum IMAPFetchMapping {
     /// upstream mirror and the value lives here at the call sites instead.
     static let responseBufferLimit = 4 * 1024 * 1024
 
+    // MARK: - Addresses
+
+    /// The sender a message is listed under: the first mailbox of its From
+    /// field, by display name (its address when it has none). A From with no
+    /// valid mailbox is listed under its text with no address, so a malformed
+    /// sender still shows what the sender wrote. `nil` for a message with no From.
+    ///
+    /// Read from SwiftMail's structured `fromAddresses`, never by re-parsing the
+    /// `from` string: that string is RFC 5322 header text, quoted and escaped,
+    /// and joins every author of a multi-author From.
+    static func sender(from info: MessageInfo) -> EmailAddress? {
+        if let mailbox = info.fromAddresses.mailboxes.first {
+            return EmailAddress(name: mailbox.name ?? mailbox.address, email: mailbox.address)
+        }
+        let text = info.fromAddresses.compactMap { entry -> String? in
+            switch entry {
+                case .invalid(let text): return text
+                case .group(let name, _): return name
+                case .mailbox: return nil
+            }
+        }.joined(separator: ", ")
+        return text.isEmpty ? nil : EmailAddress(name: text, email: "")
+    }
+
+    /// An address field as the entries TabMail stores, one per mailbox:
+    /// `"Name" <address>`, or the bare `address` when there is no name — the
+    /// shape `parseAddressList` and `extractEmailAddress` read back. A group
+    /// contributes its members; its name is not an address. Invalid text is kept
+    /// as written so the field still shows it; `buildReplyAllRecipients` never
+    /// offers it, because SwiftMail does not read it as a mailbox.
+    static func addressStrings(_ entries: [AddressListEntry]) -> [String] {
+        entries.flatMap { entry -> [String] in
+            switch entry {
+                case .mailbox(let mailbox): return [addressString(mailbox)]
+                case .group(_, let members): return members.map(addressString)
+                case .invalid(let text): return [text]
+            }
+        }
+    }
+
+    /// `addressStrings`, joined the way header rows store an address field.
+    static func addressField(_ entries: [AddressListEntry]) -> String {
+        addressStrings(entries).joined(separator: ", ")
+    }
+
+    private static func addressString(_ mailbox: SwiftMail.EmailAddress) -> String {
+        guard let name = mailbox.name else { return mailbox.address }
+        return "\"\(name)\" <\(mailbox.address)>"
+    }
+
+    /// The envelope a header block shows for a message carried as a part.
+    static func envelope(of info: MessageInfo) -> EmlMarker.Envelope {
+        EmlMarker.Envelope(
+            subject: info.subject,
+            from: addressStrings(info.fromAddresses).first,
+            date: info.date,
+            to: addressStrings(info.toAddresses),
+            cc: addressStrings(info.ccAddresses)
+        )
+    }
+
     /// Build the `messageId` string used as `MessageHeader.messageId`.
     ///
     /// MUST match `IMAPProvider.buildMessageHeaderInfo`'s format so rows the
@@ -167,14 +228,19 @@ enum IMAPFetchMapping {
         return out
     }
 
-    /// Inline image extraction from a fetched message. Mirrors
-    /// `IMAPProvider.buildFullMessageInfo`'s CID loop — uses
-    /// `message.cids.prefix(maxInlineImages)` with `decodedData()` to
+    /// Inline image extraction from a fetched message, shared by
+    /// `IMAPProvider.buildFullMessageInfo` — takes the first `maxInlineImages`
+    /// parts with a Content-ID with `decodedData()` to
     /// handle base64/quoted-printable transfer encoding before the
     /// renderer re-encodes as a `data:` URI. Strips angle brackets +
     /// whitespace from the Content-ID.
+    ///
+    /// Every part at every depth, not `message.cids`: SwiftMail's `cids` holds
+    /// only the message's own parts, but `renderBodyWithEmbeddedHeaders` puts the
+    /// HTML of each carried `message/rfc822` into the same rendered body, and its
+    /// `cid:` references name images that live under that part.
     static func extractInlineImages(message: Message, maxInlineImages: Int) -> [InlineImageRef] {
-        message.cids.prefix(maxInlineImages).compactMap { part in
+        message.parts.filter { $0.contentId != nil }.prefix(maxInlineImages).compactMap { part in
             guard let rawId = part.contentId, let data = part.decodedData() else { return nil }
             let contentId = rawId.trimmingCharacters(in: .whitespacesAndNewlines)
                 .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
@@ -319,8 +385,23 @@ enum IMAPFetchMapping {
     // MARK: - Embedded Message Header Rendering (moved from IMAPProvider)
 
     /// Render body content with TB-style header blocks before nested message/rfc822 content.
-    /// Uses component-level section prefix matching to detect nesting (avoids false positives
-    /// like section "11.2" matching rfc822 at section "1").
+    ///
+    /// The message's own bodies come first. Each message it carries as a
+    /// `message/rfc822` part is reached through SwiftMail's
+    /// `embeddedMessagesWithParts`, which hands back that message's own parts
+    /// (renumbered from `1`) together with the part that carries it, so a forwarded
+    /// message is read with the same accessors as the top-level one, at any depth.
+    /// `Message.bodies` holds only the message's OWN bodies: nothing nested under a
+    /// `message/rfc822` part is in it.
+    ///
+    /// - Plain text: each carried message follows its parent's text under a
+    ///   plain-text header block, recursively.
+    /// - HTML: each top-level carried message becomes one
+    ///   `<div class="tm-eml-section">` marker, the shape Gmail/Exchange emit and
+    ///   the preview sheet selects by filename. A message carried inside a carried
+    ///   message renders INSIDE its parent's marker under its own header block —
+    ///   never as a marker of its own, because the main view and the preview sheet
+    ///   only ever show a top-level marker.
     ///
     /// Special case: when rendering HTML and the main message body is text/plain only
     /// (no top-level text/html parts) but embedded .eml parts have HTML bodies, the
@@ -329,11 +410,6 @@ enum IMAPFetchMapping {
     /// invisible to the user.
     static func renderBodyWithEmbeddedHeaders(message: Message, type: String) -> String? {
         let isHtml = type == "text/html"
-        let matching = message.bodies.filter { $0.contentType.lowercased().hasPrefix(type) }
-
-        let rfc822Parts = message.parts.filter {
-            $0.contentType.lowercased().hasPrefix("message/rfc822") && $0.embeddedMessageInfo != nil
-        }
 
         // File-uploaded `.eml`s (typically `application/octet-stream` with a
         // `.eml` filename) — BODYSTRUCTURE doesn't expose them as rfc822, so
@@ -344,37 +420,12 @@ enum IMAPFetchMapping {
                 && part.data != nil
         }
 
-        guard !matching.isEmpty || !emlFileParts.isEmpty else { return nil }
+        guard containsBody(of: type, in: message) || !emlFileParts.isEmpty else { return nil }
 
-        // Helper: is `body` nested inside `rfc822` (section prefix match)?
-        func isNested(_ body: MessagePart, inside rfc822: MessagePart) -> Bool {
-            let bodyComp = body.section.components
-            let rfcComp = rfc822.section.components
-            return bodyComp.count > rfcComp.count
-                && Array(bodyComp.prefix(rfcComp.count)) == rfcComp
-        }
-
-        // Plain text mode: keep the historical flat interleaving (no CSS to apply,
-        // no preview sheet — users read plain text inline).
+        // Plain text mode: no CSS to apply, no preview sheet — users read plain
+        // text inline.
         if !isHtml {
-            var result = ""
-            var insertedHeaders = Set<String>()
-            for bodyPart in matching {
-                for rfc822 in rfc822Parts where isNested(bodyPart, inside: rfc822) {
-                    let key = rfc822.section.description
-                    if !insertedHeaders.contains(key), let info = rfc822.embeddedMessageInfo {
-                        insertedHeaders.insert(key)
-                        let envelope = EmlMarker.Envelope(
-                            subject: info.subject, from: info.from, date: info.date,
-                            to: info.to, cc: info.cc
-                        )
-                        result += EmlMarker.embeddedHeadersPlainText(envelope: envelope, filename: rfc822.filename)
-                    }
-                }
-                if let content = bodyPart.textContent {
-                    result += content
-                }
-            }
+            var result = plainTextWithEmbeddedHeaders(message)
             // Append plain-text headers for file-uploaded `.eml`s too — FTS
             // picks these up and search works across uploaded-eml content.
             for part in emlFileParts {
@@ -389,29 +440,17 @@ enum IMAPFetchMapping {
             return result.isEmpty ? nil : result
         }
 
-        // HTML mode: top-level parts render directly; nested .eml parts become
+        // HTML mode: own parts render directly; carried messages become
         // `<div class="tm-eml-section">` blocks via the shared `EmlMarker.build`
         // (same shape as Gmail/Exchange) — hidden in main view, shown in
         // EmlAttachmentPreview sheet, still indexed by FTS.
-        let topLevelHtml = matching.filter { bodyPart in
-            !rfc822Parts.contains { isNested(bodyPart, inside: $0) }
-        }
-
-        var topLevelContent = ""
-        for part in topLevelHtml {
-            if let content = part.textContent {
-                topLevelContent += content
-            }
-        }
+        let embedded = message.embeddedMessagesWithParts
+        var topLevelContent = ownBodyContent(of: "text/html", in: message)
 
         // Fallback: when there are rfc822 parts but no top-level HTML, promote the
         // main message's text/plain to HTML so the primary body is visible.
-        if topLevelContent.isEmpty && !rfc822Parts.isEmpty {
-            let topLevelText = message.bodies.filter { part in
-                guard part.contentType.lowercased().hasPrefix("text/plain") else { return false }
-                return !rfc822Parts.contains { isNested(part, inside: $0) }
-            }
-            for textPart in topLevelText {
+        if topLevelContent.isEmpty && !embedded.isEmpty {
+            for textPart in ownBodies(of: "text/plain", in: message) {
                 if let content = textPart.textContent, !content.isEmpty {
                     topLevelContent += EmailFilter.plainTextToHTML(content)
                     // Debug-gated per global rule 12. `#if DEBUG` rather than
@@ -430,35 +469,16 @@ enum IMAPFetchMapping {
 
         var result = topLevelContent
 
-        // Emit one marker per rfc822 part that has matching HTML bodies nested
-        // inside it. Delegates to `EmlMarker.build` for the HTML shape so IMAP,
-        // Gmail, and Exchange all produce identical marker output.
-        for rfc822 in rfc822Parts {
-            guard let info = rfc822.embeddedMessageInfo else { continue }
-            let nestedBodies = matching.filter { isNested($0, inside: rfc822) }
-            guard !nestedBodies.isEmpty else { continue }
-
-            let filename = rfc822.filename ?? "attached-email.eml"
-            let sectionId = rfc822.section.description
-            // Concatenate all nested bodies (usually exactly one); extractBodyContent
-            // strips document chrome and wraps in .tm-email-body.
-            var nestedBodyHtml = ""
-            for bodyPart in nestedBodies {
-                if let content = bodyPart.textContent {
-                    nestedBodyHtml += content
-                }
-            }
-            let envelope = EmlMarker.Envelope(
-                subject: info.subject,
-                from: info.from,
-                date: info.date,
-                to: info.to,
-                cc: info.cc
-            )
+        // Emit one marker per carried message that has HTML. Delegates to
+        // `EmlMarker.build` for the HTML shape so IMAP, Gmail, and Exchange all
+        // produce identical marker output.
+        for carried in embedded {
+            let nestedBodyHtml = htmlWithEmbeddedHeaders(carried.message)
+            guard !nestedBodyHtml.isEmpty else { continue }
             result += EmlMarker.build(
-                filename: filename,
-                partSection: sectionId,
-                envelope: envelope,
+                filename: carried.part.filename ?? "attached-email.eml",
+                partSection: carried.part.section.description,
+                envelope: envelope(of: carried.message.header),
                 bodyHtml: nestedBodyHtml
             )
         }
@@ -500,6 +520,51 @@ enum IMAPFetchMapping {
         }
 
         return result.isEmpty ? nil : result
+    }
+
+    /// The message's own `type` bodies (`text/plain` or `text/html`), in part order.
+    private static func ownBodies(of type: String, in message: Message) -> [MessagePart] {
+        message.bodies.filter { $0.contentType.lowercased().hasPrefix(type) }
+    }
+
+    /// The concatenated text of the message's own `type` bodies.
+    private static func ownBodyContent(of type: String, in message: Message) -> String {
+        ownBodies(of: type, in: message).compactMap(\.textContent).joined()
+    }
+
+    /// True when the message, or any message it carries at any depth, has a
+    /// `type` body part.
+    private static func containsBody(of type: String, in message: Message) -> Bool {
+        !ownBodies(of: type, in: message).isEmpty
+            || message.embeddedMessagesWithParts.contains { containsBody(of: type, in: $0.message) }
+    }
+
+    /// The message's own plain text, then each message it carries under a
+    /// plain-text header block, recursively. A carried message with no plain text
+    /// at any depth contributes nothing, header included.
+    private static func plainTextWithEmbeddedHeaders(_ message: Message) -> String {
+        var text = ownBodyContent(of: "text/plain", in: message)
+        for carried in message.embeddedMessagesWithParts {
+            let nested = plainTextWithEmbeddedHeaders(carried.message)
+            guard !nested.isEmpty else { continue }
+            text += EmlMarker.embeddedHeadersPlainText(envelope: envelope(of: carried.message.header), filename: carried.part.filename)
+            text += nested
+        }
+        return text
+    }
+
+    /// The body of a carried message's marker: its own HTML, then each message
+    /// it carries under an HTML header block, recursively. A carried message with
+    /// no HTML at any depth contributes nothing, header included.
+    private static func htmlWithEmbeddedHeaders(_ message: Message) -> String {
+        var html = ownBodyContent(of: "text/html", in: message)
+        for carried in message.embeddedMessagesWithParts {
+            let nested = htmlWithEmbeddedHeaders(carried.message)
+            guard !nested.isEmpty else { continue }
+            html += EmlMarker.embeddedHeadersHtml(envelope: envelope(of: carried.message.header), filename: carried.part.filename)
+            html += nested
+        }
+        return html
     }
 
     /// Given a part's section components and the list of all rfc822 section
