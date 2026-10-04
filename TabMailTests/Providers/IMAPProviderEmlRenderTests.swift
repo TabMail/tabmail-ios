@@ -80,7 +80,7 @@ struct EmlRenderTests {
     // MARK: - Embedded .eml with top-level HTML
 
     @Test("Message with top-level HTML and embedded .eml HTML renders both")
-    func topLevelHtmlAndEml() {
+    func topLevelHtmlAndEml() throws {
         // multipart/mixed: text/html at 1, message/rfc822 at 2, text/html at 2.1
         let parts = [
             makeTextHtmlPart(section: "1", html: "<p>Main body</p>"),
@@ -88,32 +88,31 @@ struct EmlRenderTests {
             makeTextHtmlPart(section: "2.1", html: "<p>Embedded body</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")
-        #expect(result != nil)
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
         // Main body should be included (before any .eml-section wrapper)
-        #expect(result!.contains("<p>Main body</p>"))
+        #expect(result.contains("<p>Main body</p>"))
         // Embedded body should be included
-        #expect(result!.contains("<p>Embedded body</p>"))
+        #expect(result.contains("<p>Embedded body</p>"))
         // Embedded headers should be present
-        #expect(result!.contains("<b>test.eml</b>"))
+        #expect(result.contains("<b>test.eml</b>"))
         // Main body comes first
-        let mainRange = result!.range(of: "Main body")!
-        let embeddedRange = result!.range(of: "Embedded body")!
+        let mainRange = try #require(result.range(of: "Main body"))
+        let embeddedRange = try #require(result.range(of: "Embedded body"))
         #expect(mainRange.lowerBound < embeddedRange.lowerBound)
         // Embedded content is wrapped in a .tm-eml-section marker
-        #expect(result!.contains("class=\"tm-eml-section\""))
-        #expect(result!.contains("data-filename=\"test.eml\""))
-        #expect(result!.contains("data-part-section=\"2\""))
+        #expect(result.contains("class=\"tm-eml-section\""))
+        #expect(result.contains("data-filename=\"test.eml\""))
+        #expect(result.contains("data-part-section=\"2\""))
         // Main body is OUTSIDE the .tm-eml-section wrapper
-        let mainPos = result!.range(of: "Main body")!.lowerBound
-        let sectionPos = result!.range(of: "tm-eml-section")!.lowerBound
+        let mainPos = try #require(result.range(of: "Main body")).lowerBound
+        let sectionPos = try #require(result.range(of: "tm-eml-section")).lowerBound
         #expect(mainPos < sectionPos)
     }
 
     // MARK: - The main bug: text/plain main body + HTML .eml
 
     @Test("Text-only main body with HTML .eml includes main text as HTML")
-    func textOnlyMainWithHtmlEml() {
+    func textOnlyMainWithHtmlEml() throws {
         // multipart/mixed: text/plain at 1, message/rfc822 at 2, text/html at 2.1.2
         let parts = [
             makeTextPlainPart(section: "1", text: "Hi Alex, this is the main body."),
@@ -121,26 +120,25 @@ struct EmlRenderTests {
             makeTextHtmlPart(section: "2.1.2", html: "<p>Embedded HTML content</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")
-        #expect(result != nil)
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
         // Main body text should be present (converted to HTML via plainTextToHTML)
-        #expect(result!.contains("Hi Alex, this is the main body."))
+        #expect(result.contains("Hi Alex, this is the main body."))
         // Embedded HTML body should be present
-        #expect(result!.contains("Embedded HTML content"))
+        #expect(result.contains("Embedded HTML content"))
         // Embedded headers should be present
-        #expect(result!.contains("<b>nested.eml</b>"))
+        #expect(result.contains("<b>nested.eml</b>"))
         // The main body text should come BEFORE the embedded section wrapper
-        let mainRange = result!.range(of: "Hi Alex")!
-        let sectionRange = result!.range(of: "tm-eml-section")!
+        let mainRange = try #require(result.range(of: "Hi Alex"))
+        let sectionRange = try #require(result.range(of: "tm-eml-section"))
         #expect(mainRange.lowerBound < sectionRange.lowerBound)
         // Should be wrapped in plainTextToHTML container (main body promoted)
-        #expect(result!.contains("white-space:pre-wrap"))
+        #expect(result.contains("white-space:pre-wrap"))
         // Embedded content wrapped in .tm-eml-section
-        #expect(result!.contains("data-filename=\"nested.eml\""))
+        #expect(result.contains("data-filename=\"nested.eml\""))
     }
 
     @Test("Text-only main body with text-only .eml does not double-prepend")
-    func textOnlyMainWithTextOnlyEml() {
+    func textOnlyMainWithTextOnlyEml() throws {
         // Both main and .eml are text/plain — no HTML parts at all
         let parts = [
             makeTextPlainPart(section: "1", text: "Main message."),
@@ -152,32 +150,30 @@ struct EmlRenderTests {
         let htmlResult = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")
         #expect(htmlResult == nil)
         // text/plain should have both
-        let textResult = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/plain")
-        #expect(textResult != nil)
-        #expect(textResult!.contains("Main message."))
-        #expect(textResult!.contains("Embedded text."))
+        let textResult = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/plain"))
+        #expect(textResult.contains("Main message."))
+        #expect(textResult.contains("Embedded text."))
     }
 
     @Test("No main body — only .eml HTML renders without extra prefix")
-    func noMainBodyOnlyEmlHtml() {
+    func noMainBodyOnlyEmlHtml() throws {
         // Only the embedded .eml has content (main message is empty forwarding wrapper)
         let parts = [
             makeRfc822Part(section: "1", filename: "forwarded.eml"),
             makeTextHtmlPart(section: "1.1", html: "<p>Forwarded content</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")
-        #expect(result != nil)
-        #expect(result!.contains("Forwarded content"))
-        #expect(result!.contains("<b>forwarded.eml</b>"))
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
+        #expect(result.contains("Forwarded content"))
+        #expect(result.contains("<b>forwarded.eml</b>"))
         // Should NOT contain pre-wrap div (no top-level text was prepended)
-        #expect(!result!.contains("white-space:pre-wrap"))
+        #expect(!result.contains("white-space:pre-wrap"))
     }
 
     // MARK: - Multiple embedded .eml parts
 
     @Test("Multiple .eml attachments with text-only main body")
-    func multipleEmlsWithTextMain() {
+    func multipleEmlsWithTextMain() throws {
         let parts = [
             makeTextPlainPart(section: "1", text: "See attached."),
             makeRfc822Part(section: "2", filename: "first.eml"),
@@ -186,21 +182,20 @@ struct EmlRenderTests {
             makeTextHtmlPart(section: "3.1", html: "<p>Second email</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")
-        #expect(result != nil)
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
         // Main text included
-        #expect(result!.contains("See attached."))
+        #expect(result.contains("See attached."))
         // Both .eml contents included
-        #expect(result!.contains("First email"))
-        #expect(result!.contains("Second email"))
+        #expect(result.contains("First email"))
+        #expect(result.contains("Second email"))
         // Both headers included
-        #expect(result!.contains("<b>first.eml</b>"))
-        #expect(result!.contains("<b>second.eml</b>"))
+        #expect(result.contains("<b>first.eml</b>"))
+        #expect(result.contains("<b>second.eml</b>"))
         // Both wrapped in separate .tm-eml-section blocks with distinct filenames
-        #expect(result!.contains("data-filename=\"first.eml\""))
-        #expect(result!.contains("data-filename=\"second.eml\""))
+        #expect(result.contains("data-filename=\"first.eml\""))
+        #expect(result.contains("data-filename=\"second.eml\""))
         // Exactly two sections
-        let sectionCount = result!.components(separatedBy: "class=\"tm-eml-section\"").count - 1
+        let sectionCount = result.components(separatedBy: "class=\"tm-eml-section\"").count - 1
         #expect(sectionCount == 2)
     }
 
@@ -216,7 +211,7 @@ struct EmlRenderTests {
     /// and trap here — on the background-sync and NSE paths, with no user
     /// gesture. Entirely in-process: no network, no server fake.
     @Test("Nested .eml body whose </body> precedes its <body> renders without trapping")
-    func nestedEmlCrossedBodyTagsRender() {
+    func nestedEmlCrossedBodyTagsRender() throws {
         let parts = [
             makeTextPlainPart(section: "1", text: "Main body"),
             makeRfc822Part(section: "2", filename: "crafted.eml"),
@@ -225,13 +220,12 @@ struct EmlRenderTests {
         let message = makeMessage(parts: parts)
         // Returning at all is the assertion: a reversed Range is a `fatalError`,
         // which Swift Testing cannot catch — a regression kills the host.
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")
-        #expect(result != nil)
-        #expect(result!.contains("data-filename=\"crafted.eml\""))
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
+        #expect(result.contains("data-filename=\"crafted.eml\""))
         // The sender's payload survives into the marker (no-pair branch), so the
         // fix cannot be mistaken for "drop the section on crossed tags".
-        #expect(result!.contains("x"))
-        #expect(result!.contains("tm-email-body"))
+        #expect(result.contains("x"))
+        #expect(result.contains("tm-email-body"))
     }
 
     /// The guarded string is **derived**, not any one part's bytes:
@@ -241,7 +235,7 @@ struct EmlRenderTests {
     /// only exists in the concatenation — so a parser that sanitized each part
     /// individually would not have prevented this.
     @Test("Crossed body tags formed only by CONCATENATION of two nested parts")
-    func nestedEmlCrossedByConcatenation() {
+    func nestedEmlCrossedByConcatenation() throws {
         let parts = [
             makeTextPlainPart(section: "1", text: "Main body"),
             makeRfc822Part(section: "2", filename: "split.eml"),
@@ -249,12 +243,11 @@ struct EmlRenderTests {
             makeTextHtmlPart(section: "2.2", html: "<body><p>beta</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")
-        #expect(result != nil)
-        #expect(result!.contains("data-filename=\"split.eml\""))
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
+        #expect(result.contains("data-filename=\"split.eml\""))
         // Both halves of the concatenation survive — nothing was dropped.
-        #expect(result!.contains("alpha"))
-        #expect(result!.contains("beta"))
+        #expect(result.contains("alpha"))
+        #expect(result.contains("beta"))
     }
 
     // MARK: - extractBodyContent
@@ -312,7 +305,7 @@ struct EmlRenderTests {
     }
 
     @Test("Embedded .eml with Outlook full HTML document is stripped to body and wrapped")
-    func outlookHtmlFullyStripped() {
+    func outlookHtmlFullyStripped() throws {
         let outlookHtml = """
         <html xmlns:v="urn:schemas-microsoft-com:vml"
               xmlns:o="urn:schemas-microsoft-com:office:office"><head>
@@ -333,34 +326,33 @@ struct EmlRenderTests {
             makeTextHtmlPart(section: "1.1", html: outlookHtml),
         ]
         let message = makeMessage(parts: parts)
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")
-        #expect(result != nil)
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
         // Must include actual content
-        #expect(result!.contains("Main content"))
+        #expect(result.contains("Main content"))
         // Must wrap in tm-email-body so our CSS can target it
-        #expect(result!.contains("tm-email-body"))
+        #expect(result.contains("tm-email-body"))
         // All style/page/font CSS must be stripped — these leak globally and break layout
-        #expect(!result!.contains("<style"))
-        #expect(!result!.contains("@page"))
-        #expect(!result!.contains("MsoChpDefault"))
-        #expect(!result!.contains("font-size: 10.0pt"))
+        #expect(!result.contains("<style"))
+        #expect(!result.contains("@page"))
+        #expect(!result.contains("MsoChpDefault"))
+        #expect(!result.contains("font-size: 10.0pt"))
         // The document-level tags must be gone
-        #expect(!result!.contains("<html"))
-        #expect(!result!.contains("<head"))
-        #expect(!result!.contains("<!DOCTYPE"))
+        #expect(!result.contains("<html"))
+        #expect(!result.contains("<head"))
+        #expect(!result.contains("<!DOCTYPE"))
         // But the WordSection1 div (inline styles already gone — it was a pure class)
         // can remain; our CSS neutralizes it.
     }
 
     @Test("Marker carries envelope metadata as data-* attributes")
-    func markerCarriesEnvelopeMetadata() {
+    func markerCarriesEnvelopeMetadata() throws {
         let parts = [
             makeTextPlainPart(section: "1", text: "Main body"),
             makeRfc822Part(section: "2", filename: "nested.eml", subject: "RE: Quarterly Plan"),
             makeTextHtmlPart(section: "2.1", html: "<p>Embedded</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")!
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
         #expect(result.contains("data-filename=\"nested.eml\""))
         #expect(result.contains("data-part-section=\"2\""))
         #expect(result.contains("data-subject=\"RE: Quarterly Plan\""))
@@ -371,14 +363,14 @@ struct EmlRenderTests {
     }
 
     @Test("parseEmlSectionMetadata extracts envelope from marker")
-    func parseEmlSectionMetadataHappyPath() {
+    func parseEmlSectionMetadataHappyPath() throws {
         let parts = [
             makeTextPlainPart(section: "1", text: "Main body"),
             makeRfc822Part(section: "2", filename: "nested.eml", subject: "RE: Quarterly Plan"),
             makeTextHtmlPart(section: "2.1", html: "<p>Embedded</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")!
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
         let md = EmailFilter.parseEmlSectionMetadata(html: result, filename: "nested.eml")
         #expect(md != nil)
         #expect(md?.subject == "RE: Quarterly Plan")
@@ -389,19 +381,19 @@ struct EmlRenderTests {
     }
 
     @Test("parseEmlSectionMetadata returns nil for non-matching filename")
-    func parseEmlSectionMetadataMiss() {
+    func parseEmlSectionMetadataMiss() throws {
         let parts = [
             makeRfc822Part(section: "2", filename: "a.eml"),
             makeTextHtmlPart(section: "2.1", html: "<p>A</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")!
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
         let md = EmailFilter.parseEmlSectionMetadata(html: result, filename: "b.eml")
         #expect(md == nil)
     }
 
     @Test("parseEmlSectionMetadata selects correct marker among multiple")
-    func parseEmlSectionMetadataMultiple() {
+    func parseEmlSectionMetadataMultiple() throws {
         let parts = [
             makeRfc822Part(section: "2", filename: "first.eml", subject: "First"),
             makeTextHtmlPart(section: "2.1", html: "<p>A</p>"),
@@ -409,7 +401,7 @@ struct EmlRenderTests {
             makeTextHtmlPart(section: "3.1", html: "<p>B</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")!
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
         let first = EmailFilter.parseEmlSectionMetadata(html: result, filename: "first.eml")
         let second = EmailFilter.parseEmlSectionMetadata(html: result, filename: "second.eml")
         #expect(first?.subject == "First")
@@ -419,20 +411,20 @@ struct EmlRenderTests {
     }
 
     @Test("parseEmlSectionMetadata decodes HTML entities in attribute values")
-    func parseEmlSectionMetadataHTMLEntities() {
+    func parseEmlSectionMetadataHTMLEntities() throws {
         // Subject with characters that get HTML-escaped ("&", "<", ">", '"')
         let parts = [
             makeRfc822Part(section: "2", filename: "q.eml", subject: "A&B <x>"),
             makeTextHtmlPart(section: "2.1", html: "<p>X</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")!
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
         let md = EmailFilter.parseEmlSectionMetadata(html: result, filename: "q.eml")
         #expect(md?.subject == "A&B <x>")
     }
 
     @Test("FTS invariant — htmlToPlainText still finds content inside .tm-eml-section")
-    func ftsStillFindsEmbedded() {
+    func ftsStillFindsEmbedded() throws {
         // The unified-blob architecture requires that FTS (htmlToPlainText)
         // continues to index content that's visually hidden via CSS class.
         let parts = [
@@ -441,21 +433,21 @@ struct EmlRenderTests {
             makeTextHtmlPart(section: "2.1", html: "<p>surplus transferred to next quarter</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let html = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")!
+        let html = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
         let plainForFTS = EmailFilter.htmlToPlainText(html)
         #expect(plainForFTS.contains("Main body visible"))
         #expect(plainForFTS.contains("surplus transferred"))
     }
 
     @Test("Strip invariant — stripEmbeddedEmlSections removes .eml content but keeps main body")
-    func stripInvariant() {
+    func stripInvariant() throws {
         let parts = [
             makeTextPlainPart(section: "1", text: "Main body visible"),
             makeRfc822Part(section: "2", filename: "nested.eml", subject: "RE: Quarterly Plan"),
             makeTextHtmlPart(section: "2.1", html: "<p>surplus transferred</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let html = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")!
+        let html = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
         let stripped = EmailFilter.stripEmbeddedEmlSections(html)
         // Main body survives the strip
         #expect(stripped.contains("Main body visible"))
@@ -626,7 +618,7 @@ struct EmlRenderTests {
     }
 
     @Test("Top-level HTML exists — no text/plain prepend occurs")
-    func topLevelHtmlExists() {
+    func topLevelHtmlExists() throws {
         // Main has HTML — no need to prepend text/plain
         let parts = [
             makeTextPlainPart(section: "1.1", text: "Plain version"),
@@ -635,12 +627,11 @@ struct EmlRenderTests {
             makeTextHtmlPart(section: "2.1", html: "<p>Attachment HTML</p>"),
         ]
         let message = makeMessage(parts: parts)
-        let result = IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html")
-        #expect(result != nil)
+        let result = try #require(IMAPFetchMapping.renderBodyWithEmbeddedHeaders(message: message, type: "text/html"))
         // HTML version used, NOT plain version converted
-        #expect(result!.contains("<p>HTML version</p>"))
-        #expect(!result!.contains("white-space:pre-wrap"))
+        #expect(result.contains("<p>HTML version</p>"))
+        #expect(!result.contains("white-space:pre-wrap"))
         // Attachment included
-        #expect(result!.contains("Attachment HTML"))
+        #expect(result.contains("Attachment HTML"))
     }
 }

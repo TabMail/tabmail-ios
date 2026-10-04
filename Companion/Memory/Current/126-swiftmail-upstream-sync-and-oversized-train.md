@@ -142,6 +142,12 @@ Upstream commits pulled in: #236 (ENABLE/QRESYNC), #237 (Outlook `.msg`), #239, 
     keep recipients as typed.
 - **C1 note above is superseded**: SwiftMail now decodes encoded display names itself, so the
   `RFC5322Parse.decodeRFC2047` calls in `EmlParsing.parse` were deleted (owner decision D).
-- **BCC is dropped on send** (pre-existing, found during this sync): `IMAPProvider.buildEmail` never
-  sets `Email.bccRecipients`, which SwiftMail's SMTP send uses for RCPT TO. Immediate follow-up PR;
-  the existing `withBCC` test pins the wrong behaviour.
+- **BCC was dropped on send** (pre-existing, found during this sync): `IMAPProvider.buildEmail` never
+  set `Email.bccRecipients`, which SwiftMail's SMTP send uses for RCPT TO; the old `withBCC` test
+  blessed it ("handled by SMTP"). **Fixed in the follow-up PR**: `buildEmail` maps `draft.bcc` through
+  `sendableRecipients` (unreadable → fatal). SwiftMail's `Email.constructContent` writes only
+  From/To/Cc, so BCC recipients are RCPT TO only — never named in the delivered message or the Sent
+  copy (`bccRecipientsAreSentButNotNamed` pins both sides). Same PR: `buildDraftEmail` writes a
+  recipient the parser reads as one mailbox in parsed form (a pasted `Bob <bob@…>` had become one
+  RFC 2047 word in the Drafts APPEND under #245/#246); unparseable text stays as typed. The IMAP Drafts
+  APPEND still writes no `Bcc` header (SwiftMail never does) — unchanged, not investigated further.
