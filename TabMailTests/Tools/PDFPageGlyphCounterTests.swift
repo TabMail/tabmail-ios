@@ -5,6 +5,7 @@
 import Testing
 import CoreGraphics
 import Foundation
+import PDFKit
 @testable import TabMail
 
 /// `PDFPageGlyphCounter` keeps pages that draw too much text away from `PDFPage.string`.
@@ -335,4 +336,53 @@ struct PDFPageGlyphCounterTests {
         #expect(check(page, 1_000_000, deadline: .now + .milliseconds(50)) == .timedOut)
         #expect(check(try firstPage(data), 1_000_000) == .withinBudget)
     }
+
+    /// The page draws form A (directly, or with `outer` through form P), and A draws `/B`. `aEntry`
+    /// is what A's dictionary adds (its `/Resources`, a decoy, or nothing); the page's `/B` draws
+    /// `pageB`, and P's `/B` draws `outerB`.
+    private static func formNamingB(aEntry: String, pageB: String, outerB: String = "SMALL", outer: Bool = false) -> Data {
+        func form(_ number: Int, _ entry: String, _ content: String) -> Data {
+            PDFFixtures.streamObject(
+                number, dictionary: "<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] \(entry) /Length \(content.utf8.count) >>",
+                data: Data(content.utf8))
+        }
+        func text(_ string: String) -> String { "BT /F1 12 Tf 72 700 Td (\(string)) Tj ET" }
+        let font = "/Resources << /Font << /F1 5 0 R >> >>"
+        let content = outer ? "/P Do" : "/A Do"
+        return PDFFixtures.document([
+            object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /A 6 0 R /P 9 0 R /B 7 0 R >> >> /Contents 4 0 R >>"),
+            PDFFixtures.streamObject(4, dictionary: "<< /Length \(content.utf8.count) >>", data: Data(content.utf8)),
+            object(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+            form(6, aEntry, "/B Do"),
+            form(7, font, text(pageB)),
+            form(8, font, text("DECOY")),
+            form(9, "/Resources << /XObject << /A 6 0 R /B 10 0 R >> >>", "/A Do"),
+            form(10, font, text(outerB)),
+        ])
+    }
+
+    @Test("A form names other forms through the resources PDFKit uses: its own, or else those of the stream drawing it")
+    func formResourcesAsPDFKitResolvesThem() throws {
+        let heavy = "HEAVY" + String(repeating: "x", count: 1_995)
+        let cases: [(label: String, data: Data, drawn: String?, verdict: PDFPageGlyphCounter.Verdict)] = [
+            ("A without resources", Self.formNamingB(aEntry: "", pageB: heavy), "HEAVY", .overBudget),
+            ("A without resources, small", Self.formNamingB(aEntry: "", pageB: "SMALL"), "SMALL", .withinBudget),
+            ("an /XObject key in A's own dictionary", Self.formNamingB(aEntry: "/XObject << /B 8 0 R >>", pageB: heavy), "HEAVY", .overBudget),
+            ("A's own resources lack B", Self.formNamingB(aEntry: "/Resources << >>", pageB: heavy), nil, .withinBudget),
+            ("A's own resources name B", Self.formNamingB(aEntry: "/Resources << /XObject << /B 8 0 R >> >>", pageB: heavy), "DECOY", .withinBudget),
+            ("P's B, heavy", Self.formNamingB(aEntry: "", pageB: "SMALL", outerB: heavy, outer: true), "HEAVY", .overBudget),
+            ("P's B, small", Self.formNamingB(aEntry: "", pageB: heavy, outerB: "SMALL", outer: true), "SMALL", .withinBudget),
+        ]
+        for (label, data, drawn, verdict) in cases {
+            // PDFKit itself is the oracle for which form A's `/B` draws.
+            let text = PDFDocument(data: data)?.page(at: 0)?.string ?? ""
+            for marker in ["HEAVY", "SMALL", "DECOY"] {
+                #expect(text.contains(marker) == (marker == drawn), "\(label): \(marker)")
+            }
+            #expect(check(try firstPage(data), 1_000) == verdict, "\(label)")
+        }
+    }
 }
+

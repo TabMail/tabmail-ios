@@ -101,6 +101,18 @@ So two checks run before PDFKit sees anything:
     460-PDF sample drew forms 89,744 times, and 9 of its 5,973 pages passed 2,000. One million
     invocations of an empty form take the counter 2.7 s at 7 MB, so the deadline bounds the work.
   - Depth 4 never tripped on the sample, and it stops a self-drawing form.
+  - **Form names resolve as PDFKit resolves them (round-6 review, 2026-10-03).** Measured with
+    PDFKit's own `page.string` as the oracle: a form with `/Resources` uses only those (a name
+    missing there draws nothing); a form without `/Resources` uses the resources of the stream
+    that drew it (the outer form's, else the page's, including resources inherited through the
+    page tree), and an `/XObject` key in the form's own stream dictionary is ignored. The counter
+    had looked names up in the form's stream dictionary when it had no `/Resources`, so a
+    sub-form named only in the page's resources was never counted: a 33 KB file drove PDFKit
+    to 3.64 GB. It now keeps, per nesting level, the stream whose resources apply. Census of the
+    class "text PDFKit lays out that the counter never sees": a Type 3 glyph procedure's own
+    `Tj`, a tiling pattern's content, an annotation appearance, a FreeText annotation and a
+    text field's value put nothing in `page.string` (measured), so page content and forms are
+    the only text paths.
   - **Fonts (round-3 review, 2026-10-03).** It also follows every font the page selects (`Tf`, or
     an `ExtGState` `/Font`) through CoreGraphics' dictionaries, decoding nothing, and leaves the
     page out when the font reaches a stream whose filters `PDFStreamBudget.counts` rejects

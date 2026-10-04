@@ -49,6 +49,7 @@ final class PDFPageGlyphCounter {
         if !counter.reachesOnlyCountedStreams(page) { return counter.timedOut ? .timedOut : .overBudget }
         let content = CGPDFContentStreamCreateWithPage(page)
         defer { CGPDFContentStreamRelease(content) }
+        counter.resourceStreams = [content]
         _ = counter.run(content)
         if counter.timedOut { return .timedOut }
         return counter.bytes > maxBytes || counter.formsTooDeep ? .overBudget : .withinBudget
@@ -62,6 +63,10 @@ final class PDFPageGlyphCounter {
     private var formDepth = 0
     /// Set when a form is nested deeper than `Bounds.maxFormDepth`; its text is then not counted.
     private var formsTooDeep = false
+    /// For the stream being scanned and each that drew it, the stream whose resources name the
+    /// forms it draws: itself, or for a form without `/Resources`, the stream that drew it, as
+    /// PDFKit resolves it (measured; an `/XObject` key in the form's own dictionary is ignored).
+    private var resourceStreams: [CGPDFContentStreamRef] = []
     /// The dictionaries already followed, each in the role it was followed in, as an image is
     /// skipped in one role and not in another.
     private var checked: Set<Checked> = []
@@ -226,7 +231,8 @@ final class PDFPageGlyphCounter {
     }
 
     private func drawForm(named name: UnsafePointer<CChar>, from content: CGPDFContentStreamRef) {
-        guard let object = CGPDFContentStreamGetResource(content, "XObject", name) else { return }
+        guard let resourceStream = resourceStreams.last,
+              let object = CGPDFContentStreamGetResource(resourceStream, "XObject", name) else { return }
         var stream: CGPDFStreamRef?
         guard CGPDFObjectGetValue(object, .stream, &stream), let stream,
               let dictionary = CGPDFStreamGetDictionary(stream) else { return }
@@ -243,6 +249,8 @@ final class PDFPageGlyphCounter {
         defer { formDepth -= 1 }
         let formContent = CGPDFContentStreamCreateWithStream(stream, resources ?? dictionary, content)
         defer { CGPDFContentStreamRelease(formContent) }
+        resourceStreams.append(resources == nil ? resourceStream : formContent)
+        defer { resourceStreams.removeLast() }
         _ = run(formContent)
     }
 }
