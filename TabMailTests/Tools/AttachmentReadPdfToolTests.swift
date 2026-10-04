@@ -356,29 +356,29 @@ struct AttachmentReadPdfToolTests {
         #expect(try errorMessage(result) == "the file is not a readable PDF (it is damaged or not really a PDF)")
     }
 
-    @Test("A decompression bomb is refused as too large to read safely; the same PDF without it is read")
-    func decompressionBomb() async throws {
-        let document = PDFFixtures.make([.text("Alpha")])
-        let bomb = PDFFixtures.streamObject(900, dictionary: "<< /Filter /FlateDecode >>", data: PDFFixtures.flateZeros(2_000_000))
-        let fixture = try await makeFixture(attachments: [pdf("2", "bomb.pdf"), pdf("3", "plain.pdf")])
-        let capped = PDFTextExtractor.Limits(
-            maxPages: 20, maxOutputChars: 100_000, timeout: .seconds(20),
-            streamCaps: PDFStreamBudget.Caps(streamBytes: 1_000_000, totalBytes: 10_000_000))
-        let reader = tool(fixture, FakeServer(["2": document + bomb, "3": document]), limits: capped)
-
-        let refused = try await reader.execute(arguments: ["unique_id": .int(42), "attachment_name": .string("bomb.pdf")])
-        #expect(try errorMessage(refused) == "the PDF is too large or complex to read safely")
-        let read = try await reader.execute(arguments: ["unique_id": .int(42), "attachment_name": .string("plain.pdf")])
-        #expect(read.contains("[page 1]\nAlpha"))
+    @Test("A page pdf.js cannot read is reported as unreadable")
+    func unreadablePage() async throws {
+        let data = PDFFixtures.document([
+            PDFFixtures.object(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            PDFFixtures.object(2, "<< /Type /Pages /Kids [2 0 R] /Count 1 >>"),
+        ])
+        let fixture = try await makeFixture(attachments: [pdf("2", "loop.pdf")])
+        let result = try await tool(fixture, FakeServer(["2": data])).execute(arguments: ["unique_id": .int(42)])
+        #expect(result.hasSuffix("text:\n[page 1]\n(this page could not be read)"))
     }
 
-    @Test("A page drawing more text than the cap is reported as unreadable")
-    func pageTextCap() async throws {
-        let data = PDFFixtures.make([.text("Alpha"), .text(String(repeating: "Bravo ", count: 20))])
-        let fixture = try await makeFixture(attachments: [pdf("2", "dense.pdf")])
-        let capped = PDFTextExtractor.Limits(maxPages: 20, maxOutputChars: 100_000, timeout: .seconds(20), maxPageTextBytes: 50)
-        let result = try await tool(fixture, FakeServer(["2": data]), limits: capped).execute(arguments: ["unique_id": .int(42)])
-        #expect(result.contains("[page 1]\nAlpha\n[page 2]\n(this page could not be read)"))
+    @Test("Each failed outcome has TB's message, and a failed read is 'could not be read'")
+    func outcomeMessages() {
+        let cases: [(PDFTextExtractor.Outcome, String)] = [
+            (.encrypted, "the PDF is password-protected, so its text cannot be read"),
+            (.malformed, "the file is not a readable PDF (it is damaged or not really a PDF)"),
+            (.timeout, "reading the PDF took too long and was stopped"),
+            (.pastEnd(totalPages: 2), "start_page 5 is past the last page (the PDF has 2 pages)"),
+            (.failed, "the PDF could not be read"),
+        ]
+        for (outcome, expected) in cases {
+            #expect(AttachmentReadPdfTool.message(for: outcome, startPage: 5) == expected)
+        }
     }
 
     @Test("A PDF header past the signature window is refused before parsing")

@@ -44,6 +44,17 @@ project's MPL-2.0 license.
 - **License texts:** vendored in-tree at `TabMail/Vendor/sqlite-vec/LICENSE-APACHE`
   and `TabMail/Vendor/sqlite-vec/LICENSE-MIT`
 
+### PDF.js
+
+- **Source:** https://github.com/mozilla/pdf.js — the `pdfjs-dist` 6.3.289 npm release, copied
+  unmodified: `legacy/build/pdf.min.mjs`, `legacy/build/pdf.worker.min.mjs`, `cmaps/` and `LICENSE`
+- **License:** Apache License 2.0 (`TabMail/Vendor/pdfjs/LICENSE`); the CMaps in `cmaps/` are
+  BSD-3-Clause (`TabMail/Vendor/pdfjs/cmaps/LICENSE`)
+- **Copyright:** Mozilla Foundation; CMaps © Adobe Systems Incorporated
+- **Usage:** Extracts the text of PDF attachments for the chat agent's `attachment_read_pdf` tool,
+  in a hidden web view, vendored in `TabMail/Vendor/pdfjs/`. Text only: no rendering, scripting or
+  forms.
+
 ---
 
 ## Bundled model & tokenizer

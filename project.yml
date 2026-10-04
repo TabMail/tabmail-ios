@@ -53,6 +53,7 @@ targets:
           - "Resources/Info.plist"
           - "Vendor/sqlite-vec/*.c"
           - "Vendor/sqlite-vec/LICENSE-*"
+          - "Vendor/pdfjs"
       - path: Shared
       - path: TabMail/Vendor/sqlite-vec
         includes:
@@ -61,6 +62,10 @@ targets:
       - path: TabMail/Resources
         excludes:
           - "Info.plist"
+        buildPhase: resources
+      # pdf.js for attachment_read_pdf (ADR-IOS-088), kept as a folder so cmaps/ stays a directory.
+      - path: TabMail/Vendor/pdfjs
+        type: folder
         buildPhase: resources
     settings:
       base:

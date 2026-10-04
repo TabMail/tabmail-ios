@@ -9,7 +9,7 @@ import GRDB
 /// returns the text of a PDF attachment, a page range per call.
 ///
 /// The PDF is downloaded through `AccountManager.fetchAttachment` (the same guarded path the
-/// attachment preview uses) and parsed locally by `PDFTextExtractor`. The bytes and the text live
+/// attachment preview uses) and parsed on the device by `PDFTextExtractor` (bundled pdf.js). The bytes and the text live
 /// only for this call: nothing is cached or written to `BodyAssetStore` (ADR-004).
 struct AttachmentReadPdfTool: AgentTool, Sendable {
     let name = "attachment_read_pdf"
@@ -23,13 +23,9 @@ struct AttachmentReadPdfTool: AgentTool, Sendable {
         static let parseTimeout: Duration = .seconds(20)
         /// How far into the file the "%PDF-" header may sit (readers tolerate leading junk).
         static let signatureScanBytes = 1024
-        /// Decompression caps checked before PDFKit opens the file (`PDFStreamBudget`). Per stream
-        /// as pypdf (75 MB); in total because CoreGraphics keeps decoded font maps.
-        static let maxDecodedStreamBytes = 75_000_000
-        static let maxDecodedTotalBytes = 256_000_000
-        /// Drawn-string bytes a page may have before PDFKit lays it out, at ~430 bytes per
-        /// character (`PDFPageGlyphCounter`): at most ~86 MB for one page.
-        static let maxPageTextBytes = 200_000
+        /// How long past `parseTimeout` `PDFTextHost` waits for its page to answer before it
+        /// releases the web view anyway. pdf.js normally stops itself at the deadline.
+        static let hostTeardownGrace: Duration = .seconds(5)
     }
 
     typealias AttachmentFetcher = @Sendable (MessageHeader, AttachmentInfo) async throws -> Data
@@ -156,21 +152,10 @@ struct AttachmentReadPdfTool: AgentTool, Sendable {
             data: data, startPage: startPage, endPage: endPage, limits: limits)
         BackgroundSyncLogger.logDebug("[AttachmentReadPdfTool] realId=\(realId.prefix(30)) section=\(DebugModeManager.escapedForLogLine(attachment.section)) bytes=\(data.count) outcome=\(Self.outcomeName(outcome))")
 
-        switch outcome {
-        case .ok(let pages):
+        if case .ok(let pages) = outcome {
             return Self.format(numericId: numericId, attachment: attachment, pages: pages)
-        case .encrypted:
-            return Self.error("the PDF is password-protected, so its text cannot be read")
-        case .malformed:
-            return Self.error("the file is not a readable PDF (it is damaged or not really a PDF)")
-        case .tooLarge:
-            // iOS only: TB's pdf.js has no such cap (IOS-AI-010).
-            return Self.error("the PDF is too large or complex to read safely")
-        case .timeout:
-            return Self.error("reading the PDF took too long and was stopped")
-        case .pastEnd(let totalPages):
-            return Self.error("start_page \(startPage) is past the last page (the PDF has \(totalPages) pages)")
         }
+        return Self.error(Self.message(for: outcome, startPage: startPage))
     }
 
     private func readHeader(_ realId: String) async throws -> MessageHeader? {
@@ -281,12 +266,23 @@ struct AttachmentReadPdfTool: AgentTool, Sendable {
         return lines.joined(separator: "\n")
     }
 
+    /// The error text for an outcome other than `.ok`, as TB words it.
+    static func message(for outcome: PDFTextExtractor.Outcome, startPage: Int) -> String {
+        switch outcome {
+        case .encrypted: return "the PDF is password-protected, so its text cannot be read"
+        case .malformed: return "the file is not a readable PDF (it is damaged or not really a PDF)"
+        case .timeout: return "reading the PDF took too long and was stopped"
+        case .pastEnd(let totalPages): return "start_page \(startPage) is past the last page (the PDF has \(totalPages) pages)"
+        case .ok, .failed: return "the PDF could not be read"
+        }
+    }
+
     private static func outcomeName(_ outcome: PDFTextExtractor.Outcome) -> String {
         switch outcome {
         case .ok: return "ok"
         case .encrypted: return "encrypted"
         case .malformed: return "malformed"
-        case .tooLarge: return "too_large"
+        case .failed: return "failed"
         case .timeout: return "timeout"
         case .pastEnd: return "past_end"
         }

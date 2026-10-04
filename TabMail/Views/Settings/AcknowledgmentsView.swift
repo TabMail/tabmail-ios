@@ -20,6 +20,7 @@ struct AcknowledgmentsView: View {
         // Parsing & text
         ("SwiftSoup", "MIT License", "https://github.com/scinfu/SwiftSoup"),
         ("ZIPFoundation", "MIT License", "https://github.com/weichsel/ZIPFoundation"),
+        ("PDF.js", "Apache License 2.0", "https://github.com/mozilla/pdf.js"),
     ]
 
     var body: some View {

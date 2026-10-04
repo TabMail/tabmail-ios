@@ -1,10 +1,17 @@
 # IOS-AI-010
 
-- Register classification: `accepted`
+- Register classification: `resolved`
 - New post-freeze record (2026-10-03) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
+
+✅ **RESOLVED (2026-10-04) by ADR-IOS-088.** `attachment_read_pdf` now reads PDFs with the
+bundled pdf.js in a hidden web view, as the Thunderbird add-on does, and `PDFStreamBudget` and
+`PDFPageGlyphCounter` are deleted: the pre-check that refused valid PDFs with large lossless images no longer exists. A PDF that exhausts memory now ends WebKit's WebContent
+process, not the app, and the tool reports "the PDF could not be read".
+
+**Prior disposition, preserved:**
 
 📋 **ACCEPTED LIMITATION (2026-10-03, owner decision).** `attachment_read_pdf`'s decompression
 pre-check (`PDFStreamBudget`, 75 MB per stream / 256 MB in total) counts every stream it can
