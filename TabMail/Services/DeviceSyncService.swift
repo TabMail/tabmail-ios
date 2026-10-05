@@ -366,7 +366,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         static let kb = "device_sync_ts:kb"
         static let templates = "device_sync_ts:templates"
         static let disabledReminders = "device_sync_ts:disabledReminders"
-        static let actionConfig = "device_sync_ts:actionConfig"
+        static let actionConfig = ActionCompactConfig.updatedAtKey
 
         static func key(for field: SyncField) -> String {
             switch field {
@@ -1227,14 +1227,43 @@ struct ActionCompactConfig: Codable, Equatable {
         case compactThresholdChars = "compact_threshold_chars"
     }
 
-    /// This device's thresholds, with the same defaults `AIService` sends to the backend.
-    static func local() -> ActionCompactConfig {
-        ActionCompactConfig(
-            compactThreshold: UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdKey) as? Int
-                ?? PromptStore.defaultActionCompactThreshold,
-            compactThresholdChars: UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdCharsKey) as? Int
-                ?? PromptStore.defaultActionCompactThresholdChars
+    /// Device Sync's per-field timestamp for these thresholds.
+    nonisolated static let updatedAtKey = "device_sync_ts:actionConfig"
+    /// Device Sync's "never edited" timestamp (`DeviceSyncService.epochZero`). Every slider
+    /// edit and every accepted sync write stamps a real timestamp.
+    private nonisolated static let neverEditedTimestamp = "1970-01-01T00:00:00.000Z"
+
+    /// This device's effective thresholds — what `AIService` sends to the backend.
+    nonisolated static func local() -> ActionCompactConfig {
+        let defaults = UserDefaults.standard
+        let resolved = resolve(
+            rules: defaults.object(forKey: PromptStore.actionCompactThresholdKey) as? Int,
+            chars: defaults.object(forKey: PromptStore.actionCompactThresholdCharsKey) as? Int,
+            updatedAt: defaults.string(forKey: updatedAtKey)
         )
+        return ActionCompactConfig(compactThreshold: resolved.rules, compactThresholdChars: resolved.chars)
+    }
+
+    /// Effective thresholds for stored values: a value still at the legacy default that was
+    /// never edited moves to the current default; every value is clamped to the slider range.
+    nonisolated static func resolve(rules: Int?, chars: Int?, updatedAt: String?) -> (rules: Int, chars: Int) {
+        let neverEdited = updatedAt == nil || updatedAt == "" || updatedAt == neverEditedTimestamp
+        return (
+            resolveThreshold(rules, fallback: PromptStore.defaultActionCompactThreshold,
+                             legacyDefault: PromptStore.legacyDefaultActionCompactThreshold,
+                             range: PromptStore.actionCompactThresholdRange, neverEdited: neverEdited),
+            resolveThreshold(chars, fallback: PromptStore.defaultActionCompactThresholdChars,
+                             legacyDefault: PromptStore.legacyDefaultActionCompactThresholdChars,
+                             range: PromptStore.actionCompactThresholdCharsRange, neverEdited: neverEdited)
+        )
+    }
+
+    private nonisolated static func resolveThreshold(
+        _ value: Int?, fallback: Int, legacyDefault: Int, range: ClosedRange<Int>, neverEdited: Bool
+    ) -> Int {
+        guard let value, value > 0 else { return fallback }
+        if neverEdited && value == legacyDefault { return fallback }
+        return min(max(value, range.lowerBound), range.upperBound)
     }
 }
 

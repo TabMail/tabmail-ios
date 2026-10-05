@@ -569,3 +569,75 @@ struct PromptStateDataActionConfigTests {
         }
     }
 }
+
+// MARK: - ActionCompactConfig resolve (defaults, legacy migration, range clamp)
+
+@Suite("ActionCompactConfig resolve")
+struct ActionCompactConfigResolveTests {
+    private let epochZero = "1970-01-01T00:00:00.000Z"
+    private var editedTs: String { Date().addingTimeInterval(-86_400).ISO8601Format() }
+
+    @Test("Defaults, range and legacy defaults match TB SETTINGS.actionCompaction and the backend")
+    func pinsSharedConfig() {
+        #expect(PromptStore.defaultActionCompactThreshold == 200)
+        #expect(PromptStore.actionCompactThresholdRange == 100...500)
+        #expect(PromptStore.actionCompactThresholdStep == 10)
+        #expect(PromptStore.defaultActionCompactThresholdChars == 32000)
+        #expect(PromptStore.actionCompactThresholdCharsRange == 16000...80000)
+        #expect(PromptStore.actionCompactThresholdCharsStep == 1000)
+        #expect(PromptStore.legacyDefaultActionCompactThreshold == 100)
+        #expect(PromptStore.legacyDefaultActionCompactThresholdChars == 16000)
+        #expect(ActionCompactConfig.updatedAtKey == "device_sync_ts:actionConfig")
+    }
+
+    @Test("Nothing stored resolves to the defaults")
+    func nothingStored() {
+        for updatedAt in [nil, "", epochZero] {
+            let resolved = ActionCompactConfig.resolve(rules: nil, chars: nil, updatedAt: updatedAt)
+            #expect(resolved.rules == 200)
+            #expect(resolved.chars == 32000)
+        }
+    }
+
+    @Test("Never-edited legacy defaults move to the current defaults, per field")
+    func legacyDefaultsMigrate() {
+        for updatedAt in [nil, "", epochZero] {
+            let both = ActionCompactConfig.resolve(rules: 100, chars: 16000, updatedAt: updatedAt)
+            #expect(both.rules == 200)
+            #expect(both.chars == 32000)
+        }
+        let customRules = ActionCompactConfig.resolve(rules: 300, chars: 16000, updatedAt: epochZero)
+        #expect(customRules.rules == 300)
+        #expect(customRules.chars == 32000)
+        let customChars = ActionCompactConfig.resolve(rules: 100, chars: 40000, updatedAt: epochZero)
+        #expect(customChars.rules == 200)
+        #expect(customChars.chars == 40000)
+    }
+
+    @Test("Values edited since the update are kept even when they equal the legacy defaults")
+    func editedLegacyValuesKept() {
+        let resolved = ActionCompactConfig.resolve(rules: 100, chars: 16000, updatedAt: editedTs)
+        #expect(resolved.rules == 100)
+        #expect(resolved.chars == 16000)
+    }
+
+    @Test("Custom values are clamped into the slider range")
+    func clamped() {
+        let low = ActionCompactConfig.resolve(rules: 40, chars: 6000, updatedAt: epochZero)
+        #expect(low.rules == 100)
+        #expect(low.chars == 16000)
+        let high = ActionCompactConfig.resolve(rules: 900, chars: 200_000, updatedAt: editedTs)
+        #expect(high.rules == 500)
+        #expect(high.chars == 80000)
+        let inRange = ActionCompactConfig.resolve(rules: 350, chars: 24000, updatedAt: editedTs)
+        #expect(inRange.rules == 350)
+        #expect(inRange.chars == 24000)
+    }
+
+    @Test("Non-positive values resolve to the defaults")
+    func nonPositive() {
+        let resolved = ActionCompactConfig.resolve(rules: 0, chars: -5, updatedAt: editedTs)
+        #expect(resolved.rules == 200)
+        #expect(resolved.chars == 32000)
+    }
+}

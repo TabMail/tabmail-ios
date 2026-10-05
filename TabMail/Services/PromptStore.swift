@@ -283,10 +283,19 @@ final class PromptStore {
 
     // MARK: - Action Compaction Config
 
+    // Must match TB `SETTINGS.actionCompaction` and the backend's actionRuleBudget.ts.
+    // Defaults keep 160 chars per rule; read through `ActionCompactConfig.local()`.
     nonisolated static let actionCompactThresholdKey = "action.compact.threshold"
-    nonisolated static let defaultActionCompactThreshold = 100
+    nonisolated static let defaultActionCompactThreshold = 200
+    nonisolated static let actionCompactThresholdRange = 100...500
+    nonisolated static let actionCompactThresholdStep = 10
     nonisolated static let actionCompactThresholdCharsKey = "action.compact.threshold.chars"
-    nonisolated static let defaultActionCompactThresholdChars = 16000
+    nonisolated static let defaultActionCompactThresholdChars = 32000
+    nonisolated static let actionCompactThresholdCharsRange = 16000...80000
+    nonisolated static let actionCompactThresholdCharsStep = 1000
+    /// Previous defaults — too aggressive; migrated to the current defaults when never edited.
+    nonisolated static let legacyDefaultActionCompactThreshold = 100
+    nonisolated static let legacyDefaultActionCompactThresholdChars = 16000
 
     // MARK: - Demo overlay key redirection (ADR-IOS-038)
 

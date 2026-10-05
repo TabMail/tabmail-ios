@@ -49,12 +49,10 @@ extension AIService {
             return
         }
 
-        // Read compaction threshold from UserDefaults; fall back to default if unset
-        // (integer(forKey:) returns 0 when unset, which would be an invalid threshold)
-        let compactThreshold = UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdKey) as? Int
-            ?? PromptStore.defaultActionCompactThreshold
-        let compactThresholdChars = UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdCharsKey) as? Int
-            ?? PromptStore.defaultActionCompactThresholdChars
+        // Effective thresholds (defaults, legacy-default migration and range clamp applied)
+        let actionConfig = ActionCompactConfig.local()
+        let compactThreshold = actionConfig.compactThreshold ?? PromptStore.defaultActionCompactThreshold
+        let compactThresholdChars = actionConfig.compactThresholdChars ?? PromptStore.defaultActionCompactThresholdChars
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: action_compact_threshold=\(compactThreshold) action_compact_threshold_chars=\(compactThresholdChars)")
         }
@@ -181,11 +179,10 @@ extension AIService {
             return .skipped(reason: "No action rules to compact")
         }
 
-        // Read both thresholds from UserDefaults (same nil-object pattern as autoUpdateUserPromptOnTag)
-        let compactThreshold = UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdKey) as? Int
-            ?? PromptStore.defaultActionCompactThreshold
-        let compactThresholdChars = UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdCharsKey) as? Int
-            ?? PromptStore.defaultActionCompactThresholdChars
+        // Effective thresholds (same source as autoUpdateUserPromptOnTag)
+        let actionConfig = ActionCompactConfig.local()
+        let compactThreshold = actionConfig.compactThreshold ?? PromptStore.defaultActionCompactThreshold
+        let compactThresholdChars = actionConfig.compactThresholdChars ?? PromptStore.defaultActionCompactThresholdChars
 
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[AIService] compactActionRules: threshold=\(compactThreshold) thresholdChars=\(compactThresholdChars) mdLen=\(currentUserActionMd.count)")
