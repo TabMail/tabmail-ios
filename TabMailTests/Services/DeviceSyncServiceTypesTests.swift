@@ -12,12 +12,13 @@ struct SyncFieldExtendedTests {
     @Test("All SyncField cases are present")
     func allCasesPresent() {
         let cases = SyncField.allCases
-        #expect(cases.count == 5)
+        #expect(cases.count == 6)
         #expect(cases.contains(.composition))
         #expect(cases.contains(.action))
         #expect(cases.contains(.kb))
         #expect(cases.contains(.templates))
         #expect(cases.contains(.disabledReminders))
+        #expect(cases.contains(.actionConfig))
     }
 
     @Test("promptFields has exactly 4 elements")
@@ -28,6 +29,7 @@ struct SyncFieldExtendedTests {
     @Test("promptFields excludes disabledReminders")
     func promptFieldsExcludesNonPromptFields() {
         #expect(!SyncField.promptFields.contains(.disabledReminders))
+        #expect(!SyncField.promptFields.contains(.actionConfig))
     }
 
     @Test("promptFields includes all prompt-related cases")

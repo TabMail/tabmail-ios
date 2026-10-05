@@ -366,6 +366,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         static let kb = "device_sync_ts:kb"
         static let templates = "device_sync_ts:templates"
         static let disabledReminders = "device_sync_ts:disabledReminders"
+        static let actionConfig = "device_sync_ts:actionConfig"
 
         static func key(for field: SyncField) -> String {
             switch field {
@@ -374,6 +375,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             case .kb: return kb
             case .templates: return templates
             case .disabledReminders: return disabledReminders
+            case .actionConfig: return actionConfig
             }
         }
     }
@@ -493,6 +495,9 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             case .disabledReminders:
                 state.disabledReminders = DisabledRemindersStore.getDisabledMap()
                 state.disabledRemindersUpdatedAt = readTimestamp(for: .disabledReminders)
+            case .actionConfig:
+                state.actionConfig = ActionCompactConfig.local()
+                state.actionConfigUpdatedAt = readTimestamp(for: .actionConfig)
             }
         }
 
@@ -521,11 +526,13 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             kb: store.rawKB,
             templates: store.templates,
             disabledReminders: DisabledRemindersStore.getDisabledMap(),
+            actionConfig: ActionCompactConfig.local(),
             compositionUpdatedAt: readTimestamp(for: .composition),
             actionUpdatedAt: readTimestamp(for: .action),
             kbUpdatedAt: readTimestamp(for: .kb),
             templatesUpdatedAt: readTimestamp(for: .templates),
-            disabledRemindersUpdatedAt: readTimestamp(for: .disabledReminders)
+            disabledRemindersUpdatedAt: readTimestamp(for: .disabledReminders),
+            actionConfigUpdatedAt: readTimestamp(for: .actionConfig)
         )
         sendPromptState(state, via: ws)
         BackgroundSyncLogger.logDebug("[DeviceSync] Broadcast all fields on connect")
@@ -662,6 +669,9 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 case "disabledReminders":
                     state.disabledReminders = DisabledRemindersStore.getDisabledMap()
                     state.disabledRemindersUpdatedAt = readTimestamp(for: .disabledReminders)
+                case "actionConfig":
+                    state.actionConfig = ActionCompactConfig.local()
+                    state.actionConfigUpdatedAt = readTimestamp(for: .actionConfig)
                 default: break
                 }
             }
@@ -876,6 +886,21 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             }
         }
 
+        // --- ActionConfig: last-write-wins. Not prompt history material — applied
+        // outside the history snapshot below.
+        if let incomingConfig = incoming.actionConfig {
+            let incomingTs = incoming.actionConfigUpdatedAt ?? Self.epochZero
+            let localTs = readTimestamp(for: .actionConfig)
+            if let accepted = Self.acceptedActionConfig(incomingConfig, incomingTs: incomingTs, localTs: localTs) {
+                UserDefaults.standard.set(accepted.rules, forKey: PromptStore.actionCompactThresholdKey)
+                UserDefaults.standard.set(accepted.chars, forKey: PromptStore.actionCompactThresholdCharsKey)
+                writeTimestamp(incomingTs, for: .actionConfig)
+                BackgroundSyncLogger.logDebug("[DeviceSync] actionConfig: LWW accept compact_threshold=\(accepted.rules) compact_threshold_chars=\(accepted.chars)")
+            } else {
+                BackgroundSyncLogger.logDebug("[DeviceSync] Skipping actionConfig — not newer or invalid (incoming \(incomingTs), local \(localTs))")
+            }
+        }
+
         // Apply text field results (skip internal history — we record below)
         if mergedComposition != nil || mergedAction != nil || mergedKB != nil {
             store.applySync(
@@ -920,6 +945,20 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         store.saveHistory(history)
 
         BackgroundSyncLogger.logDebug("[DeviceSync] Applied sync: \(changedFieldNames.joined(separator: ", "))")
+    }
+
+    /// The thresholds to adopt from a peer, or nil to keep local. Last-write-wins by
+    /// ISO timestamp, matching TB `deviceSync.js`; an epoch-zero (never edited)
+    /// incoming timestamp is never newer than local, so defaults never overwrite.
+    nonisolated static func acceptedActionConfig(
+        _ incoming: ActionCompactConfig,
+        incomingTs: String,
+        localTs: String
+    ) -> (rules: Int, chars: Int)? {
+        guard incomingTs > localTs,
+              let rules = incoming.compactThreshold, rules > 0,
+              let chars = incoming.compactThresholdChars, chars > 0 else { return nil }
+        return (rules, chars)
     }
 
     // MARK: - AI Cache Probe (Phase 5 — placeholder handlers)
@@ -1059,7 +1098,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 // MARK: - Sync Data Types
 
 enum SyncField: String, CaseIterable {
-    case composition, action, kb, templates, disabledReminders
+    case composition, action, kb, templates, disabledReminders, actionConfig
 
     /// Prompt-only fields (excludes disabledReminders). Used for history/backup/UI that only cares about prompt settings.
     static let promptFields: [SyncField] = [.composition, .action, .kb, .templates]
@@ -1071,6 +1110,7 @@ enum SyncField: String, CaseIterable {
         case .kb: return "Knowledge Base"
         case .templates: return "Templates"
         case .disabledReminders: return "Disabled Reminders"
+        case .actionConfig: return "Action Compaction Settings"
         }
     }
 
@@ -1081,6 +1121,7 @@ enum SyncField: String, CaseIterable {
         case .kb: return "book"
         case .templates: return "doc.on.doc"
         case .disabledReminders: return "bell.slash"
+        case .actionConfig: return "slider.horizontal.3"
         }
     }
 }
@@ -1092,21 +1133,24 @@ struct PromptStateData: Codable {
     var templates: [ReplyTemplate]?
     /// CRDT map: `{hash: {enabled: Bool, ts: ISO8601}}`. Decoded from either v2 map or legacy `[String]` array.
     var disabledReminders: [String: DisabledRemindersStore.DisabledEntry]?
+    var actionConfig: ActionCompactConfig?
     var updatedAt: String? // DEPRECATED — use per-field timestamps below
     var compositionUpdatedAt: String?
     var actionUpdatedAt: String?
     var kbUpdatedAt: String?
     var templatesUpdatedAt: String?
     var disabledRemindersUpdatedAt: String?
+    var actionConfigUpdatedAt: String?
 
     enum CodingKeys: String, CodingKey {
-        case composition, action, kb, templates, disabledReminders
+        case composition, action, kb, templates, disabledReminders, actionConfig
         case updatedAt = "updatedAt"
         case compositionUpdatedAt = "composition_updated_at"
         case actionUpdatedAt = "action_updated_at"
         case kbUpdatedAt = "kb_updated_at"
         case templatesUpdatedAt = "templates_updated_at"
         case disabledRemindersUpdatedAt = "disabledReminders_updated_at"
+        case actionConfigUpdatedAt = "actionConfig_updated_at"
     }
 
     init(
@@ -1115,24 +1159,28 @@ struct PromptStateData: Codable {
         kb: String? = nil,
         templates: [ReplyTemplate]? = nil,
         disabledReminders: [String: DisabledRemindersStore.DisabledEntry]? = nil,
+        actionConfig: ActionCompactConfig? = nil,
         updatedAt: String? = nil,
         compositionUpdatedAt: String? = nil,
         actionUpdatedAt: String? = nil,
         kbUpdatedAt: String? = nil,
         templatesUpdatedAt: String? = nil,
-        disabledRemindersUpdatedAt: String? = nil
+        disabledRemindersUpdatedAt: String? = nil,
+        actionConfigUpdatedAt: String? = nil
     ) {
         self.composition = composition
         self.action = action
         self.kb = kb
         self.templates = templates
         self.disabledReminders = disabledReminders
+        self.actionConfig = actionConfig
         self.updatedAt = updatedAt
         self.compositionUpdatedAt = compositionUpdatedAt
         self.actionUpdatedAt = actionUpdatedAt
         self.kbUpdatedAt = kbUpdatedAt
         self.templatesUpdatedAt = templatesUpdatedAt
         self.disabledRemindersUpdatedAt = disabledRemindersUpdatedAt
+        self.actionConfigUpdatedAt = actionConfigUpdatedAt
     }
 
     init(from decoder: Decoder) throws {
@@ -1147,6 +1195,9 @@ struct PromptStateData: Codable {
         kbUpdatedAt = try container.decodeIfPresent(String.self, forKey: .kbUpdatedAt)
         templatesUpdatedAt = try container.decodeIfPresent(String.self, forKey: .templatesUpdatedAt)
         disabledRemindersUpdatedAt = try container.decodeIfPresent(String.self, forKey: .disabledRemindersUpdatedAt)
+        actionConfigUpdatedAt = try container.decodeIfPresent(String.self, forKey: .actionConfigUpdatedAt)
+        // A malformed config from a peer must not drop the rest of the message.
+        actionConfig = try? container.decodeIfPresent(ActionCompactConfig.self, forKey: .actionConfig)
 
         // Decode disabledReminders: try v2 map first, fall back to legacy [String] array
         if let mapValue = try? container.decodeIfPresent([String: DisabledRemindersStore.DisabledEntry].self, forKey: .disabledReminders) {
@@ -1162,6 +1213,28 @@ struct PromptStateData: Codable {
         } else {
             disabledReminders = nil
         }
+    }
+}
+
+/// Action-rule compaction thresholds — TB `user_prompts:action_config`, sent to the
+/// backend as `action_compact_threshold` / `action_compact_threshold_chars`.
+struct ActionCompactConfig: Codable, Equatable {
+    var compactThreshold: Int?
+    var compactThresholdChars: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case compactThreshold = "compact_threshold"
+        case compactThresholdChars = "compact_threshold_chars"
+    }
+
+    /// This device's thresholds, with the same defaults `AIService` sends to the backend.
+    static func local() -> ActionCompactConfig {
+        ActionCompactConfig(
+            compactThreshold: UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdKey) as? Int
+                ?? PromptStore.defaultActionCompactThreshold,
+            compactThresholdChars: UserDefaults.standard.object(forKey: PromptStore.actionCompactThresholdCharsKey) as? Int
+                ?? PromptStore.defaultActionCompactThresholdChars
+        )
     }
 }
 

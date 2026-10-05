@@ -5,6 +5,7 @@
 - **Text fields (composition, action, kb)**: State-based delta merge with **peer-received base** as common ancestor. Steps: (1) epoch-zero → skip, (2) stale → skip, (3) first sync (no peer base) → LWW, (4) fast-forward (no local changes) → accept incoming, (5) both changed → 3-way bullet merge using `peer_base` as ancestor. **Critical**: `peer_base = incoming` (what peer sent), NOT merged result. Peer base stored in UserDefaults (`device_peer_base:*` / `device_peer_base_ts:*` keys). One-time migration from old `syncBase*` keys.
 - **Templates**: per-template CRDT merge by id (newer `updatedAt` wins per template)
 - **DisabledReminders**: per-hash CRDT merge (newer `ts` wins per hash)
+- **actionConfig** (compaction thresholds, 2026-10-05): LWW by `actionConfig_updated_at` via `DeviceSyncService.acceptedActionConfig`; applied straight to the `PromptStore.actionCompactThreshold[Chars]Key` UserDefaults (no echo — the only local-edit hook is the `ActionRulesView` slider setter, demo-guarded); decoded with `try?` so a malformed config never drops the rest of the `prompt_state`; excluded from `SyncField.promptFields` and prompt history. Wire shape matches TB `user_prompts:action_config`.
 - **Epoch-zero protection**: defaults and resets get epoch-zero timestamps — never overwrite customized content
 - **Virgin device detection**: all timestamps epoch-zero → skip broadcast, probe peers instead
 - `isSyncApplying` flag prevents echo loops when applying incoming sync

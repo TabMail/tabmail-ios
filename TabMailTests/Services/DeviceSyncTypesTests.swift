@@ -11,9 +11,9 @@ import Foundation
 @Suite("SyncField Enum")
 struct SyncFieldTests {
 
-    @Test("CaseIterable returns all 5 cases")
+    @Test("CaseIterable returns all 6 cases")
     func allCases() {
-        #expect(SyncField.allCases.count == 5)
+        #expect(SyncField.allCases.count == 6)
     }
 
     @Test("All expected cases exist")
@@ -24,6 +24,7 @@ struct SyncFieldTests {
         #expect(cases.contains(.kb))
         #expect(cases.contains(.templates))
         #expect(cases.contains(.disabledReminders))
+        #expect(cases.contains(.actionConfig))
     }
 
     @Test("rawValue matches expected strings")
@@ -33,6 +34,7 @@ struct SyncFieldTests {
         #expect(SyncField.kb.rawValue == "kb")
         #expect(SyncField.templates.rawValue == "templates")
         #expect(SyncField.disabledReminders.rawValue == "disabledReminders")
+        #expect(SyncField.actionConfig.rawValue == "actionConfig")
     }
 
     @Test("init(rawValue:) round-trips all cases")

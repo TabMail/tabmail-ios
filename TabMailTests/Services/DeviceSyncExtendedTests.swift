@@ -462,15 +462,110 @@ struct SyncFieldTimestampKeyTests {
         }
     }
 
-    @Test("promptFields count is allCases minus 1")
+    @Test("promptFields count is allCases minus 2")
     func promptFieldsCountRelation() {
-        #expect(SyncField.promptFields.count == SyncField.allCases.count - 1)
+        #expect(SyncField.promptFields.count == SyncField.allCases.count - 2)
     }
 
-    @Test("disabledReminders is the only non-prompt field")
+    @Test("disabledReminders and actionConfig are the only non-prompt fields")
     func nonPromptFields() {
         let nonPrompt = Set(SyncField.allCases).subtracting(SyncField.promptFields)
-        #expect(nonPrompt.count == 1)
-        #expect(nonPrompt.contains(.disabledReminders))
+        #expect(nonPrompt == [.disabledReminders, .actionConfig])
+    }
+}
+
+// MARK: - actionConfig (compaction thresholds) sync
+
+@Suite("PromptStateData actionConfig")
+struct PromptStateDataActionConfigTests {
+
+    private func iso(daysFromNow days: Double) -> String {
+        Date().addingTimeInterval(days * 86_400).ISO8601Format()
+    }
+
+    @Test("Encodes actionConfig with TB's user_prompts:action_config keys")
+    func encodesTBKeys() throws {
+        let ts = iso(daysFromNow: -1)
+        let state = PromptStateData(
+            actionConfig: ActionCompactConfig(compactThreshold: 300, compactThresholdChars: 32000),
+            actionConfigUpdatedAt: ts
+        )
+        let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(state)) as? [String: Any]
+        let config = object?["actionConfig"] as? [String: Any]
+        #expect(config?["compact_threshold"] as? Int == 300)
+        #expect(config?["compact_threshold_chars"] as? Int == 32000)
+        #expect(object?["actionConfig_updated_at"] as? String == ts)
+    }
+
+    @Test("Decodes the payload TB deviceSync.js sends")
+    func decodesTBPayload() throws {
+        let ts = iso(daysFromNow: -1)
+        let json = """
+        {"actionConfig": {"compact_threshold": 250, "compact_threshold_chars": 20000}, "actionConfig_updated_at": "\(ts)"}
+        """
+        let decoded = try JSONDecoder().decode(PromptStateData.self, from: Data(json.utf8))
+        #expect(decoded.actionConfig == ActionCompactConfig(compactThreshold: 250, compactThresholdChars: 20000))
+        #expect(decoded.actionConfigUpdatedAt == ts)
+    }
+
+    @Test("A malformed actionConfig does not drop the rest of the message")
+    func malformedConfigKeepsOtherFields() throws {
+        let json = """
+        {"kb": "- synced kb", "kb_updated_at": "\(iso(daysFromNow: -1))", "actionConfig": "not-an-object"}
+        """
+        let decoded = try JSONDecoder().decode(PromptStateData.self, from: Data(json.utf8))
+        #expect(decoded.kb == "- synced kb")
+        #expect(decoded.actionConfig == nil)
+    }
+
+    @Test("A newer valid incoming config is accepted")
+    func newerAccepted() {
+        let accepted = DeviceSyncService.acceptedActionConfig(
+            ActionCompactConfig(compactThreshold: 300, compactThresholdChars: 32000),
+            incomingTs: iso(daysFromNow: -1),
+            localTs: iso(daysFromNow: -2)
+        )
+        #expect(accepted?.rules == 300)
+        #expect(accepted?.chars == 32000)
+    }
+
+    @Test("A device that never edited the sliders (epoch-zero local) accepts")
+    func epochZeroLocalAccepts() {
+        let accepted = DeviceSyncService.acceptedActionConfig(
+            ActionCompactConfig(compactThreshold: 250, compactThresholdChars: 20000),
+            incomingTs: iso(daysFromNow: -1),
+            localTs: "1970-01-01T00:00:00.000Z"
+        )
+        #expect(accepted?.rules == 250)
+        #expect(accepted?.chars == 20000)
+    }
+
+    @Test("An older or equal incoming config is rejected")
+    func olderRejected() {
+        let local = iso(daysFromNow: -1)
+        let config = ActionCompactConfig(compactThreshold: 300, compactThresholdChars: 32000)
+        #expect(DeviceSyncService.acceptedActionConfig(config, incomingTs: iso(daysFromNow: -3), localTs: local) == nil)
+        #expect(DeviceSyncService.acceptedActionConfig(config, incomingTs: local, localTs: local) == nil)
+    }
+
+    @Test("An epoch-zero (never edited) incoming config never overwrites")
+    func epochZeroIncomingRejected() {
+        let epochZero = "1970-01-01T00:00:00.000Z"
+        let config = ActionCompactConfig(compactThreshold: 100, compactThresholdChars: 16000)
+        #expect(DeviceSyncService.acceptedActionConfig(config, incomingTs: epochZero, localTs: epochZero) == nil)
+    }
+
+    @Test("Missing or non-positive thresholds are rejected")
+    func invalidRejected() {
+        let incoming = iso(daysFromNow: -1)
+        let local = iso(daysFromNow: -2)
+        for config in [
+            ActionCompactConfig(compactThreshold: nil, compactThresholdChars: 32000),
+            ActionCompactConfig(compactThreshold: 300, compactThresholdChars: nil),
+            ActionCompactConfig(compactThreshold: 0, compactThresholdChars: 32000),
+            ActionCompactConfig(compactThreshold: 300, compactThresholdChars: -1),
+        ] {
+            #expect(DeviceSyncService.acceptedActionConfig(config, incomingTs: incoming, localTs: local) == nil)
+        }
     }
 }

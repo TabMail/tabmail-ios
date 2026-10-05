@@ -69,6 +69,14 @@ struct ActionRulesView: View {
     // Compaction state lives in the monitor so it survives navigation
     @State private var compaction = ActionCompactionMonitor.shared
 
+    /// A user slider edit is the only local edit of the thresholds; values applied by
+    /// Device Sync write UserDefaults directly and so never echo back. Demo mode keeps
+    /// Device Sync timestamps untouched (ADR-IOS-038).
+    private func broadcastActionConfigEdit() {
+        guard !DemoModeStore.isDemoActive else { return }
+        syncService.debouncedBroadcast(fields: [.actionConfig])
+    }
+
     private let syncTip = DeviceSyncTip()
 
     private let sections: [SectionInfo] = [
@@ -109,7 +117,7 @@ struct ActionRulesView: View {
                     Slider(
                         value: Binding(
                             get: { Double(actionCompactThreshold) },
-                            set: { actionCompactThreshold = Int($0) }
+                            set: { actionCompactThreshold = Int($0); broadcastActionConfigEdit() }
                         ),
                         in: 20...500,
                         step: 10
@@ -124,7 +132,7 @@ struct ActionRulesView: View {
                     Slider(
                         value: Binding(
                             get: { Double(actionCompactThresholdChars) },
-                            set: { actionCompactThresholdChars = Int($0) }
+                            set: { actionCompactThresholdChars = Int($0); broadcastActionConfigEdit() }
                         ),
                         in: 2000...40000,
                         step: 1000
