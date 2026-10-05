@@ -151,3 +151,12 @@ Upstream commits pulled in: #236 (ENABLE/QRESYNC), #237 (Outlook `.msg`), #239, 
   recipient the parser reads as one mailbox in parsed form (a pasted `Bob <bob@…>` had become one
   RFC 2047 word in the Drafts APPEND under #245/#246); unparseable text stays as typed. The IMAP Drafts
   APPEND still writes no `Bcc` header (SwiftMail never does) — unchanged, not investigated further.
+
+## Sync executed 2026-10-05 — both deviations merged upstream; pure mirror again
+
+Upstream squash-merged #248 (`9f86b77`) and #249 (`07163dc`) unchanged from our heads (same
+patch-id). A squash merge never fast-forwards a fork deviation: prove tree equality, then reset. Upstream `main` `07163dc`'s tree is byte-identical to the previous fork `main` `5851273`'s
+tree (`b8b25145`), so nothing new was pulled in and the collision check is empty. Fork `main` was
+reset to `07163dc03c37b4ed880426b2437e8b345762b2b9` and force-pushed with a lease from `5851273`;
+**zero deviations** — the next resync is the plain mirror path. App and NSE pin `07163dc` in
+`project.yml`. The two 2026-10-04 deviation entries above are superseded.

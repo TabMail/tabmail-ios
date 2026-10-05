@@ -29,7 +29,7 @@ GB2312 has no such character.
   Every SwiftMail decode site uses it: encoded-words, `detectCharsetEncoding`,
   `decodeQuotedPrintableContent`, `MessagePart.textContent`, RFC 2231 `filename*`, and the `.msg`
   RTF code-page map. Fork branch `fix/mime-charset-supersets`, upstream PR
-  [#248](https://github.com/Cocoanetics/SwiftMail/pull/248); carried on fork `main` until merged (memory 126).
+  [#248](https://github.com/Cocoanetics/SwiftMail/pull/248); merged upstream 2026-10-05 as `9f86b77`; fork `main` is a pure mirror again (memory 126).
 - App: `RFC5322Parse.charsetFor` deleted; `decodeRFC2047` resolves with
   `String.Encoding(mimeCharset:) ?? .utf8`, so the Gmail and IMAP paths decode identically.
 
