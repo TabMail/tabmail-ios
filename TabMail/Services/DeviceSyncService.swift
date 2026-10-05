@@ -170,6 +170,10 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             BackgroundSyncLogger.logDebug("[DeviceSync] Demo mode active — skipping connect")
             return
         }
+        // Records the owner on installs from before ownership existed.
+        if let userId = TabMailAuthService.getSession()?.userId {
+            claimLocalState(for: userId)
+        }
         guard isAutoEnabled else {
             BackgroundSyncLogger.logDebug("[DeviceSync] Auto-sync disabled, skipping connect")
             return
@@ -391,6 +395,33 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     /// Public timestamp write — used by PromptStore.restoreFromHistory to set fresh timestamps.
     func writeTimestampPublic(_ ts: String, for field: SyncField) {
         writeTimestamp(ts, for: field)
+    }
+
+    // MARK: - Account ownership
+
+    /// The TabMail account whose synced state (prompts, KB, templates, disabled reminders,
+    /// compaction thresholds) this device holds.
+    nonisolated static let ownerUserIdKey = "device_sync_owner_user_id"
+
+    /// Binds this device's synced state to `userId`, at every session install and connect.
+    /// The same account keeps everything. A different account gets the defaults and no
+    /// sync timestamps, so this device probes the new account's peers like a new device and
+    /// never broadcasts the previous account's data into it. With no recorded owner (an
+    /// install from before this existed) the current state is adopted as-is.
+    func claimLocalState(for userId: String) {
+        let defaults = UserDefaults.standard
+        let owner = defaults.string(forKey: Self.ownerUserIdKey)
+        defaults.set(userId, forKey: Self.ownerUserIdKey)
+        guard let owner, owner != userId else { return }
+        BackgroundSyncLogger.logDebug("[DeviceSync] Different account signed in — clearing the previous account's synced state")
+        disconnect()
+        PromptStore.shared.resetForNewAccount()
+        DisabledRemindersStore.removeAllForNewAccount()
+        let keys = [PromptStore.actionCompactThresholdKey, PromptStore.actionCompactThresholdCharsKey,
+                    backupKey, "device_sync_auto_enabled"] + SyncField.allCases.map(TimestampKey.key(for:))
+        for key in keys {
+            defaults.removeObject(forKey: key)
+        }
     }
 
     /// If no per-field timestamps exist, initialize all to epoch 0 (new device).
