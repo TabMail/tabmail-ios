@@ -462,15 +462,292 @@ struct SyncFieldTimestampKeyTests {
         }
     }
 
-    @Test("promptFields count is allCases minus 1")
+    @Test("promptFields count is allCases minus 2")
     func promptFieldsCountRelation() {
-        #expect(SyncField.promptFields.count == SyncField.allCases.count - 1)
+        #expect(SyncField.promptFields.count == SyncField.allCases.count - 2)
     }
 
-    @Test("disabledReminders is the only non-prompt field")
+    @Test("disabledReminders and actionConfig are the only non-prompt fields")
     func nonPromptFields() {
         let nonPrompt = Set(SyncField.allCases).subtracting(SyncField.promptFields)
-        #expect(nonPrompt.count == 1)
-        #expect(nonPrompt.contains(.disabledReminders))
+        #expect(nonPrompt == [.disabledReminders, .actionConfig])
+    }
+}
+
+// MARK: - actionConfig (compaction thresholds) sync
+
+@Suite("PromptStateData actionConfig")
+struct PromptStateDataActionConfigTests {
+
+    private func iso(daysFromNow days: Double) -> String {
+        Date().addingTimeInterval(days * 86_400).ISO8601Format()
+    }
+
+    @Test("Encodes actionConfig with TB's user_prompts:action_config keys")
+    func encodesTBKeys() throws {
+        let ts = iso(daysFromNow: -1)
+        let state = PromptStateData(
+            actionConfig: ActionCompactConfig(compactThreshold: 300, compactThresholdChars: 32000),
+            actionConfigUpdatedAt: ts
+        )
+        let object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(state)) as? [String: Any]
+        let config = object?["actionConfig"] as? [String: Any]
+        #expect(config?["compact_threshold"] as? Int == 300)
+        #expect(config?["compact_threshold_chars"] as? Int == 32000)
+        #expect(object?["actionConfig_updated_at"] as? String == ts)
+    }
+
+    @Test("Decodes the payload TB deviceSync.js sends")
+    func decodesTBPayload() throws {
+        let ts = iso(daysFromNow: -1)
+        let json = """
+        {"actionConfig": {"compact_threshold": 250, "compact_threshold_chars": 20000}, "actionConfig_updated_at": "\(ts)"}
+        """
+        let decoded = try JSONDecoder().decode(PromptStateData.self, from: Data(json.utf8))
+        #expect(decoded.actionConfig == ActionCompactConfig(compactThreshold: 250, compactThresholdChars: 20000))
+        #expect(decoded.actionConfigUpdatedAt == ts)
+    }
+
+    @Test("A malformed actionConfig does not drop the rest of the message")
+    func malformedConfigKeepsOtherFields() throws {
+        let json = """
+        {"kb": "- synced kb", "kb_updated_at": "\(iso(daysFromNow: -1))", "actionConfig": "not-an-object"}
+        """
+        let decoded = try JSONDecoder().decode(PromptStateData.self, from: Data(json.utf8))
+        #expect(decoded.kb == "- synced kb")
+        #expect(decoded.actionConfig == nil)
+    }
+
+    @Test("A newer valid incoming config is accepted")
+    func newerAccepted() {
+        let accepted = DeviceSyncService.acceptedActionConfig(
+            ActionCompactConfig(compactThreshold: 300, compactThresholdChars: 32000),
+            incomingTs: iso(daysFromNow: -1),
+            localTs: iso(daysFromNow: -2)
+        )
+        #expect(accepted?.rules == 300)
+        #expect(accepted?.chars == 32000)
+    }
+
+    @Test("A device that never edited the sliders (epoch-zero local) accepts")
+    func epochZeroLocalAccepts() {
+        let accepted = DeviceSyncService.acceptedActionConfig(
+            ActionCompactConfig(compactThreshold: 250, compactThresholdChars: 20000),
+            incomingTs: iso(daysFromNow: -1),
+            localTs: "1970-01-01T00:00:00.000Z"
+        )
+        #expect(accepted?.rules == 250)
+        #expect(accepted?.chars == 20000)
+    }
+
+    @Test("An older or equal incoming config is rejected")
+    func olderRejected() {
+        let local = iso(daysFromNow: -1)
+        let config = ActionCompactConfig(compactThreshold: 300, compactThresholdChars: 32000)
+        #expect(DeviceSyncService.acceptedActionConfig(config, incomingTs: iso(daysFromNow: -3), localTs: local) == nil)
+        #expect(DeviceSyncService.acceptedActionConfig(config, incomingTs: local, localTs: local) == nil)
+    }
+
+    @Test("An epoch-zero (never edited) incoming config never overwrites")
+    func epochZeroIncomingRejected() {
+        let epochZero = "1970-01-01T00:00:00.000Z"
+        let config = ActionCompactConfig(compactThreshold: 100, compactThresholdChars: 16000)
+        #expect(DeviceSyncService.acceptedActionConfig(config, incomingTs: epochZero, localTs: epochZero) == nil)
+    }
+
+    @Test("Missing or non-positive thresholds are rejected")
+    func invalidRejected() {
+        let incoming = iso(daysFromNow: -1)
+        let local = iso(daysFromNow: -2)
+        for config in [
+            ActionCompactConfig(compactThreshold: nil, compactThresholdChars: 32000),
+            ActionCompactConfig(compactThreshold: 300, compactThresholdChars: nil),
+            ActionCompactConfig(compactThreshold: 0, compactThresholdChars: 32000),
+            ActionCompactConfig(compactThreshold: 300, compactThresholdChars: -1),
+        ] {
+            #expect(DeviceSyncService.acceptedActionConfig(config, incomingTs: incoming, localTs: local) == nil)
+        }
+    }
+}
+
+// MARK: - ActionCompactConfig resolve (defaults, legacy migration, range clamp)
+
+@Suite("ActionCompactConfig resolve")
+struct ActionCompactConfigResolveTests {
+    private let epochZero = "1970-01-01T00:00:00.000Z"
+    private var editedTs: String { Date().addingTimeInterval(-86_400).ISO8601Format() }
+
+    @Test("Defaults, range and legacy defaults match TB SETTINGS.actionCompaction and the backend")
+    func pinsSharedConfig() {
+        #expect(PromptStore.defaultActionCompactThreshold == 200)
+        #expect(PromptStore.actionCompactThresholdRange == 100...500)
+        #expect(PromptStore.actionCompactThresholdStep == 10)
+        #expect(PromptStore.defaultActionCompactThresholdChars == 32000)
+        #expect(PromptStore.actionCompactThresholdCharsRange == 16000...80000)
+        #expect(PromptStore.actionCompactThresholdCharsStep == 1000)
+        #expect(PromptStore.legacyDefaultActionCompactThreshold == 100)
+        #expect(PromptStore.legacyDefaultActionCompactThresholdChars == 16000)
+        #expect(ActionCompactConfig.updatedAtKey == "device_sync_ts:actionConfig")
+    }
+
+    @Test("Nothing stored resolves to the defaults")
+    func nothingStored() {
+        for updatedAt in [nil, "", epochZero] {
+            let resolved = ActionCompactConfig.resolve(rules: nil, chars: nil, updatedAt: updatedAt)
+            #expect(resolved.rules == 200)
+            #expect(resolved.chars == 32000)
+        }
+    }
+
+    @Test("Never-edited legacy defaults move to the current defaults, per field")
+    func legacyDefaultsMigrate() {
+        for updatedAt in [nil, "", epochZero] {
+            let both = ActionCompactConfig.resolve(rules: 100, chars: 16000, updatedAt: updatedAt)
+            #expect(both.rules == 200)
+            #expect(both.chars == 32000)
+        }
+        let customRules = ActionCompactConfig.resolve(rules: 300, chars: 16000, updatedAt: epochZero)
+        #expect(customRules.rules == 300)
+        #expect(customRules.chars == 32000)
+        let customChars = ActionCompactConfig.resolve(rules: 100, chars: 40000, updatedAt: epochZero)
+        #expect(customChars.rules == 200)
+        #expect(customChars.chars == 40000)
+    }
+
+    @Test("Values edited since the update are kept even when they equal the legacy defaults")
+    func editedLegacyValuesKept() {
+        let resolved = ActionCompactConfig.resolve(rules: 100, chars: 16000, updatedAt: editedTs)
+        #expect(resolved.rules == 100)
+        #expect(resolved.chars == 16000)
+    }
+
+    @Test("Custom values are clamped into the slider range")
+    func clamped() {
+        let low = ActionCompactConfig.resolve(rules: 40, chars: 6000, updatedAt: epochZero)
+        #expect(low.rules == 100)
+        #expect(low.chars == 16000)
+        let high = ActionCompactConfig.resolve(rules: 900, chars: 200_000, updatedAt: editedTs)
+        #expect(high.rules == 500)
+        #expect(high.chars == 80000)
+        let inRange = ActionCompactConfig.resolve(rules: 350, chars: 24000, updatedAt: editedTs)
+        #expect(inRange.rules == 350)
+        #expect(inRange.chars == 24000)
+    }
+
+    @Test("Non-positive values resolve to the defaults")
+    func nonPositive() {
+        let resolved = ActionCompactConfig.resolve(rules: 0, chars: -5, updatedAt: editedTs)
+        #expect(resolved.rules == 200)
+        #expect(resolved.chars == 32000)
+    }
+}
+
+// MARK: - Effective thresholds, sync apply and sync payload (process-wide UserDefaults)
+
+/// `.serialized`/`.processGlobalState`: these read and write the process-wide
+/// `UserDefaults.standard` threshold keys and the actionConfig sync timestamp,
+/// restored after every test.
+@MainActor
+@Suite("ActionCompactConfig local state and Device Sync round trip", .serialized, .processGlobalState)
+struct ActionCompactConfigLocalStateTests {
+    private let epochZero = "1970-01-01T00:00:00.000Z"
+    private let keys = [PromptStore.actionCompactThresholdKey, PromptStore.actionCompactThresholdCharsKey, ActionCompactConfig.updatedAtKey]
+    private func iso(daysFromNow days: Double) -> String { Date().addingTimeInterval(days * 86_400).ISO8601Format() }
+
+    /// Runs `body` with the given stored values (nil = absent), then restores the previous values.
+    private func withStored(rules: Int?, chars: Int?, updatedAt: String?, _ body: () throws -> Void) rethrows {
+        let defaults = UserDefaults.standard
+        let saved = keys.map { defaults.object(forKey: $0) }
+        defer { for (key, value) in zip(keys, saved) { defaults.set(value, forKey: key) } }
+        for (key, value) in zip(keys, [rules as Any?, chars as Any?, updatedAt as Any?]) { defaults.set(value, forKey: key) }
+        try body()
+    }
+
+    private func storedConfig() -> (rules: Int?, chars: Int?, updatedAt: String?) {
+        let defaults = UserDefaults.standard
+        return (defaults.object(forKey: keys[0]) as? Int, defaults.object(forKey: keys[1]) as? Int, defaults.string(forKey: keys[2]))
+    }
+
+    @Test("local() resolves the stored values against the stored sync timestamp")
+    func localResolvesStoredState() {
+        withStored(rules: nil, chars: nil, updatedAt: nil) {
+            #expect(ActionCompactConfig.local() == ActionCompactConfig(compactThreshold: 200, compactThresholdChars: 32000))
+        }
+        for neverEdited in [nil, epochZero] {
+            withStored(rules: 100, chars: 16000, updatedAt: neverEdited) {
+                #expect(ActionCompactConfig.local() == ActionCompactConfig(compactThreshold: 200, compactThresholdChars: 32000))
+            }
+        }
+        withStored(rules: 100, chars: 16000, updatedAt: iso(daysFromNow: -1)) {
+            #expect(ActionCompactConfig.local() == ActionCompactConfig(compactThreshold: 100, compactThresholdChars: 16000))
+        }
+        withStored(rules: 900, chars: 6000, updatedAt: iso(daysFromNow: -1)) {
+            #expect(ActionCompactConfig.local() == ActionCompactConfig(compactThreshold: 500, compactThresholdChars: 16000))
+        }
+    }
+
+    @Test("A newer peer config becomes this device's effective thresholds with the peer's timestamp")
+    func applyNewerPeerConfig() {
+        let incomingTs = iso(daysFromNow: -1)
+        withStored(rules: 400, chars: 30000, updatedAt: iso(daysFromNow: -2)) {
+            DeviceSyncService.shared.applyIncomingStateWithMerge(PromptStateData(
+                actionConfig: ActionCompactConfig(compactThreshold: 100, compactThresholdChars: 16000),
+                actionConfigUpdatedAt: incomingTs
+            ))
+            let stored = storedConfig()
+            #expect(stored.rules == 100)
+            #expect(stored.chars == 16000)
+            #expect(stored.updatedAt == incomingTs)
+            // Stamped, so a peer's deliberate legacy-default value is not migrated away.
+            #expect(ActionCompactConfig.local() == ActionCompactConfig(compactThreshold: 100, compactThresholdChars: 16000))
+        }
+    }
+
+    @Test("An older, equal, never-edited, untimestamped or malformed peer config changes nothing")
+    func rejectPeerConfig() {
+        let localTs = iso(daysFromNow: -1)
+        let valid = ActionCompactConfig(compactThreshold: 300, compactThresholdChars: 40000)
+        let cases: [PromptStateData] = [
+            PromptStateData(actionConfig: valid, actionConfigUpdatedAt: iso(daysFromNow: -3)),
+            PromptStateData(actionConfig: valid, actionConfigUpdatedAt: localTs),
+            PromptStateData(actionConfig: valid, actionConfigUpdatedAt: epochZero),
+            // The deprecated global updatedAt is never this field's timestamp.
+            PromptStateData(actionConfig: valid, updatedAt: iso(daysFromNow: 0)),
+            PromptStateData(actionConfig: ActionCompactConfig(compactThreshold: nil, compactThresholdChars: 40000), actionConfigUpdatedAt: iso(daysFromNow: 0)),
+            PromptStateData(actionConfig: ActionCompactConfig(compactThreshold: 300, compactThresholdChars: 0), actionConfigUpdatedAt: iso(daysFromNow: 0)),
+        ]
+        for incoming in cases {
+            withStored(rules: 250, chars: 20000, updatedAt: localTs) {
+                DeviceSyncService.shared.applyIncomingStateWithMerge(incoming)
+                let stored = storedConfig()
+                #expect(stored.rules == 250)
+                #expect(stored.chars == 20000)
+                #expect(stored.updatedAt == localTs)
+            }
+        }
+    }
+
+    @Test("Every sync payload carries the effective thresholds and the stored timestamp")
+    func payloadCarriesEffectiveThresholds() {
+        let localTs = iso(daysFromNow: -1)
+        withStored(rules: 350, chars: 90000, updatedAt: localTs) {
+            let single = DeviceSyncService.shared.promptState(for: [.actionConfig])
+            #expect(single.actionConfig == ActionCompactConfig(compactThreshold: 350, compactThresholdChars: 80000))
+            #expect(single.actionConfigUpdatedAt == localTs)
+            #expect(single.composition == nil)
+            #expect(single.compositionUpdatedAt == nil)
+
+            let all = DeviceSyncService.shared.promptState(for: SyncField.allCases)
+            #expect(all.actionConfig == ActionCompactConfig(compactThreshold: 350, compactThresholdChars: 80000))
+            #expect(all.actionConfigUpdatedAt == localTs)
+        }
+        // A never-edited device sends resolved defaults at epoch zero, which no peer accepts.
+        withStored(rules: 100, chars: 16000, updatedAt: nil) {
+            let state = DeviceSyncService.shared.promptState(for: [.actionConfig])
+            #expect(state.actionConfig == ActionCompactConfig(compactThreshold: 200, compactThresholdChars: 32000))
+            #expect(state.actionConfigUpdatedAt == epochZero)
+        }
+        // request_state names map to fields by raw value.
+        #expect(SyncField(rawValue: "actionConfig") == .actionConfig)
     }
 }

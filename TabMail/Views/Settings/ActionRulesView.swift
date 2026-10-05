@@ -65,9 +65,35 @@ struct ActionRulesView: View {
     @State private var listHeight: CGFloat = 600
     @AppStorage(PromptStore.actionCompactThresholdKey) private var actionCompactThreshold = PromptStore.defaultActionCompactThreshold
     @AppStorage(PromptStore.actionCompactThresholdCharsKey) private var actionCompactThresholdChars = PromptStore.defaultActionCompactThresholdChars
+    @AppStorage(ActionCompactConfig.updatedAtKey) private var actionConfigUpdatedAt = ""
+
+    /// What the backend receives: stored values with the legacy-default migration and range clamp.
+    private var effectiveActionConfig: (rules: Int, chars: Int) {
+        ActionCompactConfig.resolve(
+            rules: actionCompactThreshold,
+            chars: actionCompactThresholdChars,
+            updatedAt: actionConfigUpdatedAt
+        )
+    }
 
     // Compaction state lives in the monitor so it survives navigation
     @State private var compaction = ActionCompactionMonitor.shared
+
+    /// A user slider edit is the only local edit of the thresholds; values applied by
+    /// Device Sync write UserDefaults directly and so never echo back. Demo mode keeps
+    /// Device Sync timestamps untouched (ADR-IOS-038).
+    private func broadcastActionConfigEdit() {
+        guard !DemoModeStore.isDemoActive else { return }
+        syncService.debouncedBroadcast(fields: [.actionConfig])
+    }
+
+    /// Persist BOTH effective values: the edit stamps the timestamp, after which stored
+    /// values are read literally.
+    private func setActionConfig(rules: Int, chars: Int) {
+        actionCompactThreshold = rules
+        actionCompactThresholdChars = chars
+        broadcastActionConfigEdit()
+    }
 
     private let syncTip = DeviceSyncTip()
 
@@ -101,33 +127,33 @@ struct ActionRulesView: View {
             Section {
                 Group {
                     Label {
-                        Text("Rules threshold: \(actionCompactThreshold)")
+                        Text("Rules threshold: \(effectiveActionConfig.rules)")
                     } icon: {
                         Image(systemName: "slider.horizontal.3")
                             .foregroundStyle(.primary)
                     }
                     Slider(
                         value: Binding(
-                            get: { Double(actionCompactThreshold) },
-                            set: { actionCompactThreshold = Int($0) }
+                            get: { Double(effectiveActionConfig.rules) },
+                            set: { setActionConfig(rules: Int($0), chars: effectiveActionConfig.chars) }
                         ),
-                        in: 20...500,
-                        step: 10
+                        in: Double(PromptStore.actionCompactThresholdRange.lowerBound)...Double(PromptStore.actionCompactThresholdRange.upperBound),
+                        step: Double(PromptStore.actionCompactThresholdStep)
                     )
 
                     Label {
-                        Text("Size threshold: \(actionCompactThresholdChars) chars")
+                        Text("Size threshold: \(effectiveActionConfig.chars) chars")
                     } icon: {
                         Image(systemName: "text.alignleft")
                             .foregroundStyle(.primary)
                     }
                     Slider(
                         value: Binding(
-                            get: { Double(actionCompactThresholdChars) },
-                            set: { actionCompactThresholdChars = Int($0) }
+                            get: { Double(effectiveActionConfig.chars) },
+                            set: { setActionConfig(rules: effectiveActionConfig.rules, chars: Int($0)) }
                         ),
-                        in: 2000...40000,
-                        step: 1000
+                        in: Double(PromptStore.actionCompactThresholdCharsRange.lowerBound)...Double(PromptStore.actionCompactThresholdCharsRange.upperBound),
+                        step: Double(PromptStore.actionCompactThresholdCharsStep)
                     )
 
                     Button {
