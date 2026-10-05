@@ -394,6 +394,37 @@ final class PromptStore {
         DeviceSyncService.shared.markFieldAsReset(.templates)
     }
 
+    /// A different TabMail account signed in on this device
+    /// (`DeviceSyncService.claimLocalState`): every synced prompt field goes back to its
+    /// default, and the previous account's prompt history and merge bases are dropped. No
+    /// history entry and no broadcast. The real keys are written directly, so this holds
+    /// even if demo mode is active.
+    func resetForNewAccount() {
+        historyDebounceTask?.cancel()
+        historyDebounceTask = nil
+        pendingHistoryFields = []
+        defaults.set(Defaults.composition, forKey: Keys.composition)
+        defaults.set(Defaults.action, forKey: Keys.action)
+        defaults.set(Defaults.kb, forKey: Keys.kb)
+        if let data = try? JSONEncoder().encode(Defaults.templates) {
+            defaults.set(data, forKey: Keys.templates)
+            defaults.set(true, forKey: Keys.templatesInitialized)
+        }
+        for key in [Self.historyKey,
+                    PeerBaseKeys.composition, PeerBaseKeys.action, PeerBaseKeys.kb,
+                    PeerBaseKeys.compositionTs, PeerBaseKeys.actionTs, PeerBaseKeys.kbTs] {
+            defaults.removeObject(forKey: key)
+        }
+        // Demo holds the overlay in memory; the real values above load when it exits.
+        guard !DemoModeStore.isDemoActive else { return }
+        isSyncApplying = true
+        rawComposition = Defaults.composition
+        rawAction = Defaults.action
+        rawKB = Defaults.kb
+        templates = Defaults.templates
+        isSyncApplying = false
+    }
+
     // MARK: - Template CRUD
 
     /// Templates visible to the user (excludes soft-deleted tombstones).

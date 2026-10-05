@@ -351,14 +351,12 @@ private extension AccountDeletionView {
         // 1. Cancel all in-flight AI tasks (prevents stale JWTs from hitting backend)
         await AccountManager.shared.cancelAllAIProcessing()
 
-        // 2. Deactivate the local session. This is the only operation that may
-        // emit sign-out success; a Keychain failure leaves the signed-in state.
+        // 2. Deactivate the local session (which also disconnects Device Sync). This is
+        // the only operation that may emit sign-out success; a Keychain failure leaves
+        // the signed-in state.
         guard TabMailAuthService.completeSession(mode: .deactivate) else {
             return false
         }
-
-        // 3. Disconnect Device Sync after local deactivation is confirmed.
-        DeviceSyncService.shared.disconnect()
 
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[AccountDeletion] Scoped cleanup complete — email accounts and messages preserved")

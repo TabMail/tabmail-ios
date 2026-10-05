@@ -67,6 +67,9 @@ final class TabMailAuthService: NSObject {
                 try sessionStore.deleteAllSessionStorage()
             }
             DebugModeManager.invalidateLoggingCache()
+            // The socket was authenticated as the account that just signed out; `connect()`
+            // reuses a live socket, so leaving it open keeps the next account in this one's room.
+            DeviceSyncService.shared.disconnect()
             if notify {
                 NotificationCenter.default.post(name: .tabMailDidSignOut, object: nil)
             }
@@ -369,6 +372,7 @@ final class TabMailAuthService: NSObject {
         let encoded = try JSONEncoder().encode(session)
         _ = try TabMailSessionStore.shared.installNewSession(encoded)
         AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
+        DeviceSyncService.shared.claimLocalState(for: session.userId)
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
 
@@ -472,6 +476,7 @@ final class TabMailAuthService: NSObject {
         let encoded = try JSONEncoder().encode(session)
         _ = try TabMailSessionStore.shared.installNewSession(encoded)
         AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
+        DeviceSyncService.shared.claimLocalState(for: session.userId)
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
 
@@ -570,6 +575,7 @@ final class TabMailAuthService: NSObject {
         let encoded = try JSONEncoder().encode(session)
         _ = try TabMailSessionStore.shared.installNewSession(encoded)
         AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
+        DeviceSyncService.shared.claimLocalState(for: session.userId)
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
 

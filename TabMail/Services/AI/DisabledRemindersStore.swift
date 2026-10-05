@@ -158,6 +158,14 @@ enum DisabledRemindersStore {
         }
     }
 
+    /// A different TabMail account signed in on this device
+    /// (`DeviceSyncService.claimLocalState`): drop the previous account's map. Real keys
+    /// only; no broadcast.
+    static func removeAllForNewAccount() {
+        defaults.removeObject(forKey: storageKeyV1)
+        defaults.removeObject(forKey: storageKeyV2)
+    }
+
     /// Get set of disabled hashes (entries where enabled == false).
     /// Matches TB's `getDisabledHashes()`.
     static func getDisabledHashes() -> Set<String> {
