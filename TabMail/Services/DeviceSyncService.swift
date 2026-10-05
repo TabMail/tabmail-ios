@@ -475,6 +475,13 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         let fields = pendingBroadcastFields
         pendingBroadcastFields = []
 
+        sendPromptState(promptState(for: Array(fields)), via: ws)
+        BackgroundSyncLogger.logDebug("[DeviceSync] Auto-broadcast \(fields.map(\.rawValue)) to peers")
+    }
+
+    /// This device's current value and per-field timestamp for each of `fields` — the one
+    /// payload builder for auto-broadcasts, `request_state` replies and the connect broadcast.
+    func promptState(for fields: [SyncField]) -> PromptStateData {
         let store = PromptStore.shared
         var state = PromptStateData()
 
@@ -500,9 +507,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 state.actionConfigUpdatedAt = readTimestamp(for: .actionConfig)
             }
         }
-
-        sendPromptState(state, via: ws)
-        BackgroundSyncLogger.logDebug("[DeviceSync] Auto-broadcast \(fields.map(\.rawValue)) to peers")
+        return state
     }
 
     /// Broadcast all fields with per-field timestamps (used on connect).
@@ -519,22 +524,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             return
         }
 
-        let store = PromptStore.shared
-        let state = PromptStateData(
-            composition: store.rawComposition,
-            action: store.rawAction,
-            kb: store.rawKB,
-            templates: store.templates,
-            disabledReminders: DisabledRemindersStore.getDisabledMap(),
-            actionConfig: ActionCompactConfig.local(),
-            compositionUpdatedAt: readTimestamp(for: .composition),
-            actionUpdatedAt: readTimestamp(for: .action),
-            kbUpdatedAt: readTimestamp(for: .kb),
-            templatesUpdatedAt: readTimestamp(for: .templates),
-            disabledRemindersUpdatedAt: readTimestamp(for: .disabledReminders),
-            actionConfigUpdatedAt: readTimestamp(for: .actionConfig)
-        )
-        sendPromptState(state, via: ws)
+        sendPromptState(promptState(for: SyncField.allCases), via: ws)
         BackgroundSyncLogger.logDebug("[DeviceSync] Broadcast all fields on connect")
     }
 
@@ -648,34 +638,10 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
     private func respondToRequestState(fields: [String]?) {
         guard let ws = webSocket else { return }
-        let store = PromptStore.shared
 
         if let fields, !fields.isEmpty {
-            var state = PromptStateData()
-            for field in fields {
-                switch field {
-                case "composition":
-                    state.composition = store.rawComposition
-                    state.compositionUpdatedAt = readTimestamp(for: .composition)
-                case "action":
-                    state.action = store.rawAction
-                    state.actionUpdatedAt = readTimestamp(for: .action)
-                case "kb":
-                    state.kb = store.rawKB
-                    state.kbUpdatedAt = readTimestamp(for: .kb)
-                case "templates":
-                    state.templates = store.templates
-                    state.templatesUpdatedAt = readTimestamp(for: .templates)
-                case "disabledReminders":
-                    state.disabledReminders = DisabledRemindersStore.getDisabledMap()
-                    state.disabledRemindersUpdatedAt = readTimestamp(for: .disabledReminders)
-                case "actionConfig":
-                    state.actionConfig = ActionCompactConfig.local()
-                    state.actionConfigUpdatedAt = readTimestamp(for: .actionConfig)
-                default: break
-                }
-            }
-            sendPromptState(state, via: ws)
+            // Wire field names are the SyncField raw values; unknown names are ignored.
+            sendPromptState(promptState(for: fields.compactMap(SyncField.init(rawValue:))), via: ws)
         } else {
             broadcastAllFields()
         }
@@ -694,7 +660,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     ///
     /// Templates: per-template CRDT merge by id (newer updatedAt wins per template).
     /// DisabledReminders: per-hash CRDT merge (newer ts wins per hash).
-    private func applyIncomingStateWithMerge(_ incoming: PromptStateData) {
+    func applyIncomingStateWithMerge(_ incoming: PromptStateData) {
         let store = PromptStore.shared
 
         // Capture pre-merge snapshot for history (before any merges modify state)
