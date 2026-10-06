@@ -16,8 +16,8 @@ final class DictationChunkUploads {
         let language: String?
         /// The dictionary's words and the context's terms, to spell as given.
         let vocabulary: [String]
-        /// The cleanup's variables.
-        let cleanup: [String: String]
+        /// The cleanup's variables; nil with Smart Dictation off.
+        let cleanup: [String: String]?
     }
 
     /// A transcribed chunk, and whether its audio started inside the one before it.
@@ -88,7 +88,7 @@ final class DictationChunkUploads {
     }
 
     /// The cleanup's variables every chunk went with.
-    func cleanup() async -> [String: String] {
+    func cleanup() async -> [String: String]? {
         await upload.value.cleanup
     }
 

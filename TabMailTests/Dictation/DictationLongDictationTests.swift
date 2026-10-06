@@ -94,7 +94,7 @@ private final class ChunkBackend: Sendable {
         var chunks: [Data] = []
         var attempts: [Int] = []
         var inFlight = 0
-        var cleanups: [[String: String]] = []
+        var cleanups: [[String: String]?] = []
         var languages: [String?] = []
         var vocabularies: [[String]] = []
     }
@@ -111,14 +111,14 @@ private final class ChunkBackend: Sendable {
     var sent: Int { state.withLock { $0.chunks.count } }
     var attempts: [Int] { state.withLock { $0.attempts } }
     var inFlight: Int { state.withLock { $0.inFlight } }
-    var cleanups: [[String: String]] { state.withLock { $0.cleanups } }
+    var cleanups: [[String: String]?] { state.withLock { $0.cleanups } }
     var languages: [String?] { state.withLock { $0.languages } }
     var vocabularies: [[String]] { state.withLock { $0.vocabularies } }
     /// Every request made, retries included.
     var requests: Int { state.withLock { $0.cleanups.count } }
     var chunks: [Data] { state.withLock { $0.chunks } }
 
-    func transcribe(_ flac: Data, language: String? = nil, vocabulary: [String] = [], cleanup: [String: String]) async throws -> DictationTranscription {
+    func transcribe(_ flac: Data, language: String? = nil, vocabulary: [String] = [], cleanup: [String: String]?) async throws -> DictationTranscription {
         let (index, attempt) = state.withLock { state in
             let index = state.chunks.firstIndex(of: flac) ?? {
                 state.chunks.append(flac)
@@ -228,7 +228,8 @@ struct DictationLongDictationTests {
         emailBody: @escaping DictationController.EmailBody = { _ in nil },
         useWords: @escaping @MainActor ([String]) -> Void = { _ in },
         polisher: Polisher = Polisher(),
-        polishTimeout: Duration = .seconds(5)
+        polishTimeout: Duration = .seconds(5),
+        smartDictation: Bool = true
     ) -> DictationController {
         DictationController(
             capture: capture,
@@ -236,6 +237,7 @@ struct DictationLongDictationTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
+            smartDictation: { smartDictation },
             dictionary: { .init(words: words, learnsWords: false) },
             emailBody: emailBody,
             corrections: nil,
@@ -294,7 +296,7 @@ struct DictationLongDictationTests {
         #expect(backend.sent == 3)
         // Each chunk went with the dictation's cleanup.
         #expect(backend.cleanups.count == 3)
-        #expect(backend.cleanups.allSatisfy { $0["window_title"] == "Chat" && $0["screen_text"] == "Me: hi\n» ‸" })
+        #expect(backend.cleanups.allSatisfy { $0?["window_title"] == "Chat" && $0?["screen_text"] == "Me: hi\n» ‸" })
         #expect(!capture.isRunning)
         // Every upload is a chunk, none the whole recording.
         let lengths = backend.chunks.compactMap { try? FLACTestDecoder.decode($0).totalSamples }
@@ -323,6 +325,25 @@ struct DictationLongDictationTests {
         #expect(calls[0].text == "Part 0. Part 1. Part 2.")
         #expect(calls[0].cleanup == backend.cleanups.first)
         #expect(calls[0].cleanup["dictionary"] == "Xyvora")
+    }
+
+    /// Smart Dictation off: no chunk goes with a cleanup, nothing is polished, and the chunks'
+    /// transcripts are pasted joined, as heard.
+    @Test func withSmartDictationOffALongDictationIsPastedAsHeardAndNotPolished() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let polisher = Polisher(.text("Polished."))
+        let controller = controller(capture, backend, polisher: polisher, smartDictation: false)
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 50, 12, 12, 5)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 } == ["raw 0 raw 1 raw 2"])
+        #expect(backend.cleanups.count == 3)
+        #expect(backend.cleanups.allSatisfy { $0 == nil })
+        #expect(polisher.calls.isEmpty)
     }
 
     /// The polish is only if time permits: one that fails, comes back empty or takes longer than
@@ -423,6 +444,7 @@ struct DictationLongDictationTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
+            smartDictation: { true },
             dictionary: { .init(words: [], learnsWords: false) },
             emailBody: { _ in nil },
             corrections: nil,
@@ -464,6 +486,7 @@ struct DictationLongDictationTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
+            smartDictation: { true },
             dictionary: { .init(words: [], learnsWords: false) },
             emailBody: { _ in nil },
             corrections: nil,
