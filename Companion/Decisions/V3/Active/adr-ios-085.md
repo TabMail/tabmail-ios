@@ -349,3 +349,17 @@ always retried: the speech model's rate limit, answered as a 502 until the backe
 itself. A recording tries that 429 again as it did the 502 (`isServerError`); only its 504 is still
 not retried (`backendTimedOut`, formerly `backendWaited`). A long dictation's chunk retries both, as
 before. As TabMail Voice.)*
+
+**Amendment 2026-10-05 — Smart Dictation, a Settings toggle, off by default (owner).** The backend
+cleanup costs about a second per dictation (measured 0.4–1.8 s on Groq, 2026-10-05). Owner: "default
+off, but an option to have that cleanup on", a toggle in TabMail Settings just below Dictation Language,
+"allow AI to clean up your dictations", with a warning about the delay; the same in TabMail Voice
+(ADR-DESK-008 amendment). `SmartDictation` (UserDefaults `smartDictation`, default false) is read once
+when the dictation starts, with the language (the settings snapshot rule). Off, the recording carries
+no `cleanup`, so the backend runs none, and the transcript is appended as heard; a long dictation's
+chunks carry none either and it is not polished (ADR-IOS-087). On, everything is as before. Released
+builds keep sending the cleanup; the backend had it switched off (`cleanup.enabled` false, backend
+ADR-027 amendment, 2026-10-05) and turns it back on once clients with this toggle ship.
+- Tests: `DictationControllerTests.withSmartDictationOffTheTranscriptIsAppendedAsHeardWithNoCleanupSent`,
+  `smartDictationIsReadWhenTheDictationStarts`, `smartDictationIsOffUntilTurnedOn`, and
+  `DictationLongDictationTests.withSmartDictationOffALongDictationIsPastedAsHeardAndNotPolished`.

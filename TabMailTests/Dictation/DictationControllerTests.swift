@@ -109,8 +109,8 @@ private final class Recorded: Sendable {
     let languages = Mutex<[String?]>([])
     /// The words sent to spell as given with each upload (ADR-IOS-086).
     let vocabularies = Mutex<[[String]]>([])
-    /// The cleanup's variables sent with each upload (backend ADR-027).
-    let cleanups = Mutex<[[String: String]]>([])
+    /// The cleanup's variables sent with each upload (backend ADR-027); nil: no cleanup sent.
+    let cleanups = Mutex<[[String: String]?]>([])
     let texts = Mutex<[String]>([])
     /// The texts each dictation marked the dictionary's words used in (`DictationDictionary.use`).
     let used = Mutex<[[String]]>([])
@@ -244,6 +244,7 @@ struct DictationControllerTests {
         online: Bool = true,
         optedOut: @escaping @MainActor () -> Bool = { false },
         language: @escaping @MainActor () -> String? = { nil },
+        smartDictation: Bool = true,
         microphoneAccess: @escaping @MainActor () async -> Bool = { true },
         transcript: @escaping @Sendable () async throws -> String = { "ask jordan about the road map" },
         /// The backend's `cleaned_text`: `""` when its cleanup failed, nil from a backend without it.
@@ -264,6 +265,7 @@ struct DictationControllerTests {
             isOnline: { online },
             isOptedOutOfAI: optedOut,
             dictationLanguage: language,
+            smartDictation: { smartDictation },
             dictionary: dictionary,
             emailBody: emailBody,
             corrections: corrections,
@@ -329,6 +331,64 @@ struct DictationControllerTests {
             "screen_text": "Me: hi\n» ‸",
             "dictionary": "",
         ]])
+    }
+
+    /// Smart Dictation off (Settings, the default): the recording goes with no cleanup, and the
+    /// transcript is appended as heard, whatever the backend answers as `cleaned_text`.
+    @Test func withSmartDictationOffTheTranscriptIsAppendedAsHeardWithNoCleanupSent() async {
+        let capture = FakeCapture()
+        let controller = controller(capture: capture, smartDictation: false)
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase == .idle }
+
+        #expect(recorded.texts.withLock { $0 } == ["ask jordan about the road map"])
+        #expect(recorded.cleanups.withLock { $0 } == [nil])
+    }
+
+    /// The setting is read once when the dictation starts: turned on mid-dictation, it applies from
+    /// the next one (the settings snapshot rule).
+    @Test func smartDictationIsReadWhenTheDictationStarts() async {
+        let capture = FakeCapture()
+        let smart = Mutex(false)
+        let recorded = recorded
+        let controller = DictationController(
+            capture: capture,
+            requestMicrophoneAccess: { true },
+            isOnline: { true },
+            isOptedOutOfAI: { false },
+            dictationLanguage: { nil },
+            smartDictation: { smart.withLock { $0 } },
+            transcribe: { _, _, _, cleanup in
+                recorded.cleanups.withLock { $0.append(cleanup) }
+                return DictationTranscription(text: "ask jordan", cleanedText: "Ask Jordan.")
+            },
+            warmUp: {},
+            speechDetector: FakeSpeechDetector.hearing()
+        )
+
+        await dictate(controller, capture: capture)
+        smart.withLock { $0 = true }
+        await waitUntil { controller.phase == .idle }
+        #expect(recorded.texts.withLock { $0 } == ["ask jordan"])
+        #expect(recorded.cleanups.withLock { $0 } == [nil])
+
+        controller.start(context: context, canUseAI: true) { text in recorded.texts.withLock { $0.append(text) } }
+        await waitUntil { capture.starts == 2 }
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+        #expect(recorded.texts.withLock { $0 } == ["ask jordan", "Ask Jordan."])
+        #expect(recorded.cleanups.withLock { $0.map { $0 != nil } } == [false, true])
+    }
+
+    /// The stored choice reads as off until set, then as set.
+    @Test func smartDictationIsOffUntilTurnedOn() throws {
+        let defaults = try #require(UserDefaults(suiteName: "SmartDictationTests-\(UUID().uuidString)"))
+        #expect(!SmartDictation.isOn(defaults: defaults))
+        defaults.set(true, forKey: SmartDictation.settingKey)
+        #expect(SmartDictation.isOn(defaults: defaults))
+        defaults.set(false, forKey: SmartDictation.settingKey)
+        #expect(!SmartDictation.isOn(defaults: defaults))
     }
 
     /// Dictation is transcribed on the backend: offline, nothing is recorded.
@@ -1040,6 +1100,7 @@ struct DictationControllerTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
+            smartDictation: { true },
             transcribe: { flac, _, _, _ in
                 recorded.uploads.withLock { $0.append(flac) }
                 return DictationTranscription(text: "a long dictation", cleanedText: "A long dictation.")
@@ -1326,7 +1387,7 @@ struct DictationControllerTests {
         // A dictionary word in the context is sent once.
         #expect(vocabulary.count == 3)
         #expect(Set(vocabulary) == ["Xyvora", "Kaelthorne Drake", "Brevalle Labs"])
-        #expect(recorded.cleanups.withLock { $0.first?["dictionary"] } == "Xyvora")
+        #expect(recorded.cleanups.withLock { $0.first??["dictionary"] } == "Xyvora")
     }
 
     /// An email of more terms than the backend takes: the dictionary whole, then the context's
@@ -1361,7 +1422,7 @@ struct DictationControllerTests {
         await dictate(controller, capture: capture, context: context)
 
         #expect(recorded.vocabularies.withLock { $0 } == [[]])
-        #expect(recorded.cleanups.withLock { $0.first?["dictionary"] } == "")
+        #expect(recorded.cleanups.withLock { $0.first??["dictionary"] } == "")
     }
 
     /// The dictionary is read when the dictation starts: a word added meanwhile goes with the next.
@@ -1678,6 +1739,20 @@ struct DictationOptOutFlagTests {
         #expect(controller.contains("useWords: @escaping @MainActor ([String]) -> Void = { DictationDictionary.shared.use($0) },"))
     }
 
+    /// Settings' Smart Dictation toggle writes the key the app's controller reads, off by default.
+    @Test func theSmartDictationToggleIsWired() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let controller = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationController.swift"), encoding: .utf8)
+        #expect(controller.contains("smartDictation: @escaping @MainActor () -> Bool = { SmartDictation.isOn() },"))
+        let settings = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Settings/TabMailSettingsView.swift"), encoding: .utf8)
+        #expect(settings.contains("@AppStorage(SmartDictation.settingKey) private var smartDictation = SmartDictation.defaultValue"))
+        #expect(settings.contains("Toggle(isOn: $smartDictation)"))
+        #expect(!SmartDictation.defaultValue)
+    }
+
     /// The Settings menu writes the key the controller reads, the waveform shows no language, and
     /// the mic points to the menu once a dictation has landed.
     @Test func theLanguageMenuAndItsTipAreWired() throws {
@@ -1759,6 +1834,7 @@ struct DictationWaveformTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
+            smartDictation: { true },
             transcribe: { _, _, _, _ in try await Task.sleep(for: .seconds(60)); return DictationTranscription(text: "", cleanedText: nil) },
             warmUp: {},
             speechDetector: FakeSpeechDetector.hearing()
@@ -1800,6 +1876,7 @@ struct DictationWaveformTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
+            smartDictation: { true },
             transcribe: { _, _, _, _ in throw DictationError(status: 502, code: "transcription_failed") },
             warmUp: {},
             transcriptionRetryDelays: [.seconds(60)],
@@ -1864,6 +1941,7 @@ struct DictationLanguageSettingTests {
                 requestMicrophoneAccess: { true },
                 isOnline: { true },
                 isOptedOutOfAI: { false },
+                smartDictation: { true },
                 transcribe: { _, language, _, _ in
                     languages.withLock { $0.append(language) }
                     return DictationTranscription(text: "annyeong", cleanedText: "Annyeong.")
@@ -1908,6 +1986,7 @@ struct DictationLanguageSettingTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
+            smartDictation: { true },
             transcribe: DictationController.backendTranscription(BackendClient(llmSession: http.session)),
             warmUp: {},
             speechDetector: FakeSpeechDetector.hearing()
@@ -1947,6 +2026,51 @@ struct DictationLanguageSettingTests {
             stored.wrappedValue = DictationLanguage.automatic
             #expect(DictationLanguage.current() == DictationLanguage.code(forPreferredLanguages: Locale.preferredLanguages))
         }
+    }
+
+    /// The app's controller (no `smartDictation:` injected) reads Settings' toggle as `@AppStorage`
+    /// stores it: never set, no cleanup is sent; turned on, the next dictation sends it.
+    @Test func theStoredSmartDictationChoiceDecidesTheCleanup() async {
+        let defaults = UserDefaults.standard
+        let previous = defaults.object(forKey: SmartDictation.settingKey)
+        defaults.removeObject(forKey: SmartDictation.settingKey)
+        defer {
+            if let previous { defaults.set(previous, forKey: SmartDictation.settingKey) } else { defaults.removeObject(forKey: SmartDictation.settingKey) }
+        }
+        let capture = FakeCapture()
+        let cleanups = Mutex<[[String: String]?]>([])
+        let controller = DictationController(
+            capture: capture,
+            requestMicrophoneAccess: { true },
+            isOnline: { true },
+            isOptedOutOfAI: { false },
+            dictationLanguage: { nil },
+            dictionary: { .init(words: [], learnsWords: false) },
+            corrections: nil,
+            useWords: { _ in },
+            transcribe: { _, _, _, cleanup in
+                cleanups.withLock { $0.append(cleanup) }
+                return DictationTranscription(text: "ask jordan", cleanedText: "Ask Jordan.")
+            },
+            warmUp: {},
+            speechDetector: FakeSpeechDetector.hearing()
+        )
+        let dictate = {
+            controller.start(context: DictationContext(windowTitle: "Chat", screenText: "» ‸"), canUseAI: true) { _ in }
+            let starts = capture.starts
+            let deadline = ContinuousClock.now + .seconds(5)
+            while capture.starts == starts, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+            controller.finish()
+            while controller.phase != .idle, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+        }
+
+        let stored = AppStorage(wrappedValue: SmartDictation.defaultValue, SmartDictation.settingKey)
+        #expect(!stored.wrappedValue)
+        await dictate()
+        stored.wrappedValue = true
+        await dictate()
+
+        #expect(cleanups.withLock { $0.map { $0 != nil } } == [false, true])
     }
 
     @Test func automaticIsTheIPhonesLanguage() async {

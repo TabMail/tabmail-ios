@@ -30,6 +30,10 @@ final class DictationController {
     /// The language this dictation is transcribed in, read once when it starts: a Settings change
     /// mid-dictation applies to the next one (`DictationLanguage`). Nil: none sent.
     private(set) var language: String?
+    /// Settings' "Smart Dictation", read once when the dictation starts (`SmartDictation`): on, the
+    /// backend cleans up the transcript and a long dictation is polished; off, the transcript is
+    /// appended as heard, with no cleanup sent.
+    @ObservationIgnored private var cleansUp = false
     /// The transcription failed on the server's side and is being tried again: the spinner turns
     /// toward purple at once (owner, 2026-10-02).
     private(set) var isRetrying = false
@@ -42,9 +46,9 @@ final class DictationController {
     /// Recording or transcribing: the microphone button stops (or waits for) this dictation.
     var isActive: Bool { phase == .listening || phase == .transcribing }
 
-    /// The recording (FLAC), its language, the words to spell as given and the cleanup's variables →
-    /// the transcript and its cleaned-up text.
-    typealias Transcribe = @Sendable (Data, String?, [String], [String: String]) async throws -> DictationTranscription
+    /// The recording (FLAC), its language, the words to spell as given and the cleanup's variables
+    /// (nil: no cleanup, Smart Dictation off) → the transcript and its cleaned-up text.
+    typealias Transcribe = @Sendable (Data, String?, [String], [String: String]?) async throws -> DictationTranscription
     /// Runs the cleanup prompt over a long dictation's joined text, with the cleanup's variables, and
     /// returns its reply (`BackendClient.sendCompletionsDirect`).
     typealias Polish = @Sendable (String, [String: String]) async throws -> String
@@ -64,6 +68,7 @@ final class DictationController {
     @ObservationIgnored private let isOnline: @MainActor () -> Bool
     @ObservationIgnored private let isOptedOutOfAI: @MainActor () -> Bool
     @ObservationIgnored private let dictationLanguage: @MainActor () -> String?
+    @ObservationIgnored private let smartDictation: @MainActor () -> Bool
     @ObservationIgnored private let dictionary: @MainActor () -> DictationDictionary.Snapshot
     @ObservationIgnored private let emailBody: EmailBody
     @ObservationIgnored private let corrections: DictationCorrectionWatch?
@@ -109,6 +114,7 @@ final class DictationController {
         // Settings' "Opt Out of AI" (also set by declining AI consent), as every AI call reads it.
         isOptedOutOfAI: @escaping @MainActor () -> Bool = { AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey) },
         dictationLanguage: @escaping @MainActor () -> String? = { DictationLanguage.current() },
+        smartDictation: @escaping @MainActor () -> Bool = { SmartDictation.isOn() },
         dictionary: @escaping @MainActor () -> DictationDictionary.Snapshot = { DictationDictionary.shared.snapshot },
         emailBody: @escaping EmailBody = { await DictationController.storedEmailBody(headerId: $0) },
         corrections: DictationCorrectionWatch? = DictationCorrectionWatch { DictationDictionary.shared.learn($0) },
@@ -128,6 +134,7 @@ final class DictationController {
         self.isOnline = isOnline
         self.isOptedOutOfAI = isOptedOutOfAI
         self.dictationLanguage = dictationLanguage
+        self.smartDictation = smartDictation
         self.dictionary = dictionary
         self.emailBody = emailBody
         self.corrections = corrections
@@ -213,6 +220,7 @@ final class DictationController {
         level = 0
         hasHeardSpeech = false
         language = dictationLanguage()
+        cleansUp = smartDictation()
         phase = .listening
         // Best effort, never waited for: the dictation goes on whatever it answers.
         let warmUp = warmUp
@@ -228,7 +236,7 @@ final class DictationController {
             }
             self.beginRecording(generation: current)
         }
-        BackgroundSyncLogger.logDebug("[Dictation] listening (generation \(current), language \(language ?? "none"))")
+        BackgroundSyncLogger.logDebug("[Dictation] listening (generation \(current), language \(language ?? "none"), smart dictation \(cleansUp ? "on" : "off"))")
     }
 
     /// The search index's key for the email `headerId`: the one the content stores write its body
@@ -334,7 +342,7 @@ final class DictationController {
         let words = dictionaryWords
         let language = language
         let termsTask = termsTask
-        let cleanup = DictationCleanup.variables(context: context ?? DictationContext(windowTitle: "", screenText: ""), dictionary: words)
+        let cleanup = cleanupVariables(words: words)
         let uploads = DictationChunkUploads(
             transcribe: transcribeAudio,
             upload: Task { DictationChunkUploads.Upload(language: language, vocabulary: words + (await Self.terms(from: termsTask)), cleanup: cleanup) },
@@ -425,7 +433,7 @@ final class DictationController {
         let words = dictionaryWords
         let terms = await contextTerms()
         guard generation == current, !Task.isCancelled else { return }
-        let cleanup = DictationCleanup.variables(context: context ?? DictationContext(windowTitle: "", screenText: ""), dictionary: words)
+        let cleanup = cleanupVariables(words: words)
         BackgroundSyncLogger.logDebug("[Dictation] uploading \(flac.count) bytes of FLAC, \(words.count) dictionary word(s), \(terms.count) term(s)")
         do {
             let transcription = try await transcribeRetrying(flac, language, words + terms, cleanup, generation: current)
@@ -437,7 +445,7 @@ final class DictationController {
                 return
             }
             useWords([transcript] + [transcription.cleanedText].compactMap { $0 })
-            deliver(DictationCleanup.pasted(transcript: transcript, cleanedText: transcription.cleanedText))
+            deliver(cleanup == nil ? transcript : DictationCleanup.pasted(transcript: transcript, cleanedText: transcription.cleanedText))
         } catch {
             guard generation == current, !Task.isCancelled else { return }
             BackgroundSyncLogger.logDebug("[Dictation] transcription failed: \(error)")
@@ -474,9 +482,15 @@ final class DictationController {
             return
         }
         useWords(heard.flatMap { [$0.text] + [$0.cleanedText].compactMap { $0 } })
-        let joined = DictationChunkJoin.join(texts.map { .init(text: $0.text.isEmpty ? "" : DictationCleanup.pasted(transcript: $0.text, cleanedText: $0.cleanedText), overlapped: $0.overlapped) })
-        // One chunk already had its whole cleanup.
-        let text = parts.count > 1 ? await polished(joined, cleanup: await uploads.cleanup()) : joined
+        let cleanup = await uploads.cleanup()
+        let joined = DictationChunkJoin.join(texts.map { .init(text: $0.text.isEmpty || cleanup == nil ? $0.text : DictationCleanup.pasted(transcript: $0.text, cleanedText: $0.cleanedText), overlapped: $0.overlapped) })
+        // One chunk already had its whole cleanup; with Smart Dictation off nothing is cleaned up.
+        let text: String
+        if parts.count > 1, let cleanup {
+            text = await polished(joined, cleanup: cleanup)
+        } else {
+            text = joined
+        }
         guard generation == current, !Task.isCancelled else { return }
         deliver(text)
     }
@@ -508,6 +522,12 @@ final class DictationController {
         }
     }
 
+    /// The cleanup's variables for this dictation, or nil with Smart Dictation off: no cleanup sent.
+    private func cleanupVariables(words: [String]) -> [String: String]? {
+        guard cleansUp else { return nil }
+        return DictationCleanup.variables(context: context ?? DictationContext(windowTitle: "", screenText: ""), dictionary: words)
+    }
+
     /// Ends the dictation with its text, appended to the input field.
     private func deliver(_ text: String) {
         let deliver = onText
@@ -525,7 +545,7 @@ final class DictationController {
     /// that has gone on for `transcriptionRetryNoticeDelay`. Any other failure (signed out, over quota, a refused request, a timeout) fails at
     /// once. As TabMail Voice's `transcribeRetrying` (ADR-DESK-039).
     private func transcribeRetrying(
-        _ flac: Data, _ language: String?, _ vocabulary: [String], _ cleanup: [String: String], generation current: Int
+        _ flac: Data, _ language: String?, _ vocabulary: [String], _ cleanup: [String: String]?, generation current: Int
     ) async throws -> DictationTranscription {
         var retry = 0
         while true {

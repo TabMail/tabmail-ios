@@ -13,6 +13,7 @@ struct TabMailSettingsView: View {
     @AppStorage(ChatPillState.maxMemoryTurnsKey) private var maxMemoryTurns = ChatPillState.defaultMaxMemoryTurns
     @AppStorage(ChatPillState.autoDictationKey) private var autoDictation = false
     @AppStorage(DictationLanguage.settingKey) private var dictationLanguage = DictationLanguage.automatic
+    @AppStorage(SmartDictation.settingKey) private var smartDictation = SmartDictation.defaultValue
     @AppStorage(AccountManager.markReadOnArchiveDeleteKey) private var markReadOnArchiveDelete = true
     @AppStorage(SummaryBubbleView.showAISummariesKey) private var showAISummaries = true
     @AppStorage(ProactiveNotifyService.enabledKey) private var proactiveEnabled = true
@@ -315,6 +316,20 @@ struct TabMailSettingsView: View {
                 .pickerStyle(.menu)
                 .onChange(of: dictationLanguage) {
                     DictationLanguageTip().invalidate(reason: .actionPerformed)
+                }
+
+                Toggle(isOn: $smartDictation) {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Smart Dictation")
+                            Text("Allow AI to clean up your dictations. Adds about a 1-second delay.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "sparkles")
+                            .foregroundStyle(.primary)
+                    }
                 }
 
                 Toggle(isOn: $markReadOnArchiveDelete) {
