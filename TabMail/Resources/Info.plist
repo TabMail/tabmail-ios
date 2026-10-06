@@ -79,7 +79,7 @@
 	<key>NSCameraUsageDescription</key>
 	<string>TabMail uses the camera to capture photos for email attachments.</string>
 	<key>NSContactsUsageDescription</key>
-	<string>TabMail uses your contacts to suggest recipients when composing emails.</string>
+	<string>TabMail uses your contacts to suggest recipients as you write emails; this stays on your device. If AI features are on and you ask the AI assistant to find, add or edit a contact, the names and email addresses of the matching contacts are sent to TabMail's server and its AI providers to answer your request. They aren't stored or used to train AI models.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>TabMail uses the microphone for voice dictation in the chat assistant. Your recording is sent to TabMail to be transcribed; TabMail doesn't store it.</string>
 	<key>TabMailProtocolVersion</key>

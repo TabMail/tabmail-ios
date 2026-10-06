@@ -37,7 +37,7 @@ struct AIConsentView: View {
 
                 VStack(alignment: .leading, spacing: 10) {
                     Label {
-                        Text("**Data sent:** email subject, body, sender, and calendar events. When using the AI chat assistant, contact names may also be included as context. When you dictate: your voice recording, the words in your dictation dictionary, and context about what you're working on, such as the email you're viewing.")
+                        Text("**Data sent:** email subject, body, sender, and calendar events. When you ask the AI chat assistant about your contacts: the names and email addresses of the matching contacts from your device. When you dictate: your voice recording, the words in your dictation dictionary, and context about what you're working on, such as the email you're viewing.")
                     } icon: {
                         Image(systemName: "doc.text")
                     }

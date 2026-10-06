@@ -18,6 +18,9 @@ struct ContactContainerPickerView: View {
                 Text("Choose which contact account the TabMail AI agent will use when adding new contacts on your behalf.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                Text("When you ask the AI agent to find, add or edit a contact, the names and email addresses of the matching contacts are sent to TabMail's server and its AI providers to answer your request. They aren't stored or used to train AI models. Recipient suggestions while you write stay on your device.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
 
             if permissionDenied {
