@@ -49,6 +49,19 @@ struct DictationDictionaryTests {
         #expect(dictionary.snapshot.words == ["xyvora", "TabMail", "Brevalle", "Zorblax", "Kaelthorne Drake"])
     }
 
+    /// Words used at once (learned in one correction, or in one dictation's text) keep their stored
+    /// order when sent, whichever way round they were stored.
+    @Test(arguments: [
+        (["Brevalle", "Zorblax"], ["Xyvora", "Brevalle", "Zorblax"]),
+        (["Zorblax", "Brevalle"], ["Xyvora", "Zorblax", "Brevalle"]),
+    ])
+    func sendsWordsUsedAtOnceInTheirStoredOrder(learned: [String], sent: [String]) {
+        let dictionary = DictationDictionary(defaults: defaults)
+        dictionary.learn(learned)
+        dictionary.add("Xyvora")
+        #expect(dictionary.snapshot.words == sent)
+    }
+
     @Test func aWordAlreadyThereIsNotAddedTwiceWhateverItsCase() {
         let dictionary = DictationDictionary(defaults: defaults)
         dictionary.add("Xyvora")
