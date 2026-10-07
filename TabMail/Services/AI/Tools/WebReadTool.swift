@@ -6,14 +6,14 @@ import Foundation
 
 /// Client-side `web_read` tool matching TB addon's `web_read.js`.
 /// Fetches a URL, extracts text content from HTML, and returns it for LLM consumption.
-/// Respects robots.txt and standard web etiquette.
+/// It reads one page the user asked for, as a browser does, so robots.txt (written for crawlers,
+/// RFC 9309) is not consulted; the User-Agent names TabMail so a site can tell it apart.
 /// Registered in `ToolRegistry` at app startup.
 struct WebReadTool: AgentTool, Sendable {
     let name = "web_read"
 
     private enum Config {
         static let timeoutSeconds: TimeInterval = 30
-        static let robotsTimeoutSeconds: TimeInterval = 5
         static let maxContentLength = 500_000 // 500KB max
         static let userAgent = "TabMail/1.0 (iOS; +https://tabmail.app)"
     }
@@ -31,13 +31,6 @@ struct WebReadTool: AgentTool, Sendable {
         }
 
         BackgroundSyncLogger.logDebug("[WebReadTool] Starting fetch for \(urlString)")
-
-        // Check robots.txt
-        let robotsAllowed = await checkRobotsTxt(url: url)
-        if !robotsAllowed {
-            BackgroundSyncLogger.logDebug("[WebReadTool] Access disallowed by robots.txt")
-            return #"{"error": "Access to this URL is disallowed by the site's robots.txt"}"#
-        }
 
         // Fetch the content
         let (data, response): (Data, URLResponse)
@@ -91,86 +84,6 @@ struct WebReadTool: AgentTool, Sendable {
         lines.append(text)
 
         return lines.joined(separator: "\n")
-    }
-
-    // MARK: - Robots.txt
-
-    private func checkRobotsTxt(url: URL) async -> Bool {
-        guard let host = url.host, let scheme = url.scheme else { return true }
-
-        // Include port if non-standard (matches TB's urlObj.host which includes port)
-        let hostWithPort: String
-        if let port = url.port {
-            hostWithPort = "\(host):\(port)"
-        } else {
-            hostWithPort = host
-        }
-
-        let robotsURLString = "\(scheme)://\(hostWithPort)/robots.txt"
-        guard let robotsURL = URL(string: robotsURLString) else { return true }
-
-        do {
-            var request = URLRequest(url: robotsURL, timeoutInterval: Config.robotsTimeoutSeconds)
-            request.setValue(Config.userAgent, forHTTPHeaderField: "User-Agent")
-            let (data, response) = try await sharedEphemeralSession.data(for: request)
-
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200,
-                  let robotsTxt = String(data: data, encoding: .utf8) else {
-                // No robots.txt or error → assume allowed
-                return true
-            }
-
-            // url.path returns "" for root URLs; TB's pathname returns "/"
-            let path = url.path.isEmpty ? "/" : url.path
-            return Self.isPathAllowed(robotsTxt: robotsTxt, path: path, userAgent: Config.userAgent)
-        } catch {
-            // On error, be conservative and allow
-            BackgroundSyncLogger.logDebug("[WebReadTool] robots.txt check failed: \(error), assuming allowed")
-            return true
-        }
-    }
-
-    /// Parse robots.txt and check if the path is allowed. Matches TB's `isPathAllowedByRobots`.
-    static func isPathAllowed(robotsTxt: String, path: String, userAgent: String) -> Bool {
-        let lines = robotsTxt.components(separatedBy: "\n")
-        var currentAgent: String?
-        var disallowRules: [String] = []
-        var allowRules: [String] = []
-
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
-
-            let lower = trimmed.lowercased()
-            if lower.hasPrefix("user-agent:") {
-                let agent = String(trimmed.dropFirst(11)).trimmingCharacters(in: .whitespaces)
-                currentAgent = agent
-                if agent != "*" && agent != userAgent {
-                    disallowRules = []
-                    allowRules = []
-                }
-            } else if currentAgent == "*" || currentAgent == userAgent {
-                if lower.hasPrefix("disallow:") {
-                    let rule = String(trimmed.dropFirst(9)).trimmingCharacters(in: .whitespaces)
-                    if !rule.isEmpty { disallowRules.append(rule) }
-                } else if lower.hasPrefix("allow:") {
-                    let rule = String(trimmed.dropFirst(6)).trimmingCharacters(in: .whitespaces)
-                    if !rule.isEmpty { allowRules.append(rule) }
-                }
-            }
-        }
-
-        // Allow rules take precedence
-        for rule in allowRules {
-            if path.hasPrefix(rule) { return true }
-        }
-
-        for rule in disallowRules {
-            if path.hasPrefix(rule) { return false }
-        }
-
-        return true
     }
 
     // MARK: - HTML Text Extraction
