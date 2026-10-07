@@ -133,3 +133,11 @@ to 200 words whatever the dictionary holds: all 200 from the context with no dic
 beside a full one (`dictionaryMaxEntries` stays 150, all of it always sent, first).
 - Consequence: an email with many names sends a longer list than before; the measured 200 real words
   or names did not blunt the speech model, and an email with fewer sends just those.
+
+**Amendment 2026-10-07 — the words go out most important first.** Owner: the transcriber behind a
+language will keep changing and each takes a different number of words, so the backend cuts the list
+to what the model takes, keeping the first ones (backend ADR-025 amendment 2026-10-07; AssemblyAI
+takes 100). `DictationDictionary.snapshot` now gives the typed words, then the learned, each most
+recently used first (the stored order for a tie); the context's terms follow, most frequent first, as
+before. Same order as TabMail Voice (ADR-DESK-038 amendment of the same date). The cleanup's
+`dictionary` gets the same order; Settings' list and the stored order are unchanged.

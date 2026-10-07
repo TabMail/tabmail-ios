@@ -33,6 +33,35 @@ struct DictationDictionaryTests {
         #expect(relaunched.snapshot == .init(words: ["Xyvora", "Kaelthorne Drake"], learnsWords: false))
     }
 
+    /// Owner, 2026-10-07: a dictation sends the words most important first, since the backend gives
+    /// a model that takes fewer the first ones (its ADR-025): the typed, then the learned, each most
+    /// recently used first. Settings and the stored order are unchanged.
+    @Test func sendsTheTypedWordsThenTheLearnedEachMostRecentlyUsedFirst() {
+        let dictionary = DictationDictionary(defaults: defaults)
+        dictionary.learn(["Brevalle"])
+        dictionary.add("Xyvora")
+        dictionary.learn(["Kaelthorne Drake"])
+        dictionary.add("TabMail")
+        dictionary.learn(["Zorblax"])
+        dictionary.use(["a note on Brevalle"])
+        dictionary.add("xyvora")
+        #expect(dictionary.entries.map(\.word) == ["Brevalle", "xyvora", "Kaelthorne Drake", "TabMail", "Zorblax"])
+        #expect(dictionary.snapshot.words == ["xyvora", "TabMail", "Brevalle", "Zorblax", "Kaelthorne Drake"])
+    }
+
+    /// Words used at once (learned in one correction, or in one dictation's text) keep their stored
+    /// order when sent, whichever way round they were stored.
+    @Test(arguments: [
+        (["Brevalle", "Zorblax"], ["Xyvora", "Brevalle", "Zorblax"]),
+        (["Zorblax", "Brevalle"], ["Xyvora", "Zorblax", "Brevalle"]),
+    ])
+    func sendsWordsUsedAtOnceInTheirStoredOrder(learned: [String], sent: [String]) {
+        let dictionary = DictationDictionary(defaults: defaults)
+        dictionary.learn(learned)
+        dictionary.add("Xyvora")
+        #expect(dictionary.snapshot.words == sent)
+    }
+
     @Test func aWordAlreadyThereIsNotAddedTwiceWhateverItsCase() {
         let dictionary = DictationDictionary(defaults: defaults)
         dictionary.add("Xyvora")
