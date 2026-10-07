@@ -69,8 +69,16 @@ final class DictationDictionary {
         learnsWords = defaults.object(forKey: Self.learnsWordsKey) as? Bool ?? true
     }
 
+    /// The words go most important first, since the backend gives a model that takes fewer the first
+    /// ones (its ADR-025): the typed, then the learned, each most recently used first (the stored
+    /// order for a tie).
     var snapshot: Snapshot {
-        Snapshot(words: entries.map(\.word), learnsWords: learnsWords)
+        let words = entries.enumerated().sorted { first, second in
+            if first.element.learned != second.element.learned { return !first.element.learned }
+            if first.element.lastUsed != second.element.lastUsed { return first.element.lastUsed > second.element.lastUsed }
+            return first.offset < second.offset
+        }.map(\.element.word)
+        return Snapshot(words: words, learnsWords: learnsWords)
     }
 
     /// Adds a typed word, refused (`full`) at `dictionaryMaxTypedWords` typed words. One already
