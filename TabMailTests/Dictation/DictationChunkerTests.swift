@@ -6,7 +6,9 @@ import Foundation
 import Testing
 @testable import TabMail
 
-/// Ported from TabMail Voice's `Chunker` tests with the chunker itself (ADR-IOS-087).
+/// Ported from TabMail Voice's `Chunker` tests with the chunker itself (ADR-IOS-087). Pause cuts are
+/// off as shipped (owner, 2026-10-07) and kept for a later look: the tests of that rule turn them on,
+/// and the `asShipped…` tests run the chunker as the app builds it.
 struct DictationChunkerTests {
     private typealias Audio = DictationTestAudio
     private let rate = DictationTestAudio.rate
@@ -25,8 +27,9 @@ struct DictationChunkerTests {
     }
 
     /// Feeds `audio` in the microphone's buffers, as the recorder does; returns every cut and the last.
-    private func chunk(_ audio: [Int16], step: Int = Int(DictationConfig.audioTapBufferSize)) -> (cuts: [DictationChunkCut], last: DictationChunkCut?) {
-        let chunker = DictationChunker()
+    /// `cutsAtPauses` nil runs the chunker as shipped.
+    private func chunk(_ audio: [Int16], step: Int = Int(DictationConfig.audioTapBufferSize), cutsAtPauses: Bool? = true) -> (cuts: [DictationChunkCut], last: DictationChunkCut?) {
+        let chunker = cutsAtPauses.map { DictationChunker(cutsAtPauses: $0) } ?? DictationChunker()
         var cuts: [DictationChunkCut] = []
         audio.withUnsafeBufferPointer { all in
             for offset in stride(from: 0, to: all.count, by: step) {
@@ -212,6 +215,14 @@ struct DictationChunkerTests {
     /// random lengths and loudness: the chunks always cover the recording within the maximum length.
     @Test(arguments: UInt32(100)..<UInt32(108))
     func randomDictationsAreAlwaysCoveredWithinTheMaximumLength(seed: UInt32) {
+        let audio = randomDictation(seed: seed)
+        let (cuts, last) = chunk(audio)
+        expectCovers(audio, cuts, last)
+    }
+
+    /// A seeded random dictation of one to ten minutes: speech, breaths, pauses and long silences at
+    /// random lengths and loudness.
+    private func randomDictation(seed: UInt32) -> [Int16] {
         var random = Audio.Random(seed: seed)
         var audio: [Int16] = []
         let target = (60 + random.next() * 540) * rate
@@ -227,7 +238,39 @@ struct DictationChunkerTests {
                 audio += room(1 + random.next() * (random.next() < 0.2 ? 60 : 3), &random)
             }
         }
-        let (cuts, last) = chunk(audio)
+        return audio
+    }
+
+    // MARK: As shipped: cut only at the maximum length (owner, 2026-10-07)
+
+    /// People pause between words and sentences: a pause after ten seconds of speech is not cut at.
+    @Test func asShippedADictationWithPausesAfterTenSecondsOfSpeechIsNeverCutShortOfTheMaximumLength() {
+        var random = Audio.Random(seed: 20)
+        let audio = speech(12, &random) + room(1.5, &random) + speech(30, &random) + room(1.2, &random)
+            + speech(11, &random) + room(1.1, &random) + speech(2, &random)
+        let (cuts, last) = chunk(audio, cutsAtPauses: nil)
+        #expect(cuts.isEmpty)
+        #expect(last == nil)
+    }
+
+    @Test func asShippedALongDictationWithPausesIsCutOnlyAtTheMaximumLengthEachChunkOverlappingTheOneBefore() {
+        var random = Audio.Random(seed: 21)
+        var audio: [Int16] = []
+        for _ in 0..<18 { audio += speech(12, &random) + room(1.5, &random) }
+        let (cuts, last) = chunk(audio, cutsAtPauses: nil)
+        #expect(cuts.count > 1)
+        for cut in cuts {
+            #expect(seconds(cut.end - cut.start) > seconds(DictationConfig.chunkMaxDuration - DictationConfig.chunkForcedCutSearch))
+        }
+        #expect((cuts + [last]).dropFirst().allSatisfy { $0?.overlapped == true })
         expectCovers(audio, cuts, last)
+    }
+
+    @Test(arguments: UInt32(200)..<UInt32(204))
+    func asShippedRandomDictationsAreCutOnlyAtTheMaximumLength(seed: UInt32) {
+        let audio = randomDictation(seed: seed)
+        let (cuts, last) = chunk(audio, cutsAtPauses: nil)
+        expectCovers(audio, cuts, last)
+        #expect((cuts + [last]).dropFirst().allSatisfy { $0?.overlapped == true })
     }
 }

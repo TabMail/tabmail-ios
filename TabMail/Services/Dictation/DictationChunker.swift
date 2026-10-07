@@ -26,12 +26,12 @@ struct DictationChunkCut: Sendable, Equatable {
 /// microphones speech stands only a few dB above the room, which only levels taken from the
 /// recording itself can tell apart.
 ///
-/// - **A pause:** once a chunk holds `chunkMinimumSpeech` of speech, it is cut in the middle of the
-///   next `chunkPauseDuration` of quiet. No word crosses a pause, so nothing overlaps. Speech much
-///   softer than what came before, with few frames at the room's level, can read as quiet: a cut
-///   there may split a word or two (found in TabMail Voice's review, 2026-10-03; the chunk is still
-///   sent).
-/// - **No pause:** a chunk that reaches `chunkMaxDuration` is cut anyway, at the quietest
+/// - **A pause** (only with `cutsAtPauses`, `chunkCutsAtPauses`, off since 2026-10-07): once a
+///   chunk holds `chunkMinimumSpeech` of speech, it is cut in the middle of the next
+///   `chunkPauseDuration` of quiet. No word crosses a pause, so nothing overlaps. Speech much softer
+///   than what came before, with few frames at the room's level, can read as quiet: a cut there may
+///   split a word or two (found in TabMail Voice's review, 2026-10-03; the chunk is still sent).
+/// - **No pause** (every cut while pause cuts are off): a chunk that reaches `chunkMaxDuration` is cut anyway, at the quietest
 ///   `chunkForcedCutWindow` of its last `chunkForcedCutSearch`, and the next chunk starts
 ///   `chunkOverlapSpeech` of speech earlier (at most `chunkMaxOverlap` earlier).
 ///
@@ -53,6 +53,7 @@ final class DictationChunker {
     private let forcedWindowFrames: Int
     private let gapFrames: Int
     private let blipFrames: Int
+    private let cutsAtPauses: Bool
     /// Each whole frame's loudness (dB), from the start of the recording.
     private var decibels: [Double] = []
     private var histogram = [Int](repeating: 0, count: DictationChunker.binCount)
@@ -68,7 +69,8 @@ final class DictationChunker {
     private var loudRun = 0
     private var cuts = 0
 
-    init(sampleRate: Double = DictationConfig.recordingSampleRate) {
+    init(sampleRate: Double = DictationConfig.recordingSampleRate, cutsAtPauses: Bool = DictationConfig.chunkCutsAtPauses) {
+        self.cutsAtPauses = cutsAtPauses
         let frame = DictationConfig.chunkFrameDuration
         func frames(_ duration: Duration) -> Int { max(1, Int((duration / frame).rounded())) }
         frameLength = Int((sampleRate * Self.seconds(frame)).rounded())
@@ -117,7 +119,7 @@ final class DictationChunker {
         let quiet = loudness < pauseLevel()
         count(quiet: quiet)
         let frameEnd = decibels.count * frameLength
-        if quiet, quietRun >= pauseFrames, speechFrames >= minimumSpeechFrames {
+        if cutsAtPauses, quiet, quietRun >= pauseFrames, speechFrames >= minimumSpeechFrames {
             // The middle of the pause so far: half its quiet ends this chunk, half starts the next.
             return cut(end: frameEnd - (pauseFrames / 2) * frameLength, nextStart: nil)
         }

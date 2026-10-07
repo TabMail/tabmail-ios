@@ -1123,6 +1123,43 @@ struct DictationControllerTests {
         #expect(recorded.texts.withLock { $0 } == ["A long dictation."])
     }
 
+    /// Owner, 2026-10-07: a long dictation is cut only at `chunkMaxDuration`, never at a pause. A
+    /// controller built as the app builds it (no `chunkCutsAtPauses` passed in) sends a dictation
+    /// with pauses after ten seconds of speech, shorter than `chunkMaxDuration`, as one upload.
+    @Test func theAppsControllerDoesNotCutADictationAtItsPauses() async throws {
+        var random = DictationTestAudio.Random(seed: 2)
+        let audio = DictationTestAudio.speech(12, &random) + DictationTestAudio.room(1.5, &random)
+            + DictationTestAudio.speech(30, &random) + DictationTestAudio.room(1.2, &random)
+            + DictationTestAudio.speech(11, &random)
+        let capture = FakeCapture(buffers: DictationTestAudio.buffers(audio))
+        let recorded = recorded
+        let controller = DictationController(
+            capture: capture,
+            requestMicrophoneAccess: { true },
+            isOnline: { true },
+            isOptedOutOfAI: { false },
+            dictationLanguage: { nil },
+            smartDictation: { true },
+            transcribe: { flac, _, _, _ in
+                recorded.uploads.withLock { $0.append(flac) }
+                return DictationTranscription(text: "a dictation with pauses", cleanedText: "A dictation with pauses.")
+            },
+            warmUp: {},
+            // No polish request: the uploads are what is tested, never the backend.
+            polish: { text, _ in text },
+            speechDetector: FakeSpeechDetector.hearing()
+        )
+
+        await dictate(controller, capture: capture)
+        await waitUntil { controller.phase == .idle }
+
+        let lengths = try recorded.uploads.withLock { $0 }.map { try FLACTestDecoder.decode($0).totalSamples }
+        #expect(lengths.count == 1)
+        guard lengths.count == 1 else { return }
+        #expect(lengths[0] >= audio.count)
+        #expect(recorded.texts.withLock { $0 } == ["A dictation with pauses."])
+    }
+
     @Test func anotherDictationCanStartAfterAFailure() async {
         let capture = FakeCapture()
         let controller = controller(capture: capture, transcript: { " " })

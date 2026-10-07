@@ -190,8 +190,9 @@ struct DictationAudioRecorderTests {
     /// The audio held before speech is the start of what is kept, for the chunker too
     /// (ADR-IOS-087): a pause cut falls inside the pause as recorded, not a pre-roll earlier,
     /// mid-word; each chunk holds its own samples, and the recording ends with the last.
+    /// Pause cuts are off as shipped (owner, 2026-10-07) and kept for a later look; on here.
     @Test func chunksAreCutAtThePauseCountingTheAudioHeldBeforeSpeech() throws {
-        let recorder = AudioRecorder(preRoll: .seconds(2))
+        let recorder = AudioRecorder(preRoll: .seconds(2), cutsAtPauses: true)
         var random = DictationTestAudio.Random(seed: 1)
         let rate = DictationConfig.recordingSampleRate
         for buffer in DictationTestAudio.buffers(DictationTestAudio.room(2, &random)) { recorder.append(buffer) }
@@ -218,7 +219,8 @@ struct DictationAudioRecorderTests {
     /// The microphone can still deliver a buffer as it stops: once finished, the recorder takes no
     /// more audio, so nothing after the last chunk is cut and sent.
     @Test func audioArrivingAfterTheFinishIsNotRecordedAndCutsNoChunk() throws {
-        let recorder = AudioRecorder(preRoll: .seconds(2))
+        // Pause cuts on, so the late audio would cut a chunk had it been recorded.
+        let recorder = AudioRecorder(preRoll: .seconds(2), cutsAtPauses: true)
         var random = DictationTestAudio.Random(seed: 7)
         recorder.keepFromNow()
         for buffer in DictationTestAudio.buffers(DictationTestAudio.speech(12, &random)) { recorder.append(buffer) }
