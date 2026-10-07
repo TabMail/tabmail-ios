@@ -83,6 +83,8 @@ final class DictationController {
     @ObservationIgnored private let chunkRetryDelays: [Duration]
     @ObservationIgnored private let makeSpeechDetector: MakeSpeechDetector
     @ObservationIgnored private let maxRecordingDuration: Duration
+    /// Whether a long dictation is cut at its pauses (`DictationConfig.chunkCutsAtPauses`, off).
+    @ObservationIgnored private let chunkCutsAtPauses: Bool
 
     // Per-dictation state. `generation` invalidates callbacks from a superseded dictation.
     @ObservationIgnored private var generation = 0
@@ -127,7 +129,8 @@ final class DictationController {
         transcriptionRetryNoticeDelay: Duration = DictationConfig.transcriptionRetryNoticeDelay,
         chunkRetryDelays: [Duration] = DictationConfig.chunkRetryDelays,
         speechDetector: @escaping MakeSpeechDetector = { SoundClassifierSpeechDetector(onSpeech: $0, onFailure: $1) },
-        maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration
+        maxRecordingDuration: Duration = DictationConfig.maxRecordingDuration,
+        chunkCutsAtPauses: Bool = DictationConfig.chunkCutsAtPauses
     ) {
         self.capture = capture
         self.requestMicrophoneAccess = requestMicrophoneAccess
@@ -148,6 +151,7 @@ final class DictationController {
         self.chunkRetryDelays = chunkRetryDelays
         self.makeSpeechDetector = speechDetector
         self.maxRecordingDuration = maxRecordingDuration
+        self.chunkCutsAtPauses = chunkCutsAtPauses
     }
 
     /// The transcription on the TabMail backend: the recording with its language, which picks the
@@ -277,7 +281,7 @@ final class DictationController {
     }
 
     private func beginRecording(generation current: Int) {
-        let recorder = AudioRecorder(maxDuration: maxRecordingDuration) { [weak self] in
+        let recorder = AudioRecorder(maxDuration: maxRecordingDuration, cutsAtPauses: chunkCutsAtPauses) { [weak self] in
             Task { @MainActor [weak self] in self?.chunksCut(generation: current) }
         }
         self.recorder = recorder

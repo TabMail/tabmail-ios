@@ -9,7 +9,8 @@ import Foundation
 ///
 /// - An ellipsis where two chunks meet is taken out (owner, 2026-10-03): it is the pause the cut fell
 ///   in, not the speaker's. One inside a chunk stays.
-/// - Chunks cut at a pause are joined with a space, or none between scripts written without spaces.
+/// - Chunks cut at a pause (only while `chunkCutsAtPauses` is on), or overlapping chunks with no
+///   shared run of words, are joined with a space, or none between scripts written without spaces.
 /// - A chunk that starts inside the one before it (no pause to cut at) holds the same speech as the
 ///   end of that one: the two are joined where their words first run together for at least
 ///   `chunkOverlapMinimumRun` words, the run kept once: its first word as the earlier chunk wrote

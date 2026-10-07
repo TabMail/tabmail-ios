@@ -211,6 +211,9 @@ private final class Pasted: Sendable {
 /// A long dictation on iOS (ADR-IOS-087): cut into chunks as it is recorded, each sent at once with
 /// its own cleanup, retried while the user goes on, and the text the chunks' in order up to the
 /// first that gave up. As TabMail Voice's long-dictation tests (ADR-DESK-049).
+/// These tests use short dictations cut at their pauses, to exercise the chunks' uploads; the pause
+/// cut itself is off as shipped (owner, 2026-10-07) and kept for a later look, tested on in
+/// `DictationChunkerTests`.
 @MainActor
 struct DictationLongDictationTests {
     private typealias Audio = DictationTestAudio
@@ -249,7 +252,8 @@ struct DictationLongDictationTests {
             transcriptionRetryDelays: retryDelays,
             transcriptionRetryNoticeDelay: retryNoticeDelay,
             chunkRetryDelays: chunkRetryDelays,
-            speechDetector: { onSpeech, _ in LoudnessSpeechDetector(onSpeech: onSpeech) }
+            speechDetector: { onSpeech, _ in LoudnessSpeechDetector(onSpeech: onSpeech) },
+            chunkCutsAtPauses: true
         )
     }
 
@@ -456,7 +460,8 @@ struct DictationLongDictationTests {
             warmUp: {},
             // The polish hands the joined text back: the join is what is tested, never the backend.
             polish: { text, _ in text },
-            speechDetector: { onSpeech, _ in LoudnessSpeechDetector(onSpeech: onSpeech) }
+            speechDetector: { onSpeech, _ in LoudnessSpeechDetector(onSpeech: onSpeech) },
+            chunkCutsAtPauses: true
         )
         await start(controller, capture)
 
@@ -499,7 +504,8 @@ struct DictationLongDictationTests {
             warmUp: {},
             // The polish hands the joined text back: the join is what is tested, never the backend.
             polish: { text, _ in text },
-            speechDetector: { onSpeech, _ in LoudnessSpeechDetector(onSpeech: onSpeech) }
+            speechDetector: { onSpeech, _ in LoudnessSpeechDetector(onSpeech: onSpeech) },
+            chunkCutsAtPauses: true
         )
         await start(controller, capture)
 

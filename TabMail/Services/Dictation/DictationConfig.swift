@@ -79,11 +79,17 @@ enum DictationConfig {
     /// Kept to a plosive's burst, shorter than any vowel, as a cut must be in a pause for sure (owner,
     /// 2026-10-03: "really high precision, even if some recall could be lower").
     static let chunkPauseBlip: Duration = .milliseconds(40)
+    /// Whether a chunk is cut at a pause at all. Off (owner, 2026-10-07): cutting at pauses barely
+    /// sped up a long dictation's text and cost words, as people pause between words and sentences,
+    /// so a chunk is cut only at `chunkMaxDuration`. The pause rules below are kept for a later look.
+    /// As TabMail Voice's (ADR-DESK-049 amendment 2026-10-07).
+    static let chunkCutsAtPauses = false
     /// A chunk is cut in the middle of a pause this long (owner, 2026-10-03: "a second pause")…
     static let chunkPauseDuration: Duration = .seconds(1)
     /// …once it holds this much speech (owner, 2026-10-03: "only after 10s+").
     static let chunkMinimumSpeech: Duration = .seconds(10)
-    /// With no pause, a chunk is cut at this length, under the 120 seconds the backend transcribes.
+    /// With no pause (every chunk while `chunkCutsAtPauses` is off), a chunk is cut at this length,
+    /// under the 120 seconds the backend transcribes.
     static let chunkMaxDuration: Duration = .seconds(105)
     /// A forced cut lands on the quietest window this long in the chunk's last `chunkForcedCutSearch`.
     static let chunkForcedCutWindow: Duration = .milliseconds(300)

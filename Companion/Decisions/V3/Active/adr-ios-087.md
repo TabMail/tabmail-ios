@@ -149,3 +149,26 @@ the backend answers any provider failure 502, which the apps retry.
   `theAppsControllerSendsALongDictationInChunksTheModelTranscribes`. Five mutants (failed chunks
   skipped, the release not ending waits, 504 not retried while recording, a silent chunk not sent,
   cancel not stopping requests) each fail at least one of them.
+
+### Amendment 2026-10-07: no cuts at pauses; a chunk is cut only at `chunkMaxDuration`
+
+Owner, 2026-10-07: cutting at pauses barely sped up a long dictation's text, and it made the
+dictation worse, since people pause between words and sentences and a chunk's cleanup sees only its
+own half of the sentence around the cut; "Don't remove code because we might revisit this later".
+`DictationConfig.chunkCutsAtPauses` is now false and reaches the chunker through
+`DictationController(chunkCutsAtPauses:)` → `AudioRecorder(cutsAtPauses:)` →
+`DictationChunker(cutsAtPauses:)`, each defaulting to it. Every cut is the forced one (decision 1,
+"No pause"): at the quietest `chunkForcedCutWindow` near `chunkMaxDuration` (105 s), the next chunk
+overlapping it by `chunkOverlapSpeech` and joined on their shared words (decision 2). A dictation
+under 105 s is one upload. The pause rule's code, numbers and tests are kept, switched off; uploads,
+retries, the join, the polish and what is pasted are unchanged. As TabMail Voice (ADR-DESK-049
+amendment 2026-10-07).
+
+- Tests: `DictationChunkerTests.asShipped…` (a dictation with pauses after 10 s of speech is not
+  cut; a long one is cut only near the maximum length, each chunk overlapping the one before; random
+  dictations), red with pause cuts on; the pause rule's own chunker tests,
+  `DictationLongDictationTests` and the recorder's pause-cut tests pass `cutsAtPauses: true`;
+  `DictationControllerTests.theAppsControllerDoesNotCutADictationAtItsPauses` runs the controller as
+  the app builds it (pauses after 10 s of speech, under 105 s: one upload), red with the
+  controller's default turned on (found in review, 2026-10-07: the chunker's own default is not what
+  the app passes).

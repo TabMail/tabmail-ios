@@ -55,7 +55,7 @@ final class AudioRecorder: Sendable {
         var firstError: (any Error)?
         var isHoldingPreRoll = true
         /// Reads what is kept, from `keepFromNow` on; its sample indices are `pcm`'s.
-        var chunker = DictationChunker()
+        var chunker: DictationChunker
         /// Chunks cut and not yet taken (`takeChunks`), in order.
         var chunks: [Chunk] = []
     }
@@ -67,7 +67,7 @@ final class AudioRecorder: Sendable {
     let outputFormat: AVAudioFormat
     private let maxFrames: Int
     private let preRollFrames: Int
-    private let state = OSAllocatedUnfairLock<State>(uncheckedState: State())
+    private let state: OSAllocatedUnfairLock<State>
     /// Called, on the audio thread, when a chunk is cut and waiting in `takeChunks`.
     private let onChunk: (@Sendable () -> Void)?
 
@@ -75,9 +75,11 @@ final class AudioRecorder: Sendable {
         sampleRate: Double = DictationConfig.recordingSampleRate,
         maxDuration: Duration = DictationConfig.maxRecordingDuration,
         preRoll: Duration = DictationConfig.speechPreRollDuration,
+        cutsAtPauses: Bool = DictationConfig.chunkCutsAtPauses,
         onChunk: (@Sendable () -> Void)? = nil
     ) {
         self.onChunk = onChunk
+        state = OSAllocatedUnfairLock(uncheckedState: State(chunker: DictationChunker(cutsAtPauses: cutsAtPauses)))
         // Force-unwrap: a 16-bit integer mono format is always constructible.
         outputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: sampleRate, channels: 1, interleaved: true)!
         maxFrames = Int(Double(maxDuration.components.seconds) * sampleRate)
