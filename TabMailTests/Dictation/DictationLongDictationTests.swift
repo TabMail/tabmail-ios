@@ -76,7 +76,7 @@ private final class LoudnessSpeechDetector: SpeechDetecting, @unchecked Sendable
 /// The backend, answering each chunk as the test says. A chunk is told apart by its audio: the
 /// first upload of new audio is the next chunk, a repeat is a retry of one.
 private final class ChunkBackend: Sendable {
-    enum Reply: Sendable {
+    enum Reply: Sendable, Equatable {
         case part
         case serverError
         case gatewayTimeout
@@ -88,6 +88,8 @@ private final class ChunkBackend: Sendable {
         case accountRateLimited
         /// Never answers until cancelled.
         case never
+        /// Answers as `.part`, `delay` after the test's `released()`.
+        case afterRelease(Duration)
     }
 
     private struct State {
@@ -97,6 +99,7 @@ private final class ChunkBackend: Sendable {
         var cleanups: [[String: String]?] = []
         var languages: [String?] = []
         var vocabularies: [[String]] = []
+        var released: ContinuousClock.Instant?
     }
 
     private let state = Mutex(State())
@@ -105,6 +108,11 @@ private final class ChunkBackend: Sendable {
 
     init(reply: @escaping @Sendable (_ index: Int, _ attempt: Int) -> Reply = { _, _ in .part }) {
         self.reply = reply
+    }
+
+    /// The user released now: `.afterRelease` replies count from here.
+    func released() {
+        state.withLock { $0.released = ContinuousClock.now }
     }
 
     /// Chunks sent so far, and how many tries each took.
@@ -146,6 +154,10 @@ private final class ChunkBackend: Sendable {
         case .never:
             try await Task.sleep(for: .seconds(3_600))
             throw CancellationError()
+        case .afterRelease(let delay):
+            while state.withLock({ $0.released }) == nil { try await Task.sleep(for: .milliseconds(5)) }
+            try await Task.sleep(until: state.withLock { $0.released! } + delay, clock: .continuous)
+            return DictationTranscription(text: "raw \(index)", cleanedText: "Part \(index).")
         }
     }
 }
@@ -1000,6 +1012,29 @@ struct DictationLongDictationTests {
 
     /// A long dictation whose last chunk ran out the deadline is pasted as far as it came, and not
     /// polished: there is no time left for it, so its text is not sent again.
+    /// The chunks share the one deadline from the release, not one each: a chunk answering late
+    /// but inside it leaves the next only what is left. The last, answering 2.5 s after the release,
+    /// would be in time had it got the whole 2 s from when it was awaited, but it is out.
+    @Test func theChunksShareOneDeadline() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, _ in
+            switch index {
+            case 1: .afterRelease(.milliseconds(1_200))
+            case 2: .afterRelease(.milliseconds(2_500))
+            default: .part
+            }
+        }
+        let controller = controller(capture, backend, deadline: .seconds(2))
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 65, 12, 12, 4)
+        controller.finish()
+        backend.released()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
+    }
+
     @Test func chunksInTheLastOutOfTimeNoPolishIsSent() async {
         let capture = SpeakingCapture()
         let backend = ChunkBackend { index, _ in index == 2 ? .never : .part }

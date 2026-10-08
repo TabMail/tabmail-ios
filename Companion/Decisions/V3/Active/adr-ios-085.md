@@ -384,5 +384,5 @@ amendment 2026-10-08).** Owner, 2026-10-08: the apps and the backend kept trying
 - Tests: `DictationControllerTests.aTranscriptionGivesUpAtItsDeadlineHoweverManyRetriesAreLeft`,
   `aRequestUnansweredAtTheDeadlineIsCancelled`, `theRetriesFitInTheDeadlineAndAChunkRequestMayOutlastIt`;
   `DictationLongDictationTests.aChunkNotInByTheDeadlineGivesUpAndTheChunksBeforeItArePasted`,
-  `aChunkFailingOnEveryTryGivesUpAtTheDeadline`, `chunksInTheLastOutOfTimeNoPolishIsSent`,
+  `aChunkFailingOnEveryTryGivesUpAtTheDeadline`, `theChunksShareOneDeadline`, `chunksInTheLastOutOfTimeNoPolishIsSent`,
   `thePolishStopsAtTheDictationsDeadline`.
