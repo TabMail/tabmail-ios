@@ -69,14 +69,22 @@ final class DictationChunkUploads {
     }
 
     /// The user released: chunks still failing get their last tries at once. Returns the chunks'
-    /// transcriptions in order up to the first that gave up, and why it did (nil: none did). The
-    /// chunks after it are no longer needed and are cancelled.
-    func release() async -> (parts: [Part], lost: (any Error)?) {
+    /// transcriptions in order up to the first that gave up, and why it did (nil: none did). A chunk
+    /// not in by `deadline` gives up then, with a `TimeoutError` (owner, 2026-10-08: "nobody waits for
+    /// dictation more than 10" seconds). The chunks after it are no longer needed and are cancelled.
+    func release(by deadline: ContinuousClock.Instant) async -> (parts: [Part], lost: (any Error)?) {
         isReleased = true
         for wait in waits.values { wait.cancel() }
         var parts: [Part] = []
         for job in jobs {
-            switch await job.outcome.value {
+            let outcome: Result<DictationTranscription, any Error>
+            do {
+                let pending = job.outcome
+                outcome = try await withTimeout(seconds: DictationController.seconds(max(.zero, deadline - ContinuousClock.now))) { await pending.value }
+            } catch {
+                outcome = .failure(error)
+            }
+            switch outcome {
             case .success(let transcription):
                 parts.append(Part(transcription: transcription, overlapped: job.overlapped))
             case .failure(let error):
@@ -106,7 +114,7 @@ final class DictationChunkUploads {
     /// dictation goes on: nobody waits for it yet. From the release, it gets `lastRetryDelays` more
     /// tries on the same failures, with the pill's retry state: the last chunk is sent at the
     /// release, so its backend timeout comes after it (owner, 2026-10-03: "we should not lose the
-    /// end"). Any other failure (signed out, over quota or the
+    /// end"), until `release(by:)`'s deadline ends them. Any other failure (signed out, over quota or the
     /// account's own rate limit, a refused request) gives up at once.
     private func send(_ index: Int, encode: @escaping @Sendable () -> Data) async -> Result<DictationTranscription, any Error> {
         let flac = await Task.detached(priority: .userInitiated) { encode() }.value

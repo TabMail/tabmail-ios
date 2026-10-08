@@ -363,3 +363,26 @@ ADR-027 amendment, 2026-10-05) and turns it back on once clients with this toggl
 - Tests: `DictationControllerTests.withSmartDictationOffTheTranscriptIsAppendedAsHeardWithNoCleanupSent`,
   `smartDictationIsReadWhenTheDictationStarts`, `smartDictationIsOffUntilTurnedOn`, and
   `DictationLongDictationTests.withSmartDictationOffALongDictationIsPastedAsHeardAndNotPolished`.
+
+**Amendment 2026-10-08 — one 10 s deadline from the tap to stop (owner; TabMail Voice ADR-DESK-039
+amendment 2026-10-08).** Owner, 2026-10-08: the apps and the backend kept trying for minutes;
+"nobody waits for dictation more than 10" seconds.
+
+- `DictationConfig.transcriptionDeadline` (10 s) is the dictation's whole wait for its text, counted
+  from `finish()`: the context-terms wait, the request, every retry and its waits, a long
+  dictation's chunks still out at the release (`DictationChunkUploads.release(by:)`) and its polish
+  (which gets the smaller of `chunkPolishTimeout` and what is left). Past it the request or wait in
+  progress is cancelled (`withTimeout`) and the dictation ends quietly as any failure does
+  (ADR-IOS-085: no failure messages); a long dictation pastes the chunks that came in (ADR-IOS-087).
+- `transcriptionRetryDelays` is cut to 0.5, 1.5 and 3 s (what fits). `transcriptionRequestTimeout`
+  stays 45 s on purpose: after the tap to stop the deadline ends the wait anyway, and before it a
+  long dictation's chunk may take longer than 10 s while the user goes on; a URL timeout is not
+  retried, so a 10 s one would give that chunk up for good (found in the TabMail Voice review).
+  Supersedes the 2026-10-03 "about a minute" of
+  retries. The backend answers inside the 10 s: 8 s for the speech model, 429 retries for its first
+  6 s, then the 1.5 s cleanup (backend ADR-022 amendment 2026-10-08).
+- Tests: `DictationControllerTests.aTranscriptionGivesUpAtItsDeadlineHoweverManyRetriesAreLeft`,
+  `aRequestUnansweredAtTheDeadlineIsCancelled`, `theRetriesFitInTheDeadlineAndAChunkRequestMayOutlastIt`;
+  `DictationLongDictationTests.aChunkNotInByTheDeadlineGivesUpAndTheChunksBeforeItArePasted`,
+  `aChunkFailingOnEveryTryGivesUpAtTheDeadline`, `chunksInTheLastOutOfTimeNoPolishIsSent`,
+  `thePolishStopsAtTheDictationsDeadline`.

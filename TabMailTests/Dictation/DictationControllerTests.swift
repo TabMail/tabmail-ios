@@ -256,7 +256,8 @@ struct DictationControllerTests {
         corrections: DictationCorrectionWatch? = nil,
         warmUp: DictationController.WarmUp? = nil,
         retryDelays: [Duration] = [.milliseconds(1), .milliseconds(1)],
-        retryNoticeDelay: Duration = DictationConfig.transcriptionRetryNoticeDelay
+        retryNoticeDelay: Duration = DictationConfig.transcriptionRetryNoticeDelay,
+        deadline: Duration = DictationConfig.transcriptionDeadline
     ) -> DictationController {
         let recorded = recorded
         return DictationController(
@@ -278,6 +279,7 @@ struct DictationControllerTests {
                 return DictationTranscription(text: try await transcript(), cleanedText: await cleaned())
             },
             warmUp: warmUp ?? { recorded.warmUps.withLock { $0 += 1 } },
+            transcriptionDeadline: deadline,
             transcriptionRetryDelays: retryDelays,
             transcriptionRetryNoticeDelay: retryNoticeDelay,
             speechDetector: speechDetector,
@@ -651,6 +653,68 @@ struct DictationControllerTests {
         #expect(recorded.uploads.withLock { $0.count } == 1 + retryDelays.count)
         #expect(recorded.texts.withLock { $0.isEmpty })
         #expect(!controller.isRetrying)
+    }
+
+    /// Owner, 2026-10-08: "nobody waits for dictation more than 10" seconds. From the tap to stop,
+    /// the whole wait for the text, every retry included, ends at `transcriptionDeadline`: a server
+    /// error on every try ends the dictation then, retries left or not.
+    @Test func aTranscriptionGivesUpAtItsDeadlineHoweverManyRetriesAreLeft() async {
+        let capture = FakeCapture()
+        let controller = controller(
+            capture: capture,
+            transcript: { throw DictationError(status: 502, code: "transcription_failed") },
+            retryDelays: Array(repeating: .milliseconds(50), count: 99),
+            deadline: .milliseconds(400)
+        )
+
+        await dictate(controller, capture: capture)
+        let released = ContinuousClock.now
+        await waitUntil { controller.phase == .idle }
+
+        #expect(controller.phase == .idle)
+        #expect(ContinuousClock.now - released < .milliseconds(1_500))
+        #expect(recorded.uploads.withLock { $0.count } < 20)
+        #expect(recorded.texts.withLock { $0.isEmpty })
+        #expect(!controller.isRetrying)
+    }
+
+    /// A request still unanswered at the deadline is cancelled, and the dictation ends at once.
+    @Test func aRequestUnansweredAtTheDeadlineIsCancelled() async {
+        let capture = FakeCapture()
+        let cancelled = Mutex(false)
+        let controller = controller(
+            capture: capture,
+            transcript: {
+                do {
+                    try await Task.sleep(for: .seconds(3_600))
+                } catch {
+                    cancelled.withLock { $0 = true }
+                    throw error
+                }
+                return "never"
+            },
+            deadline: .milliseconds(300)
+        )
+
+        await dictate(controller, capture: capture)
+        let released = ContinuousClock.now
+        await waitUntil { controller.phase == .idle }
+
+        #expect(controller.phase == .idle)
+        #expect(ContinuousClock.now - released < .milliseconds(1_500))
+        #expect(recorded.texts.withLock { $0.isEmpty })
+        await waitUntil { cancelled.withLock { $0 } }
+        #expect(cancelled.withLock { $0 })
+    }
+
+    /// Every retry wait fits in the deadline with room for the tries. One request may take longer
+    /// than the deadline: a long dictation's chunk sent while the user goes on is not waited for yet,
+    /// and a URL timeout is never retried, so a shorter one would give that chunk up for good.
+    @Test func theRetriesFitInTheDeadlineAndAChunkRequestMayOutlastIt() {
+        let waits = DictationConfig.transcriptionRetryDelays.reduce(Duration.zero, +)
+        #expect(waits < DictationConfig.transcriptionDeadline)
+        #expect(DictationConfig.transcriptionDeadline <= .seconds(10))
+        #expect(DictationConfig.transcriptionRequestTimeout > DictationController.seconds(DictationConfig.transcriptionDeadline))
     }
 
     @Test func eachRetryWaitsItsDelay() async {

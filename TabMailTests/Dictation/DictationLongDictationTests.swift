@@ -232,6 +232,7 @@ struct DictationLongDictationTests {
         useWords: @escaping @MainActor ([String]) -> Void = { _ in },
         polisher: Polisher = Polisher(),
         polishTimeout: Duration = .seconds(5),
+        deadline: Duration = DictationConfig.transcriptionDeadline,
         smartDictation: Bool = true
     ) -> DictationController {
         DictationController(
@@ -249,6 +250,7 @@ struct DictationLongDictationTests {
             warmUp: {},
             polish: { text, cleanup in try await polisher.polish(text, cleanup: cleanup) },
             chunkPolishTimeout: polishTimeout,
+            transcriptionDeadline: deadline,
             transcriptionRetryDelays: retryDelays,
             transcriptionRetryNoticeDelay: retryNoticeDelay,
             chunkRetryDelays: chunkRetryDelays,
@@ -960,12 +962,78 @@ struct DictationLongDictationTests {
         #expect(pasted.texts.withLock { $0 }.isEmpty)
     }
 
-    /// The provider's rate limits come in bursts of seconds: the last tries after the release span
-    /// about a minute (owner, 2026-10-03: "we definitely need more retries … we should not lose the end").
-    @Test func theLastTriesAfterTheReleaseOutlastABurstOfRateLimits() {
-        let total = DictationConfig.transcriptionRetryDelays.reduce(Duration.zero, +)
-        #expect(total >= .seconds(45))
-        #expect(DictationConfig.transcriptionRetryDelays.count >= 6)
+    /// Owner, 2026-10-08: "nobody waits for dictation more than 10" seconds. A chunk not in by the
+    /// deadline gives up then: the chunks before it are pasted, and its request is cancelled.
+    @Test func aChunkNotInByTheDeadlineGivesUpAndTheChunksBeforeItArePasted() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, _ in index == 1 ? .never : .part }
+        let controller = controller(capture, backend, deadline: .milliseconds(400))
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 61, 12, 4)
+        controller.finish()
+        let released = ContinuousClock.now
+        await waitUntil { controller.phase == .idle }
+
+        #expect(ContinuousClock.now - released < .milliseconds(1_500))
+        #expect(pasted.texts.withLock { $0 } == ["Part 0."])
+        await waitUntil { backend.inFlight == 0 }
+        #expect(backend.inFlight == 0)
+    }
+
+    /// A chunk failing on every try after the release gives up at the deadline too, however many of
+    /// its tries are left.
+    @Test func aChunkFailingOnEveryTryGivesUpAtTheDeadline() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, _ in index == 1 ? .serverError : .part }
+        let controller = controller(capture, backend, retryDelays: Array(repeating: .milliseconds(50), count: 99), deadline: .milliseconds(400))
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 62, 12, 4)
+        controller.finish()
+        let released = ContinuousClock.now
+        await waitUntil { controller.phase == .idle }
+
+        #expect(ContinuousClock.now - released < .milliseconds(1_500))
+        #expect(pasted.texts.withLock { $0 } == ["Part 0."])
+    }
+
+    /// A long dictation whose last chunk ran out the deadline is pasted as far as it came, and not
+    /// polished: there is no time left for it, so its text is not sent again.
+    @Test func chunksInTheLastOutOfTimeNoPolishIsSent() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend { index, _ in index == 2 ? .never : .part }
+        let polisher = Polisher(.text("Polished."))
+        let controller = controller(capture, backend, polisher: polisher, deadline: .milliseconds(400))
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 64, 12, 12, 4)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1."])
+        #expect(polisher.calls.isEmpty)
+    }
+
+    /// The polish gets only what is left of the deadline, never its own whole `chunkPolishTimeout`
+    /// past it: one still running then is cancelled, and the chunks' cleanups are pasted.
+    @Test func thePolishStopsAtTheDictationsDeadline() async {
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let polisher = Polisher(.never)
+        let controller = controller(capture, backend, polisher: polisher, polishTimeout: .seconds(60), deadline: .milliseconds(400))
+        await start(controller, capture)
+
+        await speak(capture, backend, seed: 63, 12, 12, 5)
+        controller.finish()
+        let released = ContinuousClock.now
+        await waitUntil { controller.phase == .idle }
+
+        #expect(ContinuousClock.now - released < .milliseconds(1_500))
+        #expect(pasted.texts.withLock { $0 } == ["Part 0. Part 1. Part 2."])
+        #expect(polisher.calls.count == 1)
+        await waitUntil { polisher.wasCancelled }
+        #expect(polisher.wasCancelled)
     }
 
     /// The first chunk giving up loses the dictation, as one recording's failure does: nothing is
