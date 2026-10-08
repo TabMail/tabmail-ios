@@ -77,7 +77,7 @@ the backend answers any provider failure 502, which the apps retry.
    the backend's own timeout (504) or the speech model's rate limit outlasting the backend's own 10 s
    of retries (429 `transcription_rate_limited`, backend ADR-022; `isServerError`, the 504 `backendTimedOut`) is tried again
    after each of `chunkRetryDelays` (1, 2, 5, 10 s, the last repeating), showing nothing. The release cuts any such wait short; from then on a chunk
-   gets `transcriptionRetryDelays` more tries (about a minute of waits, ADR-IOS-085 amendment
+   gets `transcriptionRetryDelays` more tries *(since 2026-10-08 all inside the dictation's 10 s `transcriptionDeadline`; a chunk not in by then gives up, ADR-IOS-085 amendment 2026-10-08)* (about a minute of waits, ADR-IOS-085 amendment
    2026-10-03; each try that the backend holds, up to 30 s for a 504 and about 10 s for that 429, adds
    that time, so a chunk failing that way every time keeps the pill transcribing for up to about 5.5
    minutes, 9 tries × 30 s plus the waits, until the user closes the pill; found in review,
@@ -98,7 +98,9 @@ the backend answers any provider failure 502, which the apps retry.
    `DictationConfig.cleanupPrompt`, which the app calls itself at `POST /completions/chat`
    (`BackendClient.sendCompletionsDirect`, as before the cleanup moved into the transcription
    request), with the dictation's cleanup variables and the joined text as its `dictation`. Its reply
-   is pasted if it comes within `chunkPolishTimeout` (5 s) of the chunks being in; one that fails,
+   is pasted if it comes within `chunkPolishTimeout` (5 s) of the chunks being in *(since 2026-10-08:
+   and within what is left of the dictation's 10 s `transcriptionDeadline`; with nothing left, or once a
+   chunk ran out of time, no polish is sent, ADR-IOS-085 amendment 2026-10-08)*; one that fails,
    comes back empty or runs out of time (cancelled) leaves the joined text to be pasted, as a failed
    cleanup leaves the transcript. One chunk left before a chunk that gave up already had its whole
    cleanup and is not polished; a single recording never is. As TabMail Voice's.
@@ -118,11 +120,13 @@ the backend answers any provider failure 502, which the apps retry.
 - A forced, overlapped seam with no shared run of words may repeat a few words; none are lost (owner).
 - A rate-limit burst after the release loses the end of the dictation only if it outlasts the last
   tries, about a minute of waits plus up to 30 s per try the backend holds (owner, 2026-10-03: "we
-  definitely need more retries"; they were 2 s).
+  definitely need more retries"; they were 2 s). *Superseded 2026-10-08: the chunks share the
+  dictation's one 10 s `transcriptionDeadline` from the release; one not in by then loses the end
+  (ADR-IOS-085 amendment 2026-10-08).*
 - The cleanup sees one chunk at a time, so a sentence cut at a forced cut is cleaned in two halves;
   the polish reads the whole text if it can within 5 s, at the cost of one more completions request
-  per long dictation and up to 5 s more at the spinner. A dictation of several minutes may run out of
-  time and keep its chunks' cleanups.
+  per long dictation and up to 5 s more at the spinner *(since 2026-10-08 never past the dictation's
+  10 s deadline)*. A dictation of several minutes may run out of time and keep its chunks' cleanups.
 - A long silence costs one request per 105 s, and the model may hear a stray word in it (as in
   one recording's silence).
 - `DictationController` is past 500 lines (620); the chunk logic lives in `DictationChunkUploads`,

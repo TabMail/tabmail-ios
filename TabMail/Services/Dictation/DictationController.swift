@@ -78,6 +78,7 @@ final class DictationController {
     @ObservationIgnored private let warmUp: WarmUp
     @ObservationIgnored private let polish: Polish
     @ObservationIgnored private let chunkPolishTimeout: Duration
+    @ObservationIgnored private let transcriptionDeadline: Duration
     @ObservationIgnored private let transcriptionRetryDelays: [Duration]
     @ObservationIgnored private let transcriptionRetryNoticeDelay: Duration
     @ObservationIgnored private let chunkRetryDelays: [Duration]
@@ -125,6 +126,7 @@ final class DictationController {
         warmUp: WarmUp? = nil,
         polish: Polish? = nil,
         chunkPolishTimeout: Duration = DictationConfig.chunkPolishTimeout,
+        transcriptionDeadline: Duration = DictationConfig.transcriptionDeadline,
         transcriptionRetryDelays: [Duration] = DictationConfig.transcriptionRetryDelays,
         transcriptionRetryNoticeDelay: Duration = DictationConfig.transcriptionRetryNoticeDelay,
         chunkRetryDelays: [Duration] = DictationConfig.chunkRetryDelays,
@@ -146,6 +148,7 @@ final class DictationController {
         self.warmUp = warmUp ?? Self.backendWarmUp(AccountManager.shared.backendClient)
         self.polish = polish ?? Self.backendPolish(AccountManager.shared.backendClient)
         self.chunkPolishTimeout = chunkPolishTimeout
+        self.transcriptionDeadline = transcriptionDeadline
         self.transcriptionRetryDelays = transcriptionRetryDelays
         self.transcriptionRetryNoticeDelay = transcriptionRetryNoticeDelay
         self.chunkRetryDelays = chunkRetryDelays
@@ -371,12 +374,15 @@ final class DictationController {
         // Keep the microphone open briefly after the tap so the last word isn't clipped.
         let current = generation
         let language = language
+        // The whole wait for the text, from this tap (owner, 2026-10-08: "nobody waits for
+        // dictation more than 10" seconds).
+        let deadline = ContinuousClock.now + transcriptionDeadline
         phase = .transcribing
         level = 0
         transcriptionTask = Task { [weak self] in
             try? await Task.sleep(for: DictationConfig.releaseTailDuration)
             guard !Task.isCancelled, let self, self.generation == current else { return }
-            await self.completeRecording(language: language, generation: current)
+            await self.completeRecording(language: language, deadline: deadline, generation: current)
         }
     }
 
@@ -394,7 +400,7 @@ final class DictationController {
         fail()
     }
 
-    private func completeRecording(language: String?, generation current: Int) async {
+    private func completeRecording(language: String?, deadline: ContinuousClock.Instant, generation current: Int) async {
         capture.stop()
         guard let recorder else { return }
         if !hasHeardSpeech {
@@ -419,7 +425,7 @@ final class DictationController {
         }
         BackgroundSyncLogger.logDebug("[Dictation] recorded \(recording.duration)s\(recording.lastChunk.map { " (last chunk \($0.index))" } ?? ""), peak \(recording.peakLevel), gain \(20 * log10(recording.gain)) dB, truncated \(recording.truncated)")
         if let last = recording.lastChunk {
-            await transcribeChunks(last: last, recording: recording, generation: current)
+            await transcribeChunks(last: last, recording: recording, deadline: deadline, generation: current)
             return
         }
 
@@ -430,17 +436,21 @@ final class DictationController {
             fail()
             return
         }
-        await transcribe(FLACEncoder.encode(pcm16Mono: recording.pcm, sampleRate: recording.sampleRate), language: language, generation: current)
+        await transcribe(FLACEncoder.encode(pcm16Mono: recording.pcm, sampleRate: recording.sampleRate), language: language, deadline: deadline, generation: current)
     }
 
-    private func transcribe(_ flac: Data, language: String?, generation current: Int) async {
+    /// Transcribes one recording, every try within `deadline`: past it the request or retry wait
+    /// in progress is cancelled and the dictation fails (owner, 2026-10-08).
+    private func transcribe(_ flac: Data, language: String?, deadline: ContinuousClock.Instant, generation current: Int) async {
         let words = dictionaryWords
         let terms = await contextTerms()
         guard generation == current, !Task.isCancelled else { return }
         let cleanup = cleanupVariables(words: words)
         BackgroundSyncLogger.logDebug("[Dictation] uploading \(flac.count) bytes of FLAC, \(words.count) dictionary word(s), \(terms.count) term(s)")
         do {
-            let transcription = try await transcribeRetrying(flac, language, words + terms, cleanup, generation: current)
+            let transcription = try await withTimeout(seconds: Self.seconds(max(.zero, deadline - ContinuousClock.now))) { [self] in
+                try await self.transcribeRetrying(flac, language, words + terms, cleanup, generation: current)
+            }
             guard generation == current, !Task.isCancelled else { return }
             let transcript = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
             BackgroundSyncLogger.logDebug("[Dictation] transcript ready (\(transcript.count) chars)")
@@ -461,14 +471,16 @@ final class DictationController {
     /// get their last tries, and the text is the chunks' in order up to the first that gave up
     /// (owner, 2026-10-03: "paste only the up to successful part"). The first giving up loses the dictation, as one
     /// recording's failure does; nothing says the end is missing (ADR-IOS-085: no failure messages).
-    private func transcribeChunks(last: DictationChunkCut, recording: AudioRecorder.Recording, generation current: Int) async {
+    /// A chunk not in by `deadline` gives up then (owner, 2026-10-08), and the polish gets only what
+    /// is left of it.
+    private func transcribeChunks(last: DictationChunkCut, recording: AudioRecorder.Recording, deadline: ContinuousClock.Instant, generation current: Int) async {
         // The chunks cut since the recorder last said so.
         chunksCut(generation: current)
         let uploads = uploads(generation: current)
         let pcm = recording.pcm
         let sampleRate = recording.sampleRate
         uploads.add(last) { FLACEncoder.encode(pcm16Mono: pcm, sampleRate: sampleRate) }
-        let (parts, lost) = await uploads.release()
+        let (parts, lost) = await uploads.release(by: deadline)
         guard generation == current, !Task.isCancelled else { return }
         // Every chunk has answered or given up: nothing is retrying while the text is polished (as
         // TabMail Voice's, whose retry note ends once the chunks are in).
@@ -491,7 +503,7 @@ final class DictationController {
         // One chunk already had its whole cleanup; with Smart Dictation off nothing is cleaned up.
         let text: String
         if parts.count > 1, let cleanup {
-            text = await polished(joined, cleanup: cleanup)
+            text = await polished(joined, cleanup: cleanup, deadline: deadline)
         } else {
             text = joined
         }
@@ -500,17 +512,21 @@ final class DictationController {
     }
 
     /// A long dictation's joined text (its chunks' cleanups), polished as a whole by the cleanup
-    /// prompt if that answers within `chunkPolishTimeout` (owner, 2026-10-03: "a final polished pass
-    /// if time permits"), as TabMail Voice's: the chunks' seams read as one text. Else, or when it
-    /// fails or comes back empty, `text` as it is: a failed polish never costs the user their
-    /// dictation, as a failed cleanup doesn't.
-    private func polished(_ text: String, cleanup: [String: String]) async -> String {
+    /// prompt if that answers within `chunkPolishTimeout` and before the dictation's `deadline`
+    /// (owner, 2026-10-03: "a final polished pass if time permits"), as TabMail Voice's: the chunks'
+    /// seams read as one text. Else, or when it fails or comes back empty, `text` as it is: a failed
+    /// polish never costs the user their dictation, as a failed cleanup doesn't.
+    private func polished(_ text: String, cleanup: [String: String], deadline: ContinuousClock.Instant) async -> String {
         let polish = polish
-        let timeout = chunkPolishTimeout
         let clock = ContinuousClock()
         let started = clock.now
+        let allowed = min(chunkPolishTimeout, deadline - started)
+        guard allowed > .zero else {
+            BackgroundSyncLogger.logDebug("[Dictation] no time left to polish; pasting the chunks' cleanups")
+            return text
+        }
         do {
-            let reply = try await withTimeout(seconds: Double(timeout.components.seconds) + Double(timeout.components.attoseconds) / 1e18) {
+            let reply = try await withTimeout(seconds: Self.seconds(allowed)) {
                 try await polish(text, cleanup)
             }
             let polishedText = reply.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -544,7 +560,8 @@ final class DictationController {
 
     /// Makes the transcription request, and makes it again after a server error (a 5xx other than
     /// the backend's own timeout: the speech model behind it was rate limited or failed) or a dropped
-    /// connection, once after each of `transcriptionRetryDelays`, so the user need not say it again;
+    /// connection, once after each of `transcriptionRetryDelays` while the dictation's deadline allows
+    /// (the caller's `withTimeout`), so the user need not say it again;
     /// `isRetrying` says so while it waits and tries, until a retry answers, and `showsRetryNote` once
     /// that has gone on for `transcriptionRetryNoticeDelay`. Any other failure (signed out, over quota, a refused request, a timeout) fails at
     /// once. As TabMail Voice's `transcribeRetrying` (ADR-DESK-039).
@@ -582,6 +599,11 @@ final class DictationController {
             guard let self, !Task.isCancelled, self.generation == current, self.isRetrying else { return }
             self.showsRetryNote = true
         }
+    }
+
+    /// `duration` in seconds, for `withTimeout`.
+    nonisolated static func seconds(_ duration: Duration) -> TimeInterval {
+        Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
     }
 
     /// The status the backend answers when the speech model did not answer in time.

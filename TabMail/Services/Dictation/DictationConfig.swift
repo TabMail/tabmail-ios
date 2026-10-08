@@ -99,7 +99,8 @@ enum DictationConfig {
     static let chunkOverlapSpeech: Duration = .seconds(15)
     static let chunkMaxOverlap: Duration = .seconds(30)
     /// A chunk failing while the user still dictates is tried again after each of these, the last
-    /// repeating, until the release; then it gets `transcriptionRetryDelays`.
+    /// repeating, until the release; then it gets `transcriptionRetryDelays`, within
+    /// `transcriptionDeadline`.
     static let chunkRetryDelays: [Duration] = [.seconds(1), .seconds(2), .seconds(5), .seconds(10)]
     /// Overlapping chunks' texts are matched within this many words of the seam…
     static let chunkOverlapSearchWords = 80
@@ -141,18 +142,24 @@ enum DictationConfig {
     /// token and the backend's per-request caches are warm by the time the recording is sent.
     static let warmUpPath = "/whoami"
     static let warmUpRequestTimeout: TimeInterval = 10
+    /// Longest a dictation waits for its text after the tap to stop, every request and retry
+    /// included, and a long dictation's polish (owner, 2026-10-08: "nobody waits for dictation more
+    /// than 10" seconds). As TabMail Voice's `transcriptionDeadline`. The backend gives the speech
+    /// model 8 s and the cleanup 1.5 s inside it (backend ADR-022).
+    static let transcriptionDeadline: Duration = .seconds(10)
     /// A transcription the server failed (a 5xx) or whose connection dropped is tried again after
-    /// each of these, so the user need not say it again. As TabMail Voice's. About a minute of waits in all,
-    /// plus each try's own time, up to the backend's 30 s window when it times out (owner, 2026-10-03: "we definitely need more retries … we should not lose the end"): the
-    /// provider's rate limits come in bursts of seconds.
-    static let transcriptionRetryDelays: [Duration] = [
-        .milliseconds(500), .milliseconds(1_500), .seconds(3), .seconds(5), .seconds(10), .seconds(10), .seconds(15), .seconds(15),
-    ]
+    /// each of these while `transcriptionDeadline` allows, so the user need not say it again. As
+    /// TabMail Voice's. (Was eight waits over about a minute, owner 2026-10-03; cut to what fits in
+    /// the 10 s, owner 2026-10-08.)
+    static let transcriptionRetryDelays: [Duration] = [.milliseconds(500), .milliseconds(1_500), .seconds(3)]
     /// How long after the first server error the field says it is retrying; the spinner turns toward
     /// purple at once. As TabMail Voice's `transcriptionRetryNoticeDelay` (owner, 2026-10-02).
     static let transcriptionRetryNoticeDelay: Duration = .seconds(2)
     /// Covers the upload, the transcription and the cleanup the backend runs in the same request
-    /// under its own deadline (backend ADR-027; owner, 2026-09-28: 1.5 s at most).
+    /// under its own deadline (backend ADR-027; owner, 2026-09-28: 1.5 s at most). Longer than
+    /// `transcriptionDeadline` on purpose: after the tap to stop that deadline ends the wait; before
+    /// it, a long dictation's chunk is uploaded and transcribed while the user goes on, and is not
+    /// given up on just for taking longer (a URL timeout is not retried).
     static let transcriptionRequestTimeout: TimeInterval = 45
     /// The languages the backend transcribes (backend ADR-024, `src/config/transcription.json`):
     /// its default model's 18, then the 12 it routes to a second model. Settings offers these;
