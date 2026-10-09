@@ -17,8 +17,8 @@ import SwiftUI
 /// No age answer is stored; the App Store is asked again at every launch and
 /// foreground. Apple documents that the system caches the answer and returns
 /// it until the person's next birthday, so the repeat asks do not show its
-/// sheet again. Confirm in a sandbox account in a regulated region before
-/// release, including a background and foreground that shows no block.
+/// sheet again. Apple's sheet does not run in the Simulator, so tests give
+/// `decide` the answers iOS would (owner 2026-10-09).
 enum AppStoreAgeCheck {
     enum Status: Equatable {
         /// Not yet asked, or the region question itself failed: asked again on
@@ -61,15 +61,16 @@ enum AppStoreAgeCheck {
         }
     }
 
-    /// The App Store's response, decided.
-    static func status(for response: AgeRangeService.Response) -> Status {
+    /// The App Store's response, reduced to an `Answer`. A kind of response
+    /// this SDK does not know confirms no age.
+    static func answer(for response: AgeRangeService.Response) -> Answer {
         switch response {
         case .declinedSharing:
-            return classify(.declined)
+            return .declined
         case .sharing(let range):
-            return classify(.shared(lowerBound: range.lowerBound, upperBound: range.upperBound))
+            return .shared(lowerBound: range.lowerBound, upperBound: range.upperBound)
         @unknown default:
-            return .unconfirmed
+            return .declined
         }
     }
 
@@ -79,23 +80,44 @@ enum AppStoreAgeCheck {
         // `isEligibleForAgeFeatures`, which tells whether the law applies
         // here, needs iOS 26.2, so earlier versions are not asked.
         guard #available(iOS 26.2, *) else { return .allowed }
+        // Apple's SwiftUI action is not marked Sendable, but it only presents
+        // the system sheet and returns its answer; nothing here shares it.
+        nonisolated(unsafe) let request = request
+        return await decide(
+            isRegulated: { try await isInRegulatedRegion() },
+            askAge: { answer(for: try await request(ageGates: AgeAndTermsConsent.minAgeYears)) }
+        )
+    }
+
+    /// The check, given the App Store's two questions: does the law apply
+    /// here, and what age range does the person share. `run` passes Apple's
+    /// real calls; tests pass the answers iOS would give, since Apple's age
+    /// sheet does not run in the Simulator.
+    @MainActor
+    static func decide(
+        isRegulated: () async throws -> Bool,
+        askAge: () async throws -> Answer
+    ) async -> Status {
         let regulated: Bool
         do {
-            regulated = try await isInRegulatedRegion()
+            regulated = try await isRegulated()
         } catch {
             BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] Region check failed, asking again on next foreground: \(error)")
             return .notChecked
         }
         guard regulated else { return .allowed }
-        // Apple's SwiftUI action is not marked Sendable, but it only presents
-        // the system sheet and returns its answer; nothing here shares it.
-        nonisolated(unsafe) let request = request
         do {
-            return status(for: try await request(ageGates: AgeAndTermsConsent.minAgeYears))
+            return classify(try await askAge())
         } catch {
             BackgroundSyncLogger.logDebug("[AppStoreAgeCheck] Age range request failed: \(error)")
             return .unconfirmed
         }
+    }
+
+    /// What the app shows after a check: a failed region question
+    /// (`.notChecked`) keeps the previous answer, anything else replaces it.
+    static func shown(previous: Status, checked: Status) -> Status {
+        checked == .notChecked ? previous : checked
     }
 
     /// Off the main actor: `AgeRangeService` is not `Sendable`.

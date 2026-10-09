@@ -866,8 +866,9 @@ struct RootView: View {
         isCheckingAppStoreAge = true
         defer { isCheckingAppStoreAge = false }
         let status = await AppStoreAgeCheck.run(request: requestAgeRange)
-        if status != .notChecked {
-            withAnimation { appStoreAge = status }
+        let shown = AppStoreAgeCheck.shown(previous: appStoreAge, checked: status)
+        if shown != appStoreAge {
+            withAnimation { appStoreAge = shown }
         }
         if status == .allowed {
             await AppStoreAgeCheck.acknowledgeSignificantUpdate()

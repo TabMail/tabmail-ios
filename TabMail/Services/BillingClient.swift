@@ -204,9 +204,18 @@ actor BillingClient {
     /// Delete the signed-in account after a failed age check (`ConsentGateView`).
     /// Only a request id is sent — never the date of birth. The worker re-reads
     /// the account live and refuses (409) one that has already agreed.
+    ///
+    /// A token that could not be refreshed for a transient reason means
+    /// billing was never asked, so it throws a retriable error (status 0), not
+    /// `.unauthorized`: the refusal's OK must ask again rather than sign out
+    /// (`AgeAndTermsConsent.deletionHandshake`). A session that is gone or
+    /// revoked can never ask, so that stays `.unauthorized`.
     func requestAgeIneligibleDeletion(requestId: String = UUID().uuidString.lowercased()) async throws {
-        guard let token = await currentAuthToken() else {
-            throw BackendError.unauthorized
+        let token: String
+        switch await TabMailTokenCoordinator.shared.validToken() {
+        case .success(let fresh): token = fresh
+        case .transientFailure: throw BackendError.requestFailed(statusCode: 0)
+        case .permanentFailure, .noSession: throw BackendError.unauthorized
         }
 
         let request = try Self.makeAgeIneligibleDeletionRequest(baseURL: baseURL, token: token, requestId: requestId)
