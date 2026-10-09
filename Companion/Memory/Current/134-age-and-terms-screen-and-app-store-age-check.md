@@ -28,8 +28,9 @@ ADR-034.
   `requestAgeIneligibleDeletion` reads `TabMailTokenCoordinator.validToken()` itself, so a token that
   cannot be refreshed for now throws status 0 (retry), never `.unauthorized` (`currentAuthToken`
   would fold it into nil and sign out with nothing sent). A request lost to a connection problem is
-  therefore sent again; only someone who leaves the app on the refusal, or whose session is revoked,
-  falls back to the billing sweep (7 days old and unused for 30).
+  therefore sent again; someone who leaves the app on the refusal, or whose session is revoked,
+  falls back to the billing sweep (7 days old and unused for 30), as does a request billing refuses
+  without queuing it (any 4xx, including a 401 when billing cannot verify the token).
   Demo has no account: OK exits demo at once. Keep the legal version constant in step with
   the website's `public-config.js` `LEGAL_VERSION_ISO`.
 - `TabMail/Services/AppStoreAgeCheck.swift` + `TabMail/Views/AppStoreAgeGateView.swift` — Apple's
@@ -76,7 +77,9 @@ Tests: `AgeAndTermsConsentTests`, `AppStoreAgeCheckSimulationTests` (simulated A
 `AgeIneligibleDeletionTokenTests` (refusal handshake through the real token path),
 `SignificantUpdateStorageTests` (first-run record and repeat),
 `AgeAndTermsPushGateTests`, `AgeAndTermsDeviceSyncGateTests`.
-Not covered by a test (view wiring; owner smoke list): RootView's `canStartAccountServices` handler
+Not covered by a test (view wiring; owner smoke list): `ConsentGateView.leave` (OK waits for the
+deletion request, resends on no answer, shows the connection message, signs out only after an answer),
+`RootView.checkAppStoreAge` applying `shown(previous:checked:)`, RootView's `canStartAccountServices` handler
 starting Device Sync and push after sign-in or consent, the eligible path clearing the entered
 date from the view's state, and the Apple-facing arm of `acknowledgeSignificantUpdate` (asking
 `requiredRegulatoryFeatures` and showing the notice needs a regulated-region sandbox account).

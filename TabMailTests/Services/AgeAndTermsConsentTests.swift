@@ -363,7 +363,8 @@ struct AgeIneligibleDeletionTokenTests {
             // No refresh token: the session needs signing in again.
             json = ["access_token": "test-access", "refresh_token": "", "expires_at": expired, "user": user]
         case .unrefreshable:
-            // An expired session whose refresh cannot run now.
+            // An expired session with an empty access token: the token lookup
+            // fails as unavailable (transient) before any refresh is tried.
             json = ["access_token": "", "refresh_token": "test-refresh", "expires_at": expired, "user": user]
         }
         _ = try TabMailSessionStore.shared.installNewSession(try JSONSerialization.data(withJSONObject: json))
