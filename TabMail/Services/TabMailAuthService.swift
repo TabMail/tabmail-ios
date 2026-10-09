@@ -270,10 +270,11 @@ final class TabMailAuthService: NSObject {
     /// new one, and the worker upserts idempotently, so a redundant call costs a
     /// round trip and nothing else.
     ///
-    /// Called from RootView's `.tabMailDidSignIn` receiver, the single funnel
-    /// every sign-in completion posts through. Best-effort and unawaited by the
-    /// UI: `subscribeAllAccounts()` already swallows its own failures, and the
-    /// next foreground pass repeats it.
+    /// Called from RootView's `canStartAccountServices` handler, which runs once
+    /// a signed-in account has also passed the age and terms screen (every
+    /// sign-in completion posts `.tabMailDidSignIn`, which restores that state).
+    /// Best-effort and unawaited by the UI: `subscribeAllAccounts()` already
+    /// swallows its own failures, and the next foreground pass repeats it.
     ///
     /// The consent scan runs AFTER the subscribe, and that order is the point.
     /// Sign-out erases this device's classifier consents on the worker along
