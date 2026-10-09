@@ -357,7 +357,7 @@ enum PromptVariables {
         body: RenderedBody,
         summary: SummaryContext,
         account: AccountContext,
-        recipientStatus: String = ""
+        recipientStatus: String
     ) -> [String: Any] {
         let subject = metadata.subject.isEmpty ? "Not Available" : metadata.subject
         let fromSender = formatFromSender(metadata.from)

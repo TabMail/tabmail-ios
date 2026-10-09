@@ -17,7 +17,7 @@ extension AIService {
         summary: SummaryResult,
         userName: String,
         actionPrompt: String,
-        recipientStatus: String = ""
+        recipientStatus: String
     ) async throws -> ActionTag? {
         guard !disableLLMCalls else { return nil }
 

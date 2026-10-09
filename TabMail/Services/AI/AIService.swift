@@ -6,7 +6,14 @@ import Foundation
 
 actor AIService {
     static let shared = AIService()
-    private let backendClient = BackendClient()
+    private let backendClient: BackendClient
+
+    /// Test seam (precedent: `BackendClient(llmSession:)`): inject a client built on a
+    /// `FakeHTTP` session to observe the exact request an AI call sends. Production
+    /// uses `shared`, built with the default client.
+    init(backendClient: BackendClient = BackendClient()) {
+        self.backendClient = backendClient
+    }
 
     /// UserDefaults key for the privacy opt-out toggle (Settings → AI Settings → Privacy).
     /// When true, blocks ALL AI backend calls. Device Sync cache hits still work.
