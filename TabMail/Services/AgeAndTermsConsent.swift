@@ -132,14 +132,17 @@ enum AgeAndTermsConsent {
     // MARK: - Deletion handshake
 
     /// What OK on the refusal does once the deletion request has finished
-    /// (owner 2026-10-09: sign out only after billing has answered, so a lost
-    /// request cannot leave the account to the 30-day sweep).
+    /// (owner 2026-10-09: sign out only after billing has answered, so a
+    /// request lost to a connection problem is sent again rather than left to
+    /// the 30-day sweep).
     enum DeletionHandshake: Equatable {
-        /// Billing queued the deletion, or refused it for good (a 4xx such as
-        /// an account that has already consented): sign out.
+        /// Billing queued the deletion or refused it for good (a 4xx such as an
+        /// account that has already consented), or the session is gone or
+        /// revoked so no request can ever be sent: sign out.
         case signOut
-        /// No answer (connection failure, timeout, 429, 5xx): stay signed in on
-        /// the refusal and send the request again on the next OK.
+        /// No answer (connection failure, timeout, 429, 5xx, or a token that
+        /// could not be refreshed for now): stay signed in on the refusal and
+        /// send the request again on the next OK.
         case retry
     }
 

@@ -162,7 +162,7 @@ struct AgeAndTermsConsentTests {
         #expect(Check.classify(.shared(lowerBound: 16, upperBound: nil)) == .unconfirmed)
         #expect(Check.classify(.shared(lowerBound: 16, upperBound: minAge + 2)) == .unconfirmed)
         #expect(Check.classify(.declined) == .unconfirmed)
-        #expect(Check.status(for: .declinedSharing) == .unconfirmed, "declining to share is not a pass")
+        #expect(Check.classify(Check.answer(for: .declinedSharing)) == .unconfirmed, "declining to share is not a pass")
     }
 
     @Test func aMinorOrAnUnconfirmedAgeCoversTheWholeApp() {
@@ -248,5 +248,158 @@ struct SignificantUpdateStorageTests {
 
         await AppStoreAgeCheck.acknowledgeSignificantUpdate()
         #expect(standard.string(forKey: key) == majorMinor, "a repeat run of the same version changes nothing")
+    }
+}
+
+/// Apple's age sheet does not run in the Simulator (Apple DTS), so these give
+/// `AppStoreAgeCheck.decide` the answers iOS would give and check what the app
+/// then shows (owner 2026-10-09: simulated answers stand in for a device test).
+/// Invariants: outside a regulated region the app opens and Apple is never
+/// asked; in one, only a confirmed adult gets in, a minor is blocked, a
+/// declined or failed answer blocks with Try Again; a failed region question
+/// changes nothing on screen; a foreground after an adult answer shows nothing.
+@Suite("App Store age check: simulated App Store answers")
+@MainActor
+struct AppStoreAgeCheckSimulationTests {
+    typealias Check = AppStoreAgeCheck
+    private struct AppStoreFailure: Error {}
+    /// ADR-034's minimum age, written out so a wrong constant fails here.
+    private let minAge = 18
+
+    /// One check as iOS would answer it; `asked` is whether the age sheet was requested.
+    private func check(regulated: Result<Bool, Error>, answer: Result<Check.Answer, Error>) async -> (status: Check.Status, asked: Bool) {
+        var asked = false
+        let status = await Check.decide(
+            isRegulated: { try regulated.get() },
+            askAge: {
+                asked = true
+                return try answer.get()
+            }
+        )
+        return (status, asked)
+    }
+
+    @Test func outsideARegulatedRegionTheAppOpensAndAppleIsNeverAsked() async {
+        let result = await check(regulated: .success(false), answer: .success(.declined))
+        #expect(result.status == .allowed)
+        #expect(!result.asked, "no age sheet outside a regulated region")
+        #expect(!Check.shown(previous: .notChecked, checked: result.status).blocksApp)
+    }
+
+    @Test func anAdultTheAppStoreConfirmsGetsIn() async {
+        for answer: Check.Answer in [.shared(lowerBound: minAge, upperBound: nil), .shared(lowerBound: minAge + 7, upperBound: nil)] {
+            let result = await check(regulated: .success(true), answer: .success(answer))
+            #expect(result.asked)
+            #expect(result.status == .allowed, "adult: \(answer)")
+            #expect(!Check.shown(previous: .notChecked, checked: result.status).blocksApp)
+        }
+    }
+
+    @Test func aMinorIsBlocked() async {
+        for answer: Check.Answer in [
+            .shared(lowerBound: nil, upperBound: 12), .shared(lowerBound: 13, upperBound: 15),
+            .shared(lowerBound: 16, upperBound: minAge - 1),
+        ] {
+            let result = await check(regulated: .success(true), answer: .success(answer))
+            let shown = Check.shown(previous: .notChecked, checked: result.status)
+            #expect(shown == .minor, "minor: \(answer)")
+            #expect(shown.blocksApp)
+        }
+    }
+
+    @Test func aDeclinedOrFailedAnswerBlocksAndTryAgainLetsAnAdultIn() async {
+        for answer: Result<Check.Answer, Error> in [.success(.declined), .failure(AppStoreFailure())] {
+            let first = await check(regulated: .success(true), answer: answer)
+            let shown = Check.shown(previous: .notChecked, checked: first.status)
+            #expect(shown == .unconfirmed, "the gate that offers Try Again")
+            #expect(shown.blocksApp)
+
+            let retry = await check(regulated: .success(true), answer: .success(.shared(lowerBound: minAge, upperBound: nil)))
+            #expect(!Check.shown(previous: shown, checked: retry.status).blocksApp, "Try Again with an adult answer opens the app")
+        }
+    }
+
+    @Test func aFailedRegionQuestionChangesNothingOnScreen() async {
+        let result = await check(regulated: .failure(AppStoreFailure()), answer: .success(.declined))
+        #expect(result.status == .notChecked)
+        #expect(!result.asked)
+        for previous: Check.Status in [.notChecked, .allowed, .minor, .unconfirmed] {
+            #expect(Check.shown(previous: previous, checked: result.status) == previous, "kept: \(previous)")
+        }
+    }
+
+    @Test func aForegroundAfterAnAdultAnswerShowsNothing() async {
+        let launch = await check(regulated: .success(true), answer: .success(.shared(lowerBound: minAge, upperBound: nil)))
+        let afterLaunch = Check.shown(previous: .notChecked, checked: launch.status)
+        let foreground = await check(regulated: .success(true), answer: .success(.shared(lowerBound: minAge, upperBound: nil)))
+        let afterForeground = Check.shown(previous: afterLaunch, checked: foreground.status)
+        #expect(afterForeground == .allowed)
+        #expect(!afterForeground.blocksApp)
+    }
+}
+
+/// The deletion request's real token path (`BillingClient` through
+/// `TabMailTokenCoordinator`), network-free: in each state the token lookup
+/// fails before any request is built, so neither auth nor billing is
+/// contacted. Invariant (owner 2026-10-09): OK on the refusal signs out only
+/// once billing has answered. A token that could not be refreshed for now
+/// means billing was never asked, so OK must retry; a session that is gone or
+/// revoked can never ask, so OK signs out. Uses the app's shared session,
+/// hence `.serialized` and `.processGlobalState`; the previous one is restored.
+@Suite("Age check refusal: deletion handshake through the real token path", .serialized, .processGlobalState)
+@MainActor
+struct AgeIneligibleDeletionTokenTests {
+    private enum TokenState { case none, revoked, unrefreshable }
+
+    private func install(_ state: TokenState) throws {
+        _ = TabMailAuthService.completeSession(mode: .deactivate, notify: false)
+        let expired = Int(Date().addingTimeInterval(-3600).timeIntervalSince1970)
+        let user: [String: Any] = ["id": "test-user", "email": "user@example.com"]
+        let json: [String: Any]
+        switch state {
+        case .none:
+            return
+        case .revoked:
+            // No refresh token: the session needs signing in again.
+            json = ["access_token": "test-access", "refresh_token": "", "expires_at": expired, "user": user]
+        case .unrefreshable:
+            // An expired session whose refresh cannot run now.
+            json = ["access_token": "", "refresh_token": "test-refresh", "expires_at": expired, "user": user]
+        }
+        _ = try TabMailSessionStore.shared.installNewSession(try JSONSerialization.data(withJSONObject: json))
+    }
+
+    private func handshake(for state: TokenState) async throws -> AgeAndTermsConsent.DeletionHandshake {
+        let previous = TabMailSessionStore.shared.loadActiveSession()?.data
+        defer {
+            _ = TabMailAuthService.completeSession(mode: .deactivate, notify: false)
+            if let previous { _ = try? TabMailSessionStore.shared.installNewSession(previous) }
+        }
+        try install(state)
+        if case .success = await TabMailTokenCoordinator.shared.validToken() {
+            // Never reach billing with a usable token.
+            Issue.record("the \(state) fixture produced a usable token")
+            return .signOut
+        }
+        var thrown: Error?
+        do {
+            try await BillingClient().requestAgeIneligibleDeletion()
+        } catch {
+            thrown = error
+        }
+        let error = try #require(thrown, "the request must fail before any network call")
+        return AgeAndTermsConsent.deletionHandshake(after: error)
+    }
+
+    @Test func aTokenThatCannotBeRefreshedNowMakesOKAskAgain() async throws {
+        #expect(try await handshake(for: .unrefreshable) == .retry, "billing was never asked")
+    }
+
+    @Test func aRevokedSessionSignsOut() async throws {
+        #expect(try await handshake(for: .revoked) == .signOut)
+    }
+
+    @Test func noSessionSignsOut() async throws {
+        #expect(try await handshake(for: .none) == .signOut)
     }
 }

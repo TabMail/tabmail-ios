@@ -23,8 +23,9 @@ struct ConsentGateView: View {
     /// account to delete after a failed age check.
     var persistsToBackend: Bool = true
     var onComplete: () -> Void
-    /// Runs when the person taps OK on the "can't create an account" view: the
-    /// parent signs out (or leaves demo).
+    /// Runs when the person taps OK on the "can't create an account" view and
+    /// billing has answered the deletion request (at once in demo): the parent
+    /// signs out (or leaves demo).
     var onIneligible: () async -> Void = {}
 
     @State private var birthMonth: Int?

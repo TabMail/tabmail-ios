@@ -22,20 +22,28 @@ ADR-034.
   checkbox, ineligible view. A failed check discards the date, blocks the device and sends billing
   `POST /account/age-ineligible` (`BillingClient.requestAgeIneligibleDeletion`). OK waits for that
   request's answer and signs out (prod) only once billing has answered (owner 2026-10-09 handshake,
-  `AgeAndTermsConsent.deletionHandshake`): 2xx or a definitive 4xx refusal signs out; no answer
-  (connection failure, timeout, 429, 5xx: `BackendError.isRetriable`) keeps the person on the refusal
-  and the next OK sends it again, so a lost request no longer leaves the account to the 30-day sweep.
+  `AgeAndTermsConsent.deletionHandshake`): 2xx, a definitive 4xx refusal, or a session that is gone
+  or revoked (`.unauthorized`) signs out; no answer (connection failure, timeout, 429, 5xx:
+  `BackendError.isRetriable`) keeps the person on the refusal and the next OK sends it again.
+  `requestAgeIneligibleDeletion` reads `TabMailTokenCoordinator.validToken()` itself, so a token that
+  cannot be refreshed for now throws status 0 (retry), never `.unauthorized` (`currentAuthToken`
+  would fold it into nil and sign out with nothing sent). A request lost to a connection problem is
+  therefore sent again; only someone who leaves the app on the refusal, or whose session is revoked,
+  falls back to the billing sweep (7 days old and unused for 30).
   Demo has no account: OK exits demo at once. Keep the legal version constant in step with
   the website's `public-config.js` `LEGAL_VERSION_ISO`.
 - `TabMail/Services/AppStoreAgeCheck.swift` + `TabMail/Views/AppStoreAgeGateView.swift` — Apple's
   Declared Age Range API. `isEligibleForAgeFeatures` (iOS 26.2+) says whether the region is
   regulated (TX/UT/LA today); only then `requestAgeRange(ageGates:)`. `classify`: upper bound < 18 or
   nil lower bound → `.minor` (blocked); lower ≥ 18 → `.allowed`; declined → `.unconfirmed` (blocked,
-  Try Again); `status(for:)` maps Apple's `Response`, `Status.blocksApp` is RootView's routing
-  test. Region-check error → `.notChecked`; an age-range request error → `.unconfirmed`. Runs at launch and on foreground from `RootView`,
+  Try Again); `answer(for:)` maps Apple's `Response`, `Status.blocksApp` is RootView's routing
+  test. `run` passes Apple's two real calls to `decide(isRegulated:askAge:)`. Region-check error →
+  `.notChecked`, which `shown(previous:checked:)` turns into "keep what is on screen"; an age-range
+  request error → `.unconfirmed`. Runs at launch and on foreground from `RootView`,
   ahead of demo and email-only modes. Apple documents that the system caches the answer until the
-  person's next birthday, so repeat asks do not re-show the system sheet (still confirm in a sandbox
-  account in a regulated region, including background then foreground with no block). Before iOS
+  person's next birthday, so repeat asks do not re-show the system sheet. Apple's sheet does not run
+  in the Simulator (Apple DTS), so owner 2026-10-09 accepted simulated answers through `decide` in
+  place of a device smoke test (`AppStoreAgeCheckSimulationTests`). Before iOS
   26.2 nothing is asked (`isEligibleForAgeFeatures` needs 26.2). The block covers the screens only
   (owner 2026-10-09).
   Entitlement `com.apple.developer.declared-age-range`; the App
@@ -64,7 +72,9 @@ ADR-034.
   required, shows `showSignificantUpdateAcknowledgment` before recording; a failure records nothing
   and asks again on the next foreground.
 
-Tests: `AgeAndTermsConsentTests`, `SignificantUpdateStorageTests` (first-run record and repeat),
+Tests: `AgeAndTermsConsentTests`, `AppStoreAgeCheckSimulationTests` (simulated App Store answers),
+`AgeIneligibleDeletionTokenTests` (refusal handshake through the real token path),
+`SignificantUpdateStorageTests` (first-run record and repeat),
 `AgeAndTermsPushGateTests`, `AgeAndTermsDeviceSyncGateTests`.
 Not covered by a test (view wiring; owner smoke list): RootView's `canStartAccountServices` handler
 starting Device Sync and push after sign-in or consent, the eligible path clearing the entered
