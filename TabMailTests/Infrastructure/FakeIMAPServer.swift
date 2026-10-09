@@ -53,6 +53,12 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// bytes here (keyed by section string, e.g. `"1"`, `"2"`, `"2.1"`).
         /// Falls back to slicing `body` only when nil.
         let partBodies: [String: Data]?
+        /// When set, the fake server emits this raw ENVELOPE literal instead of
+        /// its auto-generated one, which carries only From and To. Used by tests
+        /// that need named Cc/Bcc mailboxes or groups. The literal must be a
+        /// valid RFC 3501 §7.4.2 envelope, outer parentheses included; a group
+        /// starts with a NIL-host address naming it and ends with an all-NIL one.
+        var customEnvelope: String? = nil
 
         /// The same message with a different server-side `INTERNALDATE`.
         ///
@@ -78,7 +84,8 @@ final class FakeIMAPServer: @unchecked Sendable {
                 body: body,
                 headerData: headerData,
                 customBodystructure: customBodystructure,
-                partBodies: partBodies
+                partBodies: partBodies,
+                customEnvelope: customEnvelope
             )
         }
 
@@ -97,7 +104,8 @@ final class FakeIMAPServer: @unchecked Sendable {
                 body: body,
                 headerData: headerData,
                 customBodystructure: customBodystructure,
-                partBodies: partBodies
+                partBodies: partBodies,
+                customEnvelope: customEnvelope
             )
         }
     }
@@ -2568,6 +2576,7 @@ final class FakeIMAPServer: @unchecked Sendable {
     // MARK: - Response Builders
 
     private func buildEnvelope(_ msg: Message) -> String {
+        if let envelope = msg.customEnvelope { return envelope }
         let date = quote(msg.date)
         let subject = quote(msg.subject)
         let fromAddr = buildAddrList(msg.from)

@@ -6,6 +6,7 @@ import Testing
 import Foundation
 import Synchronization
 @testable import TabMail
+import SwiftMail
 
 /// Integration tests for `ExchangeProvider.fetchMessage` and `fetchAttachment`
 /// via the URLProtocol-level `FakeHTTP` mock.
@@ -182,6 +183,62 @@ struct ExchangeProviderMockTests {
         // Confirm the fallback URL was hit — the whole point of this test.
         let calls = FakeHTTP.recordedCalls().map { $0.url }
         #expect(calls.contains { $0.contains("/microsoft.graph.itemattachment/item/attachments") && !$0.contains("/attachments/\(innerPdfId)") })
+    }
+
+    /// A crafted display name on an attached message's From, To or Cc stays
+    /// inside its own mailbox in the header block the attachment renders.
+    @Test("An attached message's crafted display names read back as one mailbox each")
+    func itemAttachmentCraftedNamesStayInsideTheirMailbox() async throws {
+        FakeHTTP.reset()
+        defer { FakeHTTP.reset() }
+
+        let messageId = "msg-graph-crafted"
+        let attachmentId = "crafted-itemattachment-id"
+        let filename = "crafted.eml"
+        let crafted = #"x" <hidden@example.com>, "y"#
+        let received = ISO8601DateFormatter().string(from: Date())
+        func json(_ object: [String: Any]) throws -> String {
+            String(decoding: try JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+        }
+        func recipient(_ address: String) -> [String: Any] {
+            ["emailAddress": ["name": crafted, "address": address]]
+        }
+        let topLevel: [String: Any] = [
+            "id": messageId, "subject": "Outer",
+            "from": ["emailAddress": ["address": "sender@example.com"]],
+            "receivedDateTime": received, "isRead": true, "hasAttachments": true,
+            "body": ["contentType": "html", "content": "<p>Outer body</p>"]
+        ]
+        let attachment: [String: Any] = [
+            "@odata.type": "#microsoft.graph.itemAttachment", "id": attachmentId,
+            "name": filename, "contentType": "message/rfc822", "size": 256, "isInline": false
+        ]
+        var expanded = attachment
+        expanded["item"] = [
+            "subject": "Nested", "from": recipient("bob@example.com"),
+            "toRecipients": [recipient("ann@example.com")], "ccRecipients": [recipient("bex@example.com")],
+            "receivedDateTime": received, "hasAttachments": false,
+            "body": ["contentType": "html", "content": "<p>Nested body text</p>"]
+        ] as [String: Any]
+        FakeHTTP.register(path: "/messages/\(messageId)?", method: "GET", response: .json(raw: try json(topLevel)))
+        FakeHTTP.register(path: "/messages/\(messageId)/attachments", method: "GET", response: .json(raw: try json(["value": [attachment]])))
+        FakeHTTP.register(path: "/messages/\(messageId)/attachments/\(attachmentId)?", method: "GET", response: .json(raw: try json(expanded)))
+
+        let provider = ExchangeProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-graph-token" },
+            session: FakeHTTP.makeSession()
+        )
+        let info = try await provider.fetchMessage(id: messageId, folder: "INBOX")
+
+        let html = try #require(info.htmlBody)
+        #expect(html.contains("Nested body text"))
+        let metadata = try #require(EmailFilter.parseEmlSectionMetadata(html: html, filename: filename))
+        for (field, address) in [(metadata.from, "bob@example.com"), (metadata.toList, "ann@example.com"), (metadata.ccList, "bex@example.com")] {
+            let value = try #require(field)
+            #expect(AddressParser.parseAddressList(value).flatMap(\.mailboxes)
+                == [SwiftMail.EmailAddress(name: crafted, address: address)])
+        }
     }
 
     // MARK: - Test 2: compound section → correct download URL

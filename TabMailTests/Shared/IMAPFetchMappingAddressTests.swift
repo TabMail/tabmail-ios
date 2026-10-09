@@ -95,6 +95,9 @@ struct IMAPFetchMappingAddressTests {
         }
         let field = IMAPFetchMapping.addressField(entries)
         #expect(AddressParser.parseAddressList(field) == entries)
+        let members = entries.flatMap(\.mailboxes)
+        let groupField = IMAPFetchMapping.addressField([.group(name: "Team", members: members)])
+        #expect(AddressParser.parseAddressList(groupField).flatMap(\.mailboxes) == members)
         #expect(IMAPFetchMapping.addressField([mailbox("bob@example.com", name: #"x" <me@example.com>, "y"#)])
             == #""x\" <me@example.com>, \"y" <bob@example.com>"#)
     }

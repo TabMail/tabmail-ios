@@ -93,23 +93,27 @@ struct BuildReplyAllRecipientsTests {
         #expect(result.cc == ["bob@example.com"])
     }
 
-    /// A display name is text, never a recipient: a crafted IMAP Cc name that
-    /// holds quotes, a comma and an address must not add that address.
-    @Test("An address inside a quoted display name is never offered")
-    func addressInsideDisplayNameNeverOffered() {
+    /// A display name is text, never a recipient: a crafted IMAP name that
+    /// holds quotes, a comma and an address must not add that address, in To or
+    /// Cc, flat or inside a group (a raw Gmail header keeps its groups).
+    @Test("An address inside a quoted display name is never offered", arguments: [false, true], [false, true])
+    func addressInsideDisplayNameNeverOffered(inTo: Bool, grouped: Bool) {
         let me = makeAccount(email: "me@example.com")
         let crafted = #"x" <hidden@example.com>, "y"#
+        let flat = IMAPFetchMapping.addressField([
+            .mailbox(SwiftMail.EmailAddress(name: crafted, address: "bob@example.com")),
+            .mailbox(SwiftMail.EmailAddress(name: #"Back\slash, "Q""#, address: "ann@example.com"))
+        ])
+        let field = grouped ? "Team: \(flat);" : flat
         let msg = makeHeader(
             from: "sender@example.com",
-            to: "me@example.com",
-            cc: IMAPFetchMapping.addressField([
-                .mailbox(SwiftMail.EmailAddress(name: crafted, address: "bob@example.com")),
-                .mailbox(SwiftMail.EmailAddress(name: #"Back\slash, "Q""#, address: "ann@example.com"))
-            ])
+            to: inTo ? "me@example.com, \(field)" : "me@example.com",
+            cc: inTo ? "" : field
         )
         let result = buildReplyAllRecipients(for: msg, allAccounts: [me])
-        #expect(result.to == ["sender@example.com"])
-        #expect(result.cc == ["bob@example.com", "ann@example.com"])
+        let real = ["bob@example.com", "ann@example.com"]
+        #expect(result.to == ["sender@example.com"] + (inTo ? real : []))
+        #expect(result.cc == (inTo ? [] : real))
     }
 
     @Test("Filters out single account email from To")
