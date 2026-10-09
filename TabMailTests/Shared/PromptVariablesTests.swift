@@ -621,7 +621,8 @@ struct PromptVariablesTests {
             metadata: fixtureMetadata(),
             body: fixtureBody(),
             summary: SummaryContext(blurb: "summary text", todos: "- do X"),
-            account: account
+            account: account,
+            recipientStatus: ""
         )
         let expected: Set<String> = [
             "user_name", "user_action_prompt", "body", "subject", "from_sender",
@@ -637,7 +638,8 @@ struct PromptVariablesTests {
             metadata: fixtureMetadata(),
             body: fixtureBody(),
             summary: SummaryContext(blurb: "S", todos: "T"),
-            account: account
+            account: account,
+            recipientStatus: ""
         )
         #expect(vars["summary"] as? String == "S")
         #expect(vars["todo"] as? String == "T")
@@ -649,7 +651,8 @@ struct PromptVariablesTests {
             metadata: fixtureMetadata(),
             body: fixtureBody(),
             summary: SummaryContext(blurb: nil, todos: nil),
-            account: account
+            account: account,
+            recipientStatus: ""
         )
         #expect(vars["summary"] as? String == "Not Available")
         #expect(vars["todo"] as? String == "Not Available")
@@ -661,10 +664,27 @@ struct PromptVariablesTests {
             metadata: fixtureMetadata(),
             body: fixtureBody(),
             summary: SummaryContext(blurb: nil, todos: nil),
-            account: account
+            account: account,
+            recipientStatus: ""
         )
         #expect(vars["user_action_prompt"] as? String == "# Action rules\n- delete promos")
         #expect(vars["user_kb_content"] == nil)  // Action prompt does NOT include KB.
+    }
+
+    @Test("Action sends recipient_status only as cc, omitted otherwise")
+    func actionRecipientStatus() {
+        let cc = PromptVariables.actionVariables(
+            metadata: fixtureMetadata(), body: fixtureBody(),
+            summary: SummaryContext(blurb: nil, todos: nil), account: account,
+            recipientStatus: "cc"
+        )
+        #expect(cc["recipient_status"] as? String == "cc")
+        let direct = PromptVariables.actionVariables(
+            metadata: fixtureMetadata(), body: fixtureBody(),
+            summary: SummaryContext(blurb: nil, todos: nil), account: account,
+            recipientStatus: ""
+        )
+        #expect(direct["recipient_status"] == nil)
     }
 
     // MARK: - Parity between summary and action for overlapping keys
@@ -675,7 +695,7 @@ struct PromptVariablesTests {
         let body = fixtureBody()
         let summary = SummaryContext(blurb: nil, todos: nil)
         let s = PromptVariables.summaryVariables(metadata: metadata, body: body, account: account)
-        let a = PromptVariables.actionVariables(metadata: metadata, body: body, summary: summary, account: account)
+        let a = PromptVariables.actionVariables(metadata: metadata, body: body, summary: summary, account: account, recipientStatus: "")
 
         for key in ["user_name", "subject", "from_sender", "body", "is_noreply_address", "has_unsubscribe_link"] {
             #expect("\(s[key] ?? "nil-s")" == "\(a[key] ?? "nil-a")",

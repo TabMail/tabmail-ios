@@ -1328,16 +1328,7 @@ actor ActiveAIQueue {
         let t0 = CFAbsoluteTimeGetCurrent()
         BackgroundSyncLogger.logAIProcessing("Summary START \(Self.logId(job.headerId))")
 
-        // "cc" needs positive evidence: the RECEIVING account's address in the
-        // Cc header (claim set). All registered accounts feed the suppress set
-        // only — a cross-account To/From hit prevents a claim, never makes one.
-        let allAccountEmails = (try? await dbPool.read { db in
-            try Account.fetchAll(db).map(\.emailAddress)
-        }) ?? []
-        let recipientStatus = PromptVariables.classifyRecipientStatus(
-            toField: message.to, ccField: message.cc, fromField: message.fromAddress,
-            claimEmails: [account.emailAddress], suppressEmails: allAccountEmails
-        )
+        let recipientStatus = await recipientStatusForJob(message, account: account)
 
         do {
             let summary = try await config.aiService.generateSummary(
@@ -1412,6 +1403,19 @@ actor ActiveAIQueue {
         return false
     }
 
+    /// "cc" needs positive evidence: the RECEIVING account's address in the
+    /// Cc header (claim set). All registered accounts feed the suppress set
+    /// only — a cross-account To/From hit prevents a claim, never makes one.
+    private func recipientStatusForJob(_ message: MessageHeader, account: Account) async -> String {
+        let allAccountEmails = (try? await dbPool.read { db in
+            try Account.fetchAll(db).map(\.emailAddress)
+        }) ?? []
+        return PromptVariables.classifyRecipientStatus(
+            toField: message.to, ccField: message.cc, fromField: message.fromAddress,
+            claimEmails: [account.emailAddress], suppressEmails: allAccountEmails
+        )
+    }
+
     // MARK: - Action Job
 
     /// Action classification job. Chained by summary job on completion — summary
@@ -1441,6 +1445,8 @@ actor ActiveAIQueue {
         let t0 = CFAbsoluteTimeGetCurrent()
         BackgroundSyncLogger.logAIProcessing("Action START \(Self.logId(job.headerId))")
 
+        let recipientStatus = await recipientStatusForJob(msg, account: account)
+
         do {
             let existingSummary = SummaryResult(
                 blurb: msg.summaryBlurb,
@@ -1457,7 +1463,8 @@ actor ActiveAIQueue {
                 htmlContent: nil,
                 summary: existingSummary,
                 userName: account.displayName,
-                actionPrompt: config.actionPrompt
+                actionPrompt: config.actionPrompt,
+                recipientStatus: recipientStatus
             )
             if let action {
                 // T4.V7 site 3. The `?? action` false-success is REMOVED — reporting
