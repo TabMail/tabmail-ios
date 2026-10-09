@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 @testable import TabMail
+import SwiftMail
 
 @Suite("EmailAddressUtils Extended")
 struct EmailAddressUtilsExtendedTests {
@@ -21,12 +22,6 @@ struct EmailAddressUtilsExtendedTests {
         #expect(result == "john@example.com")
     }
 
-    @Test("parseAddressList handles semicolons")
-    func semicolonSeparated() {
-        let result = parseAddressList("a@b.com; c@d.com")
-        #expect(result.count >= 1) // Implementation may or may not support semicolons
-    }
-
     @Test("extractEmailAddress handles address with plus")
     func addressWithPlus() {
         let result = extractEmailAddress("user+tag@example.com")
@@ -37,12 +32,6 @@ struct EmailAddressUtilsExtendedTests {
     func internationalDomain() {
         let result = extractEmailAddress("user@münchen.de")
         #expect(result.contains("@"))
-    }
-
-    @Test("parseAddressList empty string returns empty")
-    func emptyStringReturnsEmpty() {
-        let result = parseAddressList("")
-        #expect(result.isEmpty)
     }
 
     @Test("extractEmailAddress nil-safe for empty string")
@@ -102,6 +91,25 @@ struct BuildReplyAllRecipientsTests {
         let result = buildReplyAllRecipients(for: msg, allAccounts: [me])
         #expect(result.to == ["sender@example.com", "ann@example.com"])
         #expect(result.cc == ["bob@example.com"])
+    }
+
+    /// A display name is text, never a recipient: a crafted IMAP Cc name that
+    /// holds quotes, a comma and an address must not add that address.
+    @Test("An address inside a quoted display name is never offered")
+    func addressInsideDisplayNameNeverOffered() {
+        let me = makeAccount(email: "me@example.com")
+        let crafted = #"x" <hidden@example.com>, "y"#
+        let msg = makeHeader(
+            from: "sender@example.com",
+            to: "me@example.com",
+            cc: IMAPFetchMapping.addressField([
+                .mailbox(SwiftMail.EmailAddress(name: crafted, address: "bob@example.com")),
+                .mailbox(SwiftMail.EmailAddress(name: #"Back\slash, "Q""#, address: "ann@example.com"))
+            ])
+        )
+        let result = buildReplyAllRecipients(for: msg, allAccounts: [me])
+        #expect(result.to == ["sender@example.com"])
+        #expect(result.cc == ["bob@example.com", "ann@example.com"])
     }
 
     @Test("Filters out single account email from To")

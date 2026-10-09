@@ -20,14 +20,16 @@ func buildReplyAllRecipients(
     if isValidEmailAddress(senderEmail), seen.insert(senderEmail).inserted {
         toEmails.append(senderEmail)
     }
-    for addr in parseAddressList(msg.to) {
-        let bare = extractEmailAddress(addr).lowercased()
+    // Read with SwiftMail's parser, which honours quoted-pairs: an address inside
+    // a quoted display name is part of the name, never a recipient.
+    for mailbox in AddressParser.parseAddressList(msg.to).flatMap(\.mailboxes) {
+        let bare = mailbox.address.lowercased()
         if isValidEmailAddress(bare), seen.insert(bare).inserted { toEmails.append(bare) }
     }
 
     var ccEmails: [String] = []
-    for addr in parseAddressList(msg.cc) {
-        let bare = extractEmailAddress(addr).lowercased()
+    for mailbox in AddressParser.parseAddressList(msg.cc).flatMap(\.mailboxes) {
+        let bare = mailbox.address.lowercased()
         if isValidEmailAddress(bare), seen.insert(bare).inserted { ccEmails.append(bare) }
     }
 
@@ -54,28 +56,4 @@ func extractEmailAddress(_ raw: String) -> String {
         return String(trimmed[trimmed.index(after: angleStart)..<angleEnd])
     }
     return trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-}
-
-/// Parse a comma-separated address header into individual address strings,
-/// respecting quoted display names that may contain commas (e.g., `"Doe, John" <j@x.com>`).
-func parseAddressList(_ raw: String) -> [String] {
-    guard !raw.isEmpty else { return [] }
-    var results: [String] = []
-    var current = ""
-    var inQuotes = false
-    for ch in raw {
-        if ch == "\"" {
-            inQuotes.toggle()
-            current.append(ch)
-        } else if ch == "," && !inQuotes {
-            let trimmed = current.trimmingCharacters(in: .whitespaces)
-            if !trimmed.isEmpty { results.append(trimmed) }
-            current = ""
-        } else {
-            current.append(ch)
-        }
-    }
-    let trimmed = current.trimmingCharacters(in: .whitespaces)
-    if !trimmed.isEmpty { results.append(trimmed) }
-    return results
 }

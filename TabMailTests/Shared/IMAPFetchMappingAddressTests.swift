@@ -78,8 +78,25 @@ struct IMAPFetchMappingAddressTests {
         ])
         #expect(field == #"ann@example.com, "Doe, Jane" <jane@example.com>, bob@example.com"#)
         // The stored field reads back to exactly the three addresses.
-        #expect(parseAddressList(field).map(extractEmailAddress)
+        #expect(AddressParser.parseAddressList(field).flatMap(\.mailboxes).map(\.address)
             == ["ann@example.com", "jane@example.com", "bob@example.com"])
+    }
+
+    @Test("A display name holding quotes, backslashes, commas or an address reads back as that one mailbox")
+    func craftedDisplayNamesReadBackAsOneMailbox() {
+        let names = [
+            #"x" <me@example.com>, "y"#,
+            #"Back\slash, "Q""#,
+            "Trailing\\",
+            "q\"\u{301} <me@example.com>, \"z"
+        ]
+        let entries = names.enumerated().map { index, name in
+            mailbox("user\(index)@example.com", name: name)
+        }
+        let field = IMAPFetchMapping.addressField(entries)
+        #expect(AddressParser.parseAddressList(field) == entries)
+        #expect(IMAPFetchMapping.addressField([mailbox("bob@example.com", name: #"x" <me@example.com>, "y"#)])
+            == #""x\" <me@example.com>, \"y" <bob@example.com>"#)
     }
 
     @Test("An empty group contributes nothing")

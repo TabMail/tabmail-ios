@@ -56,8 +56,8 @@ enum IMAPFetchMapping {
     }
 
     /// An address field as the entries TabMail stores, one per mailbox:
-    /// `"Name" <address>`, or the bare `address` when there is no name — the
-    /// shape `parseAddressList` and `extractEmailAddress` read back. A group
+    /// `"Name" <address>` (see `mailboxText`), or the bare `address` when there
+    /// is no name — the shape SwiftMail's `AddressParser` reads back. A group
     /// contributes its members; its name is not an address. Invalid text is kept
     /// as written so the field still shows it; `buildReplyAllRecipients` never
     /// offers it, because SwiftMail does not read it as a mailbox.
@@ -78,7 +78,22 @@ enum IMAPFetchMapping {
 
     private static func addressString(_ mailbox: SwiftMail.EmailAddress) -> String {
         guard let name = mailbox.name else { return mailbox.address }
-        return "\"\(name)\" <\(mailbox.address)>"
+        return mailboxText(name: name, address: mailbox.address)
+    }
+
+    /// `"Name" <address>`, with `"` and `\` in the name escaped as quoted-pairs
+    /// (RFC 5322 3.2.4), so the text reads back as this one mailbox. Unescaped,
+    /// a decoded name such as `x" <me@example.com>, "y` would read back as two
+    /// mailboxes, one of them an address the sender never addressed. Escaped by
+    /// Unicode scalar, as SwiftMail's own quoting is: a `"` followed by a
+    /// combining mark is one `Character`, but still a quote to every parser.
+    static func mailboxText(name: String, address: String) -> String {
+        var quoted = String.UnicodeScalarView()
+        for scalar in name.unicodeScalars {
+            if scalar == "\"" || scalar == "\\" { quoted.append("\\") }
+            quoted.append(scalar)
+        }
+        return "\"\(String(quoted))\" <\(address)>"
     }
 
     /// The envelope a header block shows for a message carried as a part.

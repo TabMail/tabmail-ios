@@ -541,24 +541,25 @@ struct PromptVariablesTests {
         ) == "")
     }
 
-    @Test("Documents the accepted residual: unescaped-quote + comma injection (KNOWN LIMITATION)")
-    func classifyAcceptedResidual() {
+    @Test("A crafted IMAP Cc display name holding the user's address never claims")
+    func classifyCraftedImapDisplayNameNeverClaims() {
         let me = ["me@example.com"]
-        // ACCEPTED LOW-IMPACT LIMITATION (2026-07-05) — see extractAddressEmails
-        // doc + PROJECT_MEMORY.md. A producer (SwiftMail IMAP formatAddress) that
-        // emits the decoded display name in UNESCAPED quotes with an embedded
-        // comma lets the injected <me@example.com> become the last span of its
-        // own segment. The string is BYTE-IDENTICAL to a legitimate two-recipient
-        // Cc that MUST claim, so no string parser can distinguish them. This PINS
-        // the current (spuriously "cc") behavior so the tradeoff is visible; it
-        // is NOT an endorsement.
+        // The Cc field exactly as IMAP sync stores it: a single mailbox whose
+        // decoded display name holds quotes, a comma and the user's address.
+        // Stored unescaped (before 2026-10-09) it was byte-identical to a real
+        // two-recipient Cc and claimed; escaped, it is one mailbox.
+        let craftedCc = IMAPFetchMapping.mailboxText(name: #"x" <me@example.com>, "y"#, address: "bob@example.com")
         #expect(PromptVariables.classifyRecipientStatus(
-            toField: "other@example.com", ccField: "\"x\" <me@example.com> , \"y\" <bob@corp.com>",
+            toField: "other@example.com", ccField: craftedCc,
             fromField: extFrom, claimEmails: me
-        ) == "cc")
-        // The legitimate twin it is byte-ambiguous with — MUST claim.
+        ) == "")
+        // A real two-recipient Cc naming the user, stored the same way, claims.
+        let realCc = [
+            IMAPFetchMapping.mailboxText(name: "x", address: "me@example.com"),
+            IMAPFetchMapping.mailboxText(name: "y", address: "bob@example.com")
+        ].joined(separator: ", ")
         #expect(PromptVariables.classifyRecipientStatus(
-            toField: "other@example.com", ccField: "\"Me\" <me@example.com>, \"Bob\" <bob@corp.com>",
+            toField: "other@example.com", ccField: realCc,
             fromField: extFrom, claimEmails: me
         ) == "cc")
     }

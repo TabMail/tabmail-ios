@@ -66,8 +66,8 @@ enum PromptVariables {
     /// liberal extraction + loose matching (plus-tags stripped) since a wrong
     /// suppress is harmless; the CLAIM check (Cc) uses claim-grade extraction
     /// + strict exact-address matching since a wrong claim is the failure mode
-    /// this feature works hardest to avoid (see `extractAddressEmails` for the
-    /// one accepted, low-impact residual it cannot fully close).
+    /// this feature works hardest to avoid (see `extractAddressEmails` for why its
+    /// producers must escape display names).
     ///
     /// Fields are raw header strings (`"Name" <a@b>, c@d` shapes across
     /// Gmail/Graph/IMAP).
@@ -286,17 +286,14 @@ enum PromptVariables {
     /// structural delimiters are found even with trailing combining marks (JS
     /// code-unit parity).
     ///
-    /// KNOWN LIMITATION (accepted 2026-07-05, low impact — see PROJECT_MEMORY.md
-    /// "Summary recipient_status"): resists display-name injection for escaped
-    /// quoted names and unescaped-no-comma names, but NOT the case where an
-    /// upstream producer emits the decoded display name in UNESCAPED quotes AND
-    /// the name contains a comma/semicolon (SwiftMail's IMAP `formatAddress`
-    /// does this). Such a crafted single Cc address is byte-identical to a
-    /// legitimate multi-recipient Cc that MUST claim, so no string parser can
-    /// distinguish them. Residual = a spurious "you're only cc'd" summary hint;
-    /// adversarial-only, no data/security/crash impact. A full fix needs
-    /// producer-side escaping or carrying the structured per-address array to
-    /// the classifier — deliberately not done for a low-stakes helper.
+    /// Display-name injection: an address inside a quoted display name is
+    /// never claimed, provided the producer escapes `"` and `\` in the name.
+    /// Every TabMail producer does (`IMAPFetchMapping.mailboxText`, since
+    /// 2026-10-09; Gmail keeps the raw header; Exchange stores bare addresses).
+    /// Unescaped quotes plus a comma make a single crafted address
+    /// byte-identical to a real multi-recipient Cc, which no string parser can
+    /// tell apart: that was the residual accepted on 2026-07-05, closed at the
+    /// producer.
     private static func extractAddressEmails(_ field: String) -> [String] {
         // Built ONCE per call and reused across candidates (see exactAddr).
         let emailRegex = #/[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/#
