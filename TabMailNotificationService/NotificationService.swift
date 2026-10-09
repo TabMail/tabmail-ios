@@ -943,7 +943,8 @@ final class NotificationService: UNNotificationServiceExtension {
                     let summaryCtx = SummaryContext(blurb: summaryBlurb, todos: summaryTodos)
                     let actionVars = PromptVariables.actionVariables(
                         metadata: sharedMetadata, body: sharedBody,
-                        summary: summaryCtx, account: account
+                        summary: summaryCtx, account: account,
+                        recipientStatus: recipientStatus
                     )
                     actionTag = await BackendNSEClient.sendActionVote(
                         promptAlias: "system_prompt_action",

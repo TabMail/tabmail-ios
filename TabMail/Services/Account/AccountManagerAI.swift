@@ -703,7 +703,8 @@ extension AccountManager {
                             htmlContent: htmlContent,
                             summary: existingSummary,
                             userName: userName,
-                            actionPrompt: actionPrompt
+                            actionPrompt: actionPrompt,
+                            recipientStatus: recipientStatus
                         )
                         if let action {
                             // T4.V7 site 6. The `?? action` false-success is REMOVED:

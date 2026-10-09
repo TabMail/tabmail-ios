@@ -356,7 +356,8 @@ enum PromptVariables {
         metadata: MessageMetadata,
         body: RenderedBody,
         summary: SummaryContext,
-        account: AccountContext
+        account: AccountContext,
+        recipientStatus: String = ""
     ) -> [String: Any] {
         let subject = metadata.subject.isEmpty ? "Not Available" : metadata.subject
         let fromSender = formatFromSender(metadata.from)
@@ -364,7 +365,7 @@ enum PromptVariables {
         let isNoReply = EmailFilter.isNoReply(metadata.from.email)
         let hasUnsubscribe = EmailFilter.hasUnsubscribeLink(body.htmlContent)
 
-        return [
+        var vars: [String: Any] = [
             "user_name": account.userName,
             "user_action_prompt": account.actionPrompt,
             "body": bodyText,
@@ -375,6 +376,13 @@ enum PromptVariables {
             "is_noreply_address": isNoReply,
             "has_unsubscribe_link": hasUnsubscribe,
         ]
+        // Same field and policy as the summary request: sent only as "cc", omitted
+        // otherwise (TB parity: actionGenerator.js). The general action rules never
+        // send a cc'd email to reply/none.
+        if !recipientStatus.isEmpty {
+            vars["recipient_status"] = recipientStatus
+        }
+        return vars
     }
 
     /// Mirrors the pre-refactor `AISummary` / `AIAction` formatting exactly:

@@ -16,7 +16,8 @@ extension AIService {
         htmlContent: String?,
         summary: SummaryResult,
         userName: String,
-        actionPrompt: String
+        actionPrompt: String,
+        recipientStatus: String = ""
     ) async throws -> ActionTag? {
         guard !disableLLMCalls else { return nil }
 
@@ -38,7 +39,8 @@ extension AIService {
         let account = AccountContext(userName: userName, kbText: "", actionPrompt: actionPrompt)
         let summaryCtx = SummaryContext(blurb: summary.blurb, todos: summary.todos)
         let rawVars = PromptVariables.actionVariables(
-            metadata: metadata, body: body, summary: summaryCtx, account: account
+            metadata: metadata, body: body, summary: summaryCtx, account: account,
+            recipientStatus: recipientStatus
         )
         let vars: [String: JSONValue] = rawVars.mapValues { JSONValue.fromAny($0) }
 
@@ -57,7 +59,7 @@ extension AIService {
         if DebugModeManager.isLoggingEnabled() {
             let isNoReply = EmailFilter.isNoReply(fromAddress)
             let hasUnsubscribe = EmailFilter.hasUnsubscribeLink(htmlContent)
-            BackgroundSyncLogger.logDebug("[AIService] Action payload: subject=\(subject.prefix(60)), from=\(from.prefix(40)), body.len=\(bodyText.count), noReply=\(isNoReply), unsub=\(hasUnsubscribe), todo=\((summary.todos ?? "N/A").prefix(60)), summary=\((summary.blurb ?? "N/A").prefix(60))")
+            BackgroundSyncLogger.logDebug("[AIService] Action payload: subject=\(subject.prefix(60)), from=\(from.prefix(40)), body.len=\(bodyText.count), noReply=\(isNoReply), unsub=\(hasUnsubscribe), todo=\((summary.todos ?? "N/A").prefix(60)), summary=\((summary.blurb ?? "N/A").prefix(60)), recipient_status=\(recipientStatus.isEmpty ? "omitted" : "\"\(recipientStatus)\" (SENT)")")
         }
 
         // Single attempt — natural retry via queue loop on next sync cycle.

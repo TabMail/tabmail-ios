@@ -206,7 +206,8 @@ actor AIService {
             action = try await classifyAction(
                 subject: subject, from: from, fromAddress: fromAddress,
                 bodyText: bodyText, htmlContent: htmlContent,
-                summary: summary, userName: userName, actionPrompt: actionPrompt
+                summary: summary, userName: userName, actionPrompt: actionPrompt,
+                recipientStatus: recipientStatus
             )
             BackgroundSyncLogger.logDebug("[AIService] Action classified for \(messageId): \(action?.displayName ?? "nil")")
         } else {

@@ -667,6 +667,21 @@ struct PromptVariablesTests {
         #expect(vars["user_kb_content"] == nil)  // Action prompt does NOT include KB.
     }
 
+    @Test("Action sends recipient_status only as cc, omitted otherwise")
+    func actionRecipientStatus() {
+        let cc = PromptVariables.actionVariables(
+            metadata: fixtureMetadata(), body: fixtureBody(),
+            summary: SummaryContext(blurb: nil, todos: nil), account: account,
+            recipientStatus: "cc"
+        )
+        #expect(cc["recipient_status"] as? String == "cc")
+        let direct = PromptVariables.actionVariables(
+            metadata: fixtureMetadata(), body: fixtureBody(),
+            summary: SummaryContext(blurb: nil, todos: nil), account: account
+        )
+        #expect(direct["recipient_status"] == nil)
+    }
+
     // MARK: - Parity between summary and action for overlapping keys
 
     @Test("Action and summary produce identical values for overlapping keys")
