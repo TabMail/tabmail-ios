@@ -34,7 +34,8 @@ struct ConsentGateView: View {
     @State private var isSubmitting = false
     @State private var errorMessage: String?
     @State private var isIneligible = AgeAndTermsConsent.isDeviceBlocked()
-    @State private var deletionRequested = false
+    /// The deletion request in flight or finished; OK waits for its answer.
+    @State private var deletionTask: Task<AgeAndTermsConsent.DeletionHandshake, Never>?
     @State private var isLeaving = false
 
     private var birthDateEntered: Bool {
@@ -69,6 +70,13 @@ struct ConsentGateView: View {
                             .font(.subheadline)
                             .foregroundStyle(Theme.textSecondary)
                             .multilineTextAlignment(.center)
+
+                        if let errorMessage {
+                            Text(errorMessage)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                                .multilineTextAlignment(.center)
+                        }
                     } else {
                         Text("Please enter your date of birth and accept our legal terms.")
                             .font(.subheadline)
@@ -312,32 +320,45 @@ struct ConsentGateView: View {
         birthYear = nil
         agreedToTerms = false
         withAnimation { isIneligible = true }
-        Task { await requestDeletionOnce() }
+        if persistsToBackend { deletionTask = makeDeletionRequest() }
     }
 
-    /// OK on the refusal: make sure the deletion was asked for (a device that
-    /// was already blocked has not asked yet), then hand over to the parent.
+    /// OK on the refusal: wait for billing's answer to the deletion request,
+    /// sending it now if it was never sent (a device that was already blocked)
+    /// or got no answer, and sign out only once billing has answered. With no
+    /// answer the person stays on the refusal and the next OK asks again.
     private func leave() {
         guard !isLeaving else { return }
         isLeaving = true
+        errorMessage = nil
         Task {
-            await requestDeletionOnce()
+            if persistsToBackend {
+                var handshake = await deletionTask?.value
+                if handshake != .signOut {
+                    deletionTask = makeDeletionRequest()
+                    handshake = await deletionTask?.value
+                }
+                guard handshake == .signOut else {
+                    errorMessage = "We couldn\u{2019}t reach TabMail. Check your connection, then tap OK again."
+                    isLeaving = false
+                    return
+                }
+            }
             await onIneligible()
             isLeaving = false
         }
     }
 
-    /// A failed request is not retried here: the billing worker's hourly
-    /// sweep deletes an account that never finishes this screen once it is
-    /// 7 days old and unused for 30 days.
-    private func requestDeletionOnce() async {
-        guard persistsToBackend, !deletionRequested else { return }
-        deletionRequested = true
-        do {
-            try await BillingClient().requestAgeIneligibleDeletion()
-            BackgroundSyncLogger.logDebug("[ConsentGate] Age-ineligible account deletion requested")
-        } catch {
-            BackgroundSyncLogger.logDebug("[ConsentGate] Age-ineligible deletion request failed (unfinished accounts are removed automatically): \(error)")
+    private func makeDeletionRequest() -> Task<AgeAndTermsConsent.DeletionHandshake, Never> {
+        Task {
+            do {
+                try await BillingClient().requestAgeIneligibleDeletion()
+                BackgroundSyncLogger.logDebug("[ConsentGate] Age-ineligible account deletion requested")
+                return AgeAndTermsConsent.deletionHandshake(after: nil)
+            } catch {
+                BackgroundSyncLogger.logDebug("[ConsentGate] Age-ineligible deletion request failed: \(error)")
+                return AgeAndTermsConsent.deletionHandshake(after: error)
+            }
         }
     }
 }

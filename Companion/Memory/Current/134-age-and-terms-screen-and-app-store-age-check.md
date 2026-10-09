@@ -19,9 +19,13 @@ ADR-034.
   year numbers and got wrong answers). Owner 2026-10-08: English only, keep it simple; no locale
   or other-calendar handling.
 - `TabMail/Views/ConsentGateView.swift` — neutral Month/Day/Year menus with no default, terms
-  checkbox, ineligible view. A failed check discards the date, blocks the device, calls billing
-  `POST /account/age-ineligible` once (`BillingClient.requestAgeIneligibleDeletion`), then
-  `onIneligible` signs out (prod) or exits demo. Keep the legal version constant in step with
+  checkbox, ineligible view. A failed check discards the date, blocks the device and sends billing
+  `POST /account/age-ineligible` (`BillingClient.requestAgeIneligibleDeletion`). OK waits for that
+  request's answer and signs out (prod) only once billing has answered (owner 2026-10-09 handshake,
+  `AgeAndTermsConsent.deletionHandshake`): 2xx or a definitive 4xx refusal signs out; no answer
+  (connection failure, timeout, 429, 5xx: `BackendError.isRetriable`) keeps the person on the refusal
+  and the next OK sends it again, so a lost request no longer leaves the account to the 30-day sweep.
+  Demo has no account: OK exits demo at once. Keep the legal version constant in step with
   the website's `public-config.js` `LEGAL_VERSION_ISO`.
 - `TabMail/Services/AppStoreAgeCheck.swift` + `TabMail/Views/AppStoreAgeGateView.swift` — Apple's
   Declared Age Range API. `isEligibleForAgeFeatures` (iOS 26.2+) says whether the region is

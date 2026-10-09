@@ -196,6 +196,29 @@ struct AgeAndTermsConsentTests {
         let json = try #require(try JSONSerialization.jsonObject(with: body) as? [String: String])
         #expect(json == ["request_id": "req-1"])
     }
+
+    /// Owner 2026-10-09: OK on the refusal signs out only after billing has
+    /// answered the deletion request. No answer keeps the person on the
+    /// refusal, so the next OK sends it again; a definitive refusal signs out,
+    /// since asking again would get the same answer.
+    @Test func theRefusalSignsOutOnlyOnceBillingHasAnsweredTheDeletion() {
+        typealias Consent = AgeAndTermsConsent
+        #expect(Consent.deletionHandshake(after: nil) == .signOut, "billing queued the deletion")
+        for noAnswer: Error in [
+            URLError(.notConnectedToInternet), URLError(.timedOut), URLError(.networkConnectionLost),
+            BackendError.requestFailed(statusCode: 0), BackendError.requestFailed(statusCode: 408),
+            BackendError.requestFailed(statusCode: 429), BackendError.requestFailed(statusCode: 500),
+            BackendError.requestFailed(statusCode: 503),
+        ] {
+            #expect(Consent.deletionHandshake(after: noAnswer) == .retry, "no answer: \(noAnswer)")
+        }
+        for refusal: Error in [
+            BackendError.requestFailed(statusCode: 400), BackendError.requestFailed(statusCode: 409),
+            BackendError.unauthorized,
+        ] {
+            #expect(Consent.deletionHandshake(after: refusal) == .signOut, "definitive refusal: \(refusal)")
+        }
+    }
 }
 
 /// The significant update check stores this version's major.minor on its first
