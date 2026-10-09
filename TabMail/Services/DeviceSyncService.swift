@@ -178,6 +178,12 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             BackgroundSyncLogger.logDebug("[DeviceSync] Auto-sync disabled, skipping connect")
             return
         }
+        // The device-sync worker refuses an account that has not passed the
+        // age and terms screen; RootView connects once it has.
+        guard AgeAndTermsConsent.isComplete() else {
+            BackgroundSyncLogger.logDebug("[DeviceSync] Age and terms screen not passed, skipping connect")
+            return
+        }
         guard webSocket == nil, !isConnecting else { return }
         intentionalDisconnect = false
         isConnecting = true

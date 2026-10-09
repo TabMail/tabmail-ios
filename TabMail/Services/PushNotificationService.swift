@@ -121,6 +121,15 @@ actor PushNotificationService {
         self.pushClient = pushClient
         self.subscriptionAccessTokenOverride = subscriptionAccessToken
         self.deviceId = "test-device"
+        self.ageAndTermsConsentOverride = true
+    }
+
+    /// Test-only override for `ageAndTermsConsentComplete`. Services built by
+    /// the test initializers stand for an account that has passed the age and
+    /// terms screen; set `false` to drive the refusal.
+    private var ageAndTermsConsentOverride: Bool?
+    func _setAgeAndTermsConsentForTesting(_ complete: Bool?) {
+        self.ageAndTermsConsentOverride = complete
     }
 
     /// Test-only override for the consent-status scan. When nil, the real
@@ -230,8 +239,19 @@ actor PushNotificationService {
         tokenMirrorHook = mirrorToken
         tokenRegisterHook = registerToken
         tokenReregisterHook = reregisterAccounts
+        ageAndTermsConsentOverride = true
     }
     #endif
+
+    /// Push setup is refused by the worker (`consent_required`) until this
+    /// account has passed the age and terms screen, so it is not attempted.
+    /// Removal and status calls are not gated.
+    private var ageAndTermsConsentComplete: Bool {
+        #if DEBUG
+        if let ageAndTermsConsentOverride { return ageAndTermsConsentOverride }
+        #endif
+        return AgeAndTermsConsent.isComplete()
+    }
 
     private init() { pushClient = PushClient(); deviceId = Self.loadDeviceId() }
 
@@ -334,6 +354,10 @@ actor PushNotificationService {
             BackgroundSyncLogger.logDebug("[Push] No session — skipping device registration")
             return
         }
+        guard ageAndTermsConsentComplete else {
+            BackgroundSyncLogger.logDebug("[Push] Age and terms screen not passed — skipping device registration")
+            return
+        }
 
         let token = tokenHex ?? UserDefaults.standard.string(forKey: PushConfig.lastDeviceTokenKey)
         guard let deviceToken = token else {
@@ -424,7 +448,7 @@ actor PushNotificationService {
     ///
     /// Re-registration after the next sign-in is not implicit: it is driven by
     /// `TabMailAuthService.restorePushRegistrationAfterSignIn()`, wired to
-    /// RootView's `.tabMailDidSignIn` receiver.
+    /// RootView's `canStartAccountServices` handler.
     ///
     /// Failure is thrown to the caller. Goes through the removed-account cleanup
     /// seams so tests can observe and fault the worker call.
@@ -929,6 +953,10 @@ actor PushNotificationService {
             BackgroundSyncLogger.logDebug("[Push] No session — cannot subscribe \(account.emailAddress)")
             return false
         }
+        guard ageAndTermsConsentComplete else {
+            BackgroundSyncLogger.logDebug("[Push] Age and terms screen not passed — cannot subscribe \(account.emailAddress)")
+            return false
+        }
 
         do {
             switch account.provider {
@@ -1023,6 +1051,7 @@ actor PushNotificationService {
     /// run on a bare token change (`reregisterAllDeviceAccounts`) without
     /// re-doing a full subscribe. CalDAV has no mailbox → callers skip it.
     private func registerDeviceAccountRecord(for account: Account) async {
+        guard ageAndTermsConsentComplete else { return }
         guard let session = TabMailAuthService.getSession(),
               let deviceToken = UserDefaults.standard.string(forKey: PushConfig.lastDeviceTokenKey),
               let deviceId = UserDefaults.standard.string(forKey: PushConfig.deviceIdKey) else { return }

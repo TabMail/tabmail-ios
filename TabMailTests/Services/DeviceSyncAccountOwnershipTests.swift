@@ -27,14 +27,17 @@ struct DeviceSyncAccountOwnershipTests {
         PromptStore.actionCompactThresholdKey, PromptStore.actionCompactThresholdCharsKey,
         "device_sync_backups", "device_sync_auto_enabled",
     ] + peerBaseKeys + timestampKeys
-    private static let allKeys = [DeviceSyncService.ownerUserIdKey] + accountKeys
+    private static let allKeys = [DeviceSyncService.ownerUserIdKey, AgeAndTermsConsent.completedKey] + accountKeys
 
     private func iso(daysFromNow days: Double) -> String { Date().addingTimeInterval(days * 86_400).ISO8601Format() }
 
-    /// Runs `body`, then restores every touched key and the in-memory prompt values.
+    /// Runs `body` as an account that has passed the age and terms screen
+    /// (Device Sync connects only then), then restores every touched key and
+    /// the in-memory prompt values.
     private func preservingState(_ body: () throws -> Void) rethrows {
         let defaults = UserDefaults.standard
         let saved = Self.allKeys.map { defaults.object(forKey: $0) }
+        defaults.set(true, forKey: AgeAndTermsConsent.completedKey)
         let store = PromptStore.shared
         let memory = (store.rawComposition, store.rawAction, store.rawKB, store.templates)
         defer {

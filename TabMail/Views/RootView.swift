@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import DeclaredAgeRange
 import SwiftUI
 import GRDB
 import TipKit
@@ -15,7 +16,7 @@ struct RootView: View {
     @Environment(NavigationStore.self) private var navigationStore
     @Environment(\.scenePhase) private var scenePhase
     @State private var hasTabMailSession = ScreenshotMode.isActive || TabMailAuthService.hasSession()
-    @AppStorage("hasCompletedConsentGate") private var hasCompletedConsentGate = false
+    @AppStorage(AgeAndTermsConsent.completedKey) private var hasCompletedConsentGate = false
     @AppStorage("hasSeenAIConsent") private var hasSeenAIConsent = false
     @AppStorage("hasSeenPushConsent") private var hasSeenPushConsent = false
     // Demo Mode gate persistence.
@@ -40,6 +41,14 @@ struct RootView: View {
     @State private var showSubscriptionLapsedAlert = false
     /// True while checking /whoami for prior consent — show splash instead of consent gate
     @State private var isCheckingConsent = false
+    /// App Store age assurance (`AppStoreAgeCheck`), asked at launch and on
+    /// every foreground. `.minor` / `.unconfirmed` cover the whole app.
+    @State private var appStoreAge: AppStoreAgeCheck.Status = .notChecked
+    @State private var isCheckingAppStoreAge = false
+    @Environment(\.requestAgeRange) private var requestAgeRange
+    /// Set while signing out after a failed age check: the person has just
+    /// read why, so the generic "Signed Out" alert is not shown on top.
+    @State private var suppressNextSignedOutAlert = false
 
     // MARK: - Undo-send toast state
     /// Exact authority for the retained Draft generation behind a confirmed
@@ -62,7 +71,7 @@ struct RootView: View {
     init() {
         // Debug: reset gate flags on every launch so all gate screens show
         if DEBUG_ALWAYS_SHOW_GATES {
-            UserDefaults.standard.set(false, forKey: "hasCompletedConsentGate")
+            UserDefaults.standard.set(false, forKey: AgeAndTermsConsent.completedKey)
             UserDefaults.standard.set(false, forKey: "hasSeenAIConsent")
             UserDefaults.standard.set(false, forKey: "hasSeenPushConsent")
         }
@@ -70,7 +79,7 @@ struct RootView: View {
         // For returning users (system-kill restart), skip the splash screen entirely.
         // The GRDB data is already on disk — show the inbox immediately with cached data.
         // Fresh installs (no DB, no consent) will go through the normal gated flow.
-        let onboardingDone = UserDefaults.standard.bool(forKey: "hasCompletedConsentGate")
+        let onboardingDone = UserDefaults.standard.bool(forKey: AgeAndTermsConsent.completedKey)
             && UserDefaults.standard.bool(forKey: "hasSeenAIConsent")
             && UserDefaults.standard.bool(forKey: "hasSeenPushConsent")
             && !DEBUG_ALWAYS_SHOW_GATES
@@ -86,14 +95,23 @@ struct RootView: View {
 
     @ViewBuilder
     private var routedContent: some View {
-        // Demo mode wins over all other routing. Runs the SAME consent + AI
-        // gates as production but writes to demo-prefixed AppStorage so
-        // production flags survive demo entry/exit untouched.
-        if demoStore.isActive {
+        // The App Store's age answer outranks everything, demo and the
+        // account-less mail client included: it is about the person using
+        // this device, not about a TabMail account.
+        if appStoreAge.blocksApp {
+            AppStoreAgeGateView(status: appStoreAge) {
+                await checkAppStoreAge()
+            }
+        } else if demoStore.isActive {
+            // Demo mode wins over all other routing. Runs the SAME consent + AI
+            // gates as production but writes to demo-prefixed AppStorage so
+            // production flags survive demo entry/exit untouched.
             if !demoHasCompletedConsentGate {
-                ConsentGateView(persistsToBackend: false) {
+                ConsentGateView(persistsToBackend: false, onComplete: {
                     withAnimation { demoHasCompletedConsentGate = true }
-                }
+                }, onIneligible: {
+                    await DemoModeService.shared.exit()
+                })
             } else if !demoHasSeenAIConsent {
                 AIConsentView { aiEnabled in
                     demoAiEnabled = aiEnabled
@@ -142,8 +160,9 @@ struct RootView: View {
                 // No email accounts AND no session → onboarding login.
                 // Post the SAME notification the sheet-presented login paths
                 // post: the `.tabMailDidSignIn` receiver below flips
-                // `hasTabMailSession`, restores per-user consent state,
-                // connects Device Sync, and — critically — revalidates
+                // `hasTabMailSession`, restores per-user consent state
+                // (which lets the `canStartAccountServices` handler connect
+                // Device Sync), and — critically — revalidates
                 // `AISubscriptionGate` via `/whoami`. Pre-fix (issue #56)
                 // this branch flipped the flag inline and skipped all of
                 // that, so the onboarding path never asked the backend for
@@ -156,9 +175,11 @@ struct RootView: View {
                 if isCheckingConsent {
                     SplashView()
                 } else {
-                    ConsentGateView {
+                    ConsentGateView(onComplete: {
                         withAnimation { hasCompletedConsentGate = true }
-                    }
+                    }, onIneligible: {
+                        await signOutAfterFailedAgeCheck()
+                    })
                 }
             } else if let pending = PendingAccountAdd.shared.pending {
                 // Deferred Gmail/Outlook account-add gate. Set by
@@ -221,6 +242,13 @@ struct RootView: View {
             && !navigationStore.accounts.isEmpty
             && hasSeenAIConsent
             && hasSeenPushConsent
+    }
+
+    /// Device Sync and push registration need a TabMail session that has
+    /// passed the age and terms screen; the push and device-sync workers refuse
+    /// anything else (`consent_required`).
+    private var canStartAccountServices: Bool {
+        hasTabMailSession && hasCompletedConsentGate
     }
 
     var body: some View {
@@ -328,6 +356,10 @@ struct RootView: View {
             // the last mail account. The account-scoped startup task below is
             // deliberately gated on a non-empty list and cannot provide this.
             await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
+        }
+        .task {
+            // App Store age assurance at launch; the foreground pass repeats it.
+            await checkAppStoreAge()
         }
         .task(id: navigationStore.accounts.isEmpty) {
             // Re-trigger when accounts transition from empty → non-empty
@@ -613,7 +645,11 @@ struct RootView: View {
                 pendingDeletionDate = nil
                 pendingDeletionRequestId = nil
             }
-            showSignedOutAlert = true
+            if suppressNextSignedOutAlert {
+                suppressNextSignedOutAlert = false
+            } else {
+                showSignedOutAlert = true
+            }
         }
         .alert("Signed Out", isPresented: $showSignedOutAlert) {
             Button("OK") {}
@@ -660,10 +696,17 @@ struct RootView: View {
             withAnimation { hasTabMailSession = true }
             // Restore consent state for the signed-in user (avoids re-showing consent)
             restoreConsentStateForCurrentUser()
-            // Reconnect Device Sync after re-authentication
-            DeviceSyncService.shared.connect()
             // Reopen AI subscription gate — new login may have active subscription
             Task { await Self.revalidateAISubscriptionGate() }
+            // Device Sync and push registration start in the
+            // `canStartAccountServices` handler below, once this account has
+            // also passed the age and terms screen — right away when the
+            // restore above already says so.
+        }
+        .onChange(of: canStartAccountServices) { _, canStart in
+            guard canStart else { return }
+            // Reconnect Device Sync after sign-in / consent.
+            DeviceSyncService.shared.connect()
             // Re-establish this install's push registration. Sign-out releases
             // it, so a sign-out → sign-in without leaving the app would
             // otherwise have nothing registered until the next foreground pass.
@@ -690,6 +733,8 @@ struct RootView: View {
                 Task { await AccountManager.shared.reconcileOutboxOnForeground() }
                 // Reconnect Device Sync if needed (e.g., returning from background)
                 DeviceSyncService.shared.reconnectIfNeeded()
+                // The App Store's age answer can change while backgrounded.
+                Task { await checkAppStoreAge() }
                 // Check for overdue reminders that may have been missed while backgrounded
                 Task { await ProactiveNotifyService.shared.onForegroundReturn() }
                 // Revalidate AI subscription gate if closed (user may have subscribed externally)
@@ -810,6 +855,34 @@ struct RootView: View {
         // Success: refresh the sidebar store, then clear pending so the gate
         // dismisses straight to the next step (no stale-empty-accounts flash).
         await finishPendingAccountAdd()
+    }
+
+    // MARK: - Age Checks
+
+    /// Ask the App Store for the person's age (`AppStoreAgeCheck`). A failed
+    /// region lookup (`.notChecked`) keeps the previous answer.
+    private func checkAppStoreAge() async {
+        guard !ScreenshotMode.isActive, !isCheckingAppStoreAge else { return }
+        isCheckingAppStoreAge = true
+        defer { isCheckingAppStoreAge = false }
+        let status = await AppStoreAgeCheck.run(request: requestAgeRange)
+        if status != .notChecked {
+            withAnimation { appStoreAge = status }
+        }
+        if status == .allowed {
+            await AppStoreAgeCheck.acknowledgeSignificantUpdate()
+        }
+    }
+
+    /// OK on the age and terms screen's refusal: the account deletion has
+    /// been requested; leave the account and drop any account add that was
+    /// waiting on this screen.
+    private func signOutAfterFailedAgeCheck() async {
+        suppressNextSignedOutAlert = true
+        PendingAccountAdd.shared.clear()
+        if !(await TabMailAuthService.signOut()) {
+            suppressNextSignedOutAlert = false
+        }
     }
 
     // MARK: - Per-Account Consent Gate Persistence

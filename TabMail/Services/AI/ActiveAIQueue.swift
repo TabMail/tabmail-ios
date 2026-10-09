@@ -619,7 +619,7 @@ actor ActiveAIQueue {
 
         // Snapshot state — nonisolated reads where possible, minimal MainActor hop
         let aiDisabled = AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)
-        let hasCompletedConsent = UserDefaults.standard.bool(forKey: "hasCompletedConsentGate")
+        let hasCompletedConsent = UserDefaults.standard.bool(forKey: AgeAndTermsConsent.completedKey)
         let deviceSyncConnected = DeviceSyncService.checkConnected()
         let kbText = PromptStore.kbTextSnapshot()
         let actionPrompt = PromptStore.actionMarkdownSnapshot()

@@ -54,6 +54,14 @@ private struct ExactDeletionCancellationRequest: Encodable {
     }
 }
 
+private struct AgeIneligibleDeletionRequest: Encodable {
+    let requestId: String
+
+    enum CodingKeys: String, CodingKey {
+        case requestId = "request_id"
+    }
+}
+
 /// Client for billing worker account deletion endpoints (billing.tabmail.ai).
 actor BillingClient {
     typealias CancellationResponse = BillingCancellationResponse
@@ -191,6 +199,38 @@ actor BillingClient {
             )
         }
         return try JSONDecoder().decode(DeletionResponse.self, from: data)
+    }
+
+    /// Delete the signed-in account after a failed age check (`ConsentGateView`).
+    /// Only a request id is sent — never the date of birth. The worker re-reads
+    /// the account live and refuses (409) one that has already agreed.
+    func requestAgeIneligibleDeletion(requestId: String = UUID().uuidString.lowercased()) async throws {
+        guard let token = await currentAuthToken() else {
+            throw BackendError.unauthorized
+        }
+
+        let request = try Self.makeAgeIneligibleDeletionRequest(baseURL: baseURL, token: token, requestId: requestId)
+        let (_, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              200..<300 ~= httpResponse.statusCode else {
+            throw BackendError.requestFailed(
+                statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0
+            )
+        }
+    }
+
+    nonisolated static func makeAgeIneligibleDeletionRequest(
+        baseURL: URL,
+        token: String,
+        requestId: String
+    ) throws -> URLRequest {
+        var request = URLRequest(url: baseURL.appending(path: "/account/age-ineligible"))
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 30
+        request.httpBody = try JSONEncoder().encode(AgeIneligibleDeletionRequest(requestId: requestId))
+        return request
     }
 
     func cancelAccountDeletion(requestId: String) async throws -> CancelDeletionResponse {
