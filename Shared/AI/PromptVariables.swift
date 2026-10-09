@@ -50,7 +50,7 @@ enum PromptVariables {
         return vars
     }
 
-    /// Recipient-status classification for the summary request — parity with the
+    /// Recipient-status classification for the summary and action requests — parity with the
     /// TB addon's `senderFilter.classifyRecipientStatus`. Returns "cc" ONLY on
     /// positive evidence: one of `claimEmails` (the RECEIVING account's
     /// addresses) is literally present in the Cc field as an actual mailbox

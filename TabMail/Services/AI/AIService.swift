@@ -129,7 +129,7 @@ actor AIService {
         userName: String,
         kbText: String,
         actionPrompt: String,
-        recipientStatus: String = ""
+        recipientStatus: String
     ) async throws -> (summary: SummaryResult, action: ActionTag?, reply: String?)? {
         // Device Sync probe (single roundtrip, results used independently below)
         // rfc822MessageId is already stored normalized (no angle brackets/whitespace)
