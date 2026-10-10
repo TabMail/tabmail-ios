@@ -95,9 +95,16 @@ enum IMAPFetchMapping {
         "\(quotedString(name)) <\(address)>"
     }
 
+    /// A CR or LF is written as a space: a quoted-string holds one only as
+    /// folding white space (RFC 5322 3.2.4), so SwiftMail would read a mailbox
+    /// whose decoded name holds one as invalid text, and drop that recipient.
     private static func quotedString(_ text: String) -> String {
         var quoted = String.UnicodeScalarView()
         for scalar in text.unicodeScalars {
+            if scalar == "\r" || scalar == "\n" {
+                quoted.append(" ")
+                continue
+            }
             if scalar == "\"" || scalar == "\\" { quoted.append("\\") }
             quoted.append(scalar)
         }

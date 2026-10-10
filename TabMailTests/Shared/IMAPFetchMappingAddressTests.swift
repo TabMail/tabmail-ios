@@ -102,6 +102,32 @@ struct IMAPFetchMappingAddressTests {
             == #""x\" <me@example.com>, \"y" <bob@example.com>"#)
     }
 
+    /// A decoded name can hold a CR or LF (`=?UTF-8?Q?Alice=0AX?=`), which a
+    /// quoted-string cannot; written as a space, the recipient stays readable,
+    /// labelled and offered by reply-all, and invalid text holding one still
+    /// leaves the mailbox after it whole.
+    @Test("A CR or LF in a name or invalid text keeps every mailbox readable", arguments: ["\n", "\r", "\r\n"])
+    func lineBreakKeepsMailboxReadable(lineBreak: String) {
+        let spaces = String(repeating: " ", count: lineBreak.unicodeScalars.count)
+        let field = IMAPFetchMapping.addressField([
+            mailbox("alice@example.com", name: "Alice\(lineBreak)X"),
+            .invalid("a\(lineBreak)\"b@company.com."),
+            mailbox("bob@example.com", name: "y <hidden@example.com>, z")
+        ])
+        #expect(AddressParser.parseAddressList(field).flatMap(\.mailboxes) == [
+            SwiftMail.EmailAddress(name: "Alice\(spaces)X", address: "alice@example.com"),
+            SwiftMail.EmailAddress(name: "y <hidden@example.com>, z", address: "bob@example.com")
+        ])
+        #expect(MessageViewHelpers.extractNames(field).hasPrefix("Alice\(spaces)X, "))
+        var header = MessageHeader(
+            messageId: "1", subject: "Line break", from: "sender@example.com",
+            fromAddress: "sender@example.com", to: "me@example.com", date: Date(), snippet: "",
+            folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        header.cc = field
+        #expect(buildReplyAllRecipients(for: header, allAccounts: []).cc == ["alice@example.com", "bob@example.com"])
+    }
+
     @Test("An empty group contributes nothing")
     func emptyGroupContributesNothing() {
         #expect(IMAPFetchMapping.addressField([.group(name: "undisclosed-recipients", members: [])]) == "")

@@ -479,10 +479,9 @@ struct PromptVariablesTests {
     @Test("Many REAL addresses stay fast (per-candidate validator cost is bounded)")
     func classifyRealAddressVolume() {
         let me = ["me@example.com"]
-        // Flood shapes produce zero exactAddr calls; this shape produces 2000
-        // (sized under the 64KB field cap) — pins the per-candidate regex cost
-        // (round-3 finding: per-call literal construction made 5000 candidates
-        // ~860ms even at -O).
+        // 2000 real mailboxes (sized under the 64KB field cap) — pins the
+        // parser's per-mailbox cost (an earlier scanner's per-call literal
+        // construction made 5000 candidates ~860ms even at -O).
         let bracketed = (0..<2000).map { "U\($0) <u\($0)@example.com>" }.joined(separator: ", ")
         let bare = (0..<2000).map { "u\($0)@example.com" }.joined(separator: ",")
         let t0 = Date()
@@ -505,11 +504,10 @@ struct PromptVariablesTests {
     @Test("Bracket-exposed display-name injection cannot fabricate a claim (last-span rule)")
     func classifyBracketInjection() {
         let me = ["me@example.com"]
-        // SwiftMail MIME-decodes a display name and re-wraps it in UNESCAPED
-        // quotes, so a Cc entry `bob@corp.com` with decoded name
-        // `x" <me@example.com> "y` reaches the classifier as:
-        // "x" <me@example.com> "y" <bob@corp.com>. Only the LAST bracket span
-        // per segment is the real address, so the planted span is rejected.
+        // A legacy row, written before display names were escaped: a Cc entry
+        // `bob@corp.com` with decoded name `x" <me@example.com> "y` was stored
+        // as "x" <me@example.com> "y" <bob@corp.com>. SwiftMail's parser does
+        // not read the planted address as a mailbox, so it never claims.
         #expect(PromptVariables.classifyRecipientStatus(
             toField: "other@example.com", ccField: "\"x\" <me@example.com> \"y\" <bob@corp.com>",
             fromField: extFrom, claimEmails: me
