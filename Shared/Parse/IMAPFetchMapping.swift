@@ -58,15 +58,15 @@ enum IMAPFetchMapping {
     /// An address field as the entries TabMail stores, one per mailbox:
     /// `"Name" <address>` (see `mailboxText`), or the bare `address` when there
     /// is no name — the shape SwiftMail's `AddressParser` reads back. A group
-    /// contributes its members; its name is not an address. Invalid text is kept
-    /// as written so the field still shows it; `buildReplyAllRecipients` never
-    /// offers it, because SwiftMail does not read it as a mailbox.
+    /// contributes its members; its name is not an address. Invalid text stays
+    /// in the field so it still shows (see `invalidText`); no reader takes it
+    /// for a mailbox.
     static func addressStrings(_ entries: [AddressListEntry]) -> [String] {
         entries.flatMap { entry -> [String] in
             switch entry {
                 case .mailbox(let mailbox): return [addressString(mailbox)]
                 case .group(_, let members): return members.map(addressString)
-                case .invalid(let text): return [text]
+                case .invalid(let text): return [invalidText(text)]
             }
         }
     }
@@ -88,12 +88,25 @@ enum IMAPFetchMapping {
     /// Unicode scalar, as SwiftMail's own quoting is: a `"` followed by a
     /// combining mark is one `Character`, but still a quote to every parser.
     static func mailboxText(name: String, address: String) -> String {
+        "\(quotedString(name)) <\(address)>"
+    }
+
+    /// Invalid text as written when it reads back as that same invalid text,
+    /// otherwise as a quoted-string, which SwiftMail reads back as invalid text
+    /// of its content. Written raw, text SwiftMail did not read as a mailbox
+    /// (`a, <x@example.com>, b@corp.com.` from an incomplete ENVELOPE address)
+    /// could read back as one. SwiftMail's own display form does the same.
+    private static func invalidText(_ text: String) -> String {
+        AddressParser.parseAddressList(text) == [.invalid(text)] ? text : quotedString(text)
+    }
+
+    private static func quotedString(_ text: String) -> String {
         var quoted = String.UnicodeScalarView()
-        for scalar in name.unicodeScalars {
+        for scalar in text.unicodeScalars {
             if scalar == "\"" || scalar == "\\" { quoted.append("\\") }
             quoted.append(scalar)
         }
-        return "\"\(String(quoted))\" <\(address)>"
+        return "\"\(String(quoted))\""
     }
 
     /// The envelope a header block shows for a message carried as a part.

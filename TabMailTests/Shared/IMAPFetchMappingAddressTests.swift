@@ -113,6 +113,17 @@ struct IMAPFetchMappingAddressTests {
         #expect(field == "ann@example.com, foo@@example.com")
     }
 
+    /// An incomplete ENVELOPE address can carry a quoted local-part holding
+    /// commas and an address; SwiftMail reads it as invalid text, and so must
+    /// every reader of the stored field.
+    @Test("Invalid text that would read back as a mailbox is stored quoted, still visible")
+    func invalidTextNeverReadsBackAsMailbox() {
+        let text = "a, <hidden@example.com>, b@company.com."
+        let field = IMAPFetchMapping.addressField([mailbox("ann@example.com"), .invalid(text)])
+        #expect(AddressParser.parseAddressList(field) == [mailbox("ann@example.com"), .invalid(text)])
+        #expect(MessageViewHelpers.extractNames(field) == "ann@example.com, \(text)")
+    }
+
     @Test("A carried message's header block uses the same address shape")
     func envelopeUsesStoredShape() {
         var carried = info(

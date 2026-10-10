@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import SwiftUI
+import SwiftMail
 
 // MARK: - Shared helpers used by MessageDetailView and MessageCardView
 
@@ -36,22 +37,22 @@ enum MessageViewHelpers {
         return formatter.string(from: date)
     }
 
-    /// Extract display names from a comma-separated To header.
-    /// `"John Doe" <john@example.com>, jane@example.com` → `John Doe, jane@example.com`
+    /// Display names from an address field, read with SwiftMail's parser so
+    /// quoted names keep their commas and lose their escapes.
+    /// `"Doe, John" <john@example.com>, jane@example.com` → `Doe, John, jane@example.com`
     static func extractNames(_ raw: String) -> String {
-        raw.components(separatedBy: ",").map { part in
-            let trimmed = part.trimmingCharacters(in: .whitespaces)
-            if let angleStart = trimmed.firstIndex(of: "<") {
-                let name = String(trimmed[trimmed.startIndex..<angleStart])
-                    .trimmingCharacters(in: .whitespaces)
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-                if !name.isEmpty { return name }
-                if let angleEnd = trimmed.firstIndex(of: ">") {
-                    return String(trimmed[trimmed.index(after: angleStart)..<angleEnd])
-                }
+        AddressParser.parseAddressList(raw).flatMap { entry -> [String] in
+            switch entry {
+                case .mailbox(let mailbox): return [displayName(mailbox)]
+                case .group(_, let members): return members.map(displayName)
+                case .invalid(let text): return [text]
             }
-            return trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
         }.joined(separator: ", ")
+    }
+
+    private static func displayName(_ mailbox: SwiftMail.EmailAddress) -> String {
+        guard let name = mailbox.name, !name.isEmpty else { return mailbox.address }
+        return name
     }
 
     /// Shimmer effect for WIP tag (tag assigned but reply not yet generated)

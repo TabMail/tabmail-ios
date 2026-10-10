@@ -407,23 +407,14 @@ struct PromptVariablesTests {
         ) == "")
     }
 
-    @Test("A field with brackets counts ONLY bracketed spans (quote-imbalance defense)")
-    func classifyBracketExclusivity() {
-        let me = ["me@example.com"]
-        // Unescaped quotes in a formatted display name can strand a planted
-        // address in a bare comma segment — the bracket rule ignores it.
-        #expect(PromptVariables.classifyRecipientStatus(
-            toField: "other@example.com",
-            ccField: "\"a\", me@example.com, b\" <other2@example.com>",
-            fromField: extFrom, claimEmails: me
-        ) == "")
-        // Deliberate trade-off: a bare address mixed into a bracketed field is
-        // also ignored (missed claim = safe omit).
+    /// A raw header may mix bare and bracketed mailboxes; each is a mailbox.
+    @Test("A bare Cc address beside bracketed ones claims")
+    func classifyBareBesideBracketedClaims() {
         #expect(PromptVariables.classifyRecipientStatus(
             toField: "other@example.com",
             ccField: "me@example.com, Name <c@company.com>",
-            fromField: extFrom, claimEmails: me
-        ) == "")
+            fromField: extFrom, claimEmails: ["me@example.com"]
+        ) == "cc")
     }
 
     @Test("Group syntax: leading 'name:' prefix is stripped for the first member")
@@ -562,6 +553,24 @@ struct PromptVariablesTests {
             toField: "other@example.com", ccField: realCc,
             fromField: extFrom, claimEmails: me
         ) == "cc")
+    }
+
+    /// A name holding no `"` or `\` needs no escaping, and an address may sit
+    /// in a domain literal with no name at all: the claim reads mailboxes, so
+    /// neither is evidence.
+    @Test("An address in an encoded-word-like name or a domain literal never claims")
+    func classifyAddressOutsideAnyMailboxNeverClaims() {
+        let me = ["me@example.com"]
+        let fields = [
+            IMAPFetchMapping.mailboxText(name: "<me@example.com> =?", address: "a?=b@example.com"),
+            "x@[y, <me@example.com>]"
+        ]
+        for ccField in fields {
+            #expect(PromptVariables.classifyRecipientStatus(
+                toField: "other@example.com", ccField: ccField,
+                fromField: extFrom, claimEmails: me
+            ) == "")
+        }
     }
 
     @Test("Sanitizers are escape-aware — escaped delimiters cannot expose planted spans")
