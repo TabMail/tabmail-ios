@@ -19,6 +19,10 @@ import SwiftMail
 struct IMAPWriterEscapedMailboxTests {
 
     private static let crafted = #"x" <hidden@example.com>, "y"#
+    /// A backslash followed by a combining mark: one `Character`, still a
+    /// backslash to every parser. Sent RFC 2047-encoded, as a mailer would.
+    private static let accented = "Back\\\u{301}slash"
+    private static let accentedEncoded = "=?UTF-8?B?\(Data(accented.utf8).base64EncodedString())?="
     private static let messageID = "<escaped-names@example.com>"
 
     /// RFC 5322 `Date:` header, generated from the current clock — never a
@@ -31,8 +35,9 @@ struct IMAPWriterEscapedMailboxTests {
         return formatter
     }()
 
-    /// The same names in the RFC 5322 header and the ENVELOPE: To is one named
-    /// mailbox, Cc a group of one between two addresses whose host is no domain
+    /// The same names in the RFC 5322 header and the ENVELOPE: To is the named
+    /// mailbox plus one with the encoded accented name, Cc a group of one
+    /// between two addresses whose host is no domain
     /// (SwiftMail reads each as invalid text; the first's local-part is an
     /// unclosed quote), Bcc one named mailbox (RFC 3501 §7.4.2).
     private func startServer() throws -> FakeIMAPServer {
@@ -40,7 +45,7 @@ struct IMAPWriterEscapedMailboxTests {
         let quotedName = #""x\" <hidden@example.com>, \"y""#
         let raw = """
         From: Sender <sender@example.com>\r
-        To: \(quotedName) <bob@example.com>\r
+        To: \(quotedName) <bob@example.com>, \(Self.accentedEncoded) <zed@example.com>\r
         Cc: "x\\""@company.com., Team: \(quotedName) <ann@example.com>;, "a, <hidden@example.com>, b"@company.com.\r
         Bcc: \(quotedName) <bex@example.com>\r
         Subject: Escaped names\r
@@ -52,7 +57,7 @@ struct IMAPWriterEscapedMailboxTests {
 
         """
         let from = #"(("Sender" NIL "sender" "example.com"))"#
-        let to = "((\(quotedName) NIL \"bob\" \"example.com\"))"
+        let to = "((\(quotedName) NIL \"bob\" \"example.com\") (\"\(Self.accentedEncoded)\" NIL \"zed\" \"example.com\"))"
         let cc = "((NIL NIL \"x\\\"\" \"company.com.\") (NIL NIL \"Team\" NIL) (\(quotedName) NIL \"ann\" \"example.com\") (NIL NIL NIL NIL)"
             + " (NIL NIL \"a, <hidden@example.com>, b\" \"company.com.\"))"
         let bcc = "((\(quotedName) NIL \"bex\" \"example.com\"))"
@@ -72,7 +77,12 @@ struct IMAPWriterEscapedMailboxTests {
     }
 
     private func expectOneMailboxEach(to: String, cc: String, bcc: String) {
-        for (field, address) in [(to, "bob@example.com"), (cc, "ann@example.com"), (bcc, "bex@example.com")] {
+        #expect(AddressParser.parseAddressList(to).flatMap(\.mailboxes) == [
+            SwiftMail.EmailAddress(name: Self.crafted, address: "bob@example.com"),
+            SwiftMail.EmailAddress(name: Self.accented, address: "zed@example.com")
+        ])
+        #expect(MessageViewHelpers.extractNames(to) == "\(Self.crafted), \(Self.accented)")
+        for (field, address) in [(cc, "ann@example.com"), (bcc, "bex@example.com")] {
             #expect(AddressParser.parseAddressList(field).flatMap(\.mailboxes)
                 == [SwiftMail.EmailAddress(name: Self.crafted, address: address)])
         }

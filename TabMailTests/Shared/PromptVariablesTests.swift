@@ -455,6 +455,43 @@ struct PromptVariablesTests {
         ) == "cc")
     }
 
+    /// The field budget refuses even a genuine claim: an oversized Cc that
+    /// holds the user's mailbox, or an oversized From beside it, omits, while
+    /// the same shapes under the budget still claim.
+    @Test("An oversized Cc or From omits even when the user is genuinely in Cc")
+    func classifyBudgetRefusesGenuineClaim() {
+        let me = ["me@example.com"]
+        func list(_ minChars: Int) -> String {
+            var entries: [String] = []
+            var total = 0
+            while total <= minChars {
+                let entry = "u\(entries.count)@example.com"
+                entries.append(entry)
+                total += entry.count + 2
+            }
+            return entries.joined(separator: ", ")
+        }
+        let oversized = list(70_000)
+        let small = list(1_000)
+        #expect(oversized.count > 65_536)
+        #expect(PromptVariables.classifyRecipientStatus(
+            toField: "other@example.com", ccField: oversized + ", me@example.com",
+            fromField: extFrom, claimEmails: me
+        ) == "")
+        #expect(PromptVariables.classifyRecipientStatus(
+            toField: "other@example.com", ccField: small + ", me@example.com",
+            fromField: extFrom, claimEmails: me
+        ) == "cc")
+        #expect(PromptVariables.classifyRecipientStatus(
+            toField: "other@example.com", ccField: "me@example.com",
+            fromField: extFrom + ", " + oversized, claimEmails: me
+        ) == "")
+        #expect(PromptVariables.classifyRecipientStatus(
+            toField: "other@example.com", ccField: "me@example.com",
+            fromField: extFrom + ", " + small, claimEmails: me
+        ) == "cc")
+    }
+
     @Test("Claim path is linear on unbalanced-opener floods (round-2 ReDoS shapes)")
     func classifyClaimPathLinear() {
         let me = ["me@example.com"]

@@ -88,7 +88,8 @@ struct IMAPFetchMappingAddressTests {
             #"x" <me@example.com>, "y"#,
             #"Back\slash, "Q""#,
             "Trailing\\",
-            "q\"\u{301} <me@example.com>, \"z"
+            "q\"\u{301} <me@example.com>, \"z",
+            "Back\\\u{301}slash"
         ]
         let entries = names.enumerated().map { index, name in
             mailbox("user\(index)@example.com", name: name)
