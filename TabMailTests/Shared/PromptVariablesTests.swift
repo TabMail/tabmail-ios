@@ -407,23 +407,14 @@ struct PromptVariablesTests {
         ) == "")
     }
 
-    @Test("A field with brackets counts ONLY bracketed spans (quote-imbalance defense)")
-    func classifyBracketExclusivity() {
-        let me = ["me@example.com"]
-        // Unescaped quotes in a formatted display name can strand a planted
-        // address in a bare comma segment — the bracket rule ignores it.
-        #expect(PromptVariables.classifyRecipientStatus(
-            toField: "other@example.com",
-            ccField: "\"a\", me@example.com, b\" <other2@example.com>",
-            fromField: extFrom, claimEmails: me
-        ) == "")
-        // Deliberate trade-off: a bare address mixed into a bracketed field is
-        // also ignored (missed claim = safe omit).
+    /// A raw header may mix bare and bracketed mailboxes; each is a mailbox.
+    @Test("A bare Cc address beside bracketed ones claims")
+    func classifyBareBesideBracketedClaims() {
         #expect(PromptVariables.classifyRecipientStatus(
             toField: "other@example.com",
             ccField: "me@example.com, Name <c@company.com>",
-            fromField: extFrom, claimEmails: me
-        ) == "")
+            fromField: extFrom, claimEmails: ["me@example.com"]
+        ) == "cc")
     }
 
     @Test("Group syntax: leading 'name:' prefix is stripped for the first member")
@@ -464,6 +455,43 @@ struct PromptVariablesTests {
         ) == "cc")
     }
 
+    /// The field budget refuses even a genuine claim: an oversized Cc that
+    /// holds the user's mailbox, or an oversized From beside it, omits, while
+    /// the same shapes under the budget still claim.
+    @Test("An oversized Cc or From omits even when the user is genuinely in Cc")
+    func classifyBudgetRefusesGenuineClaim() {
+        let me = ["me@example.com"]
+        func list(_ minChars: Int) -> String {
+            var entries: [String] = []
+            var total = 0
+            while total <= minChars {
+                let entry = "u\(entries.count)@example.com"
+                entries.append(entry)
+                total += entry.count + 2
+            }
+            return entries.joined(separator: ", ")
+        }
+        let oversized = list(70_000)
+        let small = list(1_000)
+        #expect(oversized.count > 65_536)
+        #expect(PromptVariables.classifyRecipientStatus(
+            toField: "other@example.com", ccField: oversized + ", me@example.com",
+            fromField: extFrom, claimEmails: me
+        ) == "")
+        #expect(PromptVariables.classifyRecipientStatus(
+            toField: "other@example.com", ccField: small + ", me@example.com",
+            fromField: extFrom, claimEmails: me
+        ) == "cc")
+        #expect(PromptVariables.classifyRecipientStatus(
+            toField: "other@example.com", ccField: "me@example.com",
+            fromField: extFrom + ", " + oversized, claimEmails: me
+        ) == "")
+        #expect(PromptVariables.classifyRecipientStatus(
+            toField: "other@example.com", ccField: "me@example.com",
+            fromField: extFrom + ", " + small, claimEmails: me
+        ) == "cc")
+    }
+
     @Test("Claim path is linear on unbalanced-opener floods (round-2 ReDoS shapes)")
     func classifyClaimPathLinear() {
         let me = ["me@example.com"]
@@ -488,10 +516,9 @@ struct PromptVariablesTests {
     @Test("Many REAL addresses stay fast (per-candidate validator cost is bounded)")
     func classifyRealAddressVolume() {
         let me = ["me@example.com"]
-        // Flood shapes produce zero exactAddr calls; this shape produces 2000
-        // (sized under the 64KB field cap) — pins the per-candidate regex cost
-        // (round-3 finding: per-call literal construction made 5000 candidates
-        // ~860ms even at -O).
+        // 2000 real mailboxes (sized under the 64KB field cap) — pins the
+        // parser's per-mailbox cost (an earlier scanner's per-call literal
+        // construction made 5000 candidates ~860ms even at -O).
         let bracketed = (0..<2000).map { "U\($0) <u\($0)@example.com>" }.joined(separator: ", ")
         let bare = (0..<2000).map { "u\($0)@example.com" }.joined(separator: ",")
         let t0 = Date()
@@ -514,11 +541,10 @@ struct PromptVariablesTests {
     @Test("Bracket-exposed display-name injection cannot fabricate a claim (last-span rule)")
     func classifyBracketInjection() {
         let me = ["me@example.com"]
-        // SwiftMail MIME-decodes a display name and re-wraps it in UNESCAPED
-        // quotes, so a Cc entry `bob@corp.com` with decoded name
-        // `x" <me@example.com> "y` reaches the classifier as:
-        // "x" <me@example.com> "y" <bob@corp.com>. Only the LAST bracket span
-        // per segment is the real address, so the planted span is rejected.
+        // A legacy row, written before display names were escaped: a Cc entry
+        // `bob@corp.com` with decoded name `x" <me@example.com> "y` was stored
+        // as "x" <me@example.com> "y" <bob@corp.com>. SwiftMail's parser does
+        // not read the planted address as a mailbox, so it never claims.
         #expect(PromptVariables.classifyRecipientStatus(
             toField: "other@example.com", ccField: "\"x\" <me@example.com> \"y\" <bob@corp.com>",
             fromField: extFrom, claimEmails: me
@@ -541,26 +567,45 @@ struct PromptVariablesTests {
         ) == "")
     }
 
-    @Test("Documents the accepted residual: unescaped-quote + comma injection (KNOWN LIMITATION)")
-    func classifyAcceptedResidual() {
+    @Test("A crafted IMAP Cc display name holding the user's address never claims")
+    func classifyCraftedImapDisplayNameNeverClaims() {
         let me = ["me@example.com"]
-        // ACCEPTED LOW-IMPACT LIMITATION (2026-07-05) — see extractAddressEmails
-        // doc + PROJECT_MEMORY.md. A producer (SwiftMail IMAP formatAddress) that
-        // emits the decoded display name in UNESCAPED quotes with an embedded
-        // comma lets the injected <me@example.com> become the last span of its
-        // own segment. The string is BYTE-IDENTICAL to a legitimate two-recipient
-        // Cc that MUST claim, so no string parser can distinguish them. This PINS
-        // the current (spuriously "cc") behavior so the tradeoff is visible; it
-        // is NOT an endorsement.
+        // The Cc field exactly as IMAP sync stores it: a single mailbox whose
+        // decoded display name holds quotes, a comma and the user's address.
+        // Stored unescaped (before 2026-10-09) it was byte-identical to a real
+        // two-recipient Cc and claimed; escaped, it is one mailbox.
+        let craftedCc = IMAPFetchMapping.mailboxText(name: #"x" <me@example.com>, "y"#, address: "bob@example.com")
         #expect(PromptVariables.classifyRecipientStatus(
-            toField: "other@example.com", ccField: "\"x\" <me@example.com> , \"y\" <bob@corp.com>",
+            toField: "other@example.com", ccField: craftedCc,
+            fromField: extFrom, claimEmails: me
+        ) == "")
+        // A real two-recipient Cc naming the user, stored the same way, claims.
+        let realCc = [
+            IMAPFetchMapping.mailboxText(name: "x", address: "me@example.com"),
+            IMAPFetchMapping.mailboxText(name: "y", address: "bob@example.com")
+        ].joined(separator: ", ")
+        #expect(PromptVariables.classifyRecipientStatus(
+            toField: "other@example.com", ccField: realCc,
             fromField: extFrom, claimEmails: me
         ) == "cc")
-        // The legitimate twin it is byte-ambiguous with — MUST claim.
-        #expect(PromptVariables.classifyRecipientStatus(
-            toField: "other@example.com", ccField: "\"Me\" <me@example.com>, \"Bob\" <bob@corp.com>",
-            fromField: extFrom, claimEmails: me
-        ) == "cc")
+    }
+
+    /// A name holding no `"` or `\` needs no escaping, and an address may sit
+    /// in a domain literal with no name at all: the claim reads mailboxes, so
+    /// neither is evidence.
+    @Test("An address in an encoded-word-like name or a domain literal never claims")
+    func classifyAddressOutsideAnyMailboxNeverClaims() {
+        let me = ["me@example.com"]
+        let fields = [
+            IMAPFetchMapping.mailboxText(name: "<me@example.com> =?", address: "a?=b@example.com"),
+            "x@[y, <me@example.com>]"
+        ]
+        for ccField in fields {
+            #expect(PromptVariables.classifyRecipientStatus(
+                toField: "other@example.com", ccField: ccField,
+                fromField: extFrom, claimEmails: me
+            ) == "")
+        }
     }
 
     @Test("Sanitizers are escape-aware — escaped delimiters cannot expose planted spans")

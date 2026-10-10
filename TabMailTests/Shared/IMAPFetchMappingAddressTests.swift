@@ -78,8 +78,55 @@ struct IMAPFetchMappingAddressTests {
         ])
         #expect(field == #"ann@example.com, "Doe, Jane" <jane@example.com>, bob@example.com"#)
         // The stored field reads back to exactly the three addresses.
-        #expect(parseAddressList(field).map(extractEmailAddress)
+        #expect(AddressParser.parseAddressList(field).flatMap(\.mailboxes).map(\.address)
             == ["ann@example.com", "jane@example.com", "bob@example.com"])
+    }
+
+    @Test("A display name holding quotes, backslashes, commas or an address reads back as that one mailbox")
+    func craftedDisplayNamesReadBackAsOneMailbox() {
+        let names = [
+            #"x" <me@example.com>, "y"#,
+            #"Back\slash, "Q""#,
+            "Trailing\\",
+            "q\"\u{301} <me@example.com>, \"z",
+            "Back\\\u{301}slash"
+        ]
+        let entries = names.enumerated().map { index, name in
+            mailbox("user\(index)@example.com", name: name)
+        }
+        let field = IMAPFetchMapping.addressField(entries)
+        #expect(AddressParser.parseAddressList(field) == entries)
+        let members = entries.flatMap(\.mailboxes)
+        let groupField = IMAPFetchMapping.addressField([.group(name: "Team", members: members)])
+        #expect(AddressParser.parseAddressList(groupField).flatMap(\.mailboxes) == members)
+        #expect(IMAPFetchMapping.addressField([mailbox("bob@example.com", name: #"x" <me@example.com>, "y"#)])
+            == #""x\" <me@example.com>, \"y" <bob@example.com>"#)
+    }
+
+    /// A decoded name can hold a CR or LF (`=?UTF-8?Q?Alice=0AX?=`), which a
+    /// quoted-string cannot; written as a space, the recipient stays readable,
+    /// labelled and offered by reply-all, and invalid text holding one still
+    /// leaves the mailbox after it whole.
+    @Test("A CR or LF in a name or invalid text keeps every mailbox readable", arguments: ["\n", "\r", "\r\n"])
+    func lineBreakKeepsMailboxReadable(lineBreak: String) {
+        let spaces = String(repeating: " ", count: lineBreak.unicodeScalars.count)
+        let field = IMAPFetchMapping.addressField([
+            mailbox("alice@example.com", name: "Alice\(lineBreak)X"),
+            .invalid("a\(lineBreak)\"b@company.com."),
+            mailbox("bob@example.com", name: "y <hidden@example.com>, z")
+        ])
+        #expect(AddressParser.parseAddressList(field).flatMap(\.mailboxes) == [
+            SwiftMail.EmailAddress(name: "Alice\(spaces)X", address: "alice@example.com"),
+            SwiftMail.EmailAddress(name: "y <hidden@example.com>, z", address: "bob@example.com")
+        ])
+        #expect(MessageViewHelpers.extractNames(field).hasPrefix("Alice\(spaces)X, "))
+        var header = MessageHeader(
+            messageId: "1", subject: "Line break", from: "sender@example.com",
+            fromAddress: "sender@example.com", to: "me@example.com", date: Date(), snippet: "",
+            folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        header.cc = field
+        #expect(buildReplyAllRecipients(for: header, allAccounts: []).cc == ["alice@example.com", "bob@example.com"])
     }
 
     @Test("An empty group contributes nothing")
@@ -90,7 +137,37 @@ struct IMAPFetchMappingAddressTests {
     @Test("Invalid entries stay visible in the field")
     func invalidEntriesStayVisible() {
         let field = IMAPFetchMapping.addressField([mailbox("ann@example.com"), .invalid("foo@@example.com")])
-        #expect(field == "ann@example.com, foo@@example.com")
+        #expect(AddressParser.parseAddressList(field) == [mailbox("ann@example.com"), .invalid("foo@@example.com")])
+        #expect(MessageViewHelpers.extractNames(field) == "ann@example.com, foo@@example.com")
+    }
+
+    /// Invalid text that reads back as itself alone can still hold an unclosed
+    /// `"`; joined into the field, that quote must not swallow the quoting of
+    /// the crafted name after it.
+    @Test("An unclosed quote in invalid text leaves the next mailbox whole", arguments: [
+        #"x"@company.com."#, "x\"\u{1}@company.com"
+    ])
+    func unclosedQuoteInInvalidTextStaysInside(text: String) {
+        let crafted = SwiftMail.EmailAddress(name: "y <hidden@example.com>, z", address: "bob@example.com")
+        let field = IMAPFetchMapping.addressField([.invalid(text), .mailbox(crafted)])
+        let entries = AddressParser.parseAddressList(field)
+        #expect(entries.count == 2)
+        #expect(entries.flatMap(\.mailboxes) == [crafted])
+        #expect(PromptVariables.classifyRecipientStatus(toField: "other@example.com", ccField: field,
+            fromField: "sender@example.com", claimEmails: ["hidden@example.com"]) == "")
+        #expect(PromptVariables.classifyRecipientStatus(toField: "other@example.com", ccField: field,
+            fromField: "sender@example.com", claimEmails: ["bob@example.com"]) == "cc")
+    }
+
+    /// An incomplete ENVELOPE address can carry a quoted local-part holding
+    /// commas and an address; SwiftMail reads it as invalid text, and so must
+    /// every reader of the stored field.
+    @Test("Invalid text that would read back as a mailbox is stored quoted, still visible")
+    func invalidTextNeverReadsBackAsMailbox() {
+        let text = "a, <hidden@example.com>, b@company.com."
+        let field = IMAPFetchMapping.addressField([mailbox("ann@example.com"), .invalid(text)])
+        #expect(AddressParser.parseAddressList(field) == [mailbox("ann@example.com"), .invalid(text)])
+        #expect(MessageViewHelpers.extractNames(field) == "ann@example.com, \(text)")
     }
 
     @Test("A carried message's header block uses the same address shape")

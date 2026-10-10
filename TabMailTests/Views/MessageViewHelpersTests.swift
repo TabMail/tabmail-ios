@@ -46,6 +46,21 @@ struct MessageViewHelpersTests {
         #expect(result == "")
     }
 
+    /// Stored names are escaped quoted-strings (`IMAPFetchMapping.mailboxText`);
+    /// the label shows each name as written, commas included.
+    @Test("extractNames shows escaped names as written")
+    func extractNamesEscapedNames() {
+        let result = MessageViewHelpers.extractNames(
+            #""John \"JJ\" Smith" <j@example.com>, "Back\\slash" <b@example.com>, "Doe, Jane" <jane@example.com>"#)
+        #expect(result == #"John "JJ" Smith, Back\slash, Doe, Jane"#)
+    }
+
+    @Test("extractNames lists a group's members, not its name")
+    func extractNamesGroupMembers() {
+        let result = MessageViewHelpers.extractNames(#"Team: ann@example.com, "Bob" <bob@example.com>;"#)
+        #expect(result == "ann@example.com, Bob")
+    }
+
     // MARK: - formatShortDate
 
     @Test("formatShortDate returns time for today")

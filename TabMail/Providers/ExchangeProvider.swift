@@ -438,13 +438,14 @@ actor ExchangeProvider: EmailProvider {
     /// the `section` field, used only for Exchange nested-attachment downloads.
     static let nestedSeparator = "|"
 
-    /// Format a Graph recipient as `"Name" <address>` when both fields exist, or
-    /// just `address` / `name` when only one is present.
+    /// Format a Graph recipient as `"Name" <address>` (escaped, see
+    /// `IMAPFetchMapping.mailboxText`) when both fields exist, or just
+    /// `address` / `name` when only one is present.
     private static func formatRecipient(_ r: GraphRecipient?) -> String? {
         guard let email = r?.emailAddress else { return nil }
         switch (email.name, email.address) {
         case let (name?, address?) where !name.isEmpty && !address.isEmpty:
-            return "\"\(name)\" <\(address)>"
+            return IMAPFetchMapping.mailboxText(name: name, address: address)
         case let (_, address?) where !address.isEmpty:
             return address
         case let (name?, _) where !name.isEmpty:

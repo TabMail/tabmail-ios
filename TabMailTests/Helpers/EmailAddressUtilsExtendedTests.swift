@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 @testable import TabMail
+import SwiftMail
 
 @Suite("EmailAddressUtils Extended")
 struct EmailAddressUtilsExtendedTests {
@@ -21,12 +22,6 @@ struct EmailAddressUtilsExtendedTests {
         #expect(result == "john@example.com")
     }
 
-    @Test("parseAddressList handles semicolons")
-    func semicolonSeparated() {
-        let result = parseAddressList("a@b.com; c@d.com")
-        #expect(result.count >= 1) // Implementation may or may not support semicolons
-    }
-
     @Test("extractEmailAddress handles address with plus")
     func addressWithPlus() {
         let result = extractEmailAddress("user+tag@example.com")
@@ -37,12 +32,6 @@ struct EmailAddressUtilsExtendedTests {
     func internationalDomain() {
         let result = extractEmailAddress("user@münchen.de")
         #expect(result.contains("@"))
-    }
-
-    @Test("parseAddressList empty string returns empty")
-    func emptyStringReturnsEmpty() {
-        let result = parseAddressList("")
-        #expect(result.isEmpty)
     }
 
     @Test("extractEmailAddress nil-safe for empty string")
@@ -102,6 +91,49 @@ struct BuildReplyAllRecipientsTests {
         let result = buildReplyAllRecipients(for: msg, allAccounts: [me])
         #expect(result.to == ["sender@example.com", "ann@example.com"])
         #expect(result.cc == ["bob@example.com"])
+    }
+
+    /// SwiftMail reads `local@localhost` as a mailbox, but TabMail cannot send
+    /// to it; reply-all admits only addresses it could send to, in To and Cc.
+    @Test("A parsed mailbox TabMail cannot send to is never offered")
+    func unsendableMailboxNeverOffered() {
+        let me = makeAccount(email: "me@example.com")
+        let field = IMAPFetchMapping.addressField([
+            .mailbox(SwiftMail.EmailAddress(address: "local@localhost")),
+            .mailbox(SwiftMail.EmailAddress(address: "bob@example.com"))
+        ])
+        #expect(AddressParser.parseAddressList(field).flatMap(\.mailboxes).map(\.address)
+            == ["local@localhost", "bob@example.com"])
+        #expect(!isValidEmailAddress("local@localhost"))
+        let inTo = buildReplyAllRecipients(for: makeHeader(from: "sender@example.com", to: field), allAccounts: [me])
+        #expect(inTo.to == ["sender@example.com", "bob@example.com"])
+        #expect(inTo.cc.isEmpty)
+        let inCc = buildReplyAllRecipients(for: makeHeader(from: "sender@example.com", to: "me@example.com", cc: field), allAccounts: [me])
+        #expect(inCc.to == ["sender@example.com"])
+        #expect(inCc.cc == ["bob@example.com"])
+    }
+
+    /// A display name is text, never a recipient: a crafted IMAP name that
+    /// holds quotes, a comma and an address must not add that address, in To or
+    /// Cc, flat or inside a group (a raw Gmail header keeps its groups).
+    @Test("An address inside a quoted display name is never offered", arguments: [false, true], [false, true])
+    func addressInsideDisplayNameNeverOffered(inTo: Bool, grouped: Bool) {
+        let me = makeAccount(email: "me@example.com")
+        let crafted = #"x" <hidden@example.com>, "y"#
+        let flat = IMAPFetchMapping.addressField([
+            .mailbox(SwiftMail.EmailAddress(name: crafted, address: "bob@example.com")),
+            .mailbox(SwiftMail.EmailAddress(name: #"Back\slash, "Q""#, address: "ann@example.com"))
+        ])
+        let field = grouped ? "Team: \(flat);" : flat
+        let msg = makeHeader(
+            from: "sender@example.com",
+            to: inTo ? "me@example.com, \(field)" : "me@example.com",
+            cc: inTo ? "" : field
+        )
+        let result = buildReplyAllRecipients(for: msg, allAccounts: [me])
+        let real = ["bob@example.com", "ann@example.com"]
+        #expect(result.to == ["sender@example.com"] + (inTo ? real : []))
+        #expect(result.cc == (inTo ? [] : real))
     }
 
     @Test("Filters out single account email from To")
