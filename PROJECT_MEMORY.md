@@ -25,7 +25,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 |---|---|
 | Key Files | [read in full](Companion/Memory/Current/001-key-files.md) |
 | Inbox list = ONE merged read-model (ADR-IOS-055, 2026-07-09 evening) — supersedes the same-day guard/carry-over fixes | [read in full](Companion/Memory/Current/002-inbox-list-one-merged-read-model-adr-ios-055-2026-07-09-evening-supersed.md) |
-| Summary `recipient_status` (cc detection) — 2026-07-04 | [read in full](Companion/Memory/Current/003-summary-recipient-status-cc-detection-2026-07-04.md) |
+| Summary `recipient_status` (cc detection) — 2026-07-04; AddressParser claim + escaped writers, crafted-name residual RESOLVED 2026-10-10 (#214) | [read in full](Companion/Memory/Current/003-summary-recipient-status-cc-detection-2026-07-04.md) |
 | IMAP external-deletion blind spot — old server-deleted messages linger forever (audit 2026-07-02) | [read in full](Companion/Memory/Current/004-imap-external-deletion-blind-spot-old-server-deleted-messages-linger-for.md) |
 | CLI testing breaks with "Simulator device failed to launch / Launchd job spawn failed" → app is UNSIGNED in DerivedData (2026-06-22) | [read in full](Companion/Memory/Current/005-cli-testing-breaks-with-simulator-device-failed-to-launch-launchd-job-sp.md) |
 | Test flakiness: `UserDefaults(suiteName:)` isolation FALLS THROUGH to `.standard` — isolating a suite's WRITES is necessary but not sufficient (2026-06-22) | [read in full](Companion/Memory/Current/006-test-flakiness-userdefaults-suitename-isolation-falls-through-to-standar.md) |
