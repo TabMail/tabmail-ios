@@ -110,7 +110,26 @@ struct IMAPFetchMappingAddressTests {
     @Test("Invalid entries stay visible in the field")
     func invalidEntriesStayVisible() {
         let field = IMAPFetchMapping.addressField([mailbox("ann@example.com"), .invalid("foo@@example.com")])
-        #expect(field == "ann@example.com, foo@@example.com")
+        #expect(AddressParser.parseAddressList(field) == [mailbox("ann@example.com"), .invalid("foo@@example.com")])
+        #expect(MessageViewHelpers.extractNames(field) == "ann@example.com, foo@@example.com")
+    }
+
+    /// Invalid text that reads back as itself alone can still hold an unclosed
+    /// `"`; joined into the field, that quote must not swallow the quoting of
+    /// the crafted name after it.
+    @Test("An unclosed quote in invalid text leaves the next mailbox whole", arguments: [
+        #"x"@company.com."#, "x\"\u{1}@company.com"
+    ])
+    func unclosedQuoteInInvalidTextStaysInside(text: String) {
+        let crafted = SwiftMail.EmailAddress(name: "y <hidden@example.com>, z", address: "bob@example.com")
+        let field = IMAPFetchMapping.addressField([.invalid(text), .mailbox(crafted)])
+        let entries = AddressParser.parseAddressList(field)
+        #expect(entries.count == 2)
+        #expect(entries.flatMap(\.mailboxes) == [crafted])
+        #expect(PromptVariables.classifyRecipientStatus(toField: "other@example.com", ccField: field,
+            fromField: "sender@example.com", claimEmails: ["hidden@example.com"]) == "")
+        #expect(PromptVariables.classifyRecipientStatus(toField: "other@example.com", ccField: field,
+            fromField: "sender@example.com", claimEmails: ["bob@example.com"]) == "cc")
     }
 
     /// An incomplete ENVELOPE address can carry a quoted local-part holding

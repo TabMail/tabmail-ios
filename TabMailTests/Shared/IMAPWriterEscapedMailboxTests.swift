@@ -11,7 +11,8 @@ import SwiftMail
 /// NSE's `NSEIMAPConnection.mapInfoToMetadata` — store address fields a display
 /// name cannot break: a crafted name holding quotes, a comma and an address
 /// reads back as the one mailbox it belongs to, in To, a Cc group and Bcc, and
-/// an incomplete address whose quoted local-part holds an address stays text.
+/// an incomplete address — whose quoted local-part holds an address, or an
+/// unclosed quote ahead of the crafted name — stays text.
 ///
 /// `.serialized` — each test binds a listening socket for the fake server.
 @Suite("IMAP writers store escaped mailbox text", .serialized)
@@ -31,15 +32,16 @@ struct IMAPWriterEscapedMailboxTests {
     }()
 
     /// The same names in the RFC 5322 header and the ENVELOPE: To is one named
-    /// mailbox, Cc a group of one plus an address whose host is no domain
-    /// (SwiftMail reads it as invalid text), Bcc one named mailbox (RFC 3501 §7.4.2).
+    /// mailbox, Cc a group of one between two addresses whose host is no domain
+    /// (SwiftMail reads each as invalid text; the first's local-part is an
+    /// unclosed quote), Bcc one named mailbox (RFC 3501 §7.4.2).
     private func startServer() throws -> FakeIMAPServer {
         let date = Self.rfc5322DateFormatter.string(from: Date())
         let quotedName = #""x\" <hidden@example.com>, \"y""#
         let raw = """
         From: Sender <sender@example.com>\r
         To: \(quotedName) <bob@example.com>\r
-        Cc: Team: \(quotedName) <ann@example.com>;, "a, <hidden@example.com>, b"@company.com.\r
+        Cc: "x\\""@company.com., Team: \(quotedName) <ann@example.com>;, "a, <hidden@example.com>, b"@company.com.\r
         Bcc: \(quotedName) <bex@example.com>\r
         Subject: Escaped names\r
         Date: \(date)\r
@@ -51,7 +53,7 @@ struct IMAPWriterEscapedMailboxTests {
         """
         let from = #"(("Sender" NIL "sender" "example.com"))"#
         let to = "((\(quotedName) NIL \"bob\" \"example.com\"))"
-        let cc = "((NIL NIL \"Team\" NIL) (\(quotedName) NIL \"ann\" \"example.com\") (NIL NIL NIL NIL)"
+        let cc = "((NIL NIL \"x\\\"\" \"company.com.\") (NIL NIL \"Team\" NIL) (\(quotedName) NIL \"ann\" \"example.com\") (NIL NIL NIL NIL)"
             + " (NIL NIL \"a, <hidden@example.com>, b\" \"company.com.\"))"
         let bcc = "((\(quotedName) NIL \"bex\" \"example.com\"))"
         let parsed = FakeIMAPServer.makeMessage(uid: 101, rfc822Text: raw)

@@ -59,14 +59,18 @@ enum IMAPFetchMapping {
     /// `"Name" <address>` (see `mailboxText`), or the bare `address` when there
     /// is no name — the shape SwiftMail's `AddressParser` reads back. A group
     /// contributes its members; its name is not an address. Invalid text stays
-    /// in the field so it still shows (see `invalidText`); no reader takes it
-    /// for a mailbox.
+    /// in the field so it still shows, as a quoted-string, which SwiftMail
+    /// reads back as invalid text of its content. Written raw, it could read
+    /// back as a mailbox (`a, <x@example.com>, b@company.com.` from an
+    /// incomplete ENVELOPE address), or an unclosed `"` in it (`x"@company.com.`)
+    /// could swallow the quoting of the entry after it. No reader takes it for
+    /// a mailbox.
     static func addressStrings(_ entries: [AddressListEntry]) -> [String] {
         entries.flatMap { entry -> [String] in
             switch entry {
                 case .mailbox(let mailbox): return [addressString(mailbox)]
                 case .group(_, let members): return members.map(addressString)
-                case .invalid(let text): return [invalidText(text)]
+                case .invalid(let text): return [quotedString(text)]
             }
         }
     }
@@ -89,15 +93,6 @@ enum IMAPFetchMapping {
     /// combining mark is one `Character`, but still a quote to every parser.
     static func mailboxText(name: String, address: String) -> String {
         "\(quotedString(name)) <\(address)>"
-    }
-
-    /// Invalid text as written when it reads back as that same invalid text,
-    /// otherwise as a quoted-string, which SwiftMail reads back as invalid text
-    /// of its content. Written raw, text SwiftMail did not read as a mailbox
-    /// (`a, <x@example.com>, b@corp.com.` from an incomplete ENVELOPE address)
-    /// could read back as one. SwiftMail's own display form does the same.
-    private static func invalidText(_ text: String) -> String {
-        AddressParser.parseAddressList(text) == [.invalid(text)] ? text : quotedString(text)
     }
 
     private static func quotedString(_ text: String) -> String {
