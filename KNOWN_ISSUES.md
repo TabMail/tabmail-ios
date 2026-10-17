@@ -101,7 +101,12 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-09-02): 6 `open` records, all of them amendment rows —
+> **Current tracker census (2026-10-17): 7 `open` records, all of them amendment rows —
+> `IOS-BODY-006`, `IOS-COMPOSE-002`, `IOS-DRAFT-020`, `IOS-IMAP-015`, `IOS-IMAP-016`,
+> `IOS-NSE-008`, `IOS-PERF-012`.** `IOS-DRAFT-020` was filed with the #217 external-draft
+> adoption (`IOS-DRAFT-019`) and is `open` because it is an owner decision.
+>
+> *Superseded, preserved:* **Current tracker census (2026-09-02): 6 `open` records, all of them amendment rows —
 > `IOS-BODY-006`, `IOS-COMPOSE-002`, `IOS-IMAP-015`, `IOS-IMAP-016`, `IOS-NSE-008`,
 > `IOS-PERF-012`.**
 > `IOS-BODY-006` was filed on 2026-09-02 with the oversized-metadata body quarantine and is
@@ -246,6 +251,13 @@ regenerated from it; their detail files live in
 | ID | Class | Executive statement |
 |---|---|---|
 | [IOS-NSE-008](Companion/Process/Current/KnownIssues/Amendments/ios-nse-008.md) | `open` | 🔓 **OPEN (2026-09-02)** — three residuals in the App Group identity mirrors the notification service extension resolves pushes through. **(A)** A re-derivation whose database read straddles a concurrent account removal can briefly restore the removed account's entries; removal itself is safe (`removeAccountFromMirrors` edits both mirrors *before* the authoritative delete), so this window is opened only by a *concurrent* reader, i.e. the foreground convergence pass — widest across `AppDataWiper.wipeAll`, whose pre-delete mirror clearing is a per-account loop followed by a multi-table transaction. Bounded by the credential delete in `disconnectAccount` one hop later, with no cross-account access; the visible residue is a stale notification for the removed address. ⚠️ **The "gone at the next foreground return" bound fails for the LAST mail account** — `RootView` gates `startForegroundPolling()` on `!navigationStore.accounts.isEmpty`, so with zero accounts the entries survive to the next cold launch. **(B)** An edit to a mirrored column of an existing account (`AccountEditableField` covers the address and the IMAP username) converges only at the next re-derivation, deliberately — a per-writer refresh census goes stale silently the next time a mirrored column is added. **(C)** Two MAIL rows at one address — reachable because `addIMAPAccount` runs no duplicate check and `Account.existing` is provider-scoped — contend for the single map slot by scan order, **deterministically and permanently**, and there is no correct precedence to apply: whichever row wins, pushes for the other provider dead-end. Resolving it means changing the model (id in the payload, or `(address, provider)` keying) or preventing the duplicate at account setup, not picking a winner in the mirror. Filed `open`, **not** `accepted`: no owner decision has been taken. Remedies are enumerated in the routed record |
+
+### DRAFT (2)
+
+| ID | Class | Executive statement |
+|---|---|---|
+| [IOS-DRAFT-019](Companion/Process/Current/KnownIssues/Amendments/ios-draft-019.md) | `resolved` | ✅ **RESOLVED (2026-10-17, GitHub #217)** — drafts written by another mail app open and edit again. With no local owner, `ServerDraftComposeLoader` adopts the server copy (`ExternalDraftAdoption`): body + attachments fetched, then one write transaction re-verifies the header and inserts an `adopted:<uuid>` `Draft` row owning the EXACT provider-native address (IMAP folder+UIDVALIDITY+UID, Gmail resource id, Graph id), status `"pushed"`. Save replaces and Send deletes exactly that copy. Owner ruling: any client, last save wins, no lease. Unproven IMAP epochs, placeholders, changed headers and unconfirmed-empty bodies still fail closed |
+| [IOS-DRAFT-020](Companion/Process/Current/KnownIssues/Amendments/ios-draft-020.md) | `open` | 🔓 **OPEN (2026-10-17) — owner decision.** A draft this device owns reopens from its LOCAL copy, so an in-place edit made later in another app (Gmail resource id and Graph id survive edits) is not shown and the next save here replaces it. Predates #217 for locally authored drafts; IMAP is unaffected (an edit elsewhere is a new UID, adopted fresh). Options: accept last-save-wins across reopen, or refresh `"pushed"` rows behind a recorded version witness |
 
 ### GRAPH (1)
 

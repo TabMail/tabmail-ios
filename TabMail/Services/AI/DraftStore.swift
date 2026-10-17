@@ -205,6 +205,20 @@ actor DraftStore {
         return .applied
     }
 
+    /// #217 — insert a row adopted from another mail app's server draft
+    /// (`ExternalDraftAdoption.insertAdoptedDraft`, inside its write transaction).
+    ///
+    /// Not `applySave`: that INSERT arm turns `"pushed"` into `"dirty"`, which would
+    /// claim a local edit that does not exist. An adopted row IS the server copy, so
+    /// it keeps `"pushed"` and its exact address; the user's first edit goes through
+    /// `admitSave`/`applySave` like any other. A brand-new key, so like `admitSave`'s
+    /// insert arm there is no predecessor generation to check.
+    static func applyAdoption(_ draft: Draft, db: Database) throws {
+        var inserted = draft
+        inserted.lastTouchedSeq = try nextLastTouchedSeq(db)
+        try inserted.insert(db)
+    }
+
     /// PORT — v2final `DraftStore.nextLastTouchedSeq`. The next monotonic
     /// eviction-recency sequence, computed INSIDE the save write transaction. GRDB's
     /// `DatabasePool` serializes writers, so `MAX+1` across concurrent saves is

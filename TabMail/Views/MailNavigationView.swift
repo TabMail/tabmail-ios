@@ -1167,9 +1167,10 @@ private struct PushedMessageDestination: View {
     }
 }
 
-/// Reopens only a locally-authored draft whose generation placeholder or exact
-/// provider-native address matches the selected Drafts header. Arbitrary
-/// server-origin drafts intentionally fail closed; sync remains authoritative.
+/// Opens a Drafts header as an editable compose. A draft this device owns reopens
+/// through its generation placeholder or exact provider-native address; a draft
+/// written by another mail app is first adopted (`ExternalDraftAdoption`, #217) and
+/// then opens the same way.
 struct ServerDraftComposeLoader: View {
     let header: MessageHeader
     #if DEBUG
@@ -1194,9 +1195,9 @@ struct ServerDraftComposeLoader: View {
     enum Resolution: Equatable {
         /// A local, editable `Draft` was resolved AND re-authorized for this header.
         case authorized(LocallyAuthoredDraftOpenAuthority)
-        /// AUTHORITATIVE ABSENCE. Every read completed and this device provably holds
-        /// no editable copy. Fail closed honestly — no retry prompt, because retrying
-        /// cannot change the answer.
+        /// AUTHORITATIVE ABSENCE. Every read completed and there is no local owner
+        /// and nothing exact to adopt (the header changed or has no exact address).
+        /// Fail closed honestly — no retry prompt.
         case noLocalCopy
         /// ⚑ NO REFERENCE — INVENTED, same rationale as
         /// `DraftComposePresenter.LoadResult.loadFailed`. A read or a provider call
@@ -1216,12 +1217,10 @@ struct ServerDraftComposeLoader: View {
                     draftId: openAuthority.draftId,
                     openAuthority: openAuthority)
             case .noLocalCopy:
-                // STATE ONLY THE OBSERVED FACT — do not promise a remedy. The
-                // refusal turns on LOCAL `Draft` state, and no sync path produces a
-                // `Draft` row (`Draft` has zero sync-engine construction sites), so
-                // the superseded copy — "Sync the Drafts folder and try again." —
-                // sent the user to do something that provably cannot help. Same
-                // precedent as `afa7889ee` (`IOS-IMAP-001`'s fifth-path closure).
+                // STATE ONLY THE OBSERVED FACT — do not promise a remedy. Since
+                // #217 every draft with an exact server address is adopted, so this
+                // arm is reached only when the header changed or vanished under us,
+                // or has no exact address (an IMAP folder whose epoch is unknown).
                 //
                 // ⚠️ THIS ARM IS FOR A PROVEN ABSENCE ONLY. The thrown-read case used
                 // to land here too; it now has its own arm below. Do not merge them
@@ -1231,7 +1230,7 @@ struct ServerDraftComposeLoader: View {
                 ContentUnavailableView {
                     Label("Draft unavailable", systemImage: "exclamationmark.shield")
                 } description: {
-                    Text("No editable copy of this draft was found on this device.")
+                    Text("This draft couldn't be opened. It may have been changed or deleted in another app.")
                 } actions: {
                     Button("Close") { dismiss() }
                         .buttonStyle(.bordered)
@@ -1317,6 +1316,28 @@ struct ServerDraftComposeLoader: View {
             return try await resolveGmailDraft()
         }
 
+        if let owner = try await resolveLocalOwner(runtimeKind: runtimeKind) {
+            return owner
+        }
+        // #217: no local owner, so this draft was written by another mail app (or
+        // this device's row was evicted). Take it over, then resolve again.
+        guard let address = try await AppDatabase.dbPool.read({ db in
+            try ExternalDraftAdoption.adoptableAddress(
+                db: db, header: header, runtimeKind: runtimeKind)
+        }) else {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[DraftAdoption] No exact address for header=\(DebugModeManager.escapedForLogLine(String(header.id.prefix(60)))) kind=\(runtimeKind) — not adoptable")
+            }
+            return nil
+        }
+        try await ExternalDraftAdoption.adopt(
+            header: header, address: address, runtimeKind: runtimeKind)
+        return try await resolveLocalOwner(runtimeKind: runtimeKind)
+    }
+
+    private func resolveLocalOwner(
+        runtimeKind: DraftRuntimeIdentityKind
+    ) async throws -> LocallyAuthoredDraftOpenAuthority? {
         let candidate = try await AppDatabase.dbPool.read { db in
             try LocallyAuthoredDraftOpenAuthority.resolve(
                 db: db, header: header, runtimeKind: runtimeKind)
@@ -1360,6 +1381,24 @@ struct ServerDraftComposeLoader: View {
             return nil
         }
 
+        if let owner = try await gmailOwner(
+            account: account, folderPath: folderPath, resourceId: resourceId) {
+            return owner
+        }
+        // #217: no local owner — take over the server draft, then resolve again.
+        try await ExternalDraftAdoption.adopt(
+            header: header,
+            address: .gmail(resourceId: resourceId, containedMessageId: header.messageId),
+            runtimeKind: .gmail)
+        return try await gmailOwner(
+            account: account, folderPath: folderPath, resourceId: resourceId)
+    }
+
+    private func gmailOwner(
+        account: Account,
+        folderPath: String,
+        resourceId: String
+    ) async throws -> LocallyAuthoredDraftOpenAuthority? {
         let candidate = try await AppDatabase.dbPool.read { db -> LocallyAuthoredDraftOpenAuthority? in
             guard let current = try MessageHeader.fetchOne(db, key: header.id),
                   current.accountId == account.id,

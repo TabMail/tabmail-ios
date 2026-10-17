@@ -2478,7 +2478,10 @@ struct ComposeView: View {
             if rowClaim == .unresolved {
                 sendError = Self.unresolvedReplyTargetMessage
             }
-            if let quote {
+            // #217: a draft adopted from another mail app already carries that
+            // app's own quote in its body; adding ours would quote twice. The
+            // parent still threads the send (`persistedReplyTargetClaim` above).
+            if let quote, !ExternalDraftAdoption.isAdoptedKey(draftId) {
                 let reply = quote.header
                 let resolvedForward = replyTo != nil ? isForward : draft.isForward
                 let dateStr = reply.date.formatted(date: .abbreviated, time: .shortened)
@@ -2496,7 +2499,7 @@ struct ComposeView: View {
                 ) {
                     quotedHTML = EmailFilter.stripEmbeddedEmlSections(html)
                 }
-            } else if draft.isReplyOrForward, DebugModeManager.isLoggingEnabled() {
+            } else if quote == nil, draft.isReplyOrForward, DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[ComposeView] ⚠ T5.8: reply target for draftId=\(draftId) could not be identity-confirmed — quote OMITTED and SEND BLOCKED (authored body untouched; save/discard unaffected)")
             }
 
