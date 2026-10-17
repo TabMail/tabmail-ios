@@ -2111,6 +2111,9 @@ actor GmailProvider: EmailProvider {
         }
         lines.append("To: \(draft.to.joined(separator: ", "))")
         if !draft.cc.isEmpty { lines.append("Cc: \(draft.cc.joined(separator: ", "))") }
+        // Gmail delivers to the Bcc header's recipients and leaves it out of the
+        // delivered copies; a draft and the Sent copy keep it.
+        if !draft.bcc.isEmpty { lines.append("Bcc: \(draft.bcc.joined(separator: ", "))") }
         lines.append("Subject: \(RFC2047.encodeHeaderValue(draft.subject))")
         if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
             lines.append("In-Reply-To: \(replyTo.hasPrefix("<") ? replyTo : "<\(replyTo)>")")
@@ -2159,6 +2162,8 @@ actor GmailProvider: EmailProvider {
         }
         message += "To: \(draft.to.joined(separator: ", "))\r\n"
         if !draft.cc.isEmpty { message += "Cc: \(draft.cc.joined(separator: ", "))\r\n" }
+        // See buildRFC822: Gmail delivers to Bcc recipients and strips the header.
+        if !draft.bcc.isEmpty { message += "Bcc: \(draft.bcc.joined(separator: ", "))\r\n" }
         message += "Subject: \(RFC2047.encodeHeaderValue(draft.subject))\r\n"
         if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
             message += "In-Reply-To: \(replyTo.hasPrefix("<") ? replyTo : "<\(replyTo)>")\r\n"

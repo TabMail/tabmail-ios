@@ -6047,9 +6047,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `SMTPError.invalidEmailAddress`, which the outbox treats as fatal, so the
     /// message stays visible for the user to fix.
     ///
-    /// BCC recipients are SMTP envelope recipients only: SwiftMail adds them to
-    /// RCPT TO and writes no `Bcc` header, so neither the delivered message nor
-    /// the Sent copy names them.
+    /// BCC recipients go into RCPT TO. The message SwiftMail sends carries no
+    /// `Bcc` header, so no recipient sees them; the copy `appendToSentFolder`
+    /// APPENDs does name them, so the sender can still see who was blind-copied.
     static func buildEmail(from draft: DraftMessage, senderEmail: String) throws -> Email {
         buildEmail(
             from: draft, senderEmail: senderEmail,
@@ -6063,12 +6063,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// as one mailbox is written in that form (`Bob <bob@example.com>` stays a
     /// name and an address); anything else is kept as typed, because a draft may
     /// hold an address the user has not finished and saving it must not fail.
+    /// BCC recipients are kept too: SwiftMail's APPEND writes them into a `Bcc`
+    /// header, so the draft still names them when it is reopened anywhere.
     static func buildDraftEmail(from draft: DraftMessage, senderEmail: String) -> Email {
         buildEmail(
             from: draft, senderEmail: senderEmail,
             recipients: draftRecipients(draft.to),
             ccRecipients: draftRecipients(draft.cc),
-            bccRecipients: []
+            bccRecipients: draftRecipients(draft.bcc)
         )
     }
 

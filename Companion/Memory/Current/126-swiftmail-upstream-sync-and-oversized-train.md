@@ -151,6 +151,8 @@ Upstream commits pulled in: #236 (ENABLE/QRESYNC), #237 (Outlook `.msg`), #239, 
   recipient the parser reads as one mailbox in parsed form (a pasted `Bob <bob@…>` had become one
   RFC 2047 word in the Drafts APPEND under #245/#246); unparseable text stays as typed. The IMAP Drafts
   APPEND still writes no `Bcc` header (SwiftMail never does) — unchanged, not investigated further.
+  **Superseded 2026-10-17 — see "Bcc kept on every path" below; that "not investigated" was the
+  miss (root `MIS-006` recurrence 32).**
 
 ## Sync executed 2026-10-05 — both deviations merged upstream; pure mirror again
 
@@ -160,3 +162,30 @@ tree (`b8b25145`), so nothing new was pulled in and the collision check is empty
 reset to `07163dc03c37b4ed880426b2437e8b345762b2b9` and force-pushed with a lease from `5851273`;
 **zero deviations** — the next resync is the plain mirror path. App and NSE pin `07163dc` in
 `project.yml`. The two 2026-10-04 deviation entries above are superseded.
+
+## 2026-10-17 — Bcc kept on every path; app pins a fork topic branch again
+
+Owner: "fix the BCC bug in all pathways, including our IMAP library". Found by census of every
+serializer that writes recipients:
+- **SwiftMail** never wrote a `Bcc` header, so `IMAPServer.createDraft` / `append(email:)` lost Bcc
+  for every caller. Fork branch `fix/bcc-header-in-stored-copies` (`1145028b`, based on the app pin
+  `07163dc`, NOT on upstream main): `Email.constructContent(use8BitMIME:includeBccHeader:)`
+  (default false, so SMTP is unchanged); `append(email:)` passes true (a stored copy is the sender's);
+  `sendDraft` now strips every Bcc field (folded lines too, byte-preserving) from the SMTP copy and
+  keeps it in the Sent copy. `IMAPTestServer` records APPEND literals (`appendedMessages`).
+- **iOS IMAP**: `buildDraftEmail` passes `draftRecipients(draft.bcc)`; the Sent copy names Bcc via
+  `append(email:)`; the delivered message still does not (`bccRecipientsAreSentButNotNamed`).
+- **Gmail**: `buildRFC822` / `buildMIMEMessage` (shared by `send` and `saveDraft`) wrote no Bcc line,
+  so Gmail SENDS never reached Bcc recipients. Google's `users.messages.send` reference: the message
+  goes to the recipients in the To, Cc and Bcc headers. Both builders now write `Bcc:`.
+- **Outlook**: send/create were right; the draft update is a PATCH, which keeps properties it does
+  not name, and an empty `ccRecipients`/`bccRecipients` was omitted — removed recipients stayed.
+  `buildGraphSendPayload` now always sends all three lists.
+- Read paths already parsed Bcc (IMAP envelope, Gmail `metadataHeaders=Bcc`, Graph `bccRecipients`).
+- Tests: `BccRecipientsTests` (red on main for IMAP draft, Gmail send + both draft calls, Outlook
+  clear). SwiftMail: `BccHeaderTests`, `BccAppendTests`.
+- **Pin state**: app `project.yml` pins `1145028b` (topic branch, not fork main). Fork `main` stays
+  the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
+  upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
+  with `tabmail-swiftmailfork-sync` and re-pin to the mirror.
+
