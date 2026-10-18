@@ -10,7 +10,8 @@ import Testing
 /// BCC recipients survive every path a draft or a sent message takes to the
 /// server: a saved draft still names them when it is reopened, a sent message
 /// reaches them, and the sender's Sent copy names them. Only the delivered
-/// message leaves them out, and that is pinned in `IMAPProviderBuildEmailTests`.
+/// message leaves them out; for IMAP that is pinned in SwiftMail's
+/// `BccHeaderTests`, which send through `SMTPServer` itself.
 @Suite("BCC recipients on every provider path", .serialized)
 struct BccRecipientsTests {
     private static let bcc = ["hidden@example.com", "Hidden Two <hidden2@example.com>"]
@@ -186,15 +187,16 @@ struct BccRecipientsTests {
     }
 
     @Test("A Gmail send refuses a recipient that is not one address, before any request",
-          arguments: Field.allCases)
-    func gmailSendRefusesUnreadableRecipient(field: Field) async {
+          arguments: Field.allCases,
+          ["me2@example.com\r\nBcc: attacker@example.org", "not an address", "a@example.com, b@example.com"])
+    func gmailSendRefusesUnreadableRecipient(field: Field, recipient: String) async {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         http.register(path: "/messages/send", method: "POST", response: .json(raw: #"{"id":"sent-1"}"#))
         let provider = GmailProvider(userEmail: "me@example.com", accessToken: { _ in "tok" }, session: http.session)
 
         do {
-            try await provider.send(draft: Self.draft("me2@example.com\r\nBcc: attacker@example.org", in: field))
+            try await provider.send(draft: Self.draft(recipient, in: field))
             Issue.record("the send went out")
         } catch {
             #expect(AccountManager.isFatalSendError(error), "\(error)")

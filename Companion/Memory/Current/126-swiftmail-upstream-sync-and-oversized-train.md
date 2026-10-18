@@ -191,8 +191,16 @@ serializer that writes recipients:
   clear; injection oracle compares header FIELD NAMES and treats a lone CR or LF as a line break,
   as a CRLF-only split passed the lone-CR/LF variants vacuously). SwiftMail: `BccHeaderTests`, and
   a `sendDraft` integration test over `IMAPTestServer` (now serves Cc/Bcc in ENVELOPE) plus a NIO
-  `SMTPCaptureServer` in the IMAP test target (fork commit `8b907e68`).
-- **Pin state**: app `project.yml` pins `8b907e68` (topic branch, not fork main; was `1145028b`). Fork `main` stays
+  `SMTPCaptureServer` in the IMAP test target (fork commit `8b907e68`). Review round 2 found the
+  SMTP "no Bcc in the delivered copy" test pinned the MECHANISM (`constructContent()` default), not
+  the send path: a mutant making `preparedContent` write Bcc passed every suite. Fixed in
+  `d20af13a`: the test goes through `SMTPServer.prepareEmailForSend` and `sendEmail` (capture server).
+- Gmail removing the Bcc header from delivered copies is OBSERVED behaviour; Google documents only
+  delivery to the To/Cc/Bcc header recipients.
+- Not fixed (not reachable from TabMail, which never calls `sendDraft`): `removingBccFields` treats a
+  line starting with a bare CR as the end of the header section, so a later Bcc line in a malformed
+  stored draft would be kept in the SMTP copy.
+- **Pin state**: app `project.yml` pins `d20af13a` (topic branch, not fork main; was `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
   with `tabmail-swiftmailfork-sync` and re-pin to the mirror.

@@ -2115,8 +2115,9 @@ actor GmailProvider: EmailProvider {
         }
         lines.append("To: \(IMAPProvider.recipientsFieldBody(draft.to))")
         if !draft.cc.isEmpty { lines.append("Cc: \(IMAPProvider.recipientsFieldBody(draft.cc))") }
-        // Gmail delivers to the Bcc header's recipients and leaves it out of the
-        // delivered copies; a draft and the Sent copy keep it.
+        // Gmail delivers to the Bcc header's recipients (documented for
+        // users.messages.send). Leaving the header out of the delivered copies
+        // while a draft and the Sent copy keep it is observed, not documented.
         if !draft.bcc.isEmpty { lines.append("Bcc: \(IMAPProvider.recipientsFieldBody(draft.bcc))") }
         lines.append("Subject: \(RFC2047.encodeHeaderValue(draft.subject))")
         if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
@@ -2166,7 +2167,8 @@ actor GmailProvider: EmailProvider {
         }
         message += "To: \(IMAPProvider.recipientsFieldBody(draft.to))\r\n"
         if !draft.cc.isEmpty { message += "Cc: \(IMAPProvider.recipientsFieldBody(draft.cc))\r\n" }
-        // See buildRFC822: Gmail delivers to Bcc recipients and strips the header.
+        // See buildRFC822: Gmail delivers to Bcc recipients and, as observed,
+        // leaves the header out of the delivered copies.
         if !draft.bcc.isEmpty { message += "Bcc: \(IMAPProvider.recipientsFieldBody(draft.bcc))\r\n" }
         message += "Subject: \(RFC2047.encodeHeaderValue(draft.subject))\r\n"
         if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
