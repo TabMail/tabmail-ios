@@ -205,7 +205,14 @@ serializer that writes recipients:
   SMTP, the draft left in place; a body CR is kept. Fail closed rather than guess where such a line
   ends, since readers disagree. Tier 2 also found the tests blind to Bcc in a visible To/Cc field,
   to HTML drafts (the app saves HTML), and to tab/repeated whitespace before the colon; all fixed.
-- **Pin state**: app `project.yml` pins `c9d54d06` (topic branch, not fork main; was `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
+- **Resent-Bcc (Tier 2, 2026-10-18)**: RFC 5322 section 3.6.6 gives `Resent-Bcc` the meaning of `Bcc`,
+  and two library paths passed it to every recipient: a stored draft sent with `sendDraft`, and an
+  `Email` whose `additionalHeaders` held it (`Email(message:)` copies non-standard headers from a
+  fetched message). Fixed in `bf833cb1` by REFUSING both before SMTP (sendDraft:
+  `IMAPError.invalidArgument`, draft kept; sendEmail: `SMTPError.sendFailed` for a `Bcc` or
+  `Resent-Bcc` additional header, any case). Not reachable from TabMail (no writer, no sendDraft).
+  Lesson: when a fix strips one header, census every header with the same MEANING, not the same name.
+- **Pin state**: app `project.yml` pins `bf833cb1` (topic branch, not fork main; was `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
   with `tabmail-swiftmailfork-sync` and re-pin to the mirror.

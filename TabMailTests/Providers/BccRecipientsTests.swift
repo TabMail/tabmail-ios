@@ -118,6 +118,23 @@ struct BccRecipientsTests {
         return String(decoding: Data(base64Encoded: base64) ?? Data(), as: UTF8.self)
     }
 
+    /// Every request recorded, as "METHOD /path", in order, so a test sees
+    /// which operation went out and not only what it carried.
+    private static func operations(_ http: FakeHTTP.Scenario) -> [String] {
+        http.recordedCalls().map { "\($0.method) \(URL(string: $0.url)?.path ?? $0.url)" }
+    }
+
+    /// Whether each operation ends with the expected "METHOD /path-suffix".
+    private static func expectOperations(_ http: FakeHTTP.Scenario, _ expected: [String]) {
+        let actual = Self.operations(http)
+        #expect(actual.count == expected.count, "\(actual)")
+        for (operation, suffix) in zip(actual, expected) {
+            let method = suffix.split(separator: " ").first.map(String.init) ?? ""
+            let path = suffix.split(separator: " ").last.map(String.init) ?? ""
+            #expect(operation.hasPrefix(method + " ") && operation.hasSuffix(path), "\(actual)")
+        }
+    }
+
     /// The `raw` message of every Gmail request recorded, decoded.
     private static func gmailRawMessages(_ http: FakeHTTP.Scenario) throws -> [String] {
         try http.recordedCalls().compactMap { call in
@@ -147,6 +164,7 @@ struct BccRecipientsTests {
             Self.draft(attachment: attachment, html: html), existingIdentity: .gmail(resourceId: "r-1"),
             draftsFolderPath: "DRAFT")
 
+        Self.expectOperations(http, ["POST /messages/send", "POST /drafts", "PUT /drafts/r-1"])
         let messages = try Self.gmailRawMessages(http)
         #expect(messages.count == 3)
         for (index, message) in messages.enumerated() {
@@ -257,6 +275,7 @@ struct BccRecipientsTests {
         try await provider.send(draft: Self.draft(bcc: bcc, cc: cc))
         _ = try await provider.saveDraft(Self.draft(bcc: bcc, cc: cc), existingIdentity: nil, draftsFolderPath: "Drafts")
 
+        Self.expectOperations(http, ["POST /sendMail", "POST /mailFolders/drafts/messages"])
         let bodies = try Self.graphBodies(http, method: "POST")
         #expect(bodies.count == 2)
         for body in bodies {
@@ -276,6 +295,7 @@ struct BccRecipientsTests {
             Self.draft(bcc: ["hidden@example.com"], cc: ["cc@example.com"]),
             existingIdentity: .outlook(graphId: "g-1"), draftsFolderPath: "Drafts")
 
+        Self.expectOperations(http, ["PATCH /messages/g-1"])
         let patch = try #require(try Self.graphBodies(http, method: "PATCH").first)
         #expect(Self.addresses(patch["ccRecipients"]) == ["cc@example.com"])
         #expect(Self.addresses(patch["bccRecipients"]) == ["hidden@example.com"])
