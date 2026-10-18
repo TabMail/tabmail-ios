@@ -225,7 +225,20 @@ serializer that writes recipients:
   `buildMIMEMessage`, Outlook `buildGraphSendPayload`); without it a crafted Message-ID would wedge
   an IMAP reply, and on Gmail it would add a header line to the raw message Gmail delivers.
   `ThreadingMessageIDLineBreakTests`. Also `f8d71a92`: the sendDraft retirement test requires `+FLAGS`.
-- **Pin state**: app `project.yml` pins `f8d71a92` (topic branch, not fork main; was `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
+- **Every written header field, not one input (Tier 1 r5, 2026-10-18)**: the `c629ec72` check covered
+  only `additionalHeaders`, but `Email.messageID` (copied by `Email(message:)`, which keeps a lone CR;
+  or set via `MessageID(localPart:domain:)`) and the sender domain a generated Message-ID takes were
+  written unchecked. A stored draft whose `Message-ID:` line ends in a lone CR swallows its `Bcc:`
+  line on parsing: the Bcc recipient was skipped and the delivered Message-Id line named them. A name
+  like `Bcc:x@example.com,X-Pad` also passed the Bcc-name check. Fixed in `a09a3e3d`: the header is
+  built as a list (`Email.headerFields`, in `Email+HeaderFields.swift`), and
+  `SMTPServer.checkHeaderFields` refuses, before SMTP, any written field whose name is not an RFC 5322
+  field name or is Bcc/Resent-Bcc, or whose value holds a CR/LF other than a fold. It replaces
+  `checkAdditionalHeaders`. TabMail is unaffected (its Message-ID is local, its header names are
+  In-Reply-To/References), but any NEW TabMail header must still be filtered first, because
+  `.sendFailed` is transient in TabMail. Lesson: census every WRITER of the header, not every
+  field NAME (MIS-006).
+- **Pin state**: app `project.yml` pins `a09a3e3d` (topic branch, not fork main; was `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
   with `tabmail-swiftmailfork-sync` and re-pin to the mirror.
