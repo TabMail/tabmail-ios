@@ -197,10 +197,15 @@ serializer that writes recipients:
   `d20af13a`: the test goes through `SMTPServer.prepareEmailForSend` and `sendEmail` (capture server).
 - Gmail removing the Bcc header from delivered copies is OBSERVED behaviour; Google documents only
   delivery to the To/Cc/Bcc header recipients.
-- Not fixed (not reachable from TabMail, which never calls `sendDraft`): `removingBccFields` treats a
-  line starting with a bare CR as the end of the header section, so a later Bcc line in a malformed
-  stored draft would be kept in the SMTP copy.
-- **Pin state**: app `project.yml` pins `d20af13a` (topic branch, not fork main; was `1145028b`). Fork `main` stays
+- ~~Not fixed (not reachable from TabMail, which never calls `sendDraft`)~~: `removingBccFields`
+  treated a line starting with a bare CR as the end of the header section, so a later Bcc line in a
+  malformed stored draft was kept in the SMTP copy. Tier 2 reproduced the disclosure over the wire;
+  "TabMail never calls it" was no reason to leave a Bcc leak in the library we upstream. Fixed in
+  `1959c9af`: a header with a CR not followed by LF is REFUSED (`IMAPError.invalidArgument`) before
+  SMTP, the draft left in place; a body CR is kept. Fail closed rather than guess where such a line
+  ends, since readers disagree. Tier 2 also found the tests blind to Bcc in a visible To/Cc field,
+  to HTML drafts (the app saves HTML), and to tab/repeated whitespace before the colon; all fixed.
+- **Pin state**: app `project.yml` pins `1959c9af` (topic branch, not fork main; was `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
   with `tabmail-swiftmailfork-sync` and re-pin to the mirror.

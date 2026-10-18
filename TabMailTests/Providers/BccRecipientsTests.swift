@@ -15,10 +15,16 @@ import Testing
 @Suite("BCC recipients on every provider path", .serialized)
 struct BccRecipientsTests {
     private static let bcc = ["hidden@example.com", "Hidden Two <hidden2@example.com>"]
+    private static let bccFieldBody = "hidden@example.com, Hidden Two <hidden2@example.com>"
+    private static let cc = ["cc@example.com"]
 
-    private static func draft(bcc: [String] = Self.bcc, cc: [String] = [], attachment: Bool = false) -> DraftMessage {
+    /// A draft as the app saves one: `DraftStore` writes HTML drafts.
+    private static func draft(
+        bcc: [String] = Self.bcc, cc: [String] = Self.cc, attachment: Bool = false, html: Bool = false
+    ) -> DraftMessage {
         var draft = DraftMessage(
-            to: ["to@example.com"], cc: cc, bcc: bcc, subject: "With BCC", body: "Body",
+            to: ["to@example.com"], cc: cc, bcc: bcc, subject: "With BCC",
+            body: html ? "<p>Body</p>" : "Body", isHTML: html,
             attachments: attachment
                 ? [DraftAttachment(filename: "a.txt", mimeType: "text/plain", data: Data("a".utf8))]
                 : [])
@@ -26,14 +32,30 @@ struct BccRecipientsTests {
         return draft
     }
 
-    /// The header block's unfolded `Bcc` field body, nil when there is none.
-    private static func bccField(in message: String) -> String? {
+    /// The unfolded body of every header field named `name`, in order.
+    private static func fields(_ name: String, in message: String) -> [String] {
         let header = message.components(separatedBy: "\r\n\r\n").first ?? message
         let unfolded = header.replacingOccurrences(of: "\r\n ", with: " ")
             .replacingOccurrences(of: "\r\n\t", with: " ")
+        let prefix = name.lowercased() + ":"
         return unfolded.components(separatedBy: "\r\n")
-            .first { $0.lowercased().hasPrefix("bcc:") }
-            .map { String($0.dropFirst(4)).trimmingCharacters(in: .whitespaces) }
+            .filter { $0.lowercased().hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// A stored or sent copy names each recipient in the field the user put
+    /// it in and nowhere else: one To, one Cc, one Bcc, so no BCC address can
+    /// show in a field the other recipients see.
+    private static func expectRecipients(in message: String, bcc: String? = Self.bccFieldBody, _ label: String) {
+        #expect(fields("To", in: message) == ["to@example.com"], "\(label)")
+        #expect(fields("Cc", in: message) == [Self.cc.joined(separator: ", ")], "\(label)")
+        #expect(fields("Bcc", in: message) == (bcc.map { [$0] } ?? []), "\(label)")
+    }
+
+    /// The copy carries the draft's body in the draft's format.
+    private static func expectBody(in message: String, html: Bool, _ label: String) {
+        #expect(message.contains("text/html") == html, "\(label)")
+        #expect(message.contains(html ? "<p>Body</p>" : "Body"), "\(label)")
     }
 
     // MARK: - IMAP
@@ -52,8 +74,9 @@ struct BccRecipientsTests {
         return String(decoding: raw, as: UTF8.self)
     }
 
-    @Test("An IMAP draft names its BCC recipients, display names included")
-    func imapDraftNamesBcc() async throws {
+    @Test("An IMAP draft names its BCC recipients, display names included, only in its Bcc field",
+          arguments: [false, true])
+    func imapDraftNamesBcc(html: Bool) async throws {
         let server = FakeIMAPServer(mailboxes: ["Drafts": []])
         server.setUidValidity(81_001, for: "Drafts")
         try server.start()
@@ -62,14 +85,15 @@ struct BccRecipientsTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        _ = try await provider.saveDraft(Self.draft(), existingIdentity: nil, draftsFolderPath: "Drafts")
+        _ = try await provider.saveDraft(Self.draft(html: html), existingIdentity: nil, draftsFolderPath: "Drafts")
 
-        let field = try #require(Self.bccField(in: try Self.storedMessage(server, in: "Drafts")))
-        #expect(field == "hidden@example.com, Hidden Two <hidden2@example.com>")
+        let stored = try Self.storedMessage(server, in: "Drafts")
+        Self.expectRecipients(in: stored, "IMAP draft")
+        Self.expectBody(in: stored, html: html, "IMAP draft")
     }
 
-    @Test("The IMAP Sent copy names the BCC recipients")
-    func imapSentCopyNamesBcc() async throws {
+    @Test("The IMAP Sent copy names the BCC recipients only in its Bcc field", arguments: [false, true])
+    func imapSentCopyNamesBcc(html: Bool) async throws {
         let server = FakeIMAPServer(mailboxes: ["Sent": []])
         try server.start()
         defer { server.stop() }
@@ -77,12 +101,13 @@ struct BccRecipientsTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        let draft = Self.draft()
+        let draft = Self.draft(html: html)
         _ = try await provider.appendToSentFolder(
             draft: draft, sentFolderPath: "Sent", messageId: try #require(draft.messageId))
 
-        let field = try #require(Self.bccField(in: try Self.storedMessage(server, in: "Sent")))
-        #expect(field == "hidden@example.com, Hidden Two <hidden2@example.com>")
+        let stored = try Self.storedMessage(server, in: "Sent")
+        Self.expectRecipients(in: stored, "IMAP Sent copy")
+        Self.expectBody(in: stored, html: html, "IMAP Sent copy")
     }
 
     // MARK: - Gmail
@@ -103,9 +128,9 @@ struct BccRecipientsTests {
         }
     }
 
-    @Test("Gmail sends and saves drafts with a Bcc header, with and without attachments",
-          arguments: [false, true])
-    func gmailNamesBcc(attachment: Bool) async throws {
+    @Test("Gmail sends and saves drafts with a Bcc header and no BCC address in a visible field",
+          arguments: [false, true], [false, true])
+    func gmailNamesBcc(attachment: Bool, html: Bool) async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         http.register(path: "/messages/send", method: "POST", response: .json(raw: #"{"id":"sent-1"}"#))
@@ -115,26 +140,27 @@ struct BccRecipientsTests {
                       response: .json(raw: #"{"id":"r-1","message":{"id":"m-2"}}"#))
         let provider = GmailProvider(userEmail: "me@example.com", accessToken: { _ in "tok" }, session: http.session)
 
-        try await provider.send(draft: Self.draft(attachment: attachment))
+        try await provider.send(draft: Self.draft(attachment: attachment, html: html))
         _ = try await provider.saveDraft(
-            Self.draft(attachment: attachment), existingIdentity: nil, draftsFolderPath: "DRAFT")
+            Self.draft(attachment: attachment, html: html), existingIdentity: nil, draftsFolderPath: "DRAFT")
         _ = try await provider.saveDraft(
-            Self.draft(attachment: attachment), existingIdentity: .gmail(resourceId: "r-1"),
+            Self.draft(attachment: attachment, html: html), existingIdentity: .gmail(resourceId: "r-1"),
             draftsFolderPath: "DRAFT")
 
         let messages = try Self.gmailRawMessages(http)
         #expect(messages.count == 3)
-        for message in messages {
-            #expect(Self.bccField(in: message) == "hidden@example.com, Hidden Two <hidden2@example.com>")
+        for (index, message) in messages.enumerated() {
+            Self.expectRecipients(in: message, "Gmail request \(index)")
+            Self.expectBody(in: message, html: html, "Gmail request \(index)")
         }
     }
 
     @Test("Gmail writes no Bcc header when there are no BCC recipients")
     func gmailNoBccNoHeader() {
         let provider = GmailProvider(userEmail: "me@example.com", accessToken: { _ in "tok" })
-        #expect(Self.bccField(in: provider.buildRFC822(draft: Self.draft(bcc: []))) == nil)
+        Self.expectRecipients(in: provider.buildRFC822(draft: Self.draft(bcc: [])), bcc: nil, "buildRFC822")
         let mime = String(decoding: provider.buildMIMEMessage(draft: Self.draft(bcc: [], attachment: true)), as: UTF8.self)
-        #expect(Self.bccField(in: mime) == nil)
+        Self.expectRecipients(in: mime, bcc: nil, "buildMIMEMessage")
     }
 
     // MARK: - Recipient text cannot add a header
