@@ -232,7 +232,7 @@ struct BccRecipientsTests {
 
     @Test("A Gmail send refuses a recipient that is not one address, before any request",
           arguments: Field.allCases,
-          ["me2@example.com\r\nBcc: attacker@example.org", "not an address", "a@example.com, b@example.com"])
+          ["me2@example.com\r\nBcc: attacker@example.org", "not an address", "a@example.com, bob"])
     func gmailSendRefusesUnreadableRecipient(field: Field, recipient: String) async {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -246,6 +246,32 @@ struct BccRecipientsTests {
             #expect(AccountManager.isFatalSendError(error), "\(error)")
         }
         #expect(http.recordedCalls().isEmpty)
+    }
+
+    /// A send queued before recipient fields became lists (ADR-IOS-092) can hold
+    /// a typed list in one recipient. It still goes to every mailbox the list
+    /// names, each in the field it was typed in, on Gmail and on IMAP.
+    @Test("A queued recipient holding a typed list goes to every mailbox it names", arguments: Field.allCases)
+    func queuedListRecipientGoesToEach(field: Field) async throws {
+        let list = "Ann <ann@example.com>, bob@example.com"
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/messages/send", method: "POST", response: .json(raw: #"{"id":"sent-1"}"#))
+        let provider = GmailProvider(userEmail: "me@example.com", accessToken: { _ in "tok" }, session: http.session)
+
+        try await provider.send(draft: Self.draft(list, in: field))
+        let messages = try Self.gmailRawMessages(http)
+        #expect(messages.count == 1)
+        let name = field.rawValue.prefix(1).uppercased() + field.rawValue.dropFirst()
+        #expect(Self.fields(name, in: messages.first ?? "") == ["Ann <ann@example.com>, bob@example.com"])
+
+        let email = try IMAPProvider.buildEmail(from: Self.draft(list, in: field), senderEmail: "me@example.com")
+        let imapList = switch field {
+        case .to: email.recipients
+        case .cc: email.ccRecipients
+        case .bcc: email.bccRecipients
+        }
+        #expect(imapList.map(\.address) == ["ann@example.com", "bob@example.com"])
     }
 
     // MARK: - Outlook

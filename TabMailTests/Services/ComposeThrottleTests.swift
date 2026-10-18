@@ -679,70 +679,41 @@ struct RecipientCapTests {
         #expect(45 < 50)
     }
 
-    // MARK: - f927ba3 (ComposeView wire-up) edge cases
+    // MARK: - Send-time cap (ComposeDraftGuards.sendRecipients)
 
-    /// ComposeView.queueSend cap check uses `totalFinal > outboxMaxRecipients`
-    /// (strict). So exactly 50 recipients passes (inclusive), 51 is rejected.
-    /// This is NOT the same as the add-gate semantics (`total < 50`, add-gate
-    /// is exclusive of 50). Keeping both boundary behaviors in one place so a
-    /// future edit doesn't accidentally flip one to match the other.
-    private func canSendAtQueueTime(to: Int, cc: Int, bcc: Int) -> Bool {
-        let totalFinal = to + cc + bcc
-        return totalFinal <= SyncConfig.outboxMaxRecipients
+    private static func field(_ count: Int, _ tag: String, input: String = "") -> ComposeDraftGuards.RecipientField {
+        ComposeDraftGuards.pendingCommitted(
+            .init(tokens: (0..<count).map { "\(tag)\($0)@example.com" }, input: input))
     }
 
-    @Test("Send-time cap: exactly 50 recipients still sends (> is strict)")
-    func sendTimeCapInclusive() {
-        #expect(canSendAtQueueTime(to: 20, cc: 20, bcc: 10) == true)
+    private static func sends(_ to: ComposeDraftGuards.RecipientField, _ cc: ComposeDraftGuards.RecipientField,
+                              _ bcc: ComposeDraftGuards.RecipientField) -> Bool {
+        if case .send = ComposeDraftGuards.sendRecipients(to: to, cc: cc, bcc: bcc) { return true }
+        return false
     }
 
-    @Test("Send-time cap: 51 recipients (reply-all prefill path) is rejected")
-    func sendTimeCapRejectsOverage() {
-        #expect(canSendAtQueueTime(to: 21, cc: 20, bcc: 10) == false)
+    /// Send's cap is strict (`> outboxMaxRecipients` refuses), unlike the add
+    /// gate (`< outboxMaxRecipients` admits), so exactly the cap still sends.
+    @Test("Send-time cap: exactly 50 recipients still sends; 51 (reply-all prefill path) is refused")
+    func sendTimeCap() {
+        #expect(Self.sends(Self.field(20, "t"), Self.field(20, "c"), Self.field(10, "b")))
+        #expect(!Self.sends(Self.field(21, "t"), Self.field(20, "c"), Self.field(10, "b")))
     }
 
-    /// Replicates ComposeView.queueSend's pending-input handling (lines
-    /// 1530-1545): when the user has typed an email into the To/Cc/Bcc
-    /// TextField but hasn't committed it to a token, queueSend appends the
-    /// pending text to the final list before the cap check. A 49-token send
-    /// with 1 pending input across all three fields = 50, which passes.
-    private func canSendWithPending(
-        toTokens: Int, ccTokens: Int, bccTokens: Int,
-        pendingTo: String, pendingCc: String, pendingBcc: String
-    ) -> Bool {
-        var total = toTokens + ccTokens + bccTokens
-        if !pendingTo.trimmingCharacters(in: .whitespaces).isEmpty { total += 1 }
-        if !pendingCc.trimmingCharacters(in: .whitespaces).isEmpty { total += 1 }
-        if !pendingBcc.trimmingCharacters(in: .whitespaces).isEmpty { total += 1 }
-        return total <= SyncConfig.outboxMaxRecipients
-    }
-
-    @Test("Send-time cap: pending text input counts toward the cap")
+    /// Pending input counts once committed: each address it names adds one,
+    /// whitespace adds none.
+    @Test("Send-time cap: the addresses in pending input count toward the cap")
     func pendingInputCountsTowardCap() {
-        // 50 tokens + 1 pending (whitespace-only, effectively empty) — still 50.
-        #expect(canSendWithPending(
-            toTokens: 25, ccTokens: 15, bccTokens: 10,
-            pendingTo: "   ", pendingCc: "", pendingBcc: ""
-        ) == true)
-        // 50 tokens + 1 non-empty pending → 51, rejected.
-        #expect(canSendWithPending(
-            toTokens: 25, ccTokens: 15, bccTokens: 10,
-            pendingTo: "late@arrival.com", pendingCc: "", pendingBcc: ""
-        ) == false)
-    }
-
-    @Test("Send-time cap: three non-empty pending inputs each add 1 to the total")
-    func threePendingInputs() {
-        // 48 tokens + 3 pending (one per field) → 51, rejected.
-        #expect(canSendWithPending(
-            toTokens: 16, ccTokens: 16, bccTokens: 16,
-            pendingTo: "a@x.com", pendingCc: "b@x.com", pendingBcc: "c@x.com"
-        ) == false)
-        // 47 tokens + 3 pending → 50, allowed.
-        #expect(canSendWithPending(
-            toTokens: 16, ccTokens: 16, bccTokens: 15,
-            pendingTo: "a@x.com", pendingCc: "b@x.com", pendingBcc: "c@x.com"
-        ) == true)
+        #expect(Self.sends(Self.field(25, "t", input: "   "), Self.field(15, "c"), Self.field(10, "b")))
+        #expect(!Self.sends(Self.field(25, "t", input: "late@example.com"), Self.field(15, "c"), Self.field(10, "b")))
+        #expect(!Self.sends(
+            Self.field(24, "t", input: "late1@example.com, late2@example.com"), Self.field(15, "c"), Self.field(10, "b")))
+        #expect(Self.sends(
+            Self.field(16, "t", input: "a@example.com"), Self.field(16, "c", input: "b@example.com"),
+            Self.field(15, "b", input: "c@example.com")))
+        #expect(!Self.sends(
+            Self.field(16, "t", input: "a@example.com"), Self.field(16, "c", input: "b@example.com"),
+            Self.field(16, "b", input: "c@example.com")))
     }
 }
 

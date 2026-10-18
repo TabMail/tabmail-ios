@@ -6060,7 +6060,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     /// Build the Email saveDraft() appends. A recipient SwiftMail's parser reads
-    /// as one mailbox is written in that form (`Bob <bob@example.com>` stays a
+    /// as mailboxes is written in that form (`Bob <bob@example.com>` stays a
     /// name and an address); anything else is kept as typed, because a draft may
     /// hold an address the user has not finished and saving it must not fail.
     /// BCC recipients are kept too: SwiftMail's APPEND writes them into a `Bcc`
@@ -6075,14 +6075,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     private static func draftRecipients(_ recipients: [String]) -> [SwiftMail.EmailAddress] {
-        recipients.map { recipient in
-            if case .mailbox(let mailbox)? = AddressListEntry(recipient) { return mailbox }
-            return SwiftMail.EmailAddress(address: recipient)
+        recipients.flatMap { recipient in
+            (try? sendableRecipients([recipient])) ?? [SwiftMail.EmailAddress(address: recipient)]
         }
     }
 
     /// The recipients as one header field body, each written as a draft writes
-    /// it. SwiftMail never writes a control character into an address, so a
+    /// it: every mailbox a recipient names, or, for text that is not a mailbox
+    /// list, the text itself (which SwiftMail encodes, never reads as an address). SwiftMail never writes a control character into an address, so a
     /// recipient cannot end the field and add a header line of its own.
     static func recipientsFieldBody(_ recipients: [String]) -> String {
         draftRecipients(recipients).map(\.description).joined(separator: ", ")
@@ -6097,14 +6097,27 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             .map { $0.hasPrefix("<") ? $0 : "<\($0)>" }
     }
 
-    /// Each recipient as SwiftMail's parser reads it; throws on the first one that
-    /// is not exactly one mailbox.
+    /// The mailboxes each recipient names. Compose hands over one address per
+    /// recipient (ADR-IOS-092), but a send queued by an earlier version can hold a
+    /// typed list such as `a@example.com, b@example.com` in one recipient; it goes
+    /// to every mailbox it names. Throws on the first recipient that names no
+    /// mailbox or holds text that is not one. Each mailbox is written again by
+    /// SwiftMail, never copied as text, so no recipient can add a header line.
     static func sendableRecipients(_ recipients: [String]) throws -> [SwiftMail.EmailAddress] {
-        try recipients.map { recipient in
-            guard case .mailbox(let mailbox)? = AddressListEntry(recipient) else {
-                throw SMTPError.invalidEmailAddress(recipient)
+        try recipients.flatMap { recipient in
+            var mailboxes: [SwiftMail.EmailAddress] = []
+            for entry in AddressParser.parseAddressList(recipient) {
+                switch entry {
+                case .mailbox(let mailbox): mailboxes.append(mailbox)
+                case .group(_, let members): mailboxes += members
+                case .invalid(let text):
+                    if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        throw SMTPError.invalidEmailAddress(recipient)
+                    }
+                }
             }
-            return mailbox
+            guard !mailboxes.isEmpty else { throw SMTPError.invalidEmailAddress(recipient) }
+            return mailboxes
         }
     }
 

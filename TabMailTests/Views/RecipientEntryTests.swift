@@ -31,7 +31,15 @@ struct RecipientEntryTests {
         ("\"Doe, Bob\" <bob@example.com>, Ann <ann@example.com>", ["bob@example.com", "ann@example.com"]),
         ("Team: a@example.com, b@example.com;", ["a@example.com", "b@example.com"]),
         ("a@example.com, A@EXAMPLE.COM", ["a@example.com"]),
-        ("\"Doe; Bob\" <bob@example.com>; Team: a@example.com; ann@example.com", ["bob@example.com", "a@example.com", "ann@example.com"])
+        ("\"Doe; Bob\" <bob@example.com>; Team: a@example.com; ann@example.com", ["bob@example.com", "a@example.com", "ann@example.com"]),
+        // A pasted column or row: the field turns line breaks into spaces and keeps tabs.
+        ("a@example.com b@example.com", ["a@example.com", "b@example.com"]),
+        ("a@example.com\tb@example.com", ["a@example.com", "b@example.com"]),
+        ("Ann <ann@example.com> Bob Lee <bob@example.com>", ["ann@example.com", "bob@example.com"]),
+        // Quoted-pairs and comments hold no separator.
+        ("\"Doe \\\" Bob\" <bob@example.com>; ann@example.com", ["bob@example.com", "ann@example.com"]),
+        ("bob@example.com (work); ann@example.com", ["bob@example.com", "ann@example.com"]),
+        ("bob@example.com (a (b) c; d); ann@example.com", ["bob@example.com", "ann@example.com"])
     ])
     func splitsIntoAddresses(text: String, expected: [String]) {
         let entry = RecipientEntry(text)
@@ -62,6 +70,28 @@ struct RecipientEntryTests {
     func keepsDisplayNames() {
         let entry = RecipientEntry("\"Doe, Bob\" <bob@example.com>, ann@example.com")
         #expect(entry.recipients.map(\.name) == ["Doe, Bob", nil])
+    }
+
+    @Test("Spaces split addresses only after an address", arguments: [
+        "Ann Lee <ann@example.com>", "ann@example.com (work)"
+    ])
+    func spacesInsideOneMailboxDoNotSplit(text: String) {
+        let entry = RecipientEntry(text)
+        #expect(entry.addresses == ["ann@example.com"])
+        #expect(entry.unparsed.isEmpty)
+        if text.hasPrefix("Ann Lee") { #expect(entry.recipients.first?.name == "Ann Lee") }
+    }
+
+    /// Kept text must read back as the same text: a named mailbox TabMail
+    /// cannot send to keeps its quotes, so a comma or address inside its name
+    /// never becomes a recipient when the input line is read again.
+    @Test("Text kept for a named mailbox reads back unchanged")
+    func keptNamedMailboxReadsBack() {
+        let entry = RecipientEntry("\"Alice <alice@example.com>, Bob\" <helpdesk@localhost>")
+        #expect(entry.addresses.isEmpty)
+        let again = RecipientEntry(entry.unparsed)
+        #expect(again.addresses.isEmpty)
+        #expect(again.unparsed == entry.unparsed)
     }
 
     /// The property the whole change exists for: every recipient a field holds
@@ -109,6 +139,17 @@ struct RecipientEntryTests {
         let field = ComposeDraftGuards.fieldState(RecipientEntry.reply(to: Self.header(replyTo: "nobody")))
         #expect(field.tokens.isEmpty)
         #expect(field.input == "nobody")
+    }
+
+    /// Reply-all opens compose through `prefillTo`; the reply target's text that
+    /// names no sendable address must reach the To input line there, as for Reply.
+    @Test("Reply-all keeps a Reply-To TabMail cannot send to as input text, never a recipient")
+    func replyAllKeepsUnsendableReplyTo() {
+        let header = Self.header(replyTo: "Help <helpdesk@localhost>, ann@example.com")
+        let recipients = buildReplyAllRecipients(for: header, allAccounts: [])
+        let field = ComposeDraftGuards.fieldState(RecipientEntry(recipients.to))
+        #expect(field.tokens == ["ann@example.com", "me@example.com"])
+        #expect(field.input == "\"Help\" <helpdesk@localhost>")
     }
 
     // MARK: - The input line
@@ -166,12 +207,47 @@ struct RecipientEntryTests {
         #expect(result.typing == typing)
     }
 
-    @Test("A paste is split whole, and a line with no separator is not split")
-    func pasteSplitsWhole() throws {
-        let pasted = try #require(ComposeDraftGuards.inputToSplit(was: "", now: "a@example.com, b@example.com"))
-        #expect(pasted.text == "a@example.com, b@example.com")
+    @Test("A paste is split whole, with or without commas", arguments: [
+        "a@example.com, b@example.com", "a@example.com b@example.com", "a@example.com\tb@example.com"
+    ])
+    func pasteSplitsWhole(pasted text: String) throws {
+        let pasted = try #require(ComposeDraftGuards.inputToSplit(was: "", now: text))
+        #expect(pasted.text == text)
         #expect(pasted.typing.isEmpty)
+        let field = try #require(ComposeDraftGuards.committing(pasted.text, to: .init(), room: 10))
+        #expect(field.tokens == ["a@example.com", "b@example.com"])
+    }
+
+    @Test("Typing with no separator is not split")
+    func typingWithoutSeparator() {
         #expect(ComposeDraftGuards.inputToSplit(was: "a@example.co", now: "a@example.com") == nil)
+        #expect(ComposeDraftGuards.inputToSplit(was: "a@example.com", now: "a@example.com ") == nil)
+    }
+
+    @Test("A picked contact becomes a recipient under its name")
+    func pickingAddsContact() {
+        var field = Self.field
+        field.input = "an"
+        let result = ComposeDraftGuards.picking("ann@example.com", name: "Ann Lee", to: field, room: 10)
+        #expect(result.tokens == ["old@example.com", "ann@example.com"])
+        #expect(result.displayNames["ann@example.com"] == "Ann Lee")
+        #expect(result.input.isEmpty)
+    }
+
+    /// A contact's address TabMail cannot send to must not make the tap do
+    /// nothing: it replaces the query, and Send then names it.
+    @Test("A picked contact TabMail cannot send to goes to the input line, and Send names it")
+    func pickingUnsendableContact() {
+        var field = Self.field
+        field.input = "bo"
+        let result = ComposeDraftGuards.picking("bob@localhost", name: "Bob", to: field, room: 10)
+        #expect(result.tokens == Self.field.tokens)
+        #expect(result.input == "\"Bob\" <bob@localhost>")
+        guard case .refused(let message) = ComposeDraftGuards.sendRecipients(to: result, cc: .init(), bcc: .init()) else {
+            Issue.record("Send was not refused")
+            return
+        }
+        #expect(message.contains("bob@localhost"))
     }
 
     /// The typing bug this guards: once `bob, ` sat in the input line, each
@@ -224,11 +300,30 @@ struct RecipientEntryTests {
         #expect(reopened.input.isEmpty)
     }
 
-    @Test("Send is refused while an input line holds text that names no address")
-    func sendRefusesUnaddressedText() {
-        #expect(ComposeDraftGuards.unaddressedRecipientMessage(to: "", cc: " ", bcc: "") == nil)
-        let message = ComposeDraftGuards.unaddressedRecipientMessage(to: "", cc: "bob", bcc: "")
-        #expect(message?.contains("bob") == true)
-        #expect(message?.contains("Cc") == true)
+    /// What Send sends, end to end from the fields: pending input is committed,
+    /// each field's addresses go in that field, and text that names no address
+    /// refuses Send, naming the field.
+    @Test("Send sends each field's addresses, pending input included")
+    func sendSendsEachField() {
+        let to = ComposeDraftGuards.pendingCommitted(.init(tokens: ["a@example.com"], input: "b@example.com, c@example.com"))
+        let cc = ComposeDraftGuards.pendingCommitted(.init(tokens: [], input: " "))
+        let bcc = ComposeDraftGuards.pendingCommitted(.init(tokens: [], input: "hidden@example.com"))
+        #expect(ComposeDraftGuards.sendRecipients(to: to, cc: cc, bcc: bcc) == .send(
+            to: ["a@example.com", "b@example.com", "c@example.com"], cc: [], bcc: ["hidden@example.com"]))
+    }
+
+    @Test("Send is refused while an input line holds text that names no address", arguments: [
+        ("To", "bob"), ("Cc", "bob, carol@example.com"), ("Bcc", "local@localhost")
+    ])
+    func sendRefusesUnaddressedText(label: String, input: String) {
+        func field(_ name: String) -> ComposeDraftGuards.RecipientField {
+            ComposeDraftGuards.pendingCommitted(.init(tokens: ["x@example.com"], input: name == label ? input : ""))
+        }
+        guard case .refused(let message) = ComposeDraftGuards.sendRecipients(to: field("To"), cc: field("Cc"), bcc: field("Bcc")) else {
+            Issue.record("Send was not refused")
+            return
+        }
+        #expect(message.contains("in \(label) "))
+        #expect(message.contains(input.components(separatedBy: ",")[0]))
     }
 }

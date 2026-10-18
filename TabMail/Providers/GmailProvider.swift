@@ -682,9 +682,11 @@ actor GmailProvider: EmailProvider {
             moveTraceLabel: "GmailProvider.move")
     }
 
-    /// A recipient that is not exactly one mailbox fails the send as
-    /// `SMTPError.invalidEmailAddress`, which the outbox treats as fatal, as an
-    /// IMAP send does; a draft keeps whatever the user typed.
+    /// A recipient that names no mailbox, or holds text that is not one, fails
+    /// the send as `SMTPError.invalidEmailAddress`, which the outbox treats as
+    /// fatal, as an IMAP send does; a draft keeps whatever the user typed. A
+    /// recipient naming several mailboxes (a send queued by an earlier version)
+    /// is written as each of them (`IMAPProvider.recipientsFieldBody`).
     func send(draft: DraftMessage) async throws {
         _ = try IMAPProvider.sendableRecipients(draft.to + draft.cc + draft.bcc)
         let body = buildSendBody(draft: draft)

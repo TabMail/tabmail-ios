@@ -333,27 +333,60 @@ enum ComposeDraftGuards {
         return result
     }
 
-    /// Which part of an edited input line to split (ADR-IOS-092). While typing,
-    /// the text up to the last `,`, `;` or line break is split and the text after
-    /// it is still being typed, so `bob, carol@example.c` never adds a half-typed
-    /// address. A paste (more than one character inserted at once) is split whole.
-    /// Nil when the line holds no separator.
+    /// Which part of an edited input line to split (ADR-IOS-092). A paste (more
+    /// than one character inserted at once) is split whole, whatever separates its
+    /// addresses: the field has already turned a pasted column's line breaks into
+    /// spaces, which `RecipientEntry` reads as separators after an address. While
+    /// typing, the text up to the last `,`, `;` or line break is split and the text
+    /// after it is still being typed, so `bob, carol@example.c` never adds a
+    /// half-typed address. Nil when typing has added no such separator.
     static func inputToSplit(was old: String, now text: String) -> (text: String, typing: String)? {
-        guard let last = text.lastIndex(where: { $0 == "," || $0 == ";" || $0.isNewline }) else { return nil }
         if text.count - old.count > 1 { return (text, "") }
+        guard let last = text.lastIndex(where: { $0 == "," || $0 == ";" || $0.isNewline }) else { return nil }
         return (String(text[...last]), String(text[text.index(after: last)...]))
     }
 
-    /// Why Send is refused while an input line holds text that names no address,
-    /// or nil when every field holds only addresses (ADR-IOS-092).
-    static func unaddressedRecipientMessage(to: String, cc: String, bcc: String) -> String? {
-        for (label, text) in [("To", to), ("Cc", cc), ("Bcc", bcc)] {
-            let trimmed = text.trimmingCharacters(in: .whitespaces)
-            if !trimmed.isEmpty {
-                return "\u{201C}\(trimmed)\u{201D} in \(label) is not an email address. Fix or remove it before sending."
+    /// A field with the addresses in its input line committed, as close, save
+    /// and Send do. No cap: Send checks the total, and a save keeps what was typed.
+    static func pendingCommitted(_ field: RecipientField) -> RecipientField {
+        committing(field.input, to: field, room: .max) ?? field
+    }
+
+    /// A picked contact: its address becomes a recipient, under its name. An
+    /// address TabMail cannot send to replaces the typed query in the input line,
+    /// so the user sees it and Send names it, instead of the tap doing nothing.
+    static func picking(
+        _ address: String, name: String?, to field: RecipientField, room: Int
+    ) -> RecipientField {
+        let text = RecipientEntry.text(name: name, address: address)
+        if let result = committing(text, to: field, room: room) { return result }
+        var result = field
+        result.input = text
+        return result
+    }
+
+    enum SendRecipients: Equatable {
+        case send(to: [String], cc: [String], bcc: [String])
+        /// Why Send is refused: an input line still holds text that names no
+        /// address, which is never sent (ADR-IOS-092).
+        case refused(String)
+    }
+
+    /// What Send sends, given fields whose input lines are already committed
+    /// (`pendingCommitted`): each field's addresses, or a refusal naming the first
+    /// field whose input line still holds text, or, past the recipient cap
+    /// (inclusive of the cap itself; reply-all prefill can exceed it), the cap.
+    static func sendRecipients(to: RecipientField, cc: RecipientField, bcc: RecipientField) -> SendRecipients {
+        for (label, field) in [("To", to), ("Cc", cc), ("Bcc", bcc)] {
+            let text = field.input.trimmingCharacters(in: .whitespaces)
+            if !text.isEmpty {
+                return .refused("\u{201C}\(text)\u{201D} in \(label) is not an email address. Fix or remove it before sending.")
             }
         }
-        return nil
+        if to.tokens.count + cc.tokens.count + bcc.tokens.count > SyncConfig.outboxMaxRecipients {
+            return .refused("Too many recipients. Limit is \(SyncConfig.outboxMaxRecipients) total across To, Cc, and Bcc.")
+        }
+        return .send(to: to.tokens, cc: cc.tokens, bcc: bcc.tokens)
     }
 
     /// PORT — `v2final:ComposeDraftGuards.runCheckedLocalDeleteThenDismiss` (R5).
@@ -1120,19 +1153,19 @@ struct ComposeView: View {
     }
 
     /// Adds the addresses `text` names to `field` within the recipient cap
-    /// (ADR-IOS-092). Returns false, changing nothing, when `text` names none.
-    @discardableResult
-    private func commitRecipients(
-        _ text: String, typing: String = "", to field: RecipientEditField, name: String? = nil
-    ) -> Bool {
+    /// (ADR-IOS-092); changes nothing when `text` names none.
+    private func commitRecipients(_ text: String, typing: String, to field: RecipientEditField) {
         let room = SyncConfig.outboxMaxRecipients - totalRecipients
-        guard var value = ComposeDraftGuards.committing(
-            text, typing: typing, to: recipientField(field), room: room) else {
-            return false
+        if let value = ComposeDraftGuards.committing(text, typing: typing, to: recipientField(field), room: room) {
+            setRecipientField(value, field)
         }
-        if let name, !name.isEmpty, let address = value.tokens.last { value.displayNames[address] = name }
-        setRecipientField(value, field)
-        return true
+    }
+
+    private func pickContact(_ contact: ContactResult, for field: RecipientEditField) {
+        let room = SyncConfig.outboxMaxRecipients - totalRecipients
+        setRecipientField(
+            ComposeDraftGuards.picking(contact.email, name: contact.name, to: recipientField(field), room: room),
+            field)
     }
 
     /// Shown next to the Cc/Bcc button: "N/50" when ≥ 45, orange at cap.
@@ -1205,7 +1238,7 @@ struct ComposeView: View {
                                     searchResults: activeField == .to ? contactSearch.search(toInput) : [],
                                     onFocus: { activeField = .to },
                                     onSelectContact: { contact in
-                                        commitRecipients(contact.email, to: .to, name: contact.name)
+                                        pickContact(contact, for: .to)
                                     },
                                     commit: { text, typing in commitRecipients(text, typing: typing, to: .to) },
                                     canAddMore: { canAddRecipient },
@@ -1238,7 +1271,7 @@ struct ComposeView: View {
                                         searchResults: activeField == .cc ? contactSearch.search(ccInput) : [],
                                         onFocus: { activeField = .cc },
                                         onSelectContact: { contact in
-                                            commitRecipients(contact.email, to: .cc, name: contact.name)
+                                            pickContact(contact, for: .cc)
                                         },
                                         commit: { text, typing in commitRecipients(text, typing: typing, to: .cc) },
                                         canAddMore: { canAddRecipient },
@@ -1262,7 +1295,7 @@ struct ComposeView: View {
                                         searchResults: activeField == .bcc ? contactSearch.search(bccInput) : [],
                                         onFocus: { activeField = .bcc },
                                         onSelectContact: { contact in
-                                            commitRecipients(contact.email, to: .bcc, name: contact.name)
+                                            pickContact(contact, for: .bcc)
                                         },
                                         commit: { text, typing in commitRecipients(text, typing: typing, to: .bcc) },
                                         canAddMore: { canAddRecipient },
@@ -2537,11 +2570,8 @@ struct ComposeView: View {
     /// persisted beside the addresses (`committedRecipients`), never as a recipient
     /// (ADR-IOS-092).
     private func commitPendingRecipientInput() {
-        // No cap here: Send checks the total, and a save keeps what was typed.
         for field in [RecipientEditField.to, .cc, .bcc] {
-            if let value = ComposeDraftGuards.committing(recipientField(field).input, to: recipientField(field), room: .max) {
-                setRecipientField(value, field)
-            }
+            setRecipientField(ComposeDraftGuards.pendingCommitted(recipientField(field)), field)
         }
     }
 
@@ -3452,20 +3482,13 @@ struct ComposeView: View {
         // Commit the addresses in any pending input. Text that names no address
         // is never sent: it stays in its input line and Send says so (ADR-IOS-092).
         commitPendingRecipientInput()
-        if let message = ComposeDraftGuards.unaddressedRecipientMessage(to: toInput, cc: ccInput, bcc: bccInput) {
+        let finalTo: [String], finalCc: [String], finalBcc: [String]
+        switch ComposeDraftGuards.sendRecipients(to: recipientField(.to), cc: recipientField(.cc), bcc: recipientField(.bcc)) {
+        case .refused(let message):
             sendError = message
             return
-        }
-        let finalTo = toTokens
-        let finalCc = ccTokens
-        let finalBcc = bccTokens
-
-        // Recipient cap — defense in depth. TokenField/picker guards usually
-        // prevent reaching this, but reply-all prefill can exceed the cap.
-        let totalFinal = finalTo.count + finalCc.count + finalBcc.count
-        if totalFinal > SyncConfig.outboxMaxRecipients {
-            sendError = "Too many recipients. Limit is \(SyncConfig.outboxMaxRecipients) total across To, Cc, and Bcc."
-            return
+        case .send(let to, let cc, let bcc):
+            (finalTo, finalCc, finalBcc) = (to, cc, bcc)
         }
 
         let (sendBody, isHTML) = buildSendBody()

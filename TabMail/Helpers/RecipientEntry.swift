@@ -50,10 +50,17 @@ struct RecipientEntry: Equatable {
     }
 
     /// The address-list parser splits on commas only, but people separate
-    /// addresses with `;` (as Outlook does) or put one per line. A line break,
-    /// or a `;` outside quotes, angle brackets, comments and groups, becomes a
-    /// comma; the `;` that ends a group (`Team: a@example.com;`) is kept, followed
-    /// by a comma so whatever follows the group is read as its own entry.
+    /// addresses with `;` (as Outlook does), put one per line, or paste a column
+    /// a single-line text field has already turned into spaces. Outside quotes,
+    /// angle brackets and comments, each of these becomes a comma:
+    /// - a line break;
+    /// - a `;`, except the one that ends a group (`Team: a@example.com;`),
+    ///   which is kept and followed by a comma so what follows is its own entry;
+    /// - spaces or tabs after an address (a word holding an `@`, or a closing
+    ///   `>`), unless a comment follows. An unquoted `@` cannot be part of a
+    ///   display name (RFC 5322 3.2.3), so `a@example.com b@example.com` and
+    ///   `Ann <a@example.com> Bob <b@example.com>` split, while
+    ///   `Ann Lee <a@example.com>` and `a@example.com (work)` stay one mailbox.
     private static func commaSeparated(_ text: String) -> String {
         var result = ""
         var inQuote = false
@@ -61,40 +68,67 @@ struct RecipientEntry: Equatable {
         var angleDepth = 0
         var commentDepth = 0
         var inGroup = false
+        var wordHasAt = false
+        var afterAngle = false
+        var gap = ""
+        var gapEndsAddress = false
         for character in text {
             if escaped {
                 escaped = false
-            } else if inQuote || commentDepth > 0, character == "\\" {
-                escaped = true
-            } else if inQuote {
-                if character == "\"" { inQuote = false }
-            } else if commentDepth > 0 {
-                if character == "(" { commentDepth += 1 } else if character == ")" { commentDepth -= 1 }
-            } else if character.isNewline {
-                result.append(",")
+                result.append(character)
                 continue
-            } else {
-                switch character {
-                case "\"": inQuote = true
-                case "(": commentDepth += 1
-                case "<": angleDepth += 1
-                case ">": angleDepth = max(0, angleDepth - 1)
-                case ":" where angleDepth == 0: inGroup = true
-                case ";" where angleDepth == 0:
-                    if inGroup {
-                        inGroup = false
-                        result.append(";,")
-                        continue
-                    } else {
-                        result.append(",")
-                        continue
-                    }
-                default: break
+            }
+            if inQuote || commentDepth > 0 {
+                if character == "\\" {
+                    escaped = true
+                } else if inQuote {
+                    if character == "\"" { inQuote = false }
+                } else if character == "(" {
+                    commentDepth += 1
+                } else if character == ")" {
+                    commentDepth -= 1
                 }
+                result.append(character)
+                continue
+            }
+            if character == " " || character == "\t" {
+                if gap.isEmpty { gapEndsAddress = angleDepth == 0 && (wordHasAt || afterAngle) }
+                gap.append(character)
+                wordHasAt = false
+                afterAngle = false
+                continue
+            }
+            if !gap.isEmpty {
+                if gapEndsAddress, !character.isNewline, !"(,;".contains(character) { result.append(",") }
+                result += gap
+                gap = ""
+            }
+            afterAngle = false
+            if character.isNewline {
+                result.append(",")
+                wordHasAt = false
+                continue
+            }
+            switch character {
+            case "\"": inQuote = true
+            case "(": commentDepth += 1
+            case "<": angleDepth += 1
+            case ">":
+                angleDepth = max(0, angleDepth - 1)
+                afterAngle = angleDepth == 0
+            case "@" where angleDepth == 0: wordHasAt = true
+            case ",": wordHasAt = false
+            case ":" where angleDepth == 0: inGroup = true
+            case ";" where angleDepth == 0:
+                wordHasAt = false
+                result.append(inGroup ? ";," : ",")
+                inGroup = false
+                continue
+            default: break
             }
             result.append(character)
         }
-        return result
+        return result + gap
     }
 
     var addresses: [String] { recipients.map(\.address) }
@@ -105,11 +139,19 @@ struct RecipientEntry: Equatable {
         _ mailbox: SwiftMail.EmailAddress, seen: inout Set<String>, leftovers: inout [String]
     ) {
         guard isValidEmailAddress(mailbox.address) else {
-            leftovers.append(mailbox.name.map { "\($0) <\(mailbox.address)>" } ?? mailbox.address)
+            leftovers.append(Self.text(name: mailbox.name, address: mailbox.address))
             return
         }
         guard seen.insert(mailbox.address.lowercased()).inserted else { return }
         recipients.append(Recipient(address: mailbox.address, name: mailbox.name))
+    }
+
+    /// A mailbox as text that reads back as the same mailbox: the name quoted,
+    /// as sync stores it (`IMAPFetchMapping.mailboxText`), so a comma or an
+    /// address inside a display name never becomes a recipient of its own.
+    static func text(name: String?, address: String) -> String {
+        guard let name, !name.isEmpty else { return address }
+        return IMAPFetchMapping.mailboxText(name: name, address: address)
     }
 
     /// Who a reply goes to: every mailbox the message's Reply-To names (Gmail

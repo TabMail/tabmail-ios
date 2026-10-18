@@ -249,6 +249,16 @@ serializer that writes recipients:
   input line and Send refuses it with a message. `replyRecipients` was deleted. The 2026-10-03
   "drafts keep recipients as typed" rule now holds only for storage: leftover text is saved beside
   the addresses and returns to the input line on reopen.
+- **ADR-IOS-092 Tier 1 r8 fixes (2026-10-18)**: a single-line SwiftUI TextField (a UITextField)
+  turns PASTED line breaks into spaces and keeps tabs (observed iOS 26.5), so a pasted column
+  arrives space-separated: `RecipientEntry` also splits on spaces/tabs after an address (unquoted
+  `@` word or closing `>`), and any multi-character insertion is split whole. Reply-all passes
+  the reply target's unsendable text to the To input line (To/Cc invalid entries still never
+  offered, 2026-10-03). An unsendable contact pick goes to the input line. Leftover named mailboxes
+  are quoted via `IMAPFetchMapping.mailboxText`. `sendableRecipients` now expands a recipient that
+  is a comma list (legacy outbox rows from before the change; text that is not a mailbox still throws);
+  `extractEmailAddress` deleted; Send's text refusal and cap live in
+  `ComposeDraftGuards.sendRecipients`.
 - **Pin state**: app `project.yml` pins `a09a3e3d` (topic branch, not fork main; was `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
