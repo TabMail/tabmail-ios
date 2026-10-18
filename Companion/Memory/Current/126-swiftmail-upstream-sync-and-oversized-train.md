@@ -182,9 +182,17 @@ serializer that writes recipients:
   not name, and an empty `ccRecipients`/`bccRecipients` was omitted — removed recipients stayed.
   `buildGraphSendPayload` now always sends all three lists.
 - Read paths already parsed Bcc (IMAP envelope, Gmail `metadataHeaders=Bcc`, Graph `bccRecipients`).
+- **Recipient header injection (review round 1)**: Gmail wrote To/Cc/Bcc text raw, so a recipient
+  from a mailto link carrying CR/LF could add a header (To/Cc were open before this change too).
+  Both builders now write recipients through `IMAPProvider.recipientsFieldBody` (SwiftMail's
+  formatter, which never writes a control character, as IMAP drafts already did), and Gmail `send`
+  refuses a recipient that is not one mailbox (`sendableRecipients`, fatal, as IMAP send does).
 - Tests: `BccRecipientsTests` (red on main for IMAP draft, Gmail send + both draft calls, Outlook
-  clear). SwiftMail: `BccHeaderTests`, `BccAppendTests`.
-- **Pin state**: app `project.yml` pins `1145028b` (topic branch, not fork main). Fork `main` stays
+  clear; injection oracle compares header FIELD NAMES and treats a lone CR or LF as a line break,
+  as a CRLF-only split passed the lone-CR/LF variants vacuously). SwiftMail: `BccHeaderTests`, and
+  a `sendDraft` integration test over `IMAPTestServer` (now serves Cc/Bcc in ENVELOPE) plus a NIO
+  `SMTPCaptureServer` in the IMAP test target (fork commit `8b907e68`).
+- **Pin state**: app `project.yml` pins `8b907e68` (topic branch, not fork main; was `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
   with `tabmail-swiftmailfork-sync` and re-pin to the mirror.

@@ -682,7 +682,11 @@ actor GmailProvider: EmailProvider {
             moveTraceLabel: "GmailProvider.move")
     }
 
+    /// A recipient that is not exactly one mailbox fails the send as
+    /// `SMTPError.invalidEmailAddress`, which the outbox treats as fatal, as an
+    /// IMAP send does; a draft keeps whatever the user typed.
     func send(draft: DraftMessage) async throws {
+        _ = try IMAPProvider.sendableRecipients(draft.to + draft.cc + draft.bcc)
         let body = buildSendBody(draft: draft)
         let jsonData = try JSONSerialization.data(withJSONObject: body)
         let _ = try await request(path: "/messages/send", method: "POST", body: jsonData)
@@ -2109,11 +2113,11 @@ actor GmailProvider: EmailProvider {
             let bracketed = messageId.hasPrefix("<") ? messageId : "<\(messageId)>"
             lines.append("Message-ID: \(bracketed)")
         }
-        lines.append("To: \(draft.to.joined(separator: ", "))")
-        if !draft.cc.isEmpty { lines.append("Cc: \(draft.cc.joined(separator: ", "))") }
+        lines.append("To: \(IMAPProvider.recipientsFieldBody(draft.to))")
+        if !draft.cc.isEmpty { lines.append("Cc: \(IMAPProvider.recipientsFieldBody(draft.cc))") }
         // Gmail delivers to the Bcc header's recipients and leaves it out of the
         // delivered copies; a draft and the Sent copy keep it.
-        if !draft.bcc.isEmpty { lines.append("Bcc: \(draft.bcc.joined(separator: ", "))") }
+        if !draft.bcc.isEmpty { lines.append("Bcc: \(IMAPProvider.recipientsFieldBody(draft.bcc))") }
         lines.append("Subject: \(RFC2047.encodeHeaderValue(draft.subject))")
         if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
             lines.append("In-Reply-To: \(replyTo.hasPrefix("<") ? replyTo : "<\(replyTo)>")")
@@ -2160,10 +2164,10 @@ actor GmailProvider: EmailProvider {
             let bracketed = messageId.hasPrefix("<") ? messageId : "<\(messageId)>"
             message += "Message-ID: \(bracketed)\r\n"
         }
-        message += "To: \(draft.to.joined(separator: ", "))\r\n"
-        if !draft.cc.isEmpty { message += "Cc: \(draft.cc.joined(separator: ", "))\r\n" }
+        message += "To: \(IMAPProvider.recipientsFieldBody(draft.to))\r\n"
+        if !draft.cc.isEmpty { message += "Cc: \(IMAPProvider.recipientsFieldBody(draft.cc))\r\n" }
         // See buildRFC822: Gmail delivers to Bcc recipients and strips the header.
-        if !draft.bcc.isEmpty { message += "Bcc: \(draft.bcc.joined(separator: ", "))\r\n" }
+        if !draft.bcc.isEmpty { message += "Bcc: \(IMAPProvider.recipientsFieldBody(draft.bcc))\r\n" }
         message += "Subject: \(RFC2047.encodeHeaderValue(draft.subject))\r\n"
         if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
             message += "In-Reply-To: \(replyTo.hasPrefix("<") ? replyTo : "<\(replyTo)>")\r\n"

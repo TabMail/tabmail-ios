@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftMail
 import Testing
 @testable import TabMail
 
@@ -135,6 +136,72 @@ struct BccRecipientsTests {
         #expect(Self.bccField(in: mime) == nil)
     }
 
+    // MARK: - Recipient text cannot add a header
+
+    enum Field: String, CaseIterable { case to, cc, bcc }
+
+    private static func draft(_ recipient: String, in field: Field) -> DraftMessage {
+        DraftMessage(
+            to: field == .to ? [recipient] : ["to@example.com"],
+            cc: field == .cc ? [recipient] : [],
+            bcc: field == .bcc ? [recipient] : [],
+            subject: "Hi", body: "Body")
+    }
+
+    /// The names of the header block's fields, folded lines skipped. A lone CR
+    /// or LF counts as a line break too, as a receiving server may read it so.
+    private static func headerFieldNames(in message: String) -> [String] {
+        (message.components(separatedBy: "\r\n\r\n").first ?? message)
+            .components(separatedBy: CharacterSet(charactersIn: "\r\n"))
+            .filter { !$0.isEmpty && !$0.hasPrefix(" ") && !$0.hasPrefix("\t") }
+            .compactMap { line in line.firstIndex(of: ":").map { String(line[line.startIndex..<$0]) } }
+    }
+
+    /// Every way a draft is written to a server, keyed by builder.
+    private static func writtenDrafts(_ draft: DraftMessage) -> [String: String] {
+        let gmail = GmailProvider(userEmail: "me@example.com", accessToken: { _ in "tok" })
+        var withAttachment = draft
+        withAttachment.attachments = [DraftAttachment(filename: "a.txt", mimeType: "text/plain", data: Data("a".utf8))]
+        return [
+            "Gmail buildRFC822": gmail.buildRFC822(draft: draft),
+            "Gmail buildMIMEMessage": String(decoding: gmail.buildMIMEMessage(draft: withAttachment), as: UTF8.self),
+            "IMAP draft": IMAPProvider.buildDraftEmail(from: draft, senderEmail: "me@example.com")
+                .constructContent(use8BitMIME: true, includeBccHeader: true),
+        ]
+    }
+
+    /// A recipient that carries a line break must give the same header fields as
+    /// an ordinary one, so text from a mailto link cannot add a header of its own.
+    /// Comparing the field names, not looking for one payload, catches any field.
+    @Test("A recipient carrying a line break adds no header field on any draft builder",
+          arguments: Field.allCases, ["\r\n", "\n", "\r"])
+    func recipientCannotAddHeader(field: Field, lineBreak: String) {
+        let hostile = Self.writtenDrafts(Self.draft("me2@example.com\(lineBreak)Reply-To: attacker@example.org", in: field))
+        let benign = Self.writtenDrafts(Self.draft("me2@example.com", in: field))
+        #expect(hostile.count == 3)
+        for (builder, message) in hostile {
+            #expect(Self.headerFieldNames(in: message) == Self.headerFieldNames(in: benign[builder] ?? ""),
+                    "\(builder) gained a header field: \(Self.headerFieldNames(in: message))")
+        }
+    }
+
+    @Test("A Gmail send refuses a recipient that is not one address, before any request",
+          arguments: Field.allCases)
+    func gmailSendRefusesUnreadableRecipient(field: Field) async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/messages/send", method: "POST", response: .json(raw: #"{"id":"sent-1"}"#))
+        let provider = GmailProvider(userEmail: "me@example.com", accessToken: { _ in "tok" }, session: http.session)
+
+        do {
+            try await provider.send(draft: Self.draft("me2@example.com\r\nBcc: attacker@example.org", in: field))
+            Issue.record("the send went out")
+        } catch {
+            #expect(AccountManager.isFatalSendError(error), "\(error)")
+        }
+        #expect(http.recordedCalls().isEmpty)
+    }
+
     // MARK: - Outlook
 
     private static func graphBodies(_ http: FakeHTTP.Scenario, method: String) throws -> [[String: Any]] {
@@ -149,7 +216,7 @@ struct BccRecipientsTests {
         (list as? [[String: Any]])?.compactMap { ($0["emailAddress"] as? [String: Any])?["address"] as? String }
     }
 
-    @Test("Outlook sends and creates drafts with the BCC recipients")
+    @Test("Outlook sends and creates drafts with the CC and BCC recipients")
     func outlookNamesBcc() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -157,15 +224,33 @@ struct BccRecipientsTests {
         http.register(path: "/mailFolders/drafts/messages", method: "POST", response: .json(raw: #"{"id":"g-1"}"#))
         let provider = ExchangeProvider(userEmail: "me@example.com", accessToken: { _ in "tok" }, session: http.session)
 
+        let cc = ["cc@example.com"]
         let bcc = ["hidden@example.com", "hidden2@example.com"]
-        try await provider.send(draft: Self.draft(bcc: bcc))
-        _ = try await provider.saveDraft(Self.draft(bcc: bcc), existingIdentity: nil, draftsFolderPath: "Drafts")
+        try await provider.send(draft: Self.draft(bcc: bcc, cc: cc))
+        _ = try await provider.saveDraft(Self.draft(bcc: bcc, cc: cc), existingIdentity: nil, draftsFolderPath: "Drafts")
 
         let bodies = try Self.graphBodies(http, method: "POST")
         #expect(bodies.count == 2)
         for body in bodies {
+            #expect(Self.addresses(body["ccRecipients"]) == cc)
             #expect(Self.addresses(body["bccRecipients"]) == bcc)
         }
+    }
+
+    @Test("An Outlook draft update names its CC and BCC recipients")
+    func outlookUpdateNamesRecipients() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/messages/g-1", method: "PATCH", response: .json(raw: #"{"id":"g-1"}"#))
+        let provider = ExchangeProvider(userEmail: "me@example.com", accessToken: { _ in "tok" }, session: http.session)
+
+        _ = try await provider.saveDraft(
+            Self.draft(bcc: ["hidden@example.com"], cc: ["cc@example.com"]),
+            existingIdentity: .outlook(graphId: "g-1"), draftsFolderPath: "Drafts")
+
+        let patch = try #require(try Self.graphBodies(http, method: "PATCH").first)
+        #expect(Self.addresses(patch["ccRecipients"]) == ["cc@example.com"])
+        #expect(Self.addresses(patch["bccRecipients"]) == ["hidden@example.com"])
     }
 
     /// A draft update is a PATCH, which keeps every property it does not name.

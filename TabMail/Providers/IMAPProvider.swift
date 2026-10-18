@@ -6081,6 +6081,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
+    /// The recipients as one header field body, each written as a draft writes
+    /// it. SwiftMail never writes a control character into an address, so a
+    /// recipient cannot end the field and add a header line of its own.
+    static func recipientsFieldBody(_ recipients: [String]) -> String {
+        draftRecipients(recipients).map(\.description).joined(separator: ", ")
+    }
+
     /// Each recipient as SwiftMail's parser reads it; throws on the first one that
     /// is not exactly one mailbox.
     static func sendableRecipients(_ recipients: [String]) throws -> [SwiftMail.EmailAddress] {
