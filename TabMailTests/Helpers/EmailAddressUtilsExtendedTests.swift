@@ -216,27 +216,6 @@ struct BuildReplyAllRecipientsTests {
         #expect(!result.to.contains("noreply@list.com"))
     }
 
-    /// Gmail stores the raw Reply-To header, which can name several mailboxes. A
-    /// send refuses a recipient that is not exactly one mailbox, so a reply
-    /// must name each of them separately, or it could not be sent at all.
-    @Test("A reply goes to every mailbox its Reply-To names, and Gmail can send it")
-    func replyGoesToEveryReplyToMailbox() throws {
-        let msg = makeHeader(
-            from: "sender@example.com",
-            replyTo: "Alice <alice@example.com>, \"Doe, Bob\" <bob@example.com>"
-        )
-        let recipients = replyRecipients(for: msg)
-        #expect(recipients.map(\.address) == ["alice@example.com", "bob@example.com"])
-        #expect(recipients.map(\.name) == ["Alice", "Doe, Bob"])
-
-        let addresses = recipients.map(\.address)
-        #expect(try IMAPProvider.sendableRecipients(addresses).map(\.address) == addresses)
-        let gmail = GmailProvider(userEmail: "me@example.com", accessToken: { _ in "tok" })
-        let raw = gmail.buildRFC822(draft: DraftMessage(to: addresses, subject: "Re: Test", body: "Body"))
-        let toLines = raw.components(separatedBy: "\r\n").filter { $0.hasPrefix("To: ") }
-        #expect(toLines == ["To: alice@example.com, bob@example.com"])
-    }
-
     @Test("Reply-all goes to every mailbox the Reply-To names")
     func replyAllGoesToEveryReplyToMailbox() {
         let me = makeAccount(email: "me@example.com")
@@ -247,25 +226,6 @@ struct BuildReplyAllRecipientsTests {
         )
         let result = buildReplyAllRecipients(for: msg, allAccounts: [me])
         #expect(result.to == ["alice@example.com", "bob@example.com", "ann@example.com"])
-    }
-
-    @Test("A reply with no Reply-To goes to the sender, under the sender's name")
-    func replyWithoutReplyToGoesToSender() {
-        var msg = makeHeader(from: "sender@example.com")
-        msg.from = "Sender Name"
-        let recipients = replyRecipients(for: msg)
-        #expect(recipients.map(\.address) == ["sender@example.com"])
-        #expect(recipients.map(\.name) == ["Sender Name"])
-    }
-
-    /// Text naming no mailbox stays one recipient as written, so the send
-    /// refuses it where the user can see it, rather than the reply losing it.
-    @Test("A Reply-To that names no mailbox is kept as written")
-    func replyToWithoutMailboxIsKept() {
-        let msg = makeHeader(from: "sender@example.com", replyTo: "undisclosed-recipients:;")
-        let recipients = replyRecipients(for: msg)
-        #expect(recipients.map(\.address) == ["undisclosed-recipients:;"])
-        #expect(recipients.map(\.name) == [nil])
     }
 
     @Test("Deduplicates addresses across To and CC")

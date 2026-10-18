@@ -270,13 +270,90 @@ enum ComposeDraftGuards {
 
     /// PORT — `v2final:ComposeDraftGuards.committedRecipients`.
     ///
-    /// Commit a pending (uncommitted) recipient input into its token array — the
-    /// same "flush the in-progress text" transform `send()` applies inline — so
-    /// close / save also SEE and PERSIST an in-progress recipient instead of
-    /// dropping it. Empty / whitespace-only input leaves the tokens unchanged.
+    /// The recipients a draft PERSISTS for one field: its addresses plus any text
+    /// left in its input line, so close / save never drop what the user typed.
+    /// Reopening the draft splits the list again (`fieldState`), so leftover text
+    /// returns to the input line, never to a recipient (ADR-IOS-092). Empty /
+    /// whitespace-only input adds nothing.
     static func committedRecipients(tokens: [String], input: String) -> [String] {
         let trimmed = input.trimmingCharacters(in: .whitespaces)
         return trimmed.isEmpty ? tokens : tokens + [trimmed]
+    }
+
+    /// One recipient field: its addresses, their display names, and the text in
+    /// its input line.
+    struct RecipientField: Equatable {
+        var tokens: [String] = []
+        var displayNames: [String: String] = [:]
+        var input = ""
+    }
+
+    /// A field filled from outside the input line (a reopened draft, a prefill, a
+    /// reply): the addresses the texts name, and the rest as input text (ADR-IOS-092).
+    static func fieldState(_ entry: RecipientEntry) -> RecipientField {
+        var field = RecipientField(tokens: entry.addresses, input: entry.unparsed)
+        for recipient in entry.recipients {
+            if let name = recipient.name, !name.isEmpty { field.displayNames[recipient.address] = name }
+        }
+        return field
+    }
+
+    /// Adds the addresses `text` names to `field`, as the user types a separator,
+    /// pastes, presses Return, leaves the field or picks a contact (ADR-IOS-092).
+    /// An address already in the field moves to the end. At most `room` new
+    /// addresses are added; the rest, any text that names no address, and then
+    /// `typing` (text the user is still typing, never split) become the field's
+    /// input. Returns nil when no address was added, so the input line is left
+    /// exactly as it is.
+    static func committing(
+        _ text: String, typing: String = "", to field: RecipientField, room: Int
+    ) -> RecipientField? {
+        let entry = RecipientEntry(text)
+        var result = field
+        var room = room
+        var kept = entry.unparsed.isEmpty ? [] : [entry.unparsed]
+        var added = false
+        for recipient in entry.recipients {
+            let key = recipient.address.lowercased()
+            let isMove = result.tokens.contains { $0.lowercased() == key }
+            guard isMove || room > 0 else {
+                kept.append(recipient.address)
+                continue
+            }
+            if !isMove { room -= 1 }
+            result.tokens.removeAll { $0.lowercased() == key }
+            result.tokens.append(recipient.address)
+            if let name = recipient.name, !name.isEmpty { result.displayNames[recipient.address] = name }
+            added = true
+        }
+        guard added else { return nil }
+        let typing = typing.drop { $0.isWhitespace }
+        if !typing.isEmpty { kept.append(String(typing)) }
+        result.input = kept.joined(separator: ", ")
+        return result
+    }
+
+    /// Which part of an edited input line to split (ADR-IOS-092). While typing,
+    /// the text up to the last `,`, `;` or line break is split and the text after
+    /// it is still being typed, so `bob, carol@example.c` never adds a half-typed
+    /// address. A paste (more than one character inserted at once) is split whole.
+    /// Nil when the line holds no separator.
+    static func inputToSplit(was old: String, now text: String) -> (text: String, typing: String)? {
+        guard let last = text.lastIndex(where: { $0 == "," || $0 == ";" || $0.isNewline }) else { return nil }
+        if text.count - old.count > 1 { return (text, "") }
+        return (String(text[...last]), String(text[text.index(after: last)...]))
+    }
+
+    /// Why Send is refused while an input line holds text that names no address,
+    /// or nil when every field holds only addresses (ADR-IOS-092).
+    static func unaddressedRecipientMessage(to: String, cc: String, bcc: String) -> String? {
+        for (label, text) in [("To", to), ("Cc", cc), ("Bcc", bcc)] {
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty {
+                return "\u{201C}\(trimmed)\u{201D} in \(label) is not an email address. Fix or remove it before sending."
+            }
+        }
+        return nil
     }
 
     /// PORT — `v2final:ComposeDraftGuards.runCheckedLocalDeleteThenDismiss` (R5).
@@ -1007,23 +1084,55 @@ struct ComposeView: View {
         totalRecipients < SyncConfig.outboxMaxRecipients
     }
 
-    /// Dedup-aware append: if `email` (case-insensitive) already exists in
-    /// `tokens`, the existing entry is removed and a fresh one is appended at
-    /// the end — this "moves" the duplicate to the new position the user is
-    /// adding to, instead of creating two chips. The recipient cap is only
-    /// enforced for genuinely-new additions; moves don't change the count.
-    private func addRecipient(
-        _ email: String,
-        name: String?,
-        tokens: inout [String],
-        displayNames: inout [String: String]
-    ) {
-        let key = email.lowercased()
-        let isMove = tokens.contains { $0.lowercased() == key }
-        guard isMove || canAddRecipient else { return }
-        tokens.removeAll { $0.lowercased() == key }
-        tokens.append(email)
-        if let name, !name.isEmpty { displayNames[email] = name }
+    private func recipientField(_ field: RecipientEditField) -> ComposeDraftGuards.RecipientField {
+        switch field {
+        case .to: return .init(tokens: toTokens, displayNames: toDisplayNames, input: toInput)
+        case .cc: return .init(tokens: ccTokens, displayNames: ccDisplayNames, input: ccInput)
+        case .bcc: return .init(tokens: bccTokens, displayNames: bccDisplayNames, input: bccInput)
+        }
+    }
+
+    private func setRecipientField(_ value: ComposeDraftGuards.RecipientField, _ field: RecipientEditField) {
+        switch field {
+        case .to:
+            toTokens = value.tokens
+            toDisplayNames = value.displayNames
+            toInput = value.input
+        case .cc:
+            ccTokens = value.tokens
+            ccDisplayNames = value.displayNames
+            ccInput = value.input
+        case .bcc:
+            bccTokens = value.tokens
+            bccDisplayNames = value.displayNames
+            bccInput = value.input
+        }
+        if field != .to, !value.tokens.isEmpty || !value.input.isEmpty { showCc = true }
+    }
+
+    /// Fills a field from outside its input line (a reopened draft, a prefill, a
+    /// reply): addresses become recipients, other text goes to the input line
+    /// (ADR-IOS-092). Display names already known are kept.
+    private func fillRecipients(_ entry: RecipientEntry, _ field: RecipientEditField) {
+        var value = ComposeDraftGuards.fieldState(entry)
+        value.displayNames = recipientField(field).displayNames.merging(value.displayNames) { _, new in new }
+        setRecipientField(value, field)
+    }
+
+    /// Adds the addresses `text` names to `field` within the recipient cap
+    /// (ADR-IOS-092). Returns false, changing nothing, when `text` names none.
+    @discardableResult
+    private func commitRecipients(
+        _ text: String, typing: String = "", to field: RecipientEditField, name: String? = nil
+    ) -> Bool {
+        let room = SyncConfig.outboxMaxRecipients - totalRecipients
+        guard var value = ComposeDraftGuards.committing(
+            text, typing: typing, to: recipientField(field), room: room) else {
+            return false
+        }
+        if let name, !name.isEmpty, let address = value.tokens.last { value.displayNames[address] = name }
+        setRecipientField(value, field)
+        return true
     }
 
     /// Shown next to the Cc/Bcc button: "N/50" when ≥ 45, orange at cap.
@@ -1096,14 +1205,9 @@ struct ComposeView: View {
                                     searchResults: activeField == .to ? contactSearch.search(toInput) : [],
                                     onFocus: { activeField = .to },
                                     onSelectContact: { contact in
-                                        addRecipient(
-                                            contact.email,
-                                            name: contact.name,
-                                            tokens: &toTokens,
-                                            displayNames: &toDisplayNames
-                                        )
-                                        toInput = ""
+                                        commitRecipients(contact.email, to: .to, name: contact.name)
                                     },
+                                    commit: { text, typing in commitRecipients(text, typing: typing, to: .to) },
                                     canAddMore: { canAddRecipient },
                                     revealedChipKey: $revealedChipKey,
                                     fieldKey: "to"
@@ -1134,14 +1238,9 @@ struct ComposeView: View {
                                         searchResults: activeField == .cc ? contactSearch.search(ccInput) : [],
                                         onFocus: { activeField = .cc },
                                         onSelectContact: { contact in
-                                            addRecipient(
-                                                contact.email,
-                                                name: contact.name,
-                                                tokens: &ccTokens,
-                                                displayNames: &ccDisplayNames
-                                            )
-                                            ccInput = ""
+                                            commitRecipients(contact.email, to: .cc, name: contact.name)
                                         },
+                                        commit: { text, typing in commitRecipients(text, typing: typing, to: .cc) },
                                         canAddMore: { canAddRecipient },
                                         revealedChipKey: $revealedChipKey,
                                         fieldKey: "cc"
@@ -1163,14 +1262,9 @@ struct ComposeView: View {
                                         searchResults: activeField == .bcc ? contactSearch.search(bccInput) : [],
                                         onFocus: { activeField = .bcc },
                                         onSelectContact: { contact in
-                                            addRecipient(
-                                                contact.email,
-                                                name: contact.name,
-                                                tokens: &bccTokens,
-                                                displayNames: &bccDisplayNames
-                                            )
-                                            bccInput = ""
+                                            commitRecipients(contact.email, to: .bcc, name: contact.name)
                                         },
+                                        commit: { text, typing in commitRecipients(text, typing: typing, to: .bcc) },
                                         canAddMore: { canAddRecipient },
                                         revealedChipKey: $revealedChipKey,
                                         fieldKey: "bcc"
@@ -2099,35 +2193,30 @@ struct ComposeView: View {
     private func applyRecipientDelta(field: RecipientEditField, delta: RecipientDelta?) {
         guard let delta, !delta.isEmpty else { return }
 
-        func mutateTokens(_ tokens: inout [String], _ names: inout [String: String]) {
-            if delta.clearsField {
-                tokens = []
-            } else if !delta.removes.isEmpty {
-                let removeSet = Set(delta.removes.map { $0.lowercased() })
-                tokens = tokens.filter { !removeSet.contains($0.lowercased()) }
-            }
-            var seen = Set(tokens.map { $0.lowercased() })
-            for add in delta.adds {
-                let email = add.email
-                guard !email.isEmpty, email != "*" else { continue }
-                let key = email.lowercased()
-                if seen.insert(key).inserted {
-                    tokens.append(email)
-                }
-                if !add.name.isEmpty { names[email] = add.name }
-            }
+        var value = recipientField(field)
+        if delta.clearsField {
+            value.tokens = []
+        } else if !delta.removes.isEmpty {
+            let removeSet = Set(delta.removes.map { $0.lowercased() })
+            value.tokens = value.tokens.filter { !removeSet.contains($0.lowercased()) }
         }
-
-        switch field {
-        case .to:
-            mutateTokens(&toTokens, &toDisplayNames)
-        case .cc:
-            mutateTokens(&ccTokens, &ccDisplayNames)
-            if !ccTokens.isEmpty { showCc = true }
-        case .bcc:
-            mutateTokens(&bccTokens, &bccDisplayNames)
-            if !bccTokens.isEmpty { showCc = true }
+        // Each add is split like typed text (ADR-IOS-092): its addresses become
+        // recipients, and text that names none goes to the input line.
+        var seen = Set(value.tokens.map { $0.lowercased() })
+        var leftovers = value.input.isEmpty ? [] : [value.input]
+        for add in delta.adds where !add.email.isEmpty && add.email != "*" {
+            let entry = RecipientEntry(add.email)
+            for recipient in entry.recipients where seen.insert(recipient.address.lowercased()).inserted {
+                value.tokens.append(recipient.address)
+            }
+            for recipient in entry.recipients {
+                let name = entry.recipients.count == 1 && !add.name.isEmpty ? add.name : recipient.name
+                if let name, !name.isEmpty { value.displayNames[recipient.address] = name }
+            }
+            if !entry.unparsed.isEmpty { leftovers.append(entry.unparsed) }
         }
+        value.input = leftovers.joined(separator: ", ")
+        setRecipientField(value, field)
     }
 
     // MARK: - From picker
@@ -2280,10 +2369,11 @@ struct ComposeView: View {
             // Restore draft state
             subject = draft.subject
             messageBody = draft.body
-            toTokens = draft.toArray
-            ccTokens = draft.ccArray
-            bccTokens = draft.bccArray
-            if !ccTokens.isEmpty || !bccTokens.isEmpty { showCc = true }
+            // A saved list may hold text that names no address (kept so nothing
+            // typed is lost); it returns to the input line (ADR-IOS-092).
+            fillRecipients(RecipientEntry(draft.toArray), .to)
+            fillRecipients(RecipientEntry(draft.ccArray), .cc)
+            fillRecipients(RecipientEntry(draft.bccArray), .bcc)
             // Load attachments from disk (saveDraftAndDismiss writes them via
             // DraftAttachmentStorage.saveAttachments; reopen restores them so
             // user sees what was saved). B1: the loader FAILS CLOSED — if a
@@ -2415,9 +2505,9 @@ struct ComposeView: View {
     private func snapshotInitialState() {
         initialSubject = subject
         initialBody = messageBody
-        initialToTokens = toTokens
-        initialCcTokens = ccTokens
-        initialBccTokens = bccTokens
+        initialToTokens = ComposeDraftGuards.committedRecipients(tokens: toTokens, input: toInput)
+        initialCcTokens = ComposeDraftGuards.committedRecipients(tokens: ccTokens, input: ccInput)
+        initialBccTokens = ComposeDraftGuards.committedRecipients(tokens: bccTokens, input: bccInput)
         initialAttachmentsFingerprint = attachmentsFingerprint(attachments)
     }
 
@@ -2441,18 +2531,18 @@ struct ComposeView: View {
 
     /// PORT — v2final `ComposeView.commitPendingRecipientInput` (F3).
     ///
-    /// Flush any uncommitted in-progress recipient text (`toInput`/`ccInput`/
-    /// `bccInput`) into the token arrays — the same flush `send()` applies to its
-    /// outbound payload — so close / save also SEE it (`hasChanges`) and PERSIST it
-    /// instead of silently dropping the address the user was mid-way through
-    /// typing. Empty / whitespace-only input is a no-op on the tokens.
+    /// Commit the addresses in any uncommitted recipient text (`toInput`/`ccInput`/
+    /// `bccInput`), as `send()` does, so close / save also SEE them (`hasChanges`)
+    /// and PERSIST them. Text that names no address stays in the input line and is
+    /// persisted beside the addresses (`committedRecipients`), never as a recipient
+    /// (ADR-IOS-092).
     private func commitPendingRecipientInput() {
-        toTokens = ComposeDraftGuards.committedRecipients(tokens: toTokens, input: toInput)
-        toInput = ""
-        ccTokens = ComposeDraftGuards.committedRecipients(tokens: ccTokens, input: ccInput)
-        ccInput = ""
-        bccTokens = ComposeDraftGuards.committedRecipients(tokens: bccTokens, input: bccInput)
-        bccInput = ""
+        // No cap here: Send checks the total, and a save keeps what was typed.
+        for field in [RecipientEditField.to, .cc, .bcc] {
+            if let value = ComposeDraftGuards.committing(recipientField(field).input, to: recipientField(field), room: .max) {
+                setRecipientField(value, field)
+            }
+        }
     }
 
     /// Apply exactly the suggestion the UI is actively offering, using the same
@@ -2515,7 +2605,9 @@ struct ComposeView: View {
             toInput: toInput, ccInput: ccInput, bccInput: bccInput,
             hasAttachments: !attachments.isEmpty || attachmentLoadFailed || attachmentPreparationIsUnsettled)
         let hasChanges = subject != initialSubject || messageBody != initialBody
-            || toTokens != initialToTokens || ccTokens != initialCcTokens || bccTokens != initialBccTokens
+            || ComposeDraftGuards.committedRecipients(tokens: toTokens, input: toInput) != initialToTokens
+            || ComposeDraftGuards.committedRecipients(tokens: ccTokens, input: ccInput) != initialCcTokens
+            || ComposeDraftGuards.committedRecipients(tokens: bccTokens, input: bccInput) != initialBccTokens
             || attachmentsFingerprint(attachments) != initialAttachmentsFingerprint
             || attachmentPreparationIsUnsettled
             || hasVisibleSuggestion
@@ -2627,9 +2719,9 @@ struct ComposeView: View {
         let now = Date().timeIntervalSince1970
         // Capture MainActor-isolated properties before entering Sendable closure
         let capDraftId = draftId
-        let capTo = toTokens
-        let capCc = ccTokens
-        let capBcc = bccTokens
+        let capTo = ComposeDraftGuards.committedRecipients(tokens: toTokens, input: toInput)
+        let capCc = ComposeDraftGuards.committedRecipients(tokens: ccTokens, input: ccInput)
+        let capBcc = ComposeDraftGuards.committedRecipients(tokens: bccTokens, input: bccInput)
         let capSubject = subject
         let capBody = messageBody
 
@@ -2940,15 +3032,9 @@ struct ComposeView: View {
         }
 
         // Apply prefill overrides (from agent tools)
-        if let prefillTo { toTokens = prefillTo }
-        if let prefillCc {
-            ccTokens = prefillCc
-            if !prefillCc.isEmpty { showCc = true }
-        }
-        if let prefillBcc {
-            bccTokens = prefillBcc
-            if !prefillBcc.isEmpty { showCc = true }
-        }
+        if let prefillTo { fillRecipients(RecipientEntry(prefillTo), .to) }
+        if let prefillCc { fillRecipients(RecipientEntry(prefillCc), .cc) }
+        if let prefillBcc { fillRecipients(RecipientEntry(prefillBcc), .bcc) }
         if let prefillSubject { subject = prefillSubject }
         if let prefillBody { messageBody = prefillBody }
         if let prefillAttachments, !prefillAttachments.isEmpty {
@@ -2964,13 +3050,7 @@ struct ComposeView: View {
                 }
             } else {
                 // Reply mode: To = reply address, "Re:" subject
-                if prefillTo == nil {
-                    let recipients = replyRecipients(for: reply)
-                    toTokens = recipients.map(\.address)
-                    for recipient in recipients {
-                        if let name = recipient.name, !name.isEmpty { toDisplayNames[recipient.address] = name }
-                    }
-                }
+                if prefillTo == nil { fillRecipients(RecipientEntry.reply(to: reply), .to) }
                 if prefillSubject == nil {
                     subject = ThreadUtils.replySubject(for: reply.subject)
                 }
@@ -3369,18 +3449,16 @@ struct ComposeView: View {
         guard let settledAttachments = await settledAttachmentSnapshot(
             for: .send) else { return }
 
-        // Commit any pending input
-        var finalTo = toTokens
-        let pendingTo = toInput.trimmingCharacters(in: .whitespaces)
-        if !pendingTo.isEmpty { finalTo.append(pendingTo) }
-
-        var finalCc = ccTokens
-        let pendingCc = ccInput.trimmingCharacters(in: .whitespaces)
-        if !pendingCc.isEmpty { finalCc.append(pendingCc) }
-
-        var finalBcc = bccTokens
-        let pendingBcc = bccInput.trimmingCharacters(in: .whitespaces)
-        if !pendingBcc.isEmpty { finalBcc.append(pendingBcc) }
+        // Commit the addresses in any pending input. Text that names no address
+        // is never sent: it stays in its input line and Send says so (ADR-IOS-092).
+        commitPendingRecipientInput()
+        if let message = ComposeDraftGuards.unaddressedRecipientMessage(to: toInput, cc: ccInput, bcc: bccInput) {
+            sendError = message
+            return
+        }
+        let finalTo = toTokens
+        let finalCc = ccTokens
+        let finalBcc = bccTokens
 
         // Recipient cap — defense in depth. TokenField/picker guards usually
         // prevent reaching this, but reply-all prefill can exceed the cap.
@@ -3762,6 +3840,9 @@ private struct TokenField: View {
     let searchResults: [ContactResult]
     let onFocus: () -> Void
     let onSelectContact: (ContactResult) -> Void
+    /// Adds the addresses the given text names to this field and leaves the
+    /// rest, then the still-typed text, in the input line (ADR-IOS-092).
+    let commit: (_ text: String, _ typing: String) -> Void
     /// Closure that returns whether the combined To+Cc+Bcc recipient count is
     /// under the hard cap (outboxMaxRecipients). When false, TextField is
     /// disabled and commitInput is a no-op — user must delete a chip to add
@@ -3802,6 +3883,13 @@ private struct TokenField: View {
                         .disabled(!canAddMore())
                         .onSubmit {
                             commitInput()
+                        }
+                        // A field is a list, never free text: a typed or pasted
+                        // separator splits what is there into recipients.
+                        .onChange(of: input) { old, text in
+                            if let split = ComposeDraftGuards.inputToSplit(was: old, now: text) {
+                                commit(split.text, split.typing)
+                            }
                         }
                         .onChange(of: isFocused) { _, focused in
                             if focused {
@@ -3880,19 +3968,8 @@ private struct TokenField: View {
     }
 
     private func commitInput() {
-        let trimmed = input.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
-        // Dedup: if a case-insensitive match already exists, move it to the
-        // end (the position the user is adding to) instead of creating two
-        // chips. Moves don't change the count, so the cap only gates genuinely
-        // new additions — when the cap blocks, keep the text in the field so
-        // the user sees why and can delete a chip to make room.
-        let key = trimmed.lowercased()
-        let isMove = tokens.contains { $0.lowercased() == key }
-        guard isMove || canAddMore() else { return }
-        tokens.removeAll { $0.lowercased() == key }
-        tokens.append(trimmed)
-        input = ""
+        guard !input.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        commit(input, "")
     }
 }
 
