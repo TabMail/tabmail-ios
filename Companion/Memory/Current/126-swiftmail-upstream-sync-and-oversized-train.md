@@ -205,7 +205,7 @@ serializer that writes recipients:
   SMTP, the draft left in place; a body CR is kept. Fail closed rather than guess where such a line
   ends, since readers disagree. Tier 2 also found the tests blind to Bcc in a visible To/Cc field,
   to HTML drafts (the app saves HTML), and to tab/repeated whitespace before the colon; all fixed.
-- **Pin state**: app `project.yml` pins `1959c9af` (topic branch, not fork main; was `d20af13a`, `1145028b`). Fork `main` stays
+- **Pin state**: app `project.yml` pins `c9d54d06` (topic branch, not fork main; was `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
   with `tabmail-swiftmailfork-sync` and re-pin to the mirror.
