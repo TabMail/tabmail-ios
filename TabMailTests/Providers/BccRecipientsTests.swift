@@ -276,9 +276,14 @@ struct BccRecipientsTests {
         _ = try await provider.saveDraft(Self.draft(bcc: bcc, cc: cc), existingIdentity: nil, draftsFolderPath: "Drafts")
 
         Self.expectOperations(http, ["POST /sendMail", "POST /mailFolders/drafts/messages"])
+        // sendMail keeps a Sent copy unless saveToSentItems is false.
+        let sendBody = try #require(http.recordedCalls().first?.body)
+        let wrapper = try #require(try JSONSerialization.jsonObject(with: sendBody) as? [String: Any])
+        #expect(wrapper["saveToSentItems"] == nil || wrapper["saveToSentItems"] as? Bool == true)
         let bodies = try Self.graphBodies(http, method: "POST")
         #expect(bodies.count == 2)
         for body in bodies {
+            #expect(Self.addresses(body["toRecipients"]) == ["to@example.com"])
             #expect(Self.addresses(body["ccRecipients"]) == cc)
             #expect(Self.addresses(body["bccRecipients"]) == bcc)
         }
@@ -297,6 +302,7 @@ struct BccRecipientsTests {
 
         Self.expectOperations(http, ["PATCH /messages/g-1"])
         let patch = try #require(try Self.graphBodies(http, method: "PATCH").first)
+        #expect(Self.addresses(patch["toRecipients"]) == ["to@example.com"])
         #expect(Self.addresses(patch["ccRecipients"]) == ["cc@example.com"])
         #expect(Self.addresses(patch["bccRecipients"]) == ["hidden@example.com"])
     }
@@ -313,6 +319,7 @@ struct BccRecipientsTests {
             Self.draft(bcc: [], cc: []), existingIdentity: .outlook(graphId: "g-1"), draftsFolderPath: "Drafts")
 
         let patch = try #require(try Self.graphBodies(http, method: "PATCH").first)
+        #expect(Self.addresses(patch["toRecipients"]) == ["to@example.com"])
         #expect(Self.addresses(patch["ccRecipients"]) == [])
         #expect(Self.addresses(patch["bccRecipients"]) == [])
     }

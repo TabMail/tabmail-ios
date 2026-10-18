@@ -6088,6 +6088,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         draftRecipients(recipients).map(\.description).joined(separator: ", ")
     }
 
+    /// Message IDs for an In-Reply-To or References field, each in angle
+    /// brackets. These IDs come from incoming mail, so one holding a line break
+    /// is left out: it would end the field and start another, and SwiftMail
+    /// refuses to send such a header.
+    static func threadingMessageIDs(_ ids: [String]) -> [String] {
+        ids.filter { !$0.isEmpty && !$0.unicodeScalars.contains { CharacterSet.newlines.contains($0) } }
+            .map { $0.hasPrefix("<") ? $0 : "<\($0)>" }
+    }
+
     /// Each recipient as SwiftMail's parser reads it; throws on the first one that
     /// is not exactly one mailbox.
     static func sendableRecipients(_ recipients: [String]) throws -> [SwiftMail.EmailAddress] {
@@ -6129,11 +6138,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
         // Set threading headers (RFC 2822 requires angle brackets around message IDs)
         var headers: [String: String] = [:]
-        if let inReplyTo = draft.inReplyTo, !inReplyTo.isEmpty {
-            headers["In-Reply-To"] = inReplyTo.hasPrefix("<") ? inReplyTo : "<\(inReplyTo)>"
+        if let inReplyTo = Self.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
+            headers["In-Reply-To"] = inReplyTo
         }
-        if !draft.references.isEmpty {
-            headers["References"] = draft.references.map { $0.hasPrefix("<") ? $0 : "<\($0)>" }.joined(separator: " ")
+        let references = Self.threadingMessageIDs(draft.references)
+        if !references.isEmpty {
+            headers["References"] = references.joined(separator: " ")
         }
         if !headers.isEmpty {
             email.additionalHeaders = headers

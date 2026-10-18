@@ -2120,11 +2120,12 @@ actor GmailProvider: EmailProvider {
         // while a draft and the Sent copy keep it is observed, not documented.
         if !draft.bcc.isEmpty { lines.append("Bcc: \(IMAPProvider.recipientsFieldBody(draft.bcc))") }
         lines.append("Subject: \(RFC2047.encodeHeaderValue(draft.subject))")
-        if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
-            lines.append("In-Reply-To: \(replyTo.hasPrefix("<") ? replyTo : "<\(replyTo)>")")
+        if let replyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
+            lines.append("In-Reply-To: \(replyTo)")
         }
-        if !draft.references.isEmpty {
-            lines.append("References: \(draft.references.map { $0.hasPrefix("<") ? $0 : "<\($0)>" }.joined(separator: " "))")
+        let references = IMAPProvider.threadingMessageIDs(draft.references)
+        if !references.isEmpty {
+            lines.append("References: \(references.joined(separator: " "))")
         }
         lines.append("MIME-Version: 1.0")
         if draft.isHTML {
@@ -2171,11 +2172,12 @@ actor GmailProvider: EmailProvider {
         // leaves the header out of the delivered copies.
         if !draft.bcc.isEmpty { message += "Bcc: \(IMAPProvider.recipientsFieldBody(draft.bcc))\r\n" }
         message += "Subject: \(RFC2047.encodeHeaderValue(draft.subject))\r\n"
-        if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
-            message += "In-Reply-To: \(replyTo.hasPrefix("<") ? replyTo : "<\(replyTo)>")\r\n"
+        if let replyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
+            message += "In-Reply-To: \(replyTo)\r\n"
         }
-        if !draft.references.isEmpty {
-            message += "References: \(draft.references.map { $0.hasPrefix("<") ? $0 : "<\($0)>" }.joined(separator: " "))\r\n"
+        let references = IMAPProvider.threadingMessageIDs(draft.references)
+        if !references.isEmpty {
+            message += "References: \(references.joined(separator: " "))\r\n"
         }
         message += "MIME-Version: 1.0\r\n"
 
