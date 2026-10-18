@@ -238,6 +238,15 @@ serializer that writes recipients:
   In-Reply-To/References), but any NEW TabMail header must still be filtered first, because
   `.sendFailed` is transient in TabMail. Lesson: census every WRITER of the header, not every
   field NAME (MIS-006).
+- **Multi-mailbox Reply-To (Tier 1 r6, 2026-10-18)**: Gmail stores the raw Reply-To header, and
+  a reply put it into ONE To token. Once Gmail send ran `sendableRecipients` (one mailbox per
+  token), a reply to `Reply-To: Alice <a@...>, Bob <b@...>` failed fatally, and its Gmail draft
+  wrote To as encoded-words naming no address; before, Gmail delivered to both. Fixed at the
+  producer: `replyRecipients(for:)` (EmailAddressUtils) gives one recipient per Reply-To mailbox
+  (or the sender), used by the compose reply seeding AND `buildReplyAllRecipients` (which used to
+  keep only the first bracketed address, so a bare Reply-To list was lost on reply-all). Reply-To
+  text naming no mailbox stays one token, so the send still refuses it visibly. A list a user
+  pastes into one To token is still refused on Gmail, as on IMAP (owner decision 2026-10-03).
 - **Pin state**: app `project.yml` pins `a09a3e3d` (topic branch, not fork main; was `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync

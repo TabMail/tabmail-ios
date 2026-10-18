@@ -2965,9 +2965,11 @@ struct ComposeView: View {
             } else {
                 // Reply mode: To = reply address, "Re:" subject
                 if prefillTo == nil {
-                    let replyEmail = reply.replyTo ?? reply.fromAddress
-                    toTokens = [replyEmail]
-                    if !reply.from.isEmpty { toDisplayNames[replyEmail] = reply.from }
+                    let recipients = replyRecipients(for: reply)
+                    toTokens = recipients.map(\.address)
+                    for recipient in recipients {
+                        if let name = recipient.name, !name.isEmpty { toDisplayNames[recipient.address] = name }
+                    }
                 }
                 if prefillSubject == nil {
                     subject = ThreadUtils.replySubject(for: reply.subject)

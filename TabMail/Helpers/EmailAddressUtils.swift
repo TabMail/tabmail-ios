@@ -14,11 +14,10 @@ func buildReplyAllRecipients(
     // Seed the dedup set with ALL of the user's account emails
     var seen: Set<String> = Set(allAccounts.map { $0.emailAddress.lowercased() })
 
-    let senderEmail = extractEmailAddress(msg.replyTo ?? msg.fromAddress).lowercased()
-
     var toEmails: [String] = []
-    if isValidEmailAddress(senderEmail), seen.insert(senderEmail).inserted {
-        toEmails.append(senderEmail)
+    for recipient in replyRecipients(for: msg) {
+        let bare = extractEmailAddress(recipient.address).lowercased()
+        if isValidEmailAddress(bare), seen.insert(bare).inserted { toEmails.append(bare) }
     }
     // Read with SwiftMail's parser, which honours quoted-pairs: an address inside
     // a quoted display name is part of the name, never a recipient.
@@ -34,6 +33,19 @@ func buildReplyAllRecipients(
     }
 
     return (toEmails, ccEmails)
+}
+
+/// The mailboxes a reply goes to: each mailbox the message's Reply-To names, or
+/// its sender, under the sender's name, when it has no Reply-To. A Reply-To can
+/// name several mailboxes (Gmail keeps the raw header), and a send refuses a
+/// recipient that is not exactly one mailbox, so each becomes its own recipient.
+/// A Reply-To that names no mailbox is kept as written, so the send refuses it
+/// where the user can see it.
+func replyRecipients(for msg: MessageHeader) -> [(address: String, name: String?)] {
+    guard let replyTo = msg.replyTo else { return [(msg.fromAddress, msg.from)] }
+    let mailboxes = AddressParser.parseAddressList(replyTo).flatMap(\.mailboxes)
+    guard !mailboxes.isEmpty else { return [(replyTo, nil)] }
+    return mailboxes.map { ($0.address, $0.name) }
 }
 
 /// Check whether a string looks like a valid email address (has `@` with non-empty local and domain parts)
