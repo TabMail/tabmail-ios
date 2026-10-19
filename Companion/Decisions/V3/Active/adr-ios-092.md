@@ -23,10 +23,13 @@ group), and spaces or tabs after an address (a word holding an unquoted `@`, or 
 read as commas first. People separate addresses with `;`, as Outlook does, or one per line, and a
 single-line text field turns a pasted column's line breaks into spaces (observed on iOS 26.5);
 `Ann Lee <a@example.com>` and `a@example.com (work)` stay one mailbox:
-- typing or pasting: a paste (more than one character at once) is split whole. While typing, when
-  the input line gains `,`, `;` or a line break, the text up to the last separator is split
-  (`ComposeDraftGuards.inputToSplit`, `committing`); the text after it is still being typed and
-  is left alone, so `bob, carol@example.c` never adds a half-typed address. Return, leaving the
+- typing or pasting: a paste (more than one character at once) is split whole. While typing, only a
+  keystroke that adds `,`, `;` or a line break splits, and then the text up to the last separator
+  is split (`ComposeDraftGuards.inputToSplit`, `committing`); the text after it is still being
+  typed and is left alone, so `bob, carol@example.c` never adds a half-typed address. A keystroke
+  that adds no separator splits nothing, so fixing leftover text where it is (as Send's refusal
+  asks) never commits it half-fixed: re-splitting on every keystroke turned `bob, ` +
+  `@example.com` into `bob@example.c` and pushed `om` into the next address. Return, leaving the
   field, saving and Send split the whole line;
 - a contact pick (`ComposeDraftGuards.picking`): an address TabMail cannot send to replaces the
   typed query in the input line instead of the tap doing nothing;

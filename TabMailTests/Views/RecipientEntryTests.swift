@@ -198,10 +198,10 @@ struct RecipientEntryTests {
         #expect(result.tokens == ["ann@example.com", "OLD@example.com"])
     }
 
-    @Test("While typing, only the text up to the last separator is split", arguments: [
+    @Test("A typed separator splits the text up to the last separator", arguments: [
         ("a@example.com", "a@example.com,", "a@example.com,", ""),
-        ("bob, carol@example.", "bob, carol@example.c", "bob,", " carol@example.c"),
-        ("a@example.com; ", "a@example.com; b", "a@example.com;", " b")
+        ("bob, carol@example.com", "bob, carol@example.com;", "bob, carol@example.com;", ""),
+        ("bob carol@example.c", "bob, carol@example.c", "bob,", " carol@example.c")
     ])
     func typingSplitsUpToTheLastSeparator(old: String, text: String, split: String, typing: String) throws {
         let result = try #require(ComposeDraftGuards.inputToSplit(was: old, now: text))
@@ -220,10 +220,16 @@ struct RecipientEntryTests {
         #expect(field.tokens == ["a@example.com", "b@example.com"])
     }
 
+    /// A keystroke that adds no separator splits nothing, even when the line
+    /// already holds one: re-splitting the unchanged text before it commits an
+    /// address the user is still fixing in place.
     @Test("Typing with no separator is not split")
     func typingWithoutSeparator() {
         #expect(ComposeDraftGuards.inputToSplit(was: "a@example.co", now: "a@example.com") == nil)
         #expect(ComposeDraftGuards.inputToSplit(was: "a@example.com", now: "a@example.com ") == nil)
+        #expect(ComposeDraftGuards.inputToSplit(was: "bob, carol@example.", now: "bob, carol@example.c") == nil)
+        #expect(ComposeDraftGuards.inputToSplit(was: "a@example.com; ", now: "a@example.com; b") == nil)
+        #expect(ComposeDraftGuards.inputToSplit(was: "bob@example., ", now: "bob@example.c, ") == nil)
     }
 
     @Test("A picked contact becomes a recipient under its name")
@@ -334,6 +340,81 @@ struct RecipientEntryTests {
             case "type after a space": after = Self.typing(" dave@example.com,", into: start)
             case "paste": after = Self.pasting("dave@example.com", into: start)
             default: after = Self.pressingReturn(Self.typing("dave@example.com", into: start))
+            }
+            #expect(after.tokens == start.tokens + ["dave@example.com"], "\(route): \(after.tokens)")
+            #expect(ComposeDraftGuards.trimmedInput(after.input) == leftover, "\(route): \(after.input)")
+            let sent = ComposeDraftGuards.sendRecipients(
+                to: ComposeDraftGuards.pendingCommitted(after), cc: .init(), bcc: .init())
+            guard case .refused(let message) = sent else {
+                Issue.record("\(route): Send was not refused: \(sent)")
+                continue
+            }
+            #expect(message.contains(leftover), "\(route): \(message)")
+        }
+    }
+
+    // MARK: - Leftover text fixed in place
+
+    /// The keystrokes of an edit made in place: each character goes in at the
+    /// caret, and when a commit rewrites the line the caret moves to its end, as
+    /// a text field's does when its text is replaced. Returns every token list
+    /// the field held along the way, so a test can check none was unfinished.
+    private static func typing(
+        _ text: String, at offset: Int, into start: ComposeDraftGuards.RecipientField
+    ) -> (field: ComposeDraftGuards.RecipientField, seen: [[String]]) {
+        var field = start
+        var caret = offset
+        var seen: [[String]] = []
+        for character in text {
+            let old = field.input
+            var line = Array(old)
+            line.insert(character, at: caret)
+            field.input = String(line)
+            caret += 1
+            if let split = ComposeDraftGuards.inputToSplit(was: old, now: field.input),
+               let next = ComposeDraftGuards.committing(split.text, typing: split.typing, to: field, room: 10) {
+                field = next
+                caret = field.input.count
+            }
+            seen.append(field.tokens)
+        }
+        return (field, seen)
+    }
+
+    /// The bug this guards: Send asks the user to fix leftover text, and fixing
+    /// it where it is re-split the line on every keystroke, so `bob@example.c`
+    /// became a recipient before `om` was typed and `om` landed in the next
+    /// address. With `bob, carol@example.com` the message went to
+    /// `bob@example.c` and `carol@example.comom`.
+    @Test("Leftover text fixed in place adds only the finished address", arguments: [
+        ("bob@example,", ".com", ["bob@example.com"]),
+        ("bob, ann@example.com,", "@example.com", ["ann@example.com", "bob@example.com"]),
+        ("bob, carol@example.com", "@example.com", ["bob@example.com", "carol@example.com"])
+    ])
+    func leftoverFixedInPlace(typed: String, fix: String, sent: [String]) {
+        let start = Self.typing(typed, into: .init())
+        let wordEnd = start.input.firstIndex(where: { ComposeDraftGuards.isSeparator($0) || $0 == " " })
+            .map { start.input.distance(from: start.input.startIndex, to: $0) } ?? start.input.count
+        let (fixed, seen) = Self.typing(fix, at: wordEnd, into: start)
+        for tokens in seen {
+            #expect(tokens == start.tokens, "a recipient was added mid-edit: \(tokens)")
+        }
+        let outcome = ComposeDraftGuards.sendRecipients(
+            to: ComposeDraftGuards.pendingCommitted(fixed), cc: .init(), bcc: .init())
+        #expect(outcome == .send(to: sent, cc: [], bcc: []), "\(fixed.tokens) \(fixed.input)")
+    }
+
+    /// Every leftover route: an address typed in place before the leftover text
+    /// is never added half-typed, and becomes its own recipient once a
+    /// separator follows it, with the leftover text kept for Send to name.
+    @Test("An address typed in place before leftover text is added only when finished")
+    func addressTypedBeforeLeftoverText() {
+        for (route, start) in Self.leftoverRoutes {
+            let leftover = ComposeDraftGuards.trimmedInput(start.input)
+            let (after, seen) = Self.typing("dave@example.com, ", at: 0, into: start)
+            for tokens in seen {
+                #expect(tokens == start.tokens || tokens == start.tokens + ["dave@example.com"],
+                        "\(route): a recipient was added mid-edit: \(tokens)")
             }
             #expect(after.tokens == start.tokens + ["dave@example.com"], "\(route): \(after.tokens)")
             #expect(ComposeDraftGuards.trimmedInput(after.input) == leftover, "\(route): \(after.input)")

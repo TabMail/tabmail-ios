@@ -361,12 +361,15 @@ enum ComposeDraftGuards {
     /// than one character inserted at once) is split whole, whatever separates its
     /// addresses: the field has already turned a pasted column's line breaks into
     /// spaces, which `RecipientEntry` reads as separators after an address. While
-    /// typing, the text up to the last `,`, `;` or line break is split and the text
-    /// after it is still being typed, so `bob, carol@example.c` never adds a
-    /// half-typed address. Nil when typing has added no such separator.
+    /// typing, only a keystroke that adds a `,`, `;` or line break splits: the text
+    /// up to the last one is split and the text after it is still being typed, so
+    /// `bob, carol@example.c` never adds a half-typed address. Nil when typing has
+    /// added no such separator, so fixing leftover text where it is never commits
+    /// it half-fixed.
     static func inputToSplit(was old: String, now text: String) -> (text: String, typing: String)? {
         if text.count - old.count > 1 { return (text, "") }
-        guard let last = text.lastIndex(where: isSeparator) else { return nil }
+        guard text.filter(isSeparator).count > old.filter(isSeparator).count,
+              let last = text.lastIndex(where: isSeparator) else { return nil }
         return (String(text[...last]), String(text[text.index(after: last)...]))
     }
 

@@ -275,6 +275,13 @@ serializer that writes recipients:
   Invariant tests drive every leftover route then type/paste/Return. Also pinned:
   `sendableRecipients` refuses an entry naming no mailbox as FATAL (without it an IMAP send with
   no recipient is `.sendFailed`, transient, retried forever). Root MIS-015 recurrence 6.
+- **ADR-IOS-092 Tier 1 r11 fix (2026-10-19)**: `inputToSplit` re-split the line up to its last
+  separator on EVERY keystroke, so fixing leftover text in place (what Send's refusal asks)
+  committed it half-fixed: `bob, carol@example.com` + `@example.com` after `bob` sent to
+  `bob@example.c` and `carol@example.comom`. Now only a keystroke that adds a separator splits.
+  Tests type in place at a caret (caret jumps to the end when a commit rewrites the line, as a
+  text field does) on every leftover route; two parameter cases that pinned the re-split were
+  replaced. Every r10 follow-up appended at the END of the line, which is why it missed this.
 - **Pin state**: app `project.yml` pins `a09a3e3d` (topic branch, not fork main; was `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
