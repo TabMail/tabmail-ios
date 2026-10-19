@@ -365,6 +365,36 @@ enum ComposeDraftGuards {
         return result
     }
 
+    /// A field after an AI recipient edit: removes first (or a clear of the
+    /// whole field), then each add split like typed text (ADR-IOS-092). Its
+    /// addresses become recipients, under the AI's name when the add names one
+    /// address, and text that names none goes to the input line, after any text
+    /// already there.
+    static func applying(_ delta: RecipientDelta, to field: RecipientField) -> RecipientField {
+        var value = field
+        if delta.clearsField {
+            value.tokens = []
+        } else if !delta.removes.isEmpty {
+            let removeSet = Set(delta.removes.map { $0.lowercased() })
+            value.tokens = value.tokens.filter { !removeSet.contains($0.lowercased()) }
+        }
+        var seen = Set(value.tokens.map { $0.lowercased() })
+        var leftovers = value.input.isEmpty ? [] : [value.input]
+        for add in delta.adds where !add.email.isEmpty && add.email != "*" {
+            let entry = RecipientEntry(add.email)
+            for recipient in entry.recipients where seen.insert(recipient.address.lowercased()).inserted {
+                value.tokens.append(recipient.address)
+            }
+            for recipient in entry.recipients {
+                let name = entry.recipients.count == 1 && !add.name.isEmpty ? add.name : recipient.name
+                if let name, !name.isEmpty { value.displayNames[recipient.address] = name }
+            }
+            if !entry.unparsed.isEmpty { leftovers.append(entry.unparsed) }
+        }
+        value.input = leftovers.joined(separator: ", ")
+        return value
+    }
+
     enum SendRecipients: Equatable {
         case send(to: [String], cc: [String], bcc: [String])
         /// Why Send is refused: an input line still holds text that names no
@@ -374,8 +404,8 @@ enum ComposeDraftGuards {
 
     /// What Send sends, given fields whose input lines are already committed
     /// (`pendingCommitted`): each field's addresses, or a refusal naming the first
-    /// field whose input line still holds text, or, past the recipient cap
-    /// (inclusive of the cap itself; reply-all prefill can exceed it), the cap.
+    /// field whose input line still holds text, or, when the fields hold more
+    /// than the recipient cap (reply-all prefill can exceed it), the cap.
     static func sendRecipients(to: RecipientField, cc: RecipientField, bcc: RecipientField) -> SendRecipients {
         for (label, field) in [("To", to), ("Cc", cc), ("Bcc", bcc)] {
             let text = field.input.trimmingCharacters(in: .whitespaces)
@@ -511,8 +541,8 @@ enum ComposeDraftGuards {
     /// the channel. The mirror image of R14-F3's own bug is a warning after every
     /// successful agent turn.
     enum AutoSaveExit: String, CaseIterable, Sendable {
-        /// The entry guard — no `composeContext`, no `ComposeGenerationCursor`, or
-        /// `composeMutationAllowed == false`.
+        /// The entry guard — no `composeContext`, no `ComposeGenerationCursor`, no
+        /// `composeRecipients`, or `composeMutationAllowed == false`.
         case composeUnavailable
         /// `DraftStore.load` THREW reading the predecessor row.
         case predecessorReadFailed
@@ -1542,6 +1572,11 @@ struct ComposeView: View {
                         composeGenerationCursor: admissionCursor,
                         composeAgentSendFence: agentSendFence,
                         composeAttachments: $attachments,
+                        composeRecipients: {
+                            (ComposeDraftGuards.committedRecipients(tokens: toTokens, input: toInput),
+                             ComposeDraftGuards.committedRecipients(tokens: ccTokens, input: ccInput),
+                             ComposeDraftGuards.committedRecipients(tokens: bccTokens, input: bccInput))
+                        },
                         composeAttachmentCarryGate: attachmentCarryGate,
                         composeMutationAllowed: draftReadState != .error,
                         // Bubble showing → suggestion stays out of agent auto-save;
@@ -2162,6 +2197,11 @@ struct ComposeView: View {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: fade-out begin instance=\(instanceToken) draftId=\(draftId)")
         }
+        // Recipients are not part of the text fade. They change now, so the
+        // agent's autosave, which runs right after this call, stores them.
+        applyRecipientDelta(field: .to, delta: toDelta)
+        applyRecipientDelta(field: .cc, delta: ccDelta)
+        applyRecipientDelta(field: .bcc, delta: bccDelta)
         Task { @MainActor in
             // Wait for fade-out to finish
             try? await Task.sleep(for: .milliseconds(280))
@@ -2185,9 +2225,6 @@ struct ComposeView: View {
                     messageBody = b
                 }
             }
-            applyRecipientDelta(field: .to, delta: toDelta)
-            applyRecipientDelta(field: .cc, delta: ccDelta)
-            applyRecipientDelta(field: .bcc, delta: bccDelta)
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: mutation applied instance=\(instanceToken) draftId=\(draftId)")
             }
@@ -2225,31 +2262,7 @@ struct ComposeView: View {
     /// (case-insensitive). Display names from adds are merged into the lookup map.
     private func applyRecipientDelta(field: RecipientEditField, delta: RecipientDelta?) {
         guard let delta, !delta.isEmpty else { return }
-
-        var value = recipientField(field)
-        if delta.clearsField {
-            value.tokens = []
-        } else if !delta.removes.isEmpty {
-            let removeSet = Set(delta.removes.map { $0.lowercased() })
-            value.tokens = value.tokens.filter { !removeSet.contains($0.lowercased()) }
-        }
-        // Each add is split like typed text (ADR-IOS-092): its addresses become
-        // recipients, and text that names none goes to the input line.
-        var seen = Set(value.tokens.map { $0.lowercased() })
-        var leftovers = value.input.isEmpty ? [] : [value.input]
-        for add in delta.adds where !add.email.isEmpty && add.email != "*" {
-            let entry = RecipientEntry(add.email)
-            for recipient in entry.recipients where seen.insert(recipient.address.lowercased()).inserted {
-                value.tokens.append(recipient.address)
-            }
-            for recipient in entry.recipients {
-                let name = entry.recipients.count == 1 && !add.name.isEmpty ? add.name : recipient.name
-                if let name, !name.isEmpty { value.displayNames[recipient.address] = name }
-            }
-            if !entry.unparsed.isEmpty { leftovers.append(entry.unparsed) }
-        }
-        value.input = leftovers.joined(separator: ", ")
-        setRecipientField(value, field)
+        setRecipientField(ComposeDraftGuards.applying(delta, to: recipientField(field)), field)
     }
 
     // MARK: - From picker
@@ -3868,8 +3881,8 @@ private struct TokenField: View {
     let commit: (_ text: String, _ typing: String) -> Void
     /// Closure that returns whether the combined To+Cc+Bcc recipient count is
     /// under the hard cap (outboxMaxRecipients). When false, TextField is
-    /// disabled and commitInput is a no-op — user must delete a chip to add
-    /// another. Passed in from ComposeView so it sees the combined count
+    /// disabled — user must delete a chip to add another. The cap on what a
+    /// commit adds is `ComposeDraftGuards.committing`'s room. Passed in from ComposeView so it sees the combined count
     /// across all three fields, not just this TokenField's tokens.
     let canAddMore: () -> Bool
     /// Shared across To/Cc/Bcc so only one chip reveals its full address at a

@@ -32,7 +32,7 @@ single-line text field turns a pasted column's line breaks into spaces (observed
   typed query in the input line instead of the tap doing nothing;
 - prefill (mailto, AI), a reopened draft, reply seeding (`RecipientEntry.reply(to:)`: every
   Reply-To mailbox, or the sender under the sender's name) and AI recipient edits
-  (`applyRecipientDelta`);
+  (`ComposeDraftGuards.applying`, applied at once, not after the text fade);
 - reply-all (`buildReplyAllRecipients`) uses the same reply target, and passes its text that names
   no sendable address on to the To input line, as Reply does. Entries of the original To and Cc
   that are not sendable mailboxes are still never offered (owner decision 2026-10-03).
@@ -75,3 +75,7 @@ mailbox is refused as before.
   replies and reply-all, contact picks, the input line, the cap, the draft round trip and Send;
   `ComposeThrottleTests` pins Send's cap through `sendRecipients`; `BccRecipientsTests` pins a
   queued list recipient.
+- The agent's autosave (`DynamicIslandChat.autoSaveDraft`) is a draft writer too: both its first
+  save and its updates store the To, Cc and Bcc the compose shows when it writes
+  (`composeRecipients`, the same `committedRecipients` lists Save uses), never the To-only context
+  the agent's turn began with. Pinned by `AgentAutoSaveRecipientsTests`.

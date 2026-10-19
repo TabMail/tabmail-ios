@@ -259,6 +259,14 @@ serializer that writes recipients:
   is a comma list (legacy outbox rows from before the change; text that is not a mailbox still throws);
   `extractEmailAddress` deleted; Send's text refusal and cap live in
   `ComposeDraftGuards.sendRecipients`.
+- **ADR-IOS-092 Tier 1 r9 fix (2026-10-18)**: the agent's autosave was the last draft writer
+  dropping Bcc: its first save wrote `ccJSON`/`bccJSON` as `"[]"` and its updates kept stale
+  recipients, so the pushed server draft lost Cc/Bcc (permanently if the app died before Save).
+  It now reads the compose's live lists through the `composeRecipients` closure at write time.
+  AI recipient deltas are applied synchronously in `applyInlineEdit` (were inside the 280 ms fade
+  Task, after which the autosave could already have read). Transform extracted as
+  `ComposeDraftGuards.applying(_:to:)` and tested. Census tell: `rg 'bccJSON'` over `TabMail/`
+  lists every Draft-row writer.
 - **Pin state**: app `project.yml` pins `a09a3e3d` (topic branch, not fork main; was `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync

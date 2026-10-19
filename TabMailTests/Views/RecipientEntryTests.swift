@@ -95,7 +95,9 @@ struct RecipientEntryTests {
     }
 
     /// The property the whole change exists for: every recipient a field holds
-    /// is one address every send path accepts, so no send can refuse it.
+    /// is one address TabMail's send path reads as one mailbox. (SwiftMail's
+    /// SMTP check is stricter for some valid addresses, such as a non-ASCII
+    /// domain; those fail visibly at send, as `IMAPProvider.buildEmail` notes.)
     @Test("Every recipient a field holds is accepted by the send path", arguments: [
         "a@example.com, b@example.com",
         "\"Doe, Bob\" <bob@example.com>; Ann <ann@example.com>",
@@ -325,5 +327,48 @@ struct RecipientEntryTests {
         }
         #expect(message.contains("in \(label) "))
         #expect(message.contains(input.components(separatedBy: ",")[0]))
+    }
+
+    // MARK: - AI recipient edits
+
+    private static func delta(adds: [(String, String)] = [], removes: [String] = []) -> RecipientDelta {
+        RecipientDelta(adds: adds.map { ParsedRecipient(name: $0.0, email: $0.1) }, removes: removes)
+    }
+
+    @Test("An AI add naming several addresses adds one recipient each", arguments: [
+        "a@example.com, b@example.com", "a@example.com; b@example.com", "a@example.com b@example.com"
+    ])
+    func aiAddSplits(add: String) {
+        let field = ComposeDraftGuards.applying(Self.delta(adds: [("", add)]), to: .init())
+        #expect(field.tokens == ["a@example.com", "b@example.com"])
+        #expect(field.input.isEmpty)
+    }
+
+    @Test("An AI add that names no address goes to the input line, after the text already there")
+    func aiAddWithoutAddressIsInputText() {
+        let start = ComposeDraftGuards.RecipientField(tokens: ["x@example.com"], input: "typed")
+        let field = ComposeDraftGuards.applying(Self.delta(adds: [("", "Jane"), ("", "b@example.com")]), to: start)
+        #expect(field.tokens == ["x@example.com", "b@example.com"])
+        #expect(field.input == "typed, Jane")
+    }
+
+    @Test("AI removes ignore case, a clear empties the field, and an add already listed is not repeated")
+    func aiRemovesClearsAndDedupes() {
+        let start = ComposeDraftGuards.RecipientField(tokens: ["a@example.com", "B@example.com"])
+        let removed = ComposeDraftGuards.applying(
+            Self.delta(adds: [("", "A@EXAMPLE.COM"), ("", "c@example.com")], removes: ["b@example.com"]), to: start)
+        #expect(removed.tokens == ["a@example.com", "c@example.com"])
+        let cleared = ComposeDraftGuards.applying(Self.delta(adds: [("", "c@example.com")], removes: ["*"]), to: start)
+        #expect(cleared.tokens == ["c@example.com"])
+    }
+
+    @Test("An AI add naming one address takes the AI's name; one naming several keeps each address's own name")
+    func aiAddNames() {
+        let one = ComposeDraftGuards.applying(Self.delta(adds: [("Ann Lee", "ann@example.com")]), to: .init())
+        #expect(one.displayNames == ["ann@example.com": "Ann Lee"])
+        let several = ComposeDraftGuards.applying(
+            Self.delta(adds: [("Team", "Bob <bob@example.com>, carol@example.com")]), to: .init())
+        #expect(several.tokens == ["bob@example.com", "carol@example.com"])
+        #expect(several.displayNames == ["bob@example.com": "Bob"])
     }
 }
