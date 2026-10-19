@@ -76,23 +76,27 @@ struct AgentAutoSaveRecipientsTests {
             let headerId = PendingOperation.draftPlaceholderHeaderPK(
                 accountId: accountId, draftsFolderPath: "Drafts", draftId: draftKey, instanceEpoch: epoch)
             let header = try await pool.read { db in try MessageHeader.fetchOne(db, key: headerId) }
+            #expect(header?.to == to.joined(separator: ", "))
             #expect(header?.cc == cc.joined(separator: ", "))
             #expect(header?.bcc == bcc.joined(separator: ", "))
         }
 
-        // Cc and Bcc added after the turn began, as the user or the agent's edit does.
-        fields.to = ["to@example.com"]
+        // Recipients changed after the turn began, as the user or the agent's edit does.
+        fields.to = ["to@example.com", "added@example.com"]
         fields.cc = ["cc@example.com"]
         fields.bcc = ["bcc@example.com"]
         #expect(await chat.autoSaveDraft(draftKey: draftKey, subject: "Subject", body: "First body") == nil)
-        try await expectSaved(to: ["to@example.com"], cc: ["cc@example.com"], bcc: ["bcc@example.com"], body: "First body")
+        try await expectSaved(
+            to: ["to@example.com", "added@example.com"], cc: ["cc@example.com"], bcc: ["bcc@example.com"],
+            body: "First body")
 
         // A later save rewrites them, uncommitted input text included.
+        fields.to = ["added@example.com"]
         fields.cc = []
         fields.bcc = ["bcc@example.com", "other@example.com", "still typing"]
         #expect(await chat.autoSaveDraft(draftKey: draftKey, subject: "Subject", body: "Second body") == nil)
         try await expectSaved(
-            to: ["to@example.com"], cc: [], bcc: ["bcc@example.com", "other@example.com", "still typing"],
+            to: ["added@example.com"], cc: [], bcc: ["bcc@example.com", "other@example.com", "still typing"],
             body: "Second body")
     }
 }
