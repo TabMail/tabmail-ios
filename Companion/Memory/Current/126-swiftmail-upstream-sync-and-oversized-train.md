@@ -291,7 +291,14 @@ serializer that writes recipients:
   it now uses the inserted text (common start/end set aside). (4) The nine per-field `@State`
   vars became one `ComposeDraftGuards.Recipients` value, so the role mapping (Bcc stays Bcc) is
   tested instead of living in view code no test runs.
-- **Pin state**: app `project.yml` pins `a09a3e3d` (topic branch, not fork main; was `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
+- **Tier 1 r13 fixes (2026-10-19)**: `removingBccFields` kept every header line it could not
+  classify, so `sendDraft` delivered a Bcc field written as `Bcc` CRLF ` : x` (unfolds to `Bcc :`,
+  RFC 5322 2.2.3/4.5), a header starting with a continuation, or a name holding a control byte
+  (`Bcc<VT>:`). Fixed in `0919b08f`: those lines are refused like a lone CR (draft left in place);
+  a field name must be non-empty printable ASCII, the `checkHeaderFields` rule. A lone no-colon
+  line is still kept. Also pinned: `constructContent()` with no arguments writes no Bcc, and the
+  contact-pick fallback keeps leftover text when the pick adds no recipient.
+- **Pin state**: app `project.yml` pins `0919b08f` (topic branch, not fork main; was `a09a3e3d`, `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
   with `tabmail-swiftmailfork-sync` and re-pin to the mirror.

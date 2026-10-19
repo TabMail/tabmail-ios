@@ -491,6 +491,29 @@ struct RecipientEntryTests {
         #expect(ComposeDraftGuards.trimmedInput(result.input) == "bob")
     }
 
+    /// When a pick adds no recipient (a contact TabMail cannot send to, or a
+    /// field at the recipient cap), the picked text joins the input line and the
+    /// leftover text before it stays there too, so neither is lost or sent.
+    @Test("A pick that adds no recipient keeps the leftover text before it", arguments: [
+        ("bob@localhost", 10),
+        ("ann@example.com", 0)
+    ])
+    func pickingAddsNothingKeepsLeftover(address: String, room: Int) {
+        var field = Self.field
+        field.input = "carol, bo"
+        let result = ComposeDraftGuards.picking(address, name: "Pick", to: field, room: room)
+        let picked = RecipientEntry.text(name: "Pick", address: address)
+        #expect(result.tokens == Self.field.tokens)
+        #expect(ComposeDraftGuards.trimmedInput(result.input) == "carol, \(picked)")
+        #expect(ComposeDraftGuards.committedRecipients(tokens: result.tokens, input: result.input)
+            == Self.field.tokens + ["carol, \(picked)"])
+        guard case .refused(let message) = ComposeDraftGuards.sendRecipients(to: result, cc: .init(), bcc: .init()) else {
+            Issue.record("Send was not refused")
+            return
+        }
+        #expect(message.contains("carol"))
+    }
+
     @Test("Text still being typed stays after the leftover text")
     func committingKeepsTypedText() throws {
         let result = try #require(ComposeDraftGuards.committing(
