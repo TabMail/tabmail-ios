@@ -1139,8 +1139,8 @@ struct ComposeView: View {
 
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
-    private enum ComposeField {
-        case to, cc, bcc, body
+    private enum ComposeField: Equatable {
+        case recipient(ComposeDraftGuards.RecipientRole), body
     }
 
     private var resolvedAccount: Account? {
@@ -1193,6 +1193,27 @@ struct ComposeView: View {
         guard new != old else { return }
         recipients = new
         if (new.cc != old.cc && !new.cc.isEmpty) || (new.bcc != old.bcc && !new.bcc.isEmpty) { showCc = true }
+    }
+
+    /// One recipient field. Every binding and action takes `role`, so typing,
+    /// a contact pick and what the field shows all reach that role's
+    /// recipients and no other (ADR-IOS-092).
+    private func recipientTokenField(_ role: ComposeDraftGuards.RecipientRole) -> some View {
+        TokenField(
+            tokens: Binding(get: { recipients[role].tokens }, set: { recipients[role].tokens = $0 }),
+            input: Binding(get: { recipients[role].input }, set: { recipients[role].input = $0 }),
+            displayNames: recipients[role].displayNames,
+            searchResults: activeField == .recipient(role)
+                ? contactSearch.search(ComposeDraftGuards.typedEntry(recipients[role].input)) : [],
+            onFocus: { activeField = .recipient(role) },
+            onSelectContact: { contact in
+                setRecipients(recipients.picking(contact.email, name: contact.name, to: role))
+            },
+            commit: { text, typing in setRecipients(recipients.committing(text, typing: typing, to: role)) },
+            canAddMore: { canAddRecipient },
+            revealedChipKey: $revealedChipKey,
+            fieldKey: "\(role)"
+        )
     }
 
     /// Shown next to the Cc/Bcc button: "N/50" when ≥ 45, orange at cap.
@@ -1258,20 +1279,7 @@ struct ComposeView: View {
                                 Text("To:")
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
-                                TokenField(
-                                    tokens: $recipients.to.tokens,
-                                    input: $recipients.to.input,
-                                    displayNames: recipients.to.displayNames,
-                                    searchResults: activeField == .to ? contactSearch.search(ComposeDraftGuards.typedEntry(recipients.to.input)) : [],
-                                    onFocus: { activeField = .to },
-                                    onSelectContact: { contact in
-                                        setRecipients(recipients.picking(contact.email, name: contact.name, to: .to))
-                                    },
-                                    commit: { text, typing in setRecipients(recipients.committing(text, typing: typing, to: .to)) },
-                                    canAddMore: { canAddRecipient },
-                                    revealedChipKey: $revealedChipKey,
-                                    fieldKey: "to"
-                                )
+                                recipientTokenField(.to)
                                 recipientCounter
                                 Button {
                                     withAnimation { showCc.toggle() }
@@ -1291,20 +1299,7 @@ struct ComposeView: View {
                                     Text("Cc:")
                                         .font(.subheadline)
                                         .foregroundStyle(.secondary)
-                                    TokenField(
-                                        tokens: $recipients.cc.tokens,
-                                        input: $recipients.cc.input,
-                                        displayNames: recipients.cc.displayNames,
-                                        searchResults: activeField == .cc ? contactSearch.search(ComposeDraftGuards.typedEntry(recipients.cc.input)) : [],
-                                        onFocus: { activeField = .cc },
-                                        onSelectContact: { contact in
-                                            setRecipients(recipients.picking(contact.email, name: contact.name, to: .cc))
-                                        },
-                                        commit: { text, typing in setRecipients(recipients.committing(text, typing: typing, to: .cc)) },
-                                        canAddMore: { canAddRecipient },
-                                        revealedChipKey: $revealedChipKey,
-                                        fieldKey: "cc"
-                                    )
+                                    recipientTokenField(.cc)
                                 }
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 6)
@@ -1315,20 +1310,7 @@ struct ComposeView: View {
                                     Text("Bcc:")
                                         .font(.subheadline)
                                         .foregroundStyle(.secondary)
-                                    TokenField(
-                                        tokens: $recipients.bcc.tokens,
-                                        input: $recipients.bcc.input,
-                                        displayNames: recipients.bcc.displayNames,
-                                        searchResults: activeField == .bcc ? contactSearch.search(ComposeDraftGuards.typedEntry(recipients.bcc.input)) : [],
-                                        onFocus: { activeField = .bcc },
-                                        onSelectContact: { contact in
-                                            setRecipients(recipients.picking(contact.email, name: contact.name, to: .bcc))
-                                        },
-                                        commit: { text, typing in setRecipients(recipients.committing(text, typing: typing, to: .bcc)) },
-                                        canAddMore: { canAddRecipient },
-                                        revealedChipKey: $revealedChipKey,
-                                        fieldKey: "bcc"
-                                    )
+                                    recipientTokenField(.bcc)
                                 }
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 6)

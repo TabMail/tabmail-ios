@@ -1549,12 +1549,13 @@ actor ExchangeProvider: EmailProvider {
 
         // Threading headers (RFC 2822 requires angle brackets around message IDs)
         var customHeaders: [[String: String]] = []
-        if let inReplyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
-            customHeaders.append(["name": "In-Reply-To", "value": inReplyTo])
+        if let inReplyTo = draft.inReplyTo, !inReplyTo.isEmpty {
+            let bracketed = inReplyTo.hasPrefix("<") ? inReplyTo : "<\(inReplyTo)>"
+            customHeaders.append(["name": "In-Reply-To", "value": bracketed])
         }
-        let references = IMAPProvider.threadingMessageIDs(draft.references)
-        if !references.isEmpty {
-            customHeaders.append(["name": "References", "value": references.joined(separator: " ")])
+        if !draft.references.isEmpty {
+            let bracketed = draft.references.map { $0.hasPrefix("<") ? $0 : "<\($0)>" }.joined(separator: " ")
+            customHeaders.append(["name": "References", "value": bracketed])
         }
         if !customHeaders.isEmpty {
             message["internetMessageHeaders"] = customHeaders

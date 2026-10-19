@@ -304,7 +304,33 @@ serializer that writes recipients:
   `d2112168`: every header line, the blank line included, must end in CRLF; a bare LF is refused like
   a lone CR. That closes the line-boundary class (fourth correction to this stripper: lone CR,
   Resent-Bcc, unclassifiable lines, bare LF). All-LF drafts are now refused by `sendDraft`.
-- **Pin state**: app `project.yml` pins `d2112168` (topic branch, not fork main; was `0919b08f`, `a09a3e3d`, `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
+- **Tier 1 r15 fixes (2026-10-19)**: (1) the IMAP APPEND path (`append(email:)`, `createDraft`)
+  wrote header fields unchecked while `sendEmail` refused the same `Email`, so a value with a
+  non-fold line break (`Email(message:)` keeps a lone CR) stored a real Bcc/Reply-To field that a
+  later `sendDraft` delivered to. Fixed in `8c72afef`: `append(email:)` uses `keptCopyContent`, which
+  runs `checkHeaderFields` on every field except the library's own Bcc (`namesBccRecipients`) and
+  throws `IMAPError.invalidArgument`. Both writers of the shared builder are now checked. (2) The
+  ComposeView sites that choose a role were untested (8 Bcc-into-Cc mutants survived): the three
+  TokenField blocks became one `recipientTokenField(role)`, and `ComposeRecipientWiringTests` fences
+  every remaining site (reopen, prefill, AI edit, Send, Save, agent autosave) against ComposeView's
+  source. Red-first: all 9 role-swap mutants (field, pick, commit, Send, reopen, prefill swap, Save,
+  AI swap, agent autosave) fail it.
+- **Scope narrowed (owner, 2026-10-19, at the 10-round cap)**: rounds 7 to 9 all landed in SwiftMail's
+  `sendDraft` Bcc removal and header checks, which TabMail never calls. Owner: narrow to what the Bcc,
+  recipient-list and draft (#217) fixes need; park the rest as issues and a follow-up PR. TabMail uses
+  only `constructContent(includeBccHeader:)` and `append(email:)` (Drafts and Sent). New narrow fork
+  branch `fix/bcc-header-in-sent-copies` (`c7cd6aa1`, on `07163dc`); upstream twin
+  `fix/bcc-in-sent-copies` (`632e4eb9`, on `017693c`): `includeBccHeader`, `append(email:)` writes
+  Bcc, `createDraft` keeps writing none (upstream `sendDraft` sends stored bytes to everyone), APPEND
+  recording in `IMAPTestServer`, `BccHeaderTests` (4 mutants red). Everything else on
+  `fix/bcc-header-in-stored-copies` / `fix/bcc-in-stored-copies` (sendDraft strip, `checkHeaderFields`,
+  `keptCopyContent`, `SMTPCaptureServer`) is follow-up PR B: tabmail-ios #220. App-side, the
+  `threadingMessageIDs` filter (`f57b3506`) existed only because the SwiftMail check would wedge a
+  reply, so it was reverted with `ThreadingMessageIDLineBreakTests` and the outbox comment: #221.
+  Other parked notes: Outlook legacy comma-list rows #222, MailtoParser naive split #223, Sent copy
+  on servers that file their own copy (unverified hypothesis, owner doubts it) #224. The r13 to r15
+  SwiftMail entries above describe PR B, not the pinned code.
+- **Pin state**: app `project.yml` pins `c7cd6aa1` (narrow topic branch, not fork main; was `8c72afef`, `d2112168`, `0919b08f`, `a09a3e3d`, `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
   with `tabmail-swiftmailfork-sync` and re-pin to the mirror.

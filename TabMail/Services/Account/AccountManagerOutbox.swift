@@ -793,10 +793,7 @@ extension AccountManager {
         if let smtpError = error as? SMTPError {
             switch smtpError {
             case .connectionFailed, .tlsFailed, .sendFailed:
-                // Connection issues, TLS negotiation, send failures are transient.
-                // SwiftMail's refusal of a header field it would write (a Bcc name, an
-                // invalid name, a line break) is also .sendFailed but never clears:
-                // filter any new header text first, as threadingMessageIDs does.
+                // Connection issues, TLS negotiation, send failures are transient
                 return true
             case .authenticationFailed, .invalidEmailAddress, .commandFailed, .messageTooLarge, .invalidResponse, .unexpectedResponse:
                 // Auth failures, bad addresses, server rejections are permanent
