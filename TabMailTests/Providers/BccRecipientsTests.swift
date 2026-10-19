@@ -248,6 +248,21 @@ struct BccRecipientsTests {
         #expect(http.recordedCalls().isEmpty)
     }
 
+    /// A send queued by an earlier version can hold an entry that names no
+    /// mailbox. It must be refused as a fatal error: expanded to nothing, an
+    /// IMAP send with no recipient fails in a way the outbox retries forever.
+    @Test("A queued recipient that names no mailbox is refused as a fatal error",
+          arguments: ["undisclosed-recipients:;", "  "])
+    func queuedRecipientNamingNobodyIsFatal(recipient: String) {
+        do {
+            let mailboxes = try IMAPProvider.sendableRecipients([recipient])
+            Issue.record("accepted as \(mailboxes)")
+        } catch {
+            #expect(AccountManager.isFatalSendError(error), "\(error)")
+            #expect(!AccountManager.isTransientSendError(error), "\(error)")
+        }
+    }
+
     /// A send queued before recipient fields became lists (ADR-IOS-092) can hold
     /// a typed list in one recipient. It still goes to every mailbox the list
     /// names, each in the field it was typed in, on Gmail and on IMAP.

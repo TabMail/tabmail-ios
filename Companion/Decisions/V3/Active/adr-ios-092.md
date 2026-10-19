@@ -42,7 +42,10 @@ address already in the field is not repeated (case-insensitive); typing it again
 end. Addresses past `SyncConfig.outboxMaxRecipients` stay in the input line.
 
 Text that names no sendable address never becomes a recipient. It stays in the field's input line,
-visible; a named mailbox kept this way is written with its name quoted
+visible, followed by `, ` (`ComposeDraftGuards.inputLine`), so the next address typed or pasted
+starts a new entry and is never joined to it (`bob` + `dave@example.com` must never become
+`bobdave@example.com`). Contact suggestions match only the entry being typed (`typedEntry`), and a
+picked contact replaces only that entry; a named mailbox kept this way is written with its name quoted
 (`IMAPFetchMapping.mailboxText`), so reading the line again never turns part of a display name into
 a recipient. Send is refused with `"<text>" in <field> is not an email address. Fix or remove it
 before sending.` (`ComposeDraftGuards.sendRecipients`, which also holds Send's recipient cap). Saving a draft still stores

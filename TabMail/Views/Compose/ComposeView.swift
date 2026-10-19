@@ -276,8 +276,33 @@ enum ComposeDraftGuards {
     /// returns to the input line, never to a recipient (ADR-IOS-092). Empty /
     /// whitespace-only input adds nothing.
     static func committedRecipients(tokens: [String], input: String) -> [String] {
-        let trimmed = input.trimmingCharacters(in: .whitespaces)
+        let trimmed = trimmedInput(input)
         return trimmed.isEmpty ? tokens : tokens + [trimmed]
+    }
+
+    /// Whether a character ends one entry of an input line.
+    static func isSeparator(_ character: Character) -> Bool {
+        character == "," || character == ";" || character.isNewline
+    }
+
+    /// Leftover text as the input line holds it: the pieces, each ended by
+    /// ", ", then the text still being typed. The separator keeps the next
+    /// address typed or pasted a separate entry, so it is never joined to the
+    /// leftover text into one address (ADR-IOS-092).
+    static func inputLine(_ leftovers: [String], typing: String = "") -> String {
+        (leftovers.isEmpty ? "" : leftovers.joined(separator: ", ") + ", ") + typing
+    }
+
+    /// An input line without the whitespace and separators around its text.
+    static func trimmedInput(_ input: String) -> String {
+        input.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",;")))
+    }
+
+    /// The entry being typed: the text after the input line's last separator,
+    /// which is what contact suggestions match.
+    static func typedEntry(_ input: String) -> String {
+        guard let last = input.lastIndex(where: isSeparator) else { return input }
+        return String(input[input.index(after: last)...]).trimmingCharacters(in: .whitespaces)
     }
 
     /// One recipient field: its addresses, their display names, and the text in
@@ -291,7 +316,8 @@ enum ComposeDraftGuards {
     /// A field filled from outside the input line (a reopened draft, a prefill, a
     /// reply): the addresses the texts name, and the rest as input text (ADR-IOS-092).
     static func fieldState(_ entry: RecipientEntry) -> RecipientField {
-        var field = RecipientField(tokens: entry.addresses, input: entry.unparsed)
+        var field = RecipientField(
+            tokens: entry.addresses, input: inputLine(entry.unparsed.isEmpty ? [] : [entry.unparsed]))
         for recipient in entry.recipients {
             if let name = recipient.name, !name.isEmpty { field.displayNames[recipient.address] = name }
         }
@@ -327,9 +353,7 @@ enum ComposeDraftGuards {
             added = true
         }
         guard added else { return nil }
-        let typing = typing.drop { $0.isWhitespace }
-        if !typing.isEmpty { kept.append(String(typing)) }
-        result.input = kept.joined(separator: ", ")
+        result.input = inputLine(kept, typing: String(typing.drop { $0.isWhitespace }))
         return result
     }
 
@@ -342,7 +366,7 @@ enum ComposeDraftGuards {
     /// half-typed address. Nil when typing has added no such separator.
     static func inputToSplit(was old: String, now text: String) -> (text: String, typing: String)? {
         if text.count - old.count > 1 { return (text, "") }
-        guard let last = text.lastIndex(where: { $0 == "," || $0 == ";" || $0.isNewline }) else { return nil }
+        guard let last = text.lastIndex(where: isSeparator) else { return nil }
         return (String(text[...last]), String(text[text.index(after: last)...]))
     }
 
@@ -352,16 +376,19 @@ enum ComposeDraftGuards {
         committing(field.input, to: field, room: .max) ?? field
     }
 
-    /// A picked contact: its address becomes a recipient, under its name. An
-    /// address TabMail cannot send to replaces the typed query in the input line,
-    /// so the user sees it and Send names it, instead of the tap doing nothing.
+    /// A picked contact replaces the entry being typed: its address becomes a
+    /// recipient, under its name, and leftover text before that entry stays. An
+    /// address TabMail cannot send to goes to the input line instead, so the
+    /// user sees it and Send names it, instead of the tap doing nothing.
     static func picking(
         _ address: String, name: String?, to field: RecipientField, room: Int
     ) -> RecipientField {
+        let before = field.input.lastIndex(where: isSeparator).map { String(field.input[...$0]) } ?? ""
         let text = RecipientEntry.text(name: name, address: address)
-        if let result = committing(text, to: field, room: room) { return result }
+        if let result = committing(before + text, to: field, room: room) { return result }
         var result = field
-        result.input = text
+        let leftover = trimmedInput(before)
+        result.input = inputLine(leftover.isEmpty ? [text] : [leftover, text])
         return result
     }
 
@@ -379,7 +406,8 @@ enum ComposeDraftGuards {
             value.tokens = value.tokens.filter { !removeSet.contains($0.lowercased()) }
         }
         var seen = Set(value.tokens.map { $0.lowercased() })
-        var leftovers = value.input.isEmpty ? [] : [value.input]
+        let existing = trimmedInput(value.input)
+        var leftovers = existing.isEmpty ? [] : [existing]
         for add in delta.adds where !add.email.isEmpty && add.email != "*" {
             let entry = RecipientEntry(add.email)
             for recipient in entry.recipients where seen.insert(recipient.address.lowercased()).inserted {
@@ -391,7 +419,7 @@ enum ComposeDraftGuards {
             }
             if !entry.unparsed.isEmpty { leftovers.append(entry.unparsed) }
         }
-        value.input = leftovers.joined(separator: ", ")
+        value.input = inputLine(leftovers)
         return value
     }
 
@@ -408,7 +436,7 @@ enum ComposeDraftGuards {
     /// than the recipient cap (reply-all prefill can exceed it), the cap.
     static func sendRecipients(to: RecipientField, cc: RecipientField, bcc: RecipientField) -> SendRecipients {
         for (label, field) in [("To", to), ("Cc", cc), ("Bcc", bcc)] {
-            let text = field.input.trimmingCharacters(in: .whitespaces)
+            let text = trimmedInput(field.input)
             if !text.isEmpty {
                 return .refused("\u{201C}\(text)\u{201D} in \(label) is not an email address. Fix or remove it before sending.")
             }
@@ -1265,7 +1293,7 @@ struct ComposeView: View {
                                     tokens: $toTokens,
                                     input: $toInput,
                                     displayNames: toDisplayNames,
-                                    searchResults: activeField == .to ? contactSearch.search(toInput) : [],
+                                    searchResults: activeField == .to ? contactSearch.search(ComposeDraftGuards.typedEntry(toInput)) : [],
                                     onFocus: { activeField = .to },
                                     onSelectContact: { contact in
                                         pickContact(contact, for: .to)
@@ -1298,7 +1326,7 @@ struct ComposeView: View {
                                         tokens: $ccTokens,
                                         input: $ccInput,
                                         displayNames: ccDisplayNames,
-                                        searchResults: activeField == .cc ? contactSearch.search(ccInput) : [],
+                                        searchResults: activeField == .cc ? contactSearch.search(ComposeDraftGuards.typedEntry(ccInput)) : [],
                                         onFocus: { activeField = .cc },
                                         onSelectContact: { contact in
                                             pickContact(contact, for: .cc)
@@ -1322,7 +1350,7 @@ struct ComposeView: View {
                                         tokens: $bccTokens,
                                         input: $bccInput,
                                         displayNames: bccDisplayNames,
-                                        searchResults: activeField == .bcc ? contactSearch.search(bccInput) : [],
+                                        searchResults: activeField == .bcc ? contactSearch.search(ComposeDraftGuards.typedEntry(bccInput)) : [],
                                         onFocus: { activeField = .bcc },
                                         onSelectContact: { contact in
                                             pickContact(contact, for: .bcc)

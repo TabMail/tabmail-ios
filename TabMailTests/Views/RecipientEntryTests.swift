@@ -140,7 +140,7 @@ struct RecipientEntryTests {
     func replyToWithoutMailbox() {
         let field = ComposeDraftGuards.fieldState(RecipientEntry.reply(to: Self.header(replyTo: "nobody")))
         #expect(field.tokens.isEmpty)
-        #expect(field.input == "nobody")
+        #expect(ComposeDraftGuards.trimmedInput(field.input) == "nobody")
     }
 
     /// Reply-all opens compose through `prefillTo`; the reply target's text that
@@ -151,7 +151,7 @@ struct RecipientEntryTests {
         let recipients = buildReplyAllRecipients(for: header, allAccounts: [])
         let field = ComposeDraftGuards.fieldState(RecipientEntry(recipients.to))
         #expect(field.tokens == ["ann@example.com", "me@example.com"])
-        #expect(field.input == "\"Help\" <helpdesk@localhost>")
+        #expect(ComposeDraftGuards.trimmedInput(field.input) == "\"Help\" <helpdesk@localhost>")
     }
 
     // MARK: - The input line
@@ -179,7 +179,7 @@ struct RecipientEntryTests {
     func committingKeepsLeftoverText() throws {
         let result = try #require(ComposeDraftGuards.committing("bob, ann@example.com", to: Self.field, room: 10))
         #expect(result.tokens == ["old@example.com", "ann@example.com"])
-        #expect(result.input == "bob")
+        #expect(ComposeDraftGuards.trimmedInput(result.input) == "bob")
     }
 
     @Test("Addresses over the recipient cap stay in the input line")
@@ -187,7 +187,7 @@ struct RecipientEntryTests {
         let result = try #require(ComposeDraftGuards.committing(
             "a@example.com, b@example.com, c@example.com", to: Self.field, room: 1))
         #expect(result.tokens == ["old@example.com", "a@example.com"])
-        #expect(result.input == "b@example.com, c@example.com")
+        #expect(ComposeDraftGuards.trimmedInput(result.input) == "b@example.com, c@example.com")
     }
 
     @Test("An address already in the field moves to the end without using the cap")
@@ -244,7 +244,7 @@ struct RecipientEntryTests {
         field.input = "bo"
         let result = ComposeDraftGuards.picking("bob@localhost", name: "Bob", to: field, room: 10)
         #expect(result.tokens == Self.field.tokens)
-        #expect(result.input == "\"Bob\" <bob@localhost>")
+        #expect(ComposeDraftGuards.trimmedInput(result.input) == "\"Bob\" <bob@localhost>")
         guard case .refused(let message) = ComposeDraftGuards.sendRecipients(to: result, cc: .init(), bcc: .init()) else {
             Issue.record("Send was not refused")
             return
@@ -270,7 +270,97 @@ struct RecipientEntryTests {
             }
         }
         #expect(field.tokens == ["carol@example.com"])
-        #expect(field.input == "bob")
+        #expect(ComposeDraftGuards.trimmedInput(field.input) == "bob")
+    }
+
+    // MARK: - Leftover text followed by more typing
+
+    /// The keystrokes TokenField sees: each character is inserted, the input
+    /// line split as `inputToSplit` says, and the result replaces the field.
+    private static func typing(_ text: String, into start: ComposeDraftGuards.RecipientField) -> ComposeDraftGuards.RecipientField {
+        var field = start
+        for character in text {
+            let old = field.input
+            field.input.append(character)
+            if let split = ComposeDraftGuards.inputToSplit(was: old, now: field.input),
+               let next = ComposeDraftGuards.committing(split.text, typing: split.typing, to: field, room: 10) {
+                field = next
+            }
+        }
+        return field
+    }
+
+    private static func pasting(_ text: String, into start: ComposeDraftGuards.RecipientField) -> ComposeDraftGuards.RecipientField {
+        var field = start
+        let old = field.input
+        field.input += text
+        if let split = ComposeDraftGuards.inputToSplit(was: old, now: field.input),
+           let next = ComposeDraftGuards.committing(split.text, typing: split.typing, to: field, room: 10) {
+            field = next
+        }
+        return field
+    }
+
+    /// Return, or leaving the field: the whole line is committed.
+    private static func pressingReturn(_ start: ComposeDraftGuards.RecipientField) -> ComposeDraftGuards.RecipientField {
+        ComposeDraftGuards.committing(start.input, to: start, room: 10) ?? start
+    }
+
+    /// Every way leftover text reaches the input line.
+    private static let leftoverRoutes: [(String, ComposeDraftGuards.RecipientField)] = [
+        ("typed", typing("bob,", into: .init())),
+        ("typed beside an address", typing("bob, ann@example.com,", into: .init())),
+        ("pasted", pasting("Doe, John <john@example.com>; Smith", into: .init())),
+        ("reopened draft", ComposeDraftGuards.fieldState(RecipientEntry(["a@example.com", "Bob"]))),
+        ("reply", ComposeDraftGuards.fieldState(RecipientEntry.reply(to: header(replyTo: "nobody")))),
+        ("AI add", ComposeDraftGuards.applying(
+            RecipientDelta(adds: [ParsedRecipient(name: "", email: "Jane")], removes: []), to: .init())),
+        ("unsendable pick", ComposeDraftGuards.picking("bob@localhost", name: "Bob", to: .init(), room: 10))
+    ]
+
+    /// The bug this guards: leftover text sat in the input line with nothing
+    /// after it, so the next address typed was joined to it, and
+    /// `bob` + `dave@example.com` became a recipient `bobdave@example.com`.
+    @Test("An address typed or pasted after leftover text becomes its own recipient", arguments: [
+        "type", "type after a space", "paste", "type and press Return"
+    ])
+    func addressAfterLeftoverText(followUp: String) throws {
+        for (route, start) in Self.leftoverRoutes {
+            let leftover = ComposeDraftGuards.trimmedInput(start.input)
+            #expect(!leftover.isEmpty, "\(route) left no text")
+            let after: ComposeDraftGuards.RecipientField
+            switch followUp {
+            case "type": after = Self.typing("dave@example.com,", into: start)
+            case "type after a space": after = Self.typing(" dave@example.com,", into: start)
+            case "paste": after = Self.pasting("dave@example.com", into: start)
+            default: after = Self.pressingReturn(Self.typing("dave@example.com", into: start))
+            }
+            #expect(after.tokens == start.tokens + ["dave@example.com"], "\(route): \(after.tokens)")
+            #expect(ComposeDraftGuards.trimmedInput(after.input) == leftover, "\(route): \(after.input)")
+            let sent = ComposeDraftGuards.sendRecipients(
+                to: ComposeDraftGuards.pendingCommitted(after), cc: .init(), bcc: .init())
+            guard case .refused(let message) = sent else {
+                Issue.record("\(route): Send was not refused: \(sent)")
+                continue
+            }
+            #expect(message.contains(leftover), "\(route): \(message)")
+        }
+    }
+
+    @Test("Contact suggestions match the entry being typed, not leftover text before it")
+    func suggestionsMatchTheTypedEntry() {
+        #expect(ComposeDraftGuards.typedEntry("bob, da") == "da")
+        #expect(ComposeDraftGuards.typedEntry("da") == "da")
+        #expect(ComposeDraftGuards.typedEntry("bob, ").isEmpty)
+    }
+
+    @Test("A picked contact replaces the typed entry and keeps leftover text before it")
+    func pickingKeepsLeftoverText() {
+        var field = Self.field
+        field.input = "bob, an"
+        let result = ComposeDraftGuards.picking("ann@example.com", name: "Ann", to: field, room: 10)
+        #expect(result.tokens == ["old@example.com", "ann@example.com"])
+        #expect(ComposeDraftGuards.trimmedInput(result.input) == "bob")
     }
 
     @Test("Text still being typed stays after the leftover text")
@@ -290,7 +380,7 @@ struct RecipientEntryTests {
         let saved = ComposeDraftGuards.committedRecipients(tokens: ["a@example.com", "b@example.com"], input: "bob")
         let reopened = ComposeDraftGuards.fieldState(RecipientEntry(saved))
         #expect(reopened.tokens == ["a@example.com", "b@example.com"])
-        #expect(reopened.input == "bob")
+        #expect(ComposeDraftGuards.trimmedInput(reopened.input) == "bob")
         #expect(ComposeDraftGuards.committedRecipients(tokens: reopened.tokens, input: reopened.input) == saved)
     }
 
@@ -349,7 +439,7 @@ struct RecipientEntryTests {
         let start = ComposeDraftGuards.RecipientField(tokens: ["x@example.com"], input: "typed")
         let field = ComposeDraftGuards.applying(Self.delta(adds: [("", "Jane"), ("", "b@example.com")]), to: start)
         #expect(field.tokens == ["x@example.com", "b@example.com"])
-        #expect(field.input == "typed, Jane")
+        #expect(ComposeDraftGuards.trimmedInput(field.input) == "typed, Jane")
     }
 
     @Test("AI removes ignore case, a clear empties the field, and an add already listed is not repeated")

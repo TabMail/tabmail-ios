@@ -267,6 +267,14 @@ serializer that writes recipients:
   Task, after which the autosave could already have read). Transform extracted as
   `ComposeDraftGuards.applying(_:to:)` and tested. Census tell: `rg 'bccJSON'` over `TabMail/`
   lists every Draft-row writer.
+- **ADR-IOS-092 Tier 1 r10 fix (2026-10-18)**: leftover text in an input line had no separator
+  after it, so the next typed or pasted address was joined to it (`bob` + `dave@example.com` sent
+  to `bobdave@example.com`). Every input-line writer (`committing`, `fieldState`, `applying`,
+  `picking`) now ends leftover text with `, ` via `ComposeDraftGuards.inputLine`;
+  `trimmedInput` strips it for storage and Send's message. Contact search uses `typedEntry`.
+  Invariant tests drive every leftover route then type/paste/Return. Also pinned:
+  `sendableRecipients` refuses an entry naming no mailbox as FATAL (without it an IMAP send with
+  no recipient is `.sendFailed`, transient, retried forever). Root MIS-015 recurrence 6.
 - **Pin state**: app `project.yml` pins `a09a3e3d` (topic branch, not fork main; was `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
