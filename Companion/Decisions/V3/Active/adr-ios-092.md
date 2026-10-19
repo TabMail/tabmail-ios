@@ -23,7 +23,9 @@ group), and spaces or tabs after an address (a word holding an unquoted `@`, or 
 read as commas first. People separate addresses with `;`, as Outlook does, or one per line, and a
 single-line text field turns a pasted column's line breaks into spaces (observed on iOS 26.5);
 `Ann Lee <a@example.com>` and `a@example.com (work)` stay one mailbox:
-- typing or pasting: a paste (more than one character at once) is split whole. While typing, only a
+- typing or pasting: a paste (more than one character inserted at once, over a selection or not;
+  the inserted text is what differs between the old and new line once their common start and end
+  are set aside, never the change in length) is split whole. While typing, only a
   keystroke that adds `,`, `;` or a line break splits, and then the text up to the last separator
   is split (`ComposeDraftGuards.inputToSplit`, `committing`); the text after it is still being
   typed and is left alone, so `bob, carol@example.c` never adds a half-typed address. A keystroke
@@ -35,14 +37,23 @@ single-line text field turns a pasted column's line breaks into spaces (observed
   typed query in the input line instead of the tap doing nothing;
 - prefill (mailto, AI), a reopened draft, reply seeding (`RecipientEntry.reply(to:)`: every
   Reply-To mailbox, or the sender under the sender's name) and AI recipient edits
-  (`ComposeDraftGuards.applying`, applied at once, not after the text fade);
+  (`ComposeDraftGuards.applying`, applied at once, not after the text fade). An address waiting in
+  the input line (over the recipient cap, or typed) is one Send would add, so an AI clear empties
+  the input line too and an AI removal also removes the address there, keeping the rest: otherwise
+  Send restored a recipient the user had just removed;
 - reply-all (`buildReplyAllRecipients`) uses the same reply target, and passes its text that names
   no sendable address on to the To input line, as Reply does. Entries of the original To and Cc
   that are not sendable mailboxes are still never offered (owner decision 2026-10-03).
 
-A group contributes its members; an empty group (`undisclosed-recipients:;`) names nobody. An
+A group contributes its members. An entry that names nobody (an empty group such as
+`undisclosed-recipients:;`, or a lone comment) is kept as text like any other, never dropped. An
 address already in the field is not repeated (case-insensitive); typing it again moves it to the
 end. Addresses past `SyncConfig.outboxMaxRecipients` stay in the input line.
+
+The compose holds its three fields as one value, `ComposeDraftGuards.Recipients`
+(`ComposeRecipients.swift`). Every change by role (typing, a pick, a prefill or reopened draft, an
+AI edit) and every read (save, the agent's autosave, Send) goes through it, so the role mapping
+that keeps Bcc recipients out of To and Cc is one tested switch instead of view code no test runs.
 
 Text that names no sendable address never becomes a recipient. It stays in the field's input line,
 visible, followed by `, ` (`ComposeDraftGuards.inputLine`), so the next address typed or pasted

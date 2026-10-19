@@ -22,24 +22,38 @@ struct RecipientEntry: Equatable {
     /// every piece was an address.
     private(set) var unparsed = ""
 
-    /// Splits each text with SwiftMail's address-list parser, the parser every
-    /// send uses. A group contributes its members; an empty group, such as
-    /// `undisclosed-recipients:;`, names nobody and is dropped. An address
-    /// already listed (in any case) is not repeated.
+    /// Splits each text into entries and reads each with SwiftMail's
+    /// address-list parser, the parser every send uses. A group contributes its
+    /// members. An entry that names nobody, such as the empty group
+    /// `undisclosed-recipients:;` or a lone comment, is kept as text, so nothing
+    /// typed silently disappears. An address already listed (in any case) is
+    /// not repeated.
     init(_ texts: [String]) {
         var leftovers: [String] = []
         var seen = Set<String>()
         for text in texts {
-            for entry in AddressParser.parseAddressList(Self.commaSeparated(text)) {
-                switch entry {
-                case .mailbox(let mailbox):
-                    add(mailbox, seen: &seen, leftovers: &leftovers)
-                case .group(_, let members):
-                    for member in members { add(member, seen: &seen, leftovers: &leftovers) }
-                case .invalid(let invalid):
-                    let trimmed = invalid.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty { leftovers.append(trimmed) }
+            for piece in Self.entries(text) {
+                var named = false
+                for entry in AddressParser.parseAddressList(piece) {
+                    switch entry {
+                    case .mailbox(let mailbox):
+                        named = true
+                        add(mailbox, seen: &seen, leftovers: &leftovers)
+                    case .group(_, let members):
+                        for member in members {
+                            named = true
+                            add(member, seen: &seen, leftovers: &leftovers)
+                        }
+                    case .invalid(let invalid):
+                        let trimmed = invalid.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty {
+                            named = true
+                            leftovers.append(trimmed)
+                        }
+                    }
                 }
+                let trimmed = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !named, !trimmed.isEmpty { leftovers.append(trimmed) }
             }
         }
         unparsed = leftovers.joined(separator: ", ")
@@ -49,10 +63,12 @@ struct RecipientEntry: Equatable {
         self.init([text])
     }
 
-    /// The address-list parser splits on commas only, but people separate
-    /// addresses with `;` (as Outlook does), put one per line, or paste a column
-    /// a single-line text field has already turned into spaces. Outside quotes,
-    /// angle brackets and comments, each of these becomes a comma:
+    /// The entries of a text. The address-list parser splits on commas only,
+    /// but people separate addresses with `;` (as Outlook does), put one per
+    /// line, or paste a column a single-line text field has already turned into
+    /// spaces. Outside quotes, angle brackets and comments, each of these ends
+    /// an entry, as a comma does (inside a group they become the commas between
+    /// its members):
     /// - a line break;
     /// - a `;`, except the one that ends a group (`Team: a@example.com;`),
     ///   which is kept and followed by a comma so what follows is its own entry;
@@ -61,8 +77,9 @@ struct RecipientEntry: Equatable {
     ///   display name (RFC 5322 3.2.3), so `a@example.com b@example.com` and
     ///   `Ann <a@example.com> Bob <b@example.com>` split, while
     ///   `Ann Lee <a@example.com>` and `a@example.com (work)` stay one mailbox.
-    private static func commaSeparated(_ text: String) -> String {
-        var result = ""
+    private static func entries(_ text: String) -> [String] {
+        var pieces: [String] = []
+        var current = ""
         var inQuote = false
         var escaped = false
         var angleDepth = 0
@@ -72,10 +89,18 @@ struct RecipientEntry: Equatable {
         var afterAngle = false
         var gap = ""
         var gapEndsAddress = false
+        func separate() {
+            if inGroup || angleDepth > 0 {
+                current.append(",")
+            } else {
+                pieces.append(current)
+                current = ""
+            }
+        }
         for character in text {
             if escaped {
                 escaped = false
-                result.append(character)
+                current.append(character)
                 continue
             }
             if inQuote || commentDepth > 0 {
@@ -88,7 +113,7 @@ struct RecipientEntry: Equatable {
                 } else if character == ")" {
                     commentDepth -= 1
                 }
-                result.append(character)
+                current.append(character)
                 continue
             }
             if character == " " || character == "\t" {
@@ -99,13 +124,13 @@ struct RecipientEntry: Equatable {
                 continue
             }
             if !gap.isEmpty {
-                if gapEndsAddress, !character.isNewline, !"(,;".contains(character) { result.append(",") }
-                result += gap
+                if gapEndsAddress, !character.isNewline, !"(,;".contains(character) { separate() }
+                current += gap
                 gap = ""
             }
             afterAngle = false
             if character.isNewline {
-                result.append(",")
+                separate()
                 wordHasAt = false
                 continue
             }
@@ -117,18 +142,24 @@ struct RecipientEntry: Equatable {
                 angleDepth = max(0, angleDepth - 1)
                 afterAngle = angleDepth == 0
             case "@" where angleDepth == 0: wordHasAt = true
-            case ",": wordHasAt = false
+            case ",":
+                wordHasAt = false
+                separate()
+                continue
             case ":" where angleDepth == 0: inGroup = true
             case ";" where angleDepth == 0:
                 wordHasAt = false
-                result.append(inGroup ? ";," : ",")
-                inGroup = false
+                if inGroup {
+                    current.append(";")
+                    inGroup = false
+                }
+                separate()
                 continue
             default: break
             }
-            result.append(character)
+            current.append(character)
         }
-        return result + gap
+        return pieces + [current + gap]
     }
 
     var addresses: [String] { recipients.map(\.address) }

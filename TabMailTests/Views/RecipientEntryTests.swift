@@ -59,10 +59,44 @@ struct RecipientEntryTests {
         #expect(entry.unparsed == unparsed)
     }
 
-    @Test("An empty group names nobody and adds nothing")
-    func emptyGroupAddsNothing() {
-        let entry = RecipientEntry("undisclosed-recipients:;")
-        #expect(entry.recipients.isEmpty)
+    /// The bug this guards: an empty group and a comment name nobody, and the
+    /// parser returns no address for them, so they vanished from the field.
+    @Test("Text naming nobody is kept as text, beside the addresses", arguments: [
+        ("undisclosed-recipients:;", [String](), "undisclosed-recipients:;"),
+        ("(just a note)", [], "(just a note)"),
+        ("undisclosed-recipients:;, ann@example.com", ["ann@example.com"], "undisclosed-recipients:;"),
+        ("(note), ann@example.com", ["ann@example.com"], "(note)")
+    ])
+    func keepsTextNamingNobody(text: String, addresses: [String], unparsed: String) {
+        let entry = RecipientEntry(text)
+        #expect(entry.addresses == addresses)
+        #expect(entry.unparsed == unparsed)
+    }
+
+    @Test("Text naming nobody survives a save and reopen, and Send names it", arguments: [
+        "undisclosed-recipients:;, ann@example.com,", "(just a note), ann@example.com,"
+    ])
+    func textNamingNobodySurvivesSave(typed: String) throws {
+        let field = try #require(ComposeDraftGuards.committing(typed, to: .init(), room: 10))
+        #expect(field.tokens == ["ann@example.com"])
+        let leftover = ComposeDraftGuards.trimmedInput(field.input)
+        #expect(!leftover.isEmpty)
+        let stored = ComposeDraftGuards.committedRecipients(tokens: field.tokens, input: field.input)
+        let reopened = ComposeDraftGuards.fieldState(RecipientEntry(stored))
+        #expect(reopened.tokens == ["ann@example.com"])
+        #expect(ComposeDraftGuards.trimmedInput(reopened.input) == leftover)
+        guard case .refused(let message) = ComposeDraftGuards.sendRecipients(
+            to: ComposeDraftGuards.pendingCommitted(reopened), cc: .init(), bcc: .init()) else {
+            Issue.record("Send was not refused")
+            return
+        }
+        #expect(message.contains(leftover))
+    }
+
+    @Test("A group's members become recipients, and nothing of it is left as text")
+    func groupWithMembers() {
+        let entry = RecipientEntry("Team: a@example.com, b@example.com;, c@example.com")
+        #expect(entry.addresses == ["a@example.com", "b@example.com", "c@example.com"])
         #expect(entry.unparsed.isEmpty)
     }
 
@@ -207,6 +241,19 @@ struct RecipientEntryTests {
         let result = try #require(ComposeDraftGuards.inputToSplit(was: old, now: text))
         #expect(result.text == split)
         #expect(result.typing == typing)
+    }
+
+    /// The bug this guards: a paste over selected text was told apart from
+    /// typing by how much the line grew, so a list pasted over a longer query
+    /// was not split.
+    @Test("A paste over selected text is split whole", arguments: [
+        ("an-unfinished-query-longer-than-the-paste", "a@example.com b@example.com"),
+        ("ann@example.com, xyzxyzxyzxyzxyzxyzxyzxyzxyz", "ann@example.com, a@example.com b@example.com")
+    ])
+    func pasteOverSelectionSplitsWhole(old: String, text: String) throws {
+        let pasted = try #require(ComposeDraftGuards.inputToSplit(was: old, now: text))
+        #expect(pasted.text == text)
+        #expect(pasted.typing.isEmpty)
     }
 
     @Test("A paste is split whole, with or without commas", arguments: [
@@ -531,6 +578,37 @@ struct RecipientEntryTests {
         #expect(removed.tokens == ["a@example.com", "c@example.com"])
         let cleared = ComposeDraftGuards.applying(Self.delta(adds: [("", "c@example.com")], removes: ["*"]), to: start)
         #expect(cleared.tokens == ["c@example.com"])
+    }
+
+    /// The bug this guards: at the recipient cap a pasted address waits in the
+    /// input line, and an AI clear or removal left it there, so Send went to a
+    /// recipient the user had removed.
+    @Test("AI removes and clears cover addresses waiting in the input line")
+    func aiRemovesCoverPendingInput() throws {
+        let capped = try #require(ComposeDraftGuards.committing(
+            "a@example.com b@example.com", to: .init(), room: 1))
+        #expect(capped.tokens == ["a@example.com"])
+        #expect(ComposeDraftGuards.trimmedInput(capped.input) == "b@example.com")
+        let to = ComposeDraftGuards.RecipientField(tokens: ["to@example.com"])
+        for delta in [Self.delta(removes: ["*"]), Self.delta(removes: ["a@example.com", "B@EXAMPLE.COM"])] {
+            let bcc = ComposeDraftGuards.applying(delta, to: capped)
+            #expect(ComposeDraftGuards.sendRecipients(
+                to: to, cc: .init(), bcc: ComposeDraftGuards.pendingCommitted(bcc))
+                == .send(to: ["to@example.com"], cc: [], bcc: []), "\(delta.removes): \(bcc)")
+        }
+    }
+
+    @Test("An AI removal keeps the other text and addresses in the input line")
+    func aiRemoveKeepsOtherInput() {
+        let field = ComposeDraftGuards.RecipientField(
+            tokens: ["a@example.com"], input: ComposeDraftGuards.inputLine(["bob", "b@example.com", "c@example.com"]))
+        let result = ComposeDraftGuards.applying(Self.delta(removes: ["b@example.com"]), to: field)
+        #expect(result.tokens == ["a@example.com"])
+        let entry = RecipientEntry(result.input)
+        #expect(entry.addresses == ["c@example.com"])
+        #expect(entry.unparsed == "bob")
+        let untouched = ComposeDraftGuards.applying(Self.delta(removes: ["a@example.com"]), to: field)
+        #expect(untouched.input == field.input)
     }
 
     @Test("An AI add naming one address takes the AI's name; one naming several keeps each address's own name")

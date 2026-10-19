@@ -357,18 +357,28 @@ enum ComposeDraftGuards {
         return result
     }
 
-    /// Which part of an edited input line to split (ADR-IOS-092). A paste (more
-    /// than one character inserted at once) is split whole, whatever separates its
+    /// Which part of an edited input line to split (ADR-IOS-092). The edit's
+    /// inserted text is what differs between the two lines once their common
+    /// start and end are set aside. A paste (more than one character inserted
+    /// at once, over a selection or not) is split whole, whatever separates its
     /// addresses: the field has already turned a pasted column's line breaks into
     /// spaces, which `RecipientEntry` reads as separators after an address. While
-    /// typing, only a keystroke that adds a `,`, `;` or line break splits: the text
-    /// up to the last one is split and the text after it is still being typed, so
-    /// `bob, carol@example.c` never adds a half-typed address. Nil when typing has
-    /// added no such separator, so fixing leftover text where it is never commits
-    /// it half-fixed.
+    /// typing, only a keystroke that inserts a `,`, `;` or line break splits: the
+    /// text up to the last one is split and the text after it is still being
+    /// typed, so `bob, carol@example.c` never adds a half-typed address. Nil when
+    /// typing has inserted no such separator, so fixing leftover text where it is
+    /// never commits it half-fixed.
     static func inputToSplit(was old: String, now text: String) -> (text: String, typing: String)? {
-        if text.count - old.count > 1 { return (text, "") }
-        guard text.filter(isSeparator).count > old.filter(isSeparator).count,
+        let before = Array(old)
+        let after = Array(text)
+        var start = 0
+        while start < before.count, start < after.count, before[start] == after[start] { start += 1 }
+        var end = 0
+        while end < before.count - start, end < after.count - start,
+              before[before.count - 1 - end] == after[after.count - 1 - end] { end += 1 }
+        let inserted = after[start..<(after.count - end)]
+        if inserted.count > 1 { return (text, "") }
+        guard inserted.contains(where: isSeparator),
               let last = text.lastIndex(where: isSeparator) else { return nil }
         return (String(text[...last]), String(text[text.index(after: last)...]))
     }
@@ -399,14 +409,24 @@ enum ComposeDraftGuards {
     /// whole field), then each add split like typed text (ADR-IOS-092). Its
     /// addresses become recipients, under the AI's name when the add names one
     /// address, and text that names none goes to the input line, after any text
-    /// already there.
+    /// already there. An address in the input line (one over the recipient cap,
+    /// or one typed) is a recipient Send would add, so a clear empties the input
+    /// line too, and a removal also removes it there, keeping the rest.
     static func applying(_ delta: RecipientDelta, to field: RecipientField) -> RecipientField {
         var value = field
         if delta.clearsField {
             value.tokens = []
+            value.input = ""
         } else if !delta.removes.isEmpty {
             let removeSet = Set(delta.removes.map { $0.lowercased() })
             value.tokens = value.tokens.filter { !removeSet.contains($0.lowercased()) }
+            let pending = RecipientEntry(value.input)
+            if pending.addresses.contains(where: { removeSet.contains($0.lowercased()) }) {
+                let kept = pending.recipients
+                    .filter { !removeSet.contains($0.address.lowercased()) }
+                    .map { RecipientEntry.text(name: $0.name, address: $0.address) }
+                value.input = inputLine((pending.unparsed.isEmpty ? [] : [pending.unparsed]) + kept)
+            }
         }
         var seen = Set(value.tokens.map { $0.lowercased() })
         let existing = trimmedInput(value.input)
@@ -907,15 +927,7 @@ struct ComposeView: View {
         let isForward: Bool
         let outbound: DraftMessage
     }
-    @State private var toTokens: [String] = []
-    @State private var ccTokens: [String] = []
-    @State private var bccTokens: [String] = []
-    @State private var toDisplayNames: [String: String] = [:]
-    @State private var ccDisplayNames: [String: String] = [:]
-    @State private var bccDisplayNames: [String: String] = [:]
-    @State private var toInput = ""
-    @State private var ccInput = ""
-    @State private var bccInput = ""
+    @State private var recipients = ComposeDraftGuards.Recipients()
     /// Identifies the chip currently revealing its full email address, as
     /// "<field>:<token>" (e.g. "to:alice@example.com"). nil means no chip is
     /// revealed. Shared across To/Cc/Bcc so only one chip reveals at a time;
@@ -1171,62 +1183,16 @@ struct ComposeView: View {
     // MARK: - Recipient cap
     /// Total recipients across To + Cc + Bcc. Tokens only; pending input text
     /// is NOT counted (still unresolved).
-    private var totalRecipients: Int {
-        toTokens.count + ccTokens.count + bccTokens.count
-    }
-    private var canAddRecipient: Bool {
-        totalRecipients < SyncConfig.outboxMaxRecipients
-    }
+    private var totalRecipients: Int { recipients.total }
+    private var canAddRecipient: Bool { recipients.canAddMore }
 
-    private func recipientField(_ field: RecipientEditField) -> ComposeDraftGuards.RecipientField {
-        switch field {
-        case .to: return .init(tokens: toTokens, displayNames: toDisplayNames, input: toInput)
-        case .cc: return .init(tokens: ccTokens, displayNames: ccDisplayNames, input: ccInput)
-        case .bcc: return .init(tokens: bccTokens, displayNames: bccDisplayNames, input: bccInput)
-        }
-    }
-
-    private func setRecipientField(_ value: ComposeDraftGuards.RecipientField, _ field: RecipientEditField) {
-        switch field {
-        case .to:
-            toTokens = value.tokens
-            toDisplayNames = value.displayNames
-            toInput = value.input
-        case .cc:
-            ccTokens = value.tokens
-            ccDisplayNames = value.displayNames
-            ccInput = value.input
-        case .bcc:
-            bccTokens = value.tokens
-            bccDisplayNames = value.displayNames
-            bccInput = value.input
-        }
-        if field != .to, !value.tokens.isEmpty || !value.input.isEmpty { showCc = true }
-    }
-
-    /// Fills a field from outside its input line (a reopened draft, a prefill, a
-    /// reply): addresses become recipients, other text goes to the input line
-    /// (ADR-IOS-092). Display names already known are kept.
-    private func fillRecipients(_ entry: RecipientEntry, _ field: RecipientEditField) {
-        var value = ComposeDraftGuards.fieldState(entry)
-        value.displayNames = recipientField(field).displayNames.merging(value.displayNames) { _, new in new }
-        setRecipientField(value, field)
-    }
-
-    /// Adds the addresses `text` names to `field` within the recipient cap
-    /// (ADR-IOS-092); changes nothing when `text` names none.
-    private func commitRecipients(_ text: String, typing: String, to field: RecipientEditField) {
-        let room = SyncConfig.outboxMaxRecipients - totalRecipients
-        if let value = ComposeDraftGuards.committing(text, typing: typing, to: recipientField(field), room: room) {
-            setRecipientField(value, field)
-        }
-    }
-
-    private func pickContact(_ contact: ContactResult, for field: RecipientEditField) {
-        let room = SyncConfig.outboxMaxRecipients - totalRecipients
-        setRecipientField(
-            ComposeDraftGuards.picking(contact.email, name: contact.name, to: recipientField(field), room: room),
-            field)
+    /// Replaces the recipient fields (ADR-IOS-092). Cc/Bcc are shown when a
+    /// change gives either of them content.
+    private func setRecipients(_ new: ComposeDraftGuards.Recipients) {
+        let old = recipients
+        guard new != old else { return }
+        recipients = new
+        if (new.cc != old.cc && !new.cc.isEmpty) || (new.bcc != old.bcc && !new.bcc.isEmpty) { showCc = true }
     }
 
     /// Shown next to the Cc/Bcc button: "N/50" when ≥ 45, orange at cap.
@@ -1293,15 +1259,15 @@ struct ComposeView: View {
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                                 TokenField(
-                                    tokens: $toTokens,
-                                    input: $toInput,
-                                    displayNames: toDisplayNames,
-                                    searchResults: activeField == .to ? contactSearch.search(ComposeDraftGuards.typedEntry(toInput)) : [],
+                                    tokens: $recipients.to.tokens,
+                                    input: $recipients.to.input,
+                                    displayNames: recipients.to.displayNames,
+                                    searchResults: activeField == .to ? contactSearch.search(ComposeDraftGuards.typedEntry(recipients.to.input)) : [],
                                     onFocus: { activeField = .to },
                                     onSelectContact: { contact in
-                                        pickContact(contact, for: .to)
+                                        setRecipients(recipients.picking(contact.email, name: contact.name, to: .to))
                                     },
-                                    commit: { text, typing in commitRecipients(text, typing: typing, to: .to) },
+                                    commit: { text, typing in setRecipients(recipients.committing(text, typing: typing, to: .to)) },
                                     canAddMore: { canAddRecipient },
                                     revealedChipKey: $revealedChipKey,
                                     fieldKey: "to"
@@ -1326,15 +1292,15 @@ struct ComposeView: View {
                                         .font(.subheadline)
                                         .foregroundStyle(.secondary)
                                     TokenField(
-                                        tokens: $ccTokens,
-                                        input: $ccInput,
-                                        displayNames: ccDisplayNames,
-                                        searchResults: activeField == .cc ? contactSearch.search(ComposeDraftGuards.typedEntry(ccInput)) : [],
+                                        tokens: $recipients.cc.tokens,
+                                        input: $recipients.cc.input,
+                                        displayNames: recipients.cc.displayNames,
+                                        searchResults: activeField == .cc ? contactSearch.search(ComposeDraftGuards.typedEntry(recipients.cc.input)) : [],
                                         onFocus: { activeField = .cc },
                                         onSelectContact: { contact in
-                                            pickContact(contact, for: .cc)
+                                            setRecipients(recipients.picking(contact.email, name: contact.name, to: .cc))
                                         },
-                                        commit: { text, typing in commitRecipients(text, typing: typing, to: .cc) },
+                                        commit: { text, typing in setRecipients(recipients.committing(text, typing: typing, to: .cc)) },
                                         canAddMore: { canAddRecipient },
                                         revealedChipKey: $revealedChipKey,
                                         fieldKey: "cc"
@@ -1350,15 +1316,15 @@ struct ComposeView: View {
                                         .font(.subheadline)
                                         .foregroundStyle(.secondary)
                                     TokenField(
-                                        tokens: $bccTokens,
-                                        input: $bccInput,
-                                        displayNames: bccDisplayNames,
-                                        searchResults: activeField == .bcc ? contactSearch.search(ComposeDraftGuards.typedEntry(bccInput)) : [],
+                                        tokens: $recipients.bcc.tokens,
+                                        input: $recipients.bcc.input,
+                                        displayNames: recipients.bcc.displayNames,
+                                        searchResults: activeField == .bcc ? contactSearch.search(ComposeDraftGuards.typedEntry(recipients.bcc.input)) : [],
                                         onFocus: { activeField = .bcc },
                                         onSelectContact: { contact in
-                                            pickContact(contact, for: .bcc)
+                                            setRecipients(recipients.picking(contact.email, name: contact.name, to: .bcc))
                                         },
-                                        commit: { text, typing in commitRecipients(text, typing: typing, to: .bcc) },
+                                        commit: { text, typing in setRecipients(recipients.committing(text, typing: typing, to: .bcc)) },
                                         canAddMore: { canAddRecipient },
                                         revealedChipKey: $revealedChipKey,
                                         fieldKey: "bcc"
@@ -1529,7 +1495,7 @@ struct ComposeView: View {
                             // untethered new message, and never mark a message
                             // replied that we have not identified.
                             .disabled(
-                                toTokens.isEmpty || subject.isEmpty || attachmentLoadFailed
+                                recipients.to.tokens.isEmpty || subject.isEmpty || attachmentLoadFailed
                                 || replyTargetBlocksSend
                                 || ComposeDraftGuards.attachmentSnapshotGate(
                                     producer: .send,
@@ -1604,9 +1570,7 @@ struct ComposeView: View {
                         composeAgentSendFence: agentSendFence,
                         composeAttachments: $attachments,
                         composeRecipients: {
-                            (ComposeDraftGuards.committedRecipients(tokens: toTokens, input: toInput),
-                             ComposeDraftGuards.committedRecipients(tokens: ccTokens, input: ccInput),
-                             ComposeDraftGuards.committedRecipients(tokens: bccTokens, input: bccInput))
+                            recipients.stored
                         },
                         composeAttachmentCarryGate: attachmentCarryGate,
                         composeMutationAllowed: draftReadState != .error,
@@ -2183,13 +2147,13 @@ struct ComposeView: View {
         }
 
         return ComposeEditContext(
-            recipients: toTokens,
-            toRecipients: toTokens,
-            ccRecipients: ccTokens,
-            bccRecipients: bccTokens,
-            toDisplayNames: toDisplayNames,
-            ccDisplayNames: ccDisplayNames,
-            bccDisplayNames: bccDisplayNames,
+            recipients: recipients.to.tokens,
+            toRecipients: recipients.to.tokens,
+            ccRecipients: recipients.cc.tokens,
+            bccRecipients: recipients.bcc.tokens,
+            toDisplayNames: recipients.to.displayNames,
+            ccDisplayNames: recipients.cc.displayNames,
+            bccDisplayNames: recipients.bcc.displayNames,
             senderName: account?.displayName ?? "",
             senderEmail: account?.emailAddress ?? "",
             mode: mode,
@@ -2230,9 +2194,7 @@ struct ComposeView: View {
         }
         // Recipients are not part of the text fade. They change now, so the
         // agent's autosave, which runs right after this call, stores them.
-        applyRecipientDelta(field: .to, delta: toDelta)
-        applyRecipientDelta(field: .cc, delta: ccDelta)
-        applyRecipientDelta(field: .bcc, delta: bccDelta)
+        setRecipients(recipients.applying(to: toDelta, cc: ccDelta, bcc: bccDelta))
         Task { @MainActor in
             // Wait for fade-out to finish
             try? await Task.sleep(for: .milliseconds(280))
@@ -2284,16 +2246,6 @@ struct ComposeView: View {
                 arguments: [text, headerId]
             )
         }
-    }
-
-    private enum RecipientEditField { case to, cc, bcc }
-
-    /// Apply one field's delta to the matching token array. Removes are applied first
-    /// (including the `*` clear-all sentinel), then adds are appended deduped on email
-    /// (case-insensitive). Display names from adds are merged into the lookup map.
-    private func applyRecipientDelta(field: RecipientEditField, delta: RecipientDelta?) {
-        guard let delta, !delta.isEmpty else { return }
-        setRecipientField(ComposeDraftGuards.applying(delta, to: recipientField(field)), field)
     }
 
     // MARK: - From picker
@@ -2448,9 +2400,8 @@ struct ComposeView: View {
             messageBody = draft.body
             // A saved list may hold text that names no address (kept so nothing
             // typed is lost); it returns to the input line (ADR-IOS-092).
-            fillRecipients(RecipientEntry(draft.toArray), .to)
-            fillRecipients(RecipientEntry(draft.ccArray), .cc)
-            fillRecipients(RecipientEntry(draft.bccArray), .bcc)
+            setRecipients(recipients.filling(
+                to: RecipientEntry(draft.toArray), cc: RecipientEntry(draft.ccArray), bcc: RecipientEntry(draft.bccArray)))
             // Load attachments from disk (saveDraftAndDismiss writes them via
             // DraftAttachmentStorage.saveAttachments; reopen restores them so
             // user sees what was saved). B1: the loader FAILS CLOSED — if a
@@ -2582,9 +2533,7 @@ struct ComposeView: View {
     private func snapshotInitialState() {
         initialSubject = subject
         initialBody = messageBody
-        initialToTokens = ComposeDraftGuards.committedRecipients(tokens: toTokens, input: toInput)
-        initialCcTokens = ComposeDraftGuards.committedRecipients(tokens: ccTokens, input: ccInput)
-        initialBccTokens = ComposeDraftGuards.committedRecipients(tokens: bccTokens, input: bccInput)
+        (initialToTokens, initialCcTokens, initialBccTokens) = recipients.stored
         initialAttachmentsFingerprint = attachmentsFingerprint(attachments)
     }
 
@@ -2608,15 +2557,13 @@ struct ComposeView: View {
 
     /// PORT — v2final `ComposeView.commitPendingRecipientInput` (F3).
     ///
-    /// Commit the addresses in any uncommitted recipient text (`toInput`/`ccInput`/
-    /// `bccInput`), as `send()` does, so close / save also SEE them (`hasChanges`)
+    /// Commit the addresses in any uncommitted recipient text (each field's input
+    /// line), as `send()` does, so close / save also SEE them (`hasChanges`)
     /// and PERSIST them. Text that names no address stays in the input line and is
     /// persisted beside the addresses (`committedRecipients`), never as a recipient
     /// (ADR-IOS-092).
     private func commitPendingRecipientInput() {
-        for field in [RecipientEditField.to, .cc, .bcc] {
-            setRecipientField(ComposeDraftGuards.pendingCommitted(recipientField(field)), field)
-        }
+        setRecipients(recipients.pendingCommitted)
     }
 
     /// Apply exactly the suggestion the UI is actively offering, using the same
@@ -2675,13 +2622,13 @@ struct ComposeView: View {
         let hasVisibleSuggestion = acceptedSuggestion != offeredSuggestion
         let hasContent = ComposeDraftGuards.hasContent(
             subject: subject, body: acceptedSuggestion.messageBody,
-            to: toTokens, cc: ccTokens, bcc: bccTokens,
-            toInput: toInput, ccInput: ccInput, bccInput: bccInput,
+            to: recipients.to.tokens, cc: recipients.cc.tokens, bcc: recipients.bcc.tokens,
+            toInput: recipients.to.input, ccInput: recipients.cc.input, bccInput: recipients.bcc.input,
             hasAttachments: !attachments.isEmpty || attachmentLoadFailed || attachmentPreparationIsUnsettled)
         let hasChanges = subject != initialSubject || messageBody != initialBody
-            || ComposeDraftGuards.committedRecipients(tokens: toTokens, input: toInput) != initialToTokens
-            || ComposeDraftGuards.committedRecipients(tokens: ccTokens, input: ccInput) != initialCcTokens
-            || ComposeDraftGuards.committedRecipients(tokens: bccTokens, input: bccInput) != initialBccTokens
+            || recipients.stored.to != initialToTokens
+            || recipients.stored.cc != initialCcTokens
+            || recipients.stored.bcc != initialBccTokens
             || attachmentsFingerprint(attachments) != initialAttachmentsFingerprint
             || attachmentPreparationIsUnsettled
             || hasVisibleSuggestion
@@ -2793,9 +2740,7 @@ struct ComposeView: View {
         let now = Date().timeIntervalSince1970
         // Capture MainActor-isolated properties before entering Sendable closure
         let capDraftId = draftId
-        let capTo = ComposeDraftGuards.committedRecipients(tokens: toTokens, input: toInput)
-        let capCc = ComposeDraftGuards.committedRecipients(tokens: ccTokens, input: ccInput)
-        let capBcc = ComposeDraftGuards.committedRecipients(tokens: bccTokens, input: bccInput)
+        let (capTo, capCc, capBcc) = recipients.stored
         let capSubject = subject
         let capBody = messageBody
 
@@ -3106,9 +3051,10 @@ struct ComposeView: View {
         }
 
         // Apply prefill overrides (from agent tools)
-        if let prefillTo { fillRecipients(RecipientEntry(prefillTo), .to) }
-        if let prefillCc { fillRecipients(RecipientEntry(prefillCc), .cc) }
-        if let prefillBcc { fillRecipients(RecipientEntry(prefillBcc), .bcc) }
+        setRecipients(recipients.filling(
+            to: prefillTo.map { RecipientEntry($0) },
+            cc: prefillCc.map { RecipientEntry($0) },
+            bcc: prefillBcc.map { RecipientEntry($0) }))
         if let prefillSubject { subject = prefillSubject }
         if let prefillBody { messageBody = prefillBody }
         if let prefillAttachments, !prefillAttachments.isEmpty {
@@ -3118,13 +3064,13 @@ struct ComposeView: View {
         if let reply = replyTo {
             if isForward {
                 // Forward mode: empty To (unless prefilled), "Fwd:" subject, quoted body
-                if prefillTo == nil { toTokens = [] }
+                if prefillTo == nil { recipients.to.tokens = [] }
                 if prefillSubject == nil {
                     subject = ThreadUtils.forwardSubject(for: reply.subject)
                 }
             } else {
                 // Reply mode: To = reply address, "Re:" subject
-                if prefillTo == nil { fillRecipients(RecipientEntry.reply(to: reply), .to) }
+                if prefillTo == nil { setRecipients(recipients.filling(to: RecipientEntry.reply(to: reply))) }
                 if prefillSubject == nil {
                     subject = ThreadUtils.replySubject(for: reply.subject)
                 }
@@ -3347,7 +3293,7 @@ struct ComposeView: View {
     /// Resolve contact display names for all current recipient tokens.
     /// Called after prepopulate() so agent-prefilled emails show contact names.
     private func resolveContactNames() {
-        let allEmails = toTokens + ccTokens + bccTokens
+        let allEmails = recipients.to.tokens + recipients.cc.tokens + recipients.bcc.tokens
         guard !allEmails.isEmpty else { return }
         let store = CNContactStore()
         let keys: [CNKeyDescriptor] = [
@@ -3357,7 +3303,7 @@ struct ComposeView: View {
         ]
         for email in allEmails {
             // Skip if already resolved
-            if toDisplayNames[email] != nil || ccDisplayNames[email] != nil || bccDisplayNames[email] != nil { continue }
+            if recipients.hasName(for: email) { continue }
             guard let contacts = try? store.unifiedContacts(
                 matching: CNContact.predicateForContacts(matchingEmailAddress: email),
                 keysToFetch: keys
@@ -3366,9 +3312,7 @@ struct ComposeView: View {
                 .filter { !$0.isEmpty }
                 .joined(separator: " ")
             guard !name.isEmpty else { continue }
-            if toTokens.contains(email) { toDisplayNames[email] = name }
-            if ccTokens.contains(email) { ccDisplayNames[email] = name }
-            if bccTokens.contains(email) { bccDisplayNames[email] = name }
+            recipients.name(email, name)
         }
     }
 
@@ -3527,7 +3471,7 @@ struct ComposeView: View {
         // is never sent: it stays in its input line and Send says so (ADR-IOS-092).
         commitPendingRecipientInput()
         let finalTo: [String], finalCc: [String], finalBcc: [String]
-        switch ComposeDraftGuards.sendRecipients(to: recipientField(.to), cc: recipientField(.cc), bcc: recipientField(.bcc)) {
+        switch recipients.sendRecipients {
         case .refused(let message):
             sendError = message
             return
