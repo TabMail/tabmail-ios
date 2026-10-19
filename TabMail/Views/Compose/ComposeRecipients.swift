@@ -70,8 +70,8 @@ extension ComposeDraftGuards {
         }
 
         /// The fields filled from outside their input lines (a reopened draft, a
-        /// prefill, a reply). A field given no entry is left as it is; display
-        /// names already known are kept.
+        /// prefill, a reply). A field given no entry is left as it is. Display
+        /// names already known are kept, and a name the fill gives wins.
         func filling(to: RecipientEntry? = nil, cc: RecipientEntry? = nil, bcc: RecipientEntry? = nil) -> Recipients {
             var result = self
             for (role, entry) in [(RecipientRole.to, to), (.cc, cc), (.bcc, bcc)] {

@@ -298,7 +298,13 @@ serializer that writes recipients:
   a field name must be non-empty printable ASCII, the `checkHeaderFields` rule. A lone no-colon
   line is still kept. Also pinned: `constructContent()` with no arguments writes no Bcc, and the
   contact-pick fallback keeps leftover text when the pick adds no recipient.
-- **Pin state**: app `project.yml` pins `0919b08f` (topic branch, not fork main; was `a09a3e3d`, `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
+- **Tier 1 r14 fix (2026-10-19)**: `removingBccFields` took a bare LF as a header line end, so
+  `Subject: x` LF CRLF `Bcc: h` read as end-of-header and the Bcc field went out as "body", while a
+  CRLF-only reader (RFC 5322 4.1 allows a bare LF inside a field) saw a Bcc field. Fixed in
+  `d2112168`: every header line, the blank line included, must end in CRLF; a bare LF is refused like
+  a lone CR. That closes the line-boundary class (fourth correction to this stripper: lone CR,
+  Resent-Bcc, unclassifiable lines, bare LF). All-LF drafts are now refused by `sendDraft`.
+- **Pin state**: app `project.yml` pins `d2112168` (topic branch, not fork main; was `0919b08f`, `a09a3e3d`, `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
   with `tabmail-swiftmailfork-sync` and re-pin to the mirror.
