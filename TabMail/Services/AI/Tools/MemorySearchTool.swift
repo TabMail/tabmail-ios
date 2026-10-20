@@ -20,8 +20,13 @@ struct MemorySearchTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
-        guard case .string(let query) = arguments["query"], !query.trimmingCharacters(in: .whitespaces).isEmpty else {
-            return #"{"error": "missing query"}"#
+        // No query (missing, empty or not a string) lists the most recent turns,
+        // newest first, as TB's memory_search does.
+        let query: String
+        if case .string(let given) = arguments["query"] {
+            query = given
+        } else {
+            query = ""
         }
 
         let pageIndex: Int

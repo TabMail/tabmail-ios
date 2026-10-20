@@ -553,16 +553,37 @@ actor MemoryIndex {
     /// rendering.
     func listTurns(limit: Int) -> [MemoryHit] {
         ensureReady()
+        return recentTurns(limit: limit, fromMs: nil, toMs: nil, demoActive: nil)
+    }
+
+    /// The newest turns first, up to `limit`, within the optional dateMs window;
+    /// `demoActive` scopes them as a search is scoped (ADR-IOS-038), nil lists
+    /// every turn (the ChatHistoryView listing).
+    private func recentTurns(limit: Int, fromMs: Int64?, toMs: Int64?, demoActive: Bool?) -> [MemoryHit] {
         guard let dbPool else { return [] }
         do {
             return try dbPool.read { db in
-                let rows = try Row.fetchAll(db, sql: """
+                var sql = """
                     SELECT meta.chatHistoryId, meta.sessionId, meta.role, meta.dateMs, fts.content
                     FROM memory_meta meta
                     JOIN memory_fts fts ON fts.rowid = meta.rowid
-                    ORDER BY meta.dateMs DESC
-                    LIMIT ?
-                    """, arguments: [limit])
+                    WHERE 1 = 1
+                    """
+                var args: [DatabaseValueConvertible?] = []
+                if let demoActive {
+                    sql += " AND \(Self.demoScopeSQL(demoActive: demoActive, alias: "meta"))"
+                }
+                if let fromMs {
+                    sql += " AND meta.dateMs >= ?"
+                    args.append(fromMs)
+                }
+                if let toMs {
+                    sql += " AND meta.dateMs <= ?"
+                    args.append(toMs)
+                }
+                sql += " ORDER BY meta.dateMs DESC LIMIT ?"
+                args.append(limit)
+                let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
                 return rows.map { row in
                     MemoryHit(
                         chatHistoryId: row["chatHistoryId"],
@@ -578,7 +599,7 @@ actor MemoryIndex {
                 }
             }
         } catch {
-            BackgroundSyncLogger.logDebug("[MemoryIndex] listTurns failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] recentTurns failed: \(error)")
             return []
         }
     }
@@ -606,9 +627,13 @@ actor MemoryIndex {
         guard let dbPool else { return [] }
         let candidateLimit = limit * SearchConfig.candidateMultiplier
         let trimmed = query.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return [] }
         // Demo isolation: snapshot once per call so both legs use the same scope.
         let demoActive = DemoModeStore.isDemoActive
+        // No query lists the most recent turns, newest first, as the native-fts
+        // helper TB uses does for an empty query ("what have we discussed").
+        guard !trimmed.isEmpty else {
+            return recentTurns(limit: limit, fromMs: fromMs, toMs: toMs, demoActive: demoActive)
+        }
 
         // FTS5 candidates — ORDER BY rank ASC, meta.dateMs DESC.
         var ftsCandidates: [(rowid: Int64, rank: Double, snippet: String, content: String, chatHistoryId: String, sessionId: String?, role: String, dateMs: Int64)] = []

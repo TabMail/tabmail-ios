@@ -80,44 +80,34 @@ struct MemorySearchToolTests {
 
     // MARK: - Argument Validation
 
-    @Test("Missing query returns error")
-    func missingQuery() async throws {
-        let tool = try makeTool()
-        let result = try await tool.execute(arguments: [:])
-        #expect(result.contains("error"))
-        #expect(result.contains("missing query"))
-    }
+    /// "What have we discussed" names no topic: with no query (missing, empty,
+    /// blank or not a string) the tool lists the most recent turns, newest
+    /// first, as TB's memory_search does.
+    @Test("No query lists the most recent turns, newest first", arguments: [
+        [String: JSONValue](),
+        ["query": .string("")],
+        ["query": .string("   ")],
+        ["query": .int(42)],
+        ["query": .bool(true)],
+    ])
+    func noQueryListsRecent(arguments: [String: JSONValue]) async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
 
-    @Test("Empty string query returns error")
-    func emptyQuery() async throws {
-        let tool = try makeTool()
-        let result = try await tool.execute(arguments: ["query": .string("")])
-        #expect(result.contains("error"))
-        #expect(result.contains("missing query"))
-    }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "old", sessionId: "s1", role: "user", dateMs: now - 3 * 86_400_000, text: "oldest_turn_marker")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "mid", sessionId: "s2", role: "user", dateMs: now - 2 * 86_400_000, text: "middle_turn_marker")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "new", sessionId: "s3", role: "user", dateMs: now - 86_400_000, text: "newest_turn_marker")
 
-    @Test("Whitespace-only query returns error")
-    func whitespaceOnlyQuery() async throws {
         let tool = try makeTool()
-        let result = try await tool.execute(arguments: ["query": .string("   ")])
-        #expect(result.contains("error"))
-        #expect(result.contains("missing query"))
-    }
-
-    @Test("Non-string query type returns error")
-    func nonStringQuery() async throws {
-        let tool = try makeTool()
-        let result = try await tool.execute(arguments: ["query": .int(42)])
-        #expect(result.contains("error"))
-        #expect(result.contains("missing query"))
-    }
-
-    @Test("Bool query type returns error")
-    func boolQuery() async throws {
-        let tool = try makeTool()
-        let result = try await tool.execute(arguments: ["query": .bool(true)])
-        #expect(result.contains("error"))
-        #expect(result.contains("missing query"))
+        let result = try await tool.execute(arguments: arguments)
+        #expect(!result.contains("missing query"))
+        #expect(result.contains("\"totalItems\":3") || result.contains("\"totalItems\": 3"))
+        let newest = try #require(result.range(of: "newest_turn_marker"))
+        let middle = try #require(result.range(of: "middle_turn_marker"))
+        let oldest = try #require(result.range(of: "oldest_turn_marker"))
+        #expect(newest.lowerBound < middle.lowerBound)
+        #expect(middle.lowerBound < oldest.lowerBound)
     }
 
     // MARK: - page_index Parsing

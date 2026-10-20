@@ -384,6 +384,30 @@ struct MemoryIndexTests {
         #expect(hits.allSatisfy { $0.snippet.isEmpty })   // no FTS match, snippet empty
     }
 
+    /// An empty query lists the newest turns first, within the dateMs window,
+    /// and in the search's demo scope (normal mode never sees demo turns).
+    @Test("search with an empty query lists the newest turns in the window, demo turns left out")
+    func search_emptyQueryListsRecent() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let day: Int64 = 86_400_000
+        for i in 0..<5 {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i)", sessionId: "s", role: "user", dateMs: now - Int64(5 - i) * day, text: "turn \(i)")
+        }
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:abc", role: "user", dateMs: now, text: "demo turn")
+
+        for query in ["", "   "] {
+            let all = await MemoryIndex.shared.search(query: query, limit: 10)
+            #expect(all.map(\.chatHistoryId) == ["t4", "t3", "t2", "t1", "t0"])
+            let capped = await MemoryIndex.shared.search(query: query, limit: 2)
+            #expect(capped.map(\.chatHistoryId) == ["t4", "t3"])
+            let window = await MemoryIndex.shared.search(query: query, fromMs: now - 4 * day, toMs: now - 2 * day, limit: 10)
+            #expect(window.map(\.chatHistoryId) == ["t3", "t2", "t1"])
+        }
+    }
+
     // MARK: - Search: per-turn hits
 
     @Test("search returns per-turn hits — session with 2 matches yields 2 hits")
