@@ -270,14 +270,15 @@ enum ComposeDraftGuards {
 
     /// PORT — `v2final:ComposeDraftGuards.committedRecipients`.
     ///
-    /// The recipients a draft PERSISTS for one field: its addresses plus any text
-    /// left in its input line, so close / save never drop what the user typed.
-    /// Reopening the draft splits the list again (`fieldState`), so leftover text
-    /// returns to the input line, never to a recipient (ADR-IOS-092). Empty /
-    /// whitespace-only input adds nothing.
-    static func committedRecipients(tokens: [String], input: String) -> [String] {
-        let trimmed = trimmedInput(input)
-        return trimmed.isEmpty ? tokens : tokens + [trimmed]
+    /// The recipients a draft PERSISTS for one field: its addresses, then each
+    /// rejected entry as written, one element each, then any text still in its
+    /// input line (only the whitespace around it trimmed), so close / save never
+    /// drop or change what the user typed. Reopening the draft reads each element
+    /// on its own (`fieldState`), so a rejected entry returns as a rejected chip,
+    /// never joined to another or read as a recipient (ADR-IOS-092).
+    static func committedRecipients(_ field: RecipientField) -> [String] {
+        let typed = field.input.trimmingCharacters(in: .whitespacesAndNewlines)
+        return field.tokens + field.rejected + (typed.isEmpty ? [] : [typed])
     }
 
     /// Whether a character ends one entry of an input line.
@@ -285,10 +286,9 @@ enum ComposeDraftGuards {
         character == "," || character == ";" || character.isNewline
     }
 
-    /// Leftover text as the input line holds it: the pieces, each ended by
-    /// ", ", then the text still being typed. The separator keeps the next
-    /// address typed or pasted a separate entry, so it is never joined to the
-    /// leftover text into one address (ADR-IOS-092).
+    /// Addresses over the recipient cap as the input line holds them: each ended
+    /// by ", ", then the text still being typed. Each is a whole mailbox, so the
+    /// separator keeps it and the next entry apart (ADR-IOS-092).
     static func inputLine(_ leftovers: [String], typing: String = "") -> String {
         (leftovers.isEmpty ? "" : leftovers.joined(separator: ", ") + ", ") + typing
     }
@@ -298,26 +298,31 @@ enum ComposeDraftGuards {
         input.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",;")))
     }
 
-    /// The entry being typed: the text after the input line's last separator,
-    /// which is what contact suggestions match.
+    /// The entry being typed: the text after the input line's last separator
+    /// outside quotes (`RecipientEntry.lastSeparator`), which is what contact
+    /// suggestions match.
     static func typedEntry(_ input: String) -> String {
-        guard let last = input.lastIndex(where: isSeparator) else { return input }
+        guard let last = RecipientEntry.lastSeparator(in: input) else { return input }
         return String(input[input.index(after: last)...]).trimmingCharacters(in: .whitespaces)
     }
 
-    /// One recipient field: its addresses, their display names, and the text in
-    /// its input line.
+    /// One recipient field: its addresses, their display names, the entries
+    /// that name no address TabMail can send to, and the text in its input line.
     struct RecipientField: Equatable {
         var tokens: [String] = []
         var displayNames: [String: String] = [:]
+        /// Entries that name no sendable address, each exactly as written, shown
+        /// as red chips. Each stays apart from every other entry and is never
+        /// read again until the user edits it, so two of them can never join into
+        /// an address. Send refuses while any is left (ADR-IOS-092).
+        var rejected: [String] = []
         var input = ""
     }
 
     /// A field filled from outside the input line (a reopened draft, a prefill, a
-    /// reply): the addresses the texts name, and the rest as input text (ADR-IOS-092).
+    /// reply): the addresses the texts name, and the rest as rejected entries (ADR-IOS-092).
     static func fieldState(_ entry: RecipientEntry) -> RecipientField {
-        var field = RecipientField(
-            tokens: entry.addresses, input: inputLine(entry.unparsed.isEmpty ? [] : [entry.unparsed]))
+        var field = RecipientField(tokens: entry.addresses, rejected: entry.leftovers)
         for recipient in entry.recipients {
             if let name = recipient.name, !name.isEmpty { field.displayNames[recipient.address] = name }
         }
@@ -327,18 +332,19 @@ enum ComposeDraftGuards {
     /// Adds the addresses `text` names to `field`, as the user types a separator,
     /// pastes, presses Return, leaves the field or picks a contact (ADR-IOS-092).
     /// An address already in the field moves to the end. At most `room` new
-    /// addresses are added; the rest, any text that names no address, and then
-    /// `typing` (text the user is still typing, never split) become the field's
-    /// input. Returns nil when no address was added, so the input line is left
-    /// exactly as it is.
+    /// addresses are added; the rest, then `typing` (text the user is still
+    /// typing, never split), become the field's input. Each entry that names no
+    /// address becomes a rejected entry, as written. Returns nil when `text`
+    /// holds no entry, so the input line is left exactly as it is.
     static func committing(
         _ text: String, typing: String = "", to field: RecipientField, room: Int
     ) -> RecipientField? {
         let entry = RecipientEntry(text)
         var result = field
         var room = room
-        var kept = entry.unparsed.isEmpty ? [] : [entry.unparsed]
-        var added = false
+        var kept: [String] = []
+        var added = !entry.leftovers.isEmpty
+        result.rejected += entry.leftovers
         for recipient in entry.recipients {
             let key = recipient.address.lowercased()
             let isMove = result.tokens.contains { $0.lowercased() == key }
@@ -352,7 +358,7 @@ enum ComposeDraftGuards {
             if let name = recipient.name, !name.isEmpty { result.displayNames[recipient.address] = name }
             added = true
         }
-        guard added else { return nil }
+        guard added || !kept.isEmpty else { return nil }
         result.input = inputLine(kept, typing: String(typing.drop { $0.isWhitespace }))
         return result
     }
@@ -364,10 +370,11 @@ enum ComposeDraftGuards {
     /// addresses: the field has already turned a pasted column's line breaks into
     /// spaces, which `RecipientEntry` reads as separators after an address. While
     /// typing, only a keystroke that inserts a `,`, `;` or line break splits: the
-    /// text up to the last one is split and the text after it is still being
-    /// typed, so `bob, carol@example.c` never adds a half-typed address. Nil when
-    /// typing has inserted no such separator, so fixing leftover text where it is
-    /// never commits it half-fixed.
+    /// text up to the last one outside quotes (`RecipientEntry.lastSeparator`) is
+    /// split and the text after it is still being typed, so `bob, carol@example.c`
+    /// never adds a half-typed address and `"Doe, J` is never cut at its comma.
+    /// Nil when typing has inserted no such separator, so text being fixed where
+    /// it is never commits half-fixed.
     static func inputToSplit(was old: String, now text: String) -> (text: String, typing: String)? {
         let before = Array(old)
         let after = Array(text)
@@ -379,7 +386,7 @@ enum ComposeDraftGuards {
         let inserted = after[start..<(after.count - end)]
         if inserted.count > 1 { return (text, "") }
         guard inserted.contains(where: isSeparator),
-              let last = text.lastIndex(where: isSeparator) else { return nil }
+              let last = RecipientEntry.lastSeparator(in: text) else { return nil }
         return (String(text[...last]), String(text[text.index(after: last)...]))
     }
 
@@ -389,44 +396,52 @@ enum ComposeDraftGuards {
         committing(field.input, to: field, room: .max) ?? field
     }
 
-    /// A picked contact replaces the entry being typed: the contact's email
-    /// text is split like typed text, its addresses become recipients, and
-    /// leftover text before that entry stays. The contact's name goes with its
-    /// address only when the text names exactly one; it is never wrapped around
-    /// the text before the text is split (a contact's email value can hold a
-    /// list). Text TabMail cannot send to goes to the input line instead, so
-    /// the user sees it and Send names it, instead of the tap doing nothing.
+    /// A tapped rejected entry goes back to the input line for editing. Text
+    /// already in the input line is committed first, so the entry is never
+    /// joined to it; the entry is placed last, so nothing follows it.
+    static func editingRejected(at index: Int, in field: RecipientField, room: Int) -> RecipientField {
+        guard field.rejected.indices.contains(index) else { return field }
+        // Committing only appends rejected entries, so `index` still names the tapped one.
+        var result = committing(field.input, to: field, room: room) ?? field
+        let text = result.rejected.remove(at: index)
+        let before = trimmedInput(result.input)
+        result.input = before.isEmpty ? text : inputLine([before], typing: text)
+        return result
+    }
+
+    /// A picked contact replaces the entry being typed: the text before that
+    /// entry and the contact's email text are committed like typed text, so the
+    /// email text is split first (a contact's email value can hold a list).
+    /// Only when it names exactly one mailbox does the contact's name go with
+    /// it, rendered as a mailbox that reads back as the same one. Text TabMail
+    /// cannot send to becomes a rejected entry, so the user sees it and Send
+    /// names it, instead of the tap doing nothing.
     static func picking(
         _ address: String, name: String?, to field: RecipientField, room: Int
     ) -> RecipientField {
-        let before = field.input.lastIndex(where: isSeparator).map { String(field.input[...$0]) } ?? ""
+        let before = RecipientEntry.lastSeparator(in: field.input).map { String(field.input[...$0]) } ?? ""
         let picked = RecipientEntry(address)
-        let named = picked.recipients.count == 1 && picked.leftovers.isEmpty ? name.flatMap { $0.isEmpty ? nil : $0 } : nil
-        guard var result = committing(before + address, to: field, room: room) else {
-            // Over the cap, the one address keeps the contact's name for when it is sent.
-            let text = named.map { RecipientEntry.text(name: $0, address: picked.addresses[0]) }
-                ?? address.trimmingCharacters(in: .whitespacesAndNewlines)
-            var result = field
-            let leftover = trimmedInput(before)
-            result.input = inputLine(leftover.isEmpty ? [text] : [leftover, text])
-            return result
+        var text = address
+        if picked.recipients.count == 1, picked.leftovers.isEmpty {
+            let mailbox = picked.recipients[0]
+            text = RecipientEntry.text(name: name.flatMap { $0.isEmpty ? nil : $0 } ?? mailbox.name, address: mailbox.address)
         }
-        if let named, let token = result.tokens.first(where: { $0.lowercased() == picked.addresses[0].lowercased() }) {
-            result.displayNames[token] = named
-        }
-        return result
+        return committing(before + text, to: field, room: room) ?? field
     }
 
     /// A field after an AI recipient edit: removes first (or a clear of the
     /// whole field), then the adds, already split like typed text (ADR-IOS-092).
-    /// Their addresses become recipients, under any name the AI gave, and text
-    /// that names none goes to the input line, after any text already there. An address in the input line (one over the recipient cap,
-    /// or one typed) is a recipient Send would add, so a clear empties the input
-    /// line too, and a removal also removes it there, keeping the rest.
+    /// Their addresses become recipients, under any name the AI gave, and
+    /// entries that name none become rejected entries. An address in the input
+    /// line (one over the recipient cap, or one typed) is a recipient Send would
+    /// add, so a clear empties the input line and the rejected entries too, and a
+    /// removal also removes it there; the input line's other entries become
+    /// recipients' text again or rejected entries, never joined into new text.
     static func applying(_ delta: RecipientDelta, to field: RecipientField) -> RecipientField {
         var value = field
         if delta.clearsField {
             value.tokens = []
+            value.rejected = []
             value.input = ""
         } else if !delta.removes.isEmpty {
             let removeSet = Set(delta.removes.map { $0.lowercased() })
@@ -436,35 +451,33 @@ enum ComposeDraftGuards {
                 let kept = pending.recipients
                     .filter { !removeSet.contains($0.address.lowercased()) }
                     .map { RecipientEntry.text(name: $0.name, address: $0.address) }
-                value.input = inputLine((pending.unparsed.isEmpty ? [] : [pending.unparsed]) + kept)
+                value.rejected += pending.leftovers
+                value.input = inputLine(kept)
             }
         }
         var seen = Set(value.tokens.map { $0.lowercased() })
-        let existing = trimmedInput(value.input)
-        var leftovers = existing.isEmpty ? [] : [existing]
         for recipient in delta.adds.recipients {
             if seen.insert(recipient.address.lowercased()).inserted { value.tokens.append(recipient.address) }
             if let name = recipient.name, !name.isEmpty { value.displayNames[recipient.address] = name }
         }
-        leftovers += delta.adds.leftovers
-        value.input = inputLine(leftovers)
+        value.rejected += delta.adds.leftovers
         return value
     }
 
     enum SendRecipients: Equatable {
         case send(to: [String], cc: [String], bcc: [String])
-        /// Why Send is refused: an input line still holds text that names no
-        /// address, which is never sent (ADR-IOS-092).
+        /// Why Send is refused: a field still holds an entry that names no
+        /// address (a rejected entry or input text), which is never sent (ADR-IOS-092).
         case refused(String)
     }
 
     /// What Send sends, given fields whose input lines are already committed
     /// (`pendingCommitted`): each field's addresses, or a refusal naming the first
-    /// field whose input line still holds text, or, when the fields hold more
+    /// field that still holds a rejected entry or input text, or, when the fields hold more
     /// than the recipient cap (reply-all prefill can exceed it), the cap.
     static func sendRecipients(to: RecipientField, cc: RecipientField, bcc: RecipientField) -> SendRecipients {
         for (label, field) in [("To", to), ("Cc", cc), ("Bcc", bcc)] {
-            let text = trimmedInput(field.input)
+            let text = field.rejected.first ?? trimmedInput(field.input)
             if !text.isEmpty {
                 return .refused("\u{201C}\(text)\u{201D} in \(label) is not an email address. Fix or remove it before sending.")
             }
@@ -1206,6 +1219,7 @@ struct ComposeView: View {
     private func recipientTokenField(_ role: ComposeDraftGuards.RecipientRole) -> some View {
         TokenField(
             tokens: Binding(get: { recipients[role].tokens }, set: { recipients[role].tokens = $0 }),
+            rejected: Binding(get: { recipients[role].rejected }, set: { recipients[role].rejected = $0 }),
             input: Binding(get: { recipients[role].input }, set: { recipients[role].input = $0 }),
             displayNames: recipients[role].displayNames,
             searchResults: activeField == .recipient(role)
@@ -1215,6 +1229,7 @@ struct ComposeView: View {
                 setRecipients(recipients.picking(contact.email, name: contact.name, to: role))
             },
             commit: { text, typing in setRecipients(recipients.committing(text, typing: typing, to: role)) },
+            onEditRejected: { index in setRecipients(recipients.editingRejected(at: index, in: role)) },
             canAddMore: { canAddRecipient },
             revealedChipKey: $revealedChipKey,
             fieldKey: "\(role)"
@@ -2386,7 +2401,7 @@ struct ComposeView: View {
             subject = draft.subject
             messageBody = draft.body
             // A saved list may hold text that names no address (kept so nothing
-            // typed is lost); it returns to the input line (ADR-IOS-092).
+            // typed is lost); each returns as a rejected entry (ADR-IOS-092).
             setRecipients(recipients.filling(
                 to: RecipientEntry(draft.toArray), cc: RecipientEntry(draft.ccArray), bcc: RecipientEntry(draft.bccArray)))
             // Load attachments from disk (saveDraftAndDismiss writes them via
@@ -2546,9 +2561,9 @@ struct ComposeView: View {
     ///
     /// Commit the addresses in any uncommitted recipient text (each field's input
     /// line), as `send()` does, so close / save also SEE them (`hasChanges`)
-    /// and PERSIST them. Text that names no address stays in the input line and is
-    /// persisted beside the addresses (`committedRecipients`), never as a recipient
-    /// (ADR-IOS-092).
+    /// and PERSIST them. An entry that names no address becomes a rejected entry
+    /// and is persisted beside the addresses (`committedRecipients`), never as a
+    /// recipient (ADR-IOS-092).
     private func commitPendingRecipientInput() {
         setRecipients(recipients.pendingCommitted)
     }
@@ -2609,7 +2624,8 @@ struct ComposeView: View {
         let hasVisibleSuggestion = acceptedSuggestion != offeredSuggestion
         let hasContent = ComposeDraftGuards.hasContent(
             subject: subject, body: acceptedSuggestion.messageBody,
-            to: recipients.to.tokens, cc: recipients.cc.tokens, bcc: recipients.bcc.tokens,
+            to: recipients.to.tokens + recipients.to.rejected, cc: recipients.cc.tokens + recipients.cc.rejected,
+            bcc: recipients.bcc.tokens + recipients.bcc.rejected,
             toInput: recipients.to.input, ccInput: recipients.cc.input, bccInput: recipients.bcc.input,
             hasAttachments: !attachments.isEmpty || attachmentLoadFailed || attachmentPreparationIsUnsettled)
         let hasChanges = subject != initialSubject || messageBody != initialBody
@@ -3454,8 +3470,8 @@ struct ComposeView: View {
         guard let settledAttachments = await settledAttachmentSnapshot(
             for: .send) else { return }
 
-        // Commit the addresses in any pending input. Text that names no address
-        // is never sent: it stays in its input line and Send says so (ADR-IOS-092).
+        // Commit the addresses in any pending input. An entry that names no
+        // address is never sent: it stays a rejected entry and Send says so (ADR-IOS-092).
         commitPendingRecipientInput()
         let finalTo: [String], finalCc: [String], finalBcc: [String]
         switch recipients.sendRecipients {
@@ -3833,14 +3849,19 @@ private struct AttachmentPreparationFailureAlert: ViewModifier {
 
 private struct TokenField: View {
     @Binding var tokens: [String]
+    /// Entries that name no sendable address, shown as red chips (ADR-IOS-092).
+    @Binding var rejected: [String]
     @Binding var input: String
     let displayNames: [String: String]
     let searchResults: [ContactResult]
     let onFocus: () -> Void
     let onSelectContact: (ContactResult) -> Void
-    /// Adds the addresses the given text names to this field and leaves the
-    /// rest, then the still-typed text, in the input line (ADR-IOS-092).
+    /// Adds the addresses the given text names to this field, makes each entry
+    /// that names none a rejected entry, and leaves the still-typed text in the
+    /// input line (ADR-IOS-092).
     let commit: (_ text: String, _ typing: String) -> Void
+    /// Moves the tapped rejected entry back to the input line for editing.
+    let onEditRejected: (_ index: Int) -> Void
     /// Closure that returns whether the combined To+Cc+Bcc recipient count is
     /// under the hard cap (outboxMaxRecipients). When false, TextField is
     /// disabled — user must delete a chip to add another. The cap on what a
@@ -3854,22 +3875,41 @@ private struct TokenField: View {
     /// "bcc") so the same email appearing in multiple fields is unambiguous.
     let fieldKey: String
     @FocusState private var isFocused: Bool
+    /// Set when a rejected entry is moved to the input line, so that change is
+    /// not read as a paste and split straight back into a chip.
+    @State private var editingRejectedText = false
+
+    /// A chip: an address, or a rejected entry by its index.
+    private enum Chip: Hashable {
+        case token(String)
+        case rejected(Int)
+    }
+
+    private var chips: [Chip] { tokens.map(Chip.token) + rejected.indices.map(Chip.rejected) }
+
+    @ViewBuilder
+    private func chipView(_ chip: Chip) -> some View {
+        switch chip {
+        case .token(let token): tokenChip(token)
+        case .rejected(let index): rejectedChip(index)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Tokens + inline input
+            // Chips + inline input
             VStack(alignment: .leading, spacing: 4) {
-                // All tokens except the last — each on its own line
-                if tokens.count > 1 {
-                    ForEach(tokens.dropLast(), id: \.self) { token in
-                        tokenChip(token)
+                // All chips except the last — each on its own line
+                if chips.count > 1 {
+                    ForEach(chips.dropLast(), id: \.self) { chip in
+                        chipView(chip)
                     }
                 }
 
-                // Last token + inline TextField on the same line
+                // Last chip + inline TextField on the same line
                 HStack(spacing: 4) {
-                    if let lastToken = tokens.last {
-                        tokenChip(lastToken)
+                    if let lastChip = chips.last {
+                        chipView(lastChip)
                     }
                     TextField("", text: $input)
                         .font(.subheadline)
@@ -3885,6 +3925,10 @@ private struct TokenField: View {
                         // A field is a list, never free text: a typed or pasted
                         // separator splits what is there into recipients.
                         .onChange(of: input) { old, text in
+                            if editingRejectedText {
+                                editingRejectedText = false
+                                return
+                            }
                             if let split = ComposeDraftGuards.inputToSplit(was: old, now: text) {
                                 commit(split.text, split.typing)
                             }
@@ -3962,6 +4006,41 @@ private struct TokenField: View {
         .contentShape(Capsule())
         .onTapGesture {
             revealedChipKey = isRevealed ? nil : key
+        }
+    }
+
+    /// An entry that names no address TabMail can send to: red, removable, and
+    /// tapped to edit it in the input line.
+    private func rejectedChip(_ index: Int) -> some View {
+        let text = rejected.indices.contains(index) ? rejected[index] : ""
+        return HStack(spacing: 4) {
+            Text(text)
+                .font(.subheadline)
+                .foregroundStyle(.red)
+                .lineLimit(1)
+                .fixedSize(horizontal: text.count <= 20, vertical: false)
+                .accessibilityLabel("\(text), not an email address")
+                .accessibilityHint("Double-tap to edit")
+                .accessibilityAddTraits(.isButton)
+            Button {
+                if rejected.indices.contains(index) { rejected.remove(at: index) }
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red.opacity(0.7))
+            }
+            .accessibilityLabel("Remove \(text)")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.red.opacity(0.12))
+        .clipShape(Capsule())
+        .layoutPriority(1)
+        .contentShape(Capsule())
+        .onTapGesture {
+            editingRejectedText = true
+            onEditRejected(index)
+            isFocused = true
         }
     }
 

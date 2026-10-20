@@ -42,22 +42,28 @@ extension ComposeDraftGuards {
 
         var canAddMore: Bool { total < SyncConfig.outboxMaxRecipients }
 
-        /// What a draft stores for each field: its addresses, then any text left
-        /// in its input line (`committedRecipients`).
+        /// What a draft stores for each field: its addresses, then its rejected
+        /// entries, then any text left in its input line (`committedRecipients`).
         var stored: (to: [String], cc: [String], bcc: [String]) {
-            (committedRecipients(tokens: to.tokens, input: to.input),
-             committedRecipients(tokens: cc.tokens, input: cc.input),
-             committedRecipients(tokens: bcc.tokens, input: bcc.input))
+            (committedRecipients(to), committedRecipients(cc), committedRecipients(bcc))
         }
 
         /// The fields after `text` was committed to one of them, within the
-        /// recipient cap; unchanged when `text` names no address.
+        /// recipient cap; unchanged when `text` holds no entry.
         func committing(_ text: String, typing: String, to role: RecipientRole) -> Recipients {
             var result = self
             let room = SyncConfig.outboxMaxRecipients - total
             if let field = ComposeDraftGuards.committing(text, typing: typing, to: self[role], room: room) {
                 result[role] = field
             }
+            return result
+        }
+
+        /// The fields after a rejected entry of one of them was tapped for editing.
+        func editingRejected(at index: Int, in role: RecipientRole) -> Recipients {
+            var result = self
+            let room = SyncConfig.outboxMaxRecipients - total
+            result[role] = ComposeDraftGuards.editingRejected(at: index, in: self[role], room: room)
             return result
         }
 
@@ -121,6 +127,6 @@ extension ComposeDraftGuards {
 }
 
 extension ComposeDraftGuards.RecipientField {
-    /// No address and no text in the input line.
-    var isEmpty: Bool { tokens.isEmpty && input.isEmpty }
+    /// No address, no rejected entry and no text in the input line.
+    var isEmpty: Bool { tokens.isEmpty && rejected.isEmpty && input.isEmpty }
 }

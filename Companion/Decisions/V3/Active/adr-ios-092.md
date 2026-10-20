@@ -125,3 +125,39 @@ Kept as is, failing closed: leftover text with an unclosed quote or `<` can abso
 after it, but the result is still input-line text that Send refuses. Tests:
 `RecipientSplitFirstTests` (raw input to the recipients Send sends, and a captured Gmail request; 9
 red on the previous code, 2 positive controls).
+
+**Amendment (owner, 2026-10-19): rejected entries are red chips.** Supersedes, for the compose
+UI, every statement above that text naming no sendable address stays in the input line, and the
+"Kept as is, failing closed" sentence of the previous amendment, which was wrong: Tier 2 (t2r6)
+showed that two entries rejected one by one (an agent tool's recipient array, or a mailto link's
+repeated fields, such as `"First` and `Second" <joined@example.com>`) were joined into one input
+line, which closed the quote across them and read as a new recipient, and a captured Gmail send went
+out. Owner's choice, 2026-10-19:
+- each entry that is not a sendable address becomes its own red chip
+  (`ComposeDraftGuards.RecipientField.rejected`), as written, and is never joined to other text or
+  read again until the user edits it;
+- tapping a red chip moves its text to the input line for editing
+  (`ComposeDraftGuards.editingRejected`); text already in the input line is committed first, so the
+  two are never joined. Its remove button deletes it;
+- Send refuses while any red chip exists (`sendRecipients` names the first one);
+- drafts store each rejected entry as its own element, as written (`committedRecipients` keeps the
+  addresses, then the rejected entries, then the input text trimmed of whitespace only, so no
+  separator or quote is lost); reopening reads each element on its own, so it returns as the same
+  red chip.
+The input line now holds only addresses over the recipient cap and the text being typed. A commit,
+a contact pick, a fill, an AI add and an AI removal of an address waiting in the input line all put
+their non-address entries into `rejected`. Same order rule, one more place: the split point while
+typing, contact suggestions and a pick's replaced entry use the last separator OUTSIDE quotes,
+angle brackets, comments and a group (`RecipientEntry.lastSeparator`), so typing the comma of
+`"Doe, John" <john@example.com>` no longer cuts the name. Also from t2r6: a comment after an address
+ends the address, so `a@example.com (work) b@example.com` is two recipients; and
+`IMAPProvider.sendableRecipients` refuses a stored recipient with any part that is not a mailbox,
+even one whose decoded text is empty (`to@example.com, ""`), instead of dropping it. A census for
+the same join found reply-all (`buildReplyAllRecipients`) passing the Reply-To's rejected entries
+on as ONE string (`RecipientEntry.unparsed`); it now passes each as its own element, and `unparsed`
+is deleted. Tests:
+`RecipientSplitFirstTests` (entries rejected one by one through tool and mailto fills, save, reopen
+and Send for To/Cc/Bcc; a captured Gmail send with zero requests plus a valid control; byte-exact
+save), `RecipientEntryTests` (tap to edit, the quote-aware split point), `ComposeRecipientsTests`
+(the role wrappers keep rejected text), `ComposeRecipientWiringTests` (the chip's tap and remove,
+and the contact button).

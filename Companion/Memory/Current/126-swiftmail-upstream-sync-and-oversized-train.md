@@ -334,6 +334,12 @@ serializer that writes recipients:
   rewritten before it was split (decoded invalid text, the AI's first-`<...>` pre-parser, a contact
   name wrapped around a list); a census found the mailto comma split (#223, now fixed), the reply
   tool's raw-string removals and over-cap name loss. Owner rule and fixes: ADR-IOS-092 amendment.
+- **Red chips (Tier 2 t2r6, 2026-10-19)**: I had told the owner that joining rejected text in the
+  input line "fails safe"; t2r6 proved two entries rejected one by one (`"First` + `Second" <x@...>`)
+  joined into a new recipient and a captured Gmail send went out. Owner chose red chips: each
+  rejected entry is its own chip, never re-read until edited; Send refuses while any exist. Lesson:
+  any step that JOINS separately rejected text and re-reads it undoes split-first. ADR-IOS-092
+  second amendment.
 - **Pin state**: app `project.yml` pins `9b48bdeb` (narrow topic branch: `c7cd6aa1` plus a doc commit after
   Tier 1 r16, which was clean; not fork main; was `c7cd6aa1`, `8c72afef`, `d2112168`, `0919b08f`, `a09a3e3d`, `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the

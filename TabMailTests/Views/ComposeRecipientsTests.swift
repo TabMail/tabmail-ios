@@ -58,7 +58,8 @@ struct ComposeRecipientsTests {
         }
         Self.expectOnly(role, changed: filled, "fill")
         #expect(filled[role].tokens == ["new@example.com"])
-        #expect(ComposeDraftGuards.trimmedInput(filled[role].input) == "leftover")
+        #expect(filled[role].rejected == ["leftover"])
+        #expect(filled[role].input.isEmpty)
 
         let delta = RecipientEntryTests.delta(add: "new@example.com", remove: "*")
         let edited: ComposeDraftGuards.Recipients
@@ -69,6 +70,50 @@ struct ComposeRecipientsTests {
         }
         Self.expectOnly(role, changed: edited, "AI edit")
         #expect(edited[role].tokens == ["new@example.com"])
+    }
+
+    /// Text that names no address is kept as a rejected entry of the field it
+    /// was given to, saved there, and refuses Send until the user edits it.
+    @Test("A commit and an AI add keep text that names no address in their field, and a tap edits it",
+          arguments: Role.allCases)
+    func rejectedTextStaysInItsField(role: Role) {
+        func stored(_ value: ComposeDraftGuards.Recipients) -> [String] {
+            let all = value.stored
+            return role == .to ? all.to : role == .cc ? all.cc : all.bcc
+        }
+        let typed = Self.start.committing("bob,", typing: "", to: role)
+        Self.expectOnly(role, changed: typed, "typing")
+        #expect(typed[role].tokens == Self.start[role].tokens)
+        #expect(typed[role].rejected == ["bob"])
+        #expect(stored(typed) == Self.start[role].tokens + ["bob"])
+
+        let delta = RecipientEntryTests.delta(add: "Jane")
+        #expect(!delta.isEmpty)
+        let edited: ComposeDraftGuards.Recipients
+        switch role {
+        case .to: edited = Self.start.applying(to: delta, cc: nil, bcc: nil)
+        case .cc: edited = Self.start.applying(to: nil, cc: delta, bcc: nil)
+        case .bcc: edited = Self.start.applying(to: nil, cc: nil, bcc: delta)
+        }
+        Self.expectOnly(role, changed: edited, "AI add")
+        #expect(edited[role].rejected == ["Jane"])
+        #expect(stored(edited) == Self.start[role].tokens + ["Jane"])
+
+        for (label, value, text) in [("typing", typed, "bob"), ("AI add", edited, "Jane")] {
+            guard case .refused(let message) = value.pendingCommitted.sendRecipients else {
+                Issue.record("\(label): Send was not refused")
+                continue
+            }
+            #expect(message.contains(text), "\(label): \(message)")
+        }
+
+        let tapped = typed.editingRejected(at: 0, in: role)
+        Self.expectOnly(role, changed: tapped, "tap")
+        #expect(tapped[role].rejected.isEmpty)
+        #expect(tapped[role].input == "bob")
+        let fixed = tapped.committing("bob@example.com,", typing: "", to: role)
+        #expect(fixed[role].tokens == Self.start[role].tokens + ["bob@example.com"])
+        #expect(fixed[role].rejected.isEmpty)
     }
 
     @Test("A fill keeps display names the field already knows")

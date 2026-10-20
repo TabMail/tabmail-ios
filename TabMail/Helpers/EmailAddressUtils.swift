@@ -9,8 +9,9 @@ import SwiftMail
 /// Build To and CC recipients for Reply All, filtering out all of the user's own email addresses.
 ///
 /// The reply target is the one Reply does (`RecipientEntry.reply(to:)`). Text in
-/// it that names no sendable address is passed on as text, so compose shows it in
-/// the To input line and Send refuses it, as for Reply (ADR-IOS-092). Entries of
+/// it that names no sendable address is passed on as text, one element per entry,
+/// so compose shows each as a rejected entry of To and Send refuses it, as for
+/// Reply (ADR-IOS-092). Entries of
 /// the original To and Cc that are not sendable mailboxes are never offered
 /// (owner decision 2026-10-03, memory 126).
 func buildReplyAllRecipients(
@@ -26,7 +27,10 @@ func buildReplyAllRecipients(
         let bare = address.lowercased()
         if seen.insert(bare).inserted { toEmails.append(bare) }
     }
-    if !replyTarget.unparsed.isEmpty { toEmails.append(replyTarget.unparsed) }
+    // Each entry that names no sendable address stays its own element, as
+    // written, so compose shows each as its own rejected entry and never reads
+    // two of them joined (ADR-IOS-092).
+    toEmails += replyTarget.leftovers
     // Read with SwiftMail's parser, which honours quoted-pairs: an address inside
     // a quoted display name is part of the name, never a recipient.
     for mailbox in AddressParser.parseAddressList(msg.to).flatMap(\.mailboxes) {

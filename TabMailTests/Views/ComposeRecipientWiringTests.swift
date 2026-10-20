@@ -39,9 +39,13 @@ struct ComposeRecipientWiringTests {
         let start = try #require(text.range(of: "private func recipientTokenField("))
         let end = try #require(text[start.upperBound...].range(of: "private "))
         let builder = String(text[start.lowerBound..<end.lowerBound])
-        #expect(Self.count("recipients[role]", in: builder) == 6)
-        #expect(builder.contains("recipients.picking(contact.email, name: contact.name, to: role)"))
-        #expect(builder.contains("recipients.committing(text, typing: typing, to: role)"))
+        #expect(Self.count("recipients[role]", in: builder) == 8)
+        #expect(builder.contains(
+            "onSelectContact: { contact in setRecipients(recipients.picking(contact.email, name: contact.name, to: role)) }"))
+        #expect(builder.contains("commit: { text, typing in setRecipients(recipients.committing(text, typing: typing, to: role)) }"))
+        #expect(builder.contains(
+            "rejected: Binding(get: { recipients[role].rejected }, set: { recipients[role].rejected = $0 })"))
+        #expect(builder.contains("onEditRejected: { index in setRecipients(recipients.editingRejected(at: index, in: role)) }"))
         for literal in [".to", ".cc", ".bcc", "recipients.to", "recipients.cc", "recipients.bcc"] {
             #expect(!builder.contains(literal + ")") && !builder.contains(literal + "."), "builder names \(literal)")
         }
@@ -49,13 +53,28 @@ struct ComposeRecipientWiringTests {
 
     /// A SwiftUI callback cannot be driven from a unit test, so this pins that
     /// the input line's change handler splits a typed or pasted separator
-    /// (`inputToSplit`, tested in RecipientEntryTests) into recipients.
+    /// (`inputToSplit`, tested in RecipientEntryTests) into recipients, except
+    /// the one change a tap on a rejected entry makes, which puts that entry's
+    /// text back for editing.
     @Test("Typing or pasting a separator in a recipient field splits it into recipients")
     func inputChangeSplits() throws {
         let text = try Self.source()
         #expect(Self.count(
-            ".onChange(of: input) { old, text in if let split = ComposeDraftGuards.inputToSplit(was: old, now: text) { commit(split.text, split.typing) } }",
+            ".onChange(of: input) { old, text in if editingRejectedText { editingRejectedText = false return } if let split = ComposeDraftGuards.inputToSplit(was: old, now: text) { commit(split.text, split.typing) } }",
             in: text) == 1)
+    }
+
+    /// The recipient field's own controls: a suggested contact's button passes
+    /// that contact on, a tap on a rejected entry moves it to the input line,
+    /// and its remove button removes only that entry.
+    @Test("A contact tap, a rejected entry's tap and its remove button reach the field")
+    func fieldControlsReachTheField() throws {
+        let text = try Self.source()
+        #expect(Self.count("Button { onSelectContact(contact) }", in: text) == 1)
+        #expect(Self.count(".onTapGesture { editingRejectedText = true onEditRejected(index) isFocused = true }", in: text) == 1)
+        #expect(Self.count("Button { if rejected.indices.contains(index) { rejected.remove(at: index) } }", in: text) == 1)
+        #expect(Self.count("case .rejected(let index): rejectedChip(index)", in: text) == 1)
+        #expect(text.contains("private var chips: [Chip] { tokens.map(Chip.token) + rejected.indices.map(Chip.rejected) }"))
     }
 
     /// The agent's autosave runs right after `applyInlineEdit` returns, so an AI

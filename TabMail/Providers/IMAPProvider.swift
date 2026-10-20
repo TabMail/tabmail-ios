@@ -6101,10 +6101,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 switch entry {
                 case .mailbox(let mailbox): mailboxes.append(mailbox)
                 case .group(_, let members): mailboxes += members
-                case .invalid(let text):
-                    if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        throw SMTPError.invalidEmailAddress(recipient)
-                    }
+                case .invalid:
+                    // Any entry that is not a mailbox fails the whole send, even
+                    // one whose decoded text is empty (`""`): nothing is dropped.
+                    throw SMTPError.invalidEmailAddress(recipient)
                 }
             }
             guard !mailboxes.isEmpty else { throw SMTPError.invalidEmailAddress(recipient) }

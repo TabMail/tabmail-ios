@@ -26,11 +26,13 @@ struct RecipientSplitFirstTests {
     func quotedTextStaysText(text: String) {
         let entry = RecipientEntry(text)
         #expect(entry.addresses.isEmpty)
-        #expect(entry.unparsed == text)
+        #expect(entry.leftovers == [text])
         let field = ComposeDraftGuards.fieldState(entry)
         let committed = ComposeDraftGuards.pendingCommitted(field)
         #expect(committed.tokens.isEmpty)
-        let stored = ComposeDraftGuards.committedRecipients(tokens: committed.tokens, input: committed.input)
+        #expect(committed.rejected == [text])
+        let stored = ComposeDraftGuards.committedRecipients(committed)
+        #expect(stored == [text])
         let reopened = ComposeDraftGuards.pendingCommitted(ComposeDraftGuards.fieldState(RecipientEntry(stored)))
         #expect(reopened.tokens.isEmpty)
         for cc in [committed, reopened] {
@@ -59,7 +61,118 @@ struct RecipientSplitFirstTests {
     func partlyUnreadableEntryIsText(text: String) {
         let entry = RecipientEntry(text)
         #expect(entry.addresses.isEmpty)
-        #expect(entry.unparsed == text)
+        #expect(entry.leftovers == [text])
+    }
+
+    // MARK: - Entries rejected one by one
+
+    /// Entries that arrive as separate values: an agent tool's recipient array
+    /// and a mailto link's repeated fields.
+    private static let separateEntries = ["\"First", "Second\" <joined@example.com>"]
+
+    private static func separateValues(_ source: String) throws -> [String] {
+        switch source {
+        case "tool array":
+            return try #require(EmailComposeTool.parseStringArray(.array(separateEntries.map { .string($0) })))
+        default:
+            let url = try #require(URL(string:
+                "mailto:?to=%22First&to=Second%22%20%3Cjoined@example.com%3E&cc=%22First&cc=Second%22%20%3Cjoined@example.com%3E&bcc=%22First&bcc=Second%22%20%3Cjoined@example.com%3E"))
+            let request = try #require(MailtoRequest.parse(url))
+            #expect(request.to == request.cc && request.cc == request.bcc)
+            return request.bcc
+        }
+    }
+
+    private static func filling(_ role: ComposeDraftGuards.RecipientRole, _ entry: RecipientEntry) -> ComposeDraftGuards.Recipients {
+        let start = ComposeDraftGuards.Recipients(to: Self.to)
+        switch role {
+        case .to: return start.filling(to: entry)
+        case .cc: return start.filling(cc: entry)
+        case .bcc: return start.filling(bcc: entry)
+        }
+    }
+
+    /// The bug this guards: two entries rejected one by one were joined into
+    /// one line of text, which closed the quote across them and read as a new
+    /// recipient, so Send went to an address no entry had named.
+    @Test("Entries rejected one by one stay rejected through a fill, a save, a reopen and Send",
+          arguments: ["tool array", "mailto"], ComposeDraftGuards.RecipientRole.allCases)
+    func separateEntriesStayRejected(source: String, role: ComposeDraftGuards.RecipientRole) throws {
+        let values = try Self.separateValues(source)
+        #expect(values == Self.separateEntries)
+        let entry = RecipientEntry(values)
+        #expect(entry.addresses.isEmpty)
+        #expect(entry.leftovers == Self.separateEntries)
+        let filled = Self.filling(role, entry).pendingCommitted
+        #expect(filled[role].tokens.isEmpty)
+        #expect(filled[role].rejected == Self.separateEntries)
+        let stored = filled.stored
+        let saved = role == .to ? stored.to : role == .cc ? stored.cc : stored.bcc
+        #expect(saved == Self.separateEntries)
+        let reopened = Self.filling(role, RecipientEntry(saved)).pendingCommitted
+        #expect(reopened == filled)
+        for fields in [filled, reopened] {
+            guard case .refused(let message) = fields.sendRecipients else {
+                Issue.record("Entries rejected one by one were sent: \(fields.sendRecipients)")
+                continue
+            }
+            #expect(message.contains(Self.separateEntries[0]))
+        }
+    }
+
+    /// Kept text is stored exactly as written, separators and quotes inside it
+    /// included, so a save never changes what the user typed.
+    @Test("A rejected entry is saved and reopened exactly as written", arguments: [
+        "\"unfinished;", "\"a, b", "Name <a@example.com", "x@example.com (note", "\"\""
+    ])
+    func rejectedEntryKeepsItsText(raw: String) {
+        let entry = RecipientEntry([raw])
+        #expect(entry.addresses.isEmpty)
+        #expect(entry.leftovers == [raw])
+        let field = ComposeDraftGuards.pendingCommitted(ComposeDraftGuards.fieldState(entry))
+        #expect(ComposeDraftGuards.committedRecipients(field) == [raw])
+        let reopened = ComposeDraftGuards.fieldState(RecipientEntry(ComposeDraftGuards.committedRecipients(field)))
+        #expect(reopened.rejected == [raw])
+    }
+
+    /// Outbox rows written before compose split recipients can hold a whole
+    /// list in one element. One part that is not a mailbox fails the send,
+    /// even a part whose decoded text is empty, so no part is dropped.
+    @Test("A stored recipient holding a mailbox and an empty quoted string fails the send", arguments: [
+        "to@example.com, \"\"", "\"\", to@example.com"
+    ])
+    func legacyMixedRecipientIsRefused(raw: String) {
+        do {
+            let sendable = try IMAPProvider.sendableRecipients([raw])
+            Issue.record("Part of \(raw) was dropped and the rest sent: \(sendable)")
+        } catch {
+            #expect(AccountManager.isFatalSendError(error))
+        }
+        #expect(throws: Never.self) { _ = try IMAPProvider.sendableRecipients(["to@example.com"]) }
+    }
+
+    @Test("Rejected entries never reach a provider send, in any field",
+          arguments: ComposeDraftGuards.RecipientRole.allCases)
+    func rejectedEntriesNeverSent(role: ComposeDraftGuards.RecipientRole) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/messages/send", method: "POST", response: .json(raw: #"{"id":"sent-test"}"#))
+        let provider = GmailProvider(userEmail: "sender@example.com", accessToken: { _ in "tok" }, session: http.session)
+        let fields = Self.filling(role, RecipientEntry(try Self.separateValues("tool array"))).pendingCommitted
+        if case .send(let to, let cc, let bcc) = fields.sendRecipients {
+            try await provider.send(draft: DraftMessage(to: to, cc: cc, bcc: bcc, subject: "Test", body: "Body text"))
+        }
+        #expect(http.recordedCalls().isEmpty)
+
+        // The same route with the quote closed in one entry sends normally.
+        let valid = Self.filling(role, RecipientEntry(["\"First, Second\" <joined@example.com>"])).pendingCommitted
+        guard case .send(let to, let cc, let bcc) = valid.sendRecipients else {
+            Issue.record("A valid entry was refused: \(valid.sendRecipients)")
+            return
+        }
+        try await provider.send(draft: DraftMessage(to: to, cc: cc, bcc: bcc, subject: "Test", body: "Body text"))
+        #expect(http.recordedCalls().count == 1)
+        #expect((role == .to ? to : role == .cc ? cc : bcc).contains("joined@example.com"))
     }
 
     // MARK: - AI edits
@@ -88,7 +201,7 @@ struct RecipientSplitFirstTests {
         let parsed = AIService.parseInlineEditResponse("+Bcc: First <first@example.com>; unfinished\nBody: Body")
         let bcc = ComposeDraftGuards.applying(try #require(parsed.bccDelta), to: .init())
         #expect(bcc.tokens == ["first@example.com"])
-        #expect(ComposeDraftGuards.trimmedInput(bcc.input) == "unfinished")
+        #expect(bcc.rejected == ["unfinished"])
         guard case .refused = ComposeDraftGuards.sendRecipients(
             to: Self.to, cc: .init(), bcc: ComposeDraftGuards.pendingCommitted(bcc)) else {
             Issue.record("The AI add's text was dropped and Send went ahead")
@@ -116,7 +229,8 @@ struct RecipientSplitFirstTests {
         field = ComposeDraftGuards.picking("ann@example.com", name: "Ann, Lee", to: field, room: 10)
         #expect(field.tokens == ["old@example.com", "ann@example.com"])
         #expect(field.displayNames == ["ann@example.com": "Ann, Lee"])
-        #expect(ComposeDraftGuards.trimmedInput(field.input) == "bob")
+        #expect(field.rejected == ["bob"])
+        #expect(field.input.isEmpty)
     }
 
     // MARK: - Over the cap

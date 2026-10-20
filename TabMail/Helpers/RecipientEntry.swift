@@ -10,7 +10,7 @@ import SwiftMail
 /// a paste, a contact, a mailto link, the AI, a reopened draft, a reply) goes
 /// through here, so "a@example.com, b@example.com" becomes two recipients.
 /// Text that names no address TabMail can send to never becomes a recipient;
-/// it is kept, as written, for the field's input line.
+/// it is kept, as written, as one of the field's rejected entries.
 struct RecipientEntry: Equatable, Sendable {
     struct Recipient: Equatable, Sendable {
         let address: String
@@ -21,8 +21,6 @@ struct RecipientEntry: Equatable, Sendable {
     /// The entries that name no sendable address, each exactly as it was
     /// written (only the whitespace around it trimmed).
     private(set) var leftovers: [String] = []
-    /// The leftovers joined by ", ". Empty when every entry was an address.
-    var unparsed: String { leftovers.joined(separator: ", ") }
 
     /// Splits each text into entries first, and only then reads each entry
     /// with SwiftMail's address-list parser, the parser every send uses. An
@@ -78,6 +76,8 @@ struct RecipientEntry: Equatable, Sendable {
     ///   display name (RFC 5322 3.2.3), so `a@example.com b@example.com` and
     ///   `Ann <a@example.com> Bob <b@example.com>` split, while
     ///   `Ann Lee <a@example.com>` and `a@example.com (work)` stay one mailbox.
+    ///   A comment after an address belongs to it, and spaces after that
+    ///   comment end the entry, as they would after the address.
     private static func entries(_ text: String) -> [String] {
         var pieces: [String] = []
         var current = ""
@@ -90,6 +90,9 @@ struct RecipientEntry: Equatable, Sendable {
         var afterAngle = false
         var gap = ""
         var gapEndsAddress = false
+        // A comment that began right after an address: when it closes, the
+        // address has ended, so spaces after it end the entry.
+        var commentEndsAddress = false
         func separate() {
             if inGroup || angleDepth > 0 {
                 current.append(",")
@@ -113,6 +116,10 @@ struct RecipientEntry: Equatable, Sendable {
                     commentDepth += 1
                 } else if character == ")" {
                     commentDepth -= 1
+                    if commentDepth == 0, commentEndsAddress {
+                        commentEndsAddress = false
+                        afterAngle = true
+                    }
                 }
                 current.append(character)
                 continue
@@ -124,6 +131,7 @@ struct RecipientEntry: Equatable, Sendable {
                 afterAngle = false
                 continue
             }
+            let addressEnded = angleDepth == 0 && (gap.isEmpty ? (wordHasAt || afterAngle) : gapEndsAddress)
             if !gap.isEmpty {
                 if gapEndsAddress, !character.isNewline, !"(,;".contains(character) { separate() }
                 current += gap
@@ -137,7 +145,9 @@ struct RecipientEntry: Equatable, Sendable {
             }
             switch character {
             case "\"": inQuote = true
-            case "(": commentDepth += 1
+            case "(":
+                commentDepth += 1
+                commentEndsAddress = addressEnded
             case "<": angleDepth += 1
             case ">":
                 angleDepth = max(0, angleDepth - 1)
@@ -161,6 +171,51 @@ struct RecipientEntry: Equatable, Sendable {
             current.append(character)
         }
         return pieces + [current + gap]
+    }
+
+    /// Where a text's last finished entry ends: its last `,`, `;` or line break
+    /// outside quotes, angle brackets, comments and a group. A separator
+    /// inside any of those is still part of the entry being typed (`"Doe, J`),
+    /// so it never ends one. Nil when the text has no such separator.
+    static func lastSeparator(in text: String) -> String.Index? {
+        var last: String.Index?
+        var inQuote = false
+        var escaped = false
+        var angleDepth = 0
+        var commentDepth = 0
+        var inGroup = false
+        for index in text.indices {
+            let character = text[index]
+            if escaped {
+                escaped = false
+            } else if inQuote || commentDepth > 0 {
+                if character == "\\" {
+                    escaped = true
+                } else if inQuote {
+                    if character == "\"" { inQuote = false }
+                } else if character == "(" {
+                    commentDepth += 1
+                } else if character == ")" {
+                    commentDepth -= 1
+                }
+            } else if character.isNewline {
+                if angleDepth == 0 { inGroup = false; last = index }
+            } else {
+                switch character {
+                case "\"": inQuote = true
+                case "(": commentDepth += 1
+                case "<": angleDepth += 1
+                case ">": angleDepth = max(0, angleDepth - 1)
+                case ":" where angleDepth == 0: inGroup = true
+                case "," where angleDepth == 0 && !inGroup: last = index
+                case ";" where angleDepth == 0:
+                    inGroup = false
+                    last = index
+                default: break
+                }
+            }
+        }
+        return last
     }
 
     var addresses: [String] { recipients.map(\.address) }
