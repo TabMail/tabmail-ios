@@ -27,7 +27,7 @@ struct MemorySearchCacheTests {
     func setGetHitsCache() async {
         await MemorySearchCache.shared.reset()
         let key = MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: nil)
-        await MemorySearchCache.shared.set(key, [hit(id: "t1"), hit(id: "t2")])
+        await MemorySearchCache.shared.set(key, [hit(id: "t1"), hit(id: "t2")], generation: await MemorySearchCache.shared.generation)
         let got = await MemorySearchCache.shared.get(key)
         #expect(got?.count == 2)
         #expect(got?.first?.chatHistoryId == "t1")
@@ -38,12 +38,34 @@ struct MemorySearchCacheTests {
         await MemorySearchCache.shared.reset()
         let k1 = MemorySearchCache.makeKey(query: "a", fromDate: nil, toDate: nil)
         let k2 = MemorySearchCache.makeKey(query: "b", fromDate: nil, toDate: nil)
-        await MemorySearchCache.shared.set(k1, [hit(id: "t1")])
-        await MemorySearchCache.shared.set(k2, [hit(id: "t2")])
+        await MemorySearchCache.shared.set(k1, [hit(id: "t1")], generation: await MemorySearchCache.shared.generation)
+        await MemorySearchCache.shared.set(k2, [hit(id: "t2")], generation: await MemorySearchCache.shared.generation)
         #expect(await MemorySearchCache.shared._testKeyCount() == 2)
         await MemorySearchCache.shared.reset()
         #expect(await MemorySearchCache.shared._testKeyCount() == 0)
         #expect(await MemorySearchCache.shared.get(k1) == nil)
+    }
+
+    /// Hits found by a search that began before a reset are not kept after it;
+    /// one that began after it are.
+    @Test("a search from before a reset stores nothing")
+    func staleSetRefused() async {
+        await MemorySearchCache.shared.reset()
+        let key = MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: nil)
+        let before = await MemorySearchCache.shared.generation
+        await MemorySearchCache.shared.reset()
+        await MemorySearchCache.shared.set(key, [hit(id: "stale")], generation: before)
+        #expect(await MemorySearchCache.shared.get(key) == nil)
+        await MemorySearchCache.shared.set(key, [hit(id: "fresh")], generation: await MemorySearchCache.shared.generation)
+        #expect(await MemorySearchCache.shared.get(key)?.first?.chatHistoryId == "fresh")
+    }
+
+    @Test("a blank query and no query share a key")
+    func blankQueryKeyIsTheEmptyKey() {
+        let none = MemorySearchCache.makeKey(query: "", fromDate: nil, toDate: nil)
+        for blank in ["\n", "\r\n", " \t\n"] {
+            #expect(MemorySearchCache.makeKey(query: blank, fromDate: nil, toDate: nil) == none)
+        }
     }
 
     @Test("distinct keys isolate cache entries")
@@ -55,8 +77,8 @@ struct MemorySearchCacheTests {
         #expect(k1 != k2)
         #expect(k1 != k3)
         #expect(k2 != k3)
-        await MemorySearchCache.shared.set(k1, [hit(id: "k1")])
-        await MemorySearchCache.shared.set(k2, [hit(id: "k2")])
+        await MemorySearchCache.shared.set(k1, [hit(id: "k1")], generation: await MemorySearchCache.shared.generation)
+        await MemorySearchCache.shared.set(k2, [hit(id: "k2")], generation: await MemorySearchCache.shared.generation)
         #expect(await MemorySearchCache.shared.get(k1)?.first?.chatHistoryId == "k1")
         #expect(await MemorySearchCache.shared.get(k2)?.first?.chatHistoryId == "k2")
         #expect(await MemorySearchCache.shared.get(k3) == nil)

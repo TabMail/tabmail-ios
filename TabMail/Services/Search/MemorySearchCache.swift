@@ -15,19 +15,27 @@ actor MemorySearchCache {
 
     private var sessions: [String: [MemoryHit]] = [:]
 
+    /// How many resets there have been. A search reads it before it looks in the cache and stores
+    /// its hits only if no reset came since, so a search still running from an earlier turn (one
+    /// canceled when demo mode started, say) can't fill the next turn's cache with what it found.
+    private(set) var generation = 0
+
     /// Look up cached hits for a normalized-args JSON key.
     func get(_ key: String) -> [MemoryHit]? {
         sessions[key]
     }
 
-    /// Store hits for a normalized-args JSON key.
-    func set(_ key: String, _ hits: [MemoryHit]) {
+    /// Store hits for a normalized-args JSON key, unless the cache was reset since `generation`
+    /// was read.
+    func set(_ key: String, _ hits: [MemoryHit], generation: Int) {
+        guard generation == self.generation else { return }
         sessions[key] = hits
     }
 
     /// Reset all caches. Called from `AIService.sendChatMessage` top.
     func reset() {
         sessions.removeAll()
+        generation += 1
     }
 
     /// Build the cache key the way TB does in `memory_search.js:27-30`:
@@ -35,7 +43,7 @@ actor MemorySearchCache {
     static func makeKey(query: String, fromDate: String?, toDate: String?) -> String {
         // Sort-order-stable JSON via explicit key layout (matches TB's JSON.stringify
         // on a three-key object).
-        let q = escape(query.trimmingCharacters(in: .whitespaces))
+        let q = escape(query.trimmingCharacters(in: .whitespacesAndNewlines))
         let f = escape(fromDate ?? "")
         let t = escape(toDate ?? "")
         return "{\"query\":\"\(q)\",\"from_date\":\"\(f)\",\"to_date\":\"\(t)\"}"

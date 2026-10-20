@@ -24,7 +24,8 @@ struct MemorySearchTool: AgentTool, Sendable {
         // newest first, as TB's memory_search does.
         let query: String
         if case .string(let given) = arguments["query"] {
-            query = given
+            // Trimmed once here, so the cache key and the search read the same query.
+            query = given.trimmingCharacters(in: .whitespacesAndNewlines)
         } else {
             query = ""
         }
@@ -60,6 +61,8 @@ struct MemorySearchTool: AgentTool, Sendable {
         let cacheKey = MemorySearchCache.makeKey(query: query, fromDate: fromRaw, toDate: toRaw)
         BackgroundSyncLogger.logDebug("[MemorySearchTool] ENTER q='\(query.prefix(60))' page=\(pageIndex) fromRaw=\(fromRaw ?? "nil") toRaw=\(toRaw ?? "nil") fromDate=\(fromDate.map { "\($0)" } ?? "nil") toDate=\(toDate.map { "\($0)" } ?? "nil") fetchLimit=\(fetchLimit)")
         var hits: [MemoryHit]
+        // Read before the lookup: a reset after this (a new turn) refuses this search's hits.
+        let cacheGeneration = await MemorySearchCache.shared.generation
         if let cached = await MemorySearchCache.shared.get(cacheKey) {
             hits = cached
             BackgroundSyncLogger.logDebug("[MemorySearchTool] CACHE HIT key=\(cacheKey.prefix(120)) hits=\(hits.count)")
@@ -83,7 +86,7 @@ struct MemorySearchTool: AgentTool, Sendable {
                 limit: fetchLimit
             )
             BackgroundSyncLogger.logDebug("[MemorySearchTool] CACHE MISS — MemoryIndex.search returned \(hits.count) hits")
-            await MemorySearchCache.shared.set(cacheKey, hits)
+            await MemorySearchCache.shared.set(cacheKey, hits, generation: cacheGeneration)
         }
 
         if hits.isEmpty {

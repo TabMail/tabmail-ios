@@ -38,7 +38,8 @@ struct MemorySearchToolTests {
     }
 
     /// Creates a fresh MemoryIndex pool for per-turn format tests.
-    private func installMemoryIndex() async throws -> (pool: DatabasePool, dir: URL) {
+    /// `readers` caps the pool's readers (one lets a test hold a search mid-read).
+    private func installMemoryIndex(readers: Int? = nil) async throws -> (pool: DatabasePool, dir: URL) {
         await MemoryIndex.shared._testReset()
         await MemorySearchCache.shared.reset()
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -51,6 +52,7 @@ struct MemorySearchToolTests {
             }
             try db.execute(sql: "PRAGMA journal_mode = WAL")
         }
+        if let readers { config.maximumReaderCount = readers }
         let pool = try DatabasePool(path: path, configuration: config)
         try await MemoryIndex.shared._testInstallPool(pool)
         return (pool, dir)
@@ -189,6 +191,83 @@ struct MemorySearchToolTests {
         await MemorySearchCache.shared.reset()
         let next = try listed(try await tool.execute(arguments: [:]))
         #expect(next.first?.dateMs == base + 15 * 3_600_000)
+    }
+
+    /// A blank query is no query, for its pages too: page one asked with a
+    /// line break and later pages with no query come from the one listing,
+    /// every turn once, a turn written between pages left out.
+    @Test("A blank query and no query page one listing", arguments: ["\n", "\r\n", " \t\n"])
+    func blankQueryPagesTheOneListing(blank: String) async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        let base = noonUTCThreeDaysAgo()
+        let pageSize = SearchConfig.memoryPageSizeDefault
+        let count = pageSize + 1
+        for i in 0..<count {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i)", sessionId: "s", role: "user", dateMs: base + Int64(i) * 3_600_000, text: "turn \(i)")
+        }
+        let expected = (0..<count).reversed().map { base + Int64($0) * 3_600_000 }
+
+        let tool = try makeTool()
+        var shown = try listed(try await tool.execute(arguments: ["query": .string(blank)])).map(\.dateMs)
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "late", sessionId: "s", role: "user", dateMs: base + Int64(count) * 3_600_000, text: "late turn")
+        shown += try listed(try await tool.execute(arguments: ["page_index": .int(2)])).map(\.dateMs)
+        #expect(shown == expected)
+    }
+
+    /// A search still running from an earlier turn never fills the next turn's
+    /// listing: a real-history search held mid-read while demo mode starts and
+    /// the next turn begins finds real history for its own (canceled) turn, and
+    /// the demo turn's listing then shows demo turns only.
+    @Test("A search from before a turn's reset never fills that turn's listing", arguments: ["", "budget"])
+    func staleSearchNeverFillsTheNextTurn(query: String) async throws {
+        let (memPool, memDir) = try await installMemoryIndex(readers: 1)
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        let base = noonUTCThreeDaysAgo()
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base + 3_600_000, text: "budget real_history_marker")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base, text: "budget demo_history_marker")
+        // Older turns of each mode that don't match the query.
+        for i in 0..<4 {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "other\(i)", sessionId: i % 2 == 0 ? "s" : "demo:a", role: "user", dateMs: base - Int64(i + 1) * 3_600_000, text: "lunch plans \(i)")
+        }
+
+        // Hold the one reader, so the search started next waits mid-read.
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        await withCheckedContinuation { (held: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                _ = try? memPool.read { _ in
+                    held.resume()
+                    release.wait()
+                }
+                finished.signal()
+            }
+        }
+        let tool = try makeTool()
+        let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
+        let stale = Task { try await tool.execute(arguments: arguments) }
+        // Long enough for it to have read real scope and be waiting on the reader:
+        // if not, its own result below holds no real history and the test fails.
+        try await Task.sleep(nanoseconds: 2_000_000_000)
+
+        try await withDemoActive(true) {
+            await MemorySearchCache.shared.reset()
+            release.signal()
+            let old = try await stale.value
+            #expect(old.contains("real_history_marker"), "the held search read real history")
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                DispatchQueue.global().async {
+                    finished.wait()
+                    done.resume()
+                }
+            }
+
+            let demo = try await tool.execute(arguments: arguments)
+            #expect(demo.contains("demo_history_marker"))
+            #expect(!demo.contains("real_history_marker"))
+        }
     }
 
     @Test("No query in demo mode lists only demo turns")
