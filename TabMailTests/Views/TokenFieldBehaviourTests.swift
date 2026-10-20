@@ -170,6 +170,54 @@ struct TokenFieldBehaviourTests {
         #expect(model.showCc == (role != .to), "paste: Cc and Bcc shown")
     }
 
+    // MARK: - The field's own controls
+
+    /// The TokenField that `RecipientTokenField` builds for `role`, bound to
+    /// `model`, so its callbacks and bindings are the production ones.
+    private static func controls(_ model: Model, role: Role) throws -> TokenField {
+        let field = RecipientTokenField(
+            role: role,
+            recipients: Binding(get: { model.recipients }, set: { model.recipients = $0 }),
+            showCc: Binding(get: { model.showCc }, set: { model.showCc = $0 }),
+            searchResults: [], onFocus: {}, revealedChipKey: .constant(nil))
+        return try #require((field.body as Any) as? TokenField)
+    }
+
+    @Test("A picked contact goes to the field it was picked in, under its name", arguments: Role.allCases)
+    func pickedContact(role: Role) throws {
+        let model = Model()
+        try Self.controls(model, role: role).onSelectContact(ContactResult(name: "Picked", email: "picked@example.com"))
+        #expect(model.recipients[role].tokens == Self.start[role].tokens + ["picked@example.com"])
+        #expect(model.recipients[role].displayNames["picked@example.com"] == "Picked")
+        Self.expectOthersUnchanged(model, role, "pick")
+        #expect(model.showCc == (role != .to))
+    }
+
+    @Test("A tapped rejected entry moves to its own field's input line", arguments: Role.allCases)
+    func editedRejectedEntry(role: Role) throws {
+        let model = Model()
+        model.recipients[role].rejected = ["unfinished"]
+        model.recipients[role].input = "typed@example.com"
+        let before = model.recipients
+        try Self.controls(model, role: role).onEditRejected(0)
+        #expect(model.recipients[role].rejected.isEmpty)
+        #expect(model.recipients[role].input == "unfinished")
+        #expect(model.recipients[role].tokens == before[role].tokens + ["typed@example.com"])
+        Self.expectOthersUnchanged(model, role, "edit")
+    }
+
+    @Test("Removing an address or a rejected entry changes only its own field", arguments: Role.allCases)
+    func removedChips(role: Role) throws {
+        let model = Model()
+        model.recipients[role].rejected = ["first", "second"]
+        let controls = try Self.controls(model, role: role)
+        controls.tokens.removeAll()
+        controls.rejected.removeFirst()
+        #expect(model.recipients[role].tokens.isEmpty)
+        #expect(model.recipients[role].rejected == ["second"])
+        Self.expectOthersUnchanged(model, role, "remove")
+    }
+
     // MARK: - Showing Cc and Bcc
 
     /// A change that leaves Cc or Bcc holding anything shows those fields, so a
