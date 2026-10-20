@@ -33,8 +33,10 @@ single-line text field turns a pasted column's line breaks into spaces (observed
   asks) never commits it half-fixed: re-splitting on every keystroke turned `bob, ` +
   `@example.com` into `bob@example.c` and pushed `om` into the next address. Return, leaving the
   field, saving and Send split the whole line;
-- a contact pick (`ComposeDraftGuards.picking`): an address TabMail cannot send to replaces the
-  typed query in the input line instead of the tap doing nothing;
+- a contact pick (`ComposeDraftGuards.picking`): the contact's email text is split like typed
+  text (a contact's email value can hold a list), and the contact's name goes with the address only
+  when the text names exactly one; text TabMail cannot send to replaces the typed query in the input
+  line instead of the tap doing nothing;
 - prefill (mailto, AI), a reopened draft, reply seeding (`RecipientEntry.reply(to:)`: every
   Reply-To mailbox, or the sender under the sender's name) and AI recipient edits
   (`ComposeDraftGuards.applying`, applied at once, not after the text fade). An address waiting in
@@ -61,9 +63,9 @@ Text that names no sendable address never becomes a recipient. It stays in the f
 visible, followed by `, ` (`ComposeDraftGuards.inputLine`), so the next address typed or pasted
 starts a new entry and is never joined to it (`bob` + `dave@example.com` must never become
 `bobdave@example.com`). Contact suggestions match only the entry being typed (`typedEntry`), and a
-picked contact replaces only that entry; a named mailbox kept this way is written with its name quoted
-(`IMAPFetchMapping.mailboxText`), so reading the line again never turns part of a display name into
-a recipient. Send is refused with `"<text>" in <field> is not an email address. Fix or remove it
+picked contact replaces only that entry; an entry kept this way is the text as it was written,
+never a decoded or rewritten form, so reading the line again never turns it, or part of a display
+name, into a recipient. Send is refused with `"<text>" in <field> is not an email address. Fix or remove it
 before sending.` (`ComposeDraftGuards.sendRecipients`, which also holds Send's recipient cap). Saving a draft still stores
 that text beside the addresses (`committedRecipients`), so nothing typed is lost; reopening puts it
 back in the input line. This overrides the 2026-10-03 "drafts keep recipients as typed" rule for
@@ -98,3 +100,28 @@ mailbox is refused as before.
   save and its updates store the To, Cc and Bcc the compose shows when it writes
   (`composeRecipients`, the same `committedRecipients` lists Save uses), never the To-only context
   the agent's turn began with. Pinned by `AgentAutoSaveRecipientsTests`.
+
+**Amendment (owner, 2026-10-19): split first, then read; never rewrite.** Raw recipient text is
+split into entries by `RecipientEntry`'s quote-aware splitter BEFORE anything reads it, and an entry
+is never replaced by a decoded or rewritten form. An entry becomes recipients only when everything
+in it is a sendable mailbox; otherwise the whole entry, as written, is input-line text and Send
+refuses it. Tier 2 found three routes that read or rewrote text before splitting, and a census found
+three more; all now follow the order:
+- the invalid-entry branch kept the parser's DECODED text (`"extra@example.com"` became
+  `extra@example.com`, which the next commit or a save and reopen made a recipient with no edit);
+- AI edits (`AIService.parseDeltaForField`) pre-parsed each comma piece by its first `<...>`, so a
+  `;`- or space-separated list added or removed only its first mailbox and a removed Bcc recipient
+  was sent. `RecipientDelta.adds` is now a `RecipientEntry` of the raw `+Field:` line; removals are
+  the raw `-Field:` line's addresses (`*` still clears). `splitNameAndEmail`,
+  `splitCommaRespectingQuotes` and `ParsedRecipient` are deleted;
+- a contact pick wrapped the contact's name around the whole email value before splitting;
+- `MailtoRequest` split every value on commas (breaking `"Doe, John" <...>`); values are now kept
+  whole for compose to split (closes tabmail-ios #223);
+- the agent reply tool (`EmailReplyTool.applyRecipientDelta`) compared removals as raw strings, so
+  `"Bob" <bob@...>` or a list in one string removed nothing; removals are now read with
+  `RecipientEntry`;
+- an address over the cap went back to the input line as a bare address, losing its name.
+Kept as is, failing closed: leftover text with an unclosed quote or `<` can absorb an address typed
+after it, but the result is still input-line text that Send refuses. Tests:
+`RecipientSplitFirstTests` (raw input to the recipients Send sends, and a captured Gmail request; 9
+red on the previous code, 2 positive controls).

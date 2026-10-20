@@ -152,7 +152,7 @@ Upstream commits pulled in: #236 (ENABLE/QRESYNC), #237 (Outlook `.msg`), #239, 
   RFC 2047 word in the Drafts APPEND under #245/#246); unparseable text stays as typed. The IMAP Drafts
   APPEND still writes no `Bcc` header (SwiftMail never does) — unchanged, not investigated further.
   **Superseded 2026-10-17 — see "Bcc kept on every path" below; that "not investigated" was the
-  miss (root `MIS-006` recurrence 32).**
+  miss.**
 
 ## Sync executed 2026-10-05 — both deviations merged upstream; pure mirror again
 
@@ -330,6 +330,10 @@ serializer that writes recipients:
   Other parked notes: Outlook legacy comma-list rows #222, MailtoParser naive split #223, Sent copy
   on servers that file their own copy (unverified hypothesis, owner doubts it) #224. The r13 to r15
   SwiftMail entries above describe PR B, not the pinned code.
+- **Split first, never rewrite (Tier 2 t2r5, 2026-10-19)**: Codex found recipient text read or
+  rewritten before it was split (decoded invalid text, the AI's first-`<...>` pre-parser, a contact
+  name wrapped around a list); a census found the mailto comma split (#223, now fixed), the reply
+  tool's raw-string removals and over-cap name loss. Owner rule and fixes: ADR-IOS-092 amendment.
 - **Pin state**: app `project.yml` pins `9b48bdeb` (narrow topic branch: `c7cd6aa1` plus a doc commit after
   Tier 1 r16, which was clean; not fork main; was `c7cd6aa1`, `8c72afef`, `d2112168`, `0919b08f`, `a09a3e3d`, `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the

@@ -9,7 +9,8 @@ import Foundation
 ///
 /// RFC 6068: `mailto:to?subject=...&cc=...&bcc=...&body=...`. Multiple
 /// recipients are comma-separated in the path (or in `to=` query) and also
-/// allowed as comma-separated strings in `cc=` / `bcc=`.
+/// allowed as comma-separated strings in `cc=` / `bcc=`. Each value is kept
+/// whole; compose splits it into recipients.
 struct MailtoRequest: Equatable {
     var to: [String]
     var cc: [String]
@@ -34,7 +35,7 @@ struct MailtoRequest: Equatable {
         // `path` and the header fields via `queryItems`. We also support the
         // query-form `to=` (non-standard but used by some clients).
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        var to = splitAddresses(components?.path ?? "")
+        var to = recipientText(components?.path ?? "")
         var cc: [String] = []
         var bcc: [String] = []
         var subject: String?
@@ -43,9 +44,9 @@ struct MailtoRequest: Equatable {
         for item in components?.queryItems ?? [] {
             let value = item.value ?? ""
             switch item.name.lowercased() {
-            case "to": to.append(contentsOf: splitAddresses(value))
-            case "cc": cc.append(contentsOf: splitAddresses(value))
-            case "bcc": bcc.append(contentsOf: splitAddresses(value))
+            case "to": to.append(contentsOf: recipientText(value))
+            case "cc": cc.append(contentsOf: recipientText(value))
+            case "bcc": bcc.append(contentsOf: recipientText(value))
             case "subject": subject = value
             case "body": body = value
             default: break
@@ -88,11 +89,11 @@ struct MailtoRequest: Equatable {
         return info
     }
 
-    private static func splitAddresses(_ raw: String) -> [String] {
-        guard !raw.isEmpty else { return [] }
-        return raw
-            .split(separator: ",", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+    /// The recipient text as the link wrote it. Compose splits it
+    /// (`RecipientEntry`, ADR-IOS-092); splitting here on every comma would
+    /// break a quoted name such as `"Doe, John" <john@example.com>`.
+    private static func recipientText(_ raw: String) -> [String] {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? [] : [text]
     }
 }

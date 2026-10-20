@@ -170,6 +170,15 @@ struct RecipientEntryTests {
         #expect(entry.recipients.map(\.name) == ["Sender Name"])
     }
 
+    /// The sender's name names the whole From field, so it goes with the
+    /// address only when From names exactly one mailbox.
+    @Test("A reply to a From naming two mailboxes gives neither the sender's name")
+    func replyToTwoSenders() {
+        let entry = RecipientEntry.reply(to: Self.header(from: "a@example.com, b@example.com", name: "Shared Name"))
+        #expect(entry.addresses == ["a@example.com", "b@example.com"])
+        #expect(entry.recipients.map(\.name) == [nil, nil])
+    }
+
     @Test("A Reply-To that names no mailbox goes to the input line, not to a recipient")
     func replyToWithoutMailbox() {
         let field = ComposeDraftGuards.fieldState(RecipientEntry.reply(to: Self.header(replyTo: "nobody")))
@@ -185,7 +194,7 @@ struct RecipientEntryTests {
         let recipients = buildReplyAllRecipients(for: header, allAccounts: [])
         let field = ComposeDraftGuards.fieldState(RecipientEntry(recipients.to))
         #expect(field.tokens == ["ann@example.com", "me@example.com"])
-        #expect(ComposeDraftGuards.trimmedInput(field.input) == "\"Help\" <helpdesk@localhost>")
+        #expect(ComposeDraftGuards.trimmedInput(field.input) == "Help <helpdesk@localhost>")
     }
 
     // MARK: - The input line
@@ -297,7 +306,7 @@ struct RecipientEntryTests {
         field.input = "bo"
         let result = ComposeDraftGuards.picking("bob@localhost", name: "Bob", to: field, room: 10)
         #expect(result.tokens == Self.field.tokens)
-        #expect(ComposeDraftGuards.trimmedInput(result.input) == "\"Bob\" <bob@localhost>")
+        #expect(ComposeDraftGuards.trimmedInput(result.input) == "bob@localhost")
         guard case .refused(let message) = ComposeDraftGuards.sendRecipients(to: result, cc: .init(), bcc: .init()) else {
             Issue.record("Send was not refused")
             return
@@ -367,7 +376,7 @@ struct RecipientEntryTests {
         ("reopened draft", ComposeDraftGuards.fieldState(RecipientEntry(["a@example.com", "Bob"]))),
         ("reply", ComposeDraftGuards.fieldState(RecipientEntry.reply(to: header(replyTo: "nobody")))),
         ("AI add", ComposeDraftGuards.applying(
-            RecipientDelta(adds: [ParsedRecipient(name: "", email: "Jane")], removes: []), to: .init())),
+            Self.delta(add: "Jane"), to: .init())),
         ("unsendable pick", ComposeDraftGuards.picking("bob@localhost", name: "Bob", to: .init(), room: 10))
     ]
 
@@ -495,14 +504,13 @@ struct RecipientEntryTests {
     /// field at the recipient cap), the picked text joins the input line and the
     /// leftover text before it stays there too, so neither is lost or sent.
     @Test("A pick that adds no recipient keeps the leftover text before it", arguments: [
-        ("bob@localhost", 10),
-        ("ann@example.com", 0)
+        ("bob@localhost", 10, "bob@localhost"),
+        ("ann@example.com", 0, "\"Pick\" <ann@example.com>")
     ])
-    func pickingAddsNothingKeepsLeftover(address: String, room: Int) {
+    func pickingAddsNothingKeepsLeftover(address: String, room: Int, picked: String) {
         var field = Self.field
         field.input = "carol, bo"
         let result = ComposeDraftGuards.picking(address, name: "Pick", to: field, room: room)
-        let picked = RecipientEntry.text(name: "Pick", address: address)
         #expect(result.tokens == Self.field.tokens)
         #expect(ComposeDraftGuards.trimmedInput(result.input) == "carol, \(picked)")
         #expect(ComposeDraftGuards.committedRecipients(tokens: result.tokens, input: result.input)
@@ -572,15 +580,18 @@ struct RecipientEntryTests {
 
     // MARK: - AI recipient edits
 
-    private static func delta(adds: [(String, String)] = [], removes: [String] = []) -> RecipientDelta {
-        RecipientDelta(adds: adds.map { ParsedRecipient(name: $0.0, email: $0.1) }, removes: removes)
+    /// The delta the real AI response parser makes from raw `+To:` / `-To:` lines.
+    static func delta(add: String? = nil, remove: String? = nil) -> RecipientDelta {
+        let lines = [add.map { "+To: \($0)" }, remove.map { "-To: \($0)" }].compactMap { $0 }
+        return AIService.parseDeltaForField(lines.joined(separator: "\n"), field: "To")
+            ?? RecipientDelta(adds: RecipientEntry([String]()), removes: [])
     }
 
     @Test("An AI add naming several addresses adds one recipient each", arguments: [
         "a@example.com, b@example.com", "a@example.com; b@example.com", "a@example.com b@example.com"
     ])
     func aiAddSplits(add: String) {
-        let field = ComposeDraftGuards.applying(Self.delta(adds: [("", add)]), to: .init())
+        let field = ComposeDraftGuards.applying(Self.delta(add: add), to: .init())
         #expect(field.tokens == ["a@example.com", "b@example.com"])
         #expect(field.input.isEmpty)
     }
@@ -588,7 +599,7 @@ struct RecipientEntryTests {
     @Test("An AI add that names no address goes to the input line, after the text already there")
     func aiAddWithoutAddressIsInputText() {
         let start = ComposeDraftGuards.RecipientField(tokens: ["x@example.com"], input: "typed")
-        let field = ComposeDraftGuards.applying(Self.delta(adds: [("", "Jane"), ("", "b@example.com")]), to: start)
+        let field = ComposeDraftGuards.applying(Self.delta(add: "Jane, b@example.com"), to: start)
         #expect(field.tokens == ["x@example.com", "b@example.com"])
         #expect(ComposeDraftGuards.trimmedInput(field.input) == "typed, Jane")
     }
@@ -597,9 +608,9 @@ struct RecipientEntryTests {
     func aiRemovesClearsAndDedupes() {
         let start = ComposeDraftGuards.RecipientField(tokens: ["a@example.com", "B@example.com"])
         let removed = ComposeDraftGuards.applying(
-            Self.delta(adds: [("", "A@EXAMPLE.COM"), ("", "c@example.com")], removes: ["b@example.com"]), to: start)
+            Self.delta(add: "A@EXAMPLE.COM, c@example.com", remove: "b@example.com"), to: start)
         #expect(removed.tokens == ["a@example.com", "c@example.com"])
-        let cleared = ComposeDraftGuards.applying(Self.delta(adds: [("", "c@example.com")], removes: ["*"]), to: start)
+        let cleared = ComposeDraftGuards.applying(Self.delta(add: "c@example.com", remove: "*"), to: start)
         #expect(cleared.tokens == ["c@example.com"])
     }
 
@@ -613,7 +624,7 @@ struct RecipientEntryTests {
         #expect(capped.tokens == ["a@example.com"])
         #expect(ComposeDraftGuards.trimmedInput(capped.input) == "b@example.com")
         let to = ComposeDraftGuards.RecipientField(tokens: ["to@example.com"])
-        for delta in [Self.delta(removes: ["*"]), Self.delta(removes: ["a@example.com", "B@EXAMPLE.COM"])] {
+        for delta in [Self.delta(remove: "*"), Self.delta(remove: "a@example.com, B@EXAMPLE.COM")] {
             let bcc = ComposeDraftGuards.applying(delta, to: capped)
             #expect(ComposeDraftGuards.sendRecipients(
                 to: to, cc: .init(), bcc: ComposeDraftGuards.pendingCommitted(bcc))
@@ -625,22 +636,22 @@ struct RecipientEntryTests {
     func aiRemoveKeepsOtherInput() {
         let field = ComposeDraftGuards.RecipientField(
             tokens: ["a@example.com"], input: ComposeDraftGuards.inputLine(["bob", "b@example.com", "c@example.com"]))
-        let result = ComposeDraftGuards.applying(Self.delta(removes: ["b@example.com"]), to: field)
+        let result = ComposeDraftGuards.applying(Self.delta(remove: "b@example.com"), to: field)
         #expect(result.tokens == ["a@example.com"])
         let entry = RecipientEntry(result.input)
         #expect(entry.addresses == ["c@example.com"])
         #expect(entry.unparsed == "bob")
-        let untouched = ComposeDraftGuards.applying(Self.delta(removes: ["a@example.com"]), to: field)
+        let untouched = ComposeDraftGuards.applying(Self.delta(remove: "a@example.com"), to: field)
         #expect(untouched.input == field.input)
     }
 
-    @Test("An AI add naming one address takes the AI's name; one naming several keeps each address's own name")
+    @Test("An AI add keeps each address's own name, quoted commas included")
     func aiAddNames() {
-        let one = ComposeDraftGuards.applying(Self.delta(adds: [("Ann Lee", "ann@example.com")]), to: .init())
+        let one = ComposeDraftGuards.applying(Self.delta(add: "Ann Lee <ann@example.com>"), to: .init())
         #expect(one.displayNames == ["ann@example.com": "Ann Lee"])
         let several = ComposeDraftGuards.applying(
-            Self.delta(adds: [("Team", "Bob <bob@example.com>, carol@example.com")]), to: .init())
+            Self.delta(add: "\"Doe, Bob\" <bob@example.com>; carol@example.com"), to: .init())
         #expect(several.tokens == ["bob@example.com", "carol@example.com"])
-        #expect(several.displayNames == ["bob@example.com": "Bob"])
+        #expect(several.displayNames == ["bob@example.com": "Doe, Bob"])
     }
 }

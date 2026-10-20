@@ -343,7 +343,7 @@ enum ComposeDraftGuards {
             let key = recipient.address.lowercased()
             let isMove = result.tokens.contains { $0.lowercased() == key }
             guard isMove || room > 0 else {
-                kept.append(recipient.address)
+                kept.append(RecipientEntry.text(name: recipient.name, address: recipient.address))
                 continue
             }
             if !isMove { room -= 1 }
@@ -389,27 +389,38 @@ enum ComposeDraftGuards {
         committing(field.input, to: field, room: .max) ?? field
     }
 
-    /// A picked contact replaces the entry being typed: its address becomes a
-    /// recipient, under its name, and leftover text before that entry stays. An
-    /// address TabMail cannot send to goes to the input line instead, so the
-    /// user sees it and Send names it, instead of the tap doing nothing.
+    /// A picked contact replaces the entry being typed: the contact's email
+    /// text is split like typed text, its addresses become recipients, and
+    /// leftover text before that entry stays. The contact's name goes with its
+    /// address only when the text names exactly one; it is never wrapped around
+    /// the text before the text is split (a contact's email value can hold a
+    /// list). Text TabMail cannot send to goes to the input line instead, so
+    /// the user sees it and Send names it, instead of the tap doing nothing.
     static func picking(
         _ address: String, name: String?, to field: RecipientField, room: Int
     ) -> RecipientField {
         let before = field.input.lastIndex(where: isSeparator).map { String(field.input[...$0]) } ?? ""
-        let text = RecipientEntry.text(name: name, address: address)
-        if let result = committing(before + text, to: field, room: room) { return result }
-        var result = field
-        let leftover = trimmedInput(before)
-        result.input = inputLine(leftover.isEmpty ? [text] : [leftover, text])
+        let picked = RecipientEntry(address)
+        let named = picked.recipients.count == 1 && picked.leftovers.isEmpty ? name.flatMap { $0.isEmpty ? nil : $0 } : nil
+        guard var result = committing(before + address, to: field, room: room) else {
+            // Over the cap, the one address keeps the contact's name for when it is sent.
+            let text = named.map { RecipientEntry.text(name: $0, address: picked.addresses[0]) }
+                ?? address.trimmingCharacters(in: .whitespacesAndNewlines)
+            var result = field
+            let leftover = trimmedInput(before)
+            result.input = inputLine(leftover.isEmpty ? [text] : [leftover, text])
+            return result
+        }
+        if let named, let token = result.tokens.first(where: { $0.lowercased() == picked.addresses[0].lowercased() }) {
+            result.displayNames[token] = named
+        }
         return result
     }
 
     /// A field after an AI recipient edit: removes first (or a clear of the
-    /// whole field), then each add split like typed text (ADR-IOS-092). Its
-    /// addresses become recipients, under the AI's name when the add names one
-    /// address, and text that names none goes to the input line, after any text
-    /// already there. An address in the input line (one over the recipient cap,
+    /// whole field), then the adds, already split like typed text (ADR-IOS-092).
+    /// Their addresses become recipients, under any name the AI gave, and text
+    /// that names none goes to the input line, after any text already there. An address in the input line (one over the recipient cap,
     /// or one typed) is a recipient Send would add, so a clear empties the input
     /// line too, and a removal also removes it there, keeping the rest.
     static func applying(_ delta: RecipientDelta, to field: RecipientField) -> RecipientField {
@@ -431,17 +442,11 @@ enum ComposeDraftGuards {
         var seen = Set(value.tokens.map { $0.lowercased() })
         let existing = trimmedInput(value.input)
         var leftovers = existing.isEmpty ? [] : [existing]
-        for add in delta.adds where !add.email.isEmpty && add.email != "*" {
-            let entry = RecipientEntry(add.email)
-            for recipient in entry.recipients where seen.insert(recipient.address.lowercased()).inserted {
-                value.tokens.append(recipient.address)
-            }
-            for recipient in entry.recipients {
-                let name = entry.recipients.count == 1 && !add.name.isEmpty ? add.name : recipient.name
-                if let name, !name.isEmpty { value.displayNames[recipient.address] = name }
-            }
-            if !entry.unparsed.isEmpty { leftovers.append(entry.unparsed) }
+        for recipient in delta.adds.recipients {
+            if seen.insert(recipient.address.lowercased()).inserted { value.tokens.append(recipient.address) }
+            if let name = recipient.name, !name.isEmpty { value.displayNames[recipient.address] = name }
         }
+        leftovers += delta.adds.leftovers
         value.input = inputLine(leftovers)
         return value
     }
@@ -2164,7 +2169,7 @@ struct ComposeView: View {
     ) {
         func desc(_ d: RecipientDelta?) -> String {
             guard let d else { return "nil" }
-            return "+\(d.adds.count)/-\(d.removes.count)\(d.clearsField ? "*" : "")"
+            return "+\(d.adds.recipients.count)/-\(d.removes.count)\(d.clearsField ? "*" : "")"
         }
         BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: subject=\(newSubject?.prefix(40) ?? "nil") bodyLen=\(newBody?.count ?? 0) to=\(desc(toDelta)) cc=\(desc(ccDelta)) bcc=\(desc(bccDelta))")
         // Phase 1: fade text out completely

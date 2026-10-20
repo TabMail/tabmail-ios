@@ -167,12 +167,14 @@ struct EmailReplyTool: AgentTool, Sendable {
     /// everything in `base`". Adds are appended after removes, de-duped case-insensitively
     /// against whatever's left.
     static func applyRecipientDelta(base: [String], adds: [String], removes: [String]) -> [String] {
-        let clearAll = removes.contains(where: { $0.trimmingCharacters(in: .whitespaces) == "*" })
+        // Read the removals as recipient text first (ADR-IOS-092), so
+        // `"Bob" <bob@example.com>` or a list in one string removes each address.
+        let removeEntry = RecipientEntry(removes)
         var result: [String]
-        if clearAll {
+        if removeEntry.leftovers.contains("*") {
             result = []
         } else {
-            let removeSet = Set(removes.map { $0.lowercased() })
+            let removeSet = Set(removeEntry.addresses.map { $0.lowercased() })
             result = base.filter { !removeSet.contains($0.lowercased()) }
         }
         var seen = Set(result.map { $0.lowercased() })

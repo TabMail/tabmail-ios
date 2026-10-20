@@ -47,6 +47,29 @@ struct ComposeRecipientWiringTests {
         }
     }
 
+    /// A SwiftUI callback cannot be driven from a unit test, so this pins that
+    /// the input line's change handler splits a typed or pasted separator
+    /// (`inputToSplit`, tested in RecipientEntryTests) into recipients.
+    @Test("Typing or pasting a separator in a recipient field splits it into recipients")
+    func inputChangeSplits() throws {
+        let text = try Self.source()
+        #expect(Self.count(
+            ".onChange(of: input) { old, text in if let split = ComposeDraftGuards.inputToSplit(was: old, now: text) { commit(split.text, split.typing) } }",
+            in: text) == 1)
+    }
+
+    /// The agent's autosave runs right after `applyInlineEdit` returns, so an AI
+    /// recipient edit applied only after the text fade would be saved without it.
+    @Test("An AI recipient edit is applied before the text fade, not after it")
+    func aiEditAppliedAtOnce() throws {
+        let text = try Self.source()
+        let start = try #require(text.range(of: "private func applyInlineEdit("))
+        let body = text[start.upperBound...]
+        let apply = try #require(body.range(of: "setRecipients(recipients.applying(to: toDelta, cc: ccDelta, bcc: bccDelta))"))
+        let fade = try #require(body.range(of: "Task { @MainActor in"))
+        #expect(apply.lowerBound < fade.lowerBound)
+    }
+
     @Test("A reopened draft, a prefill and an AI edit fill each field from its own role")
     func fillsUseTheirRole() throws {
         let text = try Self.source()

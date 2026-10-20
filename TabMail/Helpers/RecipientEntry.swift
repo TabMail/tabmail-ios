@@ -10,53 +10,54 @@ import SwiftMail
 /// a paste, a contact, a mailto link, the AI, a reopened draft, a reply) goes
 /// through here, so "a@example.com, b@example.com" becomes two recipients.
 /// Text that names no address TabMail can send to never becomes a recipient;
-/// it is kept, unchanged in meaning, for the field's input line.
-struct RecipientEntry: Equatable {
-    struct Recipient: Equatable {
+/// it is kept, as written, for the field's input line.
+struct RecipientEntry: Equatable, Sendable {
+    struct Recipient: Equatable, Sendable {
         let address: String
         let name: String?
     }
 
     private(set) var recipients: [Recipient] = []
-    /// The text that names no sendable address, joined by ", ". Empty when
-    /// every piece was an address.
-    private(set) var unparsed = ""
+    /// The entries that name no sendable address, each exactly as it was
+    /// written (only the whitespace around it trimmed).
+    private(set) var leftovers: [String] = []
+    /// The leftovers joined by ", ". Empty when every entry was an address.
+    var unparsed: String { leftovers.joined(separator: ", ") }
 
-    /// Splits each text into entries and reads each with SwiftMail's
-    /// address-list parser, the parser every send uses. A group contributes its
-    /// members. An entry that names nobody, such as the empty group
-    /// `undisclosed-recipients:;` or a lone comment, is kept as text, so nothing
-    /// typed silently disappears. An address already listed (in any case) is
-    /// not repeated.
+    /// Splits each text into entries first, and only then reads each entry
+    /// with SwiftMail's address-list parser, the parser every send uses. An
+    /// entry becomes recipients only when everything in it is a mailbox
+    /// TabMail can send to (a group contributes its members). Any other entry,
+    /// such as the empty group `undisclosed-recipients:;`, a lone comment, or a
+    /// mailbox at `localhost`, is kept as the text that was written, never as
+    /// a decoded or rewritten form of it, so nothing typed silently disappears
+    /// and kept text never reads as an address later. An address already
+    /// listed (in any case) is not repeated.
     init(_ texts: [String]) {
-        var leftovers: [String] = []
         var seen = Set<String>()
         for text in texts {
             for piece in Self.entries(text) {
-                var named = false
+                let written = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !written.isEmpty else { continue }
+                var mailboxes: [SwiftMail.EmailAddress] = []
+                var readable = true
                 for entry in AddressParser.parseAddressList(piece) {
                     switch entry {
-                    case .mailbox(let mailbox):
-                        named = true
-                        add(mailbox, seen: &seen, leftovers: &leftovers)
-                    case .group(_, let members):
-                        for member in members {
-                            named = true
-                            add(member, seen: &seen, leftovers: &leftovers)
-                        }
-                    case .invalid(let invalid):
-                        let trimmed = invalid.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !trimmed.isEmpty {
-                            named = true
-                            leftovers.append(trimmed)
-                        }
+                    case .mailbox(let mailbox): mailboxes.append(mailbox)
+                    case .group(_, let members): mailboxes += members
+                    case .invalid: readable = false
                     }
                 }
-                let trimmed = piece.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !named, !trimmed.isEmpty { leftovers.append(trimmed) }
+                guard readable, !mailboxes.isEmpty,
+                      mailboxes.allSatisfy({ isValidEmailAddress($0.address) }) else {
+                    leftovers.append(written)
+                    continue
+                }
+                for mailbox in mailboxes where seen.insert(mailbox.address.lowercased()).inserted {
+                    recipients.append(Recipient(address: mailbox.address, name: mailbox.name))
+                }
             }
         }
-        unparsed = leftovers.joined(separator: ", ")
     }
 
     init(_ text: String) {
@@ -163,19 +164,6 @@ struct RecipientEntry: Equatable {
     }
 
     var addresses: [String] { recipients.map(\.address) }
-
-    /// A mailbox SwiftMail reads but TabMail cannot send to (such as
-    /// `local@localhost`) is kept as text, like any other piece that is not an address.
-    private mutating func add(
-        _ mailbox: SwiftMail.EmailAddress, seen: inout Set<String>, leftovers: inout [String]
-    ) {
-        guard isValidEmailAddress(mailbox.address) else {
-            leftovers.append(Self.text(name: mailbox.name, address: mailbox.address))
-            return
-        }
-        guard seen.insert(mailbox.address.lowercased()).inserted else { return }
-        recipients.append(Recipient(address: mailbox.address, name: mailbox.name))
-    }
 
     /// A mailbox as text that reads back as the same mailbox: the name quoted,
     /// as sync stores it (`IMAPFetchMapping.mailboxText`), so a comma or an

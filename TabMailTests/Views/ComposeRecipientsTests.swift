@@ -60,7 +60,7 @@ struct ComposeRecipientsTests {
         #expect(filled[role].tokens == ["new@example.com"])
         #expect(ComposeDraftGuards.trimmedInput(filled[role].input) == "leftover")
 
-        let delta = RecipientDelta(adds: [ParsedRecipient(name: "", email: "new@example.com")], removes: ["*"])
+        let delta = RecipientEntryTests.delta(add: "new@example.com", remove: "*")
         let edited: ComposeDraftGuards.Recipients
         switch role {
         case .to: edited = Self.start.applying(to: delta, cc: nil, bcc: nil)
