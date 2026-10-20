@@ -120,6 +120,15 @@ extension ComposeDraftGuards {
             (cc != old.cc && !cc.isEmpty) || (bcc != old.bcc && !bcc.isEmpty)
         }
 
+        /// The one write every change to the compose's recipients goes through:
+        /// replaces them with `new`, and shows Cc and Bcc when `new` reveals them.
+        mutating func replace(with new: Recipients, showCc: inout Bool) {
+            let old = self
+            guard new != old else { return }
+            self = new
+            if new.revealsCcOrBcc(comparedTo: old) { showCc = true }
+        }
+
         /// Gives `name` to `address` in every field that lists it.
         mutating func name(_ address: String, _ name: String) {
             for role in RecipientRole.allCases where self[role].tokens.contains(address) {

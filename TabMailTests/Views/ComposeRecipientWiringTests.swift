@@ -30,7 +30,7 @@ struct ComposeRecipientWiringTests {
         text.components(separatedBy: needle).count - 1
     }
 
-    @Test("Each recipient field is built for its own role, and the builder uses only that role")
+    @Test("Each recipient field is built for its own role, and every change makes the field's write")
     func fieldsUseTheirRole() throws {
         let text = try Self.source()
         for role in ["to", "cc", "bcc"] {
@@ -39,13 +39,15 @@ struct ComposeRecipientWiringTests {
         let start = try #require(text.range(of: "private func recipientTokenField("))
         let end = try #require(text[start.upperBound...].range(of: "private "))
         let builder = String(text[start.lowerBound..<end.lowerBound])
-        #expect(Self.count("recipients[role]", in: builder) == 8)
+        // The field itself is hosted and driven in TokenFieldBehaviourTests.
+        #expect(builder.contains("RecipientTokenField( role: role, recipients: $recipients, showCc: $showCc,"))
         #expect(builder.contains(
-            "onSelectContact: { contact in setRecipients(recipients.picking(contact.email, name: contact.name, to: role)) }"))
-        #expect(builder.contains("commit: { text, typing in setRecipients(recipients.committing(text, typing: typing, to: role)) }"))
-        #expect(builder.contains(
-            "rejected: Binding(get: { recipients[role].rejected }, set: { recipients[role].rejected = $0 })"))
-        #expect(builder.contains("onEditRejected: { index in setRecipients(recipients.editingRejected(at: index, in: role)) }"))
+            "searchResults: activeField == .recipient(role) ? contactSearch.search(ComposeDraftGuards.typedEntry(recipients[role].input)) : [],"))
+        #expect(builder.contains("onFocus: { activeField = .recipient(role) },"))
+        // Every other change (prefill, reopened draft, AI edit, Send) makes the
+        // same write the field makes.
+        #expect(text.contains(
+            "private func setRecipients(_ new: ComposeDraftGuards.Recipients) { recipients.replace(with: new, showCc: &showCc) }"))
         for literal in [".to", ".cc", ".bcc", "recipients.to", "recipients.cc", "recipients.bcc"] {
             #expect(!builder.contains(literal + ")") && !builder.contains(literal + "."), "builder names \(literal)")
         }

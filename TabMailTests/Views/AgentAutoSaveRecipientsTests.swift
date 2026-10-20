@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import SwiftMail
 import SwiftUI
 import Testing
 @testable import TabMail
@@ -64,10 +65,9 @@ struct AgentAutoSaveRecipientsTests {
             composeMutationAllowed: true,
             isExpanded: .constant(false))
 
-        func expectSaved(to: [String], cc: [String], bcc: [String], body: String) async throws {
-            let row = try await pool.read { db in try Draft.fetchOne(db, key: draftKey) }
-            #expect(row != nil)
-            guard let row else { return }
+        @discardableResult
+        func expectSaved(to: [String], cc: [String], bcc: [String], body: String) async throws -> MessageHeader {
+            let row = try #require(try await pool.read { db in try Draft.fetchOne(db, key: draftKey) })
             #expect(row.body == body)
             #expect(row.toArray == to)
             #expect(row.ccArray == cc)
@@ -75,10 +75,14 @@ struct AgentAutoSaveRecipientsTests {
             let epoch = try #require(row.instanceEpoch)
             let headerId = PendingOperation.draftPlaceholderHeaderPK(
                 accountId: accountId, draftsFolderPath: "Drafts", draftId: draftKey, instanceEpoch: epoch)
-            let header = try await pool.read { db in try MessageHeader.fetchOne(db, key: headerId) }
-            #expect(header?.to == to.joined(separator: ", "))
-            #expect(header?.cc == cc.joined(separator: ", "))
-            #expect(header?.bcc == bcc.joined(separator: ", "))
+            let header = try #require(try await pool.read { db in try MessageHeader.fetchOne(db, key: headerId) })
+            // The header names exactly the entries that are addresses, never an
+            // address made by reading two rejected entries together.
+            for (text, entries) in [(header.to, to), (header.cc, cc), (header.bcc, bcc)] {
+                let read = AddressParser.parseAddressList(text).flatMap(\.mailboxes).map(\.address)
+                #expect(read == RecipientEntry(entries).addresses, "header \(text) for \(entries)")
+            }
+            return header
         }
 
         // Recipients changed after the turn began, as the user or the agent's edit does.
@@ -98,5 +102,21 @@ struct AgentAutoSaveRecipientsTests {
         try await expectSaved(
             to: ["added@example.com"], cc: [], bcc: ["bcc@example.com", "other@example.com", "still typing"],
             body: "Second body")
+
+        // Two rejected entries in To and two in Cc that, read as one text, would
+        // name a mailbox: one nobody listed, and the Bcc recipient. Reply All on
+        // the saved draft offers neither.
+        let toEntries = ["to@example.com", "\"x", "\" <invented@example.com>"]
+        let ccEntries = ["\"y", "\" <bcc@example.com>"]
+        #expect(RecipientEntry(toEntries).leftovers.count == 2)
+        #expect(RecipientEntry(ccEntries).leftovers.count == 2)
+        fields.to = toEntries
+        fields.cc = ccEntries
+        fields.bcc = ["bcc@example.com"]
+        #expect(await chat.autoSaveDraft(draftKey: draftKey, subject: "Subject", body: "Third body") == nil)
+        let header = try await expectSaved(to: toEntries, cc: ccEntries, bcc: ["bcc@example.com"], body: "Third body")
+        let replyAll = buildReplyAllRecipients(for: header, allAccounts: [])
+        #expect(replyAll.to == ["sender@example.com", "to@example.com"])
+        #expect(replyAll.cc.isEmpty)
     }
 }

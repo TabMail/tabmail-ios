@@ -280,7 +280,7 @@ actor DemoProvider: EmailProvider {
                     subject: draft.subject,
                     from: DemoSeed.demoDisplayName,
                     fromAddress: DemoSeed.demoEmail,
-                    to: draft.to.joined(separator: ", "),
+                    to: RecipientEntry(draft.to).headerText,
                     date: Date(),
                     snippet: String(Self.stripHTML(draft.body).prefix(160)),
                     folderId: folderId,
@@ -289,7 +289,7 @@ actor DemoProvider: EmailProvider {
                     isInInbox: false
                 )
             header.subject = draft.subject
-            header.to = draft.to.joined(separator: ", ")
+            header.to = RecipientEntry(draft.to).headerText
             header.date = Date()
             header.snippet = String(Self.stripHTML(draft.body).prefix(160))
             header.rfc822MessageId = serverId

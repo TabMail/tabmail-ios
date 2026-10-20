@@ -10,8 +10,9 @@ import UIKit
 
 /// The recipient field hosted in a window and driven through its real text
 /// field: typed and pasted text, Return and leaving the field must reach the
-/// recipients of the field's own role (ADR-IOS-092). The field is wired to the
-/// role wrappers exactly as `ComposeView.recipientTokenField` wires it.
+/// recipients of the field's own role (ADR-IOS-092). The field is the one
+/// `ComposeView.recipientTokenField` shows, bound to a model's recipients as
+/// ComposeView binds its own.
 @MainActor
 @Suite("A hosted recipient field commits what is typed into it", .serialized)
 struct TokenFieldBehaviourTests {
@@ -23,6 +24,7 @@ struct TokenFieldBehaviourTests {
             to: .init(tokens: ["to@example.com"]),
             cc: .init(tokens: ["cc@example.com"]),
             bcc: .init(tokens: ["bcc@example.com"]))
+        var showCc = false
     }
 
     private struct Harness: View {
@@ -31,25 +33,14 @@ struct TokenFieldBehaviourTests {
         @State private var revealed: String?
 
         var body: some View {
-            TokenField(
-                tokens: Binding(get: { model.recipients[role].tokens }, set: { model.recipients[role].tokens = $0 }),
-                rejected: Binding(get: { model.recipients[role].rejected }, set: { model.recipients[role].rejected = $0 }),
-                input: Binding(get: { model.recipients[role].input }, set: { model.recipients[role].input = $0 }),
-                displayNames: model.recipients[role].displayNames,
+            @Bindable var model = model
+            RecipientTokenField(
+                role: role,
+                recipients: $model.recipients,
+                showCc: $model.showCc,
                 searchResults: [],
                 onFocus: {},
-                onSelectContact: { contact in
-                    model.recipients = model.recipients.picking(contact.email, name: contact.name, to: role)
-                },
-                commit: { text, typing in
-                    model.recipients = model.recipients.committing(text, typing: typing, to: role)
-                },
-                onEditRejected: { index in
-                    model.recipients = model.recipients.editingRejected(at: index, in: role)
-                },
-                canAddMore: { model.recipients.canAddMore },
-                revealedChipKey: $revealed,
-                fieldKey: "\(role)")
+                revealedChipKey: $revealed)
             .frame(width: 360)
         }
     }
@@ -160,6 +151,7 @@ struct TokenFieldBehaviourTests {
                 "leaving the field: \(model.recipients[role])")
         #expect(model.recipients[role].input.isEmpty)
         Self.expectOthersUnchanged(model, role, "typing")
+        #expect(model.showCc == (role != .to), "typing: Cc and Bcc shown")
     }
 
     @Test("A pasted list becomes one recipient each, and text in it that is no address a rejected entry",
@@ -175,6 +167,7 @@ struct TokenFieldBehaviourTests {
         #expect(model.recipients[role].rejected == ["\"First"])
         #expect(model.recipients[role].input.isEmpty)
         Self.expectOthersUnchanged(model, role, "paste")
+        #expect(model.showCc == (role != .to), "paste: Cc and Bcc shown")
     }
 
     // MARK: - Showing Cc and Bcc
@@ -195,5 +188,16 @@ struct TokenFieldBehaviourTests {
         #expect(!full.revealsCcOrBcc(comparedTo: full))
         let cleared = full.applying(to: nil, cc: nil, bcc: RecipientEntryTests.delta(remove: "*"))
         #expect(!cleared.revealsCcOrBcc(comparedTo: full))
+
+        // The write every change makes: it stores the change and shows Cc and
+        // Bcc only when the change reveals them.
+        var stored = full
+        var showCc = false
+        stored.replace(with: cleared, showCc: &showCc)
+        #expect(stored == cleared)
+        #expect(!showCc)
+        stored.replace(with: full, showCc: &showCc)
+        #expect(stored == full)
+        #expect(showCc)
     }
 }

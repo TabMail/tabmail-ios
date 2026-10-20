@@ -1204,36 +1204,20 @@ struct ComposeView: View {
     private var totalRecipients: Int { recipients.total }
     private var canAddRecipient: Bool { recipients.canAddMore }
 
-    /// Replaces the recipient fields (ADR-IOS-092). Cc/Bcc are shown when a
-    /// change gives either of them content.
+    /// Replaces the recipient fields (ADR-IOS-092).
     private func setRecipients(_ new: ComposeDraftGuards.Recipients) {
-        let old = recipients
-        guard new != old else { return }
-        recipients = new
-        if new.revealsCcOrBcc(comparedTo: old) { showCc = true }
+        recipients.replace(with: new, showCc: &showCc)
     }
 
-    /// One recipient field. Every binding and action takes `role`, so typing,
-    /// a contact pick and what the field shows all reach that role's
-    /// recipients and no other (ADR-IOS-092).
     private func recipientTokenField(_ role: ComposeDraftGuards.RecipientRole) -> some View {
-        TokenField(
-            tokens: Binding(get: { recipients[role].tokens }, set: { recipients[role].tokens = $0 }),
-            rejected: Binding(get: { recipients[role].rejected }, set: { recipients[role].rejected = $0 }),
-            input: Binding(get: { recipients[role].input }, set: { recipients[role].input = $0 }),
-            displayNames: recipients[role].displayNames,
+        RecipientTokenField(
+            role: role,
+            recipients: $recipients,
+            showCc: $showCc,
             searchResults: activeField == .recipient(role)
                 ? contactSearch.search(ComposeDraftGuards.typedEntry(recipients[role].input)) : [],
             onFocus: { activeField = .recipient(role) },
-            onSelectContact: { contact in
-                setRecipients(recipients.picking(contact.email, name: contact.name, to: role))
-            },
-            commit: { text, typing in setRecipients(recipients.committing(text, typing: typing, to: role)) },
-            onEditRejected: { index in setRecipients(recipients.editingRejected(at: index, in: role)) },
-            canAddMore: { canAddRecipient },
-            revealedChipKey: $revealedChipKey,
-            fieldKey: "\(role)"
-        )
+            revealedChipKey: $revealedChipKey)
     }
 
     /// Shown next to the Cc/Bcc button: "N/50" when ≥ 45, orange at cap.

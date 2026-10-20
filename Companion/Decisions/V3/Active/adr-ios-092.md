@@ -178,3 +178,19 @@ order:
 The Cc/Bcc reveal rule is `Recipients.revealsCcOrBcc(comparedTo:)` (a rejected Bcc entry shows the
 field). `TokenFieldBehaviourTests` hosts the real `TokenField` in a window and drives its text field
 (each keystroke handled before the next, a paste, Return, leaving the field) for every role. Return ends editing, so the field's leave-the-field commit also commits on Return; the separate `onSubmit` commit was redundant and is deleted.
+
+**Follow-up (Tier 2 t2r8, 2026-10-20).** `AccountManager.queueDraftSave` wrote the Drafts-list header
+(and its search entry) by joining the draft's arrays with `", "`. With rejected entries stored
+separately, two of them joined could read as a mailbox neither named (`"x` + `" <b@example.com>`),
+and Reply All on the saved draft, opened from search, offered it as a recipient, including an
+address that was only in Bcc. The header now holds `RecipientEntry(...).headerText`: only the
+entries that are addresses, each written so it reads back as itself; rejected entries stay in the
+draft and are left out of the header, so the Drafts row does not show them until sync replaces the
+placeholder. The demo provider's draft header does the same. Deleting the header text instead was
+considered and not taken: every saved draft's row would read "(No recipient)" until sync.
+`RecipientTokenField` is now the one recipient field view ComposeView shows, and every recipient
+change, the field's included, goes through `Recipients.replace(with:showCc:)`, so
+`TokenFieldBehaviourTests` drives the production state write and the Cc/Bcc reveal rather than
+a copy of the wiring. `AgentAutoSaveRecipientsTests` asserts the header names exactly the
+addresses and that Reply All on the saved draft offers neither an invented nor a Bcc address;
+`RecipientEntryTests` covers a separator typed after a closed comment.

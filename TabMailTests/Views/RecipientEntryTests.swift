@@ -340,6 +340,18 @@ struct RecipientEntryTests {
         #expect(field.input.isEmpty)
     }
 
+    /// A comment after an address closes before the separator that follows it,
+    /// so that separator ends the entry as it would after the bare address.
+    @Test("A separator typed after a closed comment adds the address", arguments: [
+        "a@example.com (work),", "Ann <a@example.com> (work);", "a@example.com (work (home)),"
+    ])
+    func typingAfterClosedComment(typed: String) {
+        let field = Self.typing(typed, into: .init())
+        #expect(field.tokens == ["a@example.com"])
+        #expect(field.rejected.isEmpty)
+        #expect(field.input.isEmpty)
+    }
+
     @Test("A picked contact becomes a recipient under its name")
     func pickingAddsContact() {
         var field = Self.field

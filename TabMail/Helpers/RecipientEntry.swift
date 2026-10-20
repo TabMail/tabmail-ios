@@ -246,6 +246,13 @@ struct RecipientEntry: Equatable, Sendable {
 
     var addresses: [String] { recipients.map(\.address) }
 
+    /// The recipients as one header line that reads back as exactly these
+    /// recipients. Rejected entries are left out: joined into one line, two of
+    /// them could read as an address neither of them named.
+    var headerText: String {
+        recipients.map { Self.text(name: $0.name, address: $0.address) }.joined(separator: ", ")
+    }
+
     /// A mailbox as text that reads back as the same mailbox: the name quoted,
     /// as sync stores it (`IMAPFetchMapping.mailboxText`), so a comma or an
     /// address inside a display name never becomes a recipient of its own.
