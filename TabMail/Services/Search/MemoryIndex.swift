@@ -626,7 +626,7 @@ actor MemoryIndex {
         ensureReady()
         guard let dbPool else { return [] }
         let candidateLimit = limit * SearchConfig.candidateMultiplier
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         // Demo isolation: snapshot once per call so both legs use the same scope.
         let demoActive = DemoModeStore.isDemoActive
         // No query lists the most recent turns, newest first, as the native-fts

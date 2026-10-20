@@ -398,7 +398,7 @@ struct MemoryIndexTests {
         }
         await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:abc", role: "user", dateMs: now, text: "demo turn")
 
-        for query in ["", "   "] {
+        for query in ["", "   ", "\n", "\r\n"] {
             let all = await MemoryIndex.shared.search(query: query, limit: 10)
             #expect(all.map(\.chatHistoryId) == ["t4", "t3", "t2", "t1", "t0"])
             let capped = await MemoryIndex.shared.search(query: query, limit: 2)

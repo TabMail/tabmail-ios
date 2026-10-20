@@ -38,9 +38,10 @@ enum ToolFormatters {
     /// Parse a date string from tool arguments. Supports YYYY-MM-DD and full ISO8601.
     static func parseDate(_ value: JSONValue?) -> Date? {
         guard case .string(let str) = value, !str.isEmpty else { return nil }
-        // Try ISO date: YYYY-MM-DD
-        if let date = Date.fromISO8601FullDate(str) { return date }
-        // Try full ISO8601 (with or without fractional seconds)
-        return Date.fromISO8601(str)
+        // A full ISO8601 timestamp first (with or without fractional seconds):
+        // the date-only parser also accepts a timestamp's date part, as midnight.
+        if let date = Date.fromISO8601(str) { return date }
+        // Then an ISO date: YYYY-MM-DD
+        return Date.fromISO8601FullDate(str)
     }
 }
