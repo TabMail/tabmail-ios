@@ -330,7 +330,8 @@ serializer that writes recipients:
   Other parked notes: Outlook legacy comma-list rows #222, MailtoParser naive split #223, Sent copy
   on servers that file their own copy (unverified hypothesis, owner doubts it) #224. The r13 to r15
   SwiftMail entries above describe PR B, not the pinned code.
-- **Pin state**: app `project.yml` pins `c7cd6aa1` (narrow topic branch, not fork main; was `8c72afef`, `d2112168`, `0919b08f`, `a09a3e3d`, `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
+- **Pin state**: app `project.yml` pins `9b48bdeb` (narrow topic branch: `c7cd6aa1` plus a doc commit after
+  Tier 1 r16, which was clean; not fork main; was `c7cd6aa1`, `8c72afef`, `d2112168`, `0919b08f`, `a09a3e3d`, `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
   with `tabmail-swiftmailfork-sync` and re-pin to the mirror.

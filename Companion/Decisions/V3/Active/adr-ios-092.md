@@ -48,7 +48,9 @@ single-line text field turns a pasted column's line breaks into spaces (observed
 A group contributes its members. An entry that names nobody (an empty group such as
 `undisclosed-recipients:;`, or a lone comment) is kept as text like any other, never dropped. An
 address already in the field is not repeated (case-insensitive); typing it again moves it to the
-end. Addresses past `SyncConfig.outboxMaxRecipients` stay in the input line.
+end. Typing, a paste or a contact pick past `SyncConfig.outboxMaxRecipients` leaves the extra
+addresses in the input line. Fills (a reopened draft, a prefill, reply-all), AI adds and the
+commit on Save, close or Send are not capped; Send then refuses with the cap message.
 
 The compose holds its three fields as one value, `ComposeDraftGuards.Recipients`
 (`ComposeRecipients.swift`). Every change by role (typing, a pick, a prefill or reopened draft, an

@@ -6043,7 +6043,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// form it reads (`taro.@example.com` becomes `"taro."@example.com`).
     /// SwiftMail's RCPT TO validation is stricter still: it rejects quoted local
     /// parts and non-ASCII domains, which also fail the send as fatal. A
-    /// recipient it cannot read as a single mailbox fails the send as
+    /// recipient that names no mailbox, or holds text that is not one, fails the send as
     /// `SMTPError.invalidEmailAddress`, which the outbox treats as fatal, so the
     /// message stays visible for the user to fix.
     ///
