@@ -161,3 +161,20 @@ and Send for To/Cc/Bcc; a captured Gmail send with zero requests plus a valid co
 save), `RecipientEntryTests` (tap to edit, the quote-aware split point), `ComposeRecipientsTests`
 (the role wrappers keep rejected text), `ComposeRecipientWiringTests` (the chip's tap and remove,
 and the contact button).
+
+**Follow-up (Tier 2 t2r7, 2026-10-20).** Three more places where text was changed or read out of
+order:
+- a rejected entry inside a group or angle brackets was kept in its PARSE form, where a space or line
+  break between members had become a comma. `RecipientEntry.entries` now returns each entry twice,
+  `written` (exactly the text it was cut from, kept when it is rejected) and `parsed` (what the
+  parser reads);
+- quotes, comments and separators were found by comparing Swift `Character`s, and a quote followed
+  by a combining mark is one `Character` with it, so the quote was missed. Both scanners
+  (`entries` and `splitAtLastSeparator`, which replaces `lastSeparator` and returns the two halves)
+  now read Unicode scalars;
+- `IMAPProvider.sendableRecipients` dropped an empty group beside a mailbox in one stored recipient
+  (`a@example.com, undisclosed-recipients:;`) and sent the rest; it now fails the send, as any other
+  part that is not a mailbox does.
+The Cc/Bcc reveal rule is `Recipients.revealsCcOrBcc(comparedTo:)` (a rejected Bcc entry shows the
+field). `TokenFieldBehaviourTests` hosts the real `TokenField` in a window and drives its text field
+(each keystroke handled before the next, a paste, Return, leaving the field) for every role. Return ends editing, so the field's leave-the-field commit also commits on Return; the separate `onSubmit` commit was redundant and is deleted.

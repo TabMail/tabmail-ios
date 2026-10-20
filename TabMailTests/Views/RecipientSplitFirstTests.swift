@@ -56,7 +56,8 @@ struct RecipientSplitFirstTests {
     /// the text is never dropped while the mailbox goes out.
     @Test("An entry that is partly not a mailbox is kept whole as text", arguments: [
         "Team: a@example.com, helpdesk@localhost;",
-        "<a@example.com>x"
+        "<a@example.com>x",
+        "<a@example.com>undisclosed-recipients:;"
     ])
     func partlyUnreadableEntryIsText(text: String) {
         let entry = RecipientEntry(text)
@@ -123,7 +124,11 @@ struct RecipientSplitFirstTests {
     /// Kept text is stored exactly as written, separators and quotes inside it
     /// included, so a save never changes what the user typed.
     @Test("A rejected entry is saved and reopened exactly as written", arguments: [
-        "\"unfinished;", "\"a, b", "Name <a@example.com", "x@example.com (note", "\"\""
+        "\"unfinished;", "\"a, b", "Name <a@example.com", "x@example.com (note", "\"\"",
+        // Separators inside a group or angle brackets are read as commas, but
+        // the entry is kept as it was written.
+        "Team: ann@example.com\nhelpdesk@localhost;", "Team: ann@example.com helpdesk@localhost;",
+        "Name <unfinished\ntext>", "Team: a@example.com\r\nb@localhost;"
     ])
     func rejectedEntryKeepsItsText(raw: String) {
         let entry = RecipientEntry([raw])
@@ -133,13 +138,48 @@ struct RecipientSplitFirstTests {
         #expect(ComposeDraftGuards.committedRecipients(field) == [raw])
         let reopened = ComposeDraftGuards.fieldState(RecipientEntry(ComposeDraftGuards.committedRecipients(field)))
         #expect(reopened.rejected == [raw])
+        guard case .refused = ComposeDraftGuards.sendRecipients(to: Self.to, cc: .init(), bcc: reopened) else {
+            Issue.record("\(raw) was sent")
+            return
+        }
+    }
+
+    @Test("A group's members split on spaces, line breaks and semicolons still become recipients", arguments: [
+        "Team: a@example.com b@example.com;", "Team: a@example.com\nb@example.com;",
+        "Team: a@example.com\r\nb@example.com;", "Team:\na@example.com,\nb@example.com;"
+    ])
+    func groupMembersSplit(text: String) {
+        let entry = RecipientEntry(text)
+        #expect(entry.addresses == ["a@example.com", "b@example.com"])
+        #expect(entry.leftovers.isEmpty)
+    }
+
+    // MARK: - Quotes read one Unicode scalar at a time
+
+    /// The bug this guards: quotes were found by comparing Swift `Character`s,
+    /// and a quote followed by a combining mark is one `Character` with it, so
+    /// the quote was missed: quoted text split into addresses, and a valid
+    /// quoted name split into two rejected entries.
+    @Test("A quote followed by a combining mark still quotes")
+    func quoteWithCombiningMark() {
+        let quoted = "\"\u{0301}first@example.com, second@example.com, tail\""
+        let entry = RecipientEntry(quoted)
+        #expect(entry.addresses.isEmpty)
+        #expect(entry.leftovers == [quoted])
+        let named = RecipientEntry("\"\u{0301}Last, First\" <ann@example.com>")
+        #expect(named.addresses == ["ann@example.com"])
+        #expect(named.recipients.first?.name == "\u{0301}Last, First")
+        #expect(named.leftovers.isEmpty)
+        #expect(RecipientEntry.splitAtLastSeparator("\"\u{0301}Last, First,") == nil)
+        #expect(ComposeDraftGuards.inputToSplit(was: "\"\u{0301}Last, First", now: "\"\u{0301}Last, First,") == nil)
     }
 
     /// Outbox rows written before compose split recipients can hold a whole
     /// list in one element. One part that is not a mailbox fails the send,
     /// even a part whose decoded text is empty, so no part is dropped.
-    @Test("A stored recipient holding a mailbox and an empty quoted string fails the send", arguments: [
-        "to@example.com, \"\"", "\"\", to@example.com"
+    @Test("A stored recipient holding a mailbox and an empty quoted string or empty group fails the send", arguments: [
+        "to@example.com, \"\"", "\"\", to@example.com",
+        "to@example.com, undisclosed-recipients:;", "undisclosed-recipients:;, to@example.com"
     ])
     func legacyMixedRecipientIsRefused(raw: String) {
         do {
@@ -149,6 +189,37 @@ struct RecipientSplitFirstTests {
             #expect(AccountManager.isFatalSendError(error))
         }
         #expect(throws: Never.self) { _ = try IMAPProvider.sendableRecipients(["to@example.com"]) }
+    }
+
+    @Test("A stored recipient with an empty group beside an address is never submitted, in any field",
+          arguments: ComposeDraftGuards.RecipientRole.allCases)
+    func legacyEmptyGroupNeverSent(role: ComposeDraftGuards.RecipientRole) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/messages/send", method: "POST", response: .json(raw: #"{"id":"sent-test"}"#))
+        let provider = GmailProvider(userEmail: "sender@example.com", accessToken: { _ in "tok" }, session: http.session)
+        let stored = ["hidden@example.com, undisclosed-recipients:;"]
+        var draft = DraftMessage(to: ["to@example.com"], subject: "Test", body: "Body text")
+        switch role {
+        case .to: draft.to = stored
+        case .cc: draft.cc = stored
+        case .bcc: draft.bcc = stored
+        }
+        do {
+            try await provider.send(draft: draft)
+            Issue.record("The empty group was dropped and the rest sent")
+        } catch {
+            #expect(AccountManager.isFatalSendError(error))
+        }
+        #expect(http.recordedCalls().isEmpty)
+
+        switch role {
+        case .to: draft.to = ["hidden@example.com"]
+        case .cc: draft.cc = ["hidden@example.com"]
+        case .bcc: draft.bcc = ["hidden@example.com"]
+        }
+        try await provider.send(draft: draft)
+        #expect(http.recordedCalls().count == 1)
     }
 
     @Test("Rejected entries never reach a provider send, in any field",

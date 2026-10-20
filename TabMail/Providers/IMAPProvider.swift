@@ -6092,7 +6092,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// recipient (ADR-IOS-092), but a send queued by an earlier version can hold a
     /// typed list such as `a@example.com, b@example.com` in one recipient; it goes
     /// to every mailbox it names. Throws on the first recipient that names no
-    /// mailbox or holds text that is not one. Each mailbox is written again by
+    /// mailbox or holds text that is not one (an empty group included). Each mailbox is written again by
     /// SwiftMail, never copied as text, so no recipient can add a header line.
     static func sendableRecipients(_ recipients: [String]) throws -> [SwiftMail.EmailAddress] {
         try recipients.flatMap { recipient in
@@ -6100,7 +6100,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             for entry in AddressParser.parseAddressList(recipient) {
                 switch entry {
                 case .mailbox(let mailbox): mailboxes.append(mailbox)
-                case .group(_, let members): mailboxes += members
+                case .group(_, let members):
+                    // A group naming nobody is not an address: beside other
+                    // recipients it fails the send too, never silently dropped.
+                    guard !members.isEmpty else { throw SMTPError.invalidEmailAddress(recipient) }
+                    mailboxes += members
                 case .invalid:
                     // Any entry that is not a mailbox fails the whole send, even
                     // one whose decoded text is empty (`""`): nothing is dropped.

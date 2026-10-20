@@ -299,11 +299,11 @@ enum ComposeDraftGuards {
     }
 
     /// The entry being typed: the text after the input line's last separator
-    /// outside quotes (`RecipientEntry.lastSeparator`), which is what contact
-    /// suggestions match.
+    /// outside quotes (`RecipientEntry.splitAtLastSeparator`), which is what
+    /// contact suggestions match.
     static func typedEntry(_ input: String) -> String {
-        guard let last = RecipientEntry.lastSeparator(in: input) else { return input }
-        return String(input[input.index(after: last)...]).trimmingCharacters(in: .whitespaces)
+        guard let split = RecipientEntry.splitAtLastSeparator(input) else { return input }
+        return split.rest.trimmingCharacters(in: .whitespaces)
     }
 
     /// One recipient field: its addresses, their display names, the entries
@@ -370,7 +370,7 @@ enum ComposeDraftGuards {
     /// addresses: the field has already turned a pasted column's line breaks into
     /// spaces, which `RecipientEntry` reads as separators after an address. While
     /// typing, only a keystroke that inserts a `,`, `;` or line break splits: the
-    /// text up to the last one outside quotes (`RecipientEntry.lastSeparator`) is
+    /// text up to the last one outside quotes (`RecipientEntry.splitAtLastSeparator`) is
     /// split and the text after it is still being typed, so `bob, carol@example.c`
     /// never adds a half-typed address and `"Doe, J` is never cut at its comma.
     /// Nil when typing has inserted no such separator, so text being fixed where
@@ -386,8 +386,8 @@ enum ComposeDraftGuards {
         let inserted = after[start..<(after.count - end)]
         if inserted.count > 1 { return (text, "") }
         guard inserted.contains(where: isSeparator),
-              let last = RecipientEntry.lastSeparator(in: text) else { return nil }
-        return (String(text[...last]), String(text[text.index(after: last)...]))
+              let split = RecipientEntry.splitAtLastSeparator(text) else { return nil }
+        return (split.finished, split.rest)
     }
 
     /// A field with the addresses in its input line committed, as close, save
@@ -419,7 +419,7 @@ enum ComposeDraftGuards {
     static func picking(
         _ address: String, name: String?, to field: RecipientField, room: Int
     ) -> RecipientField {
-        let before = RecipientEntry.lastSeparator(in: field.input).map { String(field.input[...$0]) } ?? ""
+        let before = RecipientEntry.splitAtLastSeparator(field.input)?.finished ?? ""
         let picked = RecipientEntry(address)
         var text = address
         if picked.recipients.count == 1, picked.leftovers.isEmpty {
@@ -1210,7 +1210,7 @@ struct ComposeView: View {
         let old = recipients
         guard new != old else { return }
         recipients = new
-        if (new.cc != old.cc && !new.cc.isEmpty) || (new.bcc != old.bcc && !new.bcc.isEmpty) { showCc = true }
+        if new.revealsCcOrBcc(comparedTo: old) { showCc = true }
     }
 
     /// One recipient field. Every binding and action takes `role`, so typing,
@@ -3847,7 +3847,8 @@ private struct AttachmentPreparationFailureAlert: ViewModifier {
 
 // MARK: - Token Field (email chips with search dropdown)
 
-private struct TokenField: View {
+/// One recipient field: its chips and the input line (ADR-IOS-092).
+struct TokenField: View {
     @Binding var tokens: [String]
     /// Entries that name no sendable address, shown as red chips (ADR-IOS-092).
     @Binding var rejected: [String]
@@ -3919,9 +3920,6 @@ private struct TokenField: View {
                         .textInputAutocapitalization(.never)
                         .focused($isFocused)
                         .disabled(!canAddMore())
-                        .onSubmit {
-                            commitInput()
-                        }
                         // A field is a list, never free text: a typed or pasted
                         // separator splits what is there into recipients.
                         .onChange(of: input) { old, text in
@@ -3938,6 +3936,7 @@ private struct TokenField: View {
                                 onFocus()
                                 revealedChipKey = nil
                             }
+                            // Return ends editing too, so this commits on Return as well.
                             if !focused { commitInput() }
                         }
                 }

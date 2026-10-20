@@ -112,6 +112,14 @@ extension ComposeDraftGuards {
             ComposeDraftGuards.sendRecipients(to: to, cc: cc, bcc: bcc)
         }
 
+        /// Whether the Cc and Bcc fields must be shown after a change from `old`:
+        /// Cc or Bcc changed and now holds something (an address, a rejected
+        /// entry or input text), so nothing in them is hidden, above all a
+        /// rejected entry that refuses Send.
+        func revealsCcOrBcc(comparedTo old: Recipients) -> Bool {
+            (cc != old.cc && !cc.isEmpty) || (bcc != old.bcc && !bcc.isEmpty)
+        }
+
         /// Gives `name` to `address` in every field that lists it.
         mutating func name(_ address: String, _ name: String) {
             for role in RecipientRole.allCases where self[role].tokens.contains(address) {

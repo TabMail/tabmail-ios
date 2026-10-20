@@ -35,11 +35,11 @@ struct RecipientEntry: Equatable, Sendable {
         var seen = Set<String>()
         for text in texts {
             for piece in Self.entries(text) {
-                let written = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+                let written = piece.written.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !written.isEmpty else { continue }
                 var mailboxes: [SwiftMail.EmailAddress] = []
                 var readable = true
-                for entry in AddressParser.parseAddressList(piece) {
+                for entry in AddressParser.parseAddressList(piece.parsed) {
                     switch entry {
                     case .mailbox(let mailbox): mailboxes.append(mailbox)
                     case .group(_, let members): mailboxes += members
@@ -70,7 +70,7 @@ struct RecipientEntry: Equatable, Sendable {
     /// its members):
     /// - a line break;
     /// - a `;`, except the one that ends a group (`Team: a@example.com;`),
-    ///   which is kept and followed by a comma so what follows is its own entry;
+    ///   which stays with its group;
     /// - spaces or tabs after an address (a word holding an `@`, or a closing
     ///   `>`), unless a comment follows. An unquoted `@` cannot be part of a
     ///   display name (RFC 5322 3.2.3), so `a@example.com b@example.com` and
@@ -78,9 +78,18 @@ struct RecipientEntry: Equatable, Sendable {
     ///   `Ann Lee <a@example.com>` and `a@example.com (work)` stay one mailbox.
     ///   A comment after an address belongs to it, and spaces after that
     ///   comment end the entry, as they would after the address.
-    private static func entries(_ text: String) -> [String] {
-        var pieces: [String] = []
-        var current = ""
+    ///
+    /// Each entry comes back twice: `written`, exactly the text it was cut
+    /// from, which is what is kept when the entry names no sendable address;
+    /// and `parsed`, what the parser reads, where a separator inside a group or
+    /// angle brackets is a comma. The text is read one Unicode scalar at a
+    /// time, so a quote or separator followed by a combining mark (which Swift
+    /// joins into one `Character` with it) is still seen.
+    private static func entries(_ text: String) -> [(written: String, parsed: String)] {
+        let scalars = text.unicodeScalars
+        var pieces: [(written: String, parsed: String)] = []
+        var start = scalars.startIndex
+        var current = String.UnicodeScalarView()
         var inQuote = false
         var escaped = false
         var angleDepth = 0
@@ -88,62 +97,71 @@ struct RecipientEntry: Equatable, Sendable {
         var inGroup = false
         var wordHasAt = false
         var afterAngle = false
-        var gap = ""
+        var gap = String.UnicodeScalarView()
         var gapEndsAddress = false
         // A comment that began right after an address: when it closes, the
         // address has ended, so spaces after it end the entry.
         var commentEndsAddress = false
-        func separate() {
+        // Ends the entry before `end`; the next one starts at `next`. Inside a
+        // group or angle brackets the separator is a comma between members.
+        func separate(before end: String.Index, next: String.Index) {
             if inGroup || angleDepth > 0 {
-                current.append(",")
+                let soFar = String(current).trimmingCharacters(in: .whitespaces)
+                if !soFar.hasSuffix(","), !soFar.hasSuffix(":") { current.append(",") }
             } else {
-                pieces.append(current)
-                current = ""
+                pieces.append((String(scalars[start..<end]), String(current)))
+                current = String.UnicodeScalarView()
+                start = next
             }
         }
-        for character in text {
+        for index in scalars.indices {
+            let scalar = scalars[index]
+            let next = scalars.index(after: index)
             if escaped {
                 escaped = false
-                current.append(character)
+                current.append(scalar)
                 continue
             }
             if inQuote || commentDepth > 0 {
-                if character == "\\" {
+                if scalar == "\\" {
                     escaped = true
                 } else if inQuote {
-                    if character == "\"" { inQuote = false }
-                } else if character == "(" {
+                    if scalar == "\"" { inQuote = false }
+                } else if scalar == "(" {
                     commentDepth += 1
-                } else if character == ")" {
+                } else if scalar == ")" {
                     commentDepth -= 1
                     if commentDepth == 0, commentEndsAddress {
                         commentEndsAddress = false
                         afterAngle = true
                     }
                 }
-                current.append(character)
+                current.append(scalar)
                 continue
             }
-            if character == " " || character == "\t" {
+            if scalar == " " || scalar == "\t" {
                 if gap.isEmpty { gapEndsAddress = angleDepth == 0 && (wordHasAt || afterAngle) }
-                gap.append(character)
+                gap.append(scalar)
                 wordHasAt = false
                 afterAngle = false
                 continue
             }
+            let isNewline = CharacterSet.newlines.contains(scalar)
             let addressEnded = angleDepth == 0 && (gap.isEmpty ? (wordHasAt || afterAngle) : gapEndsAddress)
             if !gap.isEmpty {
-                if gapEndsAddress, !character.isNewline, !"(,;".contains(character) { separate() }
-                current += gap
-                gap = ""
+                if gapEndsAddress, !isNewline, scalar != "(", scalar != ",", scalar != ";" {
+                    separate(before: index, next: index)
+                }
+                current.append(contentsOf: gap)
+                gap = String.UnicodeScalarView()
             }
             afterAngle = false
-            if character.isNewline {
-                separate()
+            if isNewline {
+                separate(before: index, next: next)
                 wordHasAt = false
                 continue
             }
-            switch character {
+            switch scalar {
             case "\"": inQuote = true
             case "(":
                 commentDepth += 1
@@ -155,53 +173,59 @@ struct RecipientEntry: Equatable, Sendable {
             case "@" where angleDepth == 0: wordHasAt = true
             case ",":
                 wordHasAt = false
-                separate()
+                separate(before: index, next: next)
                 continue
             case ":" where angleDepth == 0: inGroup = true
             case ";" where angleDepth == 0:
                 wordHasAt = false
                 if inGroup {
-                    current.append(";")
+                    current.append(scalar)
                     inGroup = false
+                    separate(before: next, next: next)
+                } else {
+                    separate(before: index, next: next)
                 }
-                separate()
                 continue
             default: break
             }
-            current.append(character)
+            current.append(scalar)
         }
-        return pieces + [current + gap]
+        current.append(contentsOf: gap)
+        return pieces + [(String(scalars[start...]), String(current))]
     }
 
-    /// Where a text's last finished entry ends: its last `,`, `;` or line break
-    /// outside quotes, angle brackets, comments and a group. A separator
-    /// inside any of those is still part of the entry being typed (`"Doe, J`),
-    /// so it never ends one. Nil when the text has no such separator.
-    static func lastSeparator(in text: String) -> String.Index? {
+    /// A text cut after its last finished entry: `finished` runs through its
+    /// last `,`, `;` or line break outside quotes, angle brackets, comments and
+    /// a group (the `;` ending a group counts), and `rest` is the entry still
+    /// being typed. A separator inside any of those is part of the entry being
+    /// typed (`"Doe, J`), so it never ends one. Read one Unicode scalar at a
+    /// time, as `entries` reads. Nil when the text has no such separator.
+    static func splitAtLastSeparator(_ text: String) -> (finished: String, rest: String)? {
+        let scalars = text.unicodeScalars
         var last: String.Index?
         var inQuote = false
         var escaped = false
         var angleDepth = 0
         var commentDepth = 0
         var inGroup = false
-        for index in text.indices {
-            let character = text[index]
+        for index in scalars.indices {
+            let scalar = scalars[index]
             if escaped {
                 escaped = false
             } else if inQuote || commentDepth > 0 {
-                if character == "\\" {
+                if scalar == "\\" {
                     escaped = true
                 } else if inQuote {
-                    if character == "\"" { inQuote = false }
-                } else if character == "(" {
+                    if scalar == "\"" { inQuote = false }
+                } else if scalar == "(" {
                     commentDepth += 1
-                } else if character == ")" {
+                } else if scalar == ")" {
                     commentDepth -= 1
                 }
-            } else if character.isNewline {
-                if angleDepth == 0 { inGroup = false; last = index }
+            } else if CharacterSet.newlines.contains(scalar) {
+                if angleDepth == 0, !inGroup { last = index }
             } else {
-                switch character {
+                switch scalar {
                 case "\"": inQuote = true
                 case "(": commentDepth += 1
                 case "<": angleDepth += 1
@@ -215,7 +239,9 @@ struct RecipientEntry: Equatable, Sendable {
                 }
             }
         }
-        return last
+        guard let last else { return nil }
+        let end = scalars.index(after: last)
+        return (String(scalars[..<end]), String(scalars[end...]))
     }
 
     var addresses: [String] { recipients.map(\.address) }

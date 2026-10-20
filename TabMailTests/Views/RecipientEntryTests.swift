@@ -327,11 +327,15 @@ struct RecipientEntryTests {
         #expect(ComposeDraftGuards.typedEntry(text) == text)
     }
 
-    @Test("A quoted name typed with a comma becomes one recipient under that name")
-    func typingQuotedNameWithComma() {
-        let field = Self.typing("\"Doe, John\" <john@example.com>,", into: .init())
+    @Test("A quoted name typed with a comma becomes one recipient under that name", arguments: [
+        ("\"Doe, John\" <john@example.com>,", "Doe, John"),
+        ("\"Doe \\\", John\" <john@example.com>,", "Doe \", John"),
+        ("\"\u{0301}Doe, John\" <john@example.com>,", "\u{0301}Doe, John")
+    ])
+    func typingQuotedNameWithComma(typed: String, name: String) {
+        let field = Self.typing(typed, into: .init())
         #expect(field.tokens == ["john@example.com"])
-        #expect(field.displayNames == ["john@example.com": "Doe, John"])
+        #expect(field.displayNames == ["john@example.com": name])
         #expect(field.rejected.isEmpty)
         #expect(field.input.isEmpty)
     }
