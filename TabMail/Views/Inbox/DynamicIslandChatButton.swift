@@ -74,6 +74,8 @@ struct DynamicIslandChat: View {
     @State private var showDictationPrompt = false
 
     private var isComposeMode: Bool { composeContext != nil }
+    /// The inbox's own chat: not about a message, not editing a draft.
+    private var isInboxChat: Bool { composeContext == nil && message == nil }
     private var isBackfillInProgress: Bool {
         AccountManagerState.shared.backfillProgressByAccount.values.contains { !$0.isFullyComplete }
     }
@@ -332,10 +334,22 @@ struct DynamicIslandChat: View {
                     .frame(maxWidth: .infinity, alignment: .trailing)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 4)
+                if isInboxChat && TutorialCoordinator.shared.isRunning {
+                    TutorialCoachView(host: .chat, style: .inline)
+                        .padding(.bottom, 6)
+                        .layoutPriority(1)
+                }
                 Divider()
                 if !hasTabMailSession {
                     signInBar
                         .layoutPriority(1)
+                } else if TutorialCoordinator.shared.isRunning {
+                    // Scripted: the input is filled in and read-only.
+                    TutorialChatInputBar(
+                        prompt: isInboxChat ? TutorialCoordinator.shared.chatPrompt : nil,
+                        isWorking: isWorking,
+                        send: sendTutorialPrompt)
+                    .layoutPriority(1)
                 } else if !AISubscriptionGate.shared.isActive {
                     subscribeBar
                         .layoutPriority(1)
@@ -580,7 +594,7 @@ struct DynamicIslandChat: View {
                         guard !Task.isCancelled, isExpanded, !isTextFieldFocused else { return }
                         startDictation()
                     }
-                } else if !dictationPromptShown {
+                } else if !dictationPromptShown && !TutorialCoordinator.shared.isRunning {
                     dictationPromptShown = true
                     showDictationPrompt = true
                 }
@@ -1240,7 +1254,8 @@ struct DynamicIslandChat: View {
 
     /// Whether the mic can start a dictation (the pill shows it only with AI access).
     private var canDictate: Bool {
-        networkMonitor.isConnected && !optOutAllAI
+        // Off in the guided tutorial: it would ask for the microphone and send audio.
+        networkMonitor.isConnected && !optOutAllAI && !TutorialCoordinator.shared.isRunning
     }
 
     /// What the dictation's cleanup reads as the screen, captured when it starts: what the pill
@@ -1296,6 +1311,15 @@ struct DynamicIslandChat: View {
     /// While listening, send stays available: it finishes the dictation, then sends its text.
     private var canTapSend: Bool {
         canSend || (dictation.phase == .listening && hasTabMailSession && !isWorking && composeReadyToSend)
+    }
+
+    /// The tutorial's filled-in input: sent like typed text, answered by
+    /// `TutorialChatScript`. No tip events are donated (TipKit state outlives
+    /// the demo).
+    private func sendTutorialPrompt(_ prompt: TutorialCoordinator.ChatPrompt) {
+        isTextFieldFocused = false
+        TutorialCoordinator.shared.chatPromptSent(prompt)
+        sendAgentChat(prompt.rawValue, script: prompt)
     }
 
     private func sendMessage() {
@@ -2027,7 +2051,9 @@ struct DynamicIslandChat: View {
         lastStatusChangeTime = .distantPast
     }
 
-    private func sendAgentChat(_ text: String) {
+    /// `script`: a guided-tutorial prompt, answered by `TutorialChatScript`
+    /// on the device instead of the AI.
+    private func sendAgentChat(_ text: String, script: TutorialCoordinator.ChatPrompt? = nil) {
         // If on the "new session" page in multi-session mode, start a fresh session
         if hasSessionHistory, activeSessionIndex < loadedSessions.count,
            loadedSessions[activeSessionIndex].id == "__new__" {
@@ -2212,17 +2238,26 @@ struct DynamicIslandChat: View {
                 // THIS session so any FSM tool's card is delivered to (and rendered
                 // by) the session that launched the turn — never a global slot that
                 // other mounted pills race for.
-                let response = try await AIService.shared.sendChatMessage(
-                    userText: enrichedText,
-                    history: history,
-                    onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
-                    invocation: ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey)
-                )
+                let invocation = ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey)
+                let response: ChatResponse?
+                if let script {
+                    response = ChatResponse(
+                        text: await TutorialChatScript.answer(
+                            script, practiceReply: TutorialCoordinator.shared.practiceReplyText, invocation: invocation),
+                        thinking: nil)
+                } else {
+                    response = try await AIService.shared.sendChatMessage(
+                        userText: enrichedText,
+                        history: history,
+                        onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
+                        invocation: invocation
+                    )
+                }
 
                 let replyText = response?.text ?? "I couldn't generate a response. Please try again."
                 if response == nil {
                     BackgroundSyncLogger.logChatError("Empty/nil response from LLM", userMessage: text)
-                } else {
+                } else if script == nil {
                     confirmSubscriptionActive()
                 }
                 BackgroundSyncLogger.logDebug("[AIChatDebug] Raw LLM response (\(replyText.count) chars): \(replyText.prefix(300))")

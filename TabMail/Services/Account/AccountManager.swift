@@ -369,9 +369,12 @@ actor AccountManager {
     /// Plug a demo email + calendar provider into the active provider lookup.
     /// `DemoModeService.completeSetup()` calls this after seeding GRDB.
     /// Existing provider entries for the same accountId are replaced.
+    /// The work queue is what the outbox and action drains run through; without
+    /// it a demo send stayed queued forever and never reached Sent.
     func registerDemoProviders(email: any EmailProvider, calendar: any CalendarProvider, accountId: String) {
         providers[accountId] = email
         calendarProviders[accountId] = calendar
+        workQueues[accountId] = ProviderWorkQueue(provider: email, maxConcurrency: SyncConfig.imapMaxConnectionCeiling)
         BackgroundSyncLogger.logDebug("[AccountManager] Registered demo providers for accountId=\(accountId)")
     }
 
@@ -379,6 +382,7 @@ actor AccountManager {
     func unregisterDemoProviders(accountId: String) {
         providers.removeValue(forKey: accountId)
         calendarProviders.removeValue(forKey: accountId)
+        workQueues.removeValue(forKey: accountId)
         BackgroundSyncLogger.logDebug("[AccountManager] Unregistered demo providers for accountId=\(accountId)")
     }
 

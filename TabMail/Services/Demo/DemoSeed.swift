@@ -17,6 +17,20 @@ enum DemoSeed {
     static let demoEmail = "alex@demomail.example"
     static let demoDisplayName = "Alex Morgan"
 
+    /// Seeded messages the guided tutorial points at. A message's id is its
+    /// position in `seededMessages` (`demo-msg-<n>`), so reordering the seed
+    /// moves these; `TutorialFixtureTests` pins what each one must be.
+    enum TutorialFixture {
+        /// Jordan's flight options (lesson 3's source email).
+        static let jordanFlights = "demo-msg-2"
+        /// The PayFlow receipt, tagged Archive (lesson 1, tap the tag).
+        static let receipt = "demo-msg-3"
+        /// The DailyTech digest, tagged Archive (lesson 1, retag as Delete).
+        static let dailyTech = "demo-msg-5"
+        /// Priya's offsite email with a suggested reply (lesson 2).
+        static let priyaOffsite = "demo-msg-8"
+    }
+
     /// Run the full seed. Idempotent — wipes any prior demo rows first.
     /// Throws if AppDatabase isn't initialized or a write fails.
     static func seed() throws {

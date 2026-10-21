@@ -370,6 +370,12 @@ struct MailNavigationView: View {
 
                     // App sections
                     Section {
+                        if case .progress(let done, let total, let next) = tutorialRowState {
+                            TutorialSidebarRow(state: .progress(done: done, total: total, next: next)) {
+                                startTutorial(next)
+                            }
+                        }
+
                         if hasTabMailSession {
                             NavigationLink(value: MailboxSelection.account) {
                                 Label("TabMail Account", systemImage: "person.crop.circle")
@@ -438,6 +444,12 @@ struct MailNavigationView: View {
                         if DebugModeManager.shared.isUnlocked {
                             NavigationLink(value: MailboxSelection.debug) {
                                 Label("Debug", systemImage: "ladybug")
+                            }
+                        }
+
+                        if tutorialRowState == .replay {
+                            TutorialSidebarRow(state: .replay) {
+                                startTutorial(.actOnEmail)
                             }
                         }
                     }
@@ -708,7 +720,10 @@ struct MailNavigationView: View {
         }
         .onAppear {
             // Consume any deep link stored during cold start (notification tap
-            // before MailNavigationView was mounted).
+            // before MailNavigationView was mounted). Not in the tutorial's
+            // demo: a tap there ends the tutorial (`handleNotificationDeepLink`)
+            // and the restored inbox opens the email.
+            guard !TutorialCoordinator.shared.isRunning else { return }
             if let pending = PendingDeepLinkStore.consume() {
                 switch pending {
                 case .message(let id, let accountId):
@@ -725,6 +740,21 @@ struct MailNavigationView: View {
                     BackgroundSyncLogger.logDebug("[MailNav] Cold-start deep link: navigating to inbox")
                 }
             }
+        }
+    }
+
+    // MARK: - Tutorial
+
+    /// The sidebar tutorial row, hidden while the tutorial itself runs.
+    private var tutorialRowState: TutorialRowState? {
+        let tutorial = TutorialCoordinator.shared
+        guard !tutorial.isRunning else { return nil }
+        return tutorial.rowState
+    }
+
+    private func startTutorial(_ lesson: TutorialLesson) {
+        Task {
+            await TutorialCoordinator.shared.start(lesson, hasTabMailSession: TabMailAuthService.hasSession())
         }
     }
 
@@ -751,6 +781,14 @@ struct MailNavigationView: View {
     // MARK: - Deep Link
 
     private func handleNotificationDeepLink(_ userInfo: [AnyHashable: Any]?) {
+        // A notification tap during the guided tutorial ends it (owner V5).
+        // The pending link stays stored: the restored inbox's
+        // MailNavigationView consumes it on appear and opens the email.
+        if TutorialCoordinator.shared.isRunning {
+            BackgroundSyncLogger.logDebug("[MailNav] Notification tap during the tutorial: ending it first")
+            Task { await TutorialCoordinator.shared.end() }
+            return
+        }
         // Consume the pending store so onAppear doesn't double-navigate
         _ = PendingDeepLinkStore.consume()
 

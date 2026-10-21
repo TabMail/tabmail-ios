@@ -34,7 +34,10 @@ final class DemoModeService {
     /// Begin the demo. Mints the JWT, primes session storage, and flips
     /// `DemoModeStore.isActive`. Throws on mint failure — caller surfaces
     /// the error and stays on the login screen.
-    func start() async throws {
+    ///
+    /// `mintToken: false` is the guided tutorial: it is scripted and makes no
+    /// backend call (`DemoModeStore.isTutorialPractice`), so it starts offline.
+    func start(mintToken: Bool = true) async throws {
         let store = DemoModeStore.shared
         guard !store.isActive else { return }
         guard !store.startInProgress else { return }
@@ -45,14 +48,16 @@ final class DemoModeService {
         // Defensive: wipe any prior demo session before minting fresh.
         DemoTokenManager.clearSession()
 
-        let mint = await DemoTokenManager.shared.mint()
-        switch mint {
-        case .success:
-            break
-        case .configMissing:
-            throw DemoError.startFailed("Demo not available right now.")
-        case .transientFailure(let reason):
-            throw DemoError.startFailed(reason)
+        if mintToken {
+            let mint = await DemoTokenManager.shared.mint()
+            switch mint {
+            case .success:
+                break
+            case .configMissing:
+                throw DemoError.startFailed("Demo not available right now.")
+            case .transientFailure(let reason):
+                throw DemoError.startFailed(reason)
+            }
         }
 
         try await activate()
@@ -149,8 +154,9 @@ final class DemoModeService {
 
         // Open the AI subscription gate when
         // the user enabled AI in the demo consent gate. Otherwise the chat
-        // pill renders the "Subscribe to unlock AI features" lock bar.
-        if DemoModeStore.shared.aiEnabled {
+        // pill renders the "Subscribe to unlock AI features" lock bar. The
+        // tutorial's scripted chat needs the pill too (it calls no AI).
+        if DemoModeStore.shared.aiEnabled || DemoModeStore.shared.isTutorialPractice {
             AISubscriptionGate.shared.openGate()
         }
 
@@ -233,6 +239,7 @@ final class DemoModeService {
 
         store.isActive = false
         store.enteredFromDebugMenu = false
+        store.isTutorialPractice = false
         // Note: callsConsumed and demo gate flags persist.
 
         // Re-establish Device Sync (disconnected on demo entry). connect()

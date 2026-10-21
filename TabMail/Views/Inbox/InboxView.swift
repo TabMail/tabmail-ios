@@ -455,13 +455,24 @@ struct InboxView: View {
                         }
                         .padding(.horizontal)
                     }
+                    // Guided tutorial coach card (above the list, so it never
+                    // covers the row it points at).
+                    if TutorialCoordinator.shared.isRunning {
+                        TutorialCoachView(host: .inbox)
+                            .padding(.vertical, 8)
+                    }
                 }
 
                 Group {
                     switch viewModel.mode {
                     case .normal:
-                        normalListView
-                            .transition(.blurReplace)
+                        ScrollViewReader { proxy in
+                            ZStack {
+                                normalListView
+                                TutorialInboxScroller(proxy: proxy, groups: viewModel.displayGroups)
+                            }
+                        }
+                        .transition(.blurReplace)
                     case .triage:
                         triageView
                             .transition(.blurReplace)
@@ -566,7 +577,7 @@ struct InboxView: View {
                 }
 
                 // Chat pill hidden when demo + AI off.
-                if !(DemoModeStore.shared.isActive && !DemoModeStore.shared.aiEnabled) {
+                if !DemoModeStore.shared.hidesAIContent {
                     DynamicIslandChat(isExpanded: $chatExpanded, isInputFocused: $chatInputFocused, isWorking: $chatWorking, onAgentReply: { text in
                         showAgentToast(text, sessionKey: "inbox")
                     })

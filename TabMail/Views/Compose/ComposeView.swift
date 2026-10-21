@@ -1294,6 +1294,13 @@ struct ComposeView: View {
 
     /// The Close/Send bar's height; the opening spinner's bar matches it (#326).
     static let headerHeight: CGFloat = 66
+
+    /// The guided tutorial's practice reply to Priya (lesson 2).
+    private var isTutorialPracticeReply: Bool {
+        TutorialCoordinator.shared.isRunning
+            && replyTo?.accountId == DemoSeed.demoAccountId
+            && replyTo?.messageId == DemoSeed.TutorialFixture.priyaOffsite
+    }
     @State private var pillAppeared = false
 
     var body: some View {
@@ -1321,6 +1328,10 @@ struct ComposeView: View {
                         .padding(.vertical, 6)
                         .background(Theme.accent.opacity(0.06))
                         Divider()
+                    }
+                    if isTutorialPracticeReply {
+                        TutorialCoachView(host: .compose(showingSuggestion: showingSuggestion))
+                            .padding(.vertical, 8)
                     }
 
                     ScrollView {
@@ -3434,6 +3445,10 @@ struct ComposeView: View {
         }
 
         let (sendBody, isHTML) = buildSendBody()
+        if isTutorialPracticeReply {
+            // The template made from this reply uses the text as written.
+            TutorialCoordinator.shared.practiceReplyAuthored(messageBody)
+        }
         // Threading headers for reply / reply-all / forward. Single source of
         // truth (ThreadUtils) builds the In-Reply-To + full References chain and,
         // for Gmail, the conversation threadId (guarded by account + subject

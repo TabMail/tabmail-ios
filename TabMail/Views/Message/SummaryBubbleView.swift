@@ -29,7 +29,7 @@ struct SummaryBubbleView: View {
     /// regardless of pre-baked content.
     private var anyAISourceEnabled: Bool {
         let demoStore = DemoModeStore.shared
-        if demoStore.isActive && !demoStore.aiEnabled { return false }
+        if demoStore.hidesAIContent { return false }
         return (!optOutAllAI || DeviceSyncService.shared.isAutoEnabled) && AISubscriptionGate.shared.isActive
     }
 
@@ -89,7 +89,7 @@ struct SummaryBubbleView: View {
         let mode = Self.displayMode(
             isInInbox: message.isInInbox,
             summaryBlurb: message.summaryBlurb,
-            demoSuppressed: DemoModeStore.shared.isActive && !DemoModeStore.shared.aiEnabled,
+            demoSuppressed: DemoModeStore.shared.hidesAIContent,
             userHidden: !showAISummaries
         )
         switch mode {

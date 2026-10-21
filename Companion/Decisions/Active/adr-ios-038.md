@@ -260,6 +260,70 @@ fix gates at shared chokepoints, not per-tool patches:
   `resetCallBudget()` (reset the 50-call counter) live in the debug menu
   instead.
 
+**Amendment 2026-10-21 — guided tutorial, scripted, no AI (owner V5):**
+- **Guided tutorial on the demo.** `TutorialCoordinator` (Services/Tutorial)
+  runs three parts (act on email, reuse a reply, ask anything) on the
+  seeded demo inbox through the native screens, advancing only on real
+  events: the receipt leaves the demo Inbox, DailyTech's tag changes, a
+  local Sent row appears, a confirmed template is persisted, the source
+  email opens. Sample messages are named by `DemoSeed.TutorialFixture`
+  ids, never by rendered strings. Progress lives in `TutorialProgress`
+  (UserDefaults: version, completed parts, first-run welcome); an
+  unfinished part restarts from its beginning. The full-screen welcome
+  is armed only by the fresh-install branch of
+  `TabMailApp.prepareSessionStorageForLaunch`; everyone else gets the
+  sidebar row. Finish, Skip and Finish later all end in
+  `DemoModeService.exit()`; the run state is cleared only after it, so
+  the plain demo's consent screens never flash in between. Copy says
+  "1 of 3", never "lesson" (owner).
+- **Scripted, no AI, no consent (owner 2026-10-21).** The tutorial makes
+  no AI or backend call and shows no consent screen: the age and terms
+  screen and the AI choice stay where they are (sign-in, and the plain
+  demo before seeding). `DemoModeStore.isTutorialPractice` (in memory,
+  set before the demo activates, cleared on exit) is the switch:
+  `BackendClient.currentAuthToken()` returns nil, so no demo token is
+  minted (`DemoModeService.start(mintToken: false)`), and the two
+  builders that would send without a token (`transcribeDictation`,
+  `makeCompletionsRequest`) throw `.unauthorized` before building.
+  The seeded, pre-written tags and summaries show whatever the demo AI
+  choice (`hidesAIContent`), and `completeSetup` opens the subscription
+  gate so the chat pill is not locked.
+- **Scripted chat.** The inbox chat's input is filled in and read-only
+  (`TutorialChatInputBar`, owner: "in real use you speak or type; here it
+  is filled in"); message and draft chats show only the note. Send runs
+  `TutorialChatScript` in place of the AI call inside `sendAgentChat`, so
+  turns render and persist like an AI reply: the template answer shows
+  the real `TemplateCreateTool` card with the practice reply as written
+  in compose (`practiceReplyAuthored`), the flight answer cites Jordan's
+  seeded email (`[Email](N)` pill), "What can you do?" is a fixed list.
+  Dictation is off in the tutorial (`canDictate`), and no tip events are
+  donated.
+- **No permission prompt during the tutorial.** The launch notification
+  request waits while the welcome is pending; RootView asks once the
+  welcome is skipped or the tutorial ends. Compose skips Contacts
+  access and name lookups while the tutorial runs.
+- **Re-tags of demo samples never teach (bug fix).** A demo re-tag used to
+  enqueue an `actionRefine` row; drains are deferred while the demo runs,
+  so the row drained after exit against the real `user_action` prompt.
+  `BackfillAIQueue.enqueueActionRefine` now refuses a demo sample
+  (`ActionRefineSnapshot.isDemoSample`) and `dispatchActionRefine` drops
+  one queued by an older build. The `enqueueActionRefine` chokepoint in
+  the call accounting above therefore no longer consumes a demo call.
+- **Tips hidden in the demo** (supersedes "TipKit shown-state persists"
+  being visible in demo): `OnboardingTipGate.onboardingComplete` is
+  `allOnboardingGatesPassed && !isActive`, so no tip (each shows once) is
+  used up on sample mail. The two user-label tips gained the same rule.
+- **Signed-in replay and notifications.** The sidebar row starts the
+  tutorial next to a live account (banner hidden while the tutorial
+  runs, its coach cards carry Skip). A notification tap during the
+  tutorial ends it; the pending deep link stays stored and the restored
+  inbox's `MailNavigationView` opens the email on appear.
+- **Considered and dropped the same day: consent once.** A variant asked
+  the age/terms and AI screens before the AI parts and carried the
+  outcome to sign-in (`CarriedConsent`). The owner chose a scripted
+  tutorial instead; nothing of it shipped, and the demo-prefixed consent
+  gates above stand.
+
 **Related:**
 - The demo-auth mint/verify/throttle, the admin demo-stats readout, and the
   HMAC secret-rotation tooling all live server-side.

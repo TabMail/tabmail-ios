@@ -9,7 +9,8 @@ import TipKit
 //
 // All tips are gated on `OnboardingTipGate.onboardingComplete` so no
 // tip can render until the user has cleared every consent gate. Set
-// to `true` from `RootView` when the user finishes the last gate;
+// to `true` from `RootView` when the user finishes the last gate (and
+// back to `false` while the demo runs, so no tip is used up on sample mail);
 // TipKit persists `@Parameter` values to its datastore, so once
 // flipped this stays flipped across launches.
 //

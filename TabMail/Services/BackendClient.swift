@@ -92,7 +92,17 @@ actor BackendClient {
     /// the Supabase session — the demo flow never has a Supabase user, so
     /// the production coordinator returns `.noSession` and chat 401s.
     private func currentAuthToken() async -> String? {
-        let inDemo = await MainActor.run { DemoModeStore.shared.isActive }
+        let (inDemo, inTutorial) = await MainActor.run {
+            (DemoModeStore.shared.isActive, DemoModeStore.shared.isTutorialPractice)
+        }
+        // The guided tutorial is scripted and sends nothing anywhere
+        // (ADR-IOS-038 amendment 2026-10-21): no token, and no demo token is
+        // minted for it. Builders that would send without one refuse instead
+        // (`refuseDuringTutorial`).
+        if inTutorial {
+            BackgroundSyncLogger.logDebug("[BackendClient] Tutorial practice: no auth token, request not sent")
+            return nil
+        }
         if inDemo {
             switch await DemoTokenManager.shared.validToken() {
             case .success(let token):
@@ -107,6 +117,14 @@ actor BackendClient {
         case .permanentFailure, .transientFailure, .noSession:
             return nil
         }
+    }
+
+    /// Throws while the guided tutorial runs, before a request that would be
+    /// sent without a token is built (see `currentAuthToken`).
+    private func refuseDuringTutorial() async throws {
+        guard await MainActor.run(body: { DemoModeStore.shared.isTutorialPractice }) else { return }
+        BackgroundSyncLogger.logDebug("[BackendClient] Tutorial practice: request refused")
+        throw BackendError.unauthorized
     }
 }
 
@@ -161,6 +179,7 @@ extension BackendClient {
     func transcribeDictation(
         flac: Data, language: String?, vocabulary: [String], cleanup: [String: String]? = nil
     ) async throws -> DictationTranscription {
+        try await refuseDuringTutorial()
         var request = URLRequest(url: baseURL.appending(path: DictationConfig.transcribePath))
         request.httpMethod = "POST"
         request.timeoutInterval = DictationConfig.transcriptionRequestTimeout
@@ -837,6 +856,7 @@ extension BackendClient {
 
     /// Build a URLRequest for the completions endpoint with standard headers.
     private func makeCompletionsRequest(_ request: CompletionsRequest) async throws -> (URLRequest, Data) {
+        try await refuseDuringTutorial()
         let request = Self.augmentRequestWithDefaults(request)
         var urlRequest = URLRequest(url: baseURL.appending(path: "/completions/chat"))
         urlRequest.httpMethod = "POST"

@@ -77,6 +77,10 @@ struct UserLabelRowManageTip: Tip {
     var message: Text? {
         Text("Long-hold a message to manage labels.")
     }
+    // Like every app tip: hidden until onboarding is done and during the demo.
+    var rules: [Rule] {
+        #Rule(OnboardingTipGate.$onboardingComplete) { $0 == true }
+    }
 }
 
 /// Tip for message detail cards — shown on first label chip appearance.
@@ -86,5 +90,9 @@ struct UserLabelCardManageTip: Tip {
     }
     var message: Text? {
         Text("Long-hold the subject to manage labels.")
+    }
+    // Like every app tip: hidden until onboarding is done and during the demo.
+    var rules: [Rule] {
+        #Rule(OnboardingTipGate.$onboardingComplete) { $0 == true }
     }
 }

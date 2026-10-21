@@ -196,7 +196,9 @@ struct TabMailApp: App {
         // Silent push (content-available: 1) works without user permission,
         // but we request alert+sound+badge for future visible notifications.
         // Skip in screenshot mode to avoid permission dialog blocking screenshots.
-        if !ScreenshotMode.isActive && !ScreenshotMode.isSplashMode {
+        // Not over the first-launch tutorial welcome either: RootView asks
+        // once the welcome and the tutorial are done.
+        if !ScreenshotMode.isActive && !ScreenshotMode.isSplashMode && !TutorialProgress().isWelcomePending {
             Task {
                 await PushNotificationService.shared.requestPermissionAndRegister()
             }
@@ -293,6 +295,9 @@ struct TabMailApp: App {
             // Truly fresh install. Persist the gate BEFORE destructive work;
             // both app and NSE fail closed until a verified zero-item cleanup.
             AuthDiagnostics.log("Fresh install detected — clearing stale Keychain data")
+            // The guided tutorial's full-screen welcome is for a first launch
+            // only; an update or a signed-out install never sees it.
+            TutorialProgress(defaults: launchDefaults).markWelcomePending()
             sessionStore.markCleanupPending()
             if TabMailAuthService.completeSession(
                 mode: .deleteAll,

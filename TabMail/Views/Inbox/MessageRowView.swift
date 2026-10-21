@@ -25,7 +25,7 @@ struct MessageRowView: View {
     /// surfaces as off regardless of pre-baked content.
     private var anyAISourceEnabled: Bool {
         let demoStore = DemoModeStore.shared
-        if demoStore.isActive && !demoStore.aiEnabled { return false }
+        if demoStore.hidesAIContent { return false }
         return (!optOutAllAI || DeviceSyncService.shared.isAutoEnabled) && AISubscriptionGate.shared.isActive
     }
 
@@ -47,7 +47,7 @@ struct MessageRowView: View {
     /// Hide action chip when demo + AI off.
     private var effectiveTag: ActionTag? {
         let demoStore = DemoModeStore.shared
-        if demoStore.isActive && !demoStore.aiEnabled { return nil }
+        if demoStore.hidesAIContent { return nil }
         if let threadInfo { return threadInfo.threadTag }
         return message.actionTag
     }
@@ -156,6 +156,15 @@ struct MessageRowView: View {
                                     .padding(.vertical, 2)
                                     .actionTagButtonStyle(color: Theme.tagColor(tag))
                                     .aiWorkingShimmer(active: showShimmer)
+                                    .overlay {
+                                        // Guided tutorial: the tag this step asks for.
+                                        if TutorialCoordinator.shared.highlightsTag(
+                                            accountId: message.accountId, messageId: message.messageId) {
+                                            RoundedRectangle(cornerRadius: 6)
+                                                .stroke(Theme.accent, lineWidth: 2)
+                                                .padding(-3)
+                                        }
+                                    }
                                     .padding(.horizontal, 4)
                                     .padding(.vertical, 4)
                                     .contentShape(Rectangle())

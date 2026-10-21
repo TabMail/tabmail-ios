@@ -191,32 +191,8 @@ actor DemoProvider: EmailProvider {
     }
 
     func send(draft: DraftMessage) async throws {
-        // No network — synthesize a sent message in the seeded SENT folder.
-        guard let db = AppDatabase.shared.withLock({ $0 }) else { return }
-        try await db.dbPool.write { conn in
-            let folderId = "\(self.accountId):SENT"
-            let messageId = draft.messageId ?? "demo-sent-\(UUID().uuidString.prefix(8))"
-            var header = MessageHeader(
-                messageId: messageId,
-                subject: draft.subject,
-                from: DemoSeed.demoDisplayName,
-                fromAddress: DemoSeed.demoEmail,
-                to: draft.to.joined(separator: ", "),
-                date: Date(),
-                snippet: String(Self.stripHTML(draft.body).prefix(160)),
-                folderId: folderId,
-                accountId: self.accountId,
-                folderPath: "SENT",
-                isInInbox: false
-            )
-            header.rfc822MessageId = messageId
-            header.isRead = true
-            header.headerComplete = true
-            header.bodyComplete = true
-            try header.insert(conn)
-            try MessageBody(contentKey: ContentKey(rawValue: header.id),
-                            htmlContent: draft.isHTML ? draft.body : "<pre>\(draft.body)</pre>").insert(conn)
-        }
+        // No network and nobody to deliver to. The outbox's optimistic Sent
+        // header is the demo's sent copy, as it is for a real account until sync.
     }
 
     func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool {
