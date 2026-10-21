@@ -996,6 +996,17 @@ actor ExchangeProvider: EmailProvider {
         }
     }
 
+    /// #217: the draft's current copy, or nil on 404 (deleted elsewhere).
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
+        guard case .outlook(let graphId) = identity else {
+            throw ProviderError.actionIdentityResolutionFailed("ExchangeProvider received a non-Outlook draft identity")
+        }
+        let encodedId = try Self.encodedGraphPathSegment(graphId, context: "Graph draft message id")
+        let probe = try await authedHTTP.requestAllowing404(url: baseURL + "/messages/\(encodedId)?$select=id")
+        if probe.statusCode == 404 { return nil }
+        return try await fetchMessage(id: graphId, folder: "")
+    }
+
     func deleteDraft(identity: DraftDeleteIdentity) async throws {
         guard case .outlook(let draftId) = identity else {
             throw ProviderError.actionIdentityResolutionFailed("ExchangeProvider received a non-Outlook draft identity")

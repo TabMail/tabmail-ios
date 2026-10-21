@@ -27,8 +27,34 @@ id, a changed header, an unconfirmed-empty body or a failed attachment fetch sti
 
 **Consequences:**
 - Drafts from any client open and edit; the first save replaces the other app's copy.
-- Concurrent edits in two apps: last save wins. A later in-place edit elsewhere (Gmail/Graph keep
-  their ids) is not shown on reopen — `IOS-DRAFT-020`, open for the owner.
+- ~~Concurrent edits in two apps: last save wins. A later in-place edit elsewhere (Gmail/Graph keep
+  their ids) is not shown on reopen — `IOS-DRAFT-020`, open for the owner.~~ Superseded by the
+  amendment below (preserved as written).
 - An evicted but pushed local draft is re-adopted from its server copy when reopened.
 - Inline images in another app's HTML draft become plain-text body only (the compose is plain
   text); top-level attachments are carried.
+
+**Amendment (2026-10-17, owner's second ruling, same PR):** *"It should definitely reload from the
+server. It should not hold its local copy. … if it changed on the server, we should ask whether to
+overwrite or reload or save as new … and then before saving, always check if the server copy has
+updated. The brief gap time between our check and the save is an acceptable loophole …"*
+
+- **Revision witness.** `Draft.serverDraftRevision` (migration `v92_addDraftServerRevision`) records
+  the server revision the row's content is based on: IMAP UID (an edit elsewhere is a new APPEND),
+  Gmail draft's contained message id (changes on every update), Graph `changeKey`. Written at push
+  completion (`applyPushCompletion`), adoption and reload. `EmailProvider.draftRevision(identity:)`
+  answers `.present` / `.gone`; a throw means "could not tell" and is never treated as either.
+  A nil base (pre-v92 row) is no evidence and keeps last-save-wins.
+- **Open:** a row with no unsent edits follows the server (changed ⇒ reload before the editor
+  opens; gone ⇒ "Draft unavailable"). A row with unsent edits opens as is unless the server moved on
+  from its base, then asks Overwrite / Reload / Save as new. Check failure ⇒ open as is.
+- **Save:** checks first (`DraftServerCheckConfig.saveCheckTimeoutSeconds`); changed ⇒ the same
+  question; gone ⇒ Save as new or Cancel; failure/offline ⇒ save locally.
+- **Upload:** `pushDraftToServer` checks before the provider write. Changed ⇒ `.serverChanged`
+  (never overwrites; edits stay `"dirty"`, asked on next open); gone ⇒ saved as a new draft; throw
+  ⇒ retry. Send does not check (owner: "Send just sends").
+- **Accepted:** the check-then-write gap and the first upload of a pre-v92 dirty row
+  (`IOS-DRAFT-021`). Graph documents `changeKey` as changing on any item change, so a server-side
+  property change (for example a category) can prompt or reload without a body edit; that errs
+  toward asking, never toward overwriting.
+- `IOS-DRAFT-020` resolved.

@@ -300,6 +300,24 @@ actor DemoProvider: EmailProvider {
         return .created(.demo(localId: serverId))
     }
 
+    /// #217: the demo draft as `saveDraft` last stored it, or nil when deleted.
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
+        guard case .demo(let localId) = identity else {
+            throw ProviderError.actionIdentityResolutionFailed("DemoProvider received a non-Demo draft identity")
+        }
+        guard let db = AppDatabase.shared.withLock({ $0 }) else {
+            throw DemoError.notInDemo
+        }
+        let found: (MessageHeader, MessageBody?)? = try await db.dbPool.read { conn in
+            guard let header = try MessageHeader
+                .filter(Column("accountId") == self.accountId && Column("messageId") == localId)
+                .fetchOne(conn) else { return nil }
+            return (header, try MessageBody.filter(Column("id") == header.id).fetchOne(conn))
+        }
+        guard let (header, body) = found else { return nil }
+        return FullMessageInfo(header: Self.toInfo(header), htmlBody: body?.htmlContent, textBody: nil)
+    }
+
     func deleteDraft(identity: DraftDeleteIdentity) async throws {
         guard case .demo(let draftId) = identity else {
             throw ProviderError.actionIdentityResolutionFailed("DemoProvider received a non-Demo draft identity")

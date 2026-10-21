@@ -34,6 +34,14 @@ actor DraftStore {
         case completed
         /// A replacement/edit won the exact Stage A/B CAS. This producer is stale.
         case notApplied
+        /// #217 (ADR-IOS-091): another app changed the server copy since this row
+        /// last wrote or loaded it (its text no longer matches), so this upload must
+        /// not overwrite it (owner ruling 2026-10-17). The provider RETURNED the
+        /// changed copy — an authoritative answer, not an unknown — so the producer
+        /// retires. The
+        /// edits stay in the row (`"dirty"`) and the user is asked Overwrite /
+        /// Reload / Save as new the next time the draft opens.
+        case serverChanged
     }
 
     /// Raised when a second push for the SAME draft is attempted while one is
@@ -374,6 +382,9 @@ actor DraftStore {
         let postAPushAttemptVersion: Int
         let freshRfc: String
         let previousIdentity: DraftDeleteIdentity?
+        /// #217: the text this attempt sends (`DraftServerText`), recorded as the
+        /// row's copy of the server text when the attempt completes.
+        let sentText: String
     }
 
     private struct HeaderMigration: Sendable {
@@ -416,10 +427,11 @@ actor DraftStore {
             instanceEpoch: expectedInstanceEpoch,
             postAPushAttemptVersion: postAVersion,
             freshRfc: freshRfc,
-            previousIdentity: previousIdentity)
+            previousIdentity: previousIdentity,
+            sentText: DraftServerText.local(initialDraft))
     }
 
-    private static func priorIdentity(
+    static func priorIdentity(
         for draft: Draft,
         runtimeKind: DraftRuntimeIdentityKind
     ) -> DraftDeleteIdentity? {
@@ -467,6 +479,7 @@ actor DraftStore {
             draft.serverDraftId = nil
             draft.serverDraftUidValidity = nil
             draft.serverDraftFolderPath = nil
+            draft.serverDraftText = nil
             draft.serverPushStatus = nil
             try draft.update(db)
             return PushCompletion(applied: true, migration: nil)
@@ -505,6 +518,8 @@ actor DraftStore {
                 throw ProviderError.actionIdentityResolutionFailed(
                     "draft provider returned an address from the wrong namespace")
             }
+            // #217: the server now holds exactly what this attempt sent.
+            draft.serverDraftText = context.sentText
             draft.serverPushStatus = "pushed"
             try draft.update(db)
 
@@ -775,6 +790,31 @@ actor DraftStore {
             return .notApplied
         }
 
+        // #217 (ADR-IOS-091): before replacing the server copy, check that its text
+        // still matches this row's copy of it. Changed elsewhere ⇒ do not overwrite
+        // (the user decides on the next open). Gone ⇒ save as new. A THROWN check is
+        // an unknown: it propagates and the producer retries. The gap between this
+        // check and the provider write below is the owner-accepted race
+        // (`IOS-DRAFT-021`).
+        let previousIdentity: DraftDeleteIdentity?
+        if let identity = Self.priorIdentity(for: initialDraft, runtimeKind: runtimeKind) {
+            let current = try await provider.fetchDraftCopy(identity: identity)
+            switch DraftServerCheck.compare(
+                base: initialDraft.serverDraftText, current: current.map(DraftServerText.of)) {
+            case .unchanged:
+                previousIdentity = identity
+            case .gone:
+                previousIdentity = nil
+            case .changed:
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[DraftPush] Server copy of draft \(draftId) changed elsewhere (text differs from this device's copy) — NOT overwriting; the user is asked on the next open")
+                }
+                return .serverChanged
+            }
+        } else {
+            previousIdentity = nil
+        }
+
         let domain = initialDraft.accountId.contains("@")
             ? String(initialDraft.accountId.split(separator: "@").last ?? "tabmail.local")
             : "tabmail.local"
@@ -805,8 +845,7 @@ actor DraftStore {
             try Self.performStageA(
                 initialDraft: initialDraft,
                 expectedInstanceEpoch: expectedInstanceEpoch,
-                previousIdentity: Self.priorIdentity(
-                    for: initialDraft, runtimeKind: runtimeKind),
+                previousIdentity: previousIdentity,
                 freshRfc: freshRfc,
                 db: db)
         }) else {
@@ -882,6 +921,67 @@ actor DraftStore {
         }
         return .completed
     }
+    // MARK: - Server copy changed elsewhere (#217, ADR-IOS-091)
+
+    /// "Overwrite": keep this device's version. Records the server's current text
+    /// as this row's copy, so its next upload replaces the other app's version.
+    /// Returns false when the row is gone, was replaced, or has no server copy.
+    static func rebaseOnServerText(
+        draftId: String,
+        expectedInstanceEpoch: String,
+        serverText: String,
+        db: Database
+    ) throws -> Bool {
+        guard var draft = try Draft.fetchOne(db, key: draftId),
+              draft.instanceEpoch == expectedInstanceEpoch,
+              draft.serverDraftId != nil else {
+            return false
+        }
+        draft.serverDraftText = serverText
+        try draft.update(db)
+        return true
+    }
+
+    /// "Save as new": keep both versions. Detaches the row from the other app's
+    /// copy, so its next upload creates a new server draft and the other copy is
+    /// left untouched (it is adopted again if opened).
+    static func detachFromServerCopy(
+        draftId: String,
+        expectedInstanceEpoch: String,
+        db: Database
+    ) throws -> Bool {
+        guard var draft = try Draft.fetchOne(db, key: draftId),
+              draft.instanceEpoch == expectedInstanceEpoch else {
+            return false
+        }
+        draft.serverDraftId = nil
+        draft.serverDraftFolderPath = nil
+        draft.serverDraftUidValidity = nil
+        draft.serverDraftText = nil
+        draft.serverPushStatus = nil
+        try draft.update(db)
+        return true
+    }
+
+    /// "Reload" chosen at Save: drop this device's unsent edits. The row is marked
+    /// as holding no unsent edits while its copy of the server text stays the OLD
+    /// one, so the next open sees the server copy changed and reloads it, and any
+    /// queued upload retires at its entry guard instead of pushing the dropped edits.
+    static func discardUnsentEditsForReload(
+        draftId: String,
+        expectedInstanceEpoch: String,
+        db: Database
+    ) throws -> Bool {
+        guard var draft = try Draft.fetchOne(db, key: draftId),
+              draft.instanceEpoch == expectedInstanceEpoch,
+              draft.serverDraftId != nil else {
+            return false
+        }
+        draft.serverPushStatus = "pushed"
+        try draft.update(db)
+        return true
+    }
+
     /// Update serverPushStatus to "dirty" (needs re-push) for a draft.
     func markDirty(id: String) throws {
         try AppDatabase.dbPool.write { db in

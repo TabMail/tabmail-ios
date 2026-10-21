@@ -5778,6 +5778,35 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
+    /// #217: the draft's current copy under the recorded UIDVALIDITY. Read-only.
+    /// A PROVEN epoch change, a confirmed-absent mailbox or an absent UID is nil (the
+    /// address names nothing any more — another app's edit is a new APPEND under a
+    /// new UID); an UNKNOWN epoch throws.
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
+        guard case .imap(let folder, let uidValidity, let uid) = identity,
+              uid > 0, uidValidity > 0,
+              let recordedUidValidity = UInt32(exactly: uidValidity),
+              let targetUidValue = UInt32(exactly: uid) else {
+            throw ProviderError.actionIdentityResolutionFailed("IMAPProvider received an unusable draft identity")
+        }
+        do {
+            return try await withActionConnectionSelection(folder: folder) { server, selection in
+                do {
+                    try self.requireUidValidity(
+                        selection, expected: recordedUidValidity, folder: folder)
+                } catch ProviderError.uidValidityChanged {
+                    return nil
+                }
+                let infos = try await server.fetchMessageInfosBulk(using: UIDSet(UID(targetUidValue)))
+                guard infos.contains(where: { $0.uid?.value == targetUidValue }) else { return nil }
+                return try await self.fetchMessageOnConnection(
+                    id: String(uid), folder: folder, server: server)
+            }
+        } catch is IMAPActionMailboxAbsent {
+            return nil
+        }
+    }
+
     /// PORT/SUBTRACT of `v2final.deleteDraftStrong`: retain its UID validation and
     /// absent-target no-op, but omit optional RFC corroboration because v3's typed
     /// identity has no RFC leg.

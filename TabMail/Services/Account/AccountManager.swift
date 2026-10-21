@@ -1308,6 +1308,11 @@ actor AccountManager {
         providers[account.id]
     }
 
+    /// The registered provider for `accountId`, if connected.
+    func provider(accountId: String) -> (any EmailProvider)? {
+        providers[accountId]
+    }
+
     func connectAccount(_ account: Account) async throws {
         guard !isRuntimeRemoved(account.id) else {
             throw ProviderError.notConnected

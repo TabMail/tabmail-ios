@@ -4220,6 +4220,20 @@ final class AppDatabase: Sendable {
                 columns: ["folderId", "providerDate"]
             )
         }
+
+        // v92 (#217, ADR-IOS-091): this device's copy of a draft's server text
+        // (`DraftServerText`), so open, Save and the upload can tell that another
+        // app changed the server copy: its text no longer matches.
+        // Nullable, no backfill: nil means "no evidence" and keeps the pre-v92
+        // last-save-wins behaviour for that row until its next push or reload.
+        // Local draft state on the device, not server retention (ADR-004 unaffected).
+        migrator.registerTimedMigration(
+            "v92_addDraftServerText", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "draft") { t in
+                t.add(column: "serverDraftText", .text)
+            }
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

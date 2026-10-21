@@ -812,6 +812,39 @@ actor GmailProvider: EmailProvider {
             containedMessageId: match.containedMessageId)
     }
 
+    /// #217: the draft resource's current copy, or nil on 404 (deleted elsewhere).
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
+        guard case .gmail(let resourceId) = identity else {
+            throw ProviderError.actionIdentityResolutionFailed(
+                "GmailProvider received a non-Gmail draft identity")
+        }
+        guard let messageId = try await currentDraftMessageId(resourceId: resourceId) else {
+            return nil
+        }
+        return try await fetchMessage(id: messageId, folder: "")
+    }
+
+    /// The message a draft resource currently wraps (it changes on every update),
+    /// or nil on 404.
+    private func currentDraftMessageId(resourceId: String) async throws -> String? {
+        let path = try Self.strictEncodedPath(
+            "/drafts/\(resourceId)",
+            queryItems: [(name: "format", value: "minimal"), (name: "fields", value: "message/id")])
+        await acquireRequestSlot()
+        defer { releaseRequestSlot() }
+        let result = try await authedHTTP.requestAllowing404(url: baseURL + path)
+        if result.statusCode == 404 { return nil }
+        guard let data = result.data else {
+            throw ProviderError.networkError(underlying: HTTPError.networkError(statusCode: result.statusCode))
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let messageId = (json["message"] as? [String: Any])?["id"] as? String,
+              !messageId.isEmpty else {
+            throw ProviderError.networkError(underlying: HTTPError.networkError(statusCode: result.statusCode))
+        }
+        return messageId
+    }
+
     private func draftResources(
         wrapping containedMessageId: String
     ) async throws -> [(resourceId: String, containedMessageId: String)] {

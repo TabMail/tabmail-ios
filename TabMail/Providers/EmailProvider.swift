@@ -422,6 +422,12 @@ protocol EmailProvider: Sendable {
     /// Delete exactly one typed provider-native draft identity.
     func deleteDraft(identity: DraftDeleteIdentity) async throws
 
+    /// #217: the server's current copy of the draft at `identity`, or nil when that
+    /// address no longer names a draft (deleted, or replaced under a new IMAP UID).
+    /// Read-only. THROWS when the answer could not be determined (offline, an
+    /// unknown IMAP epoch); a throw is never "unchanged" and never "gone".
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo?
+
     // Incremental sync (optional — Gmail uses history.list, IMAP returns nil)
     func fetchHistory(since historyId: String) async throws -> HistoryResponse?
     func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo]
@@ -445,6 +451,12 @@ protocol EmailProvider: Sendable {
 }
 
 extension EmailProvider {
+    /// Default for test doubles only; every production provider overrides it.
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
+        throw ProviderError.actionIdentityResolutionFailed(
+            "fetchDraftCopy: provider has no draft read adapter")
+    }
+
     func resolveDraftResource(
         containedMessageId: String,
         draftsFolderPath: String

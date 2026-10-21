@@ -415,11 +415,49 @@ actor MockEmailProvider: EmailProvider {
         callLog.append("saveDraft(existingIdentity:\(String(describing: existingIdentity)),draftsFolderPath:\(draftsFolderPath))")
         if let saveDraftHook { await saveDraftHook() }
         if let error = saveDraftThrows { throw error }
+        lastSavedDraft = draft
         return saveDraftResult
     }
 
     func deleteDraft(identity: DraftDeleteIdentity) async throws {
         callLog.append("deleteDraft(identity:\(identity))")
+    }
+
+    /// #217 server read. Recorded apart from `callLog` so existing exact-log
+    /// assertions are unaffected. Unless overridden, the server holds exactly what
+    /// this mock's last successful `saveDraft` received (an empty draft before
+    /// any), so a row this mock pushed reads as UNCHANGED and a row with no copy of
+    /// the server text (nil) is no evidence either way.
+    var fetchDraftCopyLog: [DraftDeleteIdentity] = []
+    /// The server copy; `.success(nil)` = the draft is gone.
+    var draftCopyOverride: Result<FullMessageInfo?, any Error>?
+    var lastSavedDraft: DraftMessage?
+
+    func setDraftCopy(_ result: Result<FullMessageInfo?, any Error>?) {
+        draftCopyOverride = result
+    }
+
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
+        fetchDraftCopyLog.append(identity)
+        if let draftCopyOverride { return try draftCopyOverride.get() }
+        let saved = lastSavedDraft
+        return Self.draftCopy(
+            subject: saved?.subject ?? "", to: saved?.to ?? [], cc: saved?.cc ?? [],
+            html: saved?.body ?? "")
+    }
+
+    /// A server draft copy as a provider's read returns it.
+    static func draftCopy(subject: String, to: [String], cc: [String], html: String) -> FullMessageInfo {
+        let header = MessageHeaderInfo(
+            messageId: "mock-draft-copy", rfc822MessageId: nil, inReplyTo: nil,
+            references: [], threadId: nil,
+            subject: subject.isEmpty ? "(no subject)" : subject,
+            from: "", fromAddress: "",
+            to: to.joined(separator: ", "), cc: cc.joined(separator: ", "), bcc: "",
+            replyTo: nil, date: Date(), snippet: "",
+            isRead: true, isFlagged: false, hasAttachments: false,
+            isReplied: false, isForwarded: false, actionTag: nil)
+        return FullMessageInfo(header: header, htmlBody: html, textBody: nil)
     }
 
     // MARK: - Test Helpers

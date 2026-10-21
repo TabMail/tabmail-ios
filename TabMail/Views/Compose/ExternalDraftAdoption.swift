@@ -15,9 +15,12 @@ import GRDB
 /// has after its first push. From there every existing path (reopen, save-replaces,
 /// send-deletes, discard) treats it exactly like a local draft.
 ///
-/// OWNER RULING (2026-10-17): take over the draft whichever client wrote it, and if
-/// two apps edit it at the same time, the last save wins. There is deliberately NO
-/// lease, lock or conflict warning — the v2final Outlook lease is not ported.
+/// OWNER RULING (2026-10-17): take over the draft whichever client wrote it. There
+/// is no lease or lock — the v2final Outlook lease is not ported. Second ruling, same
+/// day: never keep a stale local copy, and ask before overwriting a server copy that
+/// another app changed. So every adopted or reloaded row keeps a copy of the server
+/// text its content came from (`Draft.serverDraftText`, `DraftServerCheck`), and
+/// `reload` refreshes a row whose server copy no longer matches it.
 ///
 /// What still fails closed, because each one is an irreversible-wire hazard rather
 /// than a concurrency question:
@@ -201,6 +204,7 @@ enum ExternalDraftAdoption {
         id: String,
         header: MessageHeader,
         address: LocallyAuthoredDraftOpenAuthority.Address,
+        serverText: String,
         body: String,
         attachmentsDirName: String?,
         replyParent: MessageHeader?,
@@ -225,6 +229,7 @@ enum ExternalDraftAdoption {
             rfc822MessageId: header.rfc822MessageId,
             attachmentsDirName: attachmentsDirName)
         draft.instanceEpoch = instanceEpoch
+        draft.serverDraftText = serverText
         draft.replyToProviderMessageId = replyParent?.messageId
         draft.replyToUidValidity = replyParent?.observedUidValidity
         switch address {
@@ -250,6 +255,7 @@ enum ExternalDraftAdoption {
         header: MessageHeader,
         address: LocallyAuthoredDraftOpenAuthority.Address,
         runtimeKind: DraftRuntimeIdentityKind,
+        serverText: String,
         body: String,
         attachmentsDirName: String?,
         now: Double = Date().timeIntervalSince1970
@@ -263,6 +269,7 @@ enum ExternalDraftAdoption {
             id: draftKeyPrefix + UUID().uuidString,
             header: current,
             address: address,
+            serverText: serverText,
             body: body,
             attachmentsDirName: attachmentsDirName,
             replyParent: try replyParent(for: current, db: db),
@@ -272,19 +279,82 @@ enum ExternalDraftAdoption {
         return draft.id
     }
 
-    // MARK: - Orchestration
-
-    /// Fetch the server copy's body and attachments, then insert the adopted row.
-    /// Returns without inserting when the header changed or a row already owns the
-    /// address; the caller re-runs its normal resolver either way. THROWS when a
-    /// read or fetch failed, which the loader shows as retryable.
-    static func adopt(
+    /// The reload, inside ONE write transaction: re-verify that `header` is still
+    /// the server copy `address` names and that `draftId` is still the same
+    /// generation and owns that address, then replace its content with the server's.
+    /// Returns the attachment directory the row used before (to delete after
+    /// commit), `.some(nil)` when it had none, or nil when nothing was written.
+    static func applyReload(
+        db: Database,
         header: MessageHeader,
         address: LocallyAuthoredDraftOpenAuthority.Address,
-        runtimeKind: DraftRuntimeIdentityKind
-    ) async throws {
-        // No-op when the body is already on the device.
-        try await AccountManager.shared.fetchBody(for: header)
+        runtimeKind: DraftRuntimeIdentityKind,
+        draftId: String,
+        expectedInstanceEpoch: String,
+        serverText: String,
+        body: String,
+        attachmentsDirName: String?,
+        now: Double = Date().timeIntervalSince1970
+    ) throws -> String?? {
+        guard let (current, folder) = try currentDraftsHeader(db: db, captured: header),
+              addressStillNames(address, header: current, folder: folder, runtimeKind: runtimeKind),
+              var draft = try Draft.fetchOne(db, key: draftId),
+              draft.accountId == current.accountId,
+              draft.instanceEpoch == expectedInstanceEpoch,
+              rowOwns(draft, address: address) else {
+            return nil
+        }
+        let previousDirName = draft.attachmentsDirName
+        draft.toJSON = Draft.encodeStringArray(Draft.parseRecipients(current.to))
+        draft.ccJSON = Draft.encodeStringArray(Draft.parseRecipients(current.cc))
+        draft.bccJSON = Draft.encodeStringArray(Draft.parseRecipients(current.bcc))
+        draft.subject = current.subject
+        draft.body = body
+        draft.attachmentsDirName = attachmentsDirName
+        draft.updatedAt = now
+        draft.serverDraftText = serverText
+        draft.serverPushStatus = "pushed"
+        try draft.update(db)
+        return .some(previousDirName)
+    }
+
+    /// Whether `draft` is the row that owns `address` (the same columns
+    /// `addressIsOwned` filters on).
+    private static func rowOwns(
+        _ draft: Draft,
+        address: LocallyAuthoredDraftOpenAuthority.Address
+    ) -> Bool {
+        switch address {
+        case .imap(let folderPath, let uidValidity, let uid):
+            return draft.serverDraftId == uid
+                && draft.serverDraftFolderPath == folderPath
+                && draft.serverDraftUidValidity == uidValidity
+        case .gmail(let resourceId, _):
+            return draft.serverDraftId == resourceId
+        case .outlook(let graphId):
+            return draft.serverDraftId == graphId
+        case .placeholder, .demo:
+            return false
+        }
+    }
+
+    // MARK: - Orchestration
+
+    /// The server copy's editable content, fetched FRESH from the provider (never
+    /// a cached body: an Outlook draft keeps its id across edits, so a cached body
+    /// can be an older version than the server's). Top-level attachments are staged
+    /// in a new directory, which the caller owns from here on.
+    private struct ServerContent {
+        let header: MessageHeader
+        let body: String
+        /// The fetched copy's text (`DraftServerText`), kept as the row's copy.
+        let serverText: String
+        let attachmentsDirName: String?
+        let attachmentCount: Int
+    }
+
+    private static func fetchServerContent(header: MessageHeader) async throws -> ServerContent {
+        try await AccountManager.shared.fetchBody(for: header, replaceExistingBody: true)
 
         let snapshot = try await AppDatabase.dbPool.read { db -> (MessageHeader, MessageBody)? in
             guard let (current, _) = try currentDraftsHeader(db: db, captured: header),
@@ -321,13 +391,30 @@ enum ExternalDraftAdoption {
                 throw error
             }
         }
+        return ServerContent(
+            header: current, body: body,
+            serverText: DraftServerText.of(current, html: messageBody.htmlContent),
+            attachmentsDirName: dirName, attachmentCount: attachments.count)
+    }
 
+    /// Fetch the server copy's body and attachments, then insert the adopted row,
+    /// keeping the fetched text as the row's copy of the server text.
+    /// Returns without inserting when the header changed or a row already owns the
+    /// address; the caller re-runs its normal resolver either way. THROWS when a
+    /// read or fetch failed, which the loader shows as retryable.
+    static func adopt(
+        header: MessageHeader,
+        address: LocallyAuthoredDraftOpenAuthority.Address,
+        runtimeKind: DraftRuntimeIdentityKind
+    ) async throws {
+        let content = try await fetchServerContent(header: header)
+        let dirName = content.attachmentsDirName
         let insertedId: String?
         do {
             insertedId = try await AppDatabase.dbPool.write { db in
                 try insertAdoptedDraft(
-                    db: db, header: current, address: address, runtimeKind: runtimeKind,
-                    body: body, attachmentsDirName: dirName)
+                    db: db, header: content.header, address: address, runtimeKind: runtimeKind,
+                    serverText: content.serverText, body: content.body, attachmentsDirName: dirName)
             }
         } catch {
             if let dirName { DraftAttachmentStorage.deleteAttachments(dirName: dirName) }
@@ -337,7 +424,45 @@ enum ExternalDraftAdoption {
             DraftAttachmentStorage.deleteAttachments(dirName: dirName)
         }
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[DraftAdoption] header=\(DebugModeManager.escapedForLogLine(String(header.id.prefix(60)))) adopted=\(insertedId ?? "nil (header changed or already owned)") attachments=\(attachments.count)")
+            BackgroundSyncLogger.logDebug("[DraftAdoption] header=\(DebugModeManager.escapedForLogLine(String(header.id.prefix(60)))) adopted=\(insertedId ?? "nil (header changed or already owned)") attachments=\(content.attachmentCount)")
         }
+    }
+
+    /// Replace `draftId`'s content with the server copy's (the open path's reload,
+    /// and the user's "Reload" choice). Returns whether the row was refreshed; false
+    /// when the header or the row changed meanwhile. THROWS when a fetch failed.
+    @discardableResult
+    static func reload(
+        header: MessageHeader,
+        address: LocallyAuthoredDraftOpenAuthority.Address,
+        runtimeKind: DraftRuntimeIdentityKind,
+        draftId: String,
+        expectedInstanceEpoch: String
+    ) async throws -> Bool {
+        let content = try await fetchServerContent(header: header)
+        let dirName = content.attachmentsDirName
+        let previousDir: String??
+        do {
+            previousDir = try await AppDatabase.dbPool.write { db in
+                try applyReload(
+                    db: db, header: content.header, address: address, runtimeKind: runtimeKind,
+                    draftId: draftId, expectedInstanceEpoch: expectedInstanceEpoch,
+                    serverText: content.serverText, body: content.body, attachmentsDirName: dirName)
+            }
+        } catch {
+            if let dirName { DraftAttachmentStorage.deleteAttachments(dirName: dirName) }
+            throw error
+        }
+        switch previousDir {
+        case .some(let oldDir):
+            // Committed: the old directory is no longer referenced.
+            if let oldDir, oldDir != dirName { DraftAttachmentStorage.deleteAttachments(dirName: oldDir) }
+        case .none:
+            if let dirName { DraftAttachmentStorage.deleteAttachments(dirName: dirName) }
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[DraftAdoption] reload draft=\(draftId) header=\(DebugModeManager.escapedForLogLine(String(header.id.prefix(60)))) applied=\(previousDir != nil) attachments=\(content.attachmentCount)")
+        }
+        return previousDir != nil
     }
 }

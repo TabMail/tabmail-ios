@@ -22,9 +22,12 @@ with status `"pushed"` and the address the save/send/delete paths already use â€
 then opens it through `DraftComposePresenter`. From there it is indistinguishable from a draft
 authored on this device: the first save REPLACES exactly that server copy, Send deletes it.
 
-**Owner ruling (2026-10-17):** take over the draft whichever client wrote it; concurrent edits from
-two apps are last-save-wins, with no lease, lock or warning. v2final's Outlook open lease is
-therefore not ported.
+**Owner ruling (2026-10-17):** take over the draft whichever client wrote it, with no lease or
+lock; v2final's Outlook open lease is therefore not ported. The first version of the ruling said
+concurrent edits are last-save-wins with no warning; the owner's second ruling the same day
+replaced that with reload-on-open and an Overwrite / Reload / Save as new question â€” see
+`IOS-DRAFT-020` (resolved) and `IOS-DRAFT-021` (the accepted check-then-write race). An adopted row
+records the server revision its content came from (`Draft.serverDraftRevision`).
 
 **What still fails closed (irreversible-wire hazards, not concurrency):** an IMAP header whose
 observed UIDVALIDITY does not equal the Drafts folder's live, unquarantined epoch; a placeholder id;

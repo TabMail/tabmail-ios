@@ -58,7 +58,7 @@ struct ExternalDraftAdoptionTests {
                 db: db, header: header, runtimeKind: .imap) else { return nil }
             return try ExternalDraftAdoption.insertAdoptedDraft(
                 db: db, header: header, address: address, runtimeKind: .imap,
-                body: body, attachmentsDirName: nil)
+                serverText: "copy of the server text", body: body, attachmentsDirName: nil)
         }
     }
 
@@ -95,6 +95,8 @@ struct ExternalDraftAdoptionTests {
         #expect(row?.subject == "Started elsewhere")
         #expect(row?.body == "Hello from the other app")
         #expect(row?.instanceEpoch?.isEmpty == false)
+        #expect(row?.serverDraftText == "copy of the server text",
+                "an adopted row must keep a copy of the server text its content came from")
         #expect(row.map { ExternalDraftAdoption.isAdoptedKey($0.id) } == true)
     }
 
@@ -178,7 +180,7 @@ struct ExternalDraftAdoptionTests {
         let inserted = try db.write { db in
             try ExternalDraftAdoption.insertAdoptedDraft(
                 db: db, header: header, address: address, runtimeKind: .imap,
-                body: "text", attachmentsDirName: nil)
+                serverText: "copy of the server text", body: "text", attachmentsDirName: nil)
         }
         #expect(inserted == nil,
                 "the insert transaction must re-prove the address it is about to own")
@@ -298,6 +300,10 @@ struct ExternalDraftAdoptionSaveTests {
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
 
+        // The other app's copy, as the server returns it.
+        let otherAppCopy = MockEmailProvider.draftCopy(
+            subject: "Started elsewhere", to: ["alice@example.com"], cc: [],
+            html: EmailFilter.plainTextToHTML("text from the other app"))
         let draftId: String = try await pool.write { db in
             var account = Account(
                 emailAddress: "imap@example.com", displayName: "Test", provider: .imap)
@@ -317,6 +323,7 @@ struct ExternalDraftAdoptionSaveTests {
                 db: db, header: header, runtimeKind: .imap))
             return try #require(try ExternalDraftAdoption.insertAdoptedDraft(
                 db: db, header: header, address: address, runtimeKind: .imap,
+                serverText: DraftServerText.of(otherAppCopy),
                 body: "text from the other app", attachmentsDirName: nil))
         }
 
@@ -331,6 +338,8 @@ struct ExternalDraftAdoptionSaveTests {
 
         let provider = MockEmailProvider(
             saveDraftResult: .created(.imap(folder: "Drafts", uidValidity: 900_001, uid: 8)))
+        // The server still holds the other app's text, unchanged since adoption.
+        await provider.setDraftCopy(.success(otherAppCopy))
         let result = try await DraftStore.shared.pushDraftToServer(
             draftId: draftId, expectedInstanceEpoch: epoch, provider: provider,
             runtimeKind: .imap, draftsFolderPath: "Drafts")
@@ -340,7 +349,13 @@ struct ExternalDraftAdoptionSaveTests {
         #expect(calls.contains {
             $0.contains("existingIdentity:Optional(TabMail.DraftDeleteIdentity.imap(folder: \"Drafts\", uidValidity: 900001, uid: 7))")
         }, "the save did not replace the other app's copy at Drafts/900001/7: \(calls)")
+        #expect(await provider.fetchDraftCopyLog == [.imap(folder: "Drafts", uidValidity: 900_001, uid: 7)],
+                "the upload must check the server copy before replacing it")
         let live = try await pool.read { try Draft.fetchOne($0, key: draftId) }
         #expect(live?.serverDraftId == "8", "after the save the row must own the NEW copy")
+        #expect(live?.serverDraftText == DraftServerText.local(
+            subject: "Started elsewhere", to: ["alice@example.com"], cc: [],
+            body: "edited on this device"),
+                "the row's copy of the server text is now the text it just wrote")
     }
 }
