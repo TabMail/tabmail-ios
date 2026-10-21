@@ -316,33 +316,240 @@ struct MemorySearchToolTests {
         #expect(!back.contains("demo_history_marker"))
     }
 
-    /// Demo turns purged from memory (on demo exit, and by the orphan wipe at
-    /// launch) are gone from memory_search too, though a listing had kept them:
-    /// demo mode entered again before any chat turn lists none of them.
-    @Test("Purged demo turns are never listed again", arguments: ["", "budget"])
-    func purgedDemoTurnsAreNeverListedAgain(query: String) async throws {
+    /// The two owners of the demo's memory cleanup: leaving the demo, and the
+    /// leftover wipe a demo start runs (after a force-quit the launch wipe clears
+    /// the main database only).
+    enum DemoCleanup: String, CaseIterable, Sendable {
+        case exit
+        case leftoverWipe
+    }
+
+    private func chatTurn(id: String, sessionId: String, dateMs: Int64, text: String) -> ChatTurn {
+        ChatTurn(
+            id: id, timestamp: Double(dateMs), role: "user",
+            content: text, userMessage: text,
+            type: "normal", chars: text.count, renderedContent: nil,
+            sessionId: sessionId, remindersSnapshot: nil,
+            emailContextJSON: nil,
+            thinkingContent: nil
+        )
+    }
+
+    /// Demo turns the demo's cleanup removes are gone from memory_search for good,
+    /// though a listing had kept them: the next demo lists none of them, from the
+    /// kept listing or afresh, and real history stays.
+    @Test("Demo turns the demo's cleanup removes are never listed again", arguments: ["", "budget"], DemoCleanup.allCases)
+    func cleanedDemoTurnsAreNeverListedAgain(query: String, cleanup: DemoCleanup) async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        try await withTool { tool in
+            let base = noonUTCThreeDaysAgo()
+            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "real", sessionId: "s", dateMs: base + 3_600_000, text: "budget real_history_marker"))
+            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "demo", sessionId: "demo:a", dateMs: base, text: "budget demo_history_marker"))
+            #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real", "demo"])
+            let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
+
+            try await withDemoActive(true) {
+                let warmed = try await tool.execute(arguments: arguments)
+                #expect(warmed.contains("demo_history_marker"))
+            }
+            switch cleanup {
+            case .exit:
+                await MainActor.run { DemoModeStore.shared.isActive = true }
+                await DemoModeService.shared.exit()
+                #expect(await MainActor.run { DemoModeStore.shared.isActive } == false)
+            case .leftoverWipe:
+                await DemoModeService.purgeOrphanedDemoData()
+            }
+            #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real"])
+
+            try await withDemoActive(true) {
+                let kept = try await tool.execute(arguments: arguments)
+                #expect(!kept.contains("demo_history_marker"))
+                #expect(!kept.contains("real_history_marker"))
+                let fresh = try await tool.execute(arguments: ["query": .string("demo_history_marker")])
+                #expect(!fresh.contains("demo_history_marker"))
+            }
+            let real = try await tool.execute(arguments: arguments)
+            #expect(real.contains("real_history_marker"))
+        }
+    }
+
+    /// A demo start runs the leftover wipe before the demo turns on. The start
+    /// itself needs the backend (it mints the demo session first), so this
+    /// reads its source: the wipe comes before the demo is made active.
+    @Test("A demo start wipes the last demo's leftovers before it turns demo on")
+    func demoStartWipesLeftoversFirst() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // Tools
+            .deletingLastPathComponent()   // TabMailTests
+            .deletingLastPathComponent()   // repository root
+        let source = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Demo/DemoModeService.swift"), encoding: .utf8)
+        let startBody = try #require(source.range(of: "func start() async throws {"))
+        let nextFunction = try #require(source.range(of: "func startFromDebugMenu()", range: startBody.upperBound..<source.endIndex))
+        let body = source[startBody.upperBound..<nextFunction.lowerBound]
+        let wipe = try #require(body.range(of: "await Self.purgeOrphanedDemoData()"))
+        let activate = try #require(body.range(of: "store.isActive = true"))
+        #expect(wipe.upperBound <= activate.lowerBound)
+    }
+
+    /// Holds the memory pool's one reader on another thread until `release`;
+    /// `finished` signals once it has let go.
+    private func holdReader(_ pool: DatabasePool) async -> (release: DispatchSemaphore, finished: DispatchSemaphore) {
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        await withCheckedContinuation { (held: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                _ = try? pool.read { _ in
+                    held.resume()
+                    release.wait()
+                }
+                finished.signal()
+            }
+        }
+        return (release, finished)
+    }
+
+    private func waitFor(_ semaphore: DispatchSemaphore) async {
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                semaphore.wait()
+                done.resume()
+            }
+        }
+    }
+
+    /// A search still running when the next turn begins stores nothing for that
+    /// turn in the same mode too: a turn written after it shows in the next
+    /// turn's results.
+    @Test("A search from before a reset never hides a later turn", arguments: ["", "budget"])
+    func staleSearchNeverHidesALaterTurn(query: String) async throws {
+        let (memPool, memDir) = try await installMemoryIndex(readers: 1)
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        let base = noonUTCThreeDaysAgo()
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "old", sessionId: "s", role: "user", dateMs: base, text: "budget old_history_marker")
+        for i in 0..<4 {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "other\(i)", sessionId: "s", role: "user", dateMs: base - Int64(i + 1) * 3_600_000, text: "lunch plans \(i)")
+        }
+        let held = await holdReader(memPool)
+        let tool = try makeTool()
+        let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
+        let stale = Task { try await tool.execute(arguments: arguments) }
+        // Long enough for it to be waiting on the reader inside the search.
+        try await Task.sleep(nanoseconds: 2_000_000_000)
+
+        await MemorySearchCache.shared.reset()
+        held.release.signal()
+        let old = try await stale.value
+        #expect(old.contains("old_history_marker"))
+        await waitFor(held.finished)
+
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "new", sessionId: "s", role: "user", dateMs: base + 3_600_000, text: "budget new_history_marker")
+        #expect(await MemoryIndex.shared.knownChatHistoryIds().isSuperset(of: ["old", "new"]))
+        let next = try await tool.execute(arguments: arguments)
+        #expect(next.contains("new_history_marker"))
+        #expect(next.contains("old_history_marker"))
+    }
+
+    /// A search waiting for the index while demo mode starts keeps the mode it
+    /// began in: it shows real history only, and so does its kept listing.
+    @Test("A search queued behind the index keeps the mode it began in", arguments: ["", "budget"])
+    func queuedSearchKeepsItsMode(query: String) async throws {
+        let (memPool, memDir) = try await installMemoryIndex(readers: 1)
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        let base = noonUTCThreeDaysAgo()
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base, text: "budget real_history_marker")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base + 3_600_000, text: "budget demo_history_marker")
+        for i in 0..<4 {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "other\(i)", sessionId: i % 2 == 0 ? "s" : "demo:a", role: "user", dateMs: base - Int64(i + 1) * 3_600_000, text: "lunch plans \(i)")
+        }
+
+        // The index is busy: another call waits on the reader inside it.
+        let held = await holdReader(memPool)
+        let busy = Task { await MemoryIndex.shared.knownChatHistoryIds() }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        let tool = try makeTool()
+        let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
+        let queued = Task { try await tool.execute(arguments: arguments) }
+        // Long enough for it to have read the mode and be waiting for the index.
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+
+        try await withDemoActive(true) {
+            held.release.signal()
+            _ = await busy.value
+            let result = try await queued.value
+            #expect(result.contains("real_history_marker"))
+            #expect(!result.contains("demo_history_marker"))
+            await waitFor(held.finished)
+        }
+        let kept = try await tool.execute(arguments: arguments)
+        #expect(kept.contains("real_history_marker"))
+        #expect(!kept.contains("demo_history_marker"))
+    }
+
+    /// The Chat History search keeps to the mode in use, as the agent's does.
+    @Test("The history search keeps to the mode in use")
+    func historySearchKeepsToItsMode() async throws {
         let (memPool, memDir) = try await installMemoryIndex()
         defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
 
         let base = noonUTCThreeDaysAgo()
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base + 3_600_000, text: "budget real_history_marker")
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base, text: "budget demo_history_marker")
-        let tool = try makeTool()
-        let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base, text: "budget real turn")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base + 3_600_000, text: "budget demo turn")
+        for i in 0..<4 {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "other\(i)", sessionId: i % 2 == 0 ? "s" : "demo:a", role: "user", dateMs: base - Int64(i + 1) * 3_600_000, text: "lunch plans \(i)")
+        }
+        #expect(await ChatHistoryView.searchHistory("budget").map(\.chatHistoryId) == ["real"])
+        await withDemoActive(true) {
+            #expect(await ChatHistoryView.searchHistory("budget").map(\.chatHistoryId) == ["demo"])
+        }
+    }
 
-        try await withDemoActive(true) {
-            let warmed = try await tool.execute(arguments: arguments)
-            #expect(warmed.contains("demo_history_marker"))
-        }
-        await DemoModeService.purgeDemoMemory()
-        #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real"])
-        try await withDemoActive(true) {
-            let again = try await tool.execute(arguments: arguments)
-            #expect(!again.contains("demo_history_marker"))
-            #expect(!again.contains("real_history_marker"))
-        }
+    /// The semantic leg keeps to the mode too: with the model loaded, a query
+    /// sharing no word with either turn but matching both by meaning finds the
+    /// turn of its own mode only, afresh and from the kept listing.
+    @Test("A semantic match never crosses into or out of demo mode")
+    func semanticMatchKeepsToItsMode() async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        let base = noonUTCThreeDaysAgo()
+        let realText = "real_history_marker quarterly budget forecast spreadsheet for the finance team"
+        let demoText = "demo_history_marker quarterly budget forecast spreadsheet for the finance team"
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base, text: realText)
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base + 3_600_000, text: demoText)
+        let query = "money planning numbers"
+        // No word in common: the keyword leg alone finds nothing.
+        #expect(EmbeddingService.shared == nil)
+        #expect(await MemoryIndex.shared.search(query: query, limit: 10, demoActive: false).isEmpty)
+
+        EmbeddingService.initialize()
+        defer { EmbeddingService._testUnload() }
+        let model = try #require(EmbeddingService.shared)
+        // Each turn's vector is the query's own, so the semantic leg finds both.
+        let queryVector = try model.embed(query)
+        let stored = await MemoryIndex.shared.storeEmbeddings([
+            (chatHistoryId: "real", observedEpoch: 1, embedding: queryVector),
+            (chatHistoryId: "demo", observedEpoch: 1, embedding: queryVector),
+        ])
+        #expect(Set(stored.committed) == ["real", "demo"])
+
+        let tool = try makeTool()
+        let arguments: [String: JSONValue] = ["query": .string(query)]
         let real = try await tool.execute(arguments: arguments)
         #expect(real.contains("real_history_marker"))
+        #expect(!real.contains("demo_history_marker"))
+        try await withDemoActive(true) {
+            let demo = try await tool.execute(arguments: arguments)
+            #expect(demo.contains("demo_history_marker"))
+            #expect(!demo.contains("real_history_marker"))
+        }
+        let kept = try await tool.execute(arguments: arguments)
+        #expect(kept.contains("real_history_marker"))
+        #expect(!kept.contains("demo_history_marker"))
     }
 
     /// The dates asked keep the listing to them, to the second for a full

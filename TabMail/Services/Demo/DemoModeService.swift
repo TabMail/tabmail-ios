@@ -53,21 +53,10 @@ final class DemoModeService {
             throw DemoError.startFailed(reason)
         }
 
-        // Defensive wipe of any leftover demo rows from a previous session
-        // that exited badly.
-        await AccountFieldPersistenceStore.production.discardAccount(DemoSeed.demoAccountId)
-        if let db = AppDatabase.shared.withLock({ $0 }) {
-            do {
-                try await db.dbPool.write { conn in try DemoSeed.wipe(conn) }
-            } catch {
-                // The old row is still authoritative when the transaction rolls
-                // back. It will be discarded again before completeSetup seeds.
-                AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[DemoMode] start(): defensive GRDB wipe failed: \(error)")
-                }
-            }
-        }
+        // Defensive wipe of anything a previous session that exited badly left
+        // behind, its memory turns included (the launch wipe after a force-quit
+        // clears the main database only), before the new demo starts.
+        await Self.purgeOrphanedDemoData()
 
         store.isActive = true
 
@@ -243,9 +232,11 @@ final class DemoModeService {
         await MemorySearchCache.shared.reset()
     }
 
-    /// Force a one-shot orphan wipe at app launch when stale demo rows are
-    /// found but no demo session is active (force-quit recovery; also covers
-    /// edge cases). Also called when the user signs up with a real account.
+    /// Wipe every demo leftover while no demo session is active: the demo rows,
+    /// FTS entries, memory turns and overlay keys a force-quit mid-demo leaves.
+    /// Runs when a demo starts and when the user signs up with a real account.
+    /// If the main-database wipe fails, the old rows stay authoritative and are
+    /// discarded again before `completeSetup` seeds.
     static func purgeOrphanedDemoData() async {
         await AccountFieldPersistenceStore.production.discardAccount(DemoSeed.demoAccountId)
         if let db = AppDatabase.shared.withLock({ $0 }) {
