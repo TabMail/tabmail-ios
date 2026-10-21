@@ -272,12 +272,12 @@ struct ParseInlineEditResponseTests {
         Body: Hi all
         """
         let result = AIService.parseInlineEditResponse(input)
-        #expect(result.toDelta?.adds.count == 1)
-        #expect(result.toDelta?.adds.first?.name == "Alice Anderson")
-        #expect(result.toDelta?.adds.first?.email == "alice@example.com")
+        #expect(result.toDelta?.adds.recipients.count == 1)
+        #expect(result.toDelta?.adds.recipients.first?.name == "Alice Anderson")
+        #expect(result.toDelta?.adds.recipients.first?.address == "alice@example.com")
         #expect(result.toDelta?.removes == ["bob@example.com"])
-        #expect(result.ccDelta?.adds.count == 1)
-        #expect(result.ccDelta?.adds.first?.email == "carol@example.com")
+        #expect(result.ccDelta?.adds.recipients.count == 1)
+        #expect(result.ccDelta?.adds.recipients.first?.address == "carol@example.com")
         #expect(result.ccDelta?.removes.isEmpty == true)
         // Bcc had no +/- line at all → no change signal.
         #expect(result.bccDelta == nil)
@@ -308,7 +308,7 @@ struct ParseInlineEditResponseTests {
         #expect(result.ccDelta != nil)
         #expect(result.ccDelta?.clearsField == true)
         #expect(result.ccDelta?.removes.contains("*") == true)
-        #expect(result.ccDelta?.adds.isEmpty == true)
+        #expect(result.ccDelta?.adds.recipients.isEmpty == true)
     }
 
     @Test("Multiple emails on a -To: line populate removes correctly")
@@ -320,7 +320,7 @@ struct ParseInlineEditResponseTests {
         """
         let result = AIService.parseInlineEditResponse(input)
         #expect(result.toDelta?.removes == ["bob@example.com", "dave@example.com"])
-        #expect(result.toDelta?.adds.isEmpty == true)
+        #expect(result.toDelta?.adds.recipients.isEmpty == true)
     }
 
     @Test("Quoted display names with commas on +To: are not split")
@@ -331,10 +331,10 @@ struct ParseInlineEditResponseTests {
         Body: body
         """
         let result = AIService.parseInlineEditResponse(input)
-        #expect(result.toDelta?.adds.count == 2)
-        #expect(result.toDelta?.adds[0].name == "Doe, John")
-        #expect(result.toDelta?.adds[0].email == "john@example.com")
-        #expect(result.toDelta?.adds[1].name == "Smith, Jane")
+        #expect(result.toDelta?.adds.recipients.count == 2)
+        #expect(result.toDelta?.adds.recipients[0].name == "Doe, John")
+        #expect(result.toDelta?.adds.recipients[0].address == "john@example.com")
+        #expect(result.toDelta?.adds.recipients[1].name == "Smith, Jane")
     }
 
     @Test("Bare emails in +To: are accepted with empty name")
@@ -345,10 +345,10 @@ struct ParseInlineEditResponseTests {
         Body: body
         """
         let result = AIService.parseInlineEditResponse(input)
-        #expect(result.toDelta?.adds.count == 2)
-        #expect(result.toDelta?.adds[0].email == "alice@example.com")
-        #expect(result.toDelta?.adds[0].name == "")
-        #expect(result.toDelta?.adds[1].email == "bob@example.com")
+        #expect(result.toDelta?.adds.recipients.count == 2)
+        #expect(result.toDelta?.adds.recipients[0].address == "alice@example.com")
+        #expect(result.toDelta?.adds.recipients[0].name == nil)
+        #expect(result.toDelta?.adds.recipients[1].address == "bob@example.com")
     }
 
     @Test("Both +Cc: and -Cc: in the same response produce one delta with both sides")
@@ -360,8 +360,8 @@ struct ParseInlineEditResponseTests {
         Body: y
         """
         let result = AIService.parseInlineEditResponse(input)
-        #expect(result.ccDelta?.adds.count == 1)
-        #expect(result.ccDelta?.adds.first?.email == "new@example.com")
+        #expect(result.ccDelta?.adds.recipients.count == 1)
+        #expect(result.ccDelta?.adds.recipients.first?.address == "new@example.com")
         #expect(result.ccDelta?.removes == ["old@example.com"])
     }
 

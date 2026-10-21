@@ -30,6 +30,10 @@ struct DynamicIslandChat: View {
     /// Live attachment state and the original-forward carry boundary owned by
     /// ComposeView. Autosave waits, then copy-on-write persists this exact set.
     let composeAttachments: Binding<[DraftAttachment]>?
+    /// The To, Cc and Bcc the compose shows now, as a saved draft stores them
+    /// (`ComposeDraftGuards.committedRecipients`). Autosave reads it when it
+    /// writes, so the row names every recipient, the agent's edits included.
+    let composeRecipients: (() -> (to: [String], cc: [String], bcc: [String]))?
     let composeAttachmentCarryGate: ComposeAttachmentCarryGate?
     let composeMutationAllowed: Bool
     /// Skip writing LLM results to the `Draft` table — caller persists elsewhere.
@@ -203,6 +207,7 @@ struct DynamicIslandChat: View {
         composeGenerationCursor: ComposeGenerationCursor? = nil,
         composeAgentSendFence: ComposeAgentSendFence? = nil,
         composeAttachments: Binding<[DraftAttachment]>? = nil,
+        composeRecipients: (() -> (to: [String], cc: [String], bcc: [String]))? = nil,
         composeAttachmentCarryGate: ComposeAttachmentCarryGate? = nil,
         composeMutationAllowed: Bool = true,
         skipDraftAutoSave: Bool = false,
@@ -223,6 +228,7 @@ struct DynamicIslandChat: View {
         self.composeGenerationCursor = composeGenerationCursor
         self.composeAgentSendFence = composeAgentSendFence
         self.composeAttachments = composeAttachments
+        self.composeRecipients = composeRecipients
         self.composeAttachmentCarryGate = composeAttachmentCarryGate
         self.composeMutationAllowed = composeMutationAllowed
         self.skipDraftAutoSave = skipDraftAutoSave
@@ -1674,14 +1680,16 @@ struct DynamicIslandChat: View {
     /// warning; the return value exists because the caller publishes a GLOBAL
     /// "Draft updated — tap to review" signal that must not outrun this write, and
     /// a chat `.warning` cannot reach a user whose compose sheet is already gone.
+    /// Internal, not private, so a test can drive the row write directly.
     @discardableResult
-    private func autoSaveDraft(draftKey: String, subject: String, body: String) async -> ComposeDraftGuards.AutoSaveExit? {
+    func autoSaveDraft(draftKey: String, subject: String, body: String) async -> ComposeDraftGuards.AutoSaveExit? {
         let entryTime = Date()
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[DraftStore] autoSaveDraft: enter draftKey=\(draftKey)")
         }
         guard let ctx = composeContext,
               let cursor = composeGenerationCursor,
+              let composeRecipients,
               composeMutationAllowed else {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[DraftStore] autoSaveDraft: exit (no composeContext) draftKey=\(draftKey)")
@@ -1711,6 +1719,7 @@ struct DynamicIslandChat: View {
             }
         }
         let attachmentSnapshot = composeAttachments?.wrappedValue
+        let recipients = composeRecipients()
         let editHistJSON = Draft.encodeEditHistory(editHistory)
         let now = Date().timeIntervalSince1970
 
@@ -1777,6 +1786,9 @@ struct DynamicIslandChat: View {
         }
 
         if var existing = existingLoaded {
+            existing.toJSON = Draft.encodeStringArray(recipients.to)
+            existing.ccJSON = Draft.encodeStringArray(recipients.cc)
+            existing.bccJSON = Draft.encodeStringArray(recipients.bcc)
             existing.subject = subject
             existing.body = body
             existing.editHistoryJSON = editHistJSON
@@ -1828,9 +1840,9 @@ struct DynamicIslandChat: View {
             var draft = Draft(
                 id: draftKey,
                 accountId: aid,
-                toJSON: Draft.encodeStringArray(ctx.recipients),
-                ccJSON: "[]",
-                bccJSON: "[]",
+                toJSON: Draft.encodeStringArray(recipients.to),
+                ccJSON: Draft.encodeStringArray(recipients.cc),
+                bccJSON: Draft.encodeStringArray(recipients.bcc),
                 subject: subject,
                 body: body,
                 replyToId: draftReplyToId,

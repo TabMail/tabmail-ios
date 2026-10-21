@@ -1534,19 +1534,17 @@ actor ExchangeProvider: EmailProvider {
             "content": draft.body,
         ]
 
-        // Recipients
+        // Recipients. Every list is sent even when empty: a draft update is a
+        // PATCH, which leaves out properties unchanged, so an omitted list would
+        // keep recipients the user removed.
         message["toRecipients"] = draft.to.map { email in
             ["emailAddress": ["address": email]]
         }
-        if !draft.cc.isEmpty {
-            message["ccRecipients"] = draft.cc.map { email in
-                ["emailAddress": ["address": email]]
-            }
+        message["ccRecipients"] = draft.cc.map { email in
+            ["emailAddress": ["address": email]]
         }
-        if !draft.bcc.isEmpty {
-            message["bccRecipients"] = draft.bcc.map { email in
-                ["emailAddress": ["address": email]]
-            }
+        message["bccRecipients"] = draft.bcc.map { email in
+            ["emailAddress": ["address": email]]
         }
 
         // Threading headers (RFC 2822 requires angle brackets around message IDs)

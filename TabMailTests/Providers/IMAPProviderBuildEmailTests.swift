@@ -218,16 +218,18 @@ struct IMAPProviderBuildEmailTests {
         #expect(email.ccRecipients.map(\.address) == ["foo@@example.com"])
     }
 
-    /// A pasted group or address list is not one mailbox; saving only its first
-    /// member would silently drop the rest from the server's draft copy.
-    @Test("A saved draft keeps a group or several addresses in one token as typed")
-    func draftKeepsMultiMailboxTokensAsTyped() {
+    /// A group or address list in one token (a draft saved before recipient
+    /// fields became lists, ADR-IOS-092) is not one mailbox; saving only its
+    /// first member would silently drop the rest from the server's draft copy.
+    /// Every member is saved, each as an address another client can read.
+    @Test("A saved draft keeps every mailbox a group or list in one token names")
+    func draftKeepsEveryMailboxOfAListToken() {
         let group = "Team: a@example.com, b@example.com;"
         let list = "a@example.com, b@example.com"
         let draft = DraftMessage(to: [group], cc: [list], subject: "Hi")
         let email = IMAPProvider.buildDraftEmail(from: draft, senderEmail: "me@test.com")
-        #expect(email.recipients.map(\.address) == [group])
-        #expect(email.ccRecipients.map(\.address) == [list])
+        #expect(email.recipients.map(\.address) == ["a@example.com", "b@example.com"])
+        #expect(email.ccRecipients.map(\.address) == ["a@example.com", "b@example.com"])
     }
 
     /// Another client resuming the draft must read a name and an address, not

@@ -7,40 +7,6 @@ import Foundation
 @testable import TabMail
 import SwiftMail
 
-@Suite("EmailAddressUtils Extended")
-struct EmailAddressUtilsExtendedTests {
-
-    @Test("extractEmailAddress handles multiple angle brackets")
-    func multipleAngleBrackets() {
-        let result = extractEmailAddress("<<test@example.com>>")
-        #expect(result.contains("test@example.com"))
-    }
-
-    @Test("extractEmailAddress handles name with comma")
-    func nameWithComma() {
-        let result = extractEmailAddress("\"Doe, John\" <john@example.com>")
-        #expect(result == "john@example.com")
-    }
-
-    @Test("extractEmailAddress handles address with plus")
-    func addressWithPlus() {
-        let result = extractEmailAddress("user+tag@example.com")
-        #expect(result == "user+tag@example.com")
-    }
-
-    @Test("extractEmailAddress handles international domain")
-    func internationalDomain() {
-        let result = extractEmailAddress("user@münchen.de")
-        #expect(result.contains("@"))
-    }
-
-    @Test("extractEmailAddress nil-safe for empty string")
-    func emptyStringExtraction() {
-        let result = extractEmailAddress("")
-        #expect(result.isEmpty)
-    }
-}
-
 // MARK: - buildReplyAllRecipients
 
 @Suite("buildReplyAllRecipients")
@@ -214,6 +180,18 @@ struct BuildReplyAllRecipientsTests {
 
         #expect(result.to.contains("list-reply@list.com"))
         #expect(!result.to.contains("noreply@list.com"))
+    }
+
+    @Test("Reply-all goes to every mailbox the Reply-To names")
+    func replyAllGoesToEveryReplyToMailbox() {
+        let me = makeAccount(email: "me@example.com")
+        let msg = makeHeader(
+            from: "sender@example.com",
+            to: "me@example.com, ann@example.com",
+            replyTo: "Alice <alice@example.com>, bob@example.com"
+        )
+        let result = buildReplyAllRecipients(for: msg, allAccounts: [me])
+        #expect(result.to == ["alice@example.com", "bob@example.com", "ann@example.com"])
     }
 
     @Test("Deduplicates addresses across To and CC")

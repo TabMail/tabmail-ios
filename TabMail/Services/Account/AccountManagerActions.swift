@@ -2393,6 +2393,12 @@ extension AccountManager {
                 let senderEmail = account?.emailAddress ?? accountId
                 let senderName = account?.displayName ?? senderEmail
                 let snippet = EmailFilter.snippetFromPlainText(draft.body)
+                // Header text the Drafts list, search and Reply All read: only the
+                // entries that are addresses, each written to read back as itself
+                // (ADR-IOS-092). The draft keeps every entry as written.
+                let to = RecipientEntry(draft.toArray).headerText
+                let cc = RecipientEntry(draft.ccArray).headerText
+                let bcc = RecipientEntry(draft.bccArray).headerText
 
                 var header = try MessageHeader.fetchOne(db, key: placeholderHeaderId)
                     ?? MessageHeader(
@@ -2400,7 +2406,7 @@ extension AccountManager {
                         subject: draft.subject,
                         from: senderName,
                         fromAddress: senderEmail,
-                        to: draft.toArray.joined(separator: ", "),
+                        to: to,
                         date: Date(timeIntervalSince1970: draft.updatedAt),
                         snippet: snippet,
                         folderId: folderId,
@@ -2408,9 +2414,9 @@ extension AccountManager {
                         folderPath: folderPath,
                         isInInbox: false)
                 header.subject = draft.subject
-                header.to = draft.toArray.joined(separator: ", ")
-                header.cc = draft.ccArray.joined(separator: ", ")
-                header.bcc = draft.bccArray.joined(separator: ", ")
+                header.to = to
+                header.cc = cc
+                header.bcc = bcc
                 header.snippet = snippet
                 header.date = Date(timeIntervalSince1970: draft.updatedAt)
                 header.isRead = true
@@ -2438,9 +2444,9 @@ extension AccountManager {
                         messageId: placeholderMessageId,
                         subject: draft.subject,
                         from: "\(senderName) <\(senderEmail)>",
-                        to: draft.toArray.joined(separator: ", "),
-                        cc: draft.ccArray.joined(separator: ", "),
-                        bcc: draft.bccArray.joined(separator: ", "),
+                        to: to,
+                        cc: cc,
+                        bcc: bcc,
                         dateMs: Int64(draft.updatedAt * 1000),
                         folderId: folderId),
                     draft.body)

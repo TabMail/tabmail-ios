@@ -827,13 +827,17 @@ struct ComposeDraftGuardTests {
     @Test("An uncommitted recipient is flushed into the tokens close and save persist")
     func pendingRecipientIsCommitted() {
         #expect(ComposeDraftGuards.committedRecipients(
-            tokens: [], input: "  late@example.com  ") == ["late@example.com"])
+            .init(input: "  late@example.com  ")) == ["late@example.com"])
         #expect(ComposeDraftGuards.committedRecipients(
-            tokens: ["first@example.com"], input: "second@example.com")
+            .init(tokens: ["first@example.com"], input: "second@example.com"))
             == ["first@example.com", "second@example.com"])
         // Whitespace-only input must not add a bogus recipient.
         #expect(ComposeDraftGuards.committedRecipients(
-            tokens: ["first@example.com"], input: "   ") == ["first@example.com"])
+            .init(tokens: ["first@example.com"], input: "   ")) == ["first@example.com"])
+        // Rejected entries are kept, each as written, before the input text.
+        #expect(ComposeDraftGuards.committedRecipients(
+            .init(tokens: ["first@example.com"], rejected: ["bob;", "\"x,"], input: " y, "))
+            == ["first@example.com", "bob;", "\"x,", "y,"])
     }
 
     @Test("A loaded draft cleared to nothing prompts instead of silently vanishing")

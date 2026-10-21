@@ -151,6 +151,8 @@ Upstream commits pulled in: #236 (ENABLE/QRESYNC), #237 (Outlook `.msg`), #239, 
   recipient the parser reads as one mailbox in parsed form (a pasted `Bob <bob@…>` had become one
   RFC 2047 word in the Drafts APPEND under #245/#246); unparseable text stays as typed. The IMAP Drafts
   APPEND still writes no `Bcc` header (SwiftMail never does) — unchanged, not investigated further.
+  **Superseded 2026-10-17 — see "Bcc kept on every path" below; that "not investigated" was the
+  miss.**
 
 ## Sync executed 2026-10-05 — both deviations merged upstream; pure mirror again
 
@@ -160,3 +162,187 @@ tree (`b8b25145`), so nothing new was pulled in and the collision check is empty
 reset to `07163dc03c37b4ed880426b2437e8b345762b2b9` and force-pushed with a lease from `5851273`;
 **zero deviations** — the next resync is the plain mirror path. App and NSE pin `07163dc` in
 `project.yml`. The two 2026-10-04 deviation entries above are superseded.
+
+## 2026-10-17 — Bcc kept on every path; app pins a fork topic branch again
+
+Owner: "fix the BCC bug in all pathways, including our IMAP library". Found by census of every
+serializer that writes recipients:
+- **SwiftMail** never wrote a `Bcc` header, so `IMAPServer.createDraft` / `append(email:)` lost Bcc
+  for every caller. Fork branch `fix/bcc-header-in-stored-copies` (`1145028b`, based on the app pin
+  `07163dc`, NOT on upstream main): `Email.constructContent(use8BitMIME:includeBccHeader:)`
+  (default false, so SMTP is unchanged); `append(email:)` passes true (a stored copy is the sender's);
+  `sendDraft` now strips every Bcc field (folded lines too, byte-preserving) from the SMTP copy and
+  keeps it in the Sent copy. `IMAPTestServer` records APPEND literals (`appendedMessages`).
+- **iOS IMAP**: `buildDraftEmail` passes `draftRecipients(draft.bcc)`; the Sent copy names Bcc via
+  `append(email:)`; the delivered message still does not (`bccRecipientsAreSentButNotNamed`).
+- **Gmail**: `buildRFC822` / `buildMIMEMessage` (shared by `send` and `saveDraft`) wrote no Bcc line,
+  so Gmail SENDS never reached Bcc recipients. Google's `users.messages.send` reference: the message
+  goes to the recipients in the To, Cc and Bcc headers. Both builders now write `Bcc:`.
+- **Outlook**: send/create were right; the draft update is a PATCH, which keeps properties it does
+  not name, and an empty `ccRecipients`/`bccRecipients` was omitted — removed recipients stayed.
+  `buildGraphSendPayload` now always sends all three lists.
+- Read paths already parsed Bcc (IMAP envelope, Gmail `metadataHeaders=Bcc`, Graph `bccRecipients`).
+- **Recipient header injection (review round 1)**: Gmail wrote To/Cc/Bcc text raw, so a recipient
+  from a mailto link carrying CR/LF could add a header (To/Cc were open before this change too).
+  Both builders now write recipients through `IMAPProvider.recipientsFieldBody` (SwiftMail's
+  formatter, which never writes a control character, as IMAP drafts already did), and Gmail `send`
+  refuses a recipient that is not one mailbox (`sendableRecipients`, fatal, as IMAP send does).
+- Tests: `BccRecipientsTests` (red on main for IMAP draft, Gmail send + both draft calls, Outlook
+  clear; injection oracle compares header FIELD NAMES and treats a lone CR or LF as a line break,
+  as a CRLF-only split passed the lone-CR/LF variants vacuously). SwiftMail: `BccHeaderTests`, and
+  a `sendDraft` integration test over `IMAPTestServer` (now serves Cc/Bcc in ENVELOPE) plus a NIO
+  `SMTPCaptureServer` in the IMAP test target (fork commit `8b907e68`). Review round 2 found the
+  SMTP "no Bcc in the delivered copy" test pinned the MECHANISM (`constructContent()` default), not
+  the send path: a mutant making `preparedContent` write Bcc passed every suite. Fixed in
+  `d20af13a`: the test goes through `SMTPServer.prepareEmailForSend` and `sendEmail` (capture server).
+- Gmail removing the Bcc header from delivered copies is OBSERVED behaviour; Google documents only
+  delivery to the To/Cc/Bcc header recipients.
+- ~~Not fixed (not reachable from TabMail, which never calls `sendDraft`)~~: `removingBccFields`
+  treated a line starting with a bare CR as the end of the header section, so a later Bcc line in a
+  malformed stored draft was kept in the SMTP copy. Tier 2 reproduced the disclosure over the wire;
+  "TabMail never calls it" was no reason to leave a Bcc leak in the library we upstream. Fixed in
+  `1959c9af`: a header with a CR not followed by LF is REFUSED (`IMAPError.invalidArgument`) before
+  SMTP, the draft left in place; a body CR is kept. Fail closed rather than guess where such a line
+  ends, since readers disagree. Tier 2 also found the tests blind to Bcc in a visible To/Cc field,
+  to HTML drafts (the app saves HTML), and to tab/repeated whitespace before the colon; all fixed.
+- **Resent-Bcc (Tier 2, 2026-10-18)**: RFC 5322 section 3.6.6 gives `Resent-Bcc` the meaning of `Bcc`,
+  and two library paths passed it to every recipient: a stored draft sent with `sendDraft`, and an
+  `Email` whose `additionalHeaders` held it (`Email(message:)` copies non-standard headers from a
+  fetched message). Fixed in `bf833cb1` by REFUSING both before SMTP (sendDraft:
+  `IMAPError.invalidArgument`, draft kept; sendEmail: `SMTPError.sendFailed` for a `Bcc` or
+  `Resent-Bcc` additional header, any case). Not reachable from TabMail (no writer, no sendDraft).
+  Lesson: when a fix strips one header, census every header with the same MEANING, not the same name.
+- **Line break in an additional header (Tier 2, 2026-10-18)**: `writeHeaders` wrote each
+  `additionalHeaders` entry as `name: value` unchecked. The header parser splits lines on LF only,
+  so a lone CR in a stored message's field survives `Email(message:)`, and a stored draft with
+  `X-Note: note<CR>Bcc: ...` was sent with that Bcc line in every recipient's copy. Fixed in
+  `c629ec72` (`SMTPServer.checkAdditionalHeaders`): `sendEmail` refuses, before SMTP, any additional
+  header whose written line holds a CR or LF other than a fold (CRLF then space/tab), with
+  `SMTPError.sendFailed`. TabMail classifies `.sendFailed` as TRANSIENT (queued forever), and its
+  only additional headers are In-Reply-To/References, built from message IDs in INCOMING mail
+  (`MessageID(_:)` keeps a CR). So `IMAPProvider.threadingMessageIDs` now drops any ID holding a
+  line break, on all four threading writers (IMAP `buildEmail`, Gmail `buildRFC822` and
+  `buildMIMEMessage`, Outlook `buildGraphSendPayload`); without it a crafted Message-ID would wedge
+  an IMAP reply, and on Gmail it would add a header line to the raw message Gmail delivers.
+  `ThreadingMessageIDLineBreakTests`. Also `f8d71a92`: the sendDraft retirement test requires `+FLAGS`.
+- **Every written header field, not one input (Tier 1 r5, 2026-10-18)**: the `c629ec72` check covered
+  only `additionalHeaders`, but `Email.messageID` (copied by `Email(message:)`, which keeps a lone CR;
+  or set via `MessageID(localPart:domain:)`) and the sender domain a generated Message-ID takes were
+  written unchecked. A stored draft whose `Message-ID:` line ends in a lone CR swallows its `Bcc:`
+  line on parsing: the Bcc recipient was skipped and the delivered Message-Id line named them. A name
+  like `Bcc:x@example.com,X-Pad` also passed the Bcc-name check. Fixed in `a09a3e3d`: the header is
+  built as a list (`Email.headerFields`, in `Email+HeaderFields.swift`), and
+  `SMTPServer.checkHeaderFields` refuses, before SMTP, any written field whose name is not an RFC 5322
+  field name or is Bcc/Resent-Bcc, or whose value holds a CR/LF other than a fold. It replaces
+  `checkAdditionalHeaders`. TabMail is unaffected (its Message-ID is local, its header names are
+  In-Reply-To/References), but any NEW TabMail header must still be filtered first, because
+  `.sendFailed` is transient in TabMail. Lesson: census every WRITER of the header, not every
+  field NAME (MIS-006).
+- **Multi-mailbox Reply-To (Tier 1 r6, 2026-10-18)**: Gmail stores the raw Reply-To header, and
+  a reply put it into ONE To token. Once Gmail send ran `sendableRecipients` (one mailbox per
+  token), a reply to `Reply-To: Alice <a@...>, Bob <b@...>` failed fatally, and its Gmail draft
+  wrote To as encoded-words naming no address; before, Gmail delivered to both. First fixed at the
+  producer with `replyRecipients(for:)`; **superseded the same day by ADR-IOS-092** (owner: recipient
+  fields are lists split as you type or paste, never free text). `RecipientEntry` now splits every
+  entry point (typing/paste on `,` `;` or newline, contact pick, prefill, reopened draft, reply
+  seeding via `RecipientEntry.reply(to:)`, AI edits, reply-all); text naming no address stays in the
+  input line and Send refuses it with a message. `replyRecipients` was deleted. The 2026-10-03
+  "drafts keep recipients as typed" rule now holds only for storage: leftover text is saved beside
+  the addresses and returns to the input line on reopen.
+- **ADR-IOS-092 Tier 1 r8 fixes (2026-10-18)**: a single-line SwiftUI TextField (a UITextField)
+  turns PASTED line breaks into spaces and keeps tabs (observed iOS 26.5), so a pasted column
+  arrives space-separated: `RecipientEntry` also splits on spaces/tabs after an address (unquoted
+  `@` word or closing `>`), and any multi-character insertion is split whole. Reply-all passes
+  the reply target's unsendable text to the To input line (To/Cc invalid entries still never
+  offered, 2026-10-03). An unsendable contact pick goes to the input line. Leftover named mailboxes
+  are quoted via `IMAPFetchMapping.mailboxText`. `sendableRecipients` now expands a recipient that
+  is a comma list (legacy outbox rows from before the change; text that is not a mailbox still throws);
+  `extractEmailAddress` deleted; Send's text refusal and cap live in
+  `ComposeDraftGuards.sendRecipients`.
+- **ADR-IOS-092 Tier 1 r9 fix (2026-10-18)**: the agent's autosave was the last draft writer
+  dropping Bcc: its first save wrote `ccJSON`/`bccJSON` as `"[]"` and its updates kept stale
+  recipients, so the pushed server draft lost Cc/Bcc (permanently if the app died before Save).
+  It now reads the compose's live lists through the `composeRecipients` closure at write time.
+  AI recipient deltas are applied synchronously in `applyInlineEdit` (were inside the 280 ms fade
+  Task, after which the autosave could already have read). Transform extracted as
+  `ComposeDraftGuards.applying(_:to:)` and tested. Census tell: `rg 'bccJSON'` over `TabMail/`
+  lists every Draft-row writer.
+- **ADR-IOS-092 Tier 1 r10 fix (2026-10-18)**: leftover text in an input line had no separator
+  after it, so the next typed or pasted address was joined to it (`bob` + `dave@example.com` sent
+  to `bobdave@example.com`). Every input-line writer (`committing`, `fieldState`, `applying`,
+  `picking`) now ends leftover text with `, ` via `ComposeDraftGuards.inputLine`;
+  `trimmedInput` strips it for storage and Send's message. Contact search uses `typedEntry`.
+  Invariant tests drive every leftover route then type/paste/Return. Also pinned:
+  `sendableRecipients` refuses an entry naming no mailbox as FATAL (without it an IMAP send with
+  no recipient is `.sendFailed`, transient, retried forever). Root MIS-015 recurrence 6.
+- **ADR-IOS-092 Tier 1 r11 fix (2026-10-19)**: `inputToSplit` re-split the line up to its last
+  separator on EVERY keystroke, so fixing leftover text in place (what Send's refusal asks)
+  committed it half-fixed: `bob, carol@example.com` + `@example.com` after `bob` sent to
+  `bob@example.c` and `carol@example.comom`. Now only a keystroke that adds a separator splits.
+  Tests type in place at a caret (caret jumps to the end when a commit rewrites the line, as a
+  text field does) on every leftover route; two parameter cases that pinned the re-split were
+  replaced. Every r10 follow-up appended at the END of the line, which is why it missed this.
+- **ADR-IOS-092 Tier 2 (Codex) r4 fixes (2026-10-19)**: (1) at the recipient cap a pasted address
+  waits in the input line; an AI clear/removal left it there and Send restored a REMOVED Bcc
+  recipient. A clear now empties the input line; a removal also drops the address there. (2)
+  `RecipientEntry` dropped entries naming nobody (empty group, lone comment): it now splits into
+  entries itself (`entries`) and keeps any entry that yields nothing as text. (3) `inputToSplit`
+  told a paste from typing by net growth, so a list pasted over a longer selection was not split;
+  it now uses the inserted text (common start/end set aside). (4) The nine per-field `@State`
+  vars became one `ComposeDraftGuards.Recipients` value, so the role mapping (Bcc stays Bcc) is
+  tested instead of living in view code no test runs.
+- **Tier 1 r13 fixes (2026-10-19)**: `removingBccFields` kept every header line it could not
+  classify, so `sendDraft` delivered a Bcc field written as `Bcc` CRLF ` : x` (unfolds to `Bcc :`,
+  RFC 5322 2.2.3/4.5), a header starting with a continuation, or a name holding a control byte
+  (`Bcc<VT>:`). Fixed in `0919b08f`: those lines are refused like a lone CR (draft left in place);
+  a field name must be non-empty printable ASCII, the `checkHeaderFields` rule. A lone no-colon
+  line is still kept. Also pinned: `constructContent()` with no arguments writes no Bcc, and the
+  contact-pick fallback keeps leftover text when the pick adds no recipient.
+- **Tier 1 r14 fix (2026-10-19)**: `removingBccFields` took a bare LF as a header line end, so
+  `Subject: x` LF CRLF `Bcc: h` read as end-of-header and the Bcc field went out as "body", while a
+  CRLF-only reader (RFC 5322 4.1 allows a bare LF inside a field) saw a Bcc field. Fixed in
+  `d2112168`: every header line, the blank line included, must end in CRLF; a bare LF is refused like
+  a lone CR. That closes the line-boundary class (fourth correction to this stripper: lone CR,
+  Resent-Bcc, unclassifiable lines, bare LF). All-LF drafts are now refused by `sendDraft`.
+- **Tier 1 r15 fixes (2026-10-19)**: (1) the IMAP APPEND path (`append(email:)`, `createDraft`)
+  wrote header fields unchecked while `sendEmail` refused the same `Email`, so a value with a
+  non-fold line break (`Email(message:)` keeps a lone CR) stored a real Bcc/Reply-To field that a
+  later `sendDraft` delivered to. Fixed in `8c72afef`: `append(email:)` uses `keptCopyContent`, which
+  runs `checkHeaderFields` on every field except the library's own Bcc (`namesBccRecipients`) and
+  throws `IMAPError.invalidArgument`. Both writers of the shared builder are now checked. (2) The
+  ComposeView sites that choose a role were untested (8 Bcc-into-Cc mutants survived): the three
+  TokenField blocks became one `recipientTokenField(role)`, and `ComposeRecipientWiringTests` fences
+  every remaining site (reopen, prefill, AI edit, Send, Save, agent autosave) against ComposeView's
+  source. Red-first: all 9 role-swap mutants (field, pick, commit, Send, reopen, prefill swap, Save,
+  AI swap, agent autosave) fail it.
+- **Scope narrowed (owner, 2026-10-19, at the 10-round cap)**: rounds 7 to 9 all landed in SwiftMail's
+  `sendDraft` Bcc removal and header checks, which TabMail never calls. Owner: narrow to what the Bcc,
+  recipient-list and draft (#217) fixes need; park the rest as issues and a follow-up PR. TabMail uses
+  only `constructContent(includeBccHeader:)` and `append(email:)` (Drafts and Sent). New narrow fork
+  branch `fix/bcc-header-in-sent-copies` (`c7cd6aa1`, on `07163dc`); upstream twin
+  `fix/bcc-in-sent-copies` (`632e4eb9`, on `017693c`): `includeBccHeader`, `append(email:)` writes
+  Bcc, `createDraft` keeps writing none (upstream `sendDraft` sends stored bytes to everyone), APPEND
+  recording in `IMAPTestServer`, `BccHeaderTests` (4 mutants red). Everything else on
+  `fix/bcc-header-in-stored-copies` / `fix/bcc-in-stored-copies` (sendDraft strip, `checkHeaderFields`,
+  `keptCopyContent`, `SMTPCaptureServer`) is follow-up PR B: tabmail-ios #220. App-side, the
+  `threadingMessageIDs` filter (`f57b3506`) existed only because the SwiftMail check would wedge a
+  reply, so it was reverted with `ThreadingMessageIDLineBreakTests` and the outbox comment: #221.
+  Other parked notes: Outlook legacy comma-list rows #222, MailtoParser naive split #223, Sent copy
+  on servers that file their own copy (unverified hypothesis, owner doubts it) #224. The r13 to r15
+  SwiftMail entries above describe PR B, not the pinned code.
+- **Split first, never rewrite (Tier 2 t2r5, 2026-10-19)**: Codex found recipient text read or
+  rewritten before it was split (decoded invalid text, the AI's first-`<...>` pre-parser, a contact
+  name wrapped around a list); a census found the mailto comma split (#223, now fixed), the reply
+  tool's raw-string removals and over-cap name loss. Owner rule and fixes: ADR-IOS-092 amendment.
+- **Red chips (Tier 2 t2r6, 2026-10-19)**: I had told the owner that joining rejected text in the
+  input line "fails safe"; t2r6 proved two entries rejected one by one (`"First` + `Second" <x@...>`)
+  joined into a new recipient and a captured Gmail send went out. Owner chose red chips: each
+  rejected entry is its own chip, never re-read until edited; Send refuses while any exist. Lesson:
+  any step that JOINS separately rejected text and re-reads it undoes split-first. ADR-IOS-092
+  second amendment.
+- **Pin state**: app `project.yml` pins `9b48bdeb` (narrow topic branch: `c7cd6aa1` plus a doc commit after
+  Tier 1 r16, which was clean; not fork main; was `c7cd6aa1`, `8c72afef`, `d2112168`, `0919b08f`, `a09a3e3d`, `f8d71a92`, `bf833cb1`, `c9d54d06`, `1959c9af`, `d20af13a`, `1145028b`). Fork `main` stays
+  the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
+  upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
+  with `tabmail-swiftmailfork-sync` and re-pin to the mirror.
+

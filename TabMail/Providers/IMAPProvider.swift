@@ -6043,13 +6043,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// form it reads (`taro.@example.com` becomes `"taro."@example.com`).
     /// SwiftMail's RCPT TO validation is stricter still: it rejects quoted local
     /// parts and non-ASCII domains, which also fail the send as fatal. A
-    /// recipient it cannot read as a single mailbox fails the send as
+    /// recipient that names no mailbox, or holds text that is not one, fails the send as
     /// `SMTPError.invalidEmailAddress`, which the outbox treats as fatal, so the
     /// message stays visible for the user to fix.
     ///
-    /// BCC recipients are SMTP envelope recipients only: SwiftMail adds them to
-    /// RCPT TO and writes no `Bcc` header, so neither the delivered message nor
-    /// the Sent copy names them.
+    /// BCC recipients go into RCPT TO. The message SwiftMail sends carries no
+    /// `Bcc` header, so no recipient sees them; the copy `appendToSentFolder`
+    /// APPENDs does name them, so the sender can still see who was blind-copied.
     static func buildEmail(from draft: DraftMessage, senderEmail: String) throws -> Email {
         buildEmail(
             from: draft, senderEmail: senderEmail,
@@ -6060,33 +6060,59 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
 
     /// Build the Email saveDraft() appends. A recipient SwiftMail's parser reads
-    /// as one mailbox is written in that form (`Bob <bob@example.com>` stays a
+    /// as mailboxes is written in that form (`Bob <bob@example.com>` stays a
     /// name and an address); anything else is kept as typed, because a draft may
     /// hold an address the user has not finished and saving it must not fail.
+    /// BCC recipients are kept too: SwiftMail's APPEND writes them into a `Bcc`
+    /// header, so the draft still names them when it is reopened anywhere.
     static func buildDraftEmail(from draft: DraftMessage, senderEmail: String) -> Email {
         buildEmail(
             from: draft, senderEmail: senderEmail,
             recipients: draftRecipients(draft.to),
             ccRecipients: draftRecipients(draft.cc),
-            bccRecipients: []
+            bccRecipients: draftRecipients(draft.bcc)
         )
     }
 
     private static func draftRecipients(_ recipients: [String]) -> [SwiftMail.EmailAddress] {
-        recipients.map { recipient in
-            if case .mailbox(let mailbox)? = AddressListEntry(recipient) { return mailbox }
-            return SwiftMail.EmailAddress(address: recipient)
+        recipients.flatMap { recipient in
+            (try? sendableRecipients([recipient])) ?? [SwiftMail.EmailAddress(address: recipient)]
         }
     }
 
-    /// Each recipient as SwiftMail's parser reads it; throws on the first one that
-    /// is not exactly one mailbox.
+    /// The recipients as one header field body, each written as a draft writes
+    /// it: every mailbox a recipient names, or, for text that is not a mailbox
+    /// list, the text itself (which SwiftMail encodes, never reads as an address). SwiftMail never writes a control character into an address, so a
+    /// recipient cannot end the field and add a header line of its own.
+    static func recipientsFieldBody(_ recipients: [String]) -> String {
+        draftRecipients(recipients).map(\.description).joined(separator: ", ")
+    }
+
+    /// The mailboxes each recipient names. Compose hands over one address per
+    /// recipient (ADR-IOS-092), but a send queued by an earlier version can hold a
+    /// typed list such as `a@example.com, b@example.com` in one recipient; it goes
+    /// to every mailbox it names. Throws on the first recipient that names no
+    /// mailbox or holds text that is not one (an empty group included). Each mailbox is written again by
+    /// SwiftMail, never copied as text, so no recipient can add a header line.
     static func sendableRecipients(_ recipients: [String]) throws -> [SwiftMail.EmailAddress] {
-        try recipients.map { recipient in
-            guard case .mailbox(let mailbox)? = AddressListEntry(recipient) else {
-                throw SMTPError.invalidEmailAddress(recipient)
+        try recipients.flatMap { recipient in
+            var mailboxes: [SwiftMail.EmailAddress] = []
+            for entry in AddressParser.parseAddressList(recipient) {
+                switch entry {
+                case .mailbox(let mailbox): mailboxes.append(mailbox)
+                case .group(_, let members):
+                    // A group naming nobody is not an address: beside other
+                    // recipients it fails the send too, never silently dropped.
+                    guard !members.isEmpty else { throw SMTPError.invalidEmailAddress(recipient) }
+                    mailboxes += members
+                case .invalid:
+                    // Any entry that is not a mailbox fails the whole send, even
+                    // one whose decoded text is empty (`""`): nothing is dropped.
+                    throw SMTPError.invalidEmailAddress(recipient)
+                }
             }
-            return mailbox
+            guard !mailboxes.isEmpty else { throw SMTPError.invalidEmailAddress(recipient) }
+            return mailboxes
         }
     }
 

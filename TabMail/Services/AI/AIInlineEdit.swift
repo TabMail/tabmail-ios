@@ -42,23 +42,19 @@ struct InlineEditTurn: Sendable {
     let assistantResponse: String
 }
 
-/// A single parsed recipient from a `+X:` response line, e.g. `Name <email>` or `<email>`.
-struct ParsedRecipient: Sendable {
-    let name: String
-    let email: String
-}
-
 /// Delta for one recipient field (To / Cc / Bcc) extracted from the LLM response.
 /// Applied on top of the current draft's tokens: removals first, then adds.
 struct RecipientDelta: Sendable {
-    /// Recipients to add. Names preserved when the LLM supplied them.
-    let adds: [ParsedRecipient]
+    /// The `+<field>:` line read as recipient text, like typed text
+    /// (ADR-IOS-092): its mailboxes, with any names the LLM gave, and the
+    /// text that names no sendable address.
+    let adds: RecipientEntry
     /// Lowercased emails to remove. Contains `"*"` (literal) when the LLM asked to clear
     /// the entire field (via e.g. `-Cc: *`).
     let removes: [String]
 
     var clearsField: Bool { removes.contains("*") }
-    var isEmpty: Bool { adds.isEmpty && removes.isEmpty }
+    var isEmpty: Bool { adds.recipients.isEmpty && adds.leftovers.isEmpty && removes.isEmpty }
 }
 
 /// Result of an inline edit operation.
@@ -250,9 +246,9 @@ extension AIService {
 
         let result = Self.parseInlineEditResponse(text)
         if DebugModeManager.isLoggingEnabled() {
-            let toDesc = result.toDelta.map { "+\($0.adds.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
-            let ccDesc = result.ccDelta.map { "+\($0.adds.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
-            let bccDesc = result.bccDelta.map { "+\($0.adds.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
+            let toDesc = result.toDelta.map { "+\($0.adds.recipients.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
+            let ccDesc = result.ccDelta.map { "+\($0.adds.recipients.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
+            let bccDesc = result.bccDelta.map { "+\($0.adds.recipients.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
             BackgroundSyncLogger.logDebug("[AIService] performInlineEdit PARSED: response=\(result.response?.prefix(60) ?? "nil") subject=\(result.subject?.prefix(40) ?? "nil") bodyLen=\(result.body?.count ?? 0) to=\(toDesc) cc=\(ccDesc) bcc=\(bccDesc)")
         }
         return result
@@ -323,25 +319,15 @@ extension AIService {
         let removeLine = extractLabelLine(text, prefix: "-", label: field)
         if addLine == nil && removeLine == nil { return nil }
 
-        let adds: [ParsedRecipient] = addLine.map { raw in
-            splitCommaRespectingQuotes(raw).compactMap { entry in
-                let (name, email) = splitNameAndEmail(entry)
-                return email.isEmpty ? nil : ParsedRecipient(name: name, email: email)
-            }
-        } ?? []
-
+        // Each line is split as typed text is, before anything reads it, so a
+        // list in any separator and a quoted name with a comma stay whole.
+        let adds = RecipientEntry(addLine.map { [$0] } ?? [])
         var removes: [String] = []
         if let raw = removeLine {
-            // Preserve the "*" sentinel literally; otherwise emit lowercased emails.
-            for entry in splitCommaRespectingQuotes(raw) {
-                let trimmed = entry.trimmingCharacters(in: .whitespaces)
-                if trimmed == "*" {
-                    removes.append("*")
-                } else {
-                    let (_, email) = splitNameAndEmail(trimmed)
-                    if !email.isEmpty { removes.append(email.lowercased()) }
-                }
-            }
+            let entry = RecipientEntry(raw)
+            removes = entry.addresses.map { $0.lowercased() }
+            // Preserve the "*" sentinel literally.
+            if entry.leftovers.contains("*") { removes.append("*") }
         }
 
         return RecipientDelta(adds: adds, removes: removes)
@@ -359,46 +345,5 @@ extension AIService {
         let match = String(text[range])
         guard let colonIdx = match.firstIndex(of: ":") else { return "" }
         return String(match[match.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)
-    }
-
-    /// Split a comma-separated recipient list into entries, ignoring commas that appear
-    /// inside quoted display names (`"Doe, John" <j@x>`) or inside angle brackets.
-    static func splitCommaRespectingQuotes(_ raw: String) -> [String] {
-        if raw.isEmpty { return [] }
-        var items: [String] = []
-        var current = ""
-        var inQuotes = false
-        var inAngles = false
-        for ch in raw {
-            if ch == "\"" { inQuotes.toggle(); current.append(ch); continue }
-            if ch == "<" { inAngles = true; current.append(ch); continue }
-            if ch == ">" { inAngles = false; current.append(ch); continue }
-            if ch == "," && !inQuotes && !inAngles {
-                let trimmed = current.trimmingCharacters(in: .whitespaces)
-                if !trimmed.isEmpty { items.append(trimmed) }
-                current = ""
-                continue
-            }
-            current.append(ch)
-        }
-        let tail = current.trimmingCharacters(in: .whitespaces)
-        if !tail.isEmpty { items.append(tail) }
-        return items
-    }
-
-    /// Split an RFC-822-ish "Name <email>" or "<email>" or "email" entry into (name, email).
-    static func splitNameAndEmail(_ entry: String) -> (name: String, email: String) {
-        let trimmed = entry.trimmingCharacters(in: .whitespaces)
-        if let lt = trimmed.firstIndex(of: "<"),
-           let gt = trimmed.firstIndex(of: ">"),
-           gt > lt {
-            let email = String(trimmed[trimmed.index(after: lt)..<gt]).trimmingCharacters(in: .whitespaces)
-            var name = String(trimmed[..<lt]).trimmingCharacters(in: .whitespaces)
-            if name.hasPrefix("\"") && name.hasSuffix("\"") && name.count >= 2 {
-                name = String(name.dropFirst().dropLast())
-            }
-            return (name, email)
-        }
-        return ("", trimmed)
     }
 }
