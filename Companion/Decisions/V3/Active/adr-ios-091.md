@@ -83,16 +83,21 @@ all for providers either."*
   exact payload it sends (`DraftServerText.of(DraftMessage)`).
 - **Open, on every route.** The check runs in the one step every saved-draft open shares,
   `ComposeView.loadDraftOrPrepopulate` → `ExternalDraftAdoption.refreshBeforeOpen` (Drafts list,
-  compose toolbar, agent draft, reply/forward resume, undo reopen). Only a row with no unsent edits
-  is checked; if its server copy changed it is reloaded from that same fetched copy. A row with
-  unsent edits opens as is and Save asks Overwrite / Reload / Save as new (the owner's ruling). The
-  separate open-time prompt in `ServerDraftComposeLoader` is deleted. A gone copy, a failed or slow
-  read (`DraftServerCheckConfig.checkTimeoutSeconds`) or an unreadable body opens the row as is;
-  Save and the upload check again.
+  compose toolbar, agent draft, reply/forward resume, undo reopen). Every row with a server address
+  is checked. A row with no unsent edits whose copy changed is reloaded from that same fetched copy.
+  A row with unsent edits whose copy changed asks Overwrite / Reload / Save as new before the editor
+  shows (`ComposeView`'s `ServerChangedOnOpenAlert`; Cancel opens the edits with nothing written).
+  This is the owner's 2026-10-17 answer: an upload that refuses a changed copy leaves the question
+  for the next open, and Send does not check, so without it an opened-then-sent draft would delete
+  the other app's newer copy unasked. (A first fix of this round asked only at Save; corrected the
+  same day.) The separate open-time prompt in `ServerDraftComposeLoader` is deleted. A gone copy, a
+  failed or slow read (`DraftServerCheckConfig.checkTimeoutSeconds`) or an unreadable body opens the
+  row as is and never asks; Save and the upload check again.
 - **One server read per adoption or reload.** Subject, recipients (Bcc included), body, attachments
   and inline images all come from one `fetchDraftCopy` result; the synced header is no longer the
   content source. Inline images are carried as ordinary attachments (the editor is plain text).
-- **Older actions never undo newer ones.** Overwrite, Save as new and Reload-at-save advance
+- **Older actions never undo newer ones.** Overwrite, Save as new and Reload-at-save (and the same
+  answers at open) advance
   `pushAttemptVersion`, so an upload already past its server check retires at Stage A. A reload
   writes only over the exact row it compared (same generation, version, status and address).
 - Images the provider's inline-image read drops (a failed image fetch, more than

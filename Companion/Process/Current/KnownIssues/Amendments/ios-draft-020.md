@@ -64,9 +64,21 @@ wrote it" needs a version witness this tree did not record for Gmail/Graph draft
 across reopen, or (2) refresh on open when the row is `"pushed"` and a recorded version witness
 shows the server copy changed. The owner chose (2) plus the question for unsent edits.
 
+## Amendment, 2026-10-20 (Codex review round 1 of #217)
+
+The mechanism above is superseded in two places; the behaviour the owner chose is unchanged.
+The comparison is the draft's text, not a server revision (ADR-IOS-091 third ruling,
+`serverDraftText`, `fetchDraftCopy`, `DraftServerText`). The open check moved from
+`ServerDraftComposeLoader.checkServerCopy` (deleted) into the step every saved-draft open shares,
+`ComposeView.loadDraftOrPrepopulate` → `ExternalDraftAdoption.refreshBeforeOpen`, so every route
+checks. A clean row whose copy changed reloads; a row with unsent edits whose copy changed asks
+Overwrite / Reload / Save as new before the editor shows; a gone copy or a failed check opens the
+row as it is. The IMAP "no round trip" note no longer holds: an IMAP draft is read like the others.
+
 ## Subsystem and search terms
 
 Drafts; stale draft on reopen; edited in another app; server revision; `serverDraftRevision`;
 `draftRevision`; `DraftServerCheck`; `DraftServerRevision`; `changeKey`; Gmail contained message id;
 reload; overwrite; save as new; `.serverChanged`; `ExternalDraftAdoption.reload`;
-`LocallyAuthoredDraftOpenAuthority`; v92
+`LocallyAuthoredDraftOpenAuthority`; v92; `refreshBeforeOpen`; `ServerChangedOnOpenAlert`;
+`serverDraftText`; `fetchDraftCopy`
