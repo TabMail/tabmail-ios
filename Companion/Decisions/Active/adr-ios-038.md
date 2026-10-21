@@ -306,9 +306,20 @@ fix gates at shared chokepoints, not per-tool patches:
   enqueue an `actionRefine` row; drains are deferred while the demo runs,
   so the row drained after exit against the real `user_action` prompt.
   `BackfillAIQueue.enqueueActionRefine` now refuses a demo sample
-  (`ActionRefineSnapshot.isDemoSample`) and `dispatchActionRefine` drops
-  one queued by an older build. The `enqueueActionRefine` chokepoint in
-  the call accounting above therefore no longer consumes a demo call.
+  (`ActionRefineSnapshot.isDemoSample`). The `enqueueActionRefine`
+  chokepoint in the call accounting above therefore no longer consumes a
+  demo call. (A drain-time drop for rows queued by older builds was
+  considered and deleted the same day: that population is rare and it
+  behaves as every shipped build already did.)
+- **Demo sends and actions drain (bug fix).** `registerDemoProviders`
+  gives the demo account a work queue; the outbox and action drains skip
+  accounts without one, so every demo send had stayed queued and never
+  reached Sent. `DemoProvider.send` writes nothing: the outbox's
+  optimistic Sent header is the one sent copy. `DemoProvider.move` is a
+  no-op: the optimistic move already placed the row and the demo has no
+  server. It used to re-key the row to a destination-shaped id, which
+  nothing followed once moves drained, so Undo of a drained demo archive
+  did nothing. Demo rows keep their id for the life of the demo.
 - **Tips hidden in the demo** (supersedes "TipKit shown-state persists"
   being visible in demo): `OnboardingTipGate.onboardingComplete` is
   `allOnboardingGatesPassed && !isActive`, so no tip (each shows once) is
@@ -330,6 +341,6 @@ fix gates at shared chokepoints, not per-tool patches:
 - ADR-IOS-008 (AI processing architecture — demo replicates the
   short-circuit).
 - ADR-IOS-018 (PendingOperation queue — DemoProvider stubs the drain
-  side).
+  side; since 2026-10-21 the demo drain runs, see above).
 
 ---

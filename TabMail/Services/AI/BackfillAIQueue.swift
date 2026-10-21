@@ -416,11 +416,6 @@ actor BackfillAIQueue {
     // MARK: - Dispatchers (call existing refinement functions unchanged)
 
     private func dispatchActionRefine(_ s: ActionRefineSnapshot) async {
-        // Rows queued by builds before the enqueue guard: drop, never teach.
-        guard !s.isDemoSample else {
-            BackgroundSyncLogger.logBackfillAI("drop actionRefine dedupKey=\(s.dedupKey) reason=demo-sample")
-            return
-        }
         let currentActionMd = PromptStore.actionMarkdownSnapshot()
         await AIService.shared.autoUpdateUserPromptOnTag(
             subject: s.subject,

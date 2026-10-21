@@ -312,7 +312,8 @@ enum MessageHeaderRekey {
     ///    rg -n --pcre2 '^(?!\s*(///|//)).*MessageHeaderRekey\.apply\(' \
     ///       TabMail/ Shared/ TabMailNotificationService/
     ///    ```
-    ///    → 5 at R17-1 (was 3), and **still 5 at R18-D5**. Check each hit
+    ///    → 5 at R17-1 (was 3), **still 5 at R18-D5**, and 4 since 2026-10-21,
+    ///    when `DemoProvider.move` stopped re-keying (see its struck bullet). Check each hit
     ///    against `AccountManager.publishMoveFinish`; the ones that do NOT
     ///    reach it are:
     ///     * the **UID-remap block in `SyncEngineFullSync`** — the
@@ -322,8 +323,11 @@ enum MessageHeaderRekey {
     ///       leg, which became a caller in R17-1 (it hand-rolled the identical
     ///       delete+reinsert before that, destroying both children outright, so
     ///       adopting this carrier strictly reduced its loss);
-    ///     * **`DemoProvider.move`**, also R17-1 — demo mode only, and demo has
-    ///       no `publishMoveFinish` path at all;
+    ///     * ~~**`DemoProvider.move`**, also R17-1 — demo mode only, and demo has
+    ///       no `publishMoveFinish` path at all;~~ ⛔ SUPERSEDED 2026-10-21: no
+    ///       longer a caller. Once the demo account got a work queue its moves
+    ///       drained, and this re-key left Undo naming an id that no longer
+    ///       existed. The demo move is now a no-op and the row keeps its id;
     ///     * 🚨 **`DraftStore.migrateExactPlaceholder` — ADDED R18-D5. The
     ///       roster said THREE and the predicate returns FIVE, and the arithmetic
     ///       is the whole point: this bullet list is the "does not reach
@@ -382,8 +386,8 @@ enum MessageHeaderRekey {
     ///       filtered out of `staleFiltered`) because the FTS entry must MOVE,
     ///       not be removed. So the obligation is not "all three legs" for every
     ///       caller — assuming that is how a reader concludes the sync path is
-    ///       broken in a way it is not. `DemoProvider.move` has no FTS mirror at
-    ///       all, which is a demo-only cost and is not this function's to close.
+    ///       broken in a way it is not. (`DemoProvider.move` had no FTS mirror
+    ///       at all; it no longer re-keys, 2026-10-21.)
     ///     * **`UndoService.applyRekeys` — NOT discharged.** An undo entry that
     ///       names the old header id keeps naming it, so the undo resolves
     ///       nothing and fails closed. Bounded by the undo stack's lifetime.

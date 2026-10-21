@@ -246,6 +246,72 @@ struct TutorialPracticeTests {
             return false
         }
     }
+
+    /// Every AI surface other than dictation (compose, inline edit, chat)
+    /// goes through the completions request. Two-sided: the same call
+    /// outside the tutorial reaches the fake server.
+    @Test("No completions request leaves the device during the tutorial")
+    func completionsRefusedDuringPractice() async throws {
+        let store = DemoModeStore.shared
+        defer { store._resetForTests() }
+        let server = FakeHTTP.Scenario()
+        defer { server.close() }
+        server.register(
+            path: "/completions/chat", method: "POST",
+            response: .bytes(Data("event: final\ndata: {\"assistant\":\"ok\"}\n\n".utf8),
+                             contentType: "text/event-stream"))
+        let client = BackendClient(llmSession: server.session)
+        let request = CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil)
+
+        store._resetForTests()
+        store.isActive = true
+        store.isTutorialPractice = true
+        await #expect {
+            _ = try await client.sendCompletionsWithToolsDirect(request)
+        } throws: { error in
+            if case BackendError.unauthorized = error { return true }
+            return false
+        }
+        #expect(server.recordedCalls().isEmpty, "nothing may reach the server during the tutorial")
+
+        store._resetForTests()
+        let answer = try await client.sendCompletionsWithToolsDirect(request)
+        #expect(answer.assistant == "ok")
+        #expect(server.servedCallSequence() == ["POST /completions/chat"],
+                "control: outside the tutorial the same request is sent")
+    }
+
+    /// Callers that send only with a token (the dictation warm-up, account
+    /// info, usage) get none during the tutorial, so no demo token is minted
+    /// and nothing is sent. Two-sided: with a stored demo token, the plain
+    /// demo sends the same warm-up.
+    @Test("The tutorial has no token, even with a demo token stored")
+    func noTokenDuringPractice() async throws {
+        let store = DemoModeStore.shared
+        defer {
+            store._resetForTests()
+            DemoTokenManager.clearSession()
+        }
+        let session = DemoTokenManager.DemoSession(
+            accessToken: "test-demo-token", sub: "test",
+            expiresAt: Int(Date().addingTimeInterval(3600).timeIntervalSince1970))
+        try KeychainHelper.save(try JSONEncoder().encode(session), for: "demo_session")
+        let server = FakeHTTP.Scenario()
+        defer { server.close() }
+        server.register(path: DictationConfig.warmUpPath, response: .status(200))
+        let client = BackendClient(llmSession: server.session)
+
+        store._resetForTests()
+        store.isActive = true
+        store.isTutorialPractice = true
+        await client.warmUpDictation()
+        #expect(server.recordedCalls().isEmpty, "nothing may reach the server during the tutorial")
+
+        store.isTutorialPractice = false
+        await client.warmUpDictation()
+        #expect(server.servedCallSequence() == ["GET \(DictationConfig.warmUpPath)"],
+                "control: the plain demo sends the warm-up with its token")
+    }
 }
 
 // MARK: - Seeded demo: fixture ids and the facts the parts advance on
@@ -312,6 +378,26 @@ struct TutorialFixtureTests {
         }
     }
 
+    /// Registers the demo providers the way `DemoModeService.completeSetup` does.
+    private func registerDemo() async {
+        let accountId = DemoSeed.demoAccountId
+        await AccountManager.shared.registerDemoProviders(
+            email: DemoProvider(accountId: accountId),
+            calendar: DemoCalendarProvider(accountId: accountId),
+            accountId: accountId)
+    }
+
+    /// Runs the demo action queue until it is empty.
+    private func drainActions(_ pool: DatabasePool) async throws {
+        for _ in 0..<100 {
+            await AccountManager.shared.drainPendingQueue()
+            await AccountManager.shared.awaitWriteQueueDrain()
+            if try await pool.read({ try PendingOperation.fetchCount($0) }) == 0 { return }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        Issue.record("the demo action queue never drained")
+    }
+
     @Test("Mail facts follow the demo mailbox: archive and retag")
     func mailFactsFollowTheMailbox() async throws {
         let fixture = try install()
@@ -324,11 +410,13 @@ struct TutorialFixtureTests {
         #expect(seeded.dailyTechTag == ActionTag.archive.rawValue)
         #expect(!seeded.sentMessageIds.isEmpty)
 
-        // Part 1, tap: the receipt really leaves the inbox (the demo move re-keys it).
-        let provider = DemoProvider(accountId: DemoSeed.demoAccountId)
-        _ = try await provider.performMessageAction(
-            .move(destination: "ARCHIVE"),
-            at: ProviderMessageSource(memberIds: [DemoSeed.TutorialFixture.receipt], folderPath: "INBOX", admittedUidValidity: nil))
+        // Part 1, tap: the Archive tag's real action takes the receipt out of the inbox.
+        await registerDemo()
+        let receipt = try #require(try await pool.read { try inboxHeader($0, DemoSeed.TutorialFixture.receipt) })
+        await AccountManager.shared.archive([receipt])
+        await AccountManager.shared.awaitWriteQueueDrain()
+        try await drainActions(pool)
+        await AccountManager.shared.unregisterDemoProviders(accountId: DemoSeed.demoAccountId)
         let archived = try await pool.read { try TutorialCoordinator.fetchMailFacts($0) }
         #expect(!archived.receiptInInbox)
         #expect(archived.dailyTechTag == ActionTag.archive.rawValue)
@@ -343,6 +431,41 @@ struct TutorialFixtureTests {
         #expect(retagged.dailyTechTag == ActionTag.delete.rawValue)
     }
 
+    /// Part 1 shows the archived receipt with the existing Undo, and the demo
+    /// queue drains the archive at once. Undo must still bring it back.
+    @Test("Undo of a demo archive restores the message after the queue drained it")
+    func demoArchiveUndoAfterDrain() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        try DemoSeed.seed()
+        let pool = fixture.0
+        let accountId = DemoSeed.demoAccountId
+        await registerDemo()
+
+        let receipt = try #require(try await pool.read { try inboxHeader($0, DemoSeed.TutorialFixture.receipt) })
+        let archivePath = try #require(try await pool.read { db in
+            try Folder.filter(Column("accountId") == accountId && Column("role") == FolderRole.archive.rawValue)
+                .fetchOne(db)?.path
+        })
+        await AccountManager.shared.archive([receipt])
+        await AccountManager.shared.awaitWriteQueueDrain()
+        try await drainActions(pool)
+        #expect(!(try await pool.read { try TutorialCoordinator.fetchMailFacts($0) }).receiptInInbox,
+                "setup: the archive must have landed")
+
+        let restored = await AccountManager.shared.undoMove(
+            accountId: accountId,
+            forwardDestinationPath: archivePath,
+            members: [UndoMember(header: receipt)])
+        await AccountManager.shared.awaitWriteQueueDrain()
+        try await drainActions(pool)
+        await AccountManager.shared.unregisterDemoProviders(accountId: accountId)
+
+        #expect(restored == [receipt.id], "Undo must accept the archive it is undoing")
+        #expect(try await pool.read { try TutorialCoordinator.fetchMailFacts($0) }.receiptInInbox,
+                "the receipt must be back in the inbox")
+    }
+
     /// Part 2 advances only when the reply reaches Sent, and compose sends
     /// through the outbox. The demo account is registered the way
     /// `DemoModeService.completeSetup` does it, then the real drain runs.
@@ -353,10 +476,7 @@ struct TutorialFixtureTests {
         try DemoSeed.seed()
         let pool = fixture.0
         let accountId = DemoSeed.demoAccountId
-        await AccountManager.shared.registerDemoProviders(
-            email: DemoProvider(accountId: accountId),
-            calendar: DemoCalendarProvider(accountId: accountId),
-            accountId: accountId)
+        await registerDemo()
         let before = try await pool.read { try TutorialCoordinator.fetchMailFacts($0) }
 
         var queued = OutboxMessage(accountId: accountId, draft: DraftMessage(
@@ -371,5 +491,151 @@ struct TutorialFixtureTests {
         #expect(after.sentMessageIds.subtracting(before.sentMessageIds).count == 1)
         let remaining = try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) }
         #expect(remaining == nil, "the sent message must leave the outbox")
+    }
+}
+
+// MARK: - A whole run: start, real mail events, end
+
+/// Drives `TutorialCoordinator.shared` through `DemoModeService` on an
+/// installed database, as RootView does. Mutates the demo store, the
+/// subscription gate and the shared coordinator: `.serialized` and
+/// `.processGlobalState`.
+@Suite("Tutorial run — starts offline, advances on mail events, ends clean", .serialized, .processGlobalState)
+@MainActor
+struct TutorialLifecycleTests {
+    /// Taps Create on the template card.
+    @MainActor
+    final class AcceptingSink: AgentUISink {
+        func deliverConfirmation(_ confirmation: AgentToolRouter.ActionConfirmation) {
+            confirmation.onRespond(true)
+        }
+    }
+
+    private func install() throws -> (DatabasePool, URL, AppDatabase?) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tutorial-run-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let saved = current
+            current = appDatabase
+            return saved
+        }
+        return (pool, directory, previous)
+    }
+
+    private func waitFor(_ step: TutorialCoordinator.Step) async throws {
+        for _ in 0..<200 {
+            if TutorialCoordinator.shared.step == step { return }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        Issue.record("the tutorial never reached \(step); it is at \(String(describing: TutorialCoordinator.shared.step))")
+    }
+
+    @Test("A run opens the chat without AI, moves on real mail events, and its end switches the tutorial off")
+    func runFromStartToEnd() async throws {
+        let fixture = try install()
+        let store = DemoModeStore.shared
+        let gate = AISubscriptionGate.shared
+        let gateWasActive = gate.isActive
+        let progressKeys = ["tutorial.version", "tutorial.completedLessons"]
+        let savedProgress = progressKeys.map { UserDefaults.standard.object(forKey: $0) }
+        defer {
+            for (key, value) in zip(progressKeys, savedProgress) {
+                UserDefaults.standard.set(value, forKey: key)
+            }
+            if gateWasActive { gate.openGate() } else { gate.closeGate() }
+            store._resetForTests()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        gate.closeGate()
+        let pool = fixture.0
+        let coordinator = TutorialCoordinator.shared
+        try #require(!coordinator.isRunning)
+
+        // Start: offline (no demo token), the tutorial switch on before the demo.
+        await coordinator.start(.actOnEmail, hasTabMailSession: false)
+        #expect(store.isTutorialPractice)
+        #expect(store.isActive)
+        #expect(coordinator.step == .starting)
+        try await DemoModeService.shared.completeSetup()
+        #expect(gate.isActive, "the scripted chat needs the pill even with demo AI off")
+        coordinator.seedingFinished()
+        #expect(coordinator.step == .archiveReceipt)
+        // The mail observation has delivered the seeded inbox: no move yet.
+        try await Task.sleep(for: .seconds(1))
+        #expect(coordinator.step == .archiveReceipt, "the step waits for the archive itself")
+
+        // Part 1: the Archive tag, then the retag.
+        let receipt = try #require(try await pool.read { db in
+            try MessageHeader
+                .filter(Column("folderId") == "\(DemoSeed.demoAccountId):INBOX"
+                    && Column("messageId") == DemoSeed.TutorialFixture.receipt)
+                .fetchOne(db)
+        })
+        await AccountManager.shared.archive([receipt])
+        try await waitFor(.receiptArchived)
+        coordinator.continueToRetag()
+        #expect(coordinator.step == .retagDailyTech)
+        try await pool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET actionTag = ? WHERE folderId = ? AND messageId = ?",
+                arguments: [ActionTag.delete.rawValue, "\(DemoSeed.demoAccountId):INBOX", DemoSeed.TutorialFixture.dailyTech])
+        }
+        try await waitFor(.actOnEmailDone)
+        #expect(coordinator.completedLessons.contains(.actOnEmail))
+
+        // Part 2: the reply reaches Sent, then Create saves the template.
+        coordinator.nextLesson()
+        #expect(coordinator.step == .replyToPriya)
+        // The mail observation takes its Sent baseline from its first value.
+        try await Task.sleep(for: .seconds(1))
+        let reply = "Count me in."
+        coordinator.practiceReplyAuthored(reply)
+        var queued = OutboxMessage(accountId: DemoSeed.demoAccountId, draft: DraftMessage(
+            to: ["priya@company.com"], subject: "Re: Engineering offsite", body: reply))
+        queued.holdUntil = Date().addingTimeInterval(-60)
+        let row = queued
+        try await pool.write { try row.insert($0) }
+        await AccountManager.shared.drainOutbox()
+        try await waitFor(.makeTemplate)
+        _ = await TutorialChatScript.answer(
+            .makeTemplate, practiceReply: coordinator.practiceReplyText,
+            invocation: ToolInvocation(uiSink: AcceptingSink()))
+        try await waitFor(.reuseReplyDone)
+        #expect(coordinator.savedTemplateId != nil)
+        #expect(coordinator.completedLessons.contains(.reuseReply))
+
+        // End: the demo is gone and the backend is no longer refused.
+        await coordinator.end()
+        #expect(!coordinator.isRunning)
+        #expect(coordinator.step == nil)
+        #expect(!store.isActive)
+        #expect(!store.isTutorialPractice, "a signed-in user's AI calls would stay refused until relaunch")
+    }
+
+    /// Every way out of the demo (sign-in, the debug menu, a seeding failure)
+    /// goes through `DemoModeService.exit`, not only the coordinator's `end`.
+    @Test("Leaving the demo by any route switches the tutorial off")
+    func demoExitEndsPractice() async throws {
+        let fixture = try install()
+        let store = DemoModeStore.shared
+        defer {
+            store._resetForTests()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        store.isTutorialPractice = true
+        try await DemoModeService.shared.start(mintToken: false)
+        try #require(store.isActive)
+        await DemoModeService.shared.exit()
+        #expect(!store.isActive)
+        #expect(!store.isTutorialPractice, "a signed-in user's AI calls would stay refused until relaunch")
     }
 }

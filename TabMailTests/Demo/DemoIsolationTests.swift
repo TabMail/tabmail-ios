@@ -332,18 +332,22 @@ struct DemoIsolationTests {
     }
 }
 
-// MARK: - R17-1 — a demo move is a header PRIMARY-KEY change
+// MARK: - Demo provider writes
 
-/// `DemoProvider.move` deletes the header row and re-inserts it under the
-/// destination-folder primary key, so it is a member of the class *"every code
-/// path that changes a header's primary key"* — the same class as
-/// `BackfillBodyQueue.rekeyRemappedHeader`, `DraftStore.migrateExactPlaceholder`
-/// and `SyncEngine.canonicalizeLocalRows`.
+/// The demo provider's action setters against an installed database.
+///
+/// ⛔ Until 2026-10-21 this suite was "Demo move — the re-key carries the
+/// header's FK children" (R17-1): `DemoProvider.move` re-keyed the row to a
+/// destination-shaped id and a test pinned that the labels, threading edges
+/// and body followed it. The demo move is now a no-op (the optimistic move
+/// already placed the row, and a re-key left Undo naming a vanished id), so
+/// that test went with the mechanism. Undo after a drained demo archive is
+/// pinned by `TutorialFixtureTests.demoArchiveUndoAfterDrain`.
 ///
 /// It is separated from `DemoIsolationTests` because it drives the real provider
 /// against an installed `AppDatabase.shared`, so unlike that suite it does mutate
 /// global state and must be `.serialized`.
-@Suite("Demo move — the re-key carries the header's FK children", .serialized)
+@Suite("Demo provider writes — setters address only their members", .serialized)
 struct DemoMoveRekeyChildrenTests {
 
     private func install() throws -> (DatabasePool, URL, AppDatabase?) {
@@ -424,129 +428,6 @@ struct DemoMoveRekeyChildrenTests {
         }
     }
 
-    /// 🚨 THE INVARIANT, as the system property and not the mechanism
-    /// (`MIS-015`): **a header that changes its primary key keeps its labels and
-    /// its threading edges.** No assertion names `MessageHeaderRekey.apply`.
-    ///
-    /// `messageHeader` has exactly two surviving cascading children —
-    /// `messageUserLabel.messageId` (`v82`) and `messageReference.messageHeaderId`
-    /// (`v27`) — and this path's hand-rolled `delete` → reassign `id` → `insert`
-    /// restored neither. It also stranded the `messageBody` row: since
-    /// `v70_dropMessageBodyHeaderFK` the body is no longer cascaded away, so it
-    /// was left ORPHANED under the id the message no longer has, and the moved
-    /// message rendered blank. Demo mode has no server, so nothing re-fetches any
-    /// of it and every loss is permanent for the life of the demo account.
-    @Test("A demo move carries the message's labels, threading edges and body to the new id")
-    func demoMoveCarriesHeaderChildren() async throws {
-        let fixture = try install()
-        defer { finish(fixture) }
-        let pool = fixture.0
-        let accountId = DemoSeed.demoAccountId
-        let parentRfc = "r17-1-demo-parent@example.com"
-        let oldId = MessageIdentity.headerId(
-            accountId: accountId, folderPath: "INBOX", messageId: "d1")
-        let newId = MessageIdentity.headerId(
-            accountId: accountId, folderPath: "ARCHIVE", messageId: "d1")
-
-        try await pool.write { db in
-            var account = Account(
-                emailAddress: "demo@example.com", displayName: "Demo", provider: .imap)
-            account.id = accountId
-            try account.insert(db)
-            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId).insert(db)
-            try Folder(
-                name: "Archive", path: "ARCHIVE", role: .archive, accountId: accountId).insert(db)
-            var header = MessageHeader(
-                messageId: "d1", subject: "Re: demo", from: "Peer",
-                fromAddress: "peer@example.com", to: "demo@example.com", date: Date(),
-                snippet: "", folderId: "\(accountId):INBOX", accountId: accountId,
-                folderPath: "INBOX", isInInbox: true)
-            var otherAccount = Account(emailAddress: "other@example.com", displayName: "Other", provider: .imap)
-            otherAccount.id = "other-demo-account"
-            try otherAccount.insert(db)
-            for (owner, folder, messageId) in [
-                (accountId, "OTHER", "d1"),
-                ("other-demo-account", "INBOX", "d1"),
-                (accountId, "INBOX", "bystander")
-            ] {
-                let bystander = MessageHeader(
-                    messageId: messageId, subject: "Untouched", from: "Peer",
-                    fromAddress: "peer@example.com", to: "demo@example.com", date: Date(),
-                    snippet: "", folderId: "\(owner):\(folder)", accountId: owner,
-                    folderPath: folder, isInInbox: folder == "INBOX")
-                try bystander.insert(db)
-            }
-            header.inReplyTo = parentRfc
-            try header.insert(db)
-            try ThreadUtils.insertMessageReferences(for: header, db: db)
-            let label = UserLabel(
-                accountId: accountId, providerLabelId: "keep", name: "Keep", isSystem: false)
-            try label.insert(db, onConflict: .ignore)
-            try MessageUserLabel(messageId: header.id, userLabelId: label.id).insert(db)
-            try MessageBody(
-                contentKey: ContentKey(rawValue: header.id),
-                htmlContent: "<p>demo body</p>").insert(db)
-        }
-
-        // MIS-030 — anchor the fixture BEFORE the act, so the post-move
-        // assertions cannot pass against rows that never existed.
-        let before = try await pool.read { db -> (Int, Int, Bool) in
-            (try MessageUserLabel.filter(Column("messageId") == oldId).fetchCount(db),
-             try Int.fetchOne(
-                db, sql: "SELECT COUNT(*) FROM messageReference WHERE messageHeaderId = ?",
-                arguments: [oldId]) ?? 0,
-             try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) != nil)
-        }
-        #expect(before.0 == 1, "precondition: the user applied a label to the message")
-        #expect(before.1 == 1, "precondition: the message has a threading edge to its parent")
-        #expect(before.2, "precondition: the message has a cached body")
-
-        let provider: any EmailProvider = DemoProvider(accountId: accountId)
-        let outcome = try await provider.performMessageAction(.move(destination: "ARCHIVE"), at: .init(
-            memberIds: ["d1"], folderPath: "INBOX", admittedUidValidity: nil))
-        #expect(outcome.dispositionedMemberIds == ["d1"])
-        #expect(outcome.confirmedGoneMemberIds.isEmpty)
-        #expect(outcome.provenDestinations.isEmpty)
-        #expect(!outcome.addressChangesOnMove)
-        #expect(try await pool.read { try MessageHeader.fetchOne($0, key: oldId) } == nil)
-
-        let after = try await pool.read { db -> (Bool, [String], [String], String?, Bool) in
-            (try MessageHeader.fetchOne(db, key: newId) != nil,
-             try MessageUserLabel.filter(Column("messageId") == newId)
-                .fetchAll(db).map(\.userLabelId),
-             try String.fetchAll(
-                db,
-                sql: "SELECT referencedRfc822Id FROM messageReference WHERE messageHeaderId = ?",
-                arguments: [newId]),
-             try MessageBody.fetchOne(db, key: ContentKey(rawValue: newId))?.htmlContent,
-             try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) != nil)
-        }
-        let headers = try await pool.read { try MessageHeader.fetchAll($0) }
-        #expect(Set(headers.map(\.id)) == Set([
-            newId,
-            MessageIdentity.headerId(accountId: accountId, folderPath: "OTHER", messageId: "d1"),
-            MessageIdentity.headerId(accountId: "other-demo-account", folderPath: "INBOX", messageId: "d1"),
-            MessageIdentity.headerId(accountId: accountId, folderPath: "INBOX", messageId: "bystander")
-        ]))
-        #expect(headers.first { $0.id == newId }?.folderPath == "ARCHIVE")
-        #expect(headers.first { $0.id == newId }?.isInInbox == false)
-        #expect(headers.filter { $0.id != newId }.allSatisfy { $0.subject == "Untouched" })
-        #expect(after.0, "setup: the move must have re-keyed the header to the destination")
-        #expect(after.1 == ["\(accountId):keep"],
-                """
-                the user's label must follow the message to the folder it was moved to — \
-                the re-key's delete cascades `messageUserLabel` and NOTHING can rebuild \
-                it, and demo has no server to re-fetch it from
-                """)
-        #expect(after.2 == [parentRfc],
-                "and the threading edge, or the message falls out of its own conversation")
-        #expect(after.3 == "<p>demo body</p>",
-                """
-                and the cached body, which since `v70_dropMessageBodyHeaderFK` is not \
-                cascaded but ORPHANED under the old id — leaving the moved message blank
-                """)
-        #expect(after.4 == false, "and nothing may be left stranded under the retired id")
-    }
 }
 
 // MARK: - R17b-B1 — a demo draft re-save is a DELETE + RE-INSERT of the same message
