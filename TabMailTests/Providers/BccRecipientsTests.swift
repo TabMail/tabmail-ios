@@ -335,13 +335,15 @@ struct BccRecipientsTests {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         http.register(path: "/messages/g-1", method: "PATCH", response: .json(raw: #"{"id":"g-1"}"#))
+        // An update then makes the attachments match (#217); this draft has none.
+        http.register(path: "/messages/g-1/attachments", method: "GET", response: .json(raw: #"{"value":[]}"#))
         let provider = ExchangeProvider(userEmail: "me@example.com", accessToken: { _ in "tok" }, session: http.session)
 
         _ = try await provider.saveDraft(
             Self.draft(bcc: ["hidden@example.com"], cc: ["cc@example.com"]),
             existingIdentity: .outlook(graphId: "g-1"), draftsFolderPath: "Drafts")
 
-        Self.expectOperations(http, ["PATCH /messages/g-1"])
+        Self.expectOperations(http, ["PATCH /messages/g-1", "GET /messages/g-1/attachments"])
         let patch = try #require(try Self.graphBodies(http, method: "PATCH").first)
         #expect(Self.addresses(patch["toRecipients"]) == ["to@example.com"])
         #expect(Self.addresses(patch["ccRecipients"]) == ["cc@example.com"])
@@ -354,6 +356,8 @@ struct BccRecipientsTests {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         http.register(path: "/messages/g-1", method: "PATCH", response: .json(raw: #"{"id":"g-1"}"#))
+        // An update then makes the attachments match (#217); this draft has none.
+        http.register(path: "/messages/g-1/attachments", method: "GET", response: .json(raw: #"{"value":[]}"#))
         let provider = ExchangeProvider(userEmail: "me@example.com", accessToken: { _ in "tok" }, session: http.session)
 
         _ = try await provider.saveDraft(

@@ -27,7 +27,10 @@ lock; v2final's Outlook open lease is therefore not ported. The first version of
 concurrent edits are last-save-wins with no warning; the owner's second ruling the same day
 replaced that with reload-on-open and an Overwrite / Reload / Save as new question — see
 `IOS-DRAFT-020` (resolved) and `IOS-DRAFT-021` (the accepted check-then-write race). An adopted row
-records the server revision its content came from (`Draft.serverDraftRevision`).
+records the server revision its content came from (`Draft.serverDraftRevision`). *(Superseded twice and preserved as written: the third ruling recorded
+the server TEXT instead, `serverDraftText`, and the fourth ruling, 2026-10-21, removed the record
+altogether: last save wins, and a clean Gmail or Outlook row reloads on every open; see
+`IOS-DRAFT-020` and `IOS-DRAFT-021`.)*
 
 **What still fails closed (irreversible-wire hazards, not concurrency):** an IMAP header whose
 observed UIDVALIDITY does not equal the Drafts folder's live, unquarantined epoch; a placeholder id;

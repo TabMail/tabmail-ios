@@ -101,7 +101,11 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-10-17): unchanged at 6 `open` records.** The #217 work filed
+> **Current tracker census (2026-10-21): unchanged at 6 `open` records.** The owner's fourth #217
+> ruling (last save wins, #233) keeps `IOS-DRAFT-020` resolved by always reloading a clean Gmail or
+> Outlook draft on open, and turns `IOS-DRAFT-021` into the last-save-wins limitation itself.
+>
+> *Preserved:* **Current tracker census (2026-10-17): unchanged at 6 `open` records.** The #217 work filed
 > `IOS-DRAFT-019` (resolved), `IOS-DRAFT-020` (resolved the same day by the owner's
 > reload-and-ask ruling) and `IOS-DRAFT-021` (`accepted`, owner-blessed: the race between the
 > server check and the write that follows it).
@@ -257,8 +261,8 @@ regenerated from it; their detail files live in
 | ID | Class | Executive statement |
 |---|---|---|
 | [IOS-DRAFT-019](Companion/Process/Current/KnownIssues/Amendments/ios-draft-019.md) | `resolved` | ✅ **RESOLVED (2026-10-17, GitHub #217)** — drafts written by another mail app open and edit again. With no local owner, `ServerDraftComposeLoader` adopts the server copy (`ExternalDraftAdoption`): body + attachments fetched, then one write transaction re-verifies the header and inserts an `adopted:<uuid>` `Draft` row owning the EXACT provider-native address (IMAP folder+UIDVALIDITY+UID, Gmail resource id, Graph id), status `"pushed"`. Save replaces and Send deletes exactly that copy. Owner ruling: any client, no lease; a copy changed elsewhere is reloaded or asked about (`IOS-DRAFT-020`). Unproven IMAP epochs, placeholders, changed headers and unconfirmed-empty bodies still fail closed |
-| [IOS-DRAFT-020](Companion/Process/Current/KnownIssues/Amendments/ios-draft-020.md) | `resolved` | ✅ **RESOLVED (2026-10-17, GitHub #217, ADR-IOS-091)** — a draft this device owns no longer reopens a stale local copy after another app edits it. Each row keeps a copy of the server text its content came from (subject, To/Cc/Bcc, attachment names, body); every open of a row with no unsent edits reloads a changed server copy, and Save asks Overwrite / Reload / Save as new when a row with unsent edits meets a changed copy. The upload never overwrites a changed copy |
-| [IOS-DRAFT-021](Companion/Process/Current/KnownIssues/Amendments/ios-draft-021.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-17, owner)** — the draft server check and the write that follows it are two calls, so another app's save inside that gap is overwritten by ours. Also covered: a pre-v92 draft with unsent edits has no recorded copy of the server text, so its first upload after updating keeps last-save-wins; attachments are compared by name only (#229); recipient text that is no address is not compared (#230) |
+| [IOS-DRAFT-020](Companion/Process/Current/KnownIssues/Amendments/ios-draft-020.md) | `resolved` | ✅ **RESOLVED (2026-10-17, GitHub #217, ADR-IOS-091)** — a draft this device owns no longer reopens a stale local copy after another app edits it. Each row keeps a copy of the server text its content came from (subject, To/Cc/Bcc, attachment names, body); every open of a row with no unsent edits reloads a changed server copy, and Save asks Overwrite / Reload / Save as new when a row with unsent edits meets a changed copy. The upload never overwrites a changed copy. **Amended 2026-10-21 (last save wins, #233):** the comparison and the question are deleted; every open of a Gmail or Outlook draft with no unsent edits reloads its server copy, and draft-copy reads are complete or fail |
+| [IOS-DRAFT-021](Companion/Process/Current/KnownIssues/Amendments/ios-draft-021.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-17, owner)** — the draft server check and the write that follows it are two calls, so another app's save inside that gap is overwritten by ours. Also covered: a pre-v92 draft with unsent edits has no recorded copy of the server text, so its first upload after updating keeps last-save-wins; attachments are compared by name only (#229); recipient text that is no address is not compared (#230). **Superseded 2026-10-21 by LAST SAVE WINS (owner, #233):** nothing reads the server copy before a save, so another app's edit to the same draft made while this device holds unsent edits is replaced by this device's next upload; #229 and #230 are moot |
 
 ### GRAPH (1)
 

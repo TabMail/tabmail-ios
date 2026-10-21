@@ -105,13 +105,6 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// Ported from `v2final:TabMail/Models/Draft.swift`'s `serverDraftUidValidity`.
     var serverDraftUidValidity: Int?
 
-    /// v92 (#217) — this device's copy of the server draft's text, as it last wrote
-    /// or loaded it (`DraftServerText`: subject, To, Cc and body, normalized). A server copy
-    /// whose text no longer matches was changed by another app. Written with the
-    /// address at push completion, adoption and reload. nil = no evidence (a pre-v92
-    /// row): such a row keeps last-save-wins until its next push or reload.
-    var serverDraftText: String? = nil
-
     /// v80 — the PROVIDER's own id (`MessageHeader.messageId`: an IMAP UID, a Gmail
     /// message id, a Graph message id) for the copy the user actually pressed
     /// Reply/Forward on. Written once, beside `replyToId`, when the reply draft is

@@ -17,12 +17,12 @@ import UniformTypeIdentifiers
 /// send-deletes, discard) treats it exactly like a local draft.
 ///
 /// OWNER RULING (2026-10-17): take over the draft whichever client wrote it. There
-/// is no lease or lock — the v2final Outlook lease is not ported. Second ruling, same
-/// day: never keep a stale local copy, and ask before overwriting a server copy that
-/// another app changed. So every adopted or reloaded row keeps a copy of the server
-/// text its content came from (`Draft.serverDraftText`, `DraftServerCheck`), and
-/// `refreshBeforeOpen` reloads a row with no unsent edits whose server copy no
-/// longer matches it.
+/// is no lease or lock — the v2final Outlook lease is not ported. Fourth ruling
+/// (2026-10-21): LAST SAVE WINS. Nothing compares the server copy before a save; an
+/// upload replaces whatever the server holds, so an edit another app made to the
+/// same draft at the same time can be overwritten (#233, accepted). To never open a
+/// stale copy, `refreshBeforeOpen` reloads a Gmail or Outlook row with no unsent
+/// edits from the server every time it opens.
 ///
 /// What still fails closed, because each one is an irreversible-wire hazard rather
 /// than a concurrency question:
@@ -46,6 +46,8 @@ enum ExternalDraftAdoption {
         /// server having confirmed it empty. Opening it would let the first save
         /// overwrite the real server draft with nothing.
         case bodyUnavailable
+        /// A copy that carries its attachment bytes lacks one of them.
+        case attachmentUnavailable
     }
 
     // MARK: - Address
@@ -244,7 +246,6 @@ enum ExternalDraftAdoption {
             rfc822MessageId: header.rfc822MessageId,
             attachmentsDirName: content.attachmentsDirName)
         draft.instanceEpoch = instanceEpoch
-        draft.serverDraftText = content.serverText
         draft.replyToProviderMessageId = replyParent?.messageId
         draft.replyToUidValidity = replyParent?.observedUidValidity
         switch address {
@@ -290,11 +291,11 @@ enum ExternalDraftAdoption {
         return draft.id
     }
 
-    /// The reload, inside ONE write transaction: `decided` is the row the open
-    /// check compared. Writes only if the row is still exactly that row — same
+    /// The reload, inside ONE write transaction: `decided` is the row the open read
+    /// started from. Writes only if the row is still exactly that row — same
     /// generation, same conflict version, same status and same server address — so a
-    /// newer save (another compose window, the agent) or a "Save as new" made while
-    /// the server copy was being read always wins. Advances `pushAttemptVersion`, so
+    /// newer save (another compose window, the agent) made while the server copy was
+    /// being read always wins. Advances `pushAttemptVersion`, so
     /// an upload started before the reload retires at Stage A.
     /// Returns the attachment directory the row used before (to delete after
     /// commit), `.some(nil)` when it had none, or nil when nothing was written.
@@ -322,7 +323,6 @@ enum ExternalDraftAdoption {
         draft.body = content.body
         draft.attachmentsDirName = content.attachmentsDirName
         draft.updatedAt = now
-        draft.serverDraftText = content.serverText
         draft.serverPushStatus = "pushed"
         draft.pushAttemptVersion += 1
         try draft.update(db)
@@ -334,43 +334,42 @@ enum ExternalDraftAdoption {
     /// A server copy's editable content, read from ONE `fetchDraftCopy` result, so
     /// subject, recipients, body and attachments all come from the same version.
     /// Attachments are staged in a new directory, which the caller owns from here on.
-    /// The user's answer when the server copy of a draft with unsent edits changed.
-    enum ServerChangeChoice: Sendable {
-        /// Keep this device's edits; the next upload replaces the other version.
-        case overwrite
-        /// Take the other version; this device's edits are dropped.
-        case reload
-        /// Keep both: this device's edits become a new server draft.
-        case saveAsNew
-    }
-
     struct ServerContent {
         let subject: String
         let to: String
         let cc: String
         let bcc: String
         let body: String
-        /// The copy's text (`DraftServerText`), kept as the row's copy.
-        let serverText: String
         let attachmentsDirName: String?
         let attachmentCount: Int
     }
 
     /// The file name an adopted inline image is carried under. The body is edited
     /// as plain text, so an inline image travels on as an ordinary attachment.
-    /// `DraftServerText` names inline images the same way, so the copy this device
-    /// uploads after adopting them compares equal to the original.
     static func inlineImageFilename(_ image: InlineImage, index: Int) -> String {
         let ext = UTType(mimeType: image.contentType)?.preferredFilenameExtension ?? "bin"
         return "image\(index + 1).\(ext)"
     }
 
-    private static func content(
-        of copy: FullMessageInfo,
+    /// A server copy's editable content with its attachment bytes in memory: the
+    /// network half, which `refreshBeforeOpen` bounds by its timeout. Nothing is
+    /// written to disk until `stage`, so a read abandoned at the timeout leaves
+    /// nothing behind.
+    struct ReadCopy: Sendable {
+        let subject: String
+        let to: String
+        let cc: String
+        let bcc: String
+        let body: String
+        let attachments: [DraftAttachment]
+    }
+
+    private static func read(
+        _ copy: FullMessageInfo,
         accountId: String,
         identity: DraftDeleteIdentity,
         bodyEmptyConfirmed: Bool
-    ) async throws -> ServerContent {
+    ) async throws -> ReadCopy {
         // Top-level only: parts nested inside an attached `.eml` travel inside it.
         let attachmentInfos = copy.attachments.filter { $0.parentEmlSection == nil }
         let html: String?
@@ -392,14 +391,22 @@ enum ExternalDraftAdoption {
         }
 
         // Attachment ids belong to the message the copy was read from (Gmail
-        // replaces that message on every save), so they are fetched by its id.
+        // replaces that message on every save), so they are fetched by its id. A
+        // copy that already carries the bytes (IMAP, read under its proven
+        // UIDVALIDITY) is never fetched a second time.
         let folderPath: String
         if case .imap(let folder, _, _) = identity { folderPath = folder } else { folderPath = "" }
         var attachments: [DraftAttachment] = []
         for info in attachmentInfos {
-            let data = try await AccountManager.shared.fetchAttachment(
-                accountId: accountId, messageId: copy.header.messageId, folderPath: folderPath,
-                section: info.section, encoding: info.encoding)
+            let data: Data
+            if let carried = copy.attachmentData {
+                guard let bytes = carried[info.section] else { throw AdoptionError.attachmentUnavailable }
+                data = bytes
+            } else {
+                data = try await AccountManager.shared.fetchAttachment(
+                    accountId: accountId, messageId: copy.header.messageId, folderPath: folderPath,
+                    section: info.section, encoding: info.encoding)
+            }
             attachments.append(DraftAttachment(
                 filename: info.filename, mimeType: info.contentType, data: data))
         }
@@ -408,23 +415,28 @@ enum ExternalDraftAdoption {
                 filename: inlineImageFilename(image, index: index),
                 mimeType: image.contentType, data: image.data))
         }
-        let dirName: String? = attachments.isEmpty ? nil : DraftAttachmentStorage.newStagingDirName()
+        return ReadCopy(
+            subject: copy.header.subject, to: copy.header.to, cc: copy.header.cc, bcc: copy.header.bcc,
+            body: body, attachments: attachments)
+    }
+
+    /// Writes a read copy's attachments to a new staging directory.
+    private static func stage(_ read: ReadCopy) throws -> ServerContent {
+        let dirName: String? = read.attachments.isEmpty ? nil : DraftAttachmentStorage.newStagingDirName()
         if let dirName {
             do {
-                try DraftAttachmentStorage.saveAttachments(attachments, dirName: dirName)
+                try DraftAttachmentStorage.saveAttachments(read.attachments, dirName: dirName)
             } catch {
                 DraftAttachmentStorage.deleteAttachments(dirName: dirName)
                 throw error
             }
         }
         return ServerContent(
-            subject: copy.header.subject, to: copy.header.to, cc: copy.header.cc, bcc: copy.header.bcc,
-            body: body, serverText: DraftServerText.of(copy),
-            attachmentsDirName: dirName, attachmentCount: attachments.count)
+            subject: read.subject, to: read.to, cc: read.cc, bcc: read.bcc, body: read.body,
+            attachmentsDirName: dirName, attachmentCount: read.attachments.count)
     }
 
-    /// Read the server copy at `address`, then insert the adopted row, keeping the
-    /// copy's text as the row's copy of the server text.
+    /// Read the server copy at `address`, then insert the adopted row.
     /// Returns without inserting when the server no longer has the draft, the
     /// header changed, or a row already owns the address; the caller re-runs its
     /// normal resolver either way. THROWS when a read or fetch failed, which the
@@ -444,9 +456,9 @@ enum ExternalDraftAdoption {
             }
             return
         }
-        let content = try await content(
-            of: copy, accountId: header.accountId, identity: identity,
-            bodyEmptyConfirmed: header.bodyEmptyConfirmed)
+        let content = try stage(try await read(
+            copy, accountId: header.accountId, identity: identity,
+            bodyEmptyConfirmed: header.bodyEmptyConfirmed))
         let dirName = content.attachmentsDirName
         let insertedId: String?
         do {
@@ -467,26 +479,38 @@ enum ExternalDraftAdoption {
         }
     }
 
+    /// Whether opening a row reloads its server copy first. Pure.
+    ///
+    /// Only a Gmail or Outlook row with no unsent edits (`"pushed"`): it holds
+    /// nothing the server lacks, and another app can edit those drafts in place. A
+    /// row with unsent edits (`"dirty"`, `"pushing"`, or never uploaded) opens as it
+    /// is and its next upload replaces the server copy (last save wins, #233). An
+    /// IMAP message never changes in place, so another app's edit is a new message
+    /// under a new UID, opened by adoption; a demo draft lives only on this device.
+    static func reloadsBeforeOpen(serverPushStatus: String?, identity: DraftDeleteIdentity) -> Bool {
+        guard serverPushStatus == "pushed" else { return false }
+        switch identity {
+        case .gmail, .outlook:
+            return true
+        case .gmailContainedMessage, .imap, .demo:
+            return false
+        }
+    }
+
     /// #217 (ADR-IOS-091): bring a saved draft up to date before it opens. Every
     /// open of a persisted draft runs this (`ComposeView.loadDraftOrPrepopulate`),
     /// whichever screen opened it.
     ///
-    /// When the server copy changed (owner rulings 2026-10-17):
-    /// - a row with no unsent edits (`"pushed"`) holds nothing the server lacks, so
-    ///   it simply takes the server's version;
-    /// - a row WITH unsent edits (saved offline, or an upload that refused the
-    ///   changed copy) asks the user first: `askAboutUnsentEdits` returns Overwrite,
-    ///   Reload or Save as new, or nil to open the edits as they are (Save asks
-    ///   again).
-    /// Anything that stops the check — offline, a gone copy, a body that could not
-    /// be read, a row that changed meanwhile — opens the row as it is: Save and the
-    /// upload check again, so nothing here can overwrite either side.
+    /// A row `reloadsBeforeOpen` selects takes the server's version, with no
+    /// comparison (owner ruling 2026-10-21, last save wins). The whole read,
+    /// attachments included, runs under `ExternalDraftOpenConfig.reloadTimeoutSeconds`.
+    /// Anything that stops it (offline, a timeout, a gone copy, a part that could not
+    /// be read, a row that changed meanwhile) opens the row as it is.
     /// `willReadServer` runs just before the network read, so a draft that needs
-    /// none (a new compose, a draft never uploaded) opens without a loading cover.
+    /// none opens without a loading cover.
     static func refreshBeforeOpen(
         draftId: String,
-        willReadServer: @MainActor () -> Void,
-        askAboutUnsentEdits: @MainActor () async -> ServerChangeChoice?
+        willReadServer: @MainActor () -> Void
     ) async {
         do {
             guard let row = try await AppDatabase.dbPool.read({ db in
@@ -495,41 +519,20 @@ enum ExternalDraftAdoption {
                   let provider = await AccountManager.shared.provider(accountId: row.accountId),
                   let identity = DraftStore.priorIdentity(
                       for: row, runtimeKind: AccountManager.draftRuntimeIdentityKind(for: provider)),
-                  identity.isSharedWithOtherApps else {
+                  reloadsBeforeOpen(serverPushStatus: row.serverPushStatus, identity: identity) else {
                 return
             }
             await willReadServer()
-            let copy = try await withTimeout(seconds: DraftServerCheckConfig.checkTimeoutSeconds) {
-                try await provider.fetchDraftCopy(identity: identity)
+            let accountId = row.accountId
+            let readCopy: ReadCopy? = try await withTimeout(
+                seconds: ExternalDraftOpenConfig.reloadTimeoutSeconds
+            ) {
+                guard let copy = try await provider.fetchDraftCopy(identity: identity) else { return nil }
+                return try await read(
+                    copy, accountId: accountId, identity: identity, bodyEmptyConfirmed: false)
             }
-            guard let copy,
-                  case .changed(let serverText) = DraftServerCheck.compare(
-                      base: row.serverDraftText, current: DraftServerText.of(copy)) else {
-                return
-            }
-            if row.serverPushStatus != "pushed" {
-                let epoch = row.instanceEpoch ?? ""
-                switch await askAboutUnsentEdits() {
-                case nil:
-                    return
-                case .overwrite?:
-                    _ = try await AppDatabase.dbPool.write { db in
-                        try DraftStore.rebaseOnServerText(
-                            draftId: draftId, expectedInstanceEpoch: epoch, serverText: serverText, db: db)
-                    }
-                    return
-                case .saveAsNew?:
-                    _ = try await AppDatabase.dbPool.write { db in
-                        try DraftStore.detachFromServerCopy(
-                            draftId: draftId, expectedInstanceEpoch: epoch, db: db)
-                    }
-                    return
-                case .reload?:
-                    break
-                }
-            }
-            let content = try await content(
-                of: copy, accountId: row.accountId, identity: identity, bodyEmptyConfirmed: false)
+            guard let readCopy else { return }
+            let content = try stage(readCopy)
             let dirName = content.attachmentsDirName
             let previousDir: String??
             do {
@@ -552,8 +555,14 @@ enum ExternalDraftAdoption {
             }
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[DraftAdoption] Open-time server check for draft=\(draftId) did not complete (\(error)) — opening the local copy; Save and the upload check again")
+                BackgroundSyncLogger.logDebug("[DraftAdoption] Open-time reload for draft=\(draftId) did not complete (\(error)) — opening the local copy")
             }
         }
     }
+}
+
+enum ExternalDraftOpenConfig {
+    /// How long opening a draft waits for its server copy before opening the local
+    /// copy instead, so a slow or offline read never blocks the user.
+    static let reloadTimeoutSeconds: TimeInterval = 8
 }

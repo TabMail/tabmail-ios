@@ -28,15 +28,6 @@ enum DraftDeleteIdentity: Sendable, Equatable {
     case outlook(graphId: String)
     case imap(folder: String, uidValidity: Int, uid: Int)
     case demo(localId: String)
-
-    /// #217 (ADR-IOS-091): whether another mail app can change the draft at this
-    /// address, so open, Save and upload must compare its server copy first. A demo
-    /// draft lives only on this device: nothing else edits it, and its stored copy
-    /// keeps only part of the draft, so it is never compared.
-    var isSharedWithOtherApps: Bool {
-        if case .demo = self { return false }
-        return true
-    }
 }
 
 enum DraftDeleteAddressKind: String, Codable, Sendable {
@@ -219,14 +210,19 @@ struct FullMessageInfo: Sendable {
     /// Pre-fetched ICS calendar data (from pipelined batch fetch).
     /// When present, renderBody skips the separate fetchAttachment call.
     let icsData: Data?
+    /// #217: the decoded bytes of `attachments`, keyed by `AttachmentInfo.section`,
+    /// when the read already downloaded them (an IMAP draft copy, read in full under
+    /// its proven UIDVALIDITY). nil = fetch each attachment on its own.
+    let attachmentData: [String: Data]?
 
-    init(header: MessageHeaderInfo, htmlBody: String?, textBody: String?, attachments: [AttachmentInfo] = [], inlineImages: [InlineImage] = [], icsData: Data? = nil) {
+    init(header: MessageHeaderInfo, htmlBody: String?, textBody: String?, attachments: [AttachmentInfo] = [], inlineImages: [InlineImage] = [], icsData: Data? = nil, attachmentData: [String: Data]? = nil) {
         self.header = header
         self.htmlBody = htmlBody
         self.textBody = textBody
         self.attachments = attachments
         self.inlineImages = inlineImages
         self.icsData = icsData
+        self.attachmentData = attachmentData
     }
 }
 
@@ -433,8 +429,11 @@ protocol EmailProvider: Sendable {
 
     /// #217: the server's current copy of the draft at `identity`, or nil when that
     /// address no longer names a draft (deleted, or replaced under a new IMAP UID).
-    /// Read-only. THROWS when the answer could not be determined (offline, an
-    /// unknown IMAP epoch); a throw is never "unchanged" and never "gone".
+    /// Read-only, and COMPLETE: a copy is everything the draft holds, because the
+    /// caller replaces a local draft with it, so a part that could not be read (an
+    /// inline image included) THROWS rather than being left out. THROWS too when
+    /// the answer could not be determined (offline, an unknown IMAP epoch); a throw
+    /// is never "gone".
     func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo?
 
     // Incremental sync (optional — Gmail uses history.list, IMAP returns nil)
@@ -461,8 +460,8 @@ protocol EmailProvider: Sendable {
 
 extension EmailProvider {
     /// Default for test doubles and the demo provider, whose drafts are never
-    /// compared (`DraftDeleteIdentity.isSharedWithOtherApps`); every other
-    /// production provider overrides it.
+    /// read back (only Gmail and Outlook drafts reload on open, and only drafts in a
+    /// Drafts folder are adopted); every other production provider overrides it.
     func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
         throw ProviderError.actionIdentityResolutionFailed(
             "fetchDraftCopy: provider has no draft read adapter")

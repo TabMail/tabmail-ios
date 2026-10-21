@@ -199,7 +199,6 @@ struct DraftGenerationSafetyTests {
                 expectedInstanceEpoch: "E1",
                 previousIdentity: nil,
                 freshRfc: "fresh@example.com",
-                sentText: "",
                 db: db)
         }
 
@@ -318,8 +317,6 @@ struct DraftGenerationSafetyTests {
         }
         let succeedingProvider = MockEmailProvider(
             saveDraftResult: .created(.outlook(graphId: "new-resource")))
-        // The same server: it still holds the copy the retry wrote.
-        await succeedingProvider.setDraftCopy(.success(await retryProvider.heldDraftCopy))
         let result = try await DraftStore.shared.pushDraftToServer(
             draftId: initial.id, expectedInstanceEpoch: "E1", provider: succeedingProvider,
             runtimeKind: .outlook, draftsFolderPath: "Drafts")
@@ -623,8 +620,6 @@ struct DraftGenerationSafetyTests {
         }
         let laterProvider = MockEmailProvider(
             saveDraftResult: .created(.outlook(graphId: "second-resource")))
-        // The same server: it still holds the copy the first push wrote.
-        await laterProvider.setDraftCopy(.success(await firstProvider.heldDraftCopy))
         let later = try await DraftStore.shared.pushDraftToServer(
             draftId: initial.id, expectedInstanceEpoch: "E1", provider: laterProvider,
             runtimeKind: .outlook, draftsFolderPath: "Drafts")

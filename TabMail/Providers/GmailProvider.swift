@@ -305,6 +305,13 @@ actor GmailProvider: EmailProvider {
     }
 
     func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo {
+        try await readMessage(id: id, completeInlineImages: false)
+    }
+
+    /// `completeInlineImages`: read EVERY inline image and throw if one cannot be
+    /// read, instead of rendering's best effort (at most `maxInlineImages`, failures
+    /// skipped). A draft copy needs it: the copy replaces the local draft (#217).
+    private func readMessage(id: String, completeInlineImages: Bool) async throws -> FullMessageInfo {
         let data = try await request(path: "/messages/\(id)\(GmailAPI.fullQuery)")
         let msg = try JSONDecoder().decode(GmailMessage.self, from: data)
 
@@ -349,7 +356,8 @@ actor GmailProvider: EmailProvider {
         // Fetch CID inline images (only if HTML body references cid:)
         let inlineImages: [InlineImage]
         if let html = htmlBody, html.range(of: "cid:", options: .caseInsensitive) != nil {
-            inlineImages = await fetchInlineImages(messageId: id, from: parts)
+            inlineImages = try await fetchInlineImages(
+                messageId: id, from: parts, complete: completeInlineImages)
         } else {
             inlineImages = []
         }
@@ -821,7 +829,7 @@ actor GmailProvider: EmailProvider {
         guard let messageId = try await currentDraftMessageId(resourceId: resourceId) else {
             return nil
         }
-        return try await fetchMessage(id: messageId, folder: "")
+        return try await readMessage(id: messageId, completeInlineImages: true)
     }
 
     /// The message a draft resource currently wraps (it changes on every update),
@@ -2077,9 +2085,13 @@ actor GmailProvider: EmailProvider {
         return results
     }
 
-    /// Fetch inline image data for CID resolution.
-    private func fetchInlineImages(messageId: String, from parts: [GmailPart]) async -> [InlineImage] {
-        let meta = extractInlineImageMeta(from: parts).prefix(SyncConfig.maxInlineImages)
+    /// Fetch inline image data for CID resolution. `complete`: every image, and a
+    /// failed fetch throws (`readMessage`).
+    private func fetchInlineImages(
+        messageId: String, from parts: [GmailPart], complete: Bool
+    ) async throws -> [InlineImage] {
+        let allMeta = extractInlineImageMeta(from: parts)
+        let meta = complete ? allMeta[...] : allMeta.prefix(SyncConfig.maxInlineImages)
         var images: [InlineImage] = []
         for item in meta {
             // Try inline body data first (small images)
@@ -2100,6 +2112,7 @@ actor GmailProvider: EmailProvider {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[Gmail] Failed to fetch inline image \(DebugModeManager.escapedForLogLine(item.contentId)): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
                 }
+                if complete { throw error }
             }
         }
         return images

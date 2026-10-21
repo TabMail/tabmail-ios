@@ -64,6 +64,67 @@ struct IMAPSaveDraftIdentityTests {
         #expect(copy == nil || id.contains(mine))
     }
 
+    @Test("A draft read carries the attachment bytes of that same read, so adoption never fetches them again")
+    func draftReadCarriesItsAttachmentBytes() async throws {
+        let mine = "mine-\(UUID().uuidString)@example.com"
+        let epoch = 73_002
+        let attachment = Data("attached notes".utf8)
+        let textBytes = Data("body".utf8)
+        let attachmentOnWire = Data(attachment.base64EncodedString().utf8)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        let date = formatter.string(from: Date())
+        formatter.dateFormat = "dd-MMM-yyyy HH:mm:ss Z"
+        let internalDate = formatter.string(from: Date())
+        let header = """
+        From: Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Subject: draft\r
+        Date: \(date)\r
+        Message-ID: <\(mine)>\r
+        Content-Type: multipart/mixed; boundary="b1"\r
+        \r
+
+        """
+        let raw = header + """
+        --b1\r
+        Content-Type: text/plain\r
+        \r
+        body\r
+        --b1\r
+        Content-Type: text/plain; name="notes.txt"\r
+        Content-Disposition: attachment; filename="notes.txt"\r
+        Content-Transfer-Encoding: base64\r
+        \r
+        \(attachment.base64EncodedString())\r
+        --b1--\r
+
+        """
+        let bodystructure = """
+        (("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" \(textBytes.count) 1)("TEXT" "PLAIN" ("NAME" "notes.txt") NIL NIL "BASE64" \(attachmentOnWire.count) 1 NIL ("attachment" ("filename" "notes.txt"))) "MIXED")
+        """
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [FakeIMAPServer.makeMultipartMessage(
+            uid: 5, subject: "draft", from: "Sender <sender@example.com>",
+            to: "Recipient <recipient@example.com>", date: date, internalDate: internalDate,
+            messageID: "<\(mine)>", rawHeader: header, fullMessage: Data(raw.utf8),
+            bodystructure: bodystructure, partBodies: ["1": textBytes, "2": attachmentOnWire])]])
+        server.setUidValidity(epoch, for: "Drafts")
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let copy = try #require(try await provider.fetchDraftCopy(
+            identity: .imap(folder: "Drafts", uidValidity: epoch, uid: 5)))
+
+        let info = try #require(copy.attachments.first { $0.filename == "notes.txt" })
+        #expect(copy.attachmentData?[info.section] == attachment,
+                "adoption would fetch the file again by UID, outside the proven UIDVALIDITY")
+    }
+
     @Test("A live prior IMAP tuple deletes only its UID; a same-RFC sibling survives and the fresh edit lands")
     func livePriorTuple() async throws {
         let shared = "shared-\(UUID().uuidString)@example.com"

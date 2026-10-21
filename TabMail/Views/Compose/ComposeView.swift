@@ -1024,9 +1024,6 @@ struct ComposeView: View {
     /// keeps the editor at opacity 0 indefinitely). Logging only.
     @State private var stuckFadeWatchTask: Task<Void, Never>?
     @State private var showDiscardPrompt = false
-    /// #217 (ADR-IOS-091): Save found the server copy changed or gone; the user
-    /// chooses Overwrite / Reload / Save as new before anything is written.
-    @State private var serverChangeOnSave: ServerChangeOnSave?
     /// PORT — v2final `ComposeView.showClearedDraftDeletePrompt` (N2), the
     /// confirmation for `ComposeDraftGuards.CloseAction.promptDelete`: a LOADED
     /// existing draft the user emptied to nothing. Closing must never make that row
@@ -1040,13 +1037,10 @@ struct ComposeView: View {
     @State private var showEmptyBodyPrompt = false
     @State private var isSavingDraft = false
     @State private var loadedDraft = false
-    /// #217: true while a saved draft is checked against its server copy before it
-    /// opens (`ExternalDraftAdoption.refreshBeforeOpen`). The editor is covered
+    /// #217: true while a saved draft reloads its server copy before it opens
+    /// (`ExternalDraftAdoption.refreshBeforeOpen`). The editor is covered
     /// meanwhile, so nothing typed can be replaced when the draft then loads.
     @State private var isCheckingServerCopy = false
-    /// #217: the open check found that the server copy of a draft with unsent edits
-    /// changed; the load waits for the user's answer (`ServerChangedOnOpenAlert`).
-    @State private var serverChangeOnOpen: ServerChangeOnOpen?
     /// PORT — sticky initial-read state from v2final ComposeDraftGuards.
     /// `.error` is never reinterpreted as genuine absence later in this view.
     @State private var draftReadState: ComposeDraftGuards.ReadState = .notFound
@@ -1704,12 +1698,6 @@ struct ComposeView: View {
             .modifier(DiscardUnsavedEditsAlert(
                 isPresented: $showErrorDiscardEditsPrompt,
                 onDiscard: { dismiss() }))
-            .modifier(ServerChangedOnSaveAlert(
-                pending: $serverChangeOnSave,
-                onChoice: { pending, choice in
-                    Task { await resolveServerChangeOnSave(pending, choice: choice) }
-                }))
-            .modifier(ServerChangedOnOpenAlert(question: $serverChangeOnOpen))
             .overlay { if isCheckingServerCopy { ServerCopyCheckCover() } }
             .alert("Empty Body", isPresented: $showEmptyBodyPrompt) {
                 if showingSuggestion, let currentSuggestion, !currentSuggestion.isEmpty {
@@ -2317,16 +2305,10 @@ struct ComposeView: View {
         BackgroundSyncLogger.logDebug("[ComposeView] loadDraftOrPrepopulate: draftId=\(draftId) prefillDraftId=\(prefillDraftId ?? "nil")")
         let draftKey = draftId
         // #217 (ADR-IOS-091): every open of a saved draft, from any screen, first
-        // checks its server copy: a changed copy reloads a row with no unsent edits,
-        // and asks the user about a row with unsent edits.
+        // reloads a Gmail or Outlook row with no unsent edits from its server copy.
         await ExternalDraftAdoption.refreshBeforeOpen(
             draftId: draftKey,
-            willReadServer: { isCheckingServerCopy = true },
-            askAboutUnsentEdits: {
-                await withCheckedContinuation { continuation in
-                    serverChangeOnOpen = ServerChangeOnOpen(answer: continuation)
-                }
-            })
+            willReadServer: { isCheckingServerCopy = true })
         isCheckingServerCopy = false
         let readResult: Result<Draft?, Error>
         do {
@@ -2700,7 +2682,7 @@ struct ComposeView: View {
         await discardDraftAndDismiss()
     }
 
-    private func saveDraftAndDismiss(skipServerCheck: Bool = false) async {
+    private func saveDraftAndDismiss() async {
         // B1: refuse to save-to-server while attachments failed to load. Saving
         // here would (a) queue a push of a partial set to the server draft and
         // (b) rewrite the on-disk attachments dir from the empty in-memory list
@@ -2793,18 +2775,6 @@ struct ComposeView: View {
         let existing: Draft?
         if case .success(let value) = readResult { existing = value } else { existing = nil }
         let previousDirName = existing?.attachmentsDirName
-
-        // #217 (ADR-IOS-091): before saving over a server copy, check whether
-        // another app changed it. If so, ask; nothing is written until the user
-        // chooses. If the check cannot run, save anyway — the upload checks again
-        // and never overwrites a changed copy.
-        if !skipServerCheck, let existing,
-           let check = await Self.serverChangeBeforeSave(existing) {
-            serverChangeOnSave = ServerChangeOnSave(
-                check: check,
-                instanceEpoch: existing.instanceEpoch ?? "")
-            return
-        }
 
         // PORT — v2final `saveDraftAndDismiss`'s F0d COPY-ON-WRITE attachment
         // staging. Persist attachments to disk BEFORE the DB write (file I/O
@@ -2947,67 +2917,6 @@ struct ComposeView: View {
             onAdmissionFailure: {
                 sendError = "This draft couldn't be saved to your Drafts folder. Your message is still here — tap Save to try again."
             })
-    }
-
-    /// nil = save normally. Otherwise the server copy changed or is gone.
-    private static func serverChangeBeforeSave(_ draft: Draft) async -> DraftServerCheck? {
-        guard let provider = await AccountManager.shared.provider(accountId: draft.accountId),
-              let identity = DraftStore.priorIdentity(
-                  for: draft, runtimeKind: AccountManager.draftRuntimeIdentityKind(for: provider)),
-              identity.isSharedWithOtherApps else {
-            return nil
-        }
-        let current: String?
-        do {
-            current = try await withTimeout(seconds: DraftServerCheckConfig.checkTimeoutSeconds) {
-                try await provider.fetchDraftCopy(identity: identity).map(DraftServerText.of)
-            }
-        } catch {
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[ComposeView] Save-time server check for draftId=\(draft.id) could not run (\(error)) — saving locally; the upload checks again")
-            }
-            return nil
-        }
-        let check = DraftServerCheck.compare(base: draft.serverDraftText, current: current)
-        return check == .unchanged ? nil : check
-    }
-
-    /// Apply the user's answer to the Save-time "changed in another app" prompt.
-    private func resolveServerChangeOnSave(
-        _ pending: ServerChangeOnSave,
-        choice: ServerChangedOnSaveAlert.Choice
-    ) async {
-        let capDraftId = draftId
-        let epoch = pending.instanceEpoch
-        do {
-            switch choice {
-            case .overwrite:
-                if case .changed(let serverText) = pending.check {
-                    _ = try await AppDatabase.dbPool.write { db in
-                        try DraftStore.rebaseOnServerText(
-                            draftId: capDraftId, expectedInstanceEpoch: epoch,
-                            serverText: serverText, db: db)
-                    }
-                }
-                await saveDraftAndDismiss(skipServerCheck: true)
-            case .saveAsNew:
-                _ = try await AppDatabase.dbPool.write { db in
-                    try DraftStore.detachFromServerCopy(
-                        draftId: capDraftId, expectedInstanceEpoch: epoch, db: db)
-                }
-                await saveDraftAndDismiss(skipServerCheck: true)
-            case .reload:
-                // Drop this device's edits and close. The next open sees the server
-                // copy changed and reloads the other app's version.
-                _ = try await AppDatabase.dbPool.write { db in
-                    try DraftStore.discardUnsentEditsForReload(
-                        draftId: capDraftId, expectedInstanceEpoch: epoch, db: db)
-                }
-                dismiss()
-            }
-        } catch {
-            sendError = "Couldn't save this draft — the database was busy. Try again in a moment."
-        }
     }
 
     private func discardDraftAndDismiss() async {
@@ -3847,81 +3756,12 @@ private struct DiscardUnsavedEditsAlert: ViewModifier {
     }
 }
 
-/// #217 (ADR-IOS-091): what Save found on the server.
-struct ServerChangeOnSave: Equatable {
-    let check: DraftServerCheck
-    let instanceEpoch: String
-}
-
-/// #217 (ADR-IOS-091): opening a draft with unsent edits found that another app
-/// changed its server copy. Holds the paused load's continuation; each button
-/// resumes it exactly once (the alert's dismissal only clears the state).
-struct ServerChangeOnOpen {
-    let answer: CheckedContinuation<ExternalDraftAdoption.ServerChangeChoice?, Never>
-}
-
-private struct ServerChangedOnOpenAlert: ViewModifier {
-    @Binding var question: ServerChangeOnOpen?
-
-    func body(content: Content) -> some View {
-        let presented = Binding(
-            get: { question != nil },
-            set: { if !$0 { question = nil } }
-        )
-        return content.alert("Draft Changed Elsewhere", isPresented: presented, presenting: question) { value in
-            Button("Overwrite") { value.answer.resume(returning: .overwrite) }
-            Button("Reload", role: .destructive) { value.answer.resume(returning: .reload) }
-            Button("Save as New") { value.answer.resume(returning: .saveAsNew) }
-            Button("Cancel", role: .cancel) { value.answer.resume(returning: nil) }
-        } message: { _ in
-            Text("This draft was edited in another app while your changes here were waiting to upload. Overwrite replaces that version with yours, Reload opens the other version and discards your changes, and Save as New keeps both.")
-        }
-    }
-}
-
-/// Covers the compose while a saved draft is checked against its server copy.
+/// Covers the compose while a saved draft reloads its server copy.
 private struct ServerCopyCheckCover: View {
     var body: some View {
         Color(.systemBackground)
             .ignoresSafeArea()
             .overlay { ProgressView("Loading draft...") }
-    }
-}
-
-/// #217 (ADR-IOS-091): Save found that another app changed (or removed) the server
-/// copy. The user chooses; Cancel keeps the compose open with nothing written. Its
-/// own `ViewModifier` for the type-checker reason `DiscardUnsavedEditsAlert` gives.
-private struct ServerChangedOnSaveAlert: ViewModifier {
-    typealias Choice = ExternalDraftAdoption.ServerChangeChoice
-
-    @Binding var pending: ServerChangeOnSave?
-    let onChoice: (ServerChangeOnSave, Choice) -> Void
-
-    func body(content: Content) -> some View {
-        let presented = Binding(
-            get: { pending != nil },
-            set: { if !$0 { pending = nil } }
-        )
-        let current = pending
-        return content.alert(title(current), isPresented: presented, presenting: current) { value in
-            if case .changed = value.check {
-                Button("Overwrite") { onChoice(value, .overwrite) }
-                Button("Reload", role: .destructive) { onChoice(value, .reload) }
-            }
-            Button("Save as New") { onChoice(value, .saveAsNew) }
-            Button("Cancel", role: .cancel) { }
-        } message: { value in
-            if case .changed = value.check {
-                Text("This draft was edited in another app. Overwrite replaces that version with yours, Reload discards your changes and shows the other version next time you open it, and Save as New keeps both.")
-            } else {
-                Text("This draft was deleted or replaced in another app. Save as New keeps your version as a new draft.")
-            }
-        }
-    }
-
-    private func title(_ value: ServerChangeOnSave?) -> String {
-        if case .gone? = value?.check { return "Draft Removed Elsewhere" }
-        return "Draft Changed Elsewhere"
     }
 }
 

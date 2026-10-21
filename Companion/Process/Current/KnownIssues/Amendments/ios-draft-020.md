@@ -82,3 +82,18 @@ Drafts; stale draft on reopen; edited in another app; server revision; `serverDr
 reload; overwrite; save as new; `.serverChanged`; `ExternalDraftAdoption.reload`;
 `LocallyAuthoredDraftOpenAuthority`; v92; `refreshBeforeOpen`; `ServerChangedOnOpenAlert`;
 `serverDraftText`; `fetchDraftCopy`
+
+## Amendment, 2026-10-21 (owner's fourth ruling: last save wins)
+
+Still `resolved`, by a simpler mechanism. The text comparison, the Save and upload checks and the
+Overwrite / Reload / Save as new question above are deleted (ADR-IOS-091 fourth ruling, #233).
+Every open of a Gmail or Outlook draft with no unsent edits (`"pushed"`) now reloads its server
+copy with no comparison (`ExternalDraftAdoption.refreshBeforeOpen`, `reloadsBeforeOpen`), so a
+stale local copy is never shown. A row with unsent edits opens as it is and its next upload
+replaces the server copy (last save wins, `IOS-DRAFT-021`). IMAP is not read at open again: an
+IMAP message never changes in place. Offline, a timeout, a gone copy or an unreadable part opens
+the local row unchanged. A reload never loses content the server holds: draft-copy reads are
+complete (every inline image; IMAP attachment bytes from the proven read) or they throw, and a
+Graph draft update now replaces the server's attachments so the reload brings back what was saved.
+Search terms: last save wins; always reload; `reloadsBeforeOpen`; `ExternalDraftOpenConfig`;
+`completeDraftCopy`; `attachmentData`; `replaceDraftAttachments`; #233.

@@ -54,3 +54,19 @@ edits of items 3 and 4, all of which the owner accepted.
 Drafts; race; check then write; time of check to time of use; last save wins; overwrite;
 `draftRevision`; `serverDraftRevision`; `fetchDraftCopy`; `serverDraftText`; `DraftServerText`;
 `DraftServerCheck`; v92; attachment names only; same-name image swap; rejected recipient entries; leftovers; ENVELOPE rewrite; #229; #230; owner-accepted
+
+## Amendment, 2026-10-21 (owner's fourth ruling): superseded by LAST SAVE WINS (#233)
+
+Items 1 to 4 above described a check that no longer exists; they are preserved as written. The
+owner replaced the whole check with last save wins: *"the first version we have a last save wins
+strategy and [file an issue] tracker that we might overwrite other drafts. Sort of a known defect
+which we put as low priority because it's really just hypothetical."* Tracked as #233 (P4).
+
+**The accepted limitation now:** nothing reads the server copy before Save or the upload, so when
+another app edits the same Gmail, Outlook or IMAP draft while this device holds unsent edits for
+it, this device's next upload replaces that edit, with no warning. A draft with no unsent edits is
+not affected: every open reloads it from the server first (`IOS-DRAFT-020`). Reachability: the
+same draft edited in two apps between two of this device's saves; the owner judges it
+hypothetical. Recoverability is unchanged: the overwritten version was a draft of the same
+message, never a wrong-message mutation or a dropped intention of this device. Items 3 and 4
+(#229, #230) are moot, as is item 2 (the v92 column it names was never released and is gone).

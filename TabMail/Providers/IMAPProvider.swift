@@ -5807,11 +5807,49 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 guard let full = self.buildFullMessageInfo(info: info, message: message) else {
                     throw ProviderError.messageNotFound
                 }
-                return full
+                return try Self.completeDraftCopy(full, message: message)
             }
         } catch is IMAPActionMailboxAbsent {
             return nil
         }
+    }
+
+    /// #217: an adopted draft keeps exactly what its copy carried, so the copy must be
+    /// COMPLETE and come from the one read above: every inline image (no display cap)
+    /// and the decoded bytes of every top-level attachment, keyed by section, so
+    /// adoption never fetches an attachment again without the proven UIDVALIDITY.
+    /// A part that came back without bytes THROWS (retryable), never "absent".
+    nonisolated static func completeDraftCopy(_ full: FullMessageInfo, message: Message) throws -> FullMessageInfo {
+        var partsBySection: [String: MessagePart] = [:]
+        for part in message.parts { partsBySection[part.section.description] = part }
+        var attachmentData: [String: Data] = [:]
+        for attachment in full.attachments where attachment.parentEmlSection == nil {
+            guard let data = partsBySection[attachment.section]?.decodedData() else {
+                throw IMAPDraftCopyIncomplete(section: attachment.section)
+            }
+            attachmentData[attachment.section] = data
+        }
+        var inlineImages: [InlineImage] = []
+        for part in message.parts {
+            guard let rawId = part.contentId else { continue }
+            let contentId = rawId.trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !contentId.isEmpty else { continue }
+            guard let data = part.decodedData() else {
+                throw IMAPDraftCopyIncomplete(section: part.section.description)
+            }
+            inlineImages.append(InlineImage(contentId: contentId, contentType: part.contentType, data: data))
+        }
+        return FullMessageInfo(
+            header: full.header, htmlBody: full.htmlBody, textBody: full.textBody,
+            attachments: full.attachments, inlineImages: inlineImages, icsData: full.icsData,
+            attachmentData: attachmentData)
+    }
+
+    /// A draft-copy part that came back without bytes. Retryable; never "gone".
+    struct IMAPDraftCopyIncomplete: Error {
+        let section: String
     }
 
     /// PORT/SUBTRACT of `v2final.deleteDraftStrong`: retain its UID validation and

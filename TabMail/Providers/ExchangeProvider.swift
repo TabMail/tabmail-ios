@@ -200,6 +200,13 @@ actor ExchangeProvider: EmailProvider {
     }
 
     func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo {
+        try await readMessage(id: id, completeInlineImages: false)
+    }
+
+    /// `completeInlineImages`: read EVERY inline image and throw if one cannot be
+    /// read, instead of rendering's best effort (at most `maxInlineImages`, failures
+    /// skipped). A draft copy needs it: the copy replaces the local draft (#217).
+    private func readMessage(id: String, completeInlineImages: Bool) async throws -> FullMessageInfo {
         let selection = ExchangeGraphMessageRequest.fetchMessage.selection
         let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
         let data = try await request(path: "/messages/\(encodedId)?\(selection.queryParameter)")
@@ -232,12 +239,13 @@ actor ExchangeProvider: EmailProvider {
                     .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !cid.isEmpty, hasCidRefs else { continue }
-                guard inlineImages.count < SyncConfig.maxInlineImages else { continue }
+                guard completeInlineImages || inlineImages.count < SyncConfig.maxInlineImages else { continue }
                 do {
                     let data = try await fetchAttachment(messageId: id, attachmentId: att.id)
                     inlineImages.append(InlineImage(contentId: cid, contentType: ct, data: data))
                 } catch {
                     if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Failed to fetch inline image \(cid): \(error)") }
+                    if completeInlineImages { throw error }
                 }
                 continue
             }
@@ -973,17 +981,23 @@ actor ExchangeProvider: EmailProvider {
         let message = buildGraphSendPayload(draft: draft)
 
         if let existingId = existingDraftId {
-            // Update existing draft via PATCH
-            let jsonData = try JSONSerialization.data(withJSONObject: message)
+            // Update the existing draft. Graph's message PATCH cannot change
+            // attachments (they are not an updatable property), so the PATCH goes
+            // without them and the attachments are replaced through the message's
+            // attachments collection. The server copy then holds exactly this draft,
+            // so reopening it, which loads the server copy, never drops a file added
+            // here (#217).
+            var patch = message
+            patch.removeValue(forKey: "attachments")
+            let jsonData = try JSONSerialization.data(withJSONObject: patch)
             let encodedExistingId = try Self.encodedGraphPathSegment(
                 existingId, context: "Graph draft message id"
             )
             let response = try await request(path: "/messages/\(encodedExistingId)", method: "PATCH", body: jsonData)
-            if let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
-               let msgId = dict["id"] as? String {
-                return .created(.outlook(graphId: msgId))
-            }
-            return .created(.outlook(graphId: existingId))
+            let graphId = (try? JSONSerialization.jsonObject(with: response) as? [String: Any])?["id"] as? String
+                ?? existingId
+            try await replaceDraftAttachments(graphId: graphId, with: draft.attachments)
+            return .created(.outlook(graphId: graphId))
         } else {
             // Create new draft in Drafts folder
             let jsonData = try JSONSerialization.data(withJSONObject: message)
@@ -1004,7 +1018,29 @@ actor ExchangeProvider: EmailProvider {
         let encodedId = try Self.encodedGraphPathSegment(graphId, context: "Graph draft message id")
         let probe = try await authedHTTP.requestAllowing404(url: baseURL + "/messages/\(encodedId)?$select=id")
         if probe.statusCode == 404 { return nil }
-        return try await fetchMessage(id: graphId, folder: "")
+        return try await readMessage(id: graphId, completeInlineImages: true)
+    }
+
+    /// Make the draft's attachments exactly `attachments`: delete every current one,
+    /// then add each. A failure part-way throws, and the retried save runs it again
+    /// from the start.
+    private func replaceDraftAttachments(graphId: String, with attachments: [DraftAttachment]) async throws {
+        let encodedId = try Self.encodedGraphPathSegment(graphId, context: "Graph draft message id")
+        let listData = try await request(path: "/messages/\(encodedId)/attachments?$select=id")
+        let current = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: listData)
+        for attachment in current.value {
+            let encodedAttachmentId = try Self.encodedGraphPathSegment(
+                attachment.id, context: "Graph attachment id")
+            _ = try await request(
+                path: "/messages/\(encodedId)/attachments/\(encodedAttachmentId)", method: "DELETE")
+        }
+        for attachment in attachments {
+            let body = try JSONSerialization.data(withJSONObject: Self.graphFileAttachment(attachment))
+            _ = try await request(path: "/messages/\(encodedId)/attachments", method: "POST", body: body)
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Exchange] saveDraft: replaced \(current.value.count) attachment(s) with \(attachments.count)")
+        }
     }
 
     func deleteDraft(identity: DraftDeleteIdentity) async throws {
@@ -1346,7 +1382,7 @@ actor ExchangeProvider: EmailProvider {
     /// ⚠ NEGATIVE CASE, because `fatalError` is an absolute and an unqualified one
     /// would be `MIS-019`: `fatalError` is correct HERE because the condition is a
     /// PROGRAMMER error unreachable by construction — every call site in this file
-    /// passes a string literal (`"POST"`, `"PATCH"`, and the `"GET"` default), there
+    /// passes a string literal (`"POST"`, `"PATCH"`, `"DELETE"`, and the `"GET"` default), there
     /// is no computed verb, and `deleteDraft`'s `DELETE` bypasses this switch
     /// entirely via `performHTTPRequest` with an absolute `url:`. It must NOT be
     /// widened into a runtime trap for conditions that are genuinely reachable —
@@ -1574,17 +1610,19 @@ actor ExchangeProvider: EmailProvider {
 
         // Attachments
         if !draft.attachments.isEmpty {
-            message["attachments"] = draft.attachments.map { att in
-                [
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": att.filename,
-                    "contentType": att.mimeType,
-                    "contentBytes": att.data.base64EncodedString(),
-                ] as [String: Any]
-            }
+            message["attachments"] = draft.attachments.map(Self.graphFileAttachment)
         }
 
         return message
+    }
+
+    nonisolated static func graphFileAttachment(_ attachment: DraftAttachment) -> [String: Any] {
+        [
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": attachment.filename,
+            "contentType": attachment.mimeType,
+            "contentBytes": attachment.data.base64EncodedString(),
+        ]
     }
 
     // MARK: - Query Helpers

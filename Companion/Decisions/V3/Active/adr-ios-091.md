@@ -119,3 +119,46 @@ all for providers either."*
 - **Accepted limitations (owner 2026-10-21):** attachments compare by name only (#229), and
   recipient text that is no address is not compared, because IMAP servers rewrite it in the
   summary we read (#230). Both are recorded in `IOS-DRAFT-021`.
+
+**Amendment (2026-10-21, owner's fourth ruling, after tier-1 review round 1): LAST SAVE WINS; the
+change check is removed.** The second and third rulings' check (compare the server copy before
+Save and before every upload; ask Overwrite / Reload / Save as new) is superseded; the text above
+is preserved as written. Owner: *"the first version we have a last save wins strategy and [file an
+issue] tracker that we might overwrite other drafts. Sort of a known defect which we put as low
+priority because it's really just hypothetical."* (dictated; "file an issue" transcribed as
+"file init") Filed as #233 (P4); `IOS-DRAFT-021` records it.
+
+Why: the review round found four of its five code defects in the check itself. A text comparison
+assumes the server stores exactly what was sent, and it does not: IMAP rewrites recipient text that
+is no address, Graph's message PATCH does not update attachments, inline-image reads skipped
+failures and capped the count, and this device's own in-flight upload read as another app's edit.
+Every mismatch became a false "edited elsewhere", for a race the owner judges hypothetical.
+
+- **Save and upload:** no read, no prompt. The upload replaces whatever the server holds.
+  `pushDraftToServer` no longer returns `.serverChanged`; `Draft.serverDraftText`, migration
+  `v92_addDraftServerText` (never released; a dev database that applied it keeps an unused column
+  and an applied identifier GRDB ignores), `DraftServerText`, `DraftServerCheck`,
+  `DraftDeleteIdentity.isSharedWithOtherApps`, the Overwrite / Reload / Save as new alerts and the
+  rebase, detach and discard-for-reload writers are deleted. Send still does not check.
+- **Open:** `ExternalDraftAdoption.refreshBeforeOpen` reloads a Gmail or Outlook row with no unsent
+  edits (`"pushed"`) from its server copy on every open, with no comparison
+  (`ExternalDraftAdoption.reloadsBeforeOpen`). The whole read, attachments included, is bounded by
+  `ExternalDraftOpenConfig.reloadTimeoutSeconds`; attachment files are written only after the read
+  returns, so a timed-out read leaves nothing behind. Offline, a timeout, a gone copy, a part that
+  could not be read or a row that changed meanwhile (the `applyReload` CAS) opens the local row as
+  it is. A row with unsent edits (`"dirty"`, `"pushing"`, never uploaded) opens as it is and its
+  next upload wins. IMAP is not read at open: an IMAP message never changes in place, so another
+  app's edit is a new UID, opened by adoption. Demo drafts are never read back.
+- **A reload must never lose what the server holds**, because the next save uploads the reloaded
+  row: a draft-copy read is COMPLETE or it throws. Gmail and Graph read every inline image (no
+  `BodyRenderer.maxInlineImages` cap) and a failed image fetch throws (the draft-copy half of #227;
+  rendering keeps its best effort). IMAP returns every inline image and the decoded bytes of every
+  top-level attachment from the one read made under the proven UIDVALIDITY
+  (`IMAPProvider.completeDraftCopy`, `FullMessageInfo.attachmentData`), so adoption never fetches
+  an attachment again by UID without that proof; a part that came back without bytes throws.
+- **A save makes the server copy equal the local draft.** Graph's message PATCH cannot change
+  attachments, so `ExchangeProvider.saveDraft`'s update PATCHes without them and then replaces the
+  set through `/messages/{id}/attachments` (list, DELETE each, POST each local file); a failure
+  throws and the retried upload runs the replacement again from the start. Gmail and IMAP already
+  replace the whole message.
+- Moot with the check: #229 and #230 (closed as not planned, pointing to #233).

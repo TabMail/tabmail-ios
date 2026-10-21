@@ -415,7 +415,6 @@ actor MockEmailProvider: EmailProvider {
         callLog.append("saveDraft(existingIdentity:\(String(describing: existingIdentity)),draftsFolderPath:\(draftsFolderPath))")
         if let saveDraftHook { await saveDraftHook() }
         if let error = saveDraftThrows { throw error }
-        lastSavedDraft = draft
         return saveDraftResult
     }
 
@@ -424,40 +423,25 @@ actor MockEmailProvider: EmailProvider {
     }
 
     /// #217 server read. Recorded apart from `callLog` so existing exact-log
-    /// assertions are unaffected. Unless overridden, the server holds exactly what
-    /// this mock's last successful `saveDraft` received (an empty draft before
-    /// any), so a row this mock pushed reads as UNCHANGED and a row with no copy of
-    /// the server text (nil) is no evidence either way.
+    /// assertions are unaffected.
     var fetchDraftCopyLog: [DraftDeleteIdentity] = []
-    /// The server copy; `.success(nil)` = the draft is gone.
-    var draftCopyOverride: Result<FullMessageInfo?, any Error>?
-    var lastSavedDraft: DraftMessage?
+    /// The server copy; nil (the default) and `.success(nil)` = the draft is gone.
+    var draftCopyResult: Result<FullMessageInfo?, any Error>?
 
     func setDraftCopy(_ result: Result<FullMessageInfo?, any Error>?) {
-        draftCopyOverride = result
+        draftCopyResult = result
     }
 
     func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
         fetchDraftCopyLog.append(identity)
-        if let draftCopyOverride { return try draftCopyOverride.get() }
-        return heldDraftCopy
+        return try draftCopyResult?.get() ?? nil
     }
 
-    /// The copy the server holds after this mock's last successful `saveDraft`.
-    /// A test that hands the next push to a different mock passes this on with
-    /// `setDraftCopy`, so both mocks model the same server.
-    var heldDraftCopy: FullMessageInfo {
-        let saved = lastSavedDraft
-        return Self.draftCopy(
-            subject: saved?.subject ?? "", to: saved?.to ?? [], cc: saved?.cc ?? [],
-            bcc: saved?.bcc ?? [], html: saved?.body ?? "",
-            attachmentNames: saved?.attachments.map(\.filename) ?? [])
-    }
-
-    /// A server draft copy as a provider's read returns it.
+    /// A server draft copy as a provider's read returns it. `attachmentData` set =
+    /// the read carried each attachment's bytes (IMAP), keyed by `mock-att-<index>`.
     static func draftCopy(
         subject: String, to: [String], cc: [String], bcc: [String] = [], html: String,
-        attachmentNames: [String] = []
+        attachmentNames: [String] = [], attachmentData: [String: Data]? = nil
     ) -> FullMessageInfo {
         let header = MessageHeaderInfo(
             messageId: "mock-draft-copy", rfc822MessageId: nil, inReplyTo: nil,
@@ -474,7 +458,9 @@ actor MockEmailProvider: EmailProvider {
                 filename: name, contentType: "application/octet-stream",
                 section: "mock-att-\(index)", size: 0, encoding: nil)
         }
-        return FullMessageInfo(header: header, htmlBody: html, textBody: nil, attachments: attachments)
+        return FullMessageInfo(
+            header: header, htmlBody: html, textBody: nil, attachments: attachments,
+            attachmentData: attachmentData)
     }
 
     // MARK: - Test Helpers
