@@ -132,7 +132,7 @@ struct ComposeAttachmentCarryTests {
     @Test("Explicit Save claims the compose before waiting for attachment carry")
     func explicitSaveClaimsBeforeCarryWait() throws {
         let body = try functionBody(
-            "private func saveDraftAndDismiss() async {",
+            "private func saveDraftAndDismiss(skipServerCheck: Bool = false) async {",
             before: "private func discardDraftAndDismiss() async {",
             in: composeSource())
         let claim = try #require(body.range(of: "isSavingDraft = true"))
@@ -167,7 +167,7 @@ struct ComposeAttachmentCarryTests {
     @Test("Explicit Save arbitrates with an already-running compose-agent edit")
     func explicitSaveClaimsAgentDispositionBeforeSnapshot() throws {
         let body = try functionBody(
-            "private func saveDraftAndDismiss() async {",
+            "private func saveDraftAndDismiss(skipServerCheck: Bool = false) async {",
             before: "private func discardDraftAndDismiss() async {",
             in: composeSource())
         let claim = try #require(body.range(of: "agentSendFence.claimExclusiveDisposition()"))

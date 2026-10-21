@@ -61,7 +61,7 @@ struct ComposeSuggestionPersistTests {
     @Test("Production Save adopts the visible suggestion after its fence and before any suspension or snapshot")
     func productionSaveWiresSuggestionAcceptanceBeforeSnapshot() throws {
         let body = try functionBody(
-            "private func saveDraftAndDismiss() async {",
+            "private func saveDraftAndDismiss(skipServerCheck: Bool = false) async {",
             before: "private func discardDraftAndDismiss() async {",
             in: composeSource())
         let claim = try #require(body.range(of: "agentSendFence.claimExclusiveDisposition()"))

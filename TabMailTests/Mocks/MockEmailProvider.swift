@@ -440,6 +440,13 @@ actor MockEmailProvider: EmailProvider {
     func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
         fetchDraftCopyLog.append(identity)
         if let draftCopyOverride { return try draftCopyOverride.get() }
+        return heldDraftCopy
+    }
+
+    /// The copy the server holds after this mock's last successful `saveDraft`.
+    /// A test that hands the next push to a different mock passes this on with
+    /// `setDraftCopy`, so both mocks model the same server.
+    var heldDraftCopy: FullMessageInfo {
         let saved = lastSavedDraft
         return Self.draftCopy(
             subject: saved?.subject ?? "", to: saved?.to ?? [], cc: saved?.cc ?? [],
