@@ -345,4 +345,19 @@ serializer that writes recipients:
   the pure mirror `07163dc`; upstream has moved (8 commits to `017693c` as of 2026-10-17), so the
   upstream PR branch is the same commit rebased onto upstream main. When upstream merges it, resync
   with `tabmail-swiftmailfork-sync` and re-pin to the mirror.
+- **Resync after #263 (2026-10-20)**: upstream squash-merged #263 as `018ca90` with the same tree as our
+  PR head `fe965e2`. Fork `main` fast-forwarded from `07163dc` to `018ca90`: a pure mirror again, with no
+  deviations. The app and NSE pin moved from `9b48bdeb` to `018ca90`, which also brings in upstream
+  #250 to #261. Collision check, all clear:
+  - #256 raises the SMTP greeting, EHLO and STARTTLS defaults to minutes. `IMAPProvider.send` is still
+    capped by `SyncConfig.smtpSendTimeoutSeconds` (30 s) through `withTimeout`. SwiftMail now honours
+    cancellation, so a send that times out no longer keeps running after the outbox has recorded the
+    timeout.
+  - #253 pins swift-nio-imap to the main revision containing #849. The decoder's line cap becomes
+    `responseBufferLimit` (4 MB from `IMAPFetchMapping`) instead of 8 KiB. `PayloadTooLargeError`
+    handling still applies above 4 MB, and lines between 8 KiB and 4 MB now succeed. This settles the
+    "wait for an NIO IMAP release" note above, as far as adoption goes; #103/#74 stay parked.
+  - The package floor is now iOS 18; the app targets 26.
+  - #250 and #258 change only PARTIAL and SORT planning. The app never passes `partialRange` or a sort.
+  - #251 and #257 are additive APIs. #254 changes how filenames are parsed. #259 keeps the 10 s default.
 
