@@ -496,6 +496,8 @@ struct DraftCopyReadTests {
              "receivedDateTime":"\(received)","isRead":true,"hasAttachments":false,
              "body":{"contentType":"html","content":"<html><body><p>Meet on Monday</p></body></html>"}}
             """))
+        // Reading a Graph message always lists its attachments too.
+        http.register(path: "/messages/g1/attachments", method: "GET", response: .json(raw: #"{"value":[]}"#))
         http.register(path: "/messages/g404", method: "GET", response: .status(404))
         let provider = ExchangeProvider(
             userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)

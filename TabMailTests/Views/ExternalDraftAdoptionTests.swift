@@ -35,7 +35,7 @@ struct ExternalDraftAdoptionTests {
             db,
             messageId: headerUid,
             subject: "Started elsewhere",
-            to: "Alice <alice@example.com>, bob@example.com",
+            to: "\"Doe, Alice\" <alice@example.com>, bob@example.com",
             folderId: folder.id,
             accountId: Self.accountId,
             folderPath: Self.draftsPath,
@@ -90,7 +90,12 @@ struct ExternalDraftAdoptionTests {
         let row = try db.read { try Draft.fetchOne($0, key: draftId ?? "") }
         #expect(row?.serverPushStatus == "pushed",
                 "an adopted row IS the server copy — 'dirty' would claim an edit nobody made")
-        #expect(row?.toArray == ["alice@example.com", "bob@example.com"])
+        // Each recipient keeps its name, and a comma inside a quoted name is part
+        // of the name (ADR-IOS-092).
+        let to = RecipientEntry(row?.toArray ?? [])
+        #expect(to.recipients == [.init(address: "alice@example.com", name: "Doe, Alice"),
+                                  .init(address: "bob@example.com", name: nil)])
+        #expect(to.leftovers.isEmpty)
         #expect(row?.ccArray == ["carol@example.com"])
         #expect(row?.subject == "Started elsewhere")
         #expect(row?.body == "Hello from the other app")

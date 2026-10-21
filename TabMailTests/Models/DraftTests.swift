@@ -46,64 +46,6 @@ struct DraftKeyTests {
     }
 }
 
-// MARK: - Draft parseRecipients Tests
-
-@Suite("Draft.parseRecipients Extended")
-struct DraftParseRecipientsExtendedTests {
-
-    @Test("Empty string returns empty array")
-    func emptyString() {
-        let result = Draft.parseRecipients("")
-        #expect(result.isEmpty)
-    }
-
-    @Test("Single email address")
-    func singleEmail() {
-        let result = Draft.parseRecipients("alice@example.com")
-        #expect(result == ["alice@example.com"])
-    }
-
-    @Test("Multiple comma-separated emails")
-    func multipleEmails() {
-        let result = Draft.parseRecipients("alice@company.com, bob@company.com, carol@company.com")
-        #expect(result.count == 3)
-        #expect(result[0] == "alice@company.com")
-        #expect(result[1] == "bob@company.com")
-        #expect(result[2] == "carol@company.com")
-    }
-
-    @Test("Angle bracket format extracts email")
-    func angleBracketFormat() {
-        let result = Draft.parseRecipients("Alice Smith <alice@company.com>")
-        #expect(result == ["alice@company.com"])
-    }
-
-    @Test("Mixed format with angle brackets and bare emails")
-    func mixedFormat() {
-        let result = Draft.parseRecipients("Alice <alice@company.com>, bob@company.com, Carol D <carol@company.com>")
-        #expect(result.count == 3)
-        #expect(result[0] == "alice@company.com")
-        #expect(result[1] == "bob@company.com")
-        #expect(result[2] == "carol@company.com")
-    }
-
-    @Test("Commas inside angle brackets are not split")
-    func commaInAngleBrackets() {
-        // This is an edge case — a comma inside angle brackets should not split
-        let result = Draft.parseRecipients("\"Last, First\" <user@company.com>")
-        #expect(result.count == 1)
-        #expect(result[0] == "user@company.com")
-    }
-
-    @Test("Whitespace is trimmed")
-    func whitespace() {
-        let result = Draft.parseRecipients("  alice@company.com  ,  bob@company.com  ")
-        #expect(result.count == 2)
-        #expect(result[0] == "alice@company.com")
-        #expect(result[1] == "bob@company.com")
-    }
-}
-
 // MARK: - Draft JSON Helpers
 
 @Suite("Draft JSON Helpers")

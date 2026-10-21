@@ -503,56 +503,6 @@ struct EvictionEdgeCaseTests {
     }
 }
 
-// MARK: - Draft.parseRecipients
-
-@Suite("Draft.parseRecipients")
-struct DraftParseRecipientsTests {
-
-    @Test("Simple comma-separated emails")
-    func simpleComma() {
-        let result = Draft.parseRecipients("alice@company.com, bob@company.com")
-        #expect(result == ["alice@company.com", "bob@company.com"])
-    }
-
-    @Test("Angle-bracket format extracts bare email")
-    func angleBracket() {
-        let result = Draft.parseRecipients("Alice <alice@company.com>, Bob <bob@company.com>")
-        #expect(result == ["alice@company.com", "bob@company.com"])
-    }
-
-    @Test("Mixed format")
-    func mixed() {
-        let result = Draft.parseRecipients("alice@company.com, Bob <bob@company.com>")
-        #expect(result == ["alice@company.com", "bob@company.com"])
-    }
-
-    @Test("Name with comma in display name")
-    func commaInName() {
-        let result = Draft.parseRecipients("\"Last, First\" <alice@company.com>, bob@company.com")
-        // The comma inside quotes is tricky but angle-bracket parsing handles it
-        // because <alice@company.com> protects the address
-        #expect(result.count == 2)
-        #expect(result[1] == "bob@company.com")
-        #expect(result[0] == "alice@company.com")
-    }
-
-    @Test("Single email")
-    func single() {
-        #expect(Draft.parseRecipients("alice@company.com") == ["alice@company.com"])
-    }
-
-    @Test("Empty string")
-    func empty() {
-        #expect(Draft.parseRecipients("").isEmpty)
-    }
-
-    @Test("Whitespace handling")
-    func whitespace() {
-        let result = Draft.parseRecipients("  alice@company.com  ,  bob@company.com  ")
-        #expect(result == ["alice@company.com", "bob@company.com"])
-    }
-}
-
 // MARK: - Draft attachment storage
 
 @Suite("DraftAttachmentStorage")
@@ -1694,7 +1644,7 @@ struct ServerDraftComposeRoutingTests {
         try db.write { try draft.insert($0) }
 
         let fetched = try db.read { try MessageHeader.fetchOne($0, key: "acc1:Drafts:draft5") }
-        let recipients = Draft.parseRecipients(fetched!.to)
+        let recipients = RecipientEntry(fetched!.to).addresses
         #expect(recipients == ["alice@company.com", "bob@company.com"])
     }
 }

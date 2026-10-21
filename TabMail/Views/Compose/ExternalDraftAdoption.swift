@@ -214,9 +214,9 @@ enum ExternalDraftAdoption {
         var draft = Draft(
             id: id,
             accountId: header.accountId,
-            toJSON: Draft.encodeStringArray(Draft.parseRecipients(header.to)),
-            ccJSON: Draft.encodeStringArray(Draft.parseRecipients(header.cc)),
-            bccJSON: Draft.encodeStringArray(Draft.parseRecipients(header.bcc)),
+            toJSON: Draft.encodeStringArray(RecipientEntry(header.to).draftEntries),
+            ccJSON: Draft.encodeStringArray(RecipientEntry(header.cc).draftEntries),
+            bccJSON: Draft.encodeStringArray(RecipientEntry(header.bcc).draftEntries),
             subject: header.subject,
             body: body,
             replyToId: replyParent?.id,
@@ -305,9 +305,9 @@ enum ExternalDraftAdoption {
             return nil
         }
         let previousDirName = draft.attachmentsDirName
-        draft.toJSON = Draft.encodeStringArray(Draft.parseRecipients(current.to))
-        draft.ccJSON = Draft.encodeStringArray(Draft.parseRecipients(current.cc))
-        draft.bccJSON = Draft.encodeStringArray(Draft.parseRecipients(current.bcc))
+        draft.toJSON = Draft.encodeStringArray(RecipientEntry(current.to).draftEntries)
+        draft.ccJSON = Draft.encodeStringArray(RecipientEntry(current.cc).draftEntries)
+        draft.bccJSON = Draft.encodeStringArray(RecipientEntry(current.bcc).draftEntries)
         draft.subject = current.subject
         draft.body = body
         draft.attachmentsDirName = attachmentsDirName

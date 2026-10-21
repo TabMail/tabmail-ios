@@ -15,7 +15,8 @@ enum DraftServerCheckConfig {
 /// edit:
 /// - subject: whitespace collapsed; the "(no subject)" servers substitute for an
 ///   empty subject counts as empty;
-/// - To / Cc: the bare addresses, lowercased and sorted (display names dropped);
+/// - To / Cc: the addresses `RecipientEntry` reads, lowercased and sorted (display
+///   names and text that is no address dropped);
 /// - body: through the same HTML-to-text conversion on both sides, with every
 ///   whitespace character removed. Only the body is HTML.
 /// Bcc is not compared: TabMail's IMAP and Gmail drafts never carry it to the
@@ -24,8 +25,8 @@ enum DraftServerText {
     /// A draft as this device writes it (`pushDraftToServer` sends this content).
     static func local(subject: String, to: [String], cc: [String], body: String) -> String {
         combine(subject: subject,
-                to: Draft.parseRecipients(to.joined(separator: ", ")),
-                cc: Draft.parseRecipients(cc.joined(separator: ", ")),
+                to: RecipientEntry(to).addresses,
+                cc: RecipientEntry(cc).addresses,
                 bodyHTML: EmailFilter.plainTextToHTML(body))
     }
 
@@ -54,8 +55,8 @@ enum DraftServerText {
             bodyHTML = EmailFilter.plainTextToHTML(text ?? "")
         }
         return combine(subject: subject,
-                       to: Draft.parseRecipients(to),
-                       cc: Draft.parseRecipients(cc),
+                       to: RecipientEntry(to).addresses,
+                       cc: RecipientEntry(cc).addresses,
                        bodyHTML: bodyHTML)
     }
 

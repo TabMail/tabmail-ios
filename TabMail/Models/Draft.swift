@@ -609,41 +609,6 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
 
     /// Whether this draft key represents a reply or forward (vs new compose).
     var isReplyOrForward: Bool { replyToId != nil }
-
-    /// Parse a raw "To" header string into individual email addresses.
-    /// Handles: "alice@co.com, bob@co.com" and "Alice <alice@co.com>, Bob <bob@co.com>".
-    /// Extracts the bare email address from angle-bracket format.
-    static func parseRecipients(_ raw: String) -> [String] {
-        guard !raw.isEmpty else { return [] }
-        // Split on commas that are NOT inside angle brackets or quotes
-        var result: [String] = []
-        var current = ""
-        var inAngleBracket = false
-        var inQuote = false
-        for char in raw {
-            if char == "\"" && !inAngleBracket { inQuote.toggle() }
-            if char == "<" && !inQuote { inAngleBracket = true }
-            if char == ">" && !inQuote { inAngleBracket = false }
-            if char == "," && !inAngleBracket && !inQuote {
-                let trimmed = current.trimmingCharacters(in: .whitespaces)
-                if !trimmed.isEmpty { result.append(extractEmail(from: trimmed)) }
-                current = ""
-            } else {
-                current.append(char)
-            }
-        }
-        let trimmed = current.trimmingCharacters(in: .whitespaces)
-        if !trimmed.isEmpty { result.append(extractEmail(from: trimmed)) }
-        return result
-    }
-
-    /// Extract bare email from "Name <email>" format. Returns as-is if no angle brackets.
-    private static func extractEmail(from token: String) -> String {
-        if let start = token.firstIndex(of: "<"), let end = token.firstIndex(of: ">"), start < end {
-            return String(token[token.index(after: start)..<end])
-        }
-        return token
-    }
 }
 
 // MARK: - Draft Attachment Disk Storage
