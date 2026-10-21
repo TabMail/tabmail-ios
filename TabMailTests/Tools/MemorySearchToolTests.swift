@@ -335,6 +335,33 @@ struct MemorySearchToolTests {
         )
     }
 
+    /// Gives the real and the demo turn a vector each, so the cleanup has all
+    /// three stores to delete from.
+    private func embedRealAndDemo() async {
+        let vector = [Float](repeating: 0.5, count: SearchConfig.embeddingDims)
+        let stored = await MemoryIndex.shared.storeEmbeddings([
+            (chatHistoryId: "real", observedEpoch: 1, embedding: vector),
+            (chatHistoryId: "demo", observedEpoch: 1, embedding: vector),
+        ])
+        #expect(Set(stored.committed) == ["real", "demo"])
+    }
+
+    /// The rowids each memory store holds: the turns, their keyword index and their vectors.
+    private func storeRowids(_ pool: DatabasePool) throws -> [Set<Int64>] {
+        try pool.read { db in
+            try ["memory_meta", "memory_fts", "memory_vec"].map { table in
+                Set(try Int64.fetchAll(db, sql: "SELECT rowid FROM \(table)"))
+            }
+        }
+    }
+
+    /// The rowid of the turn with this id.
+    private func rowid(of chatHistoryId: String, _ pool: DatabasePool) throws -> Int64 {
+        try #require(try pool.read { db in
+            try Int64.fetchOne(db, sql: "SELECT rowid FROM memory_meta WHERE chatHistoryId = ?", arguments: [chatHistoryId])
+        })
+    }
+
     /// Demo turns the demo's cleanup removes are gone from memory_search for good,
     /// though a listing had kept them: the next demo lists none of them, from the
     /// kept listing or afresh, and real history stays.
@@ -348,6 +375,10 @@ struct MemorySearchToolTests {
             _ = try await ChatStore.shared.appendTurn(chatTurn(id: "real", sessionId: "s", dateMs: base + 3_600_000, text: "budget real_history_marker"))
             _ = try await ChatStore.shared.appendTurn(chatTurn(id: "demo", sessionId: "demo:a", dateMs: base, text: "budget demo_history_marker"))
             #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real", "demo"])
+            await embedRealAndDemo()
+            let realRow = try rowid(of: "real", memPool)
+            let demoRow = try rowid(of: "demo", memPool)
+            #expect(try storeRowids(memPool) == Array(repeating: [realRow, demoRow], count: 3))
             let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
 
             try await withDemoActive(true) {
@@ -363,6 +394,8 @@ struct MemorySearchToolTests {
                 try await DemoModeService.purgeOrphanedDemoData()
             }
             #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real"])
+            // The demo turn is deleted from every store, its text and vector too.
+            #expect(try storeRowids(memPool) == Array(repeating: [realRow], count: 3))
 
             try await withDemoActive(true) {
                 let kept = try await tool.execute(arguments: arguments)
@@ -389,6 +422,10 @@ struct MemorySearchToolTests {
             _ = try await ChatStore.shared.appendTurn(chatTurn(id: "real", sessionId: "s", dateMs: base + 3_600_000, text: "budget real_history_marker"))
             _ = try await ChatStore.shared.appendTurn(chatTurn(id: "demo", sessionId: "demo:a", dateMs: base, text: "budget demo_history_marker"))
             #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real", "demo"])
+            await embedRealAndDemo()
+            let realRow = try rowid(of: "real", memPool)
+            let demoRow = try rowid(of: "demo", memPool)
+            #expect(try storeRowids(memPool) == Array(repeating: [realRow, demoRow], count: 3))
             let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
             try await withDemoActive(true) {
                 let warmed = try await tool.execute(arguments: arguments)
@@ -402,6 +439,7 @@ struct MemorySearchToolTests {
                 await #expect(throws: DemoError.self) { try await DemoModeService.shared.activate() }
                 #expect(await MainActor.run { DemoModeStore.shared.isActive } == false, "the demo stayed off")
                 #expect(await MemoryIndex.shared.knownChatHistoryIds().contains("demo"), "the wipe really failed")
+                #expect(try storeRowids(memPool) == Array(repeating: [realRow, demoRow], count: 3), "a failed wipe deletes nothing")
                 try await memPool.write { db in try db.execute(sql: "DROP TRIGGER refuse_demo_wipe") }
             }
 
@@ -410,6 +448,7 @@ struct MemorySearchToolTests {
             await MainActor.run { DemoModeStore.shared.isActive = false }
             #expect(active)
             #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real"])
+            #expect(try storeRowids(memPool) == Array(repeating: [realRow], count: 3))
 
             try await withDemoActive(true) {
                 let kept = try await tool.execute(arguments: arguments)
@@ -541,6 +580,44 @@ struct MemorySearchToolTests {
             #expect(result.contains("real_history_marker"))
             #expect(!result.contains("demo_history_marker"))
             await waitFor(held.finished)
+        }
+        let kept = try await tool.execute(arguments: arguments)
+        #expect(kept.contains("real_history_marker"))
+        #expect(!kept.contains("demo_history_marker"))
+    }
+
+    /// A search waiting on the page cache while demo mode starts keeps the mode it
+    /// began in too: it shows real history only, and so does its kept listing,
+    /// while the demo's own search shows the demo's.
+    @Test("A search waiting on the cache keeps the mode it began in", arguments: ["", "budget"])
+    func cacheWaitKeepsItsMode(query: String) async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        let base = noonUTCThreeDaysAgo()
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base, text: "budget real_history_marker")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base + 3_600_000, text: "budget demo_history_marker")
+
+        // The cache is busy, so the search waits on it after reading the mode.
+        let held = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let busy = Task.detached { await MemorySearchCache.shared._testHold(held: held, release: release) }
+        await waitFor(held)
+        let tool = try makeTool()
+        let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
+        let waiting = Task { try await tool.execute(arguments: arguments) }
+        // Long enough for it to have read the mode and be waiting on the cache.
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+
+        try await withDemoActive(true) {
+            release.signal()
+            await busy.value
+            let result = try await waiting.value
+            #expect(result.contains("real_history_marker"))
+            #expect(!result.contains("demo_history_marker"))
+            let demo = try await tool.execute(arguments: arguments)
+            #expect(demo.contains("demo_history_marker"))
+            #expect(!demo.contains("real_history_marker"))
         }
         let kept = try await tool.execute(arguments: arguments)
         #expect(kept.contains("real_history_marker"))
@@ -806,5 +883,13 @@ struct MemorySearchToolTests {
     func toolName() throws {
         let tool = try makeTool()
         #expect(tool.name == "memory_search")
+    }
+}
+
+extension MemorySearchCache {
+    /// Keeps the cache busy until `release`; `held` signals once it is.
+    func _testHold(held: DispatchSemaphore, release: DispatchSemaphore) {
+        held.signal()
+        release.wait()
     }
 }
