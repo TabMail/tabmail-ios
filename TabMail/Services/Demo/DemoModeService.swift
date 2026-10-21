@@ -10,7 +10,8 @@ import GRDB
 /// Entry sequence (`start`):
 /// 1. Mark `startInProgress = true` to disable the login button.
 /// 2. POST /demo/start → mint a demo JWT, store in Keychain (`demo_session`).
-/// 3. Wipe any leftover demo rows defensively.
+/// 3. Wipe any leftover demo rows defensively; if the leftover demo memory
+///    turns can't be deleted, stay off and throw.
 /// 4. Set `DemoModeStore.isActive = true`.
 ///
 /// Note: seeding (pre-baked AI cache) and provider injection happen
@@ -53,20 +54,23 @@ final class DemoModeService {
             throw DemoError.startFailed(reason)
         }
 
-        // Defensive wipe of any leftover demo rows from a previous session
-        // that exited badly.
-        await AccountFieldPersistenceStore.production.discardAccount(DemoSeed.demoAccountId)
-        if let db = AppDatabase.shared.withLock({ $0 }) {
-            do {
-                try await db.dbPool.write { conn in try DemoSeed.wipe(conn) }
-            } catch {
-                // The old row is still authoritative when the transaction rolls
-                // back. It will be discarded again before completeSetup seeds.
-                AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[DemoMode] start(): defensive GRDB wipe failed: \(error)")
-                }
-            }
+        try await activate()
+    }
+
+    /// The minted half of `start`: wipe what an earlier demo left, then turn the
+    /// demo on. The wipe covers anything a session that exited badly left
+    /// behind, its memory turns included (the launch wipe after a force-quit
+    /// clears the main database only). If those turns can't be deleted the demo
+    /// stays off and this throws, as a failed mint does: a demo running over them
+    /// would find the earlier demo's conversations in memory_search.
+    func activate() async throws {
+        let store = DemoModeStore.shared
+        do {
+            try await Self.purgeOrphanedDemoData()
+        } catch {
+            DemoTokenManager.clearSession()
+            BackgroundSyncLogger.logDebug("[DemoMode] start(): leftover demo memory not wiped: \(error)")
+            throw DemoError.startFailed("Demo not available right now.")
         }
 
         store.isActive = true
@@ -200,8 +204,14 @@ final class DemoModeService {
         await SearchIndex.shared.purgeForAccount(DemoSeed.demoAccountId)
 
         // memory.db — clear demo entries via MemoryIndex.purgeForSessionPrefix
-        // (net-new). Demo session ids start with "demo:".
-        await MemoryIndex.shared.purgeForSessionPrefix("demo:")
+        // (net-new). Demo session ids start with "demo:". If that fails the turns
+        // stay out of real mode's searches, and the next demo start wipes them
+        // before it turns demo on.
+        do {
+            try await Self.purgeDemoMemory()
+        } catch {
+            BackgroundSyncLogger.logDebug("[DemoMode] exit(): memory wipe failed: \(error)")
+        }
 
         // Drop ALL in-memory chat pill state — demo session pages, live demo
         // turns, and reminder buffers must not survive into the real user's
@@ -235,10 +245,27 @@ final class DemoModeService {
         BackgroundSyncLogger.logDebug("[DemoMode] exit(): cleanup complete")
     }
 
-    /// Force a one-shot orphan wipe at app launch when stale demo rows are
-    /// found but no demo session is active (force-quit recovery; also covers
-    /// edge cases). Also called when the user signs up with a real account.
-    static func purgeOrphanedDemoData() async {
+    /// Delete the demo turns from memory.db, then empty memory_search's page
+    /// cache, which may hold them, so none can be served after the purge (and a
+    /// demo search still running stores nothing). Demo session ids start with "demo:".
+    /// Throws if any demo turn may be left; the cache is emptied either way.
+    static func purgeDemoMemory() async throws {
+        do {
+            try await MemoryIndex.shared.purgeForSessionPrefix("demo:")
+        } catch {
+            await MemorySearchCache.shared.reset()
+            throw error
+        }
+        await MemorySearchCache.shared.reset()
+    }
+
+    /// Wipe every demo leftover while no demo session is active: the demo rows,
+    /// FTS entries, memory turns and overlay keys a force-quit mid-demo leaves.
+    /// Runs when a demo starts and when the user signs up with a real account.
+    /// If the main-database wipe fails, the old rows stay authoritative and are
+    /// discarded again before `completeSetup` seeds. Throws, after the rest, if
+    /// the demo memory turns may be left.
+    static func purgeOrphanedDemoData() async throws {
         await AccountFieldPersistenceStore.production.discardAccount(DemoSeed.demoAccountId)
         if let db = AppDatabase.shared.withLock({ $0 }) {
             do {
@@ -251,11 +278,17 @@ final class DemoModeService {
             }
         }
         await SearchIndex.shared.purgeForAccount(DemoSeed.demoAccountId)
-        await MemoryIndex.shared.purgeForSessionPrefix("demo:")
+        var memoryError: Error?
+        do {
+            try await purgeDemoMemory()
+        } catch {
+            memoryError = error
+        }
         // Stale demo overlay keys from a force-quit mid-demo (harmless while
         // demo is inactive — all readers use the real keys — but clean up).
         PromptStore.removeDemoOverlayKeys()
         UserDefaults.standard.removeObject(forKey: DisabledRemindersStore.demoStorageKeyV2)
+        if let memoryError { throw memoryError }
     }
 
     // MARK: - FTS indexing

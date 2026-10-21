@@ -382,9 +382,11 @@ actor MemoryIndex {
     /// Purge memory rows whose `sessionId` starts with the given prefix.
     /// Demo Mode uses session IDs prefixed `"demo:"` so this scopes the wipe
     /// to demo content only — production memory survives.
-    func purgeForSessionPrefix(_ prefix: String) {
+    /// Throws unless every matching row is gone, so a caller can refuse to go on
+    /// (a demo start does) while the rows stay searchable.
+    func purgeForSessionPrefix(_ prefix: String) throws {
         ensureReady()
-        guard let dbPool else { return }
+        guard let dbPool else { throw MemoryIndexError.unavailable }
         do {
             try dbPool.write { db in
                 let pattern = "\(prefix)%"
@@ -394,8 +396,8 @@ actor MemoryIndex {
                     arguments: [pattern]
                 )
                 for rowid in rowids {
-                    try? db.execute(sql: "DELETE FROM memory_vec WHERE rowid = ?", arguments: [rowid])
-                    try? db.execute(sql: "DELETE FROM memory_fts WHERE rowid = ?", arguments: [rowid])
+                    try db.execute(sql: "DELETE FROM memory_vec WHERE rowid = ?", arguments: [rowid])
+                    try db.execute(sql: "DELETE FROM memory_fts WHERE rowid = ?", arguments: [rowid])
                 }
                 try db.execute(
                     sql: "DELETE FROM memory_meta WHERE sessionId LIKE ?",
@@ -405,6 +407,7 @@ actor MemoryIndex {
             BackgroundSyncLogger.logDebug("[MemoryIndex] purgeForSessionPrefix(\(prefix)) done")
         } catch {
             BackgroundSyncLogger.logDebug("[MemoryIndex] purgeForSessionPrefix failed: \(error)")
+            throw error
         }
     }
 
@@ -553,16 +556,37 @@ actor MemoryIndex {
     /// rendering.
     func listTurns(limit: Int) -> [MemoryHit] {
         ensureReady()
+        return recentTurns(limit: limit, fromMs: nil, toMs: nil, demoActive: nil)
+    }
+
+    /// The newest turns first, up to `limit`, within the optional dateMs window;
+    /// `demoActive` scopes them as a search is scoped (ADR-IOS-038), nil lists
+    /// every turn (the ChatHistoryView listing).
+    private func recentTurns(limit: Int, fromMs: Int64?, toMs: Int64?, demoActive: Bool?) -> [MemoryHit] {
         guard let dbPool else { return [] }
         do {
             return try dbPool.read { db in
-                let rows = try Row.fetchAll(db, sql: """
+                var sql = """
                     SELECT meta.chatHistoryId, meta.sessionId, meta.role, meta.dateMs, fts.content
                     FROM memory_meta meta
                     JOIN memory_fts fts ON fts.rowid = meta.rowid
-                    ORDER BY meta.dateMs DESC
-                    LIMIT ?
-                    """, arguments: [limit])
+                    WHERE 1 = 1
+                    """
+                var args: [DatabaseValueConvertible?] = []
+                if let demoActive {
+                    sql += " AND \(Self.demoScopeSQL(demoActive: demoActive, alias: "meta"))"
+                }
+                if let fromMs {
+                    sql += " AND meta.dateMs >= ?"
+                    args.append(fromMs)
+                }
+                if let toMs {
+                    sql += " AND meta.dateMs <= ?"
+                    args.append(toMs)
+                }
+                sql += " ORDER BY meta.dateMs DESC LIMIT ?"
+                args.append(limit)
+                let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
                 return rows.map { row in
                     MemoryHit(
                         chatHistoryId: row["chatHistoryId"],
@@ -578,7 +602,7 @@ actor MemoryIndex {
                 }
             }
         } catch {
-            BackgroundSyncLogger.logDebug("[MemoryIndex] listTurns failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] recentTurns failed: \(error)")
             return []
         }
     }
@@ -601,14 +625,18 @@ actor MemoryIndex {
     ///
     /// - `fromMs` / `toMs`: optional dateMs window.
     /// - `limit`: post-merge cap; per-leg candidate expansion = limit × SearchConfig.candidateMultiplier.
-    func search(query: String, fromMs: Int64? = nil, toMs: Int64? = nil, limit: Int) -> [MemoryHit] {
+    /// - `demoActive`: the demo scope (ADR-IOS-038), read once by the caller so
+    ///   both legs, and the caller's cache, use the same one.
+    func search(query: String, fromMs: Int64? = nil, toMs: Int64? = nil, limit: Int, demoActive: Bool) -> [MemoryHit] {
         ensureReady()
         guard let dbPool else { return [] }
         let candidateLimit = limit * SearchConfig.candidateMultiplier
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return [] }
-        // Demo isolation: snapshot once per call so both legs use the same scope.
-        let demoActive = DemoModeStore.isDemoActive
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        // No query lists the most recent turns, newest first, as the native-fts
+        // helper TB uses does for an empty query ("what have we discussed").
+        guard !trimmed.isEmpty else {
+            return recentTurns(limit: limit, fromMs: fromMs, toMs: toMs, demoActive: demoActive)
+        }
 
         // FTS5 candidates — ORDER BY rank ASC, meta.dateMs DESC.
         var ftsCandidates: [(rowid: Int64, rank: Double, snippet: String, content: String, chatHistoryId: String, sessionId: String?, role: String, dateMs: Int64)] = []

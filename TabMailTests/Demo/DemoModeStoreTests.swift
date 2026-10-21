@@ -205,6 +205,9 @@ struct DemoModeStoreTests {
     @Test("Demo gate flags persist independent of production flags")
     func gateFlagsPersistSeparately() {
         DemoModeStore.shared._resetForTests()
+        // Leave the demo gates closed: with them passed, the test host's root
+        // view finishes a demo setup whenever a later test turns demo on.
+        defer { DemoModeStore.shared._resetForTests() }
         UserDefaults.standard.set(false, forKey: "hasCompletedConsentGate")
         UserDefaults.standard.set(false, forKey: "hasSeenAIConsent")
 

@@ -120,11 +120,7 @@ struct ChatHistoryView: View {
             searchTask = Task {
                 try? await Task.sleep(for: .milliseconds(300))
                 guard !Task.isCancelled else { return }
-                // Same memory.db hybrid pipeline the agent uses.
-                let results = await MemoryIndex.shared.search(
-                    query: newQuery,
-                    limit: SearchConfig.memoryPrefetchMaxResults
-                )
+                let results = await Self.searchHistory(newQuery)
                 guard !Task.isCancelled else { return }
                 searchResults = results
             }
@@ -228,6 +224,18 @@ struct ChatHistoryView: View {
                 BackgroundSyncLogger.logDebug("[ChatHistoryView] Failed to clear: \(error)")
             }
         }
+    }
+
+    // MARK: - Search
+
+    /// The history search: the same memory.db hybrid pipeline the agent uses,
+    /// kept to the mode in use (ADR-IOS-038), so demo and real history never mix.
+    static func searchHistory(_ query: String) async -> [MemoryHit] {
+        await MemoryIndex.shared.search(
+            query: query,
+            limit: SearchConfig.memoryPrefetchMaxResults,
+            demoActive: DemoModeStore.isDemoActive
+        )
     }
 
     // MARK: - Pill URL Stripping

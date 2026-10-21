@@ -171,7 +171,9 @@ extension AccountManager {
         // automatically via `navigationStore.hasAnyAccount` once the new
         // account row commits and `.backgroundDataDidChange` propagates.
         if account.id != DemoSeed.demoAccountId {
-            await DemoModeService.purgeOrphanedDemoData()
+            // Demo memory turns it can't delete stay out of real-mode searches,
+            // and the next demo start wipes them first, so go on regardless.
+            try? await DemoModeService.purgeOrphanedDemoData()
         }
 
         // Connect provider (fast — validates tokens, no data fetch)
@@ -282,7 +284,9 @@ extension AccountManager {
         // automatically via `navigationStore.hasAnyAccount` once the new
         // account row commits and `.backgroundDataDidChange` propagates.
         if acct.id != DemoSeed.demoAccountId {
-            await DemoModeService.purgeOrphanedDemoData()
+            // Demo memory turns it can't delete stay out of real-mode searches,
+            // and the next demo start wipes them first, so go on regardless.
+            try? await DemoModeService.purgeOrphanedDemoData()
         }
 
         providers[account.id] = testProvider
@@ -364,7 +368,9 @@ extension AccountManager {
         // automatically via `navigationStore.hasAnyAccount` once the new
         // account row commits and `.backgroundDataDidChange` propagates.
         if acct.id != DemoSeed.demoAccountId {
-            await DemoModeService.purgeOrphanedDemoData()
+            // Demo memory turns it can't delete stay out of real-mode searches,
+            // and the next demo start wipes them first, so go on regardless.
+            try? await DemoModeService.purgeOrphanedDemoData()
         }
 
         providers[account.id] = testProvider
