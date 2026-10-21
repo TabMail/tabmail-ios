@@ -798,7 +798,8 @@ actor DraftStore {
         // check and the provider write below is the owner-accepted race
         // (`IOS-DRAFT-021`).
         let previousIdentity: DraftDeleteIdentity?
-        if let identity = Self.priorIdentity(for: initialDraft, runtimeKind: runtimeKind) {
+        let priorIdentity = Self.priorIdentity(for: initialDraft, runtimeKind: runtimeKind)
+        if let identity = priorIdentity, identity.isSharedWithOtherApps {
             let current = try await provider.fetchDraftCopy(identity: identity)
             switch DraftServerCheck.compare(
                 base: initialDraft.serverDraftText, current: current.map(DraftServerText.of)) {
@@ -813,7 +814,8 @@ actor DraftStore {
                 return .serverChanged
             }
         } else {
-            previousIdentity = nil
+            // No server copy yet, or a demo draft nothing else edits.
+            previousIdentity = priorIdentity
         }
 
         let domain = initialDraft.accountId.contains("@")

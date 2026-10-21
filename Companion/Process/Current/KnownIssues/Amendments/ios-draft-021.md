@@ -27,14 +27,30 @@ race condition that I'm going to document as accepted."*
    `v92_addDraftServerRevision`). A nil base is "no evidence", so such a row keeps the old last-save-wins
    behaviour for its first upload after updating, and a row with no unsent edits opens as is.
    Every push, adoption or reload records the text, so this ends after one save per draft.
+3. **Attachments compared by name only (owner 2026-10-21, #229).** The check compares
+   attachment and inline-image file names, not their bytes: there is no time or fingerprint the
+   providers all carry, and downloading every attachment on every check is too costly. Another app
+   that swaps a file for a different one under the same name, while this device holds unsent
+   edits, is overwritten by our next upload. Inline images are the likelier case, since adoption
+   names them by position.
+4. **Recipient text that is no address is not compared (owner 2026-10-21, #230).** A recipient
+   field is compared by the addresses it names. IMAP servers rewrite text that is no address
+   (an unfinished name, for example) in the recipient summary TabMail reads, so comparing it would
+   report a change after every save. Another app that changes only that text, while this device
+   holds unsent edits, is overwritten by our next upload.
+
+Owner, 2026-10-21, on item 3: *"If metadata is not available, just name is fine. Accept it and file
+an issue tracker ... saying that we might need to revisit this."* Item 4 was accepted the same day
+on the same terms (issue #230 records when to revisit).
 
 ## Recoverability
 
 Not a dropped intention and not a wrong-message mutation: the overwritten version was a draft of
-the same message. The other app's text is lost only inside the gap above, which the owner accepted.
+the same message. The other app's text is lost only inside the gap above, or by the two narrow
+edits of items 3 and 4, all of which the owner accepted.
 
 ## Subsystem and search terms
 
 Drafts; race; check then write; time of check to time of use; last save wins; overwrite;
 `draftRevision`; `serverDraftRevision`; `fetchDraftCopy`; `serverDraftText`; `DraftServerText`;
-`DraftServerCheck`; v92; owner-accepted
+`DraftServerCheck`; v92; attachment names only; same-name image swap; rejected recipient entries; leftovers; ENVELOPE rewrite; #229; #230; owner-accepted

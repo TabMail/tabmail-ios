@@ -523,4 +523,121 @@ struct DraftServerChangeRegressionTests {
             }
         }
     }
+
+    // MARK: - Round-2 review regressions
+
+    @Test("Opening takes a confirmed empty server body instead of keeping the old one",
+          arguments: ["pushed", "dirty"])
+    func openTakesAnEmptyServerBody(status: String) async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { db in
+                var row = try insertDraft(db, status: status)
+                if status == "pushed" { row.body = "now here"; try row.update(db) }
+                return row
+            }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let provider = exchangeProvider(http, copyResponse: Self.copyJSON(body: ""))
+            try await withRegisteredProvider(provider) {
+                var asked = 0
+                await ExternalDraftAdoption.refreshBeforeOpen(
+                    draftId: draft.id, willReadServer: {},
+                    askAboutUnsentEdits: { asked += 1; return .reload })
+                #expect(http.recordedCalls().contains { $0.method == "GET" && $0.url.contains("/messages/g1") },
+                        "the server copy really was fetched")
+                #expect(asked == (status == "dirty" ? 1 : 0))
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(row.body.isEmpty, "a successful empty body must replace the old text")
+                #expect(row.serverPushStatus == "pushed")
+            }
+        }
+    }
+
+    @Test("Save as new on open keeps the phone edit reachable in Drafts")
+    func openSaveAsNewKeepsTheEditReachable() async throws {
+        try await withInstalledPool { pool in
+            let (draft, header, authority) = try await pool.write { db in
+                let draft = try insertDraft(db, status: "dirty")
+                let folder = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: Self.accountId)
+                try folder.insert(db)
+                let header = MessageHeader(messageId: "g1", subject: "Plan", from: "owner@example.com", fromAddress: "owner@example.com",
+                    to: "alice@example.com", date: Date(), snippet: "now here", folderId: folder.id, accountId: Self.accountId,
+                    folderPath: "Drafts", isInInbox: false)
+                try header.insert(db)
+                // The save that left unsent edits also left the generation's
+                // placeholder header; that is the state Save as new starts from.
+                let placeholder = MessageHeader(
+                    messageId: PendingOperation.draftPlaceholderMessageId(draftId: draft.id, instanceEpoch: draft.instanceEpoch),
+                    subject: "Plan", from: "owner@example.com", fromAddress: "owner@example.com", to: "alice@example.com",
+                    date: Date(), snippet: "phone edit", folderId: folder.id, accountId: Self.accountId,
+                    folderPath: "Drafts", isInInbox: false)
+                try placeholder.insert(db)
+                let authority = try #require(try LocallyAuthoredDraftOpenAuthority.resolve(db: db, header: header, runtimeKind: .outlook))
+                return (draft, header, authority)
+            }
+            #expect(authority.draftId == draft.id, "fixture: the row is reachable before choosing")
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let provider = exchangeProvider(http, copyResponse: Self.copyJSON(body: "rewritten elsewhere"))
+            try await withRegisteredProvider(provider) {
+                var asked = 0
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {},
+                    askAboutUnsentEdits: { asked += 1; return .saveAsNew })
+                #expect(asked == 1)
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(row.body == "phone edit", "the phone edit must still exist")
+                let routes = try await pool.read { db in
+                    try MessageHeader.filter(Column("accountId") == Self.accountId).fetchAll(db).compactMap {
+                        try LocallyAuthoredDraftOpenAuthority.resolve(db: db, header: $0, runtimeKind: .outlook)?.draftId
+                    }
+                }
+                #expect(routes.contains(draft.id), "some Drafts row must still open the phone edit")
+                #expect(!authority.matches(row, runtimeKind: .outlook), "the server copy's row no longer opens the detached edit")
+                #expect(try await pool.read { try MessageHeader.fetchOne($0, key: header.id) } != nil,
+                        "the other app's server draft is kept")
+            }
+        }
+    }
+
+    @Test("A demo draft saves again and reopens with its Cc and Bcc; it is never compared")
+    func demoDraftKeepsRecipientsOnReopen() async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { db in
+                var draft = try insertDraft(db, status: "dirty")
+                draft.serverDraftId = nil
+                draft.serverDraftText = nil
+                draft.ccJSON = Draft.encodeStringArray(["cc@example.com"])
+                draft.bccJSON = Draft.encodeStringArray(["bcc@example.com"])
+                try draft.update(db)
+                let folder = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: Self.accountId)
+                try folder.insert(db)
+                return draft
+            }
+            let provider = DemoProvider(accountId: Self.accountId)
+            let outcome = try await DraftStore.shared.pushDraftToServer(draftId: draft.id, expectedInstanceEpoch: "E1",
+                provider: provider, runtimeKind: .demo, draftsFolderPath: "Drafts")
+            #expect(outcome == .completed, "fixture: the demo draft's first save succeeded")
+            // A second save replaces the demo copy it now has an address for; it must
+            // not wait on a server comparison no demo draft can answer.
+            try await pool.write { db in
+                var row = try #require(try Draft.fetchOne(db, key: draft.id))
+                row.body = "second edit"
+                row.serverPushStatus = "dirty"
+                try row.update(db)
+            }
+            let second = try await DraftStore.shared.pushDraftToServer(draftId: draft.id, expectedInstanceEpoch: "E1",
+                provider: provider, runtimeKind: .demo, draftsFolderPath: "Drafts")
+            #expect(second == .completed, "a demo draft's second save must complete")
+            let before = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+            #expect(before.serverDraftId != nil, "fixture: the second save replaced an existing demo copy")
+            #expect(before.ccArray == ["cc@example.com"] && before.bccArray == ["bcc@example.com"])
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {},
+                    askAboutUnsentEdits: { Issue.record("no other app edits a demo draft"); return .reload })
+                let after = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(after.ccArray == before.ccArray && after.bccArray == before.bccArray,
+                        "the demo copy must never replace the draft's recipients")
+            }
+        }
+    }
 }

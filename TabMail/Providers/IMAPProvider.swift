@@ -5798,9 +5798,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     return nil
                 }
                 let infos = try await server.fetchMessageInfosBulk(using: UIDSet(UID(targetUidValue)))
-                guard infos.contains(where: { $0.uid?.value == targetUidValue }) else { return nil }
-                return try await self.fetchMessageOnConnection(
-                    id: String(uid), folder: folder, server: server)
+                guard let info = infos.first(where: { $0.uid?.value == targetUidValue }) else { return nil }
+                // Read the content under THIS selection, whose UIDVALIDITY was just
+                // proven. `fetchMessageOnConnection` would SELECT again without that
+                // proof, and a mailbox recreated in between could hand back another
+                // draft at the same UID.
+                let message = try await server.fetchMessage(from: info)
+                guard let full = self.buildFullMessageInfo(info: info, message: message) else {
+                    throw ProviderError.messageNotFound
+                }
+                return full
             }
         } catch is IMAPActionMailboxAbsent {
             return nil

@@ -379,9 +379,14 @@ enum ExternalDraftAdoption {
         } else {
             html = copy.textBody.map(EmailFilter.plainTextToHTML)
         }
+        // A body part this successful read returned, even an empty one, IS the
+        // server's word that the draft is empty (another app cleared it). Only a copy
+        // with no body part at all stays unopenable, so a body the reader failed to
+        // extract can never blank the draft.
+        let bodyReturned = copy.htmlBody != nil || copy.textBody != nil
         guard let body = editableBody(
             html: html,
-            bodyEmptyConfirmed: bodyEmptyConfirmed,
+            bodyEmptyConfirmed: bodyEmptyConfirmed || bodyReturned,
             hasAttachments: !attachmentInfos.isEmpty || !copy.inlineImages.isEmpty) else {
             throw AdoptionError.bodyUnavailable
         }
@@ -489,7 +494,8 @@ enum ExternalDraftAdoption {
                   }),
                   let provider = await AccountManager.shared.provider(accountId: row.accountId),
                   let identity = DraftStore.priorIdentity(
-                      for: row, runtimeKind: AccountManager.draftRuntimeIdentityKind(for: provider)) else {
+                      for: row, runtimeKind: AccountManager.draftRuntimeIdentityKind(for: provider)),
+                  identity.isSharedWithOtherApps else {
                 return
             }
             await willReadServer()

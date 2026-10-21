@@ -2953,7 +2953,8 @@ struct ComposeView: View {
     private static func serverChangeBeforeSave(_ draft: Draft) async -> DraftServerCheck? {
         guard let provider = await AccountManager.shared.provider(accountId: draft.accountId),
               let identity = DraftStore.priorIdentity(
-                  for: draft, runtimeKind: AccountManager.draftRuntimeIdentityKind(for: provider)) else {
+                  for: draft, runtimeKind: AccountManager.draftRuntimeIdentityKind(for: provider)),
+              identity.isSharedWithOtherApps else {
             return nil
         }
         let current: String?

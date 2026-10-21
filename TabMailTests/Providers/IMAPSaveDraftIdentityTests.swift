@@ -38,6 +38,32 @@ struct IMAPSaveDraftIdentityTests {
         return draft
     }
 
+    @Test("A draft read never returns another draft when the mailbox is recreated after its UIDVALIDITY check")
+    func draftReadUnderTheCheckedSelection() async throws {
+        let mine = "mine-\(UUID().uuidString)@example.com"
+        let other = "other-\(UUID().uuidString)@example.com"
+        let epoch = 73_001
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [Self.message(5, mine)]])
+        server.setUidValidity(epoch, for: "Drafts")
+        // Right after the read of the draft's summary, the mailbox is recreated
+        // and another draft takes the same UID.
+        server.resetMailboxAfterNextSuccessfulResponse(
+            containing: "ENVELOPE", mailbox: "Drafts", uidValidity: epoch + 1,
+            messages: [Self.message(5, other)])
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let copy = try await provider.fetchDraftCopy(
+            identity: .imap(folder: "Drafts", uidValidity: epoch, uid: 5))
+
+        let id = copy?.header.rfc822MessageId ?? ""
+        #expect(!id.contains(other), "the copy must be the draft the checked selection named, never another")
+        #expect(copy == nil || id.contains(mine))
+    }
+
     @Test("A live prior IMAP tuple deletes only its UID; a same-RFC sibling survives and the fresh edit lands")
     func livePriorTuple() async throws {
         let shared = "shared-\(UUID().uuidString)@example.com"

@@ -103,3 +103,19 @@ all for providers either."*
 - Images the provider's inline-image read drops (a failed image fetch, more than
   `BodyRenderer.maxInlineImages`) are a pre-existing reader behaviour, tracked separately rather
   than guarded here (#227).
+
+**Amendment (2026-10-21, review round 2 of the PR):**
+
+- **IMAP reads the copy under the selection it checked.** `IMAPProvider.fetchDraftCopy` proves the
+  recorded UIDVALIDITY, then reads summary and content on that same selection
+  (`fetchMessage(from:)`), never through `fetchMessageOnConnection`, which selected again without
+  the proof and could return another draft at the same UID after the mailbox was recreated.
+- **Demo drafts are never compared.** `DraftDeleteIdentity.isSharedWithOtherApps` is false for the
+  demo address; the open, Save and upload checks skip such a draft (no other app edits it, and the
+  demo copy holds only part of the draft, so a comparison would erase its Cc and Bcc).
+  `DemoProvider.fetchDraftCopy` is deleted.
+- **An empty body is a body.** A copy whose body part came back empty reloads as empty; only a copy
+  with no body part and no attachments still fails closed.
+- **Accepted limitations (owner 2026-10-21):** attachments compare by name only (#229), and
+  recipient text that is no address is not compared, because IMAP servers rewrite it in the
+  summary we read (#230). Both are recorded in `IOS-DRAFT-021`.

@@ -17,10 +17,15 @@ enum DraftServerCheckConfig {
 /// - subject: whitespace collapsed; the "(no subject)" servers substitute for an
 ///   empty subject counts as empty;
 /// - To / Cc / Bcc: the addresses `RecipientEntry` reads, lowercased and sorted
-///   (display names and text that is no address dropped);
+///   (display names and text that is no address dropped). ACCEPTED LIMITATION
+///   (owner 2026-10-21, #230): IMAP servers rewrite text that is no address in
+///   the summary we read, so comparing it would report a change after every save;
+///   a change to that text alone goes unnoticed;
 /// - attachments: the file names, sorted. Inline images count under the name
 ///   adoption gives them (`ExternalDraftAdoption.inlineImageFilename`), so a copy
-///   this device uploads after adopting them compares equal to the original;
+///   this device uploads after adopting them compares equal to the original.
+///   ACCEPTED LIMITATION (owner 2026-10-21, #229): names only, so a file swapped
+///   for another under the same name goes unnoticed;
 /// - body: through the same HTML-to-text conversion on both sides, every run of
 ///   whitespace collapsed to one space. Only the body is HTML.
 enum DraftServerText {

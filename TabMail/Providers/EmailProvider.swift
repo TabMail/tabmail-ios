@@ -28,6 +28,15 @@ enum DraftDeleteIdentity: Sendable, Equatable {
     case outlook(graphId: String)
     case imap(folder: String, uidValidity: Int, uid: Int)
     case demo(localId: String)
+
+    /// #217 (ADR-IOS-091): whether another mail app can change the draft at this
+    /// address, so open, Save and upload must compare its server copy first. A demo
+    /// draft lives only on this device: nothing else edits it, and its stored copy
+    /// keeps only part of the draft, so it is never compared.
+    var isSharedWithOtherApps: Bool {
+        if case .demo = self { return false }
+        return true
+    }
 }
 
 enum DraftDeleteAddressKind: String, Codable, Sendable {
@@ -451,7 +460,9 @@ protocol EmailProvider: Sendable {
 }
 
 extension EmailProvider {
-    /// Default for test doubles only; every production provider overrides it.
+    /// Default for test doubles and the demo provider, whose drafts are never
+    /// compared (`DraftDeleteIdentity.isSharedWithOtherApps`); every other
+    /// production provider overrides it.
     func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
         throw ProviderError.actionIdentityResolutionFailed(
             "fetchDraftCopy: provider has no draft read adapter")
