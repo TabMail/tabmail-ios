@@ -120,8 +120,10 @@ extension ComposeDraftGuards {
             (cc != old.cc && !cc.isEmpty) || (bcc != old.bcc && !bcc.isEmpty)
         }
 
-        /// The one write every change to the compose's recipients goes through:
-        /// replaces them with `new`, and shows Cc and Bcc when `new` reveals them.
+        /// Replaces the recipients with `new`, and shows Cc and Bcc when `new`
+        /// reveals them. Every change except removing a chip and a keystroke
+        /// in the input line goes through here; those happen in a field
+        /// already shown, so there is nothing to reveal.
         mutating func replace(with new: Recipients, showCc: inout Bool) {
             let old = self
             guard new != old else { return }

@@ -6,8 +6,9 @@ import SwiftUI
 
 /// One recipient field of the compose. Every binding and action takes `role`,
 /// so typing, a contact pick and what the field shows all reach that role's
-/// recipients and no other, and every change goes through
-/// `Recipients.replace(with:showCc:)` (ADR-IOS-092).
+/// recipients and no other. A commit, a contact pick and a rejected entry's
+/// edit go through `Recipients.replace(with:showCc:)`; removing a chip and
+/// each keystroke write the field directly (ADR-IOS-092).
 struct RecipientTokenField: View {
     let role: ComposeDraftGuards.RecipientRole
     @Binding var recipients: ComposeDraftGuards.Recipients
