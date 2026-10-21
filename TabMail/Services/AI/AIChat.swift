@@ -165,6 +165,9 @@ extension AIService {
         onSSEEvent: BackendClient.SSEEventHandler? = nil,
         invocation: ToolInvocation = .noninteractive
     ) async throws -> ChatResponse? {
+        // Fresh per-turn pagination cache, matching sendChatMessage.
+        await MemorySearchCache.shared.reset()
+
         guard !disableLLMCalls else {
             BackgroundSyncLogger.logDebug("[AIService] resumeChatMessage: SKIP — LLM calls disabled")
             return nil
@@ -179,8 +182,6 @@ extension AIService {
             guard !exhausted else { throw DemoError.callBudgetExhausted }
             await MainActor.run { DemoModeStore.shared.consumeCall() }
         }
-        // Fresh per-turn pagination cache, matching sendChatMessage.
-        await MemorySearchCache.shared.reset()
 
         BackgroundSyncLogger.logDebug("[AIService] resumeChatMessage: resuming from saved conversation_state")
         // Refresh client_timestamp_ms: the saved request froze it at the failed

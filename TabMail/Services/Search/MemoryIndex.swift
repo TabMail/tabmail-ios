@@ -382,9 +382,11 @@ actor MemoryIndex {
     /// Purge memory rows whose `sessionId` starts with the given prefix.
     /// Demo Mode uses session IDs prefixed `"demo:"` so this scopes the wipe
     /// to demo content only — production memory survives.
-    func purgeForSessionPrefix(_ prefix: String) {
+    /// Throws unless every matching row is gone, so a caller can refuse to go on
+    /// (a demo start does) while the rows stay searchable.
+    func purgeForSessionPrefix(_ prefix: String) throws {
         ensureReady()
-        guard let dbPool else { return }
+        guard let dbPool else { throw MemoryIndexError.unavailable }
         do {
             try dbPool.write { db in
                 let pattern = "\(prefix)%"
@@ -394,8 +396,8 @@ actor MemoryIndex {
                     arguments: [pattern]
                 )
                 for rowid in rowids {
-                    try? db.execute(sql: "DELETE FROM memory_vec WHERE rowid = ?", arguments: [rowid])
-                    try? db.execute(sql: "DELETE FROM memory_fts WHERE rowid = ?", arguments: [rowid])
+                    try db.execute(sql: "DELETE FROM memory_vec WHERE rowid = ?", arguments: [rowid])
+                    try db.execute(sql: "DELETE FROM memory_fts WHERE rowid = ?", arguments: [rowid])
                 }
                 try db.execute(
                     sql: "DELETE FROM memory_meta WHERE sessionId LIKE ?",
@@ -405,6 +407,7 @@ actor MemoryIndex {
             BackgroundSyncLogger.logDebug("[MemoryIndex] purgeForSessionPrefix(\(prefix)) done")
         } catch {
             BackgroundSyncLogger.logDebug("[MemoryIndex] purgeForSessionPrefix failed: \(error)")
+            throw error
         }
     }
 

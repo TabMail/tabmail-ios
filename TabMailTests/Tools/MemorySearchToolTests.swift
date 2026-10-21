@@ -360,7 +360,7 @@ struct MemorySearchToolTests {
                 await DemoModeService.shared.exit()
                 #expect(await MainActor.run { DemoModeStore.shared.isActive } == false)
             case .leftoverWipe:
-                await DemoModeService.purgeOrphanedDemoData()
+                try await DemoModeService.purgeOrphanedDemoData()
             }
             #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real"])
 
@@ -376,22 +376,51 @@ struct MemorySearchToolTests {
         }
     }
 
-    /// A demo start runs the leftover wipe before the demo turns on. The start
-    /// itself needs the backend (it mints the demo session first), so this
-    /// reads its source: the wipe comes before the demo is made active.
-    @Test("A demo start wipes the last demo's leftovers before it turns demo on")
-    func demoStartWipesLeftoversFirst() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()   // Tools
-            .deletingLastPathComponent()   // TabMailTests
-            .deletingLastPathComponent()   // repository root
-        let source = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Demo/DemoModeService.swift"), encoding: .utf8)
-        let startBody = try #require(source.range(of: "func start() async throws {"))
-        let nextFunction = try #require(source.range(of: "func startFromDebugMenu()", range: startBody.upperBound..<source.endIndex))
-        let body = source[startBody.upperBound..<nextFunction.lowerBound]
-        let wipe = try #require(body.range(of: "await Self.purgeOrphanedDemoData()"))
-        let activate = try #require(body.range(of: "store.isActive = true"))
-        #expect(wipe.upperBound <= activate.lowerBound)
+    /// A demo turns on only once the last demo's memory turns are gone: when the
+    /// wipe works the new demo lists none of them and real history stays; when
+    /// it fails the demo stays off (and starts once the wipe works).
+    @Test("A demo turns on only once the last demo's memory turns are gone", arguments: ["", "budget"], [false, true])
+    func demoStartsOnlyOverWipedMemory(query: String, wipeFails: Bool) async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        try await withTool { tool in
+            let base = noonUTCThreeDaysAgo()
+            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "real", sessionId: "s", dateMs: base + 3_600_000, text: "budget real_history_marker"))
+            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "demo", sessionId: "demo:a", dateMs: base, text: "budget demo_history_marker"))
+            #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real", "demo"])
+            let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
+            try await withDemoActive(true) {
+                let warmed = try await tool.execute(arguments: arguments)
+                #expect(warmed.contains("demo_history_marker"))
+            }
+
+            if wipeFails {
+                try await memPool.write { db in
+                    try db.execute(sql: "CREATE TRIGGER refuse_demo_wipe BEFORE DELETE ON memory_meta BEGIN SELECT RAISE(ABORT, 'refused'); END")
+                }
+                await #expect(throws: DemoError.self) { try await DemoModeService.shared.activate() }
+                #expect(await MainActor.run { DemoModeStore.shared.isActive } == false, "the demo stayed off")
+                #expect(await MemoryIndex.shared.knownChatHistoryIds().contains("demo"), "the wipe really failed")
+                try await memPool.write { db in try db.execute(sql: "DROP TRIGGER refuse_demo_wipe") }
+            }
+
+            try await DemoModeService.shared.activate()
+            let active = await MainActor.run { DemoModeStore.shared.isActive }
+            await MainActor.run { DemoModeStore.shared.isActive = false }
+            #expect(active)
+            #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real"])
+
+            try await withDemoActive(true) {
+                let kept = try await tool.execute(arguments: arguments)
+                #expect(!kept.contains("demo_history_marker"))
+                #expect(!kept.contains("real_history_marker"))
+                let fresh = try await tool.execute(arguments: ["query": .string("demo_history_marker")])
+                #expect(!fresh.contains("demo_history_marker"))
+            }
+            let real = try await tool.execute(arguments: arguments)
+            #expect(real.contains("real_history_marker"))
+        }
     }
 
     /// Holds the memory pool's one reader on another thread until `release`;
@@ -420,11 +449,39 @@ struct MemorySearchToolTests {
         }
     }
 
-    /// A search still running when the next turn begins stores nothing for that
-    /// turn in the same mode too: a turn written after it shows in the next
-    /// turn's results.
-    @Test("A search from before a reset never hides a later turn", arguments: ["", "budget"])
-    func staleSearchNeverHidesALaterTurn(query: String) async throws {
+    /// How the next turn begins: a new chat message, or a resumed one.
+    enum TurnStart: String, CaseIterable, Sendable {
+        case send
+        case resume
+    }
+
+    /// Begins the next turn through the chat entry point, with AI turned off so
+    /// it goes no further than its start.
+    private func beginTurn(_ start: TurnStart) async throws {
+        let store = AIService.optOutStore
+        let previous = store.object(forKey: AIService.optOutAllAIKey)
+        defer {
+            if let previous {
+                store.set(previous, forKey: AIService.optOutAllAIKey)
+            } else {
+                store.removeObject(forKey: AIService.optOutAllAIKey)
+            }
+        }
+        AIService.writeOptOutFlag(true)
+        switch start {
+        case .send:
+            #expect(try await AIService.shared.sendChatMessage(userText: "next", history: []) == nil)
+        case .resume:
+            let request = CompletionsRequest(messages: [], client_timezone: nil, disable_tools: nil)
+            #expect(try await AIService.shared.resumeChatMessage(request: request) == nil)
+        }
+    }
+
+    /// A search still running when the next turn begins (a new message or a
+    /// resumed one) stores nothing for that turn in the same mode too: a turn
+    /// written after it shows in the next turn's results.
+    @Test("A search from before a turn begins never hides a later turn", arguments: ["", "budget"], TurnStart.allCases)
+    func staleSearchNeverHidesALaterTurn(query: String, start: TurnStart) async throws {
         let (memPool, memDir) = try await installMemoryIndex(readers: 1)
         defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
 
@@ -440,7 +497,7 @@ struct MemorySearchToolTests {
         // Long enough for it to be waiting on the reader inside the search.
         try await Task.sleep(nanoseconds: 2_000_000_000)
 
-        await MemorySearchCache.shared.reset()
+        try await beginTurn(start)
         held.release.signal()
         let old = try await stale.value
         #expect(old.contains("old_history_marker"))

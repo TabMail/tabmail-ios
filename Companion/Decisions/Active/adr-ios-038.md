@@ -174,6 +174,13 @@ fix gates at shared chokepoints, not per-tool patches:
   compose edit runs the tool with no chat turn resetting the cache between
   modes. `DemoModeService.purgeDemoMemory` (demo exit and the orphan wipe)
   empties the cache after purging the demo turns, so none is served again.
+  A demo start runs the orphan wipe before it turns demo on (a force-quit's
+  launch wipe clears the main database only), and **fails closed**: if
+  `MemoryIndex.purgeForSessionPrefix` cannot confirm every demo turn is gone,
+  `DemoModeService.activate` leaves demo off and throws (the login screen's
+  start error; the user retries). Demo exit and a real sign-up only log the
+  failure: real mode never reads `demo:` turns, and the next demo start wipes
+  them first.
 - **CalendarProviderDispatch** — demo resolves ONLY `DemoCalendarProvider`
   (new `CalendarBackend.demo` case); normal mode skips the demo entry.
   Without this, coexistence calendar_read leaked real events and
