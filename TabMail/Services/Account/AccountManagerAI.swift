@@ -887,31 +887,22 @@ extension AccountManager {
             // Previously a fire-and-forget LLM call — now persisted to GRDB first so it
             // survives app kill / suspend / network drop. The queue drains on BGProcessing
             // and foreground. `currentUserActionMd` is read live at drain time.
+            // A demo sample's re-tag is dropped inside `enqueueActionRefine`
+            // (ADR-IOS-038): it must never teach the real action prompt.
             if tag != nil, originalAction != userManualTag {
-                // Re-tag enqueue counts against the
-                // demo budget, but the consume happens at *drain* time (in
-                // BackfillAIQueue) so it reflects an actual outgoing call.
-                // Here we only short-circuit when the budget is already at
-                // zero — no point queueing what can't drain.
-                let isDemo = await MainActor.run { DemoModeStore.shared.isActive }
-                let exhausted = await MainActor.run { DemoModeStore.shared.isCallBudgetExhausted }
-                if isDemo && exhausted {
-                    BackgroundSyncLogger.logDebug("[ManualTag] Step 4: skip enqueue — demo budget exhausted")
-                } else {
-                    BackgroundSyncLogger.logDebug("[ManualTag] Step 4: enqueuing actionRefine original=\(originalAction) userTag=\(userManualTag)")
-                    let snapshot = ActionRefineSnapshot(
-                        messageStableId: message.stableId,
-                        accountId: accountId,
-                        subject: subject,
-                        from: from,
-                        summaryBlurb: summaryBlurb,
-                        summaryTodos: summaryTodos,
-                        originalAction: originalAction,
-                        userManualTag: userManualTag
-                    )
-                    await BackfillAIQueue.shared.enqueueActionRefine(snapshot)
-                    BackgroundSyncLogger.logDebug("[ManualTag] Step 4: actionRefine enqueued")
-                }
+                BackgroundSyncLogger.logDebug("[ManualTag] Step 4: enqueuing actionRefine original=\(originalAction) userTag=\(userManualTag)")
+                let snapshot = ActionRefineSnapshot(
+                    messageStableId: message.stableId,
+                    accountId: accountId,
+                    subject: subject,
+                    from: from,
+                    summaryBlurb: summaryBlurb,
+                    summaryTodos: summaryTodos,
+                    originalAction: originalAction,
+                    userManualTag: userManualTag
+                )
+                await BackfillAIQueue.shared.enqueueActionRefine(snapshot)
+                BackgroundSyncLogger.logDebug("[ManualTag] Step 4: actionRefine enqueued")
             } else {
                 BackgroundSyncLogger.logDebug("[ManualTag] Step 4: skipped actionRefine — tag=\(tag?.rawValue ?? "nil") original=\(originalAction) userTag=\(userManualTag)")
             }

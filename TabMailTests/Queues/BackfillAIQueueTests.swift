@@ -92,6 +92,51 @@ struct PendingAIRefinementCodecTests {
     }
 }
 
+// MARK: - Demo re-tags never teach (ADR-IOS-038)
+
+/// Installs a temporary `AppDatabase.shared` (the queue writes through it), so
+/// the suite mutates global state and must be `.serialized`.
+@Suite("BackfillAIQueue — demo re-tags never teach the real action prompt", .serialized)
+struct BackfillAIQueueDemoRetagTests {
+    private func install() throws -> (DatabasePool, URL, AppDatabase?) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("backfill-demo-retag-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path,
+            configuration: configuration)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let saved = current
+            current = appDatabase
+            return saved
+        }
+        return (pool, directory, previous)
+    }
+
+    /// Refinement drains wait while the demo runs, so a queued demo re-tag
+    /// would drain after exit and teach the user's REAL action prompt with
+    /// demo content. No row may be queued.
+    @Test("A demo re-tag never queues a refinement of the real action prompt")
+    func demoRetagQueuesNoRefinement() async throws {
+        let fixture = try install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
+
+        await BackfillAIQueue.shared.enqueueActionRefine(ActionRefineSnapshot(
+            messageStableId: "\(DemoSeed.demoAccountId):INBOX:demo-msg-5",
+            accountId: DemoSeed.demoAccountId,
+            subject: "Weekly digest", from: "news@example.com",
+            summaryBlurb: nil, summaryTodos: nil,
+            originalAction: ActionTag.archive.rawValue, userManualTag: ActionTag.delete.rawValue))
+        await BackfillAIQueue.shared.cancelAllInFlight()
+
+        let queued = try await fixture.0.read { try PendingAIRefinement.fetchCount($0) }
+        #expect(queued == 0)
+    }
+}
+
 // MARK: - Role-aware Turn.from(ChatTurn)
 
 @Suite("KBRefineSnapshot.Turn.from — role-aware text extraction (critical)")

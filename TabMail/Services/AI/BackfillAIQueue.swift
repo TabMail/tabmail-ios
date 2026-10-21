@@ -46,6 +46,10 @@ actor BackfillAIQueue {
     /// same (message, tag) supersedes the earlier snapshot in place.
     /// Errors are caught and logged (matches `AccountManager.queueTagWrite` pattern).
     func enqueueActionRefine(_ snapshot: ActionRefineSnapshot) async {
+        guard !snapshot.isDemoSample else {
+            BackgroundSyncLogger.logBackfillAI("skip actionRefine dedupKey=\(snapshot.dedupKey) reason=demo-sample")
+            return
+        }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         do {
             let row = try PendingAIRefinement.make(snapshot, now: now)
@@ -412,6 +416,11 @@ actor BackfillAIQueue {
     // MARK: - Dispatchers (call existing refinement functions unchanged)
 
     private func dispatchActionRefine(_ s: ActionRefineSnapshot) async {
+        // Rows queued by builds before the enqueue guard: drop, never teach.
+        guard !s.isDemoSample else {
+            BackgroundSyncLogger.logBackfillAI("drop actionRefine dedupKey=\(s.dedupKey) reason=demo-sample")
+            return
+        }
         let currentActionMd = PromptStore.actionMarkdownSnapshot()
         await AIService.shared.autoUpdateUserPromptOnTag(
             subject: s.subject,
