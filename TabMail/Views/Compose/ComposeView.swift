@@ -1044,6 +1044,9 @@ struct ComposeView: View {
     /// opens (`ExternalDraftAdoption.refreshBeforeOpen`). The editor is covered
     /// meanwhile, so nothing typed can be replaced when the draft then loads.
     @State private var isCheckingServerCopy = false
+    /// #217: the open check found that the server copy of a draft with unsent edits
+    /// changed; the load waits for the user's answer (`ServerChangedOnOpenAlert`).
+    @State private var serverChangeOnOpen: ServerChangeOnOpen?
     /// PORT — sticky initial-read state from v2final ComposeDraftGuards.
     /// `.error` is never reinterpreted as genuine absence later in this view.
     @State private var draftReadState: ComposeDraftGuards.ReadState = .notFound
@@ -1706,6 +1709,7 @@ struct ComposeView: View {
                 onChoice: { pending, choice in
                     Task { await resolveServerChangeOnSave(pending, choice: choice) }
                 }))
+            .modifier(ServerChangedOnOpenAlert(question: $serverChangeOnOpen))
             .overlay { if isCheckingServerCopy { ServerCopyCheckCover() } }
             .alert("Empty Body", isPresented: $showEmptyBodyPrompt) {
                 if showingSuggestion, let currentSuggestion, !currentSuggestion.isEmpty {
@@ -2313,10 +2317,16 @@ struct ComposeView: View {
         BackgroundSyncLogger.logDebug("[ComposeView] loadDraftOrPrepopulate: draftId=\(draftId) prefillDraftId=\(prefillDraftId ?? "nil")")
         let draftKey = draftId
         // #217 (ADR-IOS-091): every open of a saved draft, from any screen, first
-        // brings a row with no unsent edits up to date with its server copy.
-        await ExternalDraftAdoption.refreshBeforeOpen(draftId: draftKey) {
-            isCheckingServerCopy = true
-        }
+        // checks its server copy: a changed copy reloads a row with no unsent edits,
+        // and asks the user about a row with unsent edits.
+        await ExternalDraftAdoption.refreshBeforeOpen(
+            draftId: draftKey,
+            willReadServer: { isCheckingServerCopy = true },
+            askAboutUnsentEdits: {
+                await withCheckedContinuation { continuation in
+                    serverChangeOnOpen = ServerChangeOnOpen(answer: continuation)
+                }
+            })
         isCheckingServerCopy = false
         let readResult: Result<Draft?, Error>
         do {
@@ -3842,9 +3852,32 @@ struct ServerChangeOnSave: Equatable {
     let instanceEpoch: String
 }
 
-/// #217 (ADR-IOS-091): Save found that another app changed (or removed) the server
-/// copy. The user chooses; Cancel keeps the compose open with nothing written. Its
-/// own `ViewModifier` for the type-checker reason `DiscardUnsavedEditsAlert` gives.
+/// #217 (ADR-IOS-091): opening a draft with unsent edits found that another app
+/// changed its server copy. Holds the paused load's continuation; each button
+/// resumes it exactly once (the alert's dismissal only clears the state).
+struct ServerChangeOnOpen {
+    let answer: CheckedContinuation<ExternalDraftAdoption.ServerChangeChoice?, Never>
+}
+
+private struct ServerChangedOnOpenAlert: ViewModifier {
+    @Binding var question: ServerChangeOnOpen?
+
+    func body(content: Content) -> some View {
+        let presented = Binding(
+            get: { question != nil },
+            set: { if !$0 { question = nil } }
+        )
+        return content.alert("Draft Changed Elsewhere", isPresented: presented, presenting: question) { value in
+            Button("Overwrite") { value.answer.resume(returning: .overwrite) }
+            Button("Reload", role: .destructive) { value.answer.resume(returning: .reload) }
+            Button("Save as New") { value.answer.resume(returning: .saveAsNew) }
+            Button("Cancel", role: .cancel) { value.answer.resume(returning: nil) }
+        } message: { _ in
+            Text("This draft was edited in another app while your changes here were waiting to upload. Overwrite replaces that version with yours, Reload opens the other version and discards your changes, and Save as New keeps both.")
+        }
+    }
+}
+
 /// Covers the compose while a saved draft is checked against its server copy.
 private struct ServerCopyCheckCover: View {
     var body: some View {
@@ -3854,8 +3887,11 @@ private struct ServerCopyCheckCover: View {
     }
 }
 
+/// #217 (ADR-IOS-091): Save found that another app changed (or removed) the server
+/// copy. The user chooses; Cancel keeps the compose open with nothing written. Its
+/// own `ViewModifier` for the type-checker reason `DiscardUnsavedEditsAlert` gives.
 private struct ServerChangedOnSaveAlert: ViewModifier {
-    enum Choice { case overwrite, reload, saveAsNew }
+    typealias Choice = ExternalDraftAdoption.ServerChangeChoice
 
     @Binding var pending: ServerChangeOnSave?
     let onChoice: (ServerChangeOnSave, Choice) -> Void

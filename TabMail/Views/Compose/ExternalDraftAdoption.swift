@@ -334,6 +334,16 @@ enum ExternalDraftAdoption {
     /// A server copy's editable content, read from ONE `fetchDraftCopy` result, so
     /// subject, recipients, body and attachments all come from the same version.
     /// Attachments are staged in a new directory, which the caller owns from here on.
+    /// The user's answer when the server copy of a draft with unsent edits changed.
+    enum ServerChangeChoice: Sendable {
+        /// Keep this device's edits; the next upload replaces the other version.
+        case overwrite
+        /// Take the other version; this device's edits are dropped.
+        case reload
+        /// Keep both: this device's edits become a new server draft.
+        case saveAsNew
+    }
+
     struct ServerContent {
         let subject: String
         let to: String
@@ -456,24 +466,27 @@ enum ExternalDraftAdoption {
     /// open of a persisted draft runs this (`ComposeView.loadDraftOrPrepopulate`),
     /// whichever screen opened it.
     ///
-    /// Only a row with no unsent edits (`"pushed"`) is checked: it holds nothing the
-    /// server lacks, so when its server copy changed it simply takes the server's
-    /// version. A row WITH unsent edits opens as it is, and Save asks the user if
-    /// the server copy changed (owner ruling 2026-10-17). Anything that stops the
-    /// check — offline, a gone copy, a body that could not be read, a row that
-    /// changed meanwhile — also opens the row as it is: Save and the upload check
-    /// again, so nothing here can overwrite either side.
+    /// When the server copy changed (owner rulings 2026-10-17):
+    /// - a row with no unsent edits (`"pushed"`) holds nothing the server lacks, so
+    ///   it simply takes the server's version;
+    /// - a row WITH unsent edits (saved offline, or an upload that refused the
+    ///   changed copy) asks the user first: `askAboutUnsentEdits` returns Overwrite,
+    ///   Reload or Save as new, or nil to open the edits as they are (Save asks
+    ///   again).
+    /// Anything that stops the check — offline, a gone copy, a body that could not
+    /// be read, a row that changed meanwhile — opens the row as it is: Save and the
+    /// upload check again, so nothing here can overwrite either side.
     /// `willReadServer` runs just before the network read, so a draft that needs
-    /// none (a new compose, a row with unsent edits) opens without a loading cover.
+    /// none (a new compose, a draft never uploaded) opens without a loading cover.
     static func refreshBeforeOpen(
         draftId: String,
-        willReadServer: @MainActor () -> Void
+        willReadServer: @MainActor () -> Void,
+        askAboutUnsentEdits: @MainActor () async -> ServerChangeChoice?
     ) async {
         do {
             guard let row = try await AppDatabase.dbPool.read({ db in
                       try Draft.fetchOne(db, key: draftId)
                   }),
-                  row.serverPushStatus == "pushed",
                   let provider = await AccountManager.shared.provider(accountId: row.accountId),
                   let identity = DraftStore.priorIdentity(
                       for: row, runtimeKind: AccountManager.draftRuntimeIdentityKind(for: provider)) else {
@@ -484,9 +497,30 @@ enum ExternalDraftAdoption {
                 try await provider.fetchDraftCopy(identity: identity)
             }
             guard let copy,
-                  case .changed = DraftServerCheck.compare(
+                  case .changed(let serverText) = DraftServerCheck.compare(
                       base: row.serverDraftText, current: DraftServerText.of(copy)) else {
                 return
+            }
+            if row.serverPushStatus != "pushed" {
+                let epoch = row.instanceEpoch ?? ""
+                switch await askAboutUnsentEdits() {
+                case nil:
+                    return
+                case .overwrite?:
+                    _ = try await AppDatabase.dbPool.write { db in
+                        try DraftStore.rebaseOnServerText(
+                            draftId: draftId, expectedInstanceEpoch: epoch, serverText: serverText, db: db)
+                    }
+                    return
+                case .saveAsNew?:
+                    _ = try await AppDatabase.dbPool.write { db in
+                        try DraftStore.detachFromServerCopy(
+                            draftId: draftId, expectedInstanceEpoch: epoch, db: db)
+                    }
+                    return
+                case .reload?:
+                    break
+                }
             }
             let content = try await content(
                 of: copy, accountId: row.accountId, identity: identity, bodyEmptyConfirmed: false)

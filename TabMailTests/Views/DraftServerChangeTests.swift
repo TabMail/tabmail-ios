@@ -225,7 +225,7 @@ struct DraftServerChangeRowTests {
     }
 
     @Test("Reload writes nothing over a row that changed after it was compared", arguments: [
-        "newer save", "generation", "status", "address",
+        "newer save", "overwrite", "generation", "status", "address",
     ])
     func reloadFailsClosed(change: String) throws {
         let db = try TestDatabase.make()
@@ -237,6 +237,12 @@ struct DraftServerChangeRowTests {
                 row.body = "newest local edit"
                 row.updatedAt += 1
                 try DraftStore.applySave(row, db: db)
+                return
+            case "overwrite":
+                // Changes only the row's copy of the server text and its version.
+                _ = try DraftStore.rebaseOnServerText(
+                    draftId: row.id, expectedInstanceEpoch: try #require(row.instanceEpoch),
+                    serverText: "copy: newer server text", db: db)
                 return
             case "generation": row.instanceEpoch = "another-generation"
             case "status": row.serverPushStatus = "dirty"

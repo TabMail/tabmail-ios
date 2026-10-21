@@ -181,8 +181,13 @@ struct DraftServerChangeRegressionTests {
             let provider = ExchangeProvider(
                 userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
             try await withRegisteredProvider(provider) {
-                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id) {}
+                var asked = false
 
+                await ExternalDraftAdoption.refreshBeforeOpen(
+                    draftId: draft.id, willReadServer: {},
+                    askAboutUnsentEdits: { asked = true; return nil })
+
+                #expect(!asked, "a row with no unsent edits takes the server version without asking")
                 let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
                 #expect(row.body == "fresh body")
                 #expect(row.subject == "fresh subject")
@@ -205,29 +210,101 @@ struct DraftServerChangeRegressionTests {
             userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
     }
 
-    private static let rewrittenCopyJSON = FakeHTTP.CannedResponse.json(raw: """
-        {"id":"g1","subject":"rewritten elsewhere","from":{"emailAddress":{"address":"owner@example.com"}},\
-        "toRecipients":[{"emailAddress":{"address":"alice@example.com"}}],\
-        "receivedDateTime":"\(ISO8601DateFormatter().string(from: Date()))","isRead":true,"isDraft":true,\
-        "hasAttachments":false,"body":{"contentType":"html","content":"<p>rewritten elsewhere</p>"}}
-        """)
+    /// The draft as the Graph API returns it; `copyJSON(body: "now here")` is the
+    /// same draft as `copy()`, the text the test row last saw.
+    private static func copyJSON(body: String) -> FakeHTTP.CannedResponse {
+        .json(raw: """
+            {"id":"g1","subject":"Plan","from":{"emailAddress":{"address":"owner@example.com"}},\
+            "toRecipients":[{"emailAddress":{"address":"alice@example.com"}}],\
+            "receivedDateTime":"\(ISO8601DateFormatter().string(from: Date()))","isRead":true,"isDraft":true,\
+            "hasAttachments":false,"body":{"contentType":"html","content":"<p>\(body)</p>"}}
+            """)
+    }
 
-    @Test("Opening a draft with unsent edits does not read the server; Save asks instead")
-    func openKeepsUnsentEditsWithoutAServerRead() async throws {
+    @Test("Opening a draft with unsent edits and an unchanged server copy opens the edits without asking")
+    func openKeepsUnsentEditsWhenTheServerIsUnchanged() async throws {
         try await withInstalledPool { pool in
             let draft = try await pool.write { try insertDraft($0, status: "dirty") }
             let http = FakeHTTP.Scenario()
             defer { http.close() }
-            let provider = exchangeProvider(http, copyResponse: Self.rewrittenCopyJSON)
+            let provider = exchangeProvider(http, copyResponse: Self.copyJSON(body: "now here"))
             try await withRegisteredProvider(provider) {
-                var coverShown = false
+                var asked = false
 
-                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id) { coverShown = true }
+                await ExternalDraftAdoption.refreshBeforeOpen(
+                    draftId: draft.id, willReadServer: {},
+                    askAboutUnsentEdits: { asked = true; return nil })
 
-                #expect(http.recordedCalls().isEmpty)
-                #expect(!coverShown, "no loading cover when nothing is read")
+                #expect(http.recordedCalls().contains { $0.method == "GET" && $0.url.contains("/messages/g1") },
+                        "the server copy must actually be read")
+                #expect(!asked, "only a server-side change asks")
                 let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
                 #expect(row.body == "phone edit" && row.serverPushStatus == "dirty")
+                #expect(row.pushAttemptVersion == draft.pushAttemptVersion)
+            }
+        }
+    }
+
+    enum OpenAnswer: String, CaseIterable, Sendable {
+        case overwrite, reload, saveAsNew, cancel
+
+        var choice: ExternalDraftAdoption.ServerChangeChoice? {
+            switch self {
+            case .overwrite: .overwrite
+            case .reload: .reload
+            case .saveAsNew: .saveAsNew
+            case .cancel: nil
+            }
+        }
+    }
+
+    @Test("Opening a draft with unsent edits that changed on the server asks first, then applies the answer",
+          arguments: OpenAnswer.allCases)
+    func openAsksAboutUnsentEditsWhenTheServerChanged(answer: OpenAnswer) async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { try insertDraft($0, status: "dirty") }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let provider = exchangeProvider(http, copyResponse: Self.copyJSON(body: "rewritten elsewhere"))
+            try await withRegisteredProvider(provider) {
+                var askCount = 0
+                var rowWhenAsked: Draft?
+
+                await ExternalDraftAdoption.refreshBeforeOpen(
+                    draftId: draft.id, willReadServer: {},
+                    askAboutUnsentEdits: {
+                        askCount += 1
+                        rowWhenAsked = try? await pool.read { try Draft.fetchOne($0, key: draft.id) }
+                        return answer.choice
+                    })
+
+                #expect(askCount == 1)
+                #expect(rowWhenAsked?.body == "phone edit", "nothing is written before the user answers")
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                switch answer {
+                case .overwrite:
+                    #expect(row.body == "phone edit" && row.serverDraftId == "g1")
+                    #expect(row.serverDraftText == DraftServerText.of(Self.copy(body: "rewritten elsewhere")),
+                            "the next upload must see the server copy as known, and replace it")
+                    #expect(row.pushAttemptVersion > draft.pushAttemptVersion)
+                case .reload:
+                    #expect(row.body == "rewritten elsewhere" && row.serverPushStatus == "pushed")
+                    #expect(row.pushAttemptVersion > draft.pushAttemptVersion,
+                            "a queued upload of the dropped edits must retire")
+                case .saveAsNew:
+                    #expect(row.body == "phone edit")
+                    #expect(row.serverDraftId == nil && row.serverPushStatus == nil,
+                            "the edits become a new server draft; the other version stays")
+                    #expect(row.pushAttemptVersion > draft.pushAttemptVersion)
+                case .cancel:
+                    #expect(row.body == "phone edit" && row.serverDraftId == "g1"
+                            && row.serverDraftText == draft.serverDraftText
+                            && row.serverPushStatus == "dirty"
+                            && row.pushAttemptVersion == draft.pushAttemptVersion,
+                            "Cancel opens the edits with nothing written; Save asks again")
+                }
+                #expect(!http.recordedCalls().contains { $0.method != "GET" },
+                        "opening never writes to the server")
             }
         }
     }
@@ -235,19 +312,24 @@ struct DraftServerChangeRegressionTests {
     @Test("Opening offline keeps the local copy untouched")
     func openOfflineKeepsTheLocalCopy() async throws {
         try await withInstalledPool { pool in
-            let draft = try await pool.write { try insertDraft($0, status: "pushed") }
+            // Saved offline: unsent edits, reopened while still offline.
+            let draft = try await pool.write { try insertDraft($0, status: "dirty") }
             let http = FakeHTTP.Scenario()
             defer { http.close() }
             let provider = exchangeProvider(http, copyResponse: .transportError(.notConnectedToInternet))
             try await withRegisteredProvider(provider) {
                 var coverShown = false
+                var asked = false
 
-                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id) { coverShown = true }
+                await ExternalDraftAdoption.refreshBeforeOpen(
+                    draftId: draft.id, willReadServer: { coverShown = true },
+                    askAboutUnsentEdits: { asked = true; return .reload })
 
                 #expect(coverShown)
+                #expect(!asked, "an unread server copy is never a reason to ask")
                 #expect(http.recordedCalls().contains { $0.method == "GET" && $0.url.contains("/messages/g1") })
                 let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
-                #expect(row.body == "phone edit" && row.subject == "Plan")
+                #expect(row.body == "phone edit" && row.subject == "Plan" && row.serverPushStatus == "dirty")
                 #expect(row.pushAttemptVersion == draft.pushAttemptVersion)
             }
         }
