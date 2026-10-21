@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import UniformTypeIdentifiers
 
 /// Issue #217: open and edit a draft that ANOTHER mail app (Gmail web, Apple Mail,
 /// Outlook, …) left in the Drafts folder.
@@ -20,7 +21,8 @@ import GRDB
 /// day: never keep a stale local copy, and ask before overwriting a server copy that
 /// another app changed. So every adopted or reloaded row keeps a copy of the server
 /// text its content came from (`Draft.serverDraftText`, `DraftServerCheck`), and
-/// `reload` refreshes a row whose server copy no longer matches it.
+/// `refreshBeforeOpen` reloads a row with no unsent edits whose server copy no
+/// longer matches it.
 ///
 /// What still fails closed, because each one is an irreversible-wire hazard rather
 /// than a concurrency question:
@@ -156,6 +158,21 @@ enum ExternalDraftAdoption {
         return try request.fetchCount(db) > 0
     }
 
+    /// The provider identity that reads the server copy at `address`.
+    static func identity(for address: LocallyAuthoredDraftOpenAuthority.Address) -> DraftDeleteIdentity? {
+        switch address {
+        case .imap(let folderPath, let uidValidity, let uid):
+            guard let uid = Int(uid), uid > 0 else { return nil }
+            return .imap(folder: folderPath, uidValidity: uidValidity, uid: uid)
+        case .gmail(let resourceId, _):
+            return .gmail(resourceId: resourceId)
+        case .outlook(let graphId):
+            return .outlook(graphId: graphId)
+        case .placeholder, .demo:
+            return nil
+        }
+    }
+
     // MARK: - Content
 
     /// The editable plain-text body, or nil when it must not open yet.
@@ -204,9 +221,7 @@ enum ExternalDraftAdoption {
         id: String,
         header: MessageHeader,
         address: LocallyAuthoredDraftOpenAuthority.Address,
-        serverText: String,
-        body: String,
-        attachmentsDirName: String?,
+        content: ServerContent,
         replyParent: MessageHeader?,
         instanceEpoch: String,
         now: Double
@@ -214,11 +229,11 @@ enum ExternalDraftAdoption {
         var draft = Draft(
             id: id,
             accountId: header.accountId,
-            toJSON: Draft.encodeStringArray(RecipientEntry(header.to).draftEntries),
-            ccJSON: Draft.encodeStringArray(RecipientEntry(header.cc).draftEntries),
-            bccJSON: Draft.encodeStringArray(RecipientEntry(header.bcc).draftEntries),
-            subject: header.subject,
-            body: body,
+            toJSON: Draft.encodeStringArray(RecipientEntry(content.to).draftEntries),
+            ccJSON: Draft.encodeStringArray(RecipientEntry(content.cc).draftEntries),
+            bccJSON: Draft.encodeStringArray(RecipientEntry(content.bcc).draftEntries),
+            subject: content.subject,
+            body: content.body,
             replyToId: replyParent?.id,
             isForward: false,
             editHistoryJSON: nil,
@@ -227,9 +242,9 @@ enum ExternalDraftAdoption {
             serverDraftId: nil,
             serverPushStatus: "pushed",
             rfc822MessageId: header.rfc822MessageId,
-            attachmentsDirName: attachmentsDirName)
+            attachmentsDirName: content.attachmentsDirName)
         draft.instanceEpoch = instanceEpoch
-        draft.serverDraftText = serverText
+        draft.serverDraftText = content.serverText
         draft.replyToProviderMessageId = replyParent?.messageId
         draft.replyToUidValidity = replyParent?.observedUidValidity
         switch address {
@@ -255,9 +270,7 @@ enum ExternalDraftAdoption {
         header: MessageHeader,
         address: LocallyAuthoredDraftOpenAuthority.Address,
         runtimeKind: DraftRuntimeIdentityKind,
-        serverText: String,
-        body: String,
-        attachmentsDirName: String?,
+        content: ServerContent,
         now: Double = Date().timeIntervalSince1970
     ) throws -> String? {
         guard let (current, folder) = try currentDraftsHeader(db: db, captured: header),
@@ -269,9 +282,7 @@ enum ExternalDraftAdoption {
             id: draftKeyPrefix + UUID().uuidString,
             header: current,
             address: address,
-            serverText: serverText,
-            body: body,
-            attachmentsDirName: attachmentsDirName,
+            content: content,
             replyParent: try replyParent(for: current, db: db),
             instanceEpoch: UUID().uuidString,
             now: now)
@@ -279,108 +290,108 @@ enum ExternalDraftAdoption {
         return draft.id
     }
 
-    /// The reload, inside ONE write transaction: re-verify that `header` is still
-    /// the server copy `address` names and that `draftId` is still the same
-    /// generation and owns that address, then replace its content with the server's.
+    /// The reload, inside ONE write transaction: `decided` is the row the open
+    /// check compared. Writes only if the row is still exactly that row — same
+    /// generation, same conflict version, same status and same server address — so a
+    /// newer save (another compose window, the agent) or a "Save as new" made while
+    /// the server copy was being read always wins. Advances `pushAttemptVersion`, so
+    /// an upload started before the reload retires at Stage A.
     /// Returns the attachment directory the row used before (to delete after
     /// commit), `.some(nil)` when it had none, or nil when nothing was written.
     static func applyReload(
         db: Database,
-        header: MessageHeader,
-        address: LocallyAuthoredDraftOpenAuthority.Address,
-        runtimeKind: DraftRuntimeIdentityKind,
-        draftId: String,
-        expectedInstanceEpoch: String,
-        serverText: String,
-        body: String,
-        attachmentsDirName: String?,
+        decided: Draft,
+        content: ServerContent,
         now: Double = Date().timeIntervalSince1970
     ) throws -> String?? {
-        guard let (current, folder) = try currentDraftsHeader(db: db, captured: header),
-              addressStillNames(address, header: current, folder: folder, runtimeKind: runtimeKind),
-              var draft = try Draft.fetchOne(db, key: draftId),
-              draft.accountId == current.accountId,
-              draft.instanceEpoch == expectedInstanceEpoch,
-              rowOwns(draft, address: address) else {
+        guard var draft = try Draft.fetchOne(db, key: decided.id),
+              draft.accountId == decided.accountId,
+              draft.instanceEpoch == decided.instanceEpoch,
+              draft.pushAttemptVersion == decided.pushAttemptVersion,
+              draft.serverPushStatus == decided.serverPushStatus,
+              draft.serverDraftId == decided.serverDraftId,
+              draft.serverDraftFolderPath == decided.serverDraftFolderPath,
+              draft.serverDraftUidValidity == decided.serverDraftUidValidity else {
             return nil
         }
         let previousDirName = draft.attachmentsDirName
-        draft.toJSON = Draft.encodeStringArray(RecipientEntry(current.to).draftEntries)
-        draft.ccJSON = Draft.encodeStringArray(RecipientEntry(current.cc).draftEntries)
-        draft.bccJSON = Draft.encodeStringArray(RecipientEntry(current.bcc).draftEntries)
-        draft.subject = current.subject
-        draft.body = body
-        draft.attachmentsDirName = attachmentsDirName
+        draft.toJSON = Draft.encodeStringArray(RecipientEntry(content.to).draftEntries)
+        draft.ccJSON = Draft.encodeStringArray(RecipientEntry(content.cc).draftEntries)
+        draft.bccJSON = Draft.encodeStringArray(RecipientEntry(content.bcc).draftEntries)
+        draft.subject = content.subject
+        draft.body = content.body
+        draft.attachmentsDirName = content.attachmentsDirName
         draft.updatedAt = now
-        draft.serverDraftText = serverText
+        draft.serverDraftText = content.serverText
         draft.serverPushStatus = "pushed"
+        draft.pushAttemptVersion += 1
         try draft.update(db)
         return .some(previousDirName)
     }
 
-    /// Whether `draft` is the row that owns `address` (the same columns
-    /// `addressIsOwned` filters on).
-    private static func rowOwns(
-        _ draft: Draft,
-        address: LocallyAuthoredDraftOpenAuthority.Address
-    ) -> Bool {
-        switch address {
-        case .imap(let folderPath, let uidValidity, let uid):
-            return draft.serverDraftId == uid
-                && draft.serverDraftFolderPath == folderPath
-                && draft.serverDraftUidValidity == uidValidity
-        case .gmail(let resourceId, _):
-            return draft.serverDraftId == resourceId
-        case .outlook(let graphId):
-            return draft.serverDraftId == graphId
-        case .placeholder, .demo:
-            return false
-        }
-    }
-
     // MARK: - Orchestration
 
-    /// The server copy's editable content, fetched FRESH from the provider (never
-    /// a cached body: an Outlook draft keeps its id across edits, so a cached body
-    /// can be an older version than the server's). Top-level attachments are staged
-    /// in a new directory, which the caller owns from here on.
-    private struct ServerContent {
-        let header: MessageHeader
+    /// A server copy's editable content, read from ONE `fetchDraftCopy` result, so
+    /// subject, recipients, body and attachments all come from the same version.
+    /// Attachments are staged in a new directory, which the caller owns from here on.
+    struct ServerContent {
+        let subject: String
+        let to: String
+        let cc: String
+        let bcc: String
         let body: String
-        /// The fetched copy's text (`DraftServerText`), kept as the row's copy.
+        /// The copy's text (`DraftServerText`), kept as the row's copy.
         let serverText: String
         let attachmentsDirName: String?
         let attachmentCount: Int
     }
 
-    private static func fetchServerContent(header: MessageHeader) async throws -> ServerContent {
-        try await AccountManager.shared.fetchBody(for: header, replaceExistingBody: true)
+    /// The file name an adopted inline image is carried under. The body is edited
+    /// as plain text, so an inline image travels on as an ordinary attachment.
+    /// `DraftServerText` names inline images the same way, so the copy this device
+    /// uploads after adopting them compares equal to the original.
+    static func inlineImageFilename(_ image: InlineImage, index: Int) -> String {
+        let ext = UTType(mimeType: image.contentType)?.preferredFilenameExtension ?? "bin"
+        return "image\(index + 1).\(ext)"
+    }
 
-        let snapshot = try await AppDatabase.dbPool.read { db -> (MessageHeader, MessageBody)? in
-            guard let (current, _) = try currentDraftsHeader(db: db, captured: header),
-                  let body = try MessageBody.fetchOne(db, key: current.id) else {
-                return nil
-            }
-            return (current, body)
-        }
-        guard let (current, messageBody) = snapshot else {
-            throw AdoptionError.bodyUnavailable
-        }
+    private static func content(
+        of copy: FullMessageInfo,
+        accountId: String,
+        identity: DraftDeleteIdentity,
+        bodyEmptyConfirmed: Bool
+    ) async throws -> ServerContent {
         // Top-level only: parts nested inside an attached `.eml` travel inside it.
-        let attachmentInfos = messageBody.attachments.filter { $0.parentEmlSection == nil }
+        let attachmentInfos = copy.attachments.filter { $0.parentEmlSection == nil }
+        let html: String?
+        if let htmlBody = copy.htmlBody, !htmlBody.isEmpty {
+            html = htmlBody
+        } else {
+            html = copy.textBody.map(EmailFilter.plainTextToHTML)
+        }
         guard let body = editableBody(
-            html: messageBody.htmlContent,
-            bodyEmptyConfirmed: current.bodyEmptyConfirmed,
-            hasAttachments: !attachmentInfos.isEmpty) else {
+            html: html,
+            bodyEmptyConfirmed: bodyEmptyConfirmed,
+            hasAttachments: !attachmentInfos.isEmpty || !copy.inlineImages.isEmpty) else {
             throw AdoptionError.bodyUnavailable
         }
 
+        // Attachment ids belong to the message the copy was read from (Gmail
+        // replaces that message on every save), so they are fetched by its id.
+        let folderPath: String
+        if case .imap(let folder, _, _) = identity { folderPath = folder } else { folderPath = "" }
         var attachments: [DraftAttachment] = []
         for info in attachmentInfos {
             let data = try await AccountManager.shared.fetchAttachment(
-                for: current, section: info.section, encoding: info.encoding)
+                accountId: accountId, messageId: copy.header.messageId, folderPath: folderPath,
+                section: info.section, encoding: info.encoding)
             attachments.append(DraftAttachment(
                 filename: info.filename, mimeType: info.contentType, data: data))
+        }
+        for (index, image) in copy.inlineImages.enumerated() {
+            attachments.append(DraftAttachment(
+                filename: inlineImageFilename(image, index: index),
+                mimeType: image.contentType, data: image.data))
         }
         let dirName: String? = attachments.isEmpty ? nil : DraftAttachmentStorage.newStagingDirName()
         if let dirName {
@@ -392,29 +403,42 @@ enum ExternalDraftAdoption {
             }
         }
         return ServerContent(
-            header: current, body: body,
-            serverText: DraftServerText.of(current, html: messageBody.htmlContent),
+            subject: copy.header.subject, to: copy.header.to, cc: copy.header.cc, bcc: copy.header.bcc,
+            body: body, serverText: DraftServerText.of(copy),
             attachmentsDirName: dirName, attachmentCount: attachments.count)
     }
 
-    /// Fetch the server copy's body and attachments, then insert the adopted row,
-    /// keeping the fetched text as the row's copy of the server text.
-    /// Returns without inserting when the header changed or a row already owns the
-    /// address; the caller re-runs its normal resolver either way. THROWS when a
-    /// read or fetch failed, which the loader shows as retryable.
+    /// Read the server copy at `address`, then insert the adopted row, keeping the
+    /// copy's text as the row's copy of the server text.
+    /// Returns without inserting when the server no longer has the draft, the
+    /// header changed, or a row already owns the address; the caller re-runs its
+    /// normal resolver either way. THROWS when a read or fetch failed, which the
+    /// loader shows as retryable.
     static func adopt(
         header: MessageHeader,
         address: LocallyAuthoredDraftOpenAuthority.Address,
         runtimeKind: DraftRuntimeIdentityKind
     ) async throws {
-        let content = try await fetchServerContent(header: header)
+        guard let identity = identity(for: address) else { return }
+        guard let provider = await AccountManager.shared.provider(accountId: header.accountId) else {
+            throw ProviderError.notConnected
+        }
+        guard let copy = try await provider.fetchDraftCopy(identity: identity) else {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[DraftAdoption] header=\(DebugModeManager.escapedForLogLine(String(header.id.prefix(60)))) server copy is gone — not adopted")
+            }
+            return
+        }
+        let content = try await content(
+            of: copy, accountId: header.accountId, identity: identity,
+            bodyEmptyConfirmed: header.bodyEmptyConfirmed)
         let dirName = content.attachmentsDirName
         let insertedId: String?
         do {
             insertedId = try await AppDatabase.dbPool.write { db in
                 try insertAdoptedDraft(
-                    db: db, header: content.header, address: address, runtimeKind: runtimeKind,
-                    serverText: content.serverText, body: content.body, attachmentsDirName: dirName)
+                    db: db, header: header, address: address, runtimeKind: runtimeKind,
+                    content: content)
             }
         } catch {
             if let dirName { DraftAttachmentStorage.deleteAttachments(dirName: dirName) }
@@ -428,41 +452,68 @@ enum ExternalDraftAdoption {
         }
     }
 
-    /// Replace `draftId`'s content with the server copy's (the open path's reload,
-    /// and the user's "Reload" choice). Returns whether the row was refreshed; false
-    /// when the header or the row changed meanwhile. THROWS when a fetch failed.
-    @discardableResult
-    static func reload(
-        header: MessageHeader,
-        address: LocallyAuthoredDraftOpenAuthority.Address,
-        runtimeKind: DraftRuntimeIdentityKind,
+    /// #217 (ADR-IOS-091): bring a saved draft up to date before it opens. Every
+    /// open of a persisted draft runs this (`ComposeView.loadDraftOrPrepopulate`),
+    /// whichever screen opened it.
+    ///
+    /// Only a row with no unsent edits (`"pushed"`) is checked: it holds nothing the
+    /// server lacks, so when its server copy changed it simply takes the server's
+    /// version. A row WITH unsent edits opens as it is, and Save asks the user if
+    /// the server copy changed (owner ruling 2026-10-17). Anything that stops the
+    /// check — offline, a gone copy, a body that could not be read, a row that
+    /// changed meanwhile — also opens the row as it is: Save and the upload check
+    /// again, so nothing here can overwrite either side.
+    /// `willReadServer` runs just before the network read, so a draft that needs
+    /// none (a new compose, a row with unsent edits) opens without a loading cover.
+    static func refreshBeforeOpen(
         draftId: String,
-        expectedInstanceEpoch: String
-    ) async throws -> Bool {
-        let content = try await fetchServerContent(header: header)
-        let dirName = content.attachmentsDirName
-        let previousDir: String??
+        willReadServer: @MainActor () -> Void
+    ) async {
         do {
-            previousDir = try await AppDatabase.dbPool.write { db in
-                try applyReload(
-                    db: db, header: content.header, address: address, runtimeKind: runtimeKind,
-                    draftId: draftId, expectedInstanceEpoch: expectedInstanceEpoch,
-                    serverText: content.serverText, body: content.body, attachmentsDirName: dirName)
+            guard let row = try await AppDatabase.dbPool.read({ db in
+                      try Draft.fetchOne(db, key: draftId)
+                  }),
+                  row.serverPushStatus == "pushed",
+                  let provider = await AccountManager.shared.provider(accountId: row.accountId),
+                  let identity = DraftStore.priorIdentity(
+                      for: row, runtimeKind: AccountManager.draftRuntimeIdentityKind(for: provider)) else {
+                return
+            }
+            await willReadServer()
+            let copy = try await withTimeout(seconds: DraftServerCheckConfig.checkTimeoutSeconds) {
+                try await provider.fetchDraftCopy(identity: identity)
+            }
+            guard let copy,
+                  case .changed = DraftServerCheck.compare(
+                      base: row.serverDraftText, current: DraftServerText.of(copy)) else {
+                return
+            }
+            let content = try await content(
+                of: copy, accountId: row.accountId, identity: identity, bodyEmptyConfirmed: false)
+            let dirName = content.attachmentsDirName
+            let previousDir: String??
+            do {
+                previousDir = try await AppDatabase.dbPool.write { db in
+                    try applyReload(db: db, decided: row, content: content)
+                }
+            } catch {
+                if let dirName { DraftAttachmentStorage.deleteAttachments(dirName: dirName) }
+                throw error
+            }
+            switch previousDir {
+            case .some(let oldDir):
+                // Committed: the old directory is no longer referenced.
+                if let oldDir, oldDir != dirName { DraftAttachmentStorage.deleteAttachments(dirName: oldDir) }
+            case .none:
+                if let dirName { DraftAttachmentStorage.deleteAttachments(dirName: dirName) }
+            }
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[DraftAdoption] reload before open draft=\(draftId) applied=\(previousDir != nil) attachments=\(content.attachmentCount)")
             }
         } catch {
-            if let dirName { DraftAttachmentStorage.deleteAttachments(dirName: dirName) }
-            throw error
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[DraftAdoption] Open-time server check for draft=\(draftId) did not complete (\(error)) — opening the local copy; Save and the upload check again")
+            }
         }
-        switch previousDir {
-        case .some(let oldDir):
-            // Committed: the old directory is no longer referenced.
-            if let oldDir, oldDir != dirName { DraftAttachmentStorage.deleteAttachments(dirName: oldDir) }
-        case .none:
-            if let dirName { DraftAttachmentStorage.deleteAttachments(dirName: dirName) }
-        }
-        if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[DraftAdoption] reload draft=\(draftId) header=\(DebugModeManager.escapedForLogLine(String(header.id.prefix(60)))) applied=\(previousDir != nil) attachments=\(content.attachmentCount)")
-        }
-        return previousDir != nil
     }
 }

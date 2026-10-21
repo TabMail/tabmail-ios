@@ -15,6 +15,20 @@ import Testing
 /// 2. **A local copy with no unsent edits never shadows a newer server copy.**
 ///    Opening follows the server.
 /// 3. **Unsent edits are never dropped without the user choosing Reload.**
+/// 4. **An older action never undoes a newer one.** Every writer here advances
+///    `pushAttemptVersion`, and a reload writes only over the exact row it compared.
+
+/// What this device sends for a draft (the upload's payload), as compared text.
+func sentDraftText(
+    subject: String, to: [String], cc: [String] = [], bcc: [String] = [], body: String,
+    attachmentNames: [String] = []
+) -> String {
+    DraftServerText.of(DraftMessage(
+        to: to, cc: cc, bcc: bcc, subject: subject, body: body,
+        attachments: attachmentNames.map {
+            DraftAttachment(filename: $0, mimeType: "application/octet-stream", data: Data())
+        }))
+}
 @Suite("Draft server-change decisions (#217)")
 struct DraftServerCheckDecisionTests {
     @Test("Compare: the same text is unchanged, different text is changed, no copy is gone")
@@ -30,29 +44,10 @@ struct DraftServerCheckDecisionTests {
         #expect(DraftServerCheck.compare(base: nil, current: nil) == .gone)
     }
 
-    @Test("Open: a clean row follows the server; a row with unsent edits asks", arguments: [
-        // (base, status, current, expected)
-        ("t1", "pushed", "t1", DraftServerCheck.OpenAction.open),
-        ("t1", "pushed", "t2", .reload),
-        (nil, "pushed", "t2", .reload),
-        ("t1", "pushed", nil, .unavailable),
-        ("t1", "dirty", "t1", .open),
-        ("t1", "dirty", "t2", .ask(text: "t2")),
-        ("t1", "pushing", "t2", .ask(text: "t2")),
-        (nil, "dirty", "t2", .open),
-        ("t1", "dirty", nil, .open),
-    ] as [(String?, String?, String?, DraftServerCheck.OpenAction)])
-    func openAction(
-        base: String?, status: String?, current: String?,
-        expected: DraftServerCheck.OpenAction
-    ) {
-        #expect(DraftServerCheck.openAction(base: base, status: status, current: current) == expected)
-    }
-
     @Test("Text: what this device sends reads back equal however the server re-formats it")
     func reformattedServerCopyIsUnchanged() {
         let body = "Hi Alice,\n\nThe plan & the dates are below.\n\n> quoted line\nThanks"
-        let sent = DraftServerText.local(
+        let sent = sentDraftText(
             subject: "  Plan   for Q3 ", to: ["Alice <Alice@Example.com>", "bob@example.com"],
             cc: ["carol@example.com"], body: body)
         // Re-formatted by a server: its own HTML document, entities and spacing,
@@ -75,46 +70,86 @@ struct DraftServerCheckDecisionTests {
 
     @Test("Text: an empty subject equals the server's \"(no subject)\"")
     func emptySubjectEqualsPlaceholder() {
-        let sent = DraftServerText.local(subject: "", to: [], cc: [], body: "Hello")
+        let sent = sentDraftText(subject: "", to: [], body: "Hello")
         #expect(DraftServerText.of(Self.copy(subject: "(no subject)", html: "<p>Hello</p>")) == sent)
         #expect(DraftServerText.of(Self.copy(subject: "(No Subject)", html: "<p>Hello</p>")) == sent)
     }
 
-    @Test("Text: a changed subject, To, Cc or body word reads as an edit; Bcc is not compared")
-    func editedFieldsAreChanged() {
-        let sent = DraftServerText.local(
-            subject: "Plan", to: ["alice@example.com"], cc: ["carol@example.com"],
-            body: "Meet on Monday")
-        func server(
-            subject: String = "Plan", to: String = "alice@example.com",
-            cc: String = "carol@example.com", bcc: String = "", html: String = "<div>Meet on Monday</div>"
-        ) -> String {
-            DraftServerText.of(Self.copy(subject: subject, to: to, cc: cc, bcc: bcc, html: html))
-        }
-        #expect(server() == sent, "precondition: the unchanged copy matches")
-        #expect(server(subject: "Plan v2") != sent)
-        #expect(server(to: "alice@example.com, dave@example.com") != sent)
-        #expect(server(cc: "") != sent)
-        #expect(server(html: "<div>Meet on Tuesday</div>") != sent)
-        #expect(server(bcc: "eve@example.com") == sent,
-                "IMAP and Gmail drafts never carry Bcc to the server, so it cannot be compared")
+    /// One field changed in another app, as `(label, server copy)`.
+    private static let editedCopies: [(String, FullMessageInfo)] = [
+        ("subject", copy(subject: "Plan v2", to: "alice@example.com", cc: "carol@example.com",
+                         bcc: "erin@example.com", html: "<div>Meet on Monday</div>", attachments: ["agenda.pdf"])),
+        ("To", copy(subject: "Plan", to: "alice@example.com, dave@example.com", cc: "carol@example.com",
+                    bcc: "erin@example.com", html: "<div>Meet on Monday</div>", attachments: ["agenda.pdf"])),
+        ("Cc", copy(subject: "Plan", to: "alice@example.com", cc: "",
+                    bcc: "erin@example.com", html: "<div>Meet on Monday</div>", attachments: ["agenda.pdf"])),
+        ("Bcc", copy(subject: "Plan", to: "alice@example.com", cc: "carol@example.com",
+                     bcc: "erin@example.com, frank@example.com", html: "<div>Meet on Monday</div>",
+                     attachments: ["agenda.pdf"])),
+        ("body word", copy(subject: "Plan", to: "alice@example.com", cc: "carol@example.com",
+                           bcc: "erin@example.com", html: "<div>Meet on Tuesday</div>", attachments: ["agenda.pdf"])),
+        ("body spacing", copy(subject: "Plan", to: "alice@example.com", cc: "carol@example.com",
+                              bcc: "erin@example.com", html: "<div>Meet onMonday</div>", attachments: ["agenda.pdf"])),
+        ("attachment added", copy(subject: "Plan", to: "alice@example.com", cc: "carol@example.com",
+                                  bcc: "erin@example.com", html: "<div>Meet on Monday</div>",
+                                  attachments: ["agenda.pdf", "notes.txt"])),
+        ("attachment removed", copy(subject: "Plan", to: "alice@example.com", cc: "carol@example.com",
+                                    bcc: "erin@example.com", html: "<div>Meet on Monday</div>")),
+        ("inline image added", copy(subject: "Plan", to: "alice@example.com", cc: "carol@example.com",
+                                    bcc: "erin@example.com", html: "<div>Meet on Monday</div>",
+                                    attachments: ["agenda.pdf"], inlineImageTypes: ["image/png"])),
+        ("text part only, changed", copy(subject: "Plan", to: "alice@example.com", cc: "carol@example.com",
+                                         bcc: "erin@example.com", html: "", text: "Meet on Tuesday",
+                                         attachments: ["agenda.pdf"])),
+    ]
+
+    private static let sentForEdits = sentDraftText(
+        subject: "Plan", to: ["alice@example.com"], cc: ["carol@example.com"], bcc: ["erin@example.com"],
+        body: "Meet on Monday", attachmentNames: ["agenda.pdf"])
+
+    @Test("Text: the unchanged copy matches what this device sent")
+    func unchangedCopyMatches() {
         #expect(DraftServerText.of(Self.copy(
-            subject: "Plan", to: "alice@example.com", cc: "carol@example.com",
-            html: "", text: "Meet on Tuesday")) != sent,
-                "an empty HTML part must fall back to the text part, not read as empty")
+            subject: "Plan", to: "alice@example.com", cc: "carol@example.com", bcc: "Erin <erin@example.com>",
+            html: "<div>Meet on Monday</div>", attachments: ["agenda.pdf"])) == Self.sentForEdits)
+    }
+
+    @Test("Text: a change to any field another app can edit reads as an edit",
+          arguments: Self.editedCopies.map(\.0))
+    func editedFieldsAreChanged(field: String) throws {
+        let edited = try #require(Self.editedCopies.first { $0.0 == field }?.1)
+        #expect(DraftServerText.of(edited) != Self.sentForEdits, "a \(field) edit read as unchanged")
+    }
+
+    @Test("Text: an adopted inline image, uploaded as an attachment, compares equal to the original")
+    func adoptedInlineImageRoundTrips() {
+        let original = Self.copy(subject: "Plan", html: "<p>See <img src=\"cid:logo@x\"></p>",
+                                 inlineImageTypes: ["image/png"])
+        let image = InlineImage(contentId: "logo@x", contentType: "image/png", data: Data([1]))
+        let uploaded = sentDraftText(
+            subject: "Plan", to: [], body: "See",
+            attachmentNames: [ExternalDraftAdoption.inlineImageFilename(image, index: 0)])
+        #expect(DraftServerText.of(original) == uploaded)
     }
 
     private static func copy(
         subject: String, to: String = "", cc: String = "", bcc: String = "",
-        html: String?, text: String? = nil
+        html: String?, text: String? = nil, attachments: [String] = [], inlineImageTypes: [String] = []
     ) -> FullMessageInfo {
         FullMessageInfo(
             header: MessageHeaderInfo(
                 messageId: "m1", rfc822MessageId: nil, inReplyTo: nil, references: [], threadId: nil,
                 subject: subject, from: "", fromAddress: "", to: to, cc: cc, bcc: bcc, replyTo: nil,
-                date: Date(), snippet: "", isRead: true, isFlagged: false, hasAttachments: false,
+                date: Date(), snippet: "", isRead: true, isFlagged: false, hasAttachments: !attachments.isEmpty,
                 isReplied: false, isForwarded: false, actionTag: nil),
-            htmlBody: html, textBody: text)
+            htmlBody: html, textBody: text,
+            attachments: attachments.enumerated().map { index, name in
+                AttachmentInfo(filename: name, contentType: "application/octet-stream",
+                               section: "\(index + 1)", size: 1, encoding: nil)
+            },
+            inlineImages: inlineImageTypes.enumerated().map { index, type in
+                InlineImage(contentId: "img\(index)@x", contentType: type, data: Data([UInt8(index)]))
+            })
     }
 }
 
@@ -142,73 +177,82 @@ struct DraftServerChangeRowTests {
         let inserted = try db.write { db in
             try ExternalDraftAdoption.insertAdoptedDraft(
                 db: db, header: header, address: address, runtimeKind: .imap,
-                serverText: "copy: old local text",
-                body: "old local text", attachmentsDirName: nil)
+                content: Self.content(body: "old local text", serverText: "copy: old local text"))
         }
         let draftId = try #require(inserted)
         let draft = try #require(try db.read { try Draft.fetchOne($0, key: draftId) })
         return (header, draft)
     }
 
-    private func reload(
-        _ db: DatabaseQueue, _ header: MessageHeader, _ draft: Draft,
-        epoch: String? = nil, address: LocallyAuthoredDraftOpenAuthority.Address? = nil
-    ) throws -> String?? {
+    static func content(
+        subject: String = "From the server", to: String = "alice@example.com", bcc: String = "",
+        body: String, serverText: String
+    ) -> ExternalDraftAdoption.ServerContent {
+        ExternalDraftAdoption.ServerContent(
+            subject: subject, to: to, cc: "", bcc: bcc, body: body, serverText: serverText,
+            attachmentsDirName: nil, attachmentCount: 0)
+    }
+
+    private func reload(_ db: DatabaseQueue, decided: Draft) throws -> String?? {
         try db.write { db in
             try ExternalDraftAdoption.applyReload(
-                db: db, header: header,
-                address: address ?? .imap(folderPath: "Drafts", uidValidity: 900_001, uid: "7"),
-                runtimeKind: .imap, draftId: draft.id,
-                expectedInstanceEpoch: epoch ?? draft.instanceEpoch ?? "",
-                serverText: "copy: server text",
-                body: "server text", attachmentsDirName: nil)
+                db: db, decided: decided,
+                content: Self.content(
+                    subject: "Edited in another app", to: "alice@example.com, dave@example.com",
+                    bcc: "erin@example.com", body: "server text", serverText: "copy: server text"))
         }
     }
 
-    @Test("Reload replaces the row's content with the server copy and marks it clean")
+    @Test("Reload replaces the row's content with the fetched copy, marks it clean and advances the version")
     func reloadReplacesContent() throws {
         let db = try TestDatabase.make()
-        var (header, draft) = try makeAdoptedImapDraft(db)
-        try db.write { db in
-            draft.body = "unsent edit"
-            draft.subject = "edited subject"
-            draft.serverPushStatus = "dirty"
-            draft.serverDraftText = "copy: older server text"
-            try draft.update(db)
-        }
-        header.subject = "From the server"
+        let (_, draft) = try makeAdoptedImapDraft(db)
 
-        let written = try reload(db, header, draft)
+        let written = try reload(db, decided: draft)
 
         #expect(written != nil, "the reload wrote nothing")
         let row = try #require(try db.read { try Draft.fetchOne($0, key: draft.id) })
         #expect(row.body == "server text")
-        #expect(row.subject == "From the server")
-        #expect(row.toArray == ["alice@example.com"])
+        #expect(row.subject == "Edited in another app", "subject must come from the fetched copy")
+        #expect(row.toArray == ["alice@example.com", "dave@example.com"])
+        #expect(row.bccArray == ["erin@example.com"])
         #expect(row.serverPushStatus == "pushed", "a reloaded row holds no unsent edits")
         #expect(row.serverDraftText == "copy: server text",
                 "the row's copy of the server text must be the copy it loaded")
         #expect(row.serverDraftId == "7", "the reload must keep the exact address")
+        #expect(row.pushAttemptVersion > draft.pushAttemptVersion,
+                "an upload started before the reload must retire at Stage A")
     }
 
-    @Test("Reload writes nothing when the row was replaced, the header moved, or the row does not own the address")
-    func reloadFailsClosed() throws {
+    @Test("Reload writes nothing over a row that changed after it was compared", arguments: [
+        "newer save", "generation", "status", "address",
+    ])
+    func reloadFailsClosed(change: String) throws {
         let db = try TestDatabase.make()
-        let (header, draft) = try makeAdoptedImapDraft(db)
-
-        #expect(try reload(db, header, draft, epoch: "another-generation") == nil)
-        #expect(try reload(db, header, draft,
-                           address: .imap(folderPath: "Drafts", uidValidity: 900_001, uid: "9")) == nil)
-
+        let (_, decided) = try makeAdoptedImapDraft(db)
         try db.write { db in
-            var renumbered = try #require(try Folder.fetchOne(db, key: header.folderId))
-            renumbered.lastKnownUidValidity = 900_002
-            try renumbered.update(db)
+            var row = try #require(try Draft.fetchOne(db, key: decided.id))
+            switch change {
+            case "newer save":
+                row.body = "newest local edit"
+                row.updatedAt += 1
+                try DraftStore.applySave(row, db: db)
+                return
+            case "generation": row.instanceEpoch = "another-generation"
+            case "status": row.serverPushStatus = "dirty"
+            default: row.serverDraftId = "9"
+            }
+            try row.update(db)
         }
-        #expect(try reload(db, header, draft) == nil)
+        let before = try #require(try db.read { try Draft.fetchOne($0, key: decided.id) })
 
-        let row = try db.read { try Draft.fetchOne($0, key: draft.id) }
-        #expect(row?.body == "old local text", "a refused reload must leave the row untouched")
+        #expect(try reload(db, decided: decided) == nil)
+
+        let after = try #require(try db.read { try Draft.fetchOne($0, key: decided.id) })
+        #expect(after.body == before.body && after.subject == before.subject
+                && after.serverPushStatus == before.serverPushStatus
+                && after.pushAttemptVersion == before.pushAttemptVersion,
+                "a refused reload must leave the row untouched (\(change))")
     }
 
     @Test("Overwrite records the server's current text and keeps the edits")
@@ -226,6 +270,7 @@ struct DraftServerChangeRowTests {
         #expect(row?.serverDraftText == "t9")
         #expect(row?.serverDraftId == "7")
         #expect(row?.body == "old local text")
+        #expect((row?.pushAttemptVersion ?? 0) > draft.pushAttemptVersion)
     }
 
     @Test("Save as new detaches the row from the other app's copy and keeps the edits")
@@ -242,6 +287,8 @@ struct DraftServerChangeRowTests {
                 && row.serverDraftUidValidity == nil && row.serverDraftText == nil)
         #expect(row.serverPushStatus == nil, "the next upload must create a new server draft")
         #expect(row.body == "old local text")
+        #expect(row.pushAttemptVersion > draft.pushAttemptVersion,
+                "an upload already past its check must not reattach the row to the other copy")
         #expect(try db.read { db in
             try LocallyAuthoredDraftOpenAuthority.resolve(db: db, header: header, runtimeKind: .imap)
         } == nil, "the other app's copy must be free to open (and be adopted) on its own")
@@ -262,6 +309,7 @@ struct DraftServerChangeRowTests {
 
         let row = try db.read { try Draft.fetchOne($0, key: draft.id) }
         #expect(row?.serverPushStatus == "pushed")
+        #expect((row?.pushAttemptVersion ?? 0) > draft.pushAttemptVersion)
         #expect(row?.serverDraftText == "copy: old local text",
                 "the copy must stay OLD so the next open sees the server copy changed and reloads")
     }
@@ -313,8 +361,8 @@ struct DraftServerChangePushTests {
                 serverDraftId: "g1", serverPushStatus: "dirty",
                 rfc822MessageId: nil, attachmentsDirName: nil)
             draft.instanceEpoch = "E1"
-            draft.serverDraftText = DraftServerText.local(
-                subject: "Plan", to: ["alice@example.com"], cc: [], body: Self.lastSaved)
+            draft.serverDraftText = sentDraftText(
+                subject: "Plan", to: ["alice@example.com"], body: Self.lastSaved)
             try draft.insert(db)
             return draft
         }
@@ -353,8 +401,8 @@ struct DraftServerChangePushTests {
             let row = try await pool.read { try Draft.fetchOne($0, key: "adopted:test") }
             #expect(row?.serverPushStatus == "dirty", "the edits must stay unsent, not be marked done")
             #expect(row?.body == "edited on this device")
-            #expect(row?.serverDraftText == DraftServerText.local(
-                subject: "Plan", to: ["alice@example.com"], cc: [], body: Self.lastSaved))
+            #expect(row?.serverDraftText == sentDraftText(
+                subject: "Plan", to: ["alice@example.com"], body: Self.lastSaved))
         }
     }
 
@@ -388,8 +436,8 @@ struct DraftServerChangePushTests {
             })
             let row = try await pool.read { try Draft.fetchOne($0, key: "adopted:test") }
             #expect(row?.serverPushStatus == "pushed")
-            #expect(row?.serverDraftText == DraftServerText.local(
-                subject: "Plan", to: ["alice@example.com"], cc: [], body: "edited on this device"),
+            #expect(row?.serverDraftText == sentDraftText(
+                subject: "Plan", to: ["alice@example.com"], body: "edited on this device"),
                     "the next check must compare against OUR write")
         }
     }
@@ -408,8 +456,8 @@ struct DraftServerChangePushTests {
                     "a vanished copy must not be addressed; the edits are saved as a new draft")
             let row = try await pool.read { try Draft.fetchOne($0, key: "adopted:test") }
             #expect(row?.serverDraftId == "g2")
-            #expect(row?.serverDraftText == DraftServerText.local(
-                subject: "Plan", to: ["alice@example.com"], cc: [], body: "edited on this device"))
+            #expect(row?.serverDraftText == sentDraftText(
+                subject: "Plan", to: ["alice@example.com"], body: "edited on this device"))
         }
     }
 
@@ -503,8 +551,8 @@ struct DraftCopyReadTests {
             userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
 
         let copy = try #require(try await provider.fetchDraftCopy(identity: .outlook(graphId: "g1")))
-        #expect(DraftServerText.of(copy) == DraftServerText.local(
-            subject: "Plan", to: [], cc: [], body: "Meet on Monday"))
+        #expect(DraftServerText.of(copy) == sentDraftText(
+            subject: "Plan", to: [], body: "Meet on Monday"))
         #expect(try await provider.fetchDraftCopy(identity: .outlook(graphId: "g404")) == nil)
     }
 
@@ -539,8 +587,8 @@ struct DraftCopyReadTests {
             userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
 
         let copy = try #require(try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r1")))
-        #expect(DraftServerText.of(copy) == DraftServerText.local(
-            subject: "Plan", to: [], cc: [], body: "Meet on Monday"))
+        #expect(DraftServerText.of(copy) == sentDraftText(
+            subject: "Plan", to: [], body: "Meet on Monday"))
         #expect(try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r404")) == nil)
     }
 

@@ -58,8 +58,15 @@ struct ExternalDraftAdoptionTests {
                 db: db, header: header, runtimeKind: .imap) else { return nil }
             return try ExternalDraftAdoption.insertAdoptedDraft(
                 db: db, header: header, address: address, runtimeKind: .imap,
-                serverText: "copy of the server text", body: body, attachmentsDirName: nil)
+                content: Self.content(of: header, body: body))
         }
+    }
+
+    /// The server copy's content as the header describes it.
+    private static func content(of header: MessageHeader, body: String) -> ExternalDraftAdoption.ServerContent {
+        ExternalDraftAdoption.ServerContent(
+            subject: header.subject, to: header.to, cc: header.cc, bcc: header.bcc, body: body,
+            serverText: "copy of the server text", attachmentsDirName: nil, attachmentCount: 0)
     }
 
     private func resolve(
@@ -185,7 +192,7 @@ struct ExternalDraftAdoptionTests {
         let inserted = try db.write { db in
             try ExternalDraftAdoption.insertAdoptedDraft(
                 db: db, header: header, address: address, runtimeKind: .imap,
-                serverText: "copy of the server text", body: "text", attachmentsDirName: nil)
+                content: Self.content(of: header, body: "text"))
         }
         #expect(inserted == nil,
                 "the insert transaction must re-prove the address it is about to own")
@@ -328,8 +335,10 @@ struct ExternalDraftAdoptionSaveTests {
                 db: db, header: header, runtimeKind: .imap))
             return try #require(try ExternalDraftAdoption.insertAdoptedDraft(
                 db: db, header: header, address: address, runtimeKind: .imap,
-                serverText: DraftServerText.of(otherAppCopy),
-                body: "text from the other app", attachmentsDirName: nil))
+                content: ExternalDraftAdoption.ServerContent(
+                    subject: "Started elsewhere", to: "alice@example.com", cc: "", bcc: "",
+                    body: "text from the other app", serverText: DraftServerText.of(otherAppCopy),
+                    attachmentsDirName: nil, attachmentCount: 0)))
         }
 
         // The user edits on this device.
@@ -358,8 +367,8 @@ struct ExternalDraftAdoptionSaveTests {
                 "the upload must check the server copy before replacing it")
         let live = try await pool.read { try Draft.fetchOne($0, key: draftId) }
         #expect(live?.serverDraftId == "8", "after the save the row must own the NEW copy")
-        #expect(live?.serverDraftText == DraftServerText.local(
-            subject: "Started elsewhere", to: ["alice@example.com"], cc: [],
+        #expect(live?.serverDraftText == sentDraftText(
+            subject: "Started elsewhere", to: ["alice@example.com"],
             body: "edited on this device"),
                 "the row's copy of the server text is now the text it just wrote")
     }

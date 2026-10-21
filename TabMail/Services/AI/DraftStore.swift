@@ -407,6 +407,7 @@ actor DraftStore {
         expectedInstanceEpoch: String,
         previousIdentity: DraftDeleteIdentity?,
         freshRfc: String,
+        sentText: String,
         db: Database
     ) throws -> StageAContext? {
         guard var current = try Draft.fetchOne(db, key: initialDraft.id),
@@ -428,7 +429,7 @@ actor DraftStore {
             postAPushAttemptVersion: postAVersion,
             freshRfc: freshRfc,
             previousIdentity: previousIdentity,
-            sentText: DraftServerText.local(initialDraft))
+            sentText: sentText)
     }
 
     static func priorIdentity(
@@ -840,6 +841,8 @@ actor DraftStore {
             inReplyTo: nil,
             attachments: attachments)
         payload.messageId = freshRfc
+        // The row's copy of the server text, once this upload lands.
+        let sentText = DraftServerText.of(payload)
 
         guard let context = try await AppDatabase.dbPool.write({ db in
             try Self.performStageA(
@@ -847,6 +850,7 @@ actor DraftStore {
                 expectedInstanceEpoch: expectedInstanceEpoch,
                 previousIdentity: previousIdentity,
                 freshRfc: freshRfc,
+                sentText: sentText,
                 db: db)
         }) else {
             return .notApplied
@@ -926,6 +930,11 @@ actor DraftStore {
     /// "Overwrite": keep this device's version. Records the server's current text
     /// as this row's copy, so its next upload replaces the other app's version.
     /// Returns false when the row is gone, was replaced, or has no server copy.
+    ///
+    /// This and the two writers below change what an upload's server check was
+    /// decided against (the row's server copy, its address or its status), so each
+    /// advances `pushAttemptVersion`: an upload already past its check then retires
+    /// at Stage A instead of acting on the user's older state.
     static func rebaseOnServerText(
         draftId: String,
         expectedInstanceEpoch: String,
@@ -938,6 +947,7 @@ actor DraftStore {
             return false
         }
         draft.serverDraftText = serverText
+        draft.pushAttemptVersion += 1
         try draft.update(db)
         return true
     }
@@ -959,6 +969,7 @@ actor DraftStore {
         draft.serverDraftUidValidity = nil
         draft.serverDraftText = nil
         draft.serverPushStatus = nil
+        draft.pushAttemptVersion += 1
         try draft.update(db)
         return true
     }
@@ -978,6 +989,7 @@ actor DraftStore {
             return false
         }
         draft.serverPushStatus = "pushed"
+        draft.pushAttemptVersion += 1
         try draft.update(db)
         return true
     }

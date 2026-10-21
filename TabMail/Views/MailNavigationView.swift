@@ -1170,19 +1170,14 @@ private struct PushedMessageDestination: View {
 /// Opens a Drafts header as an editable compose. A draft this device owns reopens
 /// through its generation placeholder or exact provider-native address; a draft
 /// written by another mail app is first adopted (`ExternalDraftAdoption`, #217) and
-/// then opens the same way. Before opening, the row is checked against the server
-/// (ADR-IOS-091): a row with no unsent edits follows the server copy, and a row with
-/// unsent edits asks Overwrite / Reload / Save as new if the server copy's text no
-/// longer matches this device's copy of it.
+/// then opens the same way. The compose checks the row against the server copy
+/// before showing it (`ExternalDraftAdoption.refreshBeforeOpen`, ADR-IOS-091).
 struct ServerDraftComposeLoader: View {
     let header: MessageHeader
     #if DEBUG
     @Environment(\.draftOpenResolverForTesting) private var resolveOpenAuthorityForTesting
     #endif
     @State private var resolution: Resolution?
-    /// A choice whose upload could not be queued yet; retried before resolving again
-    /// so the user's edits are never left without an upload.
-    @State private var pendingUpload: (draftId: String, accountId: String)?
     @Environment(\.dismiss) private var dismiss
 
     /// The three outcomes this view can reach. Mirrors
@@ -1210,14 +1205,6 @@ struct ServerDraftComposeLoader: View {
         /// THREW, so whether a local copy exists is UNKNOWN. Retryable, never
         /// authoritative.
         case resolveFailed
-        /// #217: the row has unsent edits and the server copy was changed by
-        /// another app since. The user chooses; nothing is written until then.
-        /// `serverText` is the changed copy's text (`DraftServerText`).
-        case serverChanged(LocallyAuthoredDraftOpenAuthority, serverText: String)
-    }
-
-    enum ServerChangeChoice: Equatable {
-        case overwrite, reload, saveAsNew
     }
 
     var body: some View {
@@ -1276,38 +1263,6 @@ struct ServerDraftComposeLoader: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(.systemBackground))
-            case .serverChanged(let authority, let serverText):
-                VStack(spacing: 16) {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
-                    Text("Draft changed in another app")
-                        .font(.headline)
-                    Text("This draft was edited somewhere else after your last changes here. Overwrite keeps your version, Reload shows the other version, and Save as New keeps both.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 32)
-                    Button("Overwrite") {
-                        Task { await applyServerChange(.overwrite, authority: authority, serverText: serverText) }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("server-draft-overwrite")
-                    Button("Reload") {
-                        Task { await applyServerChange(.reload, authority: authority, serverText: serverText) }
-                    }
-                    .buttonStyle(.bordered)
-                    .accessibilityIdentifier("server-draft-reload")
-                    Button("Save as New") {
-                        Task { await applyServerChange(.saveAsNew, authority: authority, serverText: serverText) }
-                    }
-                    .buttonStyle(.bordered)
-                    .accessibilityIdentifier("server-draft-save-as-new")
-                    Button("Close") { dismiss() }
-                        .accessibilityIdentifier("server-draft-close")
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color(.systemBackground))
             }
         }
         .task {
@@ -1330,127 +1285,13 @@ struct ServerDraftComposeLoader: View {
     }
 
     private func resolveLocallyAuthoredDraft() async {
-        if let pendingUpload {
-            guard await AccountManager.shared.queueDraftSave(
-                draftId: pendingUpload.draftId, accountId: pendingUpload.accountId) else {
-                resolution = .resolveFailed
-                return
-            }
-            self.pendingUpload = nil
-        }
         let outcome: Result<LocallyAuthoredDraftOpenAuthority?, any Error>
         do {
             outcome = .success(try await resolveOpenAuthority())
         } catch {
             outcome = .failure(error)
         }
-        let classified = Self.classify(outcome)
-        guard case .authorized(let authority) = classified else {
-            resolution = classified
-            return
-        }
-        #if DEBUG
-        if resolveOpenAuthorityForTesting != nil {
-            resolution = classified
-            return
-        }
-        #endif
-        do {
-            resolution = try await checkServerCopy(authority)
-        } catch {
-            resolution = .resolveFailed
-        }
-    }
-
-    /// #217 (ADR-IOS-091): never open a stale local copy. Reads the server copy and
-    /// compares its text with the row's copy (`DraftServerCheck.openAction`). If the
-    /// check cannot run, the row opens as it is; Save and the upload check again.
-    private func checkServerCopy(
-        _ authority: LocallyAuthoredDraftOpenAuthority
-    ) async throws -> Resolution {
-        let row = try await AppDatabase.dbPool.read { db in
-            try Draft.fetchOne(db, key: authority.draftId)
-        }
-        guard let row, authority.matches(row, runtimeKind: authority.runtimeKind),
-              let identity = DraftStore.priorIdentity(for: row, runtimeKind: authority.runtimeKind),
-              let provider = await AccountManager.shared.provider(accountId: authority.accountId) else {
-            // No server copy to compare (a placeholder), or the row changed under us
-            // and the compose's own re-check fails closed.
-            return .authorized(authority)
-        }
-        let current: String?
-        do {
-            current = try await provider.fetchDraftCopy(identity: identity).map(DraftServerText.of)
-        } catch {
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[ServerDraftComposeLoader] Open-time server check for draftId=\(authority.draftId) could not run (\(error)) — opening the local copy; Save and the upload check again")
-            }
-            return .authorized(authority)
-        }
-        switch DraftServerCheck.openAction(
-            base: row.serverDraftText, status: row.serverPushStatus, current: current) {
-        case .open:
-            return .authorized(authority)
-        case .unavailable:
-            return .noLocalCopy
-        case .ask(let serverText):
-            return .serverChanged(authority, serverText: serverText)
-        case .reload:
-            try await ExternalDraftAdoption.reload(
-                header: header, address: authority.address, runtimeKind: authority.runtimeKind,
-                draftId: authority.draftId, expectedInstanceEpoch: authority.instanceEpoch)
-            return Self.classify(.success(try await resolveOpenAuthority()))
-        }
-    }
-
-    /// Apply the user's answer to "Draft changed in another app", then resolve
-    /// again. Overwrite and Save as new queue the upload of this device's edits.
-    private func applyServerChange(
-        _ choice: ServerChangeChoice,
-        authority: LocallyAuthoredDraftOpenAuthority,
-        serverText: String
-    ) async {
-        resolution = nil
-        do {
-            switch choice {
-            case .overwrite:
-                if try await AppDatabase.dbPool.write({ db in
-                    try DraftStore.rebaseOnServerText(
-                        draftId: authority.draftId,
-                        expectedInstanceEpoch: authority.instanceEpoch,
-                        serverText: serverText, db: db)
-                }) {
-                    pendingUpload = (authority.draftId, authority.accountId)
-                }
-            case .reload:
-                try await ExternalDraftAdoption.reload(
-                    header: header, address: authority.address, runtimeKind: authority.runtimeKind,
-                    draftId: authority.draftId, expectedInstanceEpoch: authority.instanceEpoch)
-            case .saveAsNew:
-                if try await AppDatabase.dbPool.write({ db in
-                    try DraftStore.detachFromServerCopy(
-                        draftId: authority.draftId,
-                        expectedInstanceEpoch: authority.instanceEpoch, db: db)
-                }) {
-                    pendingUpload = (authority.draftId, authority.accountId)
-                }
-            }
-        } catch {
-            resolution = .resolveFailed
-            return
-        }
-        if choice == .saveAsNew, let pendingUpload {
-            // Both versions are now in the Drafts list; let the user pick one.
-            guard await AccountManager.shared.queueDraftSave(
-                draftId: pendingUpload.draftId, accountId: pendingUpload.accountId) else {
-                resolution = .resolveFailed
-                return
-            }
-            self.pendingUpload = nil
-            dismiss()
-            return
-        }
-        await resolveLocallyAuthoredDraft()
+        resolution = Self.classify(outcome)
     }
 
     /// Returns the authority when this device provably holds an editable copy, `nil`

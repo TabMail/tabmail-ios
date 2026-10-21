@@ -450,21 +450,31 @@ actor MockEmailProvider: EmailProvider {
         let saved = lastSavedDraft
         return Self.draftCopy(
             subject: saved?.subject ?? "", to: saved?.to ?? [], cc: saved?.cc ?? [],
-            html: saved?.body ?? "")
+            bcc: saved?.bcc ?? [], html: saved?.body ?? "",
+            attachmentNames: saved?.attachments.map(\.filename) ?? [])
     }
 
     /// A server draft copy as a provider's read returns it.
-    static func draftCopy(subject: String, to: [String], cc: [String], html: String) -> FullMessageInfo {
+    static func draftCopy(
+        subject: String, to: [String], cc: [String], bcc: [String] = [], html: String,
+        attachmentNames: [String] = []
+    ) -> FullMessageInfo {
         let header = MessageHeaderInfo(
             messageId: "mock-draft-copy", rfc822MessageId: nil, inReplyTo: nil,
             references: [], threadId: nil,
             subject: subject.isEmpty ? "(no subject)" : subject,
             from: "", fromAddress: "",
-            to: to.joined(separator: ", "), cc: cc.joined(separator: ", "), bcc: "",
+            to: to.joined(separator: ", "), cc: cc.joined(separator: ", "),
+            bcc: bcc.joined(separator: ", "),
             replyTo: nil, date: Date(), snippet: "",
-            isRead: true, isFlagged: false, hasAttachments: false,
+            isRead: true, isFlagged: false, hasAttachments: !attachmentNames.isEmpty,
             isReplied: false, isForwarded: false, actionTag: nil)
-        return FullMessageInfo(header: header, htmlBody: html, textBody: nil)
+        let attachments = attachmentNames.enumerated().map { index, name in
+            AttachmentInfo(
+                filename: name, contentType: "application/octet-stream",
+                section: "mock-att-\(index)", size: 0, encoding: nil)
+        }
+        return FullMessageInfo(header: header, htmlBody: html, textBody: nil, attachments: attachments)
     }
 
     // MARK: - Test Helpers

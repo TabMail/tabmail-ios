@@ -34,7 +34,8 @@ id, a changed header, an unconfirmed-empty body or a failed attachment fetch sti
 - Inline images in another app's HTML draft become plain-text body only (the compose is plain
   text); top-level attachments are carried.
 
-**Amendment (2026-10-17, owner's second ruling, same PR):** *"It should definitely reload from the
+**Amendment (2026-10-17, owner's second ruling, same PR):** *(Its revision witness and its open
+rules are superseded by the two amendments below; preserved as written.)* *"It should definitely reload from the
 server. It should not hold its local copy. … if it changed on the server, we should ask whether to
 overwrite or reload or save as new … and then before saving, always check if the server copy has
 updated. The brief gap time between our check and the save is an acceptable loophole …"*
@@ -58,3 +59,42 @@ updated. The brief gap time between our check and the save is an acceptable loop
   property change (for example a category) can prompt or reload without a body edit; that errs
   toward asking, never toward overwriting.
 - `IOS-DRAFT-020` resolved.
+
+**Amendment (2026-10-17, owner's third ruling, same PR): compare text, not server revisions.**
+*"Do not use server info, simply just compare the text. That's the simplest form of comparison if
+draft has changed. We can save a local copy, and if the updated copy just doesn't match, that's the
+sign of an update. Simple, and no exceptions required at all, or no server deviations required at
+all for providers either."*
+
+- `Draft.serverDraftText` (migration `v92_addDraftServerText`) replaces `serverDraftRevision`: the
+  row's copy of the server text (`DraftServerText`), written at push completion, adoption and
+  reload. `EmailProvider.fetchDraftCopy(identity:)` reads the server copy (`nil` = gone, throw =
+  unknown); `DraftServerCheck.compare` decides unchanged / changed / gone. No provider revision
+  field is read. Graph property-only changes (for example a category) no longer prompt.
+
+**Amendment (2026-10-20, review round 1 of the PR):**
+
+- **What is compared.** Subject (whitespace collapsed, "(no subject)" = empty), To, Cc and Bcc
+  (addresses, lowercased, sorted), attachment file names (sorted; inline images under the name
+  adoption gives them, `ExternalDraftAdoption.inlineImageFilename`) and the body through the same
+  HTML-to-text conversion with each whitespace run collapsed to one space. Bcc and attachments were
+  missing, and whitespace used to be deleted outright, so a remote Bcc, attachment or "now here" to
+  "nowhere" edit read as unchanged and the upload replaced it. The upload records the text of the
+  exact payload it sends (`DraftServerText.of(DraftMessage)`).
+- **Open, on every route.** The check runs in the one step every saved-draft open shares,
+  `ComposeView.loadDraftOrPrepopulate` → `ExternalDraftAdoption.refreshBeforeOpen` (Drafts list,
+  compose toolbar, agent draft, reply/forward resume, undo reopen). Only a row with no unsent edits
+  is checked; if its server copy changed it is reloaded from that same fetched copy. A row with
+  unsent edits opens as is and Save asks Overwrite / Reload / Save as new (the owner's ruling). The
+  separate open-time prompt in `ServerDraftComposeLoader` is deleted. A gone copy, a failed or slow
+  read (`DraftServerCheckConfig.checkTimeoutSeconds`) or an unreadable body opens the row as is;
+  Save and the upload check again.
+- **One server read per adoption or reload.** Subject, recipients (Bcc included), body, attachments
+  and inline images all come from one `fetchDraftCopy` result; the synced header is no longer the
+  content source. Inline images are carried as ordinary attachments (the editor is plain text).
+- **Older actions never undo newer ones.** Overwrite, Save as new and Reload-at-save advance
+  `pushAttemptVersion`, so an upload already past its server check retires at Stage A. A reload
+  writes only over the exact row it compared (same generation, version, status and address).
+- Images the provider's inline-image read drops (a failed image fetch, more than
+  `BodyRenderer.maxInlineImages`) are a pre-existing reader behaviour, tracked separately rather
+  than guarded here (#227).

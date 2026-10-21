@@ -199,6 +199,7 @@ struct DraftGenerationSafetyTests {
                 expectedInstanceEpoch: "E1",
                 previousIdentity: nil,
                 freshRfc: "fresh@example.com",
+                sentText: "",
                 db: db)
         }
 
