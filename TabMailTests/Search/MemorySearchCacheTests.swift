@@ -26,7 +26,7 @@ struct MemorySearchCacheTests {
     @Test("set then get returns cached hits")
     func setGetHitsCache() async {
         await MemorySearchCache.shared.reset()
-        let key = MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: nil)
+        let key = MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: nil, demoActive: false)
         await MemorySearchCache.shared.set(key, [hit(id: "t1"), hit(id: "t2")], generation: await MemorySearchCache.shared.generation)
         let got = await MemorySearchCache.shared.get(key)
         #expect(got?.count == 2)
@@ -36,8 +36,8 @@ struct MemorySearchCacheTests {
     @Test("reset clears all keys")
     func resetClearsAllKeys() async {
         await MemorySearchCache.shared.reset()
-        let k1 = MemorySearchCache.makeKey(query: "a", fromDate: nil, toDate: nil)
-        let k2 = MemorySearchCache.makeKey(query: "b", fromDate: nil, toDate: nil)
+        let k1 = MemorySearchCache.makeKey(query: "a", fromDate: nil, toDate: nil, demoActive: false)
+        let k2 = MemorySearchCache.makeKey(query: "b", fromDate: nil, toDate: nil, demoActive: false)
         await MemorySearchCache.shared.set(k1, [hit(id: "t1")], generation: await MemorySearchCache.shared.generation)
         await MemorySearchCache.shared.set(k2, [hit(id: "t2")], generation: await MemorySearchCache.shared.generation)
         #expect(await MemorySearchCache.shared._testKeyCount() == 2)
@@ -51,7 +51,7 @@ struct MemorySearchCacheTests {
     @Test("a search from before a reset stores nothing")
     func staleSetRefused() async {
         await MemorySearchCache.shared.reset()
-        let key = MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: nil)
+        let key = MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: nil, demoActive: false)
         let before = await MemorySearchCache.shared.generation
         await MemorySearchCache.shared.reset()
         await MemorySearchCache.shared.set(key, [hit(id: "stale")], generation: before)
@@ -60,20 +60,26 @@ struct MemorySearchCacheTests {
         #expect(await MemorySearchCache.shared.get(key)?.first?.chatHistoryId == "fresh")
     }
 
+    @Test("the demo scope is part of the key")
+    func demoScopeKeysApart() {
+        #expect(MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: nil, demoActive: true)
+            != MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: nil, demoActive: false))
+    }
+
     @Test("a blank query and no query share a key")
     func blankQueryKeyIsTheEmptyKey() {
-        let none = MemorySearchCache.makeKey(query: "", fromDate: nil, toDate: nil)
+        let none = MemorySearchCache.makeKey(query: "", fromDate: nil, toDate: nil, demoActive: false)
         for blank in ["\n", "\r\n", " \t\n"] {
-            #expect(MemorySearchCache.makeKey(query: blank, fromDate: nil, toDate: nil) == none)
+            #expect(MemorySearchCache.makeKey(query: blank, fromDate: nil, toDate: nil, demoActive: false) == none)
         }
     }
 
     @Test("distinct keys isolate cache entries")
     func distinctKeysIsolate() async {
         await MemorySearchCache.shared.reset()
-        let k1 = MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: nil)
-        let k2 = MemorySearchCache.makeKey(query: "foo", fromDate: "2025-01-01", toDate: nil)
-        let k3 = MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: "2025-12-31")
+        let k1 = MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: nil, demoActive: false)
+        let k2 = MemorySearchCache.makeKey(query: "foo", fromDate: "2025-01-01", toDate: nil, demoActive: false)
+        let k3 = MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: "2025-12-31", demoActive: false)
         #expect(k1 != k2)
         #expect(k1 != k3)
         #expect(k2 != k3)
@@ -86,21 +92,21 @@ struct MemorySearchCacheTests {
 
     @Test("makeKey is stable for same inputs")
     func keyStable() {
-        let a = MemorySearchCache.makeKey(query: "Hello World", fromDate: "2025-01-01", toDate: "2025-12-31")
-        let b = MemorySearchCache.makeKey(query: "Hello World", fromDate: "2025-01-01", toDate: "2025-12-31")
+        let a = MemorySearchCache.makeKey(query: "Hello World", fromDate: "2025-01-01", toDate: "2025-12-31", demoActive: false)
+        let b = MemorySearchCache.makeKey(query: "Hello World", fromDate: "2025-01-01", toDate: "2025-12-31", demoActive: false)
         #expect(a == b)
     }
 
     @Test("makeKey trims query whitespace")
     func keyTrimsWhitespace() {
-        let a = MemorySearchCache.makeKey(query: "  foo  ", fromDate: nil, toDate: nil)
-        let b = MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: nil)
+        let a = MemorySearchCache.makeKey(query: "  foo  ", fromDate: nil, toDate: nil, demoActive: false)
+        let b = MemorySearchCache.makeKey(query: "foo", fromDate: nil, toDate: nil, demoActive: false)
         #expect(a == b)
     }
 
     @Test("makeKey escapes double quotes in query")
     func keyEscapesQuotes() {
-        let k = MemorySearchCache.makeKey(query: "what \"is\" this?", fromDate: nil, toDate: nil)
+        let k = MemorySearchCache.makeKey(query: "what \"is\" this?", fromDate: nil, toDate: nil, demoActive: false)
         #expect(k.contains("\\\""))
     }
 }

@@ -384,6 +384,20 @@ struct MemoryIndexTests {
         #expect(hits.allSatisfy { $0.snippet.isEmpty })   // no FTS match, snippet empty
     }
 
+    /// The chat-history listing shows every turn kept, whatever its session:
+    /// real, legacy (no session) and demo, newest first.
+    @Test("listTurns lists every session's turns, newest first")
+    func listTurns_everySession() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: 3000, text: "real")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "legacy", sessionId: nil, role: "user", dateMs: 2000, text: "legacy")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: 1000, text: "demo")
+        let hits = await MemoryIndex.shared.listTurns(limit: 10)
+        #expect(hits.map(\.chatHistoryId) == ["real", "legacy", "demo"])
+    }
+
     /// An empty query lists the newest turns first, within the dateMs window,
     /// and in the search's demo scope (normal mode never sees demo turns).
     @Test("search with an empty query lists the newest turns in the window, demo turns left out")
@@ -399,11 +413,11 @@ struct MemoryIndexTests {
         await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:abc", role: "user", dateMs: now, text: "demo turn")
 
         for query in ["", "   ", "\n", "\r\n"] {
-            let all = await MemoryIndex.shared.search(query: query, limit: 10)
+            let all = await MemoryIndex.shared.search(query: query, limit: 10, demoActive: false)
             #expect(all.map(\.chatHistoryId) == ["t4", "t3", "t2", "t1", "t0"])
-            let capped = await MemoryIndex.shared.search(query: query, limit: 2)
+            let capped = await MemoryIndex.shared.search(query: query, limit: 2, demoActive: false)
             #expect(capped.map(\.chatHistoryId) == ["t4", "t3"])
-            let window = await MemoryIndex.shared.search(query: query, fromMs: now - 4 * day, toMs: now - 2 * day, limit: 10)
+            let window = await MemoryIndex.shared.search(query: query, fromMs: now - 4 * day, toMs: now - 2 * day, limit: 10, demoActive: false)
             #expect(window.map(\.chatHistoryId) == ["t3", "t2", "t1"])
         }
     }
@@ -419,7 +433,7 @@ struct MemoryIndexTests {
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t2", sessionId: "s", role: "assistant", dateMs: 1100, text: "Kyle's status looks good")
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t3", sessionId: "s", role: "user", dateMs: 1200, text: "what about Jane?")
 
-        let hits = await MemoryIndex.shared.search(query: "kyle", limit: 10)
+        let hits = await MemoryIndex.shared.search(query: "kyle", limit: 10, demoActive: false)
         let ids = Set(hits.map(\.chatHistoryId))
         #expect(ids == Set(["t1", "t2"]))
         #expect(hits.allSatisfy { $0.snippet.contains("[") && $0.snippet.contains("]") })
@@ -429,9 +443,9 @@ struct MemoryIndexTests {
     func search_emptyQueryOrNoMatch() async throws {
         let (pool, dir) = try await makeIndex()
         defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
-        #expect(await MemoryIndex.shared.search(query: "", limit: 10).isEmpty)
-        #expect(await MemoryIndex.shared.search(query: "   ", limit: 10).isEmpty)
-        #expect(await MemoryIndex.shared.search(query: "nothing", limit: 10).isEmpty)
+        #expect(await MemoryIndex.shared.search(query: "", limit: 10, demoActive: false).isEmpty)
+        #expect(await MemoryIndex.shared.search(query: "   ", limit: 10, demoActive: false).isEmpty)
+        #expect(await MemoryIndex.shared.search(query: "nothing", limit: 10, demoActive: false).isEmpty)
     }
 
     @Test("search respects date filter")
@@ -445,7 +459,7 @@ struct MemoryIndexTests {
 
         let from: Int64 = baseMs + 20 * 86_400_000
         let to: Int64 = baseMs + 40 * 86_400_000
-        let hits = await MemoryIndex.shared.search(query: "keyword", fromMs: from, toMs: to, limit: 10)
+        let hits = await MemoryIndex.shared.search(query: "keyword", fromMs: from, toMs: to, limit: 10, demoActive: false)
         let ids = Set(hits.map(\.chatHistoryId))
         #expect(ids == Set(["feb"]))
         #expect(ids.contains("jan") == false)
@@ -458,7 +472,7 @@ struct MemoryIndexTests {
 
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t1", sessionId: "s", role: "user", dateMs: 1000, text: "Melanie sent the report")
         // Short token "mel" should prefix-match "melanie" via our ftsQuery (mel*).
-        let hits = await MemoryIndex.shared.search(query: "mel", limit: 10)
+        let hits = await MemoryIndex.shared.search(query: "mel", limit: 10, demoActive: false)
         #expect(hits.contains { $0.chatHistoryId == "t1" })
     }
 

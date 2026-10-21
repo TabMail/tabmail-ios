@@ -622,13 +622,13 @@ actor MemoryIndex {
     ///
     /// - `fromMs` / `toMs`: optional dateMs window.
     /// - `limit`: post-merge cap; per-leg candidate expansion = limit × SearchConfig.candidateMultiplier.
-    func search(query: String, fromMs: Int64? = nil, toMs: Int64? = nil, limit: Int) -> [MemoryHit] {
+    /// - `demoActive`: the demo scope (ADR-IOS-038), read once by the caller so
+    ///   both legs, and the caller's cache, use the same one.
+    func search(query: String, fromMs: Int64? = nil, toMs: Int64? = nil, limit: Int, demoActive: Bool) -> [MemoryHit] {
         ensureReady()
         guard let dbPool else { return [] }
         let candidateLimit = limit * SearchConfig.candidateMultiplier
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Demo isolation: snapshot once per call so both legs use the same scope.
-        let demoActive = DemoModeStore.isDemoActive
         // No query lists the most recent turns, newest first, as the native-fts
         // helper TB uses does for an empty query ("what have we discussed").
         guard !trimmed.isEmpty else {

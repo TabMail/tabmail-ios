@@ -201,7 +201,7 @@ final class DemoModeService {
 
         // memory.db — clear demo entries via MemoryIndex.purgeForSessionPrefix
         // (net-new). Demo session ids start with "demo:".
-        await MemoryIndex.shared.purgeForSessionPrefix("demo:")
+        await Self.purgeDemoMemory()
 
         // Drop ALL in-memory chat pill state — demo session pages, live demo
         // turns, and reminder buffers must not survive into the real user's
@@ -235,6 +235,14 @@ final class DemoModeService {
         BackgroundSyncLogger.logDebug("[DemoMode] exit(): cleanup complete")
     }
 
+    /// Delete the demo turns from memory.db, then empty memory_search's page
+    /// cache, which may hold them, so none can be served after the purge (and a
+    /// demo search still running stores nothing). Demo session ids start with "demo:".
+    static func purgeDemoMemory() async {
+        await MemoryIndex.shared.purgeForSessionPrefix("demo:")
+        await MemorySearchCache.shared.reset()
+    }
+
     /// Force a one-shot orphan wipe at app launch when stale demo rows are
     /// found but no demo session is active (force-quit recovery; also covers
     /// edge cases). Also called when the user signs up with a real account.
@@ -251,7 +259,7 @@ final class DemoModeService {
             }
         }
         await SearchIndex.shared.purgeForAccount(DemoSeed.demoAccountId)
-        await MemoryIndex.shared.purgeForSessionPrefix("demo:")
+        await purgeDemoMemory()
         // Stale demo overlay keys from a force-quit mid-demo (harmless while
         // demo is inactive — all readers use the real keys — but clean up).
         PromptStore.removeDemoOverlayKeys()

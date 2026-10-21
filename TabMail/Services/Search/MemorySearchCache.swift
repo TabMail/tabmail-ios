@@ -32,21 +32,24 @@ actor MemorySearchCache {
         sessions[key] = hits
     }
 
-    /// Reset all caches. Called from `AIService.sendChatMessage` top.
+    /// Reset all caches. Called from `AIService.sendChatMessage` top, and by
+    /// `DemoModeService.exit` once demo turns are purged, so none stays readable.
     func reset() {
         sessions.removeAll()
         generation += 1
     }
 
     /// Build the cache key the way TB does in `memory_search.js:27-30`:
-    /// JSON-encoded normalized args (query / from_date / to_date).
-    static func makeKey(query: String, fromDate: String?, toDate: String?) -> String {
+    /// JSON-encoded normalized args (query / from_date / to_date), plus the demo
+    /// scope the search ran in (ADR-IOS-038: memory_search never crosses modes, so
+    /// hits found in one mode are never served in the other). TB has no demo mode.
+    static func makeKey(query: String, fromDate: String?, toDate: String?, demoActive: Bool) -> String {
         // Sort-order-stable JSON via explicit key layout (matches TB's JSON.stringify
-        // on a three-key object).
+        // on a three-key object, with the demo scope last).
         let q = escape(query.trimmingCharacters(in: .whitespacesAndNewlines))
         let f = escape(fromDate ?? "")
         let t = escape(toDate ?? "")
-        return "{\"query\":\"\(q)\",\"from_date\":\"\(f)\",\"to_date\":\"\(t)\"}"
+        return "{\"query\":\"\(q)\",\"from_date\":\"\(f)\",\"to_date\":\"\(t)\",\"demo\":\(demoActive)}"
     }
 
     /// JSON string escape — backslashes and double quotes. Enough for the three

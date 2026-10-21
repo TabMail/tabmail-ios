@@ -288,14 +288,74 @@ struct MemorySearchToolTests {
         }
     }
 
+    /// Hits kept for one mode are never served in the other (ADR-IOS-038). A
+    /// compose edit runs memory_search with no chat turn starting, so nothing
+    /// resets the listing between the calls: warmed in normal mode, then in demo
+    /// mode, then in normal mode again, each call shows only its own mode's turns.
+    @Test("A listing never crosses into or out of demo mode", arguments: ["", "budget"])
+    func listingKeepsToItsMode(query: String) async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        let base = noonUTCThreeDaysAgo()
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base + 3_600_000, text: "budget real_history_marker")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base, text: "budget demo_history_marker")
+        let tool = try makeTool()
+        let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
+
+        let real = try await tool.execute(arguments: arguments)
+        #expect(real.contains("real_history_marker"))
+        #expect(!real.contains("demo_history_marker"))
+        try await withDemoActive(true) {
+            let demo = try await tool.execute(arguments: arguments)
+            #expect(demo.contains("demo_history_marker"))
+            #expect(!demo.contains("real_history_marker"))
+        }
+        let back = try await tool.execute(arguments: arguments)
+        #expect(back.contains("real_history_marker"))
+        #expect(!back.contains("demo_history_marker"))
+    }
+
+    /// Demo turns purged from memory (on demo exit, and by the orphan wipe at
+    /// launch) are gone from memory_search too, though a listing had kept them:
+    /// demo mode entered again before any chat turn lists none of them.
+    @Test("Purged demo turns are never listed again", arguments: ["", "budget"])
+    func purgedDemoTurnsAreNeverListedAgain(query: String) async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        let base = noonUTCThreeDaysAgo()
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base + 3_600_000, text: "budget real_history_marker")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base, text: "budget demo_history_marker")
+        let tool = try makeTool()
+        let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
+
+        try await withDemoActive(true) {
+            let warmed = try await tool.execute(arguments: arguments)
+            #expect(warmed.contains("demo_history_marker"))
+        }
+        await DemoModeService.purgeDemoMemory()
+        #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real"])
+        try await withDemoActive(true) {
+            let again = try await tool.execute(arguments: arguments)
+            #expect(!again.contains("demo_history_marker"))
+            #expect(!again.contains("real_history_marker"))
+        }
+        let real = try await tool.execute(arguments: arguments)
+        #expect(real.contains("real_history_marker"))
+    }
+
     /// The dates asked keep the listing to them, to the second for a full
     /// timestamp; a date-only end includes its whole day.
     @Test("No query lists only the turns within the dates asked", arguments: [
-        ("start", 2, nil),
-        ("end", nil, 5),
-        ("start and end", 2, 5),
-    ] as [(String, Int?, Int?)])
-    func noQueryKeepsToTheDatesAsked(name: String, from: Int?, to: Int?) async throws {
+        ("start", 2, nil, false),
+        ("end", nil, 5, false),
+        ("start and end", 2, 5, false),
+        ("start, demo", 2, nil, true),
+        ("end, demo", nil, 5, true),
+        ("start and end, demo", 2, 5, true),
+    ] as [(String, Int?, Int?, Bool)])
+    func noQueryKeepsToTheDatesAsked(name: String, from: Int?, to: Int?, demo: Bool) async throws {
         let (memPool, memDir) = try await installMemoryIndex()
         defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
 
@@ -303,7 +363,9 @@ struct MemorySearchToolTests {
         let hour: Int64 = 3_600_000
         let dates = (0..<10).map { base + Int64($0) * hour }
         for (i, dateMs) in dates.enumerated() {
-            await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i)", sessionId: "s", role: "user", dateMs: dateMs, text: "turn \(i)")
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i)", sessionId: demo ? "demo:a" : "s", role: "user", dateMs: dateMs, text: "turn \(i)")
+            // The other mode's turn a minute later: inside the window, never listed.
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "o\(i)", sessionId: demo ? "s" : "demo:a", role: "user", dateMs: dateMs + 60_000, text: "other \(i)")
         }
 
         var arguments: [String: JSONValue] = [:]
@@ -313,28 +375,45 @@ struct MemorySearchToolTests {
         let inWindow = dates.indices.filter { i in (from.map { i >= $0 } ?? true) && (to.map { i <= $0 } ?? true) }
         let expected = inWindow.reversed().map { dates[$0] }
 
-        let tool = try makeTool()
-        let first = try await tool.execute(arguments: arguments)
-        var shown = try listed(first).map(\.dateMs)
-        // Every later page too (the last page repeats for a page past it).
-        if first.contains("page_index: 2") {
-            shown += try listed(try await tool.execute(arguments: arguments.merging(["page_index": .int(2)]) { $1 })).map(\.dateMs)
+        try await withDemoActive(demo) {
+            let tool = try makeTool()
+            let first = try await tool.execute(arguments: arguments)
+            var shown = try listed(first).map(\.dateMs)
+            // Every later page too (the last page repeats for a page past it).
+            if first.contains("page_index: 2") {
+                shown += try listed(try await tool.execute(arguments: arguments.merging(["page_index": .int(2)]) { $1 })).map(\.dateMs)
+            }
+            #expect(shown == expected, "\(name)")
         }
-        #expect(shown == expected, "\(name)")
     }
 
-    @Test("No query with a date-only end lists that whole day")
-    func noQueryDateOnlyEndIncludesTheDay() async throws {
+    /// A date-only start and end list that whole day, from its first millisecond
+    /// through its last: the millisecond before it and the next midnight are out.
+    @Test("No query with a date-only start and end lists that whole day", arguments: [false, true])
+    func noQueryDateOnlyBoundsListTheDay(demo: Bool) async throws {
         let (memPool, memDir) = try await installMemoryIndex()
         defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
 
         let base = noonUTCThreeDaysAgo()
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "evening", sessionId: "s", role: "user", dateMs: base + 10 * 3_600_000, text: "evening")
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "nextDay", sessionId: "s", role: "user", dateMs: base + 14 * 3_600_000, text: "next day")
+        let hour: Int64 = 3_600_000
+        let dayStart = base - 12 * hour
+        let nextMidnight = base + 12 * hour
+        let turns: [(String, Int64)] = [
+            ("before", dayStart - 1), ("first", dayStart), ("evening", base + 10 * hour),
+            ("last", nextMidnight - 1), ("nextMidnight", nextMidnight), ("nextDay", base + 14 * hour),
+        ]
+        for (id, dateMs) in turns {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: demo ? "demo:a" : "s", role: "user", dateMs: dateMs, text: id)
+        }
         let day = String(isoString(base).prefix(10))
 
-        let shown = try listed(try await makeTool().execute(arguments: ["to_date": .string(day)]))
-        #expect(shown.map(\.dateMs) == [base + 10 * 3_600_000])
+        try await withDemoActive(demo) {
+            let tool = try makeTool()
+            let whole = try listed(try await tool.execute(arguments: ["from_date": .string(day), "to_date": .string(day)]))
+            #expect(whole.map(\.dateMs) == [nextMidnight - 1, base + 10 * hour, dayStart])
+            let endOnly = try listed(try await tool.execute(arguments: ["to_date": .string(day)]))
+            #expect(endOnly.map(\.dateMs) == [nextMidnight - 1, base + 10 * hour, dayStart, dayStart - 1])
+        }
     }
 
     /// A query still searches: a newer turn that doesn't match is not listed.

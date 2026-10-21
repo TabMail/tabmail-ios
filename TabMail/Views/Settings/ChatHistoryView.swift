@@ -123,7 +123,8 @@ struct ChatHistoryView: View {
                 // Same memory.db hybrid pipeline the agent uses.
                 let results = await MemoryIndex.shared.search(
                     query: newQuery,
-                    limit: SearchConfig.memoryPrefetchMaxResults
+                    limit: SearchConfig.memoryPrefetchMaxResults,
+                    demoActive: DemoModeStore.isDemoActive
                 )
                 guard !Task.isCancelled else { return }
                 searchResults = results

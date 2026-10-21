@@ -57,8 +57,12 @@ struct MemorySearchTool: AgentTool, Sendable {
         let prefetchMax = SearchConfig.memoryPrefetchMaxResults
         let fetchLimit = min(pageSize * prefetchPages, prefetchMax)
 
+        // Demo isolation (ADR-IOS-038): the mode is read once, and both the cache
+        // and the index use that reading, so this search never serves or stores
+        // the other mode's turns, even if demo mode starts or ends while it runs.
+        let demoActive = DemoModeStore.isDemoActive
         // Per-user-turn cache keyed on normalized args (matches TB memory_search.js:27-30).
-        let cacheKey = MemorySearchCache.makeKey(query: query, fromDate: fromRaw, toDate: toRaw)
+        let cacheKey = MemorySearchCache.makeKey(query: query, fromDate: fromRaw, toDate: toRaw, demoActive: demoActive)
         BackgroundSyncLogger.logDebug("[MemorySearchTool] ENTER q='\(query.prefix(60))' page=\(pageIndex) fromRaw=\(fromRaw ?? "nil") toRaw=\(toRaw ?? "nil") fromDate=\(fromDate.map { "\($0)" } ?? "nil") toDate=\(toDate.map { "\($0)" } ?? "nil") fetchLimit=\(fetchLimit)")
         var hits: [MemoryHit]
         // Read before the lookup: a reset after this (a new turn) refuses this search's hits.
@@ -83,7 +87,8 @@ struct MemorySearchTool: AgentTool, Sendable {
                 query: query,
                 fromMs: fromMs,
                 toMs: toMs,
-                limit: fetchLimit
+                limit: fetchLimit,
+                demoActive: demoActive
             )
             BackgroundSyncLogger.logDebug("[MemorySearchTool] CACHE MISS — MemoryIndex.search returned \(hits.count) hits")
             await MemorySearchCache.shared.set(cacheKey, hits, generation: cacheGeneration)
