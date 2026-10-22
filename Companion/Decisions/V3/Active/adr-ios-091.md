@@ -222,9 +222,14 @@ not re-invent yet another converter"*; and for attachments *"Match by name, acce
 ### Review round 3 corrections (2026-10-21)
 
 The tier-1 round 3 review found three ways content could be lost, and its fixes' own tests found a
-fourth; each is fixed at its cause.
+fourth; each is fixed at its cause, except the first, which the owner accepted (below).
 
-- **Drafts uploaded by an earlier release open from this device until their next save.** Releases
+- **WITHDRAWN 2026-10-21 (owner: *"i think we should drop it"*; accepted as `IOS-DRAFT-024`; the
+  migration was removed before release and its name is burned). After the upgrade, a pre-upgrade
+  Gmail or Outlook draft with no unsent edits reloads the copy the earlier release uploaded on its
+  first open. Drafts with unsent edits or never uploaded are left as they are.** *Preserved, as
+  written before the ruling:* **Drafts uploaded by an earlier release open from this device until
+  their next save.** Releases
   up to v1.9.2 uploaded the body as HTML (which reads back with quote markers, double spaces and
   soft line ends changed) and, on Outlook, never updated attachments after the first save, so for
   their `"pushed"` rows the server copy is not the draft and the open-time reload would replace the

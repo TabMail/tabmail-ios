@@ -103,7 +103,8 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 > **Current tracker census (2026-10-21, #217 review round 3): unchanged at 6 `open` records.**
 > `IOS-DRAFT-023` (`accepted`, owner-blessed) records that typed line breaks at the very end of a
-> Gmail or Outlook draft go on save and reopen.
+> Gmail or Outlook draft go on save and reopen. `IOS-DRAFT-024` (`accepted`, owner-blessed) records
+> that a draft an earlier release uploaded reloads that upload on its first open after updating.
 >
 > *Preserved:* **Current tracker census (2026-10-21, fifth #217 ruling): unchanged at 6 `open` records.** `IOS-DRAFT-022`
 > (`accepted`, owner-blessed, #236) records the Outlook same-name attachment edge of syncing draft
@@ -264,7 +265,7 @@ regenerated from it; their detail files live in
 |---|---|---|
 | [IOS-NSE-008](Companion/Process/Current/KnownIssues/Amendments/ios-nse-008.md) | `open` | 🔓 **OPEN (2026-09-02)** — three residuals in the App Group identity mirrors the notification service extension resolves pushes through. **(A)** A re-derivation whose database read straddles a concurrent account removal can briefly restore the removed account's entries; removal itself is safe (`removeAccountFromMirrors` edits both mirrors *before* the authoritative delete), so this window is opened only by a *concurrent* reader, i.e. the foreground convergence pass — widest across `AppDataWiper.wipeAll`, whose pre-delete mirror clearing is a per-account loop followed by a multi-table transaction. Bounded by the credential delete in `disconnectAccount` one hop later, with no cross-account access; the visible residue is a stale notification for the removed address. ⚠️ **The "gone at the next foreground return" bound fails for the LAST mail account** — `RootView` gates `startForegroundPolling()` on `!navigationStore.accounts.isEmpty`, so with zero accounts the entries survive to the next cold launch. **(B)** An edit to a mirrored column of an existing account (`AccountEditableField` covers the address and the IMAP username) converges only at the next re-derivation, deliberately — a per-writer refresh census goes stale silently the next time a mirrored column is added. **(C)** Two MAIL rows at one address — reachable because `addIMAPAccount` runs no duplicate check and `Account.existing` is provider-scoped — contend for the single map slot by scan order, **deterministically and permanently**, and there is no correct precedence to apply: whichever row wins, pushes for the other provider dead-end. Resolving it means changing the model (id in the payload, or `(address, provider)` keying) or preventing the duplicate at account setup, not picking a winner in the mirror. Filed `open`, **not** `accepted`: no owner decision has been taken. Remedies are enumerated in the routed record |
 
-### DRAFT (5)
+### DRAFT (6)
 
 | ID | Class | Executive statement |
 |---|---|---|
@@ -273,6 +274,7 @@ regenerated from it; their detail files live in
 | [IOS-DRAFT-021](Companion/Process/Current/KnownIssues/Amendments/ios-draft-021.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-17, owner)** — the draft server check and the write that follows it are two calls, so another app's save inside that gap is overwritten by ours. Also covered: a pre-v92 draft with unsent edits has no recorded copy of the server text, so its first upload after updating keeps last-save-wins; attachments are compared by name only (#229); recipient text that is no address is not compared (#230). **Superseded 2026-10-21 by LAST SAVE WINS (owner, #233):** nothing reads the server copy before a save, so another app's edit to the same draft made while this device holds unsent edits is replaced by this device's next upload; #229 and #230 are moot |
 | [IOS-DRAFT-022](Companion/Process/Current/KnownIssues/Amendments/ios-draft-022.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-21, owner, #236)** — an Outlook draft's attachments sync to the server by file name: each local file the server copy has no same-named attachment for is added, then each server attachment the draft no longer has is deleted. Replacing a file with a different one of the SAME name in one edit leaves the old file on the server, and the next open reloads it; renaming the file, or removing it, saving and adding it again, recovers |
 | [IOS-DRAFT-023](Companion/Process/Current/KnownIssues/Amendments/ios-draft-023.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-21, owner)** — line breaks typed at the very end of a Gmail or Outlook draft are dropped when it is saved and reopened, since the reload removes every trailing line break so a save and reopen never grows the body; no visible character is lost |
+| [IOS-DRAFT-024](Companion/Process/Current/KnownIssues/Amendments/ios-draft-024.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-21, owner)** — a Gmail or Outlook draft uploaded by v1.9.2 or earlier with no unsent edits reloads that upload on its first open after updating: Gmail's HTML is read back as text (spacing and line breaks can differ), and an Outlook draft keeps the attachments of its first save (a later-added file is gone, a later-removed one returns). Drafts with unsent edits or never uploaded open from the device; a draft saved once by this release reopens as saved |
 
 ### GRAPH (1)
 

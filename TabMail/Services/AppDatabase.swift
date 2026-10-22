@@ -4221,30 +4221,9 @@ final class AppDatabase: Sendable {
             )
         }
 
-        // #217 (ADR-IOS-091). v92 is burned (`v92_addDraftServerText`, never
-        // released). Data only: a fresh install has no such rows, and an upgraded
-        // database ends with the same schema.
-        migrator.registerTimedMigration(
-            "v93_openPreUpgradeServerDraftsLocally", foreignKeyChecks: .immediate
-        ) { db in
-            try AppDatabase.openPreUpgradeServerDraftsLocally(db)
-        }
-    }
-
-    /// #217: a Gmail or Outlook draft uploaded by an earlier release opens from this
-    /// device until its next save. Those releases uploaded the body as HTML, which
-    /// reads back with quote markers, double spaces and line breaks changed, and on
-    /// Outlook never updated attachments after the first save, so the server copy is
-    /// not the draft and the row is the only exact one. Marked `"dirty"`, the row
-    /// opens as it is (`ExternalDraftAdoption.reloadsBeforeOpen`) and nothing pushes
-    /// it on its own; the user's next save uploads it as text, and from then on
-    /// every open reloads the server copy. Shared by the migration and its tests.
-    static func openPreUpgradeServerDraftsLocally(_ db: Database) throws {
-        try db.execute(sql: """
-            UPDATE draft SET serverPushStatus = 'dirty'
-            WHERE serverPushStatus = 'pushed'
-              AND accountId IN (SELECT id FROM account WHERE provider IN ('gmail', 'outlook'))
-            """)
+        // #217 (ADR-IOS-091): v92 (`v92_addDraftServerText`) and v93
+        // (`v93_openPreUpgradeServerDraftsLocally`) are burned. Both ran on
+        // development databases and were never released; do not reuse either name.
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static
