@@ -46,11 +46,10 @@ struct SearchScopingTests {
         #expect(result.contains("john@example.com"))
     }
 
-    @Test("from with apostrophe removes apostrophe per parser rules")
+    @Test("from with an apostrophe searches the value as typed")
     func fromApostrophe() {
         let result = SearchQueryParser.buildFTSMatch("from:o'brien")
-        #expect(result.contains("from_:"))
-        #expect(result.contains("obrien"))
+        #expect(result == #"from_:"o'brien"*"#)
     }
 
     // MARK: - FTS folderIds parameter
