@@ -342,3 +342,13 @@ The tier-1 round 6 review found two defects; each is fixed at its cause.
   An unthreaded adopted row keeps `adopted:<uuid>`; Strategy 2 keeps its exactly-one rule, so two
   copies still refuse (`IOS-DRAFT-009`). No column, no migration; adoption is unreleased, so no
   shipped row has the old form.
+
+### Review round 7 correction (2026-10-22)
+
+- **Adoption never outranks a draft saved here in the eviction cap.** `DraftStore.applyAdoption`
+  gave each adopted row `lastTouchedSeq = MAX + 1`, so opening drafts written elsewhere pushed drafts
+  typed on this device past `SyncConfig.maxComposeDraftSessions` (10), and the next maintenance pass
+  deleted the oldest even when its text had never reached the server (a dropped user intention).
+  Adopted rows are now inserted at rank 0, below every saved row; ties break on `updatedAt`; the
+  first save ranks the row like any other. An evicted adopted row is a server copy the next open
+  adopts again. IOS-DRAFT-012's "no server→local ingest path" premise is amended accordingly.

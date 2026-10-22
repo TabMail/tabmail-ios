@@ -213,9 +213,15 @@ actor DraftStore {
     /// it keeps `"pushed"` and its exact address; the user's first edit goes through
     /// `admitSave`/`applySave` like any other. A brand-new key, so like `admitSave`'s
     /// insert arm there is no predecessor generation to check.
+    ///
+    /// Eviction rank 0, below every draft saved on this device: opening another
+    /// app's draft is not a save, so it must never push a draft typed here, whose
+    /// text may not have reached the server yet, past the keep-limit. An evicted
+    /// adopted row is a server copy the next open adopts again. Its first edit
+    /// ranks it like any save (`applySave`).
     static func applyAdoption(_ draft: Draft, db: Database) throws {
         var inserted = draft
-        inserted.lastTouchedSeq = try nextLastTouchedSeq(db)
+        inserted.lastTouchedSeq = 0
         try inserted.insert(db)
     }
 

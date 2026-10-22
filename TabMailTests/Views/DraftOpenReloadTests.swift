@@ -667,6 +667,11 @@ struct DraftOpenReloadTests {
                 let files = try DraftAttachmentStorage.loadAttachments(dirName: row.attachmentsDirName)
                 #expect(files.map(\.filename) == ["added.pdf"], "reopening removed the attachment the user added")
                 #expect(files.first?.data == Data("pdf".utf8))
+                // A committed reload leaves no copy of the files it replaced: draft
+                // attachment directories have no orphan sweep.
+                #expect(row.attachmentsDirName != dir, "precondition: the reload staged a new directory")
+                #expect(!FileManager.default.fileExists(atPath: DraftAttachmentStorage.dirURL(for: dir).path),
+                        "the reload left the replaced attachment directory behind")
             }
         }
     }

@@ -54,6 +54,9 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// The declaration default `0` keeps every memberwise-init caller compiling;
     /// the value a caller's snapshot carries is IGNORED — `applySave` overrides it
     /// in-transaction (migration `v79` seeds pre-existing rows with a distinct rank).
+    /// A row adopted from another app's server draft (#217, `DraftStore.applyAdoption`)
+    /// keeps rank 0 until its first save, so opening drafts never evicts one saved
+    /// here; ties among such rows break on `updatedAt`.
     var lastTouchedSeq: Int = 0
 
     /// PORT — compose generation from v2final commit 3f2cc4c34.
