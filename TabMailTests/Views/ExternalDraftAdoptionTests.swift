@@ -233,6 +233,22 @@ struct ExternalDraftAdoptionTests {
             text: nil, html: nil, bodyEmptyConfirmed: false, hasAttachments: true) == "")
     }
 
+    @Test("A whitespace-only body the server returned opens as written", arguments: [
+        ("  ", "  "), ("\t \t", "\t \t"), ("\n  \n  \r\n", "\n  \n  "),
+    ])
+    func confirmedWhitespaceOpensAsWritten(text: String, expected: String) {
+        #expect(ExternalDraftAdoption.editableBody(
+            text: text, html: nil, bodyEmptyConfirmed: true, hasAttachments: false) == expected)
+        #expect(ExternalDraftAdoption.editableBody(
+            text: text, html: nil, bodyEmptyConfirmed: false, hasAttachments: true) == expected)
+    }
+
+    @Test("An empty HTML draft (Gmail's blank line) opens empty")
+    func confirmedEmptyHTMLOpensEmpty() {
+        #expect(ExternalDraftAdoption.editableBody(
+            text: nil, html: "<div dir=\"ltr\"><br></div>", bodyEmptyConfirmed: true, hasAttachments: false) == "")
+    }
+
     @Test("A text-only copy is the draft as typed; trailing MIME line breaks never grow it")
     func editableBodyTakesTextAsTyped() {
         let typed = "Hi Bob,\n\nThanks for the notes. \nPlan:\n  1. ship\n  2.  test\n> quoted line\nCheers \u{1F469}\u{200D}\u{1F4BB}\nAlice"

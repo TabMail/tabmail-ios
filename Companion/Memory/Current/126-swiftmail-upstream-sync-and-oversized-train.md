@@ -382,3 +382,11 @@ serializer that writes recipients:
   `MIMECharsetTests.quotedCharsetParameterIsDeclared` / `quotedCharsetDecodesText` (red on
   `a767603`). The app pins `946ae36`. It goes upstream in the same PR as the #238 commit, which now
   carries both.
+- **Quoted BODYSTRUCTURE values and a public parameter reader (#217 Codex round 1, 2026-10-22)**:
+  `contentType(for:)` wrote kept parameter values bare, so a value holding `;` (BODYSTRUCTURE hands
+  over quoted values unquoted) split into a second parameter on read-back. Commit `c86900c` on the
+  same fork branch writes a non-token value as a quoted-string and adds public
+  `MessagePart.contentTypeParameter(named:)` (the app's flowed decoder reads `format`/`delsp` with
+  it); `MessagePartBodyStructureTests.aParameterValueStaysOneParameter` and
+  `textPartParametersAreReadInAnyNameCase` (red on mutants). The app pins `c86900c`; the upstream
+  PR now carries three commits.

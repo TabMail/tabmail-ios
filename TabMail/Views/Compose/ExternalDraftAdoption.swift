@@ -203,7 +203,8 @@ enum ExternalDraftAdoption {
     ///
     /// PORT of v2final `ServerDraftBody` (F5): an empty or whitespace-only body
     /// opens only when the server CONFIRMED it empty, or when the draft carries
-    /// attachments (the body fetch stored it as an attachment-only message).
+    /// attachments (the body fetch stored it as an attachment-only message). It
+    /// then opens as written: whitespace the user typed is text like any other.
     static func editableBody(
         text: String?,
         html: String?,
@@ -221,7 +222,7 @@ enum ExternalDraftAdoption {
             plain = lines
         }
         if !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return plain }
-        return bodyEmptyConfirmed || hasAttachments ? "" : nil
+        return bodyEmptyConfirmed || hasAttachments ? plain : nil
     }
 
     /// What Gmail, Graph and IMAP header parsing put in place of an empty subject;

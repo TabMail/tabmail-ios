@@ -352,3 +352,31 @@ The tier-1 round 6 review found two defects; each is fixed at its cause.
   Adopted rows are now inserted at rank 0, below every saved row; ties break on `updatedAt`; the
   first save ranks the row like any other. An evicted adopted row is a server copy the next open
   adopts again. IOS-DRAFT-012's "no server→local ingest path" premise is amended accordingly.
+
+### Codex review round 1 corrections (2026-10-22)
+
+The owner flipped the review tiers for token supply (Codex first, then one Opus round). Codex
+round 1 on `4e37ee02` found:
+
+- **An Outlook attachment list read as one page.** Graph pages a collection with
+  `@odata.nextLink`; `ExchangeProvider.readMessage` and `replaceDraftAttachments` read only the
+  first page, so a reload kept only that page's files and the next save deleted the rest from the
+  server (irreversible operation 7). `ExchangeProvider.listAttachments` now follows the next link
+  through the existing origin-checked `requestAbsolute`, bounded by
+  `ExchangeDraftConfig.maxAttachmentListPages`; past the bound it throws
+  `GraphAttachmentListIncomplete`, so neither a read nor a save ever acts on part of the list.
+- **A whitespace-only body opened empty.** `ExternalDraftAdoption.editableBody` returned `""` for
+  a body the server returned that held only spaces, tabs or line breaks; it now returns that text
+  as written. An unconfirmed empty body is still refused.
+- **The flowed-parameter reader split on `;` and `=`.** `EmailFilter.decodeFormatFlowed` read
+  `format=flowed` inside another parameter's quoted value, and kept a trailing comment in the
+  value. It now reads `format` and `delsp` with SwiftMail's MIME parameter reader through the new
+  public `MessagePart.contentTypeParameter(named:)`.
+- **SwiftMail wrote BODYSTRUCTURE parameter values bare.** A quoted value holding `;` split into a
+  second parameter when read back (a `format` value could declare a charset the part never had).
+  Fork commit `c86900c` (after `946ae36`) writes a value that is not an RFC 2045 token as a
+  quoted-string; the app pins `c86900c`. It goes upstream with the #238 commits.
+- **HTML spacing that CSS keeps visible** (`white-space: pre-wrap` text, which TabMail's own
+  earlier HTML draft uploads used, and no-break spaces in a link label) is collapsed by
+  `htmlToPlainText(keepingSpacing:)`. Moved to #251, the immediate follow-up in this release
+  train, whose WebKit rendering replaces that conversion for drafts and honours both.

@@ -16,6 +16,8 @@ struct EmailFilterFormatFlowedTests {
         "text/plain",
         "text/plain; charset=UTF-8",
         "text/plain; format=fixed",
+        // `format=flowed` inside another parameter's quoted value is that value's text.
+        "text/plain; x-note=\"keep; format=flowed\"",
     ])
     func undeclaredIsUnchanged(contentType: String) {
         let typed = "Hi Bob, \n  indented line \n> quoted \n-- \nAlice "
@@ -47,5 +49,11 @@ struct EmailFilterFormatFlowedTests {
         let contentType = "text/plain; Format=\"Flowed\"; DelSp=Yes"
         #expect(EmailFilter.decodeFormatFlowed("Hel \nlo wor \nld", contentType: contentType) == "Hello world")
         #expect(EmailFilter.decodeFormatFlowed("Hel \nlo", contentType: "text/plain; format=flowed; delsp=no") == "Hel lo")
+    }
+
+    @Test("A comment after a parameter value is not part of it (RFC 2045)")
+    func commentIsNotPartOfTheValue() {
+        let contentType = "text/plain; format=flowed (wrapped); delsp=yes (marker)"
+        #expect(EmailFilter.decodeFormatFlowed("Hel \nlo", contentType: contentType) == "Hello")
     }
 }

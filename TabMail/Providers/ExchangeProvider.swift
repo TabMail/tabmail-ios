@@ -239,10 +239,9 @@ actor ExchangeProvider: EmailProvider {
         // Don't use $select here — contentId is a property of fileAttachment subtype,
         // not the base attachment type, so $select rejects it with HTTP 400.
         // Without $select, the API returns all properties including contentId.
-        let attData = try await request(path: "/messages/\(encodedId)/attachments")
-        let attResponse = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: attData)
+        let listed = try await listAttachments(path: "/messages/\(encodedId)/attachments")
         let hasCidRefs = htmlBody?.range(of: "cid:", options: .caseInsensitive) != nil
-        for att in attResponse.value {
+        for att in listed {
             // Only a file attachment has bytes TabMail can carry (#241).
             if forDraft, !Self.isFileAttachment(att) { throw DraftCopyUnsupportedAttachment() }
             if att.isInline == true, let rawCid = att.contentId,
@@ -1060,8 +1059,7 @@ actor ExchangeProvider: EmailProvider {
     /// any other one is never touched, since no local draft can name it (#241).
     private func replaceDraftAttachments(graphId: String, with attachments: [DraftAttachment]) async throws {
         let encodedId = try Self.encodedGraphPathSegment(graphId, context: "Graph draft message id")
-        let listData = try await request(path: "/messages/\(encodedId)/attachments?$select=id,name")
-        let current = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: listData).value
+        let current = try await listAttachments(path: "/messages/\(encodedId)/attachments?$select=id,name")
         let carried = current.compactMap { att -> (id: String, name: String)? in
             let name = att.name?.isEmpty == false ? att.name ?? "" : DraftReadConfig.unnamedAttachmentFilename
             guard Self.isFileAttachment(att), AttachmentFilename.isSafeFileComponent(name) else { return nil }
@@ -1080,6 +1078,29 @@ actor ExchangeProvider: EmailProvider {
             BackgroundSyncLogger.logDebug("[Exchange] saveDraft: added \(plan.add.count), removed \(plan.deleteIds.count) attachment(s)")
         }
     }
+
+    /// Every attachment of a message, following Graph's `@odata.nextLink` (#217):
+    /// a draft read keeps exactly the files listed and a draft save deletes the
+    /// server files the local draft lacks, so a page read as the whole list would
+    /// drop the later files on open and delete them on the next save. More than
+    /// `ExchangeDraftConfig.maxAttachmentListPages` pages throws
+    /// `GraphAttachmentListIncomplete` rather than act on part of the list.
+    private func listAttachments(path: String) async throws -> [GraphAttachmentMeta] {
+        var page = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: try await request(path: path))
+        var attachments = page.value
+        var pages = 1
+        while let link = page.odataNextLink {
+            guard pages < ExchangeDraftConfig.maxAttachmentListPages else { throw GraphAttachmentListIncomplete() }
+            page = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: try await requestAbsolute(url: link))
+            attachments += page.value
+            pages += 1
+        }
+        return attachments
+    }
+
+    /// A message's attachment list did not end within
+    /// `ExchangeDraftConfig.maxAttachmentListPages` pages.
+    struct GraphAttachmentListIncomplete: Error {}
 
     /// Whether a Graph attachment is a `#microsoft.graph.fileAttachment`. A list
     /// entry of a derived type carries its `@odata.type` (OData minimal metadata),
@@ -1863,6 +1884,12 @@ struct GraphBody: Codable {
 
 private struct GraphAttachmentListResponse: Decodable {
     let value: [GraphAttachmentMeta]
+    let odataNextLink: String?
+
+    enum CodingKeys: String, CodingKey {
+        case value
+        case odataNextLink = "@odata.nextLink"
+    }
 }
 
 private struct GraphAttachmentMeta: Decodable {
@@ -1950,4 +1977,8 @@ enum ExchangeDraftConfig {
     /// Each PUT's byte range; Graph asks for under 4 MB per request.
     static let uploadChunkBytes = 3 * 1024 * 1024
     static let uploadHosts: Set<String> = ["outlook.office.com", "outlook.office365.com"]
+    /// Pages of one message's attachment list read before giving up. Graph caps a
+    /// message at 150 MB, so a real list ends long before; the cap only stops a
+    /// list that never does.
+    static let maxAttachmentListPages = 50
 }

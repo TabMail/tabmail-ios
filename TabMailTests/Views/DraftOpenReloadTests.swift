@@ -454,6 +454,12 @@ struct DraftOpenReloadTests {
         let attachments = Mutex<[Attachment]>([])
         let patchCount = Mutex(0)
         let patchCarriedAttachments = Mutex(false)
+        /// Attachments per list page, as Graph pages a collection with
+        /// `@odata.nextLink`; nil lists them all on one page.
+        let listPageSize = Mutex<Int?>(nil)
+        /// A next link every list page carries in place of the real one: a list
+        /// that never ends, or one that points off Graph.
+        let listNextLink = Mutex<String?>(nil)
     }
 
     /// A Graph server that applies exactly the documented semantics and stores what
@@ -485,7 +491,10 @@ struct DraftOpenReloadTests {
                 }
                 return .json(raw: "{\"contentBytes\":\"\(one.bytes.base64EncodedString())\"}")
             }
-            let items: [[String: Any]] = all.map { item in
+            let query = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            let start = query.first { $0.name == "$skiptoken" }.flatMap { Int($0.value ?? "") } ?? 0
+            let pageSize = model.listPageSize.withLock { $0 } ?? max(all.count, 1)
+            let items: [[String: Any]] = all.dropFirst(start).prefix(pageSize).map { item in
                 var json: [String: Any] = [
                     "id": item.id, "name": item.name, "contentType": item.contentType, "size": item.bytes.count,
                     "isInline": item.isInline, "@odata.type": item.odataType,
@@ -493,7 +502,17 @@ struct DraftOpenReloadTests {
                 if let contentId = item.contentId { json["contentId"] = contentId }
                 return json
             }
-            guard let data = try? JSONSerialization.data(withJSONObject: ["value": items]) else { return .status(500) }
+            var page: [String: Any] = ["value": items]
+            if let link = model.listNextLink.withLock({ $0 }) {
+                page["@odata.nextLink"] = link
+            } else if start + pageSize < all.count {
+                // Graph's continuation: the same request, absolute, with a skip token.
+                var next = URLComponents(string: "https://graph.microsoft.com/v1.0/me/messages/g1/attachments")
+                next?.queryItems = query.filter { $0.name != "$skiptoken" }
+                    + [URLQueryItem(name: "$skiptoken", value: String(start + pageSize))]
+                page["@odata.nextLink"] = next?.string
+            }
+            guard let data = try? JSONSerialization.data(withJSONObject: page) else { return .status(500) }
             return .json(raw: String(decoding: data, as: UTF8.self))
         }
         http.register(path: "/messages/g1/attachments", method: "DELETE") { request in
@@ -672,6 +691,168 @@ struct DraftOpenReloadTests {
                 #expect(row.attachmentsDirName != dir, "precondition: the reload staged a new directory")
                 #expect(!FileManager.default.fileExists(atPath: DraftAttachmentStorage.dirURL(for: dir).path),
                         "the reload left the replaced attachment directory behind")
+            }
+        }
+    }
+
+    /// A clean Outlook draft with `first.txt` and `later.txt` on this device and on
+    /// the server (ids `f1`, `f2`).
+    private func insertDraftWithTwoFiles(_ pool: DatabasePool, model: ServerModel) async throws -> Draft {
+        let first = DraftAttachment(filename: "first.txt", mimeType: "text/plain", data: Data("FIRST".utf8))
+        let later = DraftAttachment(filename: "later.txt", mimeType: "text/plain", data: Data("LATER".utf8))
+        let dir = DraftAttachmentStorage.newStagingDirName()
+        try DraftAttachmentStorage.saveAttachments([first, later], dirName: dir)
+        model.attachments.withLock {
+            $0 = [first, later].enumerated().map { index, file in
+                .init(id: "f\(index + 1)", name: file.filename, contentType: file.mimeType,
+                      isInline: false, contentId: nil, bytes: file.data)
+            }
+        }
+        return try await pool.write { db -> Draft in
+            var row = try insertDraft(db)
+            row.attachmentsDirName = dir
+            try row.update(db)
+            return row
+        }
+    }
+
+    @Test("An Outlook attachment list in pages is read whole: reopening and saving keep every file")
+    func pagedAttachmentListIsReadWhole() async throws {
+        try await withInstalledPool { pool in
+            let model = ServerModel()
+            model.listPageSize.withLock { $0 = 1 }
+            let draft = try await insertDraftWithTwoFiles(pool, model: model)
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            registerGraphServer(http, model: model)
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                defer { if let dir = row.attachmentsDirName { DraftAttachmentStorage.deleteAttachments(dirName: dir) } }
+                #expect(row.pushAttemptVersion > draft.pushAttemptVersion, "precondition: the open reloaded")
+                let files = try DraftAttachmentStorage.loadAttachments(dirName: row.attachmentsDirName)
+                #expect(files.map(\.filename).sorted() == ["first.txt", "later.txt"],
+                        "reopening dropped the files on the list's later page")
+
+                try await pool.write { db in
+                    var edited = row
+                    edited.body = "user edits the body only"
+                    try DraftStore.applySave(edited, db: db)
+                }
+                #expect(try await DraftStore.shared.pushDraftToServer(
+                    draftId: row.id, expectedInstanceEpoch: "E1", provider: provider,
+                    runtimeKind: .outlook, draftsFolderPath: "Drafts") == .completed)
+                #expect(model.body.withLock { $0 } == "user edits the body only", "precondition: the save uploaded")
+                #expect(model.attachments.withLock { $0.map(\.id) } == ["f1", "f2"],
+                        "a body-only save deleted or re-added a file")
+            }
+        }
+    }
+
+    @Test("An Outlook attachment list that never ends, or continues off Graph, changes nothing",
+          arguments: [
+            "https://graph.microsoft.com/v1.0/me/messages/g1/attachments?$skiptoken=again",
+            "https://attacker.example.com/v1.0/me/messages/g1/attachments?$skiptoken=1",
+          ])
+    func unendingAttachmentListChangesNothing(nextLink: String) async throws {
+        try await withInstalledPool { pool in
+            let model = ServerModel()
+            model.listNextLink.withLock { $0 = nextLink }
+            let draft = try await insertDraftWithTwoFiles(pool, model: model)
+            defer { if let dir = draft.attachmentsDirName { DraftAttachmentStorage.deleteAttachments(dirName: dir) } }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            registerGraphServer(http, model: model)
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(row.pushAttemptVersion == draft.pushAttemptVersion, "an incomplete list replaced the draft")
+                #expect(row.attachmentsDirName == draft.attachmentsDirName)
+                #expect(try DraftAttachmentStorage.loadAttachments(dirName: row.attachmentsDirName).count == 2)
+                let lists = http.recordedCalls().filter { $0.method == "GET" && $0.url.contains("/attachments") }
+                #expect(lists.count <= ExchangeDraftConfig.maxAttachmentListPages, "the list read did not stop")
+                #expect(!lists.contains { $0.url.contains("attacker.example.com") }, "a next link left Graph")
+
+                try await pool.write { db in
+                    var edited = row
+                    edited.body = "user edits the body only"
+                    try DraftStore.applySave(edited, db: db)
+                }
+                let outcome = try? await DraftStore.shared.pushDraftToServer(
+                    draftId: row.id, expectedInstanceEpoch: "E1", provider: provider,
+                    runtimeKind: .outlook, draftsFolderPath: "Drafts")
+                #expect(outcome != .completed, "a save acted on an incomplete attachment list")
+                #expect(!http.recordedCalls().contains { $0.method == "DELETE" }, "a save deleted from an incomplete list")
+                #expect(model.attachments.withLock { $0.map(\.id) } == ["f1", "f2"])
+            }
+        }
+    }
+
+    @Test("A whitespace-only Outlook draft saved and reopened keeps its text", arguments: ["  ", "\t \t", "\n  \n  "])
+    func whitespaceOnlyDraftReopensAsTyped(typed: String) async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { db -> Draft in
+                var row = try insertDraft(db, status: "dirty")
+                row.body = typed
+                try row.update(db)
+                return row
+            }
+            let model = ServerModel()
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            registerGraphServer(http, model: model)
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            #expect(try await DraftStore.shared.pushDraftToServer(
+                draftId: draft.id, expectedInstanceEpoch: "E1", provider: provider,
+                runtimeKind: .outlook, draftsFolderPath: "Drafts") == .completed)
+            #expect(model.body.withLock { $0 } == typed, "precondition: the upload carried the exact text")
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(row.pushAttemptVersion > draft.pushAttemptVersion, "precondition: the open reloaded")
+                #expect(row.body == typed, "a save and reopen changed a whitespace-only draft")
+            }
+        }
+    }
+
+    @Test("A Bcc recipient of another app's Outlook draft is kept on adoption and on the first save")
+    func adoptedBccSurvivesTheFirstSave() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertOutlookHeader($0) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            var message = try #require(
+                try JSONSerialization.jsonObject(with: Data(Self.copyJSON(body: "body").utf8)) as? [String: Any])
+            message["body"] = ["contentType": "text", "content": "body"]
+            message["bccRecipients"] = [["emailAddress": ["name": "Hidden, Person", "address": "hidden@example.com"]]]
+            let json = try JSONSerialization.data(withJSONObject: message)
+            http.register(path: "/messages/g1", method: "GET", response: .json(raw: String(decoding: json, as: UTF8.self)))
+            http.register(path: "/messages/g1/attachments", method: "GET", response: .json(raw: #"{"value":[]}"#))
+            http.register(path: "/messages/g1", method: "PATCH", response: .json(raw: #"{"id":"g1"}"#))
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                try await ExternalDraftAdoption.adopt(header: header, address: .outlook(graphId: "g1"), runtimeKind: .outlook)
+                let row = try #require(try await pool.read { try Draft.fetchOne($0) })
+                #expect(RecipientEntry(row.bccArray).addresses == ["hidden@example.com"], "adoption lost a Bcc recipient")
+                try await pool.write { db in
+                    var edited = row
+                    edited.body += " edit"
+                    try DraftStore.applySave(edited, db: db)
+                }
+                #expect(try await DraftStore.shared.pushDraftToServer(
+                    draftId: row.id, expectedInstanceEpoch: try #require(row.instanceEpoch), provider: provider,
+                    runtimeKind: .outlook, draftsFolderPath: "Drafts") == .completed)
+                let patch = try #require(http.recordedCalls().first { $0.method == "PATCH" }?.body)
+                let payload = try #require(try JSONSerialization.jsonObject(with: patch) as? [String: Any])
+                let bcc = payload["bccRecipients"] as? [[String: Any]] ?? []
+                let addresses = bcc.compactMap { ($0["emailAddress"] as? [String: Any])?["address"] as? String }
+                #expect(addresses == ["hidden@example.com"], "the first save dropped an adopted Bcc recipient")
             }
         }
     }

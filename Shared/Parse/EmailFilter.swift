@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftMail
 import SwiftSoup
 
 /// Pure, GRDB-free email filtering and parsing utilities.
@@ -83,19 +84,10 @@ enum EmailFilter {
     /// Quoted lines are written back as one `">"` per depth and a space
     /// (`">> text"`).
     static func decodeFormatFlowed(_ text: String, contentType: String) -> String {
-        var isFlowed = false
-        var delSp = false
-        for parameter in contentType.split(separator: ";").dropFirst() {
-            let pair = parameter.split(separator: "=", maxSplits: 1).map {
-                $0.trimmingCharacters(in: .whitespaces)
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-                    .lowercased()
-            }
-            guard pair.count == 2 else { continue }
-            if pair[0] == "format" { isFlowed = pair[1] == "flowed" }
-            if pair[0] == "delsp" { delSp = pair[1] == "yes" }
-        }
-        guard isFlowed else { return text }
+        // SwiftMail's MIME parameter reader: quoted values, comments, any name case.
+        let part = MessagePart(sectionString: "1", contentType: contentType)
+        guard part.contentTypeParameter(named: "format")?.lowercased() == "flowed" else { return text }
+        let delSp = part.contentTypeParameter(named: "delsp")?.lowercased() == "yes"
 
         var lines: [String] = []
         var paragraph: String?
