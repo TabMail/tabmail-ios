@@ -38,7 +38,17 @@ final class DemoModeStore {
 
     /// Whether demo mode is currently active for this app session.
     var isActive: Bool = false {
-        didSet { Self.activeMirror.withLock { $0 = isActive } }
+        didSet {
+            Self.activeMirror.withLock { $0 = isActive }
+            // Turning on starts a new demo run with its own admission; turning
+            // off ends it (exit has already revoked it, see `revokeAdmission`).
+            if isActive != oldValue {
+                Self.admissionState.withLock { state in
+                    if isActive { state.run &+= 1 }
+                    state.open = isActive
+                }
+            }
+        }
     }
 
     /// Nonisolated mirror of `isActive` for readers that cannot hop to the
@@ -171,6 +181,45 @@ final class DemoModeStore {
     /// chat sessionId for mint OR lookup must route through this.
     static func scopedSessionId(_ base: String) -> String {
         shared.isActive ? "demo:\(base)" : base
+    }
+
+    // MARK: - Chat turn admission (#231)
+
+    /// The demo run a chat turn was started in. A turn is captured with its
+    /// session id (`chatAdmission`) and carries this to its writes, so a writer
+    /// still running after its demo's cleanup, a canceled chat task, or
+    /// compose's own user-turn persistence, can't write the turn back into chat
+    /// history or memory.db, even once the next demo has started.
+    struct Admission: Equatable, Sendable {
+        fileprivate let run: UInt64
+    }
+
+    /// Which demo run is current, and whether it still admits turns. In-memory,
+    /// like `isActive`. `run` only grows, so a run's admission never opens again.
+    nonisolated private static let admissionState = Mutex<(run: UInt64, open: Bool)>((run: 0, open: false))
+
+    /// The admission to capture with a chat turn's session id: the current demo
+    /// run's, nil outside a demo. Read on the main actor with `scopedSessionId`,
+    /// so a `demo:` session id always comes with its run's admission.
+    var chatAdmission: Admission? {
+        isActive ? Admission(run: Self.admissionState.withLock { $0.run }) : nil
+    }
+
+    /// Stop admitting the current demo run's turns. `DemoModeService.exit` calls
+    /// this before it deletes the demo's chat history and memory turns, so a
+    /// write either lands before that cleanup (and is deleted by it) or is refused.
+    func revokeAdmission() {
+        Self.admissionState.withLock { $0.open = false }
+    }
+
+    /// Whether a turn in `sessionId` captured with `admission` may still be
+    /// written. A `demo:` turn needs its run's admission, still open; any other
+    /// turn is real history and is always admitted. Callers check it inside the
+    /// write itself, so it can't go stale before the write.
+    nonisolated static func admits(sessionId: String?, admission: Admission?) -> Bool {
+        guard sessionId?.hasPrefix("demo:") == true else { return true }
+        guard let admission else { return false }
+        return admissionState.withLock { $0.open && $0.run == admission.run }
     }
 
     // MARK: - Test helpers

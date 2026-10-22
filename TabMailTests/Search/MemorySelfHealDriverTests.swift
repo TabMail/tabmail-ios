@@ -107,6 +107,32 @@ struct MemorySelfHealDriverTests {
         #expect(known.contains("b1"))
     }
 
+    /// A demo's history is discarded when the demo ends, so Stage A never
+    /// indexes it: a demo turn it loaded could otherwise be indexed after that
+    /// demo's cleanup and come back in the next demo's memory (#231).
+    @Test("Stage A leaves demo turns out and indexes the real ones")
+    func stageA_leavesDemoTurnsOut() async throws {
+        let (pool, appDir, previous) = try await MainActor.run { try installTempAppDB() }
+        let (memPool, memDir) = try await makeMemoryDB()
+        defer {
+            tearDownAppDB(pool: pool, dir: appDir, previous: previous)
+            TestDatabaseTeardown.registerForProcessExit(pool: memPool, directory: memDir)
+        }
+
+        let oldTs = Double(Int64(Date().timeIntervalSince1970 * 1000) - 10 * 60_000)
+        try await MainActor.run {
+            try insertHistoryTurn(pool, id: "real", timestamp: oldTs, sessionId: "inbox", userMessage: "real turn")
+            try insertHistoryTurn(pool, id: "legacy", timestamp: oldTs, sessionId: nil, userMessage: "legacy turn")
+            try insertHistoryTurn(pool, id: "demo-inbox", timestamp: oldTs, sessionId: "demo:inbox", userMessage: "demo turn")
+            try insertHistoryTurn(pool, id: "demo-msg", timestamp: oldTs, sessionId: "demo:msg:acc1:abc", userMessage: "demo msg turn")
+            try insertHistoryTurn(pool, id: "demo-compose", timestamp: oldTs, sessionId: "demo:compose:d1", userMessage: "demo compose turn")
+        }
+
+        await MemorySelfHealDriver.runStageA()
+
+        #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real", "legacy"])
+    }
+
     @Test("Stage A respects idle cutoff — skips in-progress turns")
     func stageA_idleCutoffRespected() async throws {
         let (pool, appDir, previous) = try await MainActor.run { try installTempAppDB() }

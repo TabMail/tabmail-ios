@@ -181,6 +181,22 @@ fix gates at shared chokepoints, not per-tool patches:
   start error; the user retries). Demo exit and a real sign-up only log the
   failure: real mode never reads `demo:` turns, and the next demo start wipes
   them first.
+  *Amended 2026-10-21 (#231, late writers):* a chat write still running from
+  a demo that has ended could bring its turn back after the next demo's
+  confirmed purge. Two writers, two fixes. (1) Memory self-heal Stage A
+  (`ChatStore.historyTurnIdsForSelfHeal`) leaves `demo:` sessions out: demo
+  history is discarded at exit, so there is nothing to repair, and a demo turn
+  it loaded could be indexed after the wipe. (2) Chat appends carry an
+  in-memory **admission** (`DemoModeStore.Admission`): a demo run opens one when
+  `isActive` turns on, `DemoModeService.exit` revokes it FIRST (before its
+  wipes), and it never reopens (a run counter). The three send paths in
+  `DynamicIslandChatButton` capture `chatAdmission` with the session id
+  (compose's own user-turn persistence included) and pass it to
+  `ChatStore.appendTurn(_:admission:)`; `DemoModeStore.admits` is checked inside
+  the chatHistory write transaction and inside `MemoryIndex.indexTurn`'s
+  memory.db write transaction, so each write lands before the cleanup that
+  deletes it or is refused (`ChatStore.DemoTurnRefused`). A `demo:` turn with
+  no admission is refused; any other turn is real history and always admitted.
 - **CalendarProviderDispatch** — demo resolves ONLY `DemoCalendarProvider`
   (new `CalendarBackend.demo` case); normal mode skips the demo entry.
   Without this, coexistence calendar_read leaked real events and

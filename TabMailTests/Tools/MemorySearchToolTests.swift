@@ -171,7 +171,7 @@ struct MemorySearchToolTests {
             await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i)", sessionId: i == 3 ? nil : "s\(i / 4)", role: role, dateMs: dateMs, text: "turn \(i)")
             expected.insert((dateMs, role == "user" ? "USER" : "AGENT"), at: 0)
         }
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:s", role: "user", dateMs: base + 20 * 3_600_000, text: "demo turn")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:s", role: "user", dateMs: base + 20 * 3_600_000, text: "demo turn")
 
         let tool = try makeTool()
         let pageSize = SearchConfig.memoryPageSizeDefault
@@ -227,10 +227,10 @@ struct MemorySearchToolTests {
 
         let base = noonUTCThreeDaysAgo()
         await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base + 3_600_000, text: "budget real_history_marker")
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base, text: "budget demo_history_marker")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base, text: "budget demo_history_marker")
         // Older turns of each mode that don't match the query.
         for i in 0..<4 {
-            await MemoryIndex.shared.indexTurn(chatHistoryId: "other\(i)", sessionId: i % 2 == 0 ? "s" : "demo:a", role: "user", dateMs: base - Int64(i + 1) * 3_600_000, text: "lunch plans \(i)")
+            await DemoRunFixture.indexTurn(chatHistoryId: "other\(i)", sessionId: i % 2 == 0 ? "s" : "demo:a", role: "user", dateMs: base - Int64(i + 1) * 3_600_000, text: "lunch plans \(i)")
         }
 
         // Hold the one reader, so the search started next waits mid-read.
@@ -278,8 +278,8 @@ struct MemorySearchToolTests {
         let base = noonUTCThreeDaysAgo()
         await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base + 3_600_000, text: "real turn")
         await MemoryIndex.shared.indexTurn(chatHistoryId: "legacy", sessionId: nil, role: "user", dateMs: base + 2 * 3_600_000, text: "legacy turn")
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo1", sessionId: "demo:a", role: "user", dateMs: base, text: "demo one")
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo2", sessionId: "demo:b", role: "assistant", dateMs: base - 3_600_000, text: "demo two")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo1", sessionId: "demo:a", role: "user", dateMs: base, text: "demo one")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo2", sessionId: "demo:b", role: "assistant", dateMs: base - 3_600_000, text: "demo two")
 
         try await withDemoActive(true) {
             let demo = try listed(try await makeTool().execute(arguments: [:]))
@@ -299,7 +299,7 @@ struct MemorySearchToolTests {
 
         let base = noonUTCThreeDaysAgo()
         await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base + 3_600_000, text: "budget real_history_marker")
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base, text: "budget demo_history_marker")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base, text: "budget demo_history_marker")
         let tool = try makeTool()
         let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
 
@@ -372,8 +372,8 @@ struct MemorySearchToolTests {
 
         try await withTool { tool in
             let base = noonUTCThreeDaysAgo()
-            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "real", sessionId: "s", dateMs: base + 3_600_000, text: "budget real_history_marker"))
-            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "demo", sessionId: "demo:a", dateMs: base, text: "budget demo_history_marker"))
+            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "real", sessionId: "s", dateMs: base + 3_600_000, text: "budget real_history_marker"), admission: nil)
+            _ = try await DemoRunFixture.appendTurn(chatTurn(id: "demo", sessionId: "demo:a", dateMs: base, text: "budget demo_history_marker"))
             #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real", "demo"])
             await embedRealAndDemo()
             let realRow = try rowid(of: "real", memPool)
@@ -419,8 +419,8 @@ struct MemorySearchToolTests {
 
         try await withTool { tool in
             let base = noonUTCThreeDaysAgo()
-            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "real", sessionId: "s", dateMs: base + 3_600_000, text: "budget real_history_marker"))
-            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "demo", sessionId: "demo:a", dateMs: base, text: "budget demo_history_marker"))
+            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "real", sessionId: "s", dateMs: base + 3_600_000, text: "budget real_history_marker"), admission: nil)
+            _ = try await DemoRunFixture.appendTurn(chatTurn(id: "demo", sessionId: "demo:a", dateMs: base, text: "budget demo_history_marker"))
             #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real", "demo"])
             await embedRealAndDemo()
             let realRow = try rowid(of: "real", memPool)
@@ -460,6 +460,251 @@ struct MemorySearchToolTests {
             let real = try await tool.execute(arguments: arguments)
             #expect(real.contains("real_history_marker"))
         }
+    }
+
+    /// The two writes a chat append makes after its demo's cleanup may have run.
+    enum LateDemoWriter: String, CaseIterable, Sendable {
+        /// The chat-history commit itself (a canceled chat task, compose's own
+        /// user-turn persistence).
+        case commit
+        /// The memory.db write after a commit that landed before the cleanup.
+        case memoryIndex
+    }
+
+    /// A chat write still running from a demo that has ended can't bring its
+    /// turn back, even once the next demo has started over a confirmed purge:
+    /// the turn's source row is gone, and no derived row is written, so neither
+    /// search form finds its text. The new demo's own turns still write (#231).
+    @Test("A demo's late chat writes can't bring its turns back in the next demo", arguments: ["", "budget"], LateDemoWriter.allCases)
+    func lateDemoWritesCantReturn(query: String, writer: LateDemoWriter) async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        try await withTool { tool in
+            let base = noonUTCThreeDaysAgo()
+            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "real", sessionId: "s", dateMs: base + 3_600_000, text: "budget real_history_marker"), admission: nil)
+            let arguments: [String: JSONValue] = query.isEmpty ? [:] : ["query": .string(query)]
+
+            // The first demo writes a turn, keeping its admission as a chat task does.
+            let firstRun = await MainActor.run { () -> DemoModeStore.Admission? in
+                DemoModeStore.shared.isActive = true
+                return DemoModeStore.shared.chatAdmission
+            }
+            let demoTurn = chatTurn(id: "demo", sessionId: "demo:a", dateMs: base, text: "budget demo_history_marker")
+            _ = try await ChatStore.shared.appendTurn(demoTurn, admission: firstRun)
+            #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real", "demo"])
+
+            // It ends, and the next demo starts over a confirmed purge.
+            await DemoModeService.shared.exit()
+            try await DemoModeService.shared.activate()
+            #expect(await MainActor.run { DemoModeStore.shared.isActive })
+            #expect(try await ChatStore.shared.allHistoryTurnIds() == ["real"], "the source row is deleted")
+            #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real"])
+
+            // The first demo's writer is released now.
+            switch writer {
+            case .commit:
+                let late = chatTurn(id: "demo-late", sessionId: "demo:a", dateMs: base + 60_000, text: "budget demo_history_marker")
+                await #expect(throws: ChatStore.DemoTurnRefused.self) {
+                    try await ChatStore.shared.appendTurn(late, admission: firstRun)
+                }
+            case .memoryIndex:
+                await MemoryIndex.shared.indexTurn(
+                    chatHistoryId: demoTurn.id, sessionId: demoTurn.sessionId, role: demoTurn.role,
+                    dateMs: base, text: "budget demo_history_marker", admission: firstRun)
+            }
+
+            #expect(try await ChatStore.shared.allHistoryTurnIds() == ["real"])
+            #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real"])
+            let realRow = try rowid(of: "real", memPool)
+            #expect(Array(try storeRowids(memPool).prefix(2)) == [[realRow], [realRow]], "no keyword or turn row for the demo")
+            let listed = try await tool.execute(arguments: arguments)
+            #expect(!listed.contains("demo_history_marker"))
+            let searched = try await tool.execute(arguments: ["query": .string("demo_history_marker")])
+            #expect(!searched.contains("demo_history_marker"))
+
+            // The running demo's own turns are still written.
+            let secondRun = await MainActor.run { DemoModeStore.shared.chatAdmission }
+            #expect(secondRun != nil && secondRun != firstRun)
+            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "demo-now", sessionId: "demo:b", dateMs: base + 120_000, text: "budget current_demo_marker"), admission: secondRun)
+            #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real", "demo-now"])
+            await MemorySearchCache.shared.reset()
+            let current = try await tool.execute(arguments: arguments)
+            #expect(current.contains("current_demo_marker"))
+            #expect(!current.contains("demo_history_marker"))
+
+            await DemoModeService.shared.exit()
+            let real = try await tool.execute(arguments: arguments)
+            #expect(real.contains("real_history_marker"))
+        }
+    }
+
+    /// Where a demo's chat append is held while its demo ends and the next one
+    /// starts: waiting for the database writer before its chat-history write
+    /// (as compose's own user-turn persistence can, never canceled), or after
+    /// that write committed, before it reaches memory.db (a canceled chat task).
+    enum HeldAppend: CaseIterable, Sendable {
+        case beforeWrite
+        case afterCommit
+    }
+
+    /// The same append, started in a demo and held across that demo's cleanup
+    /// and the next demo's start, writes nothing once released: no chat-history
+    /// row, no memory.db row, nothing listed or found. The new demo's own turns
+    /// still write (#231).
+    @Test("A demo's chat append held across the next demo's start writes nothing", arguments: HeldAppend.allCases)
+    func heldDemoAppendWritesNothing(held: HeldAppend) async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        try await withTool { tool in
+            let base = noonUTCThreeDaysAgo()
+            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "real", sessionId: "s", dateMs: base + 3_600_000, text: "budget real_history_marker"), admission: nil)
+            let firstRun = await MainActor.run { () -> DemoModeStore.Admission? in
+                DemoModeStore.shared.isActive = true
+                return DemoModeStore.shared.chatAdmission
+            }
+
+            // The app's write queue is busy, so the append waits for the writer.
+            let writer = Latch()
+            let busyWriter = Task { try await DatabaseWriteQueue.shared.execute(priority: .priority) { await writer.wait() } }
+            let writerHeld = await waitUntil { await DatabaseWriteQueue.shared.isWriting }
+            let old = chatTurn(id: "demo-old", sessionId: "demo:a", dateMs: base, text: "budget demo_history_marker")
+            let pending = Task { try await ChatStore.shared.appendTurn(old, admission: firstRun) }
+            let appendWaiting = await waitUntil { await DatabaseWriteQueue.shared.queuedCount == 1 }
+
+            let chatStoreRelease = DispatchSemaphore(value: 0)
+            var committed = true
+            if held == .afterCommit {
+                // ChatStore is kept busy, so once its write commits the append
+                // waits there before handing the turn to memory.db.
+                await withCheckedContinuation { (busy: CheckedContinuation<Void, Never>) in
+                    Task.detached { await ChatStore.shared._testHold(held: busy, release: chatStoreRelease) }
+                }
+                await writer.open()
+                committed = await waitUntil { (try? rawHistoryIds())?.contains("demo-old") == true }
+                pending.cancel()
+            }
+
+            // The demo ends and the next one starts over a confirmed purge.
+            await DemoModeService.shared.exit()
+            try await DemoModeService.shared.activate()
+            #expect(writerHeld && appendWaiting && committed)
+            #expect(try rawHistoryIds() == ["real"], "the source row is deleted")
+
+            // The append is released now.
+            switch held {
+            case .beforeWrite:
+                await writer.open()
+                await #expect(throws: ChatStore.DemoTurnRefused.self) { try await pending.value }
+            case .afterCommit:
+                chatStoreRelease.signal()
+                _ = try? await pending.value
+            }
+            _ = try? await busyWriter.value
+
+            #expect(try await ChatStore.shared.allHistoryTurnIds() == ["real"])
+            #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real"])
+            let realRow = try rowid(of: "real", memPool)
+            #expect(Array(try storeRowids(memPool).prefix(2)) == [[realRow], [realRow]], "no keyword or turn row for the demo")
+            await MemorySearchCache.shared.reset()
+            let listed = try await tool.execute(arguments: [:])
+            #expect(!listed.contains("demo_history_marker"))
+            let searched = try await tool.execute(arguments: ["query": .string("demo_history_marker")])
+            #expect(!searched.contains("demo_history_marker"))
+
+            // The running demo's own turns are still written.
+            let secondRun = await MainActor.run { DemoModeStore.shared.chatAdmission }
+            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "demo-now", sessionId: "demo:b", dateMs: base + 120_000, text: "budget current_demo_marker"), admission: secondRun)
+            #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real", "demo-now"])
+            await MemorySearchCache.shared.reset()
+            #expect(try await tool.execute(arguments: [:]).contains("current_demo_marker"))
+
+            await DemoModeService.shared.exit()
+        }
+    }
+
+    /// Chat history ids, read straight from the database (not through ChatStore,
+    /// which a test may be holding).
+    private func rawHistoryIds() throws -> Set<String> {
+        try AppDatabase.rawPool.read { db in Set(try String.fetchAll(db, sql: "SELECT id FROM chatHistory")) }
+    }
+
+    /// A demo's chat write released while that demo is exiting, after exit has
+    /// wiped its chat history, doesn't outlive the exit: once exit returns, the
+    /// turn is in neither chat history nor memory.db, so real mode can't show
+    /// it, and real history is untouched (#231).
+    @Test("A demo's chat write during its exit doesn't outlive the exit")
+    func demoWriteDuringExitDoesntOutliveIt() async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+
+        try await withTool { _ in
+            let base = noonUTCThreeDaysAgo()
+            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "real", sessionId: "s", dateMs: base + 3_600_000, text: "budget real_history_marker"), admission: nil)
+            let run = await MainActor.run { () -> DemoModeStore.Admission? in
+                DemoModeStore.shared.isActive = true
+                return DemoModeStore.shared.chatAdmission
+            }
+            _ = try await ChatStore.shared.appendTurn(chatTurn(id: "demo", sessionId: "demo:a", dateMs: base, text: "budget demo_history_marker"), admission: run)
+
+            // Exit is held at its memory.db cleanup, once it has wiped chat history.
+            let release = await holdWriter(memPool)
+            let exit = Task { await DemoModeService.shared.exit() }
+            let wiped = await waitUntil { (try? await ChatStore.shared.allHistoryTurnIds()) == ["real"] }
+
+            // The demo's writer is released now, while exit is still running, and
+            // runs until it has written or been refused.
+            let appended = DispatchSemaphore(value: 0)
+            let late = chatTurn(id: "demo-late", sessionId: "demo:a", dateMs: base + 60_000, text: "budget demo_late_marker")
+            let append = Task {
+                defer { appended.signal() }
+                _ = try? await ChatStore.shared.appendTurn(late, admission: run)
+            }
+            let settled = await waitUntil {
+                if Self.isSignaled(appended) { return true }
+                return (try? await ChatStore.shared.allHistoryTurnIds())?.contains("demo-late") == true
+            }
+            release.signal()
+            await exit.value
+            await append.value
+            #expect(wiped && settled)
+
+            #expect(try await ChatStore.shared.allHistoryTurnIds() == ["real"])
+            #expect(await MemoryIndex.shared.knownChatHistoryIds() == ["real"])
+            let realRow = try rowid(of: "real", memPool)
+            #expect(Array(try storeRowids(memPool).prefix(2)) == [[realRow], [realRow]], "no keyword or turn row for the demo")
+        }
+    }
+
+    /// Holds the memory pool's writer on another thread until the returned
+    /// semaphore is signaled.
+    private func holdWriter(_ pool: DatabasePool) async -> DispatchSemaphore {
+        let release = DispatchSemaphore(value: 0)
+        await withCheckedContinuation { (held: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                try? pool.write { _ in
+                    held.resume()
+                    release.wait()
+                }
+            }
+        }
+        return release
+    }
+
+    /// Whether `semaphore` has been signaled, without waiting.
+    private static func isSignaled(_ semaphore: DispatchSemaphore) -> Bool {
+        semaphore.wait(timeout: .now()) == .success
+    }
+
+    /// Polls `condition` until it holds or `timeoutSeconds` pass.
+    private func waitUntil(timeoutSeconds: Double = 5, _ condition: () async -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while await !condition() {
+            if Date() >= deadline { return false }
+            await Task.yield()
+        }
+        return true
     }
 
     /// Holds the memory pool's one reader on another thread until `release`;
@@ -558,9 +803,9 @@ struct MemorySearchToolTests {
 
         let base = noonUTCThreeDaysAgo()
         await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base, text: "budget real_history_marker")
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base + 3_600_000, text: "budget demo_history_marker")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base + 3_600_000, text: "budget demo_history_marker")
         for i in 0..<4 {
-            await MemoryIndex.shared.indexTurn(chatHistoryId: "other\(i)", sessionId: i % 2 == 0 ? "s" : "demo:a", role: "user", dateMs: base - Int64(i + 1) * 3_600_000, text: "lunch plans \(i)")
+            await DemoRunFixture.indexTurn(chatHistoryId: "other\(i)", sessionId: i % 2 == 0 ? "s" : "demo:a", role: "user", dateMs: base - Int64(i + 1) * 3_600_000, text: "lunch plans \(i)")
         }
 
         // The index is busy: another call waits on the reader inside it.
@@ -596,7 +841,7 @@ struct MemorySearchToolTests {
 
         let base = noonUTCThreeDaysAgo()
         await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base, text: "budget real_history_marker")
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base + 3_600_000, text: "budget demo_history_marker")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base + 3_600_000, text: "budget demo_history_marker")
 
         // The cache is busy, so the search waits on it after reading the mode.
         let held = DispatchSemaphore(value: 0)
@@ -632,9 +877,9 @@ struct MemorySearchToolTests {
 
         let base = noonUTCThreeDaysAgo()
         await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base, text: "budget real turn")
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base + 3_600_000, text: "budget demo turn")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base + 3_600_000, text: "budget demo turn")
         for i in 0..<4 {
-            await MemoryIndex.shared.indexTurn(chatHistoryId: "other\(i)", sessionId: i % 2 == 0 ? "s" : "demo:a", role: "user", dateMs: base - Int64(i + 1) * 3_600_000, text: "lunch plans \(i)")
+            await DemoRunFixture.indexTurn(chatHistoryId: "other\(i)", sessionId: i % 2 == 0 ? "s" : "demo:a", role: "user", dateMs: base - Int64(i + 1) * 3_600_000, text: "lunch plans \(i)")
         }
         #expect(await ChatHistoryView.searchHistory("budget").map(\.chatHistoryId) == ["real"])
         await withDemoActive(true) {
@@ -654,7 +899,7 @@ struct MemorySearchToolTests {
         let realText = "real_history_marker quarterly budget forecast spreadsheet for the finance team"
         let demoText = "demo_history_marker quarterly budget forecast spreadsheet for the finance team"
         await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: base, text: realText)
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base + 3_600_000, text: demoText)
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: base + 3_600_000, text: demoText)
         let query = "money planning numbers"
         // No word in common: the keyword leg alone finds nothing.
         #expect(EmbeddingService.shared == nil)
@@ -704,9 +949,9 @@ struct MemorySearchToolTests {
         let hour: Int64 = 3_600_000
         let dates = (0..<10).map { base + Int64($0) * hour }
         for (i, dateMs) in dates.enumerated() {
-            await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i)", sessionId: demo ? "demo:a" : "s", role: "user", dateMs: dateMs, text: "turn \(i)")
+            await DemoRunFixture.indexTurn(chatHistoryId: "t\(i)", sessionId: demo ? "demo:a" : "s", role: "user", dateMs: dateMs, text: "turn \(i)")
             // The other mode's turn a minute later: inside the window, never listed.
-            await MemoryIndex.shared.indexTurn(chatHistoryId: "o\(i)", sessionId: demo ? "s" : "demo:a", role: "user", dateMs: dateMs + 60_000, text: "other \(i)")
+            await DemoRunFixture.indexTurn(chatHistoryId: "o\(i)", sessionId: demo ? "s" : "demo:a", role: "user", dateMs: dateMs + 60_000, text: "other \(i)")
         }
 
         var arguments: [String: JSONValue] = [:]
@@ -744,7 +989,7 @@ struct MemorySearchToolTests {
             ("last", nextMidnight - 1), ("nextMidnight", nextMidnight), ("nextDay", base + 14 * hour),
         ]
         for (id, dateMs) in turns {
-            await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: demo ? "demo:a" : "s", role: "user", dateMs: dateMs, text: id)
+            await DemoRunFixture.indexTurn(chatHistoryId: id, sessionId: demo ? "demo:a" : "s", role: "user", dateMs: dateMs, text: id)
         }
         let day = String(isoString(base).prefix(10))
 
@@ -883,6 +1128,31 @@ struct MemorySearchToolTests {
     func toolName() throws {
         let tool = try makeTool()
         #expect(tool.name == "memory_search")
+    }
+}
+
+/// Opens once; every `wait` before or after that returns once it has.
+private actor Latch {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+    }
+}
+
+extension ChatStore {
+    /// Keeps ChatStore busy until `release`; resumes `held` once it is.
+    func _testHold(held: CheckedContinuation<Void, Never>, release: DispatchSemaphore) {
+        held.resume()
+        release.wait()
     }
 }
 

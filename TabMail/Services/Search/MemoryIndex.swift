@@ -243,12 +243,23 @@ actor MemoryIndex {
     /// Idempotent upsert of a single turn. Called synchronously after the
     /// chatHistory write commits. Non-throwing — logs errors internally; Stage A
     /// self-heal (A−B direction) picks up any write that fails here.
-    func indexTurn(chatHistoryId: String, sessionId: String?, role: String, dateMs: Int64, text: String) {
+    ///
+    /// A demo turn is written only while its demo run admits it
+    /// (`DemoModeStore.admits`), checked inside the write: a demo's cleanup
+    /// revokes the run before its memory purge, so the turn is either written
+    /// before the purge and deleted by it, or refused (#231).
+    func indexTurn(chatHistoryId: String, sessionId: String?, role: String, dateMs: Int64, text: String, admission: DemoModeStore.Admission? = nil) {
         ensureReady()
         guard let dbPool else { return }
         do {
-            try dbPool.write { db in
+            let written = try dbPool.write { db -> Bool in
+                guard DemoModeStore.admits(sessionId: sessionId, admission: admission) else { return false }
                 try Self.writeTurn(db: db, chatHistoryId: chatHistoryId, sessionId: sessionId, role: role, dateMs: dateMs, text: text)
+                return true
+            }
+            guard written else {
+                BackgroundSyncLogger.logDebug("[MemoryIndex] indexTurn REFUSED id=\(chatHistoryId.prefix(20)): its demo has ended")
+                return
             }
             if DebugModeManager.isLoggingEnabled() {
                 let head = String(text.prefix(80)).replacingOccurrences(of: "\n", with: "\\n")

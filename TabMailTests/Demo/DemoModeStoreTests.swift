@@ -94,6 +94,47 @@ struct DemoModeStoreTests {
         DemoModeStore.shared._resetForTests()
     }
 
+    // MARK: - Chat turn admission (#231)
+
+    /// A demo turn is admitted only while the demo run it was started in still
+    /// runs: not once that demo's exit has begun, and never again in a later
+    /// demo. Real turns are always admitted.
+    @Test("A demo turn is admitted only while its own demo runs")
+    func chatAdmissionFollowsTheDemoRun() {
+        DemoModeStore.shared._resetForTests()
+        defer { DemoModeStore.shared._resetForTests() }
+        let store = DemoModeStore.shared
+
+        #expect(store.chatAdmission == nil)
+        #expect(DemoModeStore.admits(sessionId: "inbox", admission: nil))
+        #expect(DemoModeStore.admits(sessionId: nil, admission: nil))
+        #expect(!DemoModeStore.admits(sessionId: "demo:inbox", admission: nil))
+
+        store.isActive = true
+        let first = store.chatAdmission
+        #expect(first != nil)
+        #expect(DemoModeStore.admits(sessionId: "demo:inbox", admission: first))
+        #expect(!DemoModeStore.admits(sessionId: "demo:inbox", admission: nil))
+        store.isActive = true
+        #expect(store.chatAdmission == first, "setting the same mode keeps the run")
+
+        // Exit has begun: the run admits nothing more, captured before or after.
+        store.revokeAdmission()
+        #expect(!DemoModeStore.admits(sessionId: "demo:inbox", admission: first))
+        #expect(!DemoModeStore.admits(sessionId: "demo:inbox", admission: store.chatAdmission))
+        #expect(DemoModeStore.admits(sessionId: "inbox", admission: first), "real turns stay admitted")
+        store.isActive = false
+        #expect(store.chatAdmission == nil)
+        #expect(!DemoModeStore.admits(sessionId: "demo:inbox", admission: first))
+
+        // The next demo admits its own turns, never the last demo's.
+        store.isActive = true
+        let second = store.chatAdmission
+        #expect(second != nil && second != first)
+        #expect(DemoModeStore.admits(sessionId: "demo:inbox", admission: second))
+        #expect(!DemoModeStore.admits(sessionId: "demo:inbox", admission: first))
+    }
+
     // MARK: - Prompt overlay (ADR-IOS-038)
 
     @Test("PromptStore demo overlay: writes route to demo keys; real prompts untouched; exit restores")
@@ -237,5 +278,45 @@ struct DemoAuthConstantsTests {
         let regex = try! NSRegularExpression(pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
         let range = NSRange(expected.startIndex..., in: expected)
         #expect(regex.firstMatch(in: expected, range: range) != nil)
+    }
+}
+
+/// The chat pill's capture of a turn's demo admission, which the store and
+/// write tests cannot reach: the send paths are private to the pill view.
+@Suite struct ChatPillDemoAdmissionWiringTests {
+    private static let pillPath = "TabMail/Views/Inbox/DynamicIslandChatButton.swift"
+
+    private func pillSource() throws -> String {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        return try String(contentsOf: projectRoot.appendingPathComponent(Self.pillPath), encoding: .utf8)
+    }
+
+    /// Each send path reads its admission with its session id, in the same
+    /// main-actor span before its chat task starts, and every chat write gets
+    /// that one value. A write read later could pick up the next demo's
+    /// admission and bring an ended demo's turn back (#231).
+    @Test func eachChatWriteCarriesTheAdmissionCapturedWithItsSessionId() throws {
+        let source = try pillSource()
+        for method in ["private func sendComposeEdit(", "private func sendAgentChat(", "private func resumeAgentChat("] {
+            let start = try #require(source.range(of: method), "\(method)")
+            let rest = source[start.upperBound...]
+            // The statement on its own line, not an `if let sid = currentSessionId` test.
+            let sid = try #require(rest.range(of: #"(?m)^\s*let sid = currentSessionId$"#, options: .regularExpression), "\(method)")
+            let task = try #require(rest.range(of: "Task {", range: sid.upperBound..<rest.endIndex), "\(method)")
+            let capture = rest[sid.lowerBound..<task.lowerBound]
+            #expect(capture.contains("let admission = DemoModeStore.shared.chatAdmission"), "\(method)")
+            #expect(!capture.contains("await"), "\(method)")
+        }
+        #expect(source.components(separatedBy: "DemoModeStore.shared.chatAdmission").count - 1 == 3, "read only where a session id is captured")
+
+        let writes = source.components(separatedBy: "appendTurn(").dropFirst()
+        #expect(!writes.isEmpty)
+        for write in writes {
+            let arguments = try #require(write.split(separator: ")", maxSplits: 1).first)
+            #expect(arguments.hasSuffix("admission: admission"), "\(arguments)")
+        }
     }
 }
