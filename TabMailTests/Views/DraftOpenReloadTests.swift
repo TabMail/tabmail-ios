@@ -1328,6 +1328,158 @@ struct DraftOpenReloadTests {
         }
     }
 
+    /// A Gmail account with a Drafts header for contained message `m-5`, owned by
+    /// `owners` saved rows naming draft resource `r1`.
+    private nonisolated func insertGmailHeader(_ db: Database, owners: Int) throws -> MessageHeader {
+        var account = Account(emailAddress: "owner@example.com", displayName: "Test", provider: .gmail)
+        account.id = Self.accountId
+        try account.insert(db)
+        let folder = Folder(name: "Drafts", path: "[Gmail]/Drafts", role: .drafts, accountId: Self.accountId)
+        try folder.insert(db)
+        let header = MessageHeader(
+            messageId: "m-5", subject: "Plan", from: "owner@example.com", fromAddress: "owner@example.com",
+            to: "alice@example.com", date: Date(), snippet: "", folderId: folder.id,
+            accountId: Self.accountId, folderPath: folder.path, isInInbox: false)
+        try header.insert(db)
+        for index in 0..<owners {
+            var draft = Draft(
+                id: "owned-draft-\(index)", accountId: Self.accountId,
+                toJSON: "[]", ccJSON: "[]", bccJSON: "[]", subject: "Plan", body: "phone edit",
+                replyToId: nil, isForward: false, editHistoryJSON: nil, createdAt: 1, updatedAt: 2,
+                serverDraftId: "r1", serverPushStatus: index == 0 ? "pushed" : "dirty",
+                rfc822MessageId: nil, attachmentsDirName: nil)
+            draft.instanceEpoch = "E\(index)"
+            try draft.insert(db)
+        }
+        return header
+    }
+
+    /// A Gmail server whose draft resource `r1` wraps message `m-5`, holding `body`
+    /// and `files` (part JSON). `onList` runs when the loader looks the resource up.
+    private func gmailProvider(
+        _ http: FakeHTTP.Scenario, body: String, files: String = "",
+        onList: @escaping @Sendable () -> Void = {}
+    ) -> GmailProvider {
+        http.register(path: "/drafts", method: "GET") { _ in
+            onList()
+            return .json(raw: #"{"drafts":[{"id":"r1","message":{"id":"m-5"}}]}"#)
+        }
+        http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-5"}}"#))
+        let internalDate = String(Int(Date().timeIntervalSince1970 * 1000))
+        let data = Data(body.utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        http.register(path: "/messages/m-5", method: "GET", response: .json(raw: """
+            {"id":"m-5","internalDate":"\(internalDate)","labelIds":["DRAFT"],
+             "payload":{"mimeType":"multipart/mixed","headers":[{"name":"Subject","value":"Plan"}],
+               "parts":[{"mimeType":"text/plain","body":{"size":\(body.utf8.count),"data":"\(data)"}}\(files)]}}
+            """))
+        return GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+    }
+
+    @Test("Gmail: the loader opens the one row that owns the draft resource, without reading the draft")
+    func gmailLoaderOpensTheOwnedDraft() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertGmailHeader($0, owners: 1) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            try await withRegisteredProvider(gmailProvider(http, body: "server body")) {
+                let resolution = await loaderResolution(header)
+
+                guard case .authorized(let authority) = resolution else {
+                    Issue.record("expected the owned draft, got \(resolution)")
+                    return
+                }
+                #expect(authority.draftId == "owned-draft-0")
+                #expect(authority.address == .gmail(resourceId: "r1", containedMessageId: "m-5"))
+                #expect(!http.recordedCalls().contains { $0.url.contains("/messages/") }, "an owned draft is not adopted again")
+            }
+        }
+    }
+
+    @Test("Gmail: the loader adopts another app's draft, then opens the adopted row")
+    func gmailLoaderAdoptsThenOpens() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertGmailHeader($0, owners: 0) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            try await withRegisteredProvider(gmailProvider(http, body: "written elsewhere")) {
+                let resolution = await loaderResolution(header)
+
+                guard case .authorized(let authority) = resolution else {
+                    Issue.record("expected the adopted draft, got \(resolution)")
+                    return
+                }
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: authority.draftId) })
+                #expect(ExternalDraftAdoption.isAdoptedKey(row.id) && row.serverDraftId == "r1")
+                #expect(row.body == "written elsewhere")
+            }
+        }
+    }
+
+    @Test("Gmail: adoption keeps a file whose bytes came in the draft and fetches the others")
+    func gmailAdoptionCarriesInlineBytesAndFetchesTheRest() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertGmailHeader($0, owners: 0) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let invite = Data("BEGIN:VCALENDAR".utf8).base64EncodedString()
+            let provider = gmailProvider(http, body: "Agenda attached", files: """
+                ,{"mimeType":"text/calendar","body":{"size":15,"data":"\(invite)"}}
+                ,{"mimeType":"application/pdf","filename":"plan.pdf","body":{"size":3,"attachmentId":"att1"}}
+                """)
+            http.register(path: "/messages/m-5/attachments/att1", method: "GET",
+                          response: .json(raw: "{\"size\":3,\"data\":\"\(Data([1, 2, 3]).base64EncodedString())\"}"))
+            try await withRegisteredProvider(provider) {
+                let resolution = await loaderResolution(header)
+
+                guard case .authorized(let authority) = resolution else {
+                    Issue.record("expected the adopted draft, got \(resolution)")
+                    return
+                }
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: authority.draftId) })
+                let files = try DraftAttachmentStorage.loadAttachments(dirName: row.attachmentsDirName)
+                #expect(files.map(\.filename) == [DraftReadConfig.unnamedAttachmentFilename, "plan.pdf"])
+                #expect(files.map(\.data) == [Data("BEGIN:VCALENDAR".utf8), Data([1, 2, 3])])
+                if let dir = row.attachmentsDirName { DraftAttachmentStorage.deleteAttachments(dirName: dir) }
+            }
+        }
+    }
+
+    @Test("Gmail: the loader opens nothing when two rows claim the draft resource")
+    func gmailLoaderRefusesTwoOwners() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertGmailHeader($0, owners: 2) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            try await withRegisteredProvider(gmailProvider(http, body: "server body")) {
+                #expect(await loaderResolution(header) == .noLocalCopy)
+                let drafts = try await pool.read { try Draft.fetchCount($0) }
+                #expect(drafts == 2, "a third row was adopted for one resource")
+            }
+        }
+    }
+
+    @Test("Gmail: the loader opens nothing when the header changed while the resource was looked up")
+    func gmailLoaderRefusesAHeaderThatChanged() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertGmailHeader($0, owners: 1) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let provider = gmailProvider(http, body: "server body") {
+                // Another save replaced the draft's message while the lookup ran.
+                try? pool.write { db in
+                    try db.execute(sql: "UPDATE messageHeader SET messageId = 'm-6' WHERE id = ?", arguments: [header.id])
+                }
+            }
+            try await withRegisteredProvider(provider) {
+                #expect(await loaderResolution(header) == .noLocalCopy)
+                let drafts = try await pool.read { try Draft.fetchCount($0) }
+                #expect(drafts == 1)
+            }
+        }
+    }
+
     @Test("The loader shows a read that failed as retryable, never as an absent draft")
     func loaderFailedReadIsRetryable() async throws {
         try await withInstalledPool { pool in

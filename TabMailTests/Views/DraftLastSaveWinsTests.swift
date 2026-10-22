@@ -417,6 +417,137 @@ struct DraftCopyReadTests {
             text: copy.textBody, html: copy.htmlBody, bodyEmptyConfirmed: false, hasAttachments: false) == expected)
     }
 
+    /// A Gmail draft message holding `parts` (JSON), read through `/drafts/r1`.
+    private static func gmailDraftProvider(_ http: FakeHTTP.Scenario, parts: String) -> GmailProvider {
+        let internalDate = String(Int(Date().timeIntervalSince1970 * 1000))
+        http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-7"}}"#))
+        http.register(path: "/messages/m-7", method: "GET", response: .json(raw: """
+            {"id":"m-7","internalDate":"\(internalDate)","labelIds":["DRAFT"],
+             "payload":{"mimeType":"multipart/mixed",
+               "headers":[{"name":"Subject","value":"Plan"},{"name":"From","value":"owner@example.com"}],
+               "parts":[\(parts)]}}
+            """))
+        return GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+    }
+
+    /// Gmail web gives every attachment it composes a Content-ID and an
+    /// X-Attachment-Id; the disposition, not the Content-ID, makes it a file.
+    @Test("Gmail: an attached file keeps its name, even with a Content-ID; only an inline image is inline")
+    func gmailAttachedFileKeepsItsName() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let text = Self.base64URL(Data("See the photo.".utf8))
+        let notes = Self.base64URL(Data("notes".utf8))
+        let provider = Self.gmailDraftProvider(http, parts: """
+            {"mimeType":"text/plain","headers":[{"name":"Content-Type","value":"text/plain; charset=UTF-8"}],
+             "body":{"size":14,"data":"\(text)"}},
+            {"mimeType":"image/jpeg","filename":"file.jpg",
+             "headers":[{"name":"Content-Type","value":"image/jpeg; name=file.jpg"},
+                        {"name":"Content-Disposition","value":"attachment; filename=file.jpg"},
+                        {"name":"Content-ID","value":"<f_k49m0kue0>"},
+                        {"name":"X-Attachment-Id","value":"f_k49m0kue0"}],
+             "body":{"size":4,"attachmentId":"att1"}},
+            {"mimeType":"text/plain","headers":[{"name":"Content-Disposition","value":"Attachment"}],
+             "body":{"size":5,"data":"\(notes)"}},
+            {"mimeType":"image/png","filename":"image.png",
+             "headers":[{"name":"Content-Disposition","value":"inline; filename=image.png"},
+                        {"name":"Content-ID","value":"<ii_1>"}],
+             "body":{"size":4,"attachmentId":"img1"}}
+            """)
+        http.register(path: "/messages/m-7/attachments/", method: "GET",
+                      response: .json(raw: "{\"size\":4,\"data\":\"\(Self.base64URL(Data([1, 2, 3, 4])))\"}"))
+
+        let copy = try #require(try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r1")))
+
+        #expect(copy.textBody == "See the photo.", "a text part attached as a file joined the body")
+        #expect(copy.attachments.map(\.filename) == ["file.jpg", DraftReadConfig.unnamedAttachmentFilename])
+        #expect(copy.attachments.map(\.section) == ["att1", "inline-part-0"])
+        #expect(copy.attachmentData == ["inline-part-0": Data("notes".utf8)])
+        #expect(copy.inlineImages.map(\.contentId) == ["ii_1"])
+    }
+
+    /// Gmail returns a part's bytes in the part itself when it has no attachment id.
+    @Test("Gmail: a file whose bytes came in the part is carried with them; an empty leaf holds nothing")
+    func gmailInlineBytesFileIsCarried() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let text = Self.base64URL(Data("Meeting notes".utf8))
+        let invite = Self.base64URL(Data("BEGIN:VCALENDAR".utf8))
+        let small = Self.base64URL(Data("a".utf8))
+        let provider = Self.gmailDraftProvider(http, parts: """
+            {"mimeType":"text/plain","body":{"size":13,"data":"\(text)"}},
+            {"mimeType":"text/calendar; method=REQUEST","body":{"size":15,"data":"\(invite)"}},
+            {"mimeType":"application/octet-stream","filename":"a.txt","body":{"size":1,"data":"\(small)"}},
+            {"mimeType":"application/octet-stream","body":{"size":0}}
+            """)
+
+        let copy = try #require(try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r1")))
+
+        #expect(copy.textBody == "Meeting notes")
+        #expect(copy.attachments.map(\.filename) == [DraftReadConfig.unnamedAttachmentFilename, "a.txt"])
+        #expect(copy.attachmentData == [
+            "inline-part-0": Data("BEGIN:VCALENDAR".utf8), "inline-part-1": Data("a".utf8)])
+        #expect(!http.recordedCalls().contains { $0.url.contains("/attachments/") })
+    }
+
+    @Test("Gmail: a draft read that cannot read a part, or the draft, throws", arguments: [
+        // Bytes that are not base64url.
+        #"{"mimeType":"text/plain","body":{"size":4,"data":"!!!*"}}"#,
+        // A file Gmail declared non-empty with neither bytes nor an attachment id.
+        #"{"mimeType":"application/pdf","filename":"a.pdf","body":{"size":9}}"#,
+        #"{"mimeType":"text/calendar","body":{"size":9}}"#,
+    ])
+    func gmailUnreadablePartThrows(part: String) async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let provider = Self.gmailDraftProvider(http, parts: part)
+        await #expect(throws: GmailDraftCopyIncomplete.self) {
+            try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r1"))
+        }
+    }
+
+    @Test("Gmail: an unreadable draft lookup or message is an unknown, never gone", arguments: [
+        (#"{"message":{}}"#, 200, true),
+        ("not json", 200, true),
+        ("", 403, true),
+        // A message with no date cannot be parsed.
+        (#"{"message":{"id":"m-8"}}"#, 200, false),
+    ])
+    func gmailUnreadableDraftThrows(lookup: String, status: Int, lookupFails: Bool) async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/drafts/r1", method: "GET",
+                      response: status == 200 ? .json(raw: lookup) : .status(status))
+        http.register(path: "/messages/m-8", method: "GET",
+                      response: .json(raw: #"{"id":"m-8","labelIds":["DRAFT"],"payload":{"mimeType":"text/plain"}}"#))
+        let provider = GmailProvider(
+            userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+        await #expect(throws: (any Error).self) {
+            try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r1"))
+        }
+        #expect(http.recordedCalls().contains { $0.url.contains("/messages/") } == !lookupFails)
+    }
+
+    @Test("Gmail: a draft with no payload, or a body declared empty, reads as an empty body")
+    func gmailEmptyDraftReads() async throws {
+        let bare = FakeHTTP.Scenario()
+        defer { bare.close() }
+        let internalDate = String(Int(Date().timeIntervalSince1970 * 1000))
+        bare.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-8"}}"#))
+        bare.register(path: "/messages/m-8", method: "GET",
+                      response: .json(raw: #"{"id":"m-8","internalDate":"\#(internalDate)","labelIds":["DRAFT"]}"#))
+        let noPayloadProvider = GmailProvider(
+            userEmail: "owner@example.com", accessToken: { _ in "token" }, session: bare.session)
+        let noPayload = try #require(try await noPayloadProvider.fetchDraftCopy(identity: .gmail(resourceId: "r1")))
+        #expect(noPayload.textBody == nil && noPayload.htmlBody == nil)
+
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let empty = Self.gmailDraftProvider(http, parts: #"{"mimeType":"text/plain","body":{"size":0}}"#)
+        let emptyBody = try #require(try await empty.fetchDraftCopy(identity: .gmail(resourceId: "r1")))
+        #expect(emptyBody.textBody == "")
+    }
+
     @Test("Providers refuse to read another provider's draft address")
     func foreignIdentityIsRefused() async {
         let http = FakeHTTP.Scenario()
@@ -574,6 +705,37 @@ struct DraftCopyReadTests {
                     "the pre-authenticated URL would be written to the exportable queue log")
             #expect((error as? URLError)?.code == .timedOut, "the failure stays a retryable connection error")
         }
+    }
+
+    /// A range Graph refused is not uploaded: counting it would mark the row pushed
+    /// with the file missing on the server, and the next open's reload would then
+    /// replace the device's copy with the server's.
+    @Test("Graph: a range the upload session refuses fails the save before any file is deleted",
+          arguments: [(500, 201), (200, 404)])
+    func refusedUploadRangeFailsTheSave(firstStatus: Int, lastStatus: Int) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let provider = Self.graphUpdateProvider(http, serverFiles: [(id: "o1", name: "old.txt")])
+        http.register(path: "/messages/g1/attachments/createUploadSession", method: "POST", response: .json(raw: """
+            {"uploadUrl":"https://outlook.office.com/api/v2.0/Users('u')/Messages('g1')/AttachmentSessions('s1')?authtoken=session-secret"}
+            """))
+        let puts = RequestLog()
+        http.register(path: "AttachmentSessions", method: "PUT") { request in
+            let isLast = puts.requests.withLock { $0.append(request); return $0.count } > 1
+            return .json(raw: "{}", statusCode: isLast ? lastStatus : firstStatus)
+        }
+        let bytes = Data(count: ExchangeDraftConfig.singlePostAttachmentLimitBytes + 1)
+
+        do {
+            _ = try await provider.saveDraft(
+                Self.draft(attachments: [DraftAttachment(filename: "big.bin", mimeType: "application/octet-stream", data: bytes)]),
+                existingIdentity: .outlook(graphId: "g1"), draftsFolderPath: "Drafts")
+            Issue.record("a refused range must fail the save")
+        } catch {
+            #expect(!"\(error)".contains("session-secret"))
+        }
+        #expect(!http.recordedCalls().contains { $0.method == "DELETE" },
+                "a file is deleted only after every add succeeded")
     }
 
     @Test("Graph: an upload session URL off the documented Outlook hosts is refused")

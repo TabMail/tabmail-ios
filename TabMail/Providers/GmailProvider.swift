@@ -831,8 +831,12 @@ actor GmailProvider: EmailProvider {
     ///   in order when split around an inline part); an attached
     ///   message (`message/rfc822`) is an attachment and is never opened, so its
     ///   text never joins the body (the render's `tm-eml-section` marker);
-    /// - every image with a Content-ID is an inline image, whether or not the body
-    ///   references it; every other part with a file name or no text type is a file;
+    /// - a part with `Content-Disposition: attachment`, or a file name and no
+    ///   `inline` disposition, is a file under its own name, even with a Content-ID
+    ///   (Gmail web gives every attachment one); the IMAP reader's rule;
+    /// - every other image with a Content-ID is an inline image, whether or not the
+    ///   body references it; every other leaf that is not body text is a file;
+    /// - a file whose bytes came inline is carried with them (`attachmentData`);
     /// - a part whose bytes cannot be read throws, never drops out.
     /// Iterative, so a deeply nested copy cannot exhaust the stack.
     private func readDraftMessage(id: String) async throws -> FullMessageInfo {
@@ -848,38 +852,32 @@ actor GmailProvider: EmailProvider {
         var htmlBody: String?
         var attachments: [AttachmentInfo] = []
         var inlineImages: [InlineImage] = []
+        var carried: [String: Data] = [:]
         var stack = [GmailPart(
             mimeType: payload.mimeType, filename: payload.filename,
             headers: payload.headers, body: payload.body, parts: payload.parts)]
         while let part = stack.popLast() {
             let mimeType = (part.mimeType ?? "").lowercased()
             let filename = part.filename ?? ""
-            let contentId = (part.headers?.first { $0.name.lowercased() == "content-id" }?.value ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            func headerValue(_ name: String) -> String {
+                (part.headers?.first { $0.name.lowercased() == name }?.value ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            let disposition = headerValue("content-disposition")
+                .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() } ?? ""
+            let contentId = headerValue("content-id")
                 .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            if mimeType.hasPrefix("image/"), !contentId.isEmpty {
+            let isMessage = mimeType.hasPrefix("message/rfc822")
+            let isFile = isMessage || disposition == "attachment" || (!filename.isEmpty && disposition != "inline")
+            if !isFile, mimeType.hasPrefix("image/"), !contentId.isEmpty {
                 inlineImages.append(InlineImage(
                     contentId: contentId, contentType: mimeType,
                     data: try await draftPartBytes(part, messageId: id)))
                 continue
             }
-            let isMessage = mimeType.hasPrefix("message/rfc822")
-            if isMessage || !filename.isEmpty {
-                guard let attachmentId = part.body?.attachmentId else {
-                    throw GmailDraftCopyIncomplete(mimeType: mimeType)
-                }
-                attachments.append(AttachmentInfo(
-                    filename: filename.isEmpty
-                        ? (isMessage ? "attached-email.eml" : DraftReadConfig.unnamedAttachmentFilename)
-                        : filename,
-                    contentType: part.mimeType ?? "application/octet-stream",
-                    section: attachmentId,
-                    size: part.body?.size ?? 0,
-                    encoding: nil))
-                continue
-            }
-            if mimeType == "text/plain" || mimeType == "text/html" {
+            if !isFile, (mimeType == "text/plain" || mimeType == "text/html"), filename.isEmpty {
                 let bytes = try await draftPartBytes(part, messageId: id)
                 // Decoded in the part's declared charset by the same SwiftMail
                 // decoder the IMAP draft read uses; text it cannot decode throws,
@@ -896,22 +894,35 @@ actor GmailProvider: EmailProvider {
                 if mimeType == "text/html" { htmlBody = (htmlBody ?? "") + text }
                 continue
             }
-            if let children = part.parts {
+            if !isFile, let children = part.parts {
                 stack.append(contentsOf: children.reversed())
                 continue
             }
+            // A leaf Gmail reports as empty holds nothing to carry.
+            if !isFile, part.body?.attachmentId == nil, (part.body?.size ?? 0) == 0,
+               (part.body?.data ?? "").isEmpty { continue }
+            // A file is fetched later by its attachment id; one whose bytes came in
+            // the part is carried under a key of its own.
+            let section: String
             if let attachmentId = part.body?.attachmentId {
-                attachments.append(AttachmentInfo(
-                    filename: DraftReadConfig.unnamedAttachmentFilename,
-                    contentType: part.mimeType ?? "application/octet-stream",
-                    section: attachmentId,
-                    size: part.body?.size ?? 0,
-                    encoding: nil))
+                section = attachmentId
+            } else {
+                section = "inline-part-\(carried.count)"
+                carried[section] = try await draftPartBytes(part, messageId: id)
             }
+            attachments.append(AttachmentInfo(
+                filename: filename.isEmpty
+                    ? (isMessage ? "attached-email.eml" : DraftReadConfig.unnamedAttachmentFilename)
+                    : filename,
+                contentType: part.mimeType ?? "application/octet-stream",
+                section: section,
+                size: part.body?.size ?? 0,
+                encoding: nil))
         }
         return FullMessageInfo(
             header: header, htmlBody: htmlBody, textBody: textBody,
-            attachments: attachments, inlineImages: inlineImages)
+            attachments: attachments, inlineImages: inlineImages,
+            attachmentData: carried.isEmpty ? nil : carried)
     }
 
     /// A draft part's bytes: inline in the part, else through the attachments API.

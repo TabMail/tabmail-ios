@@ -181,8 +181,9 @@ enum ExternalDraftAdoption {
 
     /// The editable plain-text body, or nil when it must not open yet.
     ///
-    /// A copy with an HTML part is decoded from it (`EmailFilter.htmlToPlainText`,
-    /// whose line rules never add a blank line). A copy with only a text part
+    /// A copy with an HTML part is decoded from it (`EmailFilter.htmlToPlainText`
+    /// keeping spacing as the page shows it; its line rules never add a blank
+    /// line). A copy with only a text part
     /// (every draft TabMail uploads, and an Outlook copy, which Exchange returns as
     /// text) is used as is: line endings become `\n` and trailing line breaks are
     /// dropped, since MIME adds one, so a save and reopen never grows the body.
@@ -201,7 +202,7 @@ enum ExternalDraftAdoption {
     ) -> String? {
         let plain: String
         if let html, !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            plain = EmailFilter.htmlToPlainText(html)
+            plain = EmailFilter.htmlToPlainText(html, keepingSpacing: true)
         } else {
             var lines = (text ?? "")
                 .replacingOccurrences(of: "\r\n", with: "\n")
@@ -417,16 +418,18 @@ enum ExternalDraftAdoption {
 
         // Attachment ids belong to the message the copy was read from (Gmail
         // replaces that message on every save), so they are fetched by its id. A
-        // copy that already carries the bytes (IMAP, read under its proven
-        // UIDVALIDITY) is never fetched a second time.
+        // file whose bytes the copy already carries (every IMAP file, read under its
+        // proven UIDVALIDITY; a Gmail file whose bytes came inline) is never fetched,
+        // and an IMAP file is never fetched again by UID alone.
         let folderPath: String
         if case .imap(let folder, _, _) = identity { folderPath = folder } else { folderPath = "" }
         var attachments: [DraftAttachment] = []
         for info in attachmentInfos {
             let data: Data
-            if let carried = copy.attachmentData {
-                guard let bytes = carried[info.section] else { throw AdoptionError.attachmentUnavailable }
+            if let bytes = copy.attachmentData?[info.section] {
                 data = bytes
+            } else if case .imap = identity {
+                throw AdoptionError.attachmentUnavailable
             } else {
                 data = try await AccountManager.shared.fetchAttachment(
                     accountId: accountId, messageId: copy.header.messageId, folderPath: folderPath,

@@ -375,10 +375,8 @@ struct EmailFilterHTMLDraftTests {
     @Test("Draft with &nbsp; entities converts to spaces")
     func draftWithNbsp() {
         let html = "<div>Hello&nbsp;&nbsp;&nbsp;World</div>"
-        let result = EmailFilter.htmlToPlainText(html)
-        #expect(result.contains("Hello"))
-        #expect(result.contains("World"))
-        #expect(!result.contains("&nbsp;"))
+        #expect(EmailFilter.htmlToPlainText(html) == "Hello World")
+        #expect(EmailFilter.htmlToPlainText(html, keepingSpacing: true) == "Hello   World")
     }
 
     @Test("Draft with nested formatting tags extracts text")
@@ -443,9 +441,46 @@ struct EmailFilterHTMLBlockNewlineTests {
          "Hi Bob,\n\nPlan:\nquoted\nAlice"),
         // Pretty-printed source: whitespace between blocks is not a line.
         ("<div>a</div>\n  <div>b</div>\n", "a\nb"),
+        // TinyMCE and CKEditor write a blank line as a paragraph holding a no-break space.
+        ("<p>Hi Bob,</p>\n<p>&nbsp;</p>\n<p>Thanks</p>", "Hi Bob,\n\nThanks"),
+        // The same with a raw U+00A0, and in divs.
+        ("<p>Hi Bob,</p><p>\u{00A0}</p><p>Thanks</p>", "Hi Bob,\n\nThanks"),
+        ("<div>Hi Bob,</div><div>&nbsp;</div><div>Thanks</div>", "Hi Bob,\n\nThanks"),
+        // Outlook desktop and Outlook for Mac (Word HTML).
+        ("<p class=MsoNormal>Hi Bob,<o:p></o:p></p>\n<p class=MsoNormal><o:p>&nbsp;</o:p></p>\n<p class=MsoNormal>Thanks<o:p></o:p></p>",
+         "Hi Bob,\n\nThanks"),
     ])
     func lineBreaksAsWritten(html: String, expected: String) {
         #expect(EmailFilter.htmlToPlainText(html) == expected)
+        #expect(EmailFilter.htmlToPlainText(html, keepingSpacing: true) == expected)
+    }
+
+    /// #217: a draft's editable text keeps the spacing the page shows, since the
+    /// next save uploads it over the other app's draft. Every other caller keeps
+    /// the collapsed form.
+    @Test("A draft's text keeps its spacing as the page shows it", arguments: [
+        // Thunderbird quotes a plain-text message in <pre>, after an ignored first line break.
+        ("<p>Sounds good.</p><blockquote type=\"cite\"><pre class=\"moz-quote-pre\" wrap=\"\">\nline one\nline two\n\nline  four</pre></blockquote>",
+         "Sounds good.\nline one\nline two\n\nline  four",
+         "Sounds good.\nline one line two line four"),
+        // Thunderbird's plain-text signature.
+        ("<p>Thanks</p><pre class=\"moz-signature\" cols=\"72\">Alice\r\n  Example Co.</pre>",
+         "Thanks\nAlice\n  Example Co.",
+         "Thanks\nAlice Example Co."),
+        // Gmail web writes a typed double space as "&nbsp; ".
+        ("<div dir=\"ltr\">a&nbsp; b</div>", "a  b", "a b"),
+        // Indentation typed as no-break spaces.
+        ("<div>&nbsp;&nbsp;&nbsp; indented</div>", "    indented", "indented"),
+        // Formatting inside a word or sentence adds no space; a link keeps its place.
+        ("<div>un<b>believ</b>able, <i>really</i>!</div>", "unbelievable, really!", "un believ able, really !"),
+        ("<div>see <a href=\"https://example.com/a\">this</a>.</div>",
+         "see [this](https://example.com/a).", "see [this](https://example.com/a) ."),
+    ])
+    func draftSpacingAsShown(html: String, draft: String, collapsed: String) {
+        #expect(EmailFilter.htmlToPlainText(html, keepingSpacing: true) == draft)
+        #expect(EmailFilter.htmlToPlainText(html) == collapsed)
+        #expect(ExternalDraftAdoption.editableBody(
+            text: nil, html: html, bodyEmptyConfirmed: false, hasAttachments: false) == draft)
     }
 
     @Test("Gmail-style div structure preserves line breaks")

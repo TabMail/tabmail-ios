@@ -191,6 +191,8 @@ not re-invent yet another converter"*; and for attachments *"Match by name, acce
   message (Graph item attachment, `.eml` file, `message/rfc822`) is an attachment and is never opened,
   so its text never joins the body. Every image with a Content-ID is an inline image whether or not
   the body references it; an image with no Content-ID and every other non-body part is a file.
+  *(Amended in round 5, below: a part whose disposition makes it a file is a file first, Content-ID
+  or not.)*
   Graph is asked for the body as text (`Prefer: outlook.body-content-type="text"`). A part whose
   bytes cannot be read throws. Gmail walks the payload iteratively (`readDraftMessage`); IMAP
   rebuilds the copy from the one proven read (`completeDraftCopy`); Graph uses
@@ -283,3 +285,38 @@ is fixed at its cause.
   in its userInfo, which the queue's failure log (`AccountOperationExecutor`, exportable) prints.
   `ExchangeProvider.addDraftAttachment` rethrows the PUT's `URLError` with only its code, which is
   all the retry classification reads.
+
+### Review round 5 corrections (2026-10-22)
+
+The tier-1 round 5 review found three ways another app's draft could lose content on its first
+save; each is fixed at its cause.
+
+- **The converter keeps blank lines, `<pre>` text and spacing as the page shows them.** TinyMCE,
+  CKEditor and Word HTML (Outlook desktop and Outlook for Mac) write a blank line as a paragraph
+  holding only a no-break space. A no-break space at the start of a line was never written, so the
+  round 2 block rule ("end a line only when it has text") saw the paragraph as empty and every blank
+  line went. `htmlToPlainText` now tracks whether the line holds anything visible, a no-break space
+  included, and ends only such a line; this applies to every caller. A draft's text
+  (`ExternalDraftAdoption.editableBody`) also passes `keepingSpacing: true`, which writes every
+  no-break space as a space (Gmail web types a double space as `&nbsp; `, and indentation as no-break
+  spaces), keeps whitespace inside `<pre>` as written (Thunderbird quotes a plain-text message in
+  `<pre>` and writes a plain-text signature as one) after dropping the line break right after
+  `<pre>`, and adds no space at an inline formatting tag (`un<b>believ</b>able`) or around a link.
+  Other callers (FTS, AI, snippets, the text part of HTML sends) keep the collapsed form, so a
+  newsletter's `&nbsp;` padding does not reach snippets. The named entity `&nbsp;` now decodes to
+  U+00A0, not a plain space, so it takes the same no-break-space rule as a raw U+00A0 (the collapsed
+  form is unchanged). Still one converter, as the owner ruled.
+- **Gmail classifies a draft part by its disposition first, as IMAP does.** Gmail web gives every
+  attachment it composes a Content-ID (`<f_…>`) and an `X-Attachment-Id`, and the reader took any
+  image with a Content-ID as inline, so an attached photo was renamed `image1.jpeg` on the first
+  save and in the sent mail. `GmailProvider.readDraftMessage` now takes a part with
+  `Content-Disposition: attachment`, or a file name and no `inline` disposition, as a file under its
+  own name (a text part attached as a file no longer joins the body); only then is an image with a
+  Content-ID inline. This amends "every image with a Content-ID is an inline image" above.
+- **Gmail carries a file whose bytes came in the part.** When a part has no `attachmentId`, Gmail
+  returns its whole content in `body.data`. The reader dropped such a leaf with no file name (an
+  unnamed `text/calendar` invite, a PGP/MIME control part) and threw for a named one. It now carries
+  the bytes in `FullMessageInfo.attachmentData` under a key of its own, and
+  `ExternalDraftAdoption.read` takes carried bytes for each file and fetches only the rest; an IMAP
+  file whose bytes are missing still throws, since it is never fetched again by UID alone. A leaf
+  Gmail reports as empty holds nothing and is skipped.

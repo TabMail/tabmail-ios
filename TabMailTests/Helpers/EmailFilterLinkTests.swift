@@ -157,6 +157,20 @@ struct EmailFilterLinkTests {
             == "Before\n[one two](/report)\nAfter")
     }
 
+    /// A block at the very start of a label, after a line already ended, finds the
+    /// space before the label last; dropping it would cut into the label, and an
+    /// empty label would then crash the converter on a received message.
+    @Test(arguments: [
+        ("x&#10;<a href=\"https://example.com/a\"><p>label</p></a>",
+         "x\n [label](https://example.com/a)", "x\n[label](https://example.com/a)"),
+        ("x&#10;<a href=\"https://example.com/b\"><p></a>",
+         "x\n [](https://example.com/b)", "x\n[](https://example.com/b)"),
+    ])
+    func blockOpeningALabelKeepsTheLabelWhole(html: String, collapsed: String, draft: String) {
+        #expect(EmailFilter.htmlToPlainText(html) == collapsed)
+        #expect(EmailFilter.htmlToPlainText(html, keepingSpacing: true) == draft)
+    }
+
     @Test func decodedLettersRemainReadableInStoredText() {
         let text = EmailFilter.htmlToPlainText(#"<a href="https://example.com/&#110;eedle/caf&#xE9;">Read</a>"#)
         #expect(text == "[Read](https://example.com/needle/café)")
