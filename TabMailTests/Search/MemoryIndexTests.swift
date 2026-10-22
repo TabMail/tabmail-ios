@@ -526,6 +526,31 @@ struct MemoryIndexTests {
         #expect(limited.map(\.chatHistoryId) == (25..<30).reversed().map { "b\($0)" })
     }
 
+    @Test("search: a merge that keeps nothing answers with the best keyword match first, not the newest")
+    func search_emptyMergeAnswersBestKeywordMatchFirst() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let hour: Int64 = 3_600_000
+        // "budget" in half the turns: its keyword scores are about 0 but still ordered, the short
+        // older turn ahead of the long newer one.
+        let rows: [(id: String, text: String, dateMs: Int64)] = [
+            ("strong", "budget", 1000),
+            ("weak", "budget " + String(repeating: "weather ", count: 100), 1000 + hour),
+            ("other1", "other words", 1000 + hour),
+            ("other2", "different words", 1000 + hour),
+        ]
+        for row in rows {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: row.id, sessionId: "s", role: "user", dateMs: row.dateMs, text: row.text)
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings(rows.map { (chatHistoryId: $0.id, observedEpoch: 1, embedding: Self.oneHot(1)) })
+        #expect(await MemoryIndex.shared._testVecRowCount() == 4)
+
+        // Query vector orthogonal to every stored one: the merge keeps nothing.
+        let hits = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(0),
+                                                         fromMs: nil, toMs: nil, limit: 1, demoActive: false)
+        #expect(hits.map(\.chatHistoryId) == ["strong"])
+    }
+
     @Test("search: when the merge keeps results, those are the answer")
     func search_nonEmptyMergeIsTheAnswer() async throws {
         let (pool, dir) = try await makeIndex()
