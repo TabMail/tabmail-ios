@@ -422,6 +422,31 @@ struct EmailFilterHTMLBlockNewlineTests {
         #expect(result.contains("Line 1\nLine 2"))
     }
 
+    /// #217: a draft another app wrote in HTML is edited as this text, so a line
+    /// rule that adds a blank line changes the user's draft. The exact output is
+    /// pinned for the shapes real editors write.
+    @Test("Line breaks come out as written, never with an added blank line", arguments: [
+        // Gmail web / contenteditable: one div per line, <div><br></div> per blank line.
+        ("<div dir=\"ltr\">Hi Bob,<div><br></div><div>Thanks.</div><div><br></div><div><br></div><div>Alice</div></div>",
+         "Hi Bob,\n\nThanks.\n\n\nAlice"),
+        // Apple Mail: text with <br> inside a body or div.
+        ("<body>Line one<br>Line two<br><br>Line four</body>", "Line one\nLine two\n\nLine four"),
+        // A <br> that closes a block's last line adds nothing.
+        ("<div>a<br></div><div>b</div>", "a\nb"),
+        // Nested blocks closing together end ONE line.
+        ("<div><div><div>a</div></div></div><div>b</div>", "a\nb"),
+        // A block opening after inline text starts a new line.
+        ("text<div>block</div>more", "text\nblock\nmore"),
+        // Earlier TabMail drafts (pre-wrap divs) read back line for line.
+        ("<div style=\"white-space:pre-wrap;\"><div>Hi Bob,</div><div><br></div><div>Plan:</div><blockquote>quoted</blockquote><div>Alice</div></div>",
+         "Hi Bob,\n\nPlan:\nquoted\nAlice"),
+        // Pretty-printed source: whitespace between blocks is not a line.
+        ("<div>a</div>\n  <div>b</div>\n", "a\nb"),
+    ])
+    func lineBreaksAsWritten(html: String, expected: String) {
+        #expect(EmailFilter.htmlToPlainText(html) == expected)
+    }
+
     @Test("Gmail-style div structure preserves line breaks")
     func gmailDivStructure() {
         let html = "<div>Hello</div><div><br></div><div>World</div>"

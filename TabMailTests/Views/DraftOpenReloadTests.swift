@@ -309,22 +309,38 @@ struct DraftOpenReloadTests {
             let id: String
             let name: String
             let contentType: String
+            let isInline: Bool
+            let contentId: String?
             let bytes: Data
         }
+        let subject = Mutex("Plan")
+        /// The body exactly as the last PATCH sent it.
+        let bodyType = Mutex("text")
         let body = Mutex("now here")
         let attachments = Mutex<[Attachment]>([])
         let patchCount = Mutex(0)
         let patchCarriedAttachments = Mutex(false)
     }
 
-    /// A Graph server that applies exactly the documented semantics: PATCH updates
-    /// subject, recipients and body, never attachments; attachments are listed, read,
-    /// deleted and added through `/messages/{id}/attachments`.
+    /// A Graph server that applies exactly the documented semantics and stores what
+    /// it is sent verbatim: PATCH updates subject, recipients and body (type and
+    /// content as sent), never attachments; attachments are listed, read, deleted and
+    /// added through `/messages/{id}/attachments`, where a single POST must be under
+    /// the documented size.
     private func registerGraphServer(
         _ http: FakeHTTP.Scenario, model: ServerModel, onPatch: @escaping @Sendable () -> Void = {}
     ) {
         http.register(path: "/messages/g1", method: "GET") { _ in
-            .json(raw: Self.copyJSON(body: model.body.withLock { $0 }))
+            let message: [String: Any] = [
+                "id": "g1", "subject": model.subject.withLock { $0 },
+                "from": ["emailAddress": ["address": "owner@example.com"]],
+                "toRecipients": [["emailAddress": ["address": "alice@example.com"]]],
+                "receivedDateTime": ISO8601DateFormatter().string(from: Date()),
+                "isRead": true, "isDraft": true, "hasAttachments": false,
+                "body": ["contentType": model.bodyType.withLock { $0 }, "content": model.body.withLock { $0 }],
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: message) else { return .status(500) }
+            return .json(raw: String(decoding: data, as: UTF8.self))
         }
         http.register(path: "/messages/g1/attachments", method: "GET") { request in
             let all = model.attachments.withLock { $0 }
@@ -332,10 +348,16 @@ struct DraftOpenReloadTests {
             if let one = all.first(where: { $0.id == last }) {
                 return .json(raw: "{\"contentBytes\":\"\(one.bytes.base64EncodedString())\"}")
             }
-            let items = all.map {
-                "{\"id\":\"\($0.id)\",\"name\":\"\($0.name)\",\"contentType\":\"\($0.contentType)\",\"size\":\($0.bytes.count),\"isInline\":false,\"@odata.type\":\"#microsoft.graph.fileAttachment\"}"
+            let items: [[String: Any]] = all.map { item in
+                var json: [String: Any] = [
+                    "id": item.id, "name": item.name, "contentType": item.contentType, "size": item.bytes.count,
+                    "isInline": item.isInline, "@odata.type": "#microsoft.graph.fileAttachment",
+                ]
+                if let contentId = item.contentId { json["contentId"] = contentId }
+                return json
             }
-            return .json(raw: "{\"value\":[\(items.joined(separator: ","))]}")
+            guard let data = try? JSONSerialization.data(withJSONObject: ["value": items]) else { return .status(500) }
+            return .json(raw: String(decoding: data, as: UTF8.self))
         }
         http.register(path: "/messages/g1/attachments", method: "DELETE") { request in
             let id = request.url.lastPathComponent
@@ -349,9 +371,13 @@ struct DraftOpenReloadTests {
                   let bytes = (json["contentBytes"] as? String).flatMap({ Data(base64Encoded: $0) }) else {
                 return .status(400)
             }
+            guard bytes.count < ExchangeDraftConfig.singlePostAttachmentLimitBytes else { return .status(413) }
             let id = "att-\(UUID().uuidString)"
             model.attachments.withLock {
-                $0.append(.init(id: id, name: name, contentType: json["contentType"] as? String ?? "", bytes: bytes))
+                $0.append(.init(
+                    id: id, name: name, contentType: json["contentType"] as? String ?? "",
+                    isInline: json["isInline"] as? Bool ?? false, contentId: json["contentId"] as? String,
+                    bytes: bytes))
             }
             return .json(raw: "{\"id\":\"\(id)\"}")
         }
@@ -359,14 +385,115 @@ struct DraftOpenReloadTests {
             if let body = request.body,
                let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
                 if json["attachments"] != nil { model.patchCarriedAttachments.withLock { $0 = true } }
-                if let content = (json["body"] as? [String: Any])?["content"] as? String {
-                    let text = EmailFilter.htmlToPlainText(content).trimmingCharacters(in: .whitespacesAndNewlines)
-                    model.body.withLock { $0 = text }
+                if let subject = json["subject"] as? String { model.subject.withLock { $0 = subject } }
+                if let sent = json["body"] as? [String: Any],
+                   let type = sent["contentType"] as? String, let content = sent["content"] as? String {
+                    model.bodyType.withLock { $0 = type }
+                    model.body.withLock { $0 = content }
                 }
             }
             model.patchCount.withLock { $0 += 1 }
             onPatch()
             return .json(raw: #"{"id":"g1"}"#)
+        }
+    }
+
+    final class StoredRaw: Sendable {
+        let raw = Mutex<Data?>(nil)
+    }
+
+    /// What the user typed: blank lines, a trailing space, indentation, a quote
+    /// marker and a run of blank lines, none of which may change on a save and reopen.
+    private nonisolated static let typedBody = "Hi Bob,\n\n  indented line \n> quoted\n\n\nAlice"
+
+    @Test("An Outlook draft saved and reopened has exactly the text and empty subject that were typed")
+    func outlookSaveReopenKeepsTheTypedText() async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { db -> Draft in
+                var row = try insertDraft(db, status: "dirty")
+                row.body = Self.typedBody
+                row.subject = ""
+                try row.update(db)
+                return row
+            }
+            let model = ServerModel()
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            registerGraphServer(http, model: model)
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            #expect(try await DraftStore.shared.pushDraftToServer(
+                draftId: draft.id, expectedInstanceEpoch: "E1", provider: provider,
+                runtimeKind: .outlook, draftsFolderPath: "Drafts") == .completed)
+            #expect(model.bodyType.withLock { $0 } == "text", "a draft uploads as the text the user typed")
+
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(row.pushAttemptVersion > draft.pushAttemptVersion, "precondition: the open reloaded")
+                #expect(row.body == Self.typedBody, "a save and reopen changed the spacing or line breaks")
+                #expect(row.subject == "")
+            }
+        }
+    }
+
+    @Test("A Gmail draft saved and reopened has exactly the text and empty subject that were typed")
+    func gmailSaveReopenKeepsTheTypedText() async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { db -> Draft in
+                var row = try insertDraft(db, provider: .gmail, status: "dirty")
+                row.body = Self.typedBody
+                row.subject = ""
+                try row.update(db)
+                return row
+            }
+            let stored = StoredRaw()
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            http.register(path: "/drafts/r1", method: "PUT") { request in
+                guard let body = request.body,
+                      let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                      var raw = (json["message"] as? [String: Any])?["raw"] as? String else { return .status(400) }
+                raw = raw.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+                while raw.count % 4 != 0 { raw += "=" }
+                stored.raw.withLock { $0 = Data(base64Encoded: raw) }
+                return .json(raw: #"{"id":"r1","message":{"id":"m2"}}"#)
+            }
+            http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"id":"r1","message":{"id":"m2"}}"#))
+            // Gmail serves the stored message's single text part, its line ends as CRLF.
+            http.register(path: "/messages/m2", method: "GET") { _ in
+                guard let raw = stored.raw.withLock({ $0 }).map({ String(decoding: $0, as: UTF8.self) }),
+                      let split = raw.range(of: "\r\n\r\n") else { return .status(404) }
+                let subject = raw[..<split.lowerBound].components(separatedBy: "\r\n")
+                    .first { $0.hasPrefix("Subject:") }?.dropFirst("Subject:".count)
+                    .trimmingCharacters(in: .whitespaces) ?? ""
+                let text = String(raw[split.upperBound...])
+                    .replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\n", with: "\r\n")
+                let message: [String: Any] = [
+                    "id": "m2", "internalDate": String(Int(Date().timeIntervalSince1970 * 1000)), "labelIds": ["DRAFT"],
+                    "payload": [
+                        "mimeType": "text/plain",
+                        "headers": [["name": "Subject", "value": subject], ["name": "From", "value": "owner@example.com"],
+                                    ["name": "To", "value": "alice@example.com"]],
+                        "body": ["size": text.utf8.count, "data": Self.base64URL(Data(text.utf8))],
+                    ] as [String: Any],
+                ]
+                guard let data = try? JSONSerialization.data(withJSONObject: message) else { return .status(500) }
+                return .json(raw: String(decoding: data, as: UTF8.self))
+            }
+            let provider = GmailProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            #expect(try await DraftStore.shared.pushDraftToServer(
+                draftId: draft.id, expectedInstanceEpoch: "E1", provider: provider,
+                runtimeKind: .gmail, draftsFolderPath: "DRAFT") == .completed)
+
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(row.pushAttemptVersion > draft.pushAttemptVersion, "precondition: the open reloaded")
+                #expect(row.body == Self.typedBody, "a save and reopen changed the spacing or line breaks")
+                #expect(row.subject == "")
+            }
         }
     }
 
@@ -584,6 +711,94 @@ struct DraftOpenReloadTests {
                     try await ExternalDraftAdoption.adopt(header: header, address: address, runtimeKind: .imap)
                 }
                 #expect(try await pool.read { try Draft.fetchCount($0) } == 0)
+            }
+        }
+    }
+
+    @Test("Adopting an Outlook draft takes its text, its files and every inline image from the draft itself")
+    func outlookAdoptionTakesTheDraftItself() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { db -> MessageHeader in
+                var account = Account(emailAddress: "owner@example.com", displayName: "Test", provider: .outlook)
+                account.id = Self.accountId
+                try account.insert(db)
+                let folder = Folder(name: "Drafts", path: "drafts", role: .drafts, accountId: Self.accountId)
+                try folder.insert(db)
+                let header = MessageHeader(
+                    messageId: "g1", subject: "Plan", from: "owner@example.com", fromAddress: "owner@example.com",
+                    to: "alice@example.com", date: Date(), snippet: "", folderId: folder.id,
+                    accountId: Self.accountId, folderPath: "drafts", isInInbox: false)
+                try header.insert(db)
+                return header
+            }
+            let model = ServerModel()
+            model.body.withLock { $0 = "Hi Bob,\r\n\r\n  indented line \r\n> quoted" }
+            model.attachments.withLock {
+                $0 = [.init(id: "a1", name: "notes.txt", contentType: "text/plain", isInline: false,
+                            contentId: nil, bytes: Data("notes".utf8)),
+                      .init(id: "a2", name: "logo.png", contentType: "image/png", isInline: true,
+                            contentId: "<logo>", bytes: Data([1, 2]))]
+            }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            registerGraphServer(http, model: model)
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                let address = try #require(try await pool.read { db in
+                    try ExternalDraftAdoption.adoptableAddress(db: db, header: header, runtimeKind: .outlook)
+                })
+                try await ExternalDraftAdoption.adopt(header: header, address: address, runtimeKind: .outlook)
+
+                let row = try #require(try await pool.read {
+                    try Draft.filter(Column("accountId") == Self.accountId).fetchOne($0)
+                })
+                defer { if let dir = row.attachmentsDirName { DraftAttachmentStorage.deleteAttachments(dirName: dir) } }
+                #expect(row.serverDraftId == "g1", "the adopted row must own exactly the Graph draft it read")
+                #expect(row.serverPushStatus == "pushed")
+                #expect(row.body == "Hi Bob,\n\n  indented line \n> quoted")
+                let files = try DraftAttachmentStorage.loadAttachments(dirName: row.attachmentsDirName)
+                #expect(files.contains { $0.filename == "notes.txt" && $0.data == Data("notes".utf8) })
+                #expect(files.contains { $0.data == Data([1, 2]) }, "the unreferenced inline image was dropped")
+            }
+        }
+    }
+
+    @Test("Fetching a synced message's attachment reads that message's part, on every provider",
+          arguments: [AccountProvider.gmail, .outlook])
+    func fetchAttachmentReadsTheMessagesPart(kind: AccountProvider) async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { db -> MessageHeader in
+                var account = Account(emailAddress: "owner@example.com", displayName: "Test", provider: kind)
+                account.id = Self.accountId
+                try account.insert(db)
+                let folder = Folder(name: "Inbox", path: "INBOX", role: .inbox, accountId: Self.accountId)
+                try folder.insert(db)
+                let header = MessageHeader(
+                    messageId: "m7", subject: "Plan", from: "owner@example.com", fromAddress: "owner@example.com",
+                    to: "alice@example.com", date: Date(), snippet: "", folderId: folder.id,
+                    accountId: Self.accountId, folderPath: "INBOX", isInInbox: true)
+                try header.insert(db)
+                return header
+            }
+            let bytes = Data("attached".utf8)
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let provider: any EmailProvider
+            if kind == .gmail {
+                http.register(path: "/messages/m7/attachments/a1", method: "GET",
+                              response: .json(raw: "{\"size\":\(bytes.count),\"data\":\"\(Self.base64URL(bytes))\"}"))
+                provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            } else {
+                http.register(path: "/messages/m7/attachments/a1", method: "GET",
+                              response: .json(raw: "{\"contentBytes\":\"\(bytes.base64EncodedString())\"}"))
+                provider = ExchangeProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            }
+            try await withRegisteredProvider(provider) {
+                let data = try await AccountManager.shared.fetchAttachment(for: header, section: "a1", encoding: nil)
+                #expect(data == bytes)
+                #expect(http.recordedCalls().contains { $0.url.contains("/messages/m7/attachments/a1") },
+                        "the read must address the header's own message")
             }
         }
     }

@@ -59,8 +59,7 @@ enum EmailFilter {
                     html += "<div><br></div>"
                 } else {
                     pendingLines.append(escapeHTML(stripped))
-                    let isSoftWrap = stripped.hasSuffix(" ") && stripped != "-- "
-                    if !isSoftWrap { flushPending() }
+                    if !isFlowedSoftBreak(stripped) { flushPending() }
                 }
             }
         }
@@ -68,6 +67,61 @@ enum EmailFilter {
         flushPending()
 
         return "<div style=\"white-space:pre-wrap;\">" + html + "</div>"
+    }
+
+    /// RFC 3676: a line ending in a space is soft-broken (it continues on the next
+    /// line); the signature separator `"-- "` is always a hard break.
+    static func isFlowedSoftBreak(_ line: String) -> Bool {
+        line.hasSuffix(" ") && line != "-- "
+    }
+
+    /// The text an RFC 3676 `format=flowed` body stands for, when `contentType`
+    /// declares it; any other text is returned unchanged. Each soft-broken line
+    /// (`isFlowedSoftBreak`) joins the next line of the same quote depth, unless
+    /// that is the signature separator; a
+    /// space-stuffed line loses its stuffing space; with `delsp=yes` the space
+    /// that marked the soft break goes too. Quoted lines are written back as
+    /// `"> "` per depth.
+    static func decodeFormatFlowed(_ text: String, contentType: String) -> String {
+        var isFlowed = false
+        var delSp = false
+        for parameter in contentType.split(separator: ";").dropFirst() {
+            let pair = parameter.split(separator: "=", maxSplits: 1).map {
+                $0.trimmingCharacters(in: .whitespaces)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+                    .lowercased()
+            }
+            guard pair.count == 2 else { continue }
+            if pair[0] == "format" { isFlowed = pair[1] == "flowed" }
+            if pair[0] == "delsp" { delSp = pair[1] == "yes" }
+        }
+        guard isFlowed else { return text }
+
+        var lines: [String] = []
+        var paragraph: String?
+        var paragraphDepth = 0
+        func endParagraph() {
+            guard let content = paragraph else { return }
+            let quote = String(repeating: ">", count: paragraphDepth)
+            lines.append(paragraphDepth == 0 || content.isEmpty ? quote + content : quote + " " + content)
+            paragraph = nil
+        }
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        for line in normalized.components(separatedBy: "\n") {
+            let depth = line.prefix { $0 == ">" }.count
+            var content = String(line.dropFirst(depth))
+            if content.hasPrefix(" ") { content.removeFirst() }
+            let isSoft = isFlowedSoftBreak(content)
+            if isSoft, delSp { content.removeLast() }
+            // The signature separator is neither fixed nor flowed (RFC 3676 §4.3):
+            // it is a line of its own.
+            if paragraph != nil, depth != paragraphDepth || content == "-- " { endParagraph() }
+            paragraph = (paragraph ?? "") + content
+            paragraphDepth = depth
+            if !isSoft { endParagraph() }
+        }
+        endParagraph()
+        return lines.joined(separator: "\n")
     }
 
     /// Normalize an RFC 2822 Message-ID by stripping angle brackets and whitespace.
@@ -332,7 +386,8 @@ enum EmailFilter {
         return false
     }
 
-    /// Strips HTML to plain text suitable for FTS indexing.
+    /// Strips HTML to plain text suitable for FTS indexing, the text/plain part of
+    /// an HTML send, and a draft copy's editable text (#217).
     /// Single-pass UTF-8 byte scanner; visible anchors retain destinations as Markdown links.
     /// Skips <style>/<script>/<head> block content, strips tags, decodes entities,
     /// and collapses whitespace in one pass.
@@ -485,9 +540,17 @@ enum EmailFilter {
                     // Regular tag — skip to its unquoted end.
                     i = min(tagEnd + 1, count)
 
-                    if isBr || (isBlock && isClosing) {
-                        // Block-level close tags and <br> → newline
-                        out.append(0x0A) // '\n'
+                    // Line rules (#217): `<br>` always ends the line; a block element
+                    // starts and ends a line but never adds an empty one, so only a line
+                    // holding text is ended. `<div><br></div>`, the blank line every
+                    // editor writes, is then ONE empty line, a `<br>` that closes a
+                    // block's last line adds nothing, and nested block closes do not
+                    // stack. A space left before a line break is dropped.
+                    if isBr || isBlock {
+                        if out.last == 0x20, link.map({ out.count > $0.start }) ?? true { out.removeLast() }
+                        if isBr || (out.last.map { $0 != 0x0A } ?? false) {
+                            out.append(0x0A) // '\n'
+                        }
                         lastWasSpace = true
                     } else if !lastWasSpace {
                         out.append(0x20)

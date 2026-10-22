@@ -2536,6 +2536,12 @@ final class FakeIMAPServer: @unchecked Sendable {
                         fetchItems.append("BODY[\(section)] {\(bytes.count)}\r\n\(str)")
                     }
                 }
+            } else if msg.customBodystructure == nil,
+                      ["BODY[1]", "BODY.PEEK[1]"].contains(where: { itemsStr.contains($0) }) {
+                // RFC 3501 §6.4.5: part 1 of a non-multipart message is its body,
+                // the flat single-part structure `buildBodystructure` describes.
+                let str = String(data: msg.body, encoding: .utf8) ?? ""
+                fetchItems.append("BODY[1] {\(msg.body.count)}\r\n\(str)")
             }
 
             response += "* \(seqnum) FETCH (\(fetchItems.joined(separator: " ")))\r\n"

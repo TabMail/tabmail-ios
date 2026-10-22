@@ -94,7 +94,7 @@ deletion.
 
 > **Stated negatively, because this absolute was wrong for two years and walked reviewers past two
 > live hazards.** "Never permanently deletes" is true of MAIL, **not of DRAFTS OR CALENDAR EVENTS**,
-> and the `COPYUID`-gated purge is **not** the only irreversible wire operation. There are **six**:
+> and the `COPYUID`-gated purge is **not** the only irreversible wire operation. There are **seven**:
 > (1) the `COPYUID`-gated source expunge; (2) `IMAPProvider.deleteDraftStrong`; (3) `saveDraft`'s
 > old-copy replacement; (4) Gmail's `DELETE /drafts/{id}`, which Google documents as permanent rather
 > than a trash; (5) `CalDAVProvider.deleteEvent` — WebDAV `DELETE` on the event's `.ics` resource,
@@ -109,6 +109,8 @@ deletion.
 > **(6) is not a DELETE at all: `CalDAVProvider.splitSeries`' cap `PUT`** replaces the master `.ics`
 > with an `UNTIL=`-capped `RRULE`, destroying every occurrence after the split point, under a
 > best-effort compensating rollback rather than a transaction.
+> **(7) `ExchangeProvider.replaceDraftAttachments`' attachment `DELETE`** (#217) removes a file the
+> local Outlook draft no longer names, only after every add succeeded.
 > **⚠ Membership is defined by a PROPERTY — content that existed on the server no longer does, with
 > no documented per-item recovery the call reaches — NOT by the verb `DELETE`. Do not restate this
 > integer without re-running its predicate.** The greps are a **LOWER BOUND**, not the definition:
@@ -124,7 +126,7 @@ deletion.
 > valid for mail and invalid for drafts and CalDAV events — for those paths, say why the specific
 > loss is acceptable.
 > Detail and evidence: [`Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md`](Companion/Memory/Current/102-there-are-four-irreversible-wire-operations-not-one.md)
-> (filename preserved; its count is now six).
+> (filename preserved; its count is now seven).
 
 **Check "rare" before invoking this.** An edge that is actually the common path is not an edge.
 "Undo of an already-drained move" *sounds* rare, but the drain fires immediately after the gesture, so

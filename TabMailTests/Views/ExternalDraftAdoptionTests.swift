@@ -220,15 +220,36 @@ struct ExternalDraftAdoptionTests {
     @Test("An unconfirmed empty body never opens an editor that could blank the server draft")
     func editableBodyFailsClosedOnUnconfirmedEmpty() {
         #expect(ExternalDraftAdoption.editableBody(
-            html: "<p>Hi</p>", bodyEmptyConfirmed: false, hasAttachments: false) == "Hi")
+            text: nil, html: "<p>Hi</p>", bodyEmptyConfirmed: false, hasAttachments: false) == "Hi")
         #expect(ExternalDraftAdoption.editableBody(
-            html: nil, bodyEmptyConfirmed: false, hasAttachments: false) == nil)
+            text: nil, html: nil, bodyEmptyConfirmed: false, hasAttachments: false) == nil)
         #expect(ExternalDraftAdoption.editableBody(
-            html: "<div><br></div>", bodyEmptyConfirmed: false, hasAttachments: false) == nil)
+            text: nil, html: "<div><br></div>", bodyEmptyConfirmed: false, hasAttachments: false) == nil)
         #expect(ExternalDraftAdoption.editableBody(
-            html: nil, bodyEmptyConfirmed: true, hasAttachments: false) == "")
+            text: "  \r\n", html: nil, bodyEmptyConfirmed: false, hasAttachments: false) == nil)
         #expect(ExternalDraftAdoption.editableBody(
-            html: nil, bodyEmptyConfirmed: false, hasAttachments: true) == "")
+            text: nil, html: nil, bodyEmptyConfirmed: true, hasAttachments: false) == "")
+        #expect(ExternalDraftAdoption.editableBody(
+            text: nil, html: nil, bodyEmptyConfirmed: false, hasAttachments: true) == "")
+    }
+
+    @Test("A text-only copy is the draft as typed; trailing MIME line breaks never grow it")
+    func editableBodyTakesTextAsTyped() {
+        let typed = "Hi Bob,\n\nThanks for the notes. \nPlan:\n  1. ship\n  2.  test\n> quoted line\nCheers \u{1F469}\u{200D}\u{1F4BB}\nAlice"
+        let mime = typed.replacingOccurrences(of: "\n", with: "\r\n") + "\r\n\r\n"
+        #expect(ExternalDraftAdoption.editableBody(
+            text: mime, html: nil, bodyEmptyConfirmed: false, hasAttachments: false) == typed)
+        #expect(ExternalDraftAdoption.editableBody(
+            text: typed, html: "", bodyEmptyConfirmed: false, hasAttachments: false) == typed)
+    }
+
+    @Test("A copy with an HTML part is decoded from it, never from a soft-wrapped text part")
+    func editableBodyPrefersHTMLOverFlowedText() {
+        let flowed = "A long paragraph that another client \r\nsoft-wrapped at the margin.\r\n"
+        let html = "<div>A long paragraph that another client soft-wrapped at the margin.</div>"
+        #expect(ExternalDraftAdoption.editableBody(
+            text: flowed, html: html, bodyEmptyConfirmed: false, hasAttachments: false)
+            == "A long paragraph that another client soft-wrapped at the margin.")
     }
 
     // MARK: - Reply threading

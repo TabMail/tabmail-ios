@@ -790,13 +790,17 @@ actor DraftStore {
             dirName: initialDraft.attachmentsDirName)
 
         // Build every provider payload field from the exact pre-A snapshot.
+        // The body goes up as the plain text the user typed (#217): reopening a
+        // pushed Gmail or Outlook draft reads the server copy back, and only the
+        // text itself comes back with every space and line break. An HTML body
+        // would not (`plainTextToHTML` joins a line ending in a space to the next).
         var payload = DraftMessage(
             to: initialDraft.toArray,
             cc: initialDraft.ccArray,
             bcc: initialDraft.bccArray,
             subject: initialDraft.subject,
-            body: MessageBody.plainTextToHTML(initialDraft.body),
-            isHTML: true,
+            body: initialDraft.body,
+            isHTML: false,
             inReplyTo: nil,
             attachments: attachments)
         payload.messageId = freshRfc

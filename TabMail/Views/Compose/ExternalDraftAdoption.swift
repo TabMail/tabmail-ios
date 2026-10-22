@@ -179,18 +179,40 @@ enum ExternalDraftAdoption {
 
     /// The editable plain-text body, or nil when it must not open yet.
     ///
+    /// A copy with an HTML part is decoded from it (`EmailFilter.htmlToPlainText`,
+    /// whose line rules never add a blank line). A copy with only a text part
+    /// (every draft TabMail uploads, and an Outlook copy, which Exchange returns as
+    /// text) is used as is: line endings become `\n` and trailing line breaks are
+    /// dropped, since MIME adds one, so a save and reopen never grows the body. A
+    /// `format=flowed` text part arrives here already decoded by the provider's
+    /// draft read (`EmailFilter.decodeFormatFlowed`, #238).
+    ///
     /// PORT of v2final `ServerDraftBody` (F5): an empty or whitespace-only body
     /// opens only when the server CONFIRMED it empty, or when the draft carries
     /// attachments (the body fetch stored it as an attachment-only message).
     static func editableBody(
+        text: String?,
         html: String?,
         bodyEmptyConfirmed: Bool,
         hasAttachments: Bool
     ) -> String? {
-        let plain = html.map { EmailFilter.htmlToPlainText($0) } ?? ""
+        let plain: String
+        if let html, !html.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            plain = EmailFilter.htmlToPlainText(html)
+        } else {
+            var lines = (text ?? "")
+                .replacingOccurrences(of: "\r\n", with: "\n")
+                .replacingOccurrences(of: "\r", with: "\n")
+            while lines.hasSuffix("\n") { lines.removeLast() }
+            plain = lines
+        }
         if !plain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return plain }
         return bodyEmptyConfirmed || hasAttachments ? "" : nil
     }
+
+    /// What Gmail, Graph and IMAP header parsing put in place of an empty subject;
+    /// a draft copy's subject is the draft's own, so it reads back as empty.
+    static let providerNoSubjectPlaceholder = "(no subject)"
 
     /// The reply parent the other app's draft names through `In-Reply-To`, or nil.
     ///
@@ -372,19 +394,14 @@ enum ExternalDraftAdoption {
     ) async throws -> ReadCopy {
         // Top-level only: parts nested inside an attached `.eml` travel inside it.
         let attachmentInfos = copy.attachments.filter { $0.parentEmlSection == nil }
-        let html: String?
-        if let htmlBody = copy.htmlBody, !htmlBody.isEmpty {
-            html = htmlBody
-        } else {
-            html = copy.textBody.map(EmailFilter.plainTextToHTML)
-        }
         // A body part this successful read returned, even an empty one, IS the
         // server's word that the draft is empty (another app cleared it). Only a copy
         // with no body part at all stays unopenable, so a body the reader failed to
         // extract can never blank the draft.
         let bodyReturned = copy.htmlBody != nil || copy.textBody != nil
         guard let body = editableBody(
-            html: html,
+            text: copy.textBody,
+            html: copy.htmlBody,
             bodyEmptyConfirmed: bodyEmptyConfirmed || bodyReturned,
             hasAttachments: !attachmentInfos.isEmpty || !copy.inlineImages.isEmpty) else {
             throw AdoptionError.bodyUnavailable
@@ -416,7 +433,8 @@ enum ExternalDraftAdoption {
                 mimeType: image.contentType, data: image.data))
         }
         return ReadCopy(
-            subject: copy.header.subject, to: copy.header.to, cc: copy.header.cc, bcc: copy.header.bcc,
+            subject: copy.header.subject == providerNoSubjectPlaceholder ? "" : copy.header.subject,
+            to: copy.header.to, cc: copy.header.cc, bcc: copy.header.bcc,
             body: body, attachments: attachments)
     }
 

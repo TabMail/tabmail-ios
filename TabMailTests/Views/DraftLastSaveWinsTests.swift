@@ -105,7 +105,7 @@ struct DraftReloadRowTests {
     }
 
     @Test("Reload writes nothing over a row that changed while the server copy was read", arguments: [
-        "newer save", "generation", "status", "address",
+        "newer save", "saved and uploaded", "generation", "status", "address",
     ])
     func reloadFailsClosed(change: String) throws {
         let db = try TestDatabase.make()
@@ -117,6 +117,17 @@ struct DraftReloadRowTests {
                 row.body = "newest local edit"
                 row.updatedAt += 1
                 try DraftStore.applySave(row, db: db)
+                return
+            case "saved and uploaded":
+                // A save, then its upload's Stage A and completion: the row is back
+                // to "pushed" at the same address, and only its version moved on.
+                row.body = "newest local edit"
+                row.updatedAt += 1
+                try DraftStore.applySave(row, db: db)
+                var uploaded = try #require(try Draft.fetchOne(db, key: decided.id))
+                uploaded.serverPushStatus = "pushed"
+                uploaded.pushAttemptVersion += 1
+                try uploaded.update(db)
                 return
             case "generation": row.instanceEpoch = "another-generation"
             case "status": row.serverPushStatus = "dirty"
@@ -274,6 +285,117 @@ struct DraftCopyReadTests {
         }
     }
 
+    @Test("Graph: a draft read is the draft as text, every inline image, and attached mail kept as files")
+    func graphDraftReadIsTheDraftOnly() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let reads = RequestLog()
+        let received = ISO8601DateFormatter().string(from: Date())
+        http.register(path: "/messages/g1", method: "GET") { request in
+            reads.requests.withLock { $0.append(request) }
+            return .json(raw: """
+                {"id":"g1","subject":"Plan","from":{"emailAddress":{"address":"owner@example.com"}},
+                 "receivedDateTime":"\(received)","isRead":true,"hasAttachments":true,
+                 "body":{"contentType":"text","content":"Hi Bob,\\r\\n\\r\\n  indented\\r\\n> quoted"}}
+                """)
+        }
+        http.register(path: "/messages/g1/attachments", method: "GET", response: .json(raw: """
+            {"value":[
+             {"id":"e1","name":"Forwarded","contentType":"message/rfc822","size":9,"isInline":false,
+              "@odata.type":"#microsoft.graph.itemAttachment"},
+             {"id":"f1","name":"fwd.eml","contentType":"application/octet-stream","size":9,"isInline":false,
+              "@odata.type":"#microsoft.graph.fileAttachment"},
+             {"id":"i1","name":"logo.png","contentType":"image/png","size":2,"isInline":true,"contentId":"<logo>",
+              "@odata.type":"#microsoft.graph.fileAttachment"},
+             {"id":"i2","name":"pic.png","contentType":"image/png","size":2,"isInline":true,"contentId":" ",
+              "@odata.type":"#microsoft.graph.fileAttachment"}]}
+            """))
+        http.register(path: "/messages/g1/attachments/i1", method: "GET",
+                      response: .json(raw: "{\"contentBytes\":\"\(Data([7, 8]).base64EncodedString())\"}"))
+        let provider = ExchangeProvider(
+            userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+
+        let copy = try #require(try await provider.fetchDraftCopy(identity: .outlook(graphId: "g1")))
+
+        #expect(reads.requests.withLock { $0 }.contains { $0.header("Prefer") == "outlook.body-content-type=\"text\"" },
+                "the draft body must be read as text, not re-converted from HTML")
+        #expect(copy.textBody == "Hi Bob,\r\n\r\n  indented\r\n> quoted")
+        #expect(copy.htmlBody == nil, "an attached message's text must never join the draft body")
+        #expect(copy.inlineImages.map(\.contentId) == ["logo"], "an inline image the body does not reference is still the draft's")
+        #expect(copy.inlineImages.first?.data == Data([7, 8]))
+        #expect(copy.attachments.map(\.filename) == ["Forwarded", "fwd.eml", "pic.png"],
+                "attached mail stays a file, and an image with no Content-ID is carried as a file")
+        #expect(!http.recordedCalls().contains { $0.url.contains("$expand") || $0.url.contains("/attachments/f1") },
+                "a draft read never opens an attached message")
+    }
+
+    @Test("Gmail: a draft read takes only the draft's own text, keeps attached mail a file, and every inline image")
+    func gmailDraftReadIsTheDraftOnly() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let internalDate = String(Int(Date().timeIntervalSince1970 * 1000))
+        let own = Self.base64URL(Data("Hi Bob,\n\nPlan".utf8))
+        let ownHTML = Self.base64URL(Data("<div>Hi Bob,</div><div><br></div><div>Plan</div>".utf8))
+        let inner = Self.base64URL(Data("INNER TEXT".utf8))
+        http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-5"}}"#))
+        http.register(path: "/messages/m-5", method: "GET", response: .json(raw: """
+            {"id":"m-5","internalDate":"\(internalDate)","labelIds":["DRAFT"],
+             "payload":{"mimeType":"multipart/mixed",
+               "headers":[{"name":"Subject","value":"Plan"},{"name":"From","value":"owner@example.com"}],
+               "parts":[
+                 {"mimeType":"multipart/alternative","parts":[
+                   {"mimeType":"text/plain","body":{"size":19,"data":"\(own)"}},
+                   {"mimeType":"text/html","body":{"size":50,"data":"\(ownHTML)"}}]},
+                 {"mimeType":"message/rfc822","filename":"","body":{"size":30,"attachmentId":"eml1"},
+                  "parts":[{"mimeType":"text/plain","body":{"size":10,"data":"\(inner)"}},
+                           {"mimeType":"text/html","body":{"size":10,"data":"\(inner)"}}]},
+                 {"mimeType":"image/png","headers":[{"name":"Content-ID","value":"<logo>"}],
+                  "body":{"size":4,"attachmentId":"img0"}},
+                 {"mimeType":"image/png","filename":"photo.png","body":{"size":4,"attachmentId":"p1"}}]}}
+            """))
+        http.register(path: "/messages/m-5/attachments/", method: "GET",
+                      response: .json(raw: "{\"size\":4,\"data\":\"\(Self.base64URL(Data([1, 2, 3, 4])))\"}"))
+        let provider = GmailProvider(
+            userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+
+        let copy = try #require(try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r1")))
+
+        #expect(copy.textBody == "Hi Bob,\n\nPlan")
+        #expect(copy.htmlBody == "<div>Hi Bob,</div><div><br></div><div>Plan</div>")
+        #expect(copy.attachments.map(\.filename) == ["attached-email.eml", "photo.png"])
+        #expect(copy.inlineImages.map(\.contentId) == ["logo"], "an unreferenced inline image is still the draft's")
+        let editable = try #require(ExternalDraftAdoption.editableBody(
+            text: copy.textBody, html: copy.htmlBody, bodyEmptyConfirmed: false, hasAttachments: true))
+        #expect(editable == "Hi Bob,\n\nPlan", "the attached message's text joined the draft body")
+    }
+
+    /// #238: a text-only draft another app wrote as `format=flowed` opens with its
+    /// soft line breaks joined; one that does not declare it keeps its trailing spaces.
+    @Test("Gmail: a text-only draft is decoded as format=flowed only when its part says so", arguments: [
+        ("text/plain; charset=\\\"UTF-8\\\"; format=flowed", "Thanks for the long explanation.\n\nAlice"),
+        ("text/plain; charset=\\\"UTF-8\\\"", "Thanks for the long \nexplanation.\n\nAlice"),
+    ])
+    func gmailFlowedDraftRead(contentType: String, expected: String) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let internalDate = String(Int(Date().timeIntervalSince1970 * 1000))
+        let text = Self.base64URL(Data("Thanks for the long \r\nexplanation.\r\n\r\nAlice".utf8))
+        http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-6"}}"#))
+        http.register(path: "/messages/m-6", method: "GET", response: .json(raw: """
+            {"id":"m-6","internalDate":"\(internalDate)","labelIds":["DRAFT"],
+             "payload":{"mimeType":"text/plain",
+               "headers":[{"name":"Subject","value":"Plan"},{"name":"Content-Type","value":"\(contentType)"}],
+               "body":{"size":44,"data":"\(text)"}}}
+            """))
+        let provider = GmailProvider(
+            userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+
+        let copy = try #require(try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r1")))
+
+        #expect(ExternalDraftAdoption.editableBody(
+            text: copy.textBody, html: copy.htmlBody, bodyEmptyConfirmed: false, hasAttachments: false) == expected)
+    }
+
     @Test("Providers refuse to read another provider's draft address")
     func foreignIdentityIsRefused() async {
         let http = FakeHTTP.Scenario()
@@ -291,55 +413,131 @@ struct DraftCopyReadTests {
         #expect(http.recordedCalls().isEmpty)
     }
 
-    @Test("Graph: updating a draft makes its attachments exactly the local ones")
-    func graphUpdateReplacesAttachments() async throws {
+    final class RequestLog: Sendable {
+        let requests = Mutex<[FakeHTTP.Request]>([])
+    }
+
+    private static func graphUpdateProvider(
+        _ http: FakeHTTP.Scenario, serverFiles: [(id: String, name: String)]
+    ) -> ExchangeProvider {
+        http.register(path: "/messages/g1", method: "PATCH", response: .json(raw: #"{"id":"g1"}"#))
+        let items = serverFiles.map { "{\"id\":\"\($0.id)\",\"name\":\"\($0.name)\"}" }.joined(separator: ",")
+        http.register(path: "/messages/g1/attachments", method: "GET", response: .json(raw: "{\"value\":[\(items)]}"))
+        http.register(path: "/messages/g1/attachments/", method: "DELETE", response: .status(204))
+        return ExchangeProvider(
+            userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+    }
+
+    private static func draft(attachments: [DraftAttachment]) -> DraftMessage {
+        DraftMessage(to: ["alice@example.com"], cc: [], bcc: [], subject: "Plan", body: "Meet on Monday",
+                     attachments: attachments)
+    }
+
+    private static func file(_ name: String, _ text: String = "bytes") -> DraftAttachment {
+        DraftAttachment(filename: name, mimeType: "application/pdf", data: Data(text.utf8))
+    }
+
+    @Test("Graph: a save leaves the server holding exactly the draft's files, adding before deleting")
+    func graphUpdateSyncsAttachmentsByName() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        http.register(path: "/messages/g1", method: "PATCH", response: .json(raw: #"{"id":"g1"}"#))
-        http.register(path: "/messages/g1/attachments", method: "GET",
-                      response: .json(raw: #"{"value":[{"id":"old1"},{"id":"old2"}]}"#))
-        http.register(path: "/messages/g1/attachments/", method: "DELETE", response: .status(204))
-        http.register(path: "/messages/g1/attachments", method: "POST", response: .json(raw: #"{"id":"new1"}"#))
-        let provider = ExchangeProvider(
-            userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
-        let draft = DraftMessage(
-            to: ["alice@example.com"], cc: [], bcc: [], subject: "Plan", body: "Meet on Monday",
-            attachments: [DraftAttachment(filename: "added.pdf", mimeType: "application/pdf", data: Data("pdf".utf8))])
+        let provider = Self.graphUpdateProvider(http, serverFiles: [(id: "k1", name: "keep.pdf"), (id: "r1", name: "removed.pdf")])
+        http.register(path: "/messages/g1/attachments", method: "POST", response: .json(raw: #"{"id":"n1"}"#))
 
         let result = try await provider.saveDraft(
-            draft, existingIdentity: .outlook(graphId: "g1"), draftsFolderPath: "Drafts")
+            Self.draft(attachments: [Self.file("keep.pdf"), Self.file("added.pdf", "pdf")]),
+            existingIdentity: .outlook(graphId: "g1"), draftsFolderPath: "Drafts")
 
         #expect(result == .created(.outlook(graphId: "g1")))
         let calls = http.recordedCalls()
         let patch = try #require(calls.first { $0.method == "PATCH" })
         let patchJSON = try #require(try JSONSerialization.jsonObject(with: patch.body ?? Data()) as? [String: Any])
         #expect(patchJSON["attachments"] == nil, "Graph's PATCH cannot change attachments")
-        let deleted = calls.filter { $0.method == "DELETE" }.compactMap { URL(string: $0.url)?.lastPathComponent }
-        #expect(Set(deleted) == ["old1", "old2"], "every attachment the server held must go")
         let posts = calls.filter { $0.method == "POST" }
-        #expect(posts.count == 1)
+        #expect(posts.count == 1, "a file the server already holds is never sent again")
         let posted = try #require(try JSONSerialization.jsonObject(with: posts.first?.body ?? Data()) as? [String: Any])
         #expect(posted["name"] as? String == "added.pdf")
         #expect(posted["contentBytes"] as? String == Data("pdf".utf8).base64EncodedString())
-        #expect(calls.lastIndex { $0.method == "DELETE" }! < calls.firstIndex { $0.method == "POST" }!,
-                "the new set is added after the old one is gone")
+        let deleted = calls.filter { $0.method == "DELETE" }.compactMap { URL(string: $0.url)?.lastPathComponent }
+        #expect(deleted == ["r1"], "only the file the draft no longer has goes; keep.pdf stays")
+        let lastAdd = try #require(calls.lastIndex { $0.method == "POST" })
+        let firstDelete = try #require(calls.firstIndex { $0.method == "DELETE" })
+        #expect(lastAdd < firstDelete, "a delete before the add leaves the server short if the add fails")
     }
 
-    @Test("Graph: a failed attachment replacement fails the save, so it retries")
+    @Test("Graph: a failed add fails the save and the server still holds every file")
     func graphUpdateAttachmentFailureThrows() async {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        http.register(path: "/messages/g1", method: "PATCH", response: .json(raw: #"{"id":"g1"}"#))
-        http.register(path: "/messages/g1/attachments", method: "GET", response: .json(raw: #"{"value":[]}"#))
+        let provider = Self.graphUpdateProvider(http, serverFiles: [(id: "k1", name: "keep.pdf"), (id: "r1", name: "removed.pdf")])
         http.register(path: "/messages/g1/attachments", method: "POST", response: .status(500))
-        let provider = ExchangeProvider(
-            userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
-        let draft = DraftMessage(
-            to: [], cc: [], bcc: [], subject: "Plan", body: "x",
-            attachments: [DraftAttachment(filename: "a.txt", mimeType: "text/plain", data: Data("a".utf8))])
 
         await #expect(throws: (any Error).self) {
-            try await provider.saveDraft(draft, existingIdentity: .outlook(graphId: "g1"), draftsFolderPath: "Drafts")
+            try await provider.saveDraft(
+                Self.draft(attachments: [Self.file("keep.pdf"), Self.file("added.pdf")]),
+                existingIdentity: .outlook(graphId: "g1"), draftsFolderPath: "Drafts")
+        }
+        #expect(!http.recordedCalls().contains { $0.method == "DELETE" },
+                "a failed save must not remove anything from the server copy")
+    }
+
+    @Test("Graph: files pair with server attachments by name, one to one")
+    func draftAttachmentPlanPairsByName() {
+        let plan = ExchangeProvider.draftAttachmentPlan(
+            server: [(id: "s1", name: "a.pdf"), (id: "s2", name: "b.pdf"), (id: "s3", name: "b.pdf")],
+            local: [Self.file("a.pdf"), Self.file("a.pdf"), Self.file("c.pdf")])
+        #expect(plan.add.map(\.filename) == ["a.pdf", "c.pdf"], "a second same-named local file needs its own copy")
+        #expect(plan.deleteIds == ["s2", "s3"])
+        let unchanged = ExchangeProvider.draftAttachmentPlan(
+            server: [(id: "s1", name: "a.pdf")], local: [Self.file("a.pdf")])
+        #expect(unchanged.add.isEmpty && unchanged.deleteIds.isEmpty)
+    }
+
+    @Test("Graph: a file too large for one POST goes through an upload session, in ordered ranges, without the token")
+    func graphLargeAttachmentUsesUploadSession() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let provider = Self.graphUpdateProvider(http, serverFiles: [])
+        http.register(path: "/messages/g1/attachments/createUploadSession", method: "POST", response: .json(raw: """
+            {"uploadUrl":"https://outlook.office.com/api/v2.0/Users('u')/Messages('g1')/AttachmentSessions('s1')?authtoken=t"}
+            """))
+        let total = ExchangeDraftConfig.singlePostAttachmentLimitBytes + 1
+        let bytes = Data((0..<total).map { UInt8(truncatingIfNeeded: $0) })
+        let puts = RequestLog()
+        http.register(path: "AttachmentSessions", method: "PUT") { request in
+            let isLast = puts.requests.withLock { $0.append(request); return $0.count } > 1
+            return isLast ? .json(raw: "{}", statusCode: 201) : .json(raw: "{}")
+        }
+
+        _ = try await provider.saveDraft(
+            Self.draft(attachments: [DraftAttachment(filename: "big.bin", mimeType: "application/octet-stream", data: bytes)]),
+            existingIdentity: .outlook(graphId: "g1"), draftsFolderPath: "Drafts")
+
+        let calls = http.recordedCalls()
+        #expect(!calls.contains { $0.method == "POST" && $0.url.hasSuffix("/attachments") },
+                "a file of the single-POST limit or more cannot go in one POST")
+        let session = try #require(calls.first { $0.url.contains("createUploadSession") })
+        let sessionJSON = try #require(try JSONSerialization.jsonObject(with: session.body ?? Data()) as? [String: Any])
+        let item = try #require(sessionJSON["AttachmentItem"] as? [String: Any])
+        #expect(item["name"] as? String == "big.bin")
+        #expect(item["size"] as? Int == total)
+        let sent = puts.requests.withLock { $0 }
+        try #require(sent.count == 2)
+        let chunk = ExchangeDraftConfig.uploadChunkBytes
+        #expect(sent.map { $0.header("Content-Range") } == ["bytes 0-\(chunk - 1)/\(total)", "bytes \(chunk)-\(total - 1)/\(total)"])
+        #expect(sent.allSatisfy { $0.header("Authorization") == nil }, "the session URL is pre-authenticated; the token must not leave Graph")
+        #expect(sent.compactMap(\.body).reduce(Data(), +) == bytes, "the server must receive the file's exact bytes")
+    }
+
+    @Test("Graph: an upload session URL off the documented Outlook hosts is refused")
+    func uploadURLMustBeAnOutlookHost() throws {
+        for raw in ["https://outlook.office.com/api/v2.0/x", "https://OUTLOOK.office365.com/api/v2.0/x"] {
+            #expect(throws: Never.self) { try ExchangeProvider.validatedUploadURL(raw) }
+        }
+        for raw in [nil, "http://outlook.office.com/x", "https://attacker.example.com/x",
+                    "https://outlook.office.com.example.com/x", "https://u:p@outlook.office.com/x",
+                    "https://outlook.office.com:8443/x"] {
+            #expect(throws: ProviderError.self) { try ExchangeProvider.validatedUploadURL(raw) }
         }
     }
 }
@@ -389,6 +587,25 @@ struct IMAPDraftCopyCompletenessTests {
         let copy = try IMAPProvider.completeDraftCopy(Self.full(attachments: []), message: Self.message(parts))
         #expect(copy.inlineImages.count == count)
         #expect(copy.inlineImages.first?.contentId == "pic0")
+    }
+
+    @Test("The body is only the draft's own text; attached mail and a nameless image stay files; every inline image is kept")
+    func readsTheDraftOnly() throws {
+        let attached = Data("Subject: old\r\n\r\nINNER TEXT".utf8)
+        let copy = try IMAPProvider.completeDraftCopy(Self.full(attachments: []), message: Self.message([
+            MessagePart(sectionString: "1", contentType: "text/plain", data: Data("Hi Bob,\r\n\r\n  indented".utf8)),
+            MessagePart(sectionString: "2", contentType: "message/rfc822", data: attached),
+            MessagePart(sectionString: "2.1", contentType: "text/plain", data: Data("INNER TEXT".utf8)),
+            MessagePart(sectionString: "2.2", contentType: "image/png", contentId: "<inner>", data: Data([9])),
+            MessagePart(sectionString: "3", contentType: "image/png", contentId: "<logo>", data: Data([1, 2])),
+            MessagePart(sectionString: "4", contentType: "image/png", filename: "photo.png", data: Data([3])),
+        ]))
+        #expect(copy.textBody == "Hi Bob,\r\n\r\n  indented")
+        #expect(copy.htmlBody == nil, "the render's HTML (or an attached message's text) must not become the draft body")
+        #expect(copy.inlineImages.map(\.contentId) == ["logo"], "an image inside an attached message is not the draft's")
+        #expect(copy.attachments.map(\.section) == ["2", "4"])
+        #expect(copy.attachmentData?["2"] == attached, "the attached message is carried whole, as a file")
+        #expect(copy.attachmentData?["4"] == Data([3]))
     }
 
     @Test("A part that came back without bytes fails the read", arguments: ["attachment", "inline"])

@@ -429,11 +429,14 @@ protocol EmailProvider: Sendable {
 
     /// #217: the server's current copy of the draft at `identity`, or nil when that
     /// address no longer names a draft (deleted, or replaced under a new IMAP UID).
-    /// Read-only, and COMPLETE: a copy is everything the draft holds, because the
-    /// caller replaces a local draft with it, so a part that could not be read (an
-    /// inline image included) THROWS rather than being left out. THROWS too when
-    /// the answer could not be determined (offline, an unknown IMAP epoch); a throw
-    /// is never "gone".
+    /// Read-only. The copy is the DRAFT, not a render of it, because the caller
+    /// replaces a local draft with it:
+    /// - `textBody` / `htmlBody` are the draft's own body parts only; an attached
+    ///   message stays an attachment and its text never joins the body;
+    /// - COMPLETE: every inline image (referenced by the body or not) and every
+    ///   file; a part that could not be read THROWS rather than being left out.
+    /// THROWS too when the answer could not be determined (offline, an unknown IMAP
+    /// epoch); a throw is never "gone".
     func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo?
 
     // Incremental sync (optional — Gmail uses history.list, IMAP returns nil)
@@ -456,6 +459,13 @@ protocol EmailProvider: Sendable {
     /// Returns successfully fetched messages keyed by message ID.
     /// Throws on connection-level errors. Individual message failures are omitted from result.
     func fetchMessagesBatch(ids: [String], folder: String) async throws -> [String: FullMessageInfo]
+}
+
+/// #217: draft copies (`fetchDraftCopy`).
+enum DraftReadConfig {
+    /// The name a draft-copy file gets when its part names none, so it is carried
+    /// rather than dropped.
+    static let unnamedAttachmentFilename = "attachment"
 }
 
 extension EmailProvider {

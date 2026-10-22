@@ -361,3 +361,15 @@ serializer that writes recipients:
   - #250 and #258 change only PARTIAL and SORT planning. The app never passes `partialRange` or a sort.
   - #251 and #257 are additive APIs. #254 changes how filenames are parsed. #259 keeps the 10 s default.
 
+- **format=flowed parameters (#238, 2026-10-21)**: BODYSTRUCTURE part content types kept only
+  `charset`, so the app could not see that another app's plain-text draft part is RFC 3676
+  `format=flowed` (`.eml` parsing already kept every parameter but name, filename and boundary).
+  Owner: fix it at our fork and upstream it. Fork branch `agent/format-flowed-content-type`
+  (`a767603`, on `018ca90`) adds `format` and `delsp` after `charset` in
+  `Array<MessagePart>.contentType(for:)`, with `MessagePartBodyStructureTests
+  .textPartKeepsTheParametersItsTextIsReadBy` (red on `018ca90`). The app pins `a767603` (#217);
+  fork `main` stays the pure mirror `018ca90`. Census: the parameters appear only on text parts,
+  which already carried `; charset=`, and every app consumer matches by prefix or normalises the
+  MIME type. The upstream PR opens only after our own review of the commit is clean
+  (`feedback_upstream_pr_rounds_need_our_own_review_and_the_dependency_source`). When upstream
+  merges it, resync with `tabmail-swiftmailfork-sync` and re-pin to the mirror.

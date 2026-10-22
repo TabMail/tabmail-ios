@@ -162,3 +162,59 @@ Every mismatch became a false "edited elsewhere", for a race the owner judges hy
   throws and the retried upload runs the replacement again from the start. Gmail and IMAP already
   replace the whole message.
 - Moot with the check: #229 and #230 (closed as not planned, pointing to #233).
+
+**Amendment (2026-10-21, owner's fifth ruling, after tier-1 review round 2): a draft is TEXT; read the
+draft, not its render; sync Outlook attachments by name.** The round found that a save and reopen did
+not give back what was typed: the upload sent HTML built from the text and the reload converted the
+server's HTML back, and the two conversions did not agree on spacing and blank lines. It also found
+attached-message text joining the body, unreferenced inline images dropped, and Graph attachments
+deleted before the new set was added. Owner: *"we should make sure our converter doesn't cause
+double spaces etc"*; *"minor cosmetics going away okay, as long as the spacing and the linebreaks
+are preserved properly"*; *"upload as plain text, but also should be able to decode properly. Exact
+round trip isn't required, but we SHOULD decode properly so that we don't add lines"*; *"we should
+not re-invent yet another converter"*; and for attachments *"Match by name, accept the edge"*.
+
+- **Upload as text.** `DraftStore.pushDraftToServer` uploads the row's body exactly as typed,
+  `isHTML: false` (Gmail a text/plain message, Graph `contentType: "text"`, IMAP the text body). Sent
+  mail is unchanged: the Outbox builds its own HTML.
+- **Decode with the one converter.** `ExternalDraftAdoption.editableBody` takes the HTML part through
+  `EmailFilter.htmlToPlainText` when there is one (another app's text part may be `format=flowed`
+  soft-wrapped), else the text part with CRLF/CR made LF and MIME's trailing newlines removed (so a
+  save and reopen never grows the body). `htmlToPlainText`'s line rules were fixed rather than a
+  second converter written: `<br>` always ends a line; a block open or close ends one only when the
+  line has text; a space before a break is dropped. So `<div><br></div>` is one blank line, nested
+  closes do not stack, and a block after inline text starts a new line. FTS and the text part of
+  HTML sends use the same function and gain the same fix. The provider placeholder subject
+  `"(no subject)"` reads as empty.
+- **Read the draft, not its render** (`EmailProvider.fetchDraftCopy`). The body is only the draft's
+  own text/plain and text/html parts, joined in order when split around an inline part. An attached
+  message (Graph item attachment, `.eml` file, `message/rfc822`) is an attachment and is never opened,
+  so its text never joins the body. Every image with a Content-ID is an inline image whether or not
+  the body references it; an image with no Content-ID and every other non-body part is a file.
+  Graph is asked for the body as text (`Prefer: outlook.body-content-type="text"`). A part whose
+  bytes cannot be read throws. Gmail walks the payload iteratively (`readDraftMessage`); IMAP
+  rebuilds the copy from the one proven read (`completeDraftCopy`); Graph uses
+  `readMessage(id:forDraft:)`.
+- **Outlook attachments sync by name, add before delete** (`replaceDraftAttachments`,
+  `draftAttachmentPlan`). Local files pair with server attachments by name, one to one. Each unpaired
+  local file is added first: one POST under `ExchangeDraftConfig.singlePostAttachmentLimitBytes`,
+  else an upload session whose ranges are PUT in order to its Outlook-host URL with no
+  `Authorization` header. Only then is each unpaired server attachment deleted. A failure throws
+  before any delete, so the server never loses a file the draft still has, and an unchanged file is
+  never sent again. Accepted edge: a different file under the same name keeps the old one
+  (`IOS-DRAFT-022`, #236, P4). The attachment DELETE joins the irreversible-operation census as (7).
+- Filed, not fixed here: the first save of a NEW Outlook draft with a 3 MB+ attachment still goes in
+  one POST (pre-existing, #237).
+- **A `format=flowed` text part is decoded when read** (#238, owner 2026-10-21: fix it here, at our
+  SwiftMail fork, and upstream it). Thunderbird and Apple Mail write a plain-text draft as RFC 3676
+  `format=flowed`, soft-breaking long lines with a trailing space. Gmail's `readDraftMessage` and
+  IMAP's `completeDraftCopy` pass each text/plain part through `EmailFilter.decodeFormatFlowed` with
+  that part's own Content-Type; it decodes only when the part declares `format=flowed` (joins soft
+  breaks within a quote depth, removes space-stuffing, honours `delsp=yes`, keeps `"-- "` a line of
+  its own), so a TabMail draft, which never declares it, keeps every trailing space. The soft-break
+  rule is the one `plainTextToHTML` already rendered with, now shared as
+  `EmailFilter.isFlowedSoftBreak`. IMAP needed SwiftMail to stop dropping the parameters: a
+  BODYSTRUCTURE part's content type carried only `charset`, and now carries `format` and `delsp`
+  too (fork branch `agent/format-flowed-content-type`, `a767603`, pinned by the app until upstream
+  merges it; `.eml` parsing already kept them). Graph returns an Outlook draft as text Exchange
+  converts, so it has no flowed part to decode.

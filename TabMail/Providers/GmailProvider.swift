@@ -305,13 +305,6 @@ actor GmailProvider: EmailProvider {
     }
 
     func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo {
-        try await readMessage(id: id, completeInlineImages: false)
-    }
-
-    /// `completeInlineImages`: read EVERY inline image and throw if one cannot be
-    /// read, instead of rendering's best effort (at most `maxInlineImages`, failures
-    /// skipped). A draft copy needs it: the copy replaces the local draft (#217).
-    private func readMessage(id: String, completeInlineImages: Bool) async throws -> FullMessageInfo {
         let data = try await request(path: "/messages/\(id)\(GmailAPI.fullQuery)")
         let msg = try JSONDecoder().decode(GmailMessage.self, from: data)
 
@@ -356,8 +349,7 @@ actor GmailProvider: EmailProvider {
         // Fetch CID inline images (only if HTML body references cid:)
         let inlineImages: [InlineImage]
         if let html = htmlBody, html.range(of: "cid:", options: .caseInsensitive) != nil {
-            inlineImages = try await fetchInlineImages(
-                messageId: id, from: parts, complete: completeInlineImages)
+            inlineImages = await fetchInlineImages(messageId: id, from: parts)
         } else {
             inlineImages = []
         }
@@ -829,7 +821,106 @@ actor GmailProvider: EmailProvider {
         guard let messageId = try await currentDraftMessageId(resourceId: resourceId) else {
             return nil
         }
-        return try await readMessage(id: messageId, completeInlineImages: true)
+        return try await readDraftMessage(id: messageId)
+    }
+
+    /// #217: the draft itself, not a render of it. The copy replaces the local
+    /// draft, so it holds only the draft and all of it:
+    /// - the body is the draft's own text/plain and text/html parts (each joined
+    ///   in order when split around an inline part); an attached
+    ///   message (`message/rfc822`) is an attachment and is never opened, so its
+    ///   text never joins the body (the render's `tm-eml-section` marker);
+    /// - every image with a Content-ID is an inline image, whether or not the body
+    ///   references it; every other part with a file name or no text type is a file;
+    /// - a part whose bytes cannot be read throws, never drops out.
+    /// Iterative, so a deeply nested copy cannot exhaust the stack.
+    private func readDraftMessage(id: String) async throws -> FullMessageInfo {
+        let data = try await request(path: "/messages/\(id)\(GmailAPI.fullQuery)")
+        let msg = try JSONDecoder().decode(GmailMessage.self, from: data)
+        guard let header = parseGmailMessage(msg) else {
+            throw ProviderError.messageNotFound
+        }
+        guard let payload = msg.payload else {
+            return FullMessageInfo(header: header, htmlBody: nil, textBody: nil)
+        }
+        var textBody: String?
+        var htmlBody: String?
+        var attachments: [AttachmentInfo] = []
+        var inlineImages: [InlineImage] = []
+        var stack = [GmailPart(
+            mimeType: payload.mimeType, filename: payload.filename,
+            headers: payload.headers, body: payload.body, parts: payload.parts)]
+        while let part = stack.popLast() {
+            let mimeType = (part.mimeType ?? "").lowercased()
+            let filename = part.filename ?? ""
+            let contentId = (part.headers?.first { $0.name.lowercased() == "content-id" }?.value ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if mimeType.hasPrefix("image/"), !contentId.isEmpty {
+                inlineImages.append(InlineImage(
+                    contentId: contentId, contentType: mimeType,
+                    data: try await draftPartBytes(part, messageId: id)))
+                continue
+            }
+            let isMessage = mimeType.hasPrefix("message/rfc822")
+            if isMessage || !filename.isEmpty {
+                guard let attachmentId = part.body?.attachmentId else {
+                    throw GmailDraftCopyIncomplete(mimeType: mimeType)
+                }
+                attachments.append(AttachmentInfo(
+                    filename: filename.isEmpty
+                        ? (isMessage ? "attached-email.eml" : DraftReadConfig.unnamedAttachmentFilename)
+                        : filename,
+                    contentType: part.mimeType ?? "application/octet-stream",
+                    section: attachmentId,
+                    size: part.body?.size ?? 0,
+                    encoding: nil))
+                continue
+            }
+            if mimeType == "text/plain" || mimeType == "text/html" {
+                let bytes = try await draftPartBytes(part, messageId: id)
+                // A body split around an inline part (text, image, text) is one
+                // body: its pieces are joined in order.
+                let text = String(data: bytes, encoding: .utf8) ?? ""
+                if mimeType == "text/plain" {
+                    let declared = part.headers?.first { $0.name.lowercased() == "content-type" }?.value ?? mimeType
+                    textBody = (textBody ?? "") + EmailFilter.decodeFormatFlowed(text, contentType: declared)
+                }
+                if mimeType == "text/html" { htmlBody = (htmlBody ?? "") + text }
+                continue
+            }
+            if let children = part.parts {
+                stack.append(contentsOf: children.reversed())
+                continue
+            }
+            if let attachmentId = part.body?.attachmentId {
+                attachments.append(AttachmentInfo(
+                    filename: DraftReadConfig.unnamedAttachmentFilename,
+                    contentType: part.mimeType ?? "application/octet-stream",
+                    section: attachmentId,
+                    size: part.body?.size ?? 0,
+                    encoding: nil))
+            }
+        }
+        return FullMessageInfo(
+            header: header, htmlBody: htmlBody, textBody: textBody,
+            attachments: attachments, inlineImages: inlineImages)
+    }
+
+    /// A draft part's bytes: inline in the part, else through the attachments API.
+    private func draftPartBytes(_ part: GmailPart, messageId: String) async throws -> Data {
+        if let inline = part.body?.data {
+            guard let decoded = decodeBase64URLToData(inline) else {
+                throw GmailDraftCopyIncomplete(mimeType: part.mimeType ?? "")
+            }
+            return decoded
+        }
+        if let attachmentId = part.body?.attachmentId {
+            return try await fetchAttachment(messageId: messageId, attachmentId: attachmentId)
+        }
+        if (part.body?.size ?? 0) == 0 { return Data() }
+        throw GmailDraftCopyIncomplete(mimeType: part.mimeType ?? "")
     }
 
     /// The message a draft resource currently wraps (it changes on every update),
@@ -2085,13 +2176,9 @@ actor GmailProvider: EmailProvider {
         return results
     }
 
-    /// Fetch inline image data for CID resolution. `complete`: every image, and a
-    /// failed fetch throws (`readMessage`).
-    private func fetchInlineImages(
-        messageId: String, from parts: [GmailPart], complete: Bool
-    ) async throws -> [InlineImage] {
-        let allMeta = extractInlineImageMeta(from: parts)
-        let meta = complete ? allMeta[...] : allMeta.prefix(SyncConfig.maxInlineImages)
+    /// Fetch inline image data for CID resolution.
+    private func fetchInlineImages(messageId: String, from parts: [GmailPart]) async -> [InlineImage] {
+        let meta = extractInlineImageMeta(from: parts).prefix(SyncConfig.maxInlineImages)
         var images: [InlineImage] = []
         for item in meta {
             // Try inline body data first (small images)
@@ -2112,7 +2199,6 @@ actor GmailProvider: EmailProvider {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[Gmail] Failed to fetch inline image \(DebugModeManager.escapedForLogLine(item.contentId)): \(DebugModeManager.escapedForLogLine(String(describing: error)))")
                 }
-                if complete { throw error }
             }
         }
         return images
@@ -2452,3 +2538,7 @@ private struct GmailHistoryMessage: Decodable {
     let threadId: String?
     let labelIds: [String]?
 }
+
+/// A Gmail draft-copy part that came back without readable bytes. Retryable;
+/// never "gone" (#217).
+struct GmailDraftCopyIncomplete: Error { let mimeType: String }

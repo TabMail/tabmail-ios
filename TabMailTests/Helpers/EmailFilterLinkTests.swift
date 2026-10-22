@@ -154,7 +154,7 @@ struct EmailFilterLinkTests {
         #expect(parsed.runs.compactMap { $0.link?.absoluteString } == ["/report"])
         #expect(parsed.runs.allSatisfy { $0.link?.absoluteString == "/report" })
         #expect(EmailFilter.htmlToPlainText("<p>Before</p><a href='/report'>\(labelHTML)</a><p>After</p>")
-            == "Before\n[one two](/report) After")
+            == "Before\n[one two](/report)\nAfter")
     }
 
     @Test func decodedLettersRemainReadableInStoredText() {

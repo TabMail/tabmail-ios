@@ -5814,36 +5814,73 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    /// #217: an adopted draft keeps exactly what its copy carried, so the copy must be
-    /// COMPLETE and come from the one read above: every inline image (no display cap)
-    /// and the decoded bytes of every top-level attachment, keyed by section, so
-    /// adoption never fetches an attachment again without the proven UIDVALIDITY.
+    /// #217: the draft itself, not the render `buildFullMessageInfo` made of it, and
+    /// all of it, from the one read above (adoption never fetches again without the
+    /// proven UIDVALIDITY):
+    /// - the body is the draft's own text/plain and text/html parts (each joined in
+    ///   order when split around an inline part); nothing inside an attached message
+    ///   (`message/rfc822`) joins it;
+    /// - every image with a Content-ID outside an attached message is an inline
+    ///   image, whether or not the body references it;
+    /// - every top-level attachment, and any other part that is neither body nor
+    ///   inline image, is a file carried with its decoded bytes, keyed by section.
     /// A part that came back without bytes THROWS (retryable), never "absent".
     nonisolated static func completeDraftCopy(_ full: FullMessageInfo, message: Message) throws -> FullMessageInfo {
+        let rfc822Sections: [[Int]] = message.parts.compactMap { part in
+            part.contentType.lowercased().hasPrefix("message/rfc822") ? part.section.components : nil
+        }
+        func insideAttachedMessage(_ part: MessagePart) -> Bool {
+            IMAPFetchMapping.parentEmlSection(for: part.section.components, rfc822Sections: rfc822Sections) != nil
+        }
+        var attachments = full.attachments.filter { $0.parentEmlSection == nil }
+        var fileSections = Set(attachments.map(\.section))
+        var textBody: String?
+        var htmlBody: String?
+        var inlineImages: [InlineImage] = []
+        for part in message.parts where !insideAttachedMessage(part) && !fileSections.contains(part.section.description) {
+            let contentType = part.contentType.lowercased()
+            if contentType.hasPrefix("multipart/") { continue }
+            let isBodyText = contentType.hasPrefix("text/plain") || contentType.hasPrefix("text/html")
+            if isBodyText, part.filename == nil, part.disposition?.lowercased() != "attachment" {
+                guard let text = part.textContent else {
+                    throw IMAPDraftCopyIncomplete(section: part.section.description)
+                }
+                if contentType.hasPrefix("text/plain") {
+                    textBody = (textBody ?? "") + EmailFilter.decodeFormatFlowed(text, contentType: part.contentType)
+                }
+                else { htmlBody = (htmlBody ?? "") + text }
+                continue
+            }
+            let contentId = (part.contentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if contentType.hasPrefix("image/"), !contentId.isEmpty {
+                guard let data = part.decodedData() else {
+                    throw IMAPDraftCopyIncomplete(section: part.section.description)
+                }
+                inlineImages.append(InlineImage(contentId: contentId, contentType: part.contentType, data: data))
+                continue
+            }
+            attachments.append(AttachmentInfo(
+                filename: part.filename ?? part.suggestedFilename,
+                contentType: part.contentType,
+                section: part.section.description,
+                size: part.data?.count ?? 0,
+                encoding: part.encoding))
+            fileSections.insert(part.section.description)
+        }
         var partsBySection: [String: MessagePart] = [:]
         for part in message.parts { partsBySection[part.section.description] = part }
         var attachmentData: [String: Data] = [:]
-        for attachment in full.attachments where attachment.parentEmlSection == nil {
+        for attachment in attachments {
             guard let data = partsBySection[attachment.section]?.decodedData() else {
                 throw IMAPDraftCopyIncomplete(section: attachment.section)
             }
             attachmentData[attachment.section] = data
         }
-        var inlineImages: [InlineImage] = []
-        for part in message.parts {
-            guard let rawId = part.contentId else { continue }
-            let contentId = rawId.trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !contentId.isEmpty else { continue }
-            guard let data = part.decodedData() else {
-                throw IMAPDraftCopyIncomplete(section: part.section.description)
-            }
-            inlineImages.append(InlineImage(contentId: contentId, contentType: part.contentType, data: data))
-        }
         return FullMessageInfo(
-            header: full.header, htmlBody: full.htmlBody, textBody: full.textBody,
-            attachments: full.attachments, inlineImages: inlineImages, icsData: full.icsData,
+            header: full.header, htmlBody: htmlBody, textBody: textBody,
+            attachments: attachments, inlineImages: inlineImages, icsData: full.icsData,
             attachmentData: attachmentData)
     }
 
