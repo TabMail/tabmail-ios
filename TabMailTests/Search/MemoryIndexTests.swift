@@ -123,7 +123,7 @@ struct MemoryIndexTests {
             chatHistoryId: "real1", sessionId: "real-session", role: "user",
             dateMs: 1_700_000_000_000, text: "real turn about budget"
         )
-        await MemoryIndex.shared.indexTurn(
+        await DemoRunFixture.indexTurn(
             chatHistoryId: "demo1", sessionId: "demo:abc", role: "user",
             dateMs: 1_700_000_001_000, text: "demo turn about budget"
         )
@@ -393,7 +393,7 @@ struct MemoryIndexTests {
 
         await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: 3000, text: "real")
         await MemoryIndex.shared.indexTurn(chatHistoryId: "legacy", sessionId: nil, role: "user", dateMs: 2000, text: "legacy")
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: 1000, text: "demo")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: 1000, text: "demo")
         let hits = await MemoryIndex.shared.listTurns(limit: 10)
         #expect(hits.map(\.chatHistoryId) == ["real", "legacy", "demo"])
     }
@@ -410,7 +410,7 @@ struct MemoryIndexTests {
         for i in 0..<5 {
             await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i)", sessionId: "s", role: "user", dateMs: now - Int64(5 - i) * day, text: "turn \(i)")
         }
-        await MemoryIndex.shared.indexTurn(chatHistoryId: "demo", sessionId: "demo:abc", role: "user", dateMs: now, text: "demo turn")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:abc", role: "user", dateMs: now, text: "demo turn")
 
         for query in ["", "   ", "\n", "\r\n"] {
             let all = await MemoryIndex.shared.search(query: query, limit: 10, demoActive: false)

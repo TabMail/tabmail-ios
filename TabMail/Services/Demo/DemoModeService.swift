@@ -19,6 +19,7 @@ import GRDB
 /// calls `DemoModeService.completeSetup()` which seeds + injects providers.
 ///
 /// Exit sequence (`exit`):
+/// 0. Revoke the demo run's chat admission, before any wipe (#231).
 /// 1. Wipe demo session token.
 /// 2. Disconnect demo providers from AccountManager.
 /// 3. Wipe GRDB demo rows + FTS demo entries + memory.db demo entries.
@@ -186,6 +187,12 @@ final class DemoModeService {
     func exit() async {
         let store = DemoModeStore.shared
         guard store.isActive else { return }
+
+        // First, before the wipes below: a chat write still running from this
+        // demo (a canceled chat task, compose's own user-turn persistence) then
+        // either lands before the wipes and is deleted by them, or is refused,
+        // so none of this demo's turns can come back afterwards (#231).
+        store.revokeAdmission()
 
         DemoTokenManager.clearSession()
         await AccountManager.shared.unregisterDemoProviders(accountId: DemoSeed.demoAccountId)
