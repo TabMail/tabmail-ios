@@ -166,6 +166,29 @@ struct TutorialCoachContentTests {
         #expect(TutorialCoordinator.tagTarget(for: nil) == nil)
     }
 
+    /// Owner 2026-10-21: a stray tap must not act on the sample mail the
+    /// steps need. Exactly three gestures run, each on its own message.
+    @Test("Only the gesture a step asks for runs, and only on its message")
+    func lockedGestures() {
+        let fixture = DemoSeed.TutorialFixture.self
+        let allowed: Set<String> = [
+            "\(Step.archiveReceipt) tagTap \(fixture.receipt)",
+            "\(Step.replyToPriya) tagTap \(fixture.priyaOffsite)",
+            "\(Step.retagDailyTech) retag \(fixture.dailyTech)",
+        ]
+        let gestures: [(TutorialCoordinator.MailGesture, String)] = [(.tagTap, "tagTap"), (.retag, "retag"), (.other, "other")]
+        let ids: [String?] = [fixture.receipt, fixture.dailyTech, fixture.priyaOffsite, fixture.jordanFlights, nil]
+        var admitted: Set<String> = []
+        for step in Self.allSteps.map(Optional.some) + [nil] {
+            for (gesture, name) in gestures {
+                for id in ids where TutorialCoordinator.allows(gesture, messageId: id, step: step) {
+                    admitted.insert("\(step.map { "\($0)" } ?? "nil") \(name) \(id ?? "nil")")
+                }
+            }
+        }
+        #expect(admitted == allowed)
+    }
+
     @Test("Every card says which part it belongs to, as \"n of 3\", and no card says \"lesson\"")
     func progressLinesAndNoLessonWording() {
         for lesson in TutorialLesson.allCases {
@@ -581,6 +604,15 @@ struct TutorialLifecycleTests {
         try await Task.sleep(for: .seconds(1))
         #expect(coordinator.step == .archiveReceipt, "the step waits for the archive itself")
 
+        // Other mail actions are off, with a notice; the step's own tag runs.
+        #expect(coordinator.lockedNotice == nil)
+        #expect(!coordinator.admits(.tagTap, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.dailyTech))
+        #expect(coordinator.lockedNotice == TutorialCoordinator.lockedNoticeText)
+        #expect(!coordinator.admits(.tagTap, accountId: "another-account", messageId: DemoSeed.TutorialFixture.receipt),
+                "the demo's ids are not another account's")
+        #expect(!coordinator.admits(.other))
+        #expect(coordinator.admits(.tagTap, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.receipt))
+
         // Part 1: the Archive tag, then the retag.
         let receipt = try #require(try await pool.read { db in
             try MessageHeader
@@ -651,6 +683,8 @@ struct TutorialLifecycleTests {
         #expect(coordinator.step == nil)
         #expect(!store.isActive)
         #expect(!store.isTutorialPractice, "a signed-in user's AI calls would stay refused until relaunch")
+        #expect(coordinator.admits(.other), "outside the tutorial every mail action runs")
+        #expect(coordinator.lockedNotice == nil)
     }
 
     /// Every way out of the demo (sign-in, the debug menu, a seeding failure)

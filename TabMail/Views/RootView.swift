@@ -356,8 +356,16 @@ struct RootView: View {
                     .ignoresSafeArea(.container, edges: .bottom)
             }
         }
+        // Tutorial: a refused mail action says why, where the app's other
+        // toasts sit (below the inbox's bottom bar).
+        .overlay(alignment: .bottom) {
+            TutorialLockedToast()
+                .ignoresSafeArea(.container, edges: .bottom)
+                .padding(.bottom, -12)
+        }
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: pendingSendService.current?.id)
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: demoStore.isActive)
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: tutorial.lockedNotice)
         .alert("Could not start demo", isPresented: Binding(
             get: { demoStartError != nil || tutorial.startError != nil },
             set: { if !$0 { demoStartError = nil; tutorial.startError = nil } }

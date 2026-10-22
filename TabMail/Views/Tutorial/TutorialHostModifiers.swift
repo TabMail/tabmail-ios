@@ -58,3 +58,46 @@ struct TutorialInboxScroller: View {
             }
     }
 }
+
+/// A row's only swipe action during the tutorial: it shows the locked notice
+/// instead of acting on the sample mail the steps need.
+struct TutorialLockedSwipeButton: View {
+    var body: some View {
+        Button {
+            _ = TutorialCoordinator.shared.admits(.other)
+        } label: {
+            Label("Off", systemImage: "lock")
+        }
+        .tint(Palette.untagged)
+    }
+}
+
+/// "Other actions are off during the tutorial", shown for a moment after a
+/// refused mail action. Styled and placed like the inbox's notice capsules,
+/// without their close mark (it goes away by itself).
+struct TutorialLockedToast: View {
+    var body: some View {
+        if let notice = TutorialCoordinator.shared.lockedNotice {
+            HStack(spacing: 8) {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.85))
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.85))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .background(
+                Capsule()
+                    .fill(Color(hex: 0x323232))
+                    .shadow(color: .black.opacity(0.2), radius: 4, y: 2)
+            )
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .allowsHitTesting(false)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("tutorial-locked-toast")
+        }
+    }
+}

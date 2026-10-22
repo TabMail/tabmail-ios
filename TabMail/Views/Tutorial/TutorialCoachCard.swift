@@ -11,7 +11,6 @@ struct TutorialCoachView: View {
     /// Extra host handling after a card button ran (the message view closes
     /// itself on "Next").
     var onAction: ((TutorialCoachContent.Action) -> Void)?
-    var style: TutorialCoachCard.Style = .floating
 
     private var tutorial: TutorialCoordinator { TutorialCoordinator.shared }
 
@@ -23,7 +22,6 @@ struct TutorialCoachView: View {
             isSending: PendingSendService.shared.current != nil) {
             TutorialCoachCard(
                 content: content,
-                style: style,
                 onAction: { action in
                     perform(action)
                     onAction?(action)
@@ -49,17 +47,9 @@ struct TutorialCoachView: View {
 }
 
 /// One coach card: progress line with Skip, title, message, then optional
-/// examples and buttons.
+/// examples and buttons, on its own floating surface at the top of the screen.
 struct TutorialCoachCard: View {
-    enum Style {
-        /// Over the inbox, compose or message: its own rounded surface.
-        case floating
-        /// Inside the expanded chat, which already has a glass surface.
-        case inline
-    }
-
     let content: TutorialCoachContent
-    var style: Style = .floating
     var onAction: (TutorialCoachContent.Action) -> Void = { _ in }
     var onSkip: () -> Void = {}
 
@@ -120,20 +110,14 @@ struct TutorialCoachCard: View {
                 .padding(.top, 2)
             }
         }
-        .padding(style == .floating ? 16 : 12)
+        .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background {
-            switch style {
-            case .floating:
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(Palette.boxBg)
-                    .shadow(color: .black.opacity(0.15), radius: 10, y: 3)
-            case .inline:
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Theme.accent.opacity(0.06))
-            }
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Palette.boxBg)
+                .shadow(color: .black.opacity(0.15), radius: 10, y: 3)
         }
-        .padding(.horizontal, style == .floating ? 12 : 14)
+        .padding(.horizontal, 12)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("tutorial-coach")
     }

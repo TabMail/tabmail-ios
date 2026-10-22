@@ -193,6 +193,9 @@ struct InboxView: View {
     /// as one grouped action (single undo entry), mirroring archive/delete-thread.
     @State private var moveThreadGroup: ThreadGroup?
     @State private var chatExpanded = false
+    /// The tutorial coach card's height: the list and the expanded chat keep
+    /// clear of it.
+    @State private var tutorialCardHeight: CGFloat = 0
     @State private var chatInputFocused = false
     @State private var chatWorking = false
     @State private var showSearch = false
@@ -455,11 +458,11 @@ struct InboxView: View {
                         }
                         .padding(.horizontal)
                     }
-                    // Guided tutorial coach card (above the list, so it never
-                    // covers the row it points at).
+                    // Room for the tutorial's coach card, which floats over
+                    // the top of the inbox (overlay below): the list starts
+                    // under it and never hides the row it points at.
                     if TutorialCoordinator.shared.isRunning {
-                        TutorialCoachView(host: .inbox)
-                            .padding(.vertical, 8)
+                        Color.clear.frame(height: tutorialCardHeight)
                     }
                 }
 
@@ -600,6 +603,8 @@ struct InboxView: View {
                 }
             }
             .padding(.bottom, chatExpanded ? 8 : 34)
+            // The expanded chat opens below the tutorial's coach card.
+            .padding(.top, TutorialCoordinator.shared.isRunning ? tutorialCardHeight : 0)
             .animation(.spring(response: 0.45, dampingFraction: 0.82), value: chatExpanded)
             }
             // Compact undo chip (below the bottom bar pills)
@@ -674,6 +679,16 @@ struct InboxView: View {
             }
         }
         .background(Color(.systemBackground))
+        .overlay(alignment: .top) {
+            // Guided tutorial: one coach card pinned to the top of the inbox,
+            // above the list and the expanded chat alike, so it stays put
+            // while either changes.
+            if TutorialCoordinator.shared.isRunning {
+                TutorialCoachView(host: chatExpanded ? .chat : .inbox)
+                    .padding(.vertical, 8)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { tutorialCardHeight = $0 }
+            }
+        }
         .dismissKeyboardOnTap()
         .onReceive(NotificationCenter.default.publisher(for: .emailPillTapped).receive(on: DispatchQueue.main)) { notification in
             guard let realId = notification.userInfo?["realId"] as? String else { return }
@@ -758,6 +773,8 @@ struct InboxView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
+                    // Triage acts on every card: off during the tutorial.
+                    guard TutorialCoordinator.shared.admits(.other) else { return }
                     collapseChat()
                     withAnimation(.easeInOut(duration: 0.3)) {
                         viewModel.mode = viewModel.mode == .normal ? .triage : .normal
@@ -1206,75 +1223,83 @@ struct InboxView: View {
                     }
                 }
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    if isDraftsContext {
-                        Button(role: .destructive) {
-                            if group.isThread && !isExpanded {
-                                swipeAndDeleteThread(group)
-                            } else {
-                                swipeAndDelete(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
-                            }
-                        } label: {
-                            Label("Delete", systemImage: "trash")
-                        }
-                        .tint(.red)
+                    if TutorialCoordinator.shared.isRunning {
+                        TutorialLockedSwipeButton()
                     } else {
-                        // Same-role no-op buttons stay visible but gray out; the tap
-                        // no-ops (handler guards) and just closes the swipe menu.
-                        // See isTrashContext for why the destructive role is dropped.
-                        RestrictedMailActionButton(isRestricted: isDraftsContext) {
-                            if group.isThread && !isExpanded {
-                                swipeAndArchiveThread(group)
-                            } else {
-                                swipeAndArchive(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
+                        if isDraftsContext {
+                            Button(role: .destructive) {
+                                if group.isThread && !isExpanded {
+                                    swipeAndDeleteThread(group)
+                                } else {
+                                    swipeAndDelete(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
+                                }
+                            } label: {
+                                Label("Delete", systemImage: "trash")
                             }
-                        } label: {
-                            if archiveSwipeIsInert {
-                                disabledSwipeLabel("Archive", systemImage: "archivebox")
-                            } else {
-                                Label("Archive", systemImage: "archivebox")
+                            .tint(.red)
+                        } else {
+                            // Same-role no-op buttons stay visible but gray out; the tap
+                            // no-ops (handler guards) and just closes the swipe menu.
+                            // See isTrashContext for why the destructive role is dropped.
+                            RestrictedMailActionButton(isRestricted: isDraftsContext) {
+                                if group.isThread && !isExpanded {
+                                    swipeAndArchiveThread(group)
+                                } else {
+                                    swipeAndArchive(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
+                                }
+                            } label: {
+                                if archiveSwipeIsInert {
+                                    disabledSwipeLabel("Archive", systemImage: "archivebox")
+                                } else {
+                                    Label("Archive", systemImage: "archivebox")
+                                }
                             }
+                            .tint(archiveSwipeIsInert ? disabledSwipeTint : Theme.archive)
+                            Button(role: isTrashContext ? nil : .destructive) {
+                                if group.isThread && !isExpanded {
+                                    swipeAndDeleteThread(group)
+                                } else {
+                                    swipeAndDelete(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
+                                }
+                            } label: {
+                                if isTrashContext {
+                                    disabledSwipeLabel("Trash", systemImage: "trash")
+                                } else {
+                                    Label("Trash", systemImage: "trash")
+                                }
+                            }
+                            .tint(isTrashContext ? disabledSwipeTint : .red)
                         }
-                        .tint(archiveSwipeIsInert ? disabledSwipeTint : Theme.archive)
-                        Button(role: isTrashContext ? nil : .destructive) {
-                            if group.isThread && !isExpanded {
-                                swipeAndDeleteThread(group)
-                            } else {
-                                swipeAndDelete(snapshot, expandedGroup: isExpanded && group.isThread ? group : nil)
-                            }
-                        } label: {
-                            if isTrashContext {
-                                disabledSwipeLabel("Trash", systemImage: "trash")
-                            } else {
-                                Label("Trash", systemImage: "trash")
-                            }
-                        }
-                        .tint(isTrashContext ? disabledSwipeTint : .red)
                     }
                 }
                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                    Button {
-                        viewModel.toggleRead(snapshot.id)
-                    } label: {
-                        Label(
-                            snapshot.isRead ? "Unread" : "Read",
-                            systemImage: snapshot.isRead ? "envelope.badge" : "envelope.open"
-                        )
-                    }
-                    .tint(Theme.accent)
-                    RestrictedMailActionButton(isRestricted: moveSwipeIsInert) {
-                        if group.isThread && !isExpanded {
-                            moveThreadGroup = group
-                        } else {
-                            moveMessageId = snapshot.id
+                    if TutorialCoordinator.shared.isRunning {
+                        TutorialLockedSwipeButton()
+                    } else {
+                        Button {
+                            viewModel.toggleRead(snapshot.id)
+                        } label: {
+                            Label(
+                                snapshot.isRead ? "Unread" : "Read",
+                                systemImage: snapshot.isRead ? "envelope.badge" : "envelope.open"
+                            )
                         }
-                    } label: {
-                        if moveSwipeIsInert {
-                            disabledSwipeLabel("Move", systemImage: "folder")
-                        } else {
-                            Label("Move", systemImage: "folder")
+                        .tint(Theme.accent)
+                        RestrictedMailActionButton(isRestricted: moveSwipeIsInert) {
+                            if group.isThread && !isExpanded {
+                                moveThreadGroup = group
+                            } else {
+                                moveMessageId = snapshot.id
+                            }
+                        } label: {
+                            if moveSwipeIsInert {
+                                disabledSwipeLabel("Move", systemImage: "folder")
+                            } else {
+                                Label("Move", systemImage: "folder")
+                            }
                         }
+                        .tint(moveSwipeIsInert ? disabledSwipeTint : Palette.untagged)
                     }
-                    .tint(moveSwipeIsInert ? disabledSwipeTint : Palette.untagged)
                 }
                 .listRowInsets(EdgeInsets(top: 12, leading: 8, bottom: 12, trailing: 16))
                 .modifier(MessageRowBackgroundModifier(
@@ -1313,59 +1338,67 @@ struct InboxView: View {
                         .tag(child.id)
                         .onAppear { viewModel.requestSnippetIfNeeded(for: child) }
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                            if isDraftsContext {
-                                Button(role: .destructive) {
-                                    swipeAndDelete(child)
-                                } label: {
-                                    Label("Delete", systemImage: "trash")
-                                }
-                                .tint(.red)
+                            if TutorialCoordinator.shared.isRunning {
+                                TutorialLockedSwipeButton()
                             } else {
-                                // Gray no-op buttons — see head-row swipe actions.
-                                RestrictedMailActionButton(isRestricted: isDraftsContext) {
-                                    swipeAndArchive(child)
-                                } label: {
-                                    if archiveSwipeIsInert {
-                                        disabledSwipeLabel("Archive", systemImage: "archivebox")
-                                    } else {
-                                        Label("Archive", systemImage: "archivebox")
+                                if isDraftsContext {
+                                    Button(role: .destructive) {
+                                        swipeAndDelete(child)
+                                    } label: {
+                                        Label("Delete", systemImage: "trash")
                                     }
-                                }
-                                .tint(archiveSwipeIsInert ? disabledSwipeTint : Theme.archive)
-                                Button(role: isTrashContext ? nil : .destructive) {
-                                    swipeAndDelete(child)
-                                } label: {
-                                    if isTrashContext {
-                                        disabledSwipeLabel("Trash", systemImage: "trash")
-                                    } else {
-                                        Label("Trash", systemImage: "trash")
+                                    .tint(.red)
+                                } else {
+                                    // Gray no-op buttons — see head-row swipe actions.
+                                    RestrictedMailActionButton(isRestricted: isDraftsContext) {
+                                        swipeAndArchive(child)
+                                    } label: {
+                                        if archiveSwipeIsInert {
+                                            disabledSwipeLabel("Archive", systemImage: "archivebox")
+                                        } else {
+                                            Label("Archive", systemImage: "archivebox")
+                                        }
                                     }
+                                    .tint(archiveSwipeIsInert ? disabledSwipeTint : Theme.archive)
+                                    Button(role: isTrashContext ? nil : .destructive) {
+                                        swipeAndDelete(child)
+                                    } label: {
+                                        if isTrashContext {
+                                            disabledSwipeLabel("Trash", systemImage: "trash")
+                                        } else {
+                                            Label("Trash", systemImage: "trash")
+                                        }
+                                    }
+                                    .tint(isTrashContext ? disabledSwipeTint : .red)
                                 }
-                                .tint(isTrashContext ? disabledSwipeTint : .red)
                             }
                         }
                         .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                            Button {
-                                viewModel.toggleRead(child.id)
-                            } label: {
-                                Label(
-                                    child.isRead ? "Unread" : "Read",
-                                    systemImage: child.isRead ? "envelope.badge" : "envelope.open"
-                                )
-                            }
-                            .tint(Theme.accent)
-                            RestrictedMailActionButton(isRestricted: moveSwipeIsInert) {
-                                viewModel.beginInteraction()
-                                moveMessageId = child.id
-                                viewModel.endInteraction()
-                            } label: {
-                                if moveSwipeIsInert {
-                                    disabledSwipeLabel("Move", systemImage: "folder")
-                                } else {
-                                    Label("Move", systemImage: "folder")
+                            if TutorialCoordinator.shared.isRunning {
+                                TutorialLockedSwipeButton()
+                            } else {
+                                Button {
+                                    viewModel.toggleRead(child.id)
+                                } label: {
+                                    Label(
+                                        child.isRead ? "Unread" : "Read",
+                                        systemImage: child.isRead ? "envelope.badge" : "envelope.open"
+                                    )
                                 }
+                                .tint(Theme.accent)
+                                RestrictedMailActionButton(isRestricted: moveSwipeIsInert) {
+                                    viewModel.beginInteraction()
+                                    moveMessageId = child.id
+                                    viewModel.endInteraction()
+                                } label: {
+                                    if moveSwipeIsInert {
+                                        disabledSwipeLabel("Move", systemImage: "folder")
+                                    } else {
+                                        Label("Move", systemImage: "folder")
+                                    }
+                                }
+                                .tint(moveSwipeIsInert ? disabledSwipeTint : Palette.untagged)
                             }
-                            .tint(moveSwipeIsInert ? disabledSwipeTint : Palette.untagged)
                         }
                         .listRowInsets(EdgeInsets(top: 12, leading: 8, bottom: 12, trailing: 16))
                         .listRowBackground(Color(.tertiarySystemFill))
@@ -1440,57 +1473,65 @@ struct InboxView: View {
                                         prevTag: prevTag, nextTag: nextTag)
                 )
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                    if isDraftsContext {
-                        Button(role: .destructive) {
-                            swipeAndDelete(snapshot)
-                        } label: {
-                            Label("Delete", systemImage: "trash")
-                        }
-                        .tint(.red)
+                    if TutorialCoordinator.shared.isRunning {
+                        TutorialLockedSwipeButton()
                     } else {
-                        // Gray no-op buttons — see head-row swipe actions.
-                        RestrictedMailActionButton(isRestricted: isDraftsContext) {
-                            swipeAndArchive(snapshot)
-                        } label: {
-                            if archiveSwipeIsInert {
-                                disabledSwipeLabel("Archive", systemImage: "archivebox")
-                            } else {
-                                Label("Archive", systemImage: "archivebox")
+                        if isDraftsContext {
+                            Button(role: .destructive) {
+                                swipeAndDelete(snapshot)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
                             }
-                        }
-                        .tint(archiveSwipeIsInert ? disabledSwipeTint : Theme.archive)
-                        Button(role: isTrashContext ? nil : .destructive) {
-                            swipeAndDelete(snapshot)
-                        } label: {
-                            if isTrashContext {
-                                disabledSwipeLabel("Trash", systemImage: "trash")
-                            } else {
-                                Label("Trash", systemImage: "trash")
+                            .tint(.red)
+                        } else {
+                            // Gray no-op buttons — see head-row swipe actions.
+                            RestrictedMailActionButton(isRestricted: isDraftsContext) {
+                                swipeAndArchive(snapshot)
+                            } label: {
+                                if archiveSwipeIsInert {
+                                    disabledSwipeLabel("Archive", systemImage: "archivebox")
+                                } else {
+                                    Label("Archive", systemImage: "archivebox")
+                                }
                             }
+                            .tint(archiveSwipeIsInert ? disabledSwipeTint : Theme.archive)
+                            Button(role: isTrashContext ? nil : .destructive) {
+                                swipeAndDelete(snapshot)
+                            } label: {
+                                if isTrashContext {
+                                    disabledSwipeLabel("Trash", systemImage: "trash")
+                                } else {
+                                    Label("Trash", systemImage: "trash")
+                                }
+                            }
+                            .tint(isTrashContext ? disabledSwipeTint : .red)
                         }
-                        .tint(isTrashContext ? disabledSwipeTint : .red)
                     }
                 }
                 .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                    Button {
-                        viewModel.toggleRead(snapshot.id)
-                    } label: {
-                        Label(
-                            snapshot.isRead ? "Unread" : "Read",
-                            systemImage: snapshot.isRead ? "envelope.badge" : "envelope.open"
-                        )
-                    }
-                    .tint(Theme.accent)
-                    RestrictedMailActionButton(isRestricted: moveSwipeIsInert) {
-                        moveMessageId = snapshot.id
-                    } label: {
-                        if moveSwipeIsInert {
-                            disabledSwipeLabel("Move", systemImage: "folder")
-                        } else {
-                            Label("Move", systemImage: "folder")
+                    if TutorialCoordinator.shared.isRunning {
+                        TutorialLockedSwipeButton()
+                    } else {
+                        Button {
+                            viewModel.toggleRead(snapshot.id)
+                        } label: {
+                            Label(
+                                snapshot.isRead ? "Unread" : "Read",
+                                systemImage: snapshot.isRead ? "envelope.badge" : "envelope.open"
+                            )
                         }
+                        .tint(Theme.accent)
+                        RestrictedMailActionButton(isRestricted: moveSwipeIsInert) {
+                            moveMessageId = snapshot.id
+                        } label: {
+                            if moveSwipeIsInert {
+                                disabledSwipeLabel("Move", systemImage: "folder")
+                            } else {
+                                Label("Move", systemImage: "folder")
+                            }
+                        }
+                        .tint(moveSwipeIsInert ? disabledSwipeTint : Palette.untagged)
                     }
-                    .tint(moveSwipeIsInert ? disabledSwipeTint : Palette.untagged)
                 }
             }
 

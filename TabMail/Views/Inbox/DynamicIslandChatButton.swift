@@ -334,11 +334,6 @@ struct DynamicIslandChat: View {
                     .frame(maxWidth: .infinity, alignment: .trailing)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 4)
-                if isInboxChat && TutorialCoordinator.shared.isRunning {
-                    TutorialCoachView(host: .chat, style: .inline)
-                        .padding(.bottom, 6)
-                        .layoutPriority(1)
-                }
                 Divider()
                 if !hasTabMailSession {
                     signInBar

@@ -66,6 +66,13 @@ final class TutorialCoordinator {
     /// Why the last start failed (RootView's "Could not start demo" alert).
     var startError: String?
 
+    /// Shown briefly after a mail action the step does not ask for was
+    /// refused (`TutorialLockedToast`).
+    private(set) var lockedNotice: String?
+    private var lockedNoticeGeneration = 0
+    static let lockedNoticeText = "Other actions are off during the tutorial."
+    static let lockedNoticeDuration: Duration = .seconds(2.5)
+
     private let progress = TutorialProgress()
     /// Observable copy of the durable completion set (drives the sidebar row).
     private(set) var completedLessons: Set<TutorialLesson>
@@ -146,6 +153,7 @@ final class TutorialCoordinator {
         savedTemplateId = nil
         practiceReplyText = nil
         lastFacts = nil
+        lockedNotice = nil
         DemoModeStore.shared.isTutorialPractice = false
     }
 
@@ -331,6 +339,52 @@ final class TutorialCoordinator {
     /// Whether a row's action tag gets the tutorial's highlight ring now.
     func highlightsTag(accountId: String, messageId: String) -> Bool {
         accountId == DemoSeed.demoAccountId && messageId == Self.tagTarget(for: step)
+    }
+
+    // MARK: - Locked actions
+
+    /// A mail action the tutorial may run. Every other one is off while it
+    /// runs (owner 2026-10-21), so a stray tap cannot act on the sample mail
+    /// the steps need.
+    enum MailGesture {
+        /// Tapping an action tag, which runs its action.
+        case tagTap
+        /// Choosing a tag from the tag menu (teaching the right action).
+        case retag
+        /// Swipes, triage and every other mail action.
+        case other
+    }
+
+    /// Whether the step asks for `gesture` on `messageId` (nil: no message).
+    nonisolated static func allows(_ gesture: MailGesture, messageId: String?, step: Step?) -> Bool {
+        guard let messageId, messageId == tagTarget(for: step) else { return false }
+        switch gesture {
+        case .tagTap: return step == .archiveReceipt || step == .replyToPriya
+        case .retag: return step == .retagDailyTech
+        case .other: return false
+        }
+    }
+
+    /// Outside the tutorial, true. Inside it, true only for what the step
+    /// asks for; otherwise shows the locked notice and returns false.
+    func admits(_ gesture: MailGesture, accountId: String? = nil, messageId: String? = nil) -> Bool {
+        guard isRunning else { return true }
+        if accountId == DemoSeed.demoAccountId, Self.allows(gesture, messageId: messageId, step: step) {
+            return true
+        }
+        showLockedNotice()
+        return false
+    }
+
+    private func showLockedNotice() {
+        lockedNoticeGeneration += 1
+        let generation = lockedNoticeGeneration
+        lockedNotice = Self.lockedNoticeText
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.lockedNoticeDuration)
+            guard let self, generation == self.lockedNoticeGeneration else { return }
+            self.lockedNotice = nil
+        }
     }
 
     // MARK: - Sidebar row

@@ -172,6 +172,8 @@ struct MessageRowView: View {
                                     .sensoryFeedback(.impact(weight: .medium), trigger: tagMenuOpenTick)
                             } primaryAction: {
                                 tagTapTick &+= 1
+                                guard TutorialCoordinator.shared.admits(
+                                    .tagTap, accountId: message.accountId, messageId: message.messageId) else { return }
                                 onTagAction?()
                             }
                             .simultaneousGesture(
@@ -215,20 +217,26 @@ struct MessageRowView: View {
 
     @ViewBuilder
     private var retagMenu: some View {
-        if let onRetag {
-            Button { onRetag(.reply) } label: {
+        if onRetag != nil {
+            Button { retag(.reply) } label: {
                 Label("Tag as Reply", systemImage: "arrowshape.turn.up.left")
             }
-            Button { onRetag(ActionTag.none) } label: {
+            Button { retag(ActionTag.none) } label: {
                 Label("Tag as None", systemImage: "tag.slash")
             }
-            Button { onRetag(.archive) } label: {
+            Button { retag(.archive) } label: {
                 Label("Tag as Archive", systemImage: "archivebox")
             }
-            Button { onRetag(.delete) } label: {
+            Button { retag(.delete) } label: {
                 Label("Tag as Delete", systemImage: "trash")
             }
         }
+    }
+
+    private func retag(_ tag: ActionTag) {
+        guard TutorialCoordinator.shared.admits(
+            .retag, accountId: message.accountId, messageId: message.messageId) else { return }
+        onRetag?(tag)
     }
 
     private var showShimmer: Bool {

@@ -25,15 +25,20 @@ private func previewCard(
     .background(Palette.previewPaneBg)
 }
 
-#Preview("Parts 2 and 3 in chat") {
+#Preview("Chat: card on top, filled-in input") {
     VStack(spacing: 12) {
         if let content = previewCard(.makeTemplate, .reuseReply, .chat) {
-            TutorialCoachCard(content: content, style: .inline)
+            TutorialCoachCard(content: content)
         }
+        Spacer()
         TutorialChatInputBar(prompt: .makeTemplate, isWorking: false) { _ in }
-        if let content = previewCard(.moreToAsk, .askAnything, .chat) {
-            TutorialCoachCard(content: content, style: .inline)
-        }
+    }
+    .padding(.vertical)
+}
+
+#Preview("Chat with nothing to send") {
+    VStack {
+        Spacer()
         TutorialChatInputBar(prompt: nil, isWorking: false) { _ in }
     }
     .padding(.vertical)
