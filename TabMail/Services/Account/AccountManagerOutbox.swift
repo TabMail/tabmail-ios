@@ -113,7 +113,8 @@ extension AccountManager {
         draftServerFolderPath: String? = nil,
         serverDraftGmailMessageId: String? = nil,
         draftId: String,
-        instanceEpoch: String
+        instanceEpoch: String,
+        holdsForUndo: Bool = true
     ) async throws -> (outboxId: String, holdUntil: Date?) {
         let result = try await Self.persistQueuedSend(
             draft: draft,
@@ -125,7 +126,8 @@ extension AccountManager {
             draftServerFolderPath: draftServerFolderPath,
             serverDraftGmailMessageId: serverDraftGmailMessageId,
             draftId: draftId,
-            instanceEpoch: instanceEpoch
+            instanceEpoch: instanceEpoch,
+            holdsForUndo: holdsForUndo
         )
         if DebugModeManager.isLoggingEnabled() {
             if result.deduped {
@@ -203,7 +205,8 @@ extension AccountManager {
         draftServerFolderPath: String? = nil,
         serverDraftGmailMessageId: String? = nil,
         draftId: String,
-        instanceEpoch: String
+        instanceEpoch: String,
+        holdsForUndo: Bool = true
     ) async throws -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?, holdUntil: Date?) {
         guard !instanceEpoch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw OutboxAdmissionError.invalidInstanceEpoch
@@ -229,10 +232,14 @@ extension AccountManager {
         // column — which is why `holdUntil` is returned to the caller. The toast
         // cannot re-derive this instant: it is only reached after the awaited
         // write below returns.
+        //
+        // `holdsForUndo == false` (the guided tutorial's practice reply, owner
+        // 2026-10-21) stores no hold: the drain may claim the row at once and
+        // the toast offers no Undo, exactly as for a legacy NULL hold.
         let queuedAt = Date()
-        outbox.holdUntil = queuedAt.addingTimeInterval(
-            SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds
-        )
+        outbox.holdUntil = holdsForUndo
+            ? queuedAt.addingTimeInterval(SyncConfig.outboxUndoHoldSeconds + SyncConfig.outboxClaimBufferSeconds)
+            : nil
 
         // Save attachments to disk first (outside DB transaction — a file I/O
         // failure must not leave an outbox row pointing at a half-written dir).

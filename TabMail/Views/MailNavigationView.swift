@@ -370,9 +370,9 @@ struct MailNavigationView: View {
 
                     // App sections
                     Section {
-                        if case .progress(let done, let total, let next) = tutorialRowState {
-                            TutorialSidebarRow(state: .progress(done: done, total: total, next: next)) {
-                                startTutorial(next)
+                        if let tutorialRowState {
+                            TutorialSidebarRow(state: tutorialRowState) {
+                                startTutorial(tutorialRowState.next)
                             }
                         }
 
@@ -444,12 +444,6 @@ struct MailNavigationView: View {
                         if DebugModeManager.shared.isUnlocked {
                             NavigationLink(value: MailboxSelection.debug) {
                                 Label("Debug", systemImage: "ladybug")
-                            }
-                        }
-
-                        if tutorialRowState == .replay {
-                            TutorialSidebarRow(state: .replay) {
-                                startTutorial(.actOnEmail)
                             }
                         }
                     }

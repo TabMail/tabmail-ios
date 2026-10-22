@@ -101,3 +101,23 @@ struct TutorialLockedToast: View {
         }
     }
 }
+
+/// A pulsing accent ring around the collapsed Chat pill when the step's next
+/// move is opening the chat (owner 2026-10-21: the pill was not highlighted).
+struct TutorialPillHighlight: View {
+    @State private var glowing = false
+
+    var body: some View {
+        Capsule()
+            .stroke(Theme.accent, lineWidth: 3)
+            .padding(-4)
+            .shadow(color: Theme.accent.opacity(glowing ? 0.8 : 0.25), radius: glowing ? 12 : 4)
+            .allowsHitTesting(false)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+                    glowing = true
+                }
+            }
+            .accessibilityIdentifier("tutorial-pill-highlight")
+    }
+}

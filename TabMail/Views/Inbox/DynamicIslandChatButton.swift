@@ -357,6 +357,12 @@ struct DynamicIslandChat: View {
             }
         }
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: isExpanded ? 24 : 100))
+        .overlay {
+            // Guided tutorial: the step's next move is opening the inbox chat.
+            if !isExpanded && isInboxChat && TutorialCoordinator.shared.chatPrompt != nil {
+                TutorialPillHighlight()
+            }
+        }
         .frame(
             maxWidth: isExpanded ? .infinity : nil,
             maxHeight: isExpanded ? ((UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.bounds.height ?? 800) * expandedHeightFraction : nil

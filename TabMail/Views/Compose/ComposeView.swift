@@ -972,6 +972,8 @@ struct ComposeView: View {
         /// replied.
         let resolvedReplyTarget: MessageHeader?
         let isForward: Bool
+        /// The guided tutorial's practice reply: sent with no undo hold.
+        let isTutorialPracticeReply: Bool
         let outbound: DraftMessage
     }
     @State private var recipients = ComposeDraftGuards.Recipients()
@@ -3445,7 +3447,8 @@ struct ComposeView: View {
         }
 
         let (sendBody, isHTML) = buildSendBody()
-        if isTutorialPracticeReply {
+        let isPracticeReply = isTutorialPracticeReply
+        if isPracticeReply {
             // The template made from this reply uses the text as written.
             TutorialCoordinator.shared.practiceReplyAuthored(messageBody)
         }
@@ -3486,6 +3489,7 @@ struct ComposeView: View {
             replyToUidValidity: replyTo?.observedUidValidity,
             resolvedReplyTarget: sendTarget,
             isForward: isForward,
+            isTutorialPracticeReply: isPracticeReply,
             outbound: outbound)
 
         // Capture existing draft (server-side metadata preserved through save-before-send).
@@ -3648,7 +3652,9 @@ struct ComposeView: View {
                     return containedMessageId
                 }(),
                 draftId: snapshot.draftId,
-                instanceEpoch: snapshot.instanceEpoch
+                instanceEpoch: snapshot.instanceEpoch,
+                // The tutorial's practice reply goes out at once (owner 2026-10-21).
+                holdsForUndo: !snapshot.isTutorialPracticeReply
             )
         } catch {
             // Persistence failed — the message is NOT queued. Re-enable Send so the

@@ -44,14 +44,15 @@ struct TutorialProgressTests {
         #expect(!progress.isWelcomePending)
     }
 
-    @Test("The row resumes the first unfinished part and turns into Replay when all are done")
+    @Test("The row resumes the first unfinished part and is gone when all are done")
     func rowState() {
-        #expect(TutorialProgress.rowState(completed: []) == .progress(done: 0, total: 3, next: .actOnEmail))
-        #expect(TutorialProgress.rowState(completed: [.actOnEmail]) == .progress(done: 1, total: 3, next: .reuseReply))
+        #expect(TutorialProgress.rowState(completed: []) == TutorialRowState(done: 0, total: 3, next: .actOnEmail))
+        #expect(TutorialProgress.rowState(completed: [.actOnEmail]) == TutorialRowState(done: 1, total: 3, next: .reuseReply))
         // Out-of-order completion still resumes the earliest open part.
         #expect(TutorialProgress.rowState(completed: [.actOnEmail, .askAnything])
-            == .progress(done: 2, total: 3, next: .reuseReply))
-        #expect(TutorialProgress.rowState(completed: Set(TutorialLesson.allCases)) == .replay)
+            == TutorialRowState(done: 2, total: 3, next: .reuseReply))
+        // Replay lives in the debug menu, not the sidebar (owner 2026-10-21).
+        #expect(TutorialProgress.rowState(completed: Set(TutorialLesson.allCases)) == nil)
     }
 }
 

@@ -389,7 +389,7 @@ final class TutorialCoordinator {
 
     // MARK: - Sidebar row
 
-    var rowState: TutorialRowState {
+    var rowState: TutorialRowState? {
         TutorialProgress.rowState(completed: completedLessons)
     }
 }

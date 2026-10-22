@@ -48,15 +48,16 @@ struct DebugMenuView: View {
                     }
                 }
                 if !TutorialCoordinator.shared.isRunning {
-                    // The guided tutorial from part 1, whatever its progress,
-                    // as the first-launch welcome's Start runs it. A plain demo
-                    // is replaced by the tutorial's fresh one.
+                    // Replay: the guided tutorial from part 1, whatever its
+                    // progress, as the first-launch welcome's Start runs it. The
+                    // only replay entry (owner 2026-10-21). A plain demo is
+                    // replaced by the tutorial's fresh one.
                     Button {
                         Task {
                             await TutorialCoordinator.shared.start(.actOnEmail, hasTabMailSession: TabMailAuthService.hasSession())
                         }
                     } label: {
-                        Label("Enter Tutorial", systemImage: "graduationcap")
+                        Label("Replay Tutorial", systemImage: "graduationcap")
                     }
                 }
                 if let demoEnterError {

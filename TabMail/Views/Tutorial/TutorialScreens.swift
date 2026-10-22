@@ -93,7 +93,7 @@ struct TutorialFinishView: View {
             .foregroundStyle(Theme.textPrimary)
             .padding(.vertical, 8)
 
-            Text("Practice changes stay in the demo. Replay the tutorial any time from the sidebar.")
+            Text("Practice changes stay in the demo.")
                 .font(.footnote)
                 .foregroundStyle(Theme.textSecondary)
                 .multilineTextAlignment(.center)
@@ -186,33 +186,28 @@ private struct TutorialPrimaryButton: View {
 }
 
 /// The sidebar tutorial row (owner V5): progress at the top of the app
-/// section until every part is done, then "Replay tutorial"
-/// at its end. No pop-ups or badges.
+/// section until every part is done, then nothing (replay is in the debug
+/// menu, owner 2026-10-21). No pop-ups or badges.
 struct TutorialSidebarRow: View {
     let state: TutorialRowState
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            switch state {
-            case .progress(let done, let total, _):
-                VStack(alignment: .leading, spacing: 6) {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Tutorial")
-                            Text("\(done) of \(total) done")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "graduationcap")
+            VStack(alignment: .leading, spacing: 6) {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Tutorial")
+                        Text("\(state.done) of \(state.total) done")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
-                    ProgressView(value: Double(done), total: Double(total))
-                        .tint(Theme.accent)
-                        .padding(.leading, 8)
+                } icon: {
+                    Image(systemName: "graduationcap")
                 }
-            case .replay:
-                Label("Replay tutorial", systemImage: "arrow.counterclockwise")
+                ProgressView(value: Double(state.done), total: Double(state.total))
+                    .tint(Theme.accent)
+                    .padding(.leading, 8)
             }
         }
         .foregroundStyle(Theme.textPrimary)

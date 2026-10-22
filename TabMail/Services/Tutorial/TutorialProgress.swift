@@ -22,12 +22,13 @@ enum TutorialLesson: Int, CaseIterable, Sendable {
     var next: TutorialLesson? { TutorialLesson(rawValue: rawValue + 1) }
 }
 
-/// What the sidebar tutorial row shows.
-enum TutorialRowState: Equatable, Sendable {
-    /// "Tutorial · done of total done", resumes `next`.
-    case progress(done: Int, total: Int, next: TutorialLesson)
-    /// Every part is done: a plain "Replay tutorial" row.
-    case replay
+/// The sidebar tutorial row: "Tutorial · done of total done", resumes `next`.
+/// Once every part is done there is no row; replay lives in the debug menu
+/// (owner 2026-10-21).
+struct TutorialRowState: Equatable, Sendable {
+    let done: Int
+    let total: Int
+    let next: TutorialLesson
 }
 
 /// Durable tutorial state (UserDefaults, per install): the first-run welcome
@@ -80,9 +81,10 @@ struct TutorialProgress {
         defaults.set(done.map(\.rawValue).sorted(), forKey: Keys.completedLessons)
     }
 
-    static func rowState(completed done: Set<TutorialLesson>) -> TutorialRowState {
+    /// nil once every part is done.
+    static func rowState(completed done: Set<TutorialLesson>) -> TutorialRowState? {
         let all = TutorialLesson.allCases
-        guard let next = all.first(where: { !done.contains($0) }) else { return .replay }
-        return .progress(done: all.filter(done.contains).count, total: all.count, next: next)
+        guard let next = all.first(where: { !done.contains($0) }) else { return nil }
+        return TutorialRowState(done: all.filter(done.contains).count, total: all.count, next: next)
     }
 }

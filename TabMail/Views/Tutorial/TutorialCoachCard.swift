@@ -48,31 +48,41 @@ struct TutorialCoachView: View {
 
 /// One coach card: progress line with Skip, title, message, then optional
 /// examples and buttons, on its own floating surface at the top of the screen.
+/// A dark translucent HUD in both appearances (owner 2026-10-21, mock 2), so it
+/// reads as guidance on top of the app rather than part of it.
 struct TutorialCoachCard: View {
     let content: TutorialCoachContent
     var onAction: (TutorialCoachContent.Action) -> Void = { _ in }
     var onSkip: () -> Void = {}
+
+    /// The host's appearance: the HUD is near-black over a light app and a
+    /// lifted gray over a dark one, so it stands apart from both.
+    @Environment(\.colorScheme) private var hostScheme
+
+    private var hudTint: Color {
+        hostScheme == .dark ? Color(white: 0.23).opacity(0.72) : Color(white: 0.07).opacity(0.78)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 Text(content.progressLine)
                     .font(.caption)
-                    .foregroundStyle(Theme.textSecondary)
+                    .foregroundStyle(.white.opacity(0.6))
                 Spacer(minLength: 8)
                 Button("Skip tutorial", action: onSkip)
                     .font(.caption)
-                    .foregroundStyle(Theme.textSecondary)
+                    .foregroundStyle(.white.opacity(0.6))
                     .accessibilityIdentifier("tutorial-skip")
             }
 
             Text(content.title)
                 .font(.headline)
-                .foregroundStyle(Theme.textPrimary)
+                .foregroundStyle(.white)
 
             Text(content.message)
                 .font(.subheadline)
-                .foregroundStyle(Theme.textSecondary)
+                .foregroundStyle(.white.opacity(0.78))
                 .fixedSize(horizontal: false, vertical: true)
 
             if !content.examples.isEmpty {
@@ -80,11 +90,11 @@ struct TutorialCoachCard: View {
                     Text("You can also ask TabMail to:")
                         .font(.subheadline)
                         .fontWeight(.medium)
-                        .foregroundStyle(Theme.textPrimary)
+                        .foregroundStyle(.white)
                     ForEach(content.examples, id: \.self) { example in
                         Label(example, systemImage: "checkmark")
                             .font(.subheadline)
-                            .foregroundStyle(Theme.textSecondary)
+                            .foregroundStyle(.white.opacity(0.78))
                     }
                 }
             }
@@ -112,10 +122,14 @@ struct TutorialCoachCard: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Dark controls (spinner, bordered buttons) on the dark HUD.
+        .environment(\.colorScheme, .dark)
         .background {
-            RoundedRectangle(cornerRadius: 16)
-                .fill(Palette.boxBg)
-                .shadow(color: .black.opacity(0.15), radius: 10, y: 3)
+            RoundedRectangle(cornerRadius: 18)
+                .fill(.ultraThinMaterial)
+                .environment(\.colorScheme, .dark)
+                .overlay(RoundedRectangle(cornerRadius: 18).fill(hudTint))
+                .shadow(color: .black.opacity(0.25), radius: 15, y: 5)
         }
         .padding(.horizontal, 12)
         .accessibilityElement(children: .contain)

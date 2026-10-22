@@ -17,12 +17,11 @@ import SwiftUI
     TutorialFinishView(signedIn: true)
 }
 
-#Preview("Sidebar rows") {
+#Preview("Sidebar row") {
     List {
         Section {
-            TutorialSidebarRow(state: .progress(done: 1, total: 3, next: .reuseReply)) {}
+            TutorialSidebarRow(state: TutorialRowState(done: 1, total: 3, next: .reuseReply)) {}
             Label("TabMail Settings", systemImage: "brain")
-            TutorialSidebarRow(state: .replay) {}
         }
     }
 }
