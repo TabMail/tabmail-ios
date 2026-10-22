@@ -837,6 +837,8 @@ actor GmailProvider: EmailProvider {
     /// - every other image with a Content-ID is an inline image, whether or not the
     ///   body references it; every other leaf that is not body text is a file;
     /// - a file whose bytes came inline is carried with them (`attachmentData`);
+    /// - a file that is a container with no bytes of its own is refused
+    ///   (`DraftCopyUnsupportedAttachment`); only an empty LEAF reads as empty;
     /// - a part whose bytes cannot be read throws, never drops out.
     /// Iterative, so a deeply nested copy cannot exhaust the stack.
     private func readDraftMessage(id: String) async throws -> FullMessageInfo {
@@ -936,6 +938,10 @@ actor GmailProvider: EmailProvider {
         if let attachmentId = part.body?.attachmentId {
             return try await fetchAttachment(messageId: messageId, attachmentId: attachmentId)
         }
+        // A file part with children and neither (an attached message Gmail lists as
+        // its parts, which may report size 0) cannot be carried as one file: refused
+        // like an Outlook item attachment (#241), never read as an empty file.
+        guard (part.parts ?? []).isEmpty else { throw DraftCopyUnsupportedAttachment() }
         if (part.body?.size ?? 0) == 0 { return Data() }
         throw GmailDraftCopyIncomplete(mimeType: part.mimeType ?? "")
     }

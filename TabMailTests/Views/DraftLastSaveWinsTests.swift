@@ -506,6 +506,22 @@ struct DraftCopyReadTests {
         }
     }
 
+    /// Gmail may list an attached message by its parts, with size 0 and no attachment
+    /// id; only an empty leaf is empty, so such a file is refused rather than read
+    /// as a 0-byte file a save would then upload over the real one.
+    @Test("Gmail: a file that is a container with no bytes of its own is refused, never read as empty", arguments: [
+        #"{"mimeType":"message/rfc822","filename":"fwd.eml","body":{"size":0},"parts":[{"mimeType":"text/plain","body":{"size":5,"data":"SU5ORVI"}}]}"#,
+        #"{"mimeType":"multipart/mixed","headers":[{"name":"Content-Disposition","value":"attachment"}],"body":{"size":0},"parts":[{"mimeType":"application/pdf","filename":"a.pdf","body":{"size":9,"attachmentId":"a1"}}]}"#,
+    ])
+    func gmailContainerFileIsRefused(part: String) async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let provider = Self.gmailDraftProvider(http, parts: part)
+        await #expect(throws: DraftCopyUnsupportedAttachment.self) {
+            try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r1"))
+        }
+    }
+
     @Test("Gmail: an unreadable draft lookup or message is an unknown, never gone", arguments: [
         (#"{"message":{}}"#, 200, true),
         ("not json", 200, true),
@@ -633,6 +649,42 @@ struct DraftCopyReadTests {
         }
         #expect(!http.recordedCalls().contains { $0.method == "DELETE" },
                 "a failed save must not remove anything from the server copy")
+    }
+
+    @Test("Graph: a draft file with no name is read under the unnamed-file name", arguments: ["\"\"", "null"])
+    func graphNamelessFileIsRead(name: String) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/messages/g1", method: "GET",
+                      response: .json(raw: Self.graphMessageJSON(id: "g1", html: "<p>Plan</p>")))
+        http.register(path: "/messages/g1/attachments", method: "GET", response: .json(raw: """
+            {"value":[{"id":"n1","name":\(name),"contentType":"application/pdf","size":5,"isInline":false,
+             "@odata.type":"#microsoft.graph.fileAttachment"}]}
+            """))
+        let provider = ExchangeProvider(
+            userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+
+        let copy = try #require(try await provider.fetchDraftCopy(identity: .outlook(graphId: "g1")))
+        #expect(copy.attachments.map(\.filename) == [DraftReadConfig.unnamedAttachmentFilename])
+        #expect(copy.attachments.map(\.section) == ["n1"])
+    }
+
+    @Test("Graph: a save pairs a nameless server file with the file read from it, sending and deleting nothing")
+    func graphNamelessFilePairs() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let provider = Self.graphUpdateProvider(http, serverFiles: [(id: "n1", name: "")])
+        http.register(path: "/messages/g1/attachments", method: "POST", response: .json(raw: #"{"id":"x1"}"#))
+
+        _ = try await provider.saveDraft(
+            Self.draft(attachments: [Self.file(DraftReadConfig.unnamedAttachmentFilename)]),
+            existingIdentity: .outlook(graphId: "g1"), draftsFolderPath: "Drafts")
+
+        let calls = http.recordedCalls()
+        #expect(calls.contains { $0.method == "GET" && $0.url.contains("/messages/g1/attachments") },
+                "the fixture reaches the pairing")
+        #expect(!calls.contains { $0.method == "POST" }, "the file the server holds is never sent again")
+        #expect(!calls.contains { $0.method == "DELETE" }, "the server's file is the draft's own and stays")
     }
 
     @Test("Graph: files pair with server attachments by name, one to one")

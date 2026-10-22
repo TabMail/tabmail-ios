@@ -1110,6 +1110,75 @@ struct DraftOpenReloadTests {
         }
     }
 
+    @Test("A Gmail reload facing attached mail it cannot carry keeps the local draft and its file")
+    func gmailReloadOfAnUncarriableFileKeepsTheLocalDraft() async throws {
+        try await withInstalledPool { pool in
+            let localEml = Data("From: a@example.com\r\nSubject: Fwd\r\n\r\nINNER".utf8)
+            let dir = DraftAttachmentStorage.newStagingDirName()
+            try DraftAttachmentStorage.saveAttachments(
+                [DraftAttachment(filename: "fwd.eml", mimeType: "message/rfc822", data: localEml)], dirName: dir)
+            let draft = try await pool.write { db -> Draft in
+                var row = try insertDraft(db, provider: .gmail)
+                row.attachmentsDirName = dir
+                try row.update(db)
+                return row
+            }
+            let date = String(Int(Date().timeIntervalSince1970 * 1000))
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let text = Self.base64URL(Data("phone edit".utf8))
+            let inner = Self.base64URL(Data("INNER".utf8))
+            http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"id":"r1","message":{"id":"m3"}}"#))
+            http.register(path: "/messages/m3", method: "GET", response: .json(raw: """
+                {"id":"m3","internalDate":"\(date)","labelIds":["DRAFT"],"payload":{"mimeType":"multipart/mixed",\
+                "headers":[{"name":"Subject","value":"Plan"},{"name":"From","value":"owner@example.com"},\
+                {"name":"To","value":"alice@example.com"}],"parts":[\
+                {"mimeType":"text/plain","body":{"size":10,"data":"\(text)"}},\
+                {"mimeType":"message/rfc822","filename":"fwd.eml",\
+                "headers":[{"name":"Content-Type","value":"message/rfc822; name=fwd.eml"},\
+                {"name":"Content-Disposition","value":"attachment; filename=fwd.eml"}],\
+                "body":{"size":0},\
+                "parts":[{"mimeType":"text/plain","body":{"size":5,"data":"\(inner)"}}]}]}}
+                """))
+            let provider = GmailProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                let check = await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                let files = try DraftAttachmentStorage.loadAttachments(dirName: row.attachmentsDirName)
+                #expect(check == .unsupportedAttachment)
+                #expect(row.pushAttemptVersion == draft.pushAttemptVersion, "nothing was applied")
+                #expect(row.attachmentsDirName == dir)
+                #expect(files.map(\.filename) == ["fwd.eml"])
+                #expect(files.map(\.data) == [localEml], "the local attached mail keeps its bytes")
+                DraftAttachmentStorage.deleteAttachments(dirName: dir)
+                if let rowDir = row.attachmentsDirName, rowDir != dir { DraftAttachmentStorage.deleteAttachments(dirName: rowDir) }
+            }
+        }
+    }
+
+    @Test("Gmail adoption of attached mail it cannot carry is refused and stores nothing")
+    func gmailAdoptionOfAnUncarriableFileIsRefused() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertGmailHeader($0, owners: 0) }
+            let before = try await pool.read { try Draft.fetchCount($0) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let inner = Self.base64URL(Data("INNER".utf8))
+            let provider = gmailProvider(http, body: "See the forwarded mail", files: """
+                ,{"mimeType":"message/rfc822","filename":"fwd.eml",\
+                "headers":[{"name":"Content-Disposition","value":"attachment; filename=fwd.eml"}],\
+                "body":{"size":0},"parts":[{"mimeType":"text/plain","body":{"size":5,"data":"\(inner)"}}]}
+                """)
+            try await withRegisteredProvider(provider) {
+                let resolution = await loaderResolution(header)
+                #expect(resolution == .unsupportedAttachment)
+                let after = try await pool.read { try Draft.fetchCount($0) }
+                #expect(after == before, "no adopted row")
+            }
+        }
+    }
+
     @Test("A server read that outlasts the open budget opens the local copy, and its late answer writes nothing")
     func slowServerReadOpensTheLocalCopy() async throws {
         try await withInstalledPool { pool in
@@ -1476,6 +1545,22 @@ struct DraftOpenReloadTests {
                 #expect(await loaderResolution(header) == .noLocalCopy)
                 let drafts = try await pool.read { try Draft.fetchCount($0) }
                 #expect(drafts == 1)
+            }
+        }
+    }
+
+    @Test("Opening another app's Outlook draft that is already gone shows the final card and stores nothing")
+    func adoptionOfAGoneDraftIsFinal() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertOutlookHeader($0) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let provider = exchangeProvider(http, copyResponse: .status(404))
+            try await withRegisteredProvider(provider) {
+                #expect(await loaderResolution(header) == .noLocalCopy, "gone is final, never retryable")
+                let drafts = try await pool.read { try Draft.fetchCount($0) }
+                #expect(drafts == 0, "nothing adopted")
+                #expect(http.recordedCalls().contains { $0.url.contains("/messages/g1") }, "the server was asked")
             }
         }
     }

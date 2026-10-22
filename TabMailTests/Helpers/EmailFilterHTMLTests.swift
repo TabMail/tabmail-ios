@@ -458,6 +458,13 @@ struct EmailFilterHTMLBlockNewlineTests {
     /// #217: a draft's editable text keeps the spacing the page shows, since the
     /// next save uploads it over the other app's draft. Every other caller keeps
     /// the collapsed form.
+    @Test("Thunderbird's quote as read from the server, with CRLF line ends, keeps its lines")
+    func crlfQuoteKeepsItsLines() {
+        let crlf = "<p>Sounds good.</p>\r\n<blockquote type=\"cite\"><pre class=\"moz-quote-pre\" wrap=\"\">\r\nline one\r\nline two\r\n\r\nline  four</pre></blockquote>\r\n"
+        #expect(EmailFilter.htmlToPlainText(crlf, keepingSpacing: true) == "Sounds good.\nline one\nline two\n\nline  four")
+        #expect(EmailFilter.htmlToPlainText(crlf) == "Sounds good.\nline one line two line four")
+    }
+
     @Test("A draft's text keeps its spacing as the page shows it", arguments: [
         // Thunderbird quotes a plain-text message in <pre>, after an ignored first line break.
         ("<p>Sounds good.</p><blockquote type=\"cite\"><pre class=\"moz-quote-pre\" wrap=\"\">\nline one\nline two\n\nline  four</pre></blockquote>",

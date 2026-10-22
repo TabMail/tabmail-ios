@@ -367,7 +367,7 @@ serializer that writes recipients:
   Owner: fix it at our fork and upstream it. Fork branch `agent/format-flowed-content-type`
   (`a767603`, on `018ca90`) adds `format` and `delsp` after `charset` in
   `Array<MessagePart>.contentType(for:)`, with `MessagePartBodyStructureTests
-  .textPartKeepsTheParametersItsTextIsReadBy` (red on `018ca90`). The app pins `a767603` (#217);
+  .textPartKeepsTheParametersItsTextIsReadBy` (red on `018ca90`). The app pinned `a767603` (#217), then `946ae36` (below);
   fork `main` stays the pure mirror `018ca90`. Census: the parameters appear only on text parts,
   which already carried `; charset=`, and every app consumer matches by prefix or normalises the
   MIME type. The upstream PR opens only after our own review of the commit is clean

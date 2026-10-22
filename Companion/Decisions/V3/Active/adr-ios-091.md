@@ -320,3 +320,25 @@ save; each is fixed at its cause.
   `ExternalDraftAdoption.read` takes carried bytes for each file and fetches only the rest; an IMAP
   file whose bytes are missing still throws, since it is never fetched again by UID alone. A leaf
   Gmail reports as empty holds nothing and is skipped.
+
+### Review round 6 corrections (2026-10-22)
+
+The tier-1 round 6 review found two defects; each is fixed at its cause.
+
+- **A Gmail file that is a container with no bytes of its own is refused.** Gmail may list an
+  attached message (or a multipart marked `attachment`) by its child parts, with `body.size` 0, no
+  `data` and no `attachmentId`. The round 5 rule "declared size 0 is empty" read such a part as a
+  0-byte file; a reload then replaced the real local file and the next save uploaded the empty one.
+  `GmailProvider.draftPartBytes` now throws `DraftCopyUnsupportedAttachment` for a part with children
+  and neither bytes nor an attachment id, the refusal Outlook item attachments already take (#241):
+  the open is refused, nothing is written. Only an empty LEAF reads as empty.
+- **An adopted reply finds its original again after the original moves.** The adopted key was
+  `adopted:<uuid>`, so `Draft.resolveReplyToHeader`'s Strategy 2 never ran for it, and once an IMAP
+  move re-keyed the original (new UID, new primary key) its Send was blocked for good, while a reply
+  written in TabMail re-resolves through the `{accountId}:{stableId}` tail of its `reply:` key
+  (memory 023). An adopted reply whose parent was claimed now has the key
+  `adopted:<uuid>:{accountId}:{stableId}` (`ExternalDraftAdoption.adoptedKey`), and
+  `Draft.replyKeyTail` gives Strategy 2 and `expectedReplyToRfc` the same tail from either key form.
+  An unthreaded adopted row keeps `adopted:<uuid>`; Strategy 2 keeps its exactly-one rule, so two
+  copies still refuse (`IOS-DRAFT-009`). No column, no migration; adoption is unreleased, so no
+  shipped row has the old form.

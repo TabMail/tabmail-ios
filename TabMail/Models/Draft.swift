@@ -202,6 +202,18 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         return "new:\(newId ?? UUID().uuidString)"
     }
 
+    /// The `{accountId}:{stableId}` tail naming a reply's parent: after the prefix of
+    /// a TabMail reply or forward key, or after the uuid of an adopted reply's key
+    /// (`ExternalDraftAdoption.adoptedKey`). Nil for any other key.
+    static func replyKeyTail(draftKey: String, isForward: Bool) -> Substring? {
+        let prefix = isForward ? "forward:" : "reply:"
+        if draftKey.hasPrefix(prefix) { return draftKey.dropFirst(prefix.count) }
+        guard ExternalDraftAdoption.isAdoptedKey(draftKey) else { return nil }
+        let rest = draftKey.dropFirst(ExternalDraftAdoption.draftKeyPrefix.count)
+        guard let colonIdx = rest.firstIndex(of: ":") else { return nil }
+        return rest[rest.index(after: colonIdx)...]
+    }
+
     // MARK: - Reply-target identity guard (T5.8)
     //
     // ONE mechanism, four parts, and reading any part alone will mislead:
@@ -312,9 +324,7 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// scoping, and a server-originated no-fold-literal domain (`<a@[IPv6:…]>`) would
     /// then read as "never the same message" for a message that plainly is.
     static func expectedReplyToRfc(draftKey: String, isForward: Bool) -> String? {
-        let prefix = isForward ? "forward:" : "reply:"
-        guard draftKey.hasPrefix(prefix) else { return nil }
-        let rest = String(draftKey.dropFirst(prefix.count))
+        guard let rest = replyKeyTail(draftKey: draftKey, isForward: isForward) else { return nil }
         guard let colonIdx = rest.firstIndex(of: ":") else { return nil }
         let stableId = String(rest[rest.index(after: colonIdx)...])
         return MessageIdentity.comparableRfc822Identity(stableId)
@@ -444,9 +454,7 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         }
         // Strategy 2: parse accountId + stableId from the draft key, look up by
         // account + rfc822MessageId.
-        let prefix = isForward ? "forward:" : "reply:"
-        guard draftKey.hasPrefix(prefix) else { return nil }
-        let rest = String(draftKey.dropFirst(prefix.count))
+        guard let rest = replyKeyTail(draftKey: draftKey, isForward: isForward) else { return nil }
         guard let colonIdx = rest.firstIndex(of: ":") else { return nil }
         let accountId = String(rest[rest.startIndex..<colonIdx])
         let stableId = String(rest[rest.index(after: colonIdx)...])

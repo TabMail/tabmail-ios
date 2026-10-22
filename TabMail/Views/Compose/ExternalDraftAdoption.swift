@@ -42,6 +42,16 @@ enum ExternalDraftAdoption {
         draftId.hasPrefix(draftKeyPrefix)
     }
 
+    /// The key of a new adopted row. An adopted reply's key ends with its parent's
+    /// `{accountId}:{stableId}`, the tail a reply written in TabMail carries, so
+    /// `Draft.resolveReplyToHeader`'s Strategy 2 finds the parent again after an
+    /// IMAP folder move re-keys it (`Draft.replyKeyTail`).
+    static func adoptedKey(replyParent: MessageHeader?) -> String {
+        let key = draftKeyPrefix + UUID().uuidString
+        guard let replyParent else { return key }
+        return key + ":\(replyParent.accountId):\(replyParent.stableId)"
+    }
+
     /// A read or fetch that must be retried before the draft can be adopted.
     enum AdoptionError: Error, Equatable {
         /// The body is not on the device yet, or reads as empty without the
@@ -221,7 +231,8 @@ enum ExternalDraftAdoption {
     /// The reply parent the other app's draft names through `In-Reply-To`, or nil.
     ///
     /// Same rule as `Draft.resolveReplyToHeader`'s Strategy 2: exactly ONE header in
-    /// the account carries that Message-ID. The parent is then claimed only if the
+    /// the account carries that Message-ID. The adopted key then carries the parent's
+    /// stable id (`adoptedKey`), so every reopen applies Strategy 2 again. The parent is then claimed only if the
     /// v80 stamps written from it will be accepted again at reopen
     /// (`Draft.acceptsReplyTargetHit`), so adoption never manufactures a reply whose
     /// Send is blocked from the start. No provable parent = an unthreaded draft.
@@ -305,12 +316,13 @@ enum ExternalDraftAdoption {
               try !addressIsOwned(address, accountId: current.accountId, db: db) else {
             return nil
         }
+        let parent = try replyParent(for: current, db: db)
         let draft = makeDraft(
-            id: draftKeyPrefix + UUID().uuidString,
+            id: adoptedKey(replyParent: parent),
             header: current,
             address: address,
             content: content,
-            replyParent: try replyParent(for: current, db: db),
+            replyParent: parent,
             instanceEpoch: UUID().uuidString,
             now: now)
         try DraftStore.applyAdoption(draft, db: db)

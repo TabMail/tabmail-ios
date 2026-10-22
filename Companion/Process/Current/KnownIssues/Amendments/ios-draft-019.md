@@ -40,8 +40,10 @@ reads empty without server confirmation, or a failed attachment fetch (retryable
 **Reply threading:** the other app's `In-Reply-To` is resolved like `Draft.resolveReplyToHeader`
 Strategy 2 (exactly one header in the account) and claimed only when the v80 stamps will be
 accepted again at reopen; otherwise the draft is adopted unthreaded rather than with a Send that is
-blocked from the start. Adopted drafts never get TabMail's own quote — their body already carries
-the other app's.
+blocked from the start. A claimed parent's `{accountId}:{stableId}` rides in the adopted key
+(`adopted:<uuid>:…`), so every reopen runs Strategy 2 as a TabMail reply does and finds the original
+after an IMAP move (review round 6). Adopted drafts never get TabMail's own quote — their body
+already carries the other app's.
 
 **Compared with the pre-v1.7 behaviour** (`e0d3d30e^`): that open matched rows by Message-ID and
 subject, deleted the server copy at Send by Message-ID search, opened an EMPTY editor when the body

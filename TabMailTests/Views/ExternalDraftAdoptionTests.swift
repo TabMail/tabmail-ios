@@ -297,6 +297,98 @@ struct ExternalDraftAdoptionTests {
                 "claiming a parent that reopen cannot prove would block Send from the start")
     }
 
+    @Test("An original that is not on the device leaves the adopted draft unthreaded")
+    func absentParentIsNotClaimed() throws {
+        let db = try TestDatabase.make()
+        let (header, _) = try makeImapFixture(db, inReplyTo: "original@example.com")
+        let draftId = try #require(try adopt(db, header))
+        let row = try #require(try db.read { try Draft.fetchOne($0, key: draftId) })
+        #expect(row.replyToId == nil)
+    }
+
+    @Test("Two headers sharing the original's Message-ID leave the adopted draft unthreaded")
+    func ambiguousParentIsNotClaimed() throws {
+        let db = try TestDatabase.make()
+        let (header, _) = try makeImapFixture(db, inReplyTo: "original@example.com")
+        var inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: Self.accountId)
+        inbox.lastKnownUidValidity = 5
+        try db.write { try inbox.insert($0) }
+        for uid in ["42", "43"] {
+            var parent = try TestDatabase.insertMessageHeader(
+                db, messageId: uid, folderId: inbox.id, accountId: Self.accountId,
+                folderPath: "INBOX", rfc822MessageId: "original@example.com")
+            parent.observedUidValidity = 5
+            try db.write { try parent.update($0) }
+        }
+        let draftId = try #require(try adopt(db, header))
+        let row = try #require(try db.read { try Draft.fetchOne($0, key: draftId) })
+        #expect(row.replyToId == nil, "either copy alone would be accepted; two are not proof of one")
+    }
+
+    @Test("An adopted reply still finds its original after the original is archived")
+    func adoptedReplySurvivesAnArchive() throws {
+        let db = try TestDatabase.make()
+        let (header, _) = try makeImapFixture(db, inReplyTo: "original@example.com")
+        var inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: Self.accountId)
+        inbox.lastKnownUidValidity = 5
+        try db.write { try inbox.insert($0) }
+        var parent = try TestDatabase.insertMessageHeader(
+            db, messageId: "42", folderId: inbox.id, accountId: Self.accountId,
+            folderPath: "INBOX", rfc822MessageId: "original@example.com")
+        parent.observedUidValidity = 5
+        try db.write { try parent.update($0) }
+
+        let draftId = try #require(try adopt(db, header))
+        let adoptedRow = try #require(try db.read { try Draft.fetchOne($0, key: draftId) })
+        #expect(adoptedRow.replyToId == parent.id, "precondition: adoption claimed the INBOX copy")
+
+        // The original is archived. Its INBOX row is gone and the Archive copy has its own
+        // UID, epoch and primary key: the end state of TabMail's own move once
+        // MessageHeaderRekey.finishMove re-keys the row, and of a sync after another
+        // client's move.
+        var archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: Self.accountId)
+        archive.lastKnownUidValidity = 9
+        try db.write { try archive.insert($0) }
+        let inboxCopy = parent
+        try db.write { db in _ = try inboxCopy.delete(db) }
+        var moved = try TestDatabase.insertMessageHeader(
+            db, messageId: "3", folderId: archive.id, accountId: Self.accountId,
+            folderPath: "Archive", isInInbox: false, rfc822MessageId: "original@example.com")
+        moved.observedUidValidity = 9
+        try db.write { try moved.update($0) }
+
+        // Reopen: the row as the compose reads it, resolved as ComposeView.loadDraftOrPrepopulate does.
+        let row = try #require(try db.read { try Draft.fetchOne($0, key: draftId) })
+        func resolved(draftKey: String) throws -> MessageHeader? {
+            try db.read { db in
+                try Draft.resolveReplyQuote(
+                    draftKey: draftKey, replyToId: row.replyToId, isForward: row.isForward,
+                    expectedProviderMessageId: row.replyToProviderMessageId,
+                    expectedUidValidity: row.replyToUidValidity, db: db)?.header
+            }
+        }
+        // Control: the same stored claim under the key of a reply written in TabMail.
+        #expect(try resolved(draftKey: "reply:\(Self.accountId):original@example.com")?.id == moved.id,
+                "control: a reply written in TabMail re-resolves its archived original")
+        let adopted = try resolved(draftKey: row.id)
+        #expect(adopted?.id == moved.id,
+                "the adopted reply lost its original when the original was archived")
+        let claim = ComposeDraftGuards.persistedReplyTargetClaim(
+            rowClaimsTarget: row.isReplyOrForward, resolved: adopted)
+        #expect(ComposeDraftGuards.sendReplyTarget(composeParameter: nil, persistedRowClaim: claim) != .blocked,
+                "Send is blocked for an adopted reply whose original was archived")
+
+        // Two copies of the original are still no proof of one (IOS-DRAFT-009), for
+        // an adopted reply as for one written in TabMail.
+        var second = try TestDatabase.insertMessageHeader(
+            db, messageId: "4", folderId: archive.id, accountId: Self.accountId,
+            folderPath: "Archive", isInInbox: false, rfc822MessageId: "original@example.com")
+        second.observedUidValidity = 9
+        try db.write { try second.update($0) }
+        #expect(try resolved(draftKey: "reply:\(Self.accountId):original@example.com") == nil)
+        #expect(try resolved(draftKey: row.id) == nil)
+    }
+
     @Test("Adopted keys are recognised and ordinary keys are not")
     func adoptedKeyPrefix() {
         #expect(ExternalDraftAdoption.isAdoptedKey("adopted:1234"))
