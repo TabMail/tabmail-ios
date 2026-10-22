@@ -3,7 +3,7 @@
 **Class:** testing / verification-gate integrity
 **Severity:** high (a green suite certified a path that was never executed; three separate instances
 found on one day, one of which had already survived a documented "fix")
-**First seen:** 2026-08-13 · **Recurrences:** 2 · **Status:** Active
+**First seen:** 2026-08-13 · **Recurrences:** 3 · **Status:** Active
 **Related:** `MIS-014` (a test that BLESSES the bug — asserts the wrong value) · `MIS-015`
 (mechanism-pinning instead of invariant) · `MIS-IOS-014` (a red-first proof that could not run red) ·
 `MIS-IOS-006` (a number reported but not measured) · **Rule owner:** `../CLAUDE.md` § Testing Rules
@@ -68,6 +68,17 @@ disposition was deletion plus a real pin elsewhere — the composed-closure coor
 `IOS-TEST-004` prescribes for a vacuous test. **Generalised tell: when a test asserts only relations
 the compiler already enforces (case distinctness, exhaustiveness, a `let`'s immutability), ask what
 production edit would turn it red; if the honest answer is "none that compiles", it is not a test.**
+
+**5. `TutorialLifecycleTests.runFromStartToEnd` — a wait for the NEXT step cannot tell the event
+from an early advance (2026-10-21, guided tutorial, tier-1 r1 M4 and r2 TC-1).** The coordinator
+advances a part on a GRDB observation. The test performed the event (archive, send), then
+`waitFor(<next step>)`. A mutant that advanced on the observation's FIRST value, before any event
+(the archive condition inverted in r1; the Sent baseline set to empty in r2, with the seeded Sent
+folder non-empty), passed: the wait returned at once because its condition was already true. Both
+were fixed the same way, by asserting the step still HOLDS after the observation has delivered and
+before the event, and by asserting the event's payload (the template's example equals the reply
+sent). **Tell, for this form: the test waits for a state an early, unprovoked transition also
+reaches, and asserts nothing between setup and event.**
 
 ## Why the usual defences did not catch it
 

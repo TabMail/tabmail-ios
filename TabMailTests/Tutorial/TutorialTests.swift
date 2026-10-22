@@ -236,15 +236,21 @@ struct TutorialPracticeTests {
     func backendRefusesDuringPractice() async {
         let store = DemoModeStore.shared
         defer { store._resetForTests() }
+        // A fake server, so a regressed refusal fails here rather than
+        // reaching the real backend.
+        let server = FakeHTTP.Scenario()
+        defer { server.close() }
         store._resetForTests()
         store.isActive = true
         store.isTutorialPractice = true
         await #expect {
-            _ = try await BackendClient().transcribeDictation(flac: Data([0]), language: nil, vocabulary: [])
+            _ = try await BackendClient(llmSession: server.session)
+                .transcribeDictation(flac: Data([0]), language: nil, vocabulary: [])
         } throws: { error in
             if case BackendError.unauthorized = error { return true }
             return false
         }
+        #expect(server.recordedCalls().isEmpty, "nothing may reach the server during the tutorial")
     }
 
     /// Every AI surface other than dictation (compose, inline edit, chat)
@@ -555,6 +561,9 @@ struct TutorialLifecycleTests {
         }
         store._resetForTests()
         gate.closeGate()
+        // No part done yet. Each completion re-reads these, so every
+        // completed-part check below starts from nothing.
+        for key in progressKeys { UserDefaults.standard.removeObject(forKey: key) }
         let pool = fixture.0
         let coordinator = TutorialCoordinator.shared
         try #require(!coordinator.isRunning)
@@ -594,8 +603,10 @@ struct TutorialLifecycleTests {
         // Part 2: the reply reaches Sent, then Create saves the template.
         coordinator.nextLesson()
         #expect(coordinator.step == .replyToPriya)
-        // The mail observation takes its Sent baseline from its first value.
+        // The mail observation takes its Sent baseline from its first value,
+        // and the seeded Sent folder is not empty.
         try await Task.sleep(for: .seconds(1))
+        #expect(coordinator.step == .replyToPriya, "the step waits for the reply to reach Sent")
         let reply = "Count me in."
         coordinator.practiceReplyAuthored(reply)
         var queued = OutboxMessage(accountId: DemoSeed.demoAccountId, draft: DraftMessage(
@@ -609,8 +620,30 @@ struct TutorialLifecycleTests {
             .makeTemplate, practiceReply: coordinator.practiceReplyText,
             invocation: ToolInvocation(uiSink: AcceptingSink()))
         try await waitFor(.reuseReplyDone)
-        #expect(coordinator.savedTemplateId != nil)
         #expect(coordinator.completedLessons.contains(.reuseReply))
+        let templateId = try #require(coordinator.savedTemplateId)
+        let template = try #require(PromptStore.shared.templates.first { $0.id == templateId })
+        #expect(template.exampleReply == reply, "the template is made from the reply just sent")
+
+        // Part 3: ask about the flights, then open the cited email.
+        coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
+        #expect(coordinator.step == .reuseReplyDone, "opening Jordan's email counts only in part 3")
+        coordinator.nextLesson()
+        #expect(coordinator.step == .askFlights)
+        #expect(coordinator.chatPrompt == .flights)
+        coordinator.chatPromptSent(.flights)
+        #expect(coordinator.chatPrompt == nil, "the asked question is not offered again")
+        coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.receipt)
+        #expect(coordinator.step == .askFlights, "only Jordan's email completes the part")
+        #expect(!coordinator.completedLessons.contains(.askAnything))
+        coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
+        #expect(coordinator.step == .askAnythingDone)
+        #expect(coordinator.completedLessons.contains(.askAnything))
+        coordinator.showMoreToAsk()
+        #expect(coordinator.step == .moreToAsk)
+        #expect(coordinator.chatPrompt == .whatCanYouDo)
+        coordinator.showRecap()
+        #expect(coordinator.step == .finished)
 
         // End: the demo is gone and the backend is no longer refused.
         await coordinator.end()
