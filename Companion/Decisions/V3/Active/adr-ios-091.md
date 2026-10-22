@@ -259,3 +259,27 @@ fourth; each is fixed at its cause, except the first, which the owner accepted (
   unknown size, still reads as empty.
 - **Accepted (owner 2026-10-21): typed line breaks at the very end of a draft go on save and
   reopen** (`IOS-DRAFT-023`); the reload removes every trailing line break so the body never grows.
+
+### Review round 4 corrections (2026-10-22)
+
+The tier-1 round 4 review found one way content could be lost and one secret written to a log; each
+is fixed at its cause.
+
+- **A quoted charset is the declared charset.** Gmail serves a part's Content-Type as the writing
+  app wrote it, and `charset="iso-2022-jp"` (Outlook quotes the value) is common. SwiftMail's
+  `MessagePart.declaredCharset` matched only an unquoted, lower-case `charset=`, so such text fell
+  back to UTF-8, then Windows-1252 and Latin-1: ISO-2022-JP kept its escape sequences as
+  characters, Cyrillic and Shift_JIS came out as Latin mojibake, and the next save uploaded that
+  over the other app's draft. Fixed in the SwiftMail fork (`946ae36` on
+  `agent/format-flowed-content-type`, after `a767603`; the app pins `946ae36`): `declaredCharset`
+  reads the parameter with SwiftMail's own MIME parameter reader (`EMLParser.extractHeaderParam`).
+  It goes upstream with the #238 commit. **Correction to round 3:** "text it cannot decode throws
+  `GmailDraftCopyIncomplete`" never happens for text, because Latin-1 decodes any bytes; the
+  declared charset is therefore the only thing that makes the decode right, and a test whose
+  fallback decode reads the same text as its declared charset (Latin text in ISO-8859-1) cannot
+  tell the two apart.
+- **A failed upload-session PUT no longer carries the session URL.** Graph's upload URL for a
+  3 MiB+ attachment holds a pre-authenticated `authtoken`, and a `URLError` carries its failing URL
+  in its userInfo, which the queue's failure log (`AccountOperationExecutor`, exportable) prints.
+  `ExchangeProvider.addDraftAttachment` rethrows the PUT's `URLError` with only its code, which is
+  all the retry classification reads.

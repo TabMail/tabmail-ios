@@ -552,6 +552,30 @@ struct DraftCopyReadTests {
         #expect(sent.compactMap(\.body).reduce(Data(), +) == bytes, "the server must receive the file's exact bytes")
     }
 
+    @Test("Graph: a failed upload-session PUT keeps the session's token out of the error the queue logs")
+    func failedUploadDoesNotCarryTheSessionToken() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let provider = Self.graphUpdateProvider(http, serverFiles: [])
+        http.register(path: "/messages/g1/attachments/createUploadSession", method: "POST", response: .json(raw: """
+            {"uploadUrl":"https://outlook.office.com/api/v2.0/Users('u')/Messages('g1')/AttachmentSessions('s1')?authtoken=session-secret"}
+            """))
+        http.register(path: "AttachmentSessions", method: "PUT", response: .transportError(.timedOut))
+        let bytes = Data(count: ExchangeDraftConfig.singlePostAttachmentLimitBytes + 1)
+
+        do {
+            _ = try await provider.saveDraft(
+                Self.draft(attachments: [DraftAttachment(filename: "big.bin", mimeType: "application/octet-stream", data: bytes)]),
+                existingIdentity: .outlook(graphId: "g1"), draftsFolderPath: "Drafts")
+            Issue.record("a failed upload must fail the save")
+        } catch {
+            #expect(http.recordedCalls().contains { $0.method == "PUT" }, "precondition: the upload reached its PUT")
+            #expect(!"\(error)".contains("session-secret"),
+                    "the pre-authenticated URL would be written to the exportable queue log")
+            #expect((error as? URLError)?.code == .timedOut, "the failure stays a retryable connection error")
+        }
+    }
+
     @Test("Graph: an upload session URL off the documented Outlook hosts is refused")
     func uploadURLMustBeAnOutlookHost() throws {
         for raw in ["https://outlook.office.com/api/v2.0/x", "https://OUTLOOK.office365.com/api/v2.0/x"] {

@@ -373,3 +373,12 @@ serializer that writes recipients:
   MIME type. The upstream PR opens only after our own review of the commit is clean
   (`feedback_upstream_pr_rounds_need_our_own_review_and_the_dependency_source`). When upstream
   merges it, resync with `tabmail-swiftmailfork-sync` and re-pin to the mirror.
+- **Quoted charset parameter (#217 review round 4, 2026-10-22)**: `MessagePart.declaredCharset`
+  matched only an unquoted, lower-case `charset=` (its regex excluded `"`, so the quote-stripping
+  after it never ran), so a part content type taken from the part's own header, as Gmail's draft
+  read passes it, lost `charset="iso-2022-jp"` and decoded through the UTF-8 / Windows-1252 /
+  Latin-1 fallback with no error. Commit `946ae36` on the same fork branch, after `a767603`, reads
+  it with `EMLParser.extractHeaderParam` (any case, quoted value unquoted, comments removed);
+  `MIMECharsetTests.quotedCharsetParameterIsDeclared` / `quotedCharsetDecodesText` (red on
+  `a767603`). The app pins `946ae36`. It goes upstream in the same PR as the #238 commit, which now
+  carries both.

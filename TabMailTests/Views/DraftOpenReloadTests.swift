@@ -8,6 +8,7 @@ import Synchronization
 import SwiftUI
 import Testing
 import UIKit
+import WebKit
 @testable import TabMail
 
 /// #217 (ADR-IOS-091, last save wins) end to end against the real providers on
@@ -63,21 +64,24 @@ struct DraftOpenReloadTests {
         await AccountManager.shared.unregisterProviderForTesting(accountId: Self.accountId)
     }
 
-    /// A saved draft "Plan" to alice, body "phone edit", at Graph id `g1` (Gmail `r1`).
+    /// A saved draft "Plan" to alice, body "phone edit", at Graph id `g1` (Gmail `r1`);
+    /// `replyTo` names its parent's header id and provider message id.
     private nonisolated func insertDraft(
-        _ db: Database, provider: AccountProvider = .outlook, status: String? = "pushed"
+        _ db: Database, provider: AccountProvider = .outlook, status: String? = "pushed",
+        id: String = "adopted:open-reload", replyTo: (headerId: String, messageId: String)? = nil
     ) throws -> Draft {
         var account = Account(emailAddress: "owner@example.com", displayName: "Test", provider: provider)
         account.id = Self.accountId
         try account.insert(db)
         var draft = Draft(
-            id: "adopted:open-reload", accountId: account.id,
+            id: id, accountId: account.id,
             toJSON: Draft.encodeStringArray(["alice@example.com"]), ccJSON: "[]", bccJSON: "[]",
-            subject: "Plan", body: "phone edit", replyToId: nil, isForward: false,
+            subject: "Plan", body: "phone edit", replyToId: replyTo?.headerId, isForward: false,
             editHistoryJSON: nil, createdAt: 1, updatedAt: 2,
             serverDraftId: provider == .gmail ? "r1" : "g1", serverPushStatus: status,
             rfc822MessageId: nil, attachmentsDirName: nil)
         draft.instanceEpoch = "E1"
+        draft.replyToProviderMessageId = replyTo?.messageId
         try draft.insert(db)
         return draft
     }
@@ -164,40 +168,159 @@ struct DraftOpenReloadTests {
         (view as? UITextView).map { [$0] } ?? view.subviews.flatMap { textViews($0) }
     }
 
+    /// Every alert message presented over the window's root, in order.
+    private func alertMessages(_ window: UIWindow) -> [String] {
+        var messages: [String] = []
+        var next = window.rootViewController?.presentedViewController
+        while let controller = next {
+            if let message = (controller as? UIAlertController)?.message { messages.append(message) }
+            next = controller.presentedViewController
+        }
+        return messages
+    }
+
+    private func webViews(_ view: UIView) -> [WKWebView] {
+        (view as? WKWebView).map { [$0] } ?? view.subviews.flatMap { webViews($0) }
+    }
+
+    /// Opens `draftId` the way the Drafts list's direct presenter does, in a real
+    /// window, and runs `body` against that window. The deadline only bounds a
+    /// wait; every wait ends as soon as its condition holds.
+    private func withPresentedDraft(
+        _ draftId: String, pool: DatabasePool, _ body: (UIWindow) async throws -> Void
+    ) async throws {
+        let account = try #require(try await pool.read { try Account.fetchOne($0, key: Self.accountId) })
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let navigationStore = NavigationStore()
+        navigationStore.accounts = [account]
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        window.rootViewController = UIHostingController(
+            rootView: DraftComposePresenter(draftId: draftId).environment(navigationStore))
+        window.isHidden = false
+        window.makeKeyAndVisible()
+        defer {
+            window.rootViewController?.dismiss(animated: false)
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        try await body(window)
+    }
+
+    private nonisolated static let presenterDeadlineSeconds: TimeInterval = 60
+
+    private func wait(until condition: () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(Self.presenterDeadlineSeconds)
+        while Date() < deadline && !condition() {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+    }
+
     @Test("Resuming a saved draft from a direct presenter shows the server's newer version")
     func directPresenterShowsTheServerVersion() async throws {
         try await withInstalledPool { pool in
             let draft = try await pool.write { try insertDraft($0) }
-            let account = try #require(try await pool.read { try Account.fetchOne($0, key: draft.accountId) })
             let http = FakeHTTP.Scenario()
             defer { http.close() }
             let provider = exchangeProvider(http, copyResponse: .json(raw: Self.copyJSON(body: "fresh remote body")))
             try await withRegisteredProvider(provider) {
-                let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-                let navigationStore = NavigationStore()
-                navigationStore.accounts = [account]
-                let window = UIWindow(windowScene: scene)
-                window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
-                window.rootViewController = UIHostingController(
-                    rootView: DraftComposePresenter(draftId: draft.id).environment(navigationStore))
-                window.isHidden = false
-                window.makeKeyAndVisible()
-                defer {
-                    window.isHidden = true
-                    window.rootViewController = nil
-                }
-                let deadline = Date().addingTimeInterval(10)
-                while Date() < deadline && !textViews(window).contains(where: {
-                    $0.text == "phone edit" || $0.text == "fresh remote body"
-                }) {
-                    try await Task.sleep(for: .milliseconds(20))
-                }
+                try await withPresentedDraft(draft.id, pool: pool) { window in
+                    try await wait {
+                        textViews(window).contains { $0.text == "phone edit" || $0.text == "fresh remote body" }
+                    }
 
-                let displayed = textViews(window).map(\.text)
-                #expect(displayed.contains("phone edit") || displayed.contains("fresh remote body"),
-                        "precondition: the persisted draft's editor loaded")
-                #expect(displayed.contains("fresh remote body"),
-                        "the editor showed the older local copy although the server's was newer")
+                    let displayed = textViews(window).map(\.text)
+                    #expect(displayed.contains("phone edit") || displayed.contains("fresh remote body"),
+                            "precondition: the persisted draft's editor loaded")
+                    #expect(displayed.contains("fresh remote body"),
+                            "the editor showed the older local copy although the server's was newer")
+                }
+            }
+        }
+    }
+
+    @Test("A direct presenter refuses a draft whose server copy gained an attachment TabMail cannot carry")
+    func directPresenterRefusesAnUncarriableDraft() async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { try insertDraft($0) }
+            let model = ServerModel()
+            model.body.withLock { $0 = "edited in Outlook" }
+            model.attachments.withLock {
+                $0 = [.init(id: "a2", name: "Fw: Report", contentType: "message/rfc822", isInline: false,
+                            contentId: nil, bytes: Data(), odataType: "#microsoft.graph.itemAttachment")]
+            }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            registerGraphServer(http, model: model)
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                try await withPresentedDraft(draft.id, pool: pool) { window in
+                    try await wait {
+                        !alertMessages(window).isEmpty || textViews(window).contains { $0.text == "phone edit" }
+                    }
+
+                    #expect(alertMessages(window) == [DraftReadConfig.unsupportedAttachmentMessage],
+                            "the user is told why the draft does not open")
+                    #expect(!textViews(window).contains { $0.text == "phone edit" },
+                            "the stale local copy opened for editing; its save would overwrite the server's version")
+                }
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(row.body == "phone edit" && row.serverPushStatus == "pushed"
+                        && row.pushAttemptVersion == draft.pushAttemptVersion)
+                #expect(!http.recordedCalls().contains { $0.method != "GET" }, "the refused open wrote nothing to the server")
+            }
+        }
+    }
+
+    /// A reply draft taken over from another app already carries that app's quote in
+    /// its body, so its open adds none; a TabMail reply to the same parent quotes it.
+    @Test("An adopted reply draft opens without a second quote of its parent",
+          arguments: ["adopted:open-reload", "reply:\(accountId):p1@example.com"])
+    func adoptedReplyAddsNoQuote(draftId: String) async throws {
+        try await withInstalledPool { pool in
+            let parentId = MessageIdentity.folderId(accountId: Self.accountId, folderPath: "INBOX") + ":m1"
+            let draft = try await pool.write { db -> Draft in
+                let draft = try insertDraft(
+                    db, status: "dirty", id: draftId, replyTo: (headerId: parentId, messageId: "m1"))
+                try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: Self.accountId).insert(db)
+                var parent = MessageHeader(
+                    messageId: "m1", subject: "Plan", from: "alice@example.com", fromAddress: "alice@example.com",
+                    to: "owner@example.com", date: Date(), snippet: "parent words",
+                    folderId: MessageIdentity.folderId(accountId: Self.accountId, folderPath: "INBOX"),
+                    accountId: Self.accountId, folderPath: "INBOX", isInInbox: true)
+                parent.rfc822MessageId = "p1@example.com"
+                try parent.insert(db)
+                #expect(parent.id == parentId, "precondition: the draft names its parent's row")
+                try MessageBody(contentKey: ContentKey(rawValue: parent.id), htmlContent: "<p>parent words</p>").insert(db)
+                return draft
+            }
+            let quote = try await pool.read { db in
+                try Draft.resolveReplyQuote(
+                    draftKey: draft.id, replyToId: draft.replyToId, isForward: false,
+                    expectedProviderMessageId: draft.replyToProviderMessageId,
+                    expectedUidValidity: nil, db: db)
+            }
+            #expect(quote?.bodyHTML != nil, "precondition: the parent resolves with a body to quote")
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let provider = exchangeProvider(http, copyResponse: .status(500))
+            try await withRegisteredProvider(provider) {
+                try await withPresentedDraft(draft.id, pool: pool) { window in
+                    try await wait { textViews(window).contains { $0.text == "phone edit" } }
+                    #expect(textViews(window).contains { $0.text == "phone edit" }, "precondition: the draft opened")
+                    let adopted = ExternalDraftAdoption.isAdoptedKey(draft.id)
+                    if adopted {
+                        // Nothing marks the end of the open, so give the quote read the
+                        // time it takes the TabMail reply below to show its quote.
+                        try await Task.sleep(for: .seconds(3))
+                    } else {
+                        try await wait { !webViews(window).isEmpty }
+                    }
+                    #expect(webViews(window).isEmpty == adopted,
+                            adopted ? "the other app's quote is already in the body; a second would be sent"
+                                    : "a TabMail reply quotes its parent")
+                }
             }
         }
     }
@@ -948,11 +1071,22 @@ struct DraftOpenReloadTests {
         }
     }
 
-    @Test("A Gmail draft written in another charset reloads as its text, never as an empty draft")
-    func gmailDraftInAnotherCharsetReloadsAsItsText() async throws {
+    /// Another app's draft in a non-UTF-8 charset, its Content-Type as that app wrote it
+    /// (Outlook quotes the value). Each is text no fallback decode reads correctly:
+    /// ISO-2022-JP read as ASCII keeps its escape sequences, windows-1251 read as Latin
+    /// is mojibake, so only the declared charset passes.
+    nonisolated static let charsetDrafts: [(contentType: String, bytes: [UInt8], text: String)] = [
+        ("text/plain; charset=\"ISO-2022-JP\"", Array("日本語の下書き".data(using: .iso2022JP)!), "日本語の下書き"),
+        ("text/plain; Charset=\"windows-1251\"", [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2], "Привет"),
+        ("text/plain; charset=iso-8859-1", [0x43, 0x61, 0x66, 0xE9, 0x20, 0x61, 0x74, 0x20, 0x35], "Caf\u{E9} at 5"),
+    ]
+
+    @Test("A Gmail draft written in another charset reloads as its text, in that charset",
+          arguments: 0..<charsetDrafts.count)
+    func gmailDraftInAnotherCharsetReloadsAsItsText(index: Int) async throws {
+        let (contentType, bytes, text) = Self.charsetDrafts[index]
         try await withInstalledPool { pool in
             let draft = try await pool.write { try insertDraft($0, provider: .gmail) }
-            let latin1: [UInt8] = [0x43, 0x61, 0x66, 0xE9, 0x20, 0x61, 0x74, 0x20, 0x35]
             let date = String(Int(Date().timeIntervalSince1970 * 1000))
             let http = FakeHTTP.Scenario()
             defer { http.close() }
@@ -961,8 +1095,8 @@ struct DraftOpenReloadTests {
                 {"id":"m3","internalDate":"\(date)","labelIds":["DRAFT"],"payload":{"mimeType":"text/plain",\
                 "headers":[{"name":"Subject","value":"Plan"},{"name":"From","value":"owner@example.com"},\
                 {"name":"To","value":"alice@example.com"},\
-                {"name":"Content-Type","value":"text/plain; charset=iso-8859-1"}],\
-                "body":{"size":\(latin1.count),"data":"\(Self.base64URL(Data(latin1)))"}}}
+                {"name":"Content-Type","value":"\(contentType.replacingOccurrences(of: "\"", with: "\\\""))"}],\
+                "body":{"size":\(bytes.count),"data":"\(Self.base64URL(Data(bytes)))"}}}
                 """))
             let provider = GmailProvider(
                 userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
@@ -971,7 +1105,7 @@ struct DraftOpenReloadTests {
 
                 let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
                 #expect(row.pushAttemptVersion > draft.pushAttemptVersion, "precondition: the open reloaded")
-                #expect(row.body == "Caf\u{E9} at 5")
+                #expect(row.body == text, "a draft decoded in the wrong charset is uploaded garbled by the next save")
             }
         }
     }

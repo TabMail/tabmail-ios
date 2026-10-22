@@ -1137,7 +1137,16 @@ actor ExchangeProvider: EmailProvider {
             put.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
             put.setValue("bytes \(offset)-\(end - 1)/\(total)", forHTTPHeaderField: "Content-Range")
             put.httpBody = attachment.data.subdata(in: offset..<end)
-            let (_, response) = try await (testSession ?? sharedEphemeralSession).data(for: put)
+            let response: URLResponse
+            do {
+                (_, response) = try await (testSession ?? sharedEphemeralSession).data(for: put)
+            } catch let error as URLError {
+                // The session URL carries a pre-authenticated token, and a URLError
+                // carries its failing URL into every log line that prints the error
+                // (the queue's failure log, which the user can export). Keep only the
+                // code, which is all the retry classification reads.
+                throw URLError(error.code)
+            }
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             let finished = end == total
             guard finished ? (status == 200 || status == 201) : status == 200 else {
