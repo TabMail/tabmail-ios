@@ -46,4 +46,6 @@ ADR-IOS-008 parity is measured at the **tool boundary** (args, result shape, ran
 
 **Related:** ADR-IOS-008 (TB parity scope), ADR-IOS-031 (GRDB-touching background tasks at `.medium` priority).
 
+**Amendment 2026-10-21 (tabmail-ios#240, mirrors tabmail-native-fts#28 / ADR-NF-014):** when `HybridMerge.mergeResults` keeps nothing while the keyword leg matched, `SearchIndex` and `MemoryIndex` answer keyword-only (`searchFTSOnly` / `assembleFTSOnly`), as they already do with no vector candidates. A word in at least half the rows (of a year shard, or of `memory_fts`) gets an FTS5 IDF of about 0, and with weak vector matches every merged score fell under `minScore`, so the search returned nothing. The merge itself is unchanged: a study on real Thunderbird and iPhone databases kept the current scoring: on known-item MRR@10 it beat rank fusion, min-max normalisation and query-length gating on iPhone email and memory and Thunderbird email (numbers in ADR-NF-014). Each search's hybrid part is `hybridSearch(…, queryEmbedding:)`, called by `search` after embedding the query, so tests run it with fixed vectors (the unit-test host does not load CoreML). Open parity item: vector candidates are still date-filtered after the merge (tabmail-ios#242, native-fts #25).
+
 ---

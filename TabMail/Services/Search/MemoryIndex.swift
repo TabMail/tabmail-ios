@@ -640,14 +640,32 @@ actor MemoryIndex {
     ///   both legs, and the caller's cache, use the same one.
     func search(query: String, fromMs: Int64? = nil, toMs: Int64? = nil, limit: Int, demoActive: Bool) -> [MemoryHit] {
         ensureReady()
-        guard let dbPool else { return [] }
-        let candidateLimit = limit * SearchConfig.candidateMultiplier
+        guard dbPool != nil else { return [] }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         // No query lists the most recent turns, newest first, as the native-fts
         // helper TB uses does for an empty query ("what have we discussed").
         guard !trimmed.isEmpty else {
             return recentTurns(limit: limit, fromMs: fromMs, toMs: toMs, demoActive: demoActive)
         }
+
+        // Query embedding — graceful nil on any failure (the search then answers by keyword).
+        var queryEmbedding: [Float]?
+        if let embedService = EmbeddingService.shared {
+            do {
+                queryEmbedding = try embedService.embed(trimmed)
+            } catch {
+                BackgroundSyncLogger.logDebug("[MemoryIndex] Query embedding failed: \(error)")
+            }
+        }
+        return hybridSearch(query: trimmed, queryEmbedding: queryEmbedding, fromMs: fromMs, toMs: toMs, limit: limit, demoActive: demoActive)
+    }
+
+    /// The hybrid part of `search`, given the trimmed query and its embedding (nil: no vector leg).
+    func hybridSearch(query trimmed: String, queryEmbedding: [Float]?, fromMs: Int64?, toMs: Int64?, limit: Int,
+                      demoActive: Bool) -> [MemoryHit] {
+        ensureReady()
+        guard let dbPool else { return [] }
+        let candidateLimit = limit * SearchConfig.candidateMultiplier
 
         // FTS5 candidates — ORDER BY rank ASC, meta.dateMs DESC.
         var ftsCandidates: [(rowid: Int64, rank: Double, snippet: String, content: String, chatHistoryId: String, sessionId: String?, role: String, dateMs: Int64)] = []
@@ -692,15 +710,10 @@ actor MemoryIndex {
             BackgroundSyncLogger.logDebug("[MemoryIndex] FTS candidate fetch failed: \(error)")
         }
 
-        // Vector candidates — query EmbeddingService for query vector; graceful-empty on any failure.
+        // Vector candidates; empty without a query embedding.
         var vecCandidates: [(Int64, Double)] = []
-        if let embedService = EmbeddingService.shared {
-            do {
-                let qVec = try embedService.embed(trimmed)
-                vecCandidates = searchVecCandidates(queryEmbedding: qVec, limit: candidateLimit, demoActive: demoActive)
-            } catch {
-                BackgroundSyncLogger.logDebug("[MemoryIndex] Query embedding failed: \(error)")
-            }
+        if let queryEmbedding {
+            vecCandidates = searchVecCandidates(queryEmbedding: queryEmbedding, limit: candidateLimit, demoActive: demoActive)
         }
 
         if DebugModeManager.isLoggingEnabled() {
@@ -739,6 +752,15 @@ actor MemoryIndex {
             limit: limit
         )
         BackgroundSyncLogger.logDebug("[MemoryIndex] search merged=\(merged.count) (hybrid via HybridMerge)")
+
+        // Words matched but the merge kept nothing (a word in most turns scores about 0 by keyword,
+        // and a weak vector match adds too little to reach minScore): answer by keyword, as with no
+        // vectors. Mirrors tabmail-native-fts #28 (ADR-NF-014).
+        if merged.isEmpty && !ftsCandidates.isEmpty {
+            let hits = assembleFTSOnly(Array(ftsCandidates.prefix(limit)))
+            BackgroundSyncLogger.logDebug("[MemoryIndex] search RESULT \(hits.count) hits (hybrid merge kept none of \(ftsCandidates.count) keyword matches, FTS-only fallback)")
+            return hits
+        }
 
         // Assemble results. FTS hits carry full payload already; vec-only hits need
         // a batched JOIN lookup on rowid.
