@@ -1873,7 +1873,7 @@ actor SearchIndex {
     func search(query: String, fromDateMs: Int64? = nil, toDateMs: Int64? = nil,
                 limit: Int = SearchConfig.searchDefaultLimit,
                 folderIds: [String]? = nil) throws -> [FTSSearchResult] {
-        guard let dbPool else { return [] }
+        guard dbPool != nil else { return [] }
         if let ids = folderIds, ids.isEmpty { return [] }
 
         let query = query.trimmingCharacters(in: .whitespaces)
@@ -1903,6 +1903,15 @@ actor SearchIndex {
             return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
         }
 
+        return try hybridSearch(ftsQuery: ftsQuery, queryEmbedding: try embeddingService.embed(query),
+                                fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
+    }
+
+    /// The hybrid part of `search`, given the query's embedding. Call it through `search`, which
+    /// answers an empty folder list and an empty FTS query before reaching it.
+    func hybridSearch(ftsQuery: String, queryEmbedding: [Float], fromDateMs: Int64?, toDateMs: Int64?,
+                      limit: Int, folderIds: [String]?) throws -> [FTSSearchResult] {
+        guard let dbPool else { return [] }
         let candidateLimit = limit * SearchConfig.candidateMultiplier
 
         // --- FTS5 candidates (UNION ALL across all year shards) ---
@@ -1924,7 +1933,6 @@ actor SearchIndex {
 
         // --- Vector candidates via sqlite-vec KNN ---
         let vecTopK = eligibleRowids != nil ? candidateLimit * 2 : candidateLimit
-        let queryEmbedding = try embeddingService.embed(query)
         let allVec = searchVecCandidates(queryEmbedding: queryEmbedding, limit: vecTopK)
         let vectorCandidates: [(Int64, Double)]
         if let eligible = eligibleRowids {
@@ -1946,6 +1954,14 @@ actor SearchIndex {
             textResults: textPairs, vectorResults: vectorCandidates,
             vectorWeight: SearchConfig.vectorWeight, textWeight: SearchConfig.textWeight,
             limit: limit)
+
+        // Words matched but the merge kept nothing (a word in most messages scores about 0 by keyword,
+        // and a weak vector match adds too little to reach minScore): answer by keyword, as with no
+        // vectors. Mirrors tabmail-native-fts #28 (ADR-NF-014).
+        if merged.isEmpty && !ftsCandidates.isEmpty {
+            BackgroundSyncLogger.logDebug("[SearchIndex] Hybrid merge kept none of \(ftsCandidates.count) keyword matches, falling back to FTS-only search")
+            return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
+        }
 
         // --- Assemble results ---
         var ftsMap = [Int64: (contentKey: ContentKey, messageId: String, snippet: String, dateMs: Int64)]()

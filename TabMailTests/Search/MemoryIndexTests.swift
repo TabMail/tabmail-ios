@@ -476,6 +476,117 @@ struct MemoryIndexTests {
         #expect(hits.contains { $0.chatHistoryId == "t1" })
     }
 
+    // MARK: - Search: a merge that keeps nothing answers by keyword (tabmail-ios#240)
+
+    private static func oneHot(_ i: Int) -> [Float] {
+        var v = [Float](repeating: 0, count: SearchConfig.embeddingDims)
+        v[i] = 1
+        return v
+    }
+
+    /// 30 turns naming "budget" (vector along axis 1) and 10 without (axis 2, or 3 for the first). A
+    /// word in at least half the rows gets an FTS5 IDF of about 0, so its keyword score is about 0.
+    private func indexBudgetFixture() async -> (budget: Set<String>, weather: Set<String>) {
+        let budget = (0..<30).map { "b\($0)" }
+        let weather = (0..<10).map { "w\($0)" }
+        for (i, id) in budget.enumerated() {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: "s", role: "user", dateMs: 1000 + Int64(i),
+                                               text: "we talked about the parking, the lunch order \(i), the train and the budget")
+        }
+        for (i, id) in weather.enumerated() {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: "s", role: "user", dateMs: 2000 + Int64(i),
+                                               text: "rain tomorrow \(i)")
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings(
+            budget.map { (chatHistoryId: $0, observedEpoch: 1, embedding: Self.oneHot(1)) }
+                + weather.map { (chatHistoryId: $0, observedEpoch: 1, embedding: Self.oneHot($0 == "w0" ? 3 : 2)) })
+        return (Set(budget), Set(weather))
+    }
+
+    @Test("search: a word in most turns with no near vector returns every keyword match")
+    func search_emptyMergeAnswersByKeyword() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let (budget, _) = await indexBudgetFixture()
+        #expect(await MemoryIndex.shared._testVecRowCount() == 40)
+
+        // Query vector orthogonal to every stored one: vector score 0 for all.
+        let hits = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(0),
+                                                         fromMs: nil, toMs: nil, limit: 100, demoActive: false)
+        #expect(Set(hits.map(\.chatHistoryId)) == budget)
+
+        // Within dates covering budget turns 5 to 9, with matches on both sides: those 5.
+        let dated = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(0),
+                                                          fromMs: 1005, toMs: 1009, limit: 100, demoActive: false)
+        #expect(Set(dated.map(\.chatHistoryId)) == Set((5..<10).map { "b\($0)" }))
+
+        // Fewer than the matches: `limit` of them, best keyword match first (equal here, so newest first).
+        let limited = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(0),
+                                                            fromMs: nil, toMs: nil, limit: 5, demoActive: false)
+        #expect(limited.map(\.chatHistoryId) == (25..<30).reversed().map { "b\($0)" })
+    }
+
+    @Test("search: a merge that keeps nothing answers with the best keyword match first, not the newest")
+    func search_emptyMergeAnswersBestKeywordMatchFirst() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let hour: Int64 = 3_600_000
+        // "budget" in half the turns: its keyword scores are about 0 but still ordered, the short
+        // older turn ahead of the long newer one.
+        let rows: [(id: String, text: String, dateMs: Int64)] = [
+            ("strong", "budget", 1000),
+            ("weak", "budget " + String(repeating: "weather ", count: 100), 1000 + hour),
+            ("other1", "other words", 1000 + hour),
+            ("other2", "different words", 1000 + hour),
+        ]
+        for row in rows {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: row.id, sessionId: "s", role: "user", dateMs: row.dateMs, text: row.text)
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings(rows.map { (chatHistoryId: $0.id, observedEpoch: 1, embedding: Self.oneHot(1)) })
+        #expect(await MemoryIndex.shared._testVecRowCount() == 4)
+
+        // Query vector orthogonal to every stored one: the merge keeps nothing.
+        let hits = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(0),
+                                                         fromMs: nil, toMs: nil, limit: 1, demoActive: false)
+        #expect(hits.map(\.chatHistoryId) == ["strong"])
+    }
+
+    @Test("search: when the merge keeps results, those are the answer")
+    func search_nonEmptyMergeIsTheAnswer() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let (_, weather) = await indexBudgetFixture()
+
+        // Query vector equal to most weather turns' vectors: they are kept by meaning, the budget
+        // turns (keyword score about 0, vector score 0) are not.
+        let hits = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(2),
+                                                         fromMs: nil, toMs: nil, limit: 100, demoActive: false)
+        #expect(Set(hits.map(\.chatHistoryId)) == weather.subtracting(["w0"]))
+
+        // A merge that keeps a single turn is the answer too.
+        let single = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(3),
+                                                           fromMs: nil, toMs: nil, limit: 100, demoActive: false)
+        #expect(single.map(\.chatHistoryId) == ["w0"])
+    }
+
+    @Test("search answers by the hybrid path within its dates and its limit")
+    func search_handsItsArgumentsToTheHybridPath() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let day: Int64 = 86_400_000
+        for i in 0..<6 {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "k\(i)", sessionId: "s", role: "user",
+                                               dateMs: 1000 + Int64(i) * day, text: "kyle note \(i)")
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "o\(i)", sessionId: "s", role: "user",
+                                               dateMs: 1000 + Int64(i) * day, text: "other words \(i)")
+        }
+        let dated = await MemoryIndex.shared.search(query: "kyle", fromMs: 1000 + day + day / 2,
+                                                    toMs: 1000 + 3 * day + day / 2, limit: 10, demoActive: false)
+        #expect(Set(dated.map(\.chatHistoryId)) == ["k2", "k3"])
+        let limited = await MemoryIndex.shared.search(query: "kyle", limit: 1, demoActive: false)
+        #expect(limited.count == 1)
+    }
+
     // MARK: - knownChatHistoryIds
 
     @Test("knownChatHistoryIds returns all indexed IDs")
