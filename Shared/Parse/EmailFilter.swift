@@ -78,10 +78,10 @@ enum EmailFilter {
     /// The text an RFC 3676 `format=flowed` body stands for, when `contentType`
     /// declares it; any other text is returned unchanged. Each soft-broken line
     /// (`isFlowedSoftBreak`) joins the next line of the same quote depth, unless
-    /// that is the signature separator; a
-    /// space-stuffed line loses its stuffing space; with `delsp=yes` the space
-    /// that marked the soft break goes too. Quoted lines are written back as
-    /// `"> "` per depth.
+    /// that is the signature separator; a space-stuffed line loses its stuffing
+    /// space; with `delsp=yes` the space that marked the soft break goes too.
+    /// Quoted lines are written back as one `">"` per depth and a space
+    /// (`">> text"`).
     static func decodeFormatFlowed(_ text: String, contentType: String) -> String {
         var isFlowed = false
         var delSp = false

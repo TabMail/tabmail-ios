@@ -1205,6 +1205,9 @@ struct ServerDraftComposeLoader: View {
         /// THREW, so whether a local copy exists is UNKNOWN. Retryable, never
         /// authoritative.
         case resolveFailed
+        /// The draft holds an attachment TabMail cannot carry (#241). Final, never
+        /// retryable: the draft is edited in another app.
+        case unsupportedAttachment
     }
 
     var body: some View {
@@ -1263,6 +1266,16 @@ struct ServerDraftComposeLoader: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(.systemBackground))
+            case .unsupportedAttachment:
+                ContentUnavailableView {
+                    Label("Draft unavailable", systemImage: "paperclip")
+                } description: {
+                    Text(DraftReadConfig.unsupportedAttachmentMessage)
+                } actions: {
+                    Button("Close") { dismiss() }
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("server-draft-close")
+                }
             }
         }
         .task {
@@ -1280,6 +1293,7 @@ struct ServerDraftComposeLoader: View {
         switch outcome {
         case .success(let authority?): .authorized(authority)
         case .success(nil): .noLocalCopy
+        case .failure(let error) where error is DraftCopyUnsupportedAttachment: .unsupportedAttachment
         case .failure: .resolveFailed
         }
     }
@@ -1287,7 +1301,14 @@ struct ServerDraftComposeLoader: View {
     private func resolveLocallyAuthoredDraft() async {
         let outcome: Result<LocallyAuthoredDraftOpenAuthority?, any Error>
         do {
-            outcome = .success(try await resolveOpenAuthority())
+            #if DEBUG
+            if let resolveOpenAuthorityForTesting {
+                outcome = .success(try await resolveOpenAuthorityForTesting())
+                resolution = Self.classify(outcome)
+                return
+            }
+            #endif
+            outcome = .success(try await Self.resolveOpenAuthority(header: header))
         } catch {
             outcome = .failure(error)
         }
@@ -1296,17 +1317,13 @@ struct ServerDraftComposeLoader: View {
 
     /// Returns the authority when this device provably holds an editable copy, `nil`
     /// when it provably does not, and THROWS when the answer could not be determined.
+    /// Static, so the tests run this production sequence itself.
     ///
     /// The `nil` returns below are all fully-determined refusals — a provider that is
     /// not registered for this account, a runtime kind we do not open, a candidate
     /// whose runtime kind changed under us. None of them is a thrown read, and none
     /// changes behaviour here; only the `catch` in the caller does.
-    private func resolveOpenAuthority() async throws -> LocallyAuthoredDraftOpenAuthority? {
-        #if DEBUG
-        if let resolveOpenAuthorityForTesting {
-            return try await resolveOpenAuthorityForTesting()
-        }
-        #endif
+    static func resolveOpenAuthority(header: MessageHeader) async throws -> LocallyAuthoredDraftOpenAuthority? {
         guard let runtimeKind = await AccountManager.shared
             .draftRuntimeIdentityKind(accountId: header.accountId),
               runtimeKind != .unknown else {
@@ -1314,10 +1331,10 @@ struct ServerDraftComposeLoader: View {
         }
 
         if runtimeKind == .gmail {
-            return try await resolveGmailDraft()
+            return try await resolveGmailDraft(header: header)
         }
 
-        if let owner = try await resolveLocalOwner(runtimeKind: runtimeKind) {
+        if let owner = try await resolveLocalOwner(header: header, runtimeKind: runtimeKind) {
             return owner
         }
         // #217: no local owner, so this draft was written by another mail app (or
@@ -1333,10 +1350,11 @@ struct ServerDraftComposeLoader: View {
         }
         try await ExternalDraftAdoption.adopt(
             header: header, address: address, runtimeKind: runtimeKind)
-        return try await resolveLocalOwner(runtimeKind: runtimeKind)
+        return try await resolveLocalOwner(header: header, runtimeKind: runtimeKind)
     }
 
-    private func resolveLocalOwner(
+    private static func resolveLocalOwner(
+        header: MessageHeader,
         runtimeKind: DraftRuntimeIdentityKind
     ) async throws -> LocallyAuthoredDraftOpenAuthority? {
         let candidate = try await AppDatabase.dbPool.read { db in
@@ -1354,7 +1372,7 @@ struct ServerDraftComposeLoader: View {
     /// PORT — narrow v2final Gmail contained-MESSAGE → RESOURCE lookup. The
     /// provider await is followed by a fresh header/folder/account/local-owner
     /// census; nothing captured before the await authorizes the handoff.
-    private func resolveGmailDraft() async throws -> LocallyAuthoredDraftOpenAuthority? {
+    private static func resolveGmailDraft(header: MessageHeader) async throws -> LocallyAuthoredDraftOpenAuthority? {
         let preflight = try await AppDatabase.dbPool.read { db -> (Account, String)? in
             guard let current = try MessageHeader.fetchOne(db, key: header.id),
                   current.accountId == header.accountId,
@@ -1383,7 +1401,7 @@ struct ServerDraftComposeLoader: View {
         }
 
         if let owner = try await gmailOwner(
-            account: account, folderPath: folderPath, resourceId: resourceId) {
+            header: header, account: account, folderPath: folderPath, resourceId: resourceId) {
             return owner
         }
         // #217: no local owner — take over the server draft, then resolve again.
@@ -1392,10 +1410,11 @@ struct ServerDraftComposeLoader: View {
             address: .gmail(resourceId: resourceId, containedMessageId: header.messageId),
             runtimeKind: .gmail)
         return try await gmailOwner(
-            account: account, folderPath: folderPath, resourceId: resourceId)
+            header: header, account: account, folderPath: folderPath, resourceId: resourceId)
     }
 
-    private func gmailOwner(
+    private static func gmailOwner(
+        header: MessageHeader,
         account: Account,
         folderPath: String,
         resourceId: String

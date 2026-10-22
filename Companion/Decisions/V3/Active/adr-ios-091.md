@@ -218,3 +218,39 @@ not re-invent yet another converter"*; and for attachments *"Match by name, acce
   too (fork branch `agent/format-flowed-content-type`, `a767603`, pinned by the app until upstream
   merges it; `.eml` parsing already kept them). Graph returns an Outlook draft as text Exchange
   converts, so it has no flowed part to decode.
+
+### Review round 3 corrections (2026-10-21)
+
+The tier-1 round 3 review found three ways content could be lost, and its fixes' own tests found a
+fourth; each is fixed at its cause.
+
+- **Drafts uploaded by an earlier release open from this device until their next save.** Releases
+  up to v1.9.2 uploaded the body as HTML (which reads back with quote markers, double spaces and
+  soft line ends changed) and, on Outlook, never updated attachments after the first save, so for
+  their `"pushed"` rows the server copy is not the draft and the open-time reload would replace the
+  only exact copy. Migration `v93_openPreUpgradeServerDraftsLocally` (data only; v92 is burned) marks
+  every Gmail and Outlook `"pushed"` row `"dirty"`: it opens as it is, nothing pushes it on its own
+  (the only `.saveDraft` producers are the user's and the agent's saves), and its next save uploads
+  it as text, after which every open reloads it. Cost: until that save, an edit made elsewhere to a
+  pre-upgrade draft is not shown, which is the released behaviour.
+- **A draft holding an attachment TabMail cannot carry is refused** (owner 2026-10-21: refuse and
+  say why; #241 tracks carrying them). An Outlook item attachment (attached email, contact, event)
+  or reference attachment (cloud link) has no bytes to read, and a file whose name
+  `AttachmentFilename.isSafeFileComponent` refuses cannot be stored. The draft read throws
+  `DraftCopyUnsupportedAttachment`; adoption shows a final "Draft unavailable" card with no Try
+  Again, and the open-time reload returns `.unsupportedAttachment`, which opens the compose in its
+  blocked error state, since a save of the local row would overwrite the server's version. Outlook's
+  attachment sync pairs and deletes only file attachments with names the read accepts, so a save
+  never deletes such an attachment (irreversible operation (7), memory 102).
+- **Gmail draft text is decoded in its declared charset** by SwiftMail's `MessagePart.textContent`,
+  the decoder the IMAP draft read already uses, instead of UTF-8 or nothing; text it cannot decode
+  throws `GmailDraftCopyIncomplete`, never reads as an empty draft.
+- **An IMAP draft part the server's FETCH response left out fails the read.** SwiftMail's full
+  `fetchPart` returns EMPTY bytes, not an error, when the response carries no `BODY[n]`, so
+  `IMAPProvider.completeDraftCopy`'s nil checks never fired: the text read as an empty draft and a
+  file as an empty file, which the next save (irreversible operation (3)) would upload in place of
+  the original. `IMAPProvider.draftPartArrived` treats a part BODYSTRUCTURE declares non-empty that
+  came back empty as missing (`IMAPDraftCopyIncomplete`, retryable); a part declared empty, or of
+  unknown size, still reads as empty.
+- **Accepted (owner 2026-10-21): typed line breaks at the very end of a draft go on save and
+  reopen** (`IOS-DRAFT-023`); the reload removes every trailing line break so the body never grows.

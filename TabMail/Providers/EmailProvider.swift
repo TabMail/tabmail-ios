@@ -466,7 +466,17 @@ enum DraftReadConfig {
     /// The name a draft-copy file gets when its part names none, so it is carried
     /// rather than dropped.
     static let unnamedAttachmentFilename = "attachment"
+
+    /// What the user reads when a draft holds an attachment TabMail cannot carry.
+    static let unsupportedAttachmentMessage =
+        "This draft has an attachment TabMail can't open. Edit it in another mail app."
 }
+
+/// A draft copy holds an attachment TabMail cannot carry: an Outlook item or
+/// reference attachment (an attached email, contact, event or cloud link), or a file
+/// whose name `AttachmentFilename.isSafeFileComponent` refuses. A permanent refusal,
+/// never retryable; the draft is edited in another app (owner 2026-10-21, #241).
+struct DraftCopyUnsupportedAttachment: Error {}
 
 extension EmailProvider {
     /// Default for test doubles and the demo provider, whose drafts are never

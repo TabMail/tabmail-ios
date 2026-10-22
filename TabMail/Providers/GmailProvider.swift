@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftMail
 
 /// Actor-owned ordering state for Gmail's `/labels` catalog. Kept as a small
 /// value type so out-of-order response handling can be tested deterministically
@@ -880,11 +881,16 @@ actor GmailProvider: EmailProvider {
             }
             if mimeType == "text/plain" || mimeType == "text/html" {
                 let bytes = try await draftPartBytes(part, messageId: id)
+                // Decoded in the part's declared charset by the same SwiftMail
+                // decoder the IMAP draft read uses; text it cannot decode throws,
+                // never reads as an empty draft.
+                let declared = part.headers?.first { $0.name.lowercased() == "content-type" }?.value ?? mimeType
+                guard let text = MessagePart(sectionString: "1", contentType: declared, data: bytes).textContent else {
+                    throw GmailDraftCopyIncomplete(mimeType: mimeType)
+                }
                 // A body split around an inline part (text, image, text) is one
                 // body: its pieces are joined in order.
-                let text = String(data: bytes, encoding: .utf8) ?? ""
                 if mimeType == "text/plain" {
-                    let declared = part.headers?.first { $0.name.lowercased() == "content-type" }?.value ?? mimeType
                     textBody = (textBody ?? "") + EmailFilter.decodeFormatFlowed(text, contentType: declared)
                 }
                 if mimeType == "text/html" { htmlBody = (htmlBody ?? "") + text }

@@ -30,7 +30,9 @@ import UniformTypeIdentifiers
 ///   equal the Drafts folder's live epoch; a placeholder id is never an address);
 /// - the header is re-verified inside the SAME write transaction that inserts the
 ///   row, so a re-key or renumbering during the network fetches adopts nothing;
-/// - a body or attachment that could not be read is retryable, never "empty".
+/// - a body or attachment that could not be read is retryable, never "empty";
+/// - a draft holding an attachment TabMail cannot carry is refused, never opened
+///   without it (`DraftCopyUnsupportedAttachment`, #241).
 enum ExternalDraftAdoption {
     /// Draft-key prefix for an adopted row. A random suffix, not a derived one: the
     /// insert transaction's owner check is what prevents a duplicate adoption.
@@ -183,7 +185,8 @@ enum ExternalDraftAdoption {
     /// whose line rules never add a blank line). A copy with only a text part
     /// (every draft TabMail uploads, and an Outlook copy, which Exchange returns as
     /// text) is used as is: line endings become `\n` and trailing line breaks are
-    /// dropped, since MIME adds one, so a save and reopen never grows the body. A
+    /// dropped, since MIME adds one, so a save and reopen never grows the body.
+    /// Line breaks the user typed at the very end go too (accepted, IOS-DRAFT-023). A
     /// `format=flowed` text part arrives here already decoded by the provider's
     /// draft read (`EmailFilter.decodeFormatFlowed`, #238).
     ///
@@ -394,6 +397,11 @@ enum ExternalDraftAdoption {
     ) async throws -> ReadCopy {
         // Top-level only: parts nested inside an attached `.eml` travel inside it.
         let attachmentInfos = copy.attachments.filter { $0.parentEmlSection == nil }
+        // A file this device cannot store under its own name is never carried, and
+        // never fetched first (#241).
+        guard attachmentInfos.allSatisfy({ AttachmentFilename.isSafeFileComponent($0.filename) }) else {
+            throw DraftCopyUnsupportedAttachment()
+        }
         // A body part this successful read returned, even an empty one, IS the
         // server's word that the draft is empty (another app cleared it). Only a copy
         // with no body part at all stays unopenable, so a body the reader failed to
@@ -458,7 +466,8 @@ enum ExternalDraftAdoption {
     /// Returns without inserting when the server no longer has the draft, the
     /// header changed, or a row already owns the address; the caller re-runs its
     /// normal resolver either way. THROWS when a read or fetch failed, which the
-    /// loader shows as retryable.
+    /// loader shows as retryable, or `DraftCopyUnsupportedAttachment`, which it
+    /// shows as final.
     static func adopt(
         header: MessageHeader,
         address: LocallyAuthoredDraftOpenAuthority.Address,
@@ -515,6 +524,12 @@ enum ExternalDraftAdoption {
         }
     }
 
+    /// What `refreshBeforeOpen` found: open the row, or refuse it.
+    enum OpenCheck: Equatable {
+        case open
+        case unsupportedAttachment
+    }
+
     /// #217 (ADR-IOS-091): bring a saved draft up to date before it opens. Every
     /// open of a persisted draft runs this (`ComposeView.loadDraftOrPrepopulate`),
     /// whichever screen opened it.
@@ -523,13 +538,17 @@ enum ExternalDraftAdoption {
     /// comparison (owner ruling 2026-10-21, last save wins). The whole read,
     /// attachments included, runs under `ExternalDraftOpenConfig.reloadTimeoutSeconds`.
     /// Anything that stops it (offline, a timeout, a gone copy, a part that could not
-    /// be read, a row that changed meanwhile) opens the row as it is.
+    /// be read, a row that changed meanwhile) opens the row as it is. A copy holding
+    /// an attachment TabMail cannot carry returns `.unsupportedAttachment`: the draft
+    /// is then not opened for editing, since its next save would replace the
+    /// server's version with a stale one (#241).
     /// `willReadServer` runs just before the network read, so a draft that needs
     /// none opens without a loading cover.
+    @discardableResult
     static func refreshBeforeOpen(
         draftId: String,
         willReadServer: @MainActor () -> Void
-    ) async {
+    ) async -> OpenCheck {
         do {
             guard let row = try await AppDatabase.dbPool.read({ db in
                       try Draft.fetchOne(db, key: draftId)
@@ -538,7 +557,7 @@ enum ExternalDraftAdoption {
                   let identity = DraftStore.priorIdentity(
                       for: row, runtimeKind: AccountManager.draftRuntimeIdentityKind(for: provider)),
                   reloadsBeforeOpen(serverPushStatus: row.serverPushStatus, identity: identity) else {
-                return
+                return .open
             }
             await willReadServer()
             let accountId = row.accountId
@@ -549,7 +568,7 @@ enum ExternalDraftAdoption {
                 return try await read(
                     copy, accountId: accountId, identity: identity, bodyEmptyConfirmed: false)
             }
-            guard let readCopy else { return }
+            guard let readCopy else { return .open }
             let content = try stage(readCopy)
             let dirName = content.attachmentsDirName
             let previousDir: String??
@@ -571,10 +590,17 @@ enum ExternalDraftAdoption {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[DraftAdoption] reload before open draft=\(draftId) applied=\(previousDir != nil) attachments=\(content.attachmentCount)")
             }
+            return .open
+        } catch is DraftCopyUnsupportedAttachment {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[DraftAdoption] Open-time reload for draft=\(draftId) refused: an attachment TabMail cannot carry")
+            }
+            return .unsupportedAttachment
         } catch {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[DraftAdoption] Open-time reload for draft=\(draftId) did not complete (\(error)) — opening the local copy")
             }
+            return .open
         }
     }
 }

@@ -2306,10 +2306,17 @@ struct ComposeView: View {
         let draftKey = draftId
         // #217 (ADR-IOS-091): every open of a saved draft, from any screen, first
         // reloads a Gmail or Outlook row with no unsent edits from its server copy.
-        await ExternalDraftAdoption.refreshBeforeOpen(
+        let openCheck = await ExternalDraftAdoption.refreshBeforeOpen(
             draftId: draftKey,
             willReadServer: { isCheckingServerCopy = true })
         isCheckingServerCopy = false
+        // The server copy holds an attachment TabMail cannot carry (#241): editing
+        // the local row would let its save overwrite the server's version.
+        guard openCheck == .open else {
+            draftReadState = .error
+            sendError = DraftReadConfig.unsupportedAttachmentMessage
+            return
+        }
         let readResult: Result<Draft?, Error>
         do {
             readResult = .success(try await AppDatabase.dbPool.read { db in

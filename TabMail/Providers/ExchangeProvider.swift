@@ -211,7 +211,9 @@ actor ExchangeProvider: EmailProvider {
     /// - EVERY inline image is read, referenced by the body or not, and one that
     ///   cannot be read throws; one with no Content-ID is carried as a file;
     /// - an attached message stays an attachment: its text is never added to the
-    ///   body (that is the render's `tm-eml-section` marker).
+    ///   body (that is the render's `tm-eml-section` marker);
+    /// - an attachment that is not a file (an item or reference attachment) has no
+    ///   bytes to carry, so the read refuses with `DraftCopyUnsupportedAttachment`.
     private func readMessage(id: String, forDraft: Bool) async throws -> FullMessageInfo {
         let selection = ExchangeGraphMessageRequest.fetchMessage.selection
         let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
@@ -241,6 +243,8 @@ actor ExchangeProvider: EmailProvider {
         let attResponse = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: attData)
         let hasCidRefs = htmlBody?.range(of: "cid:", options: .caseInsensitive) != nil
         for att in attResponse.value {
+            // Only a file attachment has bytes TabMail can carry (#241).
+            if forDraft, !Self.isFileAttachment(att) { throw DraftCopyUnsupportedAttachment() }
             if att.isInline == true, let rawCid = att.contentId,
                let ct = att.contentType, ct.lowercased().hasPrefix("image/") {
                 let cid = rawCid.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -267,16 +271,6 @@ actor ExchangeProvider: EmailProvider {
             }
 
             let isItemAttachment = (att.odataType ?? "").lowercased().contains("itemattachment")
-            if isItemAttachment, forDraft {
-                attachments.append(AttachmentInfo(
-                    filename: att.name ?? "attached-email.eml",
-                    contentType: att.contentType ?? "message/rfc822",
-                    section: att.id,
-                    size: att.size ?? 0,
-                    encoding: nil
-                ))
-                continue
-            }
             if isItemAttachment {
                 // Nested email (.eml equivalent). Expand to get its envelope, body, and
                 // child attachments, then inline it as a `<div class="tm-eml-section">`
@@ -1061,11 +1055,19 @@ actor ExchangeProvider: EmailProvider {
     /// old one on the server. A failure throws before any delete, so the server
     /// never loses a file the draft still has; the retried save lists again and adds
     /// only what is still missing, so a failing add never multiplies copies.
+    /// Only a server attachment the draft read could have carried (a file
+    /// attachment whose name `AttachmentFilename` accepts) is paired or deleted;
+    /// any other one is never touched, since no local draft can name it (#241).
     private func replaceDraftAttachments(graphId: String, with attachments: [DraftAttachment]) async throws {
         let encodedId = try Self.encodedGraphPathSegment(graphId, context: "Graph draft message id")
         let listData = try await request(path: "/messages/\(encodedId)/attachments?$select=id,name")
         let current = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: listData).value
-        let plan = Self.draftAttachmentPlan(server: current.map { (id: $0.id, name: $0.name ?? "") }, local: attachments)
+        let carried = current.compactMap { att -> (id: String, name: String)? in
+            let name = att.name?.isEmpty == false ? att.name ?? "" : DraftReadConfig.unnamedAttachmentFilename
+            guard Self.isFileAttachment(att), AttachmentFilename.isSafeFileComponent(name) else { return nil }
+            return (id: att.id, name: name)
+        }
+        let plan = Self.draftAttachmentPlan(server: carried, local: attachments)
         for attachment in plan.add {
             try await addDraftAttachment(attachment, encodedMessageId: encodedId)
         }
@@ -1077,6 +1079,13 @@ actor ExchangeProvider: EmailProvider {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[Exchange] saveDraft: added \(plan.add.count), removed \(plan.deleteIds.count) attachment(s)")
         }
+    }
+
+    /// Whether a Graph attachment is a `#microsoft.graph.fileAttachment`. A list
+    /// entry of a derived type carries its `@odata.type` (OData minimal metadata),
+    /// `$select` or not; an entry without one is not treated as a file.
+    private static func isFileAttachment(_ att: GraphAttachmentMeta) -> Bool {
+        (att.odataType ?? "").lowercased().contains("fileattachment")
     }
 
     /// Pair local files with server attachments by name, one to one (two local

@@ -19,6 +19,10 @@ import UIKit
 /// 3. A save replaces the server copy without reading it first, and what it saved
 ///    (attachments included) is what the next open's reload brings back.
 /// 4. Taking over another app's draft keeps its inline images and attachments.
+/// 5. A draft holding an attachment TabMail cannot carry is refused, and a save
+///    never deletes such an attachment from the server (#241).
+/// 6. The Drafts-list loader's own sequence: open the owner, else adopt and open,
+///    refuse for good, retry a failed read, or report no copy.
 @Suite("Draft open reload, end to end (#217)", .serialized, .processGlobalState)
 @MainActor
 struct DraftOpenReloadTests {
@@ -222,7 +226,7 @@ struct DraftOpenReloadTests {
     }
 
     @Test("An unreadable or gone server copy opens the local copy untouched",
-          arguments: ["offline", "server error", "gone"])
+          arguments: ["offline", "server error", "gone", "no body"])
     func unreadableCopyKeepsTheLocalCopy(failure: String) async throws {
         try await withInstalledPool { pool in
             let draft = try await pool.write { try insertDraft($0) }
@@ -231,6 +235,11 @@ struct DraftOpenReloadTests {
             let response: FakeHTTP.CannedResponse = switch failure {
             case "offline": .transportError(.notConnectedToInternet)
             case "server error": .status(500)
+            case "no body": .json(raw: """
+                {"id":"g1","subject":"Plan","from":{"emailAddress":{"address":"owner@example.com"}},\
+                "receivedDateTime":"\(ISO8601DateFormatter().string(from: Date()))","isRead":true,"isDraft":true,\
+                "hasAttachments":false}
+                """)
             default: .status(404)
             }
             let provider = exchangeProvider(http, copyResponse: response)
@@ -312,6 +321,8 @@ struct DraftOpenReloadTests {
             let isInline: Bool
             let contentId: String?
             let bytes: Data
+            /// Only a file attachment has bytes; another kind is listed and never read.
+            var odataType = "#microsoft.graph.fileAttachment"
         }
         let subject = Mutex("Plan")
         /// The body exactly as the last PATCH sent it.
@@ -346,12 +357,15 @@ struct DraftOpenReloadTests {
             let all = model.attachments.withLock { $0 }
             let last = request.url.lastPathComponent
             if let one = all.first(where: { $0.id == last }) {
+                guard one.odataType == "#microsoft.graph.fileAttachment" else {
+                    return .json(raw: "{\"@odata.type\":\"\(one.odataType)\",\"id\":\"\(one.id)\"}")
+                }
                 return .json(raw: "{\"contentBytes\":\"\(one.bytes.base64EncodedString())\"}")
             }
             let items: [[String: Any]] = all.map { item in
                 var json: [String: Any] = [
                     "id": item.id, "name": item.name, "contentType": item.contentType, "size": item.bytes.count,
-                    "isInline": item.isInline, "@odata.type": "#microsoft.graph.fileAttachment",
+                    "isInline": item.isInline, "@odata.type": item.odataType,
                 ]
                 if let contentId = item.contentId { json["contentId"] = contentId }
                 return json
@@ -839,6 +853,373 @@ struct DraftOpenReloadTests {
                 let after = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
                 #expect(after.ccArray == before.ccArray && after.bccArray == before.bccArray,
                         "the demo copy must never replace the draft's recipients")
+            }
+        }
+    }
+
+    // MARK: - 5. A draft holding an attachment TabMail cannot carry (#241)
+
+    /// Every stored copy of a file named `name` under the attachment storage root,
+    /// so a test can prove no staging directory was left behind.
+    private nonisolated static func storedCopies(named name: String) -> [URL] {
+        let enumerator = FileManager.default.enumerator(
+            at: DraftAttachmentStorage.baseDir, includingPropertiesForKeys: nil)
+        var found: [URL] = []
+        while let url = enumerator?.nextObject() as? URL {
+            if url.lastPathComponent.hasSuffix("_" + name) { found.append(url) }
+        }
+        return found
+    }
+
+    @Test("A server copy holding an attachment TabMail cannot carry refuses the open and changes nothing",
+          arguments: ["#microsoft.graph.itemAttachment", "#microsoft.graph.referenceAttachment", "unsafe file name"])
+    func uncarriableAttachmentRefusesTheOpen(kind: String) async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { try insertDraft($0) }
+            let model = ServerModel()
+            model.body.withLock { $0 = "edited in Outlook" }
+            model.attachments.withLock {
+                $0 = [kind == "unsafe file name"
+                    ? .init(id: "a2", name: "a/b.txt", contentType: "text/plain", isInline: false,
+                            contentId: nil, bytes: Data("x".utf8))
+                    : .init(id: "a2", name: "Fw: Report", contentType: "message/rfc822", isInline: false,
+                            contentId: nil, bytes: Data(), odataType: kind)]
+            }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            registerGraphServer(http, model: model)
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                let check = await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+
+                #expect(check == .unsupportedAttachment,
+                        "editing the local copy would let its save overwrite the server's version")
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(row.body == "phone edit" && row.serverPushStatus == "pushed" && row.attachmentsDirName == nil)
+                #expect(row.pushAttemptVersion == draft.pushAttemptVersion)
+                #expect(!http.recordedCalls().contains { $0.url.contains("/attachments/a2") },
+                        "an attachment the draft cannot carry is never downloaded")
+                #expect(!http.recordedCalls().contains { $0.method != "GET" }, "opening never writes to the server")
+            }
+        }
+    }
+
+    @Test("A save deletes only files TabMail could have read; every other server attachment stays")
+    func saveNeverDeletesAnAttachmentTabMailCannotCarry() async throws {
+        try await withInstalledPool { pool in
+            let keep = DraftAttachment(filename: "keep.txt", mimeType: "text/plain", data: Data("keep".utf8))
+            let dir = DraftAttachmentStorage.newStagingDirName()
+            try DraftAttachmentStorage.saveAttachments([keep], dirName: dir)
+            defer { DraftAttachmentStorage.deleteAttachments(dirName: dir) }
+            let draft = try await pool.write { db -> Draft in
+                var row = try insertDraft(db, status: "dirty")
+                row.attachmentsDirName = dir
+                try row.update(db)
+                return row
+            }
+            let model = ServerModel()
+            model.attachments.withLock {
+                $0 = [
+                    .init(id: "f1", name: "keep.txt", contentType: "text/plain", isInline: false,
+                          contentId: nil, bytes: keep.data),
+                    .init(id: "f2", name: "removed.txt", contentType: "text/plain", isInline: false,
+                          contentId: nil, bytes: Data("old".utf8)),
+                    .init(id: "e1", name: "Fw: Report", contentType: "message/rfc822", isInline: false,
+                          contentId: nil, bytes: Data(), odataType: "#microsoft.graph.itemAttachment"),
+                    .init(id: "r1", name: "Plan.docx", contentType: "application/octet-stream", isInline: false,
+                          contentId: nil, bytes: Data(), odataType: "#microsoft.graph.referenceAttachment"),
+                    .init(id: "u1", name: "a/b.txt", contentType: "text/plain", isInline: false,
+                          contentId: nil, bytes: Data("x".utf8)),
+                ]
+            }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            registerGraphServer(http, model: model)
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+
+            #expect(try await DraftStore.shared.pushDraftToServer(
+                draftId: draft.id, expectedInstanceEpoch: "E1", provider: provider,
+                runtimeKind: .outlook, draftsFolderPath: "Drafts") == .completed)
+
+            #expect(model.attachments.withLock { $0.map(\.id) } == ["f1", "e1", "r1", "u1"],
+                    "only the file the user removed is deleted; Graph cannot restore a deleted attachment")
+        }
+    }
+
+    @Test("A Gmail draft written in another charset reloads as its text, never as an empty draft")
+    func gmailDraftInAnotherCharsetReloadsAsItsText() async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { try insertDraft($0, provider: .gmail) }
+            let latin1: [UInt8] = [0x43, 0x61, 0x66, 0xE9, 0x20, 0x61, 0x74, 0x20, 0x35]
+            let date = String(Int(Date().timeIntervalSince1970 * 1000))
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"id":"r1","message":{"id":"m3"}}"#))
+            http.register(path: "/messages/m3", method: "GET", response: .json(raw: """
+                {"id":"m3","internalDate":"\(date)","labelIds":["DRAFT"],"payload":{"mimeType":"text/plain",\
+                "headers":[{"name":"Subject","value":"Plan"},{"name":"From","value":"owner@example.com"},\
+                {"name":"To","value":"alice@example.com"},\
+                {"name":"Content-Type","value":"text/plain; charset=iso-8859-1"}],\
+                "body":{"size":\(latin1.count),"data":"\(Self.base64URL(Data(latin1)))"}}}
+                """))
+            let provider = GmailProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(row.pushAttemptVersion > draft.pushAttemptVersion, "precondition: the open reloaded")
+                #expect(row.body == "Caf\u{E9} at 5")
+            }
+        }
+    }
+
+    @Test("A server read that outlasts the open budget opens the local copy, and its late answer writes nothing")
+    func slowServerReadOpensTheLocalCopy() async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { try insertDraft($0) }
+            let gate = DispatchSemaphore(value: 0)
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let provider = exchangeProvider(http, copyResponse: .parked {
+                _ = gate.wait(timeout: .now() + 30)
+                return .json(raw: Self.copyJSON(body: "late server body"))
+            })
+            try await withRegisteredProvider(provider) {
+                let started = Date()
+                let check = await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+                let waited = Date().timeIntervalSince(started)
+                for _ in 0..<4 { gate.signal() }
+
+                #expect(check == .open)
+                #expect(waited >= ExternalDraftOpenConfig.reloadTimeoutSeconds - 0.5,
+                        "precondition: the open waited for the read until its budget ran out")
+                #expect(waited < ExternalDraftOpenConfig.reloadTimeoutSeconds + 5, "the open never waits past its budget")
+                try await Task.sleep(for: .milliseconds(500))
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(row.body == "phone edit" && row.pushAttemptVersion == draft.pushAttemptVersion,
+                        "a read that answered after the open must not change the draft")
+            }
+        }
+    }
+
+    @Test("A reload that loses to a newer save keeps that save and leaves no staged copy of the server's files")
+    func reloadLosingToANewerSaveLeavesNothingStaged() async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { try insertDraft($0) }
+            let name = "staged-\(UUID().uuidString).txt"
+            let model = ServerModel()
+            model.attachments.withLock {
+                $0 = [.init(id: "a1", name: name, contentType: "text/plain", isInline: false,
+                            contentId: nil, bytes: Data("server file".utf8))]
+            }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            registerGraphServer(http, model: model)
+            // While the server copy is read, another save advances the row.
+            http.register(path: "/messages/g1/attachments/a1", method: "GET") { _ in
+                try? pool.write { db in
+                    guard var row = try Draft.fetchOne(db, key: draft.id) else { return }
+                    row.body = "newer save"
+                    row.pushAttemptVersion += 1
+                    try row.update(db)
+                }
+                return .json(raw: "{\"contentBytes\":\"\(Data("server file".utf8).base64EncodedString())\"}")
+            }
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(row.body == "newer save" && row.attachmentsDirName == nil)
+                #expect(Self.storedCopies(named: name).isEmpty, "the losing reload left its staged files on disk")
+            }
+        }
+    }
+
+    @Test("Adopting a copy another row already owns inserts nothing and leaves no staged files")
+    func adoptionIntoAnOwnedAddressLeavesNothingStaged() async throws {
+        try await withInstalledPool { pool in
+            let name = "adopt-\(UUID().uuidString).txt"
+            let header = try await pool.write { db -> MessageHeader in
+                var account = Account(emailAddress: "owner@example.com", displayName: "Test", provider: .imap)
+                account.id = Self.accountId
+                try account.insert(db)
+                var folder = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: Self.accountId)
+                folder.lastKnownUidValidity = 900_001
+                try folder.insert(db)
+                var header = MessageHeader(
+                    messageId: "7", subject: "Plan", from: "owner@example.com", fromAddress: "owner@example.com",
+                    to: "alice@example.com", date: Date(), snippet: "", folderId: folder.id,
+                    accountId: Self.accountId, folderPath: "Drafts", isInInbox: false)
+                header.observedUidValidity = 900_001
+                try header.insert(db)
+                return header
+            }
+            let provider = MockEmailProvider()
+            await provider.setDraftCopy(.success(MockEmailProvider.draftCopy(
+                subject: "Plan", to: ["alice@example.com"], cc: [], html: "<p>see attached</p>",
+                attachmentNames: [name], attachmentData: ["mock-att-0": Data("notes".utf8)])))
+            try await withRegisteredProvider(provider) {
+                let address = try #require(try await pool.read { db in
+                    try ExternalDraftAdoption.adoptableAddress(db: db, header: header, runtimeKind: .imap)
+                })
+                // Another open adopted the same copy while this one read it.
+                try await pool.write { db in
+                    var owner = Draft(
+                        id: "adopted:first", accountId: Self.accountId,
+                        toJSON: "[]", ccJSON: "[]", bccJSON: "[]", subject: "Plan", body: "first",
+                        replyToId: nil, isForward: false, editHistoryJSON: nil, createdAt: 1, updatedAt: 2,
+                        serverDraftId: "7", serverPushStatus: "pushed", rfc822MessageId: nil, attachmentsDirName: nil)
+                    owner.serverDraftFolderPath = "Drafts"
+                    owner.serverDraftUidValidity = 900_001
+                    owner.instanceEpoch = "E1"
+                    try owner.insert(db)
+                }
+                try await ExternalDraftAdoption.adopt(header: header, address: address, runtimeKind: .imap)
+
+                #expect(try await pool.read { try Draft.fetchCount($0) } == 1, "a second row was adopted for one copy")
+                #expect(Self.storedCopies(named: name).isEmpty, "the refused adoption left its staged files on disk")
+            }
+        }
+    }
+
+    // MARK: - 6. The Drafts-list loader's production sequence
+
+    /// An Outlook account with a Drafts header at Graph id `g1`, optionally owned by
+    /// a saved row, or in the Inbox when `inDrafts` is false.
+    private nonisolated func insertOutlookHeader(
+        _ db: Database, owned: Bool = false, inDrafts: Bool = true
+    ) throws -> MessageHeader {
+        var account = Account(emailAddress: "owner@example.com", displayName: "Test", provider: .outlook)
+        account.id = Self.accountId
+        try account.insert(db)
+        let folder = Folder(
+            name: inDrafts ? "Drafts" : "Inbox", path: inDrafts ? "Drafts" : "Inbox",
+            role: inDrafts ? .drafts : .inbox, accountId: Self.accountId)
+        try folder.insert(db)
+        let header = MessageHeader(
+            messageId: "g1", subject: "Plan", from: "owner@example.com", fromAddress: "owner@example.com",
+            to: "alice@example.com", date: Date(), snippet: "", folderId: folder.id,
+            accountId: Self.accountId, folderPath: folder.path, isInInbox: !inDrafts)
+        try header.insert(db)
+        if owned {
+            var draft = Draft(
+                id: "owned-draft", accountId: Self.accountId,
+                toJSON: "[]", ccJSON: "[]", bccJSON: "[]", subject: "Plan", body: "phone edit",
+                replyToId: nil, isForward: false, editHistoryJSON: nil, createdAt: 1, updatedAt: 2,
+                serverDraftId: "g1", serverPushStatus: "pushed", rfc822MessageId: nil, attachmentsDirName: nil)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+        return header
+    }
+
+    /// What `ServerDraftComposeLoader` shows for `header`: its production sequence,
+    /// classified as the view classifies it.
+    private func loaderResolution(_ header: MessageHeader) async -> ServerDraftComposeLoader.Resolution {
+        let outcome: Result<LocallyAuthoredDraftOpenAuthority?, any Error>
+        do {
+            outcome = .success(try await ServerDraftComposeLoader.resolveOpenAuthority(header: header))
+        } catch {
+            outcome = .failure(error)
+        }
+        return ServerDraftComposeLoader.classify(outcome)
+    }
+
+    @Test("The loader opens a draft this device owns without reading the server")
+    func loaderOpensTheOwnedDraft() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertOutlookHeader($0, owned: true) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let provider = exchangeProvider(http, copyResponse: .json(raw: Self.copyJSON(body: "server body")))
+            try await withRegisteredProvider(provider) {
+                let resolution = await loaderResolution(header)
+
+                guard case .authorized(let authority) = resolution else {
+                    Issue.record("expected the owned draft, got \(resolution)")
+                    return
+                }
+                #expect(authority.draftId == "owned-draft")
+                #expect(http.recordedCalls().isEmpty, "an owned draft is not adopted again")
+            }
+        }
+    }
+
+    @Test("The loader adopts another app's draft, then opens the adopted row")
+    func loaderAdoptsThenOpens() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertOutlookHeader($0) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let provider = exchangeProvider(http, copyResponse: .json(raw: Self.copyJSON(body: "written elsewhere")))
+            try await withRegisteredProvider(provider) {
+                let resolution = await loaderResolution(header)
+
+                guard case .authorized(let authority) = resolution else {
+                    Issue.record("expected the adopted draft, got \(resolution)")
+                    return
+                }
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: authority.draftId) })
+                #expect(ExternalDraftAdoption.isAdoptedKey(row.id) && row.serverDraftId == "g1")
+                #expect(row.body == "written elsewhere")
+            }
+        }
+    }
+
+    @Test("The loader refuses, for good, a draft holding an attachment TabMail cannot carry")
+    func loaderRefusesAnUncarriableDraft() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertOutlookHeader($0) }
+            let model = ServerModel()
+            model.attachments.withLock {
+                $0 = [.init(id: "e1", name: "Fw: Report", contentType: "message/rfc822", isInline: false,
+                            contentId: nil, bytes: Data(), odataType: "#microsoft.graph.itemAttachment")]
+            }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            registerGraphServer(http, model: model)
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                #expect(await loaderResolution(header) == .unsupportedAttachment,
+                        "a refusal that can never succeed must not offer Try Again")
+                let drafts = try await pool.read { try Draft.fetchCount($0) }
+                #expect(drafts == 0)
+            }
+        }
+    }
+
+    @Test("The loader shows a read that failed as retryable, never as an absent draft")
+    func loaderFailedReadIsRetryable() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertOutlookHeader($0) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let provider = exchangeProvider(http, copyResponse: .status(500))
+            try await withRegisteredProvider(provider) {
+                #expect(await loaderResolution(header) == .resolveFailed)
+                let drafts = try await pool.read { try Draft.fetchCount($0) }
+                #expect(drafts == 0)
+            }
+        }
+    }
+
+    @Test("The loader finds no editable copy for a header outside a Drafts folder")
+    func loaderHasNoCopyOutsideDrafts() async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try insertOutlookHeader($0, inDrafts: false) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let provider = exchangeProvider(http, copyResponse: .json(raw: Self.copyJSON(body: "server body")))
+            try await withRegisteredProvider(provider) {
+                #expect(await loaderResolution(header) == .noLocalCopy)
+                let drafts = try await pool.read { try Draft.fetchCount($0) }
+                #expect(http.recordedCalls().isEmpty && drafts == 0)
             }
         }
     }

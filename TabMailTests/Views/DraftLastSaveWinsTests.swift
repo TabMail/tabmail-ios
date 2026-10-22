@@ -285,6 +285,29 @@ struct DraftCopyReadTests {
         }
     }
 
+    @Test("Graph: a draft holding an attachment that is not a file is refused, never read without it",
+          arguments: ["#microsoft.graph.itemAttachment", "#microsoft.graph.referenceAttachment", nil])
+    func graphDraftWithNonFileAttachmentIsRefused(odataType: String?) async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let received = ISO8601DateFormatter().string(from: Date())
+        http.register(path: "/messages/g1", method: "GET", response: .json(raw: """
+            {"id":"g1","subject":"Plan","from":{"emailAddress":{"address":"owner@example.com"}},
+             "receivedDateTime":"\(received)","isRead":true,"hasAttachments":true,
+             "body":{"contentType":"text","content":"Hi Bob"}}
+            """))
+        let typeField = odataType.map { ",\"@odata.type\":\"\($0)\"" } ?? ""
+        http.register(path: "/messages/g1/attachments", method: "GET", response: .json(raw: """
+            {"value":[{"id":"e1","name":"Forwarded","contentType":"message/rfc822","size":9,"isInline":false\(typeField)}]}
+            """))
+        let provider = ExchangeProvider(
+            userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+
+        await #expect(throws: DraftCopyUnsupportedAttachment.self) {
+            try await provider.fetchDraftCopy(identity: .outlook(graphId: "g1"))
+        }
+    }
+
     @Test("Graph: a draft read is the draft as text, every inline image, and attached mail kept as files")
     func graphDraftReadIsTheDraftOnly() async throws {
         let http = FakeHTTP.Scenario()
@@ -301,8 +324,6 @@ struct DraftCopyReadTests {
         }
         http.register(path: "/messages/g1/attachments", method: "GET", response: .json(raw: """
             {"value":[
-             {"id":"e1","name":"Forwarded","contentType":"message/rfc822","size":9,"isInline":false,
-              "@odata.type":"#microsoft.graph.itemAttachment"},
              {"id":"f1","name":"fwd.eml","contentType":"application/octet-stream","size":9,"isInline":false,
               "@odata.type":"#microsoft.graph.fileAttachment"},
              {"id":"i1","name":"logo.png","contentType":"image/png","size":2,"isInline":true,"contentId":"<logo>",
@@ -323,7 +344,7 @@ struct DraftCopyReadTests {
         #expect(copy.htmlBody == nil, "an attached message's text must never join the draft body")
         #expect(copy.inlineImages.map(\.contentId) == ["logo"], "an inline image the body does not reference is still the draft's")
         #expect(copy.inlineImages.first?.data == Data([7, 8]))
-        #expect(copy.attachments.map(\.filename) == ["Forwarded", "fwd.eml", "pic.png"],
+        #expect(copy.attachments.map(\.filename) == ["fwd.eml", "pic.png"],
                 "attached mail stays a file, and an image with no Content-ID is carried as a file")
         #expect(!http.recordedCalls().contains { $0.url.contains("$expand") || $0.url.contains("/attachments/f1") },
                 "a draft read never opens an attached message")
@@ -421,7 +442,9 @@ struct DraftCopyReadTests {
         _ http: FakeHTTP.Scenario, serverFiles: [(id: String, name: String)]
     ) -> ExchangeProvider {
         http.register(path: "/messages/g1", method: "PATCH", response: .json(raw: #"{"id":"g1"}"#))
-        let items = serverFiles.map { "{\"id\":\"\($0.id)\",\"name\":\"\($0.name)\"}" }.joined(separator: ",")
+        let items = serverFiles.map {
+            "{\"@odata.type\":\"#microsoft.graph.fileAttachment\",\"id\":\"\($0.id)\",\"name\":\"\($0.name)\"}"
+        }.joined(separator: ",")
         http.register(path: "/messages/g1/attachments", method: "GET", response: .json(raw: "{\"value\":[\(items)]}"))
         http.register(path: "/messages/g1/attachments/", method: "DELETE", response: .status(204))
         return ExchangeProvider(
@@ -619,5 +642,38 @@ struct IMAPDraftCopyCompletenessTests {
         #expect(throws: IMAPProvider.IMAPDraftCopyIncomplete.self) {
             try IMAPProvider.completeDraftCopy(Self.full(attachments: attachments), message: Self.message([part]))
         }
+    }
+
+    /// The wire shape: SwiftMail hands back EMPTY bytes, not nil, for a part the
+    /// server's FETCH response left out, so the declared size is the evidence.
+    @Test("A part declared non-empty that comes back empty fails the read", arguments: ["text", "attachment", "inline"])
+    func emptyBytesForADeclaredPartThrow(kind: String) {
+        let attachments = kind == "attachment"
+            ? [AttachmentInfo(filename: "a.pdf", contentType: "application/pdf", section: "2", size: 8, encoding: nil)]
+            : []
+        let part = switch kind {
+            case "text": MessagePart(sectionString: "2", contentType: "text/plain", size: 8, data: Data())
+            case "attachment": MessagePart(sectionString: "2", contentType: "application/pdf", disposition: "attachment",
+                                           filename: "a.pdf", size: 8, data: Data())
+            default: MessagePart(sectionString: "2", contentType: "image/png", contentId: "<pic>", size: 8, data: Data())
+        }
+        #expect(throws: IMAPProvider.IMAPDraftCopyIncomplete.self) {
+            try IMAPProvider.completeDraftCopy(Self.full(attachments: attachments), message: Self.message([part]))
+        }
+    }
+
+    @Test("A part declared empty reads as empty: an empty draft with a file is still a draft")
+    func partDeclaredEmptyReadsAsEmpty() throws {
+        let copy = try IMAPProvider.completeDraftCopy(
+            Self.full(attachments: [
+                AttachmentInfo(filename: "a.pdf", contentType: "application/pdf", section: "2", size: 0, encoding: nil),
+            ]),
+            message: Self.message([
+                MessagePart(sectionString: "1", contentType: "text/plain", size: 0, data: Data()),
+                MessagePart(sectionString: "2", contentType: "application/pdf", disposition: "attachment",
+                            filename: "a.pdf", size: 0, data: Data()),
+            ]))
+        #expect(copy.textBody == "")
+        #expect(copy.attachmentData == ["2": Data()])
     }
 }

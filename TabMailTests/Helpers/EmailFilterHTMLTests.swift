@@ -437,7 +437,8 @@ struct EmailFilterHTMLBlockNewlineTests {
         ("<div><div><div>a</div></div></div><div>b</div>", "a\nb"),
         // A block opening after inline text starts a new line.
         ("text<div>block</div>more", "text\nblock\nmore"),
-        // Earlier TabMail drafts (pre-wrap divs) read back line for line.
+        // A pre-wrap div of line divs reads back one line per div; quote styling
+        // is cosmetic and goes.
         ("<div style=\"white-space:pre-wrap;\"><div>Hi Bob,</div><div><br></div><div>Plan:</div><blockquote>quoted</blockquote><div>Alice</div></div>",
          "Hi Bob,\n\nPlan:\nquoted\nAlice"),
         // Pretty-printed source: whitespace between blocks is not a line.

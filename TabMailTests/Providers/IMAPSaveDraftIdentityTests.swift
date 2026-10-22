@@ -68,7 +68,8 @@ struct IMAPSaveDraftIdentityTests {
     /// Content-Type parameters are `textParameters` (BODYSTRUCTURE form), and a
     /// `notes.txt` attachment holding `attachment`.
     private static func multipartDraftServer(
-        mine: String, epoch: Int, text: Data, textParameters: String, attachment: Data
+        mine: String, epoch: Int, text: Data, textParameters: String, attachment: Data,
+        serveText: Bool = true
     ) -> FakeIMAPServer {
         let attachmentOnWire = Data(attachment.base64EncodedString().utf8)
         let formatter = DateFormatter()
@@ -109,7 +110,8 @@ struct IMAPSaveDraftIdentityTests {
             uid: 5, subject: "draft", from: "Sender <sender@example.com>",
             to: "Recipient <recipient@example.com>", date: date, internalDate: internalDate,
             messageID: "<\(mine)>", rawHeader: header, fullMessage: Data(raw.utf8),
-            bodystructure: bodystructure, partBodies: ["1": text, "2": attachmentOnWire])]])
+            bodystructure: bodystructure,
+            partBodies: serveText ? ["1": text, "2": attachmentOnWire] : ["2": attachmentOnWire])]])
         server.setUidValidity(epoch, for: "Drafts")
         return server
     }
@@ -133,6 +135,23 @@ struct IMAPSaveDraftIdentityTests {
         let info = try #require(copy.attachments.first { $0.filename == "notes.txt" })
         #expect(copy.attachmentData?[info.section] == attachment,
                 "adoption would fetch the file again by UID, outside the proven UIDVALIDITY")
+    }
+
+    @Test("A draft read whose text part comes back without bytes fails, never reads as an empty draft")
+    func draftReadWithoutTextBytesThrows() async throws {
+        let epoch = 73_006
+        let server = Self.multipartDraftServer(
+            mine: "mine-\(UUID().uuidString)@example.com", epoch: epoch, text: Data("body".utf8),
+            textParameters: "\"CHARSET\" \"UTF-8\"", attachment: Data("notes".utf8), serveText: false)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        await #expect(throws: IMAPProvider.IMAPDraftCopyIncomplete.self) {
+            try await provider.fetchDraftCopy(identity: .imap(folder: "Drafts", uidValidity: epoch, uid: 5))
+        }
     }
 
     /// #238: Thunderbird and Apple Mail write a plain-text draft as `format=flowed`,

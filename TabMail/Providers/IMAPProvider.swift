@@ -5842,7 +5842,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             if contentType.hasPrefix("multipart/") { continue }
             let isBodyText = contentType.hasPrefix("text/plain") || contentType.hasPrefix("text/html")
             if isBodyText, part.filename == nil, part.disposition?.lowercased() != "attachment" {
-                guard let text = part.textContent else {
+                guard Self.draftPartArrived(part), let text = part.textContent else {
                     throw IMAPDraftCopyIncomplete(section: part.section.description)
                 }
                 if contentType.hasPrefix("text/plain") {
@@ -5855,7 +5855,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if contentType.hasPrefix("image/"), !contentId.isEmpty {
-                guard let data = part.decodedData() else {
+                guard Self.draftPartArrived(part), let data = part.decodedData() else {
                     throw IMAPDraftCopyIncomplete(section: part.section.description)
                 }
                 inlineImages.append(InlineImage(contentId: contentId, contentType: part.contentType, data: data))
@@ -5873,7 +5873,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         for part in message.parts { partsBySection[part.section.description] = part }
         var attachmentData: [String: Data] = [:]
         for attachment in attachments {
-            guard let data = partsBySection[attachment.section]?.decodedData() else {
+            guard let part = partsBySection[attachment.section], Self.draftPartArrived(part),
+                  let data = part.decodedData() else {
                 throw IMAPDraftCopyIncomplete(section: attachment.section)
             }
             attachmentData[attachment.section] = data
@@ -5882,6 +5883,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             header: full.header, htmlBody: htmlBody, textBody: textBody,
             attachments: attachments, inlineImages: inlineImages, icsData: full.icsData,
             attachmentData: attachmentData)
+    }
+
+    /// Whether a draft-copy part's bytes arrived. SwiftMail's part fetch answers
+    /// a FETCH whose response carries no `BODY[n]` with EMPTY bytes, not an error,
+    /// so a part BODYSTRUCTURE declares non-empty that came back empty never
+    /// arrived. A part declared empty, or of unknown size, is taken as read.
+    nonisolated static func draftPartArrived(_ part: MessagePart) -> Bool {
+        guard let data = part.data else { return false }
+        return !data.isEmpty || (part.size ?? 0) == 0
     }
 
     /// A draft-copy part that came back without bytes. Retryable; never "gone".
