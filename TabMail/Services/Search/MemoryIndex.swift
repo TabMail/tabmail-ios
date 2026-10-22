@@ -711,10 +711,11 @@ actor MemoryIndex {
             BackgroundSyncLogger.logDebug("[MemoryIndex] FTS candidate fetch failed: \(error)")
         }
 
-        // Vector candidates; empty without a query embedding.
+        // Vector candidates within the dates; empty without a query embedding.
         var vecCandidates: [(Int64, Double)] = []
         if let queryEmbedding {
-            vecCandidates = searchVecCandidates(queryEmbedding: queryEmbedding, limit: candidateLimit, demoActive: demoActive)
+            vecCandidates = searchVecCandidates(queryEmbedding: queryEmbedding, limit: candidateLimit, demoActive: demoActive,
+                                                fromMs: fromMs, toMs: toMs)
         }
 
         if DebugModeManager.isLoggingEnabled() {
@@ -735,8 +736,8 @@ actor MemoryIndex {
             return []
         }
 
-        // FTS-only fallback when vec table is empty (steady state during initial
-        // backfill, or when EmbeddingService is unavailable).
+        // FTS-only fallback when no vector lies within the dates (or the vec table is
+        // empty: steady state during initial backfill, or when EmbeddingService is unavailable).
         if vecCandidates.isEmpty {
             let hits = assembleFTSOnly(Array(ftsCandidates.prefix(limit)))
             BackgroundSyncLogger.logDebug("[MemoryIndex] search RESULT \(hits.count) hits (FTS-only fallback)")
@@ -791,8 +792,6 @@ actor MemoryIndex {
                     finalScore: r.finalScore
                 ))
             } else if let meta = vecOnlyMap[r.rowid] {
-                if let fromMs, meta.dateMs < fromMs { continue }
-                if let toMs, meta.dateMs > toMs { continue }
                 results.append(MemoryHit(
                     chatHistoryId: meta.chatHistoryId,
                     sessionId: meta.sessionId,
@@ -866,13 +865,23 @@ actor MemoryIndex {
     }
 
     /// Vector KNN query. Uses writer connection to avoid sqlite-vec vtab lifecycle issues
-    /// (matches `SearchIndex.searchVecCandidates`).
+    /// (matches `SearchIndex.searchVecCandidates`). With dates (either bound, each inclusive),
+    /// sqlite-vec searches only the turns dated within them (`rowid IN`), so nearer turns outside
+    /// them never take the `limit` places. Mirrors tabmail-native-fts#26 (ADR-NF-016).
     /// Internal (not private) so tests can exercise the KNN-subquery + meta
     /// JOIN shape against a real vec0 table — a planner rejection here would
     /// otherwise degrade to FTS-only silently (do/catch → []).
-    func searchVecCandidates(queryEmbedding: [Float], limit: Int, demoActive: Bool) -> [(Int64, Double)] {
+    func searchVecCandidates(queryEmbedding: [Float], limit: Int, demoActive: Bool,
+                             fromMs: Int64? = nil, toMs: Int64? = nil) -> [(Int64, Double)] {
         guard let dbPool else { return [] }
         let blob = queryEmbedding.withUnsafeBytes { Data($0) }
+        let withinDates = fromMs == nil && toMs == nil
+            ? ""
+            : " AND rowid IN (SELECT rowid FROM memory_meta WHERE dateMs >= ? AND dateMs <= ?)"
+        var arguments: StatementArguments = [blob, limit]
+        if !withinDates.isEmpty {
+            arguments += [fromMs ?? Int64.min, toMs ?? Int64.max]
+        }
         do {
             let (pairs, distances) = try dbPool.writeWithoutTransaction { db -> ([(Int64, Double)], [Double]) in
                 // KNN runs in the inner select (vec0 MATCH + k constraint);
@@ -881,10 +890,10 @@ actor MemoryIndex {
                 // rather than backfilled.
                 let rows = try Row.fetchAll(db, sql: """
                     SELECT v.rowid AS rowid, v.distance AS distance
-                    FROM (SELECT rowid, distance FROM memory_vec WHERE embedding MATCH ? AND k = ?) v
+                    FROM (SELECT rowid, distance FROM memory_vec WHERE embedding MATCH ? AND k = ?\(withinDates)) v
                     JOIN memory_meta meta ON meta.rowid = v.rowid
                     WHERE \(Self.demoScopeSQL(demoActive: demoActive, alias: "meta"))
-                    """, arguments: [blob, limit])
+                    """, arguments: arguments)
                 var pairs: [(Int64, Double)] = []
                 var ds: [Double] = []
                 for row in rows {

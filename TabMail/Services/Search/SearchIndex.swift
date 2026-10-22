@@ -1918,7 +1918,7 @@ actor SearchIndex {
         let ftsCandidates = try searchFTSCandidates(
             ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: candidateLimit, folderIds: folderIds)
 
-        // --- Column-scope filter-first: restrict vector candidates to eligible rowids ---
+        // --- Column-scope filter-first: the vector search looks only among the field's rowids ---
         let eligibleRowids: Set<Int64>?
         if Self.queryHasColumnScope(ftsQuery) {
             let filterQuery = Self.extractColumnScopeFilter(ftsQuery)
@@ -1931,17 +1931,12 @@ actor SearchIndex {
             eligibleRowids = nil
         }
 
-        // --- Vector candidates via sqlite-vec KNN ---
-        let vecTopK = eligibleRowids != nil ? candidateLimit * 2 : candidateLimit
-        let allVec = searchVecCandidates(queryEmbedding: queryEmbedding, limit: vecTopK)
-        let vectorCandidates: [(Int64, Double)]
-        if let eligible = eligibleRowids {
-            vectorCandidates = allVec.filter { eligible.contains($0.0) }
-        } else {
-            vectorCandidates = allVec
-        }
+        // --- Vector candidates via sqlite-vec KNN, within the dates and the field ---
+        let vectorCandidates = searchVecCandidates(queryEmbedding: queryEmbedding, limit: candidateLimit,
+                                                   fromDateMs: fromDateMs, toDateMs: toDateMs, eligible: eligibleRowids)
 
-        // Fall back to FTS-only when vec table is empty (e.g., during embedding rebuild).
+        // Fall back to FTS-only when no vector lies within the dates and the field (or the vec table
+        // is empty, e.g. during embedding rebuild).
         // Without this, hybrid weights (text_weight=0.3) penalize text-only results below MIN_SCORE.
         if vectorCandidates.isEmpty {
             BackgroundSyncLogger.logDebug("[SearchIndex] No vector candidates (vec table may be empty), falling back to FTS-only search")
@@ -1978,14 +1973,12 @@ actor SearchIndex {
                     snippet: fts.snippet, rank: -hr.finalScore, dateMs: fts.dateMs
                 ))
             } else {
-                // Vector-only result — fetch metadata, apply date filter.
-                // Demo scope: the KNN leg has no SQL account predicate, so
-                // out-of-scope vector hits are dropped here (headerId is
-                // accountId-prefixed).
+                // Vector-only result — fetch metadata (the KNN leg already kept
+                // only rows within the dates). Demo scope: the KNN leg has no
+                // SQL account predicate, so out-of-scope vector hits are
+                // dropped here (headerId is accountId-prefixed).
                 if let meta = try fetchMeta(rowid: hr.rowid) {
                     guard Self.contentKeyInDemoScope(meta.contentKey, demoActive: DemoModeStore.isDemoActive) else { continue }
-                    if let from = fromDateMs, meta.dateMs < from { continue }
-                    if let to = toDateMs, meta.dateMs > to { continue }
                     results.append(FTSSearchResult(
                         contentKey: meta.contentKey, messageId: meta.messageId,
                         snippet: "", rank: -hr.finalScore, dateMs: meta.dateMs
@@ -2276,17 +2269,36 @@ actor SearchIndex {
     /// Returns array of (rowid, cosineDistance) sorted by distance ascending.
     /// Gracefully returns empty if the vec table doesn't exist (e.g., during rebuild).
     ///
+    /// With dates (either bound, each inclusive) or a field's rowids, sqlite-vec searches only the
+    /// rows of `message_meta` dated within the dates and among those rowids (`rowid IN`), so nearer
+    /// rows outside them never take the `limit` places. Mirrors tabmail-native-fts#26 (ADR-NF-016).
+    ///
     /// Uses the writer connection (not reader pool) to avoid sqlite-vec vtab lifecycle
     /// crash — vec0 caches prepared statements per connection, and reader pool
     /// connection recycling can cause SIGABRT in vec0_free_resources on disconnect.
-    private func searchVecCandidates(queryEmbedding: [Float], limit: Int) -> [(Int64, Double)] {
+    /// Internal (not private) so tests can check that nearer rows outside the dates or
+    /// the field fill the unfiltered `limit`.
+    func searchVecCandidates(queryEmbedding: [Float], limit: Int, fromDateMs: Int64?, toDateMs: Int64?,
+                             eligible: Set<Int64>?) -> [(Int64, Double)] {
         guard let dbPool else { return [] }
         let blob = queryEmbedding.withUnsafeBytes { Data($0) }
+        let sql: String
+        let arguments: StatementArguments
+        if fromDateMs == nil && toDateMs == nil && eligible == nil {
+            sql = "SELECT rowid, distance FROM messages_vec WHERE embedding MATCH ? AND k = ?"
+            arguments = [blob, limit]
+        } else {
+            sql = """
+                SELECT rowid, distance FROM messages_vec WHERE embedding MATCH ? AND k = ? AND rowid IN
+                (SELECT rowid FROM message_meta WHERE dateMs >= ? AND dateMs <= ?
+                 AND (? IS NULL OR rowid IN (SELECT value FROM json_each(?))))
+                """
+            let eligibleJSON = eligible.map { "[" + $0.map(String.init).joined(separator: ",") + "]" }
+            arguments = [blob, limit, fromDateMs ?? Int64.min, toDateMs ?? Int64.max, eligibleJSON, eligibleJSON]
+        }
         do {
             return try dbPool.writeWithoutTransaction { db in
-                try Row.fetchAll(db, sql: """
-                    SELECT rowid, distance FROM messages_vec WHERE embedding MATCH ? AND k = ?
-                    """, arguments: [blob, limit])
+                try Row.fetchAll(db, sql: sql, arguments: arguments)
                 .compactMap { row -> (Int64, Double)? in
                     guard let rowid = row["rowid"] as Int64?,
                           let distance = row["distance"] as Double? else { return nil }

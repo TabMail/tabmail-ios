@@ -146,6 +146,107 @@ struct MemoryIndexTests {
         #expect(Set(normalHits.map(\.0)).isDisjoint(with: Set(demoHits.map(\.0))))
     }
 
+    /// A unit vector at cosine `cos` from axis 0, leaning towards axis 1.
+    private func vector(cos: Float) -> [Float] {
+        var v = [Float](repeating: 0, count: SearchConfig.embeddingDims)
+        v[0] = cos
+        v[1] = (1 - cos * cos).squareRoot()
+        return v
+    }
+
+    /// With dates, the vector search looks only among the turns dated within them (tabmail-ios#242,
+    /// mirroring tabmail-native-fts#26, ADR-NF-016): both bounds and either bound alone, inclusive.
+    @Test("searchVecCandidates: keeps the nearest turns within both bounds or either bound alone")
+    func vecCandidates_withinTheDates() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+
+        // Turn i at distance i/100 from the query, dated i days after the base (a month ahead, so a
+        // missing end date standing for now would exclude them), and turn 6 long before 1970.
+        let day: Int64 = 86_400_000, base = Int64(Date().timeIntervalSince1970 * 1000) + 30 * day
+        let dates = (1...5).map { base + Int64($0) * day } + [-5_000_000_000_000]
+        for (i, dateMs) in dates.enumerated() {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i + 1)", sessionId: "s", role: "user", dateMs: dateMs, text: "turn")
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings(dates.indices.map {
+            (chatHistoryId: "t\($0 + 1)", observedEpoch: 1, embedding: vector(cos: 1 - Float($0 + 1) / 100))
+        })
+        func nearest(_ k: Int, _ from: Int64?, _ to: Int64?) async -> [Int] {
+            await MemoryIndex.shared.searchVecCandidates(queryEmbedding: vector(cos: 1), limit: k, demoActive: false, fromMs: from, toMs: to)
+                .map { Int(($0.1 * 100).rounded()) }
+        }
+
+        #expect(await nearest(2, nil, nil) == [1, 2])
+        #expect(await nearest(5, base + 2 * day, base + 3 * day) == [2, 3])
+        #expect(await nearest(5, base + 4 * day, base + 4 * day) == [4])
+        #expect(await nearest(5, base + 4 * day, nil) == [4, 5])
+        #expect(await nearest(5, nil, base + day) == [1, 6])
+        #expect(await nearest(5, base + 5 * day + 1, nil) == [])
+    }
+
+    /// A dated memory search finds a turn by meaning alone past more nearer turns outside the dates
+    /// than its vector search asks for (tabmail-ios#242, mirroring tabmail-native-fts#26).
+    @Test("hybridSearch: a match by meaning inside the dates is found past nearer turns outside them")
+    func hybridSearch_matchByMeaningPastNearerTurnsOutsideTheDates() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+
+        let day: Int64 = 86_400_000, limit = 2, base = Int64(Date().timeIntervalSince1970 * 1000) + 30 * day
+        let nearer = limit * SearchConfig.candidateMultiplier * 2 + 4
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "inside", sessionId: "s", role: "user", dateMs: base + 10 * day, text: "turn")
+        var embeddings: [(chatHistoryId: String, observedEpoch: Int64, embedding: [Float])] = [
+            (chatHistoryId: "inside", observedEpoch: 1, embedding: vector(cos: 0.8))
+        ]
+        for i in 0..<nearer {
+            for (id, dateMs) in [("before\(i)", base + Int64(i) * 3_600_000), ("after\(i)", base + 20 * day + Int64(i) * 3_600_000)] {
+                await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: "s", role: "user", dateMs: dateMs, text: "turn")
+                embeddings.append((chatHistoryId: id, observedEpoch: 1, embedding: vector(cos: 1)))
+            }
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings(embeddings)
+
+        // Without dates, the nearer turns take every place the vector search asks for.
+        let unfiltered = await MemoryIndex.shared.searchVecCandidates(
+            queryEmbedding: vector(cos: 1), limit: limit * SearchConfig.candidateMultiplier, demoActive: false)
+        #expect(unfiltered.count == limit * SearchConfig.candidateMultiplier)
+        #expect(unfiltered.allSatisfy { $0.1 < 0.1 })
+
+        // No keyword matches: the turn is found by meaning alone.
+        let hits = await MemoryIndex.shared.hybridSearch(
+            query: "zyxwvut", queryEmbedding: vector(cos: 1), fromMs: base + 9 * day, toMs: base + 11 * day,
+            limit: limit, demoActive: false)
+        #expect(hits.map(\.chatHistoryId) == ["inside"])
+    }
+
+    /// With no vector within the dates (as during embedding backfill), a dated memory search answers
+    /// with every keyword match within them, the weak one too (tabmail-ios#242, native-fts #25 item 5).
+    @Test("hybridSearch: with no vector within the dates, every keyword match within them is the answer")
+    func hybridSearch_noVectorWithinTheDatesAnswersByKeyword() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+
+        let day: Int64 = 86_400_000, base = Int64(Date().timeIntervalSince1970 * 1000) + 30 * day
+        // A strong and a weak keyword match (a short turn and a long one) within the dates, one turn with
+        // the query's own vector outside them, and turns without the word.
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "strong", sessionId: "s", role: "user", dateMs: base, text: "kinkajou")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "weak", sessionId: "s", role: "user", dateMs: base + day,
+                                           text: "kinkajou " + String(repeating: "weather ", count: 2000))
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "outside", sessionId: "s", role: "user", dateMs: base + 10 * day, text: "different")
+        for i in 0..<40 {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "other\(i)", sessionId: "s", role: "user", dateMs: base + 20 * day, text: "different")
+        }
+        #expect(await MemoryIndex.shared.storeEmbeddings([(chatHistoryId: "outside", observedEpoch: 1, embedding: vector(cos: 1))]).committed == ["outside"])
+
+        // The vector exists, but not within the dates.
+        #expect(await MemoryIndex.shared.searchVecCandidates(queryEmbedding: vector(cos: 1), limit: 1, demoActive: false).count == 1)
+        #expect(await MemoryIndex.shared.searchVecCandidates(
+            queryEmbedding: vector(cos: 1), limit: 10, demoActive: false, fromMs: base, toMs: base + 2 * day).isEmpty)
+
+        let hits = await MemoryIndex.shared.hybridSearch(
+            query: "kinkajou", queryEmbedding: vector(cos: 1), fromMs: base, toMs: base + 2 * day, limit: 10, demoActive: false)
+        #expect(Set(hits.map(\.chatHistoryId)) == ["strong", "weak"])
+    }
+
     // MARK: - indexTurn writes FTS + meta (no vec)
 
     @Test("indexTurn writes single row: meta + fts, epoch=1, embeddingComplete=0, no vec")
