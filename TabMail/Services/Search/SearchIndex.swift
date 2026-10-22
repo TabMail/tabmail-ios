@@ -1907,7 +1907,8 @@ actor SearchIndex {
                                 fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
     }
 
-    /// The hybrid part of `search`, given the query's embedding.
+    /// The hybrid part of `search`, given the query's embedding. Call it through `search`, which
+    /// answers an empty folder list and an empty FTS query before reaching it.
     func hybridSearch(ftsQuery: String, queryEmbedding: [Float], fromDateMs: Int64?, toDateMs: Int64?,
                       limit: Int, folderIds: [String]?) throws -> [FTSSearchResult] {
         guard let dbPool else { return [] }

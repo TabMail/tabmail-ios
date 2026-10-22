@@ -661,6 +661,7 @@ actor MemoryIndex {
     }
 
     /// The hybrid part of `search`, given the trimmed query and its embedding (nil: no vector leg).
+    /// Call it through `search`, which answers an empty query with the recent turns.
     func hybridSearch(query trimmed: String, queryEmbedding: [Float]?, fromMs: Int64?, toMs: Int64?, limit: Int,
                       demoActive: Bool) -> [MemoryHit] {
         ensureReady()

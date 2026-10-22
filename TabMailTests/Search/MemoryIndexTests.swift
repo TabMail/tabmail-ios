@@ -544,6 +544,24 @@ struct MemoryIndexTests {
         #expect(single.map(\.chatHistoryId) == ["w0"])
     }
 
+    @Test("search answers by the hybrid path within its dates and its limit")
+    func search_handsItsArgumentsToTheHybridPath() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let day: Int64 = 86_400_000
+        for i in 0..<6 {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "k\(i)", sessionId: "s", role: "user",
+                                               dateMs: 1000 + Int64(i) * day, text: "kyle note \(i)")
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "o\(i)", sessionId: "s", role: "user",
+                                               dateMs: 1000 + Int64(i) * day, text: "other words \(i)")
+        }
+        let dated = await MemoryIndex.shared.search(query: "kyle", fromMs: 1000 + day + day / 2,
+                                                    toMs: 1000 + 3 * day + day / 2, limit: 10, demoActive: false)
+        #expect(Set(dated.map(\.chatHistoryId)) == ["k2", "k3"])
+        let limited = await MemoryIndex.shared.search(query: "kyle", limit: 1, demoActive: false)
+        #expect(limited.count == 1)
+    }
+
     // MARK: - knownChatHistoryIds
 
     @Test("knownChatHistoryIds returns all indexed IDs")

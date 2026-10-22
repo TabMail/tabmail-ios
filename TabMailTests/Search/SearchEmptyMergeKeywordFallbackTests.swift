@@ -11,7 +11,8 @@ import Foundation
 /// about 0, so its keyword score is about 0; with weak vector matches every merged score falls under
 /// `SearchConfig.minScore`. The rows live in their own far-future year shard, searched within that
 /// year only, so the shard's statistics are this fixture's alone. The query embedding is given, so the
-/// hybrid path runs without the CoreML model (the unit-test host does not load it).
+/// hybrid path runs without the CoreML model (the unit-test host does not load it by default); the
+/// last test loads it to check that `search` hands its arguments to that path.
 @Suite("SearchIndex hybrid merge keeping nothing answers by keyword", .serialized, .processGlobalState)
 struct SearchEmptyMergeKeywordFallbackTests {
 
@@ -105,5 +106,41 @@ struct SearchEmptyMergeKeywordFallbackTests {
         #expect(single.map(\.contentKey.rawValue) == [weather[0]])
 
         try await index.removeMessages(contentKeys: (budget + weather).map(ContentKey.init(rawValue:)))
+    }
+
+    @Test("search answers by the hybrid path within its dates, its limit and by the query's meaning")
+    func searchHandsItsArgumentsToTheHybridPath() async throws {
+        EmbeddingService.initialize()
+        defer { EmbeddingService._testUnload() }
+        let model = try #require(EmbeddingService.shared)
+        let (from, _) = try Self.yearBounds()
+        let day: Int64 = 86_400_000
+        // "Invoice" messages a day apart (the last a week out), and one without the word or a
+        // synonym of it, all with the query's own vector: that one is found by meaning alone.
+        let invoice = (0..<7).map { "test_empty_merge:INBOX:inv\($0)" }
+        let meaning = "test_empty_merge:INBOX:meaning"
+        let all = invoice + [meaning]
+        try await index.removeMessages(contentKeys: all.map(ContentKey.init(rawValue:)))
+        var records = [FTSHeaderRecord]()
+        for (i, hid) in invoice.enumerated() {
+            records.append(FTSHeaderRecord(contentKey: ContentKey(rawValue: hid), headerId: hid, messageId: "inv\(i)",
+                                           subject: "Invoice", from: "a@example.com", to: "b@example.com",
+                                           dateMs: from + Int64(i == 6 ? 7 : i) * day))
+        }
+        records.append(FTSHeaderRecord(contentKey: ContentKey(rawValue: meaning), headerId: meaning, messageId: "meaning",
+                                       subject: "Quokka", from: "a@example.com", to: "b@example.com", dateMs: from + 4 * day))
+        _ = try await index.indexHeaders(records)
+        let queryVector = try model.embed("invoice")
+        for hid in all {
+            try await index.storeEmbedding(contentKey: ContentKey(rawValue: hid), embedding: queryVector)
+        }
+
+        let fromDateMs = from + 2 * day + day / 2, toDateMs = from + 5 * day + day / 2
+        let results = try await index.search(query: "invoice", fromDateMs: fromDateMs, toDateMs: toDateMs, limit: 100)
+        #expect(Set(results.map(\.contentKey.rawValue)) == Set([invoice[3], invoice[4], invoice[5], meaning]))
+        let limited = try await index.search(query: "invoice", fromDateMs: fromDateMs, toDateMs: toDateMs, limit: 2)
+        #expect(limited.count == 2)
+
+        try await index.removeMessages(contentKeys: all.map(ContentKey.init(rawValue:)))
     }
 }
