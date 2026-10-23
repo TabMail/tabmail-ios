@@ -103,13 +103,13 @@ struct SearchQueryParserTests {
     @Test("Explicit wildcard preserved")
     func explicitWildcard() {
         let result = SearchQueryParser.buildFTSMatch("hel*")
-        #expect(result.contains("hel*"))
+        #expect(result == "\"hel\"*")
     }
 
-    @Test("Apostrophes removed for FTS5 compatibility")
-    func apostrophesRemoved() {
+    @Test("A word with an inner apostrophe searches both spellings")
+    func apostropheSearchesBothSpellings() {
         let result = SearchQueryParser.buildFTSMatch("don't")
-        #expect(!result.contains("'"))
+        #expect(result == #"("don't" OR "dont"*)"#)
     }
 
     @Test("Trailing slashes trimmed")

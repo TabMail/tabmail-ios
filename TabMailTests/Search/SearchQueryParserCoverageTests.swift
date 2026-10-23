@@ -9,24 +9,11 @@ import Foundation
 @Suite("SearchQueryParser Coverage — uncovered branches")
 struct SearchQueryParserCoverageTests {
 
-    // MARK: - Lines 55-60: Value already quoted
-    // Note: Lines 55-60 (value.hasPrefix("\"") && value.hasSuffix("\"") && value.count >= 2)
-    // appear unreachable in the current parsing flow because components(separatedBy: "\"")
-    // splits on all double-quote characters BEFORE tokens are processed. Within any
-    // even-indexed (unquoted) segment, no token can contain a leading or trailing quote.
-    // These lines are a defensive guard that would only trigger if the upstream splitting
-    // logic changes. Tests below exercise edge cases around this area.
-
-    @Test("Field with empty quoted value goes through field-quoted extraction")
+    @Test("Field with an empty quoted value searches nothing")
     func fieldEmptyQuotedValue() {
-        // `!isEmpty` was the whole assertion here and it cannot distinguish a correct MATCH expression
-        // from a corrupted one — the same vacuity that let the Latin-1 mojibake defect live under a
-        // test named for it. Assert the shape instead: `subject` is a real FTS column, so it survives
-        // as a column prefix, and the result must not be a bare dangling colon.
-        let r1 = SearchQueryParser.buildFTSMatch("subject:\"\"")
-        #expect(!r1.isEmpty)
-        #expect(!r1.hasSuffix(":"), "emitted a column prefix with nothing after it: \(r1)")
-        #expect(r1.contains("subject:"), "a real column must survive as a column prefix: \(r1)")
+        // An empty phrase has nothing the tokenizer indexes, so the field takes no value and writes
+        // nothing: never a dangling column prefix.
+        #expect(SearchQueryParser.buildFTSMatch("subject:\"\"") == "")
     }
 
     @Test("Incomplete quote after field colon does not crash")
@@ -43,40 +30,29 @@ struct SearchQueryParserCoverageTests {
         #expect(r2.lowercased().contains("abc"), "the typed text became unsearchable: \(r2)")
     }
 
-    // MARK: - Lines 76-78: Naked wildcard "*" → empty core → "."
+    // MARK: - Naked wildcard: no text, so no term
 
-    @Test("Field-scoped naked wildcard converts to dot: subject:*")
+    @Test("Field-scoped naked wildcard writes nothing: subject:*")
     func fieldScopedNakedWildcard() {
-        // Standalone "*" is caught by isPurePunctuation. But field:* passes
-        // isPurePunctuation (has letters in field), then splitField returns
-        // ("subject", "*"). hasWildcard=true, value="", core="", escapedCore="".
-        // Lines 76-78: escapedCore.isEmpty && hasWildcard → escapedCore = "."
-        let result = SearchQueryParser.buildFTSMatch("subject:*")
-        #expect(result.contains("subject:"))
-        #expect(result.contains("."))
+        #expect(SearchQueryParser.buildFTSMatch("subject:*") == "")
     }
 
-    @Test("Field-scoped naked wildcard with other terms")
+    @Test("Field-scoped naked wildcard with other terms leaves the other terms")
     func fieldScopedNakedWildcardMixed() {
-        let result = SearchQueryParser.buildFTSMatch("from_:* hello")
-        #expect(result.contains("from_:"))
-        #expect(result.contains("."))
-        #expect(result.contains("hello"))
+        #expect(SearchQueryParser.buildFTSMatch("from_:* hello") == "\"hello\"*")
     }
 
     // MARK: - Additional edge cases for better coverage
 
-    @Test("From with spaces before colon: from : alice")
+    @Test("From with a space before the colon is text: from : alice")
     func fromWithSpacesBeforeColon() {
-        // translateAliases handles "from" then skips spaces then matches ":"
-        let result = SearchQueryParser.buildFTSMatch("from : alice")
-        #expect(result.contains("from_:"))
+        // As in tabmail-native-fts (ADR-NF-011): only `name:` scopes.
+        #expect(SearchQueryParser.buildFTSMatch("from : alice") == "\"from\"* \"alice\"*")
     }
 
-    @Test("To with spaces before colon: to : bob")
+    @Test("To with a space before the colon is text: to : bob")
     func toWithSpacesBeforeColon() {
-        let result = SearchQueryParser.buildFTSMatch("to : bob")
-        #expect(result.contains("to_:"))
+        #expect(SearchQueryParser.buildFTSMatch("to : bob") == "\"to\" \"bob\"")
     }
 
     @Test("Field-quoted extraction with multiple field:\"value\" pairs")
@@ -103,7 +79,7 @@ struct SearchQueryParserCoverageTests {
     @Test("Explicit wildcard on short token preserves wildcard")
     func explicitWildcardShortToken() {
         let result = SearchQueryParser.buildFTSMatch("ab*")
-        #expect(result.contains("ab*"))
+        #expect(result == "\"ab\"*")
     }
 
     @Test("OR group detection suppresses auto-wildcard")
@@ -119,17 +95,15 @@ struct SearchQueryParserCoverageTests {
         }
     }
 
-    @Test("Token with apostrophe removed")
+    @Test("A possessive 's is removed")
     func apostropheRemoval() {
-        let result = SearchQueryParser.buildFTSMatch("it's")
-        #expect(!result.contains("'"))
-        #expect(result.contains("its"))
+        #expect(SearchQueryParser.buildFTSMatch("it's") == "\"it\"")
     }
 
     @Test("Field-qualified token with wildcard")
     func fieldQualifiedWithWildcard() {
         let result = SearchQueryParser.buildFTSMatch("subject:meet*")
-        #expect(result.contains("subject:meet*"))
+        #expect(result == "subject:\"meet\"*")
     }
 
     @Test("Field-qualified token with special chars gets quoted")
@@ -139,7 +113,7 @@ struct SearchQueryParserCoverageTests {
         #expect(result.contains("\""))  // should be quoted due to @ and .
     }
 
-    @Test("willExpandToOrGroup returns false for field-qualified, placeholder, punctuation")
+    @Test("Field-qualified, punctuation-only and quoted terms do not expand")
     func willExpandEdgeCases() {
         // Field-qualified terms should not expand
         let r1 = SearchQueryParser.buildFTSMatch("subject:meeting")
@@ -156,15 +130,14 @@ struct SearchQueryParserCoverageTests {
 
     @Test("Token containing double-quote in special chars gets escaped")
     func doubleQuoteEscaping() {
-        // hasSpecialCharsRequiringQuotes triggers for "-", so the value goes
-        // through the quoting path. If value also contains `"` it gets doubled.
+        // Every word is an FTS5 string; a word with punctuation is a prefix.
         let result = SearchQueryParser.buildFTSMatch("hello-world")
         #expect(result.contains("\"hello-world\""))
     }
 
     @Test("Colon at start of token — no field split")
     func colonAtStartOfToken() {
-        // splitField with colon at start: field is empty, so returns (nil, tok)
+        // An empty name before the colon is not a field.
         let result = SearchQueryParser.buildFTSMatch(":value")
         #expect(!result.isEmpty)
     }
