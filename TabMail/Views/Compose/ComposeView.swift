@@ -2312,9 +2312,16 @@ struct ComposeView: View {
         isCheckingServerCopy = false
         // The server copy holds an attachment TabMail cannot carry (#241): editing
         // the local row would let its save overwrite the server's version.
-        guard openCheck == .open else {
+        switch openCheck {
+        case .open:
+            break
+        case .unsupportedAttachment:
             draftReadState = .error
             sendError = DraftReadConfig.unsupportedAttachmentMessage
+            return
+        case .replacedElsewhere:
+            draftReadState = .error
+            sendError = "This draft changed while it was opening. Close and reopen it to try again."
             return
         }
         let readResult: Result<Draft?, Error>

@@ -208,8 +208,9 @@ actor ExchangeProvider: EmailProvider {
     /// - the body comes back as text (`Prefer: outlook.body-content-type`):
     ///   TabMail uploads drafts as text, and for a draft another app wrote in HTML
     ///   Exchange's own conversion keeps its line breaks;
-    /// - EVERY inline image is read, referenced by the body or not, and one that
-    ///   cannot be read throws; one with no Content-ID is carried as a file;
+    /// - EVERY attachment, inline images included, is carried as a file under its
+    ///   own name, so the next save pairs it with the server's by that name and an
+    ///   image whose name TabMail cannot store is refused like any file (#241);
     /// - an attached message stays an attachment: its text is never added to the
     ///   body (that is the render's `tm-eml-section` marker);
     /// - an attachment that is not a file (an item or reference attachment) has no
@@ -244,29 +245,20 @@ actor ExchangeProvider: EmailProvider {
         for att in listed {
             // Only a file attachment has bytes TabMail can carry (#241).
             if forDraft, !Self.isFileAttachment(att) { throw DraftCopyUnsupportedAttachment() }
-            if att.isInline == true, let rawCid = att.contentId,
+            if !forDraft, att.isInline == true, let rawCid = att.contentId,
                let ct = att.contentType, ct.lowercased().hasPrefix("image/") {
                 let cid = rawCid.trimmingCharacters(in: .whitespacesAndNewlines)
                     .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if forDraft {
-                    if !cid.isEmpty {
-                        let data = try await fetchAttachment(messageId: id, attachmentId: att.id)
-                        inlineImages.append(InlineImage(contentId: cid, contentType: ct, data: data))
-                        continue
-                    }
-                    // No Content-ID: carried below as a file, never dropped.
-                } else {
-                    guard !cid.isEmpty, hasCidRefs else { continue }
-                    guard inlineImages.count < SyncConfig.maxInlineImages else { continue }
-                    do {
-                        let data = try await fetchAttachment(messageId: id, attachmentId: att.id)
-                        inlineImages.append(InlineImage(contentId: cid, contentType: ct, data: data))
-                    } catch {
-                        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Failed to fetch inline image \(cid): \(error)") }
-                    }
-                    continue
+                guard !cid.isEmpty, hasCidRefs else { continue }
+                guard inlineImages.count < SyncConfig.maxInlineImages else { continue }
+                do {
+                    let data = try await fetchAttachment(messageId: id, attachmentId: att.id)
+                    inlineImages.append(InlineImage(contentId: cid, contentType: ct, data: data))
+                } catch {
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Failed to fetch inline image \(cid): \(error)") }
                 }
+                continue
             }
 
             let isItemAttachment = (att.odataType ?? "").lowercased().contains("itemattachment")

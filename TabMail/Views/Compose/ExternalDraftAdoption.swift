@@ -332,14 +332,17 @@ enum ExternalDraftAdoption {
     /// newer save (another compose window, the agent) made while the server copy was
     /// being read always wins. Advances `pushAttemptVersion`, so
     /// an upload started before the reload retires at Stage A.
-    /// Returns the attachment directory the row used before (to delete after
-    /// commit), `.some(nil)` when it had none, or nil when nothing was written.
+    ///
+    /// A copy that replies to a different message than the row does (another app
+    /// replaced the draft) is never merged into it, which would send the new text as
+    /// a reply to the old parent: the row, which holds nothing the server lacks, is
+    /// removed instead, and the next open adopts the copy whole.
     static func applyReload(
         db: Database,
         decided: Draft,
         content: ServerContent,
         now: Double = Date().timeIntervalSince1970
-    ) throws -> String?? {
+    ) throws -> ReloadWrite {
         guard var draft = try Draft.fetchOne(db, key: decided.id),
               draft.accountId == decided.accountId,
               draft.instanceEpoch == decided.instanceEpoch,
@@ -348,9 +351,13 @@ enum ExternalDraftAdoption {
               draft.serverDraftId == decided.serverDraftId,
               draft.serverDraftFolderPath == decided.serverDraftFolderPath,
               draft.serverDraftUidValidity == decided.serverDraftUidValidity else {
-            return nil
+            return .unchanged
         }
         let previousDirName = draft.attachmentsDirName
+        if try repliesElsewhere(draft, copyInReplyTo: content.inReplyTo, db: db) {
+            try draft.delete(db)
+            return .removed(previousDirName: previousDirName)
+        }
         draft.toJSON = Draft.encodeStringArray(RecipientEntry(content.to).draftEntries)
         draft.ccJSON = Draft.encodeStringArray(RecipientEntry(content.cc).draftEntries)
         draft.bccJSON = Draft.encodeStringArray(RecipientEntry(content.bcc).draftEntries)
@@ -361,7 +368,32 @@ enum ExternalDraftAdoption {
         draft.serverPushStatus = "pushed"
         draft.pushAttemptVersion += 1
         try draft.update(db)
-        return .some(previousDirName)
+        return .applied(previousDirName: previousDirName)
+    }
+
+    /// What `applyReload` wrote. `previousDirName` is the attachment directory the
+    /// row no longer references once the write commits.
+    enum ReloadWrite: Equatable {
+        /// The row changed while the copy was read; nothing was written.
+        case unchanged
+        /// The row now holds the copy's content.
+        case applied(previousDirName: String?)
+        /// The copy replies to another message; the row was removed.
+        case removed(previousDirName: String?)
+    }
+
+    /// Whether the server copy names, through `In-Reply-To`, a different parent than
+    /// the reply `draft` holds. Only a known contradiction counts: a copy naming no
+    /// parent, a forward, or a parent the device no longer has is not one.
+    static func repliesElsewhere(_ draft: Draft, copyInReplyTo: String?, db: Database) throws -> Bool {
+        guard !draft.isForward,
+              let copyParent = MessageIdentity.comparableRfc822Identity(copyInReplyTo),
+              let parentId = draft.replyToId,
+              let parent = try MessageHeader.fetchOne(db, key: parentId),
+              let rowParent = MessageIdentity.comparableRfc822Identity(parent.rfc822MessageId) else {
+            return false
+        }
+        return rowParent != copyParent
     }
 
     // MARK: - Orchestration
@@ -377,6 +409,8 @@ enum ExternalDraftAdoption {
         let body: String
         let attachmentsDirName: String?
         let attachmentCount: Int
+        /// The copy's `In-Reply-To`, as the server returned it.
+        var inReplyTo: String? = nil
     }
 
     /// The file name an adopted inline image is carried under. The body is edited
@@ -397,6 +431,7 @@ enum ExternalDraftAdoption {
         let bcc: String
         let body: String
         let attachments: [DraftAttachment]
+        let inReplyTo: String?
     }
 
     private static func read(
@@ -455,7 +490,7 @@ enum ExternalDraftAdoption {
         return ReadCopy(
             subject: copy.header.subject,
             to: copy.header.to, cc: copy.header.cc, bcc: copy.header.bcc,
-            body: body, attachments: attachments)
+            body: body, attachments: attachments, inReplyTo: copy.header.inReplyTo)
     }
 
     /// Writes a read copy's attachments to a new staging directory.
@@ -471,7 +506,8 @@ enum ExternalDraftAdoption {
         }
         return ServerContent(
             subject: read.subject, to: read.to, cc: read.cc, bcc: read.bcc, body: read.body,
-            attachmentsDirName: dirName, attachmentCount: read.attachments.count)
+            attachmentsDirName: dirName, attachmentCount: read.attachments.count,
+            inReplyTo: read.inReplyTo)
     }
 
     /// Read the server copy at `address`, then insert the adopted row.
@@ -492,6 +528,16 @@ enum ExternalDraftAdoption {
         guard let copy = try await provider.fetchDraftCopy(identity: identity) else {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[DraftAdoption] header=\(DebugModeManager.escapedForLogLine(String(header.id.prefix(60)))) server copy is gone — not adopted")
+            }
+            return
+        }
+        // Gmail replaces a draft's message on every save. A copy read from another
+        // message than the listed one is a newer version whose headers (its reply
+        // parent among them) the list has not seen yet: not adopted, like a changed
+        // header; the next sync lists it.
+        if case .gmail(_, let containedMessageId) = address, copy.header.messageId != containedMessageId {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[DraftAdoption] header=\(DebugModeManager.escapedForLogLine(String(header.id.prefix(60)))) server copy is a newer message — not adopted")
             }
             return
         }
@@ -540,6 +586,9 @@ enum ExternalDraftAdoption {
     enum OpenCheck: Equatable {
         case open
         case unsupportedAttachment
+        /// Another app replaced the draft with a reply to another message; the
+        /// local row is gone and the next open adopts the new one.
+        case replacedElsewhere
     }
 
     /// #217 (ADR-IOS-091): bring a saved draft up to date before it opens. Every
@@ -583,26 +632,31 @@ enum ExternalDraftAdoption {
             guard let readCopy else { return .open }
             let content = try stage(readCopy)
             let dirName = content.attachmentsDirName
-            let previousDir: String??
+            let written: ReloadWrite
             do {
-                previousDir = try await AppDatabase.dbPool.write { db in
+                written = try await AppDatabase.dbPool.write { db in
                     try applyReload(db: db, decided: row, content: content)
                 }
             } catch {
                 if let dirName { DraftAttachmentStorage.deleteAttachments(dirName: dirName) }
                 throw error
             }
-            switch previousDir {
-            case .some(let oldDir):
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[DraftAdoption] reload before open draft=\(draftId) write=\(written) attachments=\(content.attachmentCount)")
+            }
+            switch written {
+            case .applied(let oldDir):
                 // Committed: the old directory is no longer referenced.
                 if let oldDir, oldDir != dirName { DraftAttachmentStorage.deleteAttachments(dirName: oldDir) }
-            case .none:
+                return .open
+            case .unchanged:
                 if let dirName { DraftAttachmentStorage.deleteAttachments(dirName: dirName) }
+                return .open
+            case .removed(let oldDir):
+                if let dirName { DraftAttachmentStorage.deleteAttachments(dirName: dirName) }
+                if let oldDir { DraftAttachmentStorage.deleteAttachments(dirName: oldDir) }
+                return .replacedElsewhere
             }
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[DraftAdoption] reload before open draft=\(draftId) applied=\(previousDir != nil) attachments=\(content.attachmentCount)")
-            }
-            return .open
         } catch is DraftCopyUnsupportedAttachment {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[DraftAdoption] Open-time reload for draft=\(draftId) refused: an attachment TabMail cannot carry")

@@ -75,7 +75,7 @@ struct DraftReloadRowTests {
             attachmentsDirName: nil, attachmentCount: 0)
     }
 
-    private func reload(_ db: DatabaseQueue, decided: Draft) throws -> String?? {
+    private func reload(_ db: DatabaseQueue, decided: Draft) throws -> ExternalDraftAdoption.ReloadWrite {
         try db.write { db in
             try ExternalDraftAdoption.applyReload(
                 db: db, decided: decided,
@@ -92,7 +92,7 @@ struct DraftReloadRowTests {
 
         let written = try reload(db, decided: draft)
 
-        #expect(written != nil, "the reload wrote nothing")
+        #expect(written == .applied(previousDirName: nil), "the reload wrote nothing")
         let row = try #require(try db.read { try Draft.fetchOne($0, key: draft.id) })
         #expect(row.body == "server text")
         #expect(row.subject == "Edited in another app", "subject must come from the fetched copy")
@@ -137,7 +137,7 @@ struct DraftReloadRowTests {
         }
         let before = try #require(try db.read { try Draft.fetchOne($0, key: decided.id) })
 
-        #expect(try reload(db, decided: decided) == nil)
+        #expect(try reload(db, decided: decided) == .unchanged)
 
         let after = try #require(try db.read { try Draft.fetchOne($0, key: decided.id) })
         #expect(after.body == before.body && after.subject == before.subject
@@ -206,25 +206,6 @@ struct DraftCopyReadTests {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         http.register(path: "/messages/g1", method: "GET", response: .status(500))
-        let provider = ExchangeProvider(
-            userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
-
-        await #expect(throws: (any Error).self) {
-            try await provider.fetchDraftCopy(identity: .outlook(graphId: "g1"))
-        }
-    }
-
-    @Test("Graph: an inline image that cannot be read fails the draft read, never drops the image")
-    func graphInlineImageFailureThrows() async {
-        let http = FakeHTTP.Scenario()
-        defer { http.close() }
-        http.register(path: "/messages/g1", method: "GET",
-                      response: .json(raw: Self.graphMessageJSON(id: "g1", html: "<p>See <img src='cid:logo'></p>")))
-        http.register(path: "/messages/g1/attachments", method: "GET", response: .json(raw: """
-            {"value":[{"id":"a1","name":"logo.png","contentType":"image/png","size":4,"isInline":true,
-             "contentId":"<logo>","@odata.type":"#microsoft.graph.fileAttachment"}]}
-            """))
-        http.register(path: "/messages/g1/attachments/a1", method: "GET", response: .status(500))
         let provider = ExchangeProvider(
             userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
 
@@ -308,7 +289,7 @@ struct DraftCopyReadTests {
         }
     }
 
-    @Test("Graph: a draft read is the draft as text, every inline image, and attached mail kept as files")
+    @Test("Graph: a draft read is the draft as text, with inline images and attached mail kept as named files")
     func graphDraftReadIsTheDraftOnly() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -331,8 +312,6 @@ struct DraftCopyReadTests {
              {"id":"i2","name":"pic.png","contentType":"image/png","size":2,"isInline":true,"contentId":" ",
               "@odata.type":"#microsoft.graph.fileAttachment"}]}
             """))
-        http.register(path: "/messages/g1/attachments/i1", method: "GET",
-                      response: .json(raw: "{\"contentBytes\":\"\(Data([7, 8]).base64EncodedString())\"}"))
         let provider = ExchangeProvider(
             userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
 
@@ -342,10 +321,9 @@ struct DraftCopyReadTests {
                 "the draft body must be read as text, not re-converted from HTML")
         #expect(copy.textBody == "Hi Bob,\r\n\r\n  indented\r\n> quoted")
         #expect(copy.htmlBody == nil, "an attached message's text must never join the draft body")
-        #expect(copy.inlineImages.map(\.contentId) == ["logo"], "an inline image the body does not reference is still the draft's")
-        #expect(copy.inlineImages.first?.data == Data([7, 8]))
-        #expect(copy.attachments.map(\.filename) == ["fwd.eml", "pic.png"],
-                "attached mail stays a file, and an image with no Content-ID is carried as a file")
+        #expect(copy.inlineImages.isEmpty, "an inline image is carried as a file, so the next save pairs it by name")
+        #expect(copy.attachments.map(\.filename) == ["fwd.eml", "logo.png", "pic.png"],
+                "attached mail and every inline image stay files under their own names")
         #expect(!http.recordedCalls().contains { $0.url.contains("$expand") || $0.url.contains("/attachments/f1") },
                 "a draft read never opens an attached message")
     }
@@ -904,9 +882,9 @@ struct IMAPDraftCopyCompletenessTests {
 
     /// GBK bytes for 中文 under a label no platform resolves: the viewing decoder
     /// would fall back to Windows-1252 and read them as Latin text, which would
-    /// become the draft. A draft's text is decoded in its declared charset, or as
-    /// UTF-8, or the read fails.
-    @Test("A draft text part is decoded in its declared charset or as UTF-8, never as a guess",
+    /// become the draft. A draft's text is decoded in its declared charset, or the
+    /// read fails.
+    @Test("A draft text part is decoded in its declared charset, never as a guess",
           arguments: ["text/plain", "text/html"])
     func draftTextIsNeverAGuessedCharset(mime: String) throws {
         let gbk = Data([0xD6, 0xD0, 0xCE, 0xC4])
@@ -917,8 +895,12 @@ struct IMAPDraftCopyCompletenessTests {
             return mime == "text/html" ? copy.htmlBody : copy.textBody
         }
         #expect(try read("gbk", gbk) == "中文", "a charset the platform knows decodes its bytes")
-        #expect(try read("x-unknown-label", Data("中文".utf8)) == "中文", "UTF-8 under an unknown label reads as UTF-8")
+        // C2 A9 is GBK 漏 and UTF-8 ©: the declared charset decides, never the bytes.
+        #expect(try read("gbk", Data([0xC2, 0xA9])) == "漏")
+        #expect(try read("utf-8", Data([0xC2, 0xA9])) == "©")
+        #expect(throws: IMAPProvider.IMAPDraftCopyIncomplete.self) { try read("x-unknown-label", Data("中文".utf8)) }
         #expect(throws: IMAPProvider.IMAPDraftCopyIncomplete.self) { try read("x-unknown-label", gbk) }
+        #expect(throws: IMAPProvider.IMAPDraftCopyIncomplete.self) { try read("us-ascii", Data("中文".utf8)) }
     }
 
     @Test("A part declared empty reads as empty: an empty draft with a file is still a draft")

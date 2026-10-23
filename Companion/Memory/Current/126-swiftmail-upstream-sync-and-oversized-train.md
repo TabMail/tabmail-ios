@@ -396,3 +396,8 @@ serializer that writes recipients:
   both escape mutants). The app pins `9ceb96b`; the upstream PR carries four commits. Also found:
   `MIMECharsetTests.gbLabelsResolveToGB18030` FAILS on the iOS simulator for `chinese` and `x-gbk`
   (passes on macOS; pre-existing at `018ca90`), app issue #257.
+- **Emitted parameter syntax (#217 Codex round 3, 2026-10-23)**: deleting `parameterValue`'s
+  non-empty check emitted `format=` and every test stayed green, because the permissive reader
+  reads it back as empty. Commit `3a0cdf7` adds `isMIMEParameterValue(_:)` (an RFC 2045 token or
+  quoted-string) to `aParameterValueReadsBackAsWritten` (red on that mutant). The app pins
+  `3a0cdf7`; the upstream PR carries five commits.

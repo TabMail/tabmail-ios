@@ -1134,7 +1134,8 @@ struct DraftOpenReloadTests {
                 #expect(row.body == "Hi Bob,\n\n  indented line \n> quoted")
                 let files = try DraftAttachmentStorage.loadAttachments(dirName: row.attachmentsDirName)
                 #expect(files.contains { $0.filename == "notes.txt" && $0.data == Data("notes".utf8) })
-                #expect(files.contains { $0.data == Data([1, 2]) }, "the unreferenced inline image was dropped")
+                #expect(files.contains { $0.filename == "logo.png" && $0.data == Data([1, 2]) },
+                        "the unreferenced inline image was dropped or renamed")
             }
         }
     }
@@ -1318,8 +1319,6 @@ struct DraftOpenReloadTests {
         ("text/plain; Charset=\"windows-1251\"", [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2], "Привет"),
         ("text/plain; charset=iso-8859-1", [0x43, 0x61, 0x66, 0xE9, 0x20, 0x61, 0x74, 0x20, 0x35], "Caf\u{E9} at 5"),
         ("text/plain; charset=gbk", [0xD6, 0xD0, 0xCE, 0xC4], "中文"),
-        // A label no platform resolves: the text is read as UTF-8 when it is UTF-8.
-        ("text/plain; charset=x-unknown-label", Array("中文".utf8), "中文"),
     ]
 
     @Test("A Gmail draft written in another charset reloads as its text, in that charset",
@@ -1435,13 +1434,16 @@ struct DraftOpenReloadTests {
         return String(decoding: try JSONSerialization.data(withJSONObject: message), as: UTF8.self)
     }
 
-    /// GBK bytes for 中文 under a label no platform resolves. The viewing decoder
-    /// would read them as Windows-1252 text, and that guess would replace the draft.
-    @Test("A Gmail draft in a charset that cannot be read keeps the local copy")
-    func gmailDraftInAnUnreadableCharsetKeepsTheLocalCopy() async throws {
+    /// Text under a label no platform resolves. The viewing decoder would read GBK
+    /// bytes as Windows-1252 text, and even valid UTF-8 may be other text in the
+    /// declared charset (C2 A9 is GBK 漏 and UTF-8 ©); either guess would replace
+    /// the draft.
+    @Test("A Gmail draft in a charset that cannot be read keeps the local copy",
+          arguments: [[0xD6, 0xD0, 0xCE, 0xC4], Array("中文".utf8), [0xC2, 0xA9]] as [[UInt8]])
+    func gmailDraftInAnUnreadableCharsetKeepsTheLocalCopy(raw: [UInt8]) async throws {
         try await withInstalledPool { pool in
             let draft = try await pool.write { try insertDraft($0, provider: .gmail) }
-            let bytes = Data([0xD6, 0xD0, 0xCE, 0xC4])
+            let bytes = Data(raw)
             let http = FakeHTTP.Scenario()
             defer { http.close() }
             http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-5"}}"#))

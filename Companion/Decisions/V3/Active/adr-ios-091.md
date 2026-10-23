@@ -415,3 +415,40 @@ Codex round 2 on `f609479` found:
   moved to #251. **#251 changed since round 1** (owner 2026-10-22): no WebKit; a SwiftSoup DOM
   walk replaces `EmailFilter.htmlToPlainText` for every caller, with a small built-in CSS reader
   (inline styles plus simple `<style>` rules for display, white-space and vertical margins).
+
+### Codex review round 3 corrections (2026-10-23)
+
+Codex round 3 on `8110694` found:
+
+- **An IMAP draft file took the summary's name.** SwiftMail's full fetch restores a filename from
+  the part's own MIME header when the BODYSTRUCTURE summary lost characters (`docs\notes.txt`
+  read as `docsnotes.txt`), but `IMAPProvider.completeDraftCopy` kept the summary's name, and
+  adoption stored the altered name. A strict-copy file now takes the fetched part's filename.
+- **A Gmail draft replaced between listing and read mixed two versions.** The read returned the
+  new contained message's text and recipients, while adoption claimed the reply parent from the
+  listed (old) header, and a reload kept the row's old parent. Adoption now refuses when the copy
+  is not the listed contained message (the next open re-lists). A reload whose copy names a known
+  `In-Reply-To` different from the row's parent deletes the clean row and its files
+  (`ExternalDraftAdoption.repliesElsewhere`, `ReloadWrite.removed`), and compose reports
+  `OpenCheck.replacedElsewhere` ("This draft changed while it was opening"), so the next open
+  adopts the copy with its own parent. A forward, or a parent either side cannot name, is not
+  compared.
+- **A failed declared charset still guessed UTF-8.** The same bytes mean different text
+  (`C2 A9` is GBK 漏 and UTF-8 ©), so `MessagePart.draftTextContent` now decodes in the declared
+  charset or returns nil; UTF-8 is never tried. A charset iOS does not resolve refuses the read
+  and keeps the local copy (aliases remain #257).
+- **The format=flowed quote prefix was read as graphemes.** A quoted line whose content starts
+  with a combining mark made `>` and the mark one Character, so the depth and the stuffing space
+  were wrong. `EmailFilter.decodeFormatFlowed` reads quote indicators and stuffing as Unicode
+  scalars (RFC 3676 ASCII syntax).
+- **An Outlook inline image under an unstorable name multiplied on every save.** The draft read
+  converted Graph inline images to `InlineImage` (stored as generated `imageN` files), bypassing
+  the #241 name refusal, so a by-name save never paired the original and added another copy.
+  Resolved by deletion: a Graph draft read carries EVERY attachment, inline images included, as
+  a file under its own name through the ordinary file path, so the name is checked and the next
+  save pairs it. Viewing is unchanged.
+- **Coverage:** ordered complete body pieces and every inline image's bytes past the viewer cap
+  (Gmail, IMAP, Outlook); a database failure after staging leaves the old row and files and no
+  staged directory, on adoption and on reload; flowed markers as ASCII; the fork commit
+  `3a0cdf7` checks that each emitted BODYSTRUCTURE parameter value is a MIME token or
+  quoted-string (app pin `3a0cdf7`).

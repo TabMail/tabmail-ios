@@ -100,9 +100,13 @@ enum EmailFilter {
         }
         let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
         for line in normalized.components(separatedBy: "\n") {
-            let depth = line.prefix { $0 == ">" }.count
-            var content = String(line.dropFirst(depth))
-            if content.hasPrefix(" ") { content.removeFirst() }
+            // Quote marks and the stuffed space are ASCII bytes (RFC 3676 §4.5), read
+            // as scalars: as Characters, a combining mark after one would join it.
+            var rest = line.unicodeScalars[...]
+            let depth = rest.prefix { $0 == ">" }.count
+            rest = rest.dropFirst(depth)
+            if rest.first == " " { rest = rest.dropFirst() }
+            var content = String(Substring(rest))
             let isSoft = isFlowedSoftBreak(content)
             if isSoft, delSp { content.removeLast() }
             // The signature separator is neither fixed nor flowed (RFC 3676 §4.3):

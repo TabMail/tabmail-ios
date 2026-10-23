@@ -5833,7 +5833,16 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         func insideAttachedMessage(_ part: MessagePart) -> Bool {
             IMAPFetchMapping.parentEmlSection(for: part.section.components, rfc822Sections: rfc822Sections) != nil
         }
-        var attachments = full.attachments.filter { $0.parentEmlSection == nil }
+        var partsBySection: [String: MessagePart] = [:]
+        for part in message.parts { partsBySection[part.section.description] = part }
+        // A file keeps the name its fetched part carries: SwiftMail restores it from
+        // the part's own MIME header when the summary's BODYSTRUCTURE lost characters.
+        var attachments = full.attachments.filter { $0.parentEmlSection == nil }.map { attachment in
+            guard let name = partsBySection[attachment.section]?.filename else { return attachment }
+            return AttachmentInfo(
+                filename: name, contentType: attachment.contentType, section: attachment.section,
+                size: attachment.size, encoding: attachment.encoding)
+        }
         var fileSections = Set(attachments.map(\.section))
         var textBody: String?
         var htmlBody: String?
@@ -5870,8 +5879,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 encoding: part.encoding))
             fileSections.insert(part.section.description)
         }
-        var partsBySection: [String: MessagePart] = [:]
-        for part in message.parts { partsBySection[part.section.description] = part }
         var attachmentData: [String: Data] = [:]
         for attachment in attachments {
             guard let part = partsBySection[attachment.section], Self.draftPartArrived(part),
@@ -7176,16 +7183,14 @@ extension MessagePart {
     /// not decode, it falls back through Windows-1252 and Latin-1, which accept
     /// any bytes, so GBK text under a label the platform does not know reads as
     /// Latin mojibake. A draft's text becomes the editable copy, so a guess never
-    /// does: a declared charset decodes the bytes, or they are UTF-8 (the viewing
-    /// decoder's first fallback), or there is no text. A part declaring no
-    /// charset reads as `textContent` reads it.
+    /// does: a declared charset decodes the bytes, or there is no text. Not even
+    /// UTF-8 is tried after it, since the same bytes can be other text in the
+    /// declared charset (C2 A9 is GBK 漏 and UTF-8 ©). A part declaring no charset
+    /// reads as `textContent` reads it.
     var draftTextContent: String? {
         guard let declaredCharset else { return textContent }
-        guard let bytes = decodedData() else { return nil }
-        if let encoding = String.Encoding(mimeCharset: declaredCharset),
-           let text = String(data: bytes, encoding: encoding) {
-            return text
-        }
-        return String(data: bytes, encoding: .utf8)
+        guard let bytes = decodedData(),
+              let encoding = String.Encoding(mimeCharset: declaredCharset) else { return nil }
+        return String(data: bytes, encoding: encoding)
     }
 }
