@@ -165,6 +165,12 @@ fix gates at shared chokepoints, not per-tool patches:
   vector-only hybrid hits filtered by `headerIdInDemoScope` (headerId =
   `accountId:folderPath:messageId`). Covers email_search AND the inbox
   search UI ("Search All" spanned every account).
+  *Amended 2026-10-23 (tabmail-ios#265, ADR-IOS-094):* the vector leg is
+  scoped in SQL before the merge (`searchVecCandidates` joins the KNN
+  results to `message_meta` with `demoAccountScopeSQL`, as MemoryIndex does);
+  the post-merge filter (by then `contentKeyInDemoScope`) is deleted. A
+  date sort's 4,096 candidates otherwise let the other mode's matches by
+  meaning fill the limit before the filter dropped them.
 - **MemoryIndex** — `demoScopeSQL` (sessionId `demo:` range) on the FTS
   leg, the vec KNN leg (meta join), and `readByTimestamp` — memory_search /
   memory_read never cross modes (NULL sessionId = legacy real).

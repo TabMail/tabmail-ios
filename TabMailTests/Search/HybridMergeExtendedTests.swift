@@ -69,7 +69,7 @@ struct HybridMergeExtendedTests {
 
     @Test("mergeResults: empty inputs")
     func mergeEmpty() {
-        let results = HybridMerge.mergeResults(
+        let results = mergeDated(
             textResults: [],
             vectorResults: [],
             vectorWeight: 0.7,
@@ -81,7 +81,7 @@ struct HybridMergeExtendedTests {
 
     @Test("mergeResults: text-only results")
     func mergeTextOnly() {
-        let results = HybridMerge.mergeResults(
+        let results = mergeDated(
             textResults: [(1, -5.0), (2, -3.0), (3, -1.0)],
             vectorResults: [],
             vectorWeight: 0.7,
@@ -97,7 +97,7 @@ struct HybridMergeExtendedTests {
     @Test("mergeResults: respects limit")
     func mergeRespectsLimit() {
         let textResults: [(Int64, Double)] = (1...20).map { (Int64($0), -Double($0)) }
-        let results = HybridMerge.mergeResults(
+        let results = mergeDated(
             textResults: textResults,
             vectorResults: [],
             vectorWeight: 0.7,
@@ -109,7 +109,7 @@ struct HybridMergeExtendedTests {
 
     @Test("mergeResults: sorted by finalScore descending")
     func mergeSortedDescending() {
-        let results = HybridMerge.mergeResults(
+        let results = mergeDated(
             textResults: [(1, -1.0), (2, -10.0), (3, -5.0)],
             vectorResults: [],
             vectorWeight: 0.0,
@@ -123,7 +123,7 @@ struct HybridMergeExtendedTests {
 
     @Test("mergeResults: deduplicates same rowid from both engines")
     func mergeDeduplicates() {
-        let results = HybridMerge.mergeResults(
+        let results = mergeDated(
             textResults: [(1, -5.0)],
             vectorResults: [(1, 0.2)],
             vectorWeight: 0.7,
@@ -138,7 +138,7 @@ struct HybridMergeExtendedTests {
     @Test("mergeResults: combined scores higher for dual-match")
     func mergeDualMatchBoost() {
         // Same item appearing in both text and vector results should score higher
-        let results = HybridMerge.mergeResults(
+        let results = mergeDated(
             textResults: [(1, -5.0), (2, -5.0)],
             vectorResults: [(1, 0.1)], // item 1 also has vector match
             vectorWeight: 0.7,

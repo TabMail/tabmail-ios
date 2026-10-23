@@ -65,11 +65,11 @@ struct SearchVecWithinDatesTests {
         try await indexRows(rows)
         let query = Self.vector(7, 8, cos: 1)
         func nearest(_ k: Int, _ from: Int64?, _ to: Int64?, _ eligible: Set<Int64>? = nil) async -> [Int] {
-            await index.searchVecCandidates(queryEmbedding: query, limit: k, fromDateMs: from, toDateMs: to, eligible: eligible)
+            await index.searchVecCandidates(queryEmbedding: query, limit: k, fromDateMs: from, toDateMs: to, eligible: eligible, demoActive: false)
                 .map { Int(($0.1 * 100).rounded()) }.filter { (1...22).contains($0) }
         }
         let rowids = Dictionary(uniqueKeysWithValues: await index.searchVecCandidates(
-            queryEmbedding: query, limit: 22, fromDateMs: -5_000_000_000_000, toDateMs: start + 300 * Self.day, eligible: nil)
+            queryEmbedding: query, limit: 22, fromDateMs: -5_000_000_000_000, toDateMs: start + 300 * Self.day, eligible: nil, demoActive: false)
             .map { (Int(($0.1 * 100).rounded()), $0.0) }.filter { (1...22).contains($0.0) })
         #expect(rowids.keys.sorted() == Array(1...22))
 
@@ -107,7 +107,7 @@ struct SearchVecWithinDatesTests {
 
         // Without dates or a field, the nearer messages take every place the search asks for.
         let unfiltered = await index.searchVecCandidates(
-            queryEmbedding: query, limit: limit * SearchConfig.candidateMultiplier, fromDateMs: nil, toDateMs: nil, eligible: nil)
+            queryEmbedding: query, limit: limit * SearchConfig.candidateMultiplier, fromDateMs: nil, toDateMs: nil, eligible: nil, demoActive: false)
         #expect(unfiltered.count == limit * SearchConfig.candidateMultiplier)
         #expect(unfiltered.allSatisfy { $0.1 < 0.1 })
 
@@ -115,11 +115,11 @@ struct SearchVecWithinDatesTests {
         let dated = try await index.hybridSearch(
             ftsQuery: SearchQueryParser.buildFTSMatch("zyxwvut"), queryEmbedding: query,
             fromDateMs: start + 9 * Self.day + Self.day / 2, toDateMs: start + 10 * Self.day + Self.day / 2,
-            limit: limit, folderIds: nil)
+            limit: limit, folderIds: nil, sort: .relevance)
         #expect(dated.map(\.contentKey.rawValue) == [inside])
         let field = try await index.hybridSearch(
             ftsQuery: SearchQueryParser.buildFTSMatch("from:carol@example.com zyxwvut"), queryEmbedding: query,
-            fromDateMs: nil, toDateMs: nil, limit: limit, folderIds: nil)
+            fromDateMs: nil, toDateMs: nil, limit: limit, folderIds: nil, sort: .relevance)
         #expect(field.map(\.contentKey.rawValue) == [inside])
 
         try await index.removeMessages(contentKeys: rows.map { ContentKey(rawValue: $0.key) })
@@ -152,9 +152,9 @@ struct SearchVecWithinDatesTests {
         let expected: Set = [prefix + "strong", prefix + "weak"]
 
         // The vector exists, but not within the dates; both messages match by keyword within them.
-        #expect(await index.searchVecCandidates(queryEmbedding: query, limit: 1, fromDateMs: nil, toDateMs: nil, eligible: nil)
+        #expect(await index.searchVecCandidates(queryEmbedding: query, limit: 1, fromDateMs: nil, toDateMs: nil, eligible: nil, demoActive: false)
             .allSatisfy { $0.1 < 0.01 })
-        #expect(await index.searchVecCandidates(queryEmbedding: query, limit: 10, fromDateMs: from, toDateMs: to, eligible: nil).isEmpty)
+        #expect(await index.searchVecCandidates(queryEmbedding: query, limit: 10, fromDateMs: from, toDateMs: to, eligible: nil, demoActive: false).isEmpty)
         #expect(Set(try await index.keywordSearch(query: "kinkajou", fromDateMs: from, toDateMs: to, limit: 10).map(\.contentKey.rawValue)) == expected)
 
         for (q, from, to) in [("kinkajou", Optional(from), Optional(to)),
@@ -162,7 +162,7 @@ struct SearchVecWithinDatesTests {
                               ("from:carol@example.com kinkajou", Optional(from), Optional(to))] {
             let results = try await index.hybridSearch(
                 ftsQuery: SearchQueryParser.buildFTSMatch(q), queryEmbedding: query,
-                fromDateMs: from, toDateMs: to, limit: 10, folderIds: nil)
+                fromDateMs: from, toDateMs: to, limit: 10, folderIds: nil, sort: .relevance)
             #expect(Set(results.map(\.contentKey.rawValue)) == expected, "\(q)")
         }
 

@@ -5,7 +5,13 @@
 import Testing
 import Foundation
 import GRDB
+import SQLite3
+import Synchronization
 @testable import TabMail
+
+/// Whether the memory pool's authorizer refuses `json_each` reads (only the vector-only date read uses
+/// it), and how many it refused.
+private let memoryDateReadFault = Mutex((deny: false, refused: 0))
 
 /// Tests for `MemoryIndex` actor (v3 per-turn model).
 ///
@@ -668,6 +674,84 @@ struct MemoryIndexTests {
         let single = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(3),
                                                            fromMs: nil, toMs: nil, limit: 100, demoActive: false)
         #expect(single.map(\.chatHistoryId) == ["w0"])
+    }
+
+    /// Equal matches go newer first (tabmail-ios#265, mirroring tabmail-native-fts#46): two turns found
+    /// by meaning alone with the same vector, the older written first. Their dates are read for the merge.
+    @Test("hybridSearch: equal matches come newer first")
+    func hybridSearch_equalMatchesComeNewerFirst() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "older", sessionId: "s", role: "user", dateMs: 1000, text: "turn")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "newer", sessionId: "s", role: "user", dateMs: 2000, text: "turn")
+        _ = await MemoryIndex.shared.storeEmbeddings(["older", "newer"].map { (chatHistoryId: $0, observedEpoch: 1, embedding: vector(cos: 1)) })
+
+        let hits = await MemoryIndex.shared.hybridSearch(query: "zyxwvut", queryEmbedding: vector(cos: 1),
+                                                         fromMs: nil, toMs: nil, limit: 2, demoActive: false)
+        #expect(hits.map(\.chatHistoryId) == ["newer", "older"])
+        #expect(hits.map(\.dateMs) == [2000, 1000])
+    }
+
+    @Test("hybridSearch: the better match comes before a newer weaker one")
+    func hybridSearch_betterMatchBeforeNewerWeaker() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "better", sessionId: "s", role: "user", dateMs: 1000, text: "turn")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "newer", sessionId: "s", role: "user", dateMs: 2000, text: "turn")
+        _ = await MemoryIndex.shared.storeEmbeddings([(chatHistoryId: "better", observedEpoch: 1, embedding: vector(cos: 1)),
+                                                      (chatHistoryId: "newer", observedEpoch: 1, embedding: vector(cos: 0.8))])
+
+        let hits = await MemoryIndex.shared.hybridSearch(query: "zyxwvut", queryEmbedding: vector(cos: 1),
+                                                         fromMs: nil, toMs: nil, limit: 1, demoActive: false)
+        #expect(hits.map(\.chatHistoryId) == ["better"])
+    }
+
+    /// A failed date read of the vector-only candidates leaves them out and keeps the keyword matches,
+    /// as a failed `fetchMetaForRowids` does; the next search reads them again (tabmail-ios#265).
+    @Test("hybridSearch: a failed date read keeps the keyword matches and leaves out the vector-only ones")
+    func hybridSearch_failedDateReadKeepsKeywordMatches() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.prepareDatabase { db in
+            if let sqliteConn = db.sqliteConnection {
+                _ = tabmail_register_sqlite_vec_on_db(UnsafeMutableRawPointer(sqliteConn))
+                sqlite3_set_authorizer(sqliteConn, { _, action, table, _, _, _ in
+                    guard action == SQLITE_READ, let table, String(cString: table) == "json_each" else { return SQLITE_OK }
+                    return memoryDateReadFault.withLock { state in
+                        guard state.deny else { return SQLITE_OK }
+                        state.refused += 1
+                        return SQLITE_DENY
+                    }
+                }, nil)
+            }
+        }
+        let pool = try DatabasePool(path: dir.appendingPathComponent("memory.db").path, configuration: config)
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        await MemoryIndex.shared._testReset()
+        try await MemoryIndex.shared._testInstallPool(pool)
+
+        // "keyword" matches the word; "meaning" is found by its vector alone. Filler keeps the word rare.
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "keyword", sessionId: "s", role: "user", dateMs: 1000, text: "quokka")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "meaning", sessionId: "s", role: "user", dateMs: 2000, text: "turn")
+        for i in 0..<12 {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "filler\(i)", sessionId: "s", role: "user", dateMs: 1000, text: "turn")
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings([(chatHistoryId: "meaning", observedEpoch: 1, embedding: vector(cos: 1))])
+        func search() async -> [String] {
+            await MemoryIndex.shared.hybridSearch(query: "quokka", queryEmbedding: vector(cos: 1), fromMs: nil, toMs: nil,
+                                                  limit: 4, demoActive: false).map(\.chatHistoryId)
+        }
+
+        memoryDateReadFault.withLock { $0 = (false, 0) }
+        #expect(await search() == ["meaning", "keyword"])
+        memoryDateReadFault.withLock { $0.deny = true }
+        let failed = await search()
+        memoryDateReadFault.withLock { $0.deny = false }
+        #expect(memoryDateReadFault.withLock { $0.refused } > 0)
+        #expect(failed == ["keyword"])
+        #expect(await search() == ["meaning", "keyword"])
+        await MemoryIndex.shared._testReset()
     }
 
     @Test("search answers by the hybrid path within its dates and its limit")

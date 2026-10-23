@@ -68,21 +68,28 @@ struct SearchEmptyMergeKeywordFallbackTests {
         // Query vector orthogonal to every stored one: vector score 0 for all.
         let results = try await index.hybridSearch(
             ftsQuery: SearchQueryParser.buildFTSMatch("budget"), queryEmbedding: Self.oneHot(0),
-            fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil)
+            fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil, sort: .relevance)
         #expect(Set(results.map(\.contentKey.rawValue)) == Set(budget))
 
         // Within dates covering budget messages 5 to 9 (a day apart), with matches on both sides: those 5.
         let dated = try await index.hybridSearch(
             ftsQuery: SearchQueryParser.buildFTSMatch("budget"), queryEmbedding: Self.oneHot(0),
             fromDateMs: from + 4 * 86_400_000 + 43_200_000, toDateMs: from + 9 * 86_400_000 + 43_200_000,
-            limit: 100, folderIds: nil)
+            limit: 100, folderIds: nil, sort: .relevance)
         #expect(Set(dated.map(\.contentKey.rawValue)) == Set(budget[5..<10]))
 
-        // Fewer than the matches: the newest `limit`, newest first.
+        // Fewer than the matches: `limit` of them, best keyword match first (equal here, so newest first).
         let limited = try await index.hybridSearch(
             ftsQuery: SearchQueryParser.buildFTSMatch("budget"), queryEmbedding: Self.oneHot(0),
-            fromDateMs: from, toDateMs: to, limit: 5, folderIds: nil)
+            fromDateMs: from, toDateMs: to, limit: 5, folderIds: nil, sort: .relevance)
         #expect(limited.map(\.contentKey.rawValue) == Array(budget.suffix(5).reversed()))
+        // In date order, both directions (tabmail-ios#265).
+        for (sort, expected) in [(SearchSort.dateDesc, Array(budget.suffix(5).reversed())), (.dateAsc, Array(budget.prefix(5)))] {
+            let sorted = try await index.hybridSearch(
+                ftsQuery: SearchQueryParser.buildFTSMatch("budget"), queryEmbedding: Self.oneHot(0),
+                fromDateMs: from, toDateMs: to, limit: 5, folderIds: nil, sort: sort)
+            #expect(sorted.map(\.contentKey.rawValue) == expected, "\(sort)")
+        }
 
         try await index.removeMessages(contentKeys: (budget + weather).map(ContentKey.init(rawValue:)))
     }
@@ -96,13 +103,13 @@ struct SearchEmptyMergeKeywordFallbackTests {
         // budget messages (keyword score about 0, vector score 0) are not.
         let results = try await index.hybridSearch(
             ftsQuery: SearchQueryParser.buildFTSMatch("budget"), queryEmbedding: Self.oneHot(2),
-            fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil)
+            fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil, sort: .relevance)
         #expect(Set(results.map(\.contentKey.rawValue)) == Set(weather.dropFirst()))
 
         // A merge that keeps a single message is the answer too.
         let single = try await index.hybridSearch(
             ftsQuery: SearchQueryParser.buildFTSMatch("budget"), queryEmbedding: Self.oneHot(3),
-            fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil)
+            fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil, sort: .relevance)
         #expect(single.map(\.contentKey.rawValue) == [weather[0]])
 
         try await index.removeMessages(contentKeys: (budget + weather).map(ContentKey.init(rawValue:)))
@@ -136,9 +143,9 @@ struct SearchEmptyMergeKeywordFallbackTests {
         }
 
         let fromDateMs = from + 2 * day + day / 2, toDateMs = from + 5 * day + day / 2
-        let results = try await index.search(query: "invoice", fromDateMs: fromDateMs, toDateMs: toDateMs, limit: 100)
+        let results = try await index.search(query: "invoice", fromDateMs: fromDateMs, toDateMs: toDateMs, limit: 100, sort: .relevance)
         #expect(Set(results.map(\.contentKey.rawValue)) == Set([invoice[3], invoice[4], invoice[5], meaning]))
-        let limited = try await index.search(query: "invoice", fromDateMs: fromDateMs, toDateMs: toDateMs, limit: 2)
+        let limited = try await index.search(query: "invoice", fromDateMs: fromDateMs, toDateMs: toDateMs, limit: 2, sort: .relevance)
         #expect(limited.count == 2)
 
         try await index.removeMessages(contentKeys: all.map(ContentKey.init(rawValue:)))

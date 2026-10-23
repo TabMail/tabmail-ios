@@ -1843,15 +1843,9 @@ actor SearchIndex {
             : "\(qualifier)accountId != '\(DemoSeed.demoAccountId)'"
     }
 
-    /// Demo-scope check for results assembled without SQL scoping (vector-only
-    /// hybrid hits). Content keys are `accountId:folderPath:<tail>`, so the
-    /// account prefix is unaffected by where the tail comes from.
-    nonisolated static func contentKeyInDemoScope(_ contentKey: ContentKey, demoActive: Bool) -> Bool {
-        contentKey.rawValue.hasPrefix("\(DemoSeed.demoAccountId):") == demoActive
-    }
-
-    /// FTS5-only search across all year shards using a single UNION ALL query.
-    /// Matching TB's search_fts_only() — sorts by dateMs DESC, rank ASC.
+    /// FTS5-only search across all year shards using a single UNION ALL query, newest first (dateMs
+    /// DESC, rank ASC) for the inbox search screen's typing path. On purpose not native's
+    /// `search_fts_only`, which now orders by the search's sort (tabmail-ios#265).
     func keywordSearch(query: String, fromDateMs: Int64? = nil, toDateMs: Int64? = nil,
                        limit: Int = SearchConfig.searchDefaultLimit,
                        folderIds: [String]? = nil) throws -> [FTSSearchResult] {
@@ -1862,17 +1856,18 @@ actor SearchIndex {
         let ftsQuery = SearchQueryParser.buildFTSMatch(query)
         guard !ftsQuery.isEmpty else { return [] }
 
-        return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
+        return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit,
+                                 folderIds: folderIds, sort: .dateDesc)
     }
 
     // MARK: - Hybrid Search
 
-    /// Full hybrid search: FTS5 keyword + vector similarity, merged.
+    /// Full hybrid search: FTS5 keyword + vector similarity, merged, in `sort` order before the limit.
     /// Matching TB's search() in db.rs — includes date filtering, UNION ALL,
     /// proper FTS-only fallback, and column-scope filter-first.
     func search(query: String, fromDateMs: Int64? = nil, toDateMs: Int64? = nil,
                 limit: Int = SearchConfig.searchDefaultLimit,
-                folderIds: [String]? = nil) throws -> [FTSSearchResult] {
+                folderIds: [String]? = nil, sort: SearchSort) throws -> [FTSSearchResult] {
         guard dbPool != nil else { return [] }
         if let ids = folderIds, ids.isEmpty { return [] }
 
@@ -1891,28 +1886,41 @@ actor SearchIndex {
         // When query parses to empty FTS (e.g., "*") but dates are provided,
         // fall back to date-range scan (list all emails in the period)
         if ftsQuery.isEmpty && (fromDateMs != nil || toDateMs != nil) {
-            return try scanByDateRange(fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
+            return try scanByDateRange(fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds, sort: sort)
         }
         // When query parses to empty FTS and no dates, nothing to search
         if ftsQuery.isEmpty {
             return []
         }
 
+        // Only fields (`from:a@example.com`): nothing for the vector leg to mean, so the answer is by
+        // keyword over every match, in sort order. A field names which messages, not how well they
+        // match: its matches' keyword scores (each year shard's statistics, the field's length, how often
+        // the value is in it) are no measure of relevance, so for relevance they are tied: newest first,
+        // and "the latest from X" is exact under the default sort. Mirrors tabmail-native-fts #46.
+        if Self.queryIsFieldOnly(ftsQuery) {
+            return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit,
+                                     folderIds: folderIds, sort: sort == .relevance ? .dateDesc : sort)
+        }
+
         // Fall back to FTS-only when no embedding engine
         guard let embeddingService = EmbeddingService.shared else {
-            return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
+            return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit,
+                                     folderIds: folderIds, sort: sort)
         }
 
         return try hybridSearch(ftsQuery: ftsQuery, queryEmbedding: try embeddingService.embed(query),
-                                fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
+                                fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds, sort: sort)
     }
 
     /// The hybrid part of `search`, given the query's embedding. Call it through `search`, which
-    /// answers an empty folder list and an empty FTS query before reaching it.
+    /// answers an empty folder list, an empty FTS query and a query of only fields before reaching it.
     func hybridSearch(ftsQuery: String, queryEmbedding: [Float], fromDateMs: Int64?, toDateMs: Int64?,
-                      limit: Int, folderIds: [String]?) throws -> [FTSSearchResult] {
+                      limit: Int, folderIds: [String]?, sort: SearchSort) throws -> [FTSSearchResult] {
         guard let dbPool else { return [] }
-        let candidateLimit = limit * SearchConfig.candidateMultiplier
+        // A date sort orders all of a larger pool's matches by date, so the newest (oldest) match is
+        // found even when its score is far from the best.
+        let candidateLimit = sort == .relevance ? limit * SearchConfig.candidateMultiplier : SearchConfig.dateSortPool
 
         // --- FTS5 candidates (UNION ALL across all year shards) ---
         let ftsCandidates = try searchFTSCandidates(
@@ -1929,29 +1937,36 @@ actor SearchIndex {
 
         // --- Vector candidates via sqlite-vec KNN, within the dates and the field ---
         let vectorCandidates = searchVecCandidates(queryEmbedding: queryEmbedding, limit: candidateLimit,
-                                                   fromDateMs: fromDateMs, toDateMs: toDateMs, eligible: eligibleRowids)
+                                                   fromDateMs: fromDateMs, toDateMs: toDateMs, eligible: eligibleRowids,
+                                                   demoActive: DemoModeStore.isDemoActive)
 
         // Fall back to FTS-only when no vector lies within the dates and the field (or the vec table
         // is empty, e.g. during embedding rebuild).
         // Without this, hybrid weights (text_weight=0.3) penalize text-only results below MIN_SCORE.
         if vectorCandidates.isEmpty {
             BackgroundSyncLogger.logDebug("[SearchIndex] No vector candidates (vec table may be empty), falling back to FTS-only search")
-            return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
+            return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit,
+                                     folderIds: folderIds, sort: sort)
         }
 
         // --- Merge ---
         let textPairs = ftsCandidates.map { ($0.rowid, $0.rank) }
+        var dates = Dictionary(ftsCandidates.map { ($0.rowid, $0.dateMs) }, uniquingKeysWith: { first, _ in first })
+        let vectorOnly = vectorCandidates.map(\.0).filter { dates[$0] == nil }
+        dates.merge(try dbPool.read { db in try Self.fetchDates(db, metaTable: "message_meta", rowids: vectorOnly) },
+                    uniquingKeysWith: { first, _ in first })
         let merged = HybridMerge.mergeResults(
-            textResults: textPairs, vectorResults: vectorCandidates,
+            textResults: textPairs, vectorResults: vectorCandidates, dates: dates,
             vectorWeight: SearchConfig.vectorWeight, textWeight: SearchConfig.textWeight,
-            limit: limit)
+            sort: sort, limit: limit)
 
         // Words matched but the merge kept nothing (a word in most messages scores about 0 by keyword,
         // and a weak vector match adds too little to reach minScore): answer by keyword, as with no
         // vectors. Mirrors tabmail-native-fts #28 (ADR-NF-014).
         if merged.isEmpty && !ftsCandidates.isEmpty {
             BackgroundSyncLogger.logDebug("[SearchIndex] Hybrid merge kept none of \(ftsCandidates.count) keyword matches, falling back to FTS-only search")
-            return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
+            return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit,
+                                     folderIds: folderIds, sort: sort)
         }
 
         // --- Assemble results ---
@@ -1970,11 +1985,8 @@ actor SearchIndex {
                 ))
             } else {
                 // Vector-only result — fetch metadata (the KNN leg already kept
-                // only rows within the dates). Demo scope: the KNN leg has no
-                // SQL account predicate, so out-of-scope vector hits are
-                // dropped here (headerId is accountId-prefixed).
+                // only rows within the dates and the demo scope).
                 if let meta = try fetchMeta(rowid: hr.rowid) {
-                    guard Self.contentKeyInDemoScope(meta.contentKey, demoActive: DemoModeStore.isDemoActive) else { continue }
                     results.append(FTSSearchResult(
                         contentKey: meta.contentKey, messageId: meta.messageId,
                         snippet: "", rank: -hr.finalScore, dateMs: meta.dateMs
@@ -2071,10 +2083,11 @@ actor SearchIndex {
         }
     }
 
-    /// FTS-only search across all year shards using a single UNION ALL query.
-    /// Matching TB's search_fts_only() — sorts by dateMs DESC, rank ASC.
+    /// FTS-only search across all year shards using a single UNION ALL query, every match in `sort`
+    /// order before the limit. Matching TB's search_fts_only(): relevance is rank, then newer first;
+    /// a date sort is by date, then the better rank.
     private func searchFTSOnly(ftsQuery: String, fromDateMs: Int64?, toDateMs: Int64?,
-                                limit: Int, folderIds: [String]? = nil) throws -> [FTSSearchResult] {
+                                limit: Int, folderIds: [String]? = nil, sort: SearchSort) throws -> [FTSSearchResult] {
         guard let dbPool, !knownYears.isEmpty, !ftsQuery.isEmpty else { return [] }
 
         return try dbPool.read { [self] db in
@@ -2127,8 +2140,13 @@ actor SearchIndex {
             if let ids = nonEmptyFolderIds { args.append(contentsOf: ids) }
             args.append(limit)
 
+            let order = switch sort {
+            case .relevance: "rank ASC, dateMs DESC"
+            case .dateDesc: "dateMs DESC, rank ASC"
+            case .dateAsc: "dateMs ASC, rank ASC"
+            }
             let sql = subqueries.joined(separator: " UNION ALL ") +
-                " ORDER BY dateMs DESC, rank ASC LIMIT ?\(limitParam)"
+                " ORDER BY \(order) LIMIT ?\(limitParam)"
 
             // Gated for the same reason as `searchFTSCandidates` above: this is THE
             // per-keystroke path (it is the query the Archive-search stall episode was
@@ -2232,9 +2250,10 @@ actor SearchIndex {
     }
 
     /// Date-range-only scan when FTS query is empty (e.g., "*" with date params).
-    /// Returns messages in the date range sorted by date DESC — no text matching.
+    /// Returns messages in the date range, oldest first for `.dateAsc` and otherwise newest first (no
+    /// text matching, so nothing to rank by).
     private func scanByDateRange(fromDateMs: Int64?, toDateMs: Int64?,
-                                  limit: Int, folderIds: [String]? = nil) throws -> [FTSSearchResult] {
+                                  limit: Int, folderIds: [String]? = nil, sort: SearchSort) throws -> [FTSSearchResult] {
         guard let dbPool else { return [] }
         return try dbPool.read { db in
             var sql = "SELECT headerId, dateMs FROM message_meta WHERE "
@@ -2247,7 +2266,7 @@ actor SearchIndex {
                 sql += " AND folderId IN (\(placeholders))"
                 args.append(contentsOf: ids)
             }
-            sql += " ORDER BY dateMs DESC LIMIT ?"
+            sql += sort == .dateAsc ? " ORDER BY dateMs ASC LIMIT ?" : " ORDER BY dateMs DESC LIMIT ?"
             args.append(limit)
             let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
             return rows.map { row in
@@ -2268,6 +2287,9 @@ actor SearchIndex {
     /// With dates (either bound, each inclusive) or a field's rowids, sqlite-vec searches only the
     /// rows of `message_meta` dated within the dates and among those rowids (`rowid IN`), so nearer
     /// rows outside them never take the `limit` places. Mirrors tabmail-native-fts#26 (ADR-NF-016).
+    /// Demo scope (ADR-IOS-038): the KNN results are joined to `message_meta` and only the current
+    /// mode's account is kept, as `MemoryIndex.searchVecCandidates` does, so an out-of-scope row never
+    /// reaches the merge and never takes a place the merge keeps for the limit (tabmail-ios#265).
     ///
     /// Uses the writer connection (not reader pool) to avoid sqlite-vec vtab lifecycle
     /// crash — vec0 caches prepared statements per connection, and reader pool
@@ -2275,16 +2297,16 @@ actor SearchIndex {
     /// Internal (not private) so tests can check that nearer rows outside the dates or
     /// the field fill the unfiltered `limit`.
     func searchVecCandidates(queryEmbedding: [Float], limit: Int, fromDateMs: Int64?, toDateMs: Int64?,
-                             eligible: Set<Int64>?) -> [(Int64, Double)] {
+                             eligible: Set<Int64>?, demoActive: Bool) -> [(Int64, Double)] {
         guard let dbPool else { return [] }
         let blob = queryEmbedding.withUnsafeBytes { Data($0) }
-        let sql: String
+        let knn: String
         let arguments: StatementArguments
         if fromDateMs == nil && toDateMs == nil && eligible == nil {
-            sql = "SELECT rowid, distance FROM messages_vec WHERE embedding MATCH ? AND k = ?"
+            knn = "SELECT rowid, distance FROM messages_vec WHERE embedding MATCH ? AND k = ?"
             arguments = [blob, limit]
         } else {
-            sql = """
+            knn = """
                 SELECT rowid, distance FROM messages_vec WHERE embedding MATCH ? AND k = ? AND rowid IN
                 (SELECT rowid FROM message_meta WHERE dateMs >= ? AND dateMs <= ?
                  AND (? IS NULL OR rowid IN (SELECT value FROM json_each(?))))
@@ -2292,6 +2314,12 @@ actor SearchIndex {
             let eligibleJSON = eligible.map { "[" + $0.map(String.init).joined(separator: ",") + "]" }
             arguments = [blob, limit, fromDateMs ?? Int64.min, toDateMs ?? Int64.max, eligibleJSON, eligibleJSON]
         }
+        let sql = """
+            SELECT v.rowid AS rowid, v.distance AS distance FROM (\(knn)) v
+            JOIN message_meta meta ON meta.rowid = v.rowid
+            WHERE \(Self.demoAccountScopeSQL(demoActive: demoActive, qualifier: "meta."))
+            ORDER BY v.distance
+            """
         do {
             return try dbPool.writeWithoutTransaction { db in
                 try Row.fetchAll(db, sql: sql, arguments: arguments)
@@ -2317,17 +2345,32 @@ actor SearchIndex {
     /// Given `from_:"alice@example.com" hiring*`, returns `from_:"alice@example.com"`; an empty
     /// string when the query has none.
     /// Used to build a filter-only query for pre-filtering vector candidates.
-    /// Reads the query's UTF-8 bytes, as tabmail-native-fts `extract_column_scope_filter` does, and
-    /// cuts only at ASCII bytes, so every slice is whole UTF-8. A walk over Characters missed string
-    /// boundaries: a quote followed by a combining mark, or a Prepend character (U+0600) followed by
-    /// a quote, is one Character, and the filter then cut inside a string FTS5 refused.
     private static func extractColumnScopeFilter(_ ftsQuery: String) -> String {
+        splitColumnScope(ftsQuery).scopedTerms.joined(separator: " ")
+    }
+
+    /// Whether a processed FTS5 query is only column-scoped terms, with operators between them: no free
+    /// word, phrase or group (`from:alice@example.com`, `from:a@example.com OR to:a@example.com`).
+    static func queryIsFieldOnly(_ ftsQuery: String) -> Bool {
+        let (scopedTerms, hasFreeText) = splitColumnScope(ftsQuery)
+        return !scopedTerms.isEmpty && !hasFreeText
+    }
+
+    /// A processed FTS5 query's column-scoped terms, and whether it has any other term than an
+    /// operator, as tabmail-native-fts `split_column_scope`. Every free word, phrase and group
+    /// `SearchQueryParser.buildFTSMatch` writes starts with a quote or a parenthesis.
+    /// Reads the query's UTF-8 bytes, as native-fts does, and cuts only at ASCII bytes, so every slice
+    /// is whole UTF-8. A walk over Characters missed string boundaries: a quote followed by a combining
+    /// mark, or a Prepend character (U+0600) followed by a quote, is one Character, and the filter then
+    /// cut inside a string FTS5 refused.
+    private static func splitColumnScope(_ ftsQuery: String) -> (scopedTerms: [String], hasFreeText: Bool) {
         let bytes = Array(ftsQuery.utf8)
         let prefixes = columnScopePrefixes.map { Array($0.utf8) }
         let quote = UInt8(ascii: "\""), star = UInt8(ascii: "*"), open = UInt8(ascii: "("), close = UInt8(ascii: ")")
         // Rust `u8::is_ascii_whitespace`: space, tab, line feed, form feed, carriage return.
         let isWhitespace = { (b: UInt8) in b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0C || b == 0x0D }
         var scopedTerms: [String] = []
+        var hasFreeText = false
         var i = 0
 
         while i < bytes.count {
@@ -2363,31 +2406,46 @@ actor SearchIndex {
                 }
 
                 scopedTerms.append(String(decoding: bytes[start..<i], as: UTF8.self))
-            } else if bytes[i] == quote {
-                // Non-scoped quoted phrase — skip it
-                i += 1
-                while i < bytes.count && bytes[i] != quote {
-                    i += 1
-                }
-                if i < bytes.count { i += 1 }
-            } else if bytes[i] == open {
-                // Skip parenthesized group (synonym or spelling OR group)
-                var depth = 1
-                i += 1
-                while i < bytes.count && depth > 0 {
-                    if bytes[i] == open { depth += 1 }
-                    if bytes[i] == close { depth -= 1 }
-                    i += 1
-                }
             } else {
-                // Regular token — skip
-                while i < bytes.count && !isWhitespace(bytes[i]) {
+                // Non-scoped token — skip it
+                hasFreeText = hasFreeText || bytes[i] == quote || bytes[i] == open
+                if bytes[i] == quote {
+                    // Quoted phrase
                     i += 1
+                    while i < bytes.count && bytes[i] != quote {
+                        i += 1
+                    }
+                    if i < bytes.count { i += 1 }
+                } else if bytes[i] == open {
+                    // Parenthesized group (synonym or spelling OR group)
+                    var depth = 1
+                    i += 1
+                    while i < bytes.count && depth > 0 {
+                        if bytes[i] == open { depth += 1 }
+                        if bytes[i] == close { depth -= 1 }
+                        i += 1
+                    }
+                } else {
+                    // Operator (AND, OR, NOT)
+                    while i < bytes.count && !isWhitespace(bytes[i]) {
+                        i += 1
+                    }
                 }
             }
         }
 
-        return scopedTerms.joined(separator: " ")
+        return (scopedTerms, hasFreeText)
+    }
+
+    /// Each rowid's `dateMs` from `metaTable`, in one query; a rowid with no row is left out.
+    /// Shared with `MemoryIndex` (`memory_meta`).
+    nonisolated static func fetchDates(_ db: Database, metaTable: String, rowids: [Int64]) throws -> [Int64: Int64] {
+        guard !rowids.isEmpty else { return [:] }
+        let json = "[" + rowids.map(String.init).joined(separator: ",") + "]"
+        let rows = try Row.fetchAll(db, sql: """
+            SELECT rowid, dateMs FROM \(metaTable) WHERE rowid IN (SELECT value FROM json_each(?))
+            """, arguments: [json])
+        return Dictionary(rows.map { ($0["rowid"] as Int64, $0["dateMs"] as Int64) }, uniquingKeysWith: { first, _ in first })
     }
 
     /// Fetch all rowids matching a column-scope filter query across all year shards.

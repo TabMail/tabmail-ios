@@ -37,6 +37,16 @@ struct EmailSearchTool: AgentTool, Sendable {
             pageIndex = 1
         }
 
+        // The order the search sorts every match in before it takes its limit (tabmail-ios#265,
+        // native-fts #46). Defaults to relevance, as the `email_search` tool version that ships with it;
+        // a sort it does not know is relevance too, as on Thunderbird (tabmail-thunderbird#150).
+        let sort: SearchSort
+        if case .string(let s) = arguments["sort"], let parsed = SearchSort(rawValue: s) {
+            sort = parsed
+        } else {
+            sort = .relevance
+        }
+
         // Parse optional date filters
         let fromDate = ToolFormatters.parseDate(arguments["from_date"])
         let toDate = ToolFormatters.parseDate(arguments["to_date"])
@@ -61,30 +71,13 @@ struct EmailSearchTool: AgentTool, Sendable {
 
         // FTS search via SearchIndex (hybrid: keyword + vector, with date filtering in SQL)
         let searchStart = CFAbsoluteTimeGetCurrent()
-        var hits = try await SearchIndex.shared.search(
-            query: query, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: Config.maxResults)
+        let hits = try await SearchIndex.shared.search(
+            query: query, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: Config.maxResults, sort: sort)
         let searchMs = Int((CFAbsoluteTimeGetCurrent() - searchStart) * 1000)
         BackgroundSyncLogger.logDebug("[EmailSearchTool] email_search: FTS returned \(hits.count) items in \(searchMs)ms")
 
-        // Handle sort option
-        let sort: String
-        if case .string(let s) = arguments["sort"] {
-            sort = s
-        } else {
-            sort = "date_desc"
-        }
-
-        switch sort {
-        case "date_asc":
-            hits.sort { $0.dateMs < $1.dateMs }
-        case "date_desc":
-            hits.sort { $0.dateMs > $1.dateMs }
-        default:
-            break // "relevance" — keep FTS rank ordering
-        }
-
         let total = hits.count
-        BackgroundSyncLogger.logDebug("[EmailSearchTool] email_search: \(total) items total (sort=\(sort))")
+        BackgroundSyncLogger.logDebug("[EmailSearchTool] email_search: \(total) items total (sort=\(sort.rawValue))")
 
         // Log top results for debugging
         if DebugModeManager.isLoggingEnabled() {

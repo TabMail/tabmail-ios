@@ -9,7 +9,8 @@
 - **Vector search**: sqlite-vec KNN (v0.1.7-alpha.2), embeddings in `messages_vec` virtual table
 - **sqlite-vec safety**: ALL `messages_vec` access MUST go through the writer connection (`writeWithoutTransaction` for reads). Reader pool connections create vec0 vtab instances that crash in `vec0_free_resources` on disconnect. No `sqlite3_auto_extension` — registered per-connection in SearchIndex only.
 - **Hybrid merge**: 70% vector / 30% keyword scoring, min score 0.1, 4× candidate multiplier
-- **FTS-only fallback**: when vec table empty (embedding rebuild), uses `searchFTSOnly()` — sorts by dateMs DESC, rank ASC
+- **FTS-only fallback**: when vec table empty (embedding rebuild), uses `searchFTSOnly()` — sorts by dateMs DESC, rank ASC (until 2026-10-23; now by the search's sort, see below)
+- **Sort before the limit** (2026-10-23, #265 / native-fts #46, ADR-IOS-094): `search`/`hybridSearch` take `SearchSort` (relevance / date_desc / date_asc); merge ties relevance newer first, date better first, then rowid; date sorts read `dateSortPool` 4,096 per leg; a query of only fields answers by keyword over all matches (newest first under relevance); `searchFTSOnly` orders relevance `rank ASC, dateMs DESC`, dates `dateMs, rank`; `keywordSearch` (SearchView typing) stays `dateMs DESC, rank ASC`
 - **Empty-merge fallback** (2026-10-21, #240 / native-fts #28): when the merge keeps nothing but FTS matched (a word in at least half a shard's rows: FTS5 IDF ~0), `searchFTSOnly()` / memory `assembleFTSOnly` answer; `hybridSearch(…, queryEmbedding:)` is the testable hybrid part
 - **Date-range scan**: `query="*"` with date params → `scanByDateRange()` (no FTS MATCH, just date filter on message_meta)
 - **Column-scope filter-first**: `from:"email"` queries pre-filter vec candidates to matching rowids
