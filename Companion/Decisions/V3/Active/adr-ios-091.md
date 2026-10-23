@@ -497,3 +497,17 @@ Codex round 5 on `358fc05` found:
   ignored (#277), both with #272 as one SwiftMail reader unit; a Gmail reply replaced by a
   standalone message keeps its old parent (#278, needs a record of whether the server copy names
   a parent).
+
+### Codex review round 6 corrections (2026-10-23)
+
+Codex round 6 on `290031d` found:
+
+- **A flowed line could become a false signature separator.** With `delsp=yes`, the line
+  `"--  "` (a text space and the soft-break marker) became `"-- "` once the marker was dropped,
+  and was then taken for the signature separator, splitting the paragraph. The separator is now
+  recognised on the line as written, before the marker is dropped.
+- **A Gmail part fetched apart was not checked for completeness.** `draftPartBytes` checked inline
+  bytes against `body.size` but not bytes fetched through the attachments API, and a Gmail file
+  with an attachment id was fetched later by the generic attachment path, unchecked. A Gmail draft
+  read now reads every file whole with the draft, through `draftPartBytes`, and checks every
+  part's decoded bytes against `body.size` by either route; a short part keeps the local copy.

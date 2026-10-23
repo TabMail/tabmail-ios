@@ -903,15 +903,10 @@ actor GmailProvider: EmailProvider {
             // A leaf Gmail reports as empty holds nothing to carry.
             if !isFile, part.body?.attachmentId == nil, (part.body?.size ?? 0) == 0,
                (part.body?.data ?? "").isEmpty { continue }
-            // A file is fetched later by its attachment id; one whose bytes came in
-            // the part is carried under a key of its own.
-            let section: String
-            if let attachmentId = part.body?.attachmentId {
-                section = attachmentId
-            } else {
-                section = "inline-part-\(carried.count)"
-                carried[section] = try await draftPartBytes(part, messageId: id)
-            }
+            // Every file is read here, whole (`draftPartBytes`), and carried under its
+            // attachment id, or a key of its own when its bytes came in the part.
+            let section = part.body?.attachmentId ?? "inline-part-\(carried.count)"
+            carried[section] = try await draftPartBytes(part, messageId: id)
             attachments.append(AttachmentInfo(
                 filename: filename.isEmpty
                     ? (isMessage ? "attached-email.eml" : DraftReadConfig.unnamedAttachmentFilename)
@@ -927,27 +922,31 @@ actor GmailProvider: EmailProvider {
             attachmentData: carried.isEmpty ? nil : carried)
     }
 
-    /// A draft part's bytes: inline in the part, else through the attachments API.
-    /// Gmail may send empty `data` for a part whose bytes are stored apart, under
-    /// its `attachmentId`, so only non-empty `data` is the part's bytes.
+    /// A draft part's bytes, whole: inline in the part, else through the attachments
+    /// API. Gmail may send empty `data` for a part whose bytes are stored apart,
+    /// under its `attachmentId`, so only non-empty `data` is the part's bytes.
+    /// `body.size` counts the decoded bytes; fewer, by either route, never arrived
+    /// whole.
     private func draftPartBytes(_ part: GmailPart, messageId: String) async throws -> Data {
+        let bytes: Data
         if let inline = part.body?.data, !inline.isEmpty {
-            // `body.size` counts the decoded bytes; fewer never arrived whole.
-            guard let decoded = decodeBase64URLToData(inline),
-                  part.body?.size.map({ decoded.count >= $0 }) ?? true else {
+            guard let decoded = decodeBase64URLToData(inline) else {
                 throw GmailDraftCopyIncomplete(mimeType: part.mimeType ?? "")
             }
-            return decoded
+            bytes = decoded
+        } else if let attachmentId = part.body?.attachmentId {
+            bytes = try await fetchAttachment(messageId: messageId, attachmentId: attachmentId)
+        } else {
+            // A file part with children and neither (an attached message Gmail lists
+            // as its parts, which may report size 0) cannot be carried as one file:
+            // refused like an Outlook item attachment (#241), never read as empty.
+            guard (part.parts ?? []).isEmpty else { throw DraftCopyUnsupportedAttachment() }
+            bytes = Data()
         }
-        if let attachmentId = part.body?.attachmentId {
-            return try await fetchAttachment(messageId: messageId, attachmentId: attachmentId)
+        guard part.body?.size.map({ bytes.count >= $0 }) ?? true else {
+            throw GmailDraftCopyIncomplete(mimeType: part.mimeType ?? "")
         }
-        // A file part with children and neither (an attached message Gmail lists as
-        // its parts, which may report size 0) cannot be carried as one file: refused
-        // like an Outlook item attachment (#241), never read as an empty file.
-        guard (part.parts ?? []).isEmpty else { throw DraftCopyUnsupportedAttachment() }
-        if (part.body?.size ?? 0) == 0 { return Data() }
-        throw GmailDraftCopyIncomplete(mimeType: part.mimeType ?? "")
+        return bytes
     }
 
     /// The message a draft resource currently wraps (it changes on every update),

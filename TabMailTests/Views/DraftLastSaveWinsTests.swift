@@ -348,7 +348,7 @@ struct DraftCopyReadTests {
                  {"mimeType":"multipart/alternative","parts":[
                    {"mimeType":"text/plain","body":{"size":\(ownBytes.count),"data":"\(own)"}},
                    {"mimeType":"text/html","body":{"size":\(ownHTMLBytes.count),"data":"\(ownHTML)"}}]},
-                 {"mimeType":"message/rfc822","filename":"","body":{"size":30,"attachmentId":"eml1"},
+                 {"mimeType":"message/rfc822","filename":"","body":{"size":4,"attachmentId":"eml1"},
                   "parts":[{"mimeType":"text/plain","body":{"size":10,"data":"\(inner)"}},
                            {"mimeType":"text/html","body":{"size":10,"data":"\(inner)"}}]},
                  {"mimeType":"image/png","headers":[{"name":"Content-ID","value":"<logo>"}],
@@ -443,8 +443,9 @@ struct DraftCopyReadTests {
 
         #expect(copy.textBody == "See the photo.", "a text part attached as a file joined the body")
         #expect(copy.attachments.map(\.filename) == ["file.jpg", DraftReadConfig.unnamedAttachmentFilename])
-        #expect(copy.attachments.map(\.section) == ["att1", "inline-part-0"])
-        #expect(copy.attachmentData == ["inline-part-0": Data("notes".utf8)])
+        #expect(copy.attachments.map(\.section) == ["att1", "inline-part-1"])
+        #expect(copy.attachmentData == ["att1": Data([1, 2, 3, 4]), "inline-part-1": Data("notes".utf8)],
+                "every file is read whole with the draft")
         #expect(copy.inlineImages.map(\.contentId) == ["ii_1"])
     }
 

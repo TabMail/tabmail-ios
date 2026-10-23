@@ -7,6 +7,7 @@ import GRDB
 import SwiftMail
 import Synchronization
 import Testing
+import UIKit
 @testable import TabMail
 
 /// #217: a draft read from the server becomes the editable draft, so it must be the
@@ -826,6 +827,90 @@ struct DraftCopyIntegrityTests {
             _ = try DraftStore.shared.evictSync(dbPool: PrioritizedDatabase(pool: pool), limit: SyncConfig.maxComposeDraftSessions)
             let after = try await pool.read { try Draft.fetchOne($0, key: draftId) }
             #expect(after?.body == "UNSENT LOCAL EDIT", "the unsent reply to an Inbox message is kept")
+        }
+    }
+
+    @Test("A flowed line that reads \"-- \" only once delsp drops its marker is text, not a signature separator")
+    func flowedDashDashIsASignatureOnlyAsWritten() {
+        let type = "text/plain; format=flowed; delsp=yes"
+        #expect(EmailFilter.decodeFormatFlowed("first \r\n-- \r\nlast", contentType: type) == "first\n-- \nlast",
+                "control: a signature separator as written is a line of its own")
+        #expect(EmailFilter.decodeFormatFlowed("first \r\n--  \r\nlast", contentType: type) == "first-- last",
+                "a text space and the soft-break marker: the paragraph continues")
+    }
+
+    @Test("A Gmail body, inline image or file fetched apart that arrives short keeps the whole local draft",
+          arguments: ["body", "inline", "file"], [true, false])
+    func gmailShortSeparatePartKeepsTheLocalDraft(kind: String, shortened: Bool) async throws {
+        try await withInstalledPool { pool in
+            let oldBytes = Data("LOCAL WHOLE FILE".utf8)
+            let oldDir = DraftAttachmentStorage.newStagingDirName()
+            try DraftAttachmentStorage.saveAttachments([
+                DraftAttachment(filename: "old.bin", mimeType: "application/octet-stream", data: oldBytes)
+            ], dirName: oldDir)
+            defer { DraftAttachmentStorage.deleteAttachments(dirName: oldDir) }
+            let draftId = "new:separate-part"
+            try await pool.write { db in
+                var account = Account(emailAddress: "owner@example.com", displayName: "Test", provider: .gmail)
+                account.id = Self.accountId
+                try account.insert(db)
+                var draft = Draft(id: draftId, accountId: account.id, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                    subject: "local", body: "LOCAL WHOLE BODY", replyToId: nil, isForward: false,
+                    editHistoryJSON: nil, createdAt: 1, updatedAt: 2, serverDraftId: "r1", serverPushStatus: "pushed",
+                    rfc822MessageId: nil, attachmentsDirName: oldDir)
+                draft.instanceEpoch = "E1"
+                try draft.insert(db)
+            }
+            let remote: Data
+            if kind == "inline" {
+                remote = UIGraphicsImageRenderer(size: CGSize(width: 1, height: 1)).pngData { context in
+                    UIColor.red.setFill()
+                    context.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
+                }
+            } else {
+                remote = Data("REMOTE WHOLE PART".utf8)
+            }
+            let delivered = shortened ? Data(remote.prefix(4)) : remote
+            var separated: [String: Any] = [
+                "mimeType": kind == "body" ? "text/plain" : (kind == "inline" ? "image/png" : "application/octet-stream"),
+                "body": ["size": remote.count, "data": "", "attachmentId": "separate"],
+            ]
+            if kind == "inline" { separated["headers"] = [["name": "Content-ID", "value": "<image>"]] }
+            if kind == "file" { separated["filename"] = "remote.bin" }
+            var parts: [[String: Any]] = []
+            if kind != "body" {
+                parts.append(["mimeType": "text/plain", "body": ["size": 11, "data": Self.base64URL(Data("remote body".utf8))]])
+            }
+            parts.append(separated)
+            let payload: [String: Any] = [
+                "id": "m1", "internalDate": String(Int(Date().timeIntervalSince1970 * 1000)), "labelIds": ["DRAFT"],
+                "payload": ["mimeType": "multipart/mixed", "parts": parts,
+                            "headers": [["name": "Subject", "value": "remote"]]]]
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m1"}}"#))
+            http.register(path: "/messages/m1", method: "GET", response: .json(raw:
+                String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)))
+            http.register(path: "/messages/m1/attachments/separate", method: "GET", response: .json(raw:
+                "{\"size\":\(remote.count),\"data\":\"\(Self.base64URL(delivered))\"}"))
+            let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draftId, willReadServer: {})
+            }
+            let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draftId) })
+            defer { if let name = row.attachmentsDirName, name != oldDir { DraftAttachmentStorage.deleteAttachments(dirName: name) } }
+            let files = try DraftAttachmentStorage.loadAttachments(dirName: row.attachmentsDirName)
+            #expect(http.recordedCalls().contains { $0.url.contains("/attachments/separate") }, "fixture: the part was fetched apart")
+            #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "opening changes nothing on the server")
+            if shortened {
+                #expect(row.body == "LOCAL WHOLE BODY" && row.pushAttemptVersion == 0 && row.attachmentsDirName == oldDir,
+                        "the local row is unchanged")
+                #expect(files.map(\.data) == [oldBytes], "the local file survives whole")
+            } else {
+                #expect(row.pushAttemptVersion == 1, "control: a whole server copy is taken")
+                #expect(row.body == (kind == "body" ? "REMOTE WHOLE PART" : "remote body"))
+                #expect(files.map(\.data) == (kind == "body" ? [] : [remote]))
+            }
         }
     }
 }

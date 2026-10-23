@@ -109,11 +109,13 @@ enum EmailFilter {
             rest = rest.dropFirst(depth)
             if rest.first == " " { rest = rest.dropFirst() }
             var content = String(Substring(rest))
+            // The signature separator is neither fixed nor flowed (RFC 3676 §4.3):
+            // it is a line of its own. Read before `delsp=yes` drops a soft break's
+            // space, which would turn a flowed "--  " into one.
+            let isSignature = content == "-- "
             let isSoft = isFlowedSoftBreak(content)
             if isSoft, delSp { content = String(content.unicodeScalars.dropLast()) }
-            // The signature separator is neither fixed nor flowed (RFC 3676 §4.3):
-            // it is a line of its own.
-            if paragraph != nil, depth != paragraphDepth || content == "-- " { endParagraph() }
+            if paragraph != nil, depth != paragraphDepth || isSignature { endParagraph() }
             paragraph = (paragraph ?? "") + content
             paragraphDepth = depth
             if !isSoft { endParagraph() }

@@ -470,8 +470,8 @@ enum ExternalDraftAdoption {
         // Attachment ids belong to the message the copy was read from (Gmail
         // replaces that message on every save), so they are fetched by its id. A
         // file whose bytes the copy already carries (every IMAP file, read under its
-        // proven UIDVALIDITY; a Gmail file whose bytes came inline) is never fetched,
-        // and an IMAP file is never fetched again by UID alone.
+        // proven UIDVALIDITY; every Gmail file, read whole) is never fetched, and an
+        // IMAP file is never fetched again by UID alone.
         let folderPath: String
         if case .imap(let folder, _, _) = identity { folderPath = folder } else { folderPath = "" }
         var attachments: [DraftAttachment] = []
