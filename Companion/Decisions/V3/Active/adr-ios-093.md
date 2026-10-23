@@ -47,10 +47,11 @@ and FTS5 refused it. `queryHasColumnScope` is deleted: an empty filter already m
   apostrophe spellings and never "Don took", possessives, `NOT` excluding only the word typed,
   operators, whitespace separators, private-use characters, the per-run prefix star, each
   documented field in keyword search and in the hybrid vector filter (also beside text that joins
-  a quote into one Character), `l'ét` finding "Létude",
+  a quote into one Character, a partly typed value, and every typed field at once), `l'ét` finding "Létude",
   255 to 300 `NOT`s answering, and 3,000 seeded random queries through keyword and hybrid search.
 - Known differences, filed: a word made only of a combining mark that native-fts's older Unicode
   category tables do not know (U+11F00, U+1CF2 and others) is written differently by the two
   builders (tabmail-ios #255); trimming many leading quote marks from one word takes quadratic time
-  (#256). Both are rare input.
+  (#256). Both are rare input. A field name typed with the long s (`ſubject:`) was a field to the
+  old builder and is a word to both builders now (#267), also rare input.
 - A change to the native-fts builder must be ported here in the same train (ADR-IOS-008).

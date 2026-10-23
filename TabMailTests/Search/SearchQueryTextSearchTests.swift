@@ -424,6 +424,52 @@ struct SearchQueryTextSearchTests {
         try await cleanUp()
     }
 
+    /// Ids of the mails a hybrid search for `q` finds through vectors alone: every row is the query's
+    /// nearest vector, and the query's last word matches no mail.
+    private func foundByVectors(_ q: String) async throws -> [String] {
+        let (from, to) = try Self.yearBounds()
+        let query = q + " zyxqvnonexistent"
+        #expect(try await found(query).isEmpty, "\(q)")
+        let prefix = Self.key("").rawValue
+        return try await index.hybridSearch(ftsQuery: SearchQueryParser.buildFTSMatch(query), queryEmbedding: Self.oneHot(5),
+                                            fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil)
+            .map { String($0.contentKey.rawValue.dropFirst(prefix.count)) }
+            .sorted()
+    }
+
+    private func indexMailsWithVectors(_ mails: [Mail]) async throws {
+        try await indexMails(mails)
+        for mail in mails {
+            try await index.storeEmbedding(contentKey: Self.key(mail.id), embedding: Self.oneHot(5))
+        }
+    }
+
+    @Test("a partly typed field value keeps the longer values among vector hits")
+    func partlyTypedFieldValueKeepsVectorHits() async throws {
+        try await indexMailsWithVectors([
+            Mail(id: "alice", from: "alice@example.com", to: "team@example.com"),
+            Mail(id: "alicia", from: "alicia@example.com", to: "team@example.com"),
+            Mail(id: "bob", from: "bob@example.com", to: "team@example.com"),
+        ])
+        #expect(try await foundByVectors("from:alic") == ["alice", "alicia"])
+        #expect(try await foundByVectors("from:ali*") == ["alice", "alicia"])
+        #expect(try await foundByVectors("from:alice@examp") == ["alice"])
+        #expect(try await foundByVectors("from:zul").isEmpty)
+        try await cleanUp()
+    }
+
+    @Test("vector hits meet every typed field")
+    func vectorHitsMeetEveryTypedField() async throws {
+        try await indexMailsWithVectors([
+            Mail(id: "both", from: "alice@example.com", to: "team@example.com"),
+            Mail(id: "sender-only", from: "alice@example.com", to: "staff@example.com"),
+            Mail(id: "recipient-only", from: "bob@example.com", to: "team@example.com"),
+        ])
+        #expect(try await foundByVectors("from:alice to:team") == ["both"])
+        #expect(try await foundByVectors("from:alice to:zul").isEmpty)
+        try await cleanUp()
+    }
+
     /// Words that may be typed together, joined at random: no query makes search fail. The
     /// fragments of tabmail-native-fts `QUERY_FRAGMENTS`, and three iOS-only ones last: characters
     /// that join a quote into one Swift Character (a Prepend before it, a combining mark after it).
