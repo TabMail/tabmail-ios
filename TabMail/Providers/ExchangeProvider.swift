@@ -222,7 +222,7 @@ actor ExchangeProvider: EmailProvider {
             extraHeaders: forDraft ? ["Prefer": "outlook.body-content-type=\"text\""] : [:])
         let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
 
-        guard let header = parseGraphMessage(msg, selection: selection) else {
+        guard let header = parseGraphMessage(msg, selection: selection, keepEmptySubject: forDraft) else {
             throw ProviderError.messageNotFound
         }
 
@@ -1168,9 +1168,12 @@ actor ExchangeProvider: EmailProvider {
                 // code, which is all the retry classification reads.
                 throw URLError(error.code)
             }
+            // Graph answers each range but the last with 200 and the upload's
+            // progress, and the last with 201 once the attachment exists. A 200 to
+            // the last range means the upload is still incomplete: no attachment,
+            // so the deletes that follow every add must not run.
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            let finished = end == total
-            guard finished ? (status == 200 || status == 201) : status == 200 else {
+            guard status == (end == total ? 201 : 200) else {
                 throw ProviderError.networkError(underlying: HTTPError.networkError(statusCode: status))
             }
             offset = end
@@ -1646,9 +1649,13 @@ actor ExchangeProvider: EmailProvider {
     ///   that produced `msg`. There is no default: a parser caller must carry
     ///   its request shape through this boundary, and `GraphParse` derives the
     ///   `parentFolderId` expectation from that shape.
+    /// - Parameter keepEmptySubject: a draft copy's subject is the draft's own, so
+    ///   an empty one stays empty rather than becoming the "(no subject)" a list
+    ///   shows (#217).
     internal func parseGraphMessage(
         _ msg: GraphMessage,
-        selection: GraphMessageSelection
+        selection: GraphMessageSelection,
+        keepEmptySubject: Bool = false
     ) -> MessageHeaderInfo? {
         // Round-trip through JSON so the shared parser is the single source of
         // truth. Cheap — we already decoded once on the way in.
@@ -1669,7 +1676,7 @@ actor ExchangeProvider: EmailProvider {
             inReplyTo: metadata.inReplyTo,
             references: metadata.references,
             threadId: metadata.threadId,
-            subject: metadata.subject.isEmpty ? "(no subject)" : metadata.subject,
+            subject: metadata.subject.isEmpty && !keepEmptySubject ? "(no subject)" : metadata.subject,
             from: metadata.from.name,
             fromAddress: metadata.from.email,
             to: metadata.to.map { $0.email }.joined(separator: ", "),

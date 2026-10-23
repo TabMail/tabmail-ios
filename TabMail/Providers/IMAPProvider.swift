@@ -3580,8 +3580,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Build FullMessageInfo from BODYSTRUCTURE info + fetched message data.
     /// Extracted from fetchMessageOnConnection so batch fetch can reuse it.
     /// Returns nil if the header can't be parsed — caller should treat as fetch failure.
-    private func buildFullMessageInfo(info: MessageInfo, message: Message) -> FullMessageInfo? {
-        guard let header = mapMessageInfo(info) else { return nil }
+    /// `keepEmptySubject`: see `mapMessageInfo`.
+    private func buildFullMessageInfo(info: MessageInfo, message: Message, keepEmptySubject: Bool = false) -> FullMessageInfo? {
+        guard let header = mapMessageInfo(info, keepEmptySubject: keepEmptySubject) else { return nil }
 
         // Classify each attachment as top-level vs nested-in-.eml by checking
         // whether its MIME section is a descendant of any message/rfc822 section.
@@ -5804,7 +5805,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // proof, and a mailbox recreated in between could hand back another
                 // draft at the same UID.
                 let message = try await server.fetchMessage(from: info)
-                guard let full = self.buildFullMessageInfo(info: info, message: message) else {
+                guard let full = self.buildFullMessageInfo(info: info, message: message, keepEmptySubject: true) else {
                     throw ProviderError.messageNotFound
                 }
                 return try Self.completeDraftCopy(full, message: message)
@@ -5842,7 +5843,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             if contentType.hasPrefix("multipart/") { continue }
             let isBodyText = contentType.hasPrefix("text/plain") || contentType.hasPrefix("text/html")
             if isBodyText, part.filename == nil, part.disposition?.lowercased() != "attachment" {
-                guard Self.draftPartArrived(part), let text = part.textContent else {
+                guard Self.draftPartArrived(part), let text = part.draftTextContent else {
                     throw IMAPDraftCopyIncomplete(section: part.section.description)
                 }
                 if contentType.hasPrefix("text/plain") {
@@ -6944,7 +6945,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// ENVELOPE date are missing/unparseable. Such messages are treated as fetch
     /// failures: if the date is broken, other fields are likely broken too. Next
     /// fetch cycle will retry — by then the server should have indexed the message.
-    private func mapMessageInfo(_ info: MessageInfo) -> MessageHeaderInfo? {
+    /// `keepEmptySubject`: a draft copy's subject is the draft's own, so an absent
+    /// one reads as empty rather than as the "(no subject)" a list shows (#217).
+    private func mapMessageInfo(_ info: MessageInfo, keepEmptySubject: Bool = false) -> MessageHeaderInfo? {
         // Shared with the NSE (`NSEIMAPConnection.mapInfoToMetadata`), so both
         // targets list a message under the same sender.
         let from = IMAPFetchMapping.sender(from: info)
@@ -6983,7 +6986,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
         }
 
-        let subject = info.subject ?? "(no subject)"
+        let subject = info.subject ?? (keepEmptySubject ? "" : "(no subject)")
         // `messageId` + `rfc822MessageId` go through the shared
         // `IMAPFetchMapping` helper so NSE's one-shot fetch and this sync
         // path produce byte-identical output for the same `MessageInfo`.
@@ -7164,5 +7167,25 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     static func escapeHtml(_ string: String) -> String {
         EmlMarker.escapeHtml(string)
+    }
+}
+
+extension MessagePart {
+    /// #217: a draft-copy text part's text as written, or nil. `textContent` is
+    /// the viewing decoder: when the declared charset does not resolve or does
+    /// not decode, it falls back through Windows-1252 and Latin-1, which accept
+    /// any bytes, so GBK text under a label the platform does not know reads as
+    /// Latin mojibake. A draft's text becomes the editable copy, so a guess never
+    /// does: a declared charset decodes the bytes, or they are UTF-8 (the viewing
+    /// decoder's first fallback), or there is no text. A part declaring no
+    /// charset reads as `textContent` reads it.
+    var draftTextContent: String? {
+        guard let declaredCharset else { return textContent }
+        guard let bytes = decodedData() else { return nil }
+        if let encoding = String.Encoding(mimeCharset: declaredCharset),
+           let text = String(data: bytes, encoding: encoding) {
+            return text
+        }
+        return String(data: bytes, encoding: .utf8)
     }
 }

@@ -761,9 +761,11 @@ struct DraftCopyReadTests {
 
     /// A range Graph refused is not uploaded: counting it would mark the row pushed
     /// with the file missing on the server, and the next open's reload would then
-    /// replace the device's copy with the server's.
+    /// replace the device's copy with the server's. A 200 to the last range is
+    /// progress, not the 201 that says the attachment exists: the upload is
+    /// incomplete, so the old file must stay.
     @Test("Graph: a range the upload session refuses fails the save before any file is deleted",
-          arguments: [(500, 201), (200, 404)])
+          arguments: [(500, 201), (200, 404), (200, 200)])
     func refusedUploadRangeFailsTheSave(firstStatus: Int, lastStatus: Int) async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -898,6 +900,25 @@ struct IMAPDraftCopyCompletenessTests {
         #expect(throws: IMAPProvider.IMAPDraftCopyIncomplete.self) {
             try IMAPProvider.completeDraftCopy(Self.full(attachments: attachments), message: Self.message([part]))
         }
+    }
+
+    /// GBK bytes for 中文 under a label no platform resolves: the viewing decoder
+    /// would fall back to Windows-1252 and read them as Latin text, which would
+    /// become the draft. A draft's text is decoded in its declared charset, or as
+    /// UTF-8, or the read fails.
+    @Test("A draft text part is decoded in its declared charset or as UTF-8, never as a guess",
+          arguments: ["text/plain", "text/html"])
+    func draftTextIsNeverAGuessedCharset(mime: String) throws {
+        let gbk = Data([0xD6, 0xD0, 0xCE, 0xC4])
+        let read = { (charset: String, bytes: Data) throws -> String? in
+            let copy = try IMAPProvider.completeDraftCopy(Self.full(attachments: []), message: Self.message([
+                MessagePart(sectionString: "1", contentType: "\(mime); charset=\"\(charset)\"", size: bytes.count, data: bytes),
+            ]))
+            return mime == "text/html" ? copy.htmlBody : copy.textBody
+        }
+        #expect(try read("gbk", gbk) == "中文", "a charset the platform knows decodes its bytes")
+        #expect(try read("x-unknown-label", Data("中文".utf8)) == "中文", "UTF-8 under an unknown label reads as UTF-8")
+        #expect(throws: IMAPProvider.IMAPDraftCopyIncomplete.self) { try read("x-unknown-label", gbk) }
     }
 
     @Test("A part declared empty reads as empty: an empty draft with a file is still a draft")

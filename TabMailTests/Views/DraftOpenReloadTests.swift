@@ -562,13 +562,16 @@ struct DraftOpenReloadTests {
     /// marker and a run of blank lines, none of which may change on a save and reopen.
     private nonisolated static let typedBody = "Hi Bob,\n\n  indented line \n> quoted\n\n\nAlice"
 
-    @Test("An Outlook draft saved and reopened has exactly the text and empty subject that were typed")
-    func outlookSaveReopenKeepsTheTypedText() async throws {
+    /// A typed subject reading "(no subject)" is the user's text, not the
+    /// placeholder a list shows for an empty one.
+    @Test("An Outlook draft saved and reopened has exactly the text and subject that were typed",
+          arguments: ["", "(no subject)"])
+    func outlookSaveReopenKeepsTheTypedText(subject: String) async throws {
         try await withInstalledPool { pool in
             let draft = try await pool.write { db -> Draft in
                 var row = try insertDraft(db, status: "dirty")
                 row.body = Self.typedBody
-                row.subject = ""
+                row.subject = subject
                 try row.update(db)
                 return row
             }
@@ -588,18 +591,21 @@ struct DraftOpenReloadTests {
                 let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
                 #expect(row.pushAttemptVersion > draft.pushAttemptVersion, "precondition: the open reloaded")
                 #expect(row.body == Self.typedBody, "a save and reopen changed the spacing or line breaks")
-                #expect(row.subject == "")
+                #expect(row.subject == subject, "a save and reopen changed the subject")
             }
         }
     }
 
-    @Test("A Gmail draft saved and reopened has exactly the text and empty subject that were typed")
-    func gmailSaveReopenKeepsTheTypedText() async throws {
+    /// A typed subject reading "(no subject)" is the user's text, not the
+    /// placeholder a list shows for an empty one.
+    @Test("A Gmail draft saved and reopened has exactly the text and subject that were typed",
+          arguments: ["", "(no subject)"])
+    func gmailSaveReopenKeepsTheTypedText(subject: String) async throws {
         try await withInstalledPool { pool in
             let draft = try await pool.write { db -> Draft in
                 var row = try insertDraft(db, provider: .gmail, status: "dirty")
                 row.body = Self.typedBody
-                row.subject = ""
+                row.subject = subject
                 try row.update(db)
                 return row
             }
@@ -648,7 +654,7 @@ struct DraftOpenReloadTests {
                 let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
                 #expect(row.pushAttemptVersion > draft.pushAttemptVersion, "precondition: the open reloaded")
                 #expect(row.body == Self.typedBody, "a save and reopen changed the spacing or line breaks")
-                #expect(row.subject == "")
+                #expect(row.subject == subject, "a save and reopen changed the subject")
             }
         }
     }
@@ -790,6 +796,52 @@ struct DraftOpenReloadTests {
                 #expect(model.attachments.withLock { $0.map(\.id) } == ["f1", "f2"])
             }
         }
+    }
+
+    /// The server adds every new file before it deletes any old one, so a failed
+    /// add leaves the old file on the server (#217).
+    @Test("An Outlook save whose new file cannot be added keeps the old server file")
+    func failedReplacementKeepsTheOldServerFile() async throws {
+        let model = ServerModel()
+        let failedAdds = Mutex(0)
+        let oldBytes = Data("old server file bytes".utf8)
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        // Registered before the server model, so this answers the adds: new.bin is refused.
+        http.register(path: "/messages/g1/attachments", method: "POST") { request in
+            guard let body = request.body,
+                  let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                  let name = json["name"] as? String,
+                  let bytes = (json["contentBytes"] as? String).flatMap({ Data(base64Encoded: $0) }) else { return .status(400) }
+            if name == "new.bin" {
+                failedAdds.withLock { $0 += 1 }
+                return .status(400)
+            }
+            model.attachments.withLock {
+                $0.append(.init(id: "old-file", name: name, contentType: "application/octet-stream",
+                                isInline: false, contentId: nil, bytes: bytes))
+            }
+            return .json(raw: #"{"id":"old-file"}"#)
+        }
+        registerGraphServer(http, model: model)
+        let provider = ExchangeProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+        _ = try await provider.saveDraft(
+            DraftMessage(to: ["alice@example.com"], subject: "Plan", body: "old body",
+                         attachments: [DraftAttachment(filename: "old.bin", mimeType: "application/octet-stream", data: oldBytes)]),
+            existingIdentity: .outlook(graphId: "g1"), draftsFolderPath: "Drafts")
+        #expect(model.attachments.withLock { $0.map(\.name) } == ["old.bin"], "precondition: the first save added the old file")
+
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.saveDraft(
+                DraftMessage(to: ["alice@example.com"], subject: "Plan", body: "new body",
+                             attachments: [DraftAttachment(filename: "new.bin", mimeType: "application/octet-stream", data: Data([1, 2, 3]))]),
+                existingIdentity: .outlook(graphId: "g1"), draftsFolderPath: "Drafts")
+        }
+        #expect(failedAdds.withLock { $0 } > 0, "precondition: the save reached the refused add")
+        #expect(!http.recordedCalls().contains { $0.method == "DELETE" }, "a failed add deleted the old file")
+        #expect(model.attachments.withLock { $0.map(\.bytes) } == [oldBytes])
+        let copy = try #require(try await provider.fetchDraftCopy(identity: .outlook(graphId: "g1")))
+        #expect(copy.attachments.map(\.filename) == ["old.bin"], "the draft lost its old file")
     }
 
     @Test("A whitespace-only Outlook draft saved and reopened keeps its text", arguments: ["  ", "\t \t", "\n  \n  "])
@@ -1265,6 +1317,9 @@ struct DraftOpenReloadTests {
         ("text/plain; charset=\"ISO-2022-JP\"", Array("日本語の下書き".data(using: .iso2022JP)!), "日本語の下書き"),
         ("text/plain; Charset=\"windows-1251\"", [0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2], "Привет"),
         ("text/plain; charset=iso-8859-1", [0x43, 0x61, 0x66, 0xE9, 0x20, 0x61, 0x74, 0x20, 0x35], "Caf\u{E9} at 5"),
+        ("text/plain; charset=gbk", [0xD6, 0xD0, 0xCE, 0xC4], "中文"),
+        // A label no platform resolves: the text is read as UTF-8 when it is UTF-8.
+        ("text/plain; charset=x-unknown-label", Array("中文".utf8), "中文"),
     ]
 
     @Test("A Gmail draft written in another charset reloads as its text, in that charset",
@@ -1296,8 +1351,13 @@ struct DraftOpenReloadTests {
         }
     }
 
-    @Test("A Gmail reload facing attached mail it cannot carry keeps the local draft and its file")
-    func gmailReloadOfAnUncarriableFileKeepsTheLocalDraft() async throws {
+    /// Gmail lists an attached message as its parts, with no bytes of its own:
+    /// `data` absent or empty.
+    nonisolated static let containerBodies = [#"{"size":0}"#, #"{"size":0,"data":""}"#]
+
+    @Test("A Gmail reload facing attached mail it cannot carry keeps the local draft and its file",
+          arguments: containerBodies)
+    func gmailReloadOfAnUncarriableFileKeepsTheLocalDraft(containerBody: String) async throws {
         try await withInstalledPool { pool in
             let localEml = Data("From: a@example.com\r\nSubject: Fwd\r\n\r\nINNER".utf8)
             let dir = DraftAttachmentStorage.newStagingDirName()
@@ -1323,7 +1383,7 @@ struct DraftOpenReloadTests {
                 {"mimeType":"message/rfc822","filename":"fwd.eml",\
                 "headers":[{"name":"Content-Type","value":"message/rfc822; name=fwd.eml"},\
                 {"name":"Content-Disposition","value":"attachment; filename=fwd.eml"}],\
-                "body":{"size":0},\
+                "body":\(containerBody),\
                 "parts":[{"mimeType":"text/plain","body":{"size":5,"data":"\(inner)"}}]}]}}
                 """))
             let provider = GmailProvider(
@@ -1343,8 +1403,9 @@ struct DraftOpenReloadTests {
         }
     }
 
-    @Test("Gmail adoption of attached mail it cannot carry is refused and stores nothing")
-    func gmailAdoptionOfAnUncarriableFileIsRefused() async throws {
+    @Test("Gmail adoption of attached mail it cannot carry is refused and stores nothing",
+          arguments: containerBodies)
+    func gmailAdoptionOfAnUncarriableFileIsRefused(containerBody: String) async throws {
         try await withInstalledPool { pool in
             let header = try await pool.write { try insertGmailHeader($0, owners: 0) }
             let before = try await pool.read { try Draft.fetchCount($0) }
@@ -1354,13 +1415,174 @@ struct DraftOpenReloadTests {
             let provider = gmailProvider(http, body: "See the forwarded mail", files: """
                 ,{"mimeType":"message/rfc822","filename":"fwd.eml",\
                 "headers":[{"name":"Content-Disposition","value":"attachment; filename=fwd.eml"}],\
-                "body":{"size":0},"parts":[{"mimeType":"text/plain","body":{"size":5,"data":"\(inner)"}}]}
+                "body":\(containerBody),"parts":[{"mimeType":"text/plain","body":{"size":5,"data":"\(inner)"}}]}
                 """)
             try await withRegisteredProvider(provider) {
                 let resolution = await loaderResolution(header)
                 #expect(resolution == .unsupportedAttachment)
                 let after = try await pool.read { try Draft.fetchCount($0) }
                 #expect(after == before, "no adopted row")
+            }
+        }
+    }
+
+    /// A Gmail draft message `m-5` with `payload`, as the API returns it.
+    private nonisolated static func gmailMessageJSON(_ payload: [String: Any]) throws -> String {
+        let message: [String: Any] = [
+            "id": "m-5", "internalDate": String(Int(Date().timeIntervalSince1970 * 1000)), "labelIds": ["DRAFT"],
+            "payload": payload,
+        ]
+        return String(decoding: try JSONSerialization.data(withJSONObject: message), as: UTF8.self)
+    }
+
+    /// GBK bytes for 中文 under a label no platform resolves. The viewing decoder
+    /// would read them as Windows-1252 text, and that guess would replace the draft.
+    @Test("A Gmail draft in a charset that cannot be read keeps the local copy")
+    func gmailDraftInAnUnreadableCharsetKeepsTheLocalCopy() async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { try insertDraft($0, provider: .gmail) }
+            let bytes = Data([0xD6, 0xD0, 0xCE, 0xC4])
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-5"}}"#))
+            http.register(path: "/messages/m-5", method: "GET", response: .json(raw: try Self.gmailMessageJSON([
+                "mimeType": "text/plain",
+                "headers": [["name": "Subject", "value": "Plan"],
+                            ["name": "Content-Type", "value": "text/plain; charset=\"x-unknown-label\""]],
+                "body": ["size": bytes.count, "data": Self.base64URL(bytes)],
+            ])))
+            let provider = GmailProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                #expect(http.recordedCalls().contains { $0.url.contains("/messages/m-5") }, "precondition: the open read the server")
+                #expect(row.body == draft.body && row.pushAttemptVersion == draft.pushAttemptVersion,
+                        "text decoded in a guessed charset replaced the draft")
+            }
+        }
+    }
+
+    /// Gmail may send a part's bytes apart, under `attachmentId`, with `data` empty.
+    @Test("A Gmail part sent with empty data and an attachment id is read through that id")
+    func gmailEmptyDataIsReadThroughTheAttachmentId() async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { try insertDraft($0, provider: .gmail) }
+            let text = Data("remote body".utf8)
+            let image = Data([1, 2, 3, 4])
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-5"}}"#))
+            http.register(path: "/messages/m-5", method: "GET", response: .json(raw: try Self.gmailMessageJSON([
+                "mimeType": "multipart/related", "headers": [["name": "Subject", "value": "Plan"]],
+                "parts": [
+                    ["mimeType": "text/plain", "body": ["size": text.count, "data": "", "attachmentId": "body-bytes"]],
+                    ["mimeType": "image/png", "headers": [["name": "Content-ID", "value": "<logo>"]],
+                     "body": ["size": image.count, "data": "", "attachmentId": "image-bytes"]],
+                ] as [[String: Any]],
+            ])))
+            http.register(path: "/messages/m-5/attachments/body-bytes", method: "GET",
+                          response: .json(raw: #"{"size":11,"data":"\#(Self.base64URL(text))"}"#))
+            http.register(path: "/messages/m-5/attachments/image-bytes", method: "GET",
+                          response: .json(raw: #"{"size":4,"data":"\#(Self.base64URL(image))"}"#))
+            let provider = GmailProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                defer { if let dir = row.attachmentsDirName { DraftAttachmentStorage.deleteAttachments(dirName: dir) } }
+                #expect(row.pushAttemptVersion > draft.pushAttemptVersion, "precondition: the open reloaded")
+                #expect(row.body == "remote body", "the body stored apart read as empty")
+                #expect(try DraftAttachmentStorage.loadAttachments(dirName: row.attachmentsDirName).map(\.data) == [image],
+                        "the inline image stored apart read as zero bytes")
+            }
+        }
+    }
+
+    @Test("A Gmail inline image stored apart that cannot be read keeps the local copy, image included")
+    func gmailUnreadableImageKeepsTheLocalCopy() async throws {
+        try await withInstalledPool { pool in
+            let dir = DraftAttachmentStorage.newStagingDirName()
+            let localImage = Data("locally saved image bytes".utf8)
+            try DraftAttachmentStorage.saveAttachments(
+                [DraftAttachment(filename: "image1.png", mimeType: "image/png", data: localImage)], dirName: dir)
+            defer { DraftAttachmentStorage.deleteAttachments(dirName: dir) }
+            let draft = try await pool.write { db -> Draft in
+                var row = try insertDraft(db, provider: .gmail)
+                row.attachmentsDirName = dir
+                try row.update(db)
+                return row
+            }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-5"}}"#))
+            http.register(path: "/messages/m-5", method: "GET", response: .json(raw: try Self.gmailMessageJSON([
+                "mimeType": "multipart/related", "headers": [["name": "Subject", "value": "Plan"]],
+                "parts": [
+                    ["mimeType": "text/plain", "body": ["size": 11, "data": Self.base64URL(Data("remote body".utf8))]],
+                    ["mimeType": "image/png", "headers": [["name": "Content-ID", "value": "<logo>"]],
+                     "body": ["size": 4, "data": "", "attachmentId": "image-bytes"]],
+                ] as [[String: Any]],
+            ])))
+            http.register(path: "/messages/m-5/attachments/image-bytes", method: "GET", response: .status(500))
+            let provider = GmailProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
+                if let rowDir = row.attachmentsDirName, rowDir != dir { DraftAttachmentStorage.deleteAttachments(dirName: rowDir) }
+                #expect(http.recordedCalls().contains { $0.url.contains("/attachments/image-bytes") },
+                        "precondition: the read asked for the image")
+                #expect(row.body == "phone edit" && row.pushAttemptVersion == draft.pushAttemptVersion && row.attachmentsDirName == dir,
+                        "a reload without the image would let the next save delete it")
+                #expect(try DraftAttachmentStorage.loadAttachments(dirName: dir).map(\.data) == [localImage])
+            }
+        }
+    }
+
+    /// A recipient that is no address (an unfinished entry, a group with no
+    /// members) is kept as typed, in each field, on adoption and on reload.
+    @Test("Recipients that are not addresses survive Gmail adoption and reload in To, Cc and Bcc",
+          arguments: [true, false])
+    func unaddressedRecipientsSurviveAdoptionAndReload(adopt: Bool) async throws {
+        try await withInstalledPool { pool in
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            http.register(path: "/drafts", method: "GET", response: .json(raw: #"{"drafts":[{"id":"r1","message":{"id":"m-5"}}]}"#))
+            http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-5"}}"#))
+            http.register(path: "/messages/m-5", method: "GET", response: .json(raw: try Self.gmailMessageJSON([
+                "mimeType": "text/plain",
+                "headers": [["name": "Subject", "value": "Plan"],
+                            ["name": "To", "value": "alice@example.com, still typing to"],
+                            ["name": "Cc", "value": "carol@example.com, (unfinished cc)"],
+                            ["name": "Bcc", "value": "hidden@example.com, undisclosed-recipients:;"]],
+                "body": ["size": 4, "data": Self.base64URL(Data("body".utf8))],
+            ])))
+            let provider = GmailProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                let draftId: String
+                if adopt {
+                    let header = try await pool.write { try insertGmailHeader($0, owners: 0) }
+                    guard case .authorized(let authority) = await loaderResolution(header) else {
+                        Issue.record("fixture: the draft was not adopted")
+                        return
+                    }
+                    draftId = authority.draftId
+                } else {
+                    let draft = try await pool.write { try insertDraft($0, provider: .gmail) }
+                    await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+                    draftId = draft.id
+                }
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draftId) })
+                #expect(row.body == "body", "precondition: the copy was applied")
+                #expect(RecipientEntry(row.toArray).addresses == ["alice@example.com"])
+                #expect(RecipientEntry(row.ccArray).addresses == ["carol@example.com"])
+                #expect(RecipientEntry(row.bccArray).addresses == ["hidden@example.com"])
+                #expect(RecipientEntry(row.toArray).leftovers == ["still typing to"])
+                #expect(RecipientEntry(row.ccArray).leftovers == ["(unfinished cc)"])
+                #expect(RecipientEntry(row.bccArray).leftovers == ["undisclosed-recipients:;"])
+                #expect(!http.recordedCalls().contains { $0.method != "GET" }, "opening wrote to the server")
             }
         }
     }

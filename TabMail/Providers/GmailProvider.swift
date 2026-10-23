@@ -844,7 +844,7 @@ actor GmailProvider: EmailProvider {
     private func readDraftMessage(id: String) async throws -> FullMessageInfo {
         let data = try await request(path: "/messages/\(id)\(GmailAPI.fullQuery)")
         let msg = try JSONDecoder().decode(GmailMessage.self, from: data)
-        guard let header = parseGmailMessage(msg) else {
+        guard let header = parseGmailMessage(msg, keepEmptySubject: true) else {
             throw ProviderError.messageNotFound
         }
         guard let payload = msg.payload else {
@@ -881,11 +881,11 @@ actor GmailProvider: EmailProvider {
             }
             if !isFile, (mimeType == "text/plain" || mimeType == "text/html"), filename.isEmpty {
                 let bytes = try await draftPartBytes(part, messageId: id)
-                // Decoded in the part's declared charset by the same SwiftMail
-                // decoder the IMAP draft read uses; text it cannot decode throws,
-                // never reads as an empty draft.
+                // Decoded in the part's declared charset as the IMAP draft read
+                // decodes it (`draftTextContent`); text it cannot decode throws,
+                // never reads as an empty draft or as a guessed charset.
                 let declared = part.headers?.first { $0.name.lowercased() == "content-type" }?.value ?? mimeType
-                guard let text = MessagePart(sectionString: "1", contentType: declared, data: bytes).textContent else {
+                guard let text = MessagePart(sectionString: "1", contentType: declared, data: bytes).draftTextContent else {
                     throw GmailDraftCopyIncomplete(mimeType: mimeType)
                 }
                 // A body split around an inline part (text, image, text) is one
@@ -928,8 +928,10 @@ actor GmailProvider: EmailProvider {
     }
 
     /// A draft part's bytes: inline in the part, else through the attachments API.
+    /// Gmail may send empty `data` for a part whose bytes are stored apart, under
+    /// its `attachmentId`, so only non-empty `data` is the part's bytes.
     private func draftPartBytes(_ part: GmailPart, messageId: String) async throws -> Data {
-        if let inline = part.body?.data {
+        if let inline = part.body?.data, !inline.isEmpty {
             guard let decoded = decodeBase64URLToData(inline) else {
                 throw GmailDraftCopyIncomplete(mimeType: part.mimeType ?? "")
             }
@@ -1763,7 +1765,9 @@ actor GmailProvider: EmailProvider {
     ///
     /// ActionTag is NOT resolved from provider labels — action tags are
     /// local-only (MessageAICache + Device Sync probe). See ADR-IOS-036.
-    internal func parseGmailMessage(_ msg: GmailMessage) -> MessageHeaderInfo? {
+    /// `keepEmptySubject`: a draft copy's subject is the draft's own, so an empty
+    /// one stays empty rather than becoming the "(no subject)" a list shows (#217).
+    internal func parseGmailMessage(_ msg: GmailMessage, keepEmptySubject: Bool = false) -> MessageHeaderInfo? {
         // Serialize the decoded GmailMessage back to a [String: Any] JSON dict
         // for the shared parser. Cheap — we already decoded once.
         guard let encoded = try? JSONEncoder().encode(msg),
@@ -1786,7 +1790,7 @@ actor GmailProvider: EmailProvider {
             inReplyTo: metadata.inReplyTo,
             references: metadata.references,
             threadId: metadata.threadId,
-            subject: metadata.subject.isEmpty ? "(no subject)" : metadata.subject,
+            subject: metadata.subject.isEmpty && !keepEmptySubject ? "(no subject)" : metadata.subject,
             from: metadata.from.name,
             fromAddress: metadata.from.email,
             to: rawTo,

@@ -225,10 +225,6 @@ enum ExternalDraftAdoption {
         return bodyEmptyConfirmed || hasAttachments ? plain : nil
     }
 
-    /// What Gmail, Graph and IMAP header parsing put in place of an empty subject;
-    /// a draft copy's subject is the draft's own, so it reads back as empty.
-    static let providerNoSubjectPlaceholder = "(no subject)"
-
     /// The reply parent the other app's draft names through `In-Reply-To`, or nil.
     ///
     /// Same rule as `Draft.resolveReplyToHeader`'s Strategy 2: exactly ONE header in
@@ -457,7 +453,7 @@ enum ExternalDraftAdoption {
                 mimeType: image.contentType, data: image.data))
         }
         return ReadCopy(
-            subject: copy.header.subject == providerNoSubjectPlaceholder ? "" : copy.header.subject,
+            subject: copy.header.subject,
             to: copy.header.to, cc: copy.header.cc, bcc: copy.header.bcc,
             body: body, attachments: attachments)
     }

@@ -446,7 +446,7 @@ actor MockEmailProvider: EmailProvider {
         let header = MessageHeaderInfo(
             messageId: "mock-draft-copy", rfc822MessageId: nil, inReplyTo: nil,
             references: [], threadId: nil,
-            subject: subject.isEmpty ? "(no subject)" : subject,
+            subject: subject,
             from: "", fromAddress: "",
             to: to.joined(separator: ", "), cc: cc.joined(separator: ", "),
             bcc: bcc.joined(separator: ", "),

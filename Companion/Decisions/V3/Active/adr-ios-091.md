@@ -380,3 +380,38 @@ round 1 on `4e37ee02` found:
   earlier HTML draft uploads used, and no-break spaces in a link label) is collapsed by
   `htmlToPlainText(keepingSpacing:)`. Moved to #251, the immediate follow-up in this release
   train, whose WebKit rendering replaces that conversion for drafts and honours both.
+
+### Codex review round 2 corrections (2026-10-22)
+
+Codex round 2 on `f609479` found:
+
+- **Gmail sends empty `data` for bytes it stores apart.** `GmailProvider.draftPartBytes` returned
+  the empty inline `data` before looking at the part's `attachmentId`, so a body or inline image
+  stored apart read as empty or zero bytes, and a reload committed it. A failed image fetch was
+  never even attempted, so the reload replaced the local copy and deleted its old attachment
+  directory. Only non-empty `data` is now the part's bytes; otherwise the `attachmentId` is
+  fetched, a container with children is refused (`DraftCopyUnsupportedAttachment`), and only an
+  empty leaf reads as empty.
+- **A typed subject of "(no subject)" was erased on reopen.** The header parsers put
+  "(no subject)" in place of an empty subject for lists, and `ExternalDraftAdoption.read` mapped
+  that value back to empty, so the user's identical literal was lost. The comparison
+  (`providerNoSubjectPlaceholder`) is deleted; the draft-copy reads pass `keepEmptySubject`
+  (`parseGmailMessage`, `parseGraphMessage`, `mapMessageInfo`), so a draft's empty subject stays
+  empty and a literal one stays literal.
+- **A charset the platform cannot resolve became a guessed draft.** `MessagePart.textContent` is
+  the viewing decoder: past the declared charset it falls back to Windows-1252 and Latin-1, which
+  accept any bytes. GBK text labelled `chinese` or `x-gbk` (labels iOS does not resolve, #257)
+  read as Latin mojibake and became the editable copy. Draft reads now use
+  `MessagePart.draftTextContent`: the declared charset decodes the bytes, or they are UTF-8, or the
+  read fails and the local copy stays. A part declaring no charset reads as before.
+- **Graph upload progress was taken as completion.** `addDraftAttachment` accepted 200 or 201 on
+  the last range; Graph answers 201 when the attachment exists and 200 with `nextExpectedRanges`
+  while the upload is incomplete. A 200 there let `replaceDraftAttachments` delete the old file
+  with no replacement (irreversible operation 7). The last range now requires 201.
+- **Coverage:** recipient entries that are not addresses, in To, Cc and Bcc, on adoption and on
+  reload; a failed Outlook add keeps the old server file (add before delete); SwiftMail fork
+  commit `9ceb96b` tests that quoted parameter values read back as written (app pin `9ceb96b`).
+- **HTML conversion** (comments splitting a word, the `<pre>` boundary, U+200C/U+200D removed):
+  moved to #251. **#251 changed since round 1** (owner 2026-10-22): no WebKit; a SwiftSoup DOM
+  walk replaces `EmailFilter.htmlToPlainText` for every caller, with a small built-in CSS reader
+  (inline styles plus simple `<style>` rules for display, white-space and vertical margins).

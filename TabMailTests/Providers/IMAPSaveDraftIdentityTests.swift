@@ -178,8 +178,9 @@ struct IMAPSaveDraftIdentityTests {
                 == "Thanks for the long explanation.\n\nAlice")
     }
 
-    @Test("A draft saved over IMAP reads back as exactly the text that was typed")
-    func savedDraftReadsBackAsTyped() async throws {
+    @Test("A draft saved over IMAP reads back as exactly the text and subject that were typed",
+          arguments: ["", "(no subject)"])
+    func savedDraftReadsBackAsTyped(subject: String) async throws {
         let epoch = 73_003
         let server = FakeIMAPServer(mailboxes: ["Drafts": []])
         server.setUidValidity(epoch, for: "Drafts")
@@ -189,7 +190,7 @@ struct IMAPSaveDraftIdentityTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
         let typed = "Hi Bob,\n\n  indented line \n> quoted\n\n\nAlice"
-        var draft = DraftMessage(to: ["recipient@example.com"], subject: "", body: typed)
+        var draft = DraftMessage(to: ["recipient@example.com"], subject: subject, body: typed)
         draft.messageId = "typed-\(UUID().uuidString)@example.com"
 
         let outcome = try await provider.saveDraft(draft, existingIdentity: nil, draftsFolderPath: "Drafts")
@@ -203,6 +204,41 @@ struct IMAPSaveDraftIdentityTests {
         #expect(ExternalDraftAdoption.editableBody(
             text: copy.textBody, html: copy.htmlBody, bodyEmptyConfirmed: false, hasAttachments: false) == typed,
                 "a save and reopen changed the spacing or line breaks")
+        #expect(copy.header.subject == subject, "a save and reopen changed the subject")
+    }
+
+    @Test("Another app's IMAP draft with no Subject header reads back with an empty subject")
+    func draftWithoutASubjectHeaderReadsBackEmpty() async throws {
+        let epoch = 73_005
+        let id = "no-subject-\(UUID().uuidString)@example.com"
+        var message = FakeIMAPServer.makeMessage(uid: 5, rfc822Text: """
+        From: Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Message-ID: <\(id)>\r
+        Content-Type: text/plain\r
+        \r
+        body\r
+
+        """)
+        // An absent Subject header is a NIL envelope subject (RFC 3501 §7.4.2);
+        // the fake's own envelope writes every subject as a string.
+        let sender = #"(("Sender" NIL "sender" "example.com"))"#
+        message.customEnvelope = #"(NIL NIL \#(sender) \#(sender) \#(sender) (("Recipient" NIL "recipient" "example.com")) NIL NIL NIL "<\#(id)>")"#
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [message]])
+        server.setUidValidity(epoch, for: "Drafts")
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let copy = try #require(try await provider.fetchDraftCopy(
+            identity: .imap(folder: "Drafts", uidValidity: epoch, uid: 5)))
+
+        #expect(copy.header.subject == "", "a draft with no subject read back with the list placeholder")
+        #expect(ExternalDraftAdoption.editableBody(
+            text: copy.textBody, html: copy.htmlBody, bodyEmptyConfirmed: false, hasAttachments: false) == "body",
+                "the draft's body was not read")
     }
 
     @Test("A draft read that cannot prove it names the same message returns nothing or throws",

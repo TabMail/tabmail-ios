@@ -390,3 +390,9 @@ serializer that writes recipients:
   it); `MessagePartBodyStructureTests.aParameterValueStaysOneParameter` and
   `textPartParametersAreReadInAnyNameCase` (red on mutants). The app pins `c86900c`; the upstream
   PR now carries three commits.
+- **Round-trip test for escaped values (#217 Codex round 2, 2026-10-22)**: removing either the
+  backslash or the quote escape left every test green. Commit `9ceb96b` adds
+  `aParameterValueReadsBackAsWritten` (quotes, backslashes, `;`, whitespace-only, empty; red on
+  both escape mutants). The app pins `9ceb96b`; the upstream PR carries four commits. Also found:
+  `MIMECharsetTests.gbLabelsResolveToGB18030` FAILS on the iOS simulator for `chinese` and `x-gbk`
+  (passes on macOS; pre-existing at `018ca90`), app issue #257.
