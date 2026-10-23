@@ -13,6 +13,7 @@
 - **Empty-merge fallback** (2026-10-21, #240 / native-fts #28): when the merge keeps nothing but FTS matched (a word in at least half a shard's rows: FTS5 IDF ~0), `searchFTSOnly()` / memory `assembleFTSOnly` answer; `hybridSearch(…, queryEmbedding:)` is the testable hybrid part
 - **Date-range scan**: `query="*"` with date params → `scanByDateRange()` (no FTS MATCH, just date filter on message_meta)
 - **Column-scope filter-first**: `from:"email"` queries pre-filter vec candidates to matching rowids
+- **Vector search within the dates and the field** (2026-10-22, #242 / native-fts #26, ADR-IOS-032 amendment): `searchVecCandidates` passes the dates and the field's rowids into the KNN query (`rowid IN (SELECT rowid FROM message_meta WHERE dateMs … AND json_each(rowids))`), so nearer rows outside them never take the candidate places; no post-filter, no doubled `k` for a field
 - **Indexing pipeline**: headers indexed synchronously (`await indexHeadersForFTS`) — no `Task.detached`, eliminating body race condition. Body + embedding on fetchBody (AccountManager hook).
 - **Bulk index**: runs after sync if FTS index is sparse (first-launch catch-up). Phase 1: headers, Phase 2: body backfill from GRDB.
 - **Background embedding rebuild**: generates embeddings for messages with bodies but no embeddings, low priority
