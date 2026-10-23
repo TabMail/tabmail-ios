@@ -3,7 +3,7 @@
 **Class:** data-integrity
 **Severity:** high (wrong result shipped — one instance put the store's own metadata bytes into an
 outgoing email as an attachment)
-**First seen:** 2026-08 · **Recurrences:** 5 · **Status:** Active
+**First seen:** 2026-08 · **Recurrences:** 7 · **Status:** Active
 **Related:** `MIS-IOS-012` (a census whose SHAPE hid half its subjects — same root: the tool's
 notion of a unit was not the domain's), root `MIS-030` (scale is not shape) ·
 **Rule owner:** `../CLAUDE.md` § Data Integrity Rules
@@ -88,6 +88,21 @@ other by accident.
    been GREEN and wrong, which is the same shape as the tests that blessed the never-drop bugs.
    **The generalisation: a harness that reconstructs one representation from another is subject to
    this class exactly like production code is, and it needs its own non-vacuity test.**
+
+6. **Search query NUL replacement (2026-10-22, tabmail-ios #246).** The port of the native-fts query
+   builder replaced NUL with `query.replacingOccurrences(of: "\0", with: " ")`. A NUL followed by a
+   combining mark is one Character, so the String replacement left it in place and FTS5 read the
+   expression as an unterminated string. Rust replaces per char. Fixed by replacing per scalar in
+   `SearchQueryParser.scan`.
+7. **Hybrid column filter (2026-10-22, tabmail-ios #246, same PR).** `SearchIndex.extractColumnScopeFilter`
+   walked Characters over an FTS5 expression, a byte-level grammar. Once the builder wrote every word
+   as a string, a quote shared a Character with a combining mark after it or a Prepend character
+   (U+0600, U+0D4E) before it, the walk missed the string boundary, and the filter it cut was
+   refused by FTS5 (`unterminated string`) or dropped the field. Native-fts walks bytes. Fixed by
+   porting the walk to UTF-8 bytes, cutting only at ASCII. Neither was caught by ASCII fixtures or a
+   seeded fuzzer whose fragments held no Prepend character; both were found by review differentials
+   against the Rust reference over every scalar. **The tell, again: an expression that a byte-level
+   parser (FTS5, SQL, a wire format) reads, scanned or edited with a `String`/`Character` API.**
 
 ## Why it is not obvious
 

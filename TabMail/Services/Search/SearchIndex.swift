@@ -1920,13 +1920,9 @@ actor SearchIndex {
 
         // --- Column-scope filter-first: the vector search looks only among the field's rowids ---
         let eligibleRowids: Set<Int64>?
-        if Self.queryHasColumnScope(ftsQuery) {
-            let filterQuery = Self.extractColumnScopeFilter(ftsQuery)
-            if !filterQuery.isEmpty {
-                eligibleRowids = try fetchEligibleRowids(filterQuery: filterQuery, db: dbPool)
-            } else {
-                eligibleRowids = nil
-            }
+        let filterQuery = Self.extractColumnScopeFilter(ftsQuery)
+        if !filterQuery.isEmpty {
+            eligibleRowids = try fetchEligibleRowids(filterQuery: filterQuery, db: dbPool)
         } else {
             eligibleRowids = nil
         }
@@ -2314,88 +2310,79 @@ actor SearchIndex {
 
     // MARK: - Column Scope Detection & Filtering
 
-    /// Check if a processed FTS5 query contains column-scoped terms.
-    /// After buildFTSMatch(), field aliases are already translated (from: → from_:, to: → to_:).
+    /// Column-scope prefixes in the FTS5 queries `SearchQueryParser.buildFTSMatch` writes.
     private static let columnScopePrefixes = ["from_:", "to_:", "subject:", "cc:", "bcc:", "body:"]
 
-    private static func queryHasColumnScope(_ ftsQuery: String) -> Bool {
-        columnScopePrefixes.contains { ftsQuery.contains($0) }
-    }
-
     /// Extract only the column-scoped terms from a processed FTS5 query.
-    /// Given `from_:"alice@example.com" hiring*`, returns `from_:"alice@example.com"`.
+    /// Given `from_:"alice@example.com" hiring*`, returns `from_:"alice@example.com"`; an empty
+    /// string when the query has none.
     /// Used to build a filter-only query for pre-filtering vector candidates.
+    /// Reads the query's UTF-8 bytes, as tabmail-native-fts `extract_column_scope_filter` does, and
+    /// cuts only at ASCII bytes, so every slice is whole UTF-8. A walk over Characters missed string
+    /// boundaries: a quote followed by a combining mark, or a Prepend character (U+0600) followed by
+    /// a quote, is one Character, and the filter then cut inside a string FTS5 refused.
     private static func extractColumnScopeFilter(_ ftsQuery: String) -> String {
+        let bytes = Array(ftsQuery.utf8)
+        let prefixes = columnScopePrefixes.map { Array($0.utf8) }
+        let quote = UInt8(ascii: "\""), star = UInt8(ascii: "*"), open = UInt8(ascii: "("), close = UInt8(ascii: ")")
+        // Rust `u8::is_ascii_whitespace`: space, tab, line feed, form feed, carriage return.
+        let isWhitespace = { (b: UInt8) in b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0C || b == 0x0D }
         var scopedTerms: [String] = []
-        var i = ftsQuery.startIndex
+        var i = 0
 
-        while i < ftsQuery.endIndex {
-            // Skip whitespace and AND/OR keywords
-            if ftsQuery[i].isWhitespace {
-                i = ftsQuery.index(after: i)
+        while i < bytes.count {
+            // Skip whitespace
+            if isWhitespace(bytes[i]) {
+                i += 1
                 continue
             }
 
-            let remaining = String(ftsQuery[i...])
-
             // Check if current position starts with a column scope prefix
-            var matchedPrefix: String?
-            for prefix in columnScopePrefixes {
-                if remaining.hasPrefix(prefix) {
-                    matchedPrefix = prefix
-                    break
-                }
-            }
-
-            if let prefix = matchedPrefix {
-                // Found a column-scoped term — consume field:value
+            if let prefix = prefixes.first(where: { bytes[i...].starts(with: $0) }) {
                 let start = i
-                i = ftsQuery.index(i, offsetBy: prefix.count)
+                i += prefix.count
 
-                if i < ftsQuery.endIndex && ftsQuery[i] == "\"" {
+                if i < bytes.count && bytes[i] == quote {
                     // Quoted value: field:"value" or prefix form field:"value"*
-                    i = ftsQuery.index(after: i)
-                    while i < ftsQuery.endIndex && ftsQuery[i] != "\"" {
-                        i = ftsQuery.index(after: i)
+                    i += 1
+                    while i < bytes.count && bytes[i] != quote {
+                        i += 1
                     }
-                    if i < ftsQuery.endIndex {
-                        i = ftsQuery.index(after: i) // closing quote
+                    if i < bytes.count {
+                        i += 1 // closing quote
                     }
-                    if i < ftsQuery.endIndex && ftsQuery[i] == "*" {
-                        i = ftsQuery.index(after: i) // prefix star — keep so the
-                        // filter query preserves the main query's prefix semantics
+                    if i < bytes.count && bytes[i] == star {
+                        i += 1 // prefix star — keep so the filter query preserves the main
+                        // query's prefix semantics
                     }
                 } else {
                     // Unquoted value: field:value*
-                    while i < ftsQuery.endIndex && !ftsQuery[i].isWhitespace {
-                        i = ftsQuery.index(after: i)
+                    while i < bytes.count && !isWhitespace(bytes[i]) {
+                        i += 1
                     }
                 }
 
-                scopedTerms.append(String(ftsQuery[start..<i]))
+                scopedTerms.append(String(decoding: bytes[start..<i], as: UTF8.self))
+            } else if bytes[i] == quote {
+                // Non-scoped quoted phrase — skip it
+                i += 1
+                while i < bytes.count && bytes[i] != quote {
+                    i += 1
+                }
+                if i < bytes.count { i += 1 }
+            } else if bytes[i] == open {
+                // Skip parenthesized group (synonym or spelling OR group)
+                var depth = 1
+                i += 1
+                while i < bytes.count && depth > 0 {
+                    if bytes[i] == open { depth += 1 }
+                    if bytes[i] == close { depth -= 1 }
+                    i += 1
+                }
             } else {
-                // Non-scoped token — skip it
-                if ftsQuery[i] == "\"" {
-                    // Skip quoted phrase
-                    i = ftsQuery.index(after: i)
-                    while i < ftsQuery.endIndex && ftsQuery[i] != "\"" {
-                        i = ftsQuery.index(after: i)
-                    }
-                    if i < ftsQuery.endIndex { i = ftsQuery.index(after: i) }
-                } else if ftsQuery[i] == "(" {
-                    // Skip parenthesized group (synonym OR expansion)
-                    var depth = 1
-                    i = ftsQuery.index(after: i)
-                    while i < ftsQuery.endIndex && depth > 0 {
-                        if ftsQuery[i] == "(" { depth += 1 }
-                        if ftsQuery[i] == ")" { depth -= 1 }
-                        i = ftsQuery.index(after: i)
-                    }
-                } else {
-                    // Regular token — skip
-                    while i < ftsQuery.endIndex && !ftsQuery[i].isWhitespace {
-                        i = ftsQuery.index(after: i)
-                    }
+                // Regular token — skip
+                while i < bytes.count && !isWhitespace(bytes[i]) {
+                    i += 1
                 }
             }
         }

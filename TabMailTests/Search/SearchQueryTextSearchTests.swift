@@ -30,8 +30,8 @@ struct SearchQueryTextSearchTests {
 
     private static func yearBounds() throws -> (from: Int64, to: Int64) {
         let calendar = Calendar(identifier: .gregorian)
-        let start = try #require(calendar.date(from: DateComponents(timeZone: .gmt, year: 2097, month: 1, day: 1)))
-        let end = try #require(calendar.date(from: DateComponents(timeZone: .gmt, year: 2097, month: 12, day: 31)))
+        let start = try #require(calendar.date(from: DateComponents(timeZone: .gmt, year: 2101, month: 1, day: 1)))
+        let end = try #require(calendar.date(from: DateComponents(timeZone: .gmt, year: 2101, month: 12, day: 31)))
         return (Int64(start.timeIntervalSince1970 * 1000), Int64(end.timeIntervalSince1970 * 1000))
     }
 
@@ -321,6 +321,32 @@ struct SearchQueryTextSearchTests {
         try await cleanUp()
     }
 
+    @Test("text that joins a quote into one Character neither fails the hybrid filter nor drops a field")
+    func textJoiningAQuoteKeepsTheHybridFilter() async throws {
+        let (from, to) = try Self.yearBounds()
+        try await indexMails([
+            Mail(id: "alice", subject: "Plans", from: "alice@example.com", to: "team@example.com"),
+            Mail(id: "mentions", subject: "Plans", from: "carol@example.com", to: "team@example.com", body: "Ask alice first."),
+        ])
+        // Both rows are the query's nearest vectors.
+        for id in ["alice", "mentions"] {
+            try await index.storeEmbedding(contentKey: Self.key(id), embedding: Self.oneHot(5))
+        }
+        let hybrid = { (q: String) in
+            try await index.hybridSearch(ftsQuery: SearchQueryParser.buildFTSMatch(q), queryEmbedding: Self.oneHot(5),
+                                         fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil)
+        }
+        // A word ending in a Prepend character (U+0600, U+0D4E) or a quote followed by a combining
+        // mark, beside a field: the search answers.
+        for q in ["x\u{600} \"subject:abc\"", "from:Jane\u{600} bcc:not", "subject:\u{D4E} abc", "\"\u{301} cc: ",
+                  "from:\"\u{301}a b\""] {
+            _ = try await hybrid(q)
+        }
+        // The field still scopes the vector candidates: only the mail from alice.
+        #expect(try await hybrid("Jane\u{600} from:alice").map(\.contentKey) == [Self.key("alice")])
+        try await cleanUp()
+    }
+
     @Test("a number that is not a digit is text, and doubled quote marks are not part of a word")
     func otherNumbersAndDoubledQuoteMarks() async throws {
         try await indexMails([
@@ -398,8 +424,9 @@ struct SearchQueryTextSearchTests {
         try await cleanUp()
     }
 
-    /// Words that may be typed together, joined at random: no query makes search fail. The same
-    /// fragments as tabmail-native-fts `QUERY_FRAGMENTS`.
+    /// Words that may be typed together, joined at random: no query makes search fail. The
+    /// fragments of tabmail-native-fts `QUERY_FRAGMENTS`, and three iOS-only ones last: characters
+    /// that join a quote into one Swift Character (a Prepend before it, a combining mark after it).
     private static let queryFragments = [
         "from:", "From:", "to:", "cc:", "bcc:", "subject:", "body:", "from_:", "to_:", "note:", ":", "re:",
         "meeting", "budget", "plan", "call", "invoice", "done", "AND", "OR", "NOT", "NEAR", "\"",
@@ -407,6 +434,7 @@ struct SearchQueryTextSearchTests {
         "&", "{", "}", "[", "]", "~", "`", "\\", "|", "<", ">", "=", ";", "_", "café", "日本語", "हिन्दी",
         "Привет", "ⓐ", "\u{301}", "😀", "\u{a0}", "\u{3000}", "\u{200b}", "\u{feff}", "\u{2028}",
         "\u{e000}", "\u{1}", "\u{0}", "\t", " ", "a@example.com", "don't", "O\u{2019}Brien", "I'm",
+        "\u{600}", "\u{D4E}", "\"\u{301}",
     ]
 
     /// `count` queries of 1 to 7 fragments, from a fixed seed, so a failure repeats.

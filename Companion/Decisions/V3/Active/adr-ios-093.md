@@ -28,8 +28,11 @@ UTF-8 bytes:
   (`SearchConfig.autoPrefixMinBytes`), so `会議` and `Zür` are prefixes.
 - Only `subject from from_ to to_ cc bcc body` scope, typed as `name:` (ASCII case-insensitive).
 
-The hybrid column filter (`SearchIndex.extractColumnScopeFilter`) is unchanged; it already matched
-native-fts.
+The hybrid column filter (`SearchIndex.extractColumnScopeFilter`) is ported too: it reads the
+expression's UTF-8 bytes, as native-fts `extract_column_scope_filter` does, and cuts only at ASCII
+bytes. It walked Characters, and once every word is a string a quote can share a Character with a
+combining mark after it or a Prepend character (U+0600) before it, so the filter cut inside a string
+and FTS5 refused it. `queryHasColumnScope` is deleted: an empty filter already means no field.
 
 **Consequences:**
 - Behaviour changes, all as in native-fts and approved there by the owner (2026-10-18/21/22):
@@ -43,7 +46,8 @@ native-fts.
   shards (a far-future year, bounded by date): punctuation and operator text never fails, both
   apostrophe spellings and never "Don took", possessives, `NOT` excluding only the word typed,
   operators, whitespace separators, private-use characters, the per-run prefix star, each
-  documented field in keyword search and in the hybrid vector filter, `l'ét` finding "Létude",
+  documented field in keyword search and in the hybrid vector filter (also beside text that joins
+  a quote into one Character), `l'ét` finding "Létude",
   255 to 300 `NOT`s answering, and 3,000 seeded random queries through keyword and hybrid search.
 - Known differences, filed: a word made only of a combining mark that native-fts's older Unicode
   category tables do not know (U+11F00, U+1CF2 and others) is written differently by the two
