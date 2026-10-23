@@ -149,6 +149,9 @@ struct SearchQueryBuilderTests {
         let capped = build("abcd" + nots)
         #expect(capped.components(separatedBy: " NOT ").count - 1 == cap, "\(capped)")
         #expect(capped.hasSuffix("NOT \"qz" + String(format: "%03d", cap - 1) + "\"*"), "\(capped)")
+        // The cap counts NOTs only: every word of a longer OR list is kept.
+        let ors = build("abcd" + (0..<(cap + 5)).map { " OR qz" + String(format: "%03d", $0) }.joined())
+        #expect(ors.components(separatedBy: " OR ").count - 1 == cap + 5, "\(ors)")
     }
 
     @Test("synonym groups are joined with AND")

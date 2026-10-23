@@ -53,5 +53,8 @@ and FTS5 refused it. `queryHasColumnScope` is deleted: an empty filter already m
   category tables do not know (U+11F00, U+1CF2 and others) is written differently by the two
   builders (tabmail-ios #255); trimming many leading quote marks from one word takes quadratic time
   (#256). Both are rare input. A field name typed with the long s (`ſubject:`) was a field to the
-  old builder and is a word to both builders now (#267), also rare input.
+  old builder and is a word to both builders now (#267), also rare input. A query with no
+  searchable text (`_`, `""`, `subject:*`) writes an empty expression, and `SearchIndex.search`
+  then runs no vector search, where the old builder's expression reached hybrid search and
+  native-fts still runs one (#266).
 - A change to the native-fts builder must be ported here in the same train (ADR-IOS-008).
