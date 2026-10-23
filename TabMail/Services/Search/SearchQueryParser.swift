@@ -36,9 +36,7 @@ enum SearchQueryParser {
     /// names it (typed name, ASCII case-insensitive → table column); any other `x:` is text.
     static func buildFTSMatch(_ query: String?) -> String {
         guard let query else { return "" }
-        // FTS5 reads a NUL as the end of the query, leaving a string open; the tokenizer treats it
-        // as a separator anyway.
-        let items = scan(query.replacingOccurrences(of: "\0", with: " "))
+        let items = scan(query)
 
         // A word with synonyms becomes an OR group, and so does a word with an inner apostrophe (its
         // two spellings); FTS5 then needs an explicit AND between all terms. No word in the same run
@@ -160,7 +158,10 @@ enum SearchQueryParser {
     }
 
     private static func scan(_ q: String) -> [Item] {
-        let scalars = Array(q.unicodeScalars)
+        // FTS5 reads a NUL as the end of the query, leaving a string open; the tokenizer treats it
+        // as a separator anyway. Replaced per scalar: a String replacement compares characters,
+        // and a NUL followed by a combining mark is one character, so it would be left in place.
+        let scalars = q.unicodeScalars.map { $0 == "\0" ? " " : $0 }
         var items: [Item] = []
         var i = 0
         while true {

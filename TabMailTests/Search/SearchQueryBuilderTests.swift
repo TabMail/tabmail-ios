@@ -44,8 +44,12 @@ struct SearchQueryBuilderTests {
         #expect(build("meeting*") == #""meeting"*"#)
         // An underscore is part of a word, not punctuation: no star on a short one.
         #expect(build("a_b") == #""a_b""#)
-        // A NUL separates words.
+        // A NUL separates words, also when a combining mark follows it (one character).
         #expect(build("ab\u{0}cd") == #""ab" "cd""#)
+        #expect(build("zebra\u{0}\u{301}") == #""zebra"*"#)
+        #expect(build("subject:zebra\u{0}\u{301}") == #"subject:"zebra"*"#)
+        #expect(build("''budget''") == build("budget"))
+        #expect(build("\u{b2}") == "\"\u{b2}\"")
         #expect(build(#"-- "" _ ?"#) == "")
         #expect(build("*") == "")
         #expect(build("") == "")
@@ -138,9 +142,9 @@ struct SearchQueryBuilderTests {
         let excluded = build("invoice NOT receipt")
         #expect(excluded.hasPrefix("(") && excluded.hasSuffix(#") NOT "receipt""#), "\(excluded)")
         #expect(build("NOT receipt") == build("receipt"))
-        // At most searchMaxKeptNots capital NOTs are kept (FTS5 nests each one); an exclusion
-        // past them is left out.
-        let cap = SearchConfig.searchMaxKeptNots
+        // At most 100 capital NOTs are kept (FTS5 nests each one); an exclusion past them is left
+        // out. The decided number, not read from the config it pins.
+        let cap = 100
         let nots = (0..<(cap + 5)).map { " NOT qz" + String(format: "%03d", $0) }.joined()
         let capped = build("abcd" + nots)
         #expect(capped.components(separatedBy: " NOT ").count - 1 == cap, "\(capped)")

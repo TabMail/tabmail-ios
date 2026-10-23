@@ -302,6 +302,55 @@ struct SearchQueryTextSearchTests {
         try await cleanUp()
     }
 
+    @Test("a NUL separates words even before a combining mark, in keyword and hybrid search")
+    func nulBeforeACombiningMarkSeparatesWords() async throws {
+        let (from, to) = try Self.yearBounds()
+        try await indexMails([Mail(id: "zebra", subject: "Zebra"), Mail(id: "memo", subject: "memo")])
+        // A NUL followed by a combining mark is one character: it must still become a separator.
+        for q in ["zebra\u{0}\u{301}", "subject:zebra\u{0}\u{301}", "\"zebra\u{0}\u{301}\""] {
+            #expect(try await found(q) == ["zebra"], "\(q)")
+        }
+        // Both rows are the query's nearest vectors; only the subject's match is eligible.
+        for id in ["zebra", "memo"] {
+            try await index.storeEmbedding(contentKey: Self.key(id), embedding: Self.oneHot(5))
+        }
+        let hybrid = try await index.hybridSearch(
+            ftsQuery: SearchQueryParser.buildFTSMatch("subject:zebra\u{0}\u{301}"), queryEmbedding: Self.oneHot(5),
+            fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil)
+        #expect(hybrid.map(\.contentKey) == [Self.key("zebra")])
+        try await cleanUp()
+    }
+
+    @Test("a number that is not a digit is text, and doubled quote marks are not part of a word")
+    func otherNumbersAndDoubledQuoteMarks() async throws {
+        try await indexMails([
+            Mail(id: "squared", subject: "Area ² note"),
+            Mail(id: "budget", subject: "Budget"),
+            Mail(id: "expense", subject: "Expense"),
+            Mail(id: "memo", subject: "memo"),
+        ])
+        #expect(try await found("²") == ["squared"])
+        // Both quote marks at each end go, so the word still expands to its synonyms.
+        #expect(try await found("''budget''") == ["budget", "expense"])
+        try await cleanUp()
+    }
+
+    @Test("the hundredth NOT still excludes, and an exclusion past it is left out")
+    func theHundredthNotExcludesAndTheNextIsLeftOut() async throws {
+        try await indexMails([
+            Mail(id: "zebra", subject: "Zebra"),
+            Mail(id: "zebra99", subject: "Zebra qz099"),
+            Mail(id: "zebra100", subject: "Zebra qz100"),
+            Mail(id: "memo", subject: "memo"),
+        ])
+        let nots = { (n: Int) in (0..<n).map { " NOT qz" + String(format: "%03d", $0) }.joined() }
+        // The kept number is the decided 100, not read from the config it pins.
+        for (n, want) in [(99, ["zebra", "zebra100", "zebra99"]), (100, ["zebra", "zebra100"]), (101, ["zebra", "zebra100"])] {
+            #expect(try await found("zebra" + nots(n)) == want, "\(n) NOTs")
+        }
+        try await cleanUp()
+    }
+
     /// The documented fields, written out here so a dropped or wrong entry fails.
     private static let documentedFields = [
         ("subject", "subject"), ("from", "from_"), ("from_", "from_"), ("to", "to_"),
