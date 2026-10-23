@@ -382,17 +382,24 @@ enum ExternalDraftAdoption {
         case removed(previousDirName: String?)
     }
 
-    /// Whether the server copy names, through `In-Reply-To`, a different parent than
-    /// the reply `draft` holds. Only a known contradiction counts: a copy naming no
-    /// parent, a forward, or a parent the device no longer has is not one.
+    /// Whether the server copy names, through `In-Reply-To`, a parent other than
+    /// the one Send would reply to for `draft`. The row's parent is resolved as Send
+    /// resolves it (`Draft.resolveReplyToHeader`, which follows a parent that moved),
+    /// and a parent the row claims but cannot resolve is not taken as agreement: the
+    /// row is clean, so removing it lets the next open adopt the copy whole. A forward,
+    /// a copy naming no parent, or a row claiming none is not compared; re-adoption
+    /// of a copy whose parent the device lacks therefore claims none and stays put.
     static func repliesElsewhere(_ draft: Draft, copyInReplyTo: String?, db: Database) throws -> Bool {
         guard !draft.isForward,
               let copyParent = MessageIdentity.comparableRfc822Identity(copyInReplyTo),
-              let parentId = draft.replyToId,
-              let parent = try MessageHeader.fetchOne(db, key: parentId),
-              let rowParent = MessageIdentity.comparableRfc822Identity(parent.rfc822MessageId) else {
+              draft.replyToId != nil || Draft.replyKeyTail(draftKey: draft.id, isForward: false) != nil else {
             return false
         }
+        let parent = try Draft.resolveReplyToHeader(
+            draftKey: draft.id, replyToId: draft.replyToId, isForward: false,
+            expectedProviderMessageId: draft.replyToProviderMessageId,
+            expectedUidValidity: draft.replyToUidValidity, db: db)
+        guard let rowParent = MessageIdentity.comparableRfc822Identity(parent?.rfc822MessageId) else { return true }
         return rowParent != copyParent
     }
 

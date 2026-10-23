@@ -246,6 +246,101 @@ struct DraftCopyIntegrityTests {
         }
     }
 
+    enum MovedParentCase: String, CaseIterable, Sendable {
+        /// The parent moved; the copy still replies to it: an ordinary reload.
+        case movedSameParent
+        /// The parent moved; the copy replies to another message.
+        case movedOtherParent
+        /// No local row holds the parent any more; the copy names one.
+        case parentGone
+    }
+
+    @Test("A Gmail reload compares the parent Send would use: one that moved is still found, and one that is gone is not taken as agreement",
+          arguments: MovedParentCase.allCases)
+    func gmailReloadComparesTheParentSendUses(_ scenario: MovedParentCase) async throws {
+        try await withInstalledPool { pool in
+            try await pool.write { db in
+                _ = try self.insertReplyFixture(db, adopted: false)
+                _ = try Draft.deleteAll(db)
+            }
+            // A reply to a message in another (IMAP) account, saved from the Gmail
+            // account: the key and stamps name the source account's parent.
+            let sourceAccountId = "acc-217-source-imap"
+            let draftId = "reply:\(sourceAccountId):old-parent@example.com"
+            let oldParentId: String = try await pool.write { db in
+                var source = Account(emailAddress: "source@example.com", displayName: "Source", provider: .imap)
+                source.id = sourceAccountId
+                try source.insert(db)
+                var inbox = Folder(name: "Inbox", path: "INBOX", role: .inbox, accountId: source.id)
+                inbox.lastKnownUidValidity = 5
+                try inbox.insert(db)
+                var parent = MessageHeader(
+                    messageId: "42", subject: "old parent", from: "sender@example.com", fromAddress: "sender@example.com",
+                    to: "source@example.com", date: Date(), snippet: "", folderId: inbox.id,
+                    accountId: source.id, folderPath: inbox.path, isInInbox: true)
+                parent.rfc822MessageId = "old-parent@example.com"
+                parent.observedUidValidity = 5
+                try parent.insert(db)
+                var draft = Draft(
+                    id: draftId, accountId: Self.accountId, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                    subject: "old draft", body: "old body", replyToId: parent.id, isForward: false,
+                    editHistoryJSON: nil, createdAt: 1, updatedAt: 2, serverDraftId: nil,
+                    serverPushStatus: nil, rfc822MessageId: nil, attachmentsDirName: nil)
+                draft.instanceEpoch = "cross-account-E1"
+                draft.replyToProviderMessageId = parent.messageId
+                draft.replyToUidValidity = parent.observedUidValidity
+                try DraftStore.applySave(draft, db: db)
+                return parent.id
+            }
+            let saved = try await DraftStore.shared.pushDraftToServer(
+                draftId: draftId, expectedInstanceEpoch: "cross-account-E1",
+                provider: MockEmailProvider(saveDraftResult: .created(.gmail(resourceId: "r1", containedMessageId: "m-old"))),
+                runtimeKind: .gmail, draftsFolderPath: "DRAFT")
+            try #require(saved == .completed, "precondition: the push made a clean Gmail draft")
+            let existing = try #require(try await pool.read { try Draft.fetchOne($0, key: draftId) })
+            try #require(existing.serverPushStatus == "pushed" && existing.serverDraftId == "r1")
+            try await pool.write { db in
+                let old = try #require(try MessageHeader.fetchOne(db, key: oldParentId))
+                _ = try old.delete(db)
+                guard scenario != .parentGone else { return }
+                // Archived: sync replaces the old row with one under a new key.
+                var archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: sourceAccountId)
+                archive.lastKnownUidValidity = 9
+                try archive.insert(db)
+                var moved = MessageHeader(
+                    messageId: "3", subject: "old parent", from: "sender@example.com", fromAddress: "sender@example.com",
+                    to: "source@example.com", date: Date(), snippet: "", folderId: archive.id,
+                    accountId: sourceAccountId, folderPath: archive.path, isInInbox: false)
+                moved.rfc822MessageId = "old-parent@example.com"
+                moved.observedUidValidity = 9
+                try moved.insert(db)
+            }
+            if scenario != .parentGone {
+                try #require(try await sentParent(pool, draftId: existing.id)?.contains("old-parent") == true,
+                             "precondition: Send resolves the archived parent")
+            }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            try registerReplacedGmailDraft(
+                http, parent: scenario == .movedSameParent ? "old-parent@example.com" : "new-parent@example.com")
+            let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                let check = await ExternalDraftAdoption.refreshBeforeOpen(draftId: existing.id, willReadServer: {})
+                try #require(http.recordedCalls().contains { $0.url.contains("/messages/m-new") }, "precondition: the new copy was read")
+                #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "opening never writes the server")
+                let row = try await pool.read { try Draft.fetchOne($0, key: existing.id) }
+                if scenario == .movedSameParent {
+                    #expect(check == .open)
+                    #expect(row?.body == "new reply text", "the same parent is an ordinary reload")
+                    #expect(try await sentParent(pool, draftId: existing.id)?.contains("old-parent") == true)
+                    return
+                }
+                #expect(check == .replacedElsewhere)
+                #expect(row == nil, "new-parent's text would be kept under old-parent's claim")
+            }
+        }
+    }
+
     // MARK: - Every body piece and every image
 
     @Test("A Gmail draft keeps both body pieces around an inline image, in order", arguments: ["text/plain", "text/html"])

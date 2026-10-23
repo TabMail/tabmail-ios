@@ -452,3 +452,24 @@ Codex round 3 on `8110694` found:
   staged directory, on adoption and on reload; flowed markers as ASCII; the fork commit
   `3a0cdf7` checks that each emitted BODYSTRUCTURE parameter value is a MIME token or
   quoted-string (app pin `3a0cdf7`).
+
+### Codex review round 4 corrections (2026-10-23)
+
+Codex round 4 on `c074753` found:
+
+- **A reply whose parent moved escaped the replacement check.** `repliesElsewhere` looked the
+  row's parent up by its raw primary key, which an archive (a new folder, a new key) removes,
+  and read the miss as "no contradiction". The reload then kept the old parent's claim (Send
+  still found the parent through the reply key) under another reply's text. The row's parent is
+  now resolved as Send resolves it (`Draft.resolveReplyToHeader`), and a parent the row claims but
+  that no local row corroborates is NOT taken as agreement: the clean row is removed and the next
+  open adopts the copy with its own parent. Re-adoption of a copy whose parent the device lacks
+  claims no parent, so the check does not repeat.
+- **Coverage:** the single-POST limit for an Outlook attachment is exclusive (a file of exactly
+  `singlePostAttachmentLimitBytes` goes through an upload session; one byte less in one POST),
+  pinned at the boundary with the exact bytes the server receives.
+- **Filed, owner 2026-10-23:** a `multipart/alternative` body of two `text/plain` alternatives
+  reads with its text doubled (#272, P4, a unit of this train; IMAP needs SwiftMail to expose the
+  multipart grouping); the partial-staging-write cleanup in `ExternalDraftAdoption.stage` has no
+  test, because no test can force a mid-write failure without a production hook (#273, P5).
+  The owner stopped further review rounds at round 9 since the fifth ruling to rethink the design.

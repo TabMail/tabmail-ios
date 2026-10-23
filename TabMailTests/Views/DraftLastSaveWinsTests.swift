@@ -713,6 +713,44 @@ struct DraftCopyReadTests {
         #expect(sent.compactMap(\.body).reduce(Data(), +) == bytes, "the server must receive the file's exact bytes")
     }
 
+    @Test("Graph: a file just under the single-POST limit goes in one POST, and one of exactly the limit through a session",
+          arguments: [-1, 0])
+    func graphSinglePostLimitIsExclusive(offset: Int) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let provider = Self.graphUpdateProvider(http, serverFiles: [])
+        http.register(path: "/messages/g1/attachments", method: "POST", response: .json(raw: #"{"id":"n1"}"#))
+        http.register(path: "/messages/g1/attachments/createUploadSession", method: "POST", response: .json(raw: """
+            {"uploadUrl":"https://outlook.office.com/api/v2.0/Users('u')/Messages('g1')/AttachmentSessions('s1')?authtoken=t"}
+            """))
+        let total = ExchangeDraftConfig.singlePostAttachmentLimitBytes + offset
+        let bytes = Data((0..<total).map { UInt8(truncatingIfNeeded: $0) })
+        let puts = RequestLog()
+        http.register(path: "AttachmentSessions", method: "PUT") { request in
+            let sent = puts.requests.withLock { $0.append(request); return $0.compactMap(\.body).reduce(0) { $0 + $1.count } }
+            return sent == total ? .json(raw: "{}", statusCode: 201) : .json(raw: "{}")
+        }
+
+        _ = try await provider.saveDraft(
+            Self.draft(attachments: [DraftAttachment(filename: "edge.bin", mimeType: "application/octet-stream", data: bytes)]),
+            existingIdentity: .outlook(graphId: "g1"), draftsFolderPath: "Drafts")
+
+        let calls = http.recordedCalls()
+        let posts = calls.filter { $0.method == "POST" && $0.url.hasSuffix("/attachments") }
+        if offset < 0 {
+            let post = try #require(posts.first, "a file under the limit goes in one POST")
+            #expect(posts.count == 1 && !calls.contains { $0.url.contains("createUploadSession") })
+            let json = try #require(try JSONSerialization.jsonObject(with: post.body ?? Data()) as? [String: Any])
+            #expect((json["contentBytes"] as? String).flatMap { Data(base64Encoded: $0) } == bytes,
+                    "the server must receive the file's exact bytes")
+        } else {
+            #expect(posts.isEmpty, "a file of exactly the limit cannot go in one POST")
+            #expect(calls.contains { $0.url.contains("createUploadSession") })
+            #expect(puts.requests.withLock { $0 }.compactMap(\.body).reduce(Data(), +) == bytes,
+                    "the server must receive the file's exact bytes")
+        }
+    }
+
     @Test("Graph: a failed upload-session PUT keeps the session's token out of the error the queue logs")
     func failedUploadDoesNotCarryTheSessionToken() async throws {
         let http = FakeHTTP.Scenario()
