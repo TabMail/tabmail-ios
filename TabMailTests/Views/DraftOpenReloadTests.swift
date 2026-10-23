@@ -962,7 +962,8 @@ struct DraftOpenReloadTests {
                 UIColor.red.setFill()
                 context.fill(CGRect(x: 0, y: 0, width: 1, height: 1))
             }
-            let html = Self.base64URL(Data("<p>with image<img src=\"cid:picture\"></p>".utf8))
+            let htmlBytes = Data("<p>with image<img src=\"cid:picture\"></p>".utf8)
+            let html = Self.base64URL(htmlBytes)
             let date = String(Int(Date().timeIntervalSince1970 * 1000))
             let http = FakeHTTP.Scenario()
             defer { http.close() }
@@ -970,7 +971,7 @@ struct DraftOpenReloadTests {
                 {"id":"m1","internalDate":"\(date)","labelIds":["DRAFT"],"payload":{"mimeType":"multipart/related",\
                 "headers":[{"name":"Subject","value":"Plan"},{"name":"From","value":"owner@example.com"},\
                 {"name":"To","value":"alice@example.com"}],\
-                "parts":[{"mimeType":"text/html","body":{"size":46,"data":"\(html)"}},\
+                "parts":[{"mimeType":"text/html","body":{"size":\(htmlBytes.count),"data":"\(html)"}},\
                 {"mimeType":"image/png","headers":[{"name":"Content-ID","value":"<picture>"},\
                 {"name":"Content-Disposition","value":"inline"}],"body":{"size":\(png.count),"attachmentId":"img1"}}]}}
                 """))

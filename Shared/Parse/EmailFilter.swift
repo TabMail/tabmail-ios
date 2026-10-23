@@ -71,9 +71,11 @@ enum EmailFilter {
     }
 
     /// RFC 3676: a line ending in a space is soft-broken (it continues on the next
-    /// line); the signature separator `"-- "` is always a hard break.
+    /// line); the signature separator `"-- "` is always a hard break. The space is
+    /// read as a scalar: as a Character, a Prepend scalar before it (U+0605) would
+    /// join it.
     static func isFlowedSoftBreak(_ line: String) -> Bool {
-        line.hasSuffix(" ") && line != "-- "
+        line.unicodeScalars.last == " " && line != "-- "
     }
 
     /// The text an RFC 3676 `format=flowed` body stands for, when `contentType`
@@ -108,7 +110,7 @@ enum EmailFilter {
             if rest.first == " " { rest = rest.dropFirst() }
             var content = String(Substring(rest))
             let isSoft = isFlowedSoftBreak(content)
-            if isSoft, delSp { content.removeLast() }
+            if isSoft, delSp { content = String(content.unicodeScalars.dropLast()) }
             // The signature separator is neither fixed nor flowed (RFC 3676 §4.3):
             // it is a line of its own.
             if paragraph != nil, depth != paragraphDepth || content == "-- " { endParagraph() }

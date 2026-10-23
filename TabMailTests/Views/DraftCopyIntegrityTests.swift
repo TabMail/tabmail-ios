@@ -665,4 +665,167 @@ struct DraftCopyIntegrityTests {
         #expect(EmailFilter.decodeFormatFlowed(encoded, contentType: type)
                 == reference.replacingOccurrences(of: "X", with: "\u{0301}"))
     }
+
+    @Test("A flowed soft break is read as a scalar space, even after a Prepend scalar",
+          arguments: [("text/plain; format=flowed", "a\u{0605} b"), ("text/plain; format=flowed; delsp=yes", "a\u{0605}b")])
+    func flowedSpaceAfterAPrependScalar(contentType: String, decoded: String) {
+        #expect(EmailFilter.decodeFormatFlowed("a\u{0605} \nb", contentType: contentType) == decoded)
+        #expect(EmailFilter.decodeFormatFlowed("a \nb", contentType: contentType)
+                == decoded.replacingOccurrences(of: "\u{0605}", with: ""), "control: the ASCII form joins the same way")
+    }
+
+    // MARK: - Shortened parts
+
+    /// An IMAP draft whose one text part BODYSTRUCTURE declares `declaredSize` octets
+    /// and whose part fetch returns the 4 bytes "body".
+    private func imapCopy(declaredSize: Int) async throws -> FullMessageInfo {
+        let delivered = Data("body".utf8)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        let date = formatter.string(from: Date())
+        formatter.dateFormat = "dd-MMM-yyyy HH:mm:ss Z"
+        let internalDate = formatter.string(from: Date())
+        let header = "From: Sender <sender@example.com>\r\nTo: Recipient <recipient@example.com>\r\nSubject: draft\r\nDate: \(date)\r\nMessage-ID: <short-part@example.com>\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n"
+        let stored = declaredSize == delivered.count ? delivered : Data("body and tail!".utf8)
+        try #require(stored.count == declaredSize, "fixture: the server holds the declared bytes")
+        let message = FakeIMAPServer.makeMultipartMessage(
+            uid: 5, subject: "draft", from: "Sender <sender@example.com>",
+            to: "Recipient <recipient@example.com>", date: date, internalDate: internalDate,
+            messageID: "<short-part@example.com>", rawHeader: header, fullMessage: Data(header.utf8) + stored,
+            bodystructure: "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" \(declaredSize) 1)",
+            partBodies: ["1": delivered])
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [message]])
+        server.setUidValidity(73099, for: "Drafts")
+        try server.start()
+        defer { server.stop() }
+        let provider = IMAPProvider(host: "127.0.0.1", port: server.port,
+            username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await provider.connect()
+        do {
+            let copy = try #require(try await provider.fetchDraftCopy(
+                identity: .imap(folder: "Drafts", uidValidity: 73099, uid: 5)))
+            try await provider.disconnect()
+            return copy
+        } catch {
+            try? await provider.disconnect()
+            throw error
+        }
+    }
+
+    @Test("An IMAP draft part that arrives shorter than BODYSTRUCTURE declares is incomplete, never the draft")
+    func imapShortenedPartIsIncomplete() async throws {
+        let whole = try await imapCopy(declaredSize: 4)
+        #expect(whole.textBody == "body", "control: a part that arrives whole is the draft")
+        await #expect(throws: IMAPProvider.IMAPDraftCopyIncomplete.self) {
+            _ = try await imapCopy(declaredSize: 14)
+        }
+    }
+
+    @Test("A Gmail draft part whose data decodes shorter than its size is incomplete, never the draft",
+          arguments: [true, false])
+    func gmailShortenedPartIsIncomplete(shortened: Bool) async throws {
+        let stored = Data("body and tail!".utf8)
+        let delivered = shortened ? stored.prefix(4) : stored
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m1"}}"#))
+        let payload: [String: Any] = [
+            "id": "m1", "internalDate": String(Int(Date().timeIntervalSince1970 * 1000)), "labelIds": ["DRAFT"],
+            "payload": ["mimeType": "text/plain", "headers": [["name": "Subject", "value": "Short response"]],
+                        "body": ["size": stored.count, "data": Self.base64URL(Data(delivered))]] as [String: Any]]
+        http.register(path: "/messages/m1", method: "GET", response: .json(raw:
+            String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)))
+        let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+        if shortened {
+            await #expect(throws: GmailDraftCopyIncomplete.self) {
+                _ = try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r1"))
+            }
+        } else {
+            let copy = try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r1"))
+            #expect(copy?.textBody == "body and tail!", "control: a part that arrives whole is the draft")
+        }
+        #expect(http.recordedCalls().allSatisfy { $0.method == "GET" })
+    }
+
+    // MARK: - A reply's parent after it moves
+
+    @Test("A reply edited but unsent survives eviction while its parent, moved out of Inbox and back, is still in Inbox",
+          arguments: [true, false], ["evict-parent@example.com", "\u{0301}evict-parent@example.com"])
+    func movedInboxParentKeepsTheReply(adopted: Bool, parentId: String) async throws {
+        try await withInstalledPool { pool in
+            let draftId = try await pool.write { db -> String in
+                var account = Account(emailAddress: "owner@example.com", displayName: "Test", provider: .imap)
+                account.id = Self.accountId
+                try account.insert(db)
+                var inbox = Folder(name: "Inbox", path: "INBOX", role: .inbox, accountId: account.id)
+                inbox.lastKnownUidValidity = 5
+                try inbox.insert(db)
+                var drafts = Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: account.id)
+                drafts.lastKnownUidValidity = 9
+                try drafts.insert(db)
+                var parent = MessageHeader(messageId: "42", subject: "parent", from: "sender@example.com", fromAddress: "sender@example.com",
+                    to: "owner@example.com", date: Date(), snippet: "", folderId: inbox.id, accountId: account.id,
+                    folderPath: inbox.path, isInInbox: true)
+                parent.rfc822MessageId = parentId
+                parent.observedUidValidity = 5
+                try parent.insert(db)
+                var header = MessageHeader(messageId: "7", subject: "reply", from: "owner@example.com", fromAddress: "owner@example.com",
+                    to: "sender@example.com", date: Date(), snippet: "", folderId: drafts.id, accountId: account.id,
+                    folderPath: drafts.path, isInInbox: false)
+                header.rfc822MessageId = "evict-draft@example.com"
+                header.inReplyTo = parentId
+                header.observedUidValidity = 9
+                try header.insert(db)
+                let id: String
+                if adopted {
+                    id = try #require(try ExternalDraftAdoption.insertAdoptedDraft(db: db, header: header,
+                        address: .imap(folderPath: drafts.path, uidValidity: 9, uid: "7"), runtimeKind: .imap,
+                        content: .init(subject: "reply", to: header.to, cc: "", bcc: "", body: "server text",
+                                       attachmentsDirName: nil, attachmentCount: 0)))
+                } else {
+                    id = "reply:\(account.id):\(parentId)"
+                    var reply = Draft(id: id, accountId: account.id, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                        subject: "reply", body: "server text", replyToId: parent.id, isForward: false,
+                        editHistoryJSON: nil, createdAt: 1, updatedAt: 1, serverDraftId: "7", serverPushStatus: "pushed",
+                        rfc822MessageId: "evict-draft@example.com", attachmentsDirName: nil)
+                    reply.instanceEpoch = "ordinary-E1"
+                    reply.replyToProviderMessageId = "42"
+                    reply.replyToUidValidity = 5
+                    reply.serverDraftFolderPath = "Drafts"
+                    reply.serverDraftUidValidity = 9
+                    try DraftStore.applySave(reply, db: db)
+                }
+                var edited = try #require(try Draft.fetchOne(db, key: id))
+                try #require(edited.replyToId == parent.id, "fixture: the reply claims this parent")
+                edited.body = "UNSENT LOCAL EDIT"
+                edited.updatedAt = Date().timeIntervalSince1970
+                try DraftStore.applySave(edited, db: db)
+                // Archived and moved back: the same message under a new Inbox UID and key.
+                try parent.delete(db)
+                parent.messageId = "99"
+                parent.id = MessageIdentity.headerId(accountId: account.id, folderPath: inbox.path, messageId: "99")
+                try parent.insert(db)
+                let resolved = try Draft.resolveReplyToHeader(draftKey: id, replyToId: edited.replyToId, isForward: false,
+                    expectedProviderMessageId: edited.replyToProviderMessageId, expectedUidValidity: edited.replyToUidValidity, db: db)
+                #expect(resolved?.id == parent.id, "Send follows the parent to its new key")
+                for index in 0..<SyncConfig.maxComposeDraftSessions {
+                    var other = Draft(id: "new:cap-\(index)", accountId: account.id, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                        subject: "other", body: "other text", replyToId: nil, isForward: false, editHistoryJSON: nil,
+                        createdAt: 1, updatedAt: Date().timeIntervalSince1970, serverDraftId: nil, serverPushStatus: nil,
+                        rfc822MessageId: nil, attachmentsDirName: nil)
+                    other.instanceEpoch = "fill-\(index)"
+                    try DraftStore.applySave(other, db: db)
+                }
+                return id
+            }
+            let before = try #require(try await pool.read { try Draft.fetchOne($0, key: draftId) })
+            try #require(before.serverPushStatus == "dirty" && before.body == "UNSENT LOCAL EDIT")
+            _ = try DraftStore.shared.evictSync(dbPool: PrioritizedDatabase(pool: pool), limit: SyncConfig.maxComposeDraftSessions)
+            let after = try await pool.read { try Draft.fetchOne($0, key: draftId) }
+            #expect(after?.body == "UNSENT LOCAL EDIT", "the unsent reply to an Inbox message is kept")
+        }
+    }
 }

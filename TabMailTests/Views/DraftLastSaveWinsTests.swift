@@ -171,7 +171,8 @@ struct DraftCopyReadTests {
     private static func gmailMessageJSON(id: String, imageCount: Int) -> String {
         let internalDate = String(Int(Date().timeIntervalSince1970 * 1000))
         let refs = (0..<imageCount).map { "<img src=\"cid:pic\($0)\">" }.joined()
-        let html = base64URL(Data("<div>Meet on Monday\(refs)</div>".utf8))
+        let htmlBytes = Data("<div>Meet on Monday\(refs)</div>".utf8)
+        let html = base64URL(htmlBytes)
         let images = (0..<imageCount).map { index in
             #",{"mimeType":"image/png","headers":[{"name":"Content-ID","value":"<pic\#(index)>"}],"body":{"size":4,"attachmentId":"img\#(index)"}}"#
         }.joined()
@@ -179,7 +180,7 @@ struct DraftCopyReadTests {
             {"id":"\(id)","internalDate":"\(internalDate)","labelIds":["DRAFT"],
              "payload":{"mimeType":"multipart/related",
                "headers":[{"name":"Subject","value":"Plan"},{"name":"From","value":"owner@example.com"}],
-               "parts":[{"mimeType":"text/html","body":{"size":20,"data":"\(html)"}}\(images)]}}
+               "parts":[{"mimeType":"text/html","body":{"size":\(htmlBytes.count),"data":"\(html)"}}\(images)]}}
             """
     }
 
@@ -333,8 +334,10 @@ struct DraftCopyReadTests {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let internalDate = String(Int(Date().timeIntervalSince1970 * 1000))
-        let own = Self.base64URL(Data("Hi Bob,\n\nPlan".utf8))
-        let ownHTML = Self.base64URL(Data("<div>Hi Bob,</div><div><br></div><div>Plan</div>".utf8))
+        let ownBytes = Data("Hi Bob,\n\nPlan".utf8)
+        let own = Self.base64URL(ownBytes)
+        let ownHTMLBytes = Data("<div>Hi Bob,</div><div><br></div><div>Plan</div>".utf8)
+        let ownHTML = Self.base64URL(ownHTMLBytes)
         let inner = Self.base64URL(Data("INNER TEXT".utf8))
         http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-5"}}"#))
         http.register(path: "/messages/m-5", method: "GET", response: .json(raw: """
@@ -343,8 +346,8 @@ struct DraftCopyReadTests {
                "headers":[{"name":"Subject","value":"Plan"},{"name":"From","value":"owner@example.com"}],
                "parts":[
                  {"mimeType":"multipart/alternative","parts":[
-                   {"mimeType":"text/plain","body":{"size":19,"data":"\(own)"}},
-                   {"mimeType":"text/html","body":{"size":50,"data":"\(ownHTML)"}}]},
+                   {"mimeType":"text/plain","body":{"size":\(ownBytes.count),"data":"\(own)"}},
+                   {"mimeType":"text/html","body":{"size":\(ownHTMLBytes.count),"data":"\(ownHTML)"}}]},
                  {"mimeType":"message/rfc822","filename":"","body":{"size":30,"attachmentId":"eml1"},
                   "parts":[{"mimeType":"text/plain","body":{"size":10,"data":"\(inner)"}},
                            {"mimeType":"text/html","body":{"size":10,"data":"\(inner)"}}]},
@@ -378,13 +381,14 @@ struct DraftCopyReadTests {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let internalDate = String(Int(Date().timeIntervalSince1970 * 1000))
-        let text = Self.base64URL(Data("Thanks for the long \r\nexplanation.\r\n\r\nAlice".utf8))
+        let textBytes = Data("Thanks for the long \r\nexplanation.\r\n\r\nAlice".utf8)
+        let text = Self.base64URL(textBytes)
         http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-6"}}"#))
         http.register(path: "/messages/m-6", method: "GET", response: .json(raw: """
             {"id":"m-6","internalDate":"\(internalDate)","labelIds":["DRAFT"],
              "payload":{"mimeType":"text/plain",
                "headers":[{"name":"Subject","value":"Plan"},{"name":"Content-Type","value":"\(contentType)"}],
-               "body":{"size":44,"data":"\(text)"}}}
+               "body":{"size":\(textBytes.count),"data":"\(text)"}}}
             """))
         let provider = GmailProvider(
             userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)

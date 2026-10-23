@@ -5893,13 +5893,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             attachmentData: attachmentData)
     }
 
-    /// Whether a draft-copy part's bytes arrived. SwiftMail's part fetch answers
-    /// a FETCH whose response carries no `BODY[n]` with EMPTY bytes, not an error,
-    /// so a part BODYSTRUCTURE declares non-empty that came back empty never
-    /// arrived. A part declared empty, or of unknown size, is taken as read.
+    /// Whether a draft-copy part's bytes arrived whole. SwiftMail's part fetch
+    /// answers a FETCH whose response carries no `BODY[n]` with EMPTY bytes, not an
+    /// error, and a server can answer with fewer bytes than the part holds, so a
+    /// part that came back shorter than the encoded size BODYSTRUCTURE declares
+    /// (RFC 9051 §7.5.2) never arrived. A part of unknown size is taken as read.
     nonisolated static func draftPartArrived(_ part: MessagePart) -> Bool {
         guard let data = part.data else { return false }
-        return !data.isEmpty || (part.size ?? 0) == 0
+        return part.size.map { data.count >= $0 } ?? true
     }
 
     /// A draft-copy part that came back without bytes. Retryable; never "gone".

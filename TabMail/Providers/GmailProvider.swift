@@ -932,7 +932,9 @@ actor GmailProvider: EmailProvider {
     /// its `attachmentId`, so only non-empty `data` is the part's bytes.
     private func draftPartBytes(_ part: GmailPart, messageId: String) async throws -> Data {
         if let inline = part.body?.data, !inline.isEmpty {
-            guard let decoded = decodeBase64URLToData(inline) else {
+            // `body.size` counts the decoded bytes; fewer never arrived whole.
+            guard let decoded = decodeBase64URLToData(inline),
+                  part.body?.size.map({ decoded.count >= $0 }) ?? true else {
                 throw GmailDraftCopyIncomplete(mimeType: part.mimeType ?? "")
             }
             return decoded

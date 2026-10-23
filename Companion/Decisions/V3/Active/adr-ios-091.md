@@ -473,3 +473,27 @@ Codex round 4 on `c074753` found:
   multipart grouping); the partial-staging-write cleanup in `ExternalDraftAdoption.stage` has no
   test, because no test can force a mid-write failure without a production hook (#273, P5).
   The owner stopped further review rounds at round 9 since the fifth ruling to rethink the design.
+
+### Codex review round 5 corrections (2026-10-23)
+
+Codex round 5 on `358fc05` found:
+
+- **Eviction could delete an unsent adopted reply.** `DraftStore.evictImpl` kept a reply whose
+  parent is in Inbox, but parsed only `reply:`/`forward:` keys, so after the parent moved out of
+  Inbox and back (a new key) an edited adopted reply lost its exemption. Eviction now reads the
+  parent from the key as Send does (`Draft.replyKeyParent`).
+- **A parent whose Message-ID starts with a combining mark could not be followed.** The key tail
+  `{accountId}:{stableId}` was split at the first `:` as Characters, and a combining mark after
+  the `:` joins it into one Character. `Draft.replyKeyParent` splits it as Unicode scalars; the
+  resolver, `expectedReplyToRfc` and eviction use it.
+- **Flowed soft breaks after a Prepend scalar.** `isFlowedSoftBreak` and the `delsp=yes` removal
+  read the final space as a scalar.
+- **A part that arrives shorter than declared is incomplete.** IMAP compares the fetched bytes with
+  the BODYSTRUCTURE size (encoded octets) and Gmail compares the decoded bytes with `body.size`;
+  fewer bytes refuse the copy. A part of unknown size is taken as read. Gmail test fixtures now
+  declare their real sizes.
+- **Filed, big (a SwiftMail change or a migration), in the train after #217:** a plain-text body
+  with a Content-ID reads as a file (#276) and RFC 2231 extended charset/format parameters are
+  ignored (#277), both with #272 as one SwiftMail reader unit; a Gmail reply replaced by a
+  standalone message keeps its old parent (#278, needs a record of whether the server copy names
+  a parent).

@@ -1177,21 +1177,11 @@ actor DraftStore {
                     if let header = try MessageHeader.fetchOne(db, key: replyToId), header.isInInbox {
                         continue
                     }
-                    // Fallback: extract stableId from draft.id.
-                    // Format: "reply:{accountId}:{stableId}" or "forward:{accountId}:{stableId}".
-                    // Drop the prefix ("reply:" or "forward:"), then find first ":" to separate
-                    // accountId from stableId. This handles stableIds containing colons
-                    // (rare but valid in rfc822MessageId local-parts).
-                    let afterPrefix: Substring
-                    if draft.id.hasPrefix("reply:") {
-                        afterPrefix = draft.id.dropFirst(6) // "reply:".count
-                    } else if draft.id.hasPrefix("forward:") {
-                        afterPrefix = draft.id.dropFirst(8) // "forward:".count
-                    } else {
-                        afterPrefix = ""
-                    }
-                    if let colonIdx = afterPrefix.firstIndex(of: ":") {
-                        let stableId = String(afterPrefix[afterPrefix.index(after: colonIdx)...])
+                    // Fallback: the parent's stableId from the draft key, the one Send
+                    // follows (`Draft.replyKeyParent`): a reply, forward or adopted reply
+                    // key, its stableId possibly holding colons (rare but valid in
+                    // rfc822MessageId local-parts).
+                    if let stableId = Draft.replyKeyParent(draftKey: draft.id, isForward: draft.isForward)?.stableId {
                         let normalizedStableId = EmailFilter.normalizeMessageId(stableId)
                         if !normalizedStableId.isEmpty,
                            let header = try MessageHeader

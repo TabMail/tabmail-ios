@@ -217,6 +217,16 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         return rest[rest.index(after: colonIdx)...]
     }
 
+    /// The account and RFC identity of the parent a reply or forward key names
+    /// (`replyKeyTail`), split at the first `:`. Split as Unicode scalars: as
+    /// Characters, an identity starting with a combining mark joins the `:` and
+    /// the key would name no parent. Nil for any other key.
+    static func replyKeyParent(draftKey: String, isForward: Bool) -> (accountId: String, stableId: String)? {
+        guard let tail = replyKeyTail(draftKey: draftKey, isForward: isForward)?.unicodeScalars,
+              let colon = tail.firstIndex(of: ":") else { return nil }
+        return (String(Substring(tail[..<colon])), String(Substring(tail[tail.index(after: colon)...])))
+    }
+
     // MARK: - Reply-target identity guard (T5.8)
     //
     // ONE mechanism, four parts, and reading any part alone will mislead:
@@ -327,9 +337,7 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// scoping, and a server-originated no-fold-literal domain (`<a@[IPv6:…]>`) would
     /// then read as "never the same message" for a message that plainly is.
     static func expectedReplyToRfc(draftKey: String, isForward: Bool) -> String? {
-        guard let rest = replyKeyTail(draftKey: draftKey, isForward: isForward) else { return nil }
-        guard let colonIdx = rest.firstIndex(of: ":") else { return nil }
-        let stableId = String(rest[rest.index(after: colonIdx)...])
+        guard let stableId = replyKeyParent(draftKey: draftKey, isForward: isForward)?.stableId else { return nil }
         return MessageIdentity.comparableRfc822Identity(stableId)
     }
 
@@ -457,10 +465,7 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         }
         // Strategy 2: parse accountId + stableId from the draft key, look up by
         // account + rfc822MessageId.
-        guard let rest = replyKeyTail(draftKey: draftKey, isForward: isForward) else { return nil }
-        guard let colonIdx = rest.firstIndex(of: ":") else { return nil }
-        let accountId = String(rest[rest.startIndex..<colonIdx])
-        let stableId = String(rest[rest.index(after: colonIdx)...])
+        guard let (accountId, stableId) = replyKeyParent(draftKey: draftKey, isForward: isForward) else { return nil }
         let normalized = EmailFilter.normalizeMessageId(stableId)
         // An EMPTY normalized id is not an identity — without this it would match any
         // header in the account whose `rfc822MessageId` is the empty string, which is
