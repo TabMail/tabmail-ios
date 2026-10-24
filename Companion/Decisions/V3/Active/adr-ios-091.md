@@ -540,3 +540,12 @@ with the same `EmailFilter.htmlToPlainText(keepingSpacing: true)` and returned a
 neither kind is dropped for the other. Pieces are joined in order, with a line break added only
 where neither side of a join has one. `GmailProvider.readDraftMessage` uses it now; the IMAP
 reader follows in its own PR, once SwiftMail exposes the multipart grouping.
+
+### Multipart grouping, IMAP half (#272, 2026-10-23)
+
+`IMAPProvider.completeDraftCopy` applies the same rule. SwiftMail (pin `7120adb`, TabMail/SwiftMail
+`agent/multipart-containers`) now records on each `MessagePart` the multipart bodies that enclose
+it (`enclosingMultiparts`, from BODYSTRUCTURE and `.eml` alike) and `branch(of:)`, the child of a
+multipart that holds the part: a general MIME fact, not a draft rule. For each enclosing
+`multipart/alternative` the read takes the highest branch holding body text; a body part in any
+other branch is not read. The pieces go through the shared `DraftBodyPiece.body`.
