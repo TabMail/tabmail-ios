@@ -6,6 +6,7 @@ Replaces the line(s) beginning "- **FTS-only fallback**: when vec table empty (e
 - **FTS-only fallback**: when vec table empty (embedding rebuild), uses `searchFTSOnly()` — sorts by dateMs DESC, rank ASC (until 2026-10-23; now by the search's sort, see below)
 - **Sort before the limit** (2026-10-23, #265 / native-fts #46, ADR-IOS-094): `search`/`hybridSearch` take `SearchSort` (relevance / date_desc / date_asc); merge ties relevance newer first, date better first, then rowid; date sorts read `dateSortPool` 4,096 per leg; a query of only fields answers by keyword over all matches (newest first under relevance); `searchFTSOnly` orders relevance `rank ASC, dateMs DESC`, dates `dateMs, rank`; `keywordSearch` (SearchView typing) stays `dateMs DESC, rank ASC`
 - **Empty-merge fallback** (2026-10-21, #240 / native-fts #28): when the merge keeps nothing but FTS matched (a word in at least half a shard's rows: FTS5 IDF ~0), `searchFTSOnly()` / memory `assembleFTSOnly` answer; `hybridSearch(…, queryEmbedding:)` is the testable hybrid part
+- **Every keyword match is a result** (2026-10-24, #304 / native-fts #51, ADR-IOS-032 amendment; supersedes the empty-merge fallback above, now deleted): `HybridCandidate.keywordMatch`; `minScore` gates only vector-only candidates; email keyword pool `rank ASC, dateMs DESC`; hybrid count >= keyword-only count
 
 Added after the line beginning "- **Column-scope filter-first**: `from:"email"` queries pre-filter vec…":
 
