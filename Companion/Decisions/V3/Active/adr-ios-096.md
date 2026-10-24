@@ -19,6 +19,9 @@ draft vanished from every device. The user meant to drop the word, not the draft
    closing without a write leaves exactly the last saved copy, on the device and on the server.
 4. The guards before the decision stay for every scope: a draft that did not finish loading, a
    failed metadata read and an instance-epoch mismatch still refuse the discard.
+5. The discard runs in `ComposeDraftDiscard.run`, outside the view, which only shows its outcome
+   (ignored, refused with a message, or dismiss). `ComposeDraftDiscardTests` drive it against a real
+   database and the fake IMAP server.
 
 **Consequences:** deleting a server draft from compose takes the explicit cleared-draft Delete (or
 the mailbox's delete); Discard never destroys server content. Edits an agent autosave already wrote

@@ -143,22 +143,19 @@ struct ComposeAttachmentCarryTests {
                 "every early return after the pre-wait claim must release it")
     }
 
-    @Test("An in-flight explicit Save rejects competing close, discard, and send entries")
+    /// Discard's exclusions run in `ComposeDraftDiscardTests`.
+    @Test("An in-flight explicit Save rejects competing close and send entries")
     func explicitSaveExcludesCompetingComposeActions() throws {
         let source = try composeSource()
         let close = try functionBody(
             "private func closeCompose() async {",
             before: "private func deleteClearedDraftAndDismiss() async {",
             in: source)
-        let discard = try functionBody(
-            "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
-            before: "private func typedDeleteIdentity(for draft: Draft) async",
-            in: source)
         let send = try functionBody(
             "private func send() async {",
             before: "// MARK: - Discard-unsaved-edits confirmation",
             in: source)
-        for (name, body) in [("close", close), ("discard", discard), ("send", send)] {
+        for (name, body) in [("close", close), ("send", send)] {
             #expect(body.contains("guard !isSavingDraft else { return }"),
                     "a save waiting on attachment carry must exclude the competing \(name) action")
         }
@@ -178,40 +175,26 @@ struct ComposeAttachmentCarryTests {
                 "a failed or completed Save must release agent admission")
     }
 
-    @Test("An in-flight Send rejects competing close and discard entries")
+    @Test("An in-flight Send rejects a competing close")
     func sendExcludesCompetingTerminalComposeActions() throws {
-        let source = try composeSource()
         let close = try functionBody(
             "private func closeCompose() async {",
             before: "private func deleteClearedDraftAndDismiss() async {",
-            in: source)
-        let discard = try functionBody(
-            "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
-            before: "private func typedDeleteIdentity(for draft: Draft) async",
-            in: source)
-        for (name, body) in [("close", close), ("discard", discard)] {
-            #expect(body.contains("guard !isSending else { return }"),
-                    "an admitted send must exclude the competing \(name) action")
-        }
+            in: composeSource())
+        #expect(close.contains("guard !isSending else { return }"),
+                "an admitted send must exclude the competing close action")
     }
 
-    @Test("Close and Discard arbitrate with a running compose-agent edit")
+    @Test("Close arbitrates with a running compose-agent edit")
     func terminalComposeActionsClaimAgentDisposition() throws {
-        let source = try composeSource()
         let close = try functionBody(
             "private func closeCompose() async {",
             before: "private func deleteClearedDraftAndDismiss() async {",
-            in: source)
-        let discard = try functionBody(
-            "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
-            before: "private func typedDeleteIdentity(for draft: Draft) async",
-            in: source)
-        for (name, body) in [("close", close), ("discard", discard)] {
-            #expect(body.contains("agentSendFence.claimExclusiveDisposition()"),
-                    "a running agent edit must exclude the competing \(name) action")
-            #expect(body.contains("agentSendFence.releaseExclusiveDisposition()"),
-                    "a failed or completed \(name) must restore agent admission")
-        }
+            in: composeSource())
+        #expect(close.contains("agentSendFence.claimExclusiveDisposition()"),
+                "a running agent edit must exclude the competing close action")
+        #expect(close.contains("agentSendFence.releaseExclusiveDisposition()"),
+                "a failed or completed close must restore agent admission")
     }
 
     @Test("Close treats unsettled attachment preparation as unsaved content")

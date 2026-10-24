@@ -8,7 +8,8 @@ import Testing
 
 /// #254 (owner 2026-10-22): the Discard of the "Save Draft?" prompt drops only
 /// this session's unsaved edits. A draft already on the server stays as it was
-/// last saved; deleting it takes the explicit cleared-draft Delete.
+/// last saved; deleting it takes the explicit cleared-draft Delete. The discard
+/// itself runs in `ComposeDraftDiscardTests`.
 @Suite("Compose discard scope")
 @MainActor
 struct ComposeDiscardScopeTests {
@@ -70,16 +71,5 @@ struct ComposeDiscardScopeTests {
             before: "\n    }\n",
             in: composeSource())
         #expect(body.contains("discardDraftAndDismiss(.wholeDraft)"))
-    }
-
-    @Test("Keeping the draft writes and queues nothing")
-    func keepDraftArmHasNoSideEffect() throws {
-        let arm = try sourceSlice(
-            "case .keepDraft:",
-            before: "case .deleteServerDraft:",
-            in: composeSource())
-        for effect in ["queueDraftDelete", "deleteAsync", "deleteAttachments", "dbPool.write", "DraftStore"] {
-            #expect(!arm.contains(effect), "keeping the draft must not \(effect)")
-        }
     }
 }
