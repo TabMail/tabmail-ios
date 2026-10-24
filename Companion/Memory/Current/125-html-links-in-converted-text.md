@@ -63,3 +63,27 @@ written durably by `BodyFetchProcessor`, the inbox loader's FTS tier and
   start, and an empty label crashed `finishLink` (`Range requires lowerBound <= upperBound`) on a
   received message. Pinned by `EmailFilterLinkTests.blockOpeningALabelKeepsTheLabelWhole`.
 - ADR-IOS-091 "Review round 5 corrections" holds the rule set.
+
+## The converter is `HTMLText`, a streaming byte scanner with a small CSS reader (#251, 2026-10-24)
+
+- `EmailFilter.htmlToPlainText` calls `HTMLText.plainText` (`Shared/Parse/HTMLText.swift`) for
+  every caller, app and notification extension. The SwiftSoup DOM walk the owner first chose was
+  rejected on measurement (NSE memory); option B (owner 2026-10-24) fixed the byte scanner instead.
+  SwiftSoup is still used, but only for its entity table (`Entities.getByName`).
+- Element facts live in ONE table, `HTMLText.elementKinds` (block, inline, void, raw text). An
+  unknown tag is neither block nor inline: it writes a space in collapsed mode and nothing in
+  `keepingSpacing`. Open elements are capped at `HTMLText.maxOpenElements`.
+- CSS (`HTMLTextStyle.swift`) reads only `display: none`, `white-space` and whether the top and
+  bottom margins are zero. Precedence: `HTMLText.defaultStyleSheet` < document `<style>` <
+  inline `style`. The document sheet (selectors `tag`, `.class`, `tag.class`, `#id`; at-rules
+  skipped; a later rule wins, no specificity) applies only in `keepingSpacing`, so a
+  `@media`-only mobile copy of a newsletter stays hidden in a draft and is still searchable.
+- Line model: a margin asks for a blank line, adjacent margins join, and a line holding only
+  no-break spaces (`<p>&nbsp;</p>`) joins the margins around it rather than adding its own.
+- Spec updated by research (owner 2026-10-24: where research contradicts the spec, the spec changes):
+  U+200C/U+200D are kept only directly between two non-ASCII characters. In 1,278 HTML bodies of
+  real mail there were 9,033 joiners, all preview filler or digit splitting (`1&zwnj;1:59`).
+- Measured on that corpus (kept private, never committed):
+  collapsed speed about 0.9x the old scanner, `keepingSpacing` about 0.7x; the old scanner lost
+  text after `<3` and after a raw-text end tag written `</style >`, and turned every named entity
+  outside its short table into a space. Fixtures in `HTMLTextTests` copy the measured shapes with placeholder text.

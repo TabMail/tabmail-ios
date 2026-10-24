@@ -461,18 +461,20 @@ struct EmailFilterHTMLBlockNewlineTests {
     @Test("Thunderbird's quote as read from the server, with CRLF line ends, keeps its lines")
     func crlfQuoteKeepsItsLines() {
         let crlf = "<p>Sounds good.</p>\r\n<blockquote type=\"cite\"><pre class=\"moz-quote-pre\" wrap=\"\">\r\nline one\r\nline two\r\n\r\nline  four</pre></blockquote>\r\n"
-        #expect(EmailFilter.htmlToPlainText(crlf, keepingSpacing: true) == "Sounds good.\nline one\nline two\n\nline  four")
+        // #251: a `<p>` keeps its margin, a blank line, as Thunderbird shows it.
+        #expect(EmailFilter.htmlToPlainText(crlf, keepingSpacing: true) == "Sounds good.\n\nline one\nline two\n\nline  four")
         #expect(EmailFilter.htmlToPlainText(crlf) == "Sounds good.\nline one line two line four")
     }
 
     @Test("A draft's text keeps its spacing as the page shows it", arguments: [
-        // Thunderbird quotes a plain-text message in <pre>, after an ignored first line break.
+        // Thunderbird quotes a plain-text message in <pre>, after an ignored first line
+        // break. Its `<p>` shows a gap (#251).
         ("<p>Sounds good.</p><blockquote type=\"cite\"><pre class=\"moz-quote-pre\" wrap=\"\">\nline one\nline two\n\nline  four</pre></blockquote>",
-         "Sounds good.\nline one\nline two\n\nline  four",
+         "Sounds good.\n\nline one\nline two\n\nline  four",
          "Sounds good.\nline one line two line four"),
         // Thunderbird's plain-text signature.
         ("<p>Thanks</p><pre class=\"moz-signature\" cols=\"72\">Alice\r\n  Example Co.</pre>",
-         "Thanks\nAlice\n  Example Co.",
+         "Thanks\n\nAlice\n  Example Co.",
          "Thanks\nAlice Example Co."),
         // Gmail web writes a typed double space as "&nbsp; ".
         ("<div dir=\"ltr\">a&nbsp; b</div>", "a  b", "a b"),
