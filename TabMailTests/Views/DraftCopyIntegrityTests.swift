@@ -18,7 +18,7 @@ import UIKit
 struct DraftCopyIntegrityTests {
     private nonisolated static let accountId = "acc-217-copy-integrity"
 
-    private nonisolated static func base64URL(_ data: Data) -> String {
+    nonisolated static func base64URL(_ data: Data) -> String {
         data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
@@ -366,6 +366,117 @@ struct DraftCopyIntegrityTests {
 
         #expect((mime == "text/plain" ? copy.textBody : copy.htmlBody) == "before\nafter")
         #expect(copy.inlineImages.map(\.data) == [Data([4, 5])])
+    }
+
+    // MARK: - Multipart grouping (#272)
+
+    /// A Gmail draft body shape and the one body it opens as.
+    struct GroupingCase: CustomTestStringConvertible, Sendable {
+        let name: String
+        let mimeType: String
+        /// The root multipart's parts.
+        let parts: [GroupingPart]
+        let body: String
+        var testDescription: String { name }
+    }
+
+    indirect enum GroupingPart: Sendable {
+        case leaf(mimeType: String, contentType: String, text: String)
+        case multipart(mimeType: String, parts: [GroupingPart])
+
+        nonisolated var json: [String: Any] {
+            switch self {
+            case .leaf(let mimeType, let contentType, let text):
+                let data = Data(text.utf8)
+                return ["mimeType": mimeType, "headers": [["name": "Content-Type", "value": contentType]],
+                        "body": ["size": data.count, "data": DraftCopyIntegrityTests.base64URL(data)]]
+            case .multipart(let mimeType, let parts):
+                return ["mimeType": mimeType, "parts": parts.map(\.json)]
+            }
+        }
+    }
+
+    nonisolated static let groupingCases: [GroupingCase] = [
+        GroupingCase(
+            name: "two plain-text alternatives read once", mimeType: "multipart/alternative",
+            parts: [.leaf(mimeType: "text/plain", contentType: "text/plain; charset=utf-8", text: "Hello there"),
+                    .leaf(mimeType: "text/plain", contentType: "text/plain; charset=utf-8; format=flowed",
+                          text: "Hello \r\nthere")],
+            body: "Hello there"),
+        GroupingCase(
+            name: "a plain-text and an HTML alternative read once (control)", mimeType: "multipart/alternative",
+            parts: [.leaf(mimeType: "text/plain", contentType: "text/plain; charset=utf-8", text: "Plain version"),
+                    .leaf(mimeType: "text/html", contentType: "text/html; charset=utf-8", text: "<p>HTML version</p>")],
+            body: "HTML version"),
+        GroupingCase(
+            name: "mixed plain-text and HTML pieces both read, in order", mimeType: "multipart/mixed",
+            parts: [.leaf(mimeType: "text/plain", contentType: "text/plain; charset=utf-8", text: "Plain piece"),
+                    .leaf(mimeType: "text/html", contentType: "text/html; charset=utf-8", text: "<p>HTML piece</p>")],
+            body: "Plain piece\nHTML piece"),
+        GroupingCase(
+            name: "an alternative inside a mixed body reads once, before the next piece", mimeType: "multipart/mixed",
+            parts: [.multipart(mimeType: "multipart/alternative", parts: [
+                        .leaf(mimeType: "text/plain", contentType: "text/plain; charset=utf-8", text: "Top"),
+                        .leaf(mimeType: "text/html", contentType: "text/html; charset=utf-8", text: "<b>Top</b>")]),
+                    .leaf(mimeType: "text/plain", contentType: "text/plain; charset=utf-8", text: "Bottom")],
+            body: "Top\nBottom"),
+    ]
+
+    /// The Gmail draft `r1` at its listed message `m-old`, a reply to `old-parent`,
+    /// with the body `grouping` gives.
+    private func registerGmailDraft(_ http: FakeHTTP.Scenario, _ grouping: GroupingCase) throws {
+        http.register(path: "/drafts", method: "GET", response: .json(raw: #"{"drafts":[{"id":"r1","message":{"id":"m-old"}}]}"#))
+        http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-old"}}"#))
+        var root = GroupingPart.multipart(mimeType: grouping.mimeType, parts: grouping.parts).json
+        root["headers"] = [["name": "Subject", "value": "old draft"],
+                           ["name": "From", "value": "owner@example.com"], ["name": "To", "value": "old@example.com"],
+                           ["name": "Message-ID", "value": "<old-draft@example.com>"],
+                           ["name": "In-Reply-To", "value": "<old-parent@example.com>"]]
+        let payload: [String: Any] = [
+            "id": "m-old", "internalDate": String(Int(Date().timeIntervalSince1970 * 1000)), "labelIds": ["DRAFT"],
+            "payload": root,
+        ]
+        http.register(path: "/messages/m-old", method: "GET", response: .json(
+            raw: String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)))
+    }
+
+    @Test("A Gmail draft opens with one body: one alternative, every mixed piece in order (adoption)",
+          arguments: groupingCases)
+    func gmailAdoptionReadsOneBody(_ grouping: GroupingCase) async throws {
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try self.insertReplyFixture($0, adopted: false) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            try registerGmailDraft(http, grouping)
+            let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                let authority = try #require(try await ServerDraftComposeLoader.resolveOpenAuthority(header: header))
+                let row = try await pool.read { try Draft.fetchOne($0, key: authority.draftId) }
+                #expect(row?.body == grouping.body)
+                #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "opening must not change the server")
+            }
+        }
+    }
+
+    @Test("A Gmail draft opens with one body: one alternative, every mixed piece in order (reload)",
+          arguments: groupingCases)
+    func gmailReloadReadsOneBody(_ grouping: GroupingCase) async throws {
+        try await withInstalledPool { pool in
+            _ = try await pool.write { try self.insertReplyFixture($0, adopted: true) }
+            let existing = try #require(try await pool.read { try Draft.fetchOne($0) })
+            #expect(existing.body == "old body", "fixture: an adopted draft")
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            try registerGmailDraft(http, grouping)
+            let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                let check = await ExternalDraftAdoption.refreshBeforeOpen(draftId: existing.id, willReadServer: {})
+                #expect(check == .open)
+                let row = try await pool.read { try Draft.fetchOne($0, key: existing.id) }
+                #expect(row?.body == grouping.body)
+                #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "opening must not change the server")
+            }
+        }
     }
 
     @Test("An IMAP draft keeps both body pieces and every inline image, past the viewer's limit",

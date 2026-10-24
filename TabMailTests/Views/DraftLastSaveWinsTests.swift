@@ -362,7 +362,7 @@ struct DraftCopyReadTests {
 
         let copy = try #require(try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r1")))
 
-        #expect(copy.textBody == "Hi Bob,\n\nPlan")
+        #expect(copy.textBody == nil, "the plain-text alternative is another version of the HTML one (#272)")
         #expect(copy.htmlBody == "<div>Hi Bob,</div><div><br></div><div>Plan</div>")
         #expect(copy.attachments.map(\.filename) == ["attached-email.eml", "photo.png"])
         #expect(copy.inlineImages.map(\.contentId) == ["logo"], "an unreferenced inline image is still the draft's")
