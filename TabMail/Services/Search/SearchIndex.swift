@@ -2204,7 +2204,7 @@ actor SearchIndex {
     ///
     /// Grouped by shard so each shard costs one statement. FTS5 answers a `rowid IN (…)`
     /// constraint with a rowid-EQ seek per value (`SCAN … VIRTUAL TABLE INDEX 0:=M7`), so the
-    /// work is bounded by the number of survivors — `SearchConfig.searchDefaultLimit` (50) on
+    /// work is bounded by the number of survivors — `SearchConfig.searchDefaultLimit` (100) on
     /// the keystroke path — instead of by the candidate count.
     ///
     /// Returns `[shardYear: [ftsRowid: snippet]]`. Must be called on `db` from the same read

@@ -244,6 +244,17 @@ struct SearchSortTests {
         }
     }
 
+    @Test("a search with no limit, as the inbox search screen's, keeps the newest 100 of more matches")
+    func searchWithNoLimitKeepsOneHundred() async throws {
+        let start = try Self.start()
+        let count = 105
+        let messages = (0..<count).map { Message(id: "okapi\($0)", subject: "Okapi", dateMs: start + Int64($0) * Self.day) }
+        try await withMessages(messages) {
+            let found = try await index.keywordSearch(query: "okapi", fromDateMs: start, toDateMs: start + Int64(count) * Self.day)
+            #expect(ids(found) == (5..<count).reversed().map { "okapi\($0)" })
+        }
+    }
+
     @Test("a search of only dates lists the oldest first for date_asc, and otherwise the newest first")
     func searchOfOnlyDatesSortsByDate() async throws {
         let start = try Self.start()

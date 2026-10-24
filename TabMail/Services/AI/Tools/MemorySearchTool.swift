@@ -51,11 +51,9 @@ struct MemorySearchTool: AgentTool, Sendable {
             return nil
         }()
 
-        // TB parity — page size / prefetch / max.
-        let pageSize = SearchConfig.memoryPageSizeDefault
-        let prefetchPages = SearchConfig.memoryPrefetchPagesDefault
-        let prefetchMax = SearchConfig.memoryPrefetchMaxResults
-        let fetchLimit = min(pageSize * prefetchPages, prefetchMax)
+        // TB parity: one fetch of the best matches, served in pages.
+        let pageSize = SearchConfig.memorySearchPageSize
+        let fetchLimit = SearchConfig.memorySearchMaxResults
 
         // Demo isolation (ADR-IOS-038): the mode is read once, and both the cache
         // and the index use that reading, so this search never serves or stores
