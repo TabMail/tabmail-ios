@@ -158,8 +158,10 @@ struct MemorySearchToolTests {
     /// anchors on), a turn kept with no session included, demo turns left out.
     /// Its pages come from the one listing of the user turn: a turn written
     /// between pages shows only once the next user turn resets the listing.
-    @Test("No query pages the mode's turns, newest first, with their timestamps and roles")
-    func noQueryPagesTurnsWithTimestampsAndRoles() async throws {
+    /// A query that every turn matches equally pages the same way, from its one fetch.
+    @Test("No query, or a query, pages the mode's turns, newest first, with their timestamps and roles",
+          arguments: [nil, "turn"] as [String?])
+    func noQueryPagesTurnsWithTimestampsAndRoles(query: String?) async throws {
         let (memPool, memDir) = try await installMemoryIndex()
         defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
 
@@ -184,14 +186,16 @@ struct MemorySearchToolTests {
                 // Written mid-listing, newest of all: not on the listing's later pages.
                 await MemoryIndex.shared.indexTurn(chatHistoryId: "late", sessionId: "s9", role: "user", dateMs: late, text: "late turn")
             }
-            shown += try listed(try await tool.execute(arguments: ["page_index": .int(page)]))
+            var arguments: [String: JSONValue] = ["page_index": .int(page)]
+            if let query { arguments["query"] = .string(query) }
+            shown += try listed(try await tool.execute(arguments: arguments))
         }
         #expect(shown.map(\.dateMs) == expected.map(\.dateMs))
         #expect(shown.map(\.role) == expected.map(\.role))
 
         // The next user turn lists afresh: the late turn leads.
         await MemorySearchCache.shared.reset()
-        let next = try listed(try await tool.execute(arguments: [:]))
+        let next = try listed(try await tool.execute(arguments: query.map { ["query": .string($0)] } ?? [:]))
         #expect(next.first?.dateMs == late)
     }
 

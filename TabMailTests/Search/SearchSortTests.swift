@@ -244,14 +244,20 @@ struct SearchSortTests {
         }
     }
 
-    @Test("a search with no limit, as the inbox search screen's, keeps the newest 100 of more matches")
+    @Test("a search with no limit, as the inbox search screen's, keeps the newest 100 of more equal matches")
     func searchWithNoLimitKeepsOneHundred() async throws {
         let start = try Self.start()
         let count = 105
         let messages = (0..<count).map { Message(id: "okapi\($0)", subject: "Okapi", dateMs: start + Int64($0) * Self.day) }
         try await withMessages(messages) {
-            let found = try await index.keywordSearch(query: "okapi", fromDateMs: start, toDateMs: start + Int64(count) * Self.day)
-            #expect(ids(found) == (5..<count).reversed().map { "okapi\($0)" })
+            let from = start, to = start + Int64(count) * Self.day
+            let newest = (5..<count).reversed().map { "okapi\($0)" }
+            let every = try await index.search(query: "okapi", fromDateMs: from, toDateMs: to, limit: count, sort: .dateDesc)
+            #expect(every.count == count)
+            #expect(ids(try await index.keywordSearch(query: "okapi", fromDateMs: from, toDateMs: to)) == newest)
+            for sort in [SearchSort.relevance, .dateDesc] {
+                #expect(ids(try await index.search(query: "okapi", fromDateMs: from, toDateMs: to, sort: sort)) == newest, "\(sort)")
+            }
         }
     }
 

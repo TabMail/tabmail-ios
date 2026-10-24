@@ -121,26 +121,6 @@ struct SearchIndexEdgeCaseTests {
         #expect(results.isEmpty)
     }
 
-    // MARK: - keywordSearchShard Edge Cases
-
-    @Test("keywordSearchShard with custom limit returns at most that many results")
-    func searchShardWithLimit() async throws {
-        let years = await index.sortedShardYears
-        guard let year = years.first else { return }
-
-        let results = try await index.keywordSearchShard(query: "test", year: year, limit: 1)
-        #expect(results.count <= 1)
-    }
-
-    @Test("keywordSearchShard with zero limit returns empty")
-    func searchShardZeroLimit() async throws {
-        let years = await index.sortedShardYears
-        guard let year = years.first else { return }
-
-        let results = try await index.keywordSearchShard(query: "test", year: year, limit: 0)
-        #expect(results.isEmpty)
-    }
-
     // MARK: - Body Update Edge Cases
 
     @Test("updateBody with empty body string does not set hasBody")

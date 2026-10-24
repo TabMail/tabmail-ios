@@ -768,8 +768,7 @@ struct SearchView: View {
             guard !Task.isCancelled else { return }
 
             let ftsResults = (try? await SearchIndex.shared.keywordSearch(
-                query: trimmed, limit: SearchConfig.searchDefaultLimit,
-                folderIds: activeFolderIds)) ?? []
+                query: trimmed, folderIds: activeFolderIds)) ?? []
             guard !Task.isCancelled else { return }
 
             let searchResults = await ftsResultsToSearchResults(ftsResults)
