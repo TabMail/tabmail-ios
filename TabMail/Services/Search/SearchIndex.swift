@@ -1870,8 +1870,10 @@ actor SearchIndex {
                                      folderIds: folderIds, sort: sort == .relevance ? .dateDesc : sort)
         }
 
-        // Fall back to FTS-only when no embedding engine
-        guard let embeddingService = EmbeddingService.shared else {
+        // By keyword without the model, and for a query that excludes a sender or a word: the vector leg
+        // would return the nearest by meaning, the excluded mail among them (tabmail-ios#301, as
+        // tabmail-native-fts #21, ADR-NF-019).
+        guard let embeddingService = EmbeddingService.shared, !Self.queryExcludes(ftsQuery) else {
             return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit,
                                      folderIds: folderIds, sort: sort)
         }
@@ -2308,36 +2310,52 @@ actor SearchIndex {
     /// Column-scope prefixes in the FTS5 queries `SearchQueryParser.buildFTSMatch` writes.
     private static let columnScopePrefixes = ["from_:", "to_:", "subject:", "cc:", "bcc:", "body:"]
 
-    /// Extract only the column-scoped terms from a processed FTS5 query.
-    /// Given `from_:"alice@example.com" hiring*`, returns `from_:"alice@example.com"`; an empty
-    /// string when the query has none.
-    /// Used to build a filter-only query for pre-filtering vector candidates.
-    private static func extractColumnScopeFilter(_ ftsQuery: String) -> String {
-        splitColumnScope(ftsQuery).scopedTerms.joined(separator: " ")
+    /// The vector filter of a processed FTS5 query: the rows its fields allow, its free terms matching
+    /// anything (a query with a NOT never gets here: it answers by keyword). Each alternative between
+    /// ORs keeps its own fields: `from_:"a@example.com" OR from_:"b@example.com" "budget"*` gives
+    /// `from_:"a@example.com" OR from_:"b@example.com"`. An alternative with no field allows every row,
+    /// so there is no filter (""), as for a query without fields. As tabmail-native-fts
+    /// `extract_column_scope_filter` (ADR-NF-019).
+    static func extractColumnScopeFilter(_ ftsQuery: String) -> String {
+        let alternatives = splitColumnScope(ftsQuery).alternatives
+        if alternatives.contains(where: \.isEmpty) {
+            return ""
+        }
+        return alternatives.map { $0.joined(separator: " ") }.joined(separator: " OR ")
     }
 
     /// Whether a processed FTS5 query is only column-scoped terms, with operators between them: no free
     /// word, phrase or group (`from:alice@example.com`, `from:a@example.com OR to:a@example.com`).
     static func queryIsFieldOnly(_ ftsQuery: String) -> Bool {
-        let (scopedTerms, hasFreeText) = splitColumnScope(ftsQuery)
-        return !scopedTerms.isEmpty && !hasFreeText
+        let split = splitColumnScope(ftsQuery)
+        return split.alternatives.contains { !$0.isEmpty } && !split.hasFreeText
     }
 
-    /// A processed FTS5 query's column-scoped terms, and whether it has any other term than an
-    /// operator, as tabmail-native-fts `split_column_scope`. Every free word, phrase and group
-    /// `SearchQueryParser.buildFTSMatch` writes starts with a quote or a parenthesis.
+    /// Whether a processed FTS5 query excludes something (a kept NOT): `lunch NOT from_:"erin@example.com"`,
+    /// `"vacation"* NOT "itinerary"*`. A search by meaning can't exclude, so such a search answers by
+    /// keyword (tabmail-ios#301, as tabmail-native-fts `query_excludes`).
+    static func queryExcludes(_ ftsQuery: String) -> Bool {
+        splitColumnScope(ftsQuery).excludes
+    }
+
+    /// A processed FTS5 query's column-scoped terms in each alternative between its ORs (FTS5's OR binds
+    /// loosest), whether it has any other term than an operator, and whether it keeps a NOT, as
+    /// tabmail-native-fts `split_column_scope`. Every free word, phrase and group
+    /// `SearchQueryParser.buildFTSMatch` writes starts with a quote or a parenthesis, so an operator is
+    /// the only bare word outside them.
     /// Reads the query's UTF-8 bytes, as native-fts does, and cuts only at ASCII bytes, so every slice
     /// is whole UTF-8. A walk over Characters missed string boundaries: a quote followed by a combining
     /// mark, or a Prepend character (U+0600) followed by a quote, is one Character, and the filter then
     /// cut inside a string FTS5 refused.
-    private static func splitColumnScope(_ ftsQuery: String) -> (scopedTerms: [String], hasFreeText: Bool) {
+    private static func splitColumnScope(_ ftsQuery: String) -> (alternatives: [[String]], hasFreeText: Bool, excludes: Bool) {
         let bytes = Array(ftsQuery.utf8)
         let prefixes = columnScopePrefixes.map { Array($0.utf8) }
         let quote = UInt8(ascii: "\""), star = UInt8(ascii: "*"), open = UInt8(ascii: "("), close = UInt8(ascii: ")")
         // Rust `u8::is_ascii_whitespace`: space, tab, line feed, form feed, carriage return.
         let isWhitespace = { (b: UInt8) in b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0C || b == 0x0D }
-        var scopedTerms: [String] = []
+        var alternatives: [[String]] = [[]]
         var hasFreeText = false
+        var excludes = false
         var i = 0
 
         while i < bytes.count {
@@ -2372,7 +2390,7 @@ actor SearchIndex {
                     }
                 }
 
-                scopedTerms.append(String(decoding: bytes[start..<i], as: UTF8.self))
+                alternatives[alternatives.count - 1].append(String(decoding: bytes[start..<i], as: UTF8.self))
             } else {
                 // Non-scoped token — skip it
                 hasFreeText = hasFreeText || bytes[i] == quote || bytes[i] == open
@@ -2394,14 +2412,20 @@ actor SearchIndex {
                     }
                 } else {
                     // Operator (AND, OR, NOT)
+                    let start = i
                     while i < bytes.count && !isWhitespace(bytes[i]) {
                         i += 1
+                    }
+                    switch String(decoding: bytes[start..<i], as: UTF8.self) {
+                    case "NOT": excludes = true
+                    case "OR": alternatives.append([])
+                    default: break
                     }
                 }
             }
         }
 
-        return (scopedTerms, hasFreeText)
+        return (alternatives, hasFreeText, excludes)
     }
 
     /// Each rowid's `dateMs` from `metaTable`, in one query; a rowid with no row is left out.

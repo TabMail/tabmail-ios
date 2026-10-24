@@ -41,6 +41,13 @@ and FTS5 refused it. `queryHasColumnScope` is deleted: an empty filter already m
   `subject:*` and `subject:""` write nothing instead of a term that matched nothing.
 - The kept-`NOT`-and-hybrid-vectors limitation of native-fts #21 applies here too: the column filter
   keeps only scoped terms, so a kept `NOT` is not applied to vector candidates.
+  **Amended 2026-10-24 (tabmail-ios#301, port of native-fts #21 / ADR-NF-019):** fixed as native-fts
+  fixed it. `SearchIndex.search` answers a query that keeps a `NOT` (`SearchIndex.queryExcludes`, the
+  bare `NOT` token from `splitColumnScope`'s scan) by keyword only, in the sort asked for, so it
+  finds no match by meaning alone. `extractColumnScopeFilter` splits the fields at each `OR` outside
+  a group: each alternative keeps the AND of its own fields, the alternatives are joined with `OR`,
+  and an alternative with no field means no filter. Tests: `SearchExcludesTests`. The memory half of
+  ADR-NF-019 does not apply: `MemoryIndex.ftsQuery` keeps no operators, a difference filed as #305.
 - Tests: `SearchQueryBuilderTests` pins the expressions to the strings of native-fts
   `query::tests`; `SearchQueryTextSearchTests` runs native-fts' `db::tests` searches on real FTS5
   shards (a far-future year, bounded by date): punctuation and operator text never fails, both
