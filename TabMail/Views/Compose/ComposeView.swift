@@ -268,6 +268,36 @@ enum ComposeDraftGuards {
         readState != .error
     }
 
+    /// What a Discard covers (#254). `.unsavedEdits` is the Discard of the
+    /// "Save Draft?" prompt: it drops this session's unsaved edits. `.wholeDraft`
+    /// is the confirmed delete of a loaded draft cleared to nothing.
+    enum DiscardScope: Equatable {
+        case unsavedEdits
+        case wholeDraft
+    }
+
+    /// What Discard does to the draft row it read.
+    enum DiscardDisposition: Equatable {
+        /// The draft stays as last saved, on the device and on the server; only
+        /// the compose closes.
+        case keepDraft
+        /// Queue the server copy's delete, which then deletes the local row.
+        case deleteServerDraft
+        /// Delete the local row; no server copy exists.
+        case deleteLocalDraft
+    }
+
+    /// Owner 2026-10-22 (#254): Discard on a draft that already exists on the
+    /// server drops only this session's unsaved edits and leaves the draft as it
+    /// was; deleting it stays an explicit action. Compose writes the row only on
+    /// Save, Send and agent autosave, so closing without a write leaves exactly
+    /// the last saved copy. A draft that never reached the server is deleted, as
+    /// before.
+    static func discardDisposition(scope: DiscardScope, serverDraftId: String?) -> DiscardDisposition {
+        guard serverDraftId != nil else { return .deleteLocalDraft }
+        return scope == .unsavedEdits ? .keepDraft : .deleteServerDraft
+    }
+
     /// PORT — `v2final:ComposeDraftGuards.committedRecipients`.
     ///
     /// The recipients a draft PERSISTS for one field: its addresses, then each
@@ -1681,7 +1711,7 @@ struct ComposeView: View {
             ))
             .alert("Save Draft?", isPresented: $showDiscardPrompt) {
                 Button("Save") { Task { await saveDraftAndDismiss() } }
-                Button("Discard", role: .destructive) { Task { await discardDraftAndDismiss() } }
+                Button("Discard", role: .destructive) { Task { await discardDraftAndDismiss(.unsavedEdits) } }
                 Button("Cancel", role: .cancel) { }
             } message: {
                 Text("You have unsaved changes. Save as draft?")
@@ -2693,7 +2723,7 @@ struct ComposeView: View {
     /// and the remote server-draft cleanup queued. A local-only delete would let
     /// the server copy re-sync and REAPPEAR.
     private func deleteClearedDraftAndDismiss() async {
-        await discardDraftAndDismiss()
+        await discardDraftAndDismiss(.wholeDraft)
     }
 
     private func saveDraftAndDismiss() async {
@@ -2933,127 +2963,17 @@ struct ComposeView: View {
             })
     }
 
-    private func discardDraftAndDismiss() async {
-        // See `saveDraftAndDismiss`: never let Discard overtake another durable
-        // disposition or a running agent edit.
-        guard !isSavingDraft else { return }
-        guard !isSending else { return }
-        guard agentSendFence.claimExclusiveDisposition() else {
-            sendError = "Wait for the draft edit to finish before discarding."
-            return
-        }
-        defer { agentSendFence.releaseExclusiveDisposition() }
-        guard draftReadState != .error else {
-            sendError = "This draft did not finish loading. Close and reopen it before discarding."
-            return
-        }
-
-        // Load draft info before deleting — needed for server-side cleanup + optimistic UI removal.
-        // Async read/write so the main actor isn't blocked behind a busy writer (compose-dismiss
-        // freeze class) — this delete was a synchronous main-actor write on the discard path.
-        // `draftId` (MainActor-isolated) is captured into a local for the @Sendable closure.
-        //
-        // PORT — v2final `discardDraftAndDismiss`'s F4 rule, now stated through
-        // `ComposeDraftGuards.discardMayDelete`: a THROWN metadata read is NOT
-        // absence. We need serverDraftId / folder / uidValidity to queue the remote
-        // cleanup; without them a local delete would let the server copy re-sync and
-        // REAPPEAR. DEFER the discard (row intact) and surface the error.
-        let draftKey = draftId
-        let readResult: Result<Draft?, Error>
-        do {
-            readResult = .success(try await AppDatabase.dbPool.read { db in
-                try Draft.fetchOne(db, key: draftKey)
-            })
-        } catch {
-            readResult = .failure(error)
-        }
-        guard ComposeDraftGuards.discardMayDelete(
-            readState: ComposeDraftGuards.readState(readResult)) else {
-            sendError = "The draft could not be verified, so it was not discarded."
-            return
-        }
-        guard case .success(let loadedRecord) = readResult, let draftRecord = loadedRecord else {
+    private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {
+        switch await ComposeDraftDiscard.run(
+            scope, draftId: draftId, epoch: admissionCursor.newEpoch,
+            readState: draftReadState, isSavingDraft: isSavingDraft,
+            isSending: isSending, agentSendFence: agentSendFence) {
+        case .ignored:
+            break
+        case .refused(let message):
+            sendError = message
+        case .dismiss:
             dismiss()
-            return
-        }
-        let epoch = admissionCursor.newEpoch
-        guard draftRecord.instanceEpoch == epoch else {
-            sendError = "This draft changed in another compose window and was not discarded."
-            return
-        }
-
-        // PORT 3f2cc4c34: cancel only this exact generation after authority
-        // has been re-read and verified.
-        let sessionKey = ActiveAgentTracker.composeSessionKey(
-            draftId: draftRecord.id, epoch: epoch)
-        let session = ChatPillState.shared.session(for: sessionKey)
-        session.activeChatTask?.cancel()
-        session.activeChatTask = nil
-        ActiveAgentTracker.shared.clearWorking(sessionKey)
-        ChatPillState.shared.removeSession(for: sessionKey)
-
-        if draftRecord.serverDraftId != nil {
-            guard let identity = await typedDeleteIdentity(for: draftRecord) else {
-                sendError = "The server draft could not be safely identified, so it was not discarded."
-                return
-            }
-            guard await AccountManager.shared.queueDraftDelete(
-                identity: identity,
-                accountId: draftRecord.accountId,
-                folderPath: draftRecord.serverDraftFolderPath,
-                draftId: draftRecord.id,
-                instanceEpoch: epoch,
-                deleteOwnedLocalDraft: true) else {
-                sendError = "The server draft delete could not be saved, so the draft was not discarded."
-                return
-            }
-        } else {
-            do {
-                guard try await DraftStore.shared.deleteAsync(
-                    id: draftRecord.id, expectedInstanceEpoch: epoch) else {
-                    sendError = "This draft changed in another compose window and was not discarded."
-                    return
-                }
-                // MATCHED-DIR cleanup (v2final F0f, applied at the caller). Under
-                // copy-on-write staging the on-disk directory is an opaque UUID, no
-                // longer the draftId, so `DraftStore.deleteAsync`'s own
-                // `deleteAttachments(dirName: id)` no longer names it. Destroy the
-                // dir the ROW actually pointed at, and only AFTER the row delete has
-                // committed (persist-before-destroy). Every other draft-delete site
-                // (`AccountManagerActions` queueDraftDelete drain,
-                // `AccountManagerOutbox` send finalize, `InboxViewModel` swipe,
-                // `DraftStore.evictImpl`) already deletes by the row's own
-                // `attachmentsDirName`, so this is the only gap.
-                if let dir = draftRecord.attachmentsDirName {
-                    DraftAttachmentStorage.deleteAttachments(dirName: dir)
-                }
-            } catch {
-                sendError = "The draft could not be discarded: \(error.localizedDescription)"
-                return
-            }
-        }
-        dismiss()
-    }
-
-    private func typedDeleteIdentity(for draft: Draft) async -> DraftDeleteIdentity? {
-        guard let serverId = draft.serverDraftId,
-              !serverId.isEmpty,
-              let kind = await AccountManager.shared.draftRuntimeIdentityKind(
-                accountId: draft.accountId) else { return nil }
-        switch kind {
-        case .gmail:
-            return .gmail(resourceId: serverId)
-        case .outlook:
-            return .outlook(graphId: serverId)
-        case .demo:
-            return .demo(localId: serverId)
-        case .imap:
-            guard let folder = draft.serverDraftFolderPath,
-                  let epoch = draft.serverDraftUidValidity,
-                  let uid = Int(serverId), uid > 0 else { return nil }
-            return .imap(folder: folder, uidValidity: epoch, uid: uid)
-        case .unknown:
-            return nil
         }
     }
 

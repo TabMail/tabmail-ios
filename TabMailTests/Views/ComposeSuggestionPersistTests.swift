@@ -62,7 +62,7 @@ struct ComposeSuggestionPersistTests {
     func productionSaveWiresSuggestionAcceptanceBeforeSnapshot() throws {
         let body = try functionBody(
             "private func saveDraftAndDismiss() async {",
-            before: "private func discardDraftAndDismiss() async {",
+            before: "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
             in: composeSource())
         let claim = try #require(body.range(of: "agentSendFence.claimExclusiveDisposition()"))
         let adoption = try #require(body.range(of: "acceptVisibleSuggestionIfOffered()"))
