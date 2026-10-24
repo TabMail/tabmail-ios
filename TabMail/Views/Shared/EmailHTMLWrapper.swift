@@ -438,7 +438,9 @@ enum EmailHTMLWrapper {
             pre, code { overflow-x: auto; max-width: 100%; white-space: pre-wrap; word-break: break-all; }
             table, div, p { max-width: 100% !important; box-sizing: border-box !important; }
             td, th { max-width: 100% !important; box-sizing: border-box !important; }
-            blockquote { border-left: 3px solid #d4d7dd; margin-left: 0; padding-left: 12px; }
+            /* WebKit's default blockquote margin is 40px on BOTH sides; a level must cost
+               only its border and padding, or a deep reply narrows to one letter a line (#286). */
+            blockquote { border-left: 3px solid #d4d7dd; margin-left: 0; margin-right: 0; padding-left: 12px; }
 
             /* ---- Outlook/Word .eml attachment normalization ----
                These embedded emails carry CSS/inline-styles designed for 612pt-wide
