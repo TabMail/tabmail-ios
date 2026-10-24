@@ -43,6 +43,11 @@ struct ServerDraftCloseTestScene: View {
                         if ProcessInfo.processInfo.arguments.contains("--draft-close-failure") {
                             throw FixtureReadFailure()
                         }
+                        // The refusal a draft holding an attachment TabMail cannot
+                        // carry gets (#241): final, so no Retry, but it still closes.
+                        if ProcessInfo.processInfo.arguments.contains("--draft-close-unsupported") {
+                            throw DraftCopyUnsupportedAttachment()
+                        }
                         return nil
                     })
                     // The refused-deletion notice (#147) extends into the bottom

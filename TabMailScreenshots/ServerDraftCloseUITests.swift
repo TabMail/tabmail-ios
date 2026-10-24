@@ -10,16 +10,23 @@ final class ServerDraftCloseUITests: XCTestCase {
 
     func testUnavailableCoverCloses() { checkClose(host: "cover", failure: false) }
     func testFailedCoverClosesAfterRetry() { checkClose(host: "cover", failure: true) }
+    func testRefusedCoverCloses() { checkClose(host: "cover", failure: false, refused: true) }
     func testUnavailablePushCloses() { checkClose(host: "push", failure: false) }
     func testFailedPushClosesAfterRetry() { checkClose(host: "push", failure: true) }
+    func testRefusedPushCloses() { checkClose(host: "push", failure: false, refused: true) }
     func testUnavailableDetailCloses() { checkClose(host: "detail", failure: false) }
     func testFailedDetailClosesAfterRetry() { checkClose(host: "detail", failure: true) }
+    func testRefusedDetailCloses() { checkClose(host: "detail", failure: false, refused: true) }
 
-    private func checkClose(host: String, failure: Bool) {
+    /// `refused`: the draft holds an attachment TabMail cannot carry (#241). Its
+    /// card is final (no Retry) and must still close.
+    private func checkClose(host: String, failure: Bool, refused: Bool = false) {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test"]
         if failure { app.launchArguments.append("--draft-close-failure") }
+        if refused { app.launchArguments.append("--draft-close-unsupported") }
+        let kind = failure ? "failed" : refused ? "refused" : "unavailable"
         app.launch()
         defer { app.terminate() }
 
@@ -35,6 +42,9 @@ final class ServerDraftCloseUITests: XCTestCase {
             }
             let title = app.staticTexts[failure ? "Couldn't open this draft" : "Draft unavailable"]
             XCTAssertTrue(title.waitForExistence(timeout: waitSeconds))
+            // The refusal card says why, which the unavailable card shares no text with.
+            let refusal = app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "attachment TabMail can't open")).firstMatch
+            XCTAssertEqual(refusal.waitForExistence(timeout: refused ? waitSeconds : 0), refused)
             if failure && cycle == 1 {
                 let retry = app.buttons["Try Again"]
                 XCTAssertTrue(retry.isHittable)
@@ -48,7 +58,7 @@ final class ServerDraftCloseUITests: XCTestCase {
             let close = app.buttons["server-draft-close"]
             XCTAssertTrue(close.waitForExistence(timeout: waitSeconds))
             XCTAssertTrue(close.isHittable)
-            if cycle == 1 { capture(app, name: "\(host)-\(failure ? "failed" : "unavailable")-before-close") }
+            if cycle == 1 { capture(app, name: "\(host)-\(kind)-before-close") }
             close.tap()
             let mailbox = app.navigationBars[host == "detail" ? "All Inboxes" : "All Drafts"]
             expectation(for: NSPredicate(format: "exists == true AND hittable == true"), evaluatedWith: mailbox)
@@ -59,7 +69,7 @@ final class ServerDraftCloseUITests: XCTestCase {
             }
             app.buttons["Check rows"].tap()
             XCTAssertTrue(app.staticTexts["Rows preserved"].waitForExistence(timeout: waitSeconds))
-            if cycle == 1 { capture(app, name: "\(host)-\(failure ? "failed" : "unavailable")-after-close") }
+            if cycle == 1 { capture(app, name: "\(host)-\(kind)-after-close") }
             // Opening the same message again proves the owner can present after
             // dismissal. A split-view detail may reuse its existing resolved
             // view, so a fresh dependency read is not required on that reopen.

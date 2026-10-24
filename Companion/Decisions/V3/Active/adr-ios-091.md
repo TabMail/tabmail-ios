@@ -511,3 +511,18 @@ Codex round 6 on `290031d` found:
   with an attachment id was fetched later by the generic attachment path, unchecked. A Gmail draft
   read now reads every file whole with the draft, through `draftPartBytes`, and checks every
   part's decoded bytes against `body.size` by either route; a short part keeps the local copy.
+
+### Codex review round 7 corrections (2026-10-23)
+
+Codex round 7 on `497150d` found:
+
+- **Independent plain and HTML body pieces lose one.** A `multipart/mixed` draft with a
+  `text/plain` part and a separate `text/html` part reads both, and `editableBody` then keeps
+  only the HTML. It is the mirror of #272 (two plain alternatives doubled) and has the same
+  cause: the draft read does not know which multipart group a part belongs to. The fix selects
+  within an alternative and keeps every mixed piece in order; IMAP needs SwiftMail to expose
+  the grouping, so it is a dependency change and moves to #272 (SwiftMail reader unit, next in
+  the train), with its tests.
+- **The attachment-refusal card's Close was untested.** `ServerDraftCloseUITests` now opens a
+  draft refused for its attachment (#241) from the Drafts list, a push and a detail, and checks
+  the refusal text, no Retry, Close back to the mailbox twice, and unchanged rows.
