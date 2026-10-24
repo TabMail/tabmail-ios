@@ -124,4 +124,15 @@ struct EmailSearchToolSortTests {
             #expect(try dates(past) == Array(shown.suffix(20)))
         }
     }
+
+    /// The backend picks the `email_search` description by `X-Client-Version`, the protocol version,
+    /// not the marketing version. Below 1.9.3 it serves `email_search-v1.2.0.json`, which tells the
+    /// model results come newest first when it names no sort, while this tool then sorts by relevance.
+    /// From 1.9.3 the description's default is relevance, as here.
+    @Test("the app advertises a protocol version that is served the relevance-default email_search")
+    func advertisesRelevanceDefaultVersion() throws {
+        let parts = BackendClient.clientVersion.split(separator: ".").map { Int($0) ?? 0 }
+        try #require(parts.count == 3)
+        #expect(parts.lexicographicallyPrecedes([1, 9, 3]) == false)
+    }
 }

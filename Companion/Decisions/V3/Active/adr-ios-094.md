@@ -37,7 +37,14 @@ itself, on both stacks.
    search's relevance order for any sort value, ADR-IOS-008 parity). The agent-facing default
    changes with the `email_search` description served from client 1.9.3 (`email_search-v1.9.3.json`);
    a client reporting an older version gets the old description, which says `date_desc`. So the iOS
-   release that carries this must be numbered 1.9.3 or later.
+   release that carries this must report 1.9.3 or later.
+   **Amended 2026-10-24 (#302):** the version the backend reads is `TABMAIL_PROTOCOL_VERSION`
+   (`BackendClient.clientVersion`, Info.plist `TabMailProtocolVersion`), not `MARKETING_VERSION`. It
+   was still 1.9.0 when this merged, so a 1.10.0 build would still have been served the `date_desc`
+   description. It is 1.9.3 now, the contract iOS implements: `email_search-v1.9.3.json` (relevance
+   default) and `memory_search-v1.9.3.json` (no query lists the most recent conversations, which
+   `MemorySearchTool` already handles). `EmailSearchToolSortTests.advertisesRelevanceDefaultVersion`
+   pins it.
 8. The demo scope (ADR-IOS-038) is applied in the vector leg, before the merge:
    `SearchIndex.searchVecCandidates` joins its KNN results to `message_meta` and keeps only the
    mode's account, as `MemoryIndex.searchVecCandidates` does. The filter that dropped out-of-scope
