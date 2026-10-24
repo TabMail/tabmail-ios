@@ -681,6 +681,17 @@ struct DraftCopyIntegrityTests {
     /// and whose part fetch returns the 4 bytes "body".
     private func imapCopy(declaredSize: Int) async throws -> FullMessageInfo {
         let delivered = Data("body".utf8)
+        let stored = declaredSize == delivered.count ? delivered : Data("body and tail!".utf8)
+        try #require(stored.count == declaredSize, "fixture: the server holds the declared bytes")
+        return try await imapCopy(
+            bodystructure: "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" \(declaredSize) 1)",
+            contentType: "text/plain; charset=UTF-8", body: stored, partBodies: ["1": delivered])
+    }
+
+    /// An IMAP draft read through the fake server: `bodystructure` is sent as written,
+    /// `body` is the stored message body, and `partBodies` answer each part fetch.
+    private func imapCopy(bodystructure: String, contentType: String, body: Data,
+                          partBodies: [String: Data]) async throws -> FullMessageInfo {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(identifier: "UTC")
@@ -688,15 +699,12 @@ struct DraftCopyIntegrityTests {
         let date = formatter.string(from: Date())
         formatter.dateFormat = "dd-MMM-yyyy HH:mm:ss Z"
         let internalDate = formatter.string(from: Date())
-        let header = "From: Sender <sender@example.com>\r\nTo: Recipient <recipient@example.com>\r\nSubject: draft\r\nDate: \(date)\r\nMessage-ID: <short-part@example.com>\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n"
-        let stored = declaredSize == delivered.count ? delivered : Data("body and tail!".utf8)
-        try #require(stored.count == declaredSize, "fixture: the server holds the declared bytes")
+        let header = "From: Sender <sender@example.com>\r\nTo: Recipient <recipient@example.com>\r\nSubject: draft\r\nDate: \(date)\r\nMessage-ID: <short-part@example.com>\r\nContent-Type: \(contentType)\r\n\r\n"
         let message = FakeIMAPServer.makeMultipartMessage(
             uid: 5, subject: "draft", from: "Sender <sender@example.com>",
             to: "Recipient <recipient@example.com>", date: date, internalDate: internalDate,
-            messageID: "<short-part@example.com>", rawHeader: header, fullMessage: Data(header.utf8) + stored,
-            bodystructure: "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" \(declaredSize) 1)",
-            partBodies: ["1": delivered])
+            messageID: "<short-part@example.com>", rawHeader: header, fullMessage: Data(header.utf8) + body,
+            bodystructure: bodystructure, partBodies: partBodies)
         let server = FakeIMAPServer(mailboxes: ["Drafts": [message]])
         server.setUidValidity(73099, for: "Drafts")
         try server.start()
@@ -714,6 +722,42 @@ struct DraftCopyIntegrityTests {
             try? await provider.disconnect()
             throw error
         }
+    }
+
+    // MARK: - Text parts with a Content-ID (#276)
+
+    @Test("An IMAP draft's text body with a Content-ID opens as its body, not as a file")
+    func imapTextBodyWithContentIdIsTheBody() async throws {
+        // Python's EmailMessage.set_content(..., cid=...) writes a plain-text body
+        // with a Content-ID and no filename.
+        let text = Data("Hello from the draft".utf8)
+        let copy = try await imapCopy(
+            bodystructure: "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") \"<body@example.com>\" NIL \"7BIT\" \(text.count) 1)",
+            contentType: "text/plain; charset=UTF-8", body: text, partBodies: ["1": text])
+        #expect(copy.textBody == "Hello from the draft")
+        #expect(copy.attachments.isEmpty)
+        #expect((copy.attachmentData ?? [:]).isEmpty)
+    }
+
+    /// The HTML root's extension fields after its line count: none, or an
+    /// inline disposition as some clients write it.
+    nonisolated static let relatedRootExtensions = ["", " NIL (\"INLINE\" NIL) NIL NIL"]
+
+    @Test("A multipart/related draft's HTML root with a Content-ID is the body; its image stays an inline image",
+          arguments: relatedRootExtensions)
+    func imapRelatedRootWithContentIdIsTheBody(rootExtension: String) async throws {
+        let html = Data("<p>Hello</p>".utf8)
+        let png = Data([0x89, 0x50, 0x4E, 0x47])
+        let pngBase64 = Data(png.base64EncodedString().utf8)
+        let copy = try await imapCopy(
+            bodystructure: "((\"TEXT\" \"HTML\" (\"CHARSET\" \"UTF-8\") \"<root@example.com>\" NIL \"7BIT\" \(html.count) 1\(rootExtension))"
+                + "(\"IMAGE\" \"PNG\" NIL \"<logo@example.com>\" NIL \"BASE64\" \(pngBase64.count) NIL (\"INLINE\" NIL) NIL NIL) \"RELATED\")",
+            contentType: "multipart/related; boundary=b", body: html + pngBase64,
+            partBodies: ["1": html, "2": pngBase64])
+        #expect(copy.htmlBody == "<p>Hello</p>")
+        #expect(copy.attachments.isEmpty)
+        #expect(copy.inlineImages.map(\.contentId) == ["logo@example.com"])
+        #expect(copy.inlineImages.first?.data == png)
     }
 
     @Test("An IMAP draft part that arrives shorter than BODYSTRUCTURE declares is incomplete, never the draft")
