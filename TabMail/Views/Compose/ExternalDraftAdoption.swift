@@ -282,6 +282,7 @@ enum ExternalDraftAdoption {
         draft.instanceEpoch = instanceEpoch
         draft.replyToProviderMessageId = replyParent?.messageId
         draft.replyToUidValidity = replyParent?.observedUidValidity
+        draft.serverCopyNamesParent = MessageIdentity.comparableRfc822Identity(content.inReplyTo) != nil
         switch address {
         case .imap(let folderPath, let uidValidity, let uid):
             draft.serverDraftId = uid
@@ -366,6 +367,7 @@ enum ExternalDraftAdoption {
         draft.attachmentsDirName = content.attachmentsDirName
         draft.updatedAt = now
         draft.serverPushStatus = "pushed"
+        draft.serverCopyNamesParent = MessageIdentity.comparableRfc822Identity(content.inReplyTo) != nil
         draft.pushAttemptVersion += 1
         try draft.update(db)
         return .applied(previousDirName: previousDirName)
@@ -386,14 +388,19 @@ enum ExternalDraftAdoption {
     /// the one Send would reply to for `draft`. The row's parent is resolved as Send
     /// resolves it (`Draft.resolveReplyToHeader`, which follows a parent that moved),
     /// and a parent the row claims but cannot resolve is not taken as agreement: the
-    /// row is clean, so removing it lets the next open adopt the copy whole. A forward,
-    /// a copy naming no parent, or a row claiming none is not compared; re-adoption
-    /// of a copy whose parent the device lacks therefore claims none and stays put.
+    /// row is clean, so removing it lets the next open adopt the copy whole. A copy
+    /// naming no parent replies elsewhere only when the copy the row last uploaded or
+    /// read named one (`Draft.serverCopyNamesParent`, #278): another app put a
+    /// standalone message in the draft's place. A row with no record keeps its parent.
+    /// A forward, or a row claiming no parent, is not compared; re-adoption of a copy
+    /// whose parent the device lacks therefore claims none and stays put.
     static func repliesElsewhere(_ draft: Draft, copyInReplyTo: String?, db: Database) throws -> Bool {
         guard !draft.isForward,
-              let copyParent = MessageIdentity.comparableRfc822Identity(copyInReplyTo),
               draft.replyToId != nil || Draft.replyKeyTail(draftKey: draft.id, isForward: false) != nil else {
             return false
+        }
+        guard let copyParent = MessageIdentity.comparableRfc822Identity(copyInReplyTo) else {
+            return draft.serverCopyNamesParent == true
         }
         let parent = try Draft.resolveReplyToHeader(
             draftKey: draft.id, replyToId: draft.replyToId, isForward: false,

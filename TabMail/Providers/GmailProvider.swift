@@ -2315,6 +2315,31 @@ actor GmailProvider: EmailProvider {
         }
     }
 
+    /// RFC 5322 §2.1.1: a header line SHOULD be at most 78 characters and MUST be at
+    /// most 998. A References history of many short identifiers, or one long
+    /// Message-ID, passes 998 on a single line.
+    private static let headerLineSoftLimit = 78
+
+    /// An `In-Reply-To` or `References` field, `<id>`s in order, folded with CRLF and
+    /// a space before any identifier that would take its line past
+    /// `headerLineSoftLimit` octets. RFC 5322 §3.6.4 allows folding white space
+    /// before every msg-id, the first included, so an identifier is never split and
+    /// one too long to share a line starts its own.
+    nonisolated static func messageIDField(_ name: String, _ ids: [String]) -> String {
+        var field = "\(name):"
+        var lineLength = field.utf8.count
+        for id in ids {
+            let token = id.hasPrefix("<") ? id : "<\(id)>"
+            if lineLength + 1 + token.utf8.count > headerLineSoftLimit {
+                field += "\r\n"
+                lineLength = 0
+            }
+            field += " " + token
+            lineLength += 1 + token.utf8.count
+        }
+        return field
+    }
+
     nonisolated func buildRFC822(draft: DraftMessage) -> String {
         var lines: [String] = []
         // Include Message-ID so Gmail preserves our rfc822MessageId. Without this,
@@ -2332,10 +2357,10 @@ actor GmailProvider: EmailProvider {
         if !draft.bcc.isEmpty { lines.append("Bcc: \(IMAPProvider.recipientsFieldBody(draft.bcc))") }
         lines.append("Subject: \(RFC2047.encodeHeaderValue(draft.subject))")
         if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
-            lines.append("In-Reply-To: \(replyTo.hasPrefix("<") ? replyTo : "<\(replyTo)>")")
+            lines.append(Self.messageIDField("In-Reply-To", [replyTo]))
         }
         if !draft.references.isEmpty {
-            lines.append("References: \(draft.references.map { $0.hasPrefix("<") ? $0 : "<\($0)>" }.joined(separator: " "))")
+            lines.append(Self.messageIDField("References", draft.references))
         }
         lines.append("MIME-Version: 1.0")
         if draft.isHTML {
@@ -2383,10 +2408,10 @@ actor GmailProvider: EmailProvider {
         if !draft.bcc.isEmpty { message += "Bcc: \(IMAPProvider.recipientsFieldBody(draft.bcc))\r\n" }
         message += "Subject: \(RFC2047.encodeHeaderValue(draft.subject))\r\n"
         if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
-            message += "In-Reply-To: \(replyTo.hasPrefix("<") ? replyTo : "<\(replyTo)>")\r\n"
+            message += Self.messageIDField("In-Reply-To", [replyTo]) + "\r\n"
         }
         if !draft.references.isEmpty {
-            message += "References: \(draft.references.map { $0.hasPrefix("<") ? $0 : "<\($0)>" }.joined(separator: " "))\r\n"
+            message += Self.messageIDField("References", draft.references) + "\r\n"
         }
         message += "MIME-Version: 1.0\r\n"
 

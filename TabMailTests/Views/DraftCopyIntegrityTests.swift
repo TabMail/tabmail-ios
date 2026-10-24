@@ -124,7 +124,9 @@ struct DraftCopyIntegrityTests {
 
     /// The Gmail draft `r1` was listed at message `m-old`, a reply to `old-parent`; the
     /// other app has since replaced it with `m-new`, a reply to `new-parent`.
-    private nonisolated func insertReplyFixture(_ db: Database, adopted: Bool) throws -> MessageHeader {
+    private nonisolated func insertReplyFixture(
+        _ db: Database, adopted: Bool, copyInReplyTo: String? = nil
+    ) throws -> MessageHeader {
         var account = Account(emailAddress: "owner@example.com", displayName: "Test", provider: .gmail)
         account.id = Self.accountId
         try account.insert(db)
@@ -152,7 +154,7 @@ struct DraftCopyIntegrityTests {
                 db: db, header: header, address: .gmail(resourceId: "r1", containedMessageId: "m-old"),
                 runtimeKind: .gmail,
                 content: .init(subject: "old draft", to: "old@example.com", cc: "", bcc: "", body: "old body",
-                               attachmentsDirName: nil, attachmentCount: 0))
+                               attachmentsDirName: nil, attachmentCount: 0, inReplyTo: copyInReplyTo))
         }
         return header
     }
@@ -162,17 +164,19 @@ struct DraftCopyIntegrityTests {
         MessageIdentity.headerId(accountId: Self.accountId, folderPath: "INBOX", messageId: messageId)
     }
 
-    private func registerReplacedGmailDraft(_ http: FakeHTTP.Scenario, parent: String) throws {
+    /// `parent` nil: the other app replaced the draft with a standalone message.
+    private func registerReplacedGmailDraft(_ http: FakeHTTP.Scenario, parent: String?) throws {
         http.register(path: "/drafts", method: "GET", response: .json(raw: #"{"drafts":[{"id":"r1","message":{"id":"m-old"}}]}"#))
         http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-new"}}"#))
+        var headers = [["name": "Subject", "value": "new reply"],
+                       ["name": "From", "value": "owner@example.com"], ["name": "To", "value": "new@example.com"],
+                       ["name": "Message-ID", "value": "<new-draft@example.com>"]]
+        if let parent { headers.append(["name": "In-Reply-To", "value": "<\(parent)>"]) }
         let payload: [String: Any] = [
             "id": "m-new", "internalDate": String(Int(Date().timeIntervalSince1970 * 1000)), "labelIds": ["DRAFT"],
             "payload": [
                 "mimeType": "text/plain",
-                "headers": [["name": "Subject", "value": "new reply"],
-                            ["name": "From", "value": "owner@example.com"], ["name": "To", "value": "new@example.com"],
-                            ["name": "Message-ID", "value": "<new-draft@example.com>"],
-                            ["name": "In-Reply-To", "value": "<\(parent)>"]],
+                "headers": headers,
                 "body": ["size": 14, "data": Self.base64URL(Data("new reply text".utf8))],
             ] as [String: Any],
         ]
@@ -242,6 +246,122 @@ struct DraftCopyIntegrityTests {
                 // Reopening from the list never brings the old parent back.
                 if let authority = try await ServerDraftComposeLoader.resolveOpenAuthority(header: header) {
                     #expect(try await sentParent(pool, draftId: authority.draftId)?.contains("old-parent") != true)
+                }
+            }
+        }
+    }
+
+    // MARK: - A reply replaced by a standalone message (#278)
+
+    /// A TabMail reply (or forward) to `old-parent`, saved on the device and uploaded
+    /// through Gmail as draft `r1` (contained message `m-old`). Returns the row and
+    /// the raw message the upload sent.
+    private func pushTabMailGmailDraft(
+        _ pool: DatabasePool, http: FakeHTTP.Scenario, isForward: Bool = false, includeContainedMessageId: Bool = true
+    ) async throws -> (draft: Draft, raw: String) {
+        let draftId = "\(isForward ? "forward" : "reply"):\(Self.accountId):old-parent@example.com"
+        try await pool.write { db in
+            _ = try self.insertReplyFixture(db, adopted: false)
+            var draft = Draft(
+                id: draftId, accountId: Self.accountId, toJSON: #"["old@example.com"]"#, ccJSON: "[]", bccJSON: "[]",
+                subject: "old draft", body: "old body", replyToId: self.parentHeaderId("p-old"), isForward: isForward,
+                editHistoryJSON: nil, createdAt: 1, updatedAt: 2, serverDraftId: nil,
+                serverPushStatus: nil, rfc822MessageId: nil, attachmentsDirName: nil)
+            draft.instanceEpoch = "tabmail-E1"
+            draft.replyToProviderMessageId = "p-old"
+            try DraftStore.applySave(draft, db: db)
+        }
+        http.register(path: "/drafts", method: "POST", response: .json(raw: includeContainedMessageId ? #"{"id":"r1","message":{"id":"m-old"}}"# : #"{"id":"r1"}"#))
+        let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+        let saved = try await DraftStore.shared.pushDraftToServer(
+            draftId: draftId, expectedInstanceEpoch: "tabmail-E1", provider: provider,
+            runtimeKind: .gmail, draftsFolderPath: "DRAFT")
+        try #require(saved == .completed, "precondition: the upload made a clean Gmail draft")
+        let upload = try #require(http.recordedCalls().last { $0.method == "POST" && $0.url.hasSuffix("/drafts") })
+        let uploadBody = try #require(upload.body)
+        let json = try #require(try JSONSerialization.jsonObject(with: uploadBody) as? [String: Any])
+        let encoded = try #require((json["message"] as? [String: Any])?["raw"] as? String)
+        var base64 = encoded.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
+        let rawData = try #require(Data(base64Encoded: base64))
+        let raw = String(decoding: rawData, as: UTF8.self)
+        let draft = try #require(try await pool.read { try Draft.fetchOne($0, key: draftId) })
+        return (draft, raw)
+    }
+
+    @Test("A Gmail reply draft TabMail uploads names its parent as Send will; a forward names none",
+          arguments: [false, true])
+    func gmailReplyUploadNamesItsParent(isForward: Bool) async throws {
+        try await withInstalledPool { pool in
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let (draft, raw) = try await pushTabMailGmailDraft(pool, http: http, isForward: isForward)
+            let headerLines = raw.components(separatedBy: "\r\n\r\n").first?.components(separatedBy: "\r\n") ?? []
+            if isForward {
+                #expect(!headerLines.contains { $0.hasPrefix("In-Reply-To:") || $0.hasPrefix("References:") })
+                #expect(draft.serverCopyNamesParent == false)
+                return
+            }
+            #expect(headerLines.contains("In-Reply-To: <old-parent@example.com>"))
+            #expect(headerLines.contains("References: <old-parent@example.com>"))
+            #expect(try await sentParent(pool, draftId: draft.id) == "old-parent@example.com",
+                    "the upload names the parent Send replies to")
+            #expect(draft.serverCopyNamesParent == true)
+        }
+    }
+
+    enum StandaloneReplacementCase: String, CaseIterable, Sendable {
+        /// TabMail uploaded the reply, naming its parent; the copy now names none.
+        case tabMailUpload
+        /// The adopted copy named the parent; the copy now names none.
+        case adoptedReply
+        /// A row from before the record existed: nothing says what the copy named.
+        case rowWithoutRecord
+        /// The adopted copy named no parent either: nothing changed.
+        case adoptedCopyNamedNone
+    }
+
+    @Test("A Gmail reload never keeps the old reply parent under another app's standalone message",
+          arguments: StandaloneReplacementCase.allCases)
+    func gmailReloadOfAReplyReplacedByAStandaloneMessage(_ scenario: StandaloneReplacementCase) async throws {
+        try await withInstalledPool { pool in
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let existing: Draft
+            switch scenario {
+            case .tabMailUpload, .rowWithoutRecord:
+                existing = try await pushTabMailGmailDraft(pool, http: http).draft
+                if scenario == .rowWithoutRecord {
+                    try await pool.write { db in
+                        try db.execute(sql: "UPDATE draft SET serverCopyNamesParent = NULL WHERE id = ?",
+                                       arguments: [existing.id])
+                    }
+                }
+            case .adoptedReply, .adoptedCopyNamedNone:
+                _ = try await pool.write {
+                    try self.insertReplyFixture(
+                        $0, adopted: true,
+                        copyInReplyTo: scenario == .adoptedReply ? "<old-parent@example.com>" : nil)
+                }
+                existing = try #require(try await pool.read { try Draft.fetchOne($0) })
+            }
+            try #require(try await sentParent(pool, draftId: existing.id) == "old-parent@example.com",
+                         "fixture: a reply to old-parent")
+            try registerReplacedGmailDraft(http, parent: nil)
+            let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                let check = await ExternalDraftAdoption.refreshBeforeOpen(draftId: existing.id, willReadServer: {})
+                try #require(http.recordedCalls().contains { $0.url.contains("/messages/m-new") }, "precondition: the new copy was read")
+                let row = try await pool.read { try Draft.fetchOne($0, key: existing.id) }
+                switch scenario {
+                case .tabMailUpload, .adoptedReply:
+                    #expect(check == .replacedElsewhere)
+                    #expect(row == nil, "the standalone message would be sent as a reply to old-parent")
+                case .rowWithoutRecord, .adoptedCopyNamedNone:
+                    // Nothing says the copy ever named a parent: an ordinary reload.
+                    #expect(check == .open)
+                    #expect(row?.body == "new reply text")
+                    #expect(row?.serverCopyNamesParent == false, "the record follows the copy just read")
                 }
             }
         }
@@ -1419,6 +1539,145 @@ struct DraftCopyIntegrityTests {
                 #expect(row.pushAttemptVersion == 1, "control: a whole server copy is taken")
                 #expect(row.body == (kind == "body" ? "REMOTE WHOLE PART" : "remote body"))
                 #expect(files.map(\.data) == (kind == "body" ? [] : [remote]))
+            }
+        }
+    }
+}
+
+// #278 review: the parent the upload names, and how the copy's parent is learned and compared.
+extension DraftCopyIntegrityTests {
+    @Test("The upload names a moved parent with its history, and only on Gmail", arguments: ["reply", "moved", "outlook", "imap"])
+    func uploadThreadHeadersFollowParentAndProvider(_ mode: String) throws {
+        let queue = try TestDatabase.make()
+        try queue.write { db in
+            _ = try insertReplyFixture(db, adopted: false)
+            var parent = try #require(try MessageHeader.fetchOne(db, key: parentHeaderId("p-old")))
+            parent.referencesJSON = MessageHeader.encodeReferences(["ancestor-1@example.com", "ancestor-2@example.com"])
+            var account = try #require(try Account.fetchOne(db, key: Self.accountId))
+            let kind: DraftRuntimeIdentityKind
+            if mode == "outlook" { account.provider = .outlook; kind = .outlook }
+            else if mode == "imap" { account.provider = .imap; kind = .imap }
+            else { kind = .gmail }
+            try account.update(db)
+            if mode == "imap" {
+                try parent.delete(db)
+                parent.messageId = "7"
+                parent.id = MessageIdentity.headerId(accountId: Self.accountId, folderPath: "INBOX", messageId: "7")
+                parent.observedUidValidity = 901
+                try parent.insert(db)
+                try Folder.filter(Column("id") == parent.folderId).updateAll(db, Column("lastKnownUidValidity").set(to: 901))
+            } else { try parent.update(db) }
+            var draft = Draft(
+                id: "reply:\(Self.accountId):old-parent@example.com", accountId: Self.accountId,
+                toJSON: #"["old@example.com"]"#, ccJSON: "[]", bccJSON: "[]", subject: "Re: p-old", body: "typed text",
+                replyToId: parent.id, isForward: false, editHistoryJSON: nil, createdAt: 1, updatedAt: 2)
+            draft.replyToUidValidity = mode == "imap" ? 901 : nil
+            draft.replyToProviderMessageId = parent.messageId
+            draft.instanceEpoch = "tabmail-E1"
+            try DraftStore.applySave(draft, db: db)
+            if mode == "moved" {
+                let archive = Folder(name: "Archive", path: "Archive", role: .archive, accountId: Self.accountId)
+                try archive.insert(db)
+                try parent.delete(db)
+                parent.folderPath = archive.path; parent.folderId = archive.id
+                parent.id = MessageIdentity.headerId(accountId: Self.accountId, folderPath: archive.path, messageId: parent.messageId)
+                try parent.insert(db)
+                #expect(try MessageHeader.fetchOne(db, key: draft.replyToId!) == nil)
+            }
+            let headers = try DraftStore.uploadThreadHeaders(for: draft, runtimeKind: kind, db: db)
+            if kind == .gmail {
+                #expect(headers.inReplyTo == "old-parent@example.com")
+                #expect(headers.references == ["ancestor-1@example.com", "ancestor-2@example.com", "old-parent@example.com"])
+            } else { #expect(headers == .none) }
+            let plan = try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + Draft.replyTargetLookupSQL,
+                                        arguments: [Self.accountId, "old-parent@example.com"])
+            let details = plan.map { $0["detail"] as String }
+            #expect(details.contains { $0.contains("messageHeader_rfc822MessageId") })
+        }
+    }
+
+    @Test("A reload that reads the same reply makes a later standalone replacement detectable")
+    func reloadLearnsParentBeforeStandaloneReplacement() throws {
+        let queue = try TestDatabase.make()
+        try queue.write { db in
+            _ = try insertReplyFixture(db, adopted: true, copyInReplyTo: "<old-parent@example.com>")
+            var row = try #require(try Draft.fetchOne(db))
+            // The v94 migration is the producer of UNKNOWN on existing rows.
+            row.serverCopyNamesParent = nil; try row.update(db)
+            let same = ExternalDraftAdoption.ServerContent(subject: "reply", to: "old@example.com", cc: "", bcc: "", body: "server reply", attachmentsDirName: nil, attachmentCount: 0, inReplyTo: "<old-parent@example.com>")
+            #expect(try ExternalDraftAdoption.applyReload(db: db, decided: row, content: same) == .applied(previousDirName: nil))
+            let refreshed = try #require(try Draft.fetchOne(db, key: row.id))
+            #expect(refreshed.serverCopyNamesParent == true)
+            let standalone = ExternalDraftAdoption.ServerContent(subject: "new", to: "new@example.com", cc: "", bcc: "", body: "new standalone text", attachmentsDirName: nil, attachmentCount: 0)
+            #expect(try ExternalDraftAdoption.applyReload(db: db, decided: refreshed, content: standalone) == .removed(previousDirName: nil))
+            #expect(try Draft.fetchOne(db, key: row.id) == nil)
+        }
+    }
+
+    @Test("A server reply whose parent is absent stays adopted on repeated reload")
+    func unclaimedReplyDoesNotEvictItself() throws {
+        let queue = try TestDatabase.make()
+        try queue.write { db in
+            var header = try insertReplyFixture(db, adopted: false)
+            header.inReplyTo = "not-on-this-device@example.com"; try header.update(db)
+            let content = ExternalDraftAdoption.ServerContent(subject: "external reply", to: "old@example.com", cc: "", bcc: "", body: "server text", attachmentsDirName: nil, attachmentCount: 0, inReplyTo: "<not-on-this-device@example.com>")
+            let id = try #require(try ExternalDraftAdoption.insertAdoptedDraft(db: db, header: header, address: .gmail(resourceId: "r1", containedMessageId: "m-old"), runtimeKind: .gmail, content: content))
+            var row = try #require(try Draft.fetchOne(db, key: id))
+            #expect(row.replyToId == nil && Draft.replyKeyTail(draftKey: id, isForward: false) == nil)
+            #expect(row.serverCopyNamesParent == true)
+            for _ in 0..<2 {
+                #expect(try ExternalDraftAdoption.applyReload(db: db, decided: row, content: content) == .applied(previousDirName: nil))
+                row = try #require(try Draft.fetchOne(db, key: id))
+                #expect(row.body == "server text" && row.serverPushStatus == "pushed")
+            }
+        }
+    }
+
+    @Test("A Gmail upload answered without a contained message id still records its parent")
+    func uploadWithoutContainedMessageIdRecordsParent() async throws {
+        try await withInstalledPool { pool in
+            let http = FakeHTTP.Scenario(); defer { http.close() }
+            let (draft, raw) = try await pushTabMailGmailDraft(pool, http: http, includeContainedMessageId: false)
+            #expect(raw.contains("In-Reply-To: <old-parent@example.com>\r\n"))
+            #expect(draft.serverDraftId == "r1" && draft.serverPushStatus == "pushed")
+            #expect(draft.serverCopyNamesParent == true)
+            try registerReplacedGmailDraft(http, parent: nil)
+            let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                #expect(await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {}) == .replacedElsewhere)
+                let after = try await pool.read { try Draft.fetchOne($0, key: draft.id) }
+                #expect(after == nil)
+            }
+        }
+    }
+
+    @Test("A forward stays a forward through a reply-bearing then a parentless reload")
+    func forwardIsNotReclassifiedByReplyHeaders() async throws {
+        try await withInstalledPool { pool in
+            let http = FakeHTTP.Scenario(); defer { http.close() }
+            let existing = try await pushTabMailGmailDraft(pool, http: http, isForward: true).draft
+            let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                try registerReplacedGmailDraft(http, parent: "new-parent@example.com")
+                #expect(await ExternalDraftAdoption.refreshBeforeOpen(draftId: existing.id, willReadServer: {}) == .open)
+                let first = try #require(try await pool.read { try Draft.fetchOne($0, key: existing.id) })
+                #expect(first.isForward && first.body == "new reply text")
+                #expect(first.serverCopyNamesParent == true)
+                // Equal-prefix FakeHTTP routes keep their first registration. Reset,
+                // and model Gmail's new contained id for the second replacement.
+                http.reset()
+                http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-new-2"}}"#))
+                let text = Data("standalone text".utf8)
+                let payload: [String: Any] = [
+                    "id": "m-new-2", "internalDate": String(Int(Date().timeIntervalSince1970 * 1000)), "labelIds": ["DRAFT"],
+                    "payload": ["mimeType": "text/plain", "headers": [["name": "Subject", "value": "standalone"], ["name": "To", "value": "new@example.com"]],
+                                "body": ["size": text.count, "data": Self.base64URL(text)]] as [String: Any]]
+                http.register(path: "/messages/m-new-2", method: "GET", response: .json(raw: String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)))
+                #expect(await ExternalDraftAdoption.refreshBeforeOpen(draftId: existing.id, willReadServer: {}) == .open)
+                let second = try #require(try await pool.read { try Draft.fetchOne($0, key: existing.id) })
+                #expect(second.isForward && second.body == "standalone text")
+                #expect(second.serverCopyNamesParent == false)
+                #expect(http.servedCallSequence().count == 2)
             }
         }
     }

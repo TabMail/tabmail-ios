@@ -4224,6 +4224,20 @@ final class AppDatabase: Sendable {
         // #217 (ADR-IOS-091): v92 (`v92_addDraftServerText`) and v93
         // (`v93_openPreUpgradeServerDraftsLocally`) are burned. Both ran on
         // development databases and were never released; do not reuse either name.
+
+        // #278 (ADR-IOS-091): whether the server copy a draft row last uploaded or
+        // read names a reply parent (`Draft.serverCopyNamesParent`). NULLABLE and NO
+        // BACKFILL: nothing on the device records what an earlier upload wrote, so
+        // every existing row is UNKNOWN and keeps its parent on reload, as it did.
+        // Convergence: a fresh install and an upgraded DB both end with the column,
+        // NULL on every pre-existing row.
+        migrator.registerTimedMigration(
+            "v94_addDraftServerCopyNamesParent", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "draft") { t in
+                t.add(column: "serverCopyNamesParent", .boolean)
+            }
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

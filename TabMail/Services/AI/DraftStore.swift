@@ -380,6 +380,8 @@ actor DraftStore {
         let postAPushAttemptVersion: Int
         let freshRfc: String
         let previousIdentity: DraftDeleteIdentity?
+        /// Whether the uploaded copy names a reply parent (`Draft.serverCopyNamesParent`).
+        let copyNamesParent: Bool
     }
 
     private struct HeaderMigration: Sendable {
@@ -402,6 +404,7 @@ actor DraftStore {
         expectedInstanceEpoch: String,
         previousIdentity: DraftDeleteIdentity?,
         freshRfc: String,
+        copyNamesParent: Bool,
         db: Database
     ) throws -> StageAContext? {
         guard var current = try Draft.fetchOne(db, key: initialDraft.id),
@@ -422,7 +425,27 @@ actor DraftStore {
             instanceEpoch: expectedInstanceEpoch,
             postAPushAttemptVersion: postAVersion,
             freshRfc: freshRfc,
-            previousIdentity: previousIdentity)
+            previousIdentity: previousIdentity,
+            copyNamesParent: copyNamesParent)
+    }
+
+    /// The threading headers a draft upload writes. A Gmail reply names its parent
+    /// as Send will (`ThreadUtils.outgoingThreadHeaders` on the parent
+    /// `Draft.resolveReplyToHeader` finds), so a reload can tell TabMail's own copy
+    /// from a standalone message another app put in its place (#278). A forward, and
+    /// every other provider, writes none, as before.
+    static func uploadThreadHeaders(
+        for draft: Draft,
+        runtimeKind: DraftRuntimeIdentityKind,
+        db: Database
+    ) throws -> ThreadUtils.OutgoingThreadHeaders {
+        guard runtimeKind == .gmail, !draft.isForward else { return .none }
+        let parent = try Draft.resolveReplyToHeader(
+            draftKey: draft.id, replyToId: draft.replyToId, isForward: false,
+            expectedProviderMessageId: draft.replyToProviderMessageId,
+            expectedUidValidity: draft.replyToUidValidity, db: db)
+        return ThreadUtils.outgoingThreadHeaders(
+            replyTo: parent, sendAccountId: draft.accountId, sendSubject: draft.subject, providerKind: .gmail)
     }
 
     static func priorIdentity(
@@ -512,6 +535,7 @@ actor DraftStore {
                     "draft provider returned an address from the wrong namespace")
             }
             draft.serverPushStatus = "pushed"
+            draft.serverCopyNamesParent = context.copyNamesParent
             try draft.update(db)
 
             guard let realMessageId else {
@@ -800,6 +824,9 @@ actor DraftStore {
         // pushed Gmail or Outlook draft reads the server copy back, and only the
         // text itself comes back with every space and line break. An HTML body
         // would not (`plainTextToHTML` joins a line ending in a space to the next).
+        let threadHeaders = try await AppDatabase.dbPool.read { db in
+            try Self.uploadThreadHeaders(for: initialDraft, runtimeKind: runtimeKind, db: db)
+        }
         var payload = DraftMessage(
             to: initialDraft.toArray,
             cc: initialDraft.ccArray,
@@ -807,9 +834,11 @@ actor DraftStore {
             subject: initialDraft.subject,
             body: initialDraft.body,
             isHTML: false,
-            inReplyTo: nil,
+            inReplyTo: threadHeaders.inReplyTo,
+            references: threadHeaders.references,
             attachments: attachments)
         payload.messageId = freshRfc
+        let copyNamesParent = MessageIdentity.comparableRfc822Identity(threadHeaders.inReplyTo) != nil
 
         guard let context = try await AppDatabase.dbPool.write({ db in
             try Self.performStageA(
@@ -818,6 +847,7 @@ actor DraftStore {
                 previousIdentity: Self.priorIdentity(
                     for: initialDraft, runtimeKind: runtimeKind),
                 freshRfc: freshRfc,
+                copyNamesParent: copyNamesParent,
                 db: db)
         }) else {
             return .notApplied
