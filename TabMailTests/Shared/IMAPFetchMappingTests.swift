@@ -421,33 +421,83 @@ struct IMAPFetchMappingTests {
         #expect(!IMAPFetchMapping.hasAttachments(from: info))
     }
 
-    /// An image with a Content-ID and no disposition, as SwiftMail reads it from
-    /// BODYSTRUCTURE: named after its Content-ID, enclosed by a `subtype` multipart.
-    private func contentIdImage(in subtype: String, filename: String = "logo@example.com") -> [MessagePart] {
-        let multipart = EnclosingMultipart(path: [], subtype: subtype)
-        return [
-            MessagePart(sectionString: "1", contentType: "text/html", enclosingMultiparts: [multipart]),
-            MessagePart(sectionString: "2", contentType: "image/png", filename: filename,
-                        contentId: "<logo@example.com>", data: Data([1, 2]), enclosingMultiparts: [multipart]),
-        ]
+    /// A part with a Content-ID and no filename, which SwiftMail names after its
+    /// Content-ID, in the multipart tree it was read from (BODYSTRUCTURE gives each
+    /// part its enclosing multiparts, outermost first). `expectedFiles` is what the
+    /// attachment list must hold (#283).
+    enum ContentIdShape: String, CaseIterable, Sendable {
+        // Inline: the part is an image directly inside a related body.
+        case related, relatedInAlternative, attachedMessageOwnRelated
+        // Files.
+        case mixed, ownName, noContentId, extensionDisposition, standalone, pdf, octetStream
+        case attachedMessageMixedUnderRelated
+
+        var parts: [MessagePart] {
+            let top = { (subtype: String) in [EnclosingMultipart(path: [], subtype: subtype)] }
+            switch self {
+            case .related: return Self.body(top("related"), file: Self.part("2", top("related")))
+            case .mixed: return Self.body(top("mixed"), file: Self.part("2", top("mixed")))
+            case .ownName: return Self.body(top("related"), file: Self.part("2", top("related"), filename: "logo.png"))
+            case .noContentId:
+                return Self.body(top("related"), file: Self.part("2", top("related"), filename: "logo.png", contentId: nil))
+            case .extensionDisposition:
+                return Self.body(top("related"), file: Self.part("2", top("related"), disposition: "x-resource"))
+            case .standalone: return [Self.part("1", [])]
+            case .pdf: return Self.body(top("related"), file: Self.part("2", top("related"), type: "application/pdf"))
+            case .octetStream:
+                return Self.body(top("related"), file: Self.part("2", top("related"), type: "application/octet-stream"))
+            case .relatedInAlternative:
+                let related = top("alternative") + [EnclosingMultipart(path: [2], subtype: "related")]
+                return [MessagePart(sectionString: "1", contentType: "text/plain", enclosingMultiparts: top("alternative")),
+                        MessagePart(sectionString: "2.1", contentType: "text/html", enclosingMultiparts: related),
+                        Self.part("2.2", related)]
+            case .attachedMessageOwnRelated: return Self.attachedMessage(outer: "mixed", inner: "related")
+            case .attachedMessageMixedUnderRelated: return Self.attachedMessage(outer: "related", inner: "mixed")
+            }
+        }
+
+        var expectedFiles: [String] {
+            switch self {
+            case .related, .relatedInAlternative: return []
+            case .attachedMessageOwnRelated: return ["forwarded.eml"]
+            case .attachedMessageMixedUnderRelated: return ["forwarded.eml", "logo@example.com"]
+            case .ownName, .noContentId: return ["logo.png"]
+            case .mixed, .extensionDisposition, .standalone, .pdf, .octetStream: return ["logo@example.com"]
+            }
+        }
+
+        private static func part(_ section: String, _ enclosing: [EnclosingMultipart], type: String = "image/png",
+                                 filename: String = "logo@example.com", contentId: String? = "<logo@example.com>",
+                                 disposition: String? = nil) -> MessagePart {
+            MessagePart(sectionString: section, contentType: type, disposition: disposition, filename: filename,
+                        contentId: contentId, data: Data([1, 2]), enclosingMultiparts: enclosing)
+        }
+
+        private static func body(_ enclosing: [EnclosingMultipart], file: MessagePart) -> [MessagePart] {
+            [MessagePart(sectionString: "1", contentType: "text/html", enclosingMultiparts: enclosing), file]
+        }
+
+        /// An HTML body and an attached message whose own body is `inner`, holding
+        /// HTML and the Content-ID part.
+        private static func attachedMessage(outer: String, inner: String) -> [MessagePart] {
+            let outerBody = [EnclosingMultipart(path: [], subtype: outer)]
+            let innerBody = outerBody + [EnclosingMultipart(path: [2], subtype: inner)]
+            return [MessagePart(sectionString: "1", contentType: "text/html", enclosingMultiparts: outerBody),
+                    MessagePart(sectionString: "2", contentType: "message/rfc822", disposition: "attachment",
+                                filename: "forwarded.eml", enclosingMultiparts: outerBody),
+                    MessagePart(sectionString: "2.1", contentType: "text/html", enclosingMultiparts: innerBody),
+                    part("2.2", innerBody)]
+        }
     }
 
-    @Test("A related body's image named only by its Content-ID is not an attachment (#283)")
-    func relatedImageNamedByContentIdIsInline() {
+    @Test("Only an image directly in a related body, named only by its Content-ID, is not an attachment (#283)",
+          arguments: ContentIdShape.allCases)
+    func contentIdPartClassification(_ shape: ContentIdShape) {
         var info = makeInfo()
-        info.parts = contentIdImage(in: "related")
-        #expect(!IMAPFetchMapping.hasAttachments(from: info))
-        #expect(IMAPFetchMapping.extractAttachments(info: info, message: Message(header: info, parts: info.parts)).isEmpty)
-    }
-
-    @Test("A Content-ID image outside a related body, or with a name of its own, stays an attachment",
-          arguments: [("mixed", "logo@example.com"), ("related", "logo.png")])
-    func contentIdImageKeepsItsFile(subtype: String, filename: String) {
-        var info = makeInfo()
-        info.parts = contentIdImage(in: subtype, filename: filename)
-        #expect(IMAPFetchMapping.hasAttachments(from: info))
+        info.parts = shape.parts
         let attachments = IMAPFetchMapping.extractAttachments(info: info, message: Message(header: info, parts: info.parts))
-        #expect(attachments.map(\.filename) == [filename])
+        #expect(attachments.map(\.filename) == shape.expectedFiles)
+        #expect(IMAPFetchMapping.hasAttachments(from: info) == !shape.expectedFiles.isEmpty)
     }
 
     @Test("customKeywords extracts non-standard IMAP keywords verbatim")

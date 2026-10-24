@@ -1140,6 +1140,7 @@ struct DraftCopyIntegrityTests {
                 + "(\"IMAGE\" \"PNG\" NIL \"<logo@example.com>\" NIL \"BASE64\" \(pngBase64.count)) \"RELATED\")",
             contentType: "multipart/related; boundary=b", body: html + pngBase64,
             partBodies: ["1": html, "2": pngBase64])
+        #expect(!copy.header.hasAttachments)
         #expect(copy.attachments.isEmpty)
         #expect((copy.attachmentData ?? [:]).isEmpty)
         #expect(copy.inlineImages.map(\.contentId) == ["logo@example.com"])
@@ -1157,6 +1158,7 @@ struct DraftCopyIntegrityTests {
             contentType: "multipart/mixed; boundary=b", body: text + pngBase64,
             partBodies: ["1": text, "2": pngBase64])
         #expect(copy.textBody == "Hello")
+        #expect(copy.header.hasAttachments)
         #expect(copy.inlineImages.isEmpty)
         #expect(copy.attachments.map(\.filename) == ["logo@example.com"])
         #expect(copy.attachments.map { copy.attachmentData?[$0.section] } == [png])
