@@ -422,6 +422,47 @@ actor MockEmailProvider: EmailProvider {
         callLog.append("deleteDraft(identity:\(identity))")
     }
 
+    /// #217 server read. Recorded apart from `callLog` so existing exact-log
+    /// assertions are unaffected.
+    var fetchDraftCopyLog: [DraftDeleteIdentity] = []
+    /// The server copy; nil (the default) and `.success(nil)` = the draft is gone.
+    var draftCopyResult: Result<FullMessageInfo?, any Error>?
+
+    func setDraftCopy(_ result: Result<FullMessageInfo?, any Error>?) {
+        draftCopyResult = result
+    }
+
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
+        fetchDraftCopyLog.append(identity)
+        return try draftCopyResult?.get() ?? nil
+    }
+
+    /// A server draft copy as a provider's read returns it. `attachmentData` set =
+    /// the read carried each attachment's bytes (IMAP), keyed by `mock-att-<index>`.
+    static func draftCopy(
+        subject: String, to: [String], cc: [String], bcc: [String] = [], html: String,
+        attachmentNames: [String] = [], attachmentData: [String: Data]? = nil
+    ) -> FullMessageInfo {
+        let header = MessageHeaderInfo(
+            messageId: "mock-draft-copy", rfc822MessageId: nil, inReplyTo: nil,
+            references: [], threadId: nil,
+            subject: subject,
+            from: "", fromAddress: "",
+            to: to.joined(separator: ", "), cc: cc.joined(separator: ", "),
+            bcc: bcc.joined(separator: ", "),
+            replyTo: nil, date: Date(), snippet: "",
+            isRead: true, isFlagged: false, hasAttachments: !attachmentNames.isEmpty,
+            isReplied: false, isForwarded: false, actionTag: nil)
+        let attachments = attachmentNames.enumerated().map { index, name in
+            AttachmentInfo(
+                filename: name, contentType: "application/octet-stream",
+                section: "mock-att-\(index)", size: 0, encoding: nil)
+        }
+        return FullMessageInfo(
+            header: header, htmlBody: html, textBody: nil, attachments: attachments,
+            attachmentData: attachmentData)
+    }
+
     // MARK: - Test Helpers
 
     /// Set moveThrows from outside the actor.

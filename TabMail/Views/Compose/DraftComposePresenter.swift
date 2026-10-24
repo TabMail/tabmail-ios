@@ -6,8 +6,10 @@ import SwiftUI
 import GRDB
 
 /// PORT/SUBTRACT — the repeated v2final `ServerDraftOpen` handoff check,
-/// narrowed to an already-existing locally-authored Draft. No fresh compose,
-/// RFC adoption, recovery, or compatibility path is authorized here.
+/// narrowed to an already-existing Draft row. No fresh compose, RFC adoption,
+/// recovery, or compatibility path is authorized here. A draft written by another
+/// mail app gets its row from `ExternalDraftAdoption` (exact address only, #217)
+/// before this check runs.
 struct LocallyAuthoredDraftOpenAuthority: Sendable, Equatable {
     enum Address: Sendable, Equatable {
         case placeholder(messageId: String)
@@ -73,10 +75,10 @@ struct LocallyAuthoredDraftOpenAuthority: Sendable, Equatable {
     /// green for the whole window in which `.imap` fell through to `default: return
     /// nil` and no IMAP draft could be reopened at all (`MIS-015`).
     ///
-    /// FAIL CLOSED is the default on every axis. Arbitrary server-origin drafts have
-    /// no local `Draft` row, produce no match, and stay unopenable — sync remains
-    /// authoritative for them. An ambiguous result (two local rows claiming the same
-    /// header) refuses rather than guessing.
+    /// FAIL CLOSED is the default on every axis. A server-origin draft has no local
+    /// `Draft` row and produces no match here; `ServerDraftComposeLoader` then adopts
+    /// it (`ExternalDraftAdoption`) and calls this again. An ambiguous result (two
+    /// local rows claiming the same header) refuses rather than guessing.
     static func resolve(
         db: Database,
         header: MessageHeader,

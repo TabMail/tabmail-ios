@@ -292,16 +292,18 @@ struct LocallyAuthoredDraftResolutionTests {
                 "the pre-push placeholder arm must keep working — it is the only handle before the first save lands")
     }
 
-    @Test("A Drafts header with no local Draft row stays closed")
+    /// The resolver itself never invents an owner. Since #217 a server-origin draft
+    /// is opened by ADOPTING it first (`ExternalDraftAdoption`, pinned in
+    /// `ExternalDraftAdoptionTests`), which writes the row this resolver then finds.
+    @Test("A Drafts header with no local Draft row has no owner until it is adopted")
     func aServerOriginDraftStaysClosed() throws {
         let db = try TestDatabase.make()
         let header = try makeFixture(db)
 
         #expect(try resolve(db, header) == nil,
                 """
-                a Drafts header with NO locally-authored row opened a compose — that is the \
-                MIRROR IMAGE of the bug being fixed: arbitrary server-origin drafts must fail \
-                closed, because nothing on this device holds the bytes the user would be editing
+                the resolver returned an owner for a Drafts header with NO local row — \
+                ownership must come only from a row that records this exact address
                 """)
     }
 

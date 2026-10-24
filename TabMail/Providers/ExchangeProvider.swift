@@ -200,12 +200,30 @@ actor ExchangeProvider: EmailProvider {
     }
 
     func fetchMessage(id: String, folder: String) async throws -> FullMessageInfo {
+        try await readMessage(id: id, forDraft: false)
+    }
+
+    /// `forDraft`: read the draft itself, not a render of it (#217). The copy
+    /// replaces the local draft, so it must be complete and hold only the draft:
+    /// - the body comes back as text (`Prefer: outlook.body-content-type`):
+    ///   TabMail uploads drafts as text, and for a draft another app wrote in HTML
+    ///   Exchange's own conversion keeps its line breaks;
+    /// - EVERY attachment, inline images included, is carried as a file under its
+    ///   own name, so the next save pairs it with the server's by that name and an
+    ///   image whose name TabMail cannot store is refused like any file (#241);
+    /// - an attached message stays an attachment: its text is never added to the
+    ///   body (that is the render's `tm-eml-section` marker);
+    /// - an attachment that is not a file (an item or reference attachment) has no
+    ///   bytes to carry, so the read refuses with `DraftCopyUnsupportedAttachment`.
+    private func readMessage(id: String, forDraft: Bool) async throws -> FullMessageInfo {
         let selection = ExchangeGraphMessageRequest.fetchMessage.selection
         let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
-        let data = try await request(path: "/messages/\(encodedId)?\(selection.queryParameter)")
+        let data = try await request(
+            path: "/messages/\(encodedId)?\(selection.queryParameter)",
+            extraHeaders: forDraft ? ["Prefer": "outlook.body-content-type=\"text\""] : [:])
         let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
 
-        guard let header = parseGraphMessage(msg, selection: selection) else {
+        guard let header = parseGraphMessage(msg, selection: selection, keepEmptySubject: forDraft) else {
             throw ProviderError.messageNotFound
         }
 
@@ -222,11 +240,12 @@ actor ExchangeProvider: EmailProvider {
         // Don't use $select here — contentId is a property of fileAttachment subtype,
         // not the base attachment type, so $select rejects it with HTTP 400.
         // Without $select, the API returns all properties including contentId.
-        let attData = try await request(path: "/messages/\(encodedId)/attachments")
-        let attResponse = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: attData)
+        let listed = try await listAttachments(path: "/messages/\(encodedId)/attachments")
         let hasCidRefs = htmlBody?.range(of: "cid:", options: .caseInsensitive) != nil
-        for att in attResponse.value {
-            if att.isInline == true, let rawCid = att.contentId,
+        for att in listed {
+            // Only a file attachment has bytes TabMail can carry (#241).
+            if forDraft, !Self.isFileAttachment(att) { throw DraftCopyUnsupportedAttachment() }
+            if !forDraft, att.isInline == true, let rawCid = att.contentId,
                let ct = att.contentType, ct.lowercased().hasPrefix("image/") {
                 let cid = rawCid.trimmingCharacters(in: .whitespacesAndNewlines)
                     .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
@@ -278,7 +297,8 @@ actor ExchangeProvider: EmailProvider {
                 continue
             }
 
-            if let name = att.name, !name.isEmpty {
+            let draftName = forDraft ? DraftReadConfig.unnamedAttachmentFilename : nil
+            if let name = (att.name?.isEmpty == false ? att.name : draftName) {
                 attachments.append(AttachmentInfo(
                     filename: name,
                     contentType: att.contentType ?? "application/octet-stream",
@@ -294,7 +314,7 @@ actor ExchangeProvider: EmailProvider {
                 // inside the .eml are surfaced with `parentEmlSection = att.id`;
                 // their bytes resolve at tap time through `fetchAttachment`
                 // compound-section handling.
-                if EmlParsing.isEmlFilename(name) {
+                if !forDraft, EmlParsing.isEmlFilename(name) {
                     do {
                         let raw = try await fetchAttachment(messageId: id, attachmentId: att.id)
                         if let parsed = EmlParsing.parse(rawBytes: raw) {
@@ -973,17 +993,23 @@ actor ExchangeProvider: EmailProvider {
         let message = buildGraphSendPayload(draft: draft)
 
         if let existingId = existingDraftId {
-            // Update existing draft via PATCH
-            let jsonData = try JSONSerialization.data(withJSONObject: message)
+            // Update the existing draft. Graph's message PATCH cannot change
+            // attachments (they are not an updatable property), so the PATCH goes
+            // without them and the attachments are replaced through the message's
+            // attachments collection. The server copy then holds exactly this draft,
+            // so reopening it, which loads the server copy, never drops a file added
+            // here (#217).
+            var patch = message
+            patch.removeValue(forKey: "attachments")
+            let jsonData = try JSONSerialization.data(withJSONObject: patch)
             let encodedExistingId = try Self.encodedGraphPathSegment(
                 existingId, context: "Graph draft message id"
             )
             let response = try await request(path: "/messages/\(encodedExistingId)", method: "PATCH", body: jsonData)
-            if let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
-               let msgId = dict["id"] as? String {
-                return .created(.outlook(graphId: msgId))
-            }
-            return .created(.outlook(graphId: existingId))
+            let graphId = (try? JSONSerialization.jsonObject(with: response) as? [String: Any])?["id"] as? String
+                ?? existingId
+            try await replaceDraftAttachments(graphId: graphId, with: draft.attachments)
+            return .created(.outlook(graphId: graphId))
         } else {
             // Create new draft in Drafts folder
             let jsonData = try JSONSerialization.data(withJSONObject: message)
@@ -994,6 +1020,171 @@ actor ExchangeProvider: EmailProvider {
             }
             return .created(.outlook(graphId: msgId))
         }
+    }
+
+    /// #217: the draft's current copy, or nil on 404 (deleted elsewhere).
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
+        guard case .outlook(let graphId) = identity else {
+            throw ProviderError.actionIdentityResolutionFailed("ExchangeProvider received a non-Outlook draft identity")
+        }
+        let encodedId = try Self.encodedGraphPathSegment(graphId, context: "Graph draft message id")
+        let probe = try await authedHTTP.requestAllowing404(url: baseURL + "/messages/\(encodedId)?$select=id")
+        if probe.statusCode == 404 { return nil }
+        return try await readMessage(id: graphId, forDraft: true)
+    }
+
+    /// Make the server draft's attachments match the local ones BY FILE NAME, never
+    /// deleting before adding (#217; owner ruling 2026-10-21):
+    /// 1. list the server's attachments;
+    /// 2. add each local file the server has no same-named copy of (a file of
+    ///    `ExchangeDraftConfig.singlePostAttachmentLimitBytes` or more through an
+    ///    upload session, as Graph documents for 3-150 MB);
+    /// 3. only then delete each server attachment the local draft no longer has.
+    /// A same-named file is left alone, so an unchanged file (one too large for a
+    /// single POST included) is never sent again. Accepted cost (#236, P4):
+    /// replacing a file in TabMail with a different one of the SAME name leaves the
+    /// old one on the server. A failure throws before any delete, so the server
+    /// never loses a file the draft still has; the retried save lists again and adds
+    /// only what is still missing, so a failing add never multiplies copies.
+    /// Only a server attachment the draft read could have carried (a file
+    /// attachment whose name `AttachmentFilename` accepts) is paired or deleted;
+    /// any other one is never touched, since no local draft can name it (#241).
+    private func replaceDraftAttachments(graphId: String, with attachments: [DraftAttachment]) async throws {
+        let encodedId = try Self.encodedGraphPathSegment(graphId, context: "Graph draft message id")
+        let current = try await listAttachments(path: "/messages/\(encodedId)/attachments?$select=id,name")
+        let carried = current.compactMap { att -> (id: String, name: String)? in
+            let name = att.name?.isEmpty == false ? att.name ?? "" : DraftReadConfig.unnamedAttachmentFilename
+            guard Self.isFileAttachment(att), AttachmentFilename.isSafeFileComponent(name) else { return nil }
+            return (id: att.id, name: name)
+        }
+        let plan = Self.draftAttachmentPlan(server: carried, local: attachments)
+        for attachment in plan.add {
+            try await addDraftAttachment(attachment, encodedMessageId: encodedId)
+        }
+        for attachmentId in plan.deleteIds {
+            let encodedAttachmentId = try Self.encodedGraphPathSegment(attachmentId, context: "Graph attachment id")
+            _ = try await request(
+                path: "/messages/\(encodedId)/attachments/\(encodedAttachmentId)", method: "DELETE")
+        }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Exchange] saveDraft: added \(plan.add.count), removed \(plan.deleteIds.count) attachment(s)")
+        }
+    }
+
+    /// Every attachment of a message, following Graph's `@odata.nextLink` (#217):
+    /// a draft read keeps exactly the files listed and a draft save deletes the
+    /// server files the local draft lacks, so a page read as the whole list would
+    /// drop the later files on open and delete them on the next save. More than
+    /// `ExchangeDraftConfig.maxAttachmentListPages` pages throws
+    /// `GraphAttachmentListIncomplete` rather than act on part of the list.
+    private func listAttachments(path: String) async throws -> [GraphAttachmentMeta] {
+        var page = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: try await request(path: path))
+        var attachments = page.value
+        var pages = 1
+        while let link = page.odataNextLink {
+            guard pages < ExchangeDraftConfig.maxAttachmentListPages else { throw GraphAttachmentListIncomplete() }
+            page = try JSONDecoder().decode(GraphAttachmentListResponse.self, from: try await requestAbsolute(url: link))
+            attachments += page.value
+            pages += 1
+        }
+        return attachments
+    }
+
+    /// A message's attachment list did not end within
+    /// `ExchangeDraftConfig.maxAttachmentListPages` pages.
+    struct GraphAttachmentListIncomplete: Error {}
+
+    /// Whether a Graph attachment is a `#microsoft.graph.fileAttachment`. A list
+    /// entry of a derived type carries its `@odata.type` (OData minimal metadata),
+    /// `$select` or not; an entry without one is not treated as a file.
+    private static func isFileAttachment(_ att: GraphAttachmentMeta) -> Bool {
+        (att.odataType ?? "").lowercased().contains("fileattachment")
+    }
+
+    /// Pair local files with server attachments by name, one to one (two local
+    /// files of one name need two server ones). Unpaired local files are added;
+    /// unpaired server attachments are deleted.
+    nonisolated static func draftAttachmentPlan(
+        server: [(id: String, name: String)], local: [DraftAttachment]
+    ) -> (add: [DraftAttachment], deleteIds: [String]) {
+        var unpaired = server
+        var add: [DraftAttachment] = []
+        for attachment in local {
+            if let index = unpaired.firstIndex(where: { $0.name == attachment.filename }) {
+                unpaired.remove(at: index)
+            } else {
+                add.append(attachment)
+            }
+        }
+        return (add, unpaired.map(\.id))
+    }
+
+    /// Add one file to a draft: a single POST under the documented size, else an
+    /// upload session whose byte ranges are PUT in order to its pre-authenticated
+    /// URL, with no `Authorization` header (Graph: "Attach large files to Outlook
+    /// messages"). Any failure throws; nothing is deleted on this path.
+    private func addDraftAttachment(_ attachment: DraftAttachment, encodedMessageId: String) async throws {
+        let total = attachment.data.count
+        if total < ExchangeDraftConfig.singlePostAttachmentLimitBytes {
+            let body = try JSONSerialization.data(withJSONObject: Self.graphFileAttachment(attachment))
+            _ = try await request(path: "/messages/\(encodedMessageId)/attachments", method: "POST", body: body)
+            return
+        }
+        let sessionBody = try JSONSerialization.data(withJSONObject: [
+            "AttachmentItem": [
+                "attachmentType": "file",
+                "name": attachment.filename,
+                "contentType": attachment.mimeType,
+                "size": total,
+            ] as [String: Any],
+        ])
+        let sessionData = try await request(
+            path: "/messages/\(encodedMessageId)/attachments/createUploadSession", method: "POST", body: sessionBody)
+        let uploadURL = try Self.validatedUploadURL(
+            (try? JSONSerialization.jsonObject(with: sessionData) as? [String: Any])?["uploadUrl"] as? String)
+        var offset = 0
+        while offset < total {
+            let end = min(offset + ExchangeDraftConfig.uploadChunkBytes, total)
+            var put = URLRequest(url: uploadURL)
+            put.httpMethod = "PUT"
+            put.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+            put.setValue("bytes \(offset)-\(end - 1)/\(total)", forHTTPHeaderField: "Content-Range")
+            put.httpBody = attachment.data.subdata(in: offset..<end)
+            let response: URLResponse
+            do {
+                (_, response) = try await (testSession ?? sharedEphemeralSession).data(for: put)
+            } catch let error as URLError {
+                // The session URL carries a pre-authenticated token, and a URLError
+                // carries its failing URL into every log line that prints the error
+                // (the queue's failure log, which the user can export). Keep only the
+                // code, which is all the retry classification reads.
+                throw URLError(error.code)
+            }
+            // Graph answers each range but the last with 200 and the upload's
+            // progress, and the last with 201 once the attachment exists. A 200 to
+            // the last range means the upload is still incomplete: no attachment,
+            // so the deletes that follow every add must not run.
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == (end == total ? 201 : 200) else {
+                throw ProviderError.networkError(underlying: HTTPError.networkError(statusCode: status))
+            }
+            offset = end
+        }
+    }
+
+    /// The upload session's URL, only if it is https on a documented Outlook host:
+    /// the file's bytes go to it with no further check.
+    nonisolated static func validatedUploadURL(_ raw: String?) throws -> URL {
+        guard let raw, let components = URLComponents(string: raw),
+              components.scheme == "https",
+              let host = components.host?.lowercased(),
+              ExchangeDraftConfig.uploadHosts.contains(host),
+              components.user == nil, components.password == nil,
+              components.port == nil || components.port == 443,
+              let url = components.url else {
+            throw ProviderError.invalidURL("Graph attachment upload session")
+        }
+        return url
     }
 
     func deleteDraft(identity: DraftDeleteIdentity) async throws {
@@ -1335,20 +1526,22 @@ actor ExchangeProvider: EmailProvider {
     /// ⚠ NEGATIVE CASE, because `fatalError` is an absolute and an unqualified one
     /// would be `MIS-019`: `fatalError` is correct HERE because the condition is a
     /// PROGRAMMER error unreachable by construction — every call site in this file
-    /// passes a string literal (`"POST"`, `"PATCH"`, and the `"GET"` default), there
+    /// passes a string literal (`"POST"`, `"PATCH"`, `"DELETE"`, and the `"GET"` default), there
     /// is no computed verb, and `deleteDraft`'s `DELETE` bypasses this switch
     /// entirely via `performHTTPRequest` with an absolute `url:`. It must NOT be
     /// widened into a runtime trap for conditions that are genuinely reachable —
     /// server-, network- or user-driven — and it must not be copied into any other
     /// switch on that reasoning alone.
-    private func request(path: String, method: String = "GET", body: Data? = nil) async throws -> Data {
+    private func request(
+        path: String, method: String = "GET", body: Data? = nil, extraHeaders: [String: String] = [:]
+    ) async throws -> Data {
         let url = baseURL + path
         do {
             switch method {
-            case "GET": return try await authedHTTP.get(url)
-            case "POST": return try await authedHTTP.post(url, body: body ?? Data())
-            case "PATCH": return try await authedHTTP.patch(url, body: body ?? Data())
-            case "DELETE": return try await authedHTTP.delete(url)
+            case "GET": return try await authedHTTP.get(url, extraHeaders: extraHeaders)
+            case "POST": return try await authedHTTP.post(url, body: body ?? Data(), extraHeaders: extraHeaders)
+            case "PATCH": return try await authedHTTP.patch(url, body: body ?? Data(), extraHeaders: extraHeaders)
+            case "DELETE": return try await authedHTTP.delete(url, extraHeaders: extraHeaders)
             default: fatalError("ExchangeProvider.request: unsupported HTTP method \(method)")
             }
         } catch let e as HTTPError {
@@ -1448,9 +1641,13 @@ actor ExchangeProvider: EmailProvider {
     ///   that produced `msg`. There is no default: a parser caller must carry
     ///   its request shape through this boundary, and `GraphParse` derives the
     ///   `parentFolderId` expectation from that shape.
+    /// - Parameter keepEmptySubject: a draft copy's subject is the draft's own, so
+    ///   an empty one stays empty rather than becoming the "(no subject)" a list
+    ///   shows (#217).
     internal func parseGraphMessage(
         _ msg: GraphMessage,
-        selection: GraphMessageSelection
+        selection: GraphMessageSelection,
+        keepEmptySubject: Bool = false
     ) -> MessageHeaderInfo? {
         // Round-trip through JSON so the shared parser is the single source of
         // truth. Cheap — we already decoded once on the way in.
@@ -1471,7 +1668,7 @@ actor ExchangeProvider: EmailProvider {
             inReplyTo: metadata.inReplyTo,
             references: metadata.references,
             threadId: metadata.threadId,
-            subject: metadata.subject.isEmpty ? "(no subject)" : metadata.subject,
+            subject: metadata.subject.isEmpty && !keepEmptySubject ? "(no subject)" : metadata.subject,
             from: metadata.from.name,
             fromAddress: metadata.from.email,
             to: metadata.to.map { $0.email }.joined(separator: ", "),
@@ -1563,17 +1760,19 @@ actor ExchangeProvider: EmailProvider {
 
         // Attachments
         if !draft.attachments.isEmpty {
-            message["attachments"] = draft.attachments.map { att in
-                [
-                    "@odata.type": "#microsoft.graph.fileAttachment",
-                    "name": att.filename,
-                    "contentType": att.mimeType,
-                    "contentBytes": att.data.base64EncodedString(),
-                ] as [String: Any]
-            }
+            message["attachments"] = draft.attachments.map(Self.graphFileAttachment)
         }
 
         return message
+    }
+
+    nonisolated static func graphFileAttachment(_ attachment: DraftAttachment) -> [String: Any] {
+        [
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": attachment.filename,
+            "contentType": attachment.mimeType,
+            "contentBytes": attachment.data.base64EncodedString(),
+        ]
     }
 
     // MARK: - Query Helpers
@@ -1684,6 +1883,12 @@ struct GraphBody: Codable {
 
 private struct GraphAttachmentListResponse: Decodable {
     let value: [GraphAttachmentMeta]
+    let odataNextLink: String?
+
+    enum CodingKeys: String, CodingKey {
+        case value
+        case odataNextLink = "@odata.nextLink"
+    }
 }
 
 private struct GraphAttachmentMeta: Decodable {
@@ -1759,4 +1964,20 @@ private struct GraphDeltaMessage: Decodable {
 
 private struct GraphRemoved: Decodable {
     let reason: String?
+}
+
+/// #217: Outlook draft attachment upload (Graph "Attach large files to Outlook
+/// messages"). Graph says "under 3 MB" for a single POST and an upload session for
+/// 3-150 MB without defining the unit; a binary megabyte is assumed. A file the
+/// service refuses on either path only fails its add, which is retried and never
+/// deletes anything.
+enum ExchangeDraftConfig {
+    static let singlePostAttachmentLimitBytes = 3 * 1024 * 1024
+    /// Each PUT's byte range; Graph asks for under 4 MB per request.
+    static let uploadChunkBytes = 3 * 1024 * 1024
+    static let uploadHosts: Set<String> = ["outlook.office.com", "outlook.office365.com"]
+    /// Pages of one message's attachment list read before giving up. Graph caps a
+    /// message at 150 MB, so a real list ends long before; the cap only stops a
+    /// list that never does.
+    static let maxAttachmentListPages = 50
 }

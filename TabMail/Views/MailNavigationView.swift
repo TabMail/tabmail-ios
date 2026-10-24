@@ -1167,9 +1167,11 @@ private struct PushedMessageDestination: View {
     }
 }
 
-/// Reopens only a locally-authored draft whose generation placeholder or exact
-/// provider-native address matches the selected Drafts header. Arbitrary
-/// server-origin drafts intentionally fail closed; sync remains authoritative.
+/// Opens a Drafts header as an editable compose. A draft this device owns reopens
+/// through its generation placeholder or exact provider-native address; a draft
+/// written by another mail app is first adopted (`ExternalDraftAdoption`, #217) and
+/// then opens the same way. The compose checks the row against the server copy
+/// before showing it (`ExternalDraftAdoption.refreshBeforeOpen`, ADR-IOS-091).
 struct ServerDraftComposeLoader: View {
     let header: MessageHeader
     #if DEBUG
@@ -1194,15 +1196,18 @@ struct ServerDraftComposeLoader: View {
     enum Resolution: Equatable {
         /// A local, editable `Draft` was resolved AND re-authorized for this header.
         case authorized(LocallyAuthoredDraftOpenAuthority)
-        /// AUTHORITATIVE ABSENCE. Every read completed and this device provably holds
-        /// no editable copy. Fail closed honestly — no retry prompt, because retrying
-        /// cannot change the answer.
+        /// AUTHORITATIVE ABSENCE. Every read completed and there is no local owner
+        /// and nothing exact to adopt (the header changed or has no exact address).
+        /// Fail closed honestly — no retry prompt.
         case noLocalCopy
         /// ⚑ NO REFERENCE — INVENTED, same rationale as
         /// `DraftComposePresenter.LoadResult.loadFailed`. A read or a provider call
         /// THREW, so whether a local copy exists is UNKNOWN. Retryable, never
         /// authoritative.
         case resolveFailed
+        /// The draft holds an attachment TabMail cannot carry (#241). Final, never
+        /// retryable: the draft is edited in another app.
+        case unsupportedAttachment
     }
 
     var body: some View {
@@ -1216,12 +1221,10 @@ struct ServerDraftComposeLoader: View {
                     draftId: openAuthority.draftId,
                     openAuthority: openAuthority)
             case .noLocalCopy:
-                // STATE ONLY THE OBSERVED FACT — do not promise a remedy. The
-                // refusal turns on LOCAL `Draft` state, and no sync path produces a
-                // `Draft` row (`Draft` has zero sync-engine construction sites), so
-                // the superseded copy — "Sync the Drafts folder and try again." —
-                // sent the user to do something that provably cannot help. Same
-                // precedent as `afa7889ee` (`IOS-IMAP-001`'s fifth-path closure).
+                // STATE ONLY THE OBSERVED FACT — do not promise a remedy. Since
+                // #217 every draft with an exact server address is adopted, so this
+                // arm is reached only when the header changed or vanished under us,
+                // or has no exact address (an IMAP folder whose epoch is unknown).
                 //
                 // ⚠️ THIS ARM IS FOR A PROVEN ABSENCE ONLY. The thrown-read case used
                 // to land here too; it now has its own arm below. Do not merge them
@@ -1231,7 +1234,7 @@ struct ServerDraftComposeLoader: View {
                 ContentUnavailableView {
                     Label("Draft unavailable", systemImage: "exclamationmark.shield")
                 } description: {
-                    Text("No editable copy of this draft was found on this device.")
+                    Text("This draft couldn't be opened. It may have been changed or deleted in another app.")
                 } actions: {
                     Button("Close") { dismiss() }
                         .buttonStyle(.bordered)
@@ -1263,6 +1266,16 @@ struct ServerDraftComposeLoader: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color(.systemBackground))
+            case .unsupportedAttachment:
+                ContentUnavailableView {
+                    Label("Draft unavailable", systemImage: "paperclip")
+                } description: {
+                    Text(DraftReadConfig.unsupportedAttachmentMessage)
+                } actions: {
+                    Button("Close") { dismiss() }
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("server-draft-close")
+                }
             }
         }
         .task {
@@ -1280,6 +1293,7 @@ struct ServerDraftComposeLoader: View {
         switch outcome {
         case .success(let authority?): .authorized(authority)
         case .success(nil): .noLocalCopy
+        case .failure(let error) where error is DraftCopyUnsupportedAttachment: .unsupportedAttachment
         case .failure: .resolveFailed
         }
     }
@@ -1287,7 +1301,14 @@ struct ServerDraftComposeLoader: View {
     private func resolveLocallyAuthoredDraft() async {
         let outcome: Result<LocallyAuthoredDraftOpenAuthority?, any Error>
         do {
-            outcome = .success(try await resolveOpenAuthority())
+            #if DEBUG
+            if let resolveOpenAuthorityForTesting {
+                outcome = .success(try await resolveOpenAuthorityForTesting())
+                resolution = Self.classify(outcome)
+                return
+            }
+            #endif
+            outcome = .success(try await Self.resolveOpenAuthority(header: header))
         } catch {
             outcome = .failure(error)
         }
@@ -1296,17 +1317,13 @@ struct ServerDraftComposeLoader: View {
 
     /// Returns the authority when this device provably holds an editable copy, `nil`
     /// when it provably does not, and THROWS when the answer could not be determined.
+    /// Static, so the tests run this production sequence itself.
     ///
     /// The `nil` returns below are all fully-determined refusals — a provider that is
     /// not registered for this account, a runtime kind we do not open, a candidate
     /// whose runtime kind changed under us. None of them is a thrown read, and none
     /// changes behaviour here; only the `catch` in the caller does.
-    private func resolveOpenAuthority() async throws -> LocallyAuthoredDraftOpenAuthority? {
-        #if DEBUG
-        if let resolveOpenAuthorityForTesting {
-            return try await resolveOpenAuthorityForTesting()
-        }
-        #endif
+    static func resolveOpenAuthority(header: MessageHeader) async throws -> LocallyAuthoredDraftOpenAuthority? {
         guard let runtimeKind = await AccountManager.shared
             .draftRuntimeIdentityKind(accountId: header.accountId),
               runtimeKind != .unknown else {
@@ -1314,9 +1331,32 @@ struct ServerDraftComposeLoader: View {
         }
 
         if runtimeKind == .gmail {
-            return try await resolveGmailDraft()
+            return try await resolveGmailDraft(header: header)
         }
 
+        if let owner = try await resolveLocalOwner(header: header, runtimeKind: runtimeKind) {
+            return owner
+        }
+        // #217: no local owner, so this draft was written by another mail app (or
+        // this device's row was evicted). Take it over, then resolve again.
+        guard let address = try await AppDatabase.dbPool.read({ db in
+            try ExternalDraftAdoption.adoptableAddress(
+                db: db, header: header, runtimeKind: runtimeKind)
+        }) else {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[DraftAdoption] No exact address for header=\(DebugModeManager.escapedForLogLine(String(header.id.prefix(60)))) kind=\(runtimeKind) — not adoptable")
+            }
+            return nil
+        }
+        try await ExternalDraftAdoption.adopt(
+            header: header, address: address, runtimeKind: runtimeKind)
+        return try await resolveLocalOwner(header: header, runtimeKind: runtimeKind)
+    }
+
+    private static func resolveLocalOwner(
+        header: MessageHeader,
+        runtimeKind: DraftRuntimeIdentityKind
+    ) async throws -> LocallyAuthoredDraftOpenAuthority? {
         let candidate = try await AppDatabase.dbPool.read { db in
             try LocallyAuthoredDraftOpenAuthority.resolve(
                 db: db, header: header, runtimeKind: runtimeKind)
@@ -1332,7 +1372,7 @@ struct ServerDraftComposeLoader: View {
     /// PORT — narrow v2final Gmail contained-MESSAGE → RESOURCE lookup. The
     /// provider await is followed by a fresh header/folder/account/local-owner
     /// census; nothing captured before the await authorizes the handoff.
-    private func resolveGmailDraft() async throws -> LocallyAuthoredDraftOpenAuthority? {
+    private static func resolveGmailDraft(header: MessageHeader) async throws -> LocallyAuthoredDraftOpenAuthority? {
         let preflight = try await AppDatabase.dbPool.read { db -> (Account, String)? in
             guard let current = try MessageHeader.fetchOne(db, key: header.id),
                   current.accountId == header.accountId,
@@ -1360,6 +1400,25 @@ struct ServerDraftComposeLoader: View {
             return nil
         }
 
+        if let owner = try await gmailOwner(
+            header: header, account: account, folderPath: folderPath, resourceId: resourceId) {
+            return owner
+        }
+        // #217: no local owner — take over the server draft, then resolve again.
+        try await ExternalDraftAdoption.adopt(
+            header: header,
+            address: .gmail(resourceId: resourceId, containedMessageId: header.messageId),
+            runtimeKind: .gmail)
+        return try await gmailOwner(
+            header: header, account: account, folderPath: folderPath, resourceId: resourceId)
+    }
+
+    private static func gmailOwner(
+        header: MessageHeader,
+        account: Account,
+        folderPath: String,
+        resourceId: String
+    ) async throws -> LocallyAuthoredDraftOpenAuthority? {
         let candidate = try await AppDatabase.dbPool.read { db -> LocallyAuthoredDraftOpenAuthority? in
             guard let current = try MessageHeader.fetchOne(db, key: header.id),
                   current.accountId == account.id,

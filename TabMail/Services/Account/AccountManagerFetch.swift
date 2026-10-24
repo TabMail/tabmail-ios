@@ -330,14 +330,30 @@ extension AccountManager {
         guard await !attachmentFetchIsBlockedByPendingAddress(for: message) else {
             throw ProviderError.addressPendingMove(message.id)
         }
+        return try await fetchAttachment(
+            accountId: message.accountId, messageId: message.messageId,
+            folderPath: message.folderPath, section: section, encoding: encoding)
+    }
+
+    /// Download one attachment by its provider coordinates. The caller owns the
+    /// address: a synced header goes through `fetchAttachment(for:)` and its
+    /// pending-move check; #217 adoption passes the coordinates of the server copy
+    /// it has just read (`ExternalDraftAdoption`).
+    func fetchAttachment(
+        accountId: String,
+        messageId: String,
+        folderPath: String,
+        section: String,
+        encoding: String?
+    ) async throws -> Data {
         // Ensure provider exists
-        if providers[message.accountId] == nil {
-            guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: message.accountId) }) else {
+        if providers[accountId] == nil {
+            guard let account = try? await dbPool.read({ db in try Account.fetchOne(db, key: accountId) }) else {
                 throw ProviderError.notConnected
             }
             try await connectAccount(account)
         }
-        guard let queue = workQueues[message.accountId] else {
+        guard let queue = workQueues[accountId] else {
             throw ProviderError.notConnected
         }
         let provider = queue.provider
@@ -346,11 +362,11 @@ extension AccountManager {
             do {
                 return try await queue.execute(priority: .userAction) {
                     if let imapProvider = provider as? IMAPProvider {
-                        return try await imapProvider.fetchAttachment(messageId: message.messageId, folder: message.folderPath, section: section, encoding: encoding)
+                        return try await imapProvider.fetchAttachment(messageId: messageId, folder: folderPath, section: section, encoding: encoding)
                     } else if let gmailProvider = provider as? GmailProvider {
-                        return try await gmailProvider.fetchAttachment(messageId: message.messageId, attachmentId: section)
+                        return try await gmailProvider.fetchAttachment(messageId: messageId, attachmentId: section)
                     } else if let exchangeProvider = provider as? ExchangeProvider {
-                        return try await exchangeProvider.fetchAttachment(messageId: message.messageId, attachmentId: section)
+                        return try await exchangeProvider.fetchAttachment(messageId: messageId, attachmentId: section)
                     }
                     throw ProviderError.notConnected
                 }

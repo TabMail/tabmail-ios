@@ -487,7 +487,11 @@ final class FakeHTTP: URLProtocol, @unchecked Sendable {
     /// callbacks in exactly the same order.
     private func deliver(_ canned: CannedResponse, url: URL) {
         if let transportErrorCode = canned.transportErrorCode {
-            client?.urlProtocol(self, didFailWithError: URLError(transportErrorCode))
+            // The real URL loader names the failing URL, query included, in the
+            // error's userInfo; URLSession passes a protocol's error through as it
+            // is, so it is added here for tests of what a logged error reveals.
+            client?.urlProtocol(self, didFailWithError: URLError(
+                transportErrorCode, userInfo: [NSURLErrorFailingURLErrorKey: url]))
             return
         }
 

@@ -3580,8 +3580,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// Build FullMessageInfo from BODYSTRUCTURE info + fetched message data.
     /// Extracted from fetchMessageOnConnection so batch fetch can reuse it.
     /// Returns nil if the header can't be parsed — caller should treat as fetch failure.
-    private func buildFullMessageInfo(info: MessageInfo, message: Message) -> FullMessageInfo? {
-        guard let header = mapMessageInfo(info) else { return nil }
+    /// `keepEmptySubject`: see `mapMessageInfo`.
+    private func buildFullMessageInfo(info: MessageInfo, message: Message, keepEmptySubject: Bool = false) -> FullMessageInfo? {
+        guard let header = mapMessageInfo(info, keepEmptySubject: keepEmptySubject) else { return nil }
 
         // Classify each attachment as top-level vs nested-in-.eml by checking
         // whether its MIME section is a descendant of any message/rfc822 section.
@@ -5778,6 +5779,135 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
+    /// #217: the draft's current copy under the recorded UIDVALIDITY. Read-only.
+    /// A PROVEN epoch change, a confirmed-absent mailbox or an absent UID is nil (the
+    /// address names nothing any more — another app's edit is a new APPEND under a
+    /// new UID); an UNKNOWN epoch throws.
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
+        guard case .imap(let folder, let uidValidity, let uid) = identity,
+              uid > 0, uidValidity > 0,
+              let recordedUidValidity = UInt32(exactly: uidValidity),
+              let targetUidValue = UInt32(exactly: uid) else {
+            throw ProviderError.actionIdentityResolutionFailed("IMAPProvider received an unusable draft identity")
+        }
+        do {
+            return try await withActionConnectionSelection(folder: folder) { server, selection in
+                do {
+                    try self.requireUidValidity(
+                        selection, expected: recordedUidValidity, folder: folder)
+                } catch ProviderError.uidValidityChanged {
+                    return nil
+                }
+                let infos = try await server.fetchMessageInfosBulk(using: UIDSet(UID(targetUidValue)))
+                guard let info = infos.first(where: { $0.uid?.value == targetUidValue }) else { return nil }
+                // Read the content under THIS selection, whose UIDVALIDITY was just
+                // proven. `fetchMessageOnConnection` would SELECT again without that
+                // proof, and a mailbox recreated in between could hand back another
+                // draft at the same UID.
+                let message = try await server.fetchMessage(from: info)
+                guard let full = self.buildFullMessageInfo(info: info, message: message, keepEmptySubject: true) else {
+                    throw ProviderError.messageNotFound
+                }
+                return try Self.completeDraftCopy(full, message: message)
+            }
+        } catch is IMAPActionMailboxAbsent {
+            return nil
+        }
+    }
+
+    /// #217: the draft itself, not the render `buildFullMessageInfo` made of it, and
+    /// all of it, from the one read above (adoption never fetches again without the
+    /// proven UIDVALIDITY):
+    /// - the body is the draft's own text/plain and text/html parts (each joined in
+    ///   order when split around an inline part); nothing inside an attached message
+    ///   (`message/rfc822`) joins it;
+    /// - every image with a Content-ID outside an attached message is an inline
+    ///   image, whether or not the body references it;
+    /// - every top-level attachment, and any other part that is neither body nor
+    ///   inline image, is a file carried with its decoded bytes, keyed by section.
+    /// A part that came back without bytes THROWS (retryable), never "absent".
+    nonisolated static func completeDraftCopy(_ full: FullMessageInfo, message: Message) throws -> FullMessageInfo {
+        let rfc822Sections: [[Int]] = message.parts.compactMap { part in
+            part.contentType.lowercased().hasPrefix("message/rfc822") ? part.section.components : nil
+        }
+        func insideAttachedMessage(_ part: MessagePart) -> Bool {
+            IMAPFetchMapping.parentEmlSection(for: part.section.components, rfc822Sections: rfc822Sections) != nil
+        }
+        var partsBySection: [String: MessagePart] = [:]
+        for part in message.parts { partsBySection[part.section.description] = part }
+        // A file keeps the name its fetched part carries: SwiftMail restores it from
+        // the part's own MIME header when the summary's BODYSTRUCTURE lost characters.
+        var attachments = full.attachments.filter { $0.parentEmlSection == nil }.map { attachment in
+            guard let name = partsBySection[attachment.section]?.filename else { return attachment }
+            return AttachmentInfo(
+                filename: name, contentType: attachment.contentType, section: attachment.section,
+                size: attachment.size, encoding: attachment.encoding)
+        }
+        var fileSections = Set(attachments.map(\.section))
+        var textBody: String?
+        var htmlBody: String?
+        var inlineImages: [InlineImage] = []
+        for part in message.parts where !insideAttachedMessage(part) && !fileSections.contains(part.section.description) {
+            let contentType = part.contentType.lowercased()
+            if contentType.hasPrefix("multipart/") { continue }
+            let isBodyText = contentType.hasPrefix("text/plain") || contentType.hasPrefix("text/html")
+            if isBodyText, part.filename == nil, part.disposition?.lowercased() != "attachment" {
+                guard Self.draftPartArrived(part), let text = part.draftTextContent else {
+                    throw IMAPDraftCopyIncomplete(section: part.section.description)
+                }
+                if contentType.hasPrefix("text/plain") {
+                    textBody = (textBody ?? "") + EmailFilter.decodeFormatFlowed(text, contentType: part.contentType)
+                }
+                else { htmlBody = (htmlBody ?? "") + text }
+                continue
+            }
+            let contentId = (part.contentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if contentType.hasPrefix("image/"), !contentId.isEmpty {
+                guard Self.draftPartArrived(part), let data = part.decodedData() else {
+                    throw IMAPDraftCopyIncomplete(section: part.section.description)
+                }
+                inlineImages.append(InlineImage(contentId: contentId, contentType: part.contentType, data: data))
+                continue
+            }
+            attachments.append(AttachmentInfo(
+                filename: part.filename ?? part.suggestedFilename,
+                contentType: part.contentType,
+                section: part.section.description,
+                size: part.data?.count ?? 0,
+                encoding: part.encoding))
+            fileSections.insert(part.section.description)
+        }
+        var attachmentData: [String: Data] = [:]
+        for attachment in attachments {
+            guard let part = partsBySection[attachment.section], Self.draftPartArrived(part),
+                  let data = part.decodedData() else {
+                throw IMAPDraftCopyIncomplete(section: attachment.section)
+            }
+            attachmentData[attachment.section] = data
+        }
+        return FullMessageInfo(
+            header: full.header, htmlBody: htmlBody, textBody: textBody,
+            attachments: attachments, inlineImages: inlineImages, icsData: full.icsData,
+            attachmentData: attachmentData)
+    }
+
+    /// Whether a draft-copy part's bytes arrived whole. SwiftMail's part fetch
+    /// answers a FETCH whose response carries no `BODY[n]` with EMPTY bytes, not an
+    /// error, and a server can answer with fewer bytes than the part holds, so a
+    /// part that came back shorter than the encoded size BODYSTRUCTURE declares
+    /// (RFC 9051 §7.5.2) never arrived. A part of unknown size is taken as read.
+    nonisolated static func draftPartArrived(_ part: MessagePart) -> Bool {
+        guard let data = part.data else { return false }
+        return part.size.map { data.count >= $0 } ?? true
+    }
+
+    /// A draft-copy part that came back without bytes. Retryable; never "gone".
+    struct IMAPDraftCopyIncomplete: Error {
+        let section: String
+    }
+
     /// PORT/SUBTRACT of `v2final.deleteDraftStrong`: retain its UID validation and
     /// absent-target no-op, but omit optional RFC corroboration because v3's typed
     /// identity has no RFC leg.
@@ -6823,7 +6953,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// ENVELOPE date are missing/unparseable. Such messages are treated as fetch
     /// failures: if the date is broken, other fields are likely broken too. Next
     /// fetch cycle will retry — by then the server should have indexed the message.
-    private func mapMessageInfo(_ info: MessageInfo) -> MessageHeaderInfo? {
+    /// `keepEmptySubject`: a draft copy's subject is the draft's own, so an absent
+    /// one reads as empty rather than as the "(no subject)" a list shows (#217).
+    private func mapMessageInfo(_ info: MessageInfo, keepEmptySubject: Bool = false) -> MessageHeaderInfo? {
         // Shared with the NSE (`NSEIMAPConnection.mapInfoToMetadata`), so both
         // targets list a message under the same sender.
         let from = IMAPFetchMapping.sender(from: info)
@@ -6862,7 +6994,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
         }
 
-        let subject = info.subject ?? "(no subject)"
+        let subject = info.subject ?? (keepEmptySubject ? "" : "(no subject)")
         // `messageId` + `rfc822MessageId` go through the shared
         // `IMAPFetchMapping` helper so NSE's one-shot fetch and this sync
         // path produce byte-identical output for the same `MessageInfo`.
@@ -7043,5 +7175,23 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
 
     static func escapeHtml(_ string: String) -> String {
         EmlMarker.escapeHtml(string)
+    }
+}
+
+extension MessagePart {
+    /// #217: a draft-copy text part's text as written, or nil. `textContent` is
+    /// the viewing decoder: when the declared charset does not resolve or does
+    /// not decode, it falls back through Windows-1252 and Latin-1, which accept
+    /// any bytes, so GBK text under a label the platform does not know reads as
+    /// Latin mojibake. A draft's text becomes the editable copy, so a guess never
+    /// does: a declared charset decodes the bytes, or there is no text. Not even
+    /// UTF-8 is tried after it, since the same bytes can be other text in the
+    /// declared charset (C2 A9 is GBK 漏 and UTF-8 ©). A part declaring no charset
+    /// reads as `textContent` reads it.
+    var draftTextContent: String? {
+        guard let declaredCharset else { return textContent }
+        guard let bytes = decodedData(),
+              let encoding = String.Encoding(mimeCharset: declaredCharset) else { return nil }
+        return String(data: bytes, encoding: encoding)
     }
 }

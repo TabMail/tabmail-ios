@@ -205,6 +205,26 @@ actor DraftStore {
         return .applied
     }
 
+    /// #217 — insert a row adopted from another mail app's server draft
+    /// (`ExternalDraftAdoption.insertAdoptedDraft`, inside its write transaction).
+    ///
+    /// Not `applySave`: that INSERT arm turns `"pushed"` into `"dirty"`, which would
+    /// claim a local edit that does not exist. An adopted row IS the server copy, so
+    /// it keeps `"pushed"` and its exact address; the user's first edit goes through
+    /// `admitSave`/`applySave` like any other. A brand-new key, so like `admitSave`'s
+    /// insert arm there is no predecessor generation to check.
+    ///
+    /// Eviction rank 0, below every draft saved on this device: opening another
+    /// app's draft is not a save, so it must never push a draft typed here, whose
+    /// text may not have reached the server yet, past the keep-limit. An evicted
+    /// adopted row is a server copy the next open adopts again. Its first edit
+    /// ranks it like any save (`applySave`).
+    static func applyAdoption(_ draft: Draft, db: Database) throws {
+        var inserted = draft
+        inserted.lastTouchedSeq = 0
+        try inserted.insert(db)
+    }
+
     /// PORT — v2final `DraftStore.nextLastTouchedSeq`. The next monotonic
     /// eviction-recency sequence, computed INSIDE the save write transaction. GRDB's
     /// `DatabasePool` serializes writers, so `MAX+1` across concurrent saves is
@@ -405,7 +425,7 @@ actor DraftStore {
             previousIdentity: previousIdentity)
     }
 
-    private static func priorIdentity(
+    static func priorIdentity(
         for draft: Draft,
         runtimeKind: DraftRuntimeIdentityKind
     ) -> DraftDeleteIdentity? {
@@ -776,13 +796,17 @@ actor DraftStore {
             dirName: initialDraft.attachmentsDirName)
 
         // Build every provider payload field from the exact pre-A snapshot.
+        // The body goes up as the plain text the user typed (#217): reopening a
+        // pushed Gmail or Outlook draft reads the server copy back, and only the
+        // text itself comes back with every space and line break. An HTML body
+        // would not (`plainTextToHTML` joins a line ending in a space to the next).
         var payload = DraftMessage(
             to: initialDraft.toArray,
             cc: initialDraft.ccArray,
             bcc: initialDraft.bccArray,
             subject: initialDraft.subject,
-            body: MessageBody.plainTextToHTML(initialDraft.body),
-            isHTML: true,
+            body: initialDraft.body,
+            isHTML: false,
             inReplyTo: nil,
             attachments: attachments)
         payload.messageId = freshRfc
@@ -1153,21 +1177,11 @@ actor DraftStore {
                     if let header = try MessageHeader.fetchOne(db, key: replyToId), header.isInInbox {
                         continue
                     }
-                    // Fallback: extract stableId from draft.id.
-                    // Format: "reply:{accountId}:{stableId}" or "forward:{accountId}:{stableId}".
-                    // Drop the prefix ("reply:" or "forward:"), then find first ":" to separate
-                    // accountId from stableId. This handles stableIds containing colons
-                    // (rare but valid in rfc822MessageId local-parts).
-                    let afterPrefix: Substring
-                    if draft.id.hasPrefix("reply:") {
-                        afterPrefix = draft.id.dropFirst(6) // "reply:".count
-                    } else if draft.id.hasPrefix("forward:") {
-                        afterPrefix = draft.id.dropFirst(8) // "forward:".count
-                    } else {
-                        afterPrefix = ""
-                    }
-                    if let colonIdx = afterPrefix.firstIndex(of: ":") {
-                        let stableId = String(afterPrefix[afterPrefix.index(after: colonIdx)...])
+                    // Fallback: the parent's stableId from the draft key, the one Send
+                    // follows (`Draft.replyKeyParent`): a reply, forward or adopted reply
+                    // key, its stableId possibly holding colons (rare but valid in
+                    // rfc822MessageId local-parts).
+                    if let stableId = Draft.replyKeyParent(draftKey: draft.id, isForward: draft.isForward)?.stableId {
                         let normalizedStableId = EmailFilter.normalizeMessageId(stableId)
                         if !normalizedStableId.isEmpty,
                            let header = try MessageHeader

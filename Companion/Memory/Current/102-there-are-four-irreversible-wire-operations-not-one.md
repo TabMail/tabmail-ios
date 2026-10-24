@@ -507,3 +507,41 @@ as narrowed in `IOS-IMAP-001` and `IOS-IMAP-006`.
 success without retaining each member in at least one mailbox, or if a future provider implements a
 "move" as destructive replacement without a reached per-item recovery path. The symbol name is not
 the exclusion; retained server-side content is.
+
+---
+
+## Re-derived for #217 Outlook draft attachment sync (2026-10-21): SEVEN
+
+The property predicate and all five lower-bound searches were re-run over `TabMail/`, `Shared/` and
+`TabMailNotificationService/` on the #217 round-3 candidate (branch `agent/ios-217-fix-r2`):
+
+| pattern | hits | disposition |
+|---|---:|---|
+| A — `method\s*:\s*"DELETE"` | 8 | +1: `ExchangeProvider.replaceDraftAttachments`' attachment `DELETE` — **IN the set** |
+| B — `httpMethod\s*=\s*"DELETE"` | 3 | unchanged adjudications |
+| C — `expunge\s*\(` | 5 | unchanged (2 live UID-scoped calls, 3 comments) |
+| D — `httpMethod\s*=\s*"PUT"` | 3 | +1: `ExchangeProvider.addDraftAttachment`'s upload-session `PUT` — **outside the set** |
+| E — `method\s*:\s*"PUT"` | 2 | unchanged adjudications |
+
+**(7) `DELETE /messages/{id}/attachments/{attachmentId}` on an Outlook draft.** Graph's message PATCH
+cannot change attachments, so a draft update syncs them through the attachments collection. The
+DELETE removes a file from the server draft with no per-item recovery the call reaches (Recoverable
+Items holds messages, not a draft's removed attachments). Its guard: attachments are paired with the
+local files by name, one to one (`draftAttachmentPlan`); every add runs first, and any failure throws
+before any DELETE, so only a server attachment the local draft no longer names is ever removed, and
+only once the server already holds every local file. Only a server attachment the draft read could
+have carried takes part at all: a `#microsoft.graph.fileAttachment` whose name
+`AttachmentFilename.isSafeFileComponent` accepts. An item or reference attachment, or a file under a
+refused name, is never paired and never deleted, because no local draft can name it (t1r3 review,
+2026-10-21; such a draft is refused on open, #241). Accepted residual: a same-named replacement
+keeps the OLD file (`IOS-DRAFT-022`, #236), which errs toward keeping content.
+
+**Outside on positive evidence: the upload-session `PUT`.** Each PUT writes a byte range of a NEW
+attachment to the session URL Graph returned (`validatedUploadURL`: https, Outlook host only); it
+never replaces or removes existing content.
+
+**Negative case.** Re-adjudicate if the attachment pairing ever widens beyond exact names, if a
+DELETE can run before or without the adds succeeding, if the upload PUT ever targets an
+existing attachment, or if the DELETE set ever includes a server attachment kind or name the draft
+read cannot carry (it once did: before 2026-10-21 an attached email or cloud link another Outlook
+client added was unpairable, so the next save deleted it).

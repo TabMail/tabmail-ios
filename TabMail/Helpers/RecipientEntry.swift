@@ -253,6 +253,12 @@ struct RecipientEntry: Equatable, Sendable {
         recipients.map { Self.text(name: $0.name, address: $0.address) }.joined(separator: ", ")
     }
 
+    /// What a draft stores for this text: each recipient as text that reads back
+    /// as itself, then each rejected entry as written, one element each.
+    var draftEntries: [String] {
+        recipients.map { Self.text(name: $0.name, address: $0.address) } + leftovers
+    }
+
     /// A mailbox as text that reads back as the same mailbox: the name quoted,
     /// as sync stores it (`IMAPFetchMapping.mailboxText`), so a comma or an
     /// address inside a display name never becomes a recipient of its own.

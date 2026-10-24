@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftMail
 import SwiftSoup
 
 /// Pure, GRDB-free email filtering and parsing utilities.
@@ -59,8 +60,7 @@ enum EmailFilter {
                     html += "<div><br></div>"
                 } else {
                     pendingLines.append(escapeHTML(stripped))
-                    let isSoftWrap = stripped.hasSuffix(" ") && stripped != "-- "
-                    if !isSoftWrap { flushPending() }
+                    if !isFlowedSoftBreak(stripped) { flushPending() }
                 }
             }
         }
@@ -68,6 +68,60 @@ enum EmailFilter {
         flushPending()
 
         return "<div style=\"white-space:pre-wrap;\">" + html + "</div>"
+    }
+
+    /// RFC 3676: a line ending in a space is soft-broken (it continues on the next
+    /// line); the signature separator `"-- "` is always a hard break. The space is
+    /// read as a scalar: as a Character, a Prepend scalar before it (U+0605) would
+    /// join it.
+    static func isFlowedSoftBreak(_ line: String) -> Bool {
+        line.unicodeScalars.last == " " && line != "-- "
+    }
+
+    /// The text an RFC 3676 `format=flowed` body stands for, when `contentType`
+    /// declares it; any other text is returned unchanged. Each soft-broken line
+    /// (`isFlowedSoftBreak`) joins the next line of the same quote depth, unless
+    /// that is the signature separator; a space-stuffed line loses its stuffing
+    /// space; with `delsp=yes` the space that marked the soft break goes too.
+    /// Quoted lines are written back as one `">"` per depth and a space
+    /// (`">> text"`).
+    static func decodeFormatFlowed(_ text: String, contentType: String) -> String {
+        // SwiftMail's MIME parameter reader: quoted values, comments, any name case.
+        let part = MessagePart(sectionString: "1", contentType: contentType)
+        guard part.contentTypeParameter(named: "format")?.lowercased() == "flowed" else { return text }
+        let delSp = part.contentTypeParameter(named: "delsp")?.lowercased() == "yes"
+
+        var lines: [String] = []
+        var paragraph: String?
+        var paragraphDepth = 0
+        func endParagraph() {
+            guard let content = paragraph else { return }
+            let quote = String(repeating: ">", count: paragraphDepth)
+            lines.append(paragraphDepth == 0 || content.isEmpty ? quote + content : quote + " " + content)
+            paragraph = nil
+        }
+        let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        for line in normalized.components(separatedBy: "\n") {
+            // Quote marks and the stuffed space are ASCII bytes (RFC 3676 §4.5), read
+            // as scalars: as Characters, a combining mark after one would join it.
+            var rest = line.unicodeScalars[...]
+            let depth = rest.prefix { $0 == ">" }.count
+            rest = rest.dropFirst(depth)
+            if rest.first == " " { rest = rest.dropFirst() }
+            var content = String(Substring(rest))
+            // The signature separator is neither fixed nor flowed (RFC 3676 §4.3):
+            // it is a line of its own. Read before `delsp=yes` drops a soft break's
+            // space, which would turn a flowed "--  " into one.
+            let isSignature = content == "-- "
+            let isSoft = isFlowedSoftBreak(content)
+            if isSoft, delSp { content = String(content.unicodeScalars.dropLast()) }
+            if paragraph != nil, depth != paragraphDepth || isSignature { endParagraph() }
+            paragraph = (paragraph ?? "") + content
+            paragraphDepth = depth
+            if !isSoft { endParagraph() }
+        }
+        endParagraph()
+        return lines.joined(separator: "\n")
     }
 
     /// Normalize an RFC 2822 Message-ID by stripping angle brackets and whitespace.
@@ -332,18 +386,54 @@ enum EmailFilter {
         return false
     }
 
-    /// Strips HTML to plain text suitable for FTS indexing.
+    /// Strips HTML to plain text suitable for FTS indexing, the text/plain part of
+    /// an HTML send, and a draft copy's editable text (#217).
     /// Single-pass UTF-8 byte scanner; visible anchors retain destinations as Markdown links.
     /// Skips <style>/<script>/<head> block content, strips tags, decodes entities,
     /// and collapses whitespace in one pass.
     /// All HTML structural characters (< > & ; / ! -) are ASCII, so byte-level
     /// comparison is always correct — ASCII bytes never appear inside multi-byte
     /// UTF-8 sequences.
-    static func htmlToPlainText(_ html: String) -> String {
+    ///
+    /// `keepingSpacing` (a draft's editable text, #217) keeps the spacing as the
+    /// page shows it: every no-break space is a space, whitespace inside `<pre>` is
+    /// kept as written, and an inline formatting tag (`<b>`, `<span>`, a link)
+    /// adds no space. Every other caller keeps the collapsed form.
+    static func htmlToPlainText(_ html: String, keepingSpacing: Bool = false) -> String {
         var out: [UInt8] = []
         out.reserveCapacity(html.utf8.count / 4)
         var lastWasSpace = true
+        // Whether the current line holds anything visible, a no-break space
+        // included: the block rule ends only such a line.
+        var lineHasContent = false
+        var preDepth = 0
         var link: (start: Int, href: String)?
+
+        func appendWhitespace(_ byte: UInt8) {
+            if keepingSpacing, preDepth > 0 {
+                if byte == 0x0A {
+                    out.append(0x0A)
+                    lineHasContent = false
+                } else if byte != 0x0D {
+                    out.append(byte)
+                }
+                lastWasSpace = true
+            } else if !lastWasSpace {
+                out.append(0x20)
+                lastWasSpace = true
+            }
+        }
+
+        func appendNoBreakSpace() {
+            lineHasContent = true
+            if keepingSpacing {
+                out.append(0x20)
+                lastWasSpace = false
+            } else if !lastWasSpace {
+                out.append(0x20)
+                lastWasSpace = true
+            }
+        }
 
         func finishLink() {
             guard let active = link else { return }
@@ -377,6 +467,7 @@ enum EmailFilter {
             out.append(contentsOf: "[\(escapedLabel)](\(destination))".utf8)
             link = nil
             lastWasSpace = false
+            lineHasContent = true
         }
 
         // Zero-copy access to the string's UTF-8 bytes via withUTF8.
@@ -456,7 +547,7 @@ enum EmailFilter {
 
                     if tagName == "a" {
                         finishLink()
-                        if !lastWasSpace { out.append(0x20); lastWasSpace = true }
+                        if !keepingSpacing, !lastWasSpace { out.append(0x20); lastWasSpace = true }
                         if !isClosing, tagEnd < count,
                            let range = plainTextAttributeRange(bytes, from: ns + tagLen, to: tagEnd, named: "href") {
                             let attribute = String(decoding: UnsafeBufferPointer(start: bytes + range.lowerBound, count: range.count), as: UTF8.self)
@@ -481,14 +572,47 @@ enum EmailFilter {
                     }
                     let isBlock = tagLen > 0 && isBlockTag
                     let isBr = tagLen > 0 && tagName == "br"
+                    let isInline: Bool
+                    switch tagName {
+                    case "b", "i", "u", "s", "em", "strong", "span", "font", "small", "big", "sub", "sup",
+                         "code", "mark", "strike", "del", "ins", "tt", "abbr", "cite", "q", "kbd", "var",
+                         "samp", "dfn", "bdi", "bdo",
+                         "o": // Word HTML's `<o:p>`
+                        isInline = tagLen > 0
+                    default:
+                        isInline = false
+                    }
 
                     // Regular tag — skip to its unquoted end.
                     i = min(tagEnd + 1, count)
 
-                    if isBr || (isBlock && isClosing) {
-                        // Block-level close tags and <br> → newline
-                        out.append(0x0A) // '\n'
+                    // Line rules (#217): `<br>` always ends the line; a block element
+                    // starts and ends a line but never adds an empty one, so only a line
+                    // holding something visible is ended. `<div><br></div>`, the blank
+                    // line every editor writes, is then ONE empty line, a `<br>` that
+                    // closes a block's last line adds nothing, and nested block closes
+                    // do not stack. A paragraph holding only a no-break space
+                    // (`<p>&nbsp;</p>`, TinyMCE, CKEditor, Word HTML) is one blank
+                    // line. A space left before a line break is dropped.
+                    if isBr || isBlock {
+                        if out.last == 0x20, link.map({ out.count > $0.start }) ?? true { out.removeLast() }
+                        if isBr || lineHasContent {
+                            out.append(0x0A) // '\n'
+                            lineHasContent = false
+                        }
                         lastWasSpace = true
+                        if tagName == "pre" {
+                            if isClosing {
+                                preDepth = max(0, preDepth - 1)
+                            } else {
+                                preDepth += 1
+                                // HTML drops a line break right after `<pre>`.
+                                if keepingSpacing, i < count, bytes[i] == 0x0D { i += 1 }
+                                if keepingSpacing, i < count, bytes[i] == 0x0A { i += 1 }
+                            }
+                        }
+                    } else if keepingSpacing, isInline {
+                        // Formatting inside a word or sentence adds no space.
                     } else if !lastWasSpace {
                         out.append(0x20)
                         lastWasSpace = true
@@ -502,15 +626,16 @@ enum EmailFilter {
                     if let decoded {
                         if decoded.utf8.count == 1, decoded.utf8.first == 0x20 {
                             // space
-                            if !lastWasSpace { out.append(0x20); lastWasSpace = true }
+                            appendWhitespace(0x20)
                         } else if decoded == "\u{00A0}" {
-                            // non-breaking space → space
-                            if !lastWasSpace { out.append(0x20); lastWasSpace = true }
+                            appendNoBreakSpace()
                         } else if Self.isInvisibleScalar(decoded) {
                             // Invisible chars (soft hyphen, zero-width spaces, etc.) — skip
                         } else {
                             for byte in decoded.utf8 { out.append(byte) }
                             lastWasSpace = false
+                            // A decoded line feed (`&#10;`) ends the line like one written.
+                            lineHasContent = decoded.utf8.last != 0x0A
                         }
                         i += advance
                         continue
@@ -519,7 +644,7 @@ enum EmailFilter {
 
                 // ASCII whitespace: space, tab, LF, CR
                 if b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D {
-                    if !lastWasSpace { out.append(0x20); lastWasSpace = true }
+                    appendWhitespace(b)
                     i += 1
                     continue
                 }
@@ -528,7 +653,7 @@ enum EmailFilter {
                 if b >= 0x80 {
                     // U+00A0 (no-break space) = 0xC2 0xA0
                     if b == 0xC2, i + 1 < count, bytes[i+1] == 0xA0 {
-                        if !lastWasSpace { out.append(0x20); lastWasSpace = true }
+                        appendNoBreakSpace()
                         i += 2
                         continue
                     }
@@ -561,6 +686,7 @@ enum EmailFilter {
                     let end = min(i + seqLen, count)
                     for j in i..<end { out.append(bytes[j]) }
                     lastWasSpace = false
+                    lineHasContent = true
                     i = end
                     continue
                 }
@@ -568,6 +694,7 @@ enum EmailFilter {
                 // Regular ASCII content
                 out.append(b)
                 lastWasSpace = false
+                lineHasContent = true
                 i += 1
             }
         }
@@ -934,7 +1061,7 @@ enum EmailFilter {
         case "gt": return (">", advance)
         case "quot": return ("\"", advance)
         case "apos": return ("'", advance)
-        case "nbsp": return (" ", advance)
+        case "nbsp": return ("\u{00A0}", advance)
         case "ndash": return ("\u{2013}", advance)
         case "mdash": return ("\u{2014}", advance)
         case "lsquo": return ("\u{2018}", advance)

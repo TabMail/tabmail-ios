@@ -4220,6 +4220,10 @@ final class AppDatabase: Sendable {
                 columns: ["folderId", "providerDate"]
             )
         }
+
+        // #217 (ADR-IOS-091): v92 (`v92_addDraftServerText`) and v93
+        // (`v93_openPreUpgradeServerDraftsLocally`) are burned. Both ran on
+        // development databases and were never released; do not reuse either name.
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

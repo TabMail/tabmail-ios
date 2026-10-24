@@ -361,3 +361,43 @@ serializer that writes recipients:
   - #250 and #258 change only PARTIAL and SORT planning. The app never passes `partialRange` or a sort.
   - #251 and #257 are additive APIs. #254 changes how filenames are parsed. #259 keeps the 10 s default.
 
+- **format=flowed parameters (#238, 2026-10-21)**: BODYSTRUCTURE part content types kept only
+  `charset`, so the app could not see that another app's plain-text draft part is RFC 3676
+  `format=flowed` (`.eml` parsing already kept every parameter but name, filename and boundary).
+  Owner: fix it at our fork and upstream it. Fork branch `agent/format-flowed-content-type`
+  (`a767603`, on `018ca90`) adds `format` and `delsp` after `charset` in
+  `Array<MessagePart>.contentType(for:)`, with `MessagePartBodyStructureTests
+  .textPartKeepsTheParametersItsTextIsReadBy` (red on `018ca90`). The app pinned `a767603` (#217), then `946ae36` (below);
+  fork `main` stays the pure mirror `018ca90`. Census: the parameters appear only on text parts,
+  which already carried `; charset=`, and every app consumer matches by prefix or normalises the
+  MIME type. The upstream PR opens only after our own review of the commit is clean
+  (`feedback_upstream_pr_rounds_need_our_own_review_and_the_dependency_source`). When upstream
+  merges it, resync with `tabmail-swiftmailfork-sync` and re-pin to the mirror.
+- **Quoted charset parameter (#217 review round 4, 2026-10-22)**: `MessagePart.declaredCharset`
+  matched only an unquoted, lower-case `charset=` (its regex excluded `"`, so the quote-stripping
+  after it never ran), so a part content type taken from the part's own header, as Gmail's draft
+  read passes it, lost `charset="iso-2022-jp"` and decoded through the UTF-8 / Windows-1252 /
+  Latin-1 fallback with no error. Commit `946ae36` on the same fork branch, after `a767603`, reads
+  it with `EMLParser.extractHeaderParam` (any case, quoted value unquoted, comments removed);
+  `MIMECharsetTests.quotedCharsetParameterIsDeclared` / `quotedCharsetDecodesText` (red on
+  `a767603`). The app pins `946ae36`. It goes upstream in the same PR as the #238 commit, which now
+  carries both.
+- **Quoted BODYSTRUCTURE values and a public parameter reader (#217 Codex round 1, 2026-10-22)**:
+  `contentType(for:)` wrote kept parameter values bare, so a value holding `;` (BODYSTRUCTURE hands
+  over quoted values unquoted) split into a second parameter on read-back. Commit `c86900c` on the
+  same fork branch writes a non-token value as a quoted-string and adds public
+  `MessagePart.contentTypeParameter(named:)` (the app's flowed decoder reads `format`/`delsp` with
+  it); `MessagePartBodyStructureTests.aParameterValueStaysOneParameter` and
+  `textPartParametersAreReadInAnyNameCase` (red on mutants). The app pins `c86900c`; the upstream
+  PR now carries three commits.
+- **Round-trip test for escaped values (#217 Codex round 2, 2026-10-22)**: removing either the
+  backslash or the quote escape left every test green. Commit `9ceb96b` adds
+  `aParameterValueReadsBackAsWritten` (quotes, backslashes, `;`, whitespace-only, empty; red on
+  both escape mutants). The app pins `9ceb96b`; the upstream PR carries four commits. Also found:
+  `MIMECharsetTests.gbLabelsResolveToGB18030` FAILS on the iOS simulator for `chinese` and `x-gbk`
+  (passes on macOS; pre-existing at `018ca90`), app issue #257.
+- **Emitted parameter syntax (#217 Codex round 3, 2026-10-23)**: deleting `parameterValue`'s
+  non-empty check emitted `format=` and every test stayed green, because the permissive reader
+  reads it back as empty. Commit `3a0cdf7` adds `isMIMEParameterValue(_:)` (an RFC 2045 token or
+  quoted-string) to `aParameterValueReadsBackAsWritten` (red on that mutant). The app pins
+  `3a0cdf7`; the upstream PR carries five commits.

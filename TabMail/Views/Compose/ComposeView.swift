@@ -1037,6 +1037,10 @@ struct ComposeView: View {
     @State private var showEmptyBodyPrompt = false
     @State private var isSavingDraft = false
     @State private var loadedDraft = false
+    /// #217: true while a saved draft reloads its server copy before it opens
+    /// (`ExternalDraftAdoption.refreshBeforeOpen`). The editor is covered
+    /// meanwhile, so nothing typed can be replaced when the draft then loads.
+    @State private var isCheckingServerCopy = false
     /// PORT — sticky initial-read state from v2final ComposeDraftGuards.
     /// `.error` is never reinterpreted as genuine absence later in this view.
     @State private var draftReadState: ComposeDraftGuards.ReadState = .notFound
@@ -1694,6 +1698,7 @@ struct ComposeView: View {
             .modifier(DiscardUnsavedEditsAlert(
                 isPresented: $showErrorDiscardEditsPrompt,
                 onDiscard: { dismiss() }))
+            .overlay { if isCheckingServerCopy { ServerCopyCheckCover() } }
             .alert("Empty Body", isPresented: $showEmptyBodyPrompt) {
                 if showingSuggestion, let currentSuggestion, !currentSuggestion.isEmpty {
                     Button("Use Suggestion & Send") {
@@ -2299,6 +2304,26 @@ struct ComposeView: View {
         // Try loading persisted draft
         BackgroundSyncLogger.logDebug("[ComposeView] loadDraftOrPrepopulate: draftId=\(draftId) prefillDraftId=\(prefillDraftId ?? "nil")")
         let draftKey = draftId
+        // #217 (ADR-IOS-091): every open of a saved draft, from any screen, first
+        // reloads a Gmail or Outlook row with no unsent edits from its server copy.
+        let openCheck = await ExternalDraftAdoption.refreshBeforeOpen(
+            draftId: draftKey,
+            willReadServer: { isCheckingServerCopy = true })
+        isCheckingServerCopy = false
+        // The server copy holds an attachment TabMail cannot carry (#241): editing
+        // the local row would let its save overwrite the server's version.
+        switch openCheck {
+        case .open:
+            break
+        case .unsupportedAttachment:
+            draftReadState = .error
+            sendError = DraftReadConfig.unsupportedAttachmentMessage
+            return
+        case .replacedElsewhere:
+            draftReadState = .error
+            sendError = "This draft changed while it was opening. Close and reopen it to try again."
+            return
+        }
         let readResult: Result<Draft?, Error>
         do {
             readResult = .success(try await AppDatabase.dbPool.read { db in
@@ -2478,7 +2503,10 @@ struct ComposeView: View {
             if rowClaim == .unresolved {
                 sendError = Self.unresolvedReplyTargetMessage
             }
-            if let quote {
+            // #217: a draft adopted from another mail app already carries that
+            // app's own quote in its body; adding ours would quote twice. The
+            // parent still threads the send (`persistedReplyTargetClaim` above).
+            if let quote, !ExternalDraftAdoption.isAdoptedKey(draftId) {
                 let reply = quote.header
                 let resolvedForward = replyTo != nil ? isForward : draft.isForward
                 let dateStr = reply.date.formatted(date: .abbreviated, time: .shortened)
@@ -2496,7 +2524,7 @@ struct ComposeView: View {
                 ) {
                     quotedHTML = EmailFilter.stripEmbeddedEmlSections(html)
                 }
-            } else if draft.isReplyOrForward, DebugModeManager.isLoggingEnabled() {
+            } else if quote == nil, draft.isReplyOrForward, DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[ComposeView] ⚠ T5.8: reply target for draftId=\(draftId) could not be identity-confirmed — quote OMITTED and SEND BLOCKED (authored body untouched; save/discard unaffected)")
             }
 
@@ -3739,6 +3767,15 @@ private struct DiscardUnsavedEditsAlert: ViewModifier {
         } message: {
             Text("This draft didn't finish loading, so your changes can't be saved to it. Closing now discards them.")
         }
+    }
+}
+
+/// Covers the compose while a saved draft reloads its server copy.
+private struct ServerCopyCheckCover: View {
+    var body: some View {
+        Color(.systemBackground)
+            .ignoresSafeArea()
+            .overlay { ProgressView("Loading draft...") }
     }
 }
 

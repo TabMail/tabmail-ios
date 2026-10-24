@@ -49,3 +49,17 @@ written durably by `BodyFetchProcessor`, the inbox loader's FTS tier and
   `HTMLLinkIngestionTests.imageHeavyNewsletterPreviewsItsFirstSentence` and
   `textPlainLinkSoupPreviewsDeterministically`; loader tier 1
   `tierOneNewsletterSnippetIsTheFirstSentence`; NSE `displaySnippetSurvivesLongRunOfImageLinks`.
+
+## Draft text keeps its spacing (#217, review round 5, 2026-10-22)
+
+- `htmlToPlainText(_:keepingSpacing:)`: the draft path (`ExternalDraftAdoption.editableBody`) passes
+  `true`, so a link adds no space around itself (`see [this](https://example.com/a).`), an inline
+  formatting tag adds none, each `&nbsp;` is a space and `<pre>` whitespace is kept. Every other
+  caller (FTS, agent reads, snippets, the text part of HTML sends) keeps the collapsed default, so
+  link labels stay space-separated for search and newsletter `&nbsp;` padding never reaches a snippet.
+- The trailing-space drop before a line break must not cut into an open link's label: the space
+  written before a label sits at `link.start`, and a block opening the label after a decoded line
+  feed (`x&#10;<a href=…><p>…`) finds it last. Dropping it made the output shorter than the label
+  start, and an empty label crashed `finishLink` (`Range requires lowerBound <= upperBound`) on a
+  received message. Pinned by `EmailFilterLinkTests.blockOpeningALabelKeepsTheLabelWhole`.
+- ADR-IOS-091 "Review round 5 corrections" holds the rule set.

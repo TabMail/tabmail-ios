@@ -38,6 +38,241 @@ struct IMAPSaveDraftIdentityTests {
         return draft
     }
 
+    @Test("A draft read never returns another draft when the mailbox is recreated after its UIDVALIDITY check")
+    func draftReadUnderTheCheckedSelection() async throws {
+        let mine = "mine-\(UUID().uuidString)@example.com"
+        let other = "other-\(UUID().uuidString)@example.com"
+        let epoch = 73_001
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [Self.message(5, mine)]])
+        server.setUidValidity(epoch, for: "Drafts")
+        // Right after the read of the draft's summary, the mailbox is recreated
+        // and another draft takes the same UID.
+        server.resetMailboxAfterNextSuccessfulResponse(
+            containing: "ENVELOPE", mailbox: "Drafts", uidValidity: epoch + 1,
+            messages: [Self.message(5, other)])
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let copy = try await provider.fetchDraftCopy(
+            identity: .imap(folder: "Drafts", uidValidity: epoch, uid: 5))
+
+        let id = copy?.header.rfc822MessageId ?? ""
+        #expect(!id.contains(other), "the copy must be the draft the checked selection named, never another")
+        #expect(copy == nil || id.contains(mine))
+    }
+
+    /// A Drafts mailbox under `epoch` holding one draft at UID 5: a text part whose
+    /// Content-Type parameters are `textParameters` (BODYSTRUCTURE form), and a
+    /// `notes.txt` attachment holding `attachment`.
+    private static func multipartDraftServer(
+        mine: String, epoch: Int, text: Data, textParameters: String, attachment: Data,
+        serveText: Bool = true
+    ) -> FakeIMAPServer {
+        let attachmentOnWire = Data(attachment.base64EncodedString().utf8)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        let date = formatter.string(from: Date())
+        formatter.dateFormat = "dd-MMM-yyyy HH:mm:ss Z"
+        let internalDate = formatter.string(from: Date())
+        let header = """
+        From: Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Subject: draft\r
+        Date: \(date)\r
+        Message-ID: <\(mine)>\r
+        Content-Type: multipart/mixed; boundary="b1"\r
+        \r
+
+        """
+        let raw = header + """
+        --b1\r
+        Content-Type: text/plain\r
+        \r
+        \(String(decoding: text, as: UTF8.self))\r
+        --b1\r
+        Content-Type: text/plain; name="notes.txt"\r
+        Content-Disposition: attachment; filename="notes.txt"\r
+        Content-Transfer-Encoding: base64\r
+        \r
+        \(attachment.base64EncodedString())\r
+        --b1--\r
+
+        """
+        let bodystructure = """
+        (("TEXT" "PLAIN" (\(textParameters)) NIL NIL "7BIT" \(text.count) 1)("TEXT" "PLAIN" ("NAME" "notes.txt") NIL NIL "BASE64" \(attachmentOnWire.count) 1 NIL ("attachment" ("filename" "notes.txt"))) "MIXED")
+        """
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [FakeIMAPServer.makeMultipartMessage(
+            uid: 5, subject: "draft", from: "Sender <sender@example.com>",
+            to: "Recipient <recipient@example.com>", date: date, internalDate: internalDate,
+            messageID: "<\(mine)>", rawHeader: header, fullMessage: Data(raw.utf8),
+            bodystructure: bodystructure,
+            partBodies: serveText ? ["1": text, "2": attachmentOnWire] : ["2": attachmentOnWire])]])
+        server.setUidValidity(epoch, for: "Drafts")
+        return server
+    }
+
+    @Test("A draft read carries the attachment bytes of that same read, so adoption never fetches them again")
+    func draftReadCarriesItsAttachmentBytes() async throws {
+        let epoch = 73_002
+        let attachment = Data("attached notes".utf8)
+        let server = Self.multipartDraftServer(
+            mine: "mine-\(UUID().uuidString)@example.com", epoch: epoch, text: Data("body".utf8),
+            textParameters: "\"CHARSET\" \"UTF-8\"", attachment: attachment)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let copy = try #require(try await provider.fetchDraftCopy(
+            identity: .imap(folder: "Drafts", uidValidity: epoch, uid: 5)))
+
+        let info = try #require(copy.attachments.first { $0.filename == "notes.txt" })
+        #expect(copy.attachmentData?[info.section] == attachment,
+                "adoption would fetch the file again by UID, outside the proven UIDVALIDITY")
+    }
+
+    @Test("A draft read whose text part comes back without bytes fails, never reads as an empty draft")
+    func draftReadWithoutTextBytesThrows() async throws {
+        let epoch = 73_006
+        let server = Self.multipartDraftServer(
+            mine: "mine-\(UUID().uuidString)@example.com", epoch: epoch, text: Data("body".utf8),
+            textParameters: "\"CHARSET\" \"UTF-8\"", attachment: Data("notes".utf8), serveText: false)
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        await #expect(throws: IMAPProvider.IMAPDraftCopyIncomplete.self) {
+            try await provider.fetchDraftCopy(identity: .imap(folder: "Drafts", uidValidity: epoch, uid: 5))
+        }
+    }
+
+    /// #238: Thunderbird and Apple Mail write a plain-text draft as `format=flowed`,
+    /// soft-breaking long lines with a trailing space; with an attachment the text
+    /// is a part of its own, so only that part's BODYSTRUCTURE parameters say so.
+    @Test("A format=flowed draft with an attachment opens with its soft line breaks joined")
+    func flowedDraftOpensJoined() async throws {
+        let epoch = 73_005
+        let server = Self.multipartDraftServer(
+            mine: "flowed-\(UUID().uuidString)@example.com", epoch: epoch,
+            text: Data("Thanks for the long \r\nexplanation.\r\n\r\nAlice".utf8),
+            textParameters: "\"CHARSET\" \"UTF-8\" \"FORMAT\" \"flowed\"", attachment: Data("notes".utf8))
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let copy = try #require(try await provider.fetchDraftCopy(
+            identity: .imap(folder: "Drafts", uidValidity: epoch, uid: 5)))
+
+        #expect(ExternalDraftAdoption.editableBody(
+            text: copy.textBody, html: copy.htmlBody, bodyEmptyConfirmed: false, hasAttachments: true)
+                == "Thanks for the long explanation.\n\nAlice")
+    }
+
+    @Test("A draft saved over IMAP reads back as exactly the text and subject that were typed",
+          arguments: ["", "(no subject)"])
+    func savedDraftReadsBackAsTyped(subject: String) async throws {
+        let epoch = 73_003
+        let server = FakeIMAPServer(mailboxes: ["Drafts": []])
+        server.setUidValidity(epoch, for: "Drafts")
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+        let typed = "Hi Bob,\n\n  indented line \n> quoted\n\n\nAlice"
+        var draft = DraftMessage(to: ["recipient@example.com"], subject: subject, body: typed)
+        draft.messageId = "typed-\(UUID().uuidString)@example.com"
+
+        let outcome = try await provider.saveDraft(draft, existingIdentity: nil, draftsFolderPath: "Drafts")
+        guard case .created(.imap(let folder, let uidValidity, let uid)) = outcome else {
+            Issue.record("fixture: the save produced no IMAP address (\(outcome))")
+            return
+        }
+        let copy = try #require(try await provider.fetchDraftCopy(
+            identity: .imap(folder: folder, uidValidity: uidValidity, uid: uid)))
+
+        #expect(ExternalDraftAdoption.editableBody(
+            text: copy.textBody, html: copy.htmlBody, bodyEmptyConfirmed: false, hasAttachments: false) == typed,
+                "a save and reopen changed the spacing or line breaks")
+        #expect(copy.header.subject == subject, "a save and reopen changed the subject")
+    }
+
+    @Test("Another app's IMAP draft with no Subject header reads back with an empty subject")
+    func draftWithoutASubjectHeaderReadsBackEmpty() async throws {
+        let epoch = 73_005
+        let id = "no-subject-\(UUID().uuidString)@example.com"
+        var message = FakeIMAPServer.makeMessage(uid: 5, rfc822Text: """
+        From: Sender <sender@example.com>\r
+        To: Recipient <recipient@example.com>\r
+        Message-ID: <\(id)>\r
+        Content-Type: text/plain\r
+        \r
+        body\r
+
+        """)
+        // An absent Subject header is a NIL envelope subject (RFC 3501 §7.4.2);
+        // the fake's own envelope writes every subject as a string.
+        let sender = #"(("Sender" NIL "sender" "example.com"))"#
+        message.customEnvelope = #"(NIL NIL \#(sender) \#(sender) \#(sender) (("Recipient" NIL "recipient" "example.com")) NIL NIL NIL "<\#(id)>")"#
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [message]])
+        server.setUidValidity(epoch, for: "Drafts")
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        let copy = try #require(try await provider.fetchDraftCopy(
+            identity: .imap(folder: "Drafts", uidValidity: epoch, uid: 5)))
+
+        #expect(copy.header.subject == "", "a draft with no subject read back with the list placeholder")
+        #expect(ExternalDraftAdoption.editableBody(
+            text: copy.textBody, html: copy.htmlBody, bodyEmptyConfirmed: false, hasAttachments: false) == "body",
+                "the draft's body was not read")
+    }
+
+    @Test("A draft read that cannot prove it names the same message returns nothing or throws",
+          arguments: ["epoch changed", "uid absent", "mailbox absent"])
+    func draftReadFailsClosed(change: String) async throws {
+        let epoch = 73_004
+        let server = FakeIMAPServer(mailboxes: ["Drafts": [Self.message(5, "kept-\(UUID().uuidString)@example.com")]])
+        server.setUidValidity(epoch, for: "Drafts")
+        try server.start()
+        defer { server.stop() }
+        let provider = Self.provider(server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+        let identity: DraftDeleteIdentity = switch change {
+        case "epoch changed": .imap(folder: "Drafts", uidValidity: epoch - 1, uid: 5)
+        case "uid absent": .imap(folder: "Drafts", uidValidity: epoch, uid: 9)
+        default: .imap(folder: "Gone", uidValidity: epoch, uid: 5)
+        }
+
+        #expect(try await provider.fetchDraftCopy(identity: identity) == nil,
+                "a proven-gone draft reads as gone; it must never read another message (\(change))")
+    }
+
+    @Test("An unusable draft address is refused before any read")
+    func unusableIdentityThrows() async throws {
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: 1, username: "u", password: "p",
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        for identity in [DraftDeleteIdentity.imap(folder: "Drafts", uidValidity: 0, uid: 5),
+                         .imap(folder: "Drafts", uidValidity: 1, uid: 0), .outlook(graphId: "g1")] {
+            await #expect(throws: ProviderError.self) { try await provider.fetchDraftCopy(identity: identity) }
+        }
+    }
+
     @Test("A live prior IMAP tuple deletes only its UID; a same-RFC sibling survives and the fresh edit lands")
     func livePriorTuple() async throws {
         let shared = "shared-\(UUID().uuidString)@example.com"

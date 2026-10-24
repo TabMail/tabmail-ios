@@ -210,14 +210,19 @@ struct FullMessageInfo: Sendable {
     /// Pre-fetched ICS calendar data (from pipelined batch fetch).
     /// When present, renderBody skips the separate fetchAttachment call.
     let icsData: Data?
+    /// #217: the decoded bytes of `attachments`, keyed by `AttachmentInfo.section`,
+    /// when the read already downloaded them (an IMAP draft copy, read in full under
+    /// its proven UIDVALIDITY). nil = fetch each attachment on its own.
+    let attachmentData: [String: Data]?
 
-    init(header: MessageHeaderInfo, htmlBody: String?, textBody: String?, attachments: [AttachmentInfo] = [], inlineImages: [InlineImage] = [], icsData: Data? = nil) {
+    init(header: MessageHeaderInfo, htmlBody: String?, textBody: String?, attachments: [AttachmentInfo] = [], inlineImages: [InlineImage] = [], icsData: Data? = nil, attachmentData: [String: Data]? = nil) {
         self.header = header
         self.htmlBody = htmlBody
         self.textBody = textBody
         self.attachments = attachments
         self.inlineImages = inlineImages
         self.icsData = icsData
+        self.attachmentData = attachmentData
     }
 }
 
@@ -422,6 +427,18 @@ protocol EmailProvider: Sendable {
     /// Delete exactly one typed provider-native draft identity.
     func deleteDraft(identity: DraftDeleteIdentity) async throws
 
+    /// #217: the server's current copy of the draft at `identity`, or nil when that
+    /// address no longer names a draft (deleted, or replaced under a new IMAP UID).
+    /// Read-only. The copy is the DRAFT, not a render of it, because the caller
+    /// replaces a local draft with it:
+    /// - `textBody` / `htmlBody` are the draft's own body parts only; an attached
+    ///   message stays an attachment and its text never joins the body;
+    /// - COMPLETE: every inline image (referenced by the body or not) and every
+    ///   file; a part that could not be read THROWS rather than being left out.
+    /// THROWS too when the answer could not be determined (offline, an unknown IMAP
+    /// epoch); a throw is never "gone".
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo?
+
     // Incremental sync (optional — Gmail uses history.list, IMAP returns nil)
     func fetchHistory(since historyId: String) async throws -> HistoryResponse?
     func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo]
@@ -444,7 +461,32 @@ protocol EmailProvider: Sendable {
     func fetchMessagesBatch(ids: [String], folder: String) async throws -> [String: FullMessageInfo]
 }
 
+/// #217: draft copies (`fetchDraftCopy`).
+enum DraftReadConfig {
+    /// The name a draft-copy file gets when its part names none, so it is carried
+    /// rather than dropped.
+    static let unnamedAttachmentFilename = "attachment"
+
+    /// What the user reads when a draft holds an attachment TabMail cannot carry.
+    static let unsupportedAttachmentMessage =
+        "This draft has an attachment TabMail can't open. Edit it in another mail app."
+}
+
+/// A draft copy holds an attachment TabMail cannot carry: an Outlook item or
+/// reference attachment (an attached email, contact, event or cloud link), or a file
+/// whose name `AttachmentFilename.isSafeFileComponent` refuses. A permanent refusal,
+/// never retryable; the draft is edited in another app (owner 2026-10-21, #241).
+struct DraftCopyUnsupportedAttachment: Error {}
+
 extension EmailProvider {
+    /// Default for test doubles and the demo provider, whose drafts are never
+    /// read back (only Gmail and Outlook drafts reload on open, and only drafts in a
+    /// Drafts folder are adopted); every other production provider overrides it.
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
+        throw ProviderError.actionIdentityResolutionFailed(
+            "fetchDraftCopy: provider has no draft read adapter")
+    }
+
     func resolveDraftResource(
         containedMessageId: String,
         draftsFolderPath: String

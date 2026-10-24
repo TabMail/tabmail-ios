@@ -54,6 +54,9 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// The declaration default `0` keeps every memberwise-init caller compiling;
     /// the value a caller's snapshot carries is IGNORED — `applySave` overrides it
     /// in-transaction (migration `v79` seeds pre-existing rows with a distinct rank).
+    /// A row adopted from another app's server draft (#217, `DraftStore.applyAdoption`)
+    /// keeps rank 0 until its first save, so opening drafts never evicts one saved
+    /// here; ties among such rows break on `updatedAt`.
     var lastTouchedSeq: Int = 0
 
     /// PORT — compose generation from v2final commit 3f2cc4c34.
@@ -202,6 +205,28 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         return "new:\(newId ?? UUID().uuidString)"
     }
 
+    /// The `{accountId}:{stableId}` tail naming a reply's parent: after the prefix of
+    /// a TabMail reply or forward key, or after the uuid of an adopted reply's key
+    /// (`ExternalDraftAdoption.adoptedKey`). Nil for any other key.
+    static func replyKeyTail(draftKey: String, isForward: Bool) -> Substring? {
+        let prefix = isForward ? "forward:" : "reply:"
+        if draftKey.hasPrefix(prefix) { return draftKey.dropFirst(prefix.count) }
+        guard ExternalDraftAdoption.isAdoptedKey(draftKey) else { return nil }
+        let rest = draftKey.dropFirst(ExternalDraftAdoption.draftKeyPrefix.count)
+        guard let colonIdx = rest.firstIndex(of: ":") else { return nil }
+        return rest[rest.index(after: colonIdx)...]
+    }
+
+    /// The account and RFC identity of the parent a reply or forward key names
+    /// (`replyKeyTail`), split at the first `:`. Split as Unicode scalars: as
+    /// Characters, an identity starting with a combining mark joins the `:` and
+    /// the key would name no parent. Nil for any other key.
+    static func replyKeyParent(draftKey: String, isForward: Bool) -> (accountId: String, stableId: String)? {
+        guard let tail = replyKeyTail(draftKey: draftKey, isForward: isForward)?.unicodeScalars,
+              let colon = tail.firstIndex(of: ":") else { return nil }
+        return (String(Substring(tail[..<colon])), String(Substring(tail[tail.index(after: colon)...])))
+    }
+
     // MARK: - Reply-target identity guard (T5.8)
     //
     // ONE mechanism, four parts, and reading any part alone will mislead:
@@ -312,11 +337,7 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// scoping, and a server-originated no-fold-literal domain (`<a@[IPv6:…]>`) would
     /// then read as "never the same message" for a message that plainly is.
     static func expectedReplyToRfc(draftKey: String, isForward: Bool) -> String? {
-        let prefix = isForward ? "forward:" : "reply:"
-        guard draftKey.hasPrefix(prefix) else { return nil }
-        let rest = String(draftKey.dropFirst(prefix.count))
-        guard let colonIdx = rest.firstIndex(of: ":") else { return nil }
-        let stableId = String(rest[rest.index(after: colonIdx)...])
+        guard let stableId = replyKeyParent(draftKey: draftKey, isForward: isForward)?.stableId else { return nil }
         return MessageIdentity.comparableRfc822Identity(stableId)
     }
 
@@ -444,12 +465,7 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
         }
         // Strategy 2: parse accountId + stableId from the draft key, look up by
         // account + rfc822MessageId.
-        let prefix = isForward ? "forward:" : "reply:"
-        guard draftKey.hasPrefix(prefix) else { return nil }
-        let rest = String(draftKey.dropFirst(prefix.count))
-        guard let colonIdx = rest.firstIndex(of: ":") else { return nil }
-        let accountId = String(rest[rest.startIndex..<colonIdx])
-        let stableId = String(rest[rest.index(after: colonIdx)...])
+        guard let (accountId, stableId) = replyKeyParent(draftKey: draftKey, isForward: isForward) else { return nil }
         let normalized = EmailFilter.normalizeMessageId(stableId)
         // An EMPTY normalized id is not an identity — without this it would match any
         // header in the account whose `rfc822MessageId` is the empty string, which is
@@ -602,41 +618,6 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
 
     /// Whether this draft key represents a reply or forward (vs new compose).
     var isReplyOrForward: Bool { replyToId != nil }
-
-    /// Parse a raw "To" header string into individual email addresses.
-    /// Handles: "alice@co.com, bob@co.com" and "Alice <alice@co.com>, Bob <bob@co.com>".
-    /// Extracts the bare email address from angle-bracket format.
-    static func parseRecipients(_ raw: String) -> [String] {
-        guard !raw.isEmpty else { return [] }
-        // Split on commas that are NOT inside angle brackets or quotes
-        var result: [String] = []
-        var current = ""
-        var inAngleBracket = false
-        var inQuote = false
-        for char in raw {
-            if char == "\"" && !inAngleBracket { inQuote.toggle() }
-            if char == "<" && !inQuote { inAngleBracket = true }
-            if char == ">" && !inQuote { inAngleBracket = false }
-            if char == "," && !inAngleBracket && !inQuote {
-                let trimmed = current.trimmingCharacters(in: .whitespaces)
-                if !trimmed.isEmpty { result.append(extractEmail(from: trimmed)) }
-                current = ""
-            } else {
-                current.append(char)
-            }
-        }
-        let trimmed = current.trimmingCharacters(in: .whitespaces)
-        if !trimmed.isEmpty { result.append(extractEmail(from: trimmed)) }
-        return result
-    }
-
-    /// Extract bare email from "Name <email>" format. Returns as-is if no angle brackets.
-    private static func extractEmail(from token: String) -> String {
-        if let start = token.firstIndex(of: "<"), let end = token.firstIndex(of: ">"), start < end {
-            return String(token[token.index(after: start)..<end])
-        }
-        return token
-    }
 }
 
 // MARK: - Draft Attachment Disk Storage

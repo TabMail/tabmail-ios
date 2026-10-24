@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftMail
 
 /// Actor-owned ordering state for Gmail's `/labels` catalog. Kept as a small
 /// value type so out-of-order response handling can be tested deterministically
@@ -812,6 +813,163 @@ actor GmailProvider: EmailProvider {
             containedMessageId: match.containedMessageId)
     }
 
+    /// #217: the draft resource's current copy, or nil on 404 (deleted elsewhere).
+    func fetchDraftCopy(identity: DraftDeleteIdentity) async throws -> FullMessageInfo? {
+        guard case .gmail(let resourceId) = identity else {
+            throw ProviderError.actionIdentityResolutionFailed(
+                "GmailProvider received a non-Gmail draft identity")
+        }
+        guard let messageId = try await currentDraftMessageId(resourceId: resourceId) else {
+            return nil
+        }
+        return try await readDraftMessage(id: messageId)
+    }
+
+    /// #217: the draft itself, not a render of it. The copy replaces the local
+    /// draft, so it holds only the draft and all of it:
+    /// - the body is the draft's own text/plain and text/html parts (each joined
+    ///   in order when split around an inline part); an attached
+    ///   message (`message/rfc822`) is an attachment and is never opened, so its
+    ///   text never joins the body (the render's `tm-eml-section` marker);
+    /// - a part with `Content-Disposition: attachment`, or a file name and no
+    ///   `inline` disposition, is a file under its own name, even with a Content-ID
+    ///   (Gmail web gives every attachment one); the IMAP reader's rule;
+    /// - every other image with a Content-ID is an inline image, whether or not the
+    ///   body references it; every other leaf that is not body text is a file;
+    /// - a file whose bytes came inline is carried with them (`attachmentData`);
+    /// - a file that is a container with no bytes of its own is refused
+    ///   (`DraftCopyUnsupportedAttachment`); only an empty LEAF reads as empty;
+    /// - a part whose bytes cannot be read throws, never drops out.
+    /// Iterative, so a deeply nested copy cannot exhaust the stack.
+    private func readDraftMessage(id: String) async throws -> FullMessageInfo {
+        let data = try await request(path: "/messages/\(id)\(GmailAPI.fullQuery)")
+        let msg = try JSONDecoder().decode(GmailMessage.self, from: data)
+        guard let header = parseGmailMessage(msg, keepEmptySubject: true) else {
+            throw ProviderError.messageNotFound
+        }
+        guard let payload = msg.payload else {
+            return FullMessageInfo(header: header, htmlBody: nil, textBody: nil)
+        }
+        var textBody: String?
+        var htmlBody: String?
+        var attachments: [AttachmentInfo] = []
+        var inlineImages: [InlineImage] = []
+        var carried: [String: Data] = [:]
+        var stack = [GmailPart(
+            mimeType: payload.mimeType, filename: payload.filename,
+            headers: payload.headers, body: payload.body, parts: payload.parts)]
+        while let part = stack.popLast() {
+            let mimeType = (part.mimeType ?? "").lowercased()
+            let filename = part.filename ?? ""
+            func headerValue(_ name: String) -> String {
+                (part.headers?.first { $0.name.lowercased() == name }?.value ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            let disposition = headerValue("content-disposition")
+                .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() } ?? ""
+            let contentId = headerValue("content-id")
+                .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let isMessage = mimeType.hasPrefix("message/rfc822")
+            let isFile = isMessage || disposition == "attachment" || (!filename.isEmpty && disposition != "inline")
+            if !isFile, mimeType.hasPrefix("image/"), !contentId.isEmpty {
+                inlineImages.append(InlineImage(
+                    contentId: contentId, contentType: mimeType,
+                    data: try await draftPartBytes(part, messageId: id)))
+                continue
+            }
+            if !isFile, (mimeType == "text/plain" || mimeType == "text/html"), filename.isEmpty {
+                let bytes = try await draftPartBytes(part, messageId: id)
+                // Decoded in the part's declared charset as the IMAP draft read
+                // decodes it (`draftTextContent`); text it cannot decode throws,
+                // never reads as an empty draft or as a guessed charset.
+                let declared = part.headers?.first { $0.name.lowercased() == "content-type" }?.value ?? mimeType
+                guard let text = MessagePart(sectionString: "1", contentType: declared, data: bytes).draftTextContent else {
+                    throw GmailDraftCopyIncomplete(mimeType: mimeType)
+                }
+                // A body split around an inline part (text, image, text) is one
+                // body: its pieces are joined in order.
+                if mimeType == "text/plain" {
+                    textBody = (textBody ?? "") + EmailFilter.decodeFormatFlowed(text, contentType: declared)
+                }
+                if mimeType == "text/html" { htmlBody = (htmlBody ?? "") + text }
+                continue
+            }
+            if !isFile, let children = part.parts {
+                stack.append(contentsOf: children.reversed())
+                continue
+            }
+            // A leaf Gmail reports as empty holds nothing to carry.
+            if !isFile, part.body?.attachmentId == nil, (part.body?.size ?? 0) == 0,
+               (part.body?.data ?? "").isEmpty { continue }
+            // Every file is read here, whole (`draftPartBytes`), and carried under its
+            // attachment id, or a key of its own when its bytes came in the part.
+            let section = part.body?.attachmentId ?? "inline-part-\(carried.count)"
+            carried[section] = try await draftPartBytes(part, messageId: id)
+            attachments.append(AttachmentInfo(
+                filename: filename.isEmpty
+                    ? (isMessage ? "attached-email.eml" : DraftReadConfig.unnamedAttachmentFilename)
+                    : filename,
+                contentType: part.mimeType ?? "application/octet-stream",
+                section: section,
+                size: part.body?.size ?? 0,
+                encoding: nil))
+        }
+        return FullMessageInfo(
+            header: header, htmlBody: htmlBody, textBody: textBody,
+            attachments: attachments, inlineImages: inlineImages,
+            attachmentData: carried.isEmpty ? nil : carried)
+    }
+
+    /// A draft part's bytes, whole: inline in the part, else through the attachments
+    /// API. Gmail may send empty `data` for a part whose bytes are stored apart,
+    /// under its `attachmentId`, so only non-empty `data` is the part's bytes.
+    /// `body.size` counts the decoded bytes; fewer, by either route, never arrived
+    /// whole.
+    private func draftPartBytes(_ part: GmailPart, messageId: String) async throws -> Data {
+        let bytes: Data
+        if let inline = part.body?.data, !inline.isEmpty {
+            guard let decoded = decodeBase64URLToData(inline) else {
+                throw GmailDraftCopyIncomplete(mimeType: part.mimeType ?? "")
+            }
+            bytes = decoded
+        } else if let attachmentId = part.body?.attachmentId {
+            bytes = try await fetchAttachment(messageId: messageId, attachmentId: attachmentId)
+        } else {
+            // A file part with children and neither (an attached message Gmail lists
+            // as its parts, which may report size 0) cannot be carried as one file:
+            // refused like an Outlook item attachment (#241), never read as empty.
+            guard (part.parts ?? []).isEmpty else { throw DraftCopyUnsupportedAttachment() }
+            bytes = Data()
+        }
+        guard part.body?.size.map({ bytes.count >= $0 }) ?? true else {
+            throw GmailDraftCopyIncomplete(mimeType: part.mimeType ?? "")
+        }
+        return bytes
+    }
+
+    /// The message a draft resource currently wraps (it changes on every update),
+    /// or nil on 404.
+    private func currentDraftMessageId(resourceId: String) async throws -> String? {
+        let path = try Self.strictEncodedPath(
+            "/drafts/\(resourceId)",
+            queryItems: [(name: "format", value: "minimal"), (name: "fields", value: "message/id")])
+        await acquireRequestSlot()
+        defer { releaseRequestSlot() }
+        let result = try await authedHTTP.requestAllowing404(url: baseURL + path)
+        if result.statusCode == 404 { return nil }
+        guard let data = result.data else {
+            throw ProviderError.networkError(underlying: HTTPError.networkError(statusCode: result.statusCode))
+        }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let messageId = (json["message"] as? [String: Any])?["id"] as? String,
+              !messageId.isEmpty else {
+            throw ProviderError.networkError(underlying: HTTPError.networkError(statusCode: result.statusCode))
+        }
+        return messageId
+    }
+
     private func draftResources(
         wrapping containedMessageId: String
     ) async throws -> [(resourceId: String, containedMessageId: String)] {
@@ -1608,7 +1766,9 @@ actor GmailProvider: EmailProvider {
     ///
     /// ActionTag is NOT resolved from provider labels — action tags are
     /// local-only (MessageAICache + Device Sync probe). See ADR-IOS-036.
-    internal func parseGmailMessage(_ msg: GmailMessage) -> MessageHeaderInfo? {
+    /// `keepEmptySubject`: a draft copy's subject is the draft's own, so an empty
+    /// one stays empty rather than becoming the "(no subject)" a list shows (#217).
+    internal func parseGmailMessage(_ msg: GmailMessage, keepEmptySubject: Bool = false) -> MessageHeaderInfo? {
         // Serialize the decoded GmailMessage back to a [String: Any] JSON dict
         // for the shared parser. Cheap — we already decoded once.
         guard let encoded = try? JSONEncoder().encode(msg),
@@ -1631,7 +1791,7 @@ actor GmailProvider: EmailProvider {
             inReplyTo: metadata.inReplyTo,
             references: metadata.references,
             threadId: metadata.threadId,
-            subject: metadata.subject.isEmpty ? "(no subject)" : metadata.subject,
+            subject: metadata.subject.isEmpty && !keepEmptySubject ? "(no subject)" : metadata.subject,
             from: metadata.from.name,
             fromAddress: metadata.from.email,
             to: rawTo,
@@ -2406,3 +2566,7 @@ private struct GmailHistoryMessage: Decodable {
     let threadId: String?
     let labelIds: [String]?
 }
+
+/// A Gmail draft-copy part that came back without readable bytes. Retryable;
+/// never "gone" (#217).
+struct GmailDraftCopyIncomplete: Error { let mimeType: String }
