@@ -5818,9 +5818,12 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// #217: the draft itself, not the render `buildFullMessageInfo` made of it, and
     /// all of it, from the one read above (adoption never fetches again without the
     /// proven UIDVALIDITY):
-    /// - the body is the draft's own text/plain and text/html parts (each joined in
-    ///   order when split around an inline part); nothing inside an attached message
-    ///   (`message/rfc822`) joins it;
+    /// - the body is the draft's own text/plain and text/html parts in order, as one
+    ///   body (`DraftBodyPiece.body`), joined when split around an inline part; a
+    ///   `multipart/alternative` gives the pieces of one representation only, its
+    ///   last child that has any (RFC 2046 section 5.1.4, SwiftMail's
+    ///   `enclosingMultiparts`), though its images and files are still read (#272);
+    ///   nothing inside an attached message (`message/rfc822`) joins it;
     /// - every image with a Content-ID outside an attached message is an inline
     ///   image, whether or not the body references it;
     /// - every top-level attachment, and any other part that is neither body nor
@@ -5844,21 +5847,38 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 size: attachment.size, encoding: attachment.encoding)
         }
         var fileSections = Set(attachments.map(\.section))
-        var textBody: String?
-        var htmlBody: String?
+        func isBodyText(_ part: MessagePart) -> Bool {
+            let contentType = part.contentType.lowercased()
+            return (contentType.hasPrefix("text/plain") || contentType.hasPrefix("text/html"))
+                && part.filename == nil && part.disposition?.lowercased() != "attachment"
+                && !insideAttachedMessage(part) && !fileSections.contains(part.section.description)
+        }
+        // The alternative read of each `multipart/alternative`: its last child
+        // holding body text.
+        var readAlternative: [EnclosingMultipart: Int] = [:]
+        for part in message.parts where isBodyText(part) {
+            for multipart in part.enclosingMultiparts where multipart.subtype == "alternative" {
+                guard let branch = part.branch(of: multipart) else { continue }
+                readAlternative[multipart] = max(readAlternative[multipart] ?? branch, branch)
+            }
+        }
+        var pieces: [DraftBodyPiece] = []
         var inlineImages: [InlineImage] = []
         for part in message.parts where !insideAttachedMessage(part) && !fileSections.contains(part.section.description) {
             let contentType = part.contentType.lowercased()
             if contentType.hasPrefix("multipart/") { continue }
-            let isBodyText = contentType.hasPrefix("text/plain") || contentType.hasPrefix("text/html")
-            if isBodyText, part.filename == nil, part.disposition?.lowercased() != "attachment" {
+            if isBodyText(part) {
+                // Another version of the body, in an alternative not read.
+                let isRead = part.enclosingMultiparts.allSatisfy { multipart in
+                    multipart.subtype != "alternative" || part.branch(of: multipart) == readAlternative[multipart]
+                }
+                guard isRead else { continue }
                 guard Self.draftPartArrived(part), let text = part.draftTextContent else {
                     throw IMAPDraftCopyIncomplete(section: part.section.description)
                 }
-                if contentType.hasPrefix("text/plain") {
-                    textBody = (textBody ?? "") + EmailFilter.decodeFormatFlowed(text, contentType: part.contentType)
-                }
-                else { htmlBody = (htmlBody ?? "") + text }
+                pieces.append(contentType.hasPrefix("text/plain")
+                    ? .text(EmailFilter.decodeFormatFlowed(text, contentType: part.contentType))
+                    : .html(text))
                 continue
             }
             let contentId = (part.contentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -5887,8 +5907,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             }
             attachmentData[attachment.section] = data
         }
+        let body = DraftBodyPiece.body(of: pieces)
         return FullMessageInfo(
-            header: full.header, htmlBody: htmlBody, textBody: textBody,
+            header: full.header, htmlBody: body.html, textBody: body.text,
             attachments: attachments, inlineImages: inlineImages, icsData: full.icsData,
             attachmentData: attachmentData)
     }

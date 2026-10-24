@@ -1066,6 +1066,158 @@ struct DraftCopyIntegrityTests {
         #expect(copy?.textBody == "中文")
     }
 
+    // MARK: - IMAP multipart grouping (#272)
+
+    /// An IMAP draft body shape (its BODYSTRUCTURE and part bodies) and the one body
+    /// it opens as.
+    struct IMAPGroupingCase: CustomTestStringConvertible, Sendable {
+        let name: String
+        let bodystructure: String
+        let contentType: String
+        let parts: [String: String]
+        let body: String
+        /// Whether a non-body part rides along as a file.
+        var hasFile = false
+        var testDescription: String { name }
+    }
+
+    nonisolated static let imapGroupingCases: [IMAPGroupingCase] = {
+        func text(_ subtype: String, _ value: String, flowed: Bool = false) -> String {
+            let parameters = flowed ? "(\"CHARSET\" \"UTF-8\" \"FORMAT\" \"flowed\")" : "(\"CHARSET\" \"UTF-8\")"
+            return "(\"TEXT\" \"\(subtype)\" \(parameters) NIL NIL \"7BIT\" \(Data(value.utf8).count) 1)"
+        }
+        let attachedMessage = "Subject: inner\r\n\r\nfile"
+        let attachedMessagePart = "(\"MESSAGE\" \"RFC822\" NIL NIL NIL \"7BIT\" \(Data(attachedMessage.utf8).count) "
+            + "(NIL \"inner\" NIL NIL NIL NIL NIL NIL NIL NIL) \(text("PLAIN", "file")) 1)"
+        let filePart = "(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"7BIT\" 4)"
+        return [
+            IMAPGroupingCase(
+                name: "two plain-text alternatives read once",
+                bodystructure: "(\(text("PLAIN", "Hello there"))\(text("PLAIN", "Hello \r\nthere", flowed: true)) \"ALTERNATIVE\")",
+                contentType: "multipart/alternative; boundary=b",
+                parts: ["1": "Hello there", "2": "Hello \r\nthere"], body: "Hello there"),
+            IMAPGroupingCase(
+                name: "a plain-text and an HTML alternative read once (control)",
+                bodystructure: "(\(text("PLAIN", "Plain version"))\(text("HTML", "<p>HTML version</p>")) \"ALTERNATIVE\")",
+                contentType: "multipart/alternative; boundary=b",
+                parts: ["1": "Plain version", "2": "<p>HTML version</p>"], body: "HTML version"),
+            IMAPGroupingCase(
+                name: "mixed plain-text and HTML pieces both read, in order",
+                bodystructure: "(\(text("PLAIN", "Plain piece"))\(text("HTML", "<p>HTML piece</p>")) \"MIXED\")",
+                contentType: "multipart/mixed; boundary=b",
+                parts: ["1": "Plain piece", "2": "<p>HTML piece</p>"], body: "Plain piece\nHTML piece"),
+            IMAPGroupingCase(
+                name: "an alternative inside a mixed body reads once, before the next piece",
+                bodystructure: "((\(text("PLAIN", "Top"))\(text("HTML", "<b>Top</b>")) \"ALTERNATIVE\")\(text("PLAIN", "Bottom")) \"MIXED\")",
+                contentType: "multipart/mixed; boundary=b",
+                parts: ["1.1": "Top", "1.2": "<b>Top</b>", "2": "Bottom"], body: "Top\nBottom"),
+            IMAPGroupingCase(
+                name: "an empty last alternative is the body",
+                bodystructure: "(\(text("PLAIN", "obsolete"))\(text("HTML", "")) \"ALTERNATIVE\")",
+                contentType: "multipart/alternative; boundary=b",
+                parts: ["1": "obsolete", "2": ""], body: ""),
+            IMAPGroupingCase(
+                name: "a trailing attached message does not displace the body",
+                bodystructure: "(\(text("PLAIN", "selected"))\(attachedMessagePart) \"ALTERNATIVE\")",
+                contentType: "multipart/alternative; boundary=b",
+                parts: ["1": "selected", "2": attachedMessage, "2.1": "file"], body: "selected", hasFile: true),
+            IMAPGroupingCase(
+                name: "a trailing file does not displace the body",
+                bodystructure: "(\(text("PLAIN", "selected"))\(filePart) \"ALTERNATIVE\")",
+                contentType: "multipart/alternative; boundary=b",
+                parts: ["1": "selected", "2": "file"], body: "selected", hasFile: true),
+            IMAPGroupingCase(
+                name: "the last alternative is a related body",
+                bodystructure: "(\(text("PLAIN", "obsolete"))(\(text("HTML", "<b>selected</b>")) \"RELATED\") \"ALTERNATIVE\")",
+                contentType: "multipart/alternative; boundary=b",
+                parts: ["1": "obsolete", "2.1": "<b>selected</b>"], body: "selected"),
+            IMAPGroupingCase(
+                name: "an alternative inside an unread alternative stays unread",
+                bodystructure: "((\(text("PLAIN", "obsolete plain"))\(text("HTML", "<b>obsolete HTML</b>")) \"ALTERNATIVE\")"
+                    + "\(text("PLAIN", "selected")) \"ALTERNATIVE\")",
+                contentType: "multipart/alternative; boundary=b",
+                parts: ["1.1": "obsolete plain", "1.2": "<b>obsolete HTML</b>", "2": "selected"], body: "selected"),
+            IMAPGroupingCase(
+                name: "a plain piece next to an HTML piece stays literal",
+                bodystructure: "(\(text("PLAIN", "<b>literal</b> &amp;"))\(text("HTML", "<em>rich</em>")) \"MIXED\")",
+                contentType: "multipart/mixed; boundary=b",
+                parts: ["1": "<b>literal</b> &amp;", "2": "<em>rich</em>"], body: "<b>literal</b> &amp;\nrich"),
+            IMAPGroupingCase(
+                name: "an HTML piece keeps its spacing",
+                bodystructure: "(\(text("PLAIN", "Intro"))\(text("HTML", "<p>A&nbsp; B</p>")) \"MIXED\")",
+                contentType: "multipart/mixed; boundary=b",
+                parts: ["1": "Intro", "2": "<p>A&nbsp; B</p>"], body: "Intro\nA  B"),
+            IMAPGroupingCase(
+                name: "a plain piece starting with a line break gets no second one",
+                bodystructure: "(\(text("PLAIN", "Intro"))\(text("PLAIN", "\nNext")) \"MIXED\")",
+                contentType: "multipart/mixed; boundary=b",
+                parts: ["1": "Intro", "2": "\nNext"], body: "Intro\nNext"),
+            IMAPGroupingCase(
+                name: "a piece after HTML starting with a line break gets no second one",
+                bodystructure: "(\(text("HTML", "<b>Intro</b>"))\(text("PLAIN", "\nNext")) \"MIXED\")",
+                contentType: "multipart/mixed; boundary=b",
+                parts: ["1": "<b>Intro</b>", "2": "\nNext"], body: "Intro\nNext"),
+        ]
+    }()
+
+    @Test("An IMAP draft opens with one body: one alternative, every mixed piece in order",
+          arguments: imapGroupingCases)
+    func imapDraftReadsOneBody(_ grouping: IMAPGroupingCase) async throws {
+        let stored = grouping.parts.keys.sorted().map { Data(grouping.parts[$0]!.utf8) }.reduce(Data(), +)
+        let copy = try await imapCopy(
+            bodystructure: grouping.bodystructure, contentType: grouping.contentType, body: stored,
+            partBodies: grouping.parts.mapValues { Data($0.utf8) })
+        // As adoption reads it: a returned body part, even an empty one, is the body.
+        let editable = ExternalDraftAdoption.editableBody(
+            text: copy.textBody, html: copy.htmlBody,
+            bodyEmptyConfirmed: copy.textBody != nil || copy.htmlBody != nil, hasAttachments: false)
+        #expect(editable == grouping.body)
+        #expect(copy.attachments.isEmpty == !grouping.hasFile)
+    }
+
+    /// An IMAP draft whose first alternative is a related body holding text,
+    /// an inline image and a file, beside an HTML last alternative. The related
+    /// body's text arrives `unreadTextShortBy` bytes short of its declared size,
+    /// and the image `imageShortBy` bytes short.
+    private func imapCopyWithFilesInUnreadAlternative(
+        image: Data, file: Data, unreadTextShortBy: Int, imageShortBy: Int
+    ) async throws -> FullMessageInfo {
+        let unread = Data("unread body".utf8)
+        let selected = Data("<p>selected</p>".utf8)
+        let imageWire = Data(image.base64EncodedString().utf8)
+        return try await imapCopy(
+            bodystructure: "(((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" \(unread.count) 1)"
+                + "(\"IMAGE\" \"PNG\" NIL \"<old-image@example.com>\" NIL \"BASE64\" \(imageWire.count) NIL (\"INLINE\" NIL) NIL NIL)"
+                + "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" \(file.count) 1 NIL (\"ATTACHMENT\" (\"FILENAME\" \"inactive.txt\")) NIL NIL)"
+                + " \"RELATED\")(\"TEXT\" \"HTML\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" \(selected.count) 1) \"ALTERNATIVE\")",
+            contentType: "multipart/alternative; boundary=b", body: unread + imageWire + file + selected,
+            partBodies: ["1.1": unread.dropLast(unreadTextShortBy), "1.2": imageWire.dropLast(imageShortBy),
+                         "1.3": file, "2": selected])
+    }
+
+    @Test("An IMAP draft carries the files and images of an alternative it does not read")
+    func imapUnreadAlternativeKeepsItsFiles() async throws {
+        let image = Data([4, 5, 6])
+        let file = Data("FILE".utf8)
+        // The unread text arriving short does not matter: it is not read.
+        let copy = try await imapCopyWithFilesInUnreadAlternative(image: image, file: file, unreadTextShortBy: 4, imageShortBy: 0)
+        let editable = ExternalDraftAdoption.editableBody(
+            text: copy.textBody, html: copy.htmlBody, bodyEmptyConfirmed: false, hasAttachments: true)
+        #expect(editable == "selected")
+        #expect(copy.inlineImages.map(\.contentId) == ["old-image@example.com"])
+        #expect(copy.inlineImages.map(\.data) == [image])
+        #expect(copy.attachments.map(\.filename) == ["inactive.txt"])
+        #expect(copy.attachments.map { copy.attachmentData?[$0.section] } == [file])
+    }
+
+    @Test("An IMAP draft whose unread alternative's image arrives short is incomplete, never the draft")
+    func imapUnreadAlternativeImageFailureIsIncomplete() async throws {
+        await #expect(throws: IMAPProvider.IMAPDraftCopyIncomplete.self) {
+            _ = try await self.imapCopyWithFilesInUnreadAlternative(
+                image: Data([4, 5, 6]), file: Data("FILE".utf8), unreadTextShortBy: 0, imageShortBy: 2)
+        }
+    }
+
     @Test("An IMAP draft part that arrives shorter than BODYSTRUCTURE declares is incomplete, never the draft")
     func imapShortenedPartIsIncomplete() async throws {
         let whole = try await imapCopy(declaredSize: 4)
