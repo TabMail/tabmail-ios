@@ -1326,3 +1326,41 @@ struct MessageHeaderProviderDateMigrationTests {
         #expect(hasIndex == true)
     }
 }
+
+// MARK: - v94 — draft.serverCopyNamesParent
+
+/// `v94_addDraftServerCopyNamesParent` (#278) records whether the server copy a
+/// draft last uploaded or read names a reply parent. Nothing on the device knows
+/// what an earlier upload wrote, so every pre-existing row must read UNKNOWN (NULL),
+/// never false: a false would be a claim about a copy no one looked at.
+@Suite("Migration v94 — draft.serverCopyNamesParent")
+struct DraftServerCopyNamesParentMigrationTests {
+    @Test("v94 adds a nullable column and leaves every existing draft unknown")
+    func existingDraftsAreUnknown() throws {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: "v91_addMessageHeaderProviderDate")
+        try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        try db.write { conn in
+            try conn.execute(sql: """
+                INSERT INTO draft (id, accountId, toJSON, ccJSON, bccJSON, subject, body,
+                                   isForward, createdAt, updatedAt, serverDraftId, serverPushStatus)
+                VALUES ('reply:acc1:parent@example.com', 'acc1', '[]', '[]', '[]', 'Re: hi', 'body',
+                        0, 1, 2, 'r1', 'pushed')
+                """)
+        }
+
+        try migrator.migrate(db, upTo: "v94_addDraftServerCopyNamesParent")
+
+        let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(draft)") }
+        let column = try #require(columns.first { ($0["name"] as String) == "serverCopyNamesParent" })
+        #expect((column["notnull"] as Int) == 0)
+        let drafts = try db.read { try Draft.fetchAll($0) }
+        #expect(drafts.count == 1)
+        guard drafts.count == 1 else { return }
+        #expect(drafts[0].serverCopyNamesParent == nil)
+    }
+}

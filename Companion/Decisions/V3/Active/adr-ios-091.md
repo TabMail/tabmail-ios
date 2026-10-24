@@ -549,3 +549,20 @@ it (`enclosingMultiparts`, from BODYSTRUCTURE and `.eml` alike) and `branch(of:)
 multipart that holds the part: a general MIME fact, not a draft rule. For each enclosing
 `multipart/alternative` the read takes the highest branch holding body text; a body part in any
 other branch is not read. The pieces go through the shared `DraftBodyPiece.body`.
+
+### A Gmail reply replaced by a standalone message (#278, 2026-10-24)
+
+`repliesElsewhere` compared parents only when the server copy names one, and TabMail's own uploads
+wrote no `In-Reply-To`, so a reload could not tell TabMail's copy from another app's standalone
+message put in the draft's place (through the Gmail API, keeping the draft resource): the row took
+the new text and kept the old parent, and Send threaded it under that message.
+- A Gmail reply draft's upload now writes `In-Reply-To` and `References` as Send will
+  (`DraftStore.uploadThreadHeaders`: `ThreadUtils.outgoingThreadHeaders` on the parent
+  `Draft.resolveReplyToHeader` finds). Forwards, and every other provider, write none, as before:
+  the Outlook draft read does not return the header, and an IMAP draft is never replaced in place
+  (a new copy is a new UID).
+- `Draft.serverCopyNamesParent` (v94, nullable, no backfill) records whether the copy the row last
+  uploaded (`applyPushCompletion`), adopted (`makeDraft`) or reloaded (`applyReload`) names a parent.
+- A reload whose copy names no parent, when that record says the last one did, takes the existing
+  removal (`ReloadWrite.removed`, `OpenCheck.replacedElsewhere`) and the next open adopts the copy
+  unthreaded. A row with no record (every row from before v94) keeps its parent, as before.

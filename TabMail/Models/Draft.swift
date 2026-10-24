@@ -149,6 +149,14 @@ struct Draft: Codable, FetchableRecord, PersistableRecord, Sendable {
     /// proven mismatch (`CLAUDE.md` "Never Drop User Intention", exit 4 vs clause 2).
     var replyToUidValidity: Int? = nil
 
+    /// v94 (#278) — whether the server copy this row last uploaded or read names a
+    /// reply parent through `In-Reply-To`. A reload whose copy names none, when this
+    /// says the last one did, reads another app's standalone message put in the
+    /// draft's place (`ExternalDraftAdoption.repliesElsewhere`). nil means UNKNOWN:
+    /// every row written before v94 and a row never pushed; such a row keeps its
+    /// parent, as before.
+    var serverCopyNamesParent: Bool? = nil
+
     // MARK: - JSON Helpers
 
     var toArray: [String] {

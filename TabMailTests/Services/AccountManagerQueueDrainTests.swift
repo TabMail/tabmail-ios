@@ -430,6 +430,7 @@ struct AccountManagerQueueDrainTests {
                     expectedInstanceEpoch: epoch,
                     previousIdentity: nil,
                     freshRfc: rfc,
+                    copyNamesParent: false,
                     db: db) != nil
             }
         }
