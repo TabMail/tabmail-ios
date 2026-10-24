@@ -41,9 +41,11 @@ itself, on both stacks.
    **Amended 2026-10-24 (#302):** the version the backend reads is `TABMAIL_PROTOCOL_VERSION`
    (`BackendClient.clientVersion`, Info.plist `TabMailProtocolVersion`), not `MARKETING_VERSION`. It
    was still 1.9.0 when this merged, so a 1.10.0 build would still have been served the `date_desc`
-   description. It is 1.9.3 now, the contract iOS implements: `email_search-v1.9.3.json` (relevance
-   default) and `memory_search-v1.9.3.json` (no query lists the most recent conversations, which
-   `MemorySearchTool` already handles). `EmailSearchToolSortTests.advertisesRelevanceDefaultVersion`
+   description. The backend then moved the relevance-default description to
+   `email_search-v1.10.0.json` (tabmail-backend #116), so 1.9.x clients keep `email_search-v1.2.0.json`.
+   The protocol version is 1.10.0 now, the contract iOS implements: `email_search-v1.10.0.json`
+   (relevance default) and `memory_search-v1.9.3.json` (no query lists the most recent conversations,
+   which `MemorySearchTool` already handles). `EmailSearchToolSortTests.advertisesRelevanceDefaultVersion`
    pins it.
 8. The demo scope (ADR-IOS-038) is applied in the vector leg, before the merge:
    `SearchIndex.searchVecCandidates` joins its KNN results to `message_meta` and keeps only the
