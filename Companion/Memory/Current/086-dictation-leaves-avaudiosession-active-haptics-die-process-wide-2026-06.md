@@ -1,3 +1,10 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+**Amended after this fragment was pinned (moved into this note on 2026-10-24, #288).** Where the text below and the pinned body differ, this text wins:
+
+Added after the line beginning "---":
+
+- **Update 2026-09-26 (ADR-IOS-085):** `SpeechRecognizer` is gone; chat-pill dictation now records through `Services/Dictation/MicrophoneCapture.swift`, which activates the session in `start` and deactivates it in `teardownOnQueue` on every exit (stop, failed start). Both run on one serial queue, so a stop always follows the start it races; no generation counter is needed there. The invariant is unchanged: no recording-capable session outlives a dictation. `DictationControllerTests` pin that the controller stops its capture after every path (success, failure, cancel), using a fake capture; that `MicrophoneCapture.stop` really deactivates the session is not under test (it needs a device microphone).
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## Dictation leaves AVAudioSession active → haptics die process-wide (2026-06-27)
 
@@ -8,5 +15,3 @@
 - Not unit-tested (hardware; simulator doesn't reproduce haptic muting) — verify on device: dictate in chat → stop → tap a tag in inbox → haptic fires.
 
 ---
-
-- **Update 2026-09-26 (ADR-IOS-085):** `SpeechRecognizer` is gone; chat-pill dictation now records through `Services/Dictation/MicrophoneCapture.swift`, which activates the session in `start` and deactivates it in `teardownOnQueue` on every exit (stop, failed start). Both run on one serial queue, so a stop always follows the start it races; no generation counter is needed there. The invariant is unchanged: no recording-capable session outlives a dictation. `DictationControllerTests` pin that the controller stops its capture after every path (success, failure, cancel), using a fake capture; that `MicrophoneCapture.stop` really deactivates the session is not under test (it needs a device microphone).
