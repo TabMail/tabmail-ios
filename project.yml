@@ -35,7 +35,7 @@ settings:
 packages:
   SwiftMail:
     url: https://github.com/TabMail/SwiftMail.git
-    revision: f29b998fe31516d8cd1cf3c2d0fca129a54abc73
+    revision: 79af89f9d87081021509bc73d7ab5d17291f5e5c
   SwiftSoup:
     url: https://github.com/scinfu/SwiftSoup.git
     from: "2.6.0"

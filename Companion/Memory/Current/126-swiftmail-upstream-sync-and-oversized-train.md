@@ -401,3 +401,20 @@ serializer that writes recipients:
   reads it back as empty. Commit `3a0cdf7` adds `isMIMEParameterValue(_:)` (an RFC 2045 token or
   quoted-string) to `aParameterValueReadsBackAsWritten` (red on that mutant). The app pins
   `3a0cdf7`; the upstream PR carries five commits.
+
+## 2026-10-24 — resync to upstream 06b341e and the PR #268 rebase
+
+- Fork `main` fast-forwarded `018ca90` -> upstream `06b341e` (#265, #267: legacy Japanese charsets read
+  as their supersets; unlabelled ISO-2022-JP recognised by `ESC $` before UTF-8; a gated
+  plausible-Japanese reading before the Latin fallbacks, in `MessagePart.textContent` and EMLParser raw
+  header lines). Collision check clean: viewing only gains; `MessagePart.draftTextContent` decodes a
+  declared charset through `String.Encoding(mimeCharset:)`, which only widens; an undeclared draft part
+  already read as `textContent` reads it.
+- The upstream maintainer asked to rebase PR #268. The fork topic stack was rebased onto `06b341e` and
+  lease-pushed (format-flowed `736e1c0`, text-part-content-id `1a26034`, rfc2231-content-type-params
+  `d6979b5`, multipart-containers `7e3a28f`). Upstream CI runs `swiftlint lint --strict`, which our test
+  additions failed; each branch got a lint commit, and #268's parameter tests moved to a new
+  `MessagePartParameterTests` suite. `quotedCharsetDecodesText` had gone green on upstream's own code
+  (its ISO-2022-JP detection), so it now also decodes a quoted windows-1251 part, red on upstream.
+- The app's `main` pins `f29b998`, an orphaned commit after the rebase; fork branch
+  `pin/ios-main-f29b998` keeps it fetchable until `main`'s pin moves (the #277 repin to `d6979b5`).

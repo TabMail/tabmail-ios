@@ -1008,6 +1008,64 @@ struct DraftCopyIntegrityTests {
         #expect(copy.inlineImages.first?.data == png)
     }
 
+    // MARK: - RFC 2231 extended parameters (#277)
+
+    /// GBK bytes for 中文.
+    private nonisolated static let gbk = Data([0xD6, 0xD0, 0xCE, 0xC4])
+
+    /// `bytes` as a base64 transfer-encoded part, which keeps a non-UTF-8 body
+    /// ASCII on the fake server's wire.
+    private static func base64Part(_ bytes: Data) -> Data {
+        Data(bytes.base64EncodedString().utf8)
+    }
+
+    @Test("An IMAP draft's charset or format written in RFC 2231 extended form is read", arguments: [
+        ("(\"CHARSET*\" \"utf-8''gbk\")", gbk, "中文"),
+        ("(\"CHARSET*0*\" \"utf-8''g\" \"CHARSET*1\" \"bk\")", gbk, "中文"),
+        ("(\"CHARSET\" \"UTF-8\" \"FORMAT*\" \"utf-8''flowed\")", Data("Hello \r\nthere".utf8), "Hello there"),
+        ("(\"CHARSET*0\" \"g\" \"CHARSET*1\" \"bk\")", gbk, "中文"),
+        ("(\"CHARSET\" \"UTF-8\" \"FORMAT*0\" \"flo\" \"FORMAT*1\" \"wed\")", Data("Hello \r\nthere".utf8), "Hello there"),
+    ])
+    func imapExtendedParametersAreRead(parameters: String, bytes: Data, text: String) async throws {
+        let wire = Self.base64Part(bytes)
+        let copy = try await imapCopy(
+            bodystructure: "(\"TEXT\" \"PLAIN\" \(parameters) NIL NIL \"BASE64\" \(wire.count) 1)",
+            contentType: "text/plain", body: wire, partBodies: ["1": wire])
+        #expect(copy.textBody == text)
+    }
+
+    @Test("An IMAP draft whose extended charset no platform resolves is refused, never read as a guess")
+    func imapUnknownExtendedCharsetIsRefused() async throws {
+        let wire = Self.base64Part(Self.gbk)
+        await #expect(throws: IMAPProvider.IMAPDraftCopyIncomplete.self) {
+            _ = try await self.imapCopy(
+                bodystructure: "(\"TEXT\" \"PLAIN\" (\"CHARSET*\" \"utf-8''x-unknown-label\") NIL NIL \"BASE64\" \(wire.count) 1)",
+                contentType: "text/plain", body: wire, partBodies: ["1": wire])
+        }
+    }
+
+    @Test("A Gmail draft's charset written in RFC 2231 extended form is read", arguments: [
+        "text/plain; charset*=utf-8''gbk",
+        "text/plain; charset*0=g; charset*1=bk",
+    ])
+    func gmailExtendedCharsetIsRead(contentType: String) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m1"}}"#))
+        let payload: [String: Any] = [
+            "id": "m1", "internalDate": String(Int(Date().timeIntervalSince1970 * 1000)), "labelIds": ["DRAFT"],
+            "payload": ["mimeType": "text/plain",
+                        "headers": [["name": "Content-Type", "value": contentType]],
+                        "body": ["size": Self.gbk.count, "data": Self.base64URL(Self.gbk)]] as [String: Any],
+        ]
+        http.register(path: "/messages/m1", method: "GET", response: .json(
+            raw: String(decoding: try JSONSerialization.data(withJSONObject: payload), as: UTF8.self)))
+        let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+
+        let copy = try await provider.fetchDraftCopy(identity: .gmail(resourceId: "r1"))
+        #expect(copy?.textBody == "中文")
+    }
+
     @Test("An IMAP draft part that arrives shorter than BODYSTRUCTURE declares is incomplete, never the draft")
     func imapShortenedPartIsIncomplete() async throws {
         let whole = try await imapCopy(declaredSize: 4)
