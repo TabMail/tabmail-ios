@@ -1128,6 +1128,40 @@ struct DraftCopyIntegrityTests {
         #expect(copy.inlineImages.first?.data == png)
     }
 
+    // MARK: - Images named only by their Content-ID (#283)
+
+    @Test("A multipart/related draft's image with a Content-ID and no disposition is an inline image, not a file")
+    func imapRelatedImageWithoutDispositionIsInline() async throws {
+        let html = Data("<p>Hello <img src=\"cid:logo@example.com\"></p>".utf8)
+        let png = Data([0x89, 0x50, 0x4E, 0x47])
+        let pngBase64 = Data(png.base64EncodedString().utf8)
+        let copy = try await imapCopy(
+            bodystructure: "((\"TEXT\" \"HTML\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" \(html.count) 1)"
+                + "(\"IMAGE\" \"PNG\" NIL \"<logo@example.com>\" NIL \"BASE64\" \(pngBase64.count)) \"RELATED\")",
+            contentType: "multipart/related; boundary=b", body: html + pngBase64,
+            partBodies: ["1": html, "2": pngBase64])
+        #expect(copy.attachments.isEmpty)
+        #expect((copy.attachmentData ?? [:]).isEmpty)
+        #expect(copy.inlineImages.map(\.contentId) == ["logo@example.com"])
+        #expect(copy.inlineImages.first?.data == png)
+    }
+
+    @Test("A multipart/mixed draft's image with a Content-ID and no disposition stays a file")
+    func imapMixedImageWithContentIdIsAFile() async throws {
+        let text = Data("Hello".utf8)
+        let png = Data([0x89, 0x50, 0x4E, 0x47])
+        let pngBase64 = Data(png.base64EncodedString().utf8)
+        let copy = try await imapCopy(
+            bodystructure: "((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" \(text.count) 1)"
+                + "(\"IMAGE\" \"PNG\" NIL \"<logo@example.com>\" NIL \"BASE64\" \(pngBase64.count)) \"MIXED\")",
+            contentType: "multipart/mixed; boundary=b", body: text + pngBase64,
+            partBodies: ["1": text, "2": pngBase64])
+        #expect(copy.textBody == "Hello")
+        #expect(copy.inlineImages.isEmpty)
+        #expect(copy.attachments.map(\.filename) == ["logo@example.com"])
+        #expect(copy.attachments.map { copy.attachmentData?[$0.section] } == [png])
+    }
+
     // MARK: - RFC 2231 extended parameters (#277)
 
     /// GBK bytes for 中文.

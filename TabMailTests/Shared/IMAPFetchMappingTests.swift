@@ -421,6 +421,35 @@ struct IMAPFetchMappingTests {
         #expect(!IMAPFetchMapping.hasAttachments(from: info))
     }
 
+    /// An image with a Content-ID and no disposition, as SwiftMail reads it from
+    /// BODYSTRUCTURE: named after its Content-ID, enclosed by a `subtype` multipart.
+    private func contentIdImage(in subtype: String, filename: String = "logo@example.com") -> [MessagePart] {
+        let multipart = EnclosingMultipart(path: [], subtype: subtype)
+        return [
+            MessagePart(sectionString: "1", contentType: "text/html", enclosingMultiparts: [multipart]),
+            MessagePart(sectionString: "2", contentType: "image/png", filename: filename,
+                        contentId: "<logo@example.com>", data: Data([1, 2]), enclosingMultiparts: [multipart]),
+        ]
+    }
+
+    @Test("A related body's image named only by its Content-ID is not an attachment (#283)")
+    func relatedImageNamedByContentIdIsInline() {
+        var info = makeInfo()
+        info.parts = contentIdImage(in: "related")
+        #expect(!IMAPFetchMapping.hasAttachments(from: info))
+        #expect(IMAPFetchMapping.extractAttachments(info: info, message: Message(header: info, parts: info.parts)).isEmpty)
+    }
+
+    @Test("A Content-ID image outside a related body, or with a name of its own, stays an attachment",
+          arguments: [("mixed", "logo@example.com"), ("related", "logo.png")])
+    func contentIdImageKeepsItsFile(subtype: String, filename: String) {
+        var info = makeInfo()
+        info.parts = contentIdImage(in: subtype, filename: filename)
+        #expect(IMAPFetchMapping.hasAttachments(from: info))
+        let attachments = IMAPFetchMapping.extractAttachments(info: info, message: Message(header: info, parts: info.parts))
+        #expect(attachments.map(\.filename) == [filename])
+    }
+
     @Test("customKeywords extracts non-standard IMAP keywords verbatim")
     func customKeywordsVerbatim() {
         var info = makeInfo()

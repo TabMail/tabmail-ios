@@ -172,10 +172,24 @@ enum IMAPFetchMapping {
             let disposition = part.disposition?.lowercased()
             let hasFilename = !(part.filename?.isEmpty ?? true)
             let isExplicitAttachment = disposition == "attachment"
-            let hasFileNotInline = hasFilename && disposition != "inline"
+            let hasFileNotInline = hasFilename && disposition != "inline" && !isRelatedPartNamedByContentID(part)
             let isCalendar = ct.hasPrefix("text/calendar")
             return isExplicitAttachment || hasFileNotInline || isCalendar
         }
+    }
+
+    /// Whether `part` belongs to a `multipart/related` body, has no disposition,
+    /// and carries no name but its Content-ID. SwiftMail names a media part with
+    /// no filename after its Content-ID, so the image of a related HTML body
+    /// written without a disposition (RFC 2387) has a name it was never given:
+    /// it is inline content, not a file. Outside a related body such a part
+    /// stays a file under that name, so an image no HTML shows is still listed.
+    static func isRelatedPartNamedByContentID(_ part: MessagePart) -> Bool {
+        guard part.disposition == nil,
+              part.enclosingMultiparts.contains(where: { $0.subtype == "related" }),
+              let filename = part.filename, let contentId = part.contentId else { return false }
+        let bareId = contentId.trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+        return !bareId.isEmpty && filename == bareId
     }
 
     /// Provider-label list — extracts non-`tm_*`, non-excluded IMAP custom
@@ -215,7 +229,7 @@ enum IMAPFetchMapping {
             let disposition = part.disposition?.lowercased()
             let hasFilename = part.filename != nil
             let isExplicitAttachment = disposition == "attachment"
-            let hasFileNotInline = hasFilename && disposition != "inline"
+            let hasFileNotInline = hasFilename && disposition != "inline" && !isRelatedPartNamedByContentID(part)
             // text/calendar (ICS invites) are attachments even without explicit
             // disposition or filename — Outlook often omits both.
             let isCalendar = ct.hasPrefix("text/calendar")
