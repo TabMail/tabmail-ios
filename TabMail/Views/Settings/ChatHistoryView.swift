@@ -194,8 +194,7 @@ struct ChatHistoryView: View {
     // MARK: - Data Loading
 
     private func loadHistory() async {
-        // Default view: reverse-chronological listing from memory.db.
-        hits = await MemoryIndex.shared.listTurns(limit: SearchConfig.memoryPrefetchMaxResults)
+        hits = await Self.listHistory()
         isLoading = false
     }
 
@@ -226,6 +225,12 @@ struct ChatHistoryView: View {
         }
     }
 
+    /// The default view: the most recent turns from memory.db, newest first. Older turns are
+    /// found through the search; the screen does not page.
+    static func listHistory() async -> [MemoryHit] {
+        await MemoryIndex.shared.listTurns(limit: SearchConfig.memorySearchMaxResults)
+    }
+
     // MARK: - Search
 
     /// The history search: the same memory.db hybrid pipeline the agent uses,
@@ -233,7 +238,7 @@ struct ChatHistoryView: View {
     static func searchHistory(_ query: String) async -> [MemoryHit] {
         await MemoryIndex.shared.search(
             query: query,
-            limit: SearchConfig.memoryPrefetchMaxResults,
+            limit: SearchConfig.memorySearchMaxResults,
             demoActive: DemoModeStore.isDemoActive
         )
     }

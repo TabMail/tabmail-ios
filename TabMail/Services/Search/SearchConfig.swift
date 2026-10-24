@@ -28,7 +28,9 @@ enum SearchConfig {
     /// Matches TB's 7-column FTS schema (db.rs search_fts_candidates)
     static let bm25Weights = "0.0, 5.0, 3.0, 2.0, 1.0, 1.0, 1.0"
 
-    static let searchDefaultLimit = 50
+    /// The matches a search fetches when its caller names no limit, and the inbox search
+    /// screen's results: 100, as every search on every app (tabmail-ios#264).
+    static let searchDefaultLimit = 100
     static let snippetTokens = 16
 
     /// Capital `NOT` operators a search query keeps. FTS5 nests each `NOT` (it flattens `AND`
@@ -121,11 +123,12 @@ enum SearchConfig {
     /// Mirrors TB `MEMORY_TEXT_WEIGHT` at `config.rs:82`. Sibling to email `textWeight`.
     static let memoryTextWeight: Double = 0.3
 
-    /// Pagination defaults — mirror TB `CHAT_SETTINGS.searchPageSizeDefault` and siblings.
-    static let memoryPageSizeDefault = 5
-    static let memoryPageSizeMax = 50
-    static let memoryPrefetchPagesDefault = 4
-    static let memoryPrefetchMaxResults = 200
+    /// `memory_search` serves its matches in pages of this many: TB
+    /// `CHAT_SETTINGS.searchPageSizeDefault`.
+    static let memorySearchPageSize = 20
+    /// The most turns one memory search fetches, a listing too, and the chat history screen's
+    /// listing and search: TB `CHAT_SETTINGS.memorySearchMaxResults` (tabmail-ios#264).
+    static let memorySearchMaxResults = 100
 
     /// Fallback snippet length cap when FTS5 snippet is unavailable. Matches TB
     /// `memory_search.js:202` `content.slice(0, 400)`.

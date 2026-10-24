@@ -26,7 +26,7 @@ caller of the multi-folder statement; the tool reaches only the unscoped arm.
 separate `fts.db` pool. The prior whole-SQL-surface audit measured that arm at **22 ms** and found no
 `dateMs` index. It remains a real full scan, but it is off-main, does not contend the main GRDB pool,
 is not on the typing path, and has no demonstrated user-visible delay. There is no local query
-fallback: tool failure becomes a tool error, while the successful result set is capped at 50.
+fallback: tool failure becomes a tool error, while the successful result set is capped at 100 (50 until tabmail-ios#264).
 
 **Why no adjacent index was added.** An independent solution audit considered a single-column
 `dateMs` index for the reachable unscoped arm. That would optimize a different query than the filed

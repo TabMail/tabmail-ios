@@ -158,39 +158,45 @@ struct MemorySearchToolTests {
     /// anchors on), a turn kept with no session included, demo turns left out.
     /// Its pages come from the one listing of the user turn: a turn written
     /// between pages shows only once the next user turn resets the listing.
-    @Test("No query pages the mode's turns, newest first, with their timestamps and roles")
-    func noQueryPagesTurnsWithTimestampsAndRoles() async throws {
+    /// A query that every turn matches equally pages the same way, from its one fetch.
+    @Test("No query, or a query, pages the mode's turns, newest first, with their timestamps and roles",
+          arguments: [nil, "turn"] as [String?])
+    func noQueryPagesTurnsWithTimestampsAndRoles(query: String?) async throws {
         let (memPool, memDir) = try await installMemoryIndex()
         defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
 
+        // Turns an hour apart from three days ago, filling two pages and part of a third.
         let base = noonUTCThreeDaysAgo()
+        let pageSize = SearchConfig.memorySearchPageSize
+        let count = 2 * pageSize + 2
         var expected: [(dateMs: Int64, role: String)] = []
-        for i in 0..<12 {
+        for i in 0..<count {
             let dateMs = base + Int64(i) * 3_600_000
             let role = i % 2 == 0 ? "user" : "assistant"
             await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i)", sessionId: i == 3 ? nil : "s\(i / 4)", role: role, dateMs: dateMs, text: "turn \(i)")
             expected.insert((dateMs, role == "user" ? "USER" : "AGENT"), at: 0)
         }
-        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:s", role: "user", dateMs: base + 20 * 3_600_000, text: "demo turn")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:s", role: "user", dateMs: base + Int64(count + 1) * 3_600_000, text: "demo turn")
 
         let tool = try makeTool()
-        let pageSize = SearchConfig.memoryPageSizeDefault
+        let late = base + Int64(count) * 3_600_000
         var shown: [(dateMs: Int64, role: String)] = []
         for page in 1...3 {
             if page == 2 {
-                // Written mid-listing: not on the listing's later pages.
-                await MemoryIndex.shared.indexTurn(chatHistoryId: "late", sessionId: "s9", role: "user", dateMs: base + 15 * 3_600_000, text: "late turn")
+                // Written mid-listing, newest of all: not on the listing's later pages.
+                await MemoryIndex.shared.indexTurn(chatHistoryId: "late", sessionId: "s9", role: "user", dateMs: late, text: "late turn")
             }
-            shown += try listed(try await tool.execute(arguments: ["page_index": .int(page)]))
+            var arguments: [String: JSONValue] = ["page_index": .int(page)]
+            if let query { arguments["query"] = .string(query) }
+            shown += try listed(try await tool.execute(arguments: arguments))
         }
         #expect(shown.map(\.dateMs) == expected.map(\.dateMs))
         #expect(shown.map(\.role) == expected.map(\.role))
-        #expect(pageSize * 3 >= expected.count)
 
         // The next user turn lists afresh: the late turn leads.
         await MemorySearchCache.shared.reset()
-        let next = try listed(try await tool.execute(arguments: [:]))
-        #expect(next.first?.dateMs == base + 15 * 3_600_000)
+        let next = try listed(try await tool.execute(arguments: query.map { ["query": .string($0)] } ?? [:]))
+        #expect(next.first?.dateMs == late)
     }
 
     /// A blank query is no query, for its pages too: page one asked with a
@@ -202,7 +208,7 @@ struct MemorySearchToolTests {
         defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
 
         let base = noonUTCThreeDaysAgo()
-        let pageSize = SearchConfig.memoryPageSizeDefault
+        let pageSize = SearchConfig.memorySearchPageSize
         let count = pageSize + 1
         for i in 0..<count {
             await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i)", sessionId: "s", role: "user", dateMs: base + Int64(i) * 3_600_000, text: "turn \(i)")
@@ -885,6 +891,61 @@ struct MemorySearchToolTests {
         await withDemoActive(true) {
             #expect(await ChatHistoryView.searchHistory("budget").map(\.chatHistoryId) == ["demo"])
         }
+    }
+
+    // MARK: - One fetch of 100, in pages of 20 (tabmail-ios#264)
+
+    /// 105 turns a minute apart, each with the word: more than one search fetches. Returns the
+    /// timestamps of the 100 a search or a listing keeps: the newest, newest first.
+    private func indexMoreTurnsThanOneSearchFetches() async -> [Int64] {
+        let base = noonUTCThreeDaysAgo()
+        let count = 105
+        await MemoryIndex.shared.indexTurns((0..<count).map { i in
+            (chatHistoryId: "t\(i)", sessionId: "s", role: "user", dateMs: base + Int64(i) * 60_000, text: "kinkajou note")
+        })
+        return (5..<count).reversed().map { base + Int64($0) * 60_000 }
+    }
+
+    private func pageInfo(_ result: String) throws -> [String: Any] {
+        let data = try #require(result.data(using: .utf8))
+        return try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    /// One fetch of the 100 best turns, served in pages of 20, a search and a listing alike; past the
+    /// last page the tool answers with the last page, so the agent narrows its query instead.
+    @Test("memory_search fetches its 100 best turns and serves them in pages of 20", arguments: ["", "kinkajou"])
+    func fetchesOneHundredInPagesOfTwenty(query: String) async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+        let expected = await indexMoreTurnsThanOneSearchFetches()
+
+        let tool = try makeTool()
+        var shown: [Int64] = []
+        for page in 1...5 {
+            let result = try await tool.execute(arguments: ["query": .string(query), "page_index": .int(page)])
+            let info = try pageInfo(result)
+            #expect(info["totalItems"] as? Int == 100)
+            #expect(info["totalPages"] as? Int == 5)
+            let turns = try listed(result).map(\.dateMs)
+            #expect(turns.count == 20)
+            shown += turns
+        }
+        #expect(shown == expected)
+        let past = try await tool.execute(arguments: ["query": .string(query), "page_index": .int(6)])
+        #expect(try pageInfo(past)["page"] as? Int == 5)
+        #expect(try listed(past).map(\.dateMs) == Array(expected.suffix(20)))
+    }
+
+    /// The Chat History screen lists the 100 most recent turns and searches for the 100 best; it
+    /// does not page, and older turns are found through its search.
+    @Test("The chat history screen lists and searches 100 turns")
+    func historyListsAndSearchesOneHundred() async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+        let expected = await indexMoreTurnsThanOneSearchFetches()
+
+        #expect(await ChatHistoryView.listHistory().map(\.dateMs) == expected)
+        #expect(await ChatHistoryView.searchHistory("kinkajou").map(\.dateMs) == expected)
     }
 
     /// The semantic leg keeps to the mode too: with the model loaded, a query

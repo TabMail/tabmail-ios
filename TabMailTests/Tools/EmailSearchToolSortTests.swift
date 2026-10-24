@@ -14,7 +14,7 @@ struct EmailSearchToolSortTests {
 
     private static let day: Int64 = 86_400_000
 
-    /// 2 January of last year (UTC), so every match is in the past and the 60 days the tests use stay in
+    /// 2 January of last year (UTC), so every match is in the past and the 120 days the tests use stay in
     /// one year shard: matches in two shards are scored against different statistics, so a weaker match
     /// alone in its shard can score the same as the better one.
     private func base() throws -> Int64 {
@@ -65,7 +65,7 @@ struct EmailSearchToolSortTests {
     @Test("a date sort lists the oldest (newest) of more matches than the tool fetches first")
     func dateSortFindsTheOldestAndNewestMatch() async throws {
         let base = try base()
-        let count = 60
+        let count = 120 // more than the 100 the tool fetches
         try await withMessages((0..<count).map { (subject: "report", dateMs: base + Int64($0) * Self.day) }) { tool, marker in
             let ascending = try await tool.execute(arguments: ["query": .string(marker), "sort": .string("date_asc")])
             #expect(try dates(ascending).first == formatted(base))
@@ -98,6 +98,30 @@ struct EmailSearchToolSortTests {
                 #expect(try object(result)["error"] == nil, "\(sort)")
                 #expect(try dates(result) == [formatted(base), formatted(base + Self.day)], "\(sort)")
             }
+        }
+    }
+
+    @Test("the tool fetches its 100 best matches and serves them in pages of 20, the last page past the end")
+    func fetchesOneHundredInPagesOfTwenty() async throws {
+        let base = try base()
+        let count = 105
+        // Equal matches, so the best 100 are the newest 100, newest first.
+        try await withMessages((0..<count).map { (subject: "report", dateMs: base + Int64($0) * Self.day) }) { tool, marker in
+            var shown: [String] = []
+            for page in 1...5 {
+                let result = try await tool.execute(arguments: ["query": .string(marker), "page_index": .int(page)])
+                let info = try object(result)
+                #expect(info["totalItems"] as? Int == 100)
+                #expect(info["totalPages"] as? Int == 5)
+                let listed = try dates(result)
+                #expect(listed.count == 20)
+                shown += listed
+            }
+            #expect(shown == (5..<count).reversed().map { formatted(base + Int64($0) * Self.day) })
+            // Past the last page the tool answers with the last page: the agent narrows its query instead.
+            let past = try await tool.execute(arguments: ["query": .string(marker), "page_index": .int(6)])
+            #expect(try object(past)["page"] as? Int == 5)
+            #expect(try dates(past) == Array(shown.suffix(20)))
         }
     }
 }

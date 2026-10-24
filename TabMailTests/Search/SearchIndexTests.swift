@@ -558,18 +558,6 @@ struct SearchIndexCRUDTests {
         #expect(results.isEmpty)
     }
 
-    @Test("keywordSearchShard returns empty for non-existent year")
-    func keywordSearchShardNonExistent() async throws {
-        let results = try await index.keywordSearchShard(query: "test", year: 1900)
-        #expect(results.isEmpty)
-    }
-
-    @Test("keywordSearchShard returns empty for empty query")
-    func keywordSearchShardEmpty() async throws {
-        let results = try await index.keywordSearchShard(query: "", year: 2024)
-        #expect(results.isEmpty)
-    }
-
     @Test("Year shard for dateMs=0 uses fallback year 2000")
     func yearShardFallback() async throws {
         let hid = "test_year0:INBOX:1"

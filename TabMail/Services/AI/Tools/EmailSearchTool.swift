@@ -17,9 +17,11 @@ struct EmailSearchTool: AgentTool, Sendable {
     }
 
     private enum Config {
-        /// TB uses pageSize=20 (searchPageSizeDefault=20 clamped by searchPageSizeMax=500)
+        /// TB `CHAT_SETTINGS.searchPageSizeDefault`.
         static let pageSize = 20
-        static let maxResults = 50
+        /// The best matches fetched, in the search's sort, in one request; the pages are served
+        /// from them. TB `CHAT_SETTINGS.emailSearchMaxResults` (tabmail-ios#264).
+        static let maxResults = 100
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {

@@ -116,7 +116,7 @@ struct SearchQueryParserExtendedTests {
         #expect(good.contains("subject:\"quarterly budget\""), "real column lost its phrase: \(good)")
 
         // An invented column must NOT be emitted as a column. `extractFieldQuoted` used to re-emit any
-        // ident-led prefix verbatim, so FTS5 raised "no such column: tag", keywordSearchShard threw,
+        // ident-led prefix verbatim, so FTS5 raised "no such column: tag", the keyword search threw,
         // and the user got nothing back — the same silent empty result as the pasted-URL case.
         let bogus = SearchQueryParser.buildFTSMatch("tag:\"urgent\"")
         #expect(!bogus.contains("tag:\"urgent\""), "unknown column emitted into MATCH: \(bogus)")

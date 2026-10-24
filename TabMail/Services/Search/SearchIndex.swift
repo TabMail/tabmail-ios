@@ -1799,39 +1799,6 @@ actor SearchIndex {
     /// Year shards sorted newest-first. Used by SearchView for progressive search.
     var sortedShardYears: [Int] { knownYears.sorted(by: >) }
 
-    /// Search a single year shard. Returns results sorted by BM25 rank.
-    /// Called per-shard by SearchView for progressive type-ahead.
-    func keywordSearchShard(query: String, year: Int, limit: Int = SearchConfig.searchDefaultLimit) throws -> [FTSSearchResult] {
-        guard let dbPool, knownYears.contains(year) else { return [] }
-
-        let ftsQuery = SearchQueryParser.buildFTSMatch(query)
-        guard !ftsQuery.isEmpty else { return [] }
-
-        return try dbPool.read { [self] db in
-            let table = ftsTableName(year: year)
-            let sql = """
-                SELECT meta.headerId, fts.msgId, meta.dateMs,
-                    snippet(\(table), -1, '[', ']', '\u{2026}', \(SearchConfig.snippetTokens)) AS snippet,
-                    bm25(\(table), \(SearchConfig.bm25Weights)) AS rank
-                FROM \(table) fts
-                JOIN message_meta meta ON fts.rowid = meta.rowid
-                WHERE \(table) MATCH ?
-                ORDER BY rank ASC
-                LIMIT ?
-                """
-            let rows = try Row.fetchAll(db, sql: sql, arguments: [ftsQuery, limit])
-            return rows.map { row in
-                FTSSearchResult(
-                    contentKey: row["headerId"],
-                    messageId: row["msgId"],
-                    snippet: row["snippet"],
-                    rank: row["rank"],
-                    dateMs: row["dateMs"]
-                )
-            }
-        }
-    }
-
     /// SQL predicate scoping search results by account per demo state
     /// (ADR-IOS-038): demo mode searches ONLY the demo account's rows; normal
     /// mode never sees them. `qualifier` is the table alias prefix (e.g.
@@ -2204,7 +2171,7 @@ actor SearchIndex {
     ///
     /// Grouped by shard so each shard costs one statement. FTS5 answers a `rowid IN (…)`
     /// constraint with a rowid-EQ seek per value (`SCAN … VIRTUAL TABLE INDEX 0:=M7`), so the
-    /// work is bounded by the number of survivors — `SearchConfig.searchDefaultLimit` (50) on
+    /// work is bounded by the number of survivors — `SearchConfig.searchDefaultLimit` (100) on
     /// the keystroke path — instead of by the candidate count.
     ///
     /// Returns `[shardYear: [ftsRowid: snippet]]`. Must be called on `db` from the same read
