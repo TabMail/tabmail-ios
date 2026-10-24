@@ -418,3 +418,20 @@ serializer that writes recipients:
   (its ISO-2022-JP detection), so it now also decodes a quoted windows-1251 part, red on upstream.
 - The app's `main` pins `f29b998`, an orphaned commit after the rebase; fork branch
   `pin/ios-main-f29b998` keeps it fetchable until `main`'s pin moves (the #277 repin to `d6979b5`).
+
+## 2026-10-24 — fork main carries every PR of ours; the app pins fork main
+
+- Owner policy: fork `main` is upstream `main` plus every one of our open or queued upstream PRs, as
+  if merged, and the app pins fork `main`. Upstream merges them whenever it decides; that no longer
+  holds finished work out of the app. Closed or superseded upstream PRs are not carried.
+- Fork `main` fast-forwarded `06b341e` -> `724d1b1`: the #268 stack (format-flowed, text-part
+  Content-ID, RFC 2231 content-type parameters, multipart containers, through `0ca687a`) plus the
+  senddraft Bcc commits (#220: `13acae8`, `2604cf5`, `724d1b1`). 980 package tests pass and
+  `swiftlint --strict` is clean; no build warning is in a file our commits touch.
+- The app pins `724d1b1` (#220). Collision check for the Bcc commits: the app calls only
+  `sendEmail` and `append(email:)`, and writes only single-line `In-Reply-To` and `References`
+  values, which pass the new header-field checks; `createDraft` and `sendDraft` are unused.
+- On a resync, rebase fork `main`'s own commits onto the new upstream and drop each one upstream has
+  merged (by content: upstream squash-merges). Push `pin/ios-main-<sha>` before any rewrite of
+  `main`, or the app's pinned SHA becomes unfetchable.
+
