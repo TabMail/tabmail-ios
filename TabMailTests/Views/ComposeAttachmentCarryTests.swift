@@ -133,7 +133,7 @@ struct ComposeAttachmentCarryTests {
     func explicitSaveClaimsBeforeCarryWait() throws {
         let body = try functionBody(
             "private func saveDraftAndDismiss() async {",
-            before: "private func discardDraftAndDismiss() async {",
+            before: "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
             in: composeSource())
         let claim = try #require(body.range(of: "isSavingDraft = true"))
         let wait = try #require(body.range(of: "await settledAttachmentSnapshot"))
@@ -151,7 +151,7 @@ struct ComposeAttachmentCarryTests {
             before: "private func deleteClearedDraftAndDismiss() async {",
             in: source)
         let discard = try functionBody(
-            "private func discardDraftAndDismiss() async {",
+            "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
             before: "private func typedDeleteIdentity(for draft: Draft) async",
             in: source)
         let send = try functionBody(
@@ -168,7 +168,7 @@ struct ComposeAttachmentCarryTests {
     func explicitSaveClaimsAgentDispositionBeforeSnapshot() throws {
         let body = try functionBody(
             "private func saveDraftAndDismiss() async {",
-            before: "private func discardDraftAndDismiss() async {",
+            before: "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
             in: composeSource())
         let claim = try #require(body.range(of: "agentSendFence.claimExclusiveDisposition()"))
         let snapshot = try #require(body.range(of: "await settledAttachmentSnapshot"))
@@ -186,7 +186,7 @@ struct ComposeAttachmentCarryTests {
             before: "private func deleteClearedDraftAndDismiss() async {",
             in: source)
         let discard = try functionBody(
-            "private func discardDraftAndDismiss() async {",
+            "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
             before: "private func typedDeleteIdentity(for draft: Draft) async",
             in: source)
         for (name, body) in [("close", close), ("discard", discard)] {
@@ -203,7 +203,7 @@ struct ComposeAttachmentCarryTests {
             before: "private func deleteClearedDraftAndDismiss() async {",
             in: source)
         let discard = try functionBody(
-            "private func discardDraftAndDismiss() async {",
+            "private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {",
             before: "private func typedDeleteIdentity(for draft: Draft) async",
             in: source)
         for (name, body) in [("close", close), ("discard", discard)] {

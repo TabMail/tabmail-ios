@@ -163,3 +163,4 @@ Authored after `v1.6.38`, so they have no byte-identical twin: their bodies live
 - **[ADR-IOS-093](Companion/Decisions/V3/Active/adr-ios-093.md)** — Active. Search query text reaches FTS5 as text (#246, ADR-NF-011): `SearchQueryParser.buildFTSMatch` quotes every word; fixes `fts5: syntax error`.
 - **[ADR-IOS-094](Companion/Decisions/V3/Active/adr-ios-094.md)** — Active. A search sorts before its limit (#265, ADR-NF-017): `SearchSort`, `HybridMerge.mergeResults` ties, `SearchConfig.dateSortPool`.
 - **[ADR-IOS-095](Companion/Decisions/V3/Active/adr-ios-095.md)** — Active. Every search fetches 100, in pages of 20 where it pages (#264, TB parity): `email_search` `maxResults`, `memorySearchPageSize`.
+- **[ADR-IOS-096](Companion/Decisions/V3/Active/adr-ios-096.md)** — Active. Discard drops only unsaved edits (#254): `DiscardScope`, `discardDisposition` keeps a server draft; the cleared-draft Delete deletes it.

@@ -268,6 +268,36 @@ enum ComposeDraftGuards {
         readState != .error
     }
 
+    /// What a Discard covers (#254). `.unsavedEdits` is the Discard of the
+    /// "Save Draft?" prompt: it drops this session's unsaved edits. `.wholeDraft`
+    /// is the confirmed delete of a loaded draft cleared to nothing.
+    enum DiscardScope: Equatable {
+        case unsavedEdits
+        case wholeDraft
+    }
+
+    /// What Discard does to the draft row it read.
+    enum DiscardDisposition: Equatable {
+        /// The draft stays as last saved, on the device and on the server; only
+        /// the compose closes.
+        case keepDraft
+        /// Queue the server copy's delete, which then deletes the local row.
+        case deleteServerDraft
+        /// Delete the local row; no server copy exists.
+        case deleteLocalDraft
+    }
+
+    /// Owner 2026-10-22 (#254): Discard on a draft that already exists on the
+    /// server drops only this session's unsaved edits and leaves the draft as it
+    /// was; deleting it stays an explicit action. Compose writes the row only on
+    /// Save, Send and agent autosave, so closing without a write leaves exactly
+    /// the last saved copy. A draft that never reached the server is deleted, as
+    /// before.
+    static func discardDisposition(scope: DiscardScope, serverDraftId: String?) -> DiscardDisposition {
+        guard serverDraftId != nil else { return .deleteLocalDraft }
+        return scope == .unsavedEdits ? .keepDraft : .deleteServerDraft
+    }
+
     /// PORT — `v2final:ComposeDraftGuards.committedRecipients`.
     ///
     /// The recipients a draft PERSISTS for one field: its addresses, then each
@@ -1681,7 +1711,7 @@ struct ComposeView: View {
             ))
             .alert("Save Draft?", isPresented: $showDiscardPrompt) {
                 Button("Save") { Task { await saveDraftAndDismiss() } }
-                Button("Discard", role: .destructive) { Task { await discardDraftAndDismiss() } }
+                Button("Discard", role: .destructive) { Task { await discardDraftAndDismiss(.unsavedEdits) } }
                 Button("Cancel", role: .cancel) { }
             } message: {
                 Text("You have unsaved changes. Save as draft?")
@@ -2693,7 +2723,7 @@ struct ComposeView: View {
     /// and the remote server-draft cleanup queued. A local-only delete would let
     /// the server copy re-sync and REAPPEAR.
     private func deleteClearedDraftAndDismiss() async {
-        await discardDraftAndDismiss()
+        await discardDraftAndDismiss(.wholeDraft)
     }
 
     private func saveDraftAndDismiss() async {
@@ -2933,7 +2963,7 @@ struct ComposeView: View {
             })
     }
 
-    private func discardDraftAndDismiss() async {
+    private func discardDraftAndDismiss(_ scope: ComposeDraftGuards.DiscardScope) async {
         // See `saveDraftAndDismiss`: never let Discard overtake another durable
         // disposition or a running agent edit.
         guard !isSavingDraft else { return }
@@ -2992,7 +3022,11 @@ struct ComposeView: View {
         ActiveAgentTracker.shared.clearWorking(sessionKey)
         ChatPillState.shared.removeSession(for: sessionKey)
 
-        if draftRecord.serverDraftId != nil {
+        switch ComposeDraftGuards.discardDisposition(scope: scope, serverDraftId: draftRecord.serverDraftId) {
+        case .keepDraft:
+            // #254: the draft stays as last saved; only this session's edits go.
+            break
+        case .deleteServerDraft:
             guard let identity = await typedDeleteIdentity(for: draftRecord) else {
                 sendError = "The server draft could not be safely identified, so it was not discarded."
                 return
@@ -3007,7 +3041,7 @@ struct ComposeView: View {
                 sendError = "The server draft delete could not be saved, so the draft was not discarded."
                 return
             }
-        } else {
+        case .deleteLocalDraft:
             do {
                 guard try await DraftStore.shared.deleteAsync(
                     id: draftRecord.id, expectedInstanceEpoch: epoch) else {
