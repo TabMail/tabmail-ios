@@ -25,7 +25,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 |---|---|
 | Key Files | [read in full](Companion/Memory/Current/001-key-files.md) |
 | Inbox list = ONE merged read-model (ADR-IOS-055, 2026-07-09 evening) — supersedes the same-day guard/carry-over fixes | [read in full](Companion/Memory/Current/002-inbox-list-one-merged-read-model-adr-ios-055-2026-07-09-evening-supersed.md) |
-| Summary `recipient_status` (cc detection) — 2026-07-04; AddressParser claim + escaped writers, crafted-name residual RESOLVED 2026-10-10 (#214) | [read in full](Companion/Memory/Current/003-summary-recipient-status-cc-detection-2026-07-04.md) |
+| Summary `recipient_status` (cc detection) — 2026-07-04 | [read in full](Companion/Memory/Current/003-summary-recipient-status-cc-detection-2026-07-04.md) |
 | IMAP external-deletion blind spot — old server-deleted messages linger forever (audit 2026-07-02) | [read in full](Companion/Memory/Current/004-imap-external-deletion-blind-spot-old-server-deleted-messages-linger-for.md) |
 | CLI testing breaks with "Simulator device failed to launch / Launchd job spawn failed" → app is UNSIGNED in DerivedData (2026-06-22) | [read in full](Companion/Memory/Current/005-cli-testing-breaks-with-simulator-device-failed-to-launch-launchd-job-sp.md) |
 | Test flakiness: `UserDefaults(suiteName:)` isolation FALLS THROUGH to `.standard` — isolating a suite's WRITES is necessary but not sufficient (2026-06-22) | [read in full](Companion/Memory/Current/006-test-flakiness-userdefaults-suitename-isolation-falls-through-to-standar.md) |
@@ -70,7 +70,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | Transient provider HTTP errors must NOT surface as a sync failure — `SyncEngine.isTransientError` (2026-06-17) | [read in full](Companion/Memory/Current/045-transient-provider-http-errors-must-not-surface-as-a-sync-failure-syncen.md) |
 | Raw NIO error types must be added to `isConnectionError` by NSError DOMAIN, not substring (2026-07-04) | [read in full](Companion/Memory/Current/046-raw-nio-error-types-must-be-added-to-isconnectionerror-by-nserror-domain.md) |
 | ICS Calendar Import — Invisible SFSafariViewController Hack | [read in full](Companion/Memory/Current/047-ics-calendar-import-invisible-sfsafariviewcontroller-hack.md) |
-| Attachment Support (SwiftMail `fetchPart` returns EMPTY bytes for an absent `BODY[n]`, never nil: check BODYSTRUCTURE size) | [read in full](Companion/Memory/Current/048-attachment-support.md) |
+| Attachment Support | [read in full](Companion/Memory/Current/048-attachment-support.md) |
 | Compose AI Suggestion — chat pill edits suggestion in place when bubble is visible | [read in full](Companion/Memory/Current/049-compose-ai-suggestion-chat-pill-edits-suggestion-in-place-when-bubble-is.md) |
 | Compose body — caret-aware scroll, NO input gating | [read in full](Companion/Memory/Current/050-compose-body-caret-aware-scroll-no-input-gating.md) |
 | Compose Attachments | [read in full](Companion/Memory/Current/051-compose-attachments.md) |

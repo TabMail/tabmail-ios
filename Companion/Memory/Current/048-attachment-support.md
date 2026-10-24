@@ -1,8 +1,20 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+**Amended after this fragment was pinned (moved into this note on 2026-10-24, #288).** Where the text below and the pinned body differ, this text wins:
+
+Added after the line beginning "- IMAP: `IMAPProvider.fetchAttachment` fetches by MIME section via `se…":
+
+  - **⚠ SwiftMail's full `fetchPart` (and so `fetchMessage(from:)`, which fills every part with it) returns EMPTY `Data`, never nil or an error, when the server's FETCH response carries no `BODY[n]`** (`FetchPartHandler` only appends streamed bytes and succeeds on the tagged OK). A `part.data == nil` / `textContent == nil` check therefore cannot tell "absent" from "empty"; the evidence is BODYSTRUCTURE's declared `size` (`MessagePart.size`). `IMAPProvider.draftPartArrived` (#217 round 3, 2026-10-21) applies it to the draft read; a unit test that builds a part with `data: nil` exercises a shape the wire never produces, which is how the gap stayed green.
+
+The index row in `PROJECT_MEMORY.md` was edited too; it is restored to the manifest title, and its amended text, verbatim (fenced so its index-relative link is not re-resolved here), is:
+
+```text
+| Attachment Support (SwiftMail `fetchPart` returns EMPTY bytes for an absent `BODY[n]`, never nil: check BODYSTRUCTURE size) | [read in full](Companion/Memory/Current/048-attachment-support.md) |
+```
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Attachment Support
 - `AttachmentInfo` (filename, contentType, section, size) stored as JSON in `MessageBody.attachmentsJSON`
 - IMAP: `IMAPProvider.fetchAttachment` fetches by MIME section via `server.fetchPart(section:of:)`
-  - **⚠ SwiftMail's full `fetchPart` (and so `fetchMessage(from:)`, which fills every part with it) returns EMPTY `Data`, never nil or an error, when the server's FETCH response carries no `BODY[n]`** (`FetchPartHandler` only appends streamed bytes and succeeds on the tagged OK). A `part.data == nil` / `textContent == nil` check therefore cannot tell "absent" from "empty"; the evidence is BODYSTRUCTURE's declared `size` (`MessagePart.size`). `IMAPProvider.draftPartArrived` (#217 round 3, 2026-10-21) applies it to the draft read; a unit test that builds a part with `data: nil` exercises a shape the wire never produces, which is how the gap stayed green.
 - Gmail: `GmailProvider.fetchAttachment` fetches by `attachmentId` via REST API (`/messages/{id}/attachments/{attachmentId}`). `AttachmentInfo.section` stores the `attachmentId` for Gmail.
 - Gmail attachment metadata extracted in `fetchMessage` via `extractAttachments(from:)` — recursively walks the `GmailPart` tree for parts with non-empty `filename` and `body.attachmentId`
 - **Walk from the TOP-LEVEL `payload`, not just `payload.parts`** — a single-part message (e.g. a Google **DMARC aggregate report** = one `application/zip`, no text body, no `parts`) carries its attachment on the payload node itself. `fetchMessage` builds a synthetic root `GmailPart` from `msg.payload` (mimeType/filename/headers/body/parts) and passes that to `extractAttachments`, mirroring the shared NSE parser `GmailParse.walkParts` (which is why the inbox `hasAttachments` paperclip was already correct via `GmailParse.parseMessage`). `GmailPayload` gained a `filename` field (with a defaulted memberwise init) for this. Regression test: `GmailProviderMockTests.singlePartAttachmentOnlyMessage`.

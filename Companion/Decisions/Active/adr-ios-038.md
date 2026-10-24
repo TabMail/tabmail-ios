@@ -3,6 +3,49 @@
 > `registerAlarmsWithPushWorker` and `TaskEvaluationService.evaluate`. Both symbols were deleted
 > with the scheduled-task feature; see ADR-IOS-079. Their guard pattern still applies to any future
 > KB-reading background job: demo data must not overwrite real execution state or registrations.
+
+**Amended after this fragment was pinned (moved into this note on 2026-10-24, #288).** Where the text below and the pinned body differ, this text wins:
+
+Added after the line beginning "search UI ("Search All" spanned every account).":
+
+  *Amended 2026-10-23 (tabmail-ios#265, ADR-IOS-094):* the vector leg is
+  scoped in SQL before the merge (`searchVecCandidates` joins the KNN
+  results to `message_meta` with `demoAccountScopeSQL`, as MemoryIndex does);
+  the post-merge filter (by then `contentKeyInDemoScope`) is deleted. A
+  date sort's 4,096 candidates otherwise let the other mode's matches by
+  meaning fill the limit before the filter dropped them.
+
+Added after the line beginning "memory_read never cross modes (NULL sessionId = legacy real).":
+
+  *Amended 2026-10-20:* `memory_search`'s page cache (`MemorySearchCache`)
+  is kept per mode too: the tool reads the mode once and uses that reading
+  for both the cache key and `MemoryIndex.search(demoActive:)`, since a
+  compose edit runs the tool with no chat turn resetting the cache between
+  modes. `DemoModeService.purgeDemoMemory` (demo exit and the orphan wipe)
+  empties the cache after purging the demo turns, so none is served again.
+  A demo start runs the orphan wipe before it turns demo on (a force-quit's
+  launch wipe clears the main database only), and **fails closed**: if
+  `MemoryIndex.purgeForSessionPrefix` cannot confirm every demo turn is gone,
+  `DemoModeService.activate` leaves demo off and throws (the login screen's
+  start error; the user retries). Demo exit and a real sign-up only log the
+  failure: real mode never reads `demo:` turns, and the next demo start wipes
+  them first.
+  *Amended 2026-10-21 (#231, late writers):* a chat write still running from
+  a demo that has ended could bring its turn back after the next demo's
+  confirmed purge. Two writers, two fixes. (1) Memory self-heal Stage A
+  (`ChatStore.historyTurnIdsForSelfHeal`) leaves `demo:` sessions out: demo
+  history is discarded at exit, so there is nothing to repair, and a demo turn
+  it loaded could be indexed after the wipe. (2) Chat appends carry an
+  in-memory **admission** (`DemoModeStore.Admission`): a demo run opens one when
+  `isActive` turns on, `DemoModeService.exit` revokes it FIRST (before its
+  wipes), and it never reopens (a run counter). The three send paths in
+  `DynamicIslandChatButton` capture `chatAdmission` with the session id
+  (compose's own user-turn persistence included) and pass it to
+  `ChatStore.appendTurn(_:admission:)`; `DemoModeStore.admits` is checked inside
+  the chatHistory write transaction and inside `MemoryIndex.indexTurn`'s
+  memory.db write transaction, so each write lands before the cleanup that
+  deletes it or is refused (`ChatStore.DemoTurnRefused`). A `demo:` turn with
+  no admission is refused; any other turn is real history and always admitted.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 
@@ -165,44 +208,9 @@ fix gates at shared chokepoints, not per-tool patches:
   vector-only hybrid hits filtered by `headerIdInDemoScope` (headerId =
   `accountId:folderPath:messageId`). Covers email_search AND the inbox
   search UI ("Search All" spanned every account).
-  *Amended 2026-10-23 (tabmail-ios#265, ADR-IOS-094):* the vector leg is
-  scoped in SQL before the merge (`searchVecCandidates` joins the KNN
-  results to `message_meta` with `demoAccountScopeSQL`, as MemoryIndex does);
-  the post-merge filter (by then `contentKeyInDemoScope`) is deleted. A
-  date sort's 4,096 candidates otherwise let the other mode's matches by
-  meaning fill the limit before the filter dropped them.
 - **MemoryIndex** — `demoScopeSQL` (sessionId `demo:` range) on the FTS
   leg, the vec KNN leg (meta join), and `readByTimestamp` — memory_search /
   memory_read never cross modes (NULL sessionId = legacy real).
-  *Amended 2026-10-20:* `memory_search`'s page cache (`MemorySearchCache`)
-  is kept per mode too: the tool reads the mode once and uses that reading
-  for both the cache key and `MemoryIndex.search(demoActive:)`, since a
-  compose edit runs the tool with no chat turn resetting the cache between
-  modes. `DemoModeService.purgeDemoMemory` (demo exit and the orphan wipe)
-  empties the cache after purging the demo turns, so none is served again.
-  A demo start runs the orphan wipe before it turns demo on (a force-quit's
-  launch wipe clears the main database only), and **fails closed**: if
-  `MemoryIndex.purgeForSessionPrefix` cannot confirm every demo turn is gone,
-  `DemoModeService.activate` leaves demo off and throws (the login screen's
-  start error; the user retries). Demo exit and a real sign-up only log the
-  failure: real mode never reads `demo:` turns, and the next demo start wipes
-  them first.
-  *Amended 2026-10-21 (#231, late writers):* a chat write still running from
-  a demo that has ended could bring its turn back after the next demo's
-  confirmed purge. Two writers, two fixes. (1) Memory self-heal Stage A
-  (`ChatStore.historyTurnIdsForSelfHeal`) leaves `demo:` sessions out: demo
-  history is discarded at exit, so there is nothing to repair, and a demo turn
-  it loaded could be indexed after the wipe. (2) Chat appends carry an
-  in-memory **admission** (`DemoModeStore.Admission`): a demo run opens one when
-  `isActive` turns on, `DemoModeService.exit` revokes it FIRST (before its
-  wipes), and it never reopens (a run counter). The three send paths in
-  `DynamicIslandChatButton` capture `chatAdmission` with the session id
-  (compose's own user-turn persistence included) and pass it to
-  `ChatStore.appendTurn(_:admission:)`; `DemoModeStore.admits` is checked inside
-  the chatHistory write transaction and inside `MemoryIndex.indexTurn`'s
-  memory.db write transaction, so each write lands before the cleanup that
-  deletes it or is refused (`ChatStore.DemoTurnRefused`). A `demo:` turn with
-  no admission is refused; any other turn is real history and always admitted.
 - **CalendarProviderDispatch** — demo resolves ONLY `DemoCalendarProvider`
   (new `CalendarBackend.demo` case); normal mode skips the demo entry.
   Without this, coexistence calendar_read leaked real events and

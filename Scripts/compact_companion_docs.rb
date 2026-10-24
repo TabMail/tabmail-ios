@@ -728,7 +728,9 @@ end
 INDEX_BUDGETS = {
   "CLAUDE.md" => 30_000,
   "PROJECT_STRUCTURE.md" => 8_000,
-  "PROJECT_MEMORY.md" => 25_000,
+  # 30 KB, not 25: the owner's 2026-09-03 override for this repo (measure.sh BUDGET_IOS_MEMORY), because
+  # the 91 rows this script freezes are 14.9 KB on their own. Lower it with the pruning pass, #111.
+  "PROJECT_MEMORY.md" => 30_000,
   "DECISIONS.md" => 25_000,
   "MISTAKES.md" => 12_000
 }.freeze

@@ -1,3 +1,16 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+**Amended after this fragment was pinned (moved into this note on 2026-10-24, #288).** Where the text below and the pinned body differ, this text wins:
+
+Replaces the line(s) beginning "- **FTS-only fallback**: when vec table empty (embedding rebuild), use…":
+
+- **FTS-only fallback**: when vec table empty (embedding rebuild), uses `searchFTSOnly()` — sorts by dateMs DESC, rank ASC (until 2026-10-23; now by the search's sort, see below)
+- **Sort before the limit** (2026-10-23, #265 / native-fts #46, ADR-IOS-094): `search`/`hybridSearch` take `SearchSort` (relevance / date_desc / date_asc); merge ties relevance newer first, date better first, then rowid; date sorts read `dateSortPool` 4,096 per leg; a query of only fields answers by keyword over all matches (newest first under relevance); `searchFTSOnly` orders relevance `rank ASC, dateMs DESC`, dates `dateMs, rank`; `keywordSearch` (SearchView typing) stays `dateMs DESC, rank ASC`
+- **Empty-merge fallback** (2026-10-21, #240 / native-fts #28): when the merge keeps nothing but FTS matched (a word in at least half a shard's rows: FTS5 IDF ~0), `searchFTSOnly()` / memory `assembleFTSOnly` answer; `hybridSearch(…, queryEmbedding:)` is the testable hybrid part
+
+Added after the line beginning "- **Column-scope filter-first**: `from:"email"` queries pre-filter vec…":
+
+- **Vector search within the dates and the field** (2026-10-22, #242 / native-fts #26, ADR-IOS-032 amendment): `searchVecCandidates` passes the dates and the field's rowids into the KNN query (`rowid IN (SELECT rowid FROM message_meta WHERE dateMs … AND json_each(rowids))`), so nearer rows outside them never take the candidate places; no post-filter, no doubled `k` for a field
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Hybrid FTS5 + Vector Search (Local)
 - **Separate SQLite database** (`fts.db` in Application Support) using GRDB — separate from main `tabmail.sqlite`
@@ -9,12 +22,9 @@
 - **Vector search**: sqlite-vec KNN (v0.1.7-alpha.2), embeddings in `messages_vec` virtual table
 - **sqlite-vec safety**: ALL `messages_vec` access MUST go through the writer connection (`writeWithoutTransaction` for reads). Reader pool connections create vec0 vtab instances that crash in `vec0_free_resources` on disconnect. No `sqlite3_auto_extension` — registered per-connection in SearchIndex only.
 - **Hybrid merge**: 70% vector / 30% keyword scoring, min score 0.1, 4× candidate multiplier
-- **FTS-only fallback**: when vec table empty (embedding rebuild), uses `searchFTSOnly()` — sorts by dateMs DESC, rank ASC (until 2026-10-23; now by the search's sort, see below)
-- **Sort before the limit** (2026-10-23, #265 / native-fts #46, ADR-IOS-094): `search`/`hybridSearch` take `SearchSort` (relevance / date_desc / date_asc); merge ties relevance newer first, date better first, then rowid; date sorts read `dateSortPool` 4,096 per leg; a query of only fields answers by keyword over all matches (newest first under relevance); `searchFTSOnly` orders relevance `rank ASC, dateMs DESC`, dates `dateMs, rank`; `keywordSearch` (SearchView typing) stays `dateMs DESC, rank ASC`
-- **Empty-merge fallback** (2026-10-21, #240 / native-fts #28): when the merge keeps nothing but FTS matched (a word in at least half a shard's rows: FTS5 IDF ~0), `searchFTSOnly()` / memory `assembleFTSOnly` answer; `hybridSearch(…, queryEmbedding:)` is the testable hybrid part
+- **FTS-only fallback**: when vec table empty (embedding rebuild), uses `searchFTSOnly()` — sorts by dateMs DESC, rank ASC
 - **Date-range scan**: `query="*"` with date params → `scanByDateRange()` (no FTS MATCH, just date filter on message_meta)
 - **Column-scope filter-first**: `from:"email"` queries pre-filter vec candidates to matching rowids
-- **Vector search within the dates and the field** (2026-10-22, #242 / native-fts #26, ADR-IOS-032 amendment): `searchVecCandidates` passes the dates and the field's rowids into the KNN query (`rowid IN (SELECT rowid FROM message_meta WHERE dateMs … AND json_each(rowids))`), so nearer rows outside them never take the candidate places; no post-filter, no doubled `k` for a field
 - **Indexing pipeline**: headers indexed synchronously (`await indexHeadersForFTS`) — no `Task.detached`, eliminating body race condition. Body + embedding on fetchBody (AccountManager hook).
 - **Bulk index**: runs after sync if FTS index is sparse (first-launch catch-up). Phase 1: headers, Phase 2: body backfill from GRDB.
 - **Background embedding rebuild**: generates embeddings for messages with bodies but no embeddings, low priority
