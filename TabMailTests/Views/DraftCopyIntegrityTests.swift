@@ -1023,6 +1023,8 @@ struct DraftCopyIntegrityTests {
         ("(\"CHARSET*\" \"utf-8''gbk\")", gbk, "中文"),
         ("(\"CHARSET*0*\" \"utf-8''g\" \"CHARSET*1\" \"bk\")", gbk, "中文"),
         ("(\"CHARSET\" \"UTF-8\" \"FORMAT*\" \"utf-8''flowed\")", Data("Hello \r\nthere".utf8), "Hello there"),
+        ("(\"CHARSET*0\" \"g\" \"CHARSET*1\" \"bk\")", gbk, "中文"),
+        ("(\"CHARSET\" \"UTF-8\" \"FORMAT*0\" \"flo\" \"FORMAT*1\" \"wed\")", Data("Hello \r\nthere".utf8), "Hello there"),
     ])
     func imapExtendedParametersAreRead(parameters: String, bytes: Data, text: String) async throws {
         let wire = Self.base64Part(bytes)
@@ -1042,15 +1044,18 @@ struct DraftCopyIntegrityTests {
         }
     }
 
-    @Test("A Gmail draft's charset written in RFC 2231 extended form is read")
-    func gmailExtendedCharsetIsRead() async throws {
+    @Test("A Gmail draft's charset written in RFC 2231 extended form is read", arguments: [
+        "text/plain; charset*=utf-8''gbk",
+        "text/plain; charset*0=g; charset*1=bk",
+    ])
+    func gmailExtendedCharsetIsRead(contentType: String) async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m1"}}"#))
         let payload: [String: Any] = [
             "id": "m1", "internalDate": String(Int(Date().timeIntervalSince1970 * 1000)), "labelIds": ["DRAFT"],
             "payload": ["mimeType": "text/plain",
-                        "headers": [["name": "Content-Type", "value": "text/plain; charset*=utf-8''gbk"]],
+                        "headers": [["name": "Content-Type", "value": contentType]],
                         "body": ["size": Self.gbk.count, "data": Self.base64URL(Self.gbk)]] as [String: Any],
         ]
         http.register(path: "/messages/m1", method: "GET", response: .json(
