@@ -18,6 +18,15 @@ struct HybridResult {
     let finalScore: Double
     let textScore: Double
     let vectorScore: Double
+    let dateMs: Int64
+}
+
+/// The order a search puts its matches in before it takes its limit. Mirrors tabmail-native-fts
+/// `SearchSort` (#46, ADR-NF-017): relevance ties go newer first, date ties the better match first.
+enum SearchSort: String, Sendable {
+    case relevance
+    case dateDesc = "date_desc"
+    case dateAsc = "date_asc"
 }
 
 enum HybridMerge {
@@ -36,19 +45,23 @@ enum HybridMerge {
         max(0.0, 1.0 - distance)
     }
 
-    /// Merge FTS5 and vector search results into a single ranked list.
+    /// Merge FTS5 and vector search results into one list in `sort` order, then take `limit`.
     ///
     /// - Parameters:
     ///   - textResults: (rowid, bm25Rank) from FTS5 search
     ///   - vectorResults: (rowid, cosineDistance) from vector search
+    ///   - dates: each candidate's dateMs; a candidate without one (its row is gone) is left out
     ///   - vectorWeight: weight for semantic score (0.0..1.0)
     ///   - textWeight: weight for keyword score (0.0..1.0)
+    ///   - sort: relevance (ties newer first), or by date (ties the better match first); then rowid
     ///   - limit: maximum number of results to return
     static func mergeResults(
         textResults: [(Int64, Double)],
         vectorResults: [(Int64, Double)],
+        dates: [Int64: Int64],
         vectorWeight: Double,
         textWeight: Double,
+        sort: SearchSort,
         limit: Int
     ) -> [HybridResult] {
         var candidates = [Int64: HybridCandidate]()
@@ -74,6 +87,7 @@ enum HybridMerge {
         }
 
         var results = candidates.values.compactMap { c -> HybridResult? in
+            guard let dateMs = dates[c.rowid] else { return nil }
             // Rescale vector score: scores below threshold → 0, above → 0..1
             let th = SearchConfig.vectorScoreThreshold
             let adjustedVector = max(0.0, (c.vectorScore - th) / (1.0 - th))
@@ -83,11 +97,22 @@ enum HybridMerge {
                 rowid: c.rowid,
                 finalScore: finalScore,
                 textScore: c.textScore,
-                vectorScore: c.vectorScore
+                vectorScore: c.vectorScore,
+                dateMs: dateMs
             )
         }
 
-        results.sort { $0.finalScore > $1.finalScore }
+        results.sort { a, b in
+            let better = a.finalScore != b.finalScore ? a.finalScore > b.finalScore : nil
+            let newer = a.dateMs != b.dateMs ? a.dateMs > b.dateMs : nil
+            let first: Bool?
+            switch sort {
+            case .relevance: first = better ?? newer
+            case .dateDesc: first = newer ?? better
+            case .dateAsc: first = newer.map { !$0 } ?? better
+            }
+            return first ?? (a.rowid < b.rowid)
+        }
         if results.count > limit {
             results = Array(results.prefix(limit))
         }

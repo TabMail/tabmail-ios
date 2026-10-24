@@ -6,6 +6,15 @@ import Testing
 import Foundation
 @testable import TabMail
 
+/// `HybridMerge.mergeResults` in relevance order with every candidate dated the same, for the tests
+/// of its scoring.
+func mergeDated(textResults: [(Int64, Double)], vectorResults: [(Int64, Double)],
+                vectorWeight: Double, textWeight: Double, limit: Int) -> [HybridResult] {
+    let dates = Dictionary((textResults + vectorResults).map { ($0.0, Int64(0)) }, uniquingKeysWith: { first, _ in first })
+    return HybridMerge.mergeResults(textResults: textResults, vectorResults: vectorResults, dates: dates,
+                                    vectorWeight: vectorWeight, textWeight: textWeight, sort: .relevance, limit: limit)
+}
+
 @Suite("HybridMerge")
 struct HybridMergeTests {
 
@@ -74,7 +83,7 @@ struct HybridMergeTests {
 
     @Test("FTS-only results returned correctly")
     func ftsOnly() {
-        let results = HybridMerge.mergeResults(
+        let results = mergeDated(
             textResults: [(1, -5.0), (2, -3.0), (3, -1.0)],
             vectorResults: [],
             vectorWeight: 0.3,
@@ -90,7 +99,7 @@ struct HybridMergeTests {
 
     @Test("Vector-only results returned correctly")
     func vectorOnly() {
-        let results = HybridMerge.mergeResults(
+        let results = mergeDated(
             textResults: [],
             vectorResults: [(1, 0.1), (2, 0.3), (3, 0.5)],
             vectorWeight: 0.3,
@@ -105,7 +114,7 @@ struct HybridMergeTests {
 
     @Test("Dedup on overlapping results: same rowid in both")
     func dedupOverlapping() {
-        let results = HybridMerge.mergeResults(
+        let results = mergeDated(
             textResults: [(1, -5.0)],
             vectorResults: [(1, 0.1)],
             vectorWeight: 0.3,
@@ -120,7 +129,7 @@ struct HybridMergeTests {
     @Test("Limit is respected")
     func limitRespected() {
         let text = (1...100).map { (Int64($0), -Double($0)) }
-        let results = HybridMerge.mergeResults(
+        let results = mergeDated(
             textResults: text,
             vectorResults: [],
             vectorWeight: 0.3,
@@ -132,7 +141,7 @@ struct HybridMergeTests {
 
     @Test("Results sorted by finalScore descending")
     func sortedDescending() {
-        let results = HybridMerge.mergeResults(
+        let results = mergeDated(
             textResults: [(1, -10.0), (2, -1.0), (3, -5.0)],
             vectorResults: [],
             vectorWeight: 0.3,
@@ -146,7 +155,7 @@ struct HybridMergeTests {
 
     @Test("70/30 weighting: text dominates")
     func weightingTextDominates() {
-        let results = HybridMerge.mergeResults(
+        let results = mergeDated(
             textResults: [(1, -10.0)],
             vectorResults: [(2, 0.0)],  // distance=0 → perfect vector match
             vectorWeight: 0.3,

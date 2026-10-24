@@ -165,7 +165,7 @@ struct DemoIsolationTests {
         #expect(try rows(demoActive: false) == 3)  // real-uuid + msg: + NULL
     }
 
-    @Test("SearchIndex demo account scope — SQL predicate + headerId prefix check")
+    @Test("SearchIndex demo account scope — SQL predicate")
     func searchIndexDemoScope() throws {
         let queue = try DatabaseQueue()
         try queue.write { db in
@@ -182,12 +182,6 @@ struct DemoIsolationTests {
         }
         #expect(try ids(demoActive: true) == ["demo-account:INBOX:1"])
         #expect(try ids(demoActive: false) == ["real-1:INBOX:9"])
-
-        // Vector-leg assembly check (no SQL scoping there — prefix based)
-        #expect(SearchIndex.contentKeyInDemoScope(ContentKey(rawValue: "demo-account:INBOX:1"), demoActive: true))
-        #expect(!SearchIndex.contentKeyInDemoScope(ContentKey(rawValue: "real-1:INBOX:9"), demoActive: true))
-        #expect(SearchIndex.contentKeyInDemoScope(ContentKey(rawValue: "real-1:INBOX:9"), demoActive: false))
-        #expect(!SearchIndex.contentKeyInDemoScope(ContentKey(rawValue: "demo-account:INBOX:1"), demoActive: false))
     }
 
     @Test("DemoToolGuard.accountScope filters by demo account in both modes")

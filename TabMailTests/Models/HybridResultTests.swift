@@ -23,10 +23,11 @@ struct HybridResultTests {
 
     @Test("Init stores all fields")
     func initAllFields() {
-        let result = HybridResult(rowid: 1, finalScore: 0.9, textScore: 0.8, vectorScore: 0.7)
+        let result = HybridResult(rowid: 1, finalScore: 0.9, textScore: 0.8, vectorScore: 0.7, dateMs: 5)
         #expect(result.rowid == 1)
         #expect(result.finalScore == 0.9)
         #expect(result.textScore == 0.8)
         #expect(result.vectorScore == 0.7)
+        #expect(result.dateMs == 5)
     }
 }

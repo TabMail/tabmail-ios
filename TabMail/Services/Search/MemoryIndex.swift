@@ -744,13 +744,25 @@ actor MemoryIndex {
             return hits
         }
 
-        // Merge via HybridMerge with memory weights.
+        // Merge via HybridMerge with memory weights; equal matches newer first. The merge needs each
+        // candidate's date: vector-only ones are read in one query. A failed read leaves them out, as a
+        // failed `fetchMetaForRowids` below does.
         let textPairs: [(Int64, Double)] = ftsCandidates.map { ($0.rowid, $0.rank) }
+        var dates = Dictionary(ftsCandidates.map { ($0.rowid, $0.dateMs) }, uniquingKeysWith: { first, _ in first })
+        let vectorOnly = vecCandidates.map(\.0).filter { dates[$0] == nil }
+        do {
+            dates.merge(try dbPool.read { db in try SearchIndex.fetchDates(db, metaTable: "memory_meta", rowids: vectorOnly) },
+                        uniquingKeysWith: { first, _ in first })
+        } catch {
+            BackgroundSyncLogger.logDebug("[MemoryIndex] date lookup of \(vectorOnly.count) vector-only candidates failed: \(error)")
+        }
         let merged = HybridMerge.mergeResults(
             textResults: textPairs,
             vectorResults: vecCandidates,
+            dates: dates,
             vectorWeight: SearchConfig.memoryVectorWeight,
             textWeight: SearchConfig.memoryTextWeight,
+            sort: .relevance,
             limit: limit
         )
         BackgroundSyncLogger.logDebug("[MemoryIndex] search merged=\(merged.count) (hybrid via HybridMerge)")

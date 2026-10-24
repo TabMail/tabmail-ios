@@ -316,7 +316,7 @@ struct SearchQueryTextSearchTests {
         }
         let hybrid = try await index.hybridSearch(
             ftsQuery: SearchQueryParser.buildFTSMatch("subject:zebra\u{0}\u{301}"), queryEmbedding: Self.oneHot(5),
-            fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil)
+            fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil, sort: .relevance)
         #expect(hybrid.map(\.contentKey) == [Self.key("zebra")])
         try await cleanUp()
     }
@@ -334,7 +334,7 @@ struct SearchQueryTextSearchTests {
         }
         let hybrid = { (q: String) in
             try await index.hybridSearch(ftsQuery: SearchQueryParser.buildFTSMatch(q), queryEmbedding: Self.oneHot(5),
-                                         fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil)
+                                         fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil, sort: .relevance)
         }
         // A word ending in a Prepend character (U+0600, U+0D4E) or a quote followed by a combining
         // mark, beside a field: the search answers.
@@ -418,7 +418,7 @@ struct SearchQueryTextSearchTests {
             }
             let hybrid = try await index.hybridSearch(
                 ftsQuery: SearchQueryParser.buildFTSMatch("\(typed):\"\(value)\" meeting"), queryEmbedding: Self.oneHot(5),
-                fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil)
+                fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil, sort: .relevance)
             #expect(hybrid.map(\.contentKey) == [Self.key("in-field")], "\(typed)")
         }
         try await cleanUp()
@@ -432,7 +432,7 @@ struct SearchQueryTextSearchTests {
         #expect(try await found(query).isEmpty, "\(q)")
         let prefix = Self.key("").rawValue
         return try await index.hybridSearch(ftsQuery: SearchQueryParser.buildFTSMatch(query), queryEmbedding: Self.oneHot(5),
-                                            fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil)
+                                            fromDateMs: from, toDateMs: to, limit: 100, folderIds: nil, sort: .relevance)
             .map { String($0.contentKey.rawValue.dropFirst(prefix.count)) }
             .sorted()
     }
@@ -518,7 +518,7 @@ struct SearchQueryTextSearchTests {
             let ftsQuery = SearchQueryParser.buildFTSMatch(q)
             if !ftsQuery.isEmpty {
                 _ = try await index.hybridSearch(ftsQuery: ftsQuery, queryEmbedding: Self.oneHot(5),
-                                                 fromDateMs: from, toDateMs: to, limit: 10, folderIds: nil)
+                                                 fromDateMs: from, toDateMs: to, limit: 10, folderIds: nil, sort: .relevance)
                 hybridRuns += 1
             }
         }
@@ -527,7 +527,7 @@ struct SearchQueryTextSearchTests {
         let nots = (0..<300).map { " NOT qz" + String(format: "%03d", $0) }.joined()
         for q in ["subject: O'Brien don't", "subject:lunch don't", "don't NOT O'Brien", "budget" + nots, "don't" + nots] {
             _ = try await index.hybridSearch(ftsQuery: SearchQueryParser.buildFTSMatch(q), queryEmbedding: Self.oneHot(5),
-                                             fromDateMs: from, toDateMs: to, limit: 10, folderIds: nil)
+                                             fromDateMs: from, toDateMs: to, limit: 10, folderIds: nil, sort: .relevance)
         }
         try await cleanUp()
     }
