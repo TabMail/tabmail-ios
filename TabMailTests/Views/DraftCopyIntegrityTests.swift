@@ -739,13 +739,18 @@ struct DraftCopyIntegrityTests {
         #expect((copy.attachmentData ?? [:]).isEmpty)
     }
 
-    @Test("A multipart/related draft's HTML root with a Content-ID is the body; its image stays an inline image")
-    func imapRelatedRootWithContentIdIsTheBody() async throws {
+    /// The HTML root's extension fields after its line count: none, or an
+    /// inline disposition as some clients write it.
+    nonisolated static let relatedRootExtensions = ["", " NIL (\"INLINE\" NIL) NIL NIL"]
+
+    @Test("A multipart/related draft's HTML root with a Content-ID is the body; its image stays an inline image",
+          arguments: relatedRootExtensions)
+    func imapRelatedRootWithContentIdIsTheBody(rootExtension: String) async throws {
         let html = Data("<p>Hello</p>".utf8)
         let png = Data([0x89, 0x50, 0x4E, 0x47])
         let pngBase64 = Data(png.base64EncodedString().utf8)
         let copy = try await imapCopy(
-            bodystructure: "((\"TEXT\" \"HTML\" (\"CHARSET\" \"UTF-8\") \"<root@example.com>\" NIL \"7BIT\" \(html.count) 1)"
+            bodystructure: "((\"TEXT\" \"HTML\" (\"CHARSET\" \"UTF-8\") \"<root@example.com>\" NIL \"7BIT\" \(html.count) 1\(rootExtension))"
                 + "(\"IMAGE\" \"PNG\" NIL \"<logo@example.com>\" NIL \"BASE64\" \(pngBase64.count) NIL (\"INLINE\" NIL) NIL NIL) \"RELATED\")",
             contentType: "multipart/related; boundary=b", body: html + pngBase64,
             partBodies: ["1": html, "2": pngBase64])
