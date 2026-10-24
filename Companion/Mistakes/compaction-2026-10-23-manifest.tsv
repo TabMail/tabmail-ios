@@ -1,0 +1,30 @@
+# companion-compact 2026-10-23: MISTAKES.md index lines lost only their markdown link (index 13726 B against 12000 B).
+# Every other byte of each line is unchanged. The removed link targets, by id. Old header line, verbatim:
+# > **Compact index. One line per mistake.** Detail lives in `Companion/Mistakes/Active/`.
+id	path
+MIS-IOS-001	Companion/Mistakes/Active/MIS-IOS-001-appended-to-an-already-applied-migration.md
+MIS-IOS-002	Companion/Mistakes/Active/MIS-IOS-002-date-window-for-imap-sync.md
+MIS-IOS-004	Companion/Mistakes/Active/MIS-IOS-004-conflated-unknown-with-authoritative-stale.md
+MIS-IOS-021	Companion/Mistakes/Active/MIS-IOS-021-unified-two-look-alike-classifiers-and-widened-the-narrower-gate.md
+MIS-IOS-007	Companion/Mistakes/Active/MIS-IOS-007-read-the-first-create-table-as-the-effective-schema.md
+MIS-IOS-008	Companion/Mistakes/Active/MIS-IOS-008-verified-the-recovery-path-not-the-states-where-it-cannot-run.md
+MIS-IOS-013	Companion/Mistakes/Active/MIS-IOS-013-asked-a-byte-level-question-with-a-grapheme-level-string-api.md
+MIS-IOS-003	Companion/Mistakes/Active/MIS-IOS-003-reconstructed-an-address-the-wire-already-gave-us.md
+MIS-IOS-015	Companion/Mistakes/Active/MIS-IOS-015-made-a-guard-depend-on-a-transient-globals-lifetime-across-an-async-hop.md
+MIS-IOS-016	Companion/Mistakes/Active/MIS-IOS-016-shipped-a-test-whose-precondition-never-occurs.md
+MIS-IOS-017	Companion/Mistakes/Active/MIS-IOS-017-gated-a-view-on-state-that-only-that-view-could-resolve.md
+MIS-IOS-018	Companion/Mistakes/Active/MIS-IOS-018-extended-a-processing-bound-into-display-semantics.md
+MIS-IOS-019	Companion/Mistakes/Active/MIS-IOS-019-added-persistent-log-writers-outside-the-facade-its-registry-test-was-built-to-see.md
+MIS-IOS-020	Companion/Mistakes/Active/MIS-IOS-020-fixed-the-one-site-the-finding-named-and-built-the-retained-shape.md
+MIS-IOS-022	Companion/Mistakes/Active/MIS-IOS-022-replaced-a-splitting-mechanism-and-left-its-loop-under-the-old-aggregate-deadline.md
+MIS-IOS-023	Companion/Mistakes/Active/MIS-IOS-023-wrote-a-new-call-over-the-one-the-path-already-owed.md
+MIS-IOS-024	Companion/Mistakes/Active/MIS-IOS-024-widened-a-bound-without-asking-what-it-bounded.md
+MIS-IOS-025	Companion/Mistakes/Active/MIS-IOS-025-read-a-content-store-with-a-header-id.md
+MIS-IOS-026	Companion/Mistakes/Active/MIS-IOS-026-released-a-reference-while-an-await-still-held-the-object.md
+MIS-IOS-005	Companion/Mistakes/Active/MIS-IOS-005-bare-xcodegen-broke-nse-signing.md
+MIS-IOS-006	Companion/Mistakes/Active/MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md
+MIS-IOS-014	Companion/Mistakes/Active/MIS-IOS-014-wrote-a-red-first-proof-that-could-not-run-red.md
+MIS-IOS-009	Companion/Mistakes/Active/MIS-IOS-009-amended-a-hash-pinned-fragment-and-killed-the-verifier.md
+MIS-IOS-010	Companion/Mistakes/Active/MIS-IOS-010-bulk-write-selected-on-a-column-value-that-was-itself-a-guard.md
+MIS-IOS-011	Companion/Mistakes/Active/MIS-IOS-011-declared-a-residual-acceptable-on-an-argument-i-never-ran.md
+MIS-IOS-012	Companion/Mistakes/Active/MIS-IOS-012-guarded-one-reader-on-a-caller-census-whose-grep-shape-hid-half-the-callers.md

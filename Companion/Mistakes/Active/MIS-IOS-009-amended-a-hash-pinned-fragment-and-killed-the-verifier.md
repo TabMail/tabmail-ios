@@ -2,7 +2,7 @@
 
 **Class:** documentation / verification
 **Severity:** high
-**First seen:** 2026-08-04 · **Recurrences:** 10 (**10: 2026-09-10 — appended a quote-collapse bullet to the pinned body of `Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md` (below `COMPANION-CURRENT-NOTE-END`) and re-pinned row 37 of `Memory/manifest.tsv` to the raw-file sha256; `verify` aborted on `hash mismatch`. Caught by the round-3 correctness reviewer. Repaired the prescribed way: bullet moved inside the NOTE wrapper, hash restored, not re-pinned.** **9: edited the preserved body of `Companion/Memory/Current/030-backfill-fast-sync-completion-gate-on-pendingbodycount-never-a-server-to.md` to correct a `pendingBodyCount` predicate the oversized-quarantine stop-gap had changed — a FACTUALLY CORRECT amendment in the WRONG PLACE. `verify` aborted on its first gate (`hash mismatch:`), hiding nine downstream checks. Caught by a round-5 review specialist, not by me; see "Instance 9" at the end.** **8: appended a two-line citation note as BARE MARKDOWN to the GENERATED, byte-frozen `Companion/Process/Current/KnownIssues/ios-billing-001.md` (`a6f395517`), breaking `compact_known_issues.rb verify` from 2026-08-18 until `fb5d498a2` this morning — and `Companion/Memory/Current/115-known-issues-register-is-byte-frozen-and-has-no-append-path.md` ALREADY DOCUMENTED THAT EXACT HAZARD. The knowledge existed and was not reachable at the moment it was needed; see "Instance 8" at the end.** **7: killed `verify` with a GLOB — `…/KnownIssues/ios-*.md` written into a Ruby comment, by the exact mechanism the note below this line already describes; see "Instance 7" at the end.** **6: broke again the DAY AFTER instance 5 was repaired — see "Instance 6" at the end.** 5: was fail-open for two days — `345c04a6f` edited a preserved body and `verify` aborted on its FIRST check from 2026-08-10 to 2026-08-12, silently disabling the ADR census, routing, link, pointer and budget checks. ✅ REPAIRED 2026-08-12 the prescribed way — body restored byte-for-byte from the pinned source, amendment moved into a `COMPANION-CURRENT-NOTE` wrapper, SHA **not** re-pinned. See "Instance 5 — resolution" at the end of this file**) · **Status:** Active
+**First seen:** 2026-08-04 · **Recurrences:** 11 (**11: found 2026-10-24 — `verify` had aborted on its first gate since about 2026-09-26: seven Memory and three Decisions fragments amended in place by ordinary feature PRs, two frozen index rows edited with them; see "Instance 11" at the end.** **10: 2026-09-10 — appended a quote-collapse bullet to the pinned body of `Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md` (below `COMPANION-CURRENT-NOTE-END`) and re-pinned row 37 of `Memory/manifest.tsv` to the raw-file sha256; `verify` aborted on `hash mismatch`. Caught by the round-3 correctness reviewer. Repaired the prescribed way: bullet moved inside the NOTE wrapper, hash restored, not re-pinned.** **9: edited the preserved body of `Companion/Memory/Current/030-backfill-fast-sync-completion-gate-on-pendingbodycount-never-a-server-to.md` to correct a `pendingBodyCount` predicate the oversized-quarantine stop-gap had changed — a FACTUALLY CORRECT amendment in the WRONG PLACE. `verify` aborted on its first gate (`hash mismatch:`), hiding nine downstream checks. Caught by a round-5 review specialist, not by me; see "Instance 9" at the end.** **8: appended a two-line citation note as BARE MARKDOWN to the GENERATED, byte-frozen `Companion/Process/Current/KnownIssues/ios-billing-001.md` (`a6f395517`), breaking `compact_known_issues.rb verify` from 2026-08-18 until `fb5d498a2` this morning — and `Companion/Memory/Current/115-known-issues-register-is-byte-frozen-and-has-no-append-path.md` ALREADY DOCUMENTED THAT EXACT HAZARD. The knowledge existed and was not reachable at the moment it was needed; see "Instance 8" at the end.** **7: killed `verify` with a GLOB — `…/KnownIssues/ios-*.md` written into a Ruby comment, by the exact mechanism the note below this line already describes; see "Instance 7" at the end.** **6: broke again the DAY AFTER instance 5 was repaired — see "Instance 6" at the end.** 5: was fail-open for two days — `345c04a6f` edited a preserved body and `verify` aborted on its FIRST check from 2026-08-10 to 2026-08-12, silently disabling the ADR census, routing, link, pointer and budget checks. ✅ REPAIRED 2026-08-12 the prescribed way — body restored byte-for-byte from the pinned source, amendment moved into a `COMPANION-CURRENT-NOTE` wrapper, SHA **not** re-pinned. See "Instance 5 — resolution" at the end of this file**) · **Status:** Active
 **Related:** [MIS-IOS-006](MIS-IOS-006-stale-test-bundle-reported-a-wrong-count.md); **MIS-023** and
 **MIS-027** in the monorepo-root tree (`rg -n 'MIS-023|MIS-027' ../MISTAKES.md`) — both are the same
 shape: reading a number instead of reading how far the run got.
@@ -592,3 +592,31 @@ Fragment 1 (from the MIS-IOS-009 index line):
 Fragment 2 (from the MIS-IOS-009 index line):
 
 ⚠️ **×9 (2026-09-02): a FACTUALLY CORRECT amendment in the wrong place** — the tell is *"this documented line is now wrong, and I made it wrong"*; being right about the content is not a licence to edit the body. In a WORKTREE `verify` also fails `../CLAUDE.md` for free — read the lines, not `rc`. 
+
+## Instance 11 — found 2026-10-24: a month of feature PRs, no single culprit
+
+The tell was absent this time: nobody was editing `Companion/` as such. Each change was a feature PR
+that also brought its memory or ADR up to date, in the place a reader would look, and none of them
+ran `verify`. Found while compacting `PROJECT_MEMORY.md` and `MISTAKES.md`, when `verify` aborted on
+`hash mismatch: Companion/Memory/Current/003-summary-recipient-status-cc-detection-2026-07-04.md`
+before any change had been made.
+
+Fragments whose stripped body no longer matches its pin, with the commit that last touched each:
+
+- `Companion/Memory/Current/065-screen-keep-awake-chat-pill.md` (`2b5e2e5f`, 2026-09-26)
+- `Companion/Memory/Current/086-dictation-leaves-avaudiosession-active-haptics-die-process-wide-2026-06.md` (`83d47693`, 2026-09-26)
+- `Companion/Memory/Current/055-device-prompt-sync-ai-cache-probe.md` (`9400f5c4`, 2026-10-05)
+- `Companion/Memory/Current/003-summary-recipient-status-cc-detection-2026-07-04.md` (`43168f6d`, #216, 2026-10-10), a pure append; the frozen index row was edited too
+- `Companion/Decisions/Active/adr-ios-034.md` (`219c5bc1`, #248, 2026-10-22)
+- `Companion/Memory/Current/013-fts-tokenizer-no-tokenchars-adr-024-2026-06-09-lockstep-with-rust-crate.md` (`84b9f646`, #246, 2026-10-23)
+- `Companion/Memory/Current/054-hybrid-fts5-vector-search-local.md`, `Companion/Decisions/Active/adr-ios-032.md`, `Companion/Decisions/Active/adr-ios-038.md` (`c5c421d3`, #281, 2026-10-23)
+- `Companion/Memory/Current/048-attachment-support.md` (`af4c2ab5`, #282, 2026-10-23); the frozen index row was edited too
+
+With all of them masked in a scratch copy, every later check passes, so the damage is confined to
+those fragments and the two rows. The repair is the prescribed one: restore each pinned body
+byte-for-byte, move its amendment into a `COMPANION-CURRENT-NOTE` wrapper at the top of the file,
+restore the two rows to the manifest title, never re-pin. Tracked as its own issue.
+
+**Countermeasure this instance argues for:** the review gate and the PR checklist name `verify`
+for any PR that touches `Companion/`, not only for compaction passes; a feature PR's memory update is
+the common case, and it is the one that never thought of itself as a `Companion/` edit.
