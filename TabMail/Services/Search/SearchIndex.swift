@@ -1873,7 +1873,7 @@ actor SearchIndex {
     func search(query: String, fromDateMs: Int64? = nil, toDateMs: Int64? = nil,
                 limit: Int = SearchConfig.searchDefaultLimit,
                 folderIds: [String]? = nil) throws -> [FTSSearchResult] {
-        guard let dbPool else { return [] }
+        guard dbPool != nil else { return [] }
         if let ids = folderIds, ids.isEmpty { return [] }
 
         let query = query.trimmingCharacters(in: .whitespaces)
@@ -1903,37 +1903,36 @@ actor SearchIndex {
             return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
         }
 
+        return try hybridSearch(ftsQuery: ftsQuery, queryEmbedding: try embeddingService.embed(query),
+                                fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
+    }
+
+    /// The hybrid part of `search`, given the query's embedding. Call it through `search`, which
+    /// answers an empty folder list and an empty FTS query before reaching it.
+    func hybridSearch(ftsQuery: String, queryEmbedding: [Float], fromDateMs: Int64?, toDateMs: Int64?,
+                      limit: Int, folderIds: [String]?) throws -> [FTSSearchResult] {
+        guard let dbPool else { return [] }
         let candidateLimit = limit * SearchConfig.candidateMultiplier
 
         // --- FTS5 candidates (UNION ALL across all year shards) ---
         let ftsCandidates = try searchFTSCandidates(
             ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: candidateLimit, folderIds: folderIds)
 
-        // --- Column-scope filter-first: restrict vector candidates to eligible rowids ---
+        // --- Column-scope filter-first: the vector search looks only among the field's rowids ---
         let eligibleRowids: Set<Int64>?
-        if Self.queryHasColumnScope(ftsQuery) {
-            let filterQuery = Self.extractColumnScopeFilter(ftsQuery)
-            if !filterQuery.isEmpty {
-                eligibleRowids = try fetchEligibleRowids(filterQuery: filterQuery, db: dbPool)
-            } else {
-                eligibleRowids = nil
-            }
+        let filterQuery = Self.extractColumnScopeFilter(ftsQuery)
+        if !filterQuery.isEmpty {
+            eligibleRowids = try fetchEligibleRowids(filterQuery: filterQuery, db: dbPool)
         } else {
             eligibleRowids = nil
         }
 
-        // --- Vector candidates via sqlite-vec KNN ---
-        let vecTopK = eligibleRowids != nil ? candidateLimit * 2 : candidateLimit
-        let queryEmbedding = try embeddingService.embed(query)
-        let allVec = searchVecCandidates(queryEmbedding: queryEmbedding, limit: vecTopK)
-        let vectorCandidates: [(Int64, Double)]
-        if let eligible = eligibleRowids {
-            vectorCandidates = allVec.filter { eligible.contains($0.0) }
-        } else {
-            vectorCandidates = allVec
-        }
+        // --- Vector candidates via sqlite-vec KNN, within the dates and the field ---
+        let vectorCandidates = searchVecCandidates(queryEmbedding: queryEmbedding, limit: candidateLimit,
+                                                   fromDateMs: fromDateMs, toDateMs: toDateMs, eligible: eligibleRowids)
 
-        // Fall back to FTS-only when vec table is empty (e.g., during embedding rebuild).
+        // Fall back to FTS-only when no vector lies within the dates and the field (or the vec table
+        // is empty, e.g. during embedding rebuild).
         // Without this, hybrid weights (text_weight=0.3) penalize text-only results below MIN_SCORE.
         if vectorCandidates.isEmpty {
             BackgroundSyncLogger.logDebug("[SearchIndex] No vector candidates (vec table may be empty), falling back to FTS-only search")
@@ -1946,6 +1945,14 @@ actor SearchIndex {
             textResults: textPairs, vectorResults: vectorCandidates,
             vectorWeight: SearchConfig.vectorWeight, textWeight: SearchConfig.textWeight,
             limit: limit)
+
+        // Words matched but the merge kept nothing (a word in most messages scores about 0 by keyword,
+        // and a weak vector match adds too little to reach minScore): answer by keyword, as with no
+        // vectors. Mirrors tabmail-native-fts #28 (ADR-NF-014).
+        if merged.isEmpty && !ftsCandidates.isEmpty {
+            BackgroundSyncLogger.logDebug("[SearchIndex] Hybrid merge kept none of \(ftsCandidates.count) keyword matches, falling back to FTS-only search")
+            return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit, folderIds: folderIds)
+        }
 
         // --- Assemble results ---
         var ftsMap = [Int64: (contentKey: ContentKey, messageId: String, snippet: String, dateMs: Int64)]()
@@ -1962,14 +1969,12 @@ actor SearchIndex {
                     snippet: fts.snippet, rank: -hr.finalScore, dateMs: fts.dateMs
                 ))
             } else {
-                // Vector-only result — fetch metadata, apply date filter.
-                // Demo scope: the KNN leg has no SQL account predicate, so
-                // out-of-scope vector hits are dropped here (headerId is
-                // accountId-prefixed).
+                // Vector-only result — fetch metadata (the KNN leg already kept
+                // only rows within the dates). Demo scope: the KNN leg has no
+                // SQL account predicate, so out-of-scope vector hits are
+                // dropped here (headerId is accountId-prefixed).
                 if let meta = try fetchMeta(rowid: hr.rowid) {
                     guard Self.contentKeyInDemoScope(meta.contentKey, demoActive: DemoModeStore.isDemoActive) else { continue }
-                    if let from = fromDateMs, meta.dateMs < from { continue }
-                    if let to = toDateMs, meta.dateMs > to { continue }
                     results.append(FTSSearchResult(
                         contentKey: meta.contentKey, messageId: meta.messageId,
                         snippet: "", rank: -hr.finalScore, dateMs: meta.dateMs
@@ -2260,17 +2265,36 @@ actor SearchIndex {
     /// Returns array of (rowid, cosineDistance) sorted by distance ascending.
     /// Gracefully returns empty if the vec table doesn't exist (e.g., during rebuild).
     ///
+    /// With dates (either bound, each inclusive) or a field's rowids, sqlite-vec searches only the
+    /// rows of `message_meta` dated within the dates and among those rowids (`rowid IN`), so nearer
+    /// rows outside them never take the `limit` places. Mirrors tabmail-native-fts#26 (ADR-NF-016).
+    ///
     /// Uses the writer connection (not reader pool) to avoid sqlite-vec vtab lifecycle
     /// crash — vec0 caches prepared statements per connection, and reader pool
     /// connection recycling can cause SIGABRT in vec0_free_resources on disconnect.
-    private func searchVecCandidates(queryEmbedding: [Float], limit: Int) -> [(Int64, Double)] {
+    /// Internal (not private) so tests can check that nearer rows outside the dates or
+    /// the field fill the unfiltered `limit`.
+    func searchVecCandidates(queryEmbedding: [Float], limit: Int, fromDateMs: Int64?, toDateMs: Int64?,
+                             eligible: Set<Int64>?) -> [(Int64, Double)] {
         guard let dbPool else { return [] }
         let blob = queryEmbedding.withUnsafeBytes { Data($0) }
+        let sql: String
+        let arguments: StatementArguments
+        if fromDateMs == nil && toDateMs == nil && eligible == nil {
+            sql = "SELECT rowid, distance FROM messages_vec WHERE embedding MATCH ? AND k = ?"
+            arguments = [blob, limit]
+        } else {
+            sql = """
+                SELECT rowid, distance FROM messages_vec WHERE embedding MATCH ? AND k = ? AND rowid IN
+                (SELECT rowid FROM message_meta WHERE dateMs >= ? AND dateMs <= ?
+                 AND (? IS NULL OR rowid IN (SELECT value FROM json_each(?))))
+                """
+            let eligibleJSON = eligible.map { "[" + $0.map(String.init).joined(separator: ",") + "]" }
+            arguments = [blob, limit, fromDateMs ?? Int64.min, toDateMs ?? Int64.max, eligibleJSON, eligibleJSON]
+        }
         do {
             return try dbPool.writeWithoutTransaction { db in
-                try Row.fetchAll(db, sql: """
-                    SELECT rowid, distance FROM messages_vec WHERE embedding MATCH ? AND k = ?
-                    """, arguments: [blob, limit])
+                try Row.fetchAll(db, sql: sql, arguments: arguments)
                 .compactMap { row -> (Int64, Double)? in
                     guard let rowid = row["rowid"] as Int64?,
                           let distance = row["distance"] as Double? else { return nil }
@@ -2286,88 +2310,79 @@ actor SearchIndex {
 
     // MARK: - Column Scope Detection & Filtering
 
-    /// Check if a processed FTS5 query contains column-scoped terms.
-    /// After buildFTSMatch(), field aliases are already translated (from: → from_:, to: → to_:).
+    /// Column-scope prefixes in the FTS5 queries `SearchQueryParser.buildFTSMatch` writes.
     private static let columnScopePrefixes = ["from_:", "to_:", "subject:", "cc:", "bcc:", "body:"]
 
-    private static func queryHasColumnScope(_ ftsQuery: String) -> Bool {
-        columnScopePrefixes.contains { ftsQuery.contains($0) }
-    }
-
     /// Extract only the column-scoped terms from a processed FTS5 query.
-    /// Given `from_:"alice@example.com" hiring*`, returns `from_:"alice@example.com"`.
+    /// Given `from_:"alice@example.com" hiring*`, returns `from_:"alice@example.com"`; an empty
+    /// string when the query has none.
     /// Used to build a filter-only query for pre-filtering vector candidates.
+    /// Reads the query's UTF-8 bytes, as tabmail-native-fts `extract_column_scope_filter` does, and
+    /// cuts only at ASCII bytes, so every slice is whole UTF-8. A walk over Characters missed string
+    /// boundaries: a quote followed by a combining mark, or a Prepend character (U+0600) followed by
+    /// a quote, is one Character, and the filter then cut inside a string FTS5 refused.
     private static func extractColumnScopeFilter(_ ftsQuery: String) -> String {
+        let bytes = Array(ftsQuery.utf8)
+        let prefixes = columnScopePrefixes.map { Array($0.utf8) }
+        let quote = UInt8(ascii: "\""), star = UInt8(ascii: "*"), open = UInt8(ascii: "("), close = UInt8(ascii: ")")
+        // Rust `u8::is_ascii_whitespace`: space, tab, line feed, form feed, carriage return.
+        let isWhitespace = { (b: UInt8) in b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0C || b == 0x0D }
         var scopedTerms: [String] = []
-        var i = ftsQuery.startIndex
+        var i = 0
 
-        while i < ftsQuery.endIndex {
-            // Skip whitespace and AND/OR keywords
-            if ftsQuery[i].isWhitespace {
-                i = ftsQuery.index(after: i)
+        while i < bytes.count {
+            // Skip whitespace
+            if isWhitespace(bytes[i]) {
+                i += 1
                 continue
             }
 
-            let remaining = String(ftsQuery[i...])
-
             // Check if current position starts with a column scope prefix
-            var matchedPrefix: String?
-            for prefix in columnScopePrefixes {
-                if remaining.hasPrefix(prefix) {
-                    matchedPrefix = prefix
-                    break
-                }
-            }
-
-            if let prefix = matchedPrefix {
-                // Found a column-scoped term — consume field:value
+            if let prefix = prefixes.first(where: { bytes[i...].starts(with: $0) }) {
                 let start = i
-                i = ftsQuery.index(i, offsetBy: prefix.count)
+                i += prefix.count
 
-                if i < ftsQuery.endIndex && ftsQuery[i] == "\"" {
+                if i < bytes.count && bytes[i] == quote {
                     // Quoted value: field:"value" or prefix form field:"value"*
-                    i = ftsQuery.index(after: i)
-                    while i < ftsQuery.endIndex && ftsQuery[i] != "\"" {
-                        i = ftsQuery.index(after: i)
+                    i += 1
+                    while i < bytes.count && bytes[i] != quote {
+                        i += 1
                     }
-                    if i < ftsQuery.endIndex {
-                        i = ftsQuery.index(after: i) // closing quote
+                    if i < bytes.count {
+                        i += 1 // closing quote
                     }
-                    if i < ftsQuery.endIndex && ftsQuery[i] == "*" {
-                        i = ftsQuery.index(after: i) // prefix star — keep so the
-                        // filter query preserves the main query's prefix semantics
+                    if i < bytes.count && bytes[i] == star {
+                        i += 1 // prefix star — keep so the filter query preserves the main
+                        // query's prefix semantics
                     }
                 } else {
                     // Unquoted value: field:value*
-                    while i < ftsQuery.endIndex && !ftsQuery[i].isWhitespace {
-                        i = ftsQuery.index(after: i)
+                    while i < bytes.count && !isWhitespace(bytes[i]) {
+                        i += 1
                     }
                 }
 
-                scopedTerms.append(String(ftsQuery[start..<i]))
+                scopedTerms.append(String(decoding: bytes[start..<i], as: UTF8.self))
+            } else if bytes[i] == quote {
+                // Non-scoped quoted phrase — skip it
+                i += 1
+                while i < bytes.count && bytes[i] != quote {
+                    i += 1
+                }
+                if i < bytes.count { i += 1 }
+            } else if bytes[i] == open {
+                // Skip parenthesized group (synonym or spelling OR group)
+                var depth = 1
+                i += 1
+                while i < bytes.count && depth > 0 {
+                    if bytes[i] == open { depth += 1 }
+                    if bytes[i] == close { depth -= 1 }
+                    i += 1
+                }
             } else {
-                // Non-scoped token — skip it
-                if ftsQuery[i] == "\"" {
-                    // Skip quoted phrase
-                    i = ftsQuery.index(after: i)
-                    while i < ftsQuery.endIndex && ftsQuery[i] != "\"" {
-                        i = ftsQuery.index(after: i)
-                    }
-                    if i < ftsQuery.endIndex { i = ftsQuery.index(after: i) }
-                } else if ftsQuery[i] == "(" {
-                    // Skip parenthesized group (synonym OR expansion)
-                    var depth = 1
-                    i = ftsQuery.index(after: i)
-                    while i < ftsQuery.endIndex && depth > 0 {
-                        if ftsQuery[i] == "(" { depth += 1 }
-                        if ftsQuery[i] == ")" { depth -= 1 }
-                        i = ftsQuery.index(after: i)
-                    }
-                } else {
-                    // Regular token — skip
-                    while i < ftsQuery.endIndex && !ftsQuery[i].isWhitespace {
-                        i = ftsQuery.index(after: i)
-                    }
+                // Regular token — skip
+                while i < bytes.count && !isWhitespace(bytes[i]) {
+                    i += 1
                 }
             }
         }

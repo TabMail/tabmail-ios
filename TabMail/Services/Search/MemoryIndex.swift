@@ -243,12 +243,23 @@ actor MemoryIndex {
     /// Idempotent upsert of a single turn. Called synchronously after the
     /// chatHistory write commits. Non-throwing — logs errors internally; Stage A
     /// self-heal (A−B direction) picks up any write that fails here.
-    func indexTurn(chatHistoryId: String, sessionId: String?, role: String, dateMs: Int64, text: String) {
+    ///
+    /// A demo turn is written only while its demo run admits it
+    /// (`DemoModeStore.admits`), checked inside the write: a demo's cleanup
+    /// revokes the run before its memory purge, so the turn is either written
+    /// before the purge and deleted by it, or refused (#231).
+    func indexTurn(chatHistoryId: String, sessionId: String?, role: String, dateMs: Int64, text: String, admission: DemoModeStore.Admission? = nil) {
         ensureReady()
         guard let dbPool else { return }
         do {
-            try dbPool.write { db in
+            let written = try dbPool.write { db -> Bool in
+                guard DemoModeStore.admits(sessionId: sessionId, admission: admission) else { return false }
                 try Self.writeTurn(db: db, chatHistoryId: chatHistoryId, sessionId: sessionId, role: role, dateMs: dateMs, text: text)
+                return true
+            }
+            guard written else {
+                BackgroundSyncLogger.logDebug("[MemoryIndex] indexTurn REFUSED id=\(chatHistoryId.prefix(20)): its demo has ended")
+                return
             }
             if DebugModeManager.isLoggingEnabled() {
                 let head = String(text.prefix(80)).replacingOccurrences(of: "\n", with: "\\n")
@@ -382,9 +393,11 @@ actor MemoryIndex {
     /// Purge memory rows whose `sessionId` starts with the given prefix.
     /// Demo Mode uses session IDs prefixed `"demo:"` so this scopes the wipe
     /// to demo content only — production memory survives.
-    func purgeForSessionPrefix(_ prefix: String) {
+    /// Throws unless every matching row is gone, so a caller can refuse to go on
+    /// (a demo start does) while the rows stay searchable.
+    func purgeForSessionPrefix(_ prefix: String) throws {
         ensureReady()
-        guard let dbPool else { return }
+        guard let dbPool else { throw MemoryIndexError.unavailable }
         do {
             try dbPool.write { db in
                 let pattern = "\(prefix)%"
@@ -394,8 +407,8 @@ actor MemoryIndex {
                     arguments: [pattern]
                 )
                 for rowid in rowids {
-                    try? db.execute(sql: "DELETE FROM memory_vec WHERE rowid = ?", arguments: [rowid])
-                    try? db.execute(sql: "DELETE FROM memory_fts WHERE rowid = ?", arguments: [rowid])
+                    try db.execute(sql: "DELETE FROM memory_vec WHERE rowid = ?", arguments: [rowid])
+                    try db.execute(sql: "DELETE FROM memory_fts WHERE rowid = ?", arguments: [rowid])
                 }
                 try db.execute(
                     sql: "DELETE FROM memory_meta WHERE sessionId LIKE ?",
@@ -405,6 +418,7 @@ actor MemoryIndex {
             BackgroundSyncLogger.logDebug("[MemoryIndex] purgeForSessionPrefix(\(prefix)) done")
         } catch {
             BackgroundSyncLogger.logDebug("[MemoryIndex] purgeForSessionPrefix failed: \(error)")
+            throw error
         }
     }
 
@@ -553,16 +567,37 @@ actor MemoryIndex {
     /// rendering.
     func listTurns(limit: Int) -> [MemoryHit] {
         ensureReady()
+        return recentTurns(limit: limit, fromMs: nil, toMs: nil, demoActive: nil)
+    }
+
+    /// The newest turns first, up to `limit`, within the optional dateMs window;
+    /// `demoActive` scopes them as a search is scoped (ADR-IOS-038), nil lists
+    /// every turn (the ChatHistoryView listing).
+    private func recentTurns(limit: Int, fromMs: Int64?, toMs: Int64?, demoActive: Bool?) -> [MemoryHit] {
         guard let dbPool else { return [] }
         do {
             return try dbPool.read { db in
-                let rows = try Row.fetchAll(db, sql: """
+                var sql = """
                     SELECT meta.chatHistoryId, meta.sessionId, meta.role, meta.dateMs, fts.content
                     FROM memory_meta meta
                     JOIN memory_fts fts ON fts.rowid = meta.rowid
-                    ORDER BY meta.dateMs DESC
-                    LIMIT ?
-                    """, arguments: [limit])
+                    WHERE 1 = 1
+                    """
+                var args: [DatabaseValueConvertible?] = []
+                if let demoActive {
+                    sql += " AND \(Self.demoScopeSQL(demoActive: demoActive, alias: "meta"))"
+                }
+                if let fromMs {
+                    sql += " AND meta.dateMs >= ?"
+                    args.append(fromMs)
+                }
+                if let toMs {
+                    sql += " AND meta.dateMs <= ?"
+                    args.append(toMs)
+                }
+                sql += " ORDER BY meta.dateMs DESC LIMIT ?"
+                args.append(limit)
+                let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
                 return rows.map { row in
                     MemoryHit(
                         chatHistoryId: row["chatHistoryId"],
@@ -578,7 +613,7 @@ actor MemoryIndex {
                 }
             }
         } catch {
-            BackgroundSyncLogger.logDebug("[MemoryIndex] listTurns failed: \(error)")
+            BackgroundSyncLogger.logDebug("[MemoryIndex] recentTurns failed: \(error)")
             return []
         }
     }
@@ -601,14 +636,37 @@ actor MemoryIndex {
     ///
     /// - `fromMs` / `toMs`: optional dateMs window.
     /// - `limit`: post-merge cap; per-leg candidate expansion = limit × SearchConfig.candidateMultiplier.
-    func search(query: String, fromMs: Int64? = nil, toMs: Int64? = nil, limit: Int) -> [MemoryHit] {
+    /// - `demoActive`: the demo scope (ADR-IOS-038), read once by the caller so
+    ///   both legs, and the caller's cache, use the same one.
+    func search(query: String, fromMs: Int64? = nil, toMs: Int64? = nil, limit: Int, demoActive: Bool) -> [MemoryHit] {
+        ensureReady()
+        guard dbPool != nil else { return [] }
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        // No query lists the most recent turns, newest first, as the native-fts
+        // helper TB uses does for an empty query ("what have we discussed").
+        guard !trimmed.isEmpty else {
+            return recentTurns(limit: limit, fromMs: fromMs, toMs: toMs, demoActive: demoActive)
+        }
+
+        // Query embedding — graceful nil on any failure (the search then answers by keyword).
+        var queryEmbedding: [Float]?
+        if let embedService = EmbeddingService.shared {
+            do {
+                queryEmbedding = try embedService.embed(trimmed)
+            } catch {
+                BackgroundSyncLogger.logDebug("[MemoryIndex] Query embedding failed: \(error)")
+            }
+        }
+        return hybridSearch(query: trimmed, queryEmbedding: queryEmbedding, fromMs: fromMs, toMs: toMs, limit: limit, demoActive: demoActive)
+    }
+
+    /// The hybrid part of `search`, given the trimmed query and its embedding (nil: no vector leg).
+    /// Call it through `search`, which answers an empty query with the recent turns.
+    func hybridSearch(query trimmed: String, queryEmbedding: [Float]?, fromMs: Int64?, toMs: Int64?, limit: Int,
+                      demoActive: Bool) -> [MemoryHit] {
         ensureReady()
         guard let dbPool else { return [] }
         let candidateLimit = limit * SearchConfig.candidateMultiplier
-        let trimmed = query.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return [] }
-        // Demo isolation: snapshot once per call so both legs use the same scope.
-        let demoActive = DemoModeStore.isDemoActive
 
         // FTS5 candidates — ORDER BY rank ASC, meta.dateMs DESC.
         var ftsCandidates: [(rowid: Int64, rank: Double, snippet: String, content: String, chatHistoryId: String, sessionId: String?, role: String, dateMs: Int64)] = []
@@ -653,15 +711,11 @@ actor MemoryIndex {
             BackgroundSyncLogger.logDebug("[MemoryIndex] FTS candidate fetch failed: \(error)")
         }
 
-        // Vector candidates — query EmbeddingService for query vector; graceful-empty on any failure.
+        // Vector candidates within the dates; empty without a query embedding.
         var vecCandidates: [(Int64, Double)] = []
-        if let embedService = EmbeddingService.shared {
-            do {
-                let qVec = try embedService.embed(trimmed)
-                vecCandidates = searchVecCandidates(queryEmbedding: qVec, limit: candidateLimit, demoActive: demoActive)
-            } catch {
-                BackgroundSyncLogger.logDebug("[MemoryIndex] Query embedding failed: \(error)")
-            }
+        if let queryEmbedding {
+            vecCandidates = searchVecCandidates(queryEmbedding: queryEmbedding, limit: candidateLimit, demoActive: demoActive,
+                                                fromMs: fromMs, toMs: toMs)
         }
 
         if DebugModeManager.isLoggingEnabled() {
@@ -682,8 +736,8 @@ actor MemoryIndex {
             return []
         }
 
-        // FTS-only fallback when vec table is empty (steady state during initial
-        // backfill, or when EmbeddingService is unavailable).
+        // FTS-only fallback when no vector lies within the dates (or the vec table is
+        // empty: steady state during initial backfill, or when EmbeddingService is unavailable).
         if vecCandidates.isEmpty {
             let hits = assembleFTSOnly(Array(ftsCandidates.prefix(limit)))
             BackgroundSyncLogger.logDebug("[MemoryIndex] search RESULT \(hits.count) hits (FTS-only fallback)")
@@ -700,6 +754,15 @@ actor MemoryIndex {
             limit: limit
         )
         BackgroundSyncLogger.logDebug("[MemoryIndex] search merged=\(merged.count) (hybrid via HybridMerge)")
+
+        // Words matched but the merge kept nothing (a word in most turns scores about 0 by keyword,
+        // and a weak vector match adds too little to reach minScore): answer by keyword, as with no
+        // vectors. Mirrors tabmail-native-fts #28 (ADR-NF-014).
+        if merged.isEmpty && !ftsCandidates.isEmpty {
+            let hits = assembleFTSOnly(Array(ftsCandidates.prefix(limit)))
+            BackgroundSyncLogger.logDebug("[MemoryIndex] search RESULT \(hits.count) hits (hybrid merge kept none of \(ftsCandidates.count) keyword matches, FTS-only fallback)")
+            return hits
+        }
 
         // Assemble results. FTS hits carry full payload already; vec-only hits need
         // a batched JOIN lookup on rowid.
@@ -729,8 +792,6 @@ actor MemoryIndex {
                     finalScore: r.finalScore
                 ))
             } else if let meta = vecOnlyMap[r.rowid] {
-                if let fromMs, meta.dateMs < fromMs { continue }
-                if let toMs, meta.dateMs > toMs { continue }
                 results.append(MemoryHit(
                     chatHistoryId: meta.chatHistoryId,
                     sessionId: meta.sessionId,
@@ -804,13 +865,23 @@ actor MemoryIndex {
     }
 
     /// Vector KNN query. Uses writer connection to avoid sqlite-vec vtab lifecycle issues
-    /// (matches `SearchIndex.searchVecCandidates`).
+    /// (matches `SearchIndex.searchVecCandidates`). With dates (either bound, each inclusive),
+    /// sqlite-vec searches only the turns dated within them (`rowid IN`), so nearer turns outside
+    /// them never take the `limit` places. Mirrors tabmail-native-fts#26 (ADR-NF-016).
     /// Internal (not private) so tests can exercise the KNN-subquery + meta
     /// JOIN shape against a real vec0 table — a planner rejection here would
     /// otherwise degrade to FTS-only silently (do/catch → []).
-    func searchVecCandidates(queryEmbedding: [Float], limit: Int, demoActive: Bool) -> [(Int64, Double)] {
+    func searchVecCandidates(queryEmbedding: [Float], limit: Int, demoActive: Bool,
+                             fromMs: Int64? = nil, toMs: Int64? = nil) -> [(Int64, Double)] {
         guard let dbPool else { return [] }
         let blob = queryEmbedding.withUnsafeBytes { Data($0) }
+        let withinDates = fromMs == nil && toMs == nil
+            ? ""
+            : " AND rowid IN (SELECT rowid FROM memory_meta WHERE dateMs >= ? AND dateMs <= ?)"
+        var arguments: StatementArguments = [blob, limit]
+        if !withinDates.isEmpty {
+            arguments += [fromMs ?? Int64.min, toMs ?? Int64.max]
+        }
         do {
             let (pairs, distances) = try dbPool.writeWithoutTransaction { db -> ([(Int64, Double)], [Double]) in
                 // KNN runs in the inner select (vec0 MATCH + k constraint);
@@ -819,10 +890,10 @@ actor MemoryIndex {
                 // rather than backfilled.
                 let rows = try Row.fetchAll(db, sql: """
                     SELECT v.rowid AS rowid, v.distance AS distance
-                    FROM (SELECT rowid, distance FROM memory_vec WHERE embedding MATCH ? AND k = ?) v
+                    FROM (SELECT rowid, distance FROM memory_vec WHERE embedding MATCH ? AND k = ?\(withinDates)) v
                     JOIN memory_meta meta ON meta.rowid = v.rowid
                     WHERE \(Self.demoScopeSQL(demoActive: demoActive, alias: "meta"))
-                    """, arguments: [blob, limit])
+                    """, arguments: arguments)
                 var pairs: [(Int64, Double)] = []
                 var ds: [Double] = []
                 for row in rows {

@@ -1507,7 +1507,7 @@ struct ChatStoreActorMethodTests {
             sessionId: sessionId, remindersSnapshot: nil, emailContextJSON: nil,
             thinkingContent: nil
         )
-        try await ChatStore.shared.appendTurn(turn)
+        try await ChatStore.shared.appendTurn(turn, admission: nil)
 
         // Call actual actor method
         try await ChatStore.shared.dereferenceSessionTurns(sessionId: sessionId)

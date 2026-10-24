@@ -60,6 +60,9 @@ struct ChatHistoryTurn: Codable, FetchableRecord, PersistableRecord, Sendable {
 actor ChatStore {
     static let shared = ChatStore()
 
+    /// `appendTurn` refused a demo turn: its demo has ended (#231).
+    struct DemoTurnRefused: Error {}
+
     /// Budget constants (matching TB). PORT — internal (not private), as in
     /// v2final's `ChatStore`, so the active-compose-guard tests derive the budget
     /// thresholds FROM these constants instead of hardcoding the numbers.
@@ -91,19 +94,25 @@ actor ChatStore {
     /// A−B direction). Returns the set of `chatHistory.id` rows that:
     /// - are older than `cutoffMs` (protects in-progress sessions),
     /// - have `type = 'normal'` (filter out greetings / welcome_back / session_break),
-    /// - have `role IN ('user', 'assistant')`.
+    /// - have `role IN ('user', 'assistant')`,
+    /// - are not demo turns (`demo:` sessions).
     ///
-    /// Scope-agnostic: includes inbox, `msg:%`, and `compose:%` sessions.
+    /// Includes inbox, `msg:%`, and `compose:%` sessions. Demo history is left
+    /// out: it is discarded when its demo ends, so there is nothing to repair,
+    /// and a demo turn loaded here could be indexed after its demo's cleanup
+    /// and come back in the next demo's memory (#231).
     /// Bounded by the chatHistory turn cap (default 5000).
     ///
     /// See ADR-IOS-034.
     func historyTurnIdsForSelfHeal(olderThan cutoffMs: Int64) throws -> Set<String> {
-        try AppDatabase.dbPool.read { db in
+        let realOnly = MemoryIndex.demoScopeSQL(demoActive: false, alias: "chatHistory")
+        return try AppDatabase.dbPool.read { db in
             let ids = try String.fetchAll(db, sql: """
                 SELECT id FROM chatHistory
                 WHERE timestamp < ?
                   AND type = 'normal'
                   AND role IN ('user', 'assistant')
+                  AND \(realOnly)
                 """, arguments: [Double(cutoffMs)])
             // Scope breakdown for diagnosis.
             let scopeRows = try Row.fetchAll(db, sql: """
@@ -115,6 +124,7 @@ actor ChatStore {
                 END AS scope, COUNT(*) AS n
                 FROM chatHistory
                 WHERE timestamp < ? AND type = 'normal' AND role IN ('user', 'assistant')
+                  AND \(realOnly)
                 GROUP BY scope
                 """, arguments: [Double(cutoffMs)])
             let scopeBreakdown = scopeRows.map { (($0["scope"] as String?) ?? "?", ($0["n"] as Int?) ?? 0) }
@@ -159,8 +169,13 @@ actor ChatStore {
     /// `MemoryIndex.indexTurn` + enqueues embedding. If the memory.db write
     /// fails or the process is killed between the two, Stage A self-heal
     /// catches up on next launch (A−B direction). See ADR-IOS-034.
+    ///
+    /// `admission` is the demo run the turn was started in, captured with its
+    /// session id (`DemoModeStore.chatAdmission`). Both writes check it inside
+    /// their own transaction, so a demo turn whose demo has ended is refused
+    /// (`DemoTurnRefused`) rather than written after that demo's cleanup (#231).
     @discardableResult
-    func appendTurn(_ turn: ChatTurn) async throws -> [ChatTurn] {
+    func appendTurn(_ turn: ChatTurn, admission: DemoModeStore.Admission?) async throws -> [ChatTurn] {
         // PORT — v2final `ChatStore.appendTurn`. Both budget branches below delete the
         // globally-OLDEST turns during a normal append. Exempt the compose sessions the
         // user currently has OPEN so an append in ANOTHER session can't evict an active
@@ -178,6 +193,10 @@ actor ChatStore {
         // See `enforceTurnBudgets`' doc comment.
         let activeComposeSessions = DraftSessionRegistry.shared.activeComposeSessionIds()
         let (evictedTurns, historyTurn) = try await AppDatabase.dbPool.write { db -> ([ChatTurn], ChatHistoryTurn) in
+            // Demo exit revokes the run before it deletes the demo's chat rows.
+            guard DemoModeStore.admits(sessionId: turn.sessionId, admission: admission) else {
+                throw DemoTurnRefused()
+            }
             try turn.insert(db)
 
             // Parallel write to chatHistory — always dereferenced content.
@@ -213,7 +232,8 @@ actor ChatStore {
                 sessionId: historyTurn.sessionId,
                 role: historyTurn.role,
                 dateMs: Int64(historyTurn.timestamp),
-                text: text
+                text: text,
+                admission: admission
             )
             await BackfillMemoryEmbeddingQueue.shared.enqueue(chatHistoryId: historyTurn.id)
         }

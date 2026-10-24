@@ -115,22 +115,22 @@ struct ToolFormattersTests {
         #expect(components.day == 15)
     }
 
-    @Test("parseDate with full ISO8601 returns correct date")
-    func parseDateFullISO() {
-        let result = ToolFormatters.parseDate(.string("2024-03-15T14:30:00Z"))
-        #expect(result != nil)
-        // Verify it parses to the expected UTC time
-        let cal = Calendar(identifier: .gregorian)
-        let comps = cal.dateComponents(in: TimeZone(identifier: "UTC")!, from: result!)
-        #expect(comps.year == 2024)
-        #expect(comps.month == 3)
-        #expect(comps.day == 15)
-    }
-
-    @Test("parseDate with ISO8601 fractional seconds")
-    func parseDateFractional() {
-        let result = ToolFormatters.parseDate(.string("2024-03-15T14:30:00.123Z"))
-        #expect(result != nil)
+    /// A full timestamp is that instant, to the millisecond: its time is kept,
+    /// not read as the day's midnight, nor cut to the second.
+    @Test("parseDate with a full ISO8601 timestamp returns that instant", arguments: [
+        (".000", 0),
+        (".123", 123),
+        (".999", 999),
+        ("", 0),
+    ] as [(String, Int64)])
+    func parseDateFullISOInstant(fraction: String, milliseconds: Int64) throws {
+        // A second-aligned instant a week ago, written as the model writes one.
+        let seconds = Int64(Date().addingTimeInterval(-7 * 86_400).timeIntervalSince1970)
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        let text = formatter.string(from: Date(timeIntervalSince1970: Double(seconds))).replacingOccurrences(of: "Z", with: "\(fraction)Z")
+        let result = try #require(ToolFormatters.parseDate(.string(text)))
+        #expect(Int64((result.timeIntervalSince1970 * 1000).rounded()) == seconds * 1000 + milliseconds, "\(text)")
     }
 
     @Test("parseDate with nil returns nil")

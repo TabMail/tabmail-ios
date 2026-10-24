@@ -31,6 +31,18 @@ enum SearchConfig {
     static let searchDefaultLimit = 50
     static let snippetTokens = 16
 
+    /// Capital `NOT` operators a search query keeps. FTS5 nests each `NOT` (it flattens `AND`
+    /// and `OR` chains) and refuses an expression deeper than 256, so a query with more answered
+    /// an error. Well below 256, to leave room for the groups and column filters around them; an
+    /// exclusion past it is left out of the query. Same as tabmail-native-fts
+    /// `SEARCH_MAX_KEPT_NOTS`.
+    static let searchMaxKeptNots = 100
+
+    /// A plain query word of at least this many UTF-8 bytes is searched as a prefix (`"budg"*`),
+    /// unless a word in its run of words has synonyms. Bytes, as in tabmail-native-fts, so a
+    /// short word in another script (`会議`) is a prefix too.
+    static let autoPrefixMinBytes = 4
+
     /// Row budget for `SearchView.legacyLocalSearch`'s substring scan — the size of the
     /// most-recent page the in-memory `localizedCaseInsensitiveContains` filter runs over.
     /// Was an inline literal at three sites after the scoped query was split per folder.

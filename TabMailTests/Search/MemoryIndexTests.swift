@@ -123,7 +123,7 @@ struct MemoryIndexTests {
             chatHistoryId: "real1", sessionId: "real-session", role: "user",
             dateMs: 1_700_000_000_000, text: "real turn about budget"
         )
-        await MemoryIndex.shared.indexTurn(
+        await DemoRunFixture.indexTurn(
             chatHistoryId: "demo1", sessionId: "demo:abc", role: "user",
             dateMs: 1_700_000_001_000, text: "demo turn about budget"
         )
@@ -144,6 +144,107 @@ struct MemoryIndexTests {
         #expect(normalHits.count == 1)
         #expect(demoHits.count == 1)
         #expect(Set(normalHits.map(\.0)).isDisjoint(with: Set(demoHits.map(\.0))))
+    }
+
+    /// A unit vector at cosine `cos` from axis 0, leaning towards axis 1.
+    private func vector(cos: Float) -> [Float] {
+        var v = [Float](repeating: 0, count: SearchConfig.embeddingDims)
+        v[0] = cos
+        v[1] = (1 - cos * cos).squareRoot()
+        return v
+    }
+
+    /// With dates, the vector search looks only among the turns dated within them (tabmail-ios#242,
+    /// mirroring tabmail-native-fts#26, ADR-NF-016): both bounds and either bound alone, inclusive.
+    @Test("searchVecCandidates: keeps the nearest turns within both bounds or either bound alone")
+    func vecCandidates_withinTheDates() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+
+        // Turn i at distance i/100 from the query, dated i days after the base (a month ahead, so a
+        // missing end date standing for now would exclude them), and turn 6 long before 1970.
+        let day: Int64 = 86_400_000, base = Int64(Date().timeIntervalSince1970 * 1000) + 30 * day
+        let dates = (1...5).map { base + Int64($0) * day } + [-5_000_000_000_000]
+        for (i, dateMs) in dates.enumerated() {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i + 1)", sessionId: "s", role: "user", dateMs: dateMs, text: "turn")
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings(dates.indices.map {
+            (chatHistoryId: "t\($0 + 1)", observedEpoch: 1, embedding: vector(cos: 1 - Float($0 + 1) / 100))
+        })
+        func nearest(_ k: Int, _ from: Int64?, _ to: Int64?) async -> [Int] {
+            await MemoryIndex.shared.searchVecCandidates(queryEmbedding: vector(cos: 1), limit: k, demoActive: false, fromMs: from, toMs: to)
+                .map { Int(($0.1 * 100).rounded()) }
+        }
+
+        #expect(await nearest(2, nil, nil) == [1, 2])
+        #expect(await nearest(5, base + 2 * day, base + 3 * day) == [2, 3])
+        #expect(await nearest(5, base + 4 * day, base + 4 * day) == [4])
+        #expect(await nearest(5, base + 4 * day, nil) == [4, 5])
+        #expect(await nearest(5, nil, base + day) == [1, 6])
+        #expect(await nearest(5, base + 5 * day + 1, nil) == [])
+    }
+
+    /// A dated memory search finds a turn by meaning alone past more nearer turns outside the dates
+    /// than its vector search asks for (tabmail-ios#242, mirroring tabmail-native-fts#26).
+    @Test("hybridSearch: a match by meaning inside the dates is found past nearer turns outside them")
+    func hybridSearch_matchByMeaningPastNearerTurnsOutsideTheDates() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+
+        let day: Int64 = 86_400_000, limit = 2, base = Int64(Date().timeIntervalSince1970 * 1000) + 30 * day
+        let nearer = limit * SearchConfig.candidateMultiplier * 2 + 4
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "inside", sessionId: "s", role: "user", dateMs: base + 10 * day, text: "turn")
+        var embeddings: [(chatHistoryId: String, observedEpoch: Int64, embedding: [Float])] = [
+            (chatHistoryId: "inside", observedEpoch: 1, embedding: vector(cos: 0.8))
+        ]
+        for i in 0..<nearer {
+            for (id, dateMs) in [("before\(i)", base + Int64(i) * 3_600_000), ("after\(i)", base + 20 * day + Int64(i) * 3_600_000)] {
+                await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: "s", role: "user", dateMs: dateMs, text: "turn")
+                embeddings.append((chatHistoryId: id, observedEpoch: 1, embedding: vector(cos: 1)))
+            }
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings(embeddings)
+
+        // Without dates, the nearer turns take every place the vector search asks for.
+        let unfiltered = await MemoryIndex.shared.searchVecCandidates(
+            queryEmbedding: vector(cos: 1), limit: limit * SearchConfig.candidateMultiplier, demoActive: false)
+        #expect(unfiltered.count == limit * SearchConfig.candidateMultiplier)
+        #expect(unfiltered.allSatisfy { $0.1 < 0.1 })
+
+        // No keyword matches: the turn is found by meaning alone.
+        let hits = await MemoryIndex.shared.hybridSearch(
+            query: "zyxwvut", queryEmbedding: vector(cos: 1), fromMs: base + 9 * day, toMs: base + 11 * day,
+            limit: limit, demoActive: false)
+        #expect(hits.map(\.chatHistoryId) == ["inside"])
+    }
+
+    /// With no vector within the dates (as during embedding backfill), a dated memory search answers
+    /// with every keyword match within them, the weak one too (tabmail-ios#242, native-fts #25 item 5).
+    @Test("hybridSearch: with no vector within the dates, every keyword match within them is the answer")
+    func hybridSearch_noVectorWithinTheDatesAnswersByKeyword() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+
+        let day: Int64 = 86_400_000, base = Int64(Date().timeIntervalSince1970 * 1000) + 30 * day
+        // A strong and a weak keyword match (a short turn and a long one) within the dates, one turn with
+        // the query's own vector outside them, and turns without the word.
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "strong", sessionId: "s", role: "user", dateMs: base, text: "kinkajou")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "weak", sessionId: "s", role: "user", dateMs: base + day,
+                                           text: "kinkajou " + String(repeating: "weather ", count: 2000))
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "outside", sessionId: "s", role: "user", dateMs: base + 10 * day, text: "different")
+        for i in 0..<40 {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "other\(i)", sessionId: "s", role: "user", dateMs: base + 20 * day, text: "different")
+        }
+        #expect(await MemoryIndex.shared.storeEmbeddings([(chatHistoryId: "outside", observedEpoch: 1, embedding: vector(cos: 1))]).committed == ["outside"])
+
+        // The vector exists, but not within the dates.
+        #expect(await MemoryIndex.shared.searchVecCandidates(queryEmbedding: vector(cos: 1), limit: 1, demoActive: false).count == 1)
+        #expect(await MemoryIndex.shared.searchVecCandidates(
+            queryEmbedding: vector(cos: 1), limit: 10, demoActive: false, fromMs: base, toMs: base + 2 * day).isEmpty)
+
+        let hits = await MemoryIndex.shared.hybridSearch(
+            query: "kinkajou", queryEmbedding: vector(cos: 1), fromMs: base, toMs: base + 2 * day, limit: 10, demoActive: false)
+        #expect(Set(hits.map(\.chatHistoryId)) == ["strong", "weak"])
     }
 
     // MARK: - indexTurn writes FTS + meta (no vec)
@@ -384,6 +485,44 @@ struct MemoryIndexTests {
         #expect(hits.allSatisfy { $0.snippet.isEmpty })   // no FTS match, snippet empty
     }
 
+    /// The chat-history listing shows every turn kept, whatever its session:
+    /// real, legacy (no session) and demo, newest first.
+    @Test("listTurns lists every session's turns, newest first")
+    func listTurns_everySession() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "real", sessionId: "s", role: "user", dateMs: 3000, text: "real")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "legacy", sessionId: nil, role: "user", dateMs: 2000, text: "legacy")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:a", role: "user", dateMs: 1000, text: "demo")
+        let hits = await MemoryIndex.shared.listTurns(limit: 10)
+        #expect(hits.map(\.chatHistoryId) == ["real", "legacy", "demo"])
+    }
+
+    /// An empty query lists the newest turns first, within the dateMs window,
+    /// and in the search's demo scope (normal mode never sees demo turns).
+    @Test("search with an empty query lists the newest turns in the window, demo turns left out")
+    func search_emptyQueryListsRecent() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        let day: Int64 = 86_400_000
+        for i in 0..<5 {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "t\(i)", sessionId: "s", role: "user", dateMs: now - Int64(5 - i) * day, text: "turn \(i)")
+        }
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:abc", role: "user", dateMs: now, text: "demo turn")
+
+        for query in ["", "   ", "\n", "\r\n"] {
+            let all = await MemoryIndex.shared.search(query: query, limit: 10, demoActive: false)
+            #expect(all.map(\.chatHistoryId) == ["t4", "t3", "t2", "t1", "t0"])
+            let capped = await MemoryIndex.shared.search(query: query, limit: 2, demoActive: false)
+            #expect(capped.map(\.chatHistoryId) == ["t4", "t3"])
+            let window = await MemoryIndex.shared.search(query: query, fromMs: now - 4 * day, toMs: now - 2 * day, limit: 10, demoActive: false)
+            #expect(window.map(\.chatHistoryId) == ["t3", "t2", "t1"])
+        }
+    }
+
     // MARK: - Search: per-turn hits
 
     @Test("search returns per-turn hits — session with 2 matches yields 2 hits")
@@ -395,7 +534,7 @@ struct MemoryIndexTests {
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t2", sessionId: "s", role: "assistant", dateMs: 1100, text: "Kyle's status looks good")
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t3", sessionId: "s", role: "user", dateMs: 1200, text: "what about Jane?")
 
-        let hits = await MemoryIndex.shared.search(query: "kyle", limit: 10)
+        let hits = await MemoryIndex.shared.search(query: "kyle", limit: 10, demoActive: false)
         let ids = Set(hits.map(\.chatHistoryId))
         #expect(ids == Set(["t1", "t2"]))
         #expect(hits.allSatisfy { $0.snippet.contains("[") && $0.snippet.contains("]") })
@@ -405,9 +544,9 @@ struct MemoryIndexTests {
     func search_emptyQueryOrNoMatch() async throws {
         let (pool, dir) = try await makeIndex()
         defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
-        #expect(await MemoryIndex.shared.search(query: "", limit: 10).isEmpty)
-        #expect(await MemoryIndex.shared.search(query: "   ", limit: 10).isEmpty)
-        #expect(await MemoryIndex.shared.search(query: "nothing", limit: 10).isEmpty)
+        #expect(await MemoryIndex.shared.search(query: "", limit: 10, demoActive: false).isEmpty)
+        #expect(await MemoryIndex.shared.search(query: "   ", limit: 10, demoActive: false).isEmpty)
+        #expect(await MemoryIndex.shared.search(query: "nothing", limit: 10, demoActive: false).isEmpty)
     }
 
     @Test("search respects date filter")
@@ -421,7 +560,7 @@ struct MemoryIndexTests {
 
         let from: Int64 = baseMs + 20 * 86_400_000
         let to: Int64 = baseMs + 40 * 86_400_000
-        let hits = await MemoryIndex.shared.search(query: "keyword", fromMs: from, toMs: to, limit: 10)
+        let hits = await MemoryIndex.shared.search(query: "keyword", fromMs: from, toMs: to, limit: 10, demoActive: false)
         let ids = Set(hits.map(\.chatHistoryId))
         #expect(ids == Set(["feb"]))
         #expect(ids.contains("jan") == false)
@@ -434,8 +573,119 @@ struct MemoryIndexTests {
 
         await MemoryIndex.shared.indexTurn(chatHistoryId: "t1", sessionId: "s", role: "user", dateMs: 1000, text: "Melanie sent the report")
         // Short token "mel" should prefix-match "melanie" via our ftsQuery (mel*).
-        let hits = await MemoryIndex.shared.search(query: "mel", limit: 10)
+        let hits = await MemoryIndex.shared.search(query: "mel", limit: 10, demoActive: false)
         #expect(hits.contains { $0.chatHistoryId == "t1" })
+    }
+
+    // MARK: - Search: a merge that keeps nothing answers by keyword (tabmail-ios#240)
+
+    private static func oneHot(_ i: Int) -> [Float] {
+        var v = [Float](repeating: 0, count: SearchConfig.embeddingDims)
+        v[i] = 1
+        return v
+    }
+
+    /// 30 turns naming "budget" (vector along axis 1) and 10 without (axis 2, or 3 for the first). A
+    /// word in at least half the rows gets an FTS5 IDF of about 0, so its keyword score is about 0.
+    private func indexBudgetFixture() async -> (budget: Set<String>, weather: Set<String>) {
+        let budget = (0..<30).map { "b\($0)" }
+        let weather = (0..<10).map { "w\($0)" }
+        for (i, id) in budget.enumerated() {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: "s", role: "user", dateMs: 1000 + Int64(i),
+                                               text: "we talked about the parking, the lunch order \(i), the train and the budget")
+        }
+        for (i, id) in weather.enumerated() {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: "s", role: "user", dateMs: 2000 + Int64(i),
+                                               text: "rain tomorrow \(i)")
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings(
+            budget.map { (chatHistoryId: $0, observedEpoch: 1, embedding: Self.oneHot(1)) }
+                + weather.map { (chatHistoryId: $0, observedEpoch: 1, embedding: Self.oneHot($0 == "w0" ? 3 : 2)) })
+        return (Set(budget), Set(weather))
+    }
+
+    @Test("search: a word in most turns with no near vector returns every keyword match")
+    func search_emptyMergeAnswersByKeyword() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let (budget, _) = await indexBudgetFixture()
+        #expect(await MemoryIndex.shared._testVecRowCount() == 40)
+
+        // Query vector orthogonal to every stored one: vector score 0 for all.
+        let hits = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(0),
+                                                         fromMs: nil, toMs: nil, limit: 100, demoActive: false)
+        #expect(Set(hits.map(\.chatHistoryId)) == budget)
+
+        // Within dates covering budget turns 5 to 9, with matches on both sides: those 5.
+        let dated = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(0),
+                                                          fromMs: 1005, toMs: 1009, limit: 100, demoActive: false)
+        #expect(Set(dated.map(\.chatHistoryId)) == Set((5..<10).map { "b\($0)" }))
+
+        // Fewer than the matches: `limit` of them, best keyword match first (equal here, so newest first).
+        let limited = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(0),
+                                                            fromMs: nil, toMs: nil, limit: 5, demoActive: false)
+        #expect(limited.map(\.chatHistoryId) == (25..<30).reversed().map { "b\($0)" })
+    }
+
+    @Test("search: a merge that keeps nothing answers with the best keyword match first, not the newest")
+    func search_emptyMergeAnswersBestKeywordMatchFirst() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let hour: Int64 = 3_600_000
+        // "budget" in half the turns: its keyword scores are about 0 but still ordered, the short
+        // older turn ahead of the long newer one.
+        let rows: [(id: String, text: String, dateMs: Int64)] = [
+            ("strong", "budget", 1000),
+            ("weak", "budget " + String(repeating: "weather ", count: 100), 1000 + hour),
+            ("other1", "other words", 1000 + hour),
+            ("other2", "different words", 1000 + hour),
+        ]
+        for row in rows {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: row.id, sessionId: "s", role: "user", dateMs: row.dateMs, text: row.text)
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings(rows.map { (chatHistoryId: $0.id, observedEpoch: 1, embedding: Self.oneHot(1)) })
+        #expect(await MemoryIndex.shared._testVecRowCount() == 4)
+
+        // Query vector orthogonal to every stored one: the merge keeps nothing.
+        let hits = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(0),
+                                                         fromMs: nil, toMs: nil, limit: 1, demoActive: false)
+        #expect(hits.map(\.chatHistoryId) == ["strong"])
+    }
+
+    @Test("search: when the merge keeps results, those are the answer")
+    func search_nonEmptyMergeIsTheAnswer() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let (_, weather) = await indexBudgetFixture()
+
+        // Query vector equal to most weather turns' vectors: they are kept by meaning, the budget
+        // turns (keyword score about 0, vector score 0) are not.
+        let hits = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(2),
+                                                         fromMs: nil, toMs: nil, limit: 100, demoActive: false)
+        #expect(Set(hits.map(\.chatHistoryId)) == weather.subtracting(["w0"]))
+
+        // A merge that keeps a single turn is the answer too.
+        let single = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(3),
+                                                           fromMs: nil, toMs: nil, limit: 100, demoActive: false)
+        #expect(single.map(\.chatHistoryId) == ["w0"])
+    }
+
+    @Test("search answers by the hybrid path within its dates and its limit")
+    func search_handsItsArgumentsToTheHybridPath() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let day: Int64 = 86_400_000
+        for i in 0..<6 {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "k\(i)", sessionId: "s", role: "user",
+                                               dateMs: 1000 + Int64(i) * day, text: "kyle note \(i)")
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "o\(i)", sessionId: "s", role: "user",
+                                               dateMs: 1000 + Int64(i) * day, text: "other words \(i)")
+        }
+        let dated = await MemoryIndex.shared.search(query: "kyle", fromMs: 1000 + day + day / 2,
+                                                    toMs: 1000 + 3 * day + day / 2, limit: 10, demoActive: false)
+        #expect(Set(dated.map(\.chatHistoryId)) == ["k2", "k3"])
+        let limited = await MemoryIndex.shared.search(query: "kyle", limit: 1, demoActive: false)
+        #expect(limited.count == 1)
     }
 
     // MARK: - knownChatHistoryIds

@@ -4,394 +4,320 @@
 
 import Foundation
 
-// FTS5 query builder with email-specific syntax handling.
-// Ported from tabmail-native-fts/src/fts/query.rs.
+// FTS5 query builder, ported from tabmail-native-fts `fts::query::build_fts_match` (ADR-NF-011,
+// native-fts #14 and #31). Thunderbird is the reference (ADR-IOS-008): keep the two in step.
+// Text is read as Unicode scalars throughout, as Rust reads chars, and lengths are UTF-8 bytes.
 
 enum SearchQueryParser {
 
-    /// Build an FTS5 MATCH expression from a user query string.
-    /// Handles field aliases, quoted phrases, synonym expansion, auto-wildcards.
+    /// Fields a mail search may scope to (`from:alice`): typed name → shard column, as
+    /// native-fts `QUERY_COLUMNS`. Each column is in `SearchIndex.columnScopePrefixes`, so a
+    /// scoped hybrid search filters its vector candidates.
+    private static let queryColumns: [(typed: String, column: String)] = [
+        ("subject", "subject"),
+        ("from", "from_"),
+        ("from_", "from_"),
+        ("to", "to_"),
+        ("to_", "to_"),
+        ("cc", "cc"),
+        ("bcc", "bcc"),
+        ("body", "body"),
+    ]
+
+    /// Builds the FTS5 MATCH expression for a search query a user typed or a model wrote.
+    ///
+    /// Every word and every `"quoted phrase"` reaches FTS5 as a string, so nothing typed breaks the
+    /// query: parentheses and punctuation are searched as text, and non-ASCII text is kept whole.
+    /// A capital AND, OR or NOT between two terms stays the operator; anywhere else it is dropped.
+    /// At most `SearchConfig.searchMaxKeptNots` NOTs are kept, and a later exclusion is left out
+    /// (FTS5 nests each NOT and refuses an expression deeper than 256).
+    /// A word whose only punctuation is an inner apostrophe searches both spellings (`don't`, `dont`).
+    /// `name:word`, `name:"phrase"` and `name: word` scope to a column only when `queryColumns`
+    /// names it (typed name, ASCII case-insensitive → table column); any other `x:` is text.
     static func buildFTSMatch(_ query: String?) -> String {
-        guard let query, !query.trimmingCharacters(in: .whitespaces).isEmpty else {
-            return ""
-        }
-        let q = query.trimmingCharacters(in: .whitespaces)
+        guard let query else { return "" }
+        let items = scan(query)
 
-        // 1. Translate field aliases: from: → from_:, to: → to_:
-        var translated = translateAliases(q)
-
-        // 2. Extract field:"quoted value" segments before splitting by quotes
-        var fieldQuotedMatches: [(String, String)] = []
-        translated = extractFieldQuoted(translated, store: &fieldQuotedMatches)
-
-        // 3. Split by unescaped quotes
-        let parts = translated.components(separatedBy: "\"")
-        var output: [String] = []
-
-        for (idx, part) in parts.enumerated() {
-            let isQuoted = idx % 2 == 1
-            if isQuoted {
-                output.append("\"\(part)\"")
-                continue
-            }
-
-            let tokens = part.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
-            var mapped: [String] = []
-
-            let willHaveOrGroups = tokens.contains { willExpandToOrGroup($0, fieldQuotedMatches: fieldQuotedMatches) }
-
-            for tok in tokens {
-                // Check for field-quoted placeholder
-                if let (field, val) = placeholderFieldQuoted(tok, store: fieldQuotedMatches) {
-                    mapped.append("\(field):\"\(val)\"")
+        // A word with synonyms becomes an OR group, and so does a word with an inner apostrophe (its
+        // two spellings); FTS5 then needs an explicit AND between all terms. No word in the same run
+        // of words (between quoted phrases) as a synonym group gets an automatic prefix star; a
+        // spelling group leaves its neighbours' stars alone. Which runs have a synonym group is read
+        // from the terms written, so it can't disagree with how they were written.
+        // A capital AND, OR or NOT standing between two terms stays the FTS5 operator
+        // (`from:"a@example.com" OR to:"a@example.com"`); anywhere else (first, last, after another
+        // operator) it is dropped.
+        let render = { (groupedRuns: [Bool]) -> [Term] in
+            var out: [Term] = []
+            var pendingOperator: String?
+            var run = 0
+            var keptNots = 0
+            var i = 0
+            while i < items.count {
+                let item = items[i]
+                i += 1
+                if case .word(let w) = item, let op = operators.first(where: { $0 == w }) {
+                    if pendingOperator == nil {
+                        pendingOperator = op
+                    }
                     continue
                 }
-
-                // Skip pure punctuation
-                if isPurePunctuation(tok) {
-                    continue
-                }
-
-                let (field, rawValue) = splitField(tok)
-                var value = rawValue
-
-                // If value already quoted, preserve as-is
-                if value.hasPrefix("\"") && value.hasSuffix("\"") && value.count >= 2 {
-                    var fv = ""
-                    if let f = field { fv += "\(f):" }
-                    fv += value
-                    mapped.append(fv)
-                    continue
-                }
-
-                // Check for existing wildcard
-                let hasWildcard = value.hasSuffix("*")
-                if hasWildcard {
-                    value = String(value.dropLast())
-                }
-
-                // Trim trailing slashes and question marks
-                let core = trimTrailingSlashQuestion(value)
-
-                // Remove apostrophes for FTS5 compatibility
-                var escapedCore = core.replacingOccurrences(of: "'", with: "")
-
-                // Handle naked wildcard "*": convert to "."
-                if escapedCore.isEmpty && hasWildcard {
-                    escapedCore = "."
-                }
-
-                let needsQuote = hasSpecialCharsRequiringQuotes(escapedCore)
-
-                let finalToken: String
-                if needsQuote {
-                    let escaped = escapedCore.replacingOccurrences(of: "\"", with: "\"\"")
-                    // Quoted phrase-prefix: with no tokenchars (ADR-024) the
-                    // tokenizer treats - _ . @ like any other separator, so
-                    // "dmarc-supp" becomes the phrase [dmarc, supp*] —
-                    // adjacency-matching partial AND full addresses mid-typing.
-                    // Without the trailing star, a partial's last fragment would
-                    // need to be a complete token and mid-typing queries would
-                    // return nothing.
-                    finalToken = "\"\(escaped)\"*"
-                } else {
-                    // Auto-add wildcard for tokens >= 4 chars, but avoid if OR groups exist
-                    if !hasWildcard && escapedCore.count >= 4 && !willHaveOrGroups {
-                        finalToken = "\(escapedCore)*"
-                    } else if hasWildcard {
-                        finalToken = "\(escapedCore)*"
+                // A synonym group in this run of words; a spelling group does not count.
+                let hasOrGroups = run < groupedRuns.count && groupedRuns[run]
+                let term: (text: String, synonymGroup: Bool)?
+                switch item {
+                case .phrase(let p):
+                    run += 1
+                    term = phrase(p).map { ($0, false) }
+                case .word(let w):
+                    if let (column, value) = scopedColumn(w) {
+                        if value.isEmpty {
+                            // name:"phrase" and name: word take the next item as the value.
+                            let next = i < items.count ? items[i] : nil
+                            i += 1
+                            switch next {
+                            case .phrase(let p)?:
+                                term = phrase(p).map { ("\(column):\($0)", false) }
+                            case .word(let v)?:
+                                term = word(v, useSynonyms: false, spellings: false, hasOrGroups: hasOrGroups)
+                                    .map { ("\(column):\($0.text)", false) }
+                            case nil:
+                                term = nil
+                            }
+                        } else {
+                            // A field's value is searched as typed: no synonyms, no second spelling.
+                            term = word(value, useSynonyms: false, spellings: false, hasOrGroups: hasOrGroups)
+                                .map { ("\(column):\($0.text)", false) }
+                        }
                     } else {
-                        finalToken = escapedCore
+                        // A kept NOT excludes the word typed: its synonyms would exclude the left
+                        // side's too (`invoice NOT receipt` would find nothing). Both spellings are
+                        // the word typed, so `NOT don't` excludes "Dont" too.
+                        let excluded = pendingOperator == "NOT" && !out.isEmpty
+                        term = word(w, useSynonyms: !excluded, spellings: true, hasOrGroups: hasOrGroups)
                     }
                 }
-
-                if let f = field {
-                    mapped.append("\(f):\(finalToken)")
-                } else if !hasWildcard && !needsQuote && !finalToken.isEmpty {
-                    let expanded = SearchSynonyms.expand(finalToken)
-                    mapped.append(expanded)
-                } else {
-                    mapped.append(finalToken)
-                }
-            }
-
-            if !mapped.isEmpty {
-                let hasOrGroups = mapped.contains { $0.contains("(") && $0.contains(" OR ") }
-                if hasOrGroups {
-                    output.append(mapped.joined(separator: " AND "))
-                } else {
-                    output.append(mapped.joined(separator: " "))
-                }
-            }
-        }
-
-        return output.joined(separator: " ").trimmingCharacters(in: .whitespaces)
-    }
-
-    // MARK: - Field alias translation
-
-    /// Rewrite `from:` / `to:` to the FTS column aliases.
-    ///
-    /// Scans BYTES because the word-boundary helpers below compare UTF-8 byte patterns, but
-    /// accumulates BYTES too and decodes once at the end. Appending
-    /// `Character(UnicodeScalar(bytes[i]))` — which is what this did — reinterprets each UTF-8 byte as
-    /// a Unicode scalar, i.e. as Latin-1: `café` (`63 61 66 C3 A9`) came back out as `cafÃ©`, so every
-    /// non-ASCII search term was corrupted before it ever reached FTS and silently matched nothing.
-    /// Multi-byte scalars must survive the scan untouched.
-    private static func translateAliases(_ q: String) -> String {
-        let bytes = Array(q.utf8)
-        var out: [UInt8] = []
-        var i = 0
-
-        while i < bytes.count {
-            if startsWordAt(bytes, i: i, needle: Array("from".utf8)) {
-                let end = i + 4
-                var j = end
-                while j < bytes.count && bytes[j] == 0x20 { j += 1 }  // skip spaces
-                if j < bytes.count && bytes[j] == 0x3A {  // ':'
-                    out += Array("from_:".utf8)
-                    i = j + 1
-                    continue
-                }
-            }
-            if startsWordAt(bytes, i: i, needle: Array("to".utf8)) {
-                let end = i + 2
-                var j = end
-                while j < bytes.count && bytes[j] == 0x20 { j += 1 }
-                if j < bytes.count && bytes[j] == 0x3A {
-                    out += Array("to_:".utf8)
-                    i = j + 1
-                    continue
-                }
-            }
-            out.append(bytes[i])
-            i += 1
-        }
-
-        return String(decoding: out, as: UTF8.self)
-    }
-
-    private static func startsWordAt(_ haystack: [UInt8], i: Int, needle: [UInt8]) -> Bool {
-        guard i + needle.count <= haystack.count else { return false }
-        // Word boundary check
-        //
-        // ⚠️ This still builds a `Character` from a SINGLE BYTE, the idiom removed from `isIdentStart`
-        // and `isIdentChar` — the removal there was scoped to those two, and this site is deliberately
-        // left alone. But the MECHANISM this comment used to state was measured and is false, so it is
-        // corrected here rather than left to mislead the next reader (`MIS-032`).
-        //
-        // It claimed a continuation byte of a multi-byte LETTER "lands on a Latin-1 letter and reports
-        // `isLetter == true`, which is the right answer", and that the only wrong case was a multi-byte
-        // NON-letter. Measured over the whole continuation range `0x80`–`0xBF`, read as Latin-1:
-        //
-        //   isLetter: 3 bytes — 0xAA ª, 0xB5 µ, 0xBA º
-        //   isNumber: 6 bytes — 0xB2 ² 0xB3 ³ 0xB9 ¹ 0xBC ¼ 0xBD ½ 0xBE ¾
-        //   neither: 55 bytes — C1 controls and Latin-1 punctuation/symbols
-        //
-        // So the claimed behaviour is the exception (9 of 64 bytes reject the boundary), and the real
-        // failure direction is the OPPOSITE of the one described: the common case is a word ending in a
-        // non-ASCII letter whose LAST byte is neither letter nor number, so the boundary check passes
-        // and the alias IS translated in the middle of a Unicode word. `caféfrom:bob` (é is C3 A9,
-        // trailing byte © ), `日本from:bob` (本 is E6 9C AC, trailing ¬ ) and `Ωfrom:bob` (CE A9) all
-        // become `…from_:bob`. `füfrom:bob` does not, because ü ends 0xBC ¼ which is `isNumber` — the
-        // outcome is decided by the last byte's Latin-1 identity, which is unrelated to the scalar.
-        //
-        // Unchanged conclusion: this is not a security concern. The translated token is
-        // `caféfrom_:bob`, and `splitField` hands the field part to `canonicalFTSColumn`, which does not
-        // recognise it — so the whole token falls through as LITERAL TEXT. The user gets a query that
-        // finds nothing instead of a search of the `from_` column, and no column name or operator
-        // reaches the MATCH expression. Deliberately not fixed here. A proper fix decodes the
-        // preceding SCALAR rather than the byte, which changes alias behaviour next to every kind of
-        // non-ASCII text; that is a search-behaviour change, not part of the field-prefix fix.
-        if i > 0 {
-            let prev = haystack[i - 1]
-            let ch = Character(UnicodeScalar(prev))
-            if ch.isLetter || ch.isNumber || prev == 0x5F { return false }  // '_'
-        }
-        for k in 0..<needle.count {
-            let h = haystack[i + k]
-            let n = needle[k]
-            // Case-insensitive compare
-            let hLower = (h >= 0x41 && h <= 0x5A) ? h + 32 : h
-            let nLower = (n >= 0x41 && n <= 0x5A) ? n + 32 : n
-            if hLower != nLower { return false }
-        }
-        return true
-    }
-
-    // MARK: - Field-quoted extraction
-
-    /// Pull `field:"quoted value"` segments out into placeholders before quote-splitting.
-    ///
-    /// Same byte-accumulation rule as `translateAliases`, and for the same reason: rebuilding the
-    /// passthrough text with `Character(UnicodeScalar(byte))` reinterpreted UTF-8 as Latin-1, so any
-    /// non-ASCII text OUTSIDE the extracted segments was corrupted. Note the extracted `field` and
-    /// `val` above were always decoded correctly (`String(bytes:encoding:.utf8)`) — so a quoted value
-    /// survived while the surrounding query did not, which is why this failed so quietly.
-    private static func extractFieldQuoted(_ q: String, store: inout [(String, String)]) -> String {
-        let bytes = Array(q.utf8)
-        var out: [UInt8] = []
-        var i = 0
-
-        while i < bytes.count {
-            if isIdentStart(bytes[i]) {
-                let startIdent = i
-                var j = i + 1
-                while j < bytes.count && isIdentChar(bytes[j]) { j += 1 }
-                if j < bytes.count && bytes[j] == 0x3A && (j + 1) < bytes.count && bytes[j + 1] == 0x22 {
-                    // field:"value" pattern
-                    var k = j + 2
-                    while k < bytes.count && bytes[k] != 0x22 { k += 1 }
-                    if k < bytes.count && bytes[k] == 0x22 {
-                        let field = String(bytes: Array(bytes[startIdent..<j]), encoding: .utf8) ?? ""
-                        let val = String(bytes: Array(bytes[(j + 2)..<k]), encoding: .utf8) ?? ""
-                        // Only a REAL FTS column may become a column-scoped phrase.
-                        //
-                        // This route never reaches `splitField`, so restricting that function alone
-                        // left the same defect live here: `tag:"urgent"` was re-emitted verbatim as
-                        // `tag:"urgent"`, FTS5 rejected the whole MATCH with "no such column: tag",
-                        // `SearchIndex.keywordSearchShard` threw, and the user got nothing back — the
-                        // identical silent-empty-result the unquoted fix was for. Any ordinary
-                        // `word:"phrase"` query did it (`note:"call mom"`, `label:"work"`).
-                        //
-                        // On a non-column, fall through and copy the bytes: the token then goes down
-                        // the normal quote-splitting path and is searched as text.
-                        guard let canonical = canonicalFTSColumn(field) else {
-                            out.append(bytes[i])
-                            i += 1
-                            continue
-                        }
-                        let placeholder = "__FQ\(store.count)__"
-                        store.append((canonical, val))
-                        out += Array(placeholder.utf8)
-                        i = k + 1
+                guard let term else { continue }
+                let op = pendingOperator
+                pendingOperator = nil
+                if op == "NOT" && !out.isEmpty {
+                    // Past the cap, an exclusion is left out: the query still answers.
+                    if keptNots == SearchConfig.searchMaxKeptNots {
                         continue
                     }
+                    keptNots += 1
                 }
+                out.append(Term(op: op, text: term.text, run: run, synonymGroup: term.synonymGroup))
             }
-            out.append(bytes[i])
-            i += 1
+            return out
         }
 
-        return String(decoding: out, as: UTF8.self)
-    }
-
-    /// ASCII-only on purpose.
-    ///
-    /// These decide whether a byte can begin/continue a `field:` prefix, and the only legal fields are
-    /// the FTS5 column names, all of which are ASCII. The previous form built a `Character` from a
-    /// single byte, which reinterprets a UTF-8 continuation byte as a Latin-1 scalar: both `0xC3` (`Ã`)
-    /// and `0xAA` (`ª`) report `isLetter == true`, so `ê:"x"` (bytes `C3 AA`) was accepted as a field
-    /// named `ê` and emitted into the MATCH expression, which FTS5 then rejected outright — the same
-    /// silent-empty-result as every other non-ASCII search. Restricting to ASCII removes the misread
-    /// rather than compensating for it.
-    private static func isIdentStart(_ b: UInt8) -> Bool {
-        (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x5F  // A-Z a-z _
-    }
-
-    private static func isIdentChar(_ b: UInt8) -> Bool {
-        isIdentStart(b) || (b >= 0x30 && b <= 0x39)  // + 0-9
-    }
-
-    // MARK: - Placeholder handling
-
-    private static func placeholderFieldQuoted(_ tok: String, store: [(String, String)]) -> (String, String)? {
-        guard let idx = parsePlaceholder(tok), idx < store.count else { return nil }
-        return store[idx]
-    }
-
-    private static func parsePlaceholder(_ tok: String) -> Int? {
-        guard tok.hasPrefix("__FQ") && tok.hasSuffix("__") else { return nil }
-        let inner = tok.dropFirst(4).dropLast(2)
-        return Int(inner)
-    }
-
-    // MARK: - Token helpers
-
-    private static func isPurePunctuation(_ tok: String) -> Bool {
-        tok.allSatisfy { !$0.isLetter && !$0.isNumber && $0 != "_" }
-    }
-
-    /// The only FTS5 columns a `field:value` token may target.
-    ///
-    /// Must stay in step with the `CREATE VIRTUAL TABLE … USING fts5(…)` column list in `SearchIndex`.
-    private static let ftsColumns: [String] = ["msgId", "subject", "from_", "to_", "cc", "bcc", "body"]
-
-    /// The canonical spelling of `field` if it names a real FTS column, else nil.
-    ///
-    /// Shared by BOTH field routes — `splitField` for `field:value` and `extractFieldQuoted` for
-    /// `field:"value"`. They are separate code paths that produce the same kind of output (a
-    /// column-scoped MATCH term), so a check that lives in only one of them leaves the other open;
-    /// that is exactly how the quoted route stayed broken after the unquoted one was fixed.
-    ///
-    /// SQLite column names are case-insensitive, so the comparison is too, and the CANONICAL spelling
-    /// is returned rather than the user's — the MATCH expression should never contain user-chosen text
-    /// in the column position.
-    private static func canonicalFTSColumn(_ field: String) -> String? {
-        ftsColumns.first { $0.compare(field, options: .caseInsensitive) == .orderedSame }
-    }
-
-    /// Split `field:value`, but ONLY when `field` names a real FTS column.
-    ///
-    /// Previously any token whose prefix started with a letter or `_` was treated as a column name and
-    /// emitted straight into the MATCH expression. Two consequences, both silent:
-    ///
-    ///  - `https://example.com` split at the first colon into field `https`, so the query became
-    ///    `https://example.com` — `https` is not a column, and FTS5 rejects the whole expression. The
-    ///    user got nothing back from a perfectly ordinary paste, with no indication why.
-    /// Unrecognised prefixes now fall through as ordinary search text, which is what a user typing a
-    /// URL or a `word:word` phrase actually meant.
-    ///
-    /// ⚠️ A second consequence was claimed here and was WRONG: that a token like `a"b:c` could put a
-    /// bare double quote into the MATCH expression and terminate a phrase early. It cannot.
-    /// `buildFTSMatch` splits the query on every `"` BEFORE tokenising, so no token reaching this
-    /// function can contain a quote at all — as `SearchQueryParserCoverageTests` already documented.
-    /// The claim is retracted rather than deleted because a false security rationale in a comment
-    /// outlives the person who wrote it, and the test written to pin it was vacuous for the same
-    /// reason (it passed against the unfixed parser).
-    private static func splitField(_ tok: String) -> (String?, String) {
-        guard let colonIdx = tok.firstIndex(of: ":") else {
-            return (nil, tok)
+        let terms = render([])
+        var groupedRuns = [Bool](repeating: false, count: terms.last.map { $0.run + 1 } ?? 0)
+        for t in terms where t.synonymGroup {
+            groupedRuns[t.run] = true
         }
-        let field = String(tok[tok.startIndex..<colonIdx])
-        let rest = String(tok[tok.index(after: colonIdx)...])
-        guard let canonical = canonicalFTSColumn(field)
-        else {
-            return (nil, tok)
+        if groupedRuns.contains(true) {
+            return join(render(groupedRuns), " AND ")
         }
-        return (canonical, rest)
+        // Only a group starts with "(": words and phrases start with a quote, scoped terms with
+        // their column.
+        if terms.contains(where: { $0.text.hasPrefix("(") }) {
+            return join(terms, " AND ")
+        }
+        return join(terms, " ")
     }
 
-    private static func trimTrailingSlashQuestion(_ s: String) -> String {
-        var end = s.endIndex
-        while end > s.startIndex {
-            let prev = s.index(before: end)
-            let c = s[prev]
-            if c == "/" || c == "?" {
-                end = prev
+    /// A written term: the operator kept before it, its FTS5 text, its run of words, and whether it
+    /// is a synonym group (which takes the automatic prefix star off the words in its run).
+    private struct Term {
+        let op: String?
+        let text: String
+        let run: Int
+        let synonymGroup: Bool
+    }
+
+    private static func join(_ terms: [Term], _ joiner: String) -> String {
+        var s = ""
+        for (n, term) in terms.enumerated() {
+            if n > 0 {
+                s += term.op.map { " \($0) " } ?? joiner
+            }
+            s += term.text
+        }
+        return s
+    }
+
+    /// FTS5's binary operators, which are case-sensitive.
+    private static let operators = ["AND", "OR", "NOT"]
+
+    private enum Item {
+        /// Text between double quotes (an unclosed quote runs to the end).
+        case phrase(String)
+        /// A run of characters without whitespace or double quotes.
+        case word(String)
+    }
+
+    private static func scan(_ q: String) -> [Item] {
+        // FTS5 reads a NUL as the end of the query, leaving a string open; the tokenizer treats it
+        // as a separator anyway. Replaced per scalar: a String replacement compares characters,
+        // and a NUL followed by a combining mark is one character, so it would be left in place.
+        let scalars = q.unicodeScalars.map { $0 == "\0" ? " " : $0 }
+        var items: [Item] = []
+        var i = 0
+        while true {
+            while i < scalars.count && scalars[i].properties.isWhitespace {
+                i += 1
+            }
+            if i == scalars.count {
+                return items
+            }
+            if scalars[i] == "\"" {
+                let start = i + 1
+                let end = scalars[start...].firstIndex(of: "\"") ?? scalars.count
+                items.append(.phrase(string(scalars[start..<end])))
+                i = min(end + 1, scalars.count)
             } else {
-                break
+                let end = scalars[i...].firstIndex { $0.properties.isWhitespace || $0 == "\"" } ?? scalars.count
+                items.append(.word(string(scalars[i..<end])))
+                i = end
             }
         }
-        return String(s[s.startIndex..<end])
     }
 
-    private static func hasSpecialCharsRequiringQuotes(_ s: String) -> Bool {
-        s.contains(where: { $0 == "-" || $0 == "@" || $0 == ":" || $0 == "+" || $0 == "." })
+    private static func string<S: Sequence>(_ scalars: S) -> String where S.Element == Unicode.Scalar {
+        var view = String.UnicodeScalarView()
+        view.append(contentsOf: scalars)
+        return String(view)
     }
 
-    private static func willExpandToOrGroup(_ tok: String, fieldQuotedMatches: [(String, String)]) -> Bool {
-        if parsePlaceholder(tok) != nil || isPurePunctuation(tok) { return false }
-        let (field, rawValue) = splitField(tok)
-        if field != nil { return false }
-        var value = rawValue
-        if value.hasPrefix("\"") && value.hasSuffix("\"") { return false }
-        let hasWildcard = value.hasSuffix("*")
-        if hasWildcard { value = String(value.dropLast()) }
-        let core = trimTrailingSlashQuestion(value)
-        let escaped = core.replacingOccurrences(of: "'", with: "")
-        if escaped.isEmpty { return false }
-        if hasWildcard || hasSpecialCharsRequiringQuotes(escaped) { return false }
-        return SearchSynonyms.wouldExpand(escaped)
+    /// `(table column, value)` when `w` is `name:value` with `name` one of `queryColumns`.
+    private static func scopedColumn(_ w: String) -> (column: String, value: String)? {
+        let scalars = Array(w.unicodeScalars)
+        guard let colon = scalars.firstIndex(of: ":") else { return nil }
+        let name = string(scalars[..<colon])
+        guard let entry = queryColumns.first(where: { asciiCaseInsensitiveEqual($0.typed, name) }) else {
+            return nil
+        }
+        return (entry.column, string(scalars[(colon + 1)...]))
+    }
+
+    private static func asciiCaseInsensitiveEqual(_ a: String, _ b: String) -> Bool {
+        let lower = { (byte: UInt8) -> UInt8 in (0x41...0x5A).contains(byte) ? byte + 0x20 : byte }
+        return a.utf8.elementsEqual(b.utf8) { lower($0) == lower($1) }
+    }
+
+    /// Whether text has a character the tokenizer indexes (a term with none matches nothing).
+    /// unicode61 indexes letters, numbers and private-use characters (`L* N* Co`); the
+    /// Alphabetic property also counts the marks and enclosed-letter symbols (Ⓜ, 🅿) that
+    /// unicode61 does not index.
+    private static func hasText<S: Sequence>(_ s: S) -> Bool where S.Element == Unicode.Scalar {
+        s.contains(where: isText)
+    }
+
+    private static func isText(_ c: Unicode.Scalar) -> Bool {
+        let category = c.properties.generalCategory
+        return (isAlphanumeric(c) && !isMark(category) && !isSymbol(category)) || category == .privateUse
+    }
+
+    /// Rust's `char::is_alphanumeric`: the Alphabetic property, or a number category.
+    private static func isAlphanumeric(_ c: Unicode.Scalar) -> Bool {
+        switch c.properties.generalCategory {
+        case .decimalNumber, .letterNumber, .otherNumber: return true
+        default: return c.properties.isAlphabetic
+        }
+    }
+
+    private static func isMark(_ category: Unicode.GeneralCategory) -> Bool {
+        category == .nonspacingMark || category == .spacingMark || category == .enclosingMark
+    }
+
+    private static func isSymbol(_ category: Unicode.GeneralCategory) -> Bool {
+        category == .mathSymbol || category == .currencySymbol || category == .modifierSymbol || category == .otherSymbol
+    }
+
+    private static func phrase(_ p: String) -> String? {
+        hasText(p.unicodeScalars) ? "\"\(p)\"" : nil
+    }
+
+    /// Quote marks removed from either end of a word (`'budget'`).
+    private static let quoteMarks: Set<Unicode.Scalar> = ["'", "\u{2018}", "\u{2019}"]
+
+    /// Apostrophes a word may hold inside it (`don't`, `don’t`); also a possessive's.
+    private static let apostrophes: Set<Unicode.Scalar> = ["'", "\u{2019}"]
+
+    /// A word's searched text, whether the user ended it with `*`, and whether a possessive was
+    /// removed: one trailing `*`, then trailing `/` and `?`, then quote marks at either end
+    /// (`'budget'`), then one possessive `'s` are removed. A possessive is found at the end of the
+    /// word's text, so `Sarah's.` reads as `Sarah's`. Any other apostrophe stays: the tokenizer
+    /// splits `O'Brien` into `o` and `brien`, and the quoted word searches them as a phrase.
+    /// `John's` searches `John`, which (stemmed) also finds "John's".
+    private static func prepareWord(_ w: String) -> (core: String, star: Bool, possessive: Bool)? {
+        var s = Array(w.unicodeScalars)
+        let star = s.last == "*"
+        if star {
+            s.removeLast()
+        }
+        while let last = s.last, last == "/" || last == "?" {
+            s.removeLast()
+        }
+        while let last = s.last, quoteMarks.contains(last) {
+            s.removeLast()
+        }
+        while let first = s.first, quoteMarks.contains(first) {
+            s.removeFirst()
+        }
+        var text = s
+        while let last = text.last, !isText(last) {
+            text.removeLast()
+        }
+        let possessive = text.count >= 2 && apostrophes.contains(text[text.count - 2])
+            && (text[text.count - 1] == "s" || text[text.count - 1] == "S")
+        let core = possessive ? Array(text.dropLast(2)) : s
+        return hasText(core) ? (string(core), star, possessive) : nil
+    }
+
+    private static func hasPunctuation(_ core: String) -> Bool {
+        core.unicodeScalars.contains { !isAlphanumeric($0) && $0 != "_" && $0.properties.generalCategory != .privateUse }
+    }
+
+    /// The word written without its apostrophes, when an inner apostrophe is its only punctuation
+    /// (`don't` → `dont`, `rock'n'roll` → `rocknroll`; `a'b-c` has none).
+    private static func joinedSpelling(_ core: String) -> String? {
+        let joined = string(core.unicodeScalars.filter { !apostrophes.contains($0) })
+        return joined.utf8.count < core.utf8.count && !hasPunctuation(joined) ? joined : nil
+    }
+
+    /// The FTS5 text of a word, and whether it is a synonym group. `spellings` lets a word with an
+    /// inner apostrophe search both spellings.
+    private static func word(_ w: String, useSynonyms: Bool, spellings: Bool, hasOrGroups: Bool) -> (text: String, synonymGroup: Bool)? {
+        guard let (core, star, possessive) = prepareWord(w) else { return nil }
+        // A possessive looks up its word with the `s`, as 0.11.8 did: `comment's` gets the synonyms
+        // of `comments`, and `client's` (`clients` has none) keeps its neighbours' prefix stars.
+        // Only a word the user did not star expands (every synonym is plain letters).
+        let key = possessive ? core + "s" : core
+        if useSynonyms && !star && SearchSynonyms.wouldExpand(key) {
+            return (SearchSynonyms.expand(key), true)
+        }
+        let possessiveBytes = possessive ? 1 : 0
+        let starMark = { (prefix: Bool) in prefix ? "*" : "" }
+        // A word with an inner apostrophe finds the text as written (the tokenizer indexed `don't` as
+        // `don` `t`) and the spelling without it ("Dont"), as 0.11.8 searched it. The typed spelling
+        // is a prefix, as any word with punctuation, unless its last part is one letter: `t*` would
+        // merge every indexed word starting with t (no one-letter prefix index), and finds "Don took".
+        // The joined spelling is a plain word.
+        if spellings, let joined = joinedSpelling(core) {
+            let scalars = Array(core.unicodeScalars)
+            let lastPart = scalars.lastIndex(where: { apostrophes.contains($0) }).map { scalars.count - $0 - 1 }
+            let typed = star || lastPart != 1
+            let plain = star || (joined.utf8.count + possessiveBytes >= SearchConfig.autoPrefixMinBytes && !hasOrGroups)
+            return ("(\"\(core)\"\(starMark(typed)) OR \"\(joined)\"\(starMark(plain)))", false)
+        }
+        // A word with punctuation is a phrase of its parts ("dmarc-supp" → [dmarc, supp]); the star
+        // keeps a partial address matching while it is typed (ADR-024). Plain words of 4+ bytes get
+        // one too, unless synonym groups are present; a possessive's `s` counts, as 0.11.8 searched
+        // `Tom's` as `Toms*`.
+        let prefix = star || hasPunctuation(core)
+            || (core.utf8.count + possessiveBytes >= SearchConfig.autoPrefixMinBytes && !hasOrGroups)
+        return ("\"\(core)\"\(starMark(prefix))", false)
     }
 }

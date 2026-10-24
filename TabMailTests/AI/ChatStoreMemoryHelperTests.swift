@@ -199,7 +199,7 @@ struct ChatStoreMemoryHelperTests {
             emailContextJSON: nil,
             thinkingContent: nil
         )
-        _ = try await ChatStore.shared.appendTurn(chatTurn)
+        _ = try await ChatStore.shared.appendTurn(chatTurn, admission: nil)
 
         let stored = try await pool.read { db in
             try ChatHistoryTurn.fetchOne(db, key: "append1")
@@ -298,7 +298,7 @@ struct ChatStoreMemoryHelperTests {
             emailContextJSON: nil,
             thinkingContent: nil
         )
-        _ = try await ChatStore.shared.appendTurn(userTurn)
+        _ = try await ChatStore.shared.appendTurn(userTurn, admission: nil)
 
         let row = await MemoryIndex.shared._testMetaRow(chatHistoryId: "int-user-1")
         #expect(row != nil)
@@ -333,7 +333,7 @@ struct ChatStoreMemoryHelperTests {
             emailContextJSON: nil,
             thinkingContent: nil
         )
-        _ = try await ChatStore.shared.appendTurn(greeting)
+        _ = try await ChatStore.shared.appendTurn(greeting, admission: nil)
 
         // chatHistory row exists (dual-write happens before the memoryText filter).
         let stored = try await pool.read { db in
@@ -363,7 +363,7 @@ struct ChatStoreMemoryHelperTests {
                 chars: 5, renderedContent: nil, sessionId: "del-sess",
                 remindersSnapshot: nil, emailContextJSON: nil, thinkingContent: nil
             )
-            _ = try await ChatStore.shared.appendTurn(t)
+            _ = try await ChatStore.shared.appendTurn(t, admission: nil)
         }
         #expect(await MemoryIndex.shared.knownChatHistoryIds() == Set(["del-1", "del-2"]))
 
@@ -386,7 +386,7 @@ struct ChatStoreMemoryHelperTests {
             chars: 2, renderedContent: nil, sessionId: "s",
             remindersSnapshot: nil, emailContextJSON: nil, thinkingContent: nil
         )
-        _ = try await ChatStore.shared.appendTurn(t)
+        _ = try await ChatStore.shared.appendTurn(t, admission: nil)
         #expect(await MemoryIndex.shared._testMetaRowCount() == 1)
 
         try await ChatStore.shared.clearAll()

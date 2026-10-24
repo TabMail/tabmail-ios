@@ -30,6 +30,14 @@ final class EmbeddingService: @unchecked Sendable {
         self.dims = SearchConfig.embeddingDims
     }
 
+    #if DEBUG
+    /// Tests only: unload the shared model again (the unit-test host never
+    /// loads it, so a test that loads it unloads it when done).
+    static func _testUnload() {
+        _shared.withLock { $0 = nil }
+    }
+    #endif
+
     /// Initialize the shared embedding service. Call once at app launch.
     /// Returns silently if model or tokenizer resources are missing (FTS-only mode).
     static func initialize() {
