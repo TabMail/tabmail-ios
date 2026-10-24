@@ -420,6 +420,54 @@ struct DraftCopyIntegrityTests {
                         .leaf(mimeType: "text/html", contentType: "text/html; charset=utf-8", text: "<b>Top</b>")]),
                     .leaf(mimeType: "text/plain", contentType: "text/plain; charset=utf-8", text: "Bottom")],
             body: "Top\nBottom"),
+        GroupingCase(
+            name: "an empty last alternative is the body", mimeType: "multipart/alternative",
+            parts: [.leaf(mimeType: "text/plain", contentType: "text/plain", text: "obsolete"),
+                    .leaf(mimeType: "text/html", contentType: "text/html", text: "")],
+            body: ""),
+        GroupingCase(
+            name: "a trailing attached message does not displace the body", mimeType: "multipart/alternative",
+            parts: [.leaf(mimeType: "text/plain", contentType: "text/plain", text: "selected"),
+                    .leaf(mimeType: "message/rfc822", contentType: "message/rfc822", text: "file")],
+            body: "selected"),
+        GroupingCase(
+            name: "a trailing file does not displace the body", mimeType: "multipart/alternative",
+            parts: [.leaf(mimeType: "text/plain", contentType: "text/plain", text: "selected"),
+                    .leaf(mimeType: "application/octet-stream", contentType: "application/octet-stream", text: "file")],
+            body: "selected"),
+        GroupingCase(
+            name: "the last alternative is a related body", mimeType: "multipart/alternative",
+            parts: [.leaf(mimeType: "text/plain", contentType: "text/plain", text: "obsolete"),
+                    .multipart(mimeType: "multipart/related", parts: [
+                        .leaf(mimeType: "text/html", contentType: "text/html", text: "<b>selected</b>")])],
+            body: "selected"),
+        GroupingCase(
+            name: "an alternative inside an unread alternative stays unread", mimeType: "multipart/alternative",
+            parts: [.multipart(mimeType: "multipart/alternative", parts: [
+                        .leaf(mimeType: "text/plain", contentType: "text/plain", text: "obsolete plain"),
+                        .leaf(mimeType: "text/html", contentType: "text/html", text: "<b>obsolete HTML</b>")]),
+                    .leaf(mimeType: "text/plain", contentType: "text/plain", text: "selected")],
+            body: "selected"),
+        GroupingCase(
+            name: "a plain piece next to an HTML piece stays literal", mimeType: "multipart/mixed",
+            parts: [.leaf(mimeType: "text/plain", contentType: "text/plain", text: "<b>literal</b> &amp;"),
+                    .leaf(mimeType: "text/html", contentType: "text/html", text: "<em>rich</em>")],
+            body: "<b>literal</b> &amp;\nrich"),
+        GroupingCase(
+            name: "an HTML piece keeps its spacing", mimeType: "multipart/mixed",
+            parts: [.leaf(mimeType: "text/plain", contentType: "text/plain", text: "Intro"),
+                    .leaf(mimeType: "text/html", contentType: "text/html", text: "<p>A&nbsp; B</p>")],
+            body: "Intro\nA  B"),
+        GroupingCase(
+            name: "a plain piece starting with a line break gets no second one", mimeType: "multipart/mixed",
+            parts: [.leaf(mimeType: "text/plain", contentType: "text/plain", text: "Intro"),
+                    .leaf(mimeType: "text/plain", contentType: "text/plain", text: "\nNext")],
+            body: "Intro\nNext"),
+        GroupingCase(
+            name: "a piece after HTML starting with a line break gets no second one", mimeType: "multipart/mixed",
+            parts: [.leaf(mimeType: "text/html", contentType: "text/html", text: "<b>Intro</b>"),
+                    .leaf(mimeType: "text/plain", contentType: "text/plain", text: "\nNext")],
+            body: "Intro\nNext"),
     ]
 
     /// The Gmail draft `r1` at its listed message `m-old`, a reply to `old-parent`,
@@ -474,6 +522,95 @@ struct DraftCopyIntegrityTests {
                 #expect(check == .open)
                 let row = try await pool.read { try Draft.fetchOne($0, key: existing.id) }
                 #expect(row?.body == grouping.body)
+                #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "opening must not change the server")
+            }
+        }
+    }
+
+    /// A Gmail draft whose first alternative is a related body holding an
+    /// image and a file beside an HTML last alternative. The image is read
+    /// from `/attachments/image`; the related body's own text is never read.
+    private func registerGmailDraftWithFilesInUnreadAlternative(
+        _ http: FakeHTTP.Scenario, image: Data, file: Data, imageFails: Bool
+    ) throws {
+        http.register(path: "/drafts", method: "GET", response: .json(raw: #"{"drafts":[{"id":"r1","message":{"id":"m-old"}}]}"#))
+        http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"message":{"id":"m-old"}}"#))
+        let selected = Data("<p>selected</p>".utf8)
+        let root: [String: Any] = [
+            "mimeType": "multipart/alternative",
+            "headers": [["name": "Subject", "value": "old draft"], ["name": "From", "value": "owner@example.com"],
+                        ["name": "To", "value": "old@example.com"], ["name": "Message-ID", "value": "<old-draft@example.com>"],
+                        ["name": "In-Reply-To", "value": "<old-parent@example.com>"]],
+            "parts": [
+                ["mimeType": "multipart/related", "parts": [
+                    ["mimeType": "text/plain", "body": ["size": 9, "attachmentId": "unread-body"]],
+                    ["mimeType": "image/png", "headers": [["name": "Content-ID", "value": "<old-image>"]],
+                     "body": ["size": image.count, "attachmentId": "image"]],
+                    ["mimeType": "text/plain", "filename": "inactive.txt",
+                     "headers": [["name": "Content-Disposition", "value": "attachment"]],
+                     "body": ["size": file.count, "data": Self.base64URL(file)]],
+                ] as [[String: Any]]],
+                ["mimeType": "text/html", "body": ["size": selected.count, "data": Self.base64URL(selected)]],
+            ] as [[String: Any]],
+        ]
+        let message: [String: Any] = ["id": "m-old", "internalDate": String(Int(Date().timeIntervalSince1970 * 1000)),
+                                      "labelIds": ["DRAFT"], "payload": root]
+        http.register(path: "/messages/m-old", method: "GET", response: .json(
+            raw: String(decoding: try JSONSerialization.data(withJSONObject: message), as: UTF8.self)))
+        http.register(path: "/messages/m-old/attachments/image", method: "GET", response: imageFails
+            ? .status(500) : .json(raw: "{\"size\":\(image.count),\"data\":\"\(Self.base64URL(image))\"}"))
+        http.register(path: "/messages/m-old/attachments/unread-body", method: "GET", response: .status(500))
+    }
+
+    @Test("A Gmail draft carries the files and images of an alternative it does not read",
+          arguments: [false, true])
+    func gmailUnreadAlternativeKeepsItsFiles(adopted: Bool) async throws {
+        let image = Data([4, 5, 6])
+        let file = Data("FILE".utf8)
+        try await withInstalledPool { pool in
+            let header = try await pool.write { try self.insertReplyFixture($0, adopted: adopted) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            try registerGmailDraftWithFilesInUnreadAlternative(http, image: image, file: file, imageFails: false)
+            let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                let draftId: String
+                if adopted {
+                    let existing = try #require(try await pool.read { try Draft.fetchOne($0) })
+                    #expect(await ExternalDraftAdoption.refreshBeforeOpen(draftId: existing.id, willReadServer: {}) == .open)
+                    draftId = existing.id
+                } else {
+                    draftId = try #require(try await ServerDraftComposeLoader.resolveOpenAuthority(header: header)).draftId
+                }
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draftId) })
+                defer { if let dir = row.attachmentsDirName { DraftAttachmentStorage.deleteAttachments(dirName: dir) } }
+                #expect(row.body == "selected")
+                let files = try DraftAttachmentStorage.loadAttachments(dirName: row.attachmentsDirName)
+                #expect(files.map(\.filename) == ["inactive.txt", "image1.png"])
+                #expect(files.map(\.data) == [file, image])
+                #expect(!http.recordedCalls().contains { $0.url.contains("/attachments/unread-body") },
+                        "the unread alternative's text is not fetched")
+                #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "opening must not change the server")
+            }
+        }
+    }
+
+    @Test("A Gmail reload whose unread alternative's image fails keeps the old draft whole")
+    func gmailUnreadAlternativeImageFailureKeepsTheOldDraft() async throws {
+        try await withInstalledPool { pool in
+            _ = try await pool.write { try self.insertReplyFixture($0, adopted: true) }
+            let existing = try #require(try await pool.read { try Draft.fetchOne($0) })
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            try registerGmailDraftWithFilesInUnreadAlternative(http, image: Data([4, 5, 6]), file: Data("FILE".utf8), imageFails: true)
+            let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                #expect(await ExternalDraftAdoption.refreshBeforeOpen(draftId: existing.id, willReadServer: {}) == .open)
+                let row = try #require(try await pool.read { try Draft.fetchOne($0, key: existing.id) })
+                #expect(http.recordedCalls().contains { $0.url.contains("/attachments/image") })
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = .sortedKeys
+                #expect(try encoder.encode(row) == encoder.encode(existing), "an incomplete read keeps the old draft row")
                 #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "opening must not change the server")
             }
         }
