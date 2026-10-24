@@ -123,4 +123,26 @@ struct IMAPContentIdPartWireTests {
         }
         #expect(reads.nse.body.attachments.map(\.filename) == expected)
     }
+
+    @Test("A related image with no disposition is inline, with no app or NSE paperclip")
+    func relatedImageWithoutDispositionIsInline() async throws {
+        let html = Data("<p>Body <img src=\"cid:logo@example.com\"></p>".utf8)
+        let wire = Data(Self.png.base64EncodedString().utf8)
+        let reads = try await read(
+            contentType: "multipart/related; boundary=b; type=\"text/html\"",
+            body: Data("--b\r\nContent-Type: text/html\r\n\r\n".utf8) + html
+                + Data("\r\n--b\r\nContent-Type: image/png\r\nContent-ID: <logo@example.com>\r\nContent-Transfer-Encoding: base64\r\n\r\n".utf8)
+                + wire + Data("\r\n--b--\r\n".utf8),
+            bodystructure: "((\"TEXT\" \"HTML\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" \(html.count) 1)"
+                + "(\"IMAGE\" \"PNG\" NIL \"<logo@example.com>\" NIL \"BASE64\" \(wire.count)) \"RELATED\")",
+            partBodies: ["1": html, "2": wire])
+        #expect(!reads.app.header.hasAttachments)
+        #expect(reads.app.attachments.isEmpty)
+        #expect(reads.app.inlineImages.map(\.contentId) == ["logo@example.com"])
+        #expect(reads.app.inlineImages.first?.data == Self.png)
+        #expect(!reads.nse.metadata.hasAttachments)
+        #expect(reads.nse.body.attachments.isEmpty)
+        #expect(reads.nse.body.htmlContent?.contains("Body") == true)
+        #expect(!reads.nse.body.hasUnresolvedCIDs)
+    }
 }
