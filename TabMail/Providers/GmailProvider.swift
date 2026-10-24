@@ -827,8 +827,11 @@ actor GmailProvider: EmailProvider {
 
     /// #217: the draft itself, not a render of it. The copy replaces the local
     /// draft, so it holds only the draft and all of it:
-    /// - the body is the draft's own text/plain and text/html parts (each joined
-    ///   in order when split around an inline part); an attached
+    /// - the body is the draft's own text/plain and text/html parts in order, as
+    ///   one body (`DraftBodyPiece.body`), joined when split around an inline part;
+    ///   a `multipart/alternative` gives the pieces of one representation only, its
+    ///   last that has any (RFC 2046 section 5.1.4), though its images and files are
+    ///   still read (#272); an attached
     ///   message (`message/rfc822`) is an attachment and is never opened, so its
     ///   text never joins the body (the render's `tm-eml-section` marker);
     /// - a part with `Content-Disposition: attachment`, or a file name and no
@@ -850,36 +853,30 @@ actor GmailProvider: EmailProvider {
         guard let payload = msg.payload else {
             return FullMessageInfo(header: header, htmlBody: nil, textBody: nil)
         }
-        var textBody: String?
-        var htmlBody: String?
+        var pieces: [DraftBodyPiece] = []
         var attachments: [AttachmentInfo] = []
         var inlineImages: [InlineImage] = []
         var carried: [String: Data] = [:]
-        var stack = [GmailPart(
+        // `inBody`: false under an alternative that is not the one read, whose text
+        // is another version of the body.
+        var stack = [(part: GmailPart(
             mimeType: payload.mimeType, filename: payload.filename,
-            headers: payload.headers, body: payload.body, parts: payload.parts)]
-        while let part = stack.popLast() {
+            headers: payload.headers, body: payload.body, parts: payload.parts), inBody: true)]
+        while let (part, inBody) = stack.popLast() {
             let mimeType = (part.mimeType ?? "").lowercased()
             let filename = part.filename ?? ""
-            func headerValue(_ name: String) -> String {
-                (part.headers?.first { $0.name.lowercased() == name }?.value ?? "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            let disposition = headerValue("content-disposition")
-                .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() } ?? ""
-            let contentId = headerValue("content-id")
-                .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let role = Self.draftPartRole(part)
             let isMessage = mimeType.hasPrefix("message/rfc822")
-            let isFile = isMessage || disposition == "attachment" || (!filename.isEmpty && disposition != "inline")
-            if !isFile, mimeType.hasPrefix("image/"), !contentId.isEmpty {
+            var isFile = false
+            if case .file = role { isFile = true }
+            if case .inlineImage(let contentId) = role {
                 inlineImages.append(InlineImage(
                     contentId: contentId, contentType: mimeType,
                     data: try await draftPartBytes(part, messageId: id)))
                 continue
             }
-            if !isFile, (mimeType == "text/plain" || mimeType == "text/html"), filename.isEmpty {
+            if case .bodyText = role {
+                guard inBody else { continue }
                 let bytes = try await draftPartBytes(part, messageId: id)
                 // Decoded in the part's declared charset as the IMAP draft read
                 // decodes it (`draftTextContent`); text it cannot decode throws,
@@ -890,14 +887,18 @@ actor GmailProvider: EmailProvider {
                 }
                 // A body split around an inline part (text, image, text) is one
                 // body: its pieces are joined in order.
-                if mimeType == "text/plain" {
-                    textBody = (textBody ?? "") + EmailFilter.decodeFormatFlowed(text, contentType: declared)
-                }
-                if mimeType == "text/html" { htmlBody = (htmlBody ?? "") + text }
+                pieces.append(mimeType == "text/plain"
+                    ? .text(EmailFilter.decodeFormatFlowed(text, contentType: declared))
+                    : .html(text))
                 continue
             }
-            if !isFile, let children = part.parts {
-                stack.append(contentsOf: children.reversed())
+            if case .container(let children) = role {
+                let read = mimeType == "multipart/alternative"
+                    ? children.lastIndex { Self.draftPartHasBodyText($0) }
+                    : nil
+                for (index, child) in children.enumerated().reversed() {
+                    stack.append((child, inBody && (read == nil || index == read)))
+                }
                 continue
             }
             // A leaf Gmail reports as empty holds nothing to carry.
@@ -916,10 +917,58 @@ actor GmailProvider: EmailProvider {
                 size: part.body?.size ?? 0,
                 encoding: nil))
         }
+        let body = DraftBodyPiece.body(of: pieces)
         return FullMessageInfo(
-            header: header, htmlBody: htmlBody, textBody: textBody,
+            header: header, htmlBody: body.html, textBody: body.text,
             attachments: attachments, inlineImages: inlineImages,
             attachmentData: carried.isEmpty ? nil : carried)
+    }
+
+    /// How `readDraftMessage` takes a draft part.
+    private enum DraftPartRole {
+        /// An attachment, under its own name or a default one.
+        case file
+        case inlineImage(contentId: String)
+        /// A text/plain or text/html part of the body.
+        case bodyText
+        case container([GmailPart])
+        /// Any other leaf, also a file unless it holds nothing.
+        case otherLeaf
+    }
+
+    private static func draftPartRole(_ part: GmailPart) -> DraftPartRole {
+        let mimeType = (part.mimeType ?? "").lowercased()
+        let filename = part.filename ?? ""
+        func headerValue(_ name: String) -> String {
+            (part.headers?.first { $0.name.lowercased() == name }?.value ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let disposition = headerValue("content-disposition")
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() } ?? ""
+        let contentId = headerValue("content-id")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let isMessage = mimeType.hasPrefix("message/rfc822")
+        if isMessage || disposition == "attachment" || (!filename.isEmpty && disposition != "inline") { return .file }
+        if mimeType.hasPrefix("image/"), !contentId.isEmpty { return .inlineImage(contentId: contentId) }
+        if mimeType == "text/plain" || mimeType == "text/html", filename.isEmpty { return .bodyText }
+        if let children = part.parts { return .container(children) }
+        return .otherLeaf
+    }
+
+    /// Whether `part` holds a body part `readDraftMessage` reads, outside any file.
+    /// Iterative, like the read.
+    private static func draftPartHasBodyText(_ part: GmailPart) -> Bool {
+        var stack = [part]
+        while let next = stack.popLast() {
+            switch draftPartRole(next) {
+            case .bodyText: return true
+            case .container(let children): stack.append(contentsOf: children)
+            case .file, .inlineImage, .otherLeaf: continue
+            }
+        }
+        return false
     }
 
     /// A draft part's bytes, whole: inline in the part, else through the attachments

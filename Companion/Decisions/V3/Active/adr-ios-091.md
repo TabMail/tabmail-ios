@@ -526,3 +526,17 @@ Codex round 7 on `497150d` found:
 - **The attachment-refusal card's Close was untested.** `ServerDraftCloseUITests` now opens a
   draft refused for its attachment (#241) from the Drafts list, a push and a detail, and checks
   the refusal text, no Retry, Close back to the mailbox twice, and unchanged rows.
+
+### Multipart grouping, Gmail half (#272, 2026-10-23)
+
+A draft read now returns one body as the MIME tree groups it. Within a `multipart/alternative`
+it reads one representation, the last child that holds body text (RFC 2046 section 5.1.4:
+alternatives are versions of one body, the last the richest); the text of the other children
+is not read, though their images and files still are. The text/plain and text/html pieces of
+every other multipart (mixed, related, ...) are one body, in order. `DraftBodyPiece.body` builds
+the copy's body fields from the ordered pieces: a body all of one kind keeps it (its HTML is
+converted once, by `editableBody`, as before); a body of both kinds is converted piece by piece
+with the same `EmailFilter.htmlToPlainText(keepingSpacing: true)` and returned as text, so
+neither kind is dropped for the other. Pieces are joined in order, with a line break added only
+where neither side of a join has one. `GmailProvider.readDraftMessage` uses it now; the IMAP
+reader follows in its own PR, once SwiftMail exposes the multipart grouping.
