@@ -172,10 +172,30 @@ enum IMAPFetchMapping {
             let disposition = part.disposition?.lowercased()
             let hasFilename = !(part.filename?.isEmpty ?? true)
             let isExplicitAttachment = disposition == "attachment"
-            let hasFileNotInline = hasFilename && disposition != "inline"
+            let hasFileNotInline = hasFilename && disposition != "inline" && !isRelatedPartNamedByContentID(part)
             let isCalendar = ct.hasPrefix("text/calendar")
             return isExplicitAttachment || hasFileNotInline || isCalendar
         }
+    }
+
+    /// Whether `part` is an image of a `multipart/related` body, has no
+    /// disposition, and carries no name but its Content-ID. SwiftMail names a
+    /// media part with no filename after its Content-ID, so the image of a related
+    /// HTML body written without a disposition (RFC 2387) has a name it was never
+    /// given: it is inline content, not a file. Such a part stays a file under that
+    /// name when it is not an image (a related body may hold any resource, and the
+    /// HTML gives no way to open a document), when no related body holds it
+    /// directly (an outer related body does not reach into an attached message's
+    /// own body), or when no related body encloses it at all, so an image no HTML
+    /// shows is still listed.
+    static func isRelatedPartNamedByContentID(_ part: MessagePart) -> Bool {
+        let parentPath = Array(part.section.components.dropLast())
+        guard part.disposition == nil,
+              part.contentType.lowercased().hasPrefix("image/"),
+              part.enclosingMultiparts.contains(where: { $0.subtype == "related" && $0.path == parentPath }),
+              let filename = part.filename, let contentId = part.contentId else { return false }
+        let bareId = contentId.trimmingCharacters(in: CharacterSet(charactersIn: "<>"))
+        return !bareId.isEmpty && filename == bareId
     }
 
     /// Provider-label list — extracts non-`tm_*`, non-excluded IMAP custom
@@ -215,7 +235,7 @@ enum IMAPFetchMapping {
             let disposition = part.disposition?.lowercased()
             let hasFilename = part.filename != nil
             let isExplicitAttachment = disposition == "attachment"
-            let hasFileNotInline = hasFilename && disposition != "inline"
+            let hasFileNotInline = hasFilename && disposition != "inline" && !isRelatedPartNamedByContentID(part)
             // text/calendar (ICS invites) are attachments even without explicit
             // disposition or filename — Outlook often omits both.
             let isCalendar = ct.hasPrefix("text/calendar")

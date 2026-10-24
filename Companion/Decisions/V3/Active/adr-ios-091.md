@@ -566,3 +566,20 @@ the new text and kept the old parent, and Send threaded it under that message.
 - A reload whose copy names no parent, when that record says the last one did, takes the existing
   removal (`ReloadWrite.removed`, `OpenCheck.replacedElsewhere`) and the next open adopts the copy
   unthreaded. A row with no record (every row from before v94) keeps its parent, as before.
+
+### Images named only by their Content-ID (#283, 2026-10-24)
+
+SwiftMail names a media part that has no filename after its Content-ID (upstream behaviour,
+`MessagePart` from BODYSTRUCTURE), so the image of a `multipart/related` HTML body written without
+a `Content-Disposition` read as a file named like `logo@example.com`: in the message's attachment
+list, its paperclip, and an adopted draft, which carried it as a file instead of an inline image.
+`IMAPFetchMapping.isRelatedPartNamedByContentID` now marks a part as inline content when it is an
+image with no disposition, a `multipart/related` body holds it directly (the multipart's `path` is
+the part's section without its last number), and its filename is its Content-ID. Every IMAP
+classifier uses it: `IMAPFetchMapping.hasAttachments` (which `IMAPProvider.mapMessageInfo` now
+calls instead of its copy) and `extractAttachments`, and `IMAPProvider.buildFullMessageInfo`.
+These keep their file: a Content-ID image outside a related body, so an image no HTML shows is
+still listed; one with a name of its own; a related part that is not an image (a related body may
+hold a PDF, and the HTML gives no way to open it); and a part of an attached message's own mixed
+body when the outer message's body is related (an outer related body does not reach into an
+attached message, RFC 2046 §5.2.1).

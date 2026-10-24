@@ -3602,6 +3602,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             let hasFilename = part.filename != nil
             let isExplicitAttachment = disposition == "attachment"
             let hasFileNotInline = hasFilename && disposition != "inline"
+                && !IMAPFetchMapping.isRelatedPartNamedByContentID(part)
             // text/calendar (ICS invites) are attachments even without explicit
             // disposition or filename — Outlook often omits both.
             let isCalendar = ct.hasPrefix("text/calendar")
@@ -7042,15 +7043,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             snippet: "",
             isRead: info.flags.contains(.seen),
             isFlagged: info.flags.contains(.flagged),
-            hasAttachments: info.parts.contains { part in
-                let ct = part.contentType.lowercased()
-                let disposition = part.disposition?.lowercased()
-                let hasFilename = !(part.filename?.isEmpty ?? true)
-                let isExplicitAttachment = disposition == "attachment"
-                let hasFileNotInline = hasFilename && disposition != "inline"
-                let isCalendar = ct.hasPrefix("text/calendar")
-                return isExplicitAttachment || hasFileNotInline || isCalendar
-            },
+            hasAttachments: IMAPFetchMapping.hasAttachments(from: info),
             isReplied: info.flags.contains(.answered),
             isForwarded: info.flags.contains(.custom("$Forwarded")),
             actionTag: tag,
