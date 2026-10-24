@@ -70,6 +70,17 @@ enum HTMLText {
     static let paragraphScope: Set<String> = [
         "applet", "button", "caption", "html", "marquee", "object", "table", "td", "template", "th",
     ]
+    /// The start tags that end an open table cell, row or row group without its end
+    /// tag, as HTML parses them, each with the elements it ends: the outermost open one
+    /// within the table, and everything inside it.
+    static let closesTablePart: [String: Set<String>] = {
+        let cells: Set<String> = ["td", "th"]
+        let rows = cells.union(["tr"])
+        let groups = rows.union(["tbody", "thead", "tfoot"])
+        return ["td": cells, "th": cells, "tr": rows, "tbody": groups, "thead": groups, "tfoot": groups]
+    }()
+    /// The elements an implied table cell, row or row group end does not reach past.
+    static let tableScope: Set<String> = ["html", "table", "template"]
     /// The elements an implied `<li>`, `<dd>` or `<dt>` end does not reach past: HTML's
     /// special elements other than `address`, `div` and `p`.
     static let listItemScope: Set<String> = [
@@ -368,7 +379,12 @@ private struct Scanner {
             } else if byte == Byte.ampersand {
                 entity()
             } else if Byte.isWhitespace(byte) {
-                writeWhiteSpace(byte)
+                // HTML reads a carriage return, alone or before a line feed, as one line feed.
+                if byte == Byte.carriageReturn, i + 1 < bytes.count, bytes[i + 1] == Byte.lineFeed {
+                    i += 1
+                    continue
+                }
+                writeWhiteSpace(byte == Byte.carriageReturn ? Byte.lineFeed : byte)
                 i += 1
             } else if byte >= 0x80 {
                 nonASCII()
@@ -384,14 +400,15 @@ private struct Scanner {
 
     // MARK: - Text
 
+    /// A carriage return here is a character reference's, which CSS treats as a space.
     private mutating func writeWhiteSpace(_ byte: UInt8) {
         switch whiteSpace {
         case .collapse:
             writer.space()
         case .preserve:
-            if byte == Byte.lineFeed { writer.lineBreak() } else if byte != Byte.carriageReturn { writer.text(byte) }
+            if byte == Byte.lineFeed { writer.lineBreak() } else { writer.text(byte == Byte.carriageReturn ? Byte.space : byte) }
         case .preserveLineFeeds:
-            if byte == Byte.lineFeed { writer.lineBreak() } else if byte != Byte.carriageReturn { writer.space() }
+            if byte == Byte.lineFeed { writer.lineBreak() } else { writer.space() }
         }
     }
 
@@ -523,6 +540,9 @@ private struct Scanner {
         if HTMLText.closesParagraph.contains(name), let open = openElement(["p"], within: HTMLText.paragraphScope) {
             close(at: open)
         }
+        if let parts = HTMLText.closesTablePart[name], let open = outermostOpenElement(parts, within: HTMLText.tableScope) {
+            close(at: open)
+        }
         let parentHidden = hidden
         let style = parentHidden ? HTMLTextStyle() : self.style(name, attributes: attributes)
         let element = OpenElement(
@@ -570,6 +590,16 @@ private struct Scanner {
             if scope.contains(stack[k].name) { return nil }
         }
         return nil
+    }
+
+    /// The outermost open element named in `names` inside the innermost element in `scope`.
+    private func outermostOpenElement(_ names: Set<String>, within scope: Set<String>) -> Int? {
+        var outermost: Int?
+        for k in stack.indices.reversed() {
+            if scope.contains(stack[k].name) { break }
+            if names.contains(stack[k].name) { outermost = k }
+        }
+        return outermost
     }
 
     /// What the start or end of a visible element writes. Line rules (#217): `<br>`

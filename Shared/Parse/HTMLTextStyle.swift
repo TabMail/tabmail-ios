@@ -23,9 +23,9 @@ struct HTMLTextStyle: Equatable {
     var marginTop: Bool?
     var marginBottom: Bool?
     /// The properties set by an `!important` declaration, which only another one overrides.
-    private var important: Properties = []
+    fileprivate var important: Properties = []
 
-    private struct Properties: OptionSet {
+    fileprivate struct Properties: OptionSet {
         let rawValue: UInt8
         static let hidden = Properties(rawValue: 1)
         static let whiteSpace = Properties(rawValue: 2)
@@ -47,7 +47,7 @@ struct HTMLTextStyle: Equatable {
             var value = CSSText.text(parts[1])
             var important = false
             if let bang = value.lastIndex(of: "!"),
-               value[value.index(after: bang)...].trimmingCharacters(in: .whitespaces) == "important" {
+               CSSText.trimmed(Array(value[value.index(after: bang)...].utf8)[...]).elementsEqual("important".utf8) {
                 value = value[..<bang].trimmingCharacters(in: .whitespacesAndNewlines)
                 important = true
             }
@@ -57,7 +57,7 @@ struct HTMLTextStyle: Equatable {
                 let keywords = value.split(whereSeparator: \.isWhitespace)
                 if keywords == ["none"] {
                     set(\.hidden, .hidden, true, important: important)
-                } else if !keywords.isEmpty, keywords.allSatisfy({ Self.displayKeywords.contains(String($0)) }) {
+                } else if Self.isDisplayValue(keywords.map(String.init)) {
                     set(\.hidden, .hidden, false, important: important)
                 }
             case "white-space":
@@ -85,16 +85,34 @@ struct HTMLTextStyle: Equatable {
 
     private static let properties = ["display", "white-space", "margin", "margin-top", "margin-bottom"]
 
-    /// Every `display` keyword other than `none`, alone or combined (`inline flex`), and
-    /// the global keywords, which never hide.
-    private static let displayKeywords: Set<String> = [
-        "block", "inline", "run-in", "flow", "flow-root", "table", "flex", "grid", "ruby", "list-item",
-        "contents", "inline-block", "inline-table", "inline-flex", "inline-grid",
+    /// The `display` keywords, by their part in the grammar (CSS Display 3, `math` from MathML Core).
+    private static let displayOutside: Set<String> = ["block", "inline", "run-in"]
+    private static let displayInside: Set<String> = ["flow", "flow-root", "table", "flex", "grid", "ruby", "math"]
+    /// The values that are one keyword alone: internal, `contents`, legacy and global.
+    private static let displayAlone: Set<String> = [
         "table-row-group", "table-header-group", "table-footer-group", "table-row", "table-cell",
         "table-column-group", "table-column", "table-caption", "ruby-base", "ruby-text",
-        "ruby-base-container", "ruby-text-container", "math", "inline-math",
+        "ruby-base-container", "ruby-text-container", "contents",
+        "inline-block", "inline-table", "inline-flex", "inline-grid",
         "inherit", "initial", "unset", "revert", "revert-layer",
     ]
+
+    /// Whether `keywords` is a valid `display` value other than `none`, so it shows the element:
+    /// one keyword, an outside and an inside one (`inline flex`), or `list-item` with at most an
+    /// outside one and `flow` or `flow-root`, each once, in any order.
+    private static func isDisplayValue(_ keywords: [String]) -> Bool {
+        if keywords.count == 1, let keyword = keywords.first {
+            return displayAlone.contains(keyword) || displayOutside.contains(keyword)
+                || displayInside.contains(keyword) || keyword == "list-item"
+        }
+        let outside = keywords.filter(displayOutside.contains)
+        let inside = keywords.filter(displayInside.contains)
+        let listItem = keywords.filter { $0 == "list-item" }
+        guard outside.count <= 1, inside.count <= 1, listItem.count <= 1,
+              outside.count + inside.count + listItem.count == keywords.count, (2...3).contains(keywords.count) else { return false }
+        if listItem.isEmpty { return keywords.count == 2 }
+        return inside.allSatisfy { $0 == "flow" || $0 == "flow-root" }
+    }
 
     /// Each property `other` sets replaces this one's, except an `!important` one
     /// that `other` sets without `!important`.
@@ -105,7 +123,7 @@ struct HTMLTextStyle: Equatable {
         set(\.marginBottom, .marginBottom, other.marginBottom, important: other.important.contains(.marginBottom))
     }
 
-    private mutating func set<Value>(_ property: WritableKeyPath<HTMLTextStyle, Value?>, _ flag: Properties,
+    fileprivate mutating func set<Value>(_ property: WritableKeyPath<HTMLTextStyle, Value?>, _ flag: Properties,
                                      _ value: Value?, important isImportant: Bool) {
         guard let value, isImportant || !important.contains(flag) else { return }
         self[keyPath: property] = value
@@ -126,19 +144,64 @@ struct HTMLTextStyle: Equatable {
 /// specificity: a later rule overrides an earlier one, `!important` aside. Class and
 /// id match exactly, as in the standards-mode page TabMail shows.
 struct HTMLTextStyleSheet {
-    private struct Rule {
-        let tag: String?
-        let style: HTMLTextStyle
+    /// A property's value, the position of the rule that set it, and whether it is `!important`.
+    private struct Declared<Value: Sendable>: Sendable {
+        let value: Value
+        let position: Int
+        let important: Bool
+
+        /// The one that wins: an `!important` declaration over another, then the later one.
+        static func winner(_ a: Declared?, _ b: Declared?) -> Declared? {
+            guard let a else { return b }
+            guard let b else { return a }
+            if a.important != b.important { return a.important ? a : b }
+            return a.position > b.position ? a : b
+        }
     }
 
-    private var rules: [Rule] = []
-    /// Rule positions by the tag, class or id the selector names, so an element
-    /// checks only the rules that can match it.
-    private var byTag: [String: [Int]] = [:]
-    private var byClass: [String: [Int]] = [:]
-    private var byID: [String: [Int]] = [:]
+    /// The winning declaration of each property among some rules. Only winners are kept, so an
+    /// element combines one entry per selector it matches, however many rules name it.
+    private struct Winners {
+        var hidden: Declared<Bool>?
+        var whiteSpace: Declared<HTMLTextStyle.WhiteSpace>?
+        var marginTop: Declared<Bool>?
+        var marginBottom: Declared<Bool>?
 
-    var isEmpty: Bool { rules.isEmpty }
+        init() {}
+
+        init(_ style: HTMLTextStyle, position: Int) {
+            hidden = style.hidden.map { Declared(value: $0, position: position, important: style.important.contains(.hidden)) }
+            whiteSpace = style.whiteSpace.map { Declared(value: $0, position: position, important: style.important.contains(.whiteSpace)) }
+            marginTop = style.marginTop.map { Declared(value: $0, position: position, important: style.important.contains(.marginTop)) }
+            marginBottom = style.marginBottom.map { Declared(value: $0, position: position, important: style.important.contains(.marginBottom)) }
+        }
+
+        mutating func add(_ other: Winners) {
+            hidden = Declared.winner(hidden, other.hidden)
+            whiteSpace = Declared.winner(whiteSpace, other.whiteSpace)
+            marginTop = Declared.winner(marginTop, other.marginTop)
+            marginBottom = Declared.winner(marginBottom, other.marginBottom)
+        }
+
+        var style: HTMLTextStyle {
+            var style = HTMLTextStyle()
+            style.set(\.hidden, .hidden, hidden?.value, important: hidden?.important == true)
+            style.set(\.whiteSpace, .whiteSpace, whiteSpace?.value, important: whiteSpace?.important == true)
+            style.set(\.marginTop, .marginTop, marginTop?.value, important: marginTop?.important == true)
+            style.set(\.marginBottom, .marginBottom, marginBottom?.value, important: marginBottom?.important == true)
+            return style
+        }
+    }
+
+    /// The rules read so far, which give each rule its position.
+    private var count = 0
+    /// The winners by the tag, class, `tag.class` or id the selector names.
+    private var byTag: [String: Winners] = [:]
+    private var byClass: [String: Winners] = [:]
+    private var byTagClass: [String: Winners] = [:]
+    private var byID: [String: Winners] = [:]
+
+    var isEmpty: Bool { count == 0 }
 
     init(_ css: String = "") { add(Array(css.utf8)) }
 
@@ -166,26 +229,25 @@ struct HTMLTextStyleSheet {
         }
     }
 
-    /// The style this sheet's rules give an element, applied in rule order.
+    /// The style this sheet's rules give an element.
     func style(tag: String, classes: [Substring], id: Substring?) -> HTMLTextStyle {
-        var matching = byTag[tag] ?? []
-        for className in classes { matching += byClass[String(className)] ?? [] }
-        if let id { matching += byID[String(id)] ?? [] }
-        var style = HTMLTextStyle()
-        for index in matching.sorted() where rules[index].tag.map({ $0 == tag }) ?? true {
-            style.override(with: rules[index].style)
+        var winners = byTag[tag] ?? Winners()
+        for className in classes {
+            if let rule = byClass[String(className)] { winners.add(rule) }
+            if let rule = byTagClass[tag + "." + className] { winners.add(rule) }
         }
-        return style
+        if let id, let rule = byID[String(id)] { winners.add(rule) }
+        return winners.style
     }
 
     /// Adds the rule for `selector`, trimmed, when it is a form this sheet reads.
     private mutating func add(_ selector: String, _ style: HTMLTextStyle) {
-        let position = rules.count
+        let rule = Winners(style, position: count)
         if selector.first == "#" {
             let id = String(selector.dropFirst())
             guard Self.isIdentifier(id) else { return }
-            rules.append(Rule(tag: nil, style: style))
-            byID[id, default: []].append(position)
+            byID[id, default: Winners()].add(rule)
+            count += 1
             return
         }
         let parts = selector.split(separator: ".", omittingEmptySubsequences: false)
@@ -194,12 +256,13 @@ struct HTMLTextStyleSheet {
         let className = parts.count == 2 ? String(parts[1]) : nil
         guard tag != nil || className != nil,
               tag.map(Self.isIdentifier) ?? true, className.map(Self.isIdentifier) ?? true else { return }
-        rules.append(Rule(tag: tag, style: style))
-        if let className {
-            byClass[className, default: []].append(position)
-        } else if let tag {
-            byTag[tag, default: []].append(position)
+        switch (tag, className) {
+        case let (tag?, className?): byTagClass[tag + "." + className, default: Winners()].add(rule)
+        case let (nil, className?): byClass[className, default: Winners()].add(rule)
+        case let (tag?, nil): byTag[tag, default: Winners()].add(rule)
+        case (nil, nil): return
         }
+        count += 1
     }
 
     private static func isIdentifier(_ name: String) -> Bool {

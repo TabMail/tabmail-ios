@@ -389,6 +389,8 @@ struct HTMLTextTests {
         ("<style>.x{display:none !important}</style><div>a</div><div class=x style=\"display:block\">x</div><div>b</div>", "a\nb", "a\nx\nb"),
         ("<style>.x{display:none !important}</style><div class=x style=\"display:block !important\">x</div>", "x", "x"),
         ("<style>p{margin:0 !important}</style><p style=\"margin:1em 0\">a</p><p>b</p>", "a\nb", "a\nb"),
+        // An !important rule beats a later rule without it, for the same selector or another.
+        ("<style>.x{display:none !important} .x{display:block} div{display:block}</style><div>a</div><div class=x>x</div><div>b</div>", "a\nb", "a\nx\nb"),
     ])
     func importantDeclarations(html: String, draft expectedDraft: String, collapsed expectedCollapsed: String) {
         #expect(draft(html) == expectedDraft)
@@ -468,6 +470,106 @@ struct HTMLTextTests {
         #expect(draft(html) == "shown")
         #expect(collapsed(html) == "shown")
         #expect(collapsed("<script>a</script-x>b</script/>c") == "c")
+    }
+
+    // MARK: - Round-2 review cases, each checked against WebKit
+
+    @Test("A cell, row or row group ends the one left open, with its style, within its own table", arguments: [
+        ("<style>.x{display:none}</style><table><tr><td class=x>hidden<td>shown</tr></table><div>end</div>", "shown\nend", "hidden shown\nend"),
+        ("<style>.x{display:none}</style><table><tr class=x><td>hidden<tr><td>shown</table>", "shown", "hidden\nshown"),
+        ("<style>.x{display:none}</style><table><tbody class=x><tr><td>hidden<tbody><tr><td>shown</table>", "shown", "hidden\nshown"),
+        ("<style>.x{display:none}</style><table><tr><td class=x>hidden</td><td>shown</td></tr></table>", "shown", "hidden shown"),
+        // A nested table's cells end only its own: the outer hidden cell stays open around it.
+        ("<style>.x{display:none}</style><table><tr><td class=x><table><tr><td>inner<td>inner</table>hidden<td>shown</table>", "shown", "inner inner\nhidden shown"),
+    ])
+    func impliedTableEnds(html: String, draft expectedDraft: String, collapsed expectedCollapsed: String) {
+        #expect(draft(html) == expectedDraft)
+        #expect(collapsed(html) == expectedCollapsed)
+    }
+
+    @Test("A draft keeps a cell's visible sibling when a hidden cell's end tag is left out")
+    func draftKeepsSiblingOfHiddenCell() {
+        let html = "<style>.x{display:none}</style><table><tr><td class=x>hidden<td>shown</tr></table>"
+        #expect(ExternalDraftAdoption.editableBody(text: nil, html: html, bodyEmptyConfirmed: true, hasAttachments: false) == "shown")
+    }
+
+    @Test("CSS white space before important keeps the priority", arguments: ["! important", "!\nimportant", "!\rimportant", "!\u{0C}important", "!\timportant ", "!IMPORTANT"])
+    func whiteSpaceBeforeImportant(bang: String) {
+        let html = "<div>before</div><div style='display:none \(bang);display:block'>hidden</div><div>after</div>"
+        #expect(draft(html) == "before\nafter")
+        #expect(collapsed(html) == "before\nafter")
+    }
+
+    @Test("A display value shows only in a valid combination of its keywords", arguments: [
+        ("block", true), ("inline flex", true), ("flex inline", true), ("block math", true), ("list-item", true),
+        ("list-item block", true), ("inline flow-root list-item", true), ("table-cell", true), ("inline-block", true),
+        ("contents", true), ("inherit", true),
+        ("block block", false), ("inline block", false), ("flex grid", false), ("list-item table", false),
+        ("list-item list-item", false), ("block flow list-item list-item", false), ("table-cell block", false),
+        ("inline-block flow", false), ("contents block", false), ("inherit block", false), ("inline-math", false),
+    ])
+    func displayGrammar(value: String, shows: Bool) {
+        let html = "<div>a</div><div style='display:none;display:\(value)'>x</div><div>b</div>"
+        #expect(draft(html) == (shows ? "a\nx\nb" : "a\nb"), "\(value)")
+        #expect(collapsed(html) == (shows ? "a\nx\nb" : "a\nb"), "\(value)")
+    }
+
+    @Test("A raw CR, LF or CRLF is one line feed; a CR reference is a space", arguments: ["\r", "\n", "\r\n"])
+    func rawNewlines(newline: String) {
+        let html = "<div style='white-space:pre-wrap'>a" + newline + "b</div>"
+        #expect(draft(html) == "a\nb")
+        #expect(collapsed(html) == "a b")
+        #expect(ExternalDraftAdoption.editableBody(text: nil, html: html, bodyEmptyConfirmed: true, hasAttachments: false) == "a\nb")
+        #expect(draft("<pre>" + newline + "a" + newline + newline + "b</pre>") == "a\n\nb")
+    }
+
+    @Test("A character reference to CR is a space in preserved white space")
+    func carriageReturnReference() {
+        #expect(draft("<div style='white-space:pre-wrap'>a&#13;b</div>") == "a b")
+        #expect(draft("<div style='white-space:pre-line'>a&#13;b</div>") == "a b")
+    }
+
+    @Test("A sheet's !important white-space beats an inline one without it")
+    func importantSheetWhiteSpace() {
+        #expect(draft("<style>.x{white-space:pre !important}</style><div class=x style='white-space:normal'>a  b</div>") == "a  b")
+        #expect(draft("<style>.x{white-space:pre}</style><div class=x style='white-space:normal'>a  b</div>") == "a b")
+        #expect(collapsed("<style>.x{white-space:pre !important}</style><div class=x>a  b</div>") == "a b")
+    }
+
+    @Test("A tag.class rule applies only to that tag, a .class rule to every tag")
+    func tagQualifiedClassRule() {
+        #expect(draft("<style>span.x{display:none}</style><div class=x>shown</div><span class=x>hidden</span>") == "shown")
+        #expect(draft("<style>.x{display:none}</style><div class=x>hidden</div><span class=x>hidden</span><div>shown</div>") == "shown")
+    }
+
+    @Test("A hidden block adds no line between the text around it")
+    func hiddenBlockAddsNoLine() {
+        let html = "<div>before <div style='display:none'>hidden</div> after</div>"
+        #expect(draft(html) == "before after")
+        #expect(collapsed(html) == "before after")
+        let visible = "<div>before <div>visible</div> after</div>"
+        #expect(draft(visible) == "before\nvisible\nafter")
+        #expect(collapsed(visible) == "before\nvisible\nafter")
+    }
+
+    @Test("An element left open stays hidden to the end of the input")
+    func hiddenThroughEnd() {
+        #expect(draft("before<div style='display:none'>hidden") == "before")
+        #expect(collapsed("before<div style='display:none'>hidden <b>more</b> text") == "before")
+        #expect(draft("before<div>visible") == "before\nvisible")
+    }
+
+    /// Before only each property's winning rule was kept, every element replayed every rule
+    /// naming it: 2,048 `p` rules and paragraphs took 2.8 s, four times as long per doubling.
+    @Test("Many rules naming an element cost it no more than one", .timeLimit(.minutes(1)))
+    func manyMatchingRules() {
+        let count = 20_000
+        let html = "<style>" + String(repeating: "p{margin:0}", count: count) + "</style>" + String(repeating: "<p>x</p>", count: count)
+        let start = ContinuousClock.now
+        let text = draft(html)
+        let elapsed = ContinuousClock.now - start
+        #expect(text.split(separator: "\n").count == count)
+        #expect(elapsed < .seconds(5))
     }
 
     /// Before rules were indexed, every element checked every rule: 4,000 of each took
