@@ -1107,6 +1107,13 @@ struct DraftCopyIntegrityTests {
                 contentType: "multipart/mixed; boundary=b",
                 parts: ["1": "Plain piece", "2": "<p>HTML piece</p>"], body: "Plain piece\nHTML piece"),
             IMAPGroupingCase(
+                name: "two alternatives in a mixed body each read their own last branch",
+                bodystructure: "((\(text("PLAIN", "old first"))\(text("PLAIN", "selected first")) \"ALTERNATIVE\")"
+                    + "(\(text("PLAIN", "old second"))\(text("PLAIN", "middle second"))\(text("PLAIN", "selected second")) \"ALTERNATIVE\") \"MIXED\")",
+                contentType: "multipart/mixed; boundary=b",
+                parts: ["1.1": "old first", "1.2": "selected first", "2.1": "old second",
+                        "2.2": "middle second", "2.3": "selected second"], body: "selected first\nselected second"),
+            IMAPGroupingCase(
                 name: "an alternative inside a mixed body reads once, before the next piece",
                 bodystructure: "((\(text("PLAIN", "Top"))\(text("HTML", "<b>Top</b>")) \"ALTERNATIVE\")\(text("PLAIN", "Bottom")) \"MIXED\")",
                 contentType: "multipart/mixed; boundary=b",
