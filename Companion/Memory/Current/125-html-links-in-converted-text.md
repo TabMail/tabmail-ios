@@ -71,12 +71,13 @@ written durably by `BodyFetchProcessor`, the inbox loader's FTS tier and
   rejected on measurement (NSE memory); option B (owner 2026-10-24) fixed the byte scanner instead.
   SwiftSoup is still used, but only for its entity table (`Entities.getByName`).
 - Element facts live in ONE table, `HTMLText.elementKinds` (block, inline, void, raw text). An
-  unknown tag is neither block nor inline: it writes a space in collapsed mode and nothing in
-  `keepingSpacing`. Open elements are capped at `HTMLText.maxOpenElements`.
+  unknown tag is neither block nor inline: it writes a space in both modes. A block or list item
+  start ends a `<p>`, `<li>`, `<dd>` or `<dt>` left open, within HTML's scopes. Open elements are capped at `HTMLText.maxOpenElements`.
 - CSS (`HTMLTextStyle.swift`) reads only `display: none`, `white-space` and whether the top and
   bottom margins are zero. Precedence: `HTMLText.defaultStyleSheet` < document `<style>` <
-  inline `style`. The document sheet (selectors `tag`, `.class`, `tag.class`, `#id`; at-rules
-  skipped; a later rule wins, no specificity) applies only in `keepingSpacing`, so a
+  inline `style`, `!important` first. The document sheet (selectors `tag`, `.class`, `tag.class`,
+  `#id`, class and id matched exactly; at-rules skipped; a later rule wins, no specificity; every
+  `<style>` read before any text, wherever it sits) applies only in `keepingSpacing`, so a
   `@media`-only mobile copy of a newsletter stays hidden in a draft and is still searchable.
 - Line model: a margin asks for a blank line, adjacent margins join, and a line holding only
   no-break spaces (`<p>&nbsp;</p>`) joins the margins around it rather than adding its own.

@@ -22,6 +22,16 @@ struct HTMLTextStyle: Equatable {
     /// Whether the margin is nonzero, in any unit. Only zero or not matters.
     var marginTop: Bool?
     var marginBottom: Bool?
+    /// The properties set by an `!important` declaration, which only another one overrides.
+    private var important: Properties = []
+
+    private struct Properties: OptionSet {
+        let rawValue: UInt8
+        static let hidden = Properties(rawValue: 1)
+        static let whiteSpace = Properties(rawValue: 2)
+        static let marginTop = Properties(rawValue: 4)
+        static let marginBottom = Properties(rawValue: 8)
+    }
 
     init() {}
 
@@ -35,42 +45,71 @@ struct HTMLTextStyle: Equatable {
                   let name = Self.properties.first(where: { CSSText.trimmed(parts[0]).elementsEqual($0.utf8, by: CSSText.equalsLowercased) })
             else { continue }
             var value = CSSText.text(parts[1])
+            var important = false
             if let bang = value.lastIndex(of: "!"),
                value[value.index(after: bang)...].trimmingCharacters(in: .whitespaces) == "important" {
                 value = value[..<bang].trimmingCharacters(in: .whitespacesAndNewlines)
+                important = true
             }
+            // An invalid value is ignored, so it never undoes an earlier valid one.
             switch name {
             case "display":
-                hidden = value.split(whereSeparator: \.isWhitespace).first == "none"
+                let keywords = value.split(whereSeparator: \.isWhitespace)
+                if keywords == ["none"] {
+                    set(\.hidden, .hidden, true, important: important)
+                } else if !keywords.isEmpty, keywords.allSatisfy({ Self.displayKeywords.contains(String($0)) }) {
+                    set(\.hidden, .hidden, false, important: important)
+                }
             case "white-space":
                 switch value {
-                case "pre", "pre-wrap", "break-spaces": whiteSpace = .preserve
-                case "pre-line": whiteSpace = .preserveLineFeeds
-                case "normal", "nowrap": whiteSpace = .collapse
+                case "pre", "pre-wrap", "break-spaces": set(\.whiteSpace, .whiteSpace, .preserve, important: important)
+                case "pre-line": set(\.whiteSpace, .whiteSpace, .preserveLineFeeds, important: important)
+                case "normal", "nowrap": set(\.whiteSpace, .whiteSpace, .collapse, important: important)
                 default: break
                 }
             case "margin":
                 // One to four values: top, then right, bottom, left; bottom repeats top when absent.
                 let values = CSSText.split(Array(value.utf8)[...], at: CSSText.isWhitespace).filter { !$0.isEmpty }
-                guard (1...4).contains(values.count) else { break }
-                marginTop = Self.isNonzero(CSSText.text(values[0])) ?? marginTop
-                marginBottom = Self.isNonzero(CSSText.text(values[values.count >= 3 ? 2 : 0])) ?? marginBottom
+                guard (1...4).contains(values.count),
+                      let top = Self.isNonzero(CSSText.text(values[0])),
+                      let bottom = Self.isNonzero(CSSText.text(values[values.count >= 3 ? 2 : 0])) else { break }
+                set(\.marginTop, .marginTop, top, important: important)
+                set(\.marginBottom, .marginBottom, bottom, important: important)
             case "margin-top":
-                marginTop = Self.isNonzero(value) ?? marginTop
+                set(\.marginTop, .marginTop, Self.isNonzero(value), important: important)
             default:
-                marginBottom = Self.isNonzero(value) ?? marginBottom
+                set(\.marginBottom, .marginBottom, Self.isNonzero(value), important: important)
             }
         }
     }
 
     private static let properties = ["display", "white-space", "margin", "margin-top", "margin-bottom"]
 
-    /// Each property `other` sets replaces this one's.
+    /// Every `display` keyword other than `none`, alone or combined (`inline flex`), and
+    /// the global keywords, which never hide.
+    private static let displayKeywords: Set<String> = [
+        "block", "inline", "run-in", "flow", "flow-root", "table", "flex", "grid", "ruby", "list-item",
+        "contents", "inline-block", "inline-table", "inline-flex", "inline-grid",
+        "table-row-group", "table-header-group", "table-footer-group", "table-row", "table-cell",
+        "table-column-group", "table-column", "table-caption", "ruby-base", "ruby-text",
+        "ruby-base-container", "ruby-text-container", "math", "inline-math",
+        "inherit", "initial", "unset", "revert", "revert-layer",
+    ]
+
+    /// Each property `other` sets replaces this one's, except an `!important` one
+    /// that `other` sets without `!important`.
     mutating func override(with other: HTMLTextStyle) {
-        hidden = other.hidden ?? hidden
-        whiteSpace = other.whiteSpace ?? whiteSpace
-        marginTop = other.marginTop ?? marginTop
-        marginBottom = other.marginBottom ?? marginBottom
+        set(\.hidden, .hidden, other.hidden, important: other.important.contains(.hidden))
+        set(\.whiteSpace, .whiteSpace, other.whiteSpace, important: other.important.contains(.whiteSpace))
+        set(\.marginTop, .marginTop, other.marginTop, important: other.important.contains(.marginTop))
+        set(\.marginBottom, .marginBottom, other.marginBottom, important: other.important.contains(.marginBottom))
+    }
+
+    private mutating func set<Value>(_ property: WritableKeyPath<HTMLTextStyle, Value?>, _ flag: Properties,
+                                     _ value: Value?, important isImportant: Bool) {
+        guard let value, isImportant || !important.contains(flag) else { return }
+        self[keyPath: property] = value
+        if isImportant { important.insert(flag) }
     }
 
     /// A length in any unit, or `auto`; nil for anything else (`inherit`, `calc(...)`).
@@ -84,17 +123,20 @@ struct HTMLTextStyle: Equatable {
 /// The rules of a document's `<style>` blocks the conversion applies: those whose
 /// selector is a bare tag, `.class`, `tag.class` or `#id`. Any other selector is
 /// skipped, and so is every at-rule block (`@media`, `@font-face`, ...). There is no
-/// specificity: a later rule overrides an earlier one. A wrong pick costs a blank
-/// line, never text.
+/// specificity: a later rule overrides an earlier one, `!important` aside. Class and
+/// id match exactly, as in the standards-mode page TabMail shows.
 struct HTMLTextStyleSheet {
     private struct Rule {
         let tag: String?
-        let className: String?
-        let id: String?
         let style: HTMLTextStyle
     }
 
     private var rules: [Rule] = []
+    /// Rule positions by the tag, class or id the selector names, so an element
+    /// checks only the rules that can match it.
+    private var byTag: [String: [Int]] = [:]
+    private var byClass: [String: [Int]] = [:]
+    private var byID: [String: [Int]] = [:]
 
     var isEmpty: Bool { rules.isEmpty }
 
@@ -112,42 +154,52 @@ struct HTMLTextStyleSheet {
             guard stop < text.count else { return }
             // A statement at-rule (`@import ...;`) or a stray `;`.
             if text[stop] == UInt8(ascii: ";") { i = stop + 1; continue }
-            let end = CSSText.blockEnd(in: text, open: stop)
+            // The end of the input closes a block left open.
+            let close = CSSText.blockClose(in: text, open: stop)
             if text[i] != UInt8(ascii: "@") {
-                let style = HTMLTextStyle(declarations: text[(stop + 1)..<max(stop + 1, end - 1)])
+                let style = HTMLTextStyle(declarations: text[(stop + 1)..<close])
                 for selector in text[i..<stop].split(separator: UInt8(ascii: ",")) {
-                    if let rule = Self.rule(CSSText.text(selector), style) { rules.append(rule) }
+                    add(String(decoding: CSSText.trimmed(selector), as: UTF8.self), style)
                 }
             }
-            i = end
+            i = close + 1
         }
     }
 
-    /// The style this sheet's rules give an element. `classes` and `id` are as written.
+    /// The style this sheet's rules give an element, applied in rule order.
     func style(tag: String, classes: [Substring], id: Substring?) -> HTMLTextStyle {
+        var matching = byTag[tag] ?? []
+        for className in classes { matching += byClass[String(className)] ?? [] }
+        if let id { matching += byID[String(id)] ?? [] }
         var style = HTMLTextStyle()
-        for rule in rules {
-            if let ruleTag = rule.tag, ruleTag != tag { continue }
-            if let className = rule.className, !classes.contains(where: { $0.lowercased() == className }) { continue }
-            if let ruleID = rule.id, id?.lowercased() != ruleID { continue }
-            style.override(with: rule.style)
+        for index in matching.sorted() where rules[index].tag.map({ $0 == tag }) ?? true {
+            style.override(with: rules[index].style)
         }
         return style
     }
 
-    /// `selector` trimmed and lowercased.
-    private static func rule(_ selector: String, _ style: HTMLTextStyle) -> Rule? {
+    /// Adds the rule for `selector`, trimmed, when it is a form this sheet reads.
+    private mutating func add(_ selector: String, _ style: HTMLTextStyle) {
+        let position = rules.count
         if selector.first == "#" {
             let id = String(selector.dropFirst())
-            return isIdentifier(id) ? Rule(tag: nil, className: nil, id: id, style: style) : nil
+            guard Self.isIdentifier(id) else { return }
+            rules.append(Rule(tag: nil, style: style))
+            byID[id, default: []].append(position)
+            return
         }
-        let parts = selector.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
-        guard parts.count <= 2 else { return nil }
-        let tag = parts[0].isEmpty ? nil : parts[0]
-        let className = parts.count == 2 ? parts[1] : nil
+        let parts = selector.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count <= 2 else { return }
+        let tag = parts[0].isEmpty ? nil : parts[0].lowercased()
+        let className = parts.count == 2 ? String(parts[1]) : nil
         guard tag != nil || className != nil,
-              tag.map(isIdentifier) ?? true, className.map(isIdentifier) ?? true else { return nil }
-        return Rule(tag: tag, className: className, id: nil, style: style)
+              tag.map(Self.isIdentifier) ?? true, className.map(Self.isIdentifier) ?? true else { return }
+        rules.append(Rule(tag: tag, style: style))
+        if let className {
+            byClass[className, default: []].append(position)
+        } else if let tag {
+            byTag[tag, default: []].append(position)
+        }
     }
 
     private static func isIdentifier(_ name: String) -> Bool {
@@ -196,6 +248,8 @@ private enum CSSText {
                 i += 2
                 while i < text.count, !(text[i] == UInt8(ascii: "*") && i + 1 < text.count && text[i + 1] == UInt8(ascii: "/")) { i += 1 }
                 i += 1
+                // A comment separates what is around it: `dis/**/play` is two words.
+                out.append(UInt8(ascii: " "))
             } else {
                 if c == UInt8(ascii: "\"") || c == UInt8(ascii: "'") { quote = c }
                 out.append(c)
@@ -255,16 +309,16 @@ private enum CSSText {
         return text.count
     }
 
-    /// The index just past the `}` that closes the block opened at `open`, or `text.count`.
-    static func blockEnd(in text: [UInt8], open: Int) -> Int {
+    /// The index of the `}` that closes the block opened at `open`, or `text.count`.
+    static func blockClose(in text: [UInt8], open: Int) -> Int {
         var depth = 0
         var i = open
         while i < text.count {
             i = index(in: text, from: i, of: { $0 == UInt8(ascii: "{") || $0 == UInt8(ascii: "}") })
             guard i < text.count else { break }
             depth += text[i] == UInt8(ascii: "{") ? 1 : -1
-            i += 1
             if depth == 0 { return i }
+            i += 1
         }
         return text.count
     }

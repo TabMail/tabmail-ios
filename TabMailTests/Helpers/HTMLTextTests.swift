@@ -140,13 +140,23 @@ struct HTMLTextTests {
 
     @Test("Each selector form a rule applies to", arguments: [
         "<style>div{display:none}</style><p style=\"margin:0\">a</p><div>x</div>",
-        "<style>.sig{display:none}</style><p style=\"margin:0\">a</p><div class=\"note SIG\">x</div>",
+        "<style>.sig{display:none}</style><p style=\"margin:0\">a</p><div class=\"note sig\">x</div>",
+        "<style>DIV.sig{display:none}</style><p style=\"margin:0\">a</p><div class=\"sig\">x</div>",
         "<style>div.sig{display:none}</style><p style=\"margin:0\">a</p><div class=\"sig\">x</div>",
         "<style>#sig{display:none}</style><p style=\"margin:0\">a</p><div id=\"sig\">x</div>",
         "<style>h1, #sig , p.y{display:none}</style><p style=\"margin:0\">a</p><div id=\"sig\">x</div>",
     ])
     func selectorForms(html: String) {
         #expect(draft(html) == "a")
+    }
+
+    @Test("Class and id match exactly, as in a standards-mode page", arguments: [
+        "<style>.sig{display:none}</style><div class=\"SIG\">x</div>",
+        "<style>.SIG{display:none}</style><div class=\"sig\">x</div>",
+        "<style>#sig{display:none}</style><div id=\"Sig\">x</div>",
+    ])
+    func classAndIDMatchExactly(html: String) {
+        #expect(draft(html) == "x")
     }
 
     @Test("Any other selector is skipped", arguments: [
@@ -356,5 +366,121 @@ struct HTMLTextTests {
         let mso = "<!--[if mso]><table><tr><td><![endif]--><p>Body text</p><!--[if mso]></td></tr></table><![endif]-->"
         #expect(draft(mso) == "Body text")
         #expect(collapsed(mso) == "Body text")
+    }
+
+    // MARK: - Round-1 review cases, each checked against WebKit
+
+    @Test("A block or list item ends the paragraph or item left open, with its style", arguments: [
+        ("<style>.x{display:none}</style><p class=x>hidden<p>shown", "shown", "hidden\nshown"),
+        ("<style>.x{display:none}</style><ul><li class=x>hidden<li>shown</ul>", "shown", "hidden\nshown"),
+        ("<style>.x{display:none}</style><dl><dt class=x>hidden<dd>shown</dl>", "shown", "hidden shown"),
+        ("<p>a<div>b</div>", "a\n\nb", "a\nb"),
+        // An element in between keeps the outer one open.
+        ("<p>a</p><style>.x{display:none}</style><p class=x>hidden<object><div>inner</div></object></p><p>b</p>", "a\n\nb", "a\nhidden\ninner\nb"),
+        ("<style>.x{display:none}</style><ul><li class=x>hidden<ul><li>inner</ul></ul><p>b</p>", "b", "hidden\ninner\nb"),
+    ])
+    func impliedEnds(html: String, draft expectedDraft: String, collapsed expectedCollapsed: String) {
+        #expect(draft(html) == expectedDraft)
+        #expect(collapsed(html) == expectedCollapsed)
+    }
+
+    @Test("!important beats a later or inline declaration without it", arguments: [
+        ("<div>a</div><div style=\"display:none !important;display:block\">x</div><div>b</div>", "a\nb", "a\nb"),
+        ("<style>.x{display:none !important}</style><div>a</div><div class=x style=\"display:block\">x</div><div>b</div>", "a\nb", "a\nx\nb"),
+        ("<style>.x{display:none !important}</style><div class=x style=\"display:block !important\">x</div>", "x", "x"),
+        ("<style>p{margin:0 !important}</style><p style=\"margin:1em 0\">a</p><p>b</p>", "a\nb", "a\nb"),
+    ])
+    func importantDeclarations(html: String, draft expectedDraft: String, collapsed expectedCollapsed: String) {
+        #expect(draft(html) == expectedDraft)
+        #expect(collapsed(html) == expectedCollapsed)
+    }
+
+    @Test("An invalid display value is ignored, never undoing a valid one", arguments: [
+        ("<div>a</div><div style=\"display:none;display:garbage\">x</div><div>b</div>", "a\nb"),
+        ("<div>a</div><div style=\"display:none garbage\">x</div><div>b</div>", "a\nx\nb"),
+        ("<div>a</div><div style=\"display:block;display:none garbage\">x</div><div>b</div>", "a\nx\nb"),
+        ("<div>a</div><div style=\"display:none;display:inline flex\">x</div><div>b</div>", "a\nx\nb"),
+    ])
+    func invalidDisplayIgnored(html: String, expected: String) {
+        #expect(draft(html) == expected)
+        #expect(collapsed(html) == expected)
+    }
+
+    @Test("A style sheet applies to the whole document, wherever it sits")
+    func styleSheetAfterContent() {
+        let html = "<div class=x>hidden</div><style>.x{display:none}</style><div>shown</div>"
+        #expect(draft(html) == "shown")
+        #expect(collapsed(html) == "hidden\nshown")
+        // Not a style sheet: inside a comment, or text in a script.
+        #expect(draft("<!-- <style>.x{display:none}</style> --><div class=x>a</div>") == "a")
+        #expect(draft("<script>s = \"<style>.x{display:none}</style>\"</script><div class=x>a</div>") == "a")
+    }
+
+    @Test("The end of a style sheet closes a rule left open")
+    func ruleOpenAtEnd() {
+        #expect(draft("<style>.x{display:none</style><div class=x>hidden</div><div>shown</div>") == "shown")
+        #expect(draft("<style>p{margin:0</style><p>a</p><p>b</p>") == "a\nb")
+    }
+
+    @Test("A CSS comment separates the words around it", arguments: [
+        ("<div>a</div><div style=\"dis/**/play:none\">x</div>", "a\nx"),
+        ("<div>a</div><div style=\"display:/**/none\">x</div>", "a"),
+    ])
+    func commentSeparatesTokens(html: String, expected: String) {
+        #expect(draft(html) == expected)
+        #expect(collapsed(html) == expected)
+    }
+
+    @Test("An escaped quote in a CSS string never starts a comment")
+    func escapedQuoteInString() {
+        let html = "<div>a</div><div style=\"font-family:'a\\'/*';display:none\">x</div><div>b</div>"
+        #expect(draft(html) == "a\nb")
+        #expect(collapsed(html) == "a\nb")
+    }
+
+    @Test("A declaration of another property leaves the white-space as it was")
+    func unrelatedDeclarationKeepsWhiteSpace() {
+        let html = "<style>p{margin:0}</style><pre style=\"color:red\">a  b\nc</pre>"
+        #expect(draft(html) == "a  b\nc")
+        #expect(collapsed(html) == "a b c")
+    }
+
+    @Test("A block's margin inside a link still applies after the link")
+    func marginAfterBlockInLink() {
+        let html = "<a href=\"https://example.com/\"><p>Label</p></a><div>Next</div>"
+        #expect(draft(html) == "[Label](https://example.com/)\n\nNext")
+        #expect(collapsed(html) == "[Label](https://example.com/)\nNext")
+    }
+
+    @Test("A joiner after an ASCII character is dropped in every mode", arguments: [
+        ("x\u{200D}\u{1F469}", "x\u{1F469}"),
+        ("1&zwnj;\u{4E2D}", "1\u{4E2D}"),
+        ("a&#x200D;\u{1F4BB}", "a\u{1F4BB}"),
+    ])
+    func joinerAfterASCII(html: String, expected: String) {
+        #expect(draft(html) == expected)
+        #expect(collapsed(html) == expected)
+    }
+
+    @Test("A raw-text end tag needs white space, / or > after its name")
+    func rawTextEndTagDelimiter() {
+        let html = "<style>/* </style-x> hidden */</style><div>shown</div>"
+        #expect(draft(html) == "shown")
+        #expect(collapsed(html) == "shown")
+        #expect(collapsed("<script>a</script-x>b</script/>c") == "c")
+    }
+
+    /// Before rules were indexed, every element checked every rule: 4,000 of each took
+    /// 2.8 s, and the time grew with their product.
+    @Test("Many unused rules cost an element nothing", .timeLimit(.minutes(1)))
+    func manyRules() {
+        let count = 20_000
+        let rules = (0..<count).map { ".r\($0){margin:0}" }.joined()
+        let body = String(repeating: "<div>line</div>", count: count)
+        let start = ContinuousClock.now
+        let text = draft("<style>\(rules)</style>" + body)
+        let elapsed = ContinuousClock.now - start
+        #expect(text.split(separator: "\n").count == count)
+        #expect(elapsed < .seconds(5))
     }
 }

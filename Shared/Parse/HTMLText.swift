@@ -59,10 +59,33 @@ enum HTMLText {
         return kinds
     }()
 
+    /// The start tags that end an open `<p>` without its end tag, as HTML parses them.
+    static let closesParagraph: Set<String> = [
+        "address", "article", "aside", "blockquote", "center", "details", "dialog", "dir", "div", "dl",
+        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6",
+        "header", "hgroup", "hr", "li", "dd", "dt", "listing", "main", "menu", "nav", "ol", "p",
+        "plaintext", "pre", "search", "section", "summary", "table", "ul", "xmp",
+    ]
+    /// The elements an implied `<p>` end does not reach past.
+    static let paragraphScope: Set<String> = [
+        "applet", "button", "caption", "html", "marquee", "object", "table", "td", "template", "th",
+    ]
+    /// The elements an implied `<li>`, `<dd>` or `<dt>` end does not reach past: HTML's
+    /// special elements other than `address`, `div` and `p`.
+    static let listItemScope: Set<String> = [
+        "applet", "article", "aside", "blockquote", "body", "button", "caption", "center", "colgroup",
+        "details", "dialog", "dir", "dl", "fieldset", "figcaption", "figure", "footer", "form",
+        "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hgroup", "html", "iframe", "listing",
+        "main", "marquee", "menu", "nav", "object", "ol", "plaintext", "pre", "search", "section",
+        "select", "summary", "table", "tbody", "td", "template", "textarea", "tfoot", "th", "thead",
+        "tr", "ul", "xmp",
+    ]
+
     static func plainText(_ html: String, keepingSpacing: Bool) -> String {
         var html = html
         return html.withUTF8 { bytes in
             var scanner = Scanner(bytes: bytes, keepingSpacing: keepingSpacing)
+            if keepingSpacing { scanner.readStyleSheets() }
             scanner.run()
             return scanner.writer.finish()
         }
@@ -259,8 +282,13 @@ private struct Writer {
         out.append(contentsOf: "[\(escapedLabel)](\(destination))".utf8)
         lineHasContent = true
         lineFeeds = 0
-        // A line the label ended (a block inside the link) ends after the link.
-        if written.last == "\n" { endLine() }
+        // A line the label ended (a block inside the link) ends after the link, and
+        // the margin that block left still applies.
+        if written.last == "\n" {
+            let required = requiredLineFeeds
+            endLine()
+            requiredLineFeeds = required
+        }
     }
 
     mutating func finish() -> String {
@@ -454,13 +482,7 @@ private struct Scanner {
             }
             return
         }
-        var nameEnd = nameStart
-        while nameEnd < bytes.count, Byte.isLetter(bytes[nameEnd]) || Byte.isDigit(bytes[nameEnd]) { nameEnd += 1 }
-        // Letters and digits only, so setting bit 5 lowercases.
-        let name = String(unsafeUninitializedCapacity: nameEnd - nameStart) { name in
-            for k in nameStart..<nameEnd { name[k - nameStart] = bytes[k] | 0x20 }
-            return nameEnd - nameStart
-        }
+        let (name, nameEnd) = tagName(at: nameStart)
         let end = tagEnd(from: nameEnd)
         // A tag the input ends inside is not a tag.
         guard end < bytes.count else { i = bytes.count; return }
@@ -469,10 +491,38 @@ private struct Scanner {
         if closing { endTag(name, kind) } else { startTag(name, kind, attributes: nameEnd..<end) }
     }
 
+    /// With `keepingSpacing`, reads every `<style>` before any text is written: a
+    /// browser applies a style sheet to the whole document, wherever it sits.
+    mutating func readStyleSheets() {
+        while let open = bytes[i...].firstIndex(of: Byte.lessThan) {
+            if bytes[open...].starts(with: "<!--".utf8) {
+                i = index(after: "-->", from: open + 2)
+                continue
+            }
+            i = open + 1
+            guard i < bytes.count, Byte.isLetter(bytes[i]) else { continue }
+            let (name, nameEnd) = tagName(at: i)
+            i = tagEnd(from: nameEnd)
+            guard i < bytes.count else { break }
+            i += 1
+            guard HTMLText.elementKinds[name]?.contains(.rawText) == true else { continue }
+            let end = rawTextEnd(name)
+            if name == "style" { documentSheet.add(Array(bytes[i..<end])) }
+            i = end
+        }
+        i = 0
+    }
+
     private mutating func startTag(_ name: String, _ kind: HTMLText.ElementKind, attributes: Range<Int>) {
         // `<body>` closes a `<head>` left open.
         if name == "body", let head = stack.lastIndex(where: { $0.name == "head" }) { pop(to: head) }
         if kind.contains(.rawText) { return rawText(name) }
+        // A list item, or a block in a paragraph, ends the one open without its end tag.
+        let items: Set<String>? = name == "li" ? ["li"] : name == "dd" || name == "dt" ? ["dd", "dt"] : nil
+        if let items, let open = openElement(items, within: HTMLText.listItemScope) { close(at: open) }
+        if HTMLText.closesParagraph.contains(name), let open = openElement(["p"], within: HTMLText.paragraphScope) {
+            close(at: open)
+        }
         let parentHidden = hidden
         let style = parentHidden ? HTMLTextStyle() : self.style(name, attributes: attributes)
         let element = OpenElement(
@@ -502,13 +552,24 @@ private struct Scanner {
     }
 
     private mutating func endTag(_ name: String, _ kind: HTMLText.ElementKind) {
-        let wasHidden = hidden
-        var marginBottom = false
-        if let open = stack.lastIndex(where: { $0.name == name }) {
-            marginBottom = stack[open].marginBottom
-            pop(to: open)
+        if let open = stack.lastIndex(where: { $0.name == name }) { return close(at: open) }
+        if !hidden { boundary(name, kind, margin: false) }
+    }
+
+    /// Ends the open element at `open` and every element inside it.
+    private mutating func close(at open: Int) {
+        let element = stack[open]
+        pop(to: open)
+        if !element.hidden { boundary(element.name, HTMLText.elementKinds[element.name] ?? [], margin: element.marginBottom) }
+    }
+
+    /// The innermost open element named in `names`, unless an element in `scope` is inside it.
+    private func openElement(_ names: Set<String>, within scope: Set<String>) -> Int? {
+        for k in stack.indices.reversed() {
+            if names.contains(stack[k].name) { return k }
+            if scope.contains(stack[k].name) { return nil }
         }
-        if !wasHidden { boundary(name, kind, margin: marginBottom) }
+        return nil
     }
 
     /// What the start or end of a visible element writes. Line rules (#217): `<br>`
@@ -529,33 +590,43 @@ private struct Scanner {
         }
     }
 
-    /// Skips `<style>`, `<script>` or `<title>` content; with `keepingSpacing` a
-    /// style sheet is read, hidden or not, as a browser applies it.
+    /// Skips `<style>`, `<script>` or `<title>` content, which `readStyleSheets` read.
     private mutating func rawText(_ name: String) {
-        let start = i
-        var end = bytes.count
-        var j = i
-        while let open = bytes[j...].firstIndex(of: Byte.lessThan) {
-            if isEndTag(name, at: open) {
-                end = open
-                break
-            }
-            j = open + 1
-        }
-        if name == "style", keepingSpacing {
-            documentSheet.add(Array(bytes[start..<end]))
-        }
+        let end = rawTextEnd(name)
         i = end < bytes.count ? index(after: ">", from: end) : bytes.count
         if !hidden { writer.space() }
     }
 
-    /// Whether `</name` starts at `open`, followed by no further name character.
+    /// Where the content of raw text element `name`, starting at `i`, ends: its end tag or the input's end.
+    private func rawTextEnd(_ name: String) -> Int {
+        var j = i
+        while let open = bytes[j...].firstIndex(of: Byte.lessThan) {
+            if isEndTag(name, at: open) { return open }
+            j = open + 1
+        }
+        return bytes.count
+    }
+
+    /// Whether `</name` starts at `open`, followed by white space, `/` or `>`.
     private func isEndTag(_ name: String, at open: Int) -> Bool {
         let nameStart = open + 2
         let nameEnd = nameStart + name.utf8.count
-        guard nameEnd <= bytes.count, bytes[open + 1] == Byte.slash,
+        guard nameEnd < bytes.count, bytes[open + 1] == Byte.slash,
               zip(bytes[nameStart..<nameEnd], name.utf8).allSatisfy({ $0 | 0x20 == $1 }) else { return false }
-        return nameEnd == bytes.count || !(Byte.isLetter(bytes[nameEnd]) || Byte.isDigit(bytes[nameEnd]))
+        let next = bytes[nameEnd]
+        return Byte.isWhitespace(next) || next == Byte.slash || next == Byte.greaterThan
+    }
+
+    /// The lowercased tag name starting at `nameStart`, a letter, and the index past it.
+    private func tagName(at nameStart: Int) -> (String, Int) {
+        var nameEnd = nameStart
+        while nameEnd < bytes.count, Byte.isLetter(bytes[nameEnd]) || Byte.isDigit(bytes[nameEnd]) { nameEnd += 1 }
+        // Letters and digits only, so setting bit 5 lowercases.
+        let name = String(unsafeUninitializedCapacity: nameEnd - nameStart) { name in
+            for k in nameStart..<nameEnd { name[k - nameStart] = bytes[k] | 0x20 }
+            return nameEnd - nameStart
+        }
+        return (name, nameEnd)
     }
 
     private mutating func pop(to index: Int) {
