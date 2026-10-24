@@ -54,6 +54,19 @@ struct GmailThreadHeaderFoldingTests {
     private static let ancestors = (0..<40).map { "ancestor-\($0)-" + String(repeating: "a", count: 32) + "@example.com" }
     // "Message-ID: <id>" is a legal 998-octet line; "In-Reply-To: <id>" is one octet longer.
     private static let longParent = String(repeating: "p", count: 972) + "@example.com"
+    /// As many octets in UTF-8 (RFC 6532 allows it), in far fewer characters, so a
+    /// fold that counts characters instead of octets leaves the line too long.
+    private static let longUTF8Parent = "q" + String(repeating: "\u{0301}", count: 485) + "q@example.com"
+
+    /// The identity Gmail's reader takes from an incoming Message-ID, so the
+    /// identifiers below are ones a reply can carry.
+    private func receivedIdentity(_ messageID: String) throws -> String? {
+        let metadata = try #require(GmailParse.parseMessage([
+            "id": "parent", "internalDate": String(Int(Date().timeIntervalSince1970 * 1000)),
+            "payload": ["headers": [["name": "Message-ID", "value": "<\(messageID)>"]]]
+        ]))
+        return MessageIdentity.comparableRfc822Identity(metadata.rfc822MessageId)
+    }
 
     @Test("A long References history is folded and reads back whole, in order",
           arguments: Serializer.allCases, [false, true])
@@ -72,17 +85,33 @@ struct GmailThreadHeaderFoldingTests {
     }
 
     @Test("A parent Message-ID as long as a legal Message-ID line is kept whole",
-          arguments: Serializer.allCases)
-    func longParentID(_ serializer: Serializer) throws {
-        #expect("Message-ID: <\(Self.longParent)>".utf8.count == Self.hardLineLimit)
+          arguments: Serializer.allCases, [Self.longParent, Self.longUTF8Parent])
+    func longParentID(_ serializer: Serializer, parent: String) throws {
+        #expect("Message-ID: <\(parent)>".utf8.count == Self.hardLineLimit)
+        #expect(try receivedIdentity(parent) == parent)
         let draft = DraftMessage(
             to: ["you@example.com"], subject: "Re: thread", body: "reply",
-            inReplyTo: Self.longParent, references: [Self.longParent])
+            inReplyTo: parent, references: [parent])
         let message = raw(draft, serializer)
         #expect(headerLines(message).allSatisfy { $0.utf8.count <= Self.hardLineLimit })
         let metadata = try readBack(message)
-        #expect(metadata.inReplyTo == Self.longParent)
-        #expect(metadata.references == [Self.longParent])
+        #expect(metadata.inReplyTo == parent)
+        #expect(metadata.references == [parent])
+    }
+
+    @Test("A long UTF-8 ancestor before a short parent is folded by octets",
+          arguments: Serializer.allCases)
+    func longUTF8Ancestor(_ serializer: Serializer) throws {
+        let parent = "parent@example.com"
+        #expect(try receivedIdentity(Self.longUTF8Parent) == Self.longUTF8Parent)
+        let draft = DraftMessage(
+            to: ["you@example.com"], subject: "Re: thread", body: "reply",
+            inReplyTo: parent, references: [Self.longUTF8Parent, parent])
+        let message = raw(draft, serializer)
+        #expect(headerLines(message).allSatisfy { $0.utf8.count <= Self.hardLineLimit })
+        let metadata = try readBack(message)
+        #expect(metadata.references == [Self.longUTF8Parent, parent])
+        #expect(metadata.inReplyTo == parent)
     }
 
     @Test("Short thread headers stay on one line each", arguments: Serializer.allCases)
