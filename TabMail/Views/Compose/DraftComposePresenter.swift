@@ -170,25 +170,20 @@ struct LocallyAuthoredDraftOpenAuthority: Sendable, Equatable {
     }
 }
 
-/// Presents a saved draft's compose from a `DraftOpenPreparation` outcome, so the
-/// compose is created already holding the draft (#309). Every caller prepares the
-/// open before presenting, so the first frame is the draft; only Try Again on a
-/// failure card shows a spinner here while the open is prepared again.
+/// Opens a saved draft: the cover is up at once, with a spinner under a Close bar
+/// while `DraftOpenPreparation` reads the draft (and reloads a Gmail or Outlook
+/// row from its server copy, ADR-IOS-091), then the compose appears already
+/// holding the draft (#309, #326). No empty, editable compose is ever shown.
 ///
-/// Usage: `DraftComposePresenter(source: .header(header), prepared: outcome)`
+/// Usage: `DraftComposePresenter(source: .header(header))`
 struct DraftComposePresenter: View {
     let source: DraftOpenPreparation.Source
     #if DEBUG
     @Environment(\.draftOpenResolverForTesting) private var resolveOpenAuthorityForTesting
     #endif
-    /// Nil only while Try Again prepares the open again.
+    /// Nil while the open is prepared, and again while Try Again prepares it.
     @State private var outcome: DraftOpenPreparation.Outcome?
     @Environment(\.dismiss) private var dismiss
-
-    init(source: DraftOpenPreparation.Source, prepared: DraftOpenPreparation.Outcome) {
-        self.source = source
-        _outcome = State(initialValue: prepared)
-    }
 
     var body: some View {
         Group {
@@ -214,13 +209,12 @@ struct DraftComposePresenter: View {
                         Task { await prepare() }
                     })
             case nil:
-                Color(.systemBackground)
-                    .ignoresSafeArea()
-                    .overlay { ProgressView("Loading draft...") }
+                DraftOpeningView(close: { dismiss() })
             }
         }
+        .task { await prepare() }
         // ADR-IOS-030: Track presentation lifecycle so the agent compose FIFO queue
-        // holds during the brief loading window before the inner ComposeView renders.
+        // holds during the loading window before the inner ComposeView renders.
         // Without this, a queued agent compose could try to present from the same
         // source view while DraftComposePresenter is still loading and SwiftUI would
         // silently drop the second fullScreenCover.
@@ -238,6 +232,30 @@ struct DraftComposePresenter: View {
         #else
         outcome = await DraftOpenPreparation.prepare(source)
         #endif
+    }
+}
+
+/// The compose's opening frame while its draft is read (#326): the compose's own
+/// Close bar and background with a spinner, and no fields to type into yet. Close
+/// leaves the draft as it is saved.
+private struct DraftOpeningView: View {
+    let close: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button("Close", action: close)
+                    .font(.subheadline)
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .frame(height: ComposeView.headerHeight, alignment: .center)
+            Divider()
+            ProgressView()
+                .accessibilityLabel("Opening draft")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(Palette.previewPaneBg)
     }
 }
 

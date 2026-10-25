@@ -103,198 +103,113 @@ final class ServerDraftCloseUITests: XCTestCase {
     }
 }
 
-/// #309: which draft open the user sees, and what an early Close keeps.
+/// #309, #326: how a saved draft opens, and what an early Close keeps.
 @MainActor
-final class DraftOpenOrderUITests: XCTestCase {
+final class DraftOpenUITests: XCTestCase {
     private let waitSeconds: TimeInterval = 20
+    /// The fixture's hold on every open (`--draft-open-held`).
+    private let heldSeconds: TimeInterval = 8
 
-    /// A Drafts-row open still preparing when a pushed draft opens must not
-    /// present over it when it finally ends.
-    func testANewerOpenIsNotCoveredByAnOlderOne() {
+    /// A tapped draft opens its compose cover at once, with a spinner and no
+    /// fields while the draft is read, then shows the draft filled; from the
+    /// Drafts list in either layout, a chat pill and the detail column.
+    func testADraftRowOpensAtOnceWithASpinner() { checkOpensAtOnce(from: "row") }
+    func testATriageDraftRowOpensAtOnceWithASpinner() { checkOpensAtOnce(from: "triage") }
+    func testAPillsDraftOpensAtOnceWithASpinner() { checkOpensAtOnce(from: "push") }
+    func testADetailDraftOpensAtOnceWithASpinner() { checkOpensAtOnce(from: "detail") }
+
+    private func checkOpensAtOnce(from place: String) {
         continueAfterFailure = false
-        let app = XCUIApplication()
-        app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test", "--draft-open-ordering"]
-        app.launch()
+        let app = launchHeld()
         defer { app.terminate() }
-        XCTAssertTrue(app.staticTexts["Fixture ready"].waitForExistence(timeout: waitSeconds))
         let row = app.staticTexts["Draft close fixture"].firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: waitSeconds))
-        row.tap()
-        XCTAssertTrue(app.staticTexts["Resolution attempts: 1"].waitForExistence(timeout: waitSeconds))
-        app.buttons["Open push"].tap()
-        let newer = app.staticTexts["Couldn't open this draft"]
-        XCTAssertTrue(newer.waitForExistence(timeout: waitSeconds), "the newer open presented its card")
-        // The older open ends (with no local copy) a few seconds later.
-        let older = app.staticTexts["Draft unavailable"]
-        let olderShown = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == true AND hittable == true"), object: older)
-        XCTAssertNotEqual(XCTWaiter.wait(for: [olderShown], timeout: waitSeconds), .completed,
-                          "the older open presented over the newer one")
-        XCTAssertTrue(newer.isHittable)
-    }
-
-    /// A tapped Drafts row shows it is opening, in either list layout.
-    func testATappedDraftRowShowsItIsOpening() { checkBusyMark(triage: false) }
-    func testATappedTriageDraftRowShowsItIsOpening() { checkBusyMark(triage: true) }
-
-    private func checkBusyMark(triage: Bool) {
-        continueAfterFailure = false
-        let app = XCUIApplication()
-        app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test", "--draft-open-ordering"]
-        app.launch()
-        defer { app.terminate() }
-        XCTAssertTrue(app.staticTexts["Fixture ready"].waitForExistence(timeout: waitSeconds))
-        if triage {
+        if place == "triage" {
             // The fixture's controls overlap the left of this toolbar button.
             app.buttons["Switch to triage"].coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: 0.5)).tap()
             XCTAssertTrue(app.buttons["Switch to list"].waitForExistence(timeout: waitSeconds),
                           "precondition: the list is in triage mode")
         }
-        let row = app.staticTexts["Draft close fixture"].firstMatch
-        XCTAssertTrue(row.waitForExistence(timeout: waitSeconds))
-        row.tap()
-        XCTAssertTrue(app.staticTexts["Resolution attempts: 1"].waitForExistence(timeout: waitSeconds),
-                      "precondition: the open is being prepared")
-        XCTAssertTrue(row.isHittable, "the list stays on screen while the draft is prepared")
-        let mark = app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Opening draft")).firstMatch
-        XCTAssertTrue(mark.waitForExistence(timeout: waitSeconds), "the tapped row shows no busy mark")
-        XCTAssertTrue(mark.isHittable, "the busy mark is not on the visible list")
+        let began = Date()
+        if place == "row" || place == "triage" {
+            row.tap()
+        } else {
+            app.buttons["Open \(place)"].tap()
+        }
+        let spinner = openingSpinner(app)
+        XCTAssertTrue(spinner.waitForExistence(timeout: waitSeconds), "the compose did not open with a spinner")
+        // The cover slides up; once it is up its Close takes taps and the spinner is inside the window.
+        let close = app.buttons["Close"].firstMatch
+        let up = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isHittable == true"), object: close)
+        XCTAssertEqual(XCTWaiter.wait(for: [up], timeout: waitSeconds), .completed, "the opening compose is not on screen")
+        XCTAssertTrue(app.windows.firstMatch.frame.contains(spinner.frame), "the spinner is not on screen")
+        XCTAssertLessThan(Date().timeIntervalSince(began), heldSeconds,
+                          "the compose opened only once the draft was read")
+        // No compose fields yet: an empty, editable compose is the blank the open must not show.
+        XCTAssertFalse(app.staticTexts["Subject:"].exists, "an empty compose showed while the draft was read")
+        XCTAssertFalse(app.buttons["Send"].exists, "an empty compose showed while the draft was read")
+        if place != "detail" {
+            XCTAssertFalse(row.isHittable, "the list, not the compose, is on screen while the draft is read")
+        }
+        let subject = app.textFields.matching(NSPredicate(format: "value == %@", "Detail ready draft")).firstMatch
+        XCTAssertTrue(subject.waitForExistence(timeout: waitSeconds), "the draft never opened")
+        XCTAssertTrue(app.textViews.matching(NSPredicate(format: "value == %@", "Detail ready body")).firstMatch.exists,
+                      "the opened compose lacks the body")
+        XCTAssertFalse(spinner.exists, "the spinner stayed over the opened draft")
     }
 
-    /// A draft opened from a chat's email pill keeps the previous screen until it
-    /// is prepared, then opens.
-    func testAPillOpenKeepsThePreviousScreenUntilPrepared() {
+    /// Close while the draft is read returns to the list, and the open shows
+    /// nothing when the read ends.
+    func testClosingWhileADraftOpensReturnsToTheList() {
         continueAfterFailure = false
-        let app = XCUIApplication()
-        app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test", "--draft-open-ordering"]
-        app.launch()
+        let app = launchHeld()
         defer { app.terminate() }
-        XCTAssertTrue(app.staticTexts["Fixture ready"].waitForExistence(timeout: waitSeconds))
-        let row = app.staticTexts["Draft close fixture"].firstMatch
-        XCTAssertTrue(row.waitForExistence(timeout: waitSeconds))
-        app.buttons["Open push"].tap()
-        XCTAssertTrue(app.staticTexts["Resolution attempts: 1"].waitForExistence(timeout: waitSeconds),
-                      "precondition: the pill's draft is being prepared")
-        XCTAssertTrue(row.isHittable, "the pill left the previous screen before the draft was prepared")
-        // The fixture's first open ends after its hold with no local copy.
-        XCTAssertTrue(app.staticTexts["Draft unavailable"].waitForExistence(timeout: waitSeconds),
-                      "the pill's draft never opened")
-    }
-
-    /// A visit to the account screen, made and left while a Drafts-row open is
-    /// still preparing, is newer than it: the older open must not present afterwards.
-    func testAnAccountVisitIsNotCoveredByAnOlderOpen() {
-        continueAfterFailure = false
-        let app = XCUIApplication()
-        app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test", "--draft-open-ordering"]
-        app.launch()
-        defer { app.terminate() }
-        XCTAssertTrue(app.staticTexts["Fixture ready"].waitForExistence(timeout: waitSeconds))
         let row = app.staticTexts["Draft close fixture"].firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: waitSeconds))
         let began = Date()
         row.tap()
-        XCTAssertTrue(app.staticTexts["Resolution attempts: 1"].waitForExistence(timeout: waitSeconds))
-        app.buttons["Open account"].tap()
-        let account = app.navigationBars["TabMail Account"]
-        XCTAssertTrue(account.waitForExistence(timeout: waitSeconds), "the account screen opened")
-        account.buttons.firstMatch.tap()
-        XCTAssertTrue(app.navigationBars["All Drafts"].waitForExistence(timeout: waitSeconds), "back from the account")
-        // The fixture holds the older open for 12 seconds.
-        XCTAssertLessThan(Date().timeIntervalSince(began), 12, "precondition: the older open is still preparing")
-        let older = app.staticTexts["Draft unavailable"]
-        let olderShown = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == true AND hittable == true"), object: older)
-        XCTAssertNotEqual(XCTWaiter.wait(for: [olderShown], timeout: waitSeconds), .completed,
-                          "the older open presented after the account visit")
-    }
-
-    /// Back out of a screen, taken while a chat pill's draft is still being
-    /// prepared, is newer than that open: the draft must not open over the list
-    /// Back returned to.
-    func testBackFromAPillsMessageIsNotCoveredByAnOlderOpen() { checkBack(from: "Open message", to: "All Drafts") }
-    func testBackFromANotificationsMessageIsNotCoveredByAnOlderOpen() {
-        checkBack(from: "Open notification", to: "All Inboxes")
-    }
-    func testBackFromTheAccountIsNotCoveredByAnOlderOpen() { checkBack(from: "Open account", to: "All Drafts") }
-
-    private func checkBack(from screen: String, to list: String) {
-        continueAfterFailure = false
-        let app = XCUIApplication()
-        app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test", "--draft-open-ordering", "--draft-open-navigation"]
-        app.launch()
-        defer { app.terminate() }
-        XCTAssertTrue(app.staticTexts["Fixture ready"].waitForExistence(timeout: waitSeconds))
-        app.buttons[screen].tap()
-        let back = app.navigationBars.buttons
-            .matching(NSPredicate(format: "label == %@ OR label == %@", "Back", list)).firstMatch
-        XCTAssertTrue(back.waitForExistence(timeout: waitSeconds), "precondition: the screen was pushed")
-        let began = Date()
-        app.buttons["Open push"].tap()
-        XCTAssertTrue(app.staticTexts["Resolution attempts: 1"].waitForExistence(timeout: waitSeconds),
-                      "precondition: the pill's draft is being prepared")
-        XCTAssertTrue(back.isHittable, "precondition: the screen stays while the draft is prepared")
-        back.tap()
-        XCTAssertTrue(app.navigationBars[list].waitForExistence(timeout: waitSeconds), "Back returned to the list")
-        // The fixture holds the pill's open for 12 seconds, then ends it with no local copy.
-        XCTAssertLessThan(Date().timeIntervalSince(began), 12, "precondition: the draft is still being prepared")
-        let older = app.staticTexts["Draft unavailable"]
-        let olderShown = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == true AND hittable == true"), object: older)
-        XCTAssertNotEqual(XCTWaiter.wait(for: [olderShown], timeout: waitSeconds), .completed,
-                          "the draft opened over the list Back returned to")
-        XCTAssertTrue(app.navigationBars[list].isHittable, "Back did not return to the list")
-    }
-
-    /// Another screen chosen while a chat pill's draft is still being prepared is
-    /// newer than that open: the draft must not open over it.
-    func testAnotherScreenIsNotCoveredByAnOlderOpen() {
-        continueAfterFailure = false
-        let app = XCUIApplication()
-        app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test", "--draft-open-ordering", "--draft-open-navigation"]
-        app.launch()
-        defer { app.terminate() }
-        XCTAssertTrue(app.staticTexts["Fixture ready"].waitForExistence(timeout: waitSeconds))
-        let began = Date()
-        app.buttons["Open push"].tap()
-        XCTAssertTrue(app.staticTexts["Resolution attempts: 1"].waitForExistence(timeout: waitSeconds),
-                      "precondition: the pill's draft is being prepared")
-        app.buttons["Open settings"].tap()
-        let settings = app.navigationBars["Email Accounts"]
-        XCTAssertTrue(settings.waitForExistence(timeout: waitSeconds), "precondition: the other screen opened")
-        // The fixture holds the pill's open for 12 seconds, then ends it with no local copy.
-        XCTAssertLessThan(Date().timeIntervalSince(began), 12, "precondition: the draft is still being prepared")
-        let older = app.staticTexts["Draft unavailable"]
-        let olderShown = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "exists == true AND hittable == true"), object: older)
-        XCTAssertNotEqual(XCTWaiter.wait(for: [olderShown], timeout: waitSeconds), .completed,
-                          "the draft opened over the screen chosen after it")
-        XCTAssertTrue(settings.isHittable, "the other screen is no longer usable")
-    }
-
-    /// A new compose opened, and closed, while a Drafts-row open is still
-    /// preparing is newer than it: the older open must not present afterwards.
-    func testANewComposeIsNotCoveredByAnOlderOpen() {
-        continueAfterFailure = false
-        let app = XCUIApplication()
-        app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test", "--draft-open-ordering"]
-        app.launch()
-        defer { app.terminate() }
-        XCTAssertTrue(app.staticTexts["Fixture ready"].waitForExistence(timeout: waitSeconds))
-        let row = app.staticTexts["Draft close fixture"].firstMatch
-        XCTAssertTrue(row.waitForExistence(timeout: waitSeconds))
-        let began = Date()
-        row.tap()
-        XCTAssertTrue(app.staticTexts["Resolution attempts: 1"].waitForExistence(timeout: waitSeconds))
-        app.buttons["Compose"].firstMatch.tap()
-        let send = app.buttons["Send"]
-        XCTAssertTrue(send.waitForExistence(timeout: waitSeconds), "the new compose opened")
+        let spinner = openingSpinner(app)
+        XCTAssertTrue(spinner.waitForExistence(timeout: waitSeconds))
         app.buttons["Close"].firstMatch.tap()
-        XCTAssertTrue(send.waitForNonExistence(timeout: waitSeconds), "the new compose closed")
-        // The fixture holds the older open for 12 seconds.
-        XCTAssertLessThan(Date().timeIntervalSince(began), 12, "precondition: the older open is still preparing")
-        XCTAssertFalse(app.staticTexts["Draft unavailable"].waitForExistence(timeout: waitSeconds),
-                       "the older open presented after the newer compose")
+        XCTAssertTrue(spinner.waitForNonExistence(timeout: waitSeconds), "Close left the opening compose up")
+        XCTAssertLessThan(Date().timeIntervalSince(began), heldSeconds, "precondition: closed while the draft was read")
+        XCTAssertTrue(row.isHittable, "Close did not return to the list")
+        let subject = app.textFields.matching(NSPredicate(format: "value == %@", "Detail ready draft")).firstMatch
+        let opened = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true"), object: subject)
+        XCTAssertNotEqual(XCTWaiter.wait(for: [opened], timeout: heldSeconds + 4), .completed,
+                          "the closed open showed the draft when its read ended")
+        XCTAssertFalse(app.staticTexts["Couldn't open this draft"].exists, "the closed open showed a card")
+        XCTAssertTrue(row.isHittable)
+    }
+
+    /// A failed open offers Try Again, which opens the draft filled.
+    func testTryAgainOpensTheDraft() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test", "--draft-open-retry"]
+        app.launch()
+        defer { app.terminate() }
+        XCTAssertTrue(app.staticTexts["Fixture ready"].waitForExistence(timeout: waitSeconds))
+        let row = app.staticTexts["Draft close fixture"].firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: waitSeconds))
+        row.tap()
+        XCTAssertTrue(app.staticTexts["Couldn't open this draft"].waitForExistence(timeout: waitSeconds))
+        app.buttons["Try Again"].tap()
+        let subject = app.textFields.matching(NSPredicate(format: "value == %@", "Detail ready draft")).firstMatch
+        XCTAssertTrue(subject.waitForExistence(timeout: waitSeconds), "Try Again did not open the draft")
+        XCTAssertFalse(app.staticTexts["Couldn't open this draft"].exists)
+    }
+
+    private func launchHeld() -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments = ["--screenshot-splash", "--draft-close-ui-test", "--draft-open-held"]
+        app.launch()
+        XCTAssertTrue(app.staticTexts["Fixture ready"].waitForExistence(timeout: waitSeconds))
+        return app
+    }
+
+    private func openingSpinner(_ app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Opening draft")).firstMatch
     }
 
     /// The compose button opens the draft a compose agent is working on, and the
@@ -315,7 +230,7 @@ final class DraftOpenOrderUITests: XCTestCase {
         XCTAssertTrue(subject.waitForExistence(timeout: waitSeconds), "the button opened the agent's draft")
         app.buttons["Close"].firstMatch.tap()
         XCTAssertTrue(subject.waitForNonExistence(timeout: waitSeconds))
-        XCTAssertTrue(compose.waitForExistence(timeout: waitSeconds), "the button's busy mark ended with the open")
+        XCTAssertTrue(compose.waitForExistence(timeout: waitSeconds), "the button is back after the compose closed")
 
         app.buttons["Agent finished"].tap()
         let toast = app.staticTexts["Agent draft ready"].firstMatch
@@ -324,36 +239,7 @@ final class DraftOpenOrderUITests: XCTestCase {
         XCTAssertTrue(subject.waitForExistence(timeout: waitSeconds), "the toast opened the agent's draft")
     }
 
-    /// A draft that changed while it was opening offers Try Again, and trying
-    /// again opens it filled.
-    func testAChangedDraftOpensOnTryAgain() {
-        continueAfterFailure = false
-        let app = XCUIApplication()
-        app.launchArguments = ["--screenshot-splash", "--draft-open-early-close", "--draft-open-changed-while-opening"]
-        app.launch()
-        defer { app.terminate() }
-        let message = app.staticTexts["This draft changed while it was opening. Please try again."]
-        XCTAssertTrue(message.waitForExistence(timeout: waitSeconds), "the changed draft's card")
-        let retry = app.buttons["Try Again"]
-        XCTAssertTrue(retry.waitForExistence(timeout: waitSeconds), "the changed draft's card offers no Try Again")
-        retry.tap()
-        XCTAssertTrue(app.staticTexts["initial=held"].firstMatch.waitForExistence(timeout: waitSeconds),
-                      "Try Again did not open the draft")
-        XCTAssertTrue(app.textFields.matching(NSPredicate(format: "value == %@", "Ready before inner load")).firstMatch.exists,
-                      "the reopened compose lacks the subject")
-        XCTAssertTrue(app.textViews.matching(NSPredicate(format: "value == %@", "Keep this local attachment")).firstMatch.exists,
-                      "the reopened compose lacks the body")
-        XCTAssertFalse(message.exists)
-        guard let release = app.buttons.matching(identifier: "Release initial read").allElementsBoundByIndex
-            .first(where: { $0.isHittable }) else {
-            XCTFail("No hittable button: Release initial read")
-            return
-        }
-        release.tap()
-        XCTAssertTrue(app.staticTexts["initial=released"].firstMatch.waitForExistence(timeout: waitSeconds))
-    }
-
-    /// A prepared draft's compose shows the draft before it has read the row, and
+    /// A draft's compose shows the draft before it has read the row, and
     /// closing it then leaves the saved draft, its attachment included, exactly
     /// as it was.
     func testClosingBeforeTheDraftLoadsKeepsItAsSaved() {

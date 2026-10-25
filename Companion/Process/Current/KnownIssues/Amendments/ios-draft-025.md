@@ -1,12 +1,19 @@
 # IOS-DRAFT-025
 
-- Register classification: `accepted`
+- Register classification: `resolved`
 - New post-freeze record (2026-10-24) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
 
-📋 **ACCEPTED LIMITATION (2026-10-24, owner, #309).** GitHub [#311](https://github.com/TabMail/tabmail-ios/issues/311) (P5).
+✅ **RESOLVED (2026-10-25, GitHub [#326](https://github.com/TabMail/tabmail-ios/issues/326)).** At the
+owner's request after the 1.10.0 TestFlight smoke, a saved draft's cover now opens at once and shows
+a spinner inside while the draft is read. `DraftComposePresenter` is on screen for the whole read,
+so its `onAppear` begins the ADR-IOS-030 compose presentation before the read starts and an
+agent-made compose waits behind it, as it does behind any compose. The busy row mark and
+`DraftOpenTracker` are deleted. Pinned by `DraftOpenReloadTests.openingDraftHoldsTheAgentComposeQueue`.
+
+*Preserved, superseded:* 📋 **ACCEPTED LIMITATION (2026-10-24, owner, #309).** GitHub [#311](https://github.com/TabMail/tabmail-ios/issues/311) (P5).
 Proposed during the #309 fix; the owner accepted it: no ADR-IOS-030 hold during the draft's
 server read; if an agent-made compose takes the screen in that window, the draft does not open
 and the user taps it again.

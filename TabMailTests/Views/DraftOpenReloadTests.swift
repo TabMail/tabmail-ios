@@ -178,18 +178,14 @@ struct DraftOpenReloadTests {
         (view as? WKWebView).map { [$0] } ?? view.subviews.flatMap { webViews($0) }
     }
 
-    /// Opens `draftId` the way the compose toolbar does (#309): the open is
-    /// prepared under the toolbar's busy mark, then its compose is presented in a
-    /// real window, and `body` runs against that window. The deadline only bounds
-    /// a wait; every wait ends as soon as its condition holds.
+    /// Opens `draftId` the way the compose toolbar does (#326): its presenter, in a
+    /// real window, prepares the draft and then shows it, and `body` runs against
+    /// that window. The deadline only bounds a wait; every wait ends as soon as its
+    /// condition holds.
     private func withPresentedDraft(
         _ draftId: String, pool: DatabasePool, _ body: (UIWindow) async throws -> Void
     ) async throws {
-        let open = try #require(
-            await DraftOpenPreparation.open(.draftId(draftId), mark: DraftOpenTracker.toolbarMark))
-        #expect(DraftOpenTracker.shared.mark == nil, "the toolbar's busy mark ends with the open")
-        try await withWindow(
-            DraftComposePresenter(source: open.source, prepared: open.outcome), pool: pool, body)
+        try await withWindow(DraftComposePresenter(source: .draftId(draftId)), pool: pool, body)
     }
 
     /// Shows `root` in a real window, with the test account in its navigation store.
@@ -267,8 +263,11 @@ struct DraftOpenReloadTests {
                 let outcome = await DraftOpenPreparation.prepare(.draftId(draft.id))
                 #expect(describe(outcome) == "unavailable:unsupportedAttachment",
                         "the open is refused for the attachment, so the user is told why")
-                let frames = try await presentedFrames(outcome, source: .draftId(draft.id), pool: pool,
-                                                       seconds: Self.observedSeconds)
+                // The presenter prepares the same open again; it has ended once it
+                // has made the calls this preparation made.
+                let callsPerOpen = http.recordedCalls().count
+                let frames = try await presentedFrames(
+                    source: .draftId(draft.id), pool: pool, until: { _ in http.recordedCalls().count >= 2 * callsPerOpen })
                 #expect(!frames.contains { $0.views.contains("phone edit") },
                         "the stale local copy opened for editing; its save would overwrite the server's version")
                 let row = try #require(try await pool.read { try Draft.fetchOne($0, key: draft.id) })
@@ -2012,39 +2011,45 @@ struct DraftOpenReloadTests {
         }
     }
 
-    // MARK: - 7. A prepared open shows the draft from its first frame (#309)
+    // MARK: - 7. An open shows a spinner, then the draft, never an empty compose (#309, #326)
 
     private func textFields(_ view: UIView) -> [UITextField] {
         (view as? UITextField).map { [$0] } ?? view.subviews.flatMap { textFields($0) }
     }
 
     /// The texts a window's editors and fields show. Recipient chips are SwiftUI
-    /// texts with no UIKit view; `DraftOpenOrderUITests` reads them on the
-    /// compose's first frame.
+    /// texts with no UIKit view; `DraftOpenUITests` reads them on the compose's
+    /// first frame.
     private struct Frame: Equatable {
         let views: [String]
         let fields: [String]
+
+        /// The opening cover's spinner (`DraftOpeningView`): no editor, no field.
+        static let opening = Frame(views: [], fields: [])
     }
 
     private func frame(_ window: UIWindow) -> Frame {
         Frame(views: textViews(window).map(\.text), fields: textFields(window).map { $0.text ?? "" })
     }
 
-    /// Presents `outcome` as the Drafts list does once the open is prepared, and
-    /// returns every distinct frame the window shows over `seconds`, the first one
-    /// taken as the view is laid out, before anything asynchronous can run.
+    /// Opens `source` as every caller does (#326), and returns every distinct frame
+    /// the window shows until `until` holds for the latest one, then for
+    /// `observedSeconds` more; the
+    /// first frame is taken as the view is laid out, before anything asynchronous
+    /// can run.
     private func presentedFrames(
-        _ outcome: DraftOpenPreparation.Outcome, source: DraftOpenPreparation.Source,
-        pool: DatabasePool, seconds: TimeInterval
+        source: DraftOpenPreparation.Source, pool: DatabasePool, until: (Frame) -> Bool
     ) async throws -> [Frame] {
         var frames: [Frame] = []
-        try await withWindow(DraftComposePresenter(source: source, prepared: outcome), pool: pool) { window in
+        try await withWindow(DraftComposePresenter(source: source), pool: pool) { window in
             frames = [frame(window)]
-            let end = Date().addingTimeInterval(seconds)
-            while Date() < end {
+            let deadline = Date().addingTimeInterval(Self.presenterDeadlineSeconds)
+            var end: Date?
+            while Date() < (end ?? deadline) {
                 try await Task.sleep(for: .milliseconds(8))
                 let next = frame(window)
                 if next != frames.last { frames.append(next) }
+                if end == nil && until(next) { end = Date().addingTimeInterval(Self.observedSeconds) }
             }
         }
         return frames
@@ -2101,7 +2106,7 @@ struct DraftOpenReloadTests {
         }
     }
 
-    @Test("A prepared draft shows its content from the compose's first frame, and the server is read once, before it opens",
+    @Test("An open shows a spinner, then the draft in every field, and reads the server once",
           arguments: ["pushed", "dirty"])
     func preparedOpenShowsTheDraftFromTheFirstFrame(status: String) async throws {
         try await withInstalledPool { pool in
@@ -2127,16 +2132,19 @@ struct DraftOpenReloadTests {
                     return
                 }
                 #expect(expected.isHeld(by: prepared.draft), "the prepared row: \(prepared.draft)")
-                // The reload reads the server copy once, before the compose opens, and only for a pushed row.
-                #expect(contentReads(http).count == (status == "pushed" ? 1 : 0), "reads before the open: \(contentReads(http))")
+                // The reload reads the server copy once per open, and only for a pushed row.
+                let readsPerOpen = status == "pushed" ? 1 : 0
+                #expect(contentReads(http).count == readsPerOpen, "reads in one open: \(contentReads(http))")
 
+                // The presenter runs the same open: it reads the server once more, never twice.
                 let frames = try await presentedFrames(
-                    outcome, source: .draftId(draft.id), pool: pool, seconds: Self.observedSeconds)
+                    source: .draftId(draft.id), pool: pool, until: expected.isShown)
 
-                let first = try #require(frames.first)
-                #expect(expected.isShown(in: first), "the first frame holds the draft, every field: \(first)")
-                #expect(frames.allSatisfy(expected.isShown), "every frame shows the draft, none blank: \(frames)")
-                #expect(contentReads(http).count == (status == "pushed" ? 1 : 0),
+                #expect(frames.first == .opening, "the cover opens at once, with the spinner: \(frames)")
+                #expect(frames.allSatisfy { $0 == .opening || expected.isShown(in: $0) },
+                        "every frame shows the spinner or the draft, none an empty compose: \(frames)")
+                #expect(frames.last.map(expected.isShown) == true, "the draft opened: \(frames)")
+                #expect(contentReads(http).count == 2 * readsPerOpen,
                         "the compose read the server again: \(contentReads(http))")
             }
         }
@@ -2163,15 +2171,56 @@ struct DraftOpenReloadTests {
                 }
                 #expect(prepared.draft.id == "owned-draft" && prepared.openAuthority?.draftId == "owned-draft")
                 #expect(Version.server.isHeld(by: prepared.draft), "the prepared row: \(prepared.draft)")
-                #expect(contentReads(http).count == 1, "the server copy is read once, before the compose opens")
+                #expect(contentReads(http).count == 1, "the server copy is read once in an open")
 
                 let frames = try await presentedFrames(
-                    outcome, source: .header(header), pool: pool, seconds: Self.observedSeconds)
+                    source: .header(header), pool: pool, until: Version.server.isShown)
 
-                #expect(frames.first.map(Version.server.isShown) == true,
-                        "the first frame shows the server's version: \(String(describing: frames.first))")
-                #expect(frames.allSatisfy(Version.server.isShown), "every frame shows the server's version: \(frames)")
-                #expect(contentReads(http).count == 1, "the compose read the server again: \(contentReads(http))")
+                #expect(frames.first == .opening, "the cover opens at once, with the spinner: \(frames)")
+                #expect(frames.allSatisfy { $0 == .opening || Version.server.isShown(in: $0) },
+                        "every frame shows the spinner or the server's version: \(frames)")
+                #expect(frames.last.map(Version.server.isShown) == true, "the draft opened: \(frames)")
+                #expect(contentReads(http).count == 2, "the compose read the server again: \(contentReads(http))")
+            }
+        }
+    }
+
+    /// ADR-IOS-030: the cover is a compose presentation from the moment it opens, so
+    /// an agent compose waits while the draft is read instead of taking the screen
+    /// (IOS-DRAFT-025, resolved by #326).
+    @Test("An opening draft holds the agent compose queue while it is read")
+    func openingDraftHoldsTheAgentComposeQueue() async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { try insertDraft($0) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            let release = DispatchSemaphore(value: 0)
+            let copy = Self.copyJSON(body: "fresh remote body")
+            // Only the content read waits; the id-only probe before it answers at once.
+            http.register(path: "/messages/g1", method: "GET") { request in
+                let select = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+                    .queryItems?.first(where: { $0.name == "$select" })?.value
+                if select == "id" { return .json(raw: #"{"id":"g1"}"#) }
+                return .parked {
+                    _ = release.wait(timeout: .now() + Self.presenterDeadlineSeconds)
+                    return .json(raw: copy)
+                }
+            }
+            http.register(path: "/messages/g1/attachments", method: "GET", response: .json(raw: #"{"value":[]}"#))
+            let provider = ExchangeProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+            try await withRegisteredProvider(provider) {
+                let before = AgentToolRouter.shared.composePresentationCount
+                try await withPresentedDraft(draft.id, pool: pool) { window in
+                    try await wait { !contentReads(http).isEmpty }
+                    #expect(!contentReads(http).isEmpty, "precondition: the server read is under way")
+                    #expect(frame(window) == .opening, "precondition: the cover shows the spinner")
+                    #expect(AgentToolRouter.shared.composePresentationCount > before,
+                            "an agent compose could take the screen while the draft is read")
+                    release.signal()
+                    try await wait { textViews(window).contains { $0.text == "fresh remote body" } }
+                    #expect(textViews(window).contains { $0.text == "fresh remote body" }, "the draft opened")
+                }
             }
         }
     }
@@ -2273,142 +2322,78 @@ struct DraftOpenReloadTests {
         }
     }
 
-    // MARK: - 8. One open at a time, and the newest wins (#309)
-
-    /// Counts resolutions; the resolver runs on the main actor.
-    @MainActor private final class Counter {
-        var value = 0
-    }
-
-    /// The newest open wins, from another row or from the same place: the
-    /// toolbar's working draft can change between two taps (two compose agents),
-    /// so a second toolbar open names another draft.
-    @Test("A newer open wins over an older one still preparing, from the same place or another",
-          arguments: [true, false])
-    func newerOpenWinsOverAnOlderOne(samePlace: Bool) async throws {
-        let newerMark = samePlace ? DraftOpenTracker.toolbarMark : "row-b"
+    /// ADR-IOS-030: the hold an opening draft takes ends with its cover, so an agent
+    /// compose queued behind it is presented once the user closes (#326).
+    @Test("Closing an opening draft lets a queued agent compose proceed")
+    func closingAnOpeningDraftReleasesTheAgentQueue() async throws {
         try await withInstalledPool { pool in
-            let header = try await pool.write { try insertOutlookHeader($0) }
-            let resolutions = Counter()
-            let (held, release) = AsyncStream<Void>.makeStream()
-            let older = Task {
-                await DraftOpenPreparation.open(.header(header), mark: DraftOpenTracker.toolbarMark, resolver: {
-                    resolutions.value += 1
-                    for await _ in held { break }
-                    return nil
-                }).map { describe($0.outcome) }
-            }
-            try await wait { resolutions.value == 1 }
-            #expect(DraftOpenTracker.shared.mark == DraftOpenTracker.toolbarMark, "the tapped place shows the busy mark")
-
-            let newer = await DraftOpenPreparation.open(.header(header), mark: newerMark, resolver: {
-                resolutions.value += 1
-                return nil
-            })
-            #expect(newer.map { describe($0.outcome) } == "unavailable:noLocalCopy", "the newer open presents")
-            #expect(resolutions.value == 2, "the newer open was prepared")
-            #expect(DraftOpenTracker.shared.mark == nil)
-
-            release.yield()
-            release.finish()
-            #expect(await older.value == nil, "the older open, finishing last, presents nothing")
-            #expect(DraftOpenTracker.shared.mark == nil)
-        }
-    }
-
-    /// The other finishing order: the older open ends while the newer one is
-    /// still preparing, and must neither present nor take the newer one's mark.
-    @Test("An older open finishing first leaves a newer one still preparing in place, from the same place or another",
-          arguments: [true, false])
-    func olderOpenFinishingFirstLeavesTheNewerOne(samePlace: Bool) async throws {
-        let newerMark = samePlace ? DraftOpenTracker.toolbarMark : "row-b"
-        try await withInstalledPool { pool in
-            let header = try await pool.write { try insertOutlookHeader($0) }
-            let resolutions = Counter()
-            let (olderHeld, olderRelease) = AsyncStream<Void>.makeStream()
-            let (newerHeld, newerRelease) = AsyncStream<Void>.makeStream()
+            let header = try await pool.write { try insertOutlookHeader($0, owned: true) }
+            let router = AgentToolRouter.shared
+            router.pendingCompose = nil
+            router.resetComposeQueueForTesting()
             defer {
-                olderRelease.finish()
-                newerRelease.finish()
+                router.pendingCompose = nil
+                router.resetComposeQueueForTesting()
             }
-            let older = Task {
-                await DraftOpenPreparation.open(.header(header), mark: DraftOpenTracker.toolbarMark, resolver: {
-                    resolutions.value += 1
-                    for await _ in olderHeld { break }
-                    return nil
-                }).map { describe($0.outcome) }
-            }
-            try await wait { resolutions.value == 1 }
-            let newer = Task {
-                await DraftOpenPreparation.open(.header(header), mark: newerMark, resolver: {
-                    resolutions.value += 1
-                    for await _ in newerHeld { break }
-                    return nil
-                }).map { describe($0.outcome) }
-            }
-            try await wait { resolutions.value == 2 }
-            let newerToken = try #require(DraftOpenTracker.shared.token)
-
-            olderRelease.yield()
-            olderRelease.finish()
-            #expect(await older.value == nil, "the older open presents nothing")
-            #expect(DraftOpenTracker.shared.token == newerToken, "the newer open is still the current one")
-            #expect(DraftOpenTracker.shared.mark == newerMark, "the newer open keeps its busy mark")
-
-            newerRelease.yield()
-            newerRelease.finish()
-            #expect(await newer.value == "unavailable:noLocalCopy", "the newer open presents")
-            #expect(DraftOpenTracker.shared.mark == nil)
-        }
-    }
-
-    @Test("Moving elsewhere while a draft is opening drops that open")
-    func navigationCancelsAPendingOpen() async throws {
-        try await withInstalledPool { pool in
-            let header = try await pool.write { try insertOutlookHeader($0) }
-            let resolutions = Counter()
+            let started = Mutex(false)
             let (held, release) = AsyncStream<Void>.makeStream()
-            let pending = Task {
-                await DraftOpenPreparation.open(.header(header), mark: "row-a", resolver: {
-                    resolutions.value += 1
+            defer { release.finish() }
+            let request = AgentToolRouter.ComposeRequest(
+                mode: .compose, replyTo: nil, to: ["next@example.com"], cc: [], bcc: [],
+                subject: "Next compose", body: nil)
+            let presenter = DraftComposePresenter(source: .header(header))
+                .environment(\.draftOpenResolverForTesting, {
+                    started.withLock { $0 = true }
                     for await _ in held { break }
                     return nil
-                }).map { describe($0.outcome) }
+                })
+            try await withWindow(presenter, pool: pool) { window in
+                try await wait { started.withLock { $0 } }
+                #expect(started.withLock { $0 }, "precondition: the resolver is parked")
+                #expect(frame(window) == .opening, "precondition: no inner compose exists")
+                router.enqueueCompose(request)
+                #expect(router.pendingCompose == nil, "the agent must wait while the draft is opening")
+                #expect(router.composeQueueDepth == 1)
             }
-            try await wait { resolutions.value == 1 }
-            // What a selection change, a pushed message, a deep link or a toast does.
-            DraftOpenTracker.shared.cancel()
-            #expect(DraftOpenTracker.shared.mark == nil, "the busy mark goes with the open")
-            release.yield()
             release.finish()
-            #expect(await pending.value == nil, "the dropped open presents nothing over where the user went")
+            try await wait { router.pendingCompose?.id == request.id }
+            #expect(router.pendingCompose?.id == request.id,
+                    "closing the opening view must let the queued compose proceed")
         }
     }
 
-    @Test("The busy mark ends with every open, and a draft that is gone presents nothing",
-          arguments: ["ready", "failed", "gone"])
-    func busyMarkEndsWithEveryOpen(shape: String) async throws {
+    /// Whether the cover in `nothingToOpenDismissesTheCover` is up, and whether it appeared.
+    @MainActor @Observable
+    final class CoverState {
+        var showing = false
+        var appeared = false
+    }
+
+    /// The cover now opens before the draft is read (#326), so a draft deleted after
+    /// its id was captured is found missing inside the cover, which must close itself.
+    @Test("A draft removed before its open dismisses its cover instead of leaving a blank")
+    func nothingToOpenDismissesTheCover() async throws {
         try await withInstalledPool { pool in
-            _ = try await pool.write { try insertDraft($0, status: "dirty") }
-            // Only the resolver reads this header, and it throws.
-            let header = MessageHeader(
-                messageId: "g1", subject: "Plan", from: "owner@example.com", fromAddress: "owner@example.com",
-                to: "alice@example.com", date: Date(), snippet: "",
-                folderId: MessageIdentity.folderId(accountId: Self.accountId, folderPath: "Drafts"),
-                accountId: Self.accountId, folderPath: "Drafts", isInInbox: false)
-            let open: PreparedDraftOpen?
-            switch shape {
-            case "ready":
-                open = await DraftOpenPreparation.open(.draftId("adopted:open-reload"), mark: DraftOpenTracker.toolbarMark)
-            case "failed":
-                open = await DraftOpenPreparation.open(.header(header), mark: DraftOpenTracker.toolbarMark,
-                                                       resolver: { throw ResolveFailed() })
-            default:
-                open = await DraftOpenPreparation.open(.draftId("no-such-draft"), mark: DraftOpenTracker.toolbarMark)
+            let draft = try await pool.write { try insertDraft($0, status: "dirty") }
+            try await pool.write { db in
+                try DraftStore.applyDelete(id: draft.id, expectedInstanceEpoch: "E1", db: db)
             }
-            let expected = ["ready": "ready:adopted:open-reload", "failed": "unavailable:loadFailed"][shape]
-            #expect(open.map { describe($0.outcome) } == expected)
-            #expect(DraftOpenTracker.shared.mark == nil, "the busy mark stays only while the open prepares")
+            #expect(try await pool.read { try Draft.fetchOne($0, key: draft.id) } == nil)
+            let state = CoverState()
+            let root = Color.clear.fullScreenCover(isPresented: Binding(
+                get: { state.showing }, set: { state.showing = $0 })) {
+                    DraftComposePresenter(source: .draftId(draft.id))
+                        .onAppear { state.appeared = true }
+                }
+            try await withWindow(root, pool: pool) { _ in
+                state.showing = true
+                try await wait { state.appeared }
+                #expect(state.appeared, "precondition: the cover was actually presented")
+                try await wait { !state.showing }
+                #expect(!state.showing, "nothing to open must dismiss, not leave a blank cover")
+            }
+            #expect(try await pool.read { try Draft.fetchOne($0, key: draft.id) } == nil,
+                    "opening a missing draft must not recreate it")
         }
     }
 }

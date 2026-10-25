@@ -6,9 +6,9 @@ import SwiftUI
 import GRDB
 
 /// Everything opening a saved draft waits for, done BEFORE its compose is shown
-/// (#309), so the compose's first frame already holds the draft. The screen the
-/// draft was opened from keeps a busy mark on it meanwhile; a compose that
-/// appeared empty and filled in later read as a blank.
+/// (#309), so the compose's first frame already holds the draft; a compose that
+/// appeared empty and filled in later read as a blank. `DraftComposePresenter`
+/// runs it inside the cover, which opens at once with a spinner meanwhile (#326).
 ///
 /// The order is the open's contract: resolve a Drafts header to its local row
 /// (adopting a draft another mail app wrote, #217), reload a clean Gmail or
@@ -237,67 +237,14 @@ enum DraftOpenPreparation {
     }
 }
 
-/// A prepared draft open, as the item a full-screen cover presents.
-struct PreparedDraftOpen: Identifiable {
+/// A saved draft to open, as the item a full-screen cover presents. The cover
+/// opens at once; its `DraftComposePresenter` prepares the draft inside it (#326).
+struct DraftOpenRequest: Identifiable {
     let id = UUID()
     let source: DraftOpenPreparation.Source
-    let outcome: DraftOpenPreparation.Outcome
-}
-
-/// #309: the one draft open being prepared, app-wide, and where its busy mark
-/// shows. The newest user action wins: a newer open replaces it, and an accepted
-/// navigation (another message, a folder, a chat pill) cancels it, so a slow
-/// preparation never presents over what the user went to next.
-@MainActor @Observable
-final class DraftOpenTracker {
-    static let shared = DraftOpenTracker()
-
-    /// The mark of the compose button's working-draft open.
-    static let toolbarMark = "compose-toolbar"
-
-    private(set) var token: UUID?
-    /// The list row id (or `toolbarMark`) showing the busy mark; nil for an open
-    /// started from a toast or a chat pill whose row is not on screen.
-    private(set) var mark: String?
-
-    /// Starts an open, replacing any still being prepared: the newest wins, even
-    /// from the same place (the toolbar's working draft may have changed).
-    func begin(mark: String?) -> UUID {
-        let started = UUID()
-        token = started
-        self.mark = mark
-        return started
-    }
-
-    /// Ends the open `started` began: false when a newer open or navigation
-    /// replaced it, so its outcome must not present.
-    func end(_ started: UUID) -> Bool {
-        guard token == started else { return false }
-        cancel()
-        return true
-    }
-
-    /// A newer navigation was accepted: the open being prepared must not present.
-    func cancel() {
-        token = nil
-        mark = nil
-    }
 }
 
 extension DraftOpenPreparation {
-    /// Prepares `source` under a `DraftOpenTracker` token, with the busy mark on
-    /// `mark` meanwhile. Returns the open to present, or nil for an open a newer
-    /// action replaced, and nothing to open.
-    @MainActor
-    static func open(_ source: Source, mark: String?, resolver: Resolver? = nil) async -> PreparedDraftOpen? {
-        let tracker = DraftOpenTracker.shared
-        let started = tracker.begin(mark: mark)
-        let outcome = await prepare(source, resolver: resolver)
-        guard tracker.end(started) else { return nil }
-        if case .nothingToOpen = outcome { return nil }
-        return PreparedDraftOpen(source: source, outcome: outcome)
-    }
-
     /// The Drafts header `messageId` names, or nil for any other message. One read
     /// transaction, so the header and its folder's role agree.
     static func draftsHeader(messageId: String) -> MessageHeader? {
@@ -306,15 +253,5 @@ extension DraftOpenPreparation {
                   try Folder.fetchOne(db, key: header.folderId)?.role == .drafts else { return nil }
             return header
         }
-    }
-}
-
-/// The busy mark a draft shows where it was opened while its compose is prepared.
-struct DraftOpeningMark: View {
-    var body: some View {
-        ProgressView()
-            .padding(8)
-            .background(.regularMaterial, in: Circle())
-            .accessibilityLabel("Opening draft")
     }
 }

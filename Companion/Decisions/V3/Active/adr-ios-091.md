@@ -590,6 +590,10 @@ attached message, RFC 2046 §5.2.1).
 
 ### Drafts open prepared, with no blank frame (#309, 2026-10-24)
 
+> **Superseded in part by #326 (2026-10-25), below:** the previous screen no longer waits with a
+> busy mark, and `DraftOpenTracker` is deleted. The preparation, the seeded compose and the
+> hydration gate described here still hold.
+
 Opening a saved draft showed a blank: the cover presented a spinner, then a compose with empty
 fields that filled in once the draft (and, for a pushed Gmail or Outlook row, its server copy) had
 been read. Owner, 2026-10-24 (option B): stay on the previous screen with a busy mark on the draft
@@ -636,3 +640,24 @@ While an open is prepared nothing is presented, so the agent compose queue's hol
 starts when the presenter appears, as before; an agent compose presented during the preparation
 makes the draft's cover not present, and tapping the draft again opens it. The owner accepted this on 2026-10-24
 (`IOS-DRAFT-025`, GitHub #311, P5).
+
+### Drafts open at once, a spinner inside (#326, 2026-10-25)
+
+After the 1.10.0 TestFlight smoke the owner kept "no flash" but asked that the open look immediate:
+"It opens and then spins and then it loads." Tapping a draft now presents its compose cover at
+once with the normal open animation. `DraftComposePresenter(source:)` runs
+`DraftOpenPreparation.prepare` inside the cover and shows `DraftOpeningView` meanwhile: the
+compose's Close bar (`ComposeView.headerHeight`) and background with a spinner, and no field to
+type into. When the open is ready the compose appears holding the draft (`ComposeView(preparedDraft:)`,
+unchanged from #309); a failure shows its card in the same cover, and Try Again shows the spinner
+again. Close on the spinner dismisses and writes nothing. The server-read rule is unchanged: a clean
+Gmail or Outlook row is reloaded from its server copy, capped at
+`ExternalDraftOpenConfig.reloadTimeoutSeconds`.
+
+Every caller presents at once with a `DraftOpenRequest`: the Drafts list (both layouts), the agent
+toast, the compose button, the chat pill (`MailNavigationView`, its own cover) and the detail column
+(the presenter in place of `DetailDraftOpen`). With nothing pending outside a cover, an older open
+can no longer appear over a newer screen, so `DraftOpenTracker`, its cancellations at every
+navigation, `DraftOpenCancelledByBack`, `DraftOpenPreparation.open`, `PreparedDraftOpen` and
+`DraftOpeningMark` are deleted. Because the presenter is on screen for the whole read, the
+ADR-IOS-030 compose hold begins before the read, which resolves `IOS-DRAFT-025` (#311).

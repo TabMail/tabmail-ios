@@ -109,13 +109,9 @@ struct MailNavigationView: View {
     /// Popping the pushed view (back button / swipe-back) writes `nil` into
     /// this binding automatically — no manual reset needed.
     @State private var pushedMessageId: String?
-    /// #309: a saved draft a chat pill opened, prepared before it is presented
-    /// (`DraftOpenPreparation.open`), so nothing is pushed and the compose's first
-    /// frame is the draft.
-    @State private var pillDraftOpen: PreparedDraftOpen?
-    #if DEBUG
-    @Environment(\.draftOpenResolverForTesting) private var resolveOpenAuthorityForTesting
-    #endif
+    /// #309: a saved draft a chat pill opened. Nothing is pushed: its compose
+    /// cover opens at once and prepares the draft behind a spinner (#326).
+    @State private var pillDraftOpen: DraftOpenRequest?
     /// Same ADR-IOS-054 pattern for the PROGRAMMATIC "TabMail Account" open
     /// (chat WarningBubble's "Active subscription required" button →
     /// `.navigateToAccount`). The old handler wrote `selection = .account`
@@ -546,13 +542,8 @@ struct MailNavigationView: View {
             } else {
                 selectedMessageId = nil
             }
-            // #309: the user went to another folder, so a draft still being
-            // prepared does not open over it.
-            DraftOpenTracker.shared.cancel()
         }
         .modifier(NavigationNotificationHandlers(selection: $selection, pushedShowsAccount: $pushedShowsAccount))
-        .modifier(DraftOpenCancelledByBack(pushedMessageId: pushedMessageId, pushedShowsAccount: pushedShowsAccount,
-                                           selectedMessageId: selectedMessageId))
         .sheet(isPresented: $showSignInSheet) {
             TabMailLoginView {
                 showSignInSheet = false
@@ -585,26 +576,15 @@ struct MailNavigationView: View {
             // Uses `pushedMessageId`, NOT `selectedMessageId` — see doc comment
             // on `pushedMessageId` above.
             guard let realId = notification.userInfo?["realId"] as? String else { return }
-            // #309: a saved draft stays on this screen (its row marked busy when
-            // it is listed) until it is prepared, then opens already filled.
+            // #309: a saved draft opens in its compose cover, not as a pushed message.
             if let header = DraftOpenPreparation.draftsHeader(messageId: realId) {
-                #if DEBUG
-                let resolver = resolveOpenAuthorityForTesting
-                #else
-                let resolver: DraftOpenPreparation.Resolver? = nil
-                #endif
-                Task {
-                    guard let open = await DraftOpenPreparation.open(
-                        .header(header), mark: header.id, resolver: resolver) else { return }
-                    pillDraftOpen = open
-                }
+                pillDraftOpen = DraftOpenRequest(source: .header(header))
                 return
             }
-            DraftOpenTracker.shared.cancel()
             pushedMessageId = realId
         }
         .fullScreenCover(item: $pillDraftOpen) { open in
-            DraftComposePresenter(source: open.source, prepared: open.outcome)
+            DraftComposePresenter(source: open.source)
         }
         .onReceive(NotificationCenter.default.publisher(for: .templatePillOpenTapped).receive(on: DispatchQueue.main)) { notification in
             // Sole sheet host for template-detail. InboxView's matching listener
@@ -832,7 +812,6 @@ struct MailNavigationView: View {
         BootProfiler.mark(isSentinel
             ? "notifTap: pushed instantly (pending resolve → skeleton) \(messageId.prefix(24))"
             : "notifTap: pushed instantly (staged) \(messageId.prefix(24))")
-        DraftOpenTracker.shared.cancel()
         selectedMessageId = openId
         BackgroundSyncLogger.logDebug("[MailNav] Notification deep link: navigating to message \(messageId.prefix(30))")
     }
@@ -886,31 +865,6 @@ struct MailNavigationView: View {
 
 }
 
-// MARK: - Draft Open Cancelled By Back
-
-/// #309: Back (or swipe-back) out of a pushed message, the account screen or a
-/// selected message is a navigation newer than a draft still being prepared, so
-/// that draft does not open over the screen Back returned to. Each push already
-/// cancels where it is made; these are the pops of the same three screens.
-private struct DraftOpenCancelledByBack: ViewModifier {
-    let pushedMessageId: String?
-    let pushedShowsAccount: Bool
-    let selectedMessageId: String?
-
-    func body(content: Content) -> some View {
-        content
-            .onChange(of: pushedMessageId) { oldValue, newValue in
-                if oldValue != nil && newValue == nil { DraftOpenTracker.shared.cancel() }
-            }
-            .onChange(of: pushedShowsAccount) { oldValue, newValue in
-                if oldValue && !newValue { DraftOpenTracker.shared.cancel() }
-            }
-            .onChange(of: selectedMessageId) { oldValue, newValue in
-                if oldValue != nil && newValue == nil { DraftOpenTracker.shared.cancel() }
-            }
-    }
-}
-
 // MARK: - Navigation Notification Handlers
 
 /// Bundles the sidebar navigation notifications into one modifier. Extracted
@@ -935,8 +889,6 @@ private struct NavigationNotificationHandlers: ViewModifier {
                 }
                 guard selection != .account else { return }
                 pushedShowsAccount = true
-                // #309: a draft still being prepared does not open over the account.
-                DraftOpenTracker.shared.cancel()
             }
             .onReceive(NotificationCenter.default.publisher(for: .navigateToPlanPicker).receive(on: DispatchQueue.main)) { _ in
                 selection = .planPicker
@@ -1204,40 +1156,11 @@ private struct MessageDetailResolvedContent: View {
             return (h, f?.role == .drafts)
         }
         if let check = draftCheck, check.isDraft {
-            DetailDraftOpen(header: check.header)
+            DraftComposePresenter(source: .header(check.header))
                 .id(messageId)
         } else {
             MessageDetailView(messageId: messageId, opensWithSkeletonDwell: opensWithSkeletonDwell)
                 .id(messageId)
-        }
-    }
-}
-
-/// A Drafts header selected into the detail column. Chat pills open drafts
-/// without selecting them (`.emailPillTapped` in MailNavigationView), and Drafts
-/// rows open them as a cover (`InboxView.openDraft`), so this is reached only by a
-/// selection naming a draft some other way. The open is prepared before the
-/// compose exists (#309): a busy mark shows meanwhile, never an empty compose.
-private struct DetailDraftOpen: View {
-    let header: MessageHeader
-    #if DEBUG
-    @Environment(\.draftOpenResolverForTesting) private var resolveOpenAuthorityForTesting
-    #endif
-    @State private var outcome: DraftOpenPreparation.Outcome?
-
-    var body: some View {
-        if let outcome {
-            DraftComposePresenter(source: .header(header), prepared: outcome)
-        } else {
-            DraftOpeningMark()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .task {
-                    #if DEBUG
-                    outcome = await DraftOpenPreparation.prepare(.header(header), resolver: resolveOpenAuthorityForTesting)
-                    #else
-                    outcome = await DraftOpenPreparation.prepare(.header(header))
-                    #endif
-                }
         }
     }
 }
