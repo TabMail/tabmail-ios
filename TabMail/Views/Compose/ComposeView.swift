@@ -1292,7 +1292,8 @@ struct ComposeView: View {
         }
     }
 
-    private let headerHeight: CGFloat = 66
+    /// The Close/Send bar's height; the opening spinner's bar matches it (#326).
+    static let headerHeight: CGFloat = 66
     @State private var pillAppeared = false
 
     var body: some View {
@@ -1300,7 +1301,7 @@ struct ComposeView: View {
             ZStack(alignment: .top) {
                 // Layer 1: Fields content with header spacer
                 VStack(spacing: 0) {
-                    Spacer().frame(height: headerHeight)
+                    Spacer().frame(height: Self.headerHeight)
                     Divider()
 
                     // Demo notice — mock provider keeps the message local.
@@ -1551,7 +1552,7 @@ struct ComposeView: View {
                     }
                 }
                 .padding(.horizontal, 16)
-                .frame(height: headerHeight, alignment: .center)
+                .frame(height: Self.headerHeight, alignment: .center)
                 .animation(nil, value: chatExpanded)
 
                 // Layer 3: Floating attachment bubble (bottom-right, persistent)
@@ -1636,7 +1637,7 @@ struct ComposeView: View {
                             showAgentToast(reply)
                         }
                     )
-                    .padding(.top, chatExpanded ? 0 : (headerHeight - 56) / 2)
+                    .padding(.top, chatExpanded ? 0 : (Self.headerHeight - 56) / 2)
                     .scaleEffect(pillAppeared ? 1 : 0.6)
                     .opacity(pillAppeared ? 1 : 0)
                     .popoverTip(ComposeSaveDraftTip(), arrowEdge: .top)
@@ -1907,9 +1908,6 @@ struct ComposeView: View {
     /// (manual New, contact, reply, replyAll, forward, agent compose, agent draft).
     private func performLifecycleAppear() {
         AgentToolRouter.shared.composePresentationDidBegin()
-        // #309: a compose on screen is newer than a draft open still being
-        // prepared, which must not present over it when it ends.
-        DraftOpenTracker.shared.cancel()
         // Arm the deinit fallback with the compose-scope outcome
         // closure. Captured by value so it stays alive even if
         // `onAgentOutcome` is later nil'd by the view graph.

@@ -101,7 +101,10 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-10-24, #309): unchanged at 6 `open` records.** `IOS-DRAFT-025`
+> **Current tracker census (2026-10-25, #326): unchanged at 6 `open` records.** `IOS-DRAFT-025` is
+> resolved: a draft's cover now opens at once, so an agent compose waits behind it while it is read.
+>
+> *Preserved:* **Current tracker census (2026-10-24, #309): unchanged at 6 `open` records.** `IOS-DRAFT-025`
 > (`accepted`, owner-blessed) records that a draft opened while an agent compose appears does not open.
 >
 > *Preserved:* **Current tracker census (2026-10-21, #217 review round 3): unchanged at 6 `open` records.**
@@ -278,7 +281,7 @@ regenerated from it; their detail files live in
 | [IOS-DRAFT-022](Companion/Process/Current/KnownIssues/Amendments/ios-draft-022.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-21, owner, #236)** — an Outlook draft's attachments sync to the server by file name: each local file the server copy has no same-named attachment for is added, then each server attachment the draft no longer has is deleted. Replacing a file with a different one of the SAME name in one edit leaves the old file on the server, and the next open reloads it; renaming the file, or removing it, saving and adding it again, recovers |
 | [IOS-DRAFT-023](Companion/Process/Current/KnownIssues/Amendments/ios-draft-023.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-21, owner)** — line breaks typed at the very end of a Gmail or Outlook draft are dropped when it is saved and reopened, since the reload removes every trailing line break so a save and reopen never grows the body; no visible character is lost |
 | [IOS-DRAFT-024](Companion/Process/Current/KnownIssues/Amendments/ios-draft-024.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-21, owner)** — a Gmail or Outlook draft uploaded by v1.9.2 or earlier with no unsent edits reloads that upload on its first open after updating: Gmail's HTML is read back as text (spacing and line breaks can differ), and an Outlook draft keeps the attachments of its first save (a later-added file is gone, a later-removed one returns). Drafts with unsent edits or never uploaded open from the device; a draft saved once by this release reopens as saved |
-| [IOS-DRAFT-025](Companion/Process/Current/KnownIssues/Amendments/ios-draft-025.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-24, owner, #309, GitHub [#311](https://github.com/TabMail/tabmail-ios/issues/311))** — a saved draft now opens after its server read, and no ADR-IOS-030 hold is taken during that read; an agent-made compose presented in that window takes the screen and the draft does not open, so the user taps it again. Nothing is lost. |
+| [IOS-DRAFT-025](Companion/Process/Current/KnownIssues/Amendments/ios-draft-025.md) | `resolved` | ✅ **RESOLVED (2026-10-25, GitHub [#326](https://github.com/TabMail/tabmail-ios/issues/326))** — a saved draft's cover opens at once and holds the agent compose queue while the draft is read. *Was:* 📋 **ACCEPTED LIMITATION (2026-10-24, owner, #309, GitHub [#311](https://github.com/TabMail/tabmail-ios/issues/311))** — a saved draft now opens after its server read, and no ADR-IOS-030 hold is taken during that read; an agent-made compose presented in that window takes the screen and the draft does not open, so the user taps it again. Nothing is lost. |
 
 ### GRAPH (1)
 

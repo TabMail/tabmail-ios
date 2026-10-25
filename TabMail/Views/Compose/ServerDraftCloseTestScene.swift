@@ -40,15 +40,14 @@ struct ServerDraftCloseTestScene: View {
                     .environment(navigationStore)
                     .environment(\.draftOpenResolverForTesting, {
                         attempts += 1
-                        // #309: the first open (a Drafts-row tap) is still preparing when a
-                        // newer one (a pushed draft) starts and fails; the first then ends.
-                        if Self.orderingFixture {
-                            if attempts == 1 {
-                                try await Task.sleep(for: .seconds(Self.orderingHoldSeconds))
-                                return nil
-                            }
-                            throw FixtureReadFailure()
+                        // #326: every open is held, so its cover shows the spinner,
+                        // then opens the draft filled.
+                        if Self.heldFixture {
+                            try await Task.sleep(for: .seconds(Self.heldSeconds))
+                            return Self.detailAuthority
                         }
+                        // The first open fails, and Try Again opens the draft filled.
+                        if Self.retryFixture && attempts == 1 { throw FixtureReadFailure() }
                         if Self.detailReadyFixture { return Self.detailAuthority }
                         if ProcessInfo.processInfo.arguments.contains("--draft-close-failure") {
                             throw FixtureReadFailure()
@@ -70,7 +69,7 @@ struct ServerDraftCloseTestScene: View {
                             HStack {
                                 Button("Open push") {
                                     NotificationCenter.default.post(name: .emailPillTapped, object: nil,
-                                        userInfo: ["realId": Self.orderingFixture ? Self.newerHeaderId : Self.row.headerId])
+                                        userInfo: ["realId": Self.row.headerId])
                                 }
                                 Button("Open detail") {
                                     NSEDataBridge.latestStagedRows.withLock { $0 = [Self.row] }
@@ -78,26 +77,6 @@ struct ServerDraftCloseTestScene: View {
                                         userInfo: ["messageId": Self.row.messageId, "accountId": Self.accountID])
                                 }
                                 Button("Check rows") { checkRows() }
-                            }
-                            if Self.orderingFixture {
-                                // The chat's "TabMail Account" button (`WarningBubble`).
-                                Button("Open account") { NotificationCenter.default.post(name: .navigateToAccount, object: nil) }
-                            }
-                            if Self.orderingFixture && ProcessInfo.processInfo.arguments.contains("--draft-open-navigation") {
-                                // A received message, from a chat's email pill and from its notification, and
-                                // Settings (its own flag: a wider bar covers the list's triage button).
-                                HStack {
-                                    Button("Open message") {
-                                        NotificationCenter.default.post(name: .emailPillTapped, object: nil,
-                                            userInfo: ["realId": Self.inboxRow.headerId])
-                                    }
-                                    Button("Open notification") {
-                                        NSEDataBridge.latestStagedRows.withLock { $0 = [Self.inboxRow] }
-                                        NotificationCenter.default.post(name: .proactiveNotificationTapped, object: nil,
-                                            userInfo: ["messageId": Self.inboxRow.messageId, "accountId": Self.accountID])
-                                    }
-                                    Button("Open settings") { NotificationCenter.default.post(name: .navigateToSettings, object: nil) }
-                                }
                             }
                             if Self.agentFixture {
                                 // A compose agent working on, then finishing, a saved draft.
@@ -125,11 +104,8 @@ struct ServerDraftCloseTestScene: View {
             do {
                 let accountID = Self.accountID
                 let fixtureRow = Self.row
-                let orderingFixture = Self.orderingFixture
                 let agentDraft = Self.agentFixture ? Self.agentDraft()
                     : Self.detailReadyFixture ? Self.detailDraft() : nil
-                let newerHeaderId = Self.newerHeaderId
-                let inboxRow = Self.inboxRow
                 let deleteFixture = ProcessInfo.processInfo.arguments.contains("--draft-delete-ui-test")
                 let deleteRows = deleteFixture ? Self.deleteRows(
                     thread: ProcessInfo.processInfo.arguments.contains("--draft-delete-thread"),
@@ -156,15 +132,6 @@ struct ServerDraftCloseTestScene: View {
                         var header = fixtureRow.toMessageHeader()
                         header.isInInbox = false
                         try header.save(db)
-                        if orderingFixture {
-                            var newer = header
-                            newer.messageId = "2"
-                            newer.id = newerHeaderId
-                            newer.subject = "Newer draft"
-                            newer.rfc822MessageId = "<newer-draft@example.com>"
-                            try newer.save(db)
-                            try inboxRow.toMessageHeader().save(db)
-                        }
                         try agentDraft?.save(db)
                     }
                 }
@@ -182,26 +149,19 @@ struct ServerDraftCloseTestScene: View {
         }
     }
 
-    /// `--draft-delete-refused` keys every Drafts header on a STALE epoch, so
-    /// `InboxViewModel.deleteDraftMessage` finds no placeholder match for the
-    /// draft's current epoch and fails closed (#147). This is the real-world
-    /// shape a reopened draft leaves behind, not an invented one.
-    private static var orderingFixture: Bool {
-        ProcessInfo.processInfo.arguments.contains("--draft-open-ordering")
+    /// `--draft-open-held`: each open waits `heldSeconds` before it resolves, so
+    /// a test sees the cover's spinner (#326) and can close it meanwhile.
+    private static var heldFixture: Bool {
+        ProcessInfo.processInfo.arguments.contains("--draft-open-held")
     }
 
-    /// Long enough for the newer open (a pushed draft, or a new compose opened and
-    /// closed) to start and finish first.
-    private static let orderingHoldSeconds = 12
-    private static let newerHeaderId = MessageIdentity.headerId(accountId: accountID, folderPath: "Drafts", messageId: "2")
-    /// The ordering fixture's received message, left with Back while a draft is prepared.
-    private static let inboxRow = StagedInboxRow(
-        accountId: accountID, folderPath: "INBOX", messageId: "3",
-        rfc822MessageId: "<received@example.com>", threadId: nil, inReplyTo: nil, references: [],
-        subject: "Received fixture", senderName: "Sender", senderAddress: "sender@example.com",
-        to: "recipient@example.com", snippet: "Received fixture", date: Date(),
-        isRead: true, isFlagged: false, hasAttachments: false, isReplied: false,
-        isForwarded: false, actionTag: nil, summaryBlurb: nil)
+    /// Long enough for a test to read the opening cover and close it.
+    private static let heldSeconds = 8
+
+    /// `--draft-open-retry`: the first open fails with Try Again, which opens the draft.
+    private static var retryFixture: Bool {
+        ProcessInfo.processInfo.arguments.contains("--draft-open-retry")
+    }
 
     private static var agentFixture: Bool {
         ProcessInfo.processInfo.arguments.contains("--draft-open-agent")
@@ -224,10 +184,10 @@ struct ServerDraftCloseTestScene: View {
         return draft
     }
 
-    /// The detail column opens a saved draft the header names (#309): the
-    /// resolver authorizes the fixture's row, which then opens filled.
+    /// A saved draft the header names opens (#309): the resolver authorizes the
+    /// fixture's row, which then opens filled.
     private static var detailReadyFixture: Bool {
-        ProcessInfo.processInfo.arguments.contains("--draft-open-detail-ready")
+        heldFixture || retryFixture || ProcessInfo.processInfo.arguments.contains("--draft-open-detail-ready")
     }
 
     private static let detailDraftID = "detail-ready-draft"
@@ -250,6 +210,10 @@ struct ServerDraftCloseTestScene: View {
         return draft
     }
 
+    /// `--draft-delete-refused` keys every Drafts header on a STALE epoch, so
+    /// `InboxViewModel.deleteDraftMessage` finds no placeholder match for the
+    /// draft's current epoch and fails closed (#147). This is the real-world
+    /// shape a reopened draft leaves behind, not an invented one.
     private static var refusedFixture: Bool {
         ProcessInfo.processInfo.arguments.contains("--draft-delete-refused")
     }

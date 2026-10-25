@@ -7,8 +7,8 @@ import SwiftUI
 import GRDB
 import Synchronization
 
-/// #309 fixture: a prepared draft open whose compose is held, and closed, before
-/// it has bound its row. `--draft-open-early-close-empty-body` saves the draft with
+/// #309 fixture: a draft open whose compose is held, and closed, before it has
+/// bound its row. `--draft-open-early-close-empty-body` saves the draft with
 /// an empty body. A database trace holds the compose's first read of the
 /// row until "Release initial read", so the compose shows its first frame for as
 /// long as a test reads it; the presenter, the compose and draft storage run
@@ -16,7 +16,7 @@ import Synchronization
 struct DraftOpenEarlyCloseTestScene: View {
     @State private var gate = InitialReadGate()
     @State private var navigationStore = NavigationStore()
-    @State private var opening: PreparedDraftOpen?
+    @State private var opening: DraftOpenRequest?
     @State private var status = "Preparing early-close fixture"
     @State private var savedAt: Double?
     private static let accountID = "draft-early-close-account"
@@ -30,7 +30,7 @@ struct DraftOpenEarlyCloseTestScene: View {
         VStack { Text(status); controls }
             .environment(navigationStore)
             .fullScreenCover(item: $opening) { item in
-                DraftComposePresenter(source: item.source, prepared: item.outcome)
+                DraftComposePresenter(source: item.source)
                     .environment(navigationStore)
                     // The compose's chat offers edits only with a session.
                     .environment(\.hasTabMailSession, true)
@@ -98,15 +98,9 @@ struct DraftOpenEarlyCloseTestScene: View {
             // simulator has none, and gate state persists across tests.
             AISubscriptionGate.shared.openGate()
             savedAt = now
-            let outcome = await DraftOpenPreparation.prepare(.draftId(draftID))
-            guard case .ready = outcome else { status = "Early-close preparation failed"; return }
             status = "Early-close fixture ready"
             gate.arm()
-            // `--draft-open-changed-while-opening`: the first open finds the draft
-            // changed, so its compose comes from the card's Try Again.
-            let changed = ProcessInfo.processInfo.arguments.contains("--draft-open-changed-while-opening")
-            opening = PreparedDraftOpen(source: .draftId(draftID),
-                                        outcome: changed ? .unavailable(.changedWhileOpening) : outcome)
+            opening = DraftOpenRequest(source: .draftId(draftID))
         } catch {
             status = "Early-close fixture error: \(error)"
         }
