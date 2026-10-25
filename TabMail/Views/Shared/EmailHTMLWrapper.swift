@@ -172,7 +172,8 @@ enum EmailHTMLWrapper {
     ].joined(separator: "; ")
 
     /// CSS wrapper with dark mode text overrides (mirrors Thunderbird addon approach)
-    /// and word-break rules to prevent long URLs from causing extreme zoom-out.
+    /// and wrap rules that break only a word too long for a line, so long URLs cannot cause
+    /// extreme zoom-out.
     ///
     /// If the body is already a full HTML document (starts with `<html` or `<!DOCTYPE`),
     /// the outer `<html>/<head>/<body>` tags are unwrapped first to avoid nested `<html>`
@@ -434,8 +435,12 @@ enum EmailHTMLWrapper {
             img { max-width: 100% !important; }
             img[width] { height: auto; }
             img[style*="width"][style*="height"] { height: auto !important; }
-            a { color: #0060df; word-break: break-all; overflow-wrap: anywhere; }
-            pre, code { overflow-x: auto; max-width: 100%; white-space: pre-wrap; word-break: break-all; }
+            /* `overflow-wrap: anywhere` breaks only a word too long for a whole line (a bare URL),
+               and it lowers the min-content width, so a long link in a table cell cannot widen the
+               page. `word-break: break-all` split every word at the edge, short ones included
+               ("T/he"), so links and code no longer carry it (#287). */
+            a { color: #0060df; overflow-wrap: anywhere; }
+            pre, code { overflow-x: auto; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
             table, div, p { max-width: 100% !important; box-sizing: border-box !important; }
             td, th { max-width: 100% !important; box-sizing: border-box !important; }
             /* WebKit's default blockquote margin is 40px on BOTH sides; a level must cost
