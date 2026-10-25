@@ -406,7 +406,9 @@ struct TabMailApp: App {
                 } else if startup.isReady {
                     Group {
                         #if DEBUG
-                        if ProcessInfo.processInfo.arguments.contains("--draft-close-ui-test") {
+                        if ProcessInfo.processInfo.arguments.contains("--draft-open-early-close") {
+                            DraftOpenEarlyCloseTestScene()
+                        } else if ProcessInfo.processInfo.arguments.contains("--draft-close-ui-test") {
                             ServerDraftCloseTestScene()
                         } else {
                             RootView()

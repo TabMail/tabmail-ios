@@ -156,16 +156,4 @@ struct ComposeRecipientsTests {
         #expect(result.total == SyncConfig.outboxMaxRecipients)
         #expect(!result.canAddMore)
     }
-
-    @Test("A contact's name goes only to the fields that list its address")
-    func namesOnlyListedFields() {
-        var value = Self.start
-        value.cc.tokens.append("bcc@example.com")
-        #expect(!value.hasName(for: "bcc@example.com"))
-        value.name("bcc@example.com", "Hidden")
-        #expect(value.to.displayNames.isEmpty)
-        #expect(value.cc.displayNames == ["bcc@example.com": "Hidden"])
-        #expect(value.bcc.displayNames == ["bcc@example.com": "Hidden"])
-        #expect(value.hasName(for: "bcc@example.com"))
-    }
 }

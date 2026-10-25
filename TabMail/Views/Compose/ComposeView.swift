@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import SwiftUI
-import Contacts
 import GRDB
 import PhotosUI
 import TipKit
@@ -1071,6 +1070,12 @@ struct ComposeView: View {
     /// (`ExternalDraftAdoption.refreshBeforeOpen`). The editor is covered
     /// meanwhile, so nothing typed can be replaced when the draft then loads.
     @State private var isCheckingServerCopy = false
+    /// #309: true from a prepared open's first frame until `loadDraftOrPrepopulate`
+    /// has bound the row (attachments, change baselines, generation cursor). The
+    /// fields already show the draft, but they take no edits, and Close writes
+    /// nothing: a save now would carry the not-yet-loaded attachments as none and
+    /// delete the saved files.
+    @State private var isHydratingPreparedDraft = false
     /// PORT — sticky initial-read state from v2final ComposeDraftGuards.
     /// `.error` is never reinterpreted as genuine absence later in this view.
     @State private var draftReadState: ComposeDraftGuards.ReadState = .notFound
@@ -1127,6 +1132,11 @@ struct ComposeView: View {
     /// Exact locally-authored server-draft authority carried through loader and
     /// presenter. The inner compose repeats it after its own Draft read.
     var openAuthority: LocallyAuthoredDraftOpenAuthority?
+    /// #309: the row `DraftOpenPreparation` read for `prefillDraftId` after it had
+    /// already reloaded the server copy. The fields start from it, so the first
+    /// frame shows the draft instead of empty fields, and the open does not read
+    /// the server again. The guarded load still re-reads the row and binds it.
+    var preparedDraft: Draft?
     /// PORT — process-local Undo reopens only the retained exact Draft
     /// owner/generation reconstructed before confirmed Outbox cancellation.
     var retainedDraftAuthority: PendingSendService.RetainedDraftAuthority?
@@ -1156,6 +1166,7 @@ struct ComposeView: View {
         prefillTreatAsUnsavedChanges: Bool = false,
         prefillDraftId: String? = nil,
         openAuthority: LocallyAuthoredDraftOpenAuthority? = nil,
+        preparedDraft: Draft? = nil,
         retainedDraftAuthority: PendingSendService.RetainedDraftAuthority? = nil,
         onAgentOutcome: (@MainActor (ComposeOutcome) -> Void)? = nil
     ) {
@@ -1172,8 +1183,22 @@ struct ComposeView: View {
         self.prefillTreatAsUnsavedChanges = prefillTreatAsUnsavedChanges
         self.prefillDraftId = prefillDraftId
         self.openAuthority = openAuthority
+        self.preparedDraft = preparedDraft
         self.retainedDraftAuthority = retainedDraftAuthority
         self.onAgentOutcome = onAgentOutcome
+        if let preparedDraft {
+            var recipients = ComposeDraftGuards.Recipients()
+            var showCc = false
+            recipients.replace(with: recipients.filling(
+                to: RecipientEntry(preparedDraft.toArray), cc: RecipientEntry(preparedDraft.ccArray),
+                bcc: RecipientEntry(preparedDraft.bccArray)), showCc: &showCc)
+            _recipients = State(initialValue: recipients)
+            _showCc = State(initialValue: showCc)
+            _subject = State(initialValue: preparedDraft.subject)
+            _messageBody = State(initialValue: preparedDraft.body)
+            _currentSignature = State(initialValue: account?.signature ?? "")
+            _isHydratingPreparedDraft = State(initialValue: true)
+        }
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[ComposeView] init: prefillDraftId=\(prefillDraftId ?? "nil") replyTo=\(replyTo?.stableId ?? "nil") isForward=\(isForward)")
         }
@@ -1488,6 +1513,7 @@ struct ComposeView: View {
                         .padding(.vertical, 6)
                     }
                 }
+                .disabled(isHydratingPreparedDraft)
 
                 // Layer 2: Close/Send — below chat when expanded
                 HStack {
@@ -1554,6 +1580,9 @@ struct ComposeView: View {
                                     .glassEffect(.regular.interactive(), in: .circle)
                             }
                             .tint(.primary)
+                            // #309: an attachment added before the prepared row is bound
+                            // would be replaced by its saved attachments, or dropped by Close.
+                            .disabled(isHydratingPreparedDraft)
                         }
                         .padding(.trailing, 16)
                         .padding(.bottom, 16)
@@ -1593,7 +1622,7 @@ struct ComposeView: View {
                             recipients.stored
                         },
                         composeAttachmentCarryGate: attachmentCarryGate,
-                        composeMutationAllowed: draftReadState != .error,
+                        composeMutationAllowed: draftReadState != .error && !isHydratingPreparedDraft,
                         // Bubble showing → suggestion stays out of agent auto-save;
                         // only Use Suggestion or explicit Save adopts it as body text.
                         // Reply mode additionally persists edits to cachedReply.
@@ -1878,6 +1907,9 @@ struct ComposeView: View {
     /// (manual New, contact, reply, replyAll, forward, agent compose, agent draft).
     private func performLifecycleAppear() {
         AgentToolRouter.shared.composePresentationDidBegin()
+        // #309: a compose on screen is newer than a draft open still being
+        // prepared, which must not present over it when it ends.
+        DraftOpenTracker.shared.cancel()
         // Arm the deinit fallback with the compose-scope outcome
         // closure. Captured by value so it stays alive even if
         // `onAgentOutcome` is later nil'd by the view graph.
@@ -1943,7 +1975,6 @@ struct ComposeView: View {
         }
         contactSearch.requestAccess()
         Task { await loadDraftOrPrepopulate() }
-        resolveContactNames()
         withAnimation(.spring(response: 0.5, dampingFraction: 0.7).delay(0.15)) {
             pillAppeared = true
         }
@@ -2330,16 +2361,24 @@ struct ComposeView: View {
     private func loadDraftOrPrepopulate() async {
         guard !loadedDraft else { return }
         loadedDraft = true
+        // Every exit below has bound the row or failed closed (`draftReadState`).
+        defer { isHydratingPreparedDraft = false }
 
         // Try loading persisted draft
         BackgroundSyncLogger.logDebug("[ComposeView] loadDraftOrPrepopulate: draftId=\(draftId) prefillDraftId=\(prefillDraftId ?? "nil")")
         let draftKey = draftId
         // #217 (ADR-IOS-091): every open of a saved draft, from any screen, first
         // reloads a Gmail or Outlook row with no unsent edits from its server copy.
-        let openCheck = await ExternalDraftAdoption.refreshBeforeOpen(
-            draftId: draftKey,
-            willReadServer: { isCheckingServerCopy = true })
-        isCheckingServerCopy = false
+        // A prepared open (#309) already did, before this compose was shown.
+        let openCheck: ExternalDraftAdoption.OpenCheck
+        if preparedDraft?.id == draftKey {
+            openCheck = .open
+        } else {
+            openCheck = await ExternalDraftAdoption.refreshBeforeOpen(
+                draftId: draftKey,
+                willReadServer: { isCheckingServerCopy = true })
+            isCheckingServerCopy = false
+        }
         // The server copy holds an attachment TabMail cannot carry (#241): editing
         // the local row would let its save overwrite the server's version.
         switch openCheck {
@@ -2636,6 +2675,12 @@ struct ComposeView: View {
         // computing an authored replacement.
         guard !isSavingDraft else { return }
         guard !isSending else { return }
+        // #309: the prepared draft is not bound yet and took no edits, so the
+        // saved row is exactly what the user opened: leave it as it is.
+        if isHydratingPreparedDraft {
+            dismiss()
+            return
+        }
         guard agentSendFence.claimExclusiveDisposition() else {
             sendError = "Wait for the draft edit to finish before closing."
             return
@@ -3225,32 +3270,6 @@ struct ComposeView: View {
         return decision == .ready ? attachments : nil
     }
 
-    /// Resolve contact display names for all current recipient tokens.
-    /// Called after prepopulate() so agent-prefilled emails show contact names.
-    private func resolveContactNames() {
-        let allEmails = recipients.to.tokens + recipients.cc.tokens + recipients.bcc.tokens
-        guard !allEmails.isEmpty else { return }
-        let store = CNContactStore()
-        let keys: [CNKeyDescriptor] = [
-            CNContactGivenNameKey as CNKeyDescriptor,
-            CNContactFamilyNameKey as CNKeyDescriptor,
-            CNContactEmailAddressesKey as CNKeyDescriptor,
-        ]
-        for email in allEmails {
-            // Skip if already resolved
-            if recipients.hasName(for: email) { continue }
-            guard let contacts = try? store.unifiedContacts(
-                matching: CNContact.predicateForContacts(matchingEmailAddress: email),
-                keysToFetch: keys
-            ), let contact = contacts.first else { continue }
-            let name = [contact.givenName, contact.familyName]
-                .filter { !$0.isEmpty }
-                .joined(separator: " ")
-            guard !name.isEmpty else { continue }
-            recipients.name(email, name)
-        }
-    }
-
     // MARK: - Build send body
 
     private func buildSendBody() -> (body: String, isHTML: Bool) {
@@ -3328,6 +3347,8 @@ struct ComposeView: View {
     // MARK: - Send
 
     private func trySend() {
+        // #309: before the empty-body prompt, which would otherwise answer first.
+        guard !isHydratingPreparedDraft else { return }
         let bodyEmpty = messageBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if bodyEmpty {
             showEmptyBodyPrompt = true
@@ -3854,6 +3875,10 @@ struct TokenField: View {
                         chipView(lastChip)
                     }
                     TextField("", text: $input)
+                        // UI tests read a field's addresses by role here: its chips
+                        // are not in the accessibility tree while the compose is disabled.
+                        .accessibilityIdentifier("recipientInput-\(fieldKey)")
+                        .accessibilityLabel(Self.debugAddresses(tokens))
                         .font(.subheadline)
                         .textContentType(.emailAddress)
                         .keyboardType(.emailAddress)
@@ -3918,6 +3943,15 @@ struct TokenField: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The field's addresses in debug builds; in release the empty label the field had.
+    private static func debugAddresses(_ tokens: [String]) -> String {
+        #if DEBUG
+        tokens.joined(separator: ", ")
+        #else
+        ""
+        #endif
     }
 
     private func tokenChip(_ token: String) -> some View {

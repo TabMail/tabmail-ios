@@ -220,6 +220,9 @@ struct InboxView: View {
     @Environment(\.lastSync) private var lastSyncEnv
     @Environment(\.syncFailed) private var syncFailedEnv
     @Environment(\.syncNow) private var syncNowEnv
+    #if DEBUG
+    @Environment(\.draftOpenResolverForTesting) private var resolveOpenAuthorityForTesting
+    #endif
 
     private var isInboxView: Bool { folders.contains { $0.role == .inbox } }
     @State private var contactComposeRequest: MailtoRequest?
@@ -328,7 +331,7 @@ struct InboxView: View {
     }
 
     /// Wraps `$selectedMessageId` so a tap inside the Drafts folder is
-    /// redirected to `draftHeaderToOpen` (which drives a fullScreenCover),
+    /// redirected to `openDraft` (which ends in a fullScreenCover),
     /// leaving `selectedMessageId` nil so the detail pane does NOT push.
     private var listSelectionBinding: Binding<String?> {
         Binding(
@@ -347,15 +350,32 @@ struct InboxView: View {
                     if let header = try? AppDatabase.dbPool.read({ db in
                         try MessageHeader.fetchOne(db, key: newId)
                     }) {
-                        draftHeaderToOpen = header
+                        openDraft(.header(header), rowId: newId)
                     } else if DebugModeManager.isLoggingEnabled() {
                         BackgroundSyncLogger.logDebug("[DetailRender] drafts tap: header already gone, not presenting id=\(newId.prefix(40))")
                     }
                 } else {
+                    if newValue != nil { DraftOpenTracker.shared.cancel() }
                     selectedMessageId = newValue
                 }
             }
         )
+    }
+
+    /// #309: prepares a saved draft while this list stays on screen, with a busy
+    /// mark on `rowId`, then presents its compose already filled
+    /// (`DraftOpenPreparation.open`). A newer open or an accepted navigation
+    /// replaces one still being prepared (`DraftOpenTracker`).
+    private func openDraft(_ source: DraftOpenPreparation.Source, rowId: String?) {
+        #if DEBUG
+        let resolver = resolveOpenAuthorityForTesting
+        #else
+        let resolver: DraftOpenPreparation.Resolver? = nil
+        #endif
+        Task {
+            guard let open = await DraftOpenPreparation.open(source, mark: rowId, resolver: resolver) else { return }
+            preparedDraftOpen = open
+        }
     }
 
     @State private var showUndoAlert = false
@@ -363,7 +383,7 @@ struct InboxView: View {
     @State private var undoAlertLabel = "Undo last action?"
     @State private var undoAlertStackCount = 0
     /// Reply-all compose target. Holds a VALUE copy of the header captured at
-    /// action time (same rule as `draftHeaderToOpen`): the row can be deleted
+    /// action time (same rule as `preparedDraftOpen`): the row can be deleted
     /// or UID-rekeyed by sync while the reply compose is open, so the cover
     /// content must never re-fetch it.
     @State private var replyMessage: MessageHeader?
@@ -379,15 +399,13 @@ struct InboxView: View {
     /// only dismisses.
     @State private var draftRefusalNotice: String?
     @State private var draftRefusalNoticeDismiss: Task<Void, Never>?
-    @State private var agentDraftIdToOpen: String?
-    @State private var showAgentDraft = false
-    /// Drafts-folder tap target. Setting this presents ComposeView as a
+    /// A prepared draft open. Setting this presents ComposeView as a
     /// fullScreenCover (matching every other compose entry point) instead of
-    /// pushing MessageDetailView via `selectedMessageId`. Holds a VALUE copy
-    /// of the tapped header: the header row itself may be rekeyed/deleted by
-    /// draft-push migration + Drafts sync while compose is open, so the
-    /// presentation must never depend on re-fetching it.
-    @State private var draftHeaderToOpen: MessageHeader?
+    /// pushing MessageDetailView via `selectedMessageId`. Its source holds a
+    /// VALUE copy of the tapped header: the header row itself may be
+    /// rekeyed/deleted by draft-push migration + Drafts sync while compose is
+    /// open, so the presentation must never depend on re-fetching it.
+    @State private var preparedDraftOpen: PreparedDraftOpen?
     private var archiveOldEmailsTip = ArchiveOldEmailsTip()
     private var enableInboxPushTip = EnableInboxPushTip()
     private var undoService: UndoService { UndoService.shared }
@@ -671,6 +689,10 @@ struct InboxView: View {
             withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
                 chatExpanded = false
             }
+            // #309: a saved draft is prepared and opened by MailNavigationView's
+            // handler, which is mounted on every screen; nothing is pushed.
+            if DraftOpenPreparation.draftsHeader(messageId: realId) != nil { return }
+            DraftOpenTracker.shared.cancel()
             // `pushedMessageId`, NOT `selectedMessageId` — see doc comment on
             // `pushedMessageId` above (List(selection:) reconciliation revokes
             // foreign selection values during this concurrent collapse animation).
@@ -779,16 +801,11 @@ struct InboxView: View {
         .fullScreenCover(item: $replyMessage) { message in
             replyAllComposeView(for: message)
         }
-        .fullScreenCover(item: $draftHeaderToOpen) { header in
-            ServerDraftComposeLoader(header: header)
+        .fullScreenCover(item: $preparedDraftOpen) { open in
+            DraftComposePresenter(source: open.source, prepared: open.outcome)
         }
         .fullScreenCover(item: $agentCompose) { req in
             composeViewForAgentRequest(req)
-        }
-        .fullScreenCover(isPresented: $showAgentDraft) {
-            if let draftId = agentDraftIdToOpen {
-                DraftComposePresenter(draftId: draftId)
-            }
         }
         .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
             if newId != nil {
@@ -1033,6 +1050,7 @@ struct InboxView: View {
                 guard let messageId = try? await lookupMessageId(accountId: accountId, stableId: stableId) else { return }
                 // If already viewing this message, just reload + open chat.
                 // If different, navigate first (view creation triggers .task { loadBody() }).
+                DraftOpenTracker.shared.cancel()
                 if selectedMessageId != messageId {
                     selectedMessageId = messageId
                     // Wait for new MessageDetailView to mount
@@ -1055,8 +1073,7 @@ struct InboxView: View {
             // review" toast opened nothing, for EVERY compose agent session.
             // `v1.6.38` was correct because both ends spelled the same bare format —
             // this is a regression relative to shipped, not a latent edge.
-            agentDraftIdToOpen = draftId
-            showAgentDraft = true
+            openDraft(.draftId(draftId), rowId: nil)
         case .chatPill:
             // Inbox session or unknown — open the chat pill
             withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
@@ -1182,6 +1199,9 @@ struct InboxView: View {
                     )
                 }
                 .compositingGroup()
+                .overlay(alignment: .trailing) {
+                    if DraftOpenTracker.shared.mark == snapshot.id { DraftOpeningMark() }
+                }
                 .tag(snapshot.id)
                 .opacity(swipeFadingMessages.contains(snapshot.id) ? 0 : 1)
                 .onAppear {
@@ -1303,6 +1323,9 @@ struct InboxView: View {
                             }
                         }
                         .compositingGroup()
+                        .overlay(alignment: .trailing) {
+                            if DraftOpenTracker.shared.mark == child.id { DraftOpeningMark() }
+                        }
                         .tag(child.id)
                         .onAppear { viewModel.requestSnippetIfNeeded(for: child) }
                         .swipeActions(edge: .trailing, allowsFullSwipe: true) {
@@ -1422,6 +1445,9 @@ struct InboxView: View {
                                   onRetag: { tag in viewModel.applyManualTag(snapshot.id, tag: tag) })
                 }
                 .compositingGroup()
+                .overlay(alignment: .trailing) {
+                    if DraftOpenTracker.shared.mark == snapshot.id { DraftOpeningMark() }
+                }
                 .agentWorkingGlow(active: ActiveAgentTracker.shared.isMessageWorking(
                     accountId: snapshot.accountId, stableId: snapshot.stableId
                 ))
