@@ -109,6 +109,13 @@ struct MailNavigationView: View {
     /// Popping the pushed view (back button / swipe-back) writes `nil` into
     /// this binding automatically — no manual reset needed.
     @State private var pushedMessageId: String?
+    /// #309: a saved draft a chat pill opened, prepared before it is presented
+    /// (`DraftOpenPreparation.open`), so nothing is pushed and the compose's first
+    /// frame is the draft.
+    @State private var pillDraftOpen: PreparedDraftOpen?
+    #if DEBUG
+    @Environment(\.draftOpenResolverForTesting) private var resolveOpenAuthorityForTesting
+    #endif
     /// Same ADR-IOS-054 pattern for the PROGRAMMATIC "TabMail Account" open
     /// (chat WarningBubble's "Active subscription required" button →
     /// `.navigateToAccount`). The old handler wrote `selection = .account`
@@ -539,8 +546,13 @@ struct MailNavigationView: View {
             } else {
                 selectedMessageId = nil
             }
+            // #309: the user went to another folder, so a draft still being
+            // prepared does not open over it.
+            DraftOpenTracker.shared.cancel()
         }
         .modifier(NavigationNotificationHandlers(selection: $selection, pushedShowsAccount: $pushedShowsAccount))
+        .modifier(DraftOpenCancelledByBack(pushedMessageId: pushedMessageId, pushedShowsAccount: pushedShowsAccount,
+                                           selectedMessageId: selectedMessageId))
         .sheet(isPresented: $showSignInSheet) {
             TabMailLoginView {
                 showSignInSheet = false
@@ -573,7 +585,26 @@ struct MailNavigationView: View {
             // Uses `pushedMessageId`, NOT `selectedMessageId` — see doc comment
             // on `pushedMessageId` above.
             guard let realId = notification.userInfo?["realId"] as? String else { return }
+            // #309: a saved draft stays on this screen (its row marked busy when
+            // it is listed) until it is prepared, then opens already filled.
+            if let header = DraftOpenPreparation.draftsHeader(messageId: realId) {
+                #if DEBUG
+                let resolver = resolveOpenAuthorityForTesting
+                #else
+                let resolver: DraftOpenPreparation.Resolver? = nil
+                #endif
+                Task {
+                    guard let open = await DraftOpenPreparation.open(
+                        .header(header), mark: header.id, resolver: resolver) else { return }
+                    pillDraftOpen = open
+                }
+                return
+            }
+            DraftOpenTracker.shared.cancel()
             pushedMessageId = realId
+        }
+        .fullScreenCover(item: $pillDraftOpen) { open in
+            DraftComposePresenter(source: open.source, prepared: open.outcome)
         }
         .onReceive(NotificationCenter.default.publisher(for: .templatePillOpenTapped).receive(on: DispatchQueue.main)) { notification in
             // Sole sheet host for template-detail. InboxView's matching listener
@@ -801,6 +832,7 @@ struct MailNavigationView: View {
         BootProfiler.mark(isSentinel
             ? "notifTap: pushed instantly (pending resolve → skeleton) \(messageId.prefix(24))"
             : "notifTap: pushed instantly (staged) \(messageId.prefix(24))")
+        DraftOpenTracker.shared.cancel()
         selectedMessageId = openId
         BackgroundSyncLogger.logDebug("[MailNav] Notification deep link: navigating to message \(messageId.prefix(30))")
     }
@@ -854,6 +886,31 @@ struct MailNavigationView: View {
 
 }
 
+// MARK: - Draft Open Cancelled By Back
+
+/// #309: Back (or swipe-back) out of a pushed message, the account screen or a
+/// selected message is a navigation newer than a draft still being prepared, so
+/// that draft does not open over the screen Back returned to. Each push already
+/// cancels where it is made; these are the pops of the same three screens.
+private struct DraftOpenCancelledByBack: ViewModifier {
+    let pushedMessageId: String?
+    let pushedShowsAccount: Bool
+    let selectedMessageId: String?
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: pushedMessageId) { oldValue, newValue in
+                if oldValue != nil && newValue == nil { DraftOpenTracker.shared.cancel() }
+            }
+            .onChange(of: pushedShowsAccount) { oldValue, newValue in
+                if oldValue && !newValue { DraftOpenTracker.shared.cancel() }
+            }
+            .onChange(of: selectedMessageId) { oldValue, newValue in
+                if oldValue != nil && newValue == nil { DraftOpenTracker.shared.cancel() }
+            }
+    }
+}
+
 // MARK: - Navigation Notification Handlers
 
 /// Bundles the sidebar navigation notifications into one modifier. Extracted
@@ -878,6 +935,8 @@ private struct NavigationNotificationHandlers: ViewModifier {
                 }
                 guard selection != .account else { return }
                 pushedShowsAccount = true
+                // #309: a draft still being prepared does not open over the account.
+                DraftOpenTracker.shared.cancel()
             }
             .onReceive(NotificationCenter.default.publisher(for: .navigateToPlanPicker).receive(on: DispatchQueue.main)) { _ in
                 selection = .planPicker
@@ -1122,7 +1181,7 @@ private struct MessageDetailContainer: View {
 }
 
 /// Resolves a concrete (non-nil) message id to its detail content: drafts
-/// check + branch between `ServerDraftComposeLoader` (server-draft message,
+/// check + branch between `DraftComposePresenter` (server-draft message,
 /// opened as a compose view) and `MessageDetailView` (everything else).
 ///
 /// Shared by two call sites so the drafts-check read logic isn't duplicated:
@@ -1145,11 +1204,40 @@ private struct MessageDetailResolvedContent: View {
             return (h, f?.role == .drafts)
         }
         if let check = draftCheck, check.isDraft {
-            ServerDraftComposeLoader(header: check.header)
+            DetailDraftOpen(header: check.header)
                 .id(messageId)
         } else {
             MessageDetailView(messageId: messageId, opensWithSkeletonDwell: opensWithSkeletonDwell)
                 .id(messageId)
+        }
+    }
+}
+
+/// A Drafts header selected into the detail column. Chat pills open drafts
+/// without selecting them (`.emailPillTapped` in MailNavigationView), and Drafts
+/// rows open them as a cover (`InboxView.openDraft`), so this is reached only by a
+/// selection naming a draft some other way. The open is prepared before the
+/// compose exists (#309): a busy mark shows meanwhile, never an empty compose.
+private struct DetailDraftOpen: View {
+    let header: MessageHeader
+    #if DEBUG
+    @Environment(\.draftOpenResolverForTesting) private var resolveOpenAuthorityForTesting
+    #endif
+    @State private var outcome: DraftOpenPreparation.Outcome?
+
+    var body: some View {
+        if let outcome {
+            DraftComposePresenter(source: .header(header), prepared: outcome)
+        } else {
+            DraftOpeningMark()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .task {
+                    #if DEBUG
+                    outcome = await DraftOpenPreparation.prepare(.header(header), resolver: resolveOpenAuthorityForTesting)
+                    #else
+                    outcome = await DraftOpenPreparation.prepare(.header(header))
+                    #endif
+                }
         }
     }
 }
@@ -1167,22 +1255,15 @@ private struct PushedMessageDestination: View {
     }
 }
 
-/// Opens a Drafts header as an editable compose. A draft this device owns reopens
-/// through its generation placeholder or exact provider-native address; a draft
-/// written by another mail app is first adopted (`ExternalDraftAdoption`, #217) and
-/// then opens the same way. The compose checks the row against the server copy
-/// before showing it (`ExternalDraftAdoption.refreshBeforeOpen`, ADR-IOS-091).
-struct ServerDraftComposeLoader: View {
-    let header: MessageHeader
-    #if DEBUG
-    @Environment(\.draftOpenResolverForTesting) private var resolveOpenAuthorityForTesting
-    #endif
-    @State private var resolution: Resolution?
-    @Environment(\.dismiss) private var dismiss
-
-    /// The three outcomes this view can reach. Mirrors
-    /// `DraftComposePresenter.LoadResult`'s shape on purpose — the same distinction,
-    /// one layer up — rather than inventing a parallel vocabulary.
+/// Resolves a Drafts header to the local, editable `Draft` that owns it, for
+/// `DraftOpenPreparation`. A draft this device owns reopens through its generation
+/// placeholder or exact provider-native address; a draft written by another mail
+/// app is first adopted (`ExternalDraftAdoption`, #217) and then resolves the same
+/// way.
+enum ServerDraftComposeLoader {
+    /// The outcomes resolving a header can reach. `DraftOpenPreparation.Failure`
+    /// keeps the same distinction one layer up rather than inventing a parallel
+    /// vocabulary.
     ///
     /// 🚨 **`.noLocalCopy` AND `.resolveFailed` ARE NOT THE SAME ANSWER.** Until this
     /// split, `resolveLocallyAuthoredDraft` ended `} catch { openAuthority = nil }`,
@@ -1191,8 +1272,8 @@ struct ServerDraftComposeLoader: View {
     /// found" card as a genuine, fully-determined absence. That is never-drop
     /// clause 2's *"we could not determine the answer" treated as authoritative*,
     /// the single most repeated defect class in this codebase's history, and the
-    /// neighbouring `DraftComposePresenter` already models the distinction with
-    /// `LoadResult.loadFailed`.
+    /// neighbouring draft load already modelled the distinction with
+    /// `DraftOpenPreparation.Failure.loadFailed`.
     enum Resolution: Equatable {
         /// A local, editable `Draft` was resolved AND re-authorized for this header.
         case authorized(LocallyAuthoredDraftOpenAuthority)
@@ -1201,86 +1282,13 @@ struct ServerDraftComposeLoader: View {
         /// Fail closed honestly — no retry prompt.
         case noLocalCopy
         /// ⚑ NO REFERENCE — INVENTED, same rationale as
-        /// `DraftComposePresenter.LoadResult.loadFailed`. A read or a provider call
+        /// `DraftOpenPreparation.Failure.loadFailed`. A read or a provider call
         /// THREW, so whether a local copy exists is UNKNOWN. Retryable, never
         /// authoritative.
         case resolveFailed
         /// The draft holds an attachment TabMail cannot carry (#241). Final, never
         /// retryable: the draft is edited in another app.
         case unsupportedAttachment
-    }
-
-    var body: some View {
-        Group {
-            switch resolution {
-            case nil:
-                ProgressView("Loading draft...")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .authorized(let openAuthority):
-                DraftComposePresenter(
-                    draftId: openAuthority.draftId,
-                    openAuthority: openAuthority)
-            case .noLocalCopy:
-                // STATE ONLY THE OBSERVED FACT — do not promise a remedy. Since
-                // #217 every draft with an exact server address is adopted, so this
-                // arm is reached only when the header changed or vanished under us,
-                // or has no exact address (an IMAP folder whose epoch is unknown).
-                //
-                // ⚠️ THIS ARM IS FOR A PROVEN ABSENCE ONLY. The thrown-read case used
-                // to land here too; it now has its own arm below. Do not merge them
-                // back — and equally, do not let the retryable arm swallow this one:
-                // a header with no local `Draft` must keep getting this honest card
-                // rather than an endless "try again" the user can never satisfy.
-                ContentUnavailableView {
-                    Label("Draft unavailable", systemImage: "exclamationmark.shield")
-                } description: {
-                    Text("This draft couldn't be opened. It may have been changed or deleted in another app.")
-                } actions: {
-                    Button("Close") { dismiss() }
-                        .buttonStyle(.bordered)
-                        .accessibilityIdentifier("server-draft-close")
-                }
-            case .resolveFailed:
-                // Copy deliberately parallel to `DraftComposePresenter`'s
-                // `.loadFailed` arm. This loader also appears in the Drafts-list
-                // full-screen cover, so both terminal states need an escape.
-                VStack(spacing: 16) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
-                    Text("Couldn't open this draft")
-                        .font(.headline)
-                    Text("This draft didn't finish loading. Please try again in a moment.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 32)
-                    Button("Close") { dismiss() }
-                        .buttonStyle(.bordered)
-                        .accessibilityIdentifier("server-draft-close")
-                    Button("Try Again") {
-                        resolution = nil
-                        Task { await resolveLocallyAuthoredDraft() }
-                    }
-                    .buttonStyle(.borderedProminent)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color(.systemBackground))
-            case .unsupportedAttachment:
-                ContentUnavailableView {
-                    Label("Draft unavailable", systemImage: "paperclip")
-                } description: {
-                    Text(DraftReadConfig.unsupportedAttachmentMessage)
-                } actions: {
-                    Button("Close") { dismiss() }
-                        .buttonStyle(.bordered)
-                        .accessibilityIdentifier("server-draft-close")
-                }
-            }
-        }
-        .task {
-            await resolveLocallyAuthoredDraft()
-        }
     }
 
     /// The decision the third state exists for, isolated from SwiftUI so the
@@ -1296,23 +1304,6 @@ struct ServerDraftComposeLoader: View {
         case .failure(let error) where error is DraftCopyUnsupportedAttachment: .unsupportedAttachment
         case .failure: .resolveFailed
         }
-    }
-
-    private func resolveLocallyAuthoredDraft() async {
-        let outcome: Result<LocallyAuthoredDraftOpenAuthority?, any Error>
-        do {
-            #if DEBUG
-            if let resolveOpenAuthorityForTesting {
-                outcome = .success(try await resolveOpenAuthorityForTesting())
-                resolution = Self.classify(outcome)
-                return
-            }
-            #endif
-            outcome = .success(try await Self.resolveOpenAuthority(header: header))
-        } catch {
-            outcome = .failure(error)
-        }
-        resolution = Self.classify(outcome)
     }
 
     /// Returns the authority when this device provably holds an editable copy, `nil`

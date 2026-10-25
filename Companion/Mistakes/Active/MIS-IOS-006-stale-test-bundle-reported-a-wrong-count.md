@@ -2,7 +2,11 @@
 
 **Class:** testing
 **Severity:** high
-**First seen:** 2026 · **Recurrences:** 8 (**8, 2026-10-02: my test run and a peer reviewer's ran
+**First seen:** 2026 · **Recurrences:** 9 (**9, 2026-10-25: I rebased a PR branch onto a main that
+had gained new source files (#315's `HTMLText`) and ran the targeted suites without re-running
+`./Scripts/xcodegen.sh`; the ignored `TabMail.xcodeproj` predated them and the build failed
+"cannot find 'HTMLText' in scope" — caught by the build this time, not by a count. A rebase or merge
+that brings in new files needs the project regenerated before any build**; **8, 2026-10-02: my test run and a peer reviewer's ran
 on the SAME simulator `-destination id=` at once, each with its own `-derivedDataPath`: mine reported
 "24 tests in 4 suites" where 73 run, plus an unrelated failure and a 600 s simulator-diagnostics
 timeout; the reviewer's first run died "Test crashed with signal kill" — caught by the count**; **7, 2026-09-29: four new test files written after the

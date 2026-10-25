@@ -587,3 +587,52 @@ still listed; one with a name of its own; a related part that is not an image (a
 hold a PDF, and the HTML gives no way to open it); and a part of an attached message's own mixed
 body when the outer message's body is related (an outer related body does not reach into an
 attached message, RFC 2046 §5.2.1).
+
+### Drafts open prepared, with no blank frame (#309, 2026-10-24)
+
+Opening a saved draft showed a blank: the cover presented a spinner, then a compose with empty
+fields that filled in once the draft (and, for a pushed Gmail or Outlook row, its server copy) had
+been read. Owner, 2026-10-24 (option B): stay on the previous screen with a busy mark on the draft
+row until the server read finishes, then open the compose already filled; the read stays capped at
+`ExternalDraftOpenConfig.reloadTimeoutSeconds`.
+
+`DraftOpenPreparation.prepare` now does the whole open before anything is presented: resolve a
+Drafts header to its local row (`ServerDraftComposeLoader`, now only the resolver, adopting as
+above), `ExternalDraftAdoption.refreshBeforeOpen`, then the row with its exact owning account and
+reply parent (the checks `DraftComposePresenter` ran before). `DraftComposePresenter(source:
+prepared:)` renders the outcome; `ComposeView(preparedDraft:)` starts its fields from the prepared
+row, so its first frame is the draft, and does not read the server again (its guarded local read
+and every bind check still run). Every presenter caller prepares before presenting, and
+`DraftComposePresenter` has no unprepared initializer: the Drafts list (`InboxView.openDraft`, busy
+mark on the row in both the normal and triage layouts), the agent-draft toast, the compose toolbar's working draft (the button shows the
+busy mark), the detail column (`DetailDraftOpen`, a busy mark in the column) and a chat-pill push
+(`MailNavigationView`, its own cover). Reply/forward resume and Undo reopen do not go through the
+presenter and keep the open-time reload inside `ComposeView` (`ServerCopyCheckCover`).
+
+The opens that present a cover (Drafts list, toast, toolbar, chat pill) are prepared one at a time,
+app-wide (`DraftOpenTracker`, through `DraftOpenPreparation.open`; the detail column's open lives and
+ends with its view):
+a newer open, from another place or the same one (a second toolbar tap may name another working
+draft, so a re-tap is never dropped, only prepared again), a navigation the user makes
+meanwhile (another message, a folder, a pushed message, a deep link, a toast, the account screen,
+or Back out of a pushed message, a selected message or the account screen — `DraftOpenCancelledByBack`,
+review r5), or any compose that
+appears (a new message, a reply; `ComposeView.performLifecycleAppear`) supersedes it, and the
+superseded open presents nothing when it ends, so an older, slower open never covers what the user
+went to. The busy mark is the tracker's, so it ends with every open, failed or not.
+
+Until the compose has bound the prepared row (its attachments, change baselines and generation, in
+`loadDraftOrPrepopulate`), its fields, its attachment button and its chat take no edits, Send does
+nothing (before the empty-body question too) and Close dismisses without writing: the row on disk is exactly the draft the user opened, while a save in that window would
+have carried the not-yet-loaded attachments as none and deleted the saved files. The first frame does
+no synchronous Contacts lookup: the `resolveContactNames` prepaint, inert while recipients arrived
+only after it, waited on the Contacts permission dialog on the main thread once they were seeded
+before it, and is deleted (review r3, 2026-10-25).
+
+A failed open is a card in the presented cover, as before: no local copy and an uncarriable
+attachment are final; a failed read, an unverifiable account and a copy that replaced the row while
+opening (formerly an error inside the compose) offer Try Again, which re-runs the preparation.
+While an open is prepared nothing is presented, so the agent compose queue's hold (ADR-IOS-030)
+starts when the presenter appears, as before; an agent compose presented during the preparation
+makes the draft's cover not present, and tapping the draft again opens it. The owner accepted this on 2026-10-24
+(`IOS-DRAFT-025`, GitHub #311, P5).

@@ -857,6 +857,7 @@ struct DynamicIslandChat: View {
                         .contentShape(Rectangle())
                 }
                 .disabled(!canTapSend)
+                .accessibilityIdentifier("chatSend")
             }
         }
         .padding(.horizontal, 14)

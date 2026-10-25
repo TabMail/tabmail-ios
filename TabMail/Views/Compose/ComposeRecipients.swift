@@ -130,18 +130,6 @@ extension ComposeDraftGuards {
             self = new
             if new.revealsCcOrBcc(comparedTo: old) { showCc = true }
         }
-
-        /// Gives `name` to `address` in every field that lists it.
-        mutating func name(_ address: String, _ name: String) {
-            for role in RecipientRole.allCases where self[role].tokens.contains(address) {
-                self[role].displayNames[address] = name
-            }
-        }
-
-        /// Whether any field already knows a name for `address`.
-        func hasName(for address: String) -> Bool {
-            RecipientRole.allCases.contains { self[$0].displayNames[address] != nil }
-        }
     }
 }
 
