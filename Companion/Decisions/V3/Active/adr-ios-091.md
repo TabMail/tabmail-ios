@@ -415,6 +415,9 @@ Codex round 2 on `f609479` found:
   moved to #251. **#251 changed since round 1** (owner 2026-10-22): no WebKit; a SwiftSoup DOM
   walk replaces `EmailFilter.htmlToPlainText` for every caller, with a small built-in CSS reader
   (inline styles plus simple `<style>` rules for display, white-space and vertical margins).
+  **Superseded 2026-10-24 (option B):** the DOM walk was rejected on NSE memory; #251 fixes the
+  streaming byte scanner instead (`HTMLText`), with the same CSS reader. Design:
+  `Companion/Memory/Current/125-html-links-in-converted-text.md`.
 
 ### Codex review round 3 corrections (2026-10-23)
 

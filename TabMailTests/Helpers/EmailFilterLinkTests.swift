@@ -112,6 +112,8 @@ struct EmailFilterLinkTests {
         #expect(EmailFilter.htmlToPlainText(#"<a href="/one">One</a href="/wrong"> tail"#)
             == "[One](/one) tail")
         #expect(EmailFilter.htmlToPlainText(#"Visible<a href="/unfinished"#) == "Visible")
+        #expect(EmailFilter.htmlToPlainText(#"Visible<a href="/unfinished"#, keepingSpacing: true) == "Visible")
+        #expect(ExternalDraftAdoption.editableBody(text: nil, html: #"Visible<a href="/unfinished"#, bodyEmptyConfirmed: false, hasAttachments: false) == "Visible")
         #expect(EmailFilter.htmlToPlainText(#"<a href>Label</a> <a href= >Empty</a>"#) == "Label Empty")
     }
 
@@ -159,12 +161,17 @@ struct EmailFilterLinkTests {
 
     /// A block at the very start of a label, after a line already ended, finds the
     /// space before the label last; dropping it would cut into the label, and an
-    /// empty label would then crash the converter on a received message.
+    /// empty label would then crash the converter on a received message. Since
+    /// #251 no line starts with a space, and in a draft the paragraph's margin
+    /// gives its blank line.
     @Test(arguments: [
         ("x&#10;<a href=\"https://example.com/a\"><p>label</p></a>",
-         "x\n [label](https://example.com/a)", "x\n[label](https://example.com/a)"),
+         "x\n[label](https://example.com/a)", "x\n\n[label](https://example.com/a)"),
         ("x&#10;<a href=\"https://example.com/b\"><p></a>",
-         "x\n [](https://example.com/b)", "x\n[](https://example.com/b)"),
+         "x\n[](https://example.com/b)", "x\n\n[](https://example.com/b)"),        ("x<br><a href=\"https://example.com/a\"><p>label</p></a>",
+         "x\n[label](https://example.com/a)", "x\n\n[label](https://example.com/a)"),
+        ("x<br><a href=\"https://example.com/b\"><p></a>",
+         "x\n[](https://example.com/b)", "x\n\n[](https://example.com/b)"),
     ])
     func blockOpeningALabelKeepsTheLabelWhole(html: String, collapsed: String, draft: String) {
         #expect(EmailFilter.htmlToPlainText(html) == collapsed)
