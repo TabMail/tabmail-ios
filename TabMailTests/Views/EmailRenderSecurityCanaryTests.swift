@@ -439,6 +439,8 @@ final class HostedRenderView {
         html: String,
         headerId: String?,
         previewFilename: String? = nil,
+        userInterfaceStyle: UIUserInterfaceStyle = .unspecified,
+        backdrop: Color? = nil,
         onUserDisclosureToggle: @escaping () -> Void = {}
     ) async {
         guard let scene = UIApplication.shared.connectedScenes
@@ -450,16 +452,30 @@ final class HostedRenderView {
         // (the body's authoritative `MessageBody.id`). The canary hosts the two
         // together so it keeps measuring the production shape — every real call site
         // that supplies one supplies both.
-        let view = AutoSizingHTMLView(
-            html: html,
-            previewFilename: previewFilename,
-            headerId: headerId,
-            bodyContentKey: headerId.map { ContentKey(rawValue: $0) },
-            onUserDisclosureToggle: onUserDisclosureToggle
-        )
+        // With no `backdrop` the view takes its own default, as the message card and the
+        // attachment preview construct it.
+        let view = if let backdrop {
+            AutoSizingHTMLView(
+                html: html,
+                previewFilename: previewFilename,
+                headerId: headerId,
+                bodyContentKey: headerId.map { ContentKey(rawValue: $0) },
+                backdrop: backdrop,
+                onUserDisclosureToggle: onUserDisclosureToggle
+            )
+        } else {
+            AutoSizingHTMLView(
+                html: html,
+                previewFilename: previewFilename,
+                headerId: headerId,
+                bodyContentKey: headerId.map { ContentKey(rawValue: $0) },
+                onUserDisclosureToggle: onUserDisclosureToggle
+            )
+        }
         let hc = UIHostingController(rootView: VStack(spacing: 0) { view; Spacer() })
         let w = UIWindow(windowScene: scene)
         w.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        w.overrideUserInterfaceStyle = userInterfaceStyle
         w.rootViewController = hc
         w.isHidden = false
         w.makeKeyAndVisible()

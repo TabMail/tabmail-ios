@@ -127,6 +127,9 @@ struct AutoSizingHTMLView: View {
     let bodyContentKey: ContentKey?
     /// Explicit same-bytes reload trigger used by pull-to-refresh.
     let reloadToken: Int
+    /// What the view sits on. The page is transparent in dark mode, so a fill the dark-mode
+    /// script must keep opaque is painted in this colour (#307).
+    let backdrop: Color
     /// Called immediately before native applies a height payload atomically
     /// tagged as originating after app-owned quote/invite disclosure.
     let onUserDisclosureToggle: () -> Void
@@ -154,6 +157,7 @@ struct AutoSizingHTMLView: View {
         headerId: String? = nil,
         bodyContentKey: ContentKey? = nil,
         reloadToken: Int = 0,
+        backdrop: Color = Theme.cardBackground,
         onUserDisclosureToggle: @escaping () -> Void = {}
     ) {
         self.html = html
@@ -161,6 +165,7 @@ struct AutoSizingHTMLView: View {
         self.headerId = headerId
         self.bodyContentKey = bodyContentKey
         self.reloadToken = reloadToken
+        self.backdrop = backdrop
         self.onUserDisclosureToggle = onUserDisclosureToggle
         // Seed the initial frame height from the last applied measurement for
         // this message. SwiftUI List dismantles far-offscreen rows — when an
@@ -221,7 +226,7 @@ struct AutoSizingHTMLView: View {
     private var showsLoadingPlaceholder: Bool { headerId != nil && !hasRevealed }
 
     var body: some View {
-        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, bodyContentKey: bodyContentKey, reloadToken: reloadToken, onUserDisclosureToggle: onUserDisclosureToggle, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
+        HTMLWebView(html: html, previewFilename: previewFilename, headerId: headerId, bodyContentKey: bodyContentKey, reloadToken: reloadToken, backdrop: backdrop, onUserDisclosureToggle: onUserDisclosureToggle, height: $height, hasRevealed: $hasRevealed, leadingPad: $leadingPad, trailingPad: $trailingPad)
             // ── P1d (ADR-IOS-076 decision 5; plan §10.1 C4): the body ContentKey is
             // part of the representable's IDENTITY, so a change to it dismantles the
             // platform view and `makeUIView` runs again.
@@ -468,6 +473,7 @@ private struct HTMLWebView: UIViewRepresentable {
     /// part of this representable's SwiftUI identity (see `AutoSizingHTMLView.body`).
     let bodyContentKey: ContentKey?
     let reloadToken: Int
+    let backdrop: Color
     let onUserDisclosureToggle: () -> Void
     @Binding var height: CGFloat
     @Binding var hasRevealed: Bool
@@ -632,7 +638,7 @@ private struct HTMLWebView: UIViewRepresentable {
         )
         let mediaFix = WKUserScript(source: enforceMediaDisplayJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         let widthFix = WKUserScript(source: constrainWidthsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
-        let darkMode = WKUserScript(source: fixDarkModeColorsJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
+        let darkMode = WKUserScript(source: fixDarkModeColorsJS(backdrop: UIColor(backdrop)), injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         let emlCleanup = WKUserScript(source: cleanupEmlBodyJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         let quoteCollapse = WKUserScript(source: collapseQuotesJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
         let icsCollapse = WKUserScript(source: collapseICSJS, injectionTime: .atDocumentEnd, forMainFrameOnly: true, in: RenderContentWorld.isolated)
@@ -2498,6 +2504,11 @@ private var enforceMediaDisplayJS: String {
 /// at document end). Uses inline style.setProperty which has the highest CSS
 /// priority — overrides both stylesheet !important and HTML width attributes.
 /// Uses screen.width as reference since the WKWebView frame may be zero at this point.
+/// A table fills the width its container leaves it, not `auto`: an auto table shrinks to its
+/// content, so a 468px date table drew its rule only under the date (#307). `-webkit-fill-available`
+/// is the container's width less the table's own margins, so a table inset by its margins still
+/// fits, where `100%` overflowed by them. Every other element here is a block or a cell, where
+/// `auto` already fills the container.
 private let constrainWidthsJS = """
     (function() {
         if (!document.body) return;
@@ -2508,7 +2519,7 @@ private let constrainWidthsJS = """
             try { if (el.classList && (el.classList.contains('tm-quote-wrapper') || el.classList.contains('tm-quote-toggle') || el.classList.contains('tm-quote-content'))) continue; } catch(_) {}
             var w = el.offsetWidth;
             if (w > vw) {
-                el.style.setProperty('width', 'auto', 'important');
+                el.style.setProperty('width', el.tagName === 'TABLE' ? '-webkit-fill-available' : 'auto', 'important');
                 el.style.setProperty('max-width', '100%', 'important');
                 el.style.setProperty('min-width', '0', 'important');
             }
@@ -2656,9 +2667,16 @@ private var constrainLeftOverflowJS: String {
 /// - Colored backgrounds → dimmed to ~brightness 80 so white text is readable.
 /// - Dark inline text → forced to light #fbfbfe.
 /// - Links inside colored-bg elements → forced to white (overrides CSS blue).
+/// - A near-white fill that lies across a border its ancestors draw (a rule behind centred
+///   text) keeps hiding it: painted, opaque, in the colour that shows through it (#307).
+/// `backdrop` is what lies behind the web view, which is transparent in dark mode.
 /// Exposed as `internal` for unit tests (same pattern as `_fitViewportJS`).
-internal var _fixDarkModeColorsJS: String { fixDarkModeColorsJS }
-private var fixDarkModeColorsJS: String {
+internal var _fixDarkModeColorsJS: String { fixDarkModeColorsJS(backdrop: UIColor(Theme.cardBackground)) }
+private func fixDarkModeColorsJS(backdrop: UIColor) -> String {
+    var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
+    backdrop.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
+        .getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+    let backdropRGB = "{r:\(Int((red * 255).rounded())), g:\(Int((green * 255).rounded())), b:\(Int((blue * 255).rounded()))}"
     let dl = DebugModeManager.isLoggingEnabled()
         ? "function dl(s){try{window.webkit.messageHandlers.consoleLog.postMessage('[DarkMode] '+s);}catch(_){}}"
         : "function dl(s){}"
@@ -2675,6 +2693,83 @@ private var fixDarkModeColorsJS: String {
         }
         function lum(r,g,b) { return (r*299+g*587+b*114)/1000; }
         function sat(r,g,b) { return Math.max(r,g,b) - Math.min(r,g,b); }
+        // What lies behind the web view: the page is transparent in dark mode.
+        var BACKDROP = \(backdropRGB);
+        // The colour that shows through `el` once its own fill is gone: its ancestors' fills, as
+        // this pass has already rewritten them (document order reaches ancestors first), over
+        // BACKDROP.
+        function shownThrough(el) {
+            var layers = [];
+            for (var p = el.parentElement; p; p = p.parentElement) {
+                var c = parseRGB(window.getComputedStyle(p).backgroundColor);
+                if (!c || c.a <= 0) continue;
+                layers.push(c);
+                if (c.a >= 1) break;
+            }
+            var r = BACKDROP.r, g = BACKDROP.g, b = BACKDROP.b;
+            for (var k = layers.length - 1; k >= 0; k--) {
+                var l = layers[k];
+                r = l.r * l.a + r * (1 - l.a); g = l.g * l.a + g * (1 - l.a); b = l.b * l.a + b * (1 - l.a);
+            }
+            return 'rgb(' + Math.round(r) + ', ' + Math.round(g) + ', ' + Math.round(b) + ')';
+        }
+        // The width of the `side` ('Top' or 'Bottom') border of `cs` if it draws a line: none for
+        // no style or a fully transparent colour, unless a border image paints it instead (a
+        // colour this cannot read still counts as drawn). `width` is the border's width, already
+        // read; only a border with one reads further.
+        function drawnWidth(cs, side, width) {
+            if (width <= 0) return 0;
+            var style = cs['border' + side + 'Style'];
+            if (style === 'none' || style === 'hidden') return 0;
+            if (cs.borderImageSource === 'none') {
+                var c = parseRGB(cs['border' + side + 'Color']);
+                if (c && c.a <= 0) return 0;
+            }
+            return width;
+        }
+        // The part of box `r` that `cs`'s background colour paints: the last layer's
+        // `background-clip` can stop it at the padding edge or the content edge.
+        function paintBox(r, cs) {
+            var clip = String(cs.backgroundClip).split(',').pop().trim();
+            if (clip !== 'padding-box' && clip !== 'content-box') return r;
+            function inset(side) {
+                return (parseFloat(cs['border' + side + 'Width']) || 0)
+                    + (clip === 'content-box' ? parseFloat(cs['padding' + side]) || 0 : 0);
+            }
+            var top = r.top + inset('Top'), bottom = r.bottom - inset('Bottom');
+            var left = r.left + inset('Left'), right = r.right - inset('Right');
+            return {top: top, bottom: bottom, left: left, right: right, width: right - left, height: bottom - top};
+        }
+        // How many elements the main loop has recorded as drawing a rule so far: until one does,
+        // no fill can hide one, and mail with no rules pays nothing for the check.
+        var ruleCount = 0;
+        // Each rule-drawing ancestor's box, measured once per pass (see hidesAncestorBorder).
+        var ruleRects = new Map();
+        // Whether `el` lies across the top or bottom border of an ancestor: the "rule behind
+        // centred text" pattern, where a heading's border is pulled up through its text by a tiny
+        // line-height and a light fill on the text hides the rule under it. That fill is a mask,
+        // not a surface: made transparent, the rule runs through the text (#307). The fill must
+        // overlap the painted stroke, if only part of a thick one; a child inside the ancestor's
+        // padding box, even one ending exactly on the stroke, overlaps none of it. The main loop records each element's drawn top and bottom
+        // borders as it passes (`__tmRuleEdges`, ancestors first, the body included), so this
+        // reads no border style. `r` is `el`'s box, already measured, and `cs` its computed style;
+        // this pass only recolours, so each ancestor that draws a rule is measured once for all
+        // the fills under it.
+        function hidesAncestorBorder(el, r, cs) {
+            if (ruleCount === 0) return false;
+            r = paintBox(r, cs);
+            if (r.width <= 0 || r.height <= 0) return false;
+            for (var p = el.parentElement; p; p = p.parentElement) {
+                var edges = p.__tmRuleEdges;
+                if (!edges) continue;
+                var pr = ruleRects.get(p);
+                if (!pr) { pr = p.getBoundingClientRect(); ruleRects.set(p, pr); }
+                if (r.right <= pr.left || r.left >= pr.right) continue;
+                if (edges.top > 0 && r.top < pr.top + edges.top && r.bottom > pr.top) return true;
+                if (edges.bottom > 0 && r.top < pr.bottom && r.bottom > pr.bottom - edges.bottom) return true;
+            }
+            return false;
+        }
         // "Chrome" = a deliberate box: a visible border, rounded corners, or a
         // shadow. Shared by the PAGE_DOMINANCE pre-pass below and the main
         // loop so both apply the identical predicate.
@@ -2772,11 +2867,13 @@ private var fixDarkModeColorsJS: String {
             // cream callout inside a cream section both collapse to the same dimmed
             // luminance and the box's fill "disappears", leaving only its border.
             var hasChrome = computeHasChrome(cs);
+            var borderTop = parseFloat(cs.borderTopWidth) || 0, borderBottom = parseFloat(cs.borderBottomWidth) || 0;
+            var rect = hasBg ? el.getBoundingClientRect() : null;
             if (hasBg) {
                 dl((nearWhite ? 'nearWhite' : 'colored') + ' ' + el.tagName + '.' + (el.className || '')
                     + ' bg=rgb(' + bg.r + ',' + bg.g + ',' + bg.b + ') L=' + Math.round(bgL) + ' S=' + Math.round(bgS)
                     + ' chrome=' + (hasChrome ? 1 : 0)
-                    + ' w=' + Math.round(el.getBoundingClientRect().width)
+                    + ' w=' + Math.round(rect.width)
                     + ' text=' + ((el.textContent || '').replace(/\\u00a0/g, ' ').trim().length > 0 ? 1 : 0)
                     + ' "' + (el.innerText || '').slice(0, 18).replace(/\\s+/g, ' ') + '"');
             }
@@ -2818,10 +2915,21 @@ private var fixDarkModeColorsJS: String {
                 //   even when nested (a bordered callout must keep a fill, not
                 //   just its border). Only PLAIN nested wrappers (no chrome) go
                 //   transparent.
-                if (pageColorMode && !hasChrome) {
+                //
+                //   Before both: a fill that hides an ancestor's border keeps hiding it, in the
+                //   colour that shows through it, in either regime (#307).
+                if (hidesAncestorBorder(el, rect, cs)) {
+                    var shown = shownThrough(el);
+                    el.style.setProperty('background-color', shown, 'important');
+                    if (el.style.background) el.style.setProperty('background', shown, 'important');
+                    // Its descendants are treated as inside a panel, as under the fill it replaces:
+                    // a nested light fill hiding no border stays transparent rather than darkening.
+                    el.setAttribute('data-tm-panel', '1');
+                    dl('mask→' + shown + ' ' + el.tagName + '.' + (el.className || '') + ' w=' + Math.round(rect.width));
+                } else if (pageColorMode && !hasChrome) {
                     el.style.setProperty('background-color', 'transparent', 'important');
                     if (el.style.background) el.style.setProperty('background', 'transparent', 'important');
-                    dl('pageColor→transparent ' + el.tagName + '.' + (el.className || '') + ' w=' + Math.round(el.getBoundingClientRect().width));
+                    dl('pageColor→transparent ' + el.tagName + '.' + (el.className || '') + ' w=' + Math.round(rect.width));
                 } else {
                     var ancestorPanel = el.parentElement && el.parentElement.closest('[data-tm-panel]');
                     if (ancestorPanel && !hasChrome) {
@@ -2831,7 +2939,7 @@ private var fixDarkModeColorsJS: String {
                         el.style.setProperty('background-color', 'rgba(0,0,0,0.22)', 'important');
                         if (el.style.background) el.style.setProperty('background', 'rgba(0,0,0,0.22)', 'important');
                         el.setAttribute('data-tm-panel', '1');
-                        dl('panel→darken ' + el.tagName + '.' + (el.className || '') + ' chrome=' + (hasChrome ? 1 : 0) + ' w=' + Math.round(el.getBoundingClientRect().width));
+                        dl('panel→darken ' + el.tagName + '.' + (el.className || '') + ' chrome=' + (hasChrome ? 1 : 0) + ' w=' + Math.round(rect.width));
                     }
                 }
                 if (el.hasAttribute('bgcolor')) el.removeAttribute('bgcolor');
@@ -2898,6 +3006,15 @@ private var fixDarkModeColorsJS: String {
                 var links = el.querySelectorAll('a');
                 for (var j = 0; j < links.length; j++) {
                     links[j].style.setProperty('color', LIGHT, 'important');
+                }
+            }
+            // Recorded after this element's own colour rewrite, which a `currentColor` border
+            // follows; its descendants come later in document order and read it.
+            if (borderTop > 0 || borderBottom > 0) {
+                var ruleTop = drawnWidth(cs, 'Top', borderTop), ruleBottom = drawnWidth(cs, 'Bottom', borderBottom);
+                if (ruleTop > 0 || ruleBottom > 0) {
+                    el.__tmRuleEdges = {top: ruleTop, bottom: ruleBottom};
+                    ruleCount++;
                 }
             }
         }
