@@ -435,3 +435,24 @@ serializer that writes recipients:
   merged (by content: upstream squash-merges). Push `pin/ios-main-<sha>` before any rewrite of
   `main`, or the app's pinned SHA becomes unfetchable.
 
+
+## 2026-10-25 — every PR of ours merged upstream; fork main is a mirror again
+
+- Upstream merged #268 (`f198086`), then the rest of the old stack, each opened on its own once
+  #268 had merged: #271 Content-ID names media only (`04765d0`), #272 RFC 2231 extended and
+  continued content-type parameters (`2656297`), #274 Bcc kept in drafts and stripped from
+  `sendDraft`'s delivery, with header-field checks (`00eac72`), and #273 enclosing multiparts
+  (`ffcaf0a`). Only #272 depended on #268 by code (it extends `contentTypeParameter(named:)`); the
+  other three applied and passed alone on upstream, so the stack had been ordering, not dependency.
+- #273's review found one LOW issue: an `.eml` multipart with an empty subtype (`multipart/`,
+  `multipart/(comment)`) recorded the subtype `multipart`, because `split(separator:)` drops empty
+  pieces. Fixed before merge (`dc2db84`, now the text after the first `/`), with a red-first test.
+- Fork `main` reset to upstream `ffcaf0a`: a pure mirror, zero deviations. 981 package tests pass,
+  `swiftlint --strict` clean. The interim fork `main` `36d6d00` (upstream `f198086` + #271-#274)
+  was never pinned; `pin/ios-main-724d1b1` kept the previous app pin fetchable.
+- The app and NSE pin `ffcaf0a`. Against `724d1b1` the only source change is the empty-subtype fix;
+  the app compares the subtype only with `related` and `alternative`, which neither the old
+  (`multipart`) nor the new (empty) value matches, so app behaviour is unchanged.
+- Fork CI trap: `gh workflow run swift.yml --ref <branch>` also runs the experimental `build-windows`
+  job, which always fails inside swift-nio-ssl (`#error("unsupported os")`); upstream runs it only on
+  manual dispatch. Judge a branch by build-linux, build-macos, build-ios and build-android.
