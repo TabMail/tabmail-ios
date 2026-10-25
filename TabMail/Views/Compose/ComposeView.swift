@@ -1425,7 +1425,7 @@ struct ComposeView: View {
                                     // do not attribute it to the render-hardening phases, and
                                     // do not "fix" it by handing this view an unrestricted
                                     // asset lookup — that is what C5 forbids.
-                                    AutoSizingHTMLView(html: html)
+                                    AutoSizingHTMLView(html: html, backdrop: Palette.previewPaneBg)
                                         .padding(.leading, 4)
                                 }
                                 .padding(.horizontal, 12)
