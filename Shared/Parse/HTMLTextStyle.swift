@@ -48,13 +48,13 @@ struct HTMLTextStyle: Equatable {
             var important = false
             if let bang = value.lastIndex(of: "!"),
                CSSText.trimmed(Array(value[value.index(after: bang)...].utf8)[...]).elementsEqual("important".utf8) {
-                value = value[..<bang].trimmingCharacters(in: .whitespacesAndNewlines)
+                value = CSSText.text(value[..<bang].utf8)
                 important = true
             }
             // An invalid value is ignored, so it never undoes an earlier valid one.
             switch name {
             case "display":
-                let keywords = value.split(whereSeparator: \.isWhitespace)
+                let keywords = value.split(whereSeparator: HTMLText.isWhitespace)
                 if keywords == ["none"] {
                     set(\.hidden, .hidden, true, important: important)
                 } else if Self.isDisplayValue(keywords.map(String.init)) {
@@ -293,9 +293,9 @@ private enum CSSText {
         byte == lowercase || (lowercase >= UInt8(ascii: "a") && lowercase <= UInt8(ascii: "z") && byte | 0x20 == lowercase)
     }
 
-    /// `bytes` as a trimmed, lowercased string.
+    /// `bytes` as a lowercased string without leading and trailing CSS white space.
     static func text(_ bytes: some Collection<UInt8>) -> String {
-        String(decoding: bytes, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        String(decoding: trimmed(Array(bytes)[...]), as: UTF8.self).lowercased()
     }
 
     static func removingComments(_ css: some Collection<UInt8>) -> [UInt8] {

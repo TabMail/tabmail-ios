@@ -282,6 +282,10 @@ struct HTMLTextTests {
         #expect(draft("<p>a</p><p>&nbsp;</p><p>b</p>") == "a\n\nb")
         #expect(draft("<p>a</p><p>&nbsp;</p><p>&nbsp;</p><p>b</p>") == "a\n\n\nb")
         #expect(draft("<div>a</div><div>&nbsp;</div><div>&nbsp;</div><div>b</div>") == "a\n\n\nb")
+        let leading = "<div>&nbsp;</div><div>Visible</div>"
+        #expect(draft(leading) == "\nVisible")
+        #expect(collapsed(leading) == "\nVisible")
+        #expect(adopted(leading) == "\nVisible")
     }
 
     @Test("A space after a no-break space is not at the line start, so a draft keeps it", arguments: [
@@ -314,6 +318,11 @@ struct HTMLTextTests {
     func namedReferences() {
         let html = "caf&eacute; &hellip; &euro;5 &unknown; R&amp;D AT&T; &#x2014;"
         #expect(collapsed(html) == "caf\u{00E9} \u{2026} \u{20AC}5 &unknown; R&D AT&T; \u{2014}")
+        // The longest name in the HTML table, and a name that decodes to two scalars.
+        let long = "a&CounterClockwiseContourIntegral;b &NotEqualTilde; c"
+        #expect(collapsed(long) == "a\u{2233}b \u{2242}\u{0338} c")
+        #expect(draft(long) == "a\u{2233}b \u{2242}\u{0338} c")
+        #expect(adopted(long) == "a\u{2233}b \u{2242}\u{0338} c")
     }
 
     @Test("A raw-text end tag may carry space before its >")
@@ -502,6 +511,9 @@ struct HTMLTextTests {
         ("", true), ("media=''", true), ("type=''", true), ("type='text/css'", true), ("type=TEXT/CSS", true),
         ("media=screen", true), ("media='all'", true), ("media='print, screen'", true),
         ("media='only screen and (max-width: 600px)'", true), ("media='(min-width: 1px)'", true), ("media='not print'", true),
+        ("type=' text/css '", false), ("type='text/css '", false), ("media='print, '", false), ("media='print,'", false),
+        ("media=','", false), ("media='only'", false), ("media='not'", false), ("media='only screen'", true),
+        ("media='print, , screen'", true),
     ])
     func styleSheetApplicability(attributes: String, applies: Bool) {
         let html = "<style \(attributes)>.x{display:none}</style><div class=x>Keep this draft text</div><div>Footer</div>"
@@ -617,5 +629,88 @@ struct HTMLTextTests {
         let elapsed = ContinuousClock.now - start
         #expect(text.split(separator: "\n").count == count)
         #expect(elapsed < .seconds(5))
+    }
+
+    private func adopted(_ html: String) -> String? {
+        ExternalDraftAdoption.editableBody(text: nil, html: html, bodyEmptyConfirmed: false, hasAttachments: false)
+    }
+
+    @Test("A line feed reference reads as a written line feed, in every white-space mode",
+          arguments: ["&#10;", "&#x0a;", "&#X0A;", "&#010;", "&NewLine;"])
+    func lineFeedReference(reference: String) {
+        for style in ["normal", "nowrap", "pre", "pre-wrap", "break-spaces", "pre-line"] {
+            let html = "<div style='white-space:\(style)'>one\(reference)two</div>"
+            let expected = style == "normal" || style == "nowrap" ? "one two" : "one\ntwo"
+            #expect(draft(html) == expected, "\(style)")
+            #expect(adopted(html) == expected, "\(style)")
+            #expect(collapsed(html) == "one two", "\(style)")
+        }
+        #expect(draft("<div>one\(reference)two</div>") == "one two")
+        // HTML drops one line feed right after `<pre>`, a reference's as well as a written one.
+        #expect(draft("<div>x</div><pre>\(reference)one</pre>") == "x\none")
+        #expect(draft("<div>x</div><pre>\(reference)\(reference)one</pre>") == "x\n\none")
+        #expect(draft("<div>x</div><pre>\n\(reference)one</pre>") == "x\n\none")
+        #expect(draft("<div>x</div><pre>\r\(reference)one</pre>") == "x\n\none")
+        #expect(collapsed("<div>x</div><pre>\(reference)one</pre>") == "x\none")
+        // Only right after `<pre>`: anywhere else a leading line feed stays.
+        #expect(draft("<div>x</div><div style='white-space:pre'>\(reference)one</div>") == "x\n\none")
+        #expect(draft("<div>x</div><pre><b></b>\(reference)one</pre>") == "x\n\none")
+    }
+
+    @Test("Only a line feed is dropped after <pre>: a CR reference stays a space")
+    func carriageReturnReferenceAfterPre() {
+        #expect(draft("<div>x</div><pre>&#13;one</pre>") == "x\n one")
+        #expect(draft("<div>x</div><pre>&amp;one</pre>") == "x\n&one")
+    }
+
+    /// CSS and HTML class lists split on ASCII white space only; a no-break space is a
+    /// character of the word, so the value it sits in is invalid (CSS) or one class (HTML).
+    @Test("A no-break space is part of a CSS word, never white space", arguments: [
+        ("display:\u{00A0}none", true), ("display:none\u{00A0}", true), ("display:none\u{00A0}!important", true),
+        ("display:none;display:inline\u{00A0}flex", false), ("display:none;display:block\u{00A0}", false),
+        ("display:\tnone", false), ("display: none\u{0C}", false), ("display:none\t!important;display:block", false),
+        ("display:none;display:inline\tflex", true), ("display:none;display:block ", true),
+    ])
+    func noBreakSpaceInCSS(declarations: String, shows: Bool) {
+        let html = "<div style='\(declarations)'>Keep text</div><div>Footer</div>"
+        let expected = shows ? "Keep text\nFooter" : "Footer"
+        #expect(draft(html) == expected)
+        #expect(adopted(html) == expected)
+        #expect(collapsed(html) == expected)
+    }
+
+    @Test("A no-break space in white-space or a class list is part of the word")
+    func noBreakSpaceInWhiteSpaceAndClasses() {
+        #expect(draft("<div style='white-space:pre\u{00A0}'>a  b</div>") == "a b")
+        #expect(draft("<div style='white-space:\u{00A0}pre'>a  b</div>") == "a b")
+        #expect(draft("<div style='white-space:\tpre '>a  b</div>") == "a  b")
+        #expect(draft("<div style='white-space:normal;white-space:pre\u{00A0}!important'>a  b</div>") == "a b")
+        let sheet = "<style>.x{display:none}</style>"
+        #expect(adopted(sheet + "<div class='x\u{00A0}y'>Keep text</div><div>Footer</div>") == "Keep text\nFooter")
+        #expect(adopted(sheet + "<div class='y\u{00A0}x'>Keep text</div><div>Footer</div>") == "Keep text\nFooter")
+        #expect(adopted(sheet + "<div class='y\tx'>Keep text</div><div>Footer</div>") == "Footer")
+        #expect(adopted(sheet + "<div class='y\u{0C}x\ny'>Keep text</div><div>Footer</div>") == "Footer")
+    }
+
+    /// A `<template>`'s content is inert: its style sheets apply to nothing and its text never shows.
+    @Test("A template's style sheet and text do nothing")
+    func templateIsInert() {
+        let rule = "<style>.x{display:none}</style>"
+        let target = "<div class=x>Keep text</div><div>Footer</div>"
+        #expect(adopted("<template>\(rule)</template>" + target) == "Keep text\nFooter")
+        #expect(adopted("<TEMPLATE><div>\(rule)</div></TEMPLATE>" + target) == "Keep text\nFooter")
+        #expect(adopted("<template><template></template>\(rule)</template>" + target) == "Keep text\nFooter")
+        #expect(adopted("<template><template>\(rule)</template></template>" + target) == "Keep text\nFooter")
+        // Outside every template, and after a stray end tag, a sheet still applies.
+        #expect(adopted("<template></template>\(rule)" + target) == "Footer")
+        #expect(adopted("<template><template></template></template>\(rule)" + target) == "Footer")
+        #expect(adopted("</template>\(rule)" + target) == "Footer")
+        #expect(adopted("</template><template></template>\(rule)" + target) == "Footer")
+        #expect(adopted(rule + target) == "Footer")
+        for html in ["<div>a</div><template><div>inert</div></template><div>b</div>",
+                     "<div>a</div><template><template>inert</template>inert</template><div>b</div>"] {
+            #expect(draft(html) == "a\nb")
+            #expect(collapsed(html) == "a\nb")
+        }
     }
 }

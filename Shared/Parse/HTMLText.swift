@@ -17,32 +17,39 @@ import SwiftSoup
 /// the default style sheet below, then the document's `<style>` rules, then the
 /// element's `style` attribute. See `HTMLTextStyle` for the CSS read.
 enum HTMLText {
-    /// The deepest nesting the converter follows; a deeper element takes its parent's style.
     /// Whether a `<style>` with these `type` and `media` attributes styles the screen. A `type`
-    /// other than CSS makes no style sheet at all, and a sheet only for other media (`print`,
-    /// `speech`) does not apply. Media features (`(max-width: ...)`) are not evaluated: a query
-    /// for the screen with features counts as applying.
+    /// other than CSS, compared as written, makes no style sheet at all, and a sheet only for
+    /// other media (`print`, `speech`) does not apply. A query that is empty or only a prefix
+    /// (`print, `, `only`) matches nothing. Media features (`(max-width: ...)`) are not
+    /// evaluated: a query for the screen with features counts as applying.
     static func sheetApplies(type: String?, media: String?) -> Bool {
-        if let type = type?.trimmingCharacters(in: .whitespaces).lowercased(),
-           !type.isEmpty, type != "text/css" { return false }
-        guard let media = media?.lowercased(), !media.allSatisfy(\.isWhitespace) else { return true }
-        return media.split(separator: ",").contains { query in
-            var words = query.split(whereSeparator: \.isWhitespace)
+        if let type = type?.lowercased(), !type.isEmpty, type != "text/css" { return false }
+        guard let media = media?.lowercased(), !media.allSatisfy(isWhitespace) else { return true }
+        return media.split(separator: ",", omittingEmptySubsequences: false).contains { query in
+            var words = query.split(whereSeparator: isWhitespace)
             if words.first == "only" { words.removeFirst() }
             let negated = words.first == "not"
             if negated { words.removeFirst() }
-            let mediaType = words.first.map { $0.hasPrefix("(") ? "all" : String($0) } ?? "all"
+            guard let first = words.first else { return false }
+            let mediaType = first.hasPrefix("(") ? "all" : String(first)
             let screen = mediaType == "all" || mediaType == "screen"
             return negated ? !screen : screen
         }
     }
 
+    /// HTML's and CSS's white space: ASCII only, so a no-break space is part of a word.
+    static func isWhitespace(_ character: Character) -> Bool {
+        character.asciiValue.map(Byte.isWhitespace) ?? false
+    }
+
+    /// The deepest nesting the converter follows; a deeper element takes its parent's style.
     static let maxOpenElements = 512
     /// The longest entity reference read, `&` and `;` included; the longest HTML name is 33.
     static let maxEntityLength = 40
 
     /// The browser defaults the conversion relies on.
-    static let defaultStyleSheet = HTMLTextStyleSheet("head { display: none } p { margin: 1em 0 } pre { white-space: pre }")
+    static let defaultStyleSheet = HTMLTextStyleSheet(
+        "head, template { display: none } p { margin: 1em 0 } pre { white-space: pre }")
 
     struct ElementKind: OptionSet {
         let rawValue: UInt8
@@ -448,17 +455,14 @@ private struct Scanner {
 
     /// A character reference; one that names no character stays as written.
     private mutating func entity() {
-        let limit = min(i + HTMLText.maxEntityLength, bytes.count)
-        guard let end = bytes[(i + 1)..<limit].firstIndex(of: Byte.semicolon), end > i + 1,
-              let decoded = Self.decode(bytes[(i + 1)..<end]) else {
+        guard let (decoded, end) = reference(at: i) else {
             writer.text(Byte.ampersand)
             i += 1
             return
         }
-        i = end + 1
+        i = end
         switch decoded {
-        case "\n": writer.lineBreak()
-        case " ", "\t", "\r": writeWhiteSpace(decoded.utf8.first!)
+        case " ", "\t", "\n", "\r": writeWhiteSpace(decoded.utf8.first!)
         case "\u{00A0}": writer.noBreakSpace()
         default:
             if decoded.unicodeScalars.count == 1, let scalar = decoded.unicodeScalars.first?.value {
@@ -467,6 +471,14 @@ private struct Scanner {
             }
             writer.text(decoded)
         }
+    }
+
+    /// The character reference at `start`, an `&`, and the index past its `;`; nil if it names no character.
+    private func reference(at start: Int) -> (String, Int)? {
+        let limit = min(start + HTMLText.maxEntityLength, bytes.count)
+        guard start + 1 < limit, let end = bytes[(start + 1)..<limit].firstIndex(of: Byte.semicolon), end > start + 1,
+              let decoded = Self.decode(bytes[(start + 1)..<end]) else { return nil }
+        return (decoded, end + 1)
     }
 
     private static func decode(_ body: UnsafeBufferPointer<UInt8>.SubSequence) -> String? {
@@ -528,13 +540,16 @@ private struct Scanner {
     }
 
     /// With `keepingSpacing`, reads every `<style>` before any text is written: a
-    /// browser applies a style sheet to the whole document, wherever it sits.
+    /// browser applies a style sheet to the whole document, wherever it sits. A
+    /// `<template>`'s content is inert, so a sheet inside one applies to nothing.
     mutating func readStyleSheets() {
+        var templates = 0
         while let open = bytes[i...].firstIndex(of: Byte.lessThan) {
             if bytes[open...].starts(with: "<!--".utf8) {
                 i = index(after: "-->", from: open + 2)
                 continue
             }
+            if isEndTag("template", at: open) { templates = max(0, templates - 1) }
             i = open + 1
             guard i < bytes.count, Byte.isLetter(bytes[i]) else { continue }
             let (name, nameEnd) = tagName(at: i)
@@ -542,9 +557,10 @@ private struct Scanner {
             guard i < bytes.count else { break }
             let attributes = nameEnd..<i
             i += 1
+            if name == "template" { templates += 1 }
             guard HTMLText.elementKinds[name]?.contains(.rawText) == true else { continue }
             let end = rawTextEnd(name)
-            if name == "style", HTMLText.sheetApplies(
+            if name == "style", templates == 0, HTMLText.sheetApplies(
                 type: attribute("type", in: attributes), media: attribute("media", in: attributes)) {
                 documentSheet.add(Array(bytes[i..<end]))
             }
@@ -582,10 +598,16 @@ private struct Scanner {
             if !parentHidden { writer.space() }
             return
         }
-        // HTML drops a line feed right after `<pre>`.
-        if name == "pre" {
-            if i < bytes.count, bytes[i] == Byte.carriageReturn { i += 1 }
-            if i < bytes.count, bytes[i] == Byte.lineFeed { i += 1 }
+        // HTML drops a line feed right after `<pre>`, written or as a character reference.
+        if name == "pre", i < bytes.count {
+            if bytes[i] == Byte.carriageReturn {
+                i += 1
+                if i < bytes.count, bytes[i] == Byte.lineFeed { i += 1 }
+            } else if bytes[i] == Byte.lineFeed {
+                i += 1
+            } else if bytes[i] == Byte.ampersand, let (decoded, end) = reference(at: i), decoded == "\n" {
+                i = end
+            }
         }
         boundary(name, kind, margin: keepingSpacing && style.marginTop == true)
         if name == "a", let href = attribute("href", in: attributes)?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -697,7 +719,7 @@ private struct Scanner {
     private func style(_ name: String, attributes: Range<Int>) -> HTMLTextStyle {
         var style = HTMLText.defaultStyleSheet.style(tag: name, classes: [], id: nil)
         if keepingSpacing, !documentSheet.isEmpty {
-            let classes = attribute("class", in: attributes)?.split(whereSeparator: { $0.isWhitespace }) ?? []
+            let classes = attribute("class", in: attributes)?.split(whereSeparator: HTMLText.isWhitespace) ?? []
             let id = attribute("id", in: attributes).map { Substring($0) }
             style.override(with: documentSheet.style(tag: name, classes: classes, id: id))
         }
