@@ -18,6 +18,25 @@ import SwiftSoup
 /// element's `style` attribute. See `HTMLTextStyle` for the CSS read.
 enum HTMLText {
     /// The deepest nesting the converter follows; a deeper element takes its parent's style.
+    /// Whether a `<style>` with these `type` and `media` attributes styles the screen. A `type`
+    /// other than CSS makes no style sheet at all, and a sheet only for other media (`print`,
+    /// `speech`) does not apply. Media features (`(max-width: ...)`) are not evaluated: a query
+    /// for the screen with features counts as applying.
+    static func sheetApplies(type: String?, media: String?) -> Bool {
+        if let type = type?.trimmingCharacters(in: .whitespaces).lowercased(),
+           !type.isEmpty, type != "text/css" { return false }
+        guard let media = media?.lowercased(), !media.allSatisfy(\.isWhitespace) else { return true }
+        return media.split(separator: ",").contains { query in
+            var words = query.split(whereSeparator: \.isWhitespace)
+            if words.first == "only" { words.removeFirst() }
+            let negated = words.first == "not"
+            if negated { words.removeFirst() }
+            let mediaType = words.first.map { $0.hasPrefix("(") ? "all" : String($0) } ?? "all"
+            let screen = mediaType == "all" || mediaType == "screen"
+            return negated ? !screen : screen
+        }
+    }
+
     static let maxOpenElements = 512
     /// The longest entity reference read, `&` and `;` included; the longest HTML name is 33.
     static let maxEntityLength = 40
@@ -521,10 +540,14 @@ private struct Scanner {
             let (name, nameEnd) = tagName(at: i)
             i = tagEnd(from: nameEnd)
             guard i < bytes.count else { break }
+            let attributes = nameEnd..<i
             i += 1
             guard HTMLText.elementKinds[name]?.contains(.rawText) == true else { continue }
             let end = rawTextEnd(name)
-            if name == "style" { documentSheet.add(Array(bytes[i..<end])) }
+            if name == "style", HTMLText.sheetApplies(
+                type: attribute("type", in: attributes), media: attribute("media", in: attributes)) {
+                documentSheet.add(Array(bytes[i..<end]))
+            }
             i = end
         }
         i = 0

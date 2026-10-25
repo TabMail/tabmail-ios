@@ -195,10 +195,11 @@ struct HTMLTextStyleSheet {
 
     /// The rules read so far, which give each rule its position.
     private var count = 0
-    /// The winners by the tag, class, `tag.class` or id the selector names.
+    /// The winners by the tag, class, `tag.class` or id the selector names. `tag.class` is keyed by
+    /// tag, then class, so a lookup never builds a key holding the tag once per class.
     private var byTag: [String: Winners] = [:]
     private var byClass: [String: Winners] = [:]
-    private var byTagClass: [String: Winners] = [:]
+    private var byTagClass: [String: [String: Winners]] = [:]
     private var byID: [String: Winners] = [:]
 
     var isEmpty: Bool { count == 0 }
@@ -232,9 +233,11 @@ struct HTMLTextStyleSheet {
     /// The style this sheet's rules give an element.
     func style(tag: String, classes: [Substring], id: Substring?) -> HTMLTextStyle {
         var winners = byTag[tag] ?? Winners()
+        let tagClasses = byTagClass[tag]
         for className in classes {
-            if let rule = byClass[String(className)] { winners.add(rule) }
-            if let rule = byTagClass[tag + "." + className] { winners.add(rule) }
+            let className = String(className)
+            if let rule = byClass[className] { winners.add(rule) }
+            if let rule = tagClasses?[className] { winners.add(rule) }
         }
         if let id, let rule = byID[String(id)] { winners.add(rule) }
         return winners.style
@@ -257,7 +260,7 @@ struct HTMLTextStyleSheet {
         guard tag != nil || className != nil,
               tag.map(Self.isIdentifier) ?? true, className.map(Self.isIdentifier) ?? true else { return }
         switch (tag, className) {
-        case let (tag?, className?): byTagClass[tag + "." + className, default: Winners()].add(rule)
+        case let (tag?, className?): byTagClass[tag, default: [:]][className, default: Winners()].add(rule)
         case let (nil, className?): byClass[className, default: Winners()].add(rule)
         case let (tag?, nil): byTag[tag, default: Winners()].add(rule)
         case (nil, nil): return

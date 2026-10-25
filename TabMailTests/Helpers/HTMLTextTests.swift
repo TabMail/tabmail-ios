@@ -479,6 +479,8 @@ struct HTMLTextTests {
         ("<style>.x{display:none}</style><table><tr class=x><td>hidden<tr><td>shown</table>", "shown", "hidden\nshown"),
         ("<style>.x{display:none}</style><table><tbody class=x><tr><td>hidden<tbody><tr><td>shown</table>", "shown", "hidden\nshown"),
         ("<style>.x{display:none}</style><table><tr><td class=x>hidden</td><td>shown</td></tr></table>", "shown", "hidden shown"),
+        ("<style>.x{display:none}</style><table><tr><th class=x>hidden<th>shown</table>", "shown", "hidden shown"),
+        ("<style>.x{display:none}</style><table><tr><th class=x>hidden<td>shown</table>", "shown", "hidden shown"),
         // A nested table's cells end only its own: the outer hidden cell stays open around it.
         ("<style>.x{display:none}</style><table><tr><td class=x><table><tr><td>inner<td>inner</table>hidden<td>shown</table>", "shown", "inner inner\nhidden shown"),
     ])
@@ -487,10 +489,26 @@ struct HTMLTextTests {
         #expect(collapsed(html) == expectedCollapsed)
     }
 
-    @Test("A draft keeps a cell's visible sibling when a hidden cell's end tag is left out")
-    func draftKeepsSiblingOfHiddenCell() {
-        let html = "<style>.x{display:none}</style><table><tr><td class=x>hidden<td>shown</tr></table>"
+    @Test("A draft keeps a cell's visible sibling when a hidden cell's end tag is left out", arguments: ["td", "th"])
+    func draftKeepsSiblingOfHiddenCell(cell: String) {
+        let html = "<style>.x{display:none}</style><table><tr><\(cell) class=x>hidden<\(cell)>shown</tr></table>"
         #expect(ExternalDraftAdoption.editableBody(text: nil, html: html, bodyEmptyConfirmed: true, hasAttachments: false) == "shown")
+    }
+
+    /// A `<style>` styles the screen only when it is CSS for the screen; WebKit agrees on each case.
+    @Test("A style sheet for other media, or not CSS, hides nothing", arguments: [
+        ("media='print'", false), ("media=speech", false), ("type='text/plain'", false),
+        ("type='text/javascript' media=screen", false), ("media='not all'", false),
+        ("", true), ("media=''", true), ("type=''", true), ("type='text/css'", true), ("type=TEXT/CSS", true),
+        ("media=screen", true), ("media='all'", true), ("media='print, screen'", true),
+        ("media='only screen and (max-width: 600px)'", true), ("media='(min-width: 1px)'", true), ("media='not print'", true),
+    ])
+    func styleSheetApplicability(attributes: String, applies: Bool) {
+        let html = "<style \(attributes)>.x{display:none}</style><div class=x>Keep this draft text</div><div>Footer</div>"
+        let expected = applies ? "Footer" : "Keep this draft text\nFooter"
+        #expect(draft(html) == expected)
+        #expect(ExternalDraftAdoption.editableBody(text: nil, html: html, bodyEmptyConfirmed: true, hasAttachments: false) == expected)
+        #expect(collapsed(html) == "Keep this draft text\nFooter")
     }
 
     @Test("CSS white space before important keeps the priority", arguments: ["! important", "!\nimportant", "!\rimportant", "!\u{0C}important", "!\timportant ", "!IMPORTANT"])
@@ -570,6 +588,21 @@ struct HTMLTextTests {
         let elapsed = ContinuousClock.now - start
         #expect(text.split(separator: "\n").count == count)
         #expect(elapsed < .seconds(5))
+    }
+
+    /// When a `tag.class` lookup built a key holding the tag for each class, a long tag name with
+    /// many classes cost their product: 64,000 of each took 1.2 s, 60 times as long for 8 times
+    /// the input.
+    @Test("A long tag name with many classes costs no more than its length", .timeLimit(.minutes(1)))
+    func longTagWithManyClasses() {
+        let count = 128_000
+        let tag = String(repeating: "t", count: count)
+        let html = "<style>.unused{white-space:pre}</style><\(tag) class='" + String(repeating: "c ", count: count) + "'>visible</\(tag)>"
+        let start = ContinuousClock.now
+        let text = draft(html)
+        let elapsed = ContinuousClock.now - start
+        #expect(text == "visible")
+        #expect(elapsed < .seconds(1))
     }
 
     /// Before rules were indexed, every element checked every rule: 4,000 of each took
