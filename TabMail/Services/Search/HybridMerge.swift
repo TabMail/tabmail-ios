@@ -11,6 +11,8 @@ struct HybridCandidate {
     let rowid: Int64
     var textScore: Double
     var vectorScore: Double
+    /// Found by keyword: a result whatever its score (#304, native-fts #51).
+    var keywordMatch: Bool
 }
 
 struct HybridResult {
@@ -45,7 +47,8 @@ enum HybridMerge {
         max(0.0, 1.0 - distance)
     }
 
-    /// Merge FTS5 and vector search results into one list in `sort` order, then take `limit`.
+    /// Merge FTS5 and vector search results into one list in `sort` order, then take `limit`. Every
+    /// keyword match is a result; a candidate found by meaning alone needs `SearchConfig.minScore`.
     ///
     /// - Parameters:
     ///   - textResults: (rowid, bm25Rank) from FTS5 search
@@ -72,7 +75,7 @@ enum HybridMerge {
                 existing.textScore = score
                 candidates[rowid] = existing
             } else {
-                candidates[rowid] = HybridCandidate(rowid: rowid, textScore: score, vectorScore: 0.0)
+                candidates[rowid] = HybridCandidate(rowid: rowid, textScore: score, vectorScore: 0.0, keywordMatch: true)
             }
         }
 
@@ -82,7 +85,7 @@ enum HybridMerge {
                 existing.vectorScore = score
                 candidates[rowid] = existing
             } else {
-                candidates[rowid] = HybridCandidate(rowid: rowid, textScore: 0.0, vectorScore: score)
+                candidates[rowid] = HybridCandidate(rowid: rowid, textScore: 0.0, vectorScore: score, keywordMatch: false)
             }
         }
 
@@ -92,7 +95,11 @@ enum HybridMerge {
             let th = SearchConfig.vectorScoreThreshold
             let adjustedVector = max(0.0, (c.vectorScore - th) / (1.0 - th))
             let finalScore = vectorWeight * adjustedVector + textWeight * c.textScore
-            guard finalScore >= SearchConfig.minScore else { return nil }
+            // Every keyword match is a result, however low it scores: a word in at least half the rows
+            // scores about 0 by keyword (FTS5 clamps its IDF), and dropping those returned fewer
+            // matches than a keyword-only search (#304, native-fts #51, ADR-NF-020). `minScore` gates
+            // only the candidates found by meaning alone.
+            guard c.keywordMatch || finalScore >= SearchConfig.minScore else { return nil }
             return HybridResult(
                 rowid: c.rowid,
                 finalScore: finalScore,

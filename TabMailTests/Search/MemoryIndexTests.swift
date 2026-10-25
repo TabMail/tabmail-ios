@@ -24,7 +24,7 @@ private let memoryDateReadFault = Mutex((deny: false, refused: 0))
 /// `.serialized` because `MemoryIndex.shared` is a singleton.
 ///
 /// See ADR-IOS-034.
-@Suite("MemoryIndex", .serialized)
+@Suite("MemoryIndex", .serialized, .processGlobalState)
 struct MemoryIndexTests {
 
     // MARK: - Fixtures
@@ -583,7 +583,7 @@ struct MemoryIndexTests {
         #expect(hits.contains { $0.chatHistoryId == "t1" })
     }
 
-    // MARK: - Search: a merge that keeps nothing answers by keyword (tabmail-ios#240)
+    // MARK: - Search: every keyword match is a result (tabmail-ios#304, native-fts #51; replaced the #240 fallback)
 
     private static func oneHot(_ i: Int) -> [Float] {
         var v = [Float](repeating: 0, count: SearchConfig.embeddingDims)
@@ -611,7 +611,7 @@ struct MemoryIndexTests {
     }
 
     @Test("search: a word in most turns with no near vector returns every keyword match")
-    func search_emptyMergeAnswersByKeyword() async throws {
+    func search_wordInMostTurnsReturnsEveryKeywordMatch() async throws {
         let (pool, dir) = try await makeIndex()
         defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
         let (budget, _) = await indexBudgetFixture()
@@ -633,8 +633,8 @@ struct MemoryIndexTests {
         #expect(limited.map(\.chatHistoryId) == (25..<30).reversed().map { "b\($0)" })
     }
 
-    @Test("search: a merge that keeps nothing answers with the best keyword match first, not the newest")
-    func search_emptyMergeAnswersBestKeywordMatchFirst() async throws {
+    @Test("search: keyword matches scoring about 0 answer the best first, not the newest")
+    func search_keywordMatchesAnswerBestFirst() async throws {
         let (pool, dir) = try await makeIndex()
         defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
         let hour: Int64 = 3_600_000
@@ -652,28 +652,110 @@ struct MemoryIndexTests {
         _ = await MemoryIndex.shared.storeEmbeddings(rows.map { (chatHistoryId: $0.id, observedEpoch: 1, embedding: Self.oneHot(1)) })
         #expect(await MemoryIndex.shared._testVecRowCount() == 4)
 
-        // Query vector orthogonal to every stored one: the merge keeps nothing.
+        // Query vector orthogonal to every stored one: found by keyword only.
         let hits = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(0),
                                                          fromMs: nil, toMs: nil, limit: 1, demoActive: false)
         #expect(hits.map(\.chatHistoryId) == ["strong"])
     }
 
-    @Test("search: when the merge keeps results, those are the answer")
-    func search_nonEmptyMergeIsTheAnswer() async throws {
+    @Test("search: matches by meaning come first, then every keyword match scoring about 0")
+    func search_matchesByMeaningThenKeywordMatches() async throws {
         let (pool, dir) = try await makeIndex()
         defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
-        let (_, weather) = await indexBudgetFixture()
+        let (budget, weather) = await indexBudgetFixture()
+        let budgetNewestFirst = (0..<30).reversed().map { "b\($0)" }
+        #expect(Set(budgetNewestFirst) == budget)
 
-        // Query vector equal to most weather turns' vectors: they are kept by meaning, the budget
-        // turns (keyword score about 0, vector score 0) are not.
+        // Query vector equal to most weather turns' vectors: they are found by meaning and come first;
+        // the budget turns (keyword score about 0, vector score 0) follow, newest first.
         let hits = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(2),
                                                          fromMs: nil, toMs: nil, limit: 100, demoActive: false)
-        #expect(Set(hits.map(\.chatHistoryId)) == weather.subtracting(["w0"]))
+        #expect(Set(hits.prefix(9).map(\.chatHistoryId)) == weather.subtracting(["w0"]))
+        #expect(hits.dropFirst(9).map(\.chatHistoryId) == budgetNewestFirst)
 
-        // A merge that keeps a single turn is the answer too.
+        // One match by meaning, then the 30 keyword matches (until #304 only that one was returned).
         let single = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(3),
                                                            fromMs: nil, toMs: nil, limit: 100, demoActive: false)
-        #expect(single.map(\.chatHistoryId) == ["w0"])
+        #expect(single.map(\.chatHistoryId) == ["w0"] + budgetNewestFirst)
+    }
+
+    /// native-fts `memory_search_returns_every_keyword_match_of_a_word_in_most_messages`: a hybrid
+    /// search never returns fewer keyword matches than a keyword-only search with the same dates and
+    /// limit, and returns all of them when the limit has room. The vectors are the model's.
+    @Test("search: a hybrid search returns every keyword match a keyword-only search does, for a word in every turn")
+    func search_hybridReturnsEveryKeywordMatchOfACommonWord() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        EmbeddingService.initialize()
+        defer { EmbeddingService._testUnload() }
+        let model = try #require(EmbeddingService.shared)
+        let topics = ["the quarterly budget review with finance", "a dentist appointment next week", "planning the team offsite in the mountains",
+                      "debugging the login page timeout", "the budget for the offsite catering", "renewing the car insurance",
+                      "notes on the product launch email", "the meeting about hiring a designer"]
+        let day: Int64 = 86_400_000
+        var pairs: [(chatHistoryId: String, observedEpoch: Int64, embedding: [Float])] = []
+        for (i, topic) in topics.enumerated() {
+            let text = "we talked about \(topic) and the meeting notes"
+            await MemoryIndex.shared.indexTurn(chatHistoryId: "m\(i)", sessionId: "s\(i)", role: "user", dateMs: 1000 + Int64(i) * day, text: text)
+            pairs.append((chatHistoryId: "m\(i)", observedEpoch: 1, embedding: try model.embed(text)))
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings(pairs)
+        for q in ["meeting", "notes", "talked"] {
+            let queryVector = try model.embed(q)
+            #expect(await MemoryIndex.shared.hybridSearch(query: q, queryEmbedding: nil, fromMs: nil, toMs: nil,
+                                                          limit: 100, demoActive: false).count == 8, "every turn has \(q)")
+            for (from, limit, room) in [(Int64?.none, 100, true), (Int64?.some(1000 + 3 * day + day / 2), 100, true), (Int64?.none, 3, false)] {
+                let keyword = await MemoryIndex.shared.hybridSearch(query: q, queryEmbedding: nil, fromMs: from, toMs: nil,
+                                                                    limit: limit, demoActive: false).map(\.chatHistoryId)
+                let hybrid = await MemoryIndex.shared.hybridSearch(query: q, queryEmbedding: queryVector, fromMs: from, toMs: nil,
+                                                                   limit: limit, demoActive: false).map(\.chatHistoryId)
+                #expect(hybrid.count >= keyword.count, "\(q) \(limit): \(hybrid) < \(keyword)")
+                if room { #expect(Set(keyword).isSubset(of: Set(hybrid)), "\(q): \(hybrid) lacks some of \(keyword)") }
+            }
+        }
+    }
+
+    /// native-fts `memory_search_keeps_the_best_keyword_match_over_newer_weaker_ones_at_a_small_limit`:
+    /// with more keyword matches than the candidates a search takes, the best match is among them even
+    /// when the weaker ones are newer: candidates are taken by rank, then date.
+    @Test("search: the best keyword match is kept over newer weaker ones at a small limit")
+    func search_keepsBestKeywordMatchOverNewerWeakerOnes() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let hour: Int64 = 3_600_000
+        let now: Int64 = 100 * hour
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "best", sessionId: "s", role: "user", dateMs: now - 24 * hour,
+                                           text: String(repeating: "budget ", count: 50))
+        let weak = (0..<12).map { "weak-\($0)" }
+        for (i, id) in weak.enumerated() {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: "s", role: "user", dateMs: now - Int64(i) * hour,
+                                               text: "budget " + String(repeating: "padding ", count: 200))
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings((["best"] + weak).map { (chatHistoryId: $0, observedEpoch: 1, embedding: Self.oneHot(1)) })
+        let hits = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(0),
+                                                         fromMs: nil, toMs: nil, limit: 1, demoActive: false)
+        #expect(hits.map(\.chatHistoryId) == ["best"])
+    }
+
+    /// native-fts `memory_keyword_candidates_of_equal_rank_are_the_newest`: with more equal keyword
+    /// matches than the candidates a search takes, the candidates are the newest, whatever order the
+    /// turns were indexed in; each one is a result, so the candidates decide which are answered.
+    @Test("search: keyword candidates of equal rank are the newest")
+    func search_keywordCandidatesOfEqualRankAreTheNewest() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let hour: Int64 = 3_600_000
+        let limit = 2
+        // Indexed oldest first: the oldest have the lowest rowids.
+        let ids = (0..<(limit * SearchConfig.candidateMultiplier * 3)).map { "t\($0)" }
+        for (i, id) in ids.enumerated() {
+            await MemoryIndex.shared.indexTurn(chatHistoryId: id, sessionId: "s", role: "user", dateMs: 1000 + Int64(i) * hour,
+                                               text: "the quarterly budget")
+        }
+        _ = await MemoryIndex.shared.storeEmbeddings(ids.map { (chatHistoryId: $0, observedEpoch: 1, embedding: Self.oneHot(1)) })
+        let hits = await MemoryIndex.shared.hybridSearch(query: "budget", queryEmbedding: Self.oneHot(0),
+                                                         fromMs: nil, toMs: nil, limit: limit, demoActive: false)
+        #expect(hits.map(\.chatHistoryId) == Array(ids.suffix(limit).reversed()))
     }
 
     /// Equal matches go newer first (tabmail-ios#265, mirroring tabmail-native-fts#46): two turns found

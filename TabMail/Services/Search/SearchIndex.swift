@@ -1910,8 +1910,8 @@ actor SearchIndex {
                                                    demoActive: DemoModeStore.isDemoActive)
 
         // Fall back to FTS-only when no vector lies within the dates and the field (or the vec table
-        // is empty, e.g. during embedding rebuild).
-        // Without this, hybrid weights (text_weight=0.3) penalize text-only results below MIN_SCORE.
+        // is empty, e.g. during embedding rebuild). It orders every keyword match, where the merge
+        // would order only the keyword leg's candidates.
         if vectorCandidates.isEmpty {
             BackgroundSyncLogger.logDebug("[SearchIndex] No vector candidates (vec table may be empty), falling back to FTS-only search")
             return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit,
@@ -1928,15 +1928,6 @@ actor SearchIndex {
             textResults: textPairs, vectorResults: vectorCandidates, dates: dates,
             vectorWeight: SearchConfig.vectorWeight, textWeight: SearchConfig.textWeight,
             sort: sort, limit: limit)
-
-        // Words matched but the merge kept nothing (a word in most messages scores about 0 by keyword,
-        // and a weak vector match adds too little to reach minScore): answer by keyword, as with no
-        // vectors. Mirrors tabmail-native-fts #28 (ADR-NF-014).
-        if merged.isEmpty && !ftsCandidates.isEmpty {
-            BackgroundSyncLogger.logDebug("[SearchIndex] Hybrid merge kept none of \(ftsCandidates.count) keyword matches, falling back to FTS-only search")
-            return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit,
-                                     folderIds: folderIds, sort: sort)
-        }
 
         // --- Assemble results ---
         var ftsMap = [Int64: (contentKey: ContentKey, messageId: String, snippet: String, dateMs: Int64)]()
@@ -2024,8 +2015,10 @@ actor SearchIndex {
             if let ids = nonEmptyFolderIds { args.append(contentsOf: ids) }
             args.append(limit)
 
+            // Equal ranks newer first, as `searchFTSOnly` orders them: every keyword candidate is a
+            // result (#304, native-fts #51), so the pool decides which tied matches are answered.
             let sql = subqueries.joined(separator: " UNION ALL ") +
-                " ORDER BY rank ASC LIMIT ?\(limitParam)"
+                " ORDER BY rank ASC, dateMs DESC LIMIT ?\(limitParam)"
 
             // Gated. This arm is the HYBRID path (`search()` ← `EmailSearchTool`), not the
             // per-keystroke typing path — that one is `keywordSearch` → `searchFTSOnly`
@@ -2055,8 +2048,8 @@ actor SearchIndex {
     /// FTS-only search across all year shards using a single UNION ALL query, every match in `sort`
     /// order before the limit. Matching TB's search_fts_only(): relevance is rank, then newer first;
     /// a date sort is by date, then the better rank.
-    private func searchFTSOnly(ftsQuery: String, fromDateMs: Int64?, toDateMs: Int64?,
-                                limit: Int, folderIds: [String]? = nil, sort: SearchSort) throws -> [FTSSearchResult] {
+    func searchFTSOnly(ftsQuery: String, fromDateMs: Int64?, toDateMs: Int64?,
+                       limit: Int, folderIds: [String]? = nil, sort: SearchSort) throws -> [FTSSearchResult] {
         guard let dbPool, !knownYears.isEmpty, !ftsQuery.isEmpty else { return [] }
 
         return try dbPool.read { [self] db in

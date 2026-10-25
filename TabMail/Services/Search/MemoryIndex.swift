@@ -767,15 +767,6 @@ actor MemoryIndex {
         )
         BackgroundSyncLogger.logDebug("[MemoryIndex] search merged=\(merged.count) (hybrid via HybridMerge)")
 
-        // Words matched but the merge kept nothing (a word in most turns scores about 0 by keyword,
-        // and a weak vector match adds too little to reach minScore): answer by keyword, as with no
-        // vectors. Mirrors tabmail-native-fts #28 (ADR-NF-014).
-        if merged.isEmpty && !ftsCandidates.isEmpty {
-            let hits = assembleFTSOnly(Array(ftsCandidates.prefix(limit)))
-            BackgroundSyncLogger.logDebug("[MemoryIndex] search RESULT \(hits.count) hits (hybrid merge kept none of \(ftsCandidates.count) keyword matches, FTS-only fallback)")
-            return hits
-        }
-
         // Assemble results. FTS hits carry full payload already; vec-only hits need
         // a batched JOIN lookup on rowid.
         var ftsMap: [Int64: (content: String, chatHistoryId: String, sessionId: String?, role: String, dateMs: Int64, snippet: String)] = [:]

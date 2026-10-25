@@ -11,10 +11,11 @@ struct HybridCandidateTests {
 
     @Test("Init with text and vector scores")
     func initScores() {
-        let candidate = HybridCandidate(rowid: 42, textScore: 0.8, vectorScore: 0.6)
+        let candidate = HybridCandidate(rowid: 42, textScore: 0.8, vectorScore: 0.6, keywordMatch: true)
         #expect(candidate.rowid == 42)
         #expect(candidate.textScore == 0.8)
         #expect(candidate.vectorScore == 0.6)
+        #expect(candidate.keywordMatch)
     }
 }
 

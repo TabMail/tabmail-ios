@@ -106,7 +106,8 @@ struct HybridMergeTests {
             textWeight: 0.7,
             limit: 10
         )
-        // Some results may be filtered by minScore threshold
+        // Found by meaning alone, so minScore gates them: distance 0.5 scores below it.
+        #expect(results.map(\.rowid) == [1, 2])
         for result in results {
             #expect(result.textScore == 0.0)
         }
@@ -124,6 +125,29 @@ struct HybridMergeTests {
         // Should be deduplicated to a single entry
         let rowid1Count = results.filter { $0.rowid == 1 }.count
         #expect(rowid1Count <= 1)
+    }
+
+    /// native-fts `every_keyword_match_is_kept_and_meaning_alone_needs_min_score` (#304, native-fts #51):
+    /// every keyword match is a result, however low it scores; a candidate found by meaning alone is
+    /// kept only at `SearchConfig.minScore` or above.
+    @Test("Every keyword match is kept; a match by meaning alone needs minScore", arguments: [SearchSort.relevance, .dateDesc, .dateAsc])
+    func everyKeywordMatchIsKeptAndMeaningAloneNeedsMinScore(sort: SearchSort) {
+        // Rank -0.000001: about 0 by keyword; rank 0 (a match only in a column weighted 0): exactly 0.
+        // Distance 1.0: 0 by meaning. 3 is also found by meaning, weakly; 4 by meaning alone, weakly;
+        // 5 by meaning alone, strongly.
+        let text: [(Int64, Double)] = [(1, -0.000001), (2, 0.0), (3, -0.000001)]
+        let vector: [(Int64, Double)] = [(3, 1.0), (4, 1.0), (5, 0.0)]
+        let dates = Dictionary(uniqueKeysWithValues: (1...5).map { (Int64($0), Int64(10 * $0)) })
+        let merged = HybridMerge.mergeResults(textResults: text, vectorResults: vector, dates: dates,
+                                              vectorWeight: 0.7, textWeight: 0.3, sort: sort, limit: 10)
+        #expect(merged.map(\.rowid).sorted() == [1, 2, 3, 5])
+        #expect(merged.filter { $0.rowid != 5 }.allSatisfy { $0.finalScore < SearchConfig.minScore })
+        // By relevance the match by meaning comes first.
+        if sort == .relevance {
+            let first = HybridMerge.mergeResults(textResults: text, vectorResults: vector, dates: dates,
+                                                 vectorWeight: 0.7, textWeight: 0.3, sort: sort, limit: 1)
+            #expect(first.map(\.rowid) == [5])
+        }
     }
 
     @Test("Limit is respected")
