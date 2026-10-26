@@ -31,6 +31,7 @@ struct ExchangeNewDraftAttachmentTests {
             var files: [String: Data] = [:]
             var draftIds = Set<String>()
             var uploaded = Data()
+            var uploadAuthorizations: [String?] = []
         }
         let state = Mutex(State())
 
@@ -62,7 +63,7 @@ struct ExchangeNewDraftAttachmentTests {
                       let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
                     return .status(400)
                 }
-                if request.url.contains("createUploadSession") {
+                if request.url.absoluteString.contains("createUploadSession") {
                     self.state.withLock { $0.uploaded = Data() }
                     return .json(raw: #"{"uploadUrl":"https://outlook.office.com/AttachmentSessions/session?authtoken=synthetic-token"}"#)
                 }
@@ -73,6 +74,7 @@ struct ExchangeNewDraftAttachmentTests {
                 return .json(raw: #"{"id":"file"}"#, statusCode: 201)
             }
             http.register(path: "AttachmentSessions", method: "PUT") { request in
+                self.state.withLock { $0.uploadAuthorizations.append(request.header("Authorization")) }
                 guard let body = request.body, let range = request.header("Content-Range"),
                       let total = range.split(separator: "/").last.flatMap({ Int($0) }) else { return .status(400) }
                 return self.state.withLock { state in
@@ -85,7 +87,7 @@ struct ExchangeNewDraftAttachmentTests {
                 }
             }
             http.register(path: "/messages/", method: "DELETE") { request in
-                let id = URL(string: request.url)?.lastPathComponent ?? ""
+                let id = request.url.lastPathComponent
                 self.state.withLock { state in
                     state.draftIds.remove(id)
                     state.files.removeAll()
@@ -134,7 +136,8 @@ struct ExchangeNewDraftAttachmentTests {
         #expect(!calls.contains { $0.method == "DELETE" || $0.method == "PATCH" })
         let puts = calls.filter { $0.method == "PUT" }
         #expect(puts.isEmpty == !(shape == "boundary" || shape == "large"))
-        #expect(puts.allSatisfy { $0.header("Authorization") == nil })
+        #expect(mailbox.state.withLock { $0.uploadAuthorizations.count } == puts.count)
+        #expect(mailbox.state.withLock { $0.uploadAuthorizations.allSatisfy { $0 == nil } })
     }
 
     @Test("A failed first attachment upload throws, removes only its incomplete draft, and a retry succeeds",
@@ -213,6 +216,57 @@ struct ExchangeNewDraftAttachmentTests {
             #expect(status == 403)
         }
         #expect(http.recordedCalls().contains { $0.method == "DELETE" })
+    }
+
+    @Test("A retry after failed cleanup puts its files on the completed draft, not the surviving partial copy")
+    func retryAfterFailedCleanupOwnsItsFiles() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let filesByMessage = Mutex<[String: [String: Data]]>([:])
+        let creations = Mutex(0)
+        let firstAdd = Mutex(true)
+        let bytes = Data("authored file bytes".utf8)
+        http.register(path: "/mailFolders/drafts/messages", method: "POST") { _ in
+            let id = creations.withLock { $0 += 1; return "g\($0)" }
+            filesByMessage.withLock { $0[id] = [:] }
+            return .json(raw: "{\"id\":\"\(id)\"}", statusCode: 201)
+        }
+        http.register(path: "/messages/", method: "GET") { request in
+            let id = request.url.deletingLastPathComponent().lastPathComponent
+            return filesByMessage.withLock { $0[id] != nil }
+                ? .json(raw: #"{"value":[]}"#) : .status(404)
+        }
+        http.register(path: "/messages/", method: "POST") { request in
+            let id = request.url.deletingLastPathComponent().lastPathComponent
+            guard let body = request.body,
+                  let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                  let name = json["name"] as? String, let raw = json["contentBytes"] as? String,
+                  let data = Data(base64Encoded: raw) else { return .status(400) }
+            if firstAdd.withLock({ value in let first = value; value = false; return first }) {
+                return .status(403)
+            }
+            return filesByMessage.withLock { files in
+                guard files[id] != nil else { return .status(404) }
+                files[id]?[name] = data
+                return .json(raw: #"{"id":"file"}"#, statusCode: 201)
+            }
+        }
+        http.register(path: "/messages/", method: "DELETE", response: .status(503))
+        let graph = provider(http)
+        let authored = draft([DraftAttachment(filename: "notes.txt", mimeType: "text/plain", data: bytes)])
+
+        await #expect(throws: (any Error).self) {
+            try await graph.saveDraft(authored, existingIdentity: nil, draftsFolderPath: "Drafts")
+        }
+        #expect(filesByMessage.withLock { $0 } == ["g1": [:]], "the failed cleanup leaves the partial copy")
+
+        let saved = try await graph.saveDraft(authored, existingIdentity: nil, draftsFolderPath: "Drafts")
+
+        #expect(saved == .created(.outlook(graphId: "g2")))
+        #expect(filesByMessage.withLock { $0["g2"] } == ["notes.txt": bytes],
+                "reloading the completed draft must recover its own files")
+        #expect(filesByMessage.withLock { $0["g1"]?.isEmpty } == true,
+                "a surviving partial copy must not receive a later attempt's files")
     }
 
     @Test("A refused or unaddressable creation never uploads or deletes anything",
