@@ -26,6 +26,57 @@ struct EmailRenderTiming: Sendable {
     }
 }
 
+/// How a quote level is drawn (#286, #327). Like Apple Mail, each level is a thin coloured bar
+/// with a small gap before its text, the colours cycling by level, and the indent stops growing
+/// past `maxIndentedDepth`, so a very long thread keeps a usable width.
+enum QuoteLevelConfig {
+    /// Width of a level's bar, in CSS px.
+    static let barWidth = 2
+    /// Space between a level's bar and its text, in CSS px.
+    static let barGap = 8
+    /// Levels deeper than this add no bar and no indent of their own; they read as part of
+    /// the deepest drawn level. At 5, the innermost text of any thread keeps all but
+    /// 5 x (barWidth + barGap) = 50px of its column.
+    static let maxIndentedDepth = 5
+    /// Bar colours by level (Apple system blue, green, purple), cycling past the last.
+    static let barColors = ["#007aff", "#34c759", "#af52de"]
+    /// The same colours for dark appearance.
+    static let darkBarColors = ["#0a84ff", "#30d158", "#bf5af2"]
+
+    /// A blockquote that is a quote. Gmail's "Indent" button writes a blockquote with an inline
+    /// `border:none` (`margin:0 0 0 40px;border:none;padding:0px`): that is an indented
+    /// paragraph, not a quote, so it keeps the sender's own style and does not count as a level.
+    static let quoteSelector = #"blockquote:not([style*="border:none" i]):not([style*="border: none" i])"#
+
+    /// The selector for quotes nested exactly `level` deep or deeper.
+    static func selector(level: Int) -> String {
+        Array(repeating: quoteSelector, count: level).joined(separator: " ")
+    }
+
+    /// `!important` beats the sender's inline quote styles (Gmail writes its own margin, border
+    /// and padding inline on every level), so every thread gets the same bounded indent.
+    static var css: String {
+        var rules = ["\(selector(level: 1)) { margin-left: 0 !important; margin-right: 0 !important; "
+            + "padding-left: \(barGap)px !important; border-left: \(barWidth)px solid \(barColors[0]) !important; }"]
+        rules += colorRules(barColors)
+        rules.append("\(selector(level: maxIndentedDepth + 1)) { padding-left: 0 !important; border-left: none !important; }")
+        return rules.joined(separator: "\n")
+    }
+
+    /// The dark-appearance colours; goes inside the wrapper's dark `@media` block.
+    static var darkCSS: String {
+        (["\(selector(level: 1)) { border-left-color: \(darkBarColors[0]) !important; }"] + colorRules(darkBarColors))
+            .joined(separator: "\n")
+    }
+
+    private static func colorRules(_ colors: [String]) -> [String] {
+        guard maxIndentedDepth >= 2 else { return [] }
+        return (2...maxIndentedDepth).map { level in
+            "\(selector(level: level)) { border-left-color: \(colors[(level - 1) % colors.count]) !important; }"
+        }
+    }
+}
+
 /// Wraps email message HTML with TabMail's viewport, CSS, and unwrap-full-document
 /// handling. Produces the HTML string that HTMLWebView loads into WKWebView.
 ///
@@ -444,8 +495,10 @@ enum EmailHTMLWrapper {
             table, div, p { max-width: 100% !important; box-sizing: border-box !important; }
             td, th { max-width: 100% !important; box-sizing: border-box !important; }
             /* WebKit's default blockquote margin is 40px on BOTH sides; a level must cost
-               only its border and padding, or a deep reply narrows to one letter a line (#286). */
-            blockquote { border-left: 3px solid #d4d7dd; margin-left: 0; margin-right: 0; padding-left: 12px; }
+               only its border and padding, or a deep reply narrows to one letter a line (#286).
+               A level is a thin coloured bar, and levels past QuoteLevelConfig.maxIndentedDepth
+               add no indent (#327). */
+            \(QuoteLevelConfig.css)
 
             /* ---- Outlook/Word .eml attachment normalization ----
                These embedded emails carry CSS/inline-styles designed for 612pt-wide
@@ -567,7 +620,7 @@ enum EmailHTMLWrapper {
                 }
                 a { color: #0a84ff !important; }
                 a:visited { color: #b5a5ff !important; }
-                blockquote { border-left-color: #52525e; }
+                \(QuoteLevelConfig.darkCSS)
                 .tm-quote-wrapper.tm-collapsed { background: rgba(255,255,255,0.08); }
                 .tm-quote-wrapper:not(.tm-collapsed) { background: rgba(255,255,255,0.05); }
                 .tm-quote-toggle-text { color: rgba(255,255,255,0.5); }

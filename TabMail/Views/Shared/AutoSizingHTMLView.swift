@@ -3321,6 +3321,81 @@ function sweepQuoteContent(quoteStart, content, body, logFn) {
 }
 """
 
+/// Values for `fitQuoteContentJS`.
+enum QuoteFitConfig {
+    /// A block may pass the quote's right edge by this many CSS px (sub-pixel
+    /// rounding) before it is scaled down.
+    static let overflowSlop = 1
+    /// Scale factors are rounded DOWN to this many steps per 1.0, so rounding
+    /// can never leave the scaled block a fraction of a pixel too wide.
+    static let scaleSteps = 1000
+}
+
+/// Shrinks over-wide content inside an expanded quote so it fits the quote's width.
+///
+/// `fitViewportJS` measures the page while every quote is still collapsed
+/// (`.tm-quote-content` is `display:none`), so a forwarded ticket or receipt table
+/// wider than the column is never seen by it; once the user expands the quote, the
+/// `overflow: hidden` quote box clips the table's right side. Like Apple Mail, this
+/// scales the over-wide block down, fonts and all. Only the outermost over-wide block
+/// of each branch is scaled, so the surrounding quoted text keeps its size.
+///
+/// It scales with `transform: scale()`, not CSS `zoom`: WebKit clamps zoomed text to
+/// its minimum logical font size (about 9px), so a zoomed table re-lays out wider as the
+/// zoom drops and its visible width barely moves (a 576px table stayed about 352px wide
+/// at every zoom under 0.6). A transform scales the painted block exactly. Its layout box
+/// keeps the full height, so a negative bottom margin takes back the difference; the
+/// block's own inline `margin-bottom` is kept in `data-tm-quote-scale` and restored.
+/// The block starts at its container's left edge (it overflows to the right), so the
+/// origin is its top left.
+///
+/// Idempotent: every run first removes the scale it set before, then measures, so a
+/// rerun after images load or the column width changes reaches the same answer as a
+/// first run on that content.
+///
+/// Defined as a top-level JS string so that `collapseQuotesJS` (production) and the
+/// tests consume the same source.
+let fitQuoteContentJS = """
+function tmFitQuoteContent(content) {
+    var scaled = content.querySelectorAll('[data-tm-quote-scale]');
+    for (var z = 0; z < scaled.length; z++) {
+        var saved = scaled[z].getAttribute('data-tm-quote-scale').split('|');
+        scaled[z].style.removeProperty('transform');
+        scaled[z].style.removeProperty('transform-origin');
+        scaled[z].style.removeProperty('margin-bottom');
+        if (saved[0]) scaled[z].style.setProperty('margin-bottom', saved[0], saved[1] || '');
+        scaled[z].removeAttribute('data-tm-quote-scale');
+    }
+    var box = content.getBoundingClientRect();
+    if (box.width <= 0) return 0;
+    var cs = getComputedStyle(content);
+    var right = box.right - (parseFloat(cs.borderRightWidth) || 0) - (parseFloat(cs.paddingRight) || 0);
+    var all = content.getElementsByTagName('*');
+    var picks = [];
+    var last = null;
+    for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        if (last && last.contains(el)) continue;
+        var r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.right <= right + \(QuoteFitConfig.overflowSlop) || r.left >= right) continue;
+        var es = getComputedStyle(el);
+        // An inline box is a run of text; the block or table inside it is the one to scale.
+        if (es.display === 'inline' && el.tagName !== 'IMG') continue;
+        var scale = Math.floor((right - r.left) / r.width * \(QuoteFitConfig.scaleSteps)) / \(QuoteFitConfig.scaleSteps);
+        if (scale > 0 && scale < 1) picks.push([el, scale, r.height, parseFloat(es.marginBottom) || 0]);
+        last = el;
+    }
+    for (var p = 0; p < picks.length; p++) {
+        var target = picks[p][0], s = picks[p][1];
+        target.setAttribute('data-tm-quote-scale', target.style.getPropertyValue('margin-bottom') + '|' + target.style.getPropertyPriority('margin-bottom'));
+        target.style.setProperty('transform-origin', '0 0', 'important');
+        target.style.setProperty('transform', 'scale(' + s + ')', 'important');
+        target.style.setProperty('margin-bottom', (picks[p][3] - picks[p][2] * (1 - s)) + 'px', 'important');
+    }
+    return picks.length;
+}
+"""
+
 /// Quote collapse: detect quote boundaries using comprehensive patterns
 /// matching the Thunderbird addon's quoteAndSignature.js — multi-language
 /// attribution lines, Outlook headers, forwarded messages, dash separators, > prefix.
@@ -3385,6 +3460,15 @@ private var collapseQuotesJS: String {
         \(quotedFallbackBoundaryJS)
         \(findQuoteStartBlockJS)
         \(sweepQuoteContentJS)
+        \(fitQuoteContentJS)
+        // Keeps an expanded quote's over-wide content fitted when images inside it load
+        // or its width changes (rotation, sheet resize). The click handler fits it on
+        // expand; a refit is idempotent, so the observer settles after one pass.
+        function _watchQuoteFit(wrapper, content) {
+            function refit() { if (!wrapper.classList.contains('tm-collapsed')) tmFitQuoteContent(content); }
+            content.addEventListener('load', refit, true);
+            new ResizeObserver(refit).observe(content);
+        }
         var body = document.body;
         if (!body) { _log('[QuoteDetect] No body, bailing'); return; }
         var existingWrapper = body.querySelector('.tm-quote-wrapper');
@@ -3622,6 +3706,7 @@ private var collapseQuotesJS: String {
                     }
                     wrapperI.classList.toggle('tm-collapsed');
                     var collapsed = wrapperI.classList.contains('tm-collapsed');
+                    if (!collapsed) tmFitQuoteContent(contentI);
                     toggleI.innerHTML = '<span class="tm-quote-toggle-text">' + (collapsed ? showLabelI : hideLabelI) + '</span>';
                     setTimeout(function() {
                         try { \(_postDisclosureHeightJS) } catch(ex) {}
@@ -3638,6 +3723,7 @@ private var collapseQuotesJS: String {
                     contentI.appendChild(ns);
                 }
                 contentI.insertBefore(quoteStart, contentI.firstChild);
+                _watchQuoteFit(wrapperI, contentI);
                 return;
             }
         }
@@ -3737,6 +3823,7 @@ private var collapseQuotesJS: String {
             }
             wrapper.classList.toggle('tm-collapsed');
             var collapsed = wrapper.classList.contains('tm-collapsed');
+            if (!collapsed) tmFitQuoteContent(content);
             toggle.innerHTML = '<span class="tm-quote-toggle-text">' + (collapsed ? showLabel : hideLabel) + '</span>';
             // Signal native side to re-measure height
             setTimeout(function() {
@@ -3757,6 +3844,7 @@ private var collapseQuotesJS: String {
         // wrapper when quoteStart is anchored deep (see sweepQuoteContentJS).
         sweepQuoteContent(quoteStart, content, body, _log);
         content.insertBefore(quoteStart, content.firstChild);
+        _watchQuoteFit(wrapper, content);
 
     })();
     """ }
