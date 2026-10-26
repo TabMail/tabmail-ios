@@ -46,7 +46,9 @@ private struct OrientationLockModifier: ViewModifier {
             .compactMap({ $0 as? UIWindowScene })
             .first
         else { return }
-        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { error in
+        // `@Sendable`, so not main-actor isolated: UIKit may call the error
+        // handler on a background queue, where a main-actor closure traps.
+        scene.requestGeometryUpdate(.iOS(interfaceOrientations: mask)) { @Sendable error in
             // Failures are non-fatal — system may reject the update if
             // another scene is requesting a conflicting orientation.
             BackgroundSyncLogger.logDebug("[OrientationLock] requestGeometryUpdate failed: \(error)")

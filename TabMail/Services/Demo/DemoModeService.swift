@@ -31,6 +31,12 @@ final class DemoModeService {
 
     private init() {}
 
+    /// `exit()` came while a start was still on its way to turning the demo
+    /// on (the tutorial ended during its entry): that start stops before it
+    /// activates, so the older start cannot bring back a demo the newer exit
+    /// ended. Reset by each start.
+    private var startWithdrawn = false
+
     /// Begin the demo. Mints the JWT, primes session storage, and flips
     /// `DemoModeStore.isActive`. Throws on mint failure — caller surfaces
     /// the error and stays on the login screen.
@@ -44,6 +50,7 @@ final class DemoModeService {
 
         store.startInProgress = true
         defer { store.startInProgress = false }
+        startWithdrawn = false
 
         // Defensive: wipe any prior demo session before minting fresh.
         DemoTokenManager.clearSession()
@@ -77,6 +84,11 @@ final class DemoModeService {
             DemoTokenManager.clearSession()
             BackgroundSyncLogger.logDebug("[DemoMode] start(): leftover demo memory not wiped: \(error)")
             throw DemoError.startFailed("Demo not available right now.")
+        }
+        guard !startWithdrawn else {
+            DemoTokenManager.clearSession()
+            BackgroundSyncLogger.logDebug("[DemoMode] start(): withdrawn by exit before activation")
+            return
         }
 
         store.isActive = true
@@ -202,7 +214,11 @@ final class DemoModeService {
     /// providers, demo GRDB rows, demo FTS entries, demo memory.db entries.
     func exit() async {
         let store = DemoModeStore.shared
-        guard store.isActive else { return }
+        guard store.isActive else {
+            // A start still on its way never turns on (`startWithdrawn`).
+            if store.startInProgress { startWithdrawn = true }
+            return
+        }
 
         // First, before the wipes below: a chat write still running from this
         // demo (a canceled chat task, compose's own user-turn persistence) then

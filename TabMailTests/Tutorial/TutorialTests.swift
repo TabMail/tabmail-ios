@@ -2,9 +2,15 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import Contacts
 import Foundation
 import GRDB
+import ObjectiveC.runtime
+import Synchronization
+import SwiftUI
 import Testing
+import UIKit
+import UserNotifications
 @testable import TabMail
 
 /// A throwaway UserDefaults suite, so no test touches the app's real state.
@@ -488,6 +494,30 @@ struct TutorialFixtureTests {
             for time in ["5pm", "6:30pm", "$240"] {
                 #expect(body.htmlContent?.contains(time) == true)
                 #expect(scripted.contains(time))
+            }
+        }
+    }
+
+    /// The answer's email capsule opens the message it cites: the one whose
+    /// text holds the times the answer quotes.
+    @MainActor
+    @Test("The flight answer's email capsule opens Jordan's email with the quoted times")
+    func flightAnswerOpensItsSource() async throws {
+        let fixture = try install()
+        defer { finish(fixture) }
+        try DemoSeed.seed()
+
+        let answer = await TutorialChatScript.answer(.flights, practiceReply: nil, invocation: ToolInvocation())
+        let reference = try #require(answer.firstMatch(of: #/\[Email\]\((\d+)\)/#))
+        let numericId = try #require(Int(reference.1))
+        let realId = try #require(await ChatIdTranslator.shared.toRealId(numericId))
+        try await fixture.0.read { db in
+            let source = try #require(try MessageHeader.fetchOne(db, key: realId), "the capsule names a seeded email")
+            #expect(source.accountId == DemoSeed.demoAccountId)
+            let body = try #require(try MessageBody.fetchOne(db, key: ContentKey(rawValue: source.id)))
+            for time in ["5pm", "6:30pm", "$240"] {
+                #expect(answer.contains(time))
+                #expect(body.htmlContent?.contains(time) == true, "the cited email holds \(time)")
             }
         }
     }
@@ -1159,6 +1189,287 @@ struct TutorialLifecycleTests {
                 "no demo provider is left registered")
         let demoAccount = try await pool.read { try Account.fetchOne($0, key: DemoSeed.demoAccountId) }
         #expect(demoAccount == nil, "no demo mail is left behind")
+    }
+
+    /// Waits on a background thread until `semaphore` is signalled.
+    private func wait(for semaphore: DispatchSemaphore) async {
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                semaphore.wait()
+                done.resume()
+            }
+        }
+    }
+
+    /// End (a notification tap) can come while the start is still wiping the
+    /// last demo's leftovers, before the demo is on. The older start must not
+    /// turn the demo on after the newer End.
+    @Test("Ending a tutorial whose demo is still starting keeps it ended")
+    func endWhileStartIsPending() async throws {
+        let fixture = try install()
+        let pool = fixture.0
+        let store = DemoModeStore.shared
+        let coordinator = TutorialCoordinator.shared
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        defer {
+            release.signal()
+            store._resetForTests()
+            coordinator.demoDidExit()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        try #require(!coordinator.isRunning)
+
+        // Park the start's wipe: the pool's writer is held.
+        await withCheckedContinuation { (held: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                _ = try? pool.write { _ in
+                    held.resume()
+                    release.wait()
+                }
+                finished.signal()
+            }
+        }
+        let start = Task { await coordinator.start(.actOnEmail, hasTabMailSession: true) }
+        let pending = await eventually { coordinator.isRunning && store.startInProgress }
+        try #require(pending, "the start is on its way")
+        try #require(!store.isActive, "the demo is not on before its wipe")
+
+        await coordinator.end()
+        try #require(!coordinator.isRunning)
+        release.signal()
+        await wait(for: finished)
+        await start.value
+
+        #expect(!store.isActive, "the older start does not turn the demo on after End")
+        #expect(!store.isTutorialPractice)
+        #expect(!coordinator.isRunning)
+        #expect(coordinator.admits(.other), "real-mail actions are unlocked")
+
+        // The next start runs.
+        try await startRun(.actOnEmail)
+        #expect(store.isActive)
+        #expect(coordinator.step == .archiveReceipt)
+        await coordinator.end()
+    }
+
+    /// Stands in for `UNUserNotificationCenter.requestAuthorization`: answers
+    /// "denied" with no system alert. RootView asks when a tutorial ends, and
+    /// the alert leaves the test host's scene inactive, where a newly shown
+    /// view's `.task` does not start.
+    private static func silentNotificationRequest() -> IMP {
+        typealias Completion = @convention(block) (Bool, NSError?) -> Void
+        let block: @convention(block) (AnyObject, UInt, @escaping Completion) -> Void = { _, _, completion in
+            completion(false, nil)
+        }
+        return imp_implementationWithBlock(block)
+    }
+
+    /// RootView sets the demo up behind a splash, where the inbox (and its
+    /// notification handler) is not on screen. A notification tap there still
+    /// ends the tutorial, and the next run gets its own setup.
+    @Test("A notification tap during the setup splash ends the tutorial, and the next run is set up")
+    func notificationDuringSplashEndsTheRun() async throws {
+        let fixture = try install(readers: 1)
+        let pool = fixture.0
+        let store = DemoModeStore.shared
+        let coordinator = TutorialCoordinator.shared
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        defer {
+            release.signal()
+            _ = PendingDeepLinkStore.consume()
+            store._resetForTests()
+            coordinator.demoDidExit()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        try #require(!coordinator.isRunning)
+        let request = try #require(class_getInstanceMethod(
+            UNUserNotificationCenter.self, NSSelectorFromString("requestAuthorizationWithOptions:completionHandler:")))
+        let silent = Self.silentNotificationRequest()
+        let systemRequest = method_setImplementation(request, silent)
+        defer {
+            method_setImplementation(request, systemRequest)
+            imp_removeBlock(silent)
+        }
+
+        // Park the setup at its first read: the pool's one reader is held.
+        await withCheckedContinuation { (held: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                _ = try? pool.read { _ in
+                    held.resume()
+                    release.wait()
+                }
+                finished.signal()
+            }
+        }
+        // A fresh app root view in place of the test host's (two would both
+        // set the demo up): it sets the demo up behind its splash, nothing
+        // here calls the setup.
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = try #require(scene.windows.first)
+        let hostRoot = window.rootViewController
+        window.rootViewController = UIHostingController(rootView: RootView().environment(NavigationStore()))
+        window.makeKeyAndVisible()
+        window.layoutIfNeeded()
+        defer { window.rootViewController = hostRoot }
+
+        await coordinator.start(.actOnEmail, hasTabMailSession: true)
+        try #require(store.isActive)
+        let seeded = try await eventually {
+            try await pool.write { try Account.fetchOne($0, key: DemoSeed.demoAccountId) } != nil
+        }
+        try #require(seeded, "RootView is setting the demo up behind its splash")
+        try #require(coordinator.step == .starting)
+
+        PendingDeepLinkStore.store(.message(id: "tapped-message", accountId: "tapped-account"))
+        NotificationCenter.default.post(
+            name: .proactiveNotificationTapped, object: nil,
+            userInfo: ["messageId": "tapped-message", "accountId": "tapped-account"])
+        let ended = await eventually { !coordinator.isRunning && !store.isActive }
+        #expect(ended, "the tap ends the tutorial during the splash")
+
+        // The ended run's setup gets its read and stops.
+        release.signal()
+        await wait(for: finished)
+        try await Task.sleep(for: .milliseconds(300))
+
+        await coordinator.start(.actOnEmail, hasTabMailSession: true)
+        let begun = await eventually { coordinator.step == .archiveReceipt }
+        #expect(begun, "the next run is set up and begins")
+        await coordinator.end()
+    }
+
+    /// The demo account's sends drain offline; a real message that was sent
+    /// but whose Sent copy failed waits for the network, then is copied once.
+    @Test("Offline, a real message's pending Sent copy waits, then is copied without a resend")
+    func pendingRealSentCopyWaitsOffline() async throws {
+        let fixture = try install()
+        let pool = fixture.0
+        let store = DemoModeStore.shared
+        let coordinator = TutorialCoordinator.shared
+        let provider = MockEmailProvider()
+        let accountId = "acc-append-\(UUID().uuidString)"
+        let wasConnected = NetworkMonitor.checkConnected()
+        defer {
+            NetworkMonitor.setConnectedForTesting(wasConnected)
+            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: accountId) }
+            store._resetForTests()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        try #require(!coordinator.isRunning)
+
+        try await startRun(.reuseReply)
+        let account = try await pool.write { db -> Account in
+            var account = Account(emailAddress: "sender@example.com", displayName: "Sender", provider: .imap)
+            account.id = accountId
+            try account.insert(db)
+            try Folder(name: "Sent", path: "SENT", role: .sent, accountId: accountId).insert(db)
+            var draft = Draft(
+                id: "append-draft", accountId: accountId,
+                toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Pending copy", body: "Copy this later.", replyToId: nil,
+                isForward: false, editHistoryJSON: nil,
+                createdAt: Date().timeIntervalSince1970,
+                updatedAt: Date().timeIntervalSince1970)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+            return account
+        }
+        await AccountManager.shared.registerProviderForTesting(accountId: accountId, provider: provider)
+        // Online, the send goes out but its Sent copy fails: the row stays,
+        // sent, for the copy to be retried.
+        await provider.setAppendToSentResult(false)
+        NetworkMonitor.setConnectedForTesting(true)
+        let queued = try await AccountManager.shared.queueSend(
+            draft: DraftMessage(to: ["recipient@example.com"], subject: "Pending copy", body: "Copy this later."),
+            from: account, draftId: "append-draft", instanceEpoch: "E1", holdsForUndo: false)
+        let awaitingCopy = try await eventually {
+            let row = try await pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId) }
+            let draining = await AccountManager.shared.isDrainingOutbox
+            return row?.sentAt != nil && !draining
+        }
+        try #require(awaitingCopy, "the message was sent and its Sent copy is pending")
+        try #require(await provider.sentDrafts.count == 1)
+        try #require(await provider.appendedToSent.count == 1)
+
+        // Offline (held as in `practiceReplySendsOffline`), the copy waits.
+        let heldOffline = await eventually {
+            NetworkMonitor.setConnectedForTesting(false)
+            try? await Task.sleep(for: .milliseconds(250))
+            let draining = await AccountManager.shared.isDrainingOutbox
+            return !NetworkMonitor.checkConnected() && !draining
+        }
+        try #require(heldOffline)
+        await provider.setAppendToSentResult(true)
+        await AccountManager.shared.drainOutbox()
+        #expect(!NetworkMonitor.checkConnected())
+        #expect(await provider.appendedToSent.count == 1, "no Sent copy is attempted offline")
+        let retained = try await pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId) }
+        #expect(retained?.sentAt != nil && retained?.appendedToSent == false, "the pending copy is kept")
+
+        // Back online, the copy is made once and the message is not resent.
+        NetworkMonitor.setConnectedForTesting(true)
+        let copied = try await eventually {
+            await AccountManager.shared.drainOutbox()
+            return try await pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId) } == nil
+        }
+        #expect(copied)
+        #expect(await provider.appendedToSent.count == 2)
+        #expect(await provider.sentDrafts.count == 1, "the message is not sent again")
+        await coordinator.end()
+    }
+
+    private final class Calls: Sendable {
+        let count = Mutex(0)
+    }
+
+    /// Stands in for `CNContactStore.requestAccess(for:completionHandler:)`:
+    /// counts the request and answers "denied", with no system prompt.
+    private static func countingContactsRequest(_ calls: Calls) -> IMP {
+        typealias Completion = @convention(block) (Bool, NSError?) -> Void
+        let block: @convention(block) (AnyObject, Int, @escaping Completion) -> Void = { _, _, completion in
+            calls.count.withLock { $0 += 1 }
+            completion(false, nil)
+        }
+        return imp_implementationWithBlock(block)
+    }
+
+    /// Compose asks for Contacts access when it opens; the tutorial's
+    /// practice reply must not raise that prompt.
+    @Test("Compose asks for Contacts access outside the tutorial, never during it")
+    func noContactsPromptDuringTheTutorial() async throws {
+        let fixture = try install()
+        let store = DemoModeStore.shared
+        let coordinator = TutorialCoordinator.shared
+        let method = try #require(class_getInstanceMethod(
+            CNContactStore.self, NSSelectorFromString("requestAccessForEntityType:completionHandler:")))
+        let calls = Calls()
+        let replacement = Self.countingContactsRequest(calls)
+        let original = method_setImplementation(method, replacement)
+        defer {
+            method_setImplementation(method, original)
+            imp_removeBlock(replacement)
+            store._resetForTests()
+            coordinator.demoDidExit()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        try #require(!coordinator.isRunning)
+
+        let contacts = ContactSearchService()
+        contacts.requestAccess()
+        let asked = await eventually { calls.count.withLock { $0 } == 1 }
+        try #require(asked, "outside the tutorial the request reaches Contacts")
+
+        try await startRun(.reuseReply)
+        contacts.requestAccess()
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(calls.count.withLock { $0 } == 1, "no Contacts request during the tutorial")
+        await coordinator.end()
     }
 
     /// Every way out of the demo (sign-in, the debug menu, a seeding failure)

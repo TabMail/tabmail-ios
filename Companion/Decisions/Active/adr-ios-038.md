@@ -421,6 +421,20 @@ fix gates at shared chokepoints, not per-tool patches:
   writes the bundled defaults over the real prompts and syncs them. The five
   tutorial hooks that live in SwiftUI views have no committed test; the
   owner accepted that as `IOS-TEST-012` rather than adding a UI test.
+- **Review round c3 (Codex, 2026-10-26).** An End that arrives while a
+  start is still wiping the last demo's leftovers (before the demo is on)
+  withdraws that start: `DemoModeService.exit` marks it, and `activate`
+  stops before turning the demo on, so the older start cannot bring back a
+  demo the newer End ended. The tutorial's notification-tap handler moved
+  from `MailNavigationView` to `RootView`, which stays mounted through the
+  seeding splash and the finish page; `MailNavigationView` still leaves the
+  pending link alone while the tutorial runs. RootView's splash setup
+  captures its demo run too, so a setup stopped by an exit does not mark
+  the next run seeded. `OrientationLockModifier`'s geometry error handler is
+  `@Sendable`: UIKit reported a refusal on a background queue, where a
+  main-actor closure traps. Tests added for each, and for a real message's
+  pending Sent copy waiting offline, the flight answer's capsule opening the
+  cited email, and no Contacts prompt during the tutorial.
 - **Considered and dropped the same day: consent once.** A variant asked
   the age/terms and AI screens before the AI parts and carried the
   outcome to sign-in (`CarriedConsent`). The owner chose a scripted

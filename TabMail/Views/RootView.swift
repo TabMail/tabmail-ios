@@ -128,8 +128,13 @@ struct RootView: View {
                 DemoSeedingSplash()
                     .task(id: demoStore.isActive) {
                         guard demoStore.isActive, !demoSeedingComplete else { return }
+                        // The demo run this setup is for. If it ends during the
+                        // splash (a notification tap ends the tutorial), setup
+                        // stops early and must not mark the next run seeded.
+                        let run = demoStore.chatAdmission
                         do {
                             try await DemoModeService.shared.completeSetup()
+                            guard DemoModeStore.admits(run) else { return }
                             // The lesson's first step is set BEFORE the inbox
                             // appears: a view built at `.starting` missed a
                             // step change made in the same frames, leaving
@@ -392,6 +397,15 @@ struct RootView: View {
         }
         .onChange(of: tutorial.isRunning) { _, running in
             if !running { requestPushPermissionAfterTutorial() }
+        }
+        // A notification tap during the guided tutorial ends it (owner V5),
+        // here because RootView stays mounted through the tutorial's splash
+        // and finish screens, where MailNavigationView is not. The pending
+        // link stays stored for the restored inbox to open.
+        .onReceive(NotificationCenter.default.publisher(for: .proactiveNotificationTapped).receive(on: DispatchQueue.main)) { _ in
+            guard tutorial.isRunning else { return }
+            BackgroundSyncLogger.logDebug("[RootView] Notification tap during the tutorial: ending it first")
+            Task { await tutorial.end() }
         }
         // Undo-Send reopen: the Outbox cancellation was confirmed and the Draft
         // row remains durable. UndoReopenCompose resolves the snapshot's exact

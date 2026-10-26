@@ -728,8 +728,8 @@ struct MailNavigationView: View {
         .onAppear {
             // Consume any deep link stored during cold start (notification tap
             // before MailNavigationView was mounted). Not in the tutorial's
-            // demo: a tap there ends the tutorial (`handleNotificationDeepLink`)
-            // and the restored inbox opens the email.
+            // demo: a tap there ends the tutorial (RootView) and the restored
+            // inbox opens the email.
             guard !TutorialCoordinator.shared.isRunning else { return }
             if let pending = PendingDeepLinkStore.consume() {
                 switch pending {
@@ -788,14 +788,11 @@ struct MailNavigationView: View {
     // MARK: - Deep Link
 
     private func handleNotificationDeepLink(_ userInfo: [AnyHashable: Any]?) {
-        // A notification tap during the guided tutorial ends it (owner V5).
-        // The pending link stays stored: the restored inbox's
-        // MailNavigationView consumes it on appear and opens the email.
-        if TutorialCoordinator.shared.isRunning {
-            BackgroundSyncLogger.logDebug("[MailNav] Notification tap during the tutorial: ending it first")
-            Task { await TutorialCoordinator.shared.end() }
-            return
-        }
+        // A notification tap during the guided tutorial ends it (owner V5;
+        // RootView does, as it is mounted through the tutorial's splash and
+        // finish screens too). The pending link stays stored: the restored
+        // inbox's MailNavigationView consumes it on appear and opens the email.
+        guard !TutorialCoordinator.shared.isRunning else { return }
         // Consume the pending store so onAppear doesn't double-navigate
         _ = PendingDeepLinkStore.consume()
 
