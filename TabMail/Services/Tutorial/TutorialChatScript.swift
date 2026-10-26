@@ -24,6 +24,20 @@ enum TutorialChatScript {
     /// that something is happening, short enough not to feel slow.
     static let editDuration: Duration = .milliseconds(1400)
 
+    /// A chat turn's response: the scripted answer when the turn is one of the
+    /// tutorial's prompts (`script`), the model's otherwise. A scripted turn
+    /// never reaches `model`, so the tutorial makes no AI call.
+    static func response(
+        for script: TutorialCoordinator.ChatPrompt?,
+        invocation: ToolInvocation,
+        model: () async throws -> ChatResponse?
+    ) async throws -> ChatResponse? {
+        guard let script else { return try await model() }
+        return ChatResponse(
+            text: await answer(script, practiceReply: TutorialCoordinator.shared.practiceReplyText, invocation: invocation),
+            thinking: nil)
+    }
+
     /// The answer to `prompt`, as the agent's reply text (`[Email](N)` refs
     /// are resolved for display by the chat, like an AI reply's).
     /// `practiceReply`: the practice reply as written, the template's example.

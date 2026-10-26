@@ -96,7 +96,7 @@ struct PendingAIRefinementCodecTests {
 
 /// Installs a temporary `AppDatabase.shared` (the queue writes through it), so
 /// the suite mutates global state and must be `.serialized`.
-@Suite("BackfillAIQueue — demo re-tags never teach the real action prompt", .serialized)
+@Suite("BackfillAIQueue — demo re-tags never teach the real action prompt", .serialized, .processGlobalState)
 struct BackfillAIQueueDemoRetagTests {
     private func install() throws -> (DatabasePool, URL, AppDatabase?) {
         let directory = FileManager.default.temporaryDirectory
@@ -134,6 +134,41 @@ struct BackfillAIQueueDemoRetagTests {
 
         let queued = try await fixture.0.read { try PendingAIRefinement.fetchCount($0) }
         #expect(queued == 0)
+    }
+
+    /// The pair to the demo case: a real account's re-tag is queued to teach
+    /// its action prompt. Demo mode is held on meanwhile only so the queue
+    /// defers its drain (no AI call in a test); the admission is by account.
+    @Test("A real account's re-tag queues one refinement of its action prompt")
+    @MainActor
+    func realRetagQueuesARefinement() async throws {
+        let fixture = try install()
+        let store = DemoModeStore.shared
+        defer {
+            store._resetForTests()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        store.isActive = true
+        try #require(DemoModeStore.isDemoActive)
+
+        let snapshot = ActionRefineSnapshot(
+            messageStableId: "acc-real:INBOX:42",
+            accountId: "acc-real",
+            subject: "Weekly digest", from: "news@example.com",
+            summaryBlurb: nil, summaryTodos: nil,
+            originalAction: ActionTag.archive.rawValue, userManualTag: ActionTag.delete.rawValue)
+        await BackfillAIQueue.shared.enqueueActionRefine(snapshot)
+        await BackfillAIQueue.shared.cancelAllInFlight()
+
+        let rows = try await fixture.0.read { try PendingAIRefinement.fetchAll($0) }
+        try #require(rows.count == 1)
+        guard rows.count == 1 else { return }
+        #expect(rows[0].dedupKey == snapshot.dedupKey)
+        #expect(rows[0].jobType == BackfillAIJobType.actionRefine.rawValue)
+        let payload = try JSONDecoder().decode(ActionRefineSnapshot.self, from: Data(rows[0].payloadJSON.utf8))
+        #expect(payload.accountId == "acc-real")
+        #expect(payload.userManualTag == ActionTag.delete.rawValue)
     }
 }
 

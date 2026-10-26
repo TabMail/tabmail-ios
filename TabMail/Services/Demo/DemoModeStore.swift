@@ -230,6 +230,13 @@ final class DemoModeStore {
     /// write itself, so it can't go stale before the write.
     nonisolated static func admits(sessionId: String?, admission: Admission?) -> Bool {
         guard sessionId?.hasPrefix("demo:") == true else { return true }
+        return admits(admission)
+    }
+
+    /// Whether the demo run `admission` was captured in is still the current
+    /// one and still open: false once that demo exited, even after the next one
+    /// started, and false for nil (captured outside a demo).
+    nonisolated static func admits(_ admission: Admission?) -> Bool {
         guard let admission else { return false }
         return admissionState.withLock { $0.open && $0.run == admission.run }
     }

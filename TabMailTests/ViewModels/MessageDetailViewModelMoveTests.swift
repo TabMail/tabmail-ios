@@ -378,8 +378,16 @@ struct MessageDetailViewModelMoveTests {
         // archive. Both are synchronous MainActor gestures with no suspension
         // between them, exactly as two taps are — nothing can re-read the row
         // and quietly repair the in-memory header in between.
+        // A re-tag outside the tutorial counts toward its part 1 (TutorialDiscovery).
+        let progressKeys = ["tutorial.version", "tutorial.completedLessons", "tutorial.discoveries"]
+        let savedProgress = progressKeys.map { UserDefaults.standard.object(forKey: $0) }
+        defer { for (key, value) in zip(progressKeys, savedProgress) { UserDefaults.standard.set(value, forKey: key) } }
+        for key in progressKeys { UserDefaults.standard.removeObject(forKey: key) }
+        try #require(!TutorialCoordinator.shared.isRunning)
+        #expect(TutorialProgress().discoveries.isEmpty)
         let target = try #require(vm.message)
         vm.applyManualTag(target, tag: .delete)
+        #expect(TutorialProgress().discoveries.contains(.retag), "the message view's re-tag is recorded as found")
         #expect(vm.message?.actionTag == .delete, "the retag took, so this is the header the undo capture sees")
         #expect(vm.archive(), "archive must be recorded — otherwise no undo entry exists to assert on")
 

@@ -106,6 +106,11 @@ final class TutorialCoordinator {
         let demoStore = DemoModeStore.shared
         // A plain demo is replaced: the tutorial needs the fresh seed.
         if demoStore.isActive { await DemoModeService.shared.exit() }
+        // After that await: another start may have claimed the demo meanwhile
+        // (an ordinary demo entry still minting, or a second tap). Its demo is
+        // not this run's, and `DemoModeService.start` would return without
+        // starting one, leaving the tutorial on with no demo under it.
+        guard !isRunning, !demoStore.isActive, !demoStore.startInProgress else { return }
 
         self.lesson = lesson
         step = .starting
@@ -268,6 +273,18 @@ final class TutorialCoordinator {
 
     /// The template proposal's Create is the next tap in part 2.
     var highlightsTemplateCreate: Bool { step == .makeTemplate }
+
+    /// The practice reply's scripted edit: after the edit's wait, hands the
+    /// declined reply to `apply` (the draft) and records the edit. Nothing
+    /// happens when the demo run it began in has ended meanwhile (Skip, then a
+    /// new run, before the wait is over): the edit belongs to that run alone.
+    func runPracticeReplyEdit(apply: (String) -> Void) async {
+        let admission = DemoModeStore.shared.chatAdmission
+        try? await Task.sleep(for: TutorialChatScript.editDuration)
+        guard DemoModeStore.admits(admission) else { return }
+        apply(TutorialChatScript.declinedReply)
+        practiceReplyEdited()
+    }
 
     /// What the practice reply's draft chat holds before its edit ran.
     static let editPrompt = "Say I can’t make it"

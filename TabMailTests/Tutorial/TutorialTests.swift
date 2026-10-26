@@ -305,6 +305,23 @@ struct TutorialPracticeTests {
         #expect(answer.contains("No template made"))
     }
 
+    @Test("A tutorial prompt is answered by the script and never reaches the model; a typed turn does")
+    func scriptedTurnsNeverReachTheModel() async throws {
+        var modelCalls = 0
+        let scripted = try await TutorialChatScript.response(for: .flights, invocation: ToolInvocation()) {
+            modelCalls += 1
+            return ChatResponse(text: "model", thinking: nil)
+        }
+        #expect(modelCalls == 0, "a scripted turn makes no AI call")
+        #expect(scripted?.text.contains("[Email](") == true, "the scripted flight answer")
+        let typed = try await TutorialChatScript.response(for: nil, invocation: ToolInvocation()) {
+            modelCalls += 1
+            return ChatResponse(text: "model", thinking: nil)
+        }
+        #expect(modelCalls == 1)
+        #expect(typed?.text == "model")
+    }
+
     @Test("The flight answer cites Jordan's email for its pill")
     func flightAnswerCitesTheSource() async {
         let answer = await TutorialChatScript.answer(.flights, practiceReply: nil, invocation: ToolInvocation())
@@ -716,17 +733,34 @@ struct TutorialLifecycleTests {
         // The draft chat holds the edit; Use Suggestion waits for it.
         #expect(coordinator.composeEditPrompt == TutorialCoordinator.editPrompt)
         #expect(!coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
-        coordinator.practiceReplyEdited()
+        var edited: String?
+        await coordinator.runPracticeReplyEdit { edited = $0 }
+        #expect(edited == TutorialChatScript.declinedReply, "the draft receives the declined reply")
+        #expect(coordinator.replyEdited)
         #expect(coordinator.composeEditPrompt == nil, "the edit is not offered again")
         #expect(coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
         let reply = "Count me in."
         coordinator.practiceReplyAuthored(reply)
-        var queued = OutboxMessage(accountId: DemoSeed.demoAccountId, draft: DraftMessage(
-            to: ["priya@company.com"], subject: "Re: Engineering offsite", body: reply))
-        queued.holdUntil = Date().addingTimeInterval(-60)
-        let row = queued
-        try await pool.write { try row.insert($0) }
-        await AccountManager.shared.drainOutbox()
+        // Sent the way compose sends the practice reply: no undo hold, so the
+        // drain queueSend starts sends it at once (a held send would wait out
+        // the hold, longer than `waitFor` waits).
+        let draftId = "tutorial-practice-\(UUID().uuidString)"
+        try await pool.write { db in
+            var draft = Draft(
+                id: draftId, accountId: DemoSeed.demoAccountId,
+                toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Re: Engineering offsite", body: reply, replyToId: nil,
+                isForward: false, editHistoryJSON: nil,
+                createdAt: Date().timeIntervalSince1970,
+                updatedAt: Date().timeIntervalSince1970)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+        let demoAccount = try #require(try await pool.read { try Account.fetchOne($0, key: DemoSeed.demoAccountId) })
+        let queued = try await AccountManager.shared.queueSend(
+            draft: DraftMessage(to: ["priya@company.com"], subject: "Re: Engineering offsite", body: reply),
+            from: demoAccount, draftId: draftId, instanceEpoch: "E1", holdsForUndo: false)
+        #expect(queued.holdUntil == nil, "the practice reply has no undo hold")
         try await waitFor(.makeTemplate)
         #expect(coordinator.highlightsTemplateCreate, "the proposal's Create is the next tap")
         _ = await TutorialChatScript.answer(
@@ -811,6 +845,99 @@ struct TutorialLifecycleTests {
         #expect(!coordinator.completedLessons.contains(.askAnything))
         coordinator.discovered(.inboxChat)
         #expect(coordinator.rowState == nil, "all three found: no sidebar row")
+    }
+
+    /// Starts a run at `lesson` and seeds it, as RootView does.
+    private func startRun(_ lesson: TutorialLesson) async throws {
+        await TutorialCoordinator.shared.start(lesson, hasTabMailSession: false)
+        try await DemoModeService.shared.completeSetup()
+        TutorialCoordinator.shared.seedingFinished()
+    }
+
+    /// The scripted edit waits before it lands. Skip and a new run during
+    /// that wait must not let the old edit complete the new run's step.
+    @Test("An edit begun in an ended run changes neither the draft nor the next run")
+    func editFromAnEndedRunIsDropped() async throws {
+        let fixture = try install()
+        let store = DemoModeStore.shared
+        let coordinator = TutorialCoordinator.shared
+        defer {
+            store._resetForTests()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        try #require(!coordinator.isRunning)
+
+        try await startRun(.reuseReply)
+        try #require(coordinator.step == .replyToPriya)
+        var edited: String?
+        let edit = Task { await coordinator.runPracticeReplyEdit { edited = $0 } }
+        await Task.yield()
+        // Skip, then part 2 again, while the edit waits.
+        await coordinator.end()
+        try await startRun(.reuseReply)
+        try #require(coordinator.step == .replyToPriya)
+        await edit.value
+
+        #expect(edited == nil, "the ended run's edit must not reach a draft")
+        #expect(!coordinator.replyEdited, "the new run's reply is not edited")
+        #expect(coordinator.composeEditPrompt == TutorialCoordinator.editPrompt, "the new run still offers its edit")
+        #expect(!coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
+        await coordinator.end()
+    }
+
+    /// The debug menu offers Replay next to Enter Demo Mode. A Replay while an
+    /// ordinary demo entry is still starting must not take the tutorial on.
+    @Test("Replay while a demo is still starting leaves the tutorial off")
+    func replayWhileADemoStartsIsRefused() async throws {
+        let fixture = try install()
+        let store = DemoModeStore.shared
+        let coordinator = TutorialCoordinator.shared
+        defer {
+            store._resetForTests()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        try #require(!coordinator.isRunning)
+
+        // An ordinary demo start, still minting its token.
+        store.startInProgress = true
+        await coordinator.start(.actOnEmail, hasTabMailSession: true)
+        #expect(!coordinator.isRunning)
+        #expect(!store.isTutorialPractice, "the backend must not stay refused")
+        #expect(coordinator.admits(.other), "real-mail actions must not stay locked")
+
+        // Once that start is over, Replay runs.
+        store.startInProgress = false
+        await coordinator.start(.actOnEmail, hasTabMailSession: true)
+        #expect(coordinator.isRunning)
+        #expect(store.isActive)
+        await coordinator.end()
+    }
+
+    /// RootView reports a demo exit it did not start (sign-in, the debug menu,
+    /// a seeding failure) to the coordinator, which ends the run.
+    @Test("A demo exit from outside the tutorial ends the run")
+    func outsideDemoExitEndsTheRun() async throws {
+        let fixture = try install()
+        let store = DemoModeStore.shared
+        let coordinator = TutorialCoordinator.shared
+        defer {
+            store._resetForTests()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        try #require(!coordinator.isRunning)
+
+        try await startRun(.actOnEmail)
+        try #require(coordinator.isRunning)
+        try #require(!coordinator.admits(.other))
+        await DemoModeService.shared.exit()
+        coordinator.demoDidExit()
+        #expect(!coordinator.isRunning)
+        #expect(coordinator.step == nil)
+        #expect(!store.isTutorialPractice)
+        #expect(coordinator.admits(.other), "real-mail actions are unlocked again")
     }
 
     /// Every way out of the demo (sign-in, the debug menu, a seeding failure)

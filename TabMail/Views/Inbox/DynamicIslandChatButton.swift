@@ -1353,10 +1353,10 @@ struct DynamicIslandChat: View {
         }
         isWorking = true
         Task { @MainActor in
-            try? await Task.sleep(for: TutorialChatScript.editDuration)
-            onDraftUpdate?(nil, TutorialChatScript.declinedReply, nil, nil, nil)
+            await TutorialCoordinator.shared.runPracticeReplyEdit { reply in
+                onDraftUpdate?(nil, reply, nil, nil, nil)
+            }
             isWorking = false
-            TutorialCoordinator.shared.practiceReplyEdited()
         }
     }
 
@@ -2288,13 +2288,8 @@ struct DynamicIslandChat: View {
                 // other mounted pills race for.
                 let invocation = ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey)
                 let response: ChatResponse?
-                if let script {
-                    response = ChatResponse(
-                        text: await TutorialChatScript.answer(
-                            script, practiceReply: TutorialCoordinator.shared.practiceReplyText, invocation: invocation),
-                        thinking: nil)
-                } else {
-                    response = try await AIService.shared.sendChatMessage(
+                response = try await TutorialChatScript.response(for: script, invocation: invocation) {
+                    try await AIService.shared.sendChatMessage(
                         userText: enrichedText,
                         history: history,
                         onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),

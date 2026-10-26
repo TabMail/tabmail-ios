@@ -399,6 +399,16 @@ fix gates at shared chokepoints, not per-tool patches:
   settling its height, and the offset stayed 0 (debug log, 2026-10-25).
   A one-shot scroll on appear is not enough; the simulator happened to
   settle in time.
+- **Review round c1 (Codex, 2026-10-26).** The scripted compose edit
+  belongs to the demo run it began in: `runPracticeReplyEdit` captures
+  `DemoModeStore.chatAdmission` before its wait and applies nothing unless
+  `DemoModeStore.admits(_:)` still holds after it, so Skip and a new run
+  during the wait cannot complete the new run's edit. `start` re-checks,
+  after its exit await, that no other demo start holds the demo
+  (`startInProgress`, `isActive`) before claiming the run, so a Replay
+  during an ordinary demo entry leaves the tutorial off rather than on
+  with no demo under it. A chat turn's script-or-model choice moved into
+  `TutorialChatScript.response(for:invocation:model:)`.
 - **Considered and dropped the same day: consent once.** A variant asked
   the age/terms and AI screens before the AI parts and carried the
   outcome to sign-in (`CarriedConsent`). The owner chose a scripted
