@@ -625,12 +625,14 @@ struct TutorialLifecycleTests {
         }
     }
 
-    private func install() throws -> (DatabasePool, URL, AppDatabase?) {
+    /// `readers` caps the pool's readers (one lets a test hold a read).
+    private func install(readers: Int? = nil) throws -> (DatabasePool, URL, AppDatabase?) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("tutorial-run-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var configuration = Configuration()
         configuration.foreignKeysEnabled = true
+        if let readers { configuration.maximumReaderCount = readers }
         let pool = try DatabasePool(
             path: directory.appendingPathComponent("test.sqlite").path,
             configuration: configuration)
@@ -938,6 +940,225 @@ struct TutorialLifecycleTests {
         #expect(coordinator.step == nil)
         #expect(!store.isTutorialPractice)
         #expect(coordinator.admits(.other), "real-mail actions are unlocked again")
+    }
+
+    /// The tutorial starts offline (no demo token) and its mail is local, so
+    /// the practice reply must reach Sent with no network. A real account's
+    /// send queued alongside it still waits for the network.
+    @Test("Offline, the practice reply reaches Sent and moves part 2 on; a real send waits for the network")
+    func practiceReplySendsOffline() async throws {
+        let fixture = try install()
+        let pool = fixture.0
+        let store = DemoModeStore.shared
+        let coordinator = TutorialCoordinator.shared
+        let realAccountId = "acc-offline-\(UUID().uuidString)"
+        let realProvider = MockEmailProvider()
+        let wasConnected = NetworkMonitor.checkConnected()
+        defer {
+            NetworkMonitor.setConnectedForTesting(wasConnected)
+            Task { await AccountManager.shared.unregisterProviderForTesting(accountId: realAccountId) }
+            store._resetForTests()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        try #require(!coordinator.isRunning)
+
+        try await startRun(.reuseReply)
+        try #require(coordinator.step == .replyToPriya)
+        try await pool.write { db in
+            var account = Account(emailAddress: "real@example.com", displayName: "Real", provider: .imap)
+            account.id = realAccountId
+            try account.insert(db)
+        }
+        // The test host's RootView starts the real path monitor for each new
+        // database, and its first update sets the cached value back to
+        // connected; a drain decides online or offline once, when it starts.
+        // Hold offline until that update has landed and no drain begun online
+        // is still running.
+        let heldOffline = await eventually {
+            NetworkMonitor.setConnectedForTesting(false)
+            try? await Task.sleep(for: .milliseconds(250))
+            let draining = await AccountManager.shared.isDrainingOutbox
+            return !NetworkMonitor.checkConnected() && !draining
+        }
+        try #require(heldOffline)
+        await AccountManager.shared.registerProviderForTesting(accountId: realAccountId, provider: realProvider)
+        var realSend = OutboxMessage(accountId: realAccountId, draft: DraftMessage(
+            to: ["someone@example.com"], subject: "Real mail", body: "Sent once online."))
+        realSend.holdUntil = Date().addingTimeInterval(-60)
+        let realRow = realSend
+        try await pool.write { try realRow.insert($0) }
+        let draftId = "tutorial-practice-\(UUID().uuidString)"
+        try await pool.write { db in
+            var draft = Draft(
+                id: draftId, accountId: DemoSeed.demoAccountId,
+                toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Re: Engineering offsite", body: "Count me in.", replyToId: nil,
+                isForward: false, editHistoryJSON: nil,
+                createdAt: Date().timeIntervalSince1970,
+                updatedAt: Date().timeIntervalSince1970)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+        let demoAccount = try #require(try await pool.read { try Account.fetchOne($0, key: DemoSeed.demoAccountId) })
+        let queued = try await AccountManager.shared.queueSend(
+            draft: DraftMessage(to: ["priya@company.com"], subject: "Re: Engineering offsite", body: "Count me in."),
+            from: demoAccount, draftId: draftId, instanceEpoch: "E1", holdsForUndo: false)
+        try await waitFor(.makeTemplate)
+        // queueSend's own drain sends it; the row leaves once that send finalizes.
+        let practiceLeft = try await eventually {
+            try await pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId) } == nil
+        }
+        #expect(practiceLeft, "the practice reply left the outbox")
+        #expect(!NetworkMonitor.checkConnected(), "the network stayed off through the drain")
+        let waiting = try await pool.read { try OutboxMessage.fetchOne($0, key: realRow.id) }
+        #expect(waiting?.status == OutboxStatus.queued.rawValue, "the real send waits for the network")
+        #expect(await realProvider.sentDrafts.isEmpty, "nothing was sent through the real account offline")
+
+        // Back online, the same real row sends (a drain still running returns
+        // the next one at once, so drain until it has).
+        NetworkMonitor.setConnectedForTesting(true)
+        let realSent = await eventually {
+            await AccountManager.shared.drainOutbox()
+            return await !realProvider.sentDrafts.isEmpty
+        }
+        #expect(realSent)
+        #expect(await realProvider.sentDrafts.map(\.subject) == ["Real mail"])
+        await coordinator.end()
+    }
+
+    /// Polls `condition` for up to five seconds.
+    private func eventually(_ condition: () async throws -> Bool) async rethrows -> Bool {
+        for _ in 0..<200 {
+            if try await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        return false
+    }
+
+    /// A demo only turns on over a wiped memory index. When the last demo's
+    /// memory turns cannot be deleted, the start fails: the tutorial must end
+    /// up off and unlocked, not hold the failed run, and a later start runs.
+    @Test("A failed start leaves the tutorial off and unlocked, and the next start runs")
+    func failedStartRollsBackAndRetries() async throws {
+        let fixture = try install()
+        let store = DemoModeStore.shared
+        let coordinator = TutorialCoordinator.shared
+        await MemoryIndex.shared._testReset()
+        await MemorySearchCache.shared.reset()
+        let memDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tutorial-memory-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: memDir, withIntermediateDirectories: true)
+        var memConfig = Configuration()
+        memConfig.prepareDatabase { db in
+            if let sqliteConn = db.sqliteConnection {
+                _ = tabmail_register_sqlite_vec_on_db(UnsafeMutableRawPointer(sqliteConn))
+            }
+            try db.execute(sql: "PRAGMA journal_mode = WAL")
+        }
+        let memPool = try DatabasePool(path: memDir.appendingPathComponent("memory.db").path, configuration: memConfig)
+        try await MemoryIndex.shared._testInstallPool(memPool)
+        defer {
+            store._resetForTests()
+            Task {
+                await MemoryIndex.shared._testReset()
+                await MemorySearchCache.shared.reset()
+                TestDatabaseTeardown.retire(pool: memPool, directory: memDir)
+            }
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        try #require(!coordinator.isRunning)
+        let progressBefore = coordinator.completedLessons
+
+        // A turn an earlier demo left behind, which cannot be deleted.
+        await DemoRunFixture.indexTurn(
+            chatHistoryId: "left-over", sessionId: "demo:left-over", role: "user",
+            dateMs: Int64(Date().timeIntervalSince1970 * 1000), text: "left over")
+        try #require(await MemoryIndex.shared.knownChatHistoryIds().contains("left-over"))
+        try await memPool.write { db in
+            try db.execute(sql: "CREATE TRIGGER refuse_demo_wipe BEFORE DELETE ON memory_meta BEGIN SELECT RAISE(ABORT, 'refused'); END")
+        }
+
+        await coordinator.start(.actOnEmail, hasTabMailSession: false)
+        #expect(coordinator.startError != nil, "the failure is shown")
+        #expect(!coordinator.isRunning, "the failed run is not kept")
+        #expect(coordinator.step == nil)
+        #expect(!store.isActive, "no demo runs over the old turns")
+        #expect(!store.isTutorialPractice, "the backend is not left refused")
+        #expect(coordinator.admits(.other), "real-mail actions are not left locked")
+        #expect(coordinator.completedLessons == progressBefore, "progress is untouched")
+
+        // Once the wipe works, the next start runs.
+        try await memPool.write { db in try db.execute(sql: "DROP TRIGGER refuse_demo_wipe") }
+        await coordinator.start(.actOnEmail, hasTabMailSession: false)
+        #expect(coordinator.isRunning)
+        #expect(store.isActive)
+        #expect(!(await MemoryIndex.shared.knownChatHistoryIds().contains("left-over")))
+        await coordinator.end()
+    }
+
+    /// The demo can end while its setup is suspended: a notification tap ends
+    /// the tutorial during the seeding splash, which also runs next to a live
+    /// account. The setup must not carry on after that exit: its prompt
+    /// overlay would write the bundled defaults over the real prompts.
+    @Test("A demo that ends during its setup leaves the real prompts and providers alone")
+    func exitDuringSetupKeepsRealPrompts() async throws {
+        let fixture = try install(readers: 1)
+        let pool = fixture.0
+        let store = DemoModeStore.shared
+        let prompts = PromptStore.shared
+        let kbKey = "user_prompts:user_kb.md"
+        let savedKB = prompts.rawKB
+        defer {
+            store._resetForTests()
+            prompts.rawKB = savedKB
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        let realKB = "- real kb \(UUID().uuidString)"
+        prompts.rawKB = realKB
+        let realTemplateIds = prompts.templates.map(\.id)
+
+        try await DemoModeService.shared.start(mintToken: false)
+        try #require(store.isActive)
+        // Park the setup at its first read: the pool's one reader is held.
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        await withCheckedContinuation { (held: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                _ = try? pool.read { _ in
+                    held.resume()
+                    release.wait()
+                }
+                finished.signal()
+            }
+        }
+        let setup = Task { try await DemoModeService.shared.completeSetup() }
+        let seeded = try await eventually {
+            try await pool.write { try Account.fetchOne($0, key: DemoSeed.demoAccountId) } != nil
+        }
+        try #require(seeded, "the setup seeded, then waits on its read")
+
+        // The demo ends while the setup waits.
+        await DemoModeService.shared.exit()
+        try #require(!store.isActive)
+        release.signal()
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().async {
+                finished.wait()
+                done.resume()
+            }
+        }
+        try await setup.value
+
+        #expect(prompts.rawKB == realKB, "the real KB is not replaced")
+        #expect(UserDefaults.standard.string(forKey: kbKey) == realKB, "the stored real KB is not replaced")
+        #expect(prompts.templates.map(\.id) == realTemplateIds, "the real templates are not replaced")
+        #expect(await AccountManager.shared.provider(accountId: DemoSeed.demoAccountId) == nil,
+                "no demo provider is left registered")
+        let demoAccount = try await pool.read { try Account.fetchOne($0, key: DemoSeed.demoAccountId) }
+        #expect(demoAccount == nil, "no demo mail is left behind")
     }
 
     /// Every way out of the demo (sign-in, the debug menu, a seeding failure)

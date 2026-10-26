@@ -409,6 +409,18 @@ fix gates at shared chokepoints, not per-tool patches:
   during an ordinary demo entry leaves the tutorial off rather than on
   with no demo under it. A chat turn's script-or-model choice moved into
   `TutorialChatScript.response(for:invocation:model:)`.
+- **Review round c2 (Codex, 2026-10-26).** The tutorial starts offline,
+  so its practice reply must reach Sent with no network: `drainOutbox`
+  no longer skips the demo account's rows when offline (its provider is
+  local); every other account's rows still wait for the network. Tests
+  added for that and for a failed start's rollback and retry.
+  `DemoModeService.completeSetup` captures its demo run and stops after
+  any suspension once that run has ended: a demo exit during the seeding
+  splash (a notification tap ends the tutorial there, also next to a live
+  account) let it go on to `enterDemoOverlay` with the demo off, which
+  writes the bundled defaults over the real prompts and syncs them. The five
+  tutorial hooks that live in SwiftUI views have no committed test; the
+  owner accepted that as `IOS-TEST-012` rather than adding a UI test.
 - **Considered and dropped the same day: consent once.** A variant asked
   the age/terms and AI screens before the AI parts and carried the
   outcome to sign-in (`CarriedConsent`). The owner chose a scripted

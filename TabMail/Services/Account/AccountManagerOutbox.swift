@@ -363,10 +363,15 @@ extension AccountManager {
             BackgroundSyncLogger.logDebug("[Outbox] Skipped drain — already draining")
             return
         }
-        guard NetworkMonitor.checkConnected() else {
+        // The demo account's provider is local (`DemoProvider`, no server), so
+        // its sends drain offline: the tutorial's practice reply must reach
+        // Sent with no network (ADR-IOS-038). Every other account waits for it.
+        let online = NetworkMonitor.checkConnected()
+        guard online || workQueues[DemoSeed.demoAccountId] != nil else {
             BackgroundSyncLogger.logDebug("[Outbox] Skipped drain — offline")
             return
         }
+        let reachable: (String) -> Bool = { online || $0 == DemoSeed.demoAccountId }
         isDrainingOutbox = true
         defer { isDrainingOutbox = false }
 
@@ -386,7 +391,7 @@ extension AccountManager {
         }
 
         // Phase 1: Retry pending Sent folder appends (sent but not yet appended)
-        await drainPendingSentAppends()
+        await drainPendingSentAppends(reachable: reachable)
 
         // Phase 2: Serial drain of ready (past-hold) queued messages.
         var attempted: Set<String> = []
@@ -403,6 +408,7 @@ extension AccountManager {
             }) ?? []
             guard let msg = queuedAll.first(where: {
                 !attempted.contains($0.id) &&
+                reachable($0.accountId) &&
                 ($0.holdUntil ?? .distantPast) <= Date() &&
                 workQueues[$0.accountId] != nil
             }) else { break }
@@ -1028,7 +1034,7 @@ extension AccountManager {
 
     /// Drain pending Sent folder appends — messages that were sent via SMTP but whose
     /// IMAP APPEND to the Sent folder didn't complete (crash, connection drop, etc.).
-    private func drainPendingSentAppends() async {
+    private func drainPendingSentAppends(reachable: (String) -> Bool) async {
         let pendingMessages: [OutboxMessage]
         do {
             pendingMessages = try await dbPool.read { db in
@@ -1045,7 +1051,7 @@ extension AccountManager {
         guard !pendingMessages.isEmpty else { return }
         BackgroundSyncLogger.logDebug("[Outbox] Retrying \(pendingMessages.count) pending Sent folder appends")
 
-        for msg in pendingMessages {
+        for msg in pendingMessages where reachable(msg.accountId) {
             guard let queue = workQueues[msg.accountId] else {
                 BackgroundSyncLogger.logDebug("[Outbox] No provider for \(msg.accountId) — skipping sent append")
                 continue

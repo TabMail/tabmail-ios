@@ -121,6 +121,13 @@ final class DemoModeService {
     /// session are no-ops.
     func completeSetup() async throws {
         guard DemoModeStore.shared.isActive else { return }
+        // The demo run this setup is for. The demo can end while setup is
+        // suspended (a notification tap ends the tutorial during the splash,
+        // shown next to a live account too): each step after a suspension runs
+        // only while that run is still open. Above all the prompt overlay,
+        // which with the demo off would write the bundled defaults over the
+        // real prompts and sync them to the user's other devices.
+        let run = DemoModeStore.shared.chatAdmission
 
         // Note: the one-time destructive cached-mail resets (StartupMigrations)
         // already ran synchronously at DB-open (AppDatabase.init), long before the
@@ -130,6 +137,7 @@ final class DemoModeService {
         // Seed messages, folders, calendar events. The fixed demo account id is
         // reopened only after the replacement row commits successfully.
         await AccountFieldPersistenceStore.production.discardAccount(DemoSeed.demoAccountId)
+        guard DemoModeStore.admits(run) else { return }
         do {
             try DemoSeed.seed()
             AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
@@ -141,6 +149,7 @@ final class DemoModeService {
 
         // Index seeded headers + bodies in FTS so search works in demo.
         await indexSeededFTS()
+        guard DemoModeStore.admits(run) else { return }
 
         // Register provider mocks. These plug into the existing
         // EmailProvider / CalendarProvider lookups in AccountManager.
@@ -151,6 +160,7 @@ final class DemoModeService {
             calendar: calendar,
             accountId: DemoSeed.demoAccountId
         )
+        guard DemoModeStore.admits(run) else { return }
 
         // Open the AI subscription gate when
         // the user enabled AI in the demo consent gate. Otherwise the chat
