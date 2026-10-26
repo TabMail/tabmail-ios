@@ -158,4 +158,22 @@ struct EmailQuoteWidthTests {
         #expect(indent.border == 0, "an indented paragraph gets no quote bar")
         #expect(indent.marginLeft == 40, "an indented paragraph keeps the sender's indent")
     }
+
+    @Test("Quotes inside a Gmail Indent paragraph count their levels from the first real quote")
+    func gmailIndentDoesNotUseUpAQuoteLevel() async throws {
+        let depth = QuoteLevelConfig.maxIndentedDepth
+        let quotes = Self.nested(depth).replacingOccurrences(of: "<p id=\"top\">Top</p>", with: "")
+        let webView = await render("<p id=\"top\">Top</p>"
+            + #"<blockquote style="margin:0 0 0 40px;border:none;padding:0px">Indented paragraph<br>"# + quotes + "</blockquote>")
+        let g = try await geometry(webView)
+        #expect(g.quotes.count == depth + 1)
+        guard g.quotes.count == depth + 1 else { return }
+        #expect(g.quotes[0].border == 0 && g.quotes[0].marginLeft == 40, "the indent keeps its style and no bar")
+        for level in 1...depth {
+            let quote = g.quotes[level]
+            #expect(quote.border == Double(QuoteLevelConfig.barWidth), "quote level \(level) keeps its bar")
+            #expect(quote.color == Self.rgb(QuoteLevelConfig.barColors[(level - 1) % QuoteLevelConfig.barColors.count]),
+                    "quote level \(level) colour \(quote.color)")
+        }
+    }
 }
