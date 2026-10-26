@@ -102,28 +102,33 @@ struct TutorialLockedToast: View {
     }
 }
 
-/// A pulsing accent ring with a soft glow around the control the step asks
-/// for: the collapsed Chat pill (owner 2026-10-21: the pill was not
-/// highlighted) and the action tag to tap or change (owner 2026-10-25: "blink
-/// or a little bit of glow").
-struct TutorialGlowRing<S: Shape>: View {
+/// The hint on the control a step asks for: an accent ring with a second ring
+/// rippling out from it, over and over, so the hint moves and catches the eye
+/// (owner 2026-10-25: pulsing, not a static or glowing ring).
+struct TutorialPulseRing<S: Shape>: View {
     let shape: S
     var lineWidth: CGFloat = 3
     /// How far the ring sits outside the control.
     var outset: CGFloat = 4
-
-    @State private var glowing = false
+    /// How far the ripple travels past the ring before it fades out.
+    var rippleTravel: CGFloat = 10
 
     var body: some View {
-        shape
-            .stroke(Theme.accent, lineWidth: lineWidth)
-            .padding(-outset)
-            .shadow(color: Theme.accent.opacity(glowing ? 0.8 : 0.25), radius: glowing ? 12 : 4)
-            .allowsHitTesting(false)
-            .onAppear {
-                withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
-                    glowing = true
+        ZStack {
+            shape
+                .stroke(Theme.accent, lineWidth: lineWidth)
+                .padding(-outset)
+            shape
+                .stroke(Theme.accent, lineWidth: lineWidth)
+                .phaseAnimator([false, true]) { ripple, out in
+                    ripple
+                        .padding(-(outset + (out ? rippleTravel : 0)))
+                        .opacity(out ? 0 : 0.9)
+                } animation: { out in
+                    // Out over the beat, then straight back to the ring.
+                    out ? .easeOut(duration: 1.1) : nil
                 }
-            }
+        }
+        .allowsHitTesting(false)
     }
 }

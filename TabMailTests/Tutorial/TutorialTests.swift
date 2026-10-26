@@ -97,7 +97,7 @@ struct TutorialCoachContentTests {
     typealias Step = TutorialCoordinator.Step
 
     private static let hosts: [TutorialCoachHost] = [
-        .inbox, .chat, .compose(showingSuggestion: true), .compose(showingSuggestion: false), .message,
+        .inbox, .chat, .compose(showingSuggestion: true), .compose(showingSuggestion: false), .message, .actionRules,
     ]
 
     private static let allSteps: [Step] = [
@@ -128,28 +128,41 @@ struct TutorialCoachContentTests {
         }
     }
 
-    @Test("A finished part says so and offers Next or a stop; the last one leads to the recap")
+    /// Owner 2026-10-25: forward buttons say "Next", and no card offers a
+    /// stop (Skip tutorial is always at the top right).
+    @Test("A finished part says so and offers what it made plus Next; the last one leads to the recap")
     func partEnds() throws {
-        for (step, lesson) in [(Step.actOnEmailDone, TutorialLesson.actOnEmail), (.reuseReplyDone, .reuseReply)] {
+        let ends: [(Step, TutorialLesson, TutorialCoachContent.Action)] = [
+            (.actOnEmailDone, .actOnEmail, .seeRule), (.reuseReplyDone, .reuseReply, .seeTemplate),
+        ]
+        for (step, lesson, see) in ends {
             let card = try #require(TutorialCoachContent.make(step: step, lesson: lesson, host: .inbox, flightsAsked: false))
             #expect(card.progressLine.hasSuffix("· done"))
-            let actions = card.buttons.map(\.action)
-            #expect(actions.contains(.nextLesson) && actions.contains(.finishLater))
+            #expect(card.buttons.map(\.action) == [see, .nextLesson])
         }
+        let received = try #require(TutorialCoachContent.make(
+            step: .receiptArchived, lesson: .actOnEmail, host: .inbox, flightsAsked: false))
+        #expect(received.buttons.map(\.label) == ["Next"])
+        let rule = try #require(TutorialCoachContent.make(
+            step: .actOnEmailDone, lesson: .actOnEmail, host: .actionRules, flightsAsked: false))
+        #expect(rule.buttons.isEmpty, "the sheet closes with Done")
         let last = try #require(TutorialCoachContent.make(step: .moreToAsk, lesson: .askAnything, host: .chat, flightsAsked: true))
         #expect(last.buttons.map(\.action) == [.showRecap])
         #expect(!last.examples.isEmpty)
     }
 
-    @Test("Compose asks for Use Suggestion first, then Send")
+    @Test("Compose asks for the Edit first, then Use Suggestion, then Send")
     func composeFollowsTheSuggestion() throws {
-        let before = try #require(TutorialCoachContent.make(
-            step: .replyToPriya, lesson: .reuseReply, host: .compose(showingSuggestion: true), flightsAsked: false))
-        let after = try #require(TutorialCoachContent.make(
-            step: .replyToPriya, lesson: .reuseReply, host: .compose(showingSuggestion: false), flightsAsked: false))
-        #expect(before.message.contains("Use Suggestion"))
-        #expect(after.title.contains("Send"))
+        func compose(showingSuggestion: Bool, edited: Bool) throws -> TutorialCoachContent {
+            try #require(TutorialCoachContent.make(
+                step: .replyToPriya, lesson: .reuseReply, host: .compose(showingSuggestion: showingSuggestion),
+                flightsAsked: false, replyEdited: edited))
+        }
+        #expect(try compose(showingSuggestion: true, edited: false).message.contains("Edit"))
+        #expect(try compose(showingSuggestion: true, edited: true).message.contains("Use Suggestion"))
+        #expect(try compose(showingSuggestion: false, edited: true).title.contains("Send"))
     }
+
 
     @Test("The chat input is filled in only at the chat steps, and the flight question only until it was asked")
     func chatPrompts() {
@@ -170,7 +183,7 @@ struct TutorialCoachContentTests {
         for lesson in TutorialLesson.allCases {
             for step in Self.allSteps {
                 for flightsAsked in [false, true] {
-                    for host in [TutorialCoachHost.inbox, .message] {
+                    for host in [TutorialCoachHost.inbox, .message, .actionRules] {
                         guard let card = TutorialCoachContent.make(
                             step: step, lesson: lesson, host: host, flightsAsked: flightsAsked) else { continue }
                         #expect(!(card.title + " " + card.message).contains("Tap Send"), "\(step) on \(host)")
@@ -211,7 +224,9 @@ struct TutorialCoachContentTests {
             "\(Step.replyToPriya) tagTap \(fixture.priyaOffsite)",
             "\(Step.retagDailyTech) retag \(fixture.dailyTech)",
         ]
-        let gestures: [(TutorialCoordinator.MailGesture, String)] = [(.tagTap, "tagTap"), (.retag, "retag"), (.other, "other")]
+        let gestures: [(TutorialCoordinator.MailGesture, String)] = [
+            (.tagTap, "tagTap"), (.retag, "retag"), (.useSuggestion, "useSuggestion"), (.other, "other"),
+        ]
         let ids: [String?] = [fixture.receipt, fixture.dailyTech, fixture.priyaOffsite, fixture.jordanFlights, nil]
         var admitted: Set<String> = []
         for step in Self.allSteps.map(Optional.some) + [nil] {
@@ -222,6 +237,11 @@ struct TutorialCoachContentTests {
             }
         }
         #expect(admitted == allowed)
+        // Use Suggestion comes after the practice reply's edit, never before.
+        #expect(TutorialCoordinator.allows(.useSuggestion, messageId: fixture.priyaOffsite, step: .replyToPriya, replyEdited: true))
+        for step in Self.allSteps where step != .replyToPriya {
+            #expect(!TutorialCoordinator.allows(.useSuggestion, messageId: fixture.priyaOffsite, step: step, replyEdited: true))
+        }
     }
 
     @Test("Every card says which part it belongs to, as \"n of 3\", and no card says \"lesson\"")
@@ -666,6 +686,11 @@ struct TutorialLifecycleTests {
         }
         try await waitFor(.actOnEmailDone)
         #expect(coordinator.completedLessons.contains(.actOnEmail))
+        // "See rule": a sample rule, written only to the demo's prompt overlay.
+        #expect(PromptStore.shared.deleteRules.contains(TutorialCoordinator.sampleDeleteRule))
+        #expect(!coordinator.showsActionRule)
+        coordinator.showActionRule()
+        #expect(coordinator.showsActionRule)
 
         // Part 2: the reply reaches Sent, then Create saves the template.
         coordinator.nextLesson()
@@ -674,6 +699,12 @@ struct TutorialLifecycleTests {
         // and the seeded Sent folder is not empty.
         try await Task.sleep(for: .seconds(1))
         #expect(coordinator.step == .replyToPriya, "the step waits for the reply to reach Sent")
+        // The draft chat holds the edit; Use Suggestion waits for it.
+        #expect(coordinator.composeEditPrompt == TutorialCoordinator.editPrompt)
+        #expect(!coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
+        coordinator.practiceReplyEdited()
+        #expect(coordinator.composeEditPrompt == nil, "the edit is not offered again")
+        #expect(coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
         let reply = "Count me in."
         coordinator.practiceReplyAuthored(reply)
         var queued = OutboxMessage(accountId: DemoSeed.demoAccountId, draft: DraftMessage(
@@ -698,8 +729,10 @@ struct TutorialLifecycleTests {
         coordinator.nextLesson()
         #expect(coordinator.step == .askFlights)
         #expect(coordinator.chatPrompt == .flights)
+        #expect(!coordinator.highlightsEmailReference, "no answer to point at yet")
         coordinator.chatPromptSent(.flights)
         #expect(coordinator.chatPrompt == nil, "the asked question is not offered again")
+        #expect(coordinator.highlightsEmailReference)
         coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.receipt)
         #expect(coordinator.step == .askFlights, "only Jordan's email completes the part")
         coordinator.discovered(.inboxChat)
@@ -707,6 +740,7 @@ struct TutorialLifecycleTests {
         #expect(TutorialProgress().discoveries.isEmpty)
         coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
         #expect(coordinator.step == .askAnythingDone)
+        #expect(!coordinator.highlightsEmailReference)
         #expect(coordinator.completedLessons.contains(.askAnything))
         coordinator.showMoreToAsk()
         #expect(coordinator.step == .moreToAsk)
@@ -720,6 +754,9 @@ struct TutorialLifecycleTests {
         #expect(coordinator.step == nil)
         #expect(!store.isActive)
         #expect(!store.isTutorialPractice, "a signed-in user's AI calls would stay refused until relaunch")
+        #expect(!coordinator.showsActionRule)
+        #expect(!PromptStore.shared.deleteRules.contains(TutorialCoordinator.sampleDeleteRule),
+                "the sample rule leaves with the demo")
         #expect(coordinator.admits(.other), "outside the tutorial every mail action runs")
         #expect(coordinator.lockedNotice == nil)
     }

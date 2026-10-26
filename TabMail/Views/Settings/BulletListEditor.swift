@@ -10,6 +10,8 @@ import SwiftUI
 struct BulletListEditor: View {
     @Binding var text: String
     var placeholder: String = "Add item..."
+    /// An item the guided tutorial points at (its sample action rule).
+    var highlightedItem: String?
 
     @State private var newItem = ""
     @FocusState private var fieldFocused: Bool
@@ -30,6 +32,12 @@ struct BulletListEditor: View {
     var body: some View {
         ForEach(Array(items.enumerated()), id: \.offset) { index, item in
             Text(item)
+                .padding(.horizontal, item == highlightedItem ? 6 : 0)
+                .overlay {
+                    if item == highlightedItem {
+                        TutorialPulseRing(shape: RoundedRectangle(cornerRadius: 6), lineWidth: 2, outset: 2)
+                    }
+                }
                 .swipeActions(edge: .trailing) {
                     Button(role: .destructive) {
                         var current = items

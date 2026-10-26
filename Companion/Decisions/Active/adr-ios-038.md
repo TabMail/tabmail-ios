@@ -272,7 +272,7 @@ fix gates at shared chokepoints, not per-tool patches:
   unfinished part restarts from its beginning. The full-screen welcome
   is armed only by the fresh-install branch of
   `TabMailApp.prepareSessionStorageForLaunch`; everyone else gets the
-  sidebar row. Finish, Skip and Finish later all end in
+  sidebar row. Finish and Skip tutorial both end in
   `DemoModeService.exit()`; the run state is cleared only after it, so
   the plain demo's consent screens never flash in between. Copy says
   "1 of 3", never "lesson" (owner).
@@ -348,7 +348,31 @@ fix gates at shared chokepoints, not per-tool patches:
   write after a version bump drops the older version's progress first).
   Ignored while the tutorial runs: its own steps complete their parts.
   The step's target tag and the Chat pill carry a pulsing glow ring
-  (`TutorialGlowRing`, owner: "blink or a little bit of glow").
+  (`TutorialGlowRing`, owner: "blink or a little bit of glow"; replaced
+  by the moving ring below the same day).
+- **Smoke-test round 3 (owner 2026-10-25).** Hints move: every hint is
+  `TutorialPulseRing`, a steady outline plus a ripple that grows outward
+  and fades ("something that's moving is more likely to catch
+  attention"). Rings: the step's tag, the Chat pill, the chat Send
+  button, the compose Send and Use Suggestion buttons, the email pill
+  in the part 3 answer and its Open Email link. No "Finish later" on
+  any card (Skip tutorial is always at the top right); part ends show
+  See rule / See template and Next. Part 1's retag adds a sample delete
+  rule to the demo overlay's `deleteRules` (dropped on exit with the
+  overlay) and See rule opens Settings' Action Classification screen
+  with that rule ringed and a coach card saying it is a sample. The
+  screen shows the rules only: the thresholds (real settings, synced),
+  Compact now (an AI call) and Reset are hidden. No AI, nothing
+  persisted. Part 2's compose step shows an Edit prompt ("Say I
+  can't make it") in the read-only chat input; Send shows the working
+  pulse for a short delay (`TutorialChatScript.editDuration`) and swaps
+  the suggestion for a scripted decline through the compose's own
+  `onDraftUpdate` path; Use Suggestion stays locked until then
+  (`MailGesture.useSuggestion`). The template is "Polite decline".
+  The compose cover did not re-run its coach card when the edit landed
+  (measured with debug logs: the inbox card re-ran, the compose card did
+  not, while ComposeView itself redrew), so the compose card's identity
+  follows `replyEdited` (`.id`).
 - **Considered and dropped the same day: consent once.** A variant asked
   the age/terms and AI screens before the AI parts and carried the
   outcome to sign-in (`CarriedConsent`). The owner chose a scripted

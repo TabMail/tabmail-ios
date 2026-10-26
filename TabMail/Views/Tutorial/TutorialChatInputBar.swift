@@ -10,13 +10,14 @@ import SwiftUI
 /// over the microphone says that in real use you speak or type. Chats with
 /// nothing to send here (a message's or a draft's) show a dimmed bar.
 struct TutorialChatInputBar: View {
-    let prompt: TutorialCoordinator.ChatPrompt?
+    /// The filled-in text, or nil when this step has nothing to send here.
+    let prompt: String?
     let isWorking: Bool
-    let send: (TutorialCoordinator.ChatPrompt) -> Void
+    let send: () -> Void
 
     /// The prompt whose tooltip was closed (by sending it or tapping it), so
     /// the tooltip never covers the answer that follows.
-    @State private var tooltipClosedFor: TutorialCoordinator.ChatPrompt?
+    @State private var tooltipClosedFor: String?
 
     private var showsTooltip: Bool {
         prompt != nil && tooltipClosedFor != prompt && !isWorking
@@ -44,16 +45,16 @@ struct TutorialChatInputBar: View {
                 .frame(width: 28, height: 28)
                 .accessibilityHidden(true)
 
-            Text(prompt?.rawValue ?? "Chat follows the tutorial steps")
+            Text(prompt ?? "Chat follows the tutorial steps")
                 .foregroundStyle(prompt == nil ? Theme.textSecondary : Theme.textPrimary)
                 .lineLimit(1...6)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .accessibilityIdentifier("tutorial-chat-input")
 
             Button {
-                guard let prompt else { return }
+                guard prompt != nil else { return }
                 tooltipClosedFor = prompt
-                send(prompt)
+                send()
             } label: {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.title2)
@@ -62,6 +63,11 @@ struct TutorialChatInputBar: View {
                     .contentShape(Rectangle())
             }
             .disabled(prompt == nil || isWorking)
+            .overlay {
+                if prompt != nil && !isWorking {
+                    TutorialPulseRing(shape: Circle(), outset: -4)
+                }
+            }
             .accessibilityLabel("Send")
             .accessibilityIdentifier("tutorial-chat-send")
         }

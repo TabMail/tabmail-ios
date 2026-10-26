@@ -1333,6 +1333,10 @@ struct ComposeView: View {
                     }
                     if isTutorialPracticeReply {
                         TutorialCoachView(host: .compose(showingSuggestion: showingSuggestion))
+                            // The cover does not re-run this card when the edit
+                            // lands (measured: only the inbox card did), while
+                            // compose itself redraws: a new card per edit state.
+                            .id(TutorialCoordinator.shared.replyEdited)
                             .padding(.vertical, 8)
                     }
 
@@ -1562,6 +1566,12 @@ struct ComposeView: View {
                                     outstandingCarryCount: attachmentCarryGate.outstanding,
                                     hasUnacknowledgedFailure:
                                         attachmentCarryGate.hasUnacknowledgedFailure) != .ready)
+                            .overlay {
+                                // Guided tutorial: Send is the practice reply's last step.
+                                if isTutorialPracticeReply && !showingSuggestion {
+                                    TutorialPulseRing(shape: Capsule(), outset: 8)
+                                }
+                            }
                     }
                 }
                 .padding(.horizontal, 16)
@@ -2049,6 +2059,7 @@ struct ComposeView: View {
                 Spacer()
 
                 Button {
+                    guard TutorialCoordinator.shared.admits(.other) else { return }
                     withAnimation(.easeOut(duration: 0.2)) {
                         showingSuggestion = false
                     }
@@ -2060,6 +2071,9 @@ struct ComposeView: View {
                 .buttonStyle(.plain)
 
                 Button {
+                    // Guided tutorial: after the edit step, not before it.
+                    guard TutorialCoordinator.shared.admits(
+                        .useSuggestion, accountId: replyTo?.accountId, messageId: replyTo?.messageId) else { return }
                     withAnimation(.easeInOut(duration: 0.35)) {
                         acceptVisibleSuggestionIfOffered()
                     }
@@ -2072,6 +2086,11 @@ struct ComposeView: View {
                         .padding(.vertical, 6)
                         .background(Theme.accent)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay {
+                            if isTutorialPracticeReply && TutorialCoordinator.shared.replyEdited {
+                                TutorialPulseRing(shape: RoundedRectangle(cornerRadius: 8), lineWidth: 2, outset: 3)
+                            }
+                        }
                 }
                 .buttonStyle(.plain)
             }

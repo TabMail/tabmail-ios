@@ -54,6 +54,10 @@ final class TutorialCoordinator {
 
     /// The flight question was sent: the chat card moves on to "Check the original".
     private(set) var flightsAsked = false
+    /// The practice reply's scripted edit ran: compose moves on to Use Suggestion.
+    private(set) var replyEdited = false
+    /// "See rule" opened the Action Classification sheet with the sample rule.
+    var showsActionRule = false
     /// The template the practice reply became, for "See template".
     private(set) var savedTemplateId: String?
     /// The text of the practice reply as written in compose (no quote or
@@ -123,7 +127,7 @@ final class TutorialCoordinator {
         begin(lesson)
     }
 
-    /// Finish, Skip tutorial and Finish later all end here: canonical demo
+    /// Finish and Skip tutorial both end here: canonical demo
     /// cleanup, then RootView routes to sign-in or the restored inbox. The
     /// run state is cleared only after the demo is gone, so RootView never
     /// shows the plain demo's consent screens in between.
@@ -150,6 +154,8 @@ final class TutorialCoordinator {
         step = nil
         isEnding = false
         flightsAsked = false
+        replyEdited = false
+        showsActionRule = false
         savedTemplateId = nil
         practiceReplyText = nil
         lastFacts = nil
@@ -165,7 +171,7 @@ final class TutorialCoordinator {
         begin(next)
     }
 
-    /// "Next: change a suggestion" on the receipt result.
+    /// "Next" on the receipt result.
     func continueToRetag() {
         guard step == .receiptArchived else { return }
         step = .retagDailyTech
@@ -185,12 +191,32 @@ final class TutorialCoordinator {
     }
 
     private func begin(_ lesson: TutorialLesson) {
+        replyEdited = false
         switch lesson {
         case .actOnEmail: step = .archiveReceipt
         case .reuseReply: step = .replyToPriya
         case .askAnything: step = .askFlights
         }
         startObservingMail()
+    }
+
+    /// "See rule" on the part 1 result.
+    func showActionRule() {
+        guard step == .actOnEmailDone else { return }
+        showsActionRule = true
+    }
+
+    /// The rule part 1 shows as learned from the DailyTech change. A sample:
+    /// the demo never runs the AI refinement (re-tags of demo samples never
+    /// teach), and the demo's prompt overlay drops it on exit.
+    static let sampleDeleteRule = "Tech news digests like DailyTech Digest"
+
+    private func addSampleRule() {
+        guard DemoModeStore.isDemoActive else { return }
+        let store = PromptStore.shared
+        let line = "- \(Self.sampleDeleteRule)"
+        guard !store.deleteRules.contains(line) else { return }
+        store.deleteRules = store.deleteRules.isEmpty ? line : store.deleteRules + "\n" + line
     }
 
     private func complete(_ finished: TutorialLesson, step done: Step) {
@@ -225,6 +251,22 @@ final class TutorialCoordinator {
     func chatPromptSent(_ prompt: ChatPrompt) {
         if prompt == .flights, step == .askFlights { flightsAsked = true }
     }
+
+    /// What the practice reply's draft chat holds before its edit ran.
+    static let editPrompt = "Say I can’t make it"
+
+    /// The practice reply's draft chat input now, if this step has one.
+    var composeEditPrompt: String? { step == .replyToPriya && !replyEdited ? Self.editPrompt : nil }
+
+    /// The draft chat's scripted edit rewrote the practice reply.
+    func practiceReplyEdited() {
+        guard step == .replyToPriya else { return }
+        replyEdited = true
+    }
+
+    /// The step's email reference in the chat answer (and its Open Email) is
+    /// the next tap.
+    var highlightsEmailReference: Bool { step == .askFlights && flightsAsked }
 
     /// Compose is sending the practice reply to Priya with this text.
     func practiceReplyAuthored(_ text: String) {
@@ -289,6 +331,7 @@ final class TutorialCoordinator {
         case .archiveReceipt where !facts.receiptInInbox:
             step = .receiptArchived
         case .retagDailyTech where facts.dailyTechTag == ActionTag.delete.rawValue:
+            addSampleRule()
             complete(.actOnEmail, step: .actOnEmailDone)
         case .replyToPriya where !facts.sentMessageIds.subtracting(sentBaseline).isEmpty:
             templateBaseline = Set(PromptStore.shared.templates.map(\.id))
@@ -351,16 +394,21 @@ final class TutorialCoordinator {
         case tagTap
         /// Choosing a tag from the tag menu (teaching the right action).
         case retag
+        /// Use Suggestion on the practice reply, once its edit ran.
+        case useSuggestion
         /// Swipes, triage and every other mail action.
         case other
     }
 
     /// Whether the step asks for `gesture` on `messageId` (nil: no message).
-    nonisolated static func allows(_ gesture: MailGesture, messageId: String?, step: Step?) -> Bool {
+    nonisolated static func allows(
+        _ gesture: MailGesture, messageId: String?, step: Step?, replyEdited: Bool = false
+    ) -> Bool {
         guard let messageId, messageId == tagTarget(for: step) else { return false }
         switch gesture {
         case .tagTap: return step == .archiveReceipt || step == .replyToPriya
         case .retag: return step == .retagDailyTech
+        case .useSuggestion: return step == .replyToPriya && replyEdited
         case .other: return false
         }
     }
@@ -369,7 +417,8 @@ final class TutorialCoordinator {
     /// asks for; otherwise shows the locked notice and returns false.
     func admits(_ gesture: MailGesture, accountId: String? = nil, messageId: String? = nil) -> Bool {
         guard isRunning else { return true }
-        if accountId == DemoSeed.demoAccountId, Self.allows(gesture, messageId: messageId, step: step) {
+        if accountId == DemoSeed.demoAccountId,
+           Self.allows(gesture, messageId: messageId, step: step, replyEdited: replyEdited) {
             return true
         }
         showLockedNotice()

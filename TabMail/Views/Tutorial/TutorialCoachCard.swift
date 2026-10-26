@@ -19,6 +19,7 @@ struct TutorialCoachView: View {
            let content = TutorialCoachContent.make(
             step: step, lesson: lesson, host: host,
             flightsAsked: tutorial.flightsAsked,
+            replyEdited: tutorial.replyEdited,
             isSending: PendingSendService.shared.current != nil) {
             TutorialCoachCard(
                 content: content,
@@ -35,7 +36,7 @@ struct TutorialCoachView: View {
         switch action {
         case .continueToRetag: tutorial.continueToRetag()
         case .nextLesson: tutorial.nextLesson()
-        case .finishLater: Task { await tutorial.end() }
+        case .seeRule: tutorial.showActionRule()
         case .showMoreToAsk: tutorial.showMoreToAsk()
         case .showRecap: tutorial.showRecap()
         case .seeTemplate:

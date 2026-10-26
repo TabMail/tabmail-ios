@@ -341,9 +341,9 @@ struct DynamicIslandChat: View {
                 } else if TutorialCoordinator.shared.isRunning {
                     // Scripted: the input is filled in and read-only.
                     TutorialChatInputBar(
-                        prompt: isInboxChat ? TutorialCoordinator.shared.chatPrompt : nil,
+                        prompt: tutorialPromptText,
                         isWorking: isWorking,
-                        send: sendTutorialPrompt)
+                        send: sendTutorialInput)
                     .layoutPriority(1)
                 } else if !AISubscriptionGate.shared.isActive {
                     subscribeBar
@@ -358,9 +358,9 @@ struct DynamicIslandChat: View {
         }
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: isExpanded ? 24 : 100))
         .overlay {
-            // Guided tutorial: the step's next move is opening the inbox chat.
-            if !isExpanded && isInboxChat && TutorialCoordinator.shared.chatPrompt != nil {
-                TutorialGlowRing(shape: Capsule())
+            // Guided tutorial: the step's next move is opening this chat.
+            if !isExpanded && tutorialPromptText != nil {
+                TutorialPulseRing(shape: Capsule())
                     .accessibilityIdentifier("tutorial-pill-highlight")
             }
         }
@@ -1313,6 +1313,43 @@ struct DynamicIslandChat: View {
     /// While listening, send stays available: it finishes the dictation, then sends its text.
     private var canTapSend: Bool {
         canSend || (dictation.phase == .listening && hasTabMailSession && !isWorking && composeReadyToSend)
+    }
+
+    /// The practice reply's draft chat (part 2), where the tutorial fills in an edit.
+    private var isTutorialPracticeDraft: Bool {
+        isComposeMode && draftReplyToProviderMessageId == DemoSeed.TutorialFixture.priyaOffsite
+    }
+
+    /// The tutorial's filled-in input in this chat now, if any.
+    private var tutorialPromptText: String? {
+        if isInboxChat { return TutorialCoordinator.shared.chatPrompt?.rawValue }
+        if isTutorialPracticeDraft { return TutorialCoordinator.shared.composeEditPrompt }
+        return nil
+    }
+
+    private func sendTutorialInput() {
+        if isInboxChat, let prompt = TutorialCoordinator.shared.chatPrompt {
+            sendTutorialPrompt(prompt)
+        } else if isTutorialPracticeDraft, TutorialCoordinator.shared.composeEditPrompt != nil {
+            sendTutorialEdit()
+        }
+    }
+
+    /// The practice reply's scripted edit, through the real edit path: the
+    /// chat closes, the draft pulses as during an AI edit, then fades to the
+    /// declined reply.
+    private func sendTutorialEdit() {
+        isTextFieldFocused = false
+        withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+            isExpanded = false
+        }
+        isWorking = true
+        Task { @MainActor in
+            try? await Task.sleep(for: TutorialChatScript.editDuration)
+            onDraftUpdate?(nil, TutorialChatScript.declinedReply, nil, nil, nil)
+            isWorking = false
+            TutorialCoordinator.shared.practiceReplyEdited()
+        }
     }
 
     /// The tutorial's filled-in input: sent like typed text, answered by

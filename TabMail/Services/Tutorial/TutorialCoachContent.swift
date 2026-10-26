@@ -17,6 +17,8 @@ enum TutorialCoachHost: Equatable {
     case compose(showingSuggestion: Bool)
     /// The source email of part 3.
     case message
+    /// Action Classification, opened by "See rule" on the part 1 result.
+    case actionRules
 }
 
 /// The text and buttons of one coach card (owner V5 mockup copy). Pure, so
@@ -25,7 +27,7 @@ struct TutorialCoachContent: Equatable {
     enum Action: Equatable {
         case continueToRetag
         case nextLesson
-        case finishLater
+        case seeRule
         case seeTemplate
         case showMoreToAsk
         case showRecap
@@ -55,21 +57,21 @@ struct TutorialCoachContent: Equatable {
 
     /// The card `host` shows for `step`, or nil when this host has none.
     /// `isSending`: a send is waiting out its undo window (`PendingSendService`).
+    /// `replyEdited`: the practice reply's scripted edit ran.
     static func make(
         step: TutorialCoordinator.Step,
         lesson: TutorialLesson,
         host: TutorialCoachHost,
         flightsAsked: Bool,
+        replyEdited: Bool = false,
         isSending: Bool = false
     ) -> TutorialCoachContent? {
         func card(_ title: String, _ message: String, done: Bool = false) -> TutorialCoachContent {
             let line = "\(lesson.rawValue) of \(TutorialLesson.allCases.count) · \(lesson.title)"
             return TutorialCoachContent(progressLine: done ? line + " · done" : line, title: title, message: message)
         }
-        let partEnd = [
-            Button(label: "Next", action: .nextLesson, isPrimary: true),
-            Button(label: "Finish later", action: .finishLater),
-        ]
+        // Skip tutorial, always at the top right, is the way to stop (owner 2026-10-25).
+        let next = Button(label: "Next", action: .nextLesson, isPrimary: true)
 
         switch (step, host) {
         // Part 1
@@ -77,7 +79,7 @@ struct TutorialCoachContent: Equatable {
             return card("Tap the Archive tag.", "The small colored tag is a button. Try it on the receipt.")
         case (.receiptArchived, .inbox):
             var c = card("One tap. One less email.", "Reply opens a draft. Delete moves a message to Trash.")
-            c.buttons = [Button(label: "Next: change a suggestion", action: .continueToRetag, isPrimary: true)]
+            c.buttons = [Button(label: "Next", action: .continueToRetag, isPrimary: true)]
             return c
         case (.retagDailyTech, .inbox):
             return card(
@@ -87,11 +89,16 @@ struct TutorialCoachContent: Equatable {
         case (.actOnEmailDone, .inbox):
             var c = card(
                 "Suggestion changed.",
-                "The digest stays in your inbox. In your own inbox, TabMail learns from changes like this. "
-                    + "Rules live in TabMail Settings → Action Classification.",
+                "The digest stays in your inbox. In your own inbox, TabMail learns a rule from changes like this.",
                 done: true)
-            c.buttons = partEnd
+            c.buttons = [Button(label: "See rule", action: .seeRule), next]
             return c
+        case (.actOnEmailDone, .actionRules):
+            return card(
+                "The rule it learned.",
+                "Rules live in Settings → Action Classification. In your own inbox, "
+                    + "TabMail adds one like this when you change a suggestion. This one is a sample.",
+                done: true)
 
         // Part 2
         case (.replyToPriya, .inbox) where isSending:
@@ -102,9 +109,12 @@ struct TutorialCoachContent: Equatable {
         case (.replyToPriya, .inbox):
             return card("Tap the green Reply tag.", "Priya’s invitation already has a suggested reply.")
         case (.replyToPriya, .compose(let showingSuggestion)):
-            return showingSuggestion
-                ? card("TabMail wrote a reply.", "Tap Use Suggestion. To change it, you’d tap Edit at the top and say what you want.")
-                : card("Tap Send.", "Practice only: it goes to the demo Sent folder. Nobody receives an email.")
+            if !showingSuggestion {
+                return card("Tap Send.", "Practice only: it goes to the demo Sent folder. Nobody receives an email.")
+            }
+            return replyEdited
+                ? card("TabMail changed it.", "Tap Use Suggestion to put it in your reply.")
+                : card("TabMail wrote a reply.", "Say what to change: tap Edit at the top, then Send.")
         case (.makeTemplate, .inbox):
             return card("Sent. Now reuse it.", "Nobody received it. Tap Chat to turn it into a template.")
         case (.makeTemplate, .chat):
@@ -115,7 +125,7 @@ struct TutorialCoachContent: Equatable {
                 "In your own inbox, ask TabMail to make a template the same way, "
                     + "and it will be used when you reply to similar emails.",
                 done: true)
-            c.buttons = [Button(label: "See template", action: .seeTemplate)] + partEnd
+            c.buttons = [Button(label: "See template", action: .seeTemplate), next]
             return c
 
         // Part 3

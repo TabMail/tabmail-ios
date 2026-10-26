@@ -31,7 +31,7 @@ private func previewCard(
             TutorialCoachCard(content: content)
         }
         Spacer()
-        TutorialChatInputBar(prompt: .makeTemplate, isWorking: false) { _ in }
+        TutorialChatInputBar(prompt: TutorialCoordinator.ChatPrompt.makeTemplate.rawValue, isWorking: false) {}
     }
     .padding(.vertical)
 }
@@ -39,7 +39,7 @@ private func previewCard(
 #Preview("Chat with nothing to send") {
     VStack {
         Spacer()
-        TutorialChatInputBar(prompt: nil, isWorking: false) { _ in }
+        TutorialChatInputBar(prompt: nil, isWorking: false) {}
     }
     .padding(.vertical)
 }

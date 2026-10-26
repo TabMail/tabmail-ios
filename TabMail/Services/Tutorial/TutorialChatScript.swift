@@ -10,12 +10,19 @@ import Foundation
 /// flight one cites Jordan's seeded email so its pill opens the original.
 @MainActor
 enum TutorialChatScript {
-    static let templateName = "Event RSVP"
+    static let templateName = "Polite decline"
     static let templateInstructions = [
-        "Confirm you will attend.",
-        "Say what you will do before any deadline in the invitation.",
+        "Thank them for the invitation.",
+        "Say you can’t make it.",
         "Keep it to one or two sentences.",
     ]
+
+    /// The practice reply after its draft-chat edit ("Say I can’t make it").
+    static let declinedReply = "Thanks for organizing, Priya. I can’t make the offsite this time. "
+        + "Could you share the agenda notes afterward?"
+    /// How long the draft pulses before the edit lands: long enough to see
+    /// that something is happening, short enough not to feel slow.
+    static let editDuration: Duration = .milliseconds(1400)
 
     /// The answer to `prompt`, as the agent's reply text (`[Email](N)` refs
     /// are resolved for display by the chat, like an AI reply's).
@@ -40,7 +47,7 @@ enum TutorialChatScript {
                 ],
                 invocation: invocation)
             return "Saved. The template \"\(templateName)\" follows the reply you just sent, "
-                + "so it can be used when you reply to similar invitations."
+                + "so it can be used when you turn down similar invitations."
         } catch {
             return "No template made. Tap Send to try again."
         }

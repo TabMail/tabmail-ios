@@ -599,6 +599,19 @@ struct MailNavigationView: View {
             templateSheetItem = TemplateSheetItem(id: templateId)
             BackgroundSyncLogger.logDebug("[MailNavigationView] Template pill Open Template: \(templateId.prefix(30))")
         }
+        .sheet(isPresented: Binding(
+            get: { TutorialCoordinator.shared.showsActionRule },
+            set: { TutorialCoordinator.shared.showsActionRule = $0 })) {
+            // Guided tutorial "See rule": where action rules live, with the sample rule.
+            NavigationStack {
+                ActionRulesView(tutorialRule: TutorialCoordinator.sampleDeleteRule)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { TutorialCoordinator.shared.showsActionRule = false }
+                        }
+                    }
+            }
+        }
         .sheet(item: $templateSheetItem) { item in
             NavigationStack {
                 TemplateDetailView(templateId: item.id)

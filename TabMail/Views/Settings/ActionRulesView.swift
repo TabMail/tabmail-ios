@@ -58,6 +58,10 @@ final class ActionCompactionMonitor {
 }
 
 struct ActionRulesView: View {
+    /// The guided tutorial's sample delete rule ("See rule"): the rules alone,
+    /// with its coach card and the rule ringed.
+    var tutorialRule: String?
+
     @State private var store = PromptStore.shared
     @State private var syncService = DeviceSyncService.shared
     @State private var showResetConfirmation = false
@@ -120,10 +124,23 @@ struct ActionRulesView: View {
     }
 
     var body: some View {
+        rulesForm
+            .safeAreaInset(edge: .top) {
+                if tutorialRule != nil {
+                    TutorialCoachView(host: .actionRules)
+                        .padding(.vertical, 8)
+                }
+            }
+    }
+
+    private var rulesForm: some View {
         Form {
             TipView(syncTip)
                 .listRowBackground(Color.clear)
 
+            // The tutorial shows the rules only: the thresholds and Compact now
+            // write real settings and call the AI.
+            if tutorialRule == nil {
             Section {
                 Group {
                     Label {
@@ -183,10 +200,11 @@ struct ActionRulesView: View {
                     .textCase(nil)
             }
             .listRowBackground(Palette.boxBg)
+            }
 
             Group {
             Section {
-                BulletListEditor(text: $store.deleteRules)
+                BulletListEditor(text: $store.deleteRules, highlightedItem: tutorialRule)
                     .background(sectionTracker("delete"))
             } header: {
                 sectionHeader(title: "Emails to Delete", count: ruleCount(store.deleteRules), subtitle: "Emails matching these rules will be suggested for deletion. Swipe to delete.", color: Theme.tagColor(.delete))
@@ -215,6 +233,7 @@ struct ActionRulesView: View {
             }
             .listRowBackground(Palette.boxBg)
 
+            if tutorialRule == nil {
             Section {
                 Button(role: .destructive) {
                     showResetConfirmation = true
@@ -227,6 +246,7 @@ struct ActionRulesView: View {
                 }
             }
             .listRowBackground(Palette.boxBg)
+            }
         }
         .coordinateSpace(name: "actionRulesList")
         // Compaction of a large rules file can run for minutes — keep the screen
