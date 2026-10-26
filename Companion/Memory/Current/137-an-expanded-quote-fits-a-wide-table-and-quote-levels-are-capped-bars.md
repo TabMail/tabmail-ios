@@ -36,6 +36,19 @@ the difference; the block's own inline `margin-bottom` value and priority are sa
 at its container's left edge and overflows to the right (an RTL block overflowing LEFT is not
 measured, since the check is the right edge).
 
+🚨 **Overflow the sender already handles is left alone (`tmQuoteFitLeaves`).** Codex review round 1
+caught two regressions in the first version. (a) A table inside the sender's own `overflow-x:auto`
+scroller (the usual receipt / markdown-render pan pattern) passes the quote's edge by its rect, but it
+already pans in its own box; scaling it shrank the text to about 40% while keeping the scroll extent.
+Any ancestor between the block and `.tm-quote-content` with `overflow-x` auto/scroll/hidden/clip now
+exempts the block, the same containment rule as `fitViewportJS`'s `measureMaxRight` (the walk stops
+at the quote content, which is itself `overflow:hidden`). A scroller that itself overflows is still
+scaled. The wrapper's own `overflow-x:auto` rules (`pre`/`code`, `.tm-eml-section` tables) are
+scrollers too, so they keep panning. (b) A block with the sender's own `transform` (or under a
+transformed ancestor) had it overwritten, and the reset restores only `margin-bottom`, so a later
+refit with room erased the sender's transform. Such a block is now left as authored (fail closed:
+it may stay clipped). Either way the block still ends its branch, so its descendants are skipped too.
+
 **Why not re-run the page fit on expand.** ADR-IOS-039 says a re-fit of injected content must go
 through `resetAndFit`; that widens the layout viewport and shrinks the WHOLE message, the reply text
 included, and a collapse would need another re-fit back. Scaling only the quoted block leaves the
@@ -45,7 +58,12 @@ page fit untouched, so ADR-IOS-039's idempotency and the height seed cache are u
 quote content's edge and still spans it, the quoted paragraph keeps the reply's line height, the
 paragraph after the scaled table sits one margin below its painted bottom (no blank space left by the
 full-height layout box), collapse-and-expand gives the same fit, and a widened table refits on a
-`load` event. Red-first: all three fail with the fit disabled.
+`load` event. After review round 1 it also pins: a table in a sender scroller (every
+`overflow-x` value) and a sender-transformed block or subtree keep their size; the scaled table's
+text is scaled once (descendants are not picked again); the column narrowing refits (observer);
+a load that widens the table without changing the quote box's height refits (load listener); the
+inline-reply layout's trailing quote fits; the sender's `margin-bottom` and priority return; an
+inline-block inside an inline wrapper is the scaled block. Red-first: each fails with its mutation.
 
 ## 2. Quote levels: thin coloured bars, and the indent stops at a depth (#327)
 

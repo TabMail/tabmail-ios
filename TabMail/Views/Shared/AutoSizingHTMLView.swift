@@ -3349,6 +3349,12 @@ enum QuoteFitConfig {
 /// The block starts at its container's left edge (it overflows to the right), so the
 /// origin is its top left.
 ///
+/// Overflow the sender already handles is left alone (`tmQuoteFitLeaves`): a block inside
+/// an `overflow-x` auto/scroll/hidden/clip ancestor pans or clips in its own box (the same
+/// containment rule as `fitViewportJS`'s `measureMaxRight`), and a block that carries or
+/// sits under the sender's own transform would lose it, since only `margin-bottom` is
+/// saved and restored.
+///
 /// Idempotent: every run first removes the scale it set before, then measures, so a
 /// rerun after images load or the column width changes reaches the same answer as a
 /// first run on that content.
@@ -3356,6 +3362,14 @@ enum QuoteFitConfig {
 /// Defined as a top-level JS string so that `collapseQuotesJS` (production) and the
 /// tests consume the same source.
 let fitQuoteContentJS = """
+function tmQuoteFitLeaves(el, content) {
+    if (getComputedStyle(el).transform !== 'none') return true;
+    for (var a = el.parentElement; a && a !== content; a = a.parentElement) {
+        var as = getComputedStyle(a), ov = as.overflowX;
+        if (ov === 'auto' || ov === 'scroll' || ov === 'hidden' || ov === 'clip' || as.transform !== 'none') return true;
+    }
+    return false;
+}
 function tmFitQuoteContent(content) {
     var scaled = content.querySelectorAll('[data-tm-quote-scale]');
     for (var z = 0; z < scaled.length; z++) {
@@ -3381,9 +3395,10 @@ function tmFitQuoteContent(content) {
         var es = getComputedStyle(el);
         // An inline box is a run of text; the block or table inside it is the one to scale.
         if (es.display === 'inline' && el.tagName !== 'IMG') continue;
+        last = el;
+        if (tmQuoteFitLeaves(el, content)) continue;
         var scale = Math.floor((right - r.left) / r.width * \(QuoteFitConfig.scaleSteps)) / \(QuoteFitConfig.scaleSteps);
         if (scale > 0 && scale < 1) picks.push([el, scale, r.height, parseFloat(es.marginBottom) || 0]);
-        last = el;
     }
     for (var p = 0; p < picks.length; p++) {
         var target = picks[p][0], s = picks[p][1];
