@@ -2686,6 +2686,7 @@ final class InboxViewModel {
     /// gesture-path DB read (zero-DB rule).
     func applyManualTag(_ messageId: String, tag: ActionTag?) {
         guard let snapshot = loadedMessages.first(where: { $0.id == messageId }) else { return }
+        TutorialCoordinator.shared.discovered(.retag)
         if let idx = loadedMessages.firstIndex(where: { $0.id == messageId }) {
             loadedMessages[idx].actionTag = tag
         }

@@ -11,6 +11,7 @@ extension MessageDetailView {
 
     func executeTaggedAction(_ message: MessageHeader) {
         guard let tag = message.actionTag else { return }
+        TutorialCoordinator.shared.discovered(.tagTap)
         let result = tag.resolveAction(isMainMessage: message.id == viewModel.message?.id)
         switch result {
         case .reply:

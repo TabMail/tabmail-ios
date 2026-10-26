@@ -2035,6 +2035,7 @@ final class MessageDetailViewModel {
         // mutations below — `msg` is the render-time snapshot (visualized
         // state), mirroring `toggleRead`'s act-on-visualized-state contract.
         let baseline = msg.actionTag
+        TutorialCoordinator.shared.discovered(.retag)
         // Optimistic UI update
         if msg.id == message?.id {
             message?.actionTag = tag

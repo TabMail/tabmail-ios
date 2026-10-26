@@ -268,7 +268,7 @@ fix gates at shared chokepoints, not per-tool patches:
   local Sent row appears, a confirmed template is persisted, the source
   email opens. Sample messages are named by `DemoSeed.TutorialFixture`
   ids, never by rendered strings. Progress lives in `TutorialProgress`
-  (UserDefaults: version, completed parts, first-run welcome); an
+  (UserDefaults: version, completed parts, discoveries, first-run welcome); an
   unfinished part restarts from its beginning. The full-screen welcome
   is armed only by the fresh-install branch of
   `TabMailApp.prepareSessionStorageForLaunch`; everyone else gets the
@@ -329,6 +329,26 @@ fix gates at shared chokepoints, not per-tool patches:
   runs, its coach cards carry Skip). A notification tap during the
   tutorial ends it; the pending deep link stays stored and the restored
   inbox's `MailNavigationView` opens the email on appear.
+- **Smoke-test round 2 (owner 2026-10-21).** Replay moved from the
+  sidebar to the debug menu ("Replay Tutorial"); the sidebar row shows
+  progress only and is gone once every part is done. The practice reply
+  is sent with no undo hold (`queueSend(holdsForUndo: false)`, stored
+  `holdUntil` NULL, so the drain claims it at once and the toast offers
+  no Undo); every other send keeps the hold. The coach card is a dark
+  translucent HUD in both appearances.
+- **Parts found on their own count as done (owner 2026-10-25).** Outside
+  the tutorial, doing a part's moves in the real app completes it, as if
+  the part had been taken: part 1 needs both an action-tag tap
+  (`executeTaggedAction`, inbox and message view) and a tag change from
+  the hold menu (`applyManualTag`, both view models), each recorded on
+  its own; part 2 a created template (`PromptStore.addTemplate`, the
+  funnel for settings, marketplace and chat; Device Sync merges do not
+  count); part 3 a message sent in the inbox chat. `TutorialDiscovery`
+  in `TutorialProgress` (UserDefaults, version-gated like completion; a
+  write after a version bump drops the older version's progress first).
+  Ignored while the tutorial runs: its own steps complete their parts.
+  The step's target tag and the Chat pill carry a pulsing glow ring
+  (`TutorialGlowRing`, owner: "blink or a little bit of glow").
 - **Considered and dropped the same day: consent once.** A variant asked
   the age/terms and AI screens before the AI parts and carried the
   outcome to sign-in (`CarriedConsent`). The owner chose a scripted

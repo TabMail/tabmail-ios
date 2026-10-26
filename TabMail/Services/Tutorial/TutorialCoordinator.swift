@@ -387,6 +387,18 @@ final class TutorialCoordinator {
         }
     }
 
+    // MARK: - Found on their own
+
+    /// The person did something a part teaches in the real app. Outside the
+    /// tutorial, a part whose moves have all been found counts as done, as if
+    /// they had taken it (owner 2026-10-25). The tutorial's own steps complete
+    /// their parts themselves.
+    func discovered(_ discovery: TutorialDiscovery) {
+        guard !isRunning, !progress.completedLessons.contains(discovery.lesson) else { return }
+        progress.markDiscovered(discovery)
+        completedLessons = progress.completedLessons
+    }
+
     // MARK: - Sidebar row
 
     var rowState: TutorialRowState? {

@@ -1633,6 +1633,7 @@ struct InboxView: View {
             tag = snapshot.actionTag
         }
         guard let tag else { return }
+        TutorialCoordinator.shared.discovered(.tagTap)
         switch tag {
         case .reply:
             // Mark as read — user is actively dismissing (matches TB behavior).

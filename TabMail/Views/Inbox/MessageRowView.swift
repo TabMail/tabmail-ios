@@ -160,9 +160,8 @@ struct MessageRowView: View {
                                         // Guided tutorial: the tag this step asks for.
                                         if TutorialCoordinator.shared.highlightsTag(
                                             accountId: message.accountId, messageId: message.messageId) {
-                                            RoundedRectangle(cornerRadius: 6)
-                                                .stroke(Theme.accent, lineWidth: 2)
-                                                .padding(-3)
+                                            TutorialGlowRing(shape: RoundedRectangle(cornerRadius: 6), lineWidth: 2, outset: 3)
+                                                .accessibilityIdentifier("tutorial-tag-highlight")
                                         }
                                     }
                                     .padding(.horizontal, 4)

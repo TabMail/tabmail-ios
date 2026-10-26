@@ -34,6 +34,40 @@ struct TutorialProgressTests {
         #expect(TutorialProgress(defaults: defaults).completedLessons.isEmpty)
     }
 
+    @Test("Part 1 needs both a tag tap and a tag change; a template and an inbox chat each finish theirs")
+    func discoveriesCompleteParts() {
+        let defaults = isolatedDefaults()
+        let progress = TutorialProgress(defaults: defaults)
+        progress.markDiscovered(.tagTap)
+        progress.markDiscovered(.tagTap)
+        #expect(progress.completedLessons.isEmpty, "a tag tap alone is half of part 1")
+        progress.markDiscovered(.retag)
+        #expect(progress.completedLessons == [.actOnEmail])
+        progress.markDiscovered(.inboxChat)
+        #expect(progress.completedLessons == [.actOnEmail, .askAnything])
+        progress.markDiscovered(.template)
+        #expect(TutorialProgress(defaults: defaults).completedLessons == Set(TutorialLesson.allCases))
+        #expect(TutorialProgress(defaults: defaults).discoveries == Set(TutorialDiscovery.allCases))
+    }
+
+    @Test("A write after a tutorial version bump does not revive the older version's progress")
+    func versionBumpForgetsOnWrite() {
+        let defaults = isolatedDefaults()
+        let progress = TutorialProgress(defaults: defaults)
+        for lesson in TutorialLesson.allCases { progress.markCompleted(lesson) }
+        progress.markDiscovered(.retag)
+        defaults.set(TutorialProgress.version - 1, forKey: "tutorial.version")
+
+        progress.markDiscovered(.tagTap)
+        #expect(progress.completedLessons.isEmpty, "the old retag does not pair with the new tag tap")
+        #expect(progress.discoveries == [.tagTap])
+
+        defaults.set(TutorialProgress.version - 1, forKey: "tutorial.version")
+        progress.markCompleted(.reuseReply)
+        #expect(progress.completedLessons == [.reuseReply])
+        #expect(progress.discoveries.isEmpty)
+    }
+
     @Test("The welcome is pending only between the fresh-install mark and a choice")
     func welcomeLifecycle() {
         let progress = TutorialProgress(defaults: isolatedDefaults())
@@ -573,7 +607,7 @@ struct TutorialLifecycleTests {
         let store = DemoModeStore.shared
         let gate = AISubscriptionGate.shared
         let gateWasActive = gate.isActive
-        let progressKeys = ["tutorial.version", "tutorial.completedLessons"]
+        let progressKeys = ["tutorial.version", "tutorial.completedLessons", "tutorial.discoveries"]
         let savedProgress = progressKeys.map { UserDefaults.standard.object(forKey: $0) }
         defer {
             for (key, value) in zip(progressKeys, savedProgress) {
@@ -668,7 +702,9 @@ struct TutorialLifecycleTests {
         #expect(coordinator.chatPrompt == nil, "the asked question is not offered again")
         coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.receipt)
         #expect(coordinator.step == .askFlights, "only Jordan's email completes the part")
-        #expect(!coordinator.completedLessons.contains(.askAnything))
+        coordinator.discovered(.inboxChat)
+        #expect(!coordinator.completedLessons.contains(.askAnything), "inside the tutorial only its own steps complete a part")
+        #expect(TutorialProgress().discoveries.isEmpty)
         coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
         #expect(coordinator.step == .askAnythingDone)
         #expect(coordinator.completedLessons.contains(.askAnything))
@@ -686,6 +722,35 @@ struct TutorialLifecycleTests {
         #expect(!store.isTutorialPractice, "a signed-in user's AI calls would stay refused until relaunch")
         #expect(coordinator.admits(.other), "outside the tutorial every mail action runs")
         #expect(coordinator.lockedNotice == nil)
+    }
+
+    @Test("Outside the tutorial, a part counts as done once its moves are found in the app")
+    func discoveriesOutsideTheTutorial() throws {
+        let progressKeys = ["tutorial.version", "tutorial.completedLessons", "tutorial.discoveries"]
+        let savedProgress = progressKeys.map { UserDefaults.standard.object(forKey: $0) }
+        let templateId = "tutorial-discovery-\(UUID().uuidString)"
+        defer {
+            PromptStore.shared.deleteTemplate(id: templateId)
+            for (key, value) in zip(progressKeys, savedProgress) {
+                UserDefaults.standard.set(value, forKey: key)
+            }
+        }
+        for key in progressKeys { UserDefaults.standard.removeObject(forKey: key) }
+        let coordinator = TutorialCoordinator.shared
+        try #require(!coordinator.isRunning)
+
+        // Creating a template anywhere goes through the store.
+        PromptStore.shared.addTemplate(ReplyTemplate(id: templateId, name: "Discovery"))
+        #expect(TutorialProgress().completedLessons.contains(.reuseReply))
+        #expect(coordinator.completedLessons.contains(.reuseReply))
+
+        coordinator.discovered(.retag)
+        #expect(!coordinator.completedLessons.contains(.actOnEmail), "part 1 also needs a tag tap")
+        coordinator.discovered(.tagTap)
+        #expect(coordinator.completedLessons.contains(.actOnEmail))
+        #expect(!coordinator.completedLessons.contains(.askAnything))
+        coordinator.discovered(.inboxChat)
+        #expect(coordinator.rowState == nil, "all three found: no sidebar row")
     }
 
     /// Every way out of the demo (sign-in, the debug menu, a seeding failure)

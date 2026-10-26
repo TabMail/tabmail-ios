@@ -22,6 +22,28 @@ enum TutorialLesson: Int, CaseIterable, Sendable {
     var next: TutorialLesson? { TutorialLesson(rawValue: rawValue + 1) }
 }
 
+/// Something a part teaches, done in the real app outside the tutorial. A
+/// part counts as done once the person has found every one of its moves on
+/// their own (owner 2026-10-25): part 1 needs both a tag tap and a tag change.
+enum TutorialDiscovery: String, CaseIterable, Sendable {
+    /// Tapped an action tag, which ran its action.
+    case tagTap
+    /// Changed a tag from the hold menu.
+    case retag
+    /// Created a template.
+    case template
+    /// Sent a message in the inbox chat.
+    case inboxChat
+
+    var lesson: TutorialLesson {
+        switch self {
+        case .tagTap, .retag: return .actOnEmail
+        case .template: return .reuseReply
+        case .inboxChat: return .askAnything
+        }
+    }
+}
+
 /// The sidebar tutorial row: "Tutorial · done of total done", resumes `next`.
 /// Once every part is done there is no row; replay lives in the debug menu
 /// (owner 2026-10-21).
@@ -31,8 +53,9 @@ struct TutorialRowState: Equatable, Sendable {
     let next: TutorialLesson
 }
 
-/// Durable tutorial state (UserDefaults, per install): the first-run welcome
-/// and which lessons are done. Never consent flags, never the call budget.
+/// Durable tutorial state (UserDefaults, per install): the first-run welcome,
+/// which lessons are done, and which of their moves the person found on their
+/// own outside it. Never consent flags, never the call budget.
 /// An unfinished lesson restarts from its beginning, so no step is stored.
 struct TutorialProgress {
     /// Bump when the lessons change enough that earlier completion should not count.
@@ -41,6 +64,7 @@ struct TutorialProgress {
     private enum Keys {
         static let version = "tutorial.version"
         static let completedLessons = "tutorial.completedLessons"
+        static let discoveries = "tutorial.discoveries"
         static let welcomePending = "tutorial.welcomePending"
     }
 
@@ -75,10 +99,40 @@ struct TutorialProgress {
     }
 
     func markCompleted(_ lesson: TutorialLesson) {
+        adoptCurrentVersion()
         var done = completedLessons
         done.insert(lesson)
-        defaults.set(Self.version, forKey: Keys.version)
         defaults.set(done.map(\.rawValue).sorted(), forKey: Keys.completedLessons)
+    }
+
+    // MARK: - Found on their own
+
+    var discoveries: Set<TutorialDiscovery> {
+        guard defaults.integer(forKey: Keys.version) == Self.version else { return [] }
+        let raw = defaults.array(forKey: Keys.discoveries) as? [String] ?? []
+        return Set(raw.compactMap(TutorialDiscovery.init(rawValue:)))
+    }
+
+    /// Records `discovery`, and completes its part once all of that part's
+    /// moves have been found.
+    func markDiscovered(_ discovery: TutorialDiscovery) {
+        adoptCurrentVersion()
+        var found = discoveries
+        found.insert(discovery)
+        defaults.set(found.map(\.rawValue).sorted(), forKey: Keys.discoveries)
+        let lesson = discovery.lesson
+        if TutorialDiscovery.allCases.filter({ $0.lesson == lesson }).allSatisfy(found.contains) {
+            markCompleted(lesson)
+        }
+    }
+
+    /// Drops completion and discoveries recorded under an older `version`, so
+    /// a write under the current one never revives them.
+    private func adoptCurrentVersion() {
+        guard defaults.integer(forKey: Keys.version) != Self.version else { return }
+        defaults.removeObject(forKey: Keys.completedLessons)
+        defaults.removeObject(forKey: Keys.discoveries)
+        defaults.set(Self.version, forKey: Keys.version)
     }
 
     /// nil once every part is done.

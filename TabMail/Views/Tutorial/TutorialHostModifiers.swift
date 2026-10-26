@@ -102,15 +102,22 @@ struct TutorialLockedToast: View {
     }
 }
 
-/// A pulsing accent ring around the collapsed Chat pill when the step's next
-/// move is opening the chat (owner 2026-10-21: the pill was not highlighted).
-struct TutorialPillHighlight: View {
+/// A pulsing accent ring with a soft glow around the control the step asks
+/// for: the collapsed Chat pill (owner 2026-10-21: the pill was not
+/// highlighted) and the action tag to tap or change (owner 2026-10-25: "blink
+/// or a little bit of glow").
+struct TutorialGlowRing<S: Shape>: View {
+    let shape: S
+    var lineWidth: CGFloat = 3
+    /// How far the ring sits outside the control.
+    var outset: CGFloat = 4
+
     @State private var glowing = false
 
     var body: some View {
-        Capsule()
-            .stroke(Theme.accent, lineWidth: 3)
-            .padding(-4)
+        shape
+            .stroke(Theme.accent, lineWidth: lineWidth)
+            .padding(-outset)
             .shadow(color: Theme.accent.opacity(glowing ? 0.8 : 0.25), radius: glowing ? 12 : 4)
             .allowsHitTesting(false)
             .onAppear {
@@ -118,6 +125,5 @@ struct TutorialPillHighlight: View {
                     glowing = true
                 }
             }
-            .accessibilityIdentifier("tutorial-pill-highlight")
     }
 }

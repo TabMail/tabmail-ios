@@ -360,7 +360,8 @@ struct DynamicIslandChat: View {
         .overlay {
             // Guided tutorial: the step's next move is opening the inbox chat.
             if !isExpanded && isInboxChat && TutorialCoordinator.shared.chatPrompt != nil {
-                TutorialPillHighlight()
+                TutorialGlowRing(shape: Capsule())
+                    .accessibilityIdentifier("tutorial-pill-highlight")
             }
         }
         .frame(
@@ -1353,6 +1354,7 @@ struct DynamicIslandChat: View {
                 MessageChatCollapseTip.hasStartedMessageChat = true
             } else {
                 InboxChatCollapseTip.hasStartedInboxChat = true
+                TutorialCoordinator.shared.discovered(.inboxChat)
             }
             if isComposeMode {
                 sendComposeEdit(text, agentAdmissionAcquired: composeAdmissionAcquired)
