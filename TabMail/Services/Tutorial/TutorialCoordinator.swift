@@ -266,6 +266,9 @@ final class TutorialCoordinator {
         step == .reuseReplyDone || (step == .moreToAsk && whatCanYouDoAsked)
     }
 
+    /// The template proposal's Create is the next tap in part 2.
+    var highlightsTemplateCreate: Bool { step == .makeTemplate }
+
     /// What the practice reply's draft chat holds before its edit ran.
     static let editPrompt = "Say I can’t make it"
 

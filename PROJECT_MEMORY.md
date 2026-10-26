@@ -58,7 +58,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | Optimistic UI Rollback | [read in full](Companion/Memory/Current/033-optimistic-ui-rollback.md) |
 | Gmail Label System | [read in full](Companion/Memory/Current/034-gmail-label-system.md) |
 | SwiftUI Observable Array Mutation Safety | [read in full](Companion/Memory/Current/035-swiftui-observable-array-mutation-safety.md) |
-| SwiftUI Layout Gotchas | [read in full](Companion/Memory/Current/036-swiftui-layout-gotchas.md) |
+| SwiftUI Layout Gotchas (incl. one-shot scrollTo on first List appearance dropped on device) | [read in full](Companion/Memory/Current/036-swiftui-layout-gotchas.md) |
 | HTML Email Render Pipeline (AutoSizingHTMLView) — MUST stay idempotent (ADR-IOS-039) | [read in full](Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md) |
 | Swift Gotchas | [read in full](Companion/Memory/Current/038-swift-gotchas.md) |
 | Folder.== must include every UI-visible field | [read in full](Companion/Memory/Current/039-folder-must-include-every-ui-visible-field.md) |

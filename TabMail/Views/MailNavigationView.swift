@@ -607,7 +607,7 @@ struct MailNavigationView: View {
                 ActionRulesView(tutorialRule: TutorialCoordinator.sampleDeleteRule)
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
-                            Button("Done") { TutorialCoordinator.shared.showsActionRule = false }
+                            TutorialSheetDoneButton { TutorialCoordinator.shared.showsActionRule = false }
                         }
                     }
             }
@@ -617,7 +617,7 @@ struct MailNavigationView: View {
                 TemplateDetailView(templateId: item.id)
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
-                            Button("Done") { templateSheetItem = nil }
+                            TutorialSheetDoneButton { templateSheetItem = nil }
                         }
                     }
             }

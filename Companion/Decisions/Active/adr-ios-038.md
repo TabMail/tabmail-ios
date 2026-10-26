@@ -389,6 +389,16 @@ fix gates at shared chokepoints, not per-tool patches:
   inbox card says "Check the original" and the Chat pill is ringed. The
   email pill's ring goes while its popover is open, so only Open Email
   is ringed.
+- **Smoke-test round 5 (owner 2026-10-25).** The template proposal's
+  Create is ringed (`highlightsTemplateCreate`), and so is Done on the
+  See rule and See template sheets (`TutorialSheetDoneButton`). The
+  scroll to a tag step's row is re-issued whenever the list's geometry
+  changes while a step targets a row (`TutorialInboxScroll`): on device,
+  a Replay from the debug menu asked for the scroll as the inbox first
+  appeared, while the list was still laying out and the coach card was
+  settling its height, and the offset stayed 0 (debug log, 2026-10-25).
+  A one-shot scroll on appear is not enough; the simulator happened to
+  settle in time.
 - **Considered and dropped the same day: consent once.** A variant asked
   the age/terms and AI screens before the AI parts and carried the
   outcome to sign-in (`CarriedConsent`). The owner chose a scripted

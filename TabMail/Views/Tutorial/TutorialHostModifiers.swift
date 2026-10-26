@@ -35,11 +35,24 @@ struct TutorialMessageHost: ViewModifier {
 }
 
 /// The inbox list: scrolls the row a tag step points at into view, so a card
-/// never asks for a tag that is below the fold. Sits beside the list inside
-/// its `ScrollViewReader`; rows are identified by `ThreadGroup.id`.
-struct TutorialInboxScroller: View {
+/// never asks for a tag that is below the fold. Applied to the list inside its
+/// `ScrollViewReader`; rows are identified by `ThreadGroup.id`.
+///
+/// The scroll is re-issued whenever the list's geometry changes while a step
+/// targets a row: a scroll asked for as the inbox first appears is dropped,
+/// because the list is still laying out and the coach card above it is still
+/// settling its height (measured on device 2026-10-25: the offset stayed 0).
+struct TutorialInboxScroll: ViewModifier {
     let proxy: ScrollViewProxy
     let groups: [ThreadGroup]
+
+    /// What the scroll depends on: the target row and the list's laid-out size.
+    private struct Layout: Equatable {
+        var containerHeight: CGFloat = 0
+        var contentHeight: CGFloat = 0
+    }
+
+    @State private var layout = Layout()
 
     private var targetGroupId: String? {
         let tutorial = TutorialCoordinator.shared
@@ -49,12 +62,37 @@ struct TutorialInboxScroller: View {
         }?.id
     }
 
-    var body: some View {
-        Color.clear
-            .allowsHitTesting(false)
+    func body(content: Content) -> some View {
+        content
+            .onScrollGeometryChange(for: Layout.self) {
+                Layout(containerHeight: $0.containerSize.height, contentHeight: $0.contentSize.height)
+            } action: { _, new in
+                layout = new
+            }
             .onChange(of: targetGroupId, initial: true) { _, id in
+                BackgroundSyncLogger.logDebug("[TutScroll] target=\(id ?? "nil") groups=\(groups.count) step=\(String(describing: TutorialCoordinator.shared.step))")
                 guard let id else { return }
                 withAnimation { proxy.scrollTo(id, anchor: .center) }
+            }
+            .onChange(of: layout) { _, new in
+                guard let id = targetGroupId, new.contentHeight > 0 else { return }
+                BackgroundSyncLogger.logDebug("[TutScroll] relayout container=\(Int(new.containerHeight)) content=\(Int(new.contentHeight)): rescroll")
+                proxy.scrollTo(id, anchor: .center)
+            }
+    }
+}
+
+/// A sheet's Done, ringed while the tutorial runs: the tutorial's sheets
+/// (See rule, See template) close with it.
+struct TutorialSheetDoneButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button("Done", action: action)
+            .overlay {
+                if TutorialCoordinator.shared.isRunning {
+                    TutorialPulseRing(shape: Capsule(), lineWidth: 2, outset: 6)
+                }
             }
     }
 }

@@ -712,6 +712,7 @@ struct TutorialLifecycleTests {
         // and the seeded Sent folder is not empty.
         try await Task.sleep(for: .seconds(1))
         #expect(coordinator.step == .replyToPriya, "the step waits for the reply to reach Sent")
+        #expect(!coordinator.highlightsTemplateCreate, "no proposal before the reply is sent")
         // The draft chat holds the edit; Use Suggestion waits for it.
         #expect(coordinator.composeEditPrompt == TutorialCoordinator.editPrompt)
         #expect(!coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
@@ -727,10 +728,12 @@ struct TutorialLifecycleTests {
         try await pool.write { try row.insert($0) }
         await AccountManager.shared.drainOutbox()
         try await waitFor(.makeTemplate)
+        #expect(coordinator.highlightsTemplateCreate, "the proposal's Create is the next tap")
         _ = await TutorialChatScript.answer(
             .makeTemplate, practiceReply: coordinator.practiceReplyText,
             invocation: ToolInvocation(uiSink: AcceptingSink()))
         try await waitFor(.reuseReplyDone)
+        #expect(!coordinator.highlightsTemplateCreate, "the template is saved")
         #expect(coordinator.completedLessons.contains(.reuseReply))
         let templateId = try #require(coordinator.savedTemplateId)
         let template = try #require(PromptStore.shared.templates.first { $0.id == templateId })

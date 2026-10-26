@@ -470,10 +470,12 @@ struct InboxView: View {
                     switch viewModel.mode {
                     case .normal:
                         ScrollViewReader { proxy in
-                            ZStack {
-                                normalListView
-                                TutorialInboxScroller(proxy: proxy, groups: viewModel.displayGroups)
-                            }
+                            normalListView
+                                .modifier(TutorialInboxScroll(proxy: proxy, groups: viewModel.displayGroups))
+                                .onScrollGeometryChange(for: Int.self) { Int($0.contentOffset.y) } action: { _, y in
+                                    guard TutorialCoordinator.shared.isRunning else { return }
+                                    BackgroundSyncLogger.logDebug("[TutScroll] offset=\(y)")
+                                }
                         }
                         .transition(.blurReplace)
                     case .triage:
@@ -686,7 +688,10 @@ struct InboxView: View {
             if TutorialCoordinator.shared.isRunning && !chatExpanded {
                 TutorialCoachView(host: .inbox)
                     .padding(.vertical, 8)
-                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { tutorialCardHeight = $0 }
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: {
+                        BackgroundSyncLogger.logDebug("[TutScroll] cardHeight=\(Int($0))")
+                        tutorialCardHeight = $0
+                    }
             }
         }
         .dismissKeyboardOnTap()
