@@ -3346,14 +3346,18 @@ enum QuoteFitConfig {
 /// at every zoom under 0.6). A transform scales the painted block exactly. Its layout box
 /// keeps the full height, so a negative bottom margin takes back the difference; the
 /// block's own inline `margin-bottom` is kept in `data-tm-quote-scale` and restored.
+/// That height is `offsetHeight`, the block's own layout height in the same CSS px as
+/// its margin; the bounding rect is in screen px, which a sender's transform around the
+/// whole message multiplies, so taking that back from the margin overlapped the next text.
 /// The block starts at its container's left edge (it overflows to the right), so the
 /// origin is its top left.
 ///
 /// Overflow the sender already handles is left alone (`tmQuoteFitLeaves`): a block inside
 /// an `overflow-x` auto/scroll/hidden/clip ancestor pans or clips in its own box (the same
 /// containment rule as `fitViewportJS`'s `measureMaxRight`), and a block that carries or
-/// sits under the sender's own transform would lose it, since only `margin-bottom` is
-/// saved and restored.
+/// sits under the sender's own `transform`, `scale` or `rotate` would lose it or be scaled
+/// twice, since only `margin-bottom` is saved and restored. (`scale` and `rotate` are
+/// separate properties and do not show in the computed `transform`.)
 ///
 /// Idempotent: every run first removes the scale it set before, then measures, so a
 /// rerun after images load or the column width changes reaches the same answer as a
@@ -3362,11 +3366,14 @@ enum QuoteFitConfig {
 /// Defined as a top-level JS string so that `collapseQuotesJS` (production) and the
 /// tests consume the same source.
 let fitQuoteContentJS = """
+function tmQuoteFitTransformed(s) {
+    return s.transform !== 'none' || s.scale !== 'none' || s.rotate !== 'none';
+}
 function tmQuoteFitLeaves(el, content) {
-    if (getComputedStyle(el).transform !== 'none') return true;
+    if (tmQuoteFitTransformed(getComputedStyle(el))) return true;
     for (var a = el.parentElement; a && a !== content; a = a.parentElement) {
         var as = getComputedStyle(a), ov = as.overflowX;
-        if (ov === 'auto' || ov === 'scroll' || ov === 'hidden' || ov === 'clip' || as.transform !== 'none') return true;
+        if (ov === 'auto' || ov === 'scroll' || ov === 'hidden' || ov === 'clip' || tmQuoteFitTransformed(as)) return true;
     }
     return false;
 }
@@ -3398,7 +3405,7 @@ function tmFitQuoteContent(content) {
         last = el;
         if (tmQuoteFitLeaves(el, content)) continue;
         var scale = Math.floor((right - r.left) / r.width * \(QuoteFitConfig.scaleSteps)) / \(QuoteFitConfig.scaleSteps);
-        if (scale > 0 && scale < 1) picks.push([el, scale, r.height, parseFloat(es.marginBottom) || 0]);
+        if (scale > 0 && scale < 1) picks.push([el, scale, el.offsetHeight, parseFloat(es.marginBottom) || 0]);
     }
     for (var p = 0; p < picks.length; p++) {
         var target = picks[p][0], s = picks[p][1];

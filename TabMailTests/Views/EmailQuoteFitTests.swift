@@ -285,18 +285,23 @@ struct EmailQuoteFitTests {
         #expect(inline == "scale(0.8)")
     }
 
-    @Test("A wide block under an ancestor the sender transformed is left alone")
-    func overflowUnderAnAuthoredTransformIsLeftAlone() async throws {
+    @Test("A wide block with, or under an ancestor with, the sender's transform, scale or rotate is left alone",
+          arguments: ["transform:scale(0.9)", "scale:0.9", "rotate:1deg"], [false, true])
+    func overflowWithAnAuthoredTransformIsLeftAlone(_ style: String, onAncestor: Bool) async throws {
+        let table = #"<table id="t" style="width:600px;height:120px;\#(onAncestor ? "" : style)"><tr><td>Placeholder</td></tr></table>"#
         let d = try await bare("""
-            <div id="c"><div style="transform:scale(0.9);transform-origin:0 0"><table id="t" style="width:600px;height:120px"><tr><td>Placeholder</td></tr></table></div></div>
+            <div id="c">\(onAncestor ? #"<div style="transform-origin:0 0;\#(style)">"# + table + "</div>" : table)</div>
             """, """
             JSON.stringify((function () {
                 var c = document.getElementById('c'), t = document.getElementById('t');
-                return { picks: tmFitQuoteContent(c), paint: t.getBoundingClientRect().width, layout: t.offsetWidth };
+                var before = t.getBoundingClientRect().right;
+                return { before: before, edge: c.getBoundingClientRect().right, picks: tmFitQuoteContent(c),
+                         ours: t.hasAttribute('data-tm-quote-scale') ? 1 : 0 };
             })())
             """)
-        #expect(d["picks"] == 0)
-        #expect(abs((d["paint"] ?? 0) - (d["layout"] ?? 0) * 0.9) < 0.5, "\(d)")
+        try #require((d["before"] ?? 0) > (d["edge"] ?? 0) + 50, "the fixture must overflow: \(d)")
+        #expect(d["picks"] == 0, "\(style) on \(onAncestor ? "an ancestor" : "the block"): \(d)")
+        #expect(d["ours"] == 0)
     }
 
     @Test("A scaled table's text is scaled once, with the table")
@@ -336,6 +341,85 @@ struct EmailQuoteFitTests {
         #expect(abs((d["before"] ?? 0) - 13) < 0.5, "\(d)")
         #expect(abs((d["after"] ?? 0) - 13) < 0.5, "\(d)")
         #expect(d["priority"] == 1)
+    }
+
+    @Test("A table only twenty pixels too wide is scaled to fit")
+    func smallOverflowFits() async throws {
+        let d = try await bare("""
+            <div id="c"><table id="t" style="width:320px;height:40px"><tr><td>Placeholder</td></tr></table></div>
+            """, """
+            JSON.stringify((function () {
+                var c = document.getElementById('c'), t = document.getElementById('t');
+                var before = t.getBoundingClientRect().right;
+                tmFitQuoteContent(c);
+                return { before: before, right: t.getBoundingClientRect().right, edge: c.getBoundingClientRect().right };
+            })())
+            """)
+        let before = try #require(d["before"]), right = try #require(d["right"]), edge = try #require(d["edge"])
+        try #require(abs(before - edge - 20) < 1, "the fixture must overflow by 20px: \(d)")
+        #expect(right <= edge + 1 && right >= edge - 2, "table ends at \(right), column at \(edge)")
+    }
+
+    @Test("An image wider than the quote is scaled to fit")
+    func wideImageFits() async throws {
+        let d = try await bare("""
+            <div id="c"><img id="t" width="600" height="120" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='600' height='120'%3E%3C/svg%3E"></div>
+            """, """
+            JSON.stringify((function () {
+                var c = document.getElementById('c'), t = document.getElementById('t');
+                tmFitQuoteContent(c);
+                return { display: getComputedStyle(t).display === 'inline' ? 1 : 0, right: t.getBoundingClientRect().right,
+                         edge: c.getBoundingClientRect().right, height: t.getBoundingClientRect().height };
+            })())
+            """)
+        let right = try #require(d["right"]), edge = try #require(d["edge"])
+        try #require(d["display"] == 1, "the image must be an inline box: \(d)")
+        #expect(right <= edge + 1 && right >= edge - 2, "image ends at \(right), column at \(edge)")
+        #expect((d["height"] ?? 0) > 10)
+    }
+
+    @Test("A table too wide to scale to any visible size is left at full size, not scaled to nothing")
+    func unscalableTableStaysVisible() async throws {
+        let row = String(repeating: "W", count: 100_000)
+        let d = try await bare("""
+            <div id="c"><table id="t" style="height:120px"><tr><td style="white-space:nowrap">\(row)</td></tr></table></div>
+            """, """
+            JSON.stringify((function () {
+                var c = document.getElementById('c'), t = document.getElementById('t');
+                return { picks: tmFitQuoteContent(c), layout: t.offsetWidth, paint: t.getBoundingClientRect().width,
+                         height: t.getBoundingClientRect().height };
+            })())
+            """)
+        let layout = try #require(d["layout"]), paint = try #require(d["paint"])
+        try #require(layout > 300 * Double(QuoteFitConfig.scaleSteps), "the table must be too wide for one scale step: \(d)")
+        #expect(d["picks"] == 0)
+        #expect(abs(paint - layout) < 1 && (d["height"] ?? 0) > 100, "\(d)")
+    }
+
+    @Test("Under a sender transform around the whole message, text after the scaled table stays below it")
+    func senderTransformAroundTheMessageKeepsTheFlow() async throws {
+        let hosted = try await hosted("""
+            <div style="width:160px;transform:scale(2);transform-origin:0 0;margin-bottom:800px"><p>Placeholder reply</p>\(Self.attribution)<blockquote><table id="wide"><tr><td style="white-space:nowrap">Placeholder receipt row that cannot wrap and must fit the quote width</td></tr><tr><td>Row two</td></tr><tr><td>Row three</td></tr><tr><td>Row four</td></tr><tr><td>Row five</td></tr></table><div id="tail" style="height:20px">Placeholder tail</div></blockquote></div>
+            """)
+        defer { hosted.tearDown() }
+        try await toggle(hosted.webView)
+        try await Task.sleep(for: .milliseconds(150))
+        let json = await CanaryKit.eval(hosted.webView, """
+            (function () {
+                var c = document.querySelector('.tm-quote-content'), t = document.getElementById('wide');
+                return JSON.stringify({ bottom: t.getBoundingClientRect().bottom, tail: document.getElementById('tail').getBoundingClientRect().top,
+                                        clip: c.getBoundingClientRect().bottom, paint: t.getBoundingClientRect().width,
+                                        layout: t.offsetWidth * 2 });
+            })()
+            """)
+        let d = try #require(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Double], "bad result: \(json)")
+        let bottom = try #require(d["bottom"]), tail = try #require(d["tail"]), clip = try #require(d["clip"])
+        let paint = try #require(d["paint"]), layout = try #require(d["layout"])
+        try #require(paint < layout - 20, "the table must have been scaled: \(d)")
+        #expect(tail >= bottom - 1, "following text overlaps the table: \(d)")
+        // Compact as without the outer transform: no blank space left by the full-height layout box.
+        #expect(tail <= bottom + 3, "blank space under the scaled table: \(d)")
+        #expect(clip >= bottom - 1, "the quote clips the table's bottom: \(d)")
     }
 
     @Test("A wide inline-block inside an inline wrapper is the block that is scaled")

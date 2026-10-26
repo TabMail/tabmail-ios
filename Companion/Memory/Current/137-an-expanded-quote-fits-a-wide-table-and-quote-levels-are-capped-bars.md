@@ -49,6 +49,18 @@ transformed ancestor) had it overwritten, and the reset restores only `margin-bo
 refit with room erased the sender's transform. Such a block is now left as authored (fail closed:
 it may stay clipped). Either way the block still ends its branch, so its descendants are skipped too.
 
+🚨 **The height taken back is `offsetHeight`, not the bounding rect (review round 2).** The rect is in
+screen px; a sender `transform` around the whole message (above `.tm-quote-content`, outside the
+`tmQuoteFitLeaves` walk) multiplies it, so subtracting it as CSS px over-reclaimed: text after the
+table overlapped it and the quote clipped its bottom. `offsetHeight` is the block's own layout height
+in the same CSS px as its margin, whatever is transformed above it. The reviewer proposed deleting the
+compensation (accept blank space under every scaled table, about half its height at scale 0.5); that
+is a visible change from the compact result the owner approved in simulator screenshots for a rare
+input, and an adversarial consult agreed the cause-level fix is the right call. The same consult
+found that the separate CSS `scale` and `rotate` properties do not show in the computed `transform`,
+so `tmQuoteFitTransformed` checks all three. The scale ratio itself uses rects on both sides, so it is
+unit-free under an outer scale (a rotated message is not handled).
+
 **Why not re-run the page fit on expand.** ADR-IOS-039 says a re-fit of injected content must go
 through `resetAndFit`; that widens the layout viewport and shrinks the WHOLE message, the reply text
 included, and a collapse would need another re-fit back. Scaling only the quoted block leaves the
@@ -63,7 +75,10 @@ full-height layout box), collapse-and-expand gives the same fit, and a widened t
 text is scaled once (descendants are not picked again); the column narrowing refits (observer);
 a load that widens the table without changing the quote box's height refits (load listener); the
 inline-reply layout's trailing quote fits; the sender's `margin-bottom` and priority return; an
-inline-block inside an inline wrapper is the scaled block. Red-first: each fails with its mutation.
+inline-block inside an inline wrapper is the scaled block. Round 2 added: a 20px overflow fits
+(slop), an inline image fits, a table too wide for one scale step stays full size (no scale 0), and
+text after a table scaled under a whole-message sender transform sits right below it.
+Red-first: each fails with its mutation.
 
 ## 2. Quote levels: thin coloured bars, and the indent stops at a depth (#327)
 
