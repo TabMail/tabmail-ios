@@ -21,6 +21,7 @@ flips, or give a test seam a default that differs from production's initial valu
 · **raise a "arbitrary" size/window/scan constant because it is too small → MIS-IOS-024.**
 · **call a key/id wrong from a remembered keying fact before reading the function that mints it, or write `ContentKey(rawValue: header.id)` → MIS-IOS-025.**
 · **write a `finish`/`cancel` that "releases" an object by nilling a property while a `Task`/`await` elsewhere still calls it → MIS-IOS-026.**
+· **write a `getBoundingClientRect()` length back into a style as px (margin/width/height), or call a region "untransformed" from `transform` alone → MIS-IOS-027.**
 
 ## Data integrity — the irreversible ones
 
@@ -49,6 +50,7 @@ flips, or give a test seam a default that differs from production's initial valu
 - **MIS-IOS-024** — **widened a scan window (`snippetLinkScanChars` 4,000 → 32,000) on a happy-path benchmark without asking what the bound was protecting**: the regex behind `unwrapMarkdownLinks` was quadratic on unclosed `[](` / `\[` runs (3.5–6.8 s on the main actor at the new window); two cap-inside-the-regex patches each broke a valid link (MIS-005 ×28) before the construct was replaced by a linear scanner (#162, PR #163). Benchmark the ADVERSARIAL input in terms of the limit; worse than linear ⇒ replace the algorithm, never tune caps. (×1)
 - **MIS-IOS-025** — **declared `ContentKey(rawValue: message.id)` a missing-body bug from the "FTS is RFC-keyed" note without reading `ContentKey.forHeader`**, which is Stage B (== header id; RFC tail only at E1); my own proving test failed. Read the mint before calling a key wrong; still read content stores via `MessageContentStore.capture`. (×1)
 - **MIS-IOS-026** — **"released" `PDFTextHost`'s web view by nilling `self.webView` while `Task { await readPages(webView) }` still awaited `callAsyncJavaScript` on it**: the web view outlived a cancel by 9 s and a wedged page forever; fixed with a `[weak self]` completion handler; tell = a teardown that clears a property while a pending await/closure owns the object; test with a weak ref that must go nil
+- **MIS-IOS-027** — **subtracted the quoted table's screen-px `getBoundingClientRect().height` from its CSS-px `margin-bottom`** in `tmFitQuoteContent`; a sender `transform` above the quote doubled it and the next text overlapped the table; fixed with `offsetHeight`, and `tmQuoteFitTransformed` checks `transform`/`scale`/`rotate` (separate properties hide from computed `transform`); tell = rect geometry written back into a style as px (×1)
 
 ## Build & test ops
 
