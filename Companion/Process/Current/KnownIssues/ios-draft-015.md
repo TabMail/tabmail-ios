@@ -24,3 +24,14 @@ Drafts; `DraftStore.pushDraftToServer`; `DraftStore.restorePushableAfterProvider
 **Bound.** Unlike `IOS-DRAFT-011`'s K, this residual is bounded by the number of attempts whose response was lost *after the server committed*, not by the number of saves: a throw before the server acted leaves no stray at all, and a throw after it leaves at most one per such attempt. Durable actions retry without a cap, so the bound is the network's, not the queue's — but each retry that reaches the server and returns replaces rather than adds, because `applyPushCompletion` then advances `serverDraftId` and the next `priorIdentity` names the copy that exists.
 
 **Pinned by** `NeverDropExitClosureTests.aThrownDraftAppendKeepsItsSaveProducerAndTheNextDrainLandsIt` (a `FakeIMAPServer` that refuses the first `APPEND`: the durable producer survives the throw AND the SECOND drain actually issues an `APPEND` and lands the draft — the wedge half, asserted on the wire rather than on `serverPushStatus`) and `DraftGenerationSafetyTests.providerThrowRethrowsAndLeavesTheDraftPushable` (the throw is rethrown, the prior linkage survives, and a straight retry with no authored edit completes). The latter **replaces a blessing test** (MIS-014): `providerThrowThenAuthoredEdit` asserted `first == .terminalUnconfirmed` and `serverPushStatus == "unconfirmed"`, i.e. it asserted the never-drop violation was correct, so its premise was the defect and it was rewritten rather than repaired.
+
+## New Outlook draft cleanup (#237, 2026-10-26)
+
+Creating an Outlook draft now adds its attachments after creating the message. If attachment
+listing or upload fails, `ExchangeProvider.saveDraft` attempts to delete only that new message and
+rethrows the original failure. A failed cleanup can leave one partial server copy per failed
+cleanup attempt. The local draft retains every authored byte and its Save remains retryable;
+sync exposes the stray as an ordinary Drafts message that one delete gesture removes. This is the
+same recoverable residual class above, now also reachable through a failed cleanup rather than
+only a lost creation response. `ExchangeNewDraftAttachmentTests` pins failure propagation,
+successful cleanup and retry, and preservation of the original error when cleanup fails.

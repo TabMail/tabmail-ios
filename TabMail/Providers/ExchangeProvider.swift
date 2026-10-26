@@ -990,7 +990,9 @@ actor ExchangeProvider: EmailProvider {
             throw ProviderError.actionIdentityResolutionFailed(
                 "ExchangeProvider received a non-Outlook prior draft identity")
         }
-        let message = buildGraphSendPayload(draft: draft)
+        var messageDraft = draft
+        messageDraft.attachments = []
+        let message = buildGraphSendPayload(draft: messageDraft)
 
         if let existingId = existingDraftId {
             // Update the existing draft. Graph's message PATCH cannot change
@@ -999,9 +1001,7 @@ actor ExchangeProvider: EmailProvider {
             // attachments collection. The server copy then holds exactly this draft,
             // so reopening it, which loads the server copy, never drops a file added
             // here (#217).
-            var patch = message
-            patch.removeValue(forKey: "attachments")
-            let jsonData = try JSONSerialization.data(withJSONObject: patch)
+            let jsonData = try JSONSerialization.data(withJSONObject: message)
             let encodedExistingId = try Self.encodedGraphPathSegment(
                 existingId, context: "Graph draft message id"
             )
@@ -1011,12 +1011,27 @@ actor ExchangeProvider: EmailProvider {
             try await replaceDraftAttachments(graphId: graphId, with: draft.attachments)
             return .created(.outlook(graphId: graphId))
         } else {
-            // Create new draft in Drafts folder
+            // Create the message first, then add each file through the same
+            // size-aware path as an update (#237). Sending them in this POST
+            // would reject a large file before an upload session can be made.
             let jsonData = try JSONSerialization.data(withJSONObject: message)
             let response = try await request(path: "/mailFolders/drafts/messages", method: "POST", body: jsonData)
             guard let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
                   let msgId = dict["id"] as? String else {
                 throw NSError(domain: "ExchangeProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "No message ID in draft response"])
+            }
+            do {
+                if !draft.attachments.isEmpty {
+                    try await replaceDraftAttachments(graphId: msgId, with: draft.attachments)
+                }
+            } catch {
+                // The local draft still owns every byte and the throw keeps its
+                // Save queued. Remove only this attempt's incomplete server copy
+                // so the retry normally creates one complete draft. If cleanup
+                // also fails, sync can surface that copy for ordinary deletion;
+                // preserve the original error for the queue's retry classifier.
+                try? await deleteDraft(identity: .outlook(graphId: msgId))
+                throw error
             }
             return .created(.outlook(graphId: msgId))
         }

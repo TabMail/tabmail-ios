@@ -661,3 +661,16 @@ can no longer appear over a newer screen, so `DraftOpenTracker`, its cancellatio
 navigation, `DraftOpenCancelledByBack`, `DraftOpenPreparation.open`, `PreparedDraftOpen` and
 `DraftOpeningMark` are deleted. Because the presenter is on screen for the whole read, the
 ADR-IOS-030 compose hold begins before the read, which resolves `IOS-DRAFT-025` (#311).
+
+### New Outlook draft attachment uploads (#237, 2026-10-26)
+
+A new Outlook draft is created without attachments, then receives each file through
+`replaceDraftAttachments`, the same size-aware collection/upload-session path an existing draft
+uses. The message payload is built from a copy with no attachments, so large file bytes are not
+base64-encoded merely to discard them. Send keeps its existing payload.
+
+An attachment-list or upload failure attempts `deleteDraft` for only the message this attempt
+created, then rethrows the original failure. The local draft and its durable Save producer remain
+retryable; a successful cleanup prevents the next attempt from accumulating partial copies. If the
+cleanup fails too, the incomplete server copy is an ordinary synced draft the user can delete
+(`IOS-DRAFT-015`); no receipt, new persistent state, or recovery loop is introduced.
