@@ -8,10 +8,9 @@ import Foundation
 /// for its own steps only, so a card never points at a control that is not
 /// on screen.
 enum TutorialCoachHost: Equatable {
-    /// The inbox list, chat collapsed.
+    /// The inbox list, chat collapsed. The open chat covers the card (owner
+    /// 2026-10-25): its ringed Send, pill and close button show the way.
     case inbox
-    /// The inbox's expanded Agent Chat (not a message or draft chat).
-    case chat
     /// A reply to Priya's practice email. `showingSuggestion` is the AI
     /// Suggestion bubble still waiting for Use Suggestion.
     case compose(showingSuggestion: Bool)
@@ -117,9 +116,7 @@ struct TutorialCoachContent: Equatable {
                 : card("TabMail wrote a reply.", "Say what to change: tap Edit at the top, then Send.")
         case (.makeTemplate, .inbox):
             return card("Sent. Now reuse it.", "Nobody received it. Tap Chat to turn it into a template.")
-        case (.makeTemplate, .chat):
-            return card("Ask for a template.", "Your practice reply is in Sent. Tap Send to ask TabMail to make it reusable.")
-        case (.reuseReplyDone, .inbox), (.reuseReplyDone, .chat):
+        case (.reuseReplyDone, .inbox):
             var c = card(
                 "Template saved.",
                 "In your own inbox, ask TabMail to make a template the same way, "
@@ -129,21 +126,16 @@ struct TutorialCoachContent: Equatable {
             return c
 
         // Part 3
+        case (.askFlights, .inbox) where flightsAsked:
+            return card("Check the original.", "Open Chat and tap the email reference in the answer.")
         case (.askFlights, .inbox):
             return card("Start with Chat.", "Tap Chat at the bottom of the inbox.")
-        case (.askFlights, .chat):
-            if flightsAsked {
-                return card("Check the original.", "Tap the email reference to open it.")
-            }
-            return card("Ask about past email.", "Tap Send to ask for a detail you’d otherwise dig through emails to find.")
         case (.askAnythingDone, .message), (.askAnythingDone, .inbox):
             var c = card("There’s your answer.", "You went from a question to the original email.", done: true)
             c.buttons = [Button(label: "Next", action: .showMoreToAsk, isPrimary: true)]
             return c
-        case (.moreToAsk, .inbox), (.moreToAsk, .chat):
-            // The inbox has no Send: its card points at Chat first.
-            let tap = host == .chat ? "Tap Send" : "Tap Chat"
-            var c = card("Ask anything.", "Not sure where to start? \(tap) to ask TabMail what it can do.", done: true)
+        case (.moreToAsk, .inbox):
+            var c = card("Ask anything.", "Not sure where to start? Tap Chat to ask TabMail what it can do.", done: true)
             c.examples = askExamples
             c.buttons = [Button(label: "Finish", action: .showRecap, isPrimary: true)]
             return c

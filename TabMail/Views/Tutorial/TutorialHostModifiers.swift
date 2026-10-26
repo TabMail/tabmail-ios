@@ -132,3 +132,22 @@ struct TutorialPulseRing<S: Shape>: View {
         .allowsHitTesting(false)
     }
 }
+
+/// Navigation the tutorial turns off (owner 2026-10-25): the control stays in
+/// place, disabled and dimmed, until the tutorial ends.
+struct TutorialLockedNavigation: ViewModifier {
+    static let lockedOpacity = 0.35
+
+    func body(content: Content) -> some View {
+        let locked = TutorialCoordinator.shared.isRunning
+        content
+            .disabled(locked)
+            .opacity(locked ? Self.lockedOpacity : 1)
+    }
+}
+
+extension View {
+    func tutorialLockedNavigation() -> some View {
+        modifier(TutorialLockedNavigation())
+    }
+}

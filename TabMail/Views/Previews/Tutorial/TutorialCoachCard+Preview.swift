@@ -25,11 +25,8 @@ private func previewCard(
     .background(Palette.previewPaneBg)
 }
 
-#Preview("Chat: card on top, filled-in input") {
+#Preview("Chat: filled-in input") {
     VStack(spacing: 12) {
-        if let content = previewCard(.makeTemplate, .reuseReply, .chat) {
-            TutorialCoachCard(content: content)
-        }
         Spacer()
         TutorialChatInputBar(prompt: TutorialCoordinator.ChatPrompt.makeTemplate.rawValue, isWorking: false) {}
     }

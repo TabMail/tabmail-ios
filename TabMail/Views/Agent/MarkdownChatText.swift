@@ -710,8 +710,10 @@ private struct ChatPillChip: View {
                     )
                 )
                 .overlay {
-                    // Guided tutorial: the answer's email reference is the next tap.
-                    if type == "email" && !isHistory && TutorialCoordinator.shared.highlightsEmailReference {
+                    // Guided tutorial: the answer's email reference is the next tap
+                    // (its popover's Open Email takes the ring once it is open).
+                    if type == "email" && !isHistory && presentation == nil
+                        && TutorialCoordinator.shared.highlightsEmailReference {
                         TutorialPulseRing(shape: Capsule(), lineWidth: 2, outset: 3)
                     }
                 }

@@ -97,7 +97,7 @@ struct TutorialCoachContentTests {
     typealias Step = TutorialCoordinator.Step
 
     private static let hosts: [TutorialCoachHost] = [
-        .inbox, .chat, .compose(showingSuggestion: true), .compose(showingSuggestion: false), .message, .actionRules,
+        .inbox, .compose(showingSuggestion: true), .compose(showingSuggestion: false), .message, .actionRules,
     ]
 
     private static let allSteps: [Step] = [
@@ -146,7 +146,7 @@ struct TutorialCoachContentTests {
         let rule = try #require(TutorialCoachContent.make(
             step: .actOnEmailDone, lesson: .actOnEmail, host: .actionRules, flightsAsked: false))
         #expect(rule.buttons.isEmpty, "the sheet closes with Done")
-        let last = try #require(TutorialCoachContent.make(step: .moreToAsk, lesson: .askAnything, host: .chat, flightsAsked: true))
+        let last = try #require(TutorialCoachContent.make(step: .moreToAsk, lesson: .askAnything, host: .inbox, flightsAsked: true))
         #expect(last.buttons.map(\.action) == [.showRecap])
         #expect(!last.examples.isEmpty)
     }
@@ -171,11 +171,24 @@ struct TutorialCoachContentTests {
         #expect(C.chatPrompt(for: .askFlights, flightsAsked: false) == .flights)
         #expect(C.chatPrompt(for: .askFlights, flightsAsked: true) == nil)
         #expect(C.chatPrompt(for: .moreToAsk, flightsAsked: true) == .whatCanYouDo)
+        #expect(C.chatPrompt(for: .moreToAsk, flightsAsked: true, whatCanYouDoAsked: true) == nil)
         let withPrompt: Set<Step> = [.makeTemplate, .askFlights, .moreToAsk]
         for step in Self.allSteps where !withPrompt.contains(step) {
             #expect(C.chatPrompt(for: step, flightsAsked: false) == nil, "\(step) has nothing to send")
         }
         #expect(C.chatPrompt(for: nil, flightsAsked: false) == nil)
+    }
+
+    /// The open chat covers the card (owner 2026-10-25), so a closed chat's
+    /// card must still say where the next tap is after the question was asked.
+    @Test("After the flight question, the inbox card points back at the answer in Chat")
+    func inboxCardAfterTheQuestion() throws {
+        let before = try #require(TutorialCoachContent.make(
+            step: .askFlights, lesson: .askAnything, host: .inbox, flightsAsked: false))
+        let after = try #require(TutorialCoachContent.make(
+            step: .askFlights, lesson: .askAnything, host: .inbox, flightsAsked: true))
+        #expect(before.title != after.title)
+        #expect(after.message.contains("email reference"))
     }
 
     @Test("A card asks for Send only on a screen that has a Send button")
@@ -724,15 +737,18 @@ struct TutorialLifecycleTests {
         #expect(template.exampleReply == reply, "the template is made from the reply just sent")
 
         // Part 3: ask about the flights, then open the cited email.
+        #expect(coordinator.highlightsChatClose, "the open chat covers the card with Next")
         coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
         #expect(coordinator.step == .reuseReplyDone, "opening Jordan's email counts only in part 3")
         coordinator.nextLesson()
         #expect(coordinator.step == .askFlights)
+        #expect(!coordinator.highlightsChatClose)
         #expect(coordinator.chatPrompt == .flights)
         #expect(!coordinator.highlightsEmailReference, "no answer to point at yet")
         coordinator.chatPromptSent(.flights)
         #expect(coordinator.chatPrompt == nil, "the asked question is not offered again")
         #expect(coordinator.highlightsEmailReference)
+        #expect(!coordinator.highlightsChatClose, "the next tap is the email reference, not Close")
         coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.receipt)
         #expect(coordinator.step == .askFlights, "only Jordan's email completes the part")
         coordinator.discovered(.inboxChat)
@@ -745,6 +761,10 @@ struct TutorialLifecycleTests {
         coordinator.showMoreToAsk()
         #expect(coordinator.step == .moreToAsk)
         #expect(coordinator.chatPrompt == .whatCanYouDo)
+        #expect(!coordinator.highlightsChatClose, "Send is the next tap")
+        coordinator.chatPromptSent(.whatCanYouDo)
+        #expect(coordinator.chatPrompt == nil, "the question is not offered again")
+        #expect(coordinator.highlightsChatClose, "Finish is on the card under the chat")
         coordinator.showRecap()
         #expect(coordinator.step == .finished)
 

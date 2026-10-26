@@ -54,6 +54,8 @@ final class TutorialCoordinator {
 
     /// The flight question was sent: the chat card moves on to "Check the original".
     private(set) var flightsAsked = false
+    /// "What can you do?" was sent: nothing more to send, Finish is on the card.
+    private(set) var whatCanYouDoAsked = false
     /// The practice reply's scripted edit ran: compose moves on to Use Suggestion.
     private(set) var replyEdited = false
     /// "See rule" opened the Action Classification sheet with the sample rule.
@@ -154,6 +156,7 @@ final class TutorialCoordinator {
         step = nil
         isEnding = false
         flightsAsked = false
+        whatCanYouDoAsked = false
         replyEdited = false
         showsActionRule = false
         savedTemplateId = nil
@@ -236,13 +239,17 @@ final class TutorialCoordinator {
     }
 
     /// The inbox chat's filled-in input now, if this step has one.
-    var chatPrompt: ChatPrompt? { Self.chatPrompt(for: step, flightsAsked: flightsAsked) }
+    var chatPrompt: ChatPrompt? {
+        Self.chatPrompt(for: step, flightsAsked: flightsAsked, whatCanYouDoAsked: whatCanYouDoAsked)
+    }
 
-    nonisolated static func chatPrompt(for step: Step?, flightsAsked: Bool) -> ChatPrompt? {
+    nonisolated static func chatPrompt(
+        for step: Step?, flightsAsked: Bool, whatCanYouDoAsked: Bool = false
+    ) -> ChatPrompt? {
         switch step {
         case .makeTemplate: return .makeTemplate
         case .askFlights where !flightsAsked: return .flights
-        case .moreToAsk: return .whatCanYouDo
+        case .moreToAsk where !whatCanYouDoAsked: return .whatCanYouDo
         default: return nil
         }
     }
@@ -250,6 +257,13 @@ final class TutorialCoordinator {
     /// The inbox chat sent `prompt` (its scripted answer follows).
     func chatPromptSent(_ prompt: ChatPrompt) {
         if prompt == .flights, step == .askFlights { flightsAsked = true }
+        if prompt == .whatCanYouDo, step == .moreToAsk { whatCanYouDoAsked = true }
+    }
+
+    /// The open chat covers the coach card (owner 2026-10-25): when the step's
+    /// next move is a card button, closing the chat is the next tap.
+    var highlightsChatClose: Bool {
+        step == .reuseReplyDone || (step == .moreToAsk && whatCanYouDoAsked)
     }
 
     /// What the practice reply's draft chat holds before its edit ran.

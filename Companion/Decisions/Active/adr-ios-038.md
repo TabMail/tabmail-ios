@@ -373,6 +373,22 @@ fix gates at shared chokepoints, not per-tool patches:
   (measured with debug logs: the inbox card re-ran, the compose card did
   not, while ComposeView itself redrew), so the compose card's identity
   follows `replyEdited` (`.id`).
+- **Smoke-test round 4 (owner 2026-10-25).** Navigation is off while
+  the tutorial runs: the inbox's back button (to the folders) is hidden,
+  and triage, compose, filter and search in the inbox and compose, reply
+  and archive in the message view are disabled and dimmed
+  (`tutorialLockedNavigation`). The message view keeps its back button:
+  a row tap opens any message, and back is the only way out of one
+  without a card. The open inbox chat covers the coach card at full
+  height (it was laid out below the card, too short to read in part 3);
+  the chat-hosted card is gone, and the chat's rings lead instead:
+  Send, the email pill, and the close button when the next move is a
+  card button (`highlightsChatClose`: Template saved, and Ask anything
+  once "What can you do?" was sent, which is now asked once, like the
+  flight question). With the chat closed after the flight question, the
+  inbox card says "Check the original" and the Chat pill is ringed. The
+  email pill's ring goes while its popover is open, so only Open Email
+  is ringed.
 - **Considered and dropped the same day: consent once.** A variant asked
   the age/terms and AI screens before the AI parts and carried the
   outcome to sign-in (`CarriedConsent`). The owner chose a scripted

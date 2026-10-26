@@ -576,6 +576,7 @@ struct InboxView: View {
                             .glassEffect(.regular.interactive(), in: .circle)
                     }
                     .buttonStyle(.plain)
+                    .tutorialLockedNavigation()
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
 
@@ -599,12 +600,11 @@ struct InboxView: View {
                             .glassEffect(.regular.interactive(), in: .circle)
                     }
                     .buttonStyle(.plain)
+                    .tutorialLockedNavigation()
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
             .padding(.bottom, chatExpanded ? 8 : 34)
-            // The expanded chat opens below the tutorial's coach card.
-            .padding(.top, TutorialCoordinator.shared.isRunning ? tutorialCardHeight : 0)
             .animation(.spring(response: 0.45, dampingFraction: 0.82), value: chatExpanded)
             }
             // Compact undo chip (below the bottom bar pills)
@@ -680,11 +680,11 @@ struct InboxView: View {
         }
         .background(Color(.systemBackground))
         .overlay(alignment: .top) {
-            // Guided tutorial: one coach card pinned to the top of the inbox,
-            // above the list and the expanded chat alike, so it stays put
-            // while either changes.
-            if TutorialCoordinator.shared.isRunning {
-                TutorialCoachView(host: chatExpanded ? .chat : .inbox)
+            // Guided tutorial: one coach card pinned to the top of the inbox.
+            // The open chat covers it (owner 2026-10-25: the chat needs the
+            // height); the chat's own rings show the way meanwhile.
+            if TutorialCoordinator.shared.isRunning && !chatExpanded {
+                TutorialCoachView(host: .inbox)
                     .padding(.vertical, 8)
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { tutorialCardHeight = $0 }
             }
@@ -732,6 +732,8 @@ struct InboxView: View {
         .toolbarVisibility(chatExpanded && chatInputFocused ? .hidden : .automatic, for: .navigationBar)
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
+        // Guided tutorial: no way out to the folders while it runs.
+        .navigationBarBackButtonHidden(TutorialCoordinator.shared.isRunning)
         // Toolbar items are wrapped in a .transaction { $0.disablesAnimations
         // = true } inside each ToolbarItem's content view. This is a scoped
         // workaround for a known SwiftUI bug where NavigationSplitView's
@@ -773,8 +775,6 @@ struct InboxView: View {
             }
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    // Triage acts on every card: off during the tutorial.
-                    guard TutorialCoordinator.shared.admits(.other) else { return }
                     collapseChat()
                     withAnimation(.easeInOut(duration: 0.3)) {
                         viewModel.mode = viewModel.mode == .normal ? .triage : .normal
@@ -786,6 +786,7 @@ struct InboxView: View {
                         .contentTransition(.symbolEffect(.replace))
                 }
                 .accessibilityLabel(viewModel.mode == .normal ? "Switch to triage" : "Switch to list")
+                .tutorialLockedNavigation()
                 .popoverTip(TriageModeTip(), arrowEdge: .top)
                 .transaction { $0.disablesAnimations = true }
             }
@@ -794,6 +795,7 @@ struct InboxView: View {
                     collapseChat()
                     viewModel.showCompose = true
                 })
+                .tutorialLockedNavigation()
                 .transaction { $0.disablesAnimations = true }
             }
         }

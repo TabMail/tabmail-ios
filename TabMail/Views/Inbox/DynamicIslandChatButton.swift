@@ -278,6 +278,13 @@ struct DynamicIslandChat: View {
                                 .background(Color(.systemGray5))
                                 .clipShape(Circle())
                         }
+                        .overlay {
+                            // Guided tutorial: the open chat covers the card, whose
+                            // button is the next tap.
+                            if isInboxChat && TutorialCoordinator.shared.highlightsChatClose {
+                                TutorialPulseRing(shape: Circle(), lineWidth: 2, outset: 3)
+                            }
+                        }
                         .accessibilityIdentifier("chatClose")
                     }
                 }
@@ -359,7 +366,8 @@ struct DynamicIslandChat: View {
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: isExpanded ? 24 : 100))
         .overlay {
             // Guided tutorial: the step's next move is opening this chat.
-            if !isExpanded && tutorialPromptText != nil {
+            if !isExpanded
+                && (tutorialPromptText != nil || (isInboxChat && TutorialCoordinator.shared.highlightsEmailReference)) {
                 TutorialPulseRing(shape: Capsule())
                     .accessibilityIdentifier("tutorial-pill-highlight")
             }
