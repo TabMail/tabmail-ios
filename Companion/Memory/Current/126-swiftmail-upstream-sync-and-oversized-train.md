@@ -456,3 +456,14 @@ serializer that writes recipients:
 - Fork CI trap: `gh workflow run swift.yml --ref <branch>` also runs the experimental `build-windows`
   job, which always fails inside swift-nio-ssl (`#error("unsupported os")`); upstream runs it only on
   manual dispatch. Judge a branch by build-linux, build-macos, build-ios and build-android.
+
+## 2026-10-26 — iOS GBK aliases (#257)
+
+- Fork `main` fast-forwarded `ffcaf0a` → `b14f52a`, adding only the iOS GBK alias
+  correction and regressions. App and NSE share that exact fork revision.
+- [Upstream PR #278](https://github.com/Cocoanetics/SwiftMail/pull/278) folds
+  `chinese`, `x-gbk`, `iso-ir-58` and `csISO58GB231280` to `gbk` before the platform
+  lookup, then uses the existing GB18030 decoder. See memory 132.
+- Upstream main had independently advanced to `806c55a` (#275–#277). This focused
+  pin does not adopt those changes. At the next general sync, apply the normal
+  collision checks and drop this fork deviation once upstream contains its content.
