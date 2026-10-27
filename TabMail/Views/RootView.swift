@@ -126,7 +126,12 @@ struct RootView: View {
                 }
             } else if !demoSeedingComplete {
                 DemoSeedingSplash()
-                    .task(id: demoStore.isActive) {
+                    // Keyed by the demo run, not `isActive`: a demo that ends
+                    // and starts again while this splash is still animating
+                    // out gets the same splash back, with its finished task
+                    // and `isActive` true both times. The new run's id starts
+                    // its setup.
+                    .task(id: demoStore.chatAdmission) {
                         guard demoStore.isActive, !demoSeedingComplete else { return }
                         // The demo run this setup is for. If it ends during the
                         // splash (a notification tap ends the tutorial), setup

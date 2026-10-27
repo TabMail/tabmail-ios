@@ -102,7 +102,7 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 ## Post-freeze amendments
 
 > **Current tracker census (2026-10-26, guided tutorial): unchanged at 6 `open` records.** `IOS-TEST-012`
-> (`accepted`, owner-blessed) records that five tutorial hooks in SwiftUI views have no committed test.
+> (`accepted`, owner-blessed) records that eight tutorial hooks in SwiftUI views have no committed test.
 >
 > *Preserved:* **Current tracker census (2026-10-25, #326): unchanged at 6 `open` records.** `IOS-DRAFT-025` is
 > resolved: a draft's cover now opens at once, so an agent compose waits behind it while it is read.
@@ -296,7 +296,7 @@ regenerated from it; their detail files live in
 
 | ID | Class | Executive statement |
 |---|---|---|
-| [IOS-TEST-012](Companion/Process/Current/KnownIssues/Amendments/ios-test-012.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-26, owner)** — five guided-tutorial hooks in SwiftUI view code have no committed test (the scripted chat prompt forwarded to the script, the practice reply's no-undo send, and the found-on-their-own records for inbox tag taps, message-view tag taps and inbox chat). Unit tests cannot reach a view's private function; the decisions behind each hook are tested at the coordinator and service. A lost hook re-teaches a part, delays the practice send, or shows an error in part 3; nothing is lost |
+| [IOS-TEST-012](Companion/Process/Current/KnownIssues/Amendments/ios-test-012.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-26, owner; extended after review round c4)** — eight guided-tutorial hooks in SwiftUI view code have no committed test (the scripted chat prompt forwarded to the script, the practice reply's no-undo send, the found-on-their-own records for inbox tag taps, message-view tag taps and inbox chat, Compose's Use Suggestion gate, the chat's scripted-edit send, and opening Jordan's email finishing part 3). Unit tests cannot reach a view's private function; the decisions behind each hook are tested at the coordinator and service. A lost hook re-teaches a part, delays the practice send, skips or stalls part 2's edit step, or shows an error in part 3 or leaves it unfinished; nothing is lost |
 
 ## GitHub live trackers (updated 2026-08-20)
 

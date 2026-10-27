@@ -10,7 +10,6 @@ import Synchronization
 import SwiftUI
 import Testing
 import UIKit
-import UserNotifications
 @testable import TabMail
 
 /// A throwaway UserDefaults suite, so no test touches the app's real state.
@@ -628,12 +627,19 @@ struct TutorialFixtureTests {
         queued.holdUntil = Date().addingTimeInterval(-60)
         let row = queued
         try await pool.write { try row.insert($0) }
-        await AccountManager.shared.drainOutbox()
+        // `drainOutbox` returns at once while another drain runs (one an
+        // earlier test left behind, such as a hold's wake-up): drain until the
+        // row leaves the outbox.
+        var remaining: OutboxMessage? = row
+        for _ in 0..<200 where remaining != nil {
+            await AccountManager.shared.drainOutbox()
+            remaining = try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) }
+            if remaining != nil { try await Task.sleep(for: .milliseconds(25)) }
+        }
         await AccountManager.shared.unregisterDemoProviders(accountId: accountId)
 
         let after = try await pool.read { try TutorialCoordinator.fetchMailFacts($0) }
         #expect(after.sentMessageIds.subtracting(before.sentMessageIds).count == 1)
-        let remaining = try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) }
         #expect(remaining == nil, "the sent message must leave the outbox")
     }
 }
@@ -1254,18 +1260,6 @@ struct TutorialLifecycleTests {
         await coordinator.end()
     }
 
-    /// Stands in for `UNUserNotificationCenter.requestAuthorization`: answers
-    /// "denied" with no system alert. RootView asks when a tutorial ends, and
-    /// the alert leaves the test host's scene inactive, where a newly shown
-    /// view's `.task` does not start.
-    private static func silentNotificationRequest() -> IMP {
-        typealias Completion = @convention(block) (Bool, NSError?) -> Void
-        let block: @convention(block) (AnyObject, UInt, @escaping Completion) -> Void = { _, _, completion in
-            completion(false, nil)
-        }
-        return imp_implementationWithBlock(block)
-    }
-
     /// RootView sets the demo up behind a splash, where the inbox (and its
     /// notification handler) is not on screen. A notification tap there still
     /// ends the tutorial, and the next run gets its own setup.
@@ -1286,15 +1280,6 @@ struct TutorialLifecycleTests {
         }
         store._resetForTests()
         try #require(!coordinator.isRunning)
-        let request = try #require(class_getInstanceMethod(
-            UNUserNotificationCenter.self, NSSelectorFromString("requestAuthorizationWithOptions:completionHandler:")))
-        let silent = Self.silentNotificationRequest()
-        let systemRequest = method_setImplementation(request, silent)
-        defer {
-            method_setImplementation(request, systemRequest)
-            imp_removeBlock(silent)
-        }
-
         // Park the setup at its first read: the pool's one reader is held.
         await withCheckedContinuation { (held: CheckedContinuation<Void, Never>) in
             DispatchQueue.global().async {
@@ -1309,6 +1294,12 @@ struct TutorialLifecycleTests {
         // set the demo up): it sets the demo up behind its splash, nothing
         // here calls the setup.
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        // SwiftUI does not start the splash's setup task in an inactive scene
+        // (a system alert over the test host); the notification request
+        // RootView makes when a run ends is answered silently
+        // (`TestNotificationAuthorization`).
+        let sceneActive = await eventually { scene.activationState == .foregroundActive }
+        try #require(sceneActive, "the test host's scene is active")
         let window = try #require(scene.windows.first)
         let hostRoot = window.rootViewController
         window.rootViewController = UIHostingController(rootView: RootView().environment(NavigationStore()))
@@ -1334,8 +1325,12 @@ struct TutorialLifecycleTests {
         // The ended run's setup gets its read and stops.
         release.signal()
         await wait(for: finished)
-        try await Task.sleep(for: .milliseconds(300))
 
+        // Start again at once, while the ended run's splash is still
+        // animating out: SwiftUI brings that splash back for the new run, and
+        // it must set the new run up.
+        let stillActive = await eventually { scene.activationState == .foregroundActive }
+        try #require(stillActive, "the scene is still active after the ended run (no permission alert)")
         await coordinator.start(.actOnEmail, hasTabMailSession: true)
         let begun = await eventually { coordinator.step == .archiveReceipt }
         #expect(begun, "the next run is set up and begins")

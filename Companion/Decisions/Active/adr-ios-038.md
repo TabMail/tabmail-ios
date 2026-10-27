@@ -435,6 +435,21 @@ fix gates at shared chokepoints, not per-tool patches:
   main-actor closure traps. Tests added for each, and for a real message's
   pending Sent copy waiting offline, the flight answer's capsule opening the
   cited email, and no Contacts prompt during the tutorial.
+- **Review round c4 (Codex, 2026-10-26).** Correctness and robustness
+  clean; coverage only. Three more tutorial hooks in SwiftUI views (Compose's
+  Use Suggestion gate, the chat's scripted-edit send, opening Jordan's email
+  finishing part 3) have no committed test; the owner extended
+  `IOS-TEST-012` to them (eight hooks). The unit-test host now answers every
+  notification-permission request with a silent "denied" for the whole test
+  process (`TestNotificationAuthorization`): the host's RootView asks when a
+  tutorial run ends, and the system alert left the scene inactive, where
+  the next splash's setup task never started. Found while making that
+  fixture reliable: RootView's splash setup task was keyed by
+  `demoStore.isActive`. A demo that ends and starts again while the
+  splash is still animating out (RootView animates `isActive` with a
+  spring) gets the same splash back, with `isActive` true both times, so
+  the task never restarted and the new run stayed on the splash. It is
+  keyed by the demo run (`demoStore.chatAdmission`) now.
 - **Considered and dropped the same day: consent once.** A variant asked
   the age/terms and AI screens before the AI parts and carried the
   outcome to sign-in (`CarriedConsent`). The owner chose a scripted
