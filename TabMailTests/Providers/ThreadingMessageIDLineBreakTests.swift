@@ -23,8 +23,8 @@ struct ThreadingMessageIDLineBreakTests {
     private static func headerFields(_ name: String, in message: String) -> [String] {
         (message.components(separatedBy: "\r\n\r\n").first ?? message)
             .components(separatedBy: "\r\n")
-            .filter { $0.hasPrefix(name + ": ") }
-            .map { String($0.dropFirst(name.count + 2)) }
+            .filter { $0.hasPrefix(name + ":") }
+            .map { String($0.dropFirst(name.count + 1)).trimmingCharacters(in: .whitespaces) }
     }
 
     private static func fromText(_ message: String) -> Written {
@@ -64,15 +64,16 @@ struct ThreadingMessageIDLineBreakTests {
         ]
     }
 
-    private static func draft(inReplyTo: String, references: [String]) -> DraftMessage {
+    private static func draft(inReplyTo: String?, references: [String]) -> DraftMessage {
         DraftMessage(to: ["to@example.com"], subject: "Re: Hello", body: "Body",
                      inReplyTo: inReplyTo, references: references)
     }
 
     @Test("A message ID with a line break is left out of In-Reply-To and References on every writer",
-          arguments: ["\r\n", "\n", "\r", "\u{000B}", "\u{000C}", "\u{0085}", "\u{2028}", "\u{2029}"])
-    func lineBreakIDIsLeftOut(lineBreak: String) throws {
-        let hostile = "<mid@example.com>\(lineBreak)X-Injected: yes"
+          arguments: ["\r\n", "\n", "\r", "\u{000B}", "\u{000C}", "\u{0085}", "\u{2028}", "\u{2029}"], [false, true])
+    func lineBreakIDIsLeftOut(lineBreak: String, bracketed: Bool) throws {
+        let bare = "mid\(lineBreak)X-Injected: yes@example.com"
+        let hostile = bracketed ? "<\(bare)>" : bare
         let all = try Self.written(Self.draft(
             inReplyTo: hostile, references: ["root@example.com", hostile, "<last@example.com>"]))
 
@@ -81,6 +82,21 @@ struct ThreadingMessageIDLineBreakTests {
             #expect(written.inReplyTo.isEmpty, "\(writer)")
             #expect(written.references == ["<root@example.com> <last@example.com>"], "\(writer)")
             #expect(!written.text.contains("X-Injected"), "\(writer)")
+        }
+    }
+
+    @Test("Unsafe ancestors are omitted with a valid or missing parent",
+          arguments: [false, true], [false, true])
+    func unsafeAncestorsWithSafeOrMissingParent(hasParent: Bool, bracketed: Bool) throws {
+        let bare = "old\rX-Injected: yes@example.com"
+        let hostile = bracketed ? "<\(bare)>" : bare
+        let parent = hasParent ? "parent@example.com" : nil
+        for references in [["root@example.com", hostile, "<last@example.com>"], [hostile]] {
+            for (writer, written) in try Self.written(Self.draft(inReplyTo: parent, references: references)) {
+                #expect(written.inReplyTo == (hasParent ? ["<parent@example.com>"] : []), "\(writer)")
+                #expect(written.references == (references.count == 1 ? [] : ["<root@example.com> <last@example.com>"]), "\(writer)")
+                #expect(!written.text.contains("X-Injected"), "\(writer)")
+            }
         }
     }
 
