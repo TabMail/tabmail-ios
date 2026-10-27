@@ -8,7 +8,7 @@ GB2312 has no such character.
 
 ## Root cause
 
-- CoreFoundation's `CFStringConvertIANACharSetNameToEncoding` maps the labels `gb2312`, `euc-cn`,
+- On macOS, CoreFoundation's `CFStringConvertIANACharSetNameToEncoding` maps the labels `gb2312`, `euc-cn`,
   `csgb2312`, `chinese` and `iso-ir-58` to **strict EUC-CN** (`0x930`), `gbk`/`x-gbk` to GBK_95
   (`0x631`), `cp936`/`windows-936` to DOSChineseSimplif (`0x421`), and `euc-kr` to strict EUC-KR
   (`0x940`). SwiftCross's `String.Encoding(ianaCharsetName:)` uses that table on Apple platforms.
@@ -68,3 +68,16 @@ punctuation sequences differently, some to two-scalar sequences ending in privat
   Only a re-sync of the account replaces them. No migration was built.
 - **Bodies stored as mojibake are user-recoverable**: the same message-view pull-to-refresh re-fetches
   and replaces the body, now decoded with the superset charset.
+
+## iOS GBK alias parity (#257, 2026-10-26)
+
+iOS CoreFoundation rejects `chinese`, `x-gbk`, `iso-ir-58` and `csISO58GB231280`,
+although macOS accepts them. SwiftMail now folds those four labels to `gbk` before
+the IANA lookup, preserving the existing GB18030 widening. Trimming, quoting and
+case variants use the same rule. Other labels keep their existing lookup.
+
+The app and NSE pin fork `main` commit `b14f52a63b7b5d0dbe57367b79fd06793b1aa6aa`;
+[upstream PR #278](https://github.com/Cocoanetics/SwiftMail/pull/278) carries the fix.
+Received raw-EML subjects and bodies are covered in the library; the app regression
+checks both header decoders and `MessagePart.textContent`. The stored-mail policy
+above still applies: no subject migration; body refetch can recover stored mojibake.

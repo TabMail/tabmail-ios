@@ -180,6 +180,21 @@ struct RFC5322ParseTests {
 
     // MARK: - decodeRFC2047 charsets
 
+    @Test("GBK alias subjects and received bodies decode as Chinese on iOS", arguments: [
+        "chinese", "CHINESE", "x-gbk", "X-GBK",
+        "iso-ir-58", "ISO-IR-58", "csISO58GB231280", "CSISO58GB231280"
+    ])
+    func gbAliasMailDecodes(label: String) {
+        let subject = "=?\(label)?B?1tDOxKhD?="
+        #expect(RFC5322Parse.decodeRFC2047(subject) == "中文\u{2013}")
+        #expect(subject.decodeMIMEHeader() == "中文\u{2013}")
+        let part = MessagePart(
+            sectionString: "1", contentType: "text/plain; charset=\"\(label)\"",
+            data: Data([0xD6, 0xD0, 0xCE, 0xC4, 0xA8, 0x43])
+        )
+        #expect(part.textContent == "中文\u{2013}")
+    }
+
     /// A subject labelled `gb2312` whose first word carries the GBK en dash
     /// `A8 43`, which strict GB2312 lacks ("Report – draft" / " for review").
     /// Strict decoding left the whole first encoded-word on screen.
