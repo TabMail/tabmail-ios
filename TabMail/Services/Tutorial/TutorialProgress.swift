@@ -45,8 +45,8 @@ enum TutorialDiscovery: String, CaseIterable, Sendable {
 }
 
 /// The sidebar tutorial row: "Tutorial · done of total done", resumes `next`.
-/// Once every part is done there is no row; replay lives in the debug menu
-/// (owner 2026-10-21).
+/// Once every part is done there is no row; replay is the last sidebar item
+/// above Debug and in the debug menu (owner 2026-10-21, 2026-10-26).
 struct TutorialRowState: Equatable, Sendable {
     let done: Int
     let total: Int

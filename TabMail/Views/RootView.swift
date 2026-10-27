@@ -184,7 +184,12 @@ struct RootView: View {
                 // for good; Skip and Sign in land on the login below.
                 TutorialWelcomeView(onStart: {
                     await tutorial.start(.actOnEmail, hasTabMailSession: false)
-                    dismissTutorialWelcome()
+                    // Only the screen goes away: the pending flag stays until the
+                    // tutorial ends (`onChange(of: tutorial.isRunning)`), so a
+                    // force-quit mid-tutorial relaunches into the welcome, not
+                    // sign-in. A failed start keeps the welcome up for a retry.
+                    guard tutorial.isRunning else { return }
+                    withAnimation { showsTutorialWelcome = false }
                 }, onSkip: {
                     dismissTutorialWelcome()
                 })
@@ -200,7 +205,9 @@ struct RootView: View {
                 // that, so the onboarding path never asked the backend for
                 // entitlement and routed active subscribers to the paywall
                 // on the gate's hydrated default.
-                TabMailLoginView {
+                TabMailLoginView(onPlayTutorial: {
+                    withAnimation { showsTutorialWelcome = true }
+                }) {
                     NotificationCenter.default.post(name: .tabMailDidSignIn, object: nil)
                 }
             } else if !hasCompletedConsentGate {
@@ -401,7 +408,11 @@ struct RootView: View {
             tutorial.demoDidExit()
         }
         .onChange(of: tutorial.isRunning) { _, running in
-            if !running { requestPushPermissionAfterTutorial() }
+            if !running {
+                // Finished or skipped: the first-launch welcome is done for good.
+                TutorialProgress().dismissWelcome()
+                requestPushPermissionAfterTutorial()
+            }
         }
         // A notification tap during the guided tutorial ends it (owner V5),
         // here because RootView stays mounted through the tutorial's splash

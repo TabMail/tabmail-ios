@@ -10,6 +10,9 @@ struct TutorialWelcomeView: View {
     var onStart: () async -> Void
     /// Skip and "I have an account · Sign in": both open the sign-in screen.
     var onSkip: () -> Void
+    /// Shown again from the sidebar or the debug menu: no sign-in link, and
+    /// Skip reads "Not now".
+    var isReplay = false
 
     @State private var isStarting = false
 
@@ -19,23 +22,29 @@ struct TutorialWelcomeView: View {
                 .renderingMode(.original)
                 .resizable()
                 .scaledToFit()
-                .frame(maxWidth: 160)
+                .frame(maxWidth: 200)
 
-            Text("A little practice.\nLess time on email.")
-                .font(.title)
-                .fontWeight(.bold)
-                .foregroundStyle(Theme.textPrimary)
-                .multilineTextAlignment(.center)
+            // The second line is the quieter one (owner 2026-10-26).
+            VStack(spacing: 0) {
+                Text("Welcome to TabMail")
+                    .fontWeight(.bold)
+                    .foregroundStyle(Theme.textPrimary)
+                Text("Less time on email")
+                    .fontWeight(.regular)
+                    .foregroundStyle(Theme.textSecondary)
+            }
+            .font(.title)
+            .multilineTextAlignment(.center)
 
-            Text("Try TabMail on sample emails before you sign in.")
+            Text("Take a quick tour on sample mail and see how much time you get back.")
                 .font(.subheadline)
                 .foregroundStyle(Theme.textSecondary)
                 .multilineTextAlignment(.center)
 
             VStack(alignment: .leading, spacing: 14) {
-                TutorialBenefit(symbol: "hand.tap", title: "Act with a tap", detail: "Tags are buttons. Hold one to change it.")
-                TutorialBenefit(symbol: "arrowshape.turn.up.left", title: "Reuse your best replies", detail: "Turn a reply into a template.")
-                TutorialBenefit(symbol: "magnifyingglass", title: "Ask anything", detail: "Find past email and more.")
+                TutorialBenefit(symbol: "hand.tap", title: "Tap away your emails, your way", detail: "Tap tags to act, or hold to teach.")
+                TutorialBenefit(symbol: "arrowshape.turn.up.left", title: "Reply in seconds, and reuse them", detail: "Pre-written replies. Turn any reply into a smart template.")
+                TutorialBenefit(symbol: "magnifyingglass", title: "Ask anything", detail: "Find past emails and calendar events, schedule meetings, and more.")
             }
             .padding(.vertical, 8)
 
@@ -43,7 +52,7 @@ struct TutorialWelcomeView: View {
                 .font(.footnote)
                 .foregroundStyle(Theme.textSecondary)
         } footer: {
-            TutorialPrimaryButton(title: "Give it a quick try", isLoading: isStarting) {
+            TutorialPrimaryButton(title: "Take the tour", isLoading: isStarting) {
                 isStarting = true
                 Task {
                     await onStart()
@@ -52,8 +61,12 @@ struct TutorialWelcomeView: View {
             }
             .accessibilityIdentifier("tutorial-welcome-start")
             HStack(spacing: 24) {
-                Button("Skip", action: onSkip)
-                Button("I have an account · Sign in", action: onSkip)
+                if isReplay {
+                    Button("Not now", action: onSkip)
+                } else {
+                    Button("Skip", action: onSkip)
+                    Button("I have an account · Sign in", action: onSkip)
+                }
             }
             .font(.subheadline)
             .foregroundStyle(Theme.textSecondary)
@@ -123,14 +136,14 @@ private struct TutorialPage<Content: View, Footer: View>: View {
                 VStack(spacing: 16) {
                     content
                 }
-                .padding(.horizontal, 32)
+                .padding(.horizontal, 20)
                 .padding(.top, 56)
                 .frame(maxWidth: .infinity)
             }
             VStack(spacing: 14) {
                 footer
             }
-            .padding(.horizontal, 32)
+            .padding(.horizontal, 20)
             .padding(.bottom, 24)
         }
         .background(Palette.previewPaneBg)
@@ -204,6 +217,7 @@ struct TutorialSidebarRow: View {
                     }
                 } icon: {
                     Image(systemName: "graduationcap")
+                        .foregroundStyle(Theme.accent)
                 }
                 ProgressView(value: Double(state.done), total: Double(state.total))
                     .tint(Theme.accent)

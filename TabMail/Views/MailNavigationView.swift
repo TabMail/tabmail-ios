@@ -36,6 +36,7 @@ struct MailNavigationView: View {
     @Environment(\.scenePhase) private var scenePhase
     var initialSelection: MailboxSelection? = .unified(.inbox)
     @State private var showSignInSheet = false
+    @State private var showsTutorialReplay = false
     /// Mirror of `AISubscriptionGate.shared.isActive`. `@Observable` tracking is
     /// unreliable inside `NavigationSplitView` sidebar content, so we observe the
     /// gate at the body root via `.onChange` below and drive the banner from this
@@ -372,7 +373,7 @@ struct MailNavigationView: View {
                     Section {
                         if let tutorialRowState {
                             TutorialSidebarRow(state: tutorialRowState) {
-                                startTutorial(tutorialRowState.next)
+                                showsTutorialReplay = true
                             }
                         }
 
@@ -439,6 +440,23 @@ struct MailNavigationView: View {
 
                         NavigationLink(value: MailboxSelection.contacts) {
                             Label("Contacts", systemImage: "person.crop.circle")
+                        }
+
+                        // Every part done: the progress row above is gone, so replay
+                        // is here, last before Debug (owner 2026-10-26).
+                        if tutorialRowState == nil && !TutorialCoordinator.shared.isRunning {
+                            Button {
+                                showsTutorialReplay = true
+                            } label: {
+                                Label {
+                                    Text("Replay Tutorial")
+                                } icon: {
+                                    Image(systemName: "graduationcap")
+                                        .foregroundStyle(Theme.accent)
+                                }
+                            }
+                            .foregroundStyle(Theme.textPrimary)
+                            .accessibilityIdentifier("tutorial-replay-row")
                         }
 
                         if DebugModeManager.shared.isUnlocked {
@@ -550,6 +568,14 @@ struct MailNavigationView: View {
             }
         }
         .modifier(NavigationNotificationHandlers(selection: $selection, pushedShowsAccount: $pushedShowsAccount))
+        .fullScreenCover(isPresented: $showsTutorialReplay) {
+            TutorialWelcomeView(onStart: {
+                await TutorialCoordinator.shared.start(.actOnEmail, hasTabMailSession: TabMailAuthService.hasSession())
+                showsTutorialReplay = false
+            }, onSkip: {
+                showsTutorialReplay = false
+            }, isReplay: true)
+        }
         .sheet(isPresented: $showSignInSheet) {
             TabMailLoginView {
                 showSignInSheet = false
@@ -759,11 +785,6 @@ struct MailNavigationView: View {
         return tutorial.rowState
     }
 
-    private func startTutorial(_ lesson: TutorialLesson) {
-        Task {
-            await TutorialCoordinator.shared.start(lesson, hasTabMailSession: TabMailAuthService.hasSession())
-        }
-    }
 
     // MARK: - Notification visibility hint
 

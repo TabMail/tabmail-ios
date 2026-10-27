@@ -14,6 +14,9 @@ struct TabMailLoginView: View {
     @State private var otpCode: String = ""
     /// Demo Mode store — drives "Try the demo" button visibility/state.
     @Bindable private var demoStore = DemoModeStore.shared
+    /// The first-run sign-in screen offers the guided tutorial as a text link
+    /// at the bottom, back to the welcome screen (the sheet presentations do not).
+    var onPlayTutorial: (() -> Void)?
     var onSignedIn: () -> Void
 
     private let authService = TabMailAuthService()
@@ -63,6 +66,13 @@ struct TabMailLoginView: View {
                         .font(.caption)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 40)
+                }
+
+                if let onPlayTutorial, loginState == .providers {
+                    Button("Play tutorial", action: onPlayTutorial)
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.textSecondary)
+                        .accessibilityIdentifier("login-play-tutorial")
                 }
 
                 Spacer()

@@ -467,4 +467,13 @@ fix gates at shared chokepoints, not per-tool patches:
 - ADR-IOS-018 (PendingOperation queue — DemoProvider stubs the drain
   side; since 2026-10-21 the demo drain runs, see above).
 
+**Amendment 2026-10-26 — first-run welcome survives a force-quit; every tutorial entry is the welcome (owner):**
+The pending first-run flag (`TutorialProgress.welcomePending`) is cleared only when the tutorial ends
+(Finish or Skip tutorial), not when Start is tapped, so a force-quit mid-tutorial relaunches into the
+welcome instead of sign-in. A failed start keeps the welcome up. Every entry point (sign-in "Play tutorial",
+sidebar Tutorial row, sidebar "Replay Tutorial" last above Debug once all parts are done, debug "Replay
+Tutorial") opens the welcome screen, whose Start begins at part 1; the replay variant shows "Not now" only.
+This reverses the 2026-10-21 "replay lives only in the debug menu" decision. Welcome copy: "Welcome to TabMail /
+Less time on email", button "Take the tour".
+
 ---
