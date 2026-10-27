@@ -11,6 +11,7 @@ struct DebugMenuView: View {
     @State private var reminderTestStatus: String?
     @State private var showTouchRings = TouchVisualizer.shared.isEnabled
     @State private var demoEnterError: String?
+    @State private var showsTutorialWelcome = false
     @Bindable private var demoStore = DemoModeStore.shared
     @State private var stuckScanStatus: String?
     @Environment(NavigationStore.self) private var navigationStore
@@ -48,14 +49,12 @@ struct DebugMenuView: View {
                     }
                 }
                 if !TutorialCoordinator.shared.isRunning {
-                    // Replay: the guided tutorial from part 1, whatever its
-                    // progress, as the first-launch welcome's Start runs it. The
-                    // only replay entry (owner 2026-10-21). A plain demo is
-                    // replaced by the tutorial's fresh one.
+                    // Replay: the first-launch welcome, whose Start runs the guided
+                    // tutorial from part 1 whatever its progress. The only replay
+                    // entry (owner 2026-10-21). A plain demo is replaced by the
+                    // tutorial's fresh one. Skip and Sign in just close it.
                     Button {
-                        Task {
-                            await TutorialCoordinator.shared.start(.actOnEmail, hasTabMailSession: TabMailAuthService.hasSession())
-                        }
+                        showsTutorialWelcome = true
                     } label: {
                         Label("Replay Tutorial", systemImage: "graduationcap")
                     }
@@ -189,6 +188,14 @@ struct DebugMenuView: View {
             }
         }
         .navigationTitle("Debug")
+        .fullScreenCover(isPresented: $showsTutorialWelcome) {
+            TutorialWelcomeView(onStart: {
+                await TutorialCoordinator.shared.start(.actOnEmail, hasTabMailSession: TabMailAuthService.hasSession())
+                showsTutorialWelcome = false
+            }, onSkip: {
+                showsTutorialWelcome = false
+            }, isReplay: true)
+        }
     }
 
     private func resetSyncProgress() async {
