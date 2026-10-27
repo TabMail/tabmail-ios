@@ -1295,9 +1295,9 @@ struct TutorialLifecycleTests {
         // here calls the setup.
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         // SwiftUI does not start the splash's setup task in an inactive scene
-        // (a system alert over the test host); the notification request
-        // RootView makes when a run ends is answered silently
-        // (`TestNotificationAuthorization`).
+        // (a system alert over the test host); the permission requests the
+        // host makes (RootView when a run ends, ComposeView on appear) are
+        // answered silently (`TestPermissionPrompts`).
         let sceneActive = await eventually { scene.activationState == .foregroundActive }
         try #require(sceneActive, "the test host's scene is active")
         let window = try #require(scene.windows.first)

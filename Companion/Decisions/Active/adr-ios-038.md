@@ -440,10 +440,13 @@ fix gates at shared chokepoints, not per-tool patches:
   Use Suggestion gate, the chat's scripted-edit send, opening Jordan's email
   finishing part 3) have no committed test; the owner extended
   `IOS-TEST-012` to them (eight hooks). The unit-test host now answers every
-  notification-permission request with a silent "denied" for the whole test
-  process (`TestNotificationAuthorization`): the host's RootView asks when a
-  tutorial run ends, and the system alert left the scene inactive, where
-  the next splash's setup task never started. Found while making that
+  notification and Contacts permission request with a silent "denied" for
+  the whole test process (`TestPermissionPrompts`): the host's RootView asks
+  for notifications when a tutorial run ends, ComposeView asks for Contacts
+  when view tests mount it, and either system alert left the scene
+  inactive, where the next splash's setup task never started. (The Contacts
+  prompt only showed in the first full-suite run on a freshly erased
+  simulator; the simulator then records it as denied.) Found while making that
   fixture reliable: RootView's splash setup task was keyed by
   `demoStore.isActive`. A demo that ends and starts again while the
   splash is still animating out (RootView animates `isActive` with a
