@@ -2356,11 +2356,12 @@ actor GmailProvider: EmailProvider {
         // while a draft and the Sent copy keep it is observed, not documented.
         if !draft.bcc.isEmpty { lines.append("Bcc: \(IMAPProvider.recipientsFieldBody(draft.bcc))") }
         lines.append("Subject: \(RFC2047.encodeHeaderValue(draft.subject))")
-        if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
+        if let replyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
             lines.append(Self.messageIDField("In-Reply-To", [replyTo]))
         }
-        if !draft.references.isEmpty {
-            lines.append(Self.messageIDField("References", draft.references))
+        let references = IMAPProvider.threadingMessageIDs(draft.references)
+        if !references.isEmpty {
+            lines.append(Self.messageIDField("References", references))
         }
         lines.append("MIME-Version: 1.0")
         if draft.isHTML {
@@ -2407,11 +2408,12 @@ actor GmailProvider: EmailProvider {
         // leaves the header out of the delivered copies.
         if !draft.bcc.isEmpty { message += "Bcc: \(IMAPProvider.recipientsFieldBody(draft.bcc))\r\n" }
         message += "Subject: \(RFC2047.encodeHeaderValue(draft.subject))\r\n"
-        if let replyTo = draft.inReplyTo, !replyTo.isEmpty {
+        if let replyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
             message += Self.messageIDField("In-Reply-To", [replyTo]) + "\r\n"
         }
-        if !draft.references.isEmpty {
-            message += Self.messageIDField("References", draft.references) + "\r\n"
+        let references = IMAPProvider.threadingMessageIDs(draft.references)
+        if !references.isEmpty {
+            message += Self.messageIDField("References", references) + "\r\n"
         }
         message += "MIME-Version: 1.0\r\n"
 

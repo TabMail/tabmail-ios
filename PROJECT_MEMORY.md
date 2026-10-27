@@ -89,7 +89,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | Agent Chat (ADR-IOS-022, ADR-IOS-023) | [read in full](Companion/Memory/Current/064-agent-chat-adr-ios-022-adr-ios-023.md) |
 | Screen Keep-Awake (chat pill) | [read in full](Companion/Memory/Current/065-screen-keep-awake-chat-pill.md) |
 | Agent Compose FIFO Queue (ADR-IOS-030) | [read in full](Companion/Memory/Current/066-agent-compose-fifo-queue-adr-ios-030.md) |
-| Outgoing Threading — reply/forward stay in-thread on every provider (ADR-IOS-043, 2026-06-23) | [read in full](Companion/Memory/Current/067-outgoing-threading-reply-forward-stay-in-thread-on-every-provider-adr-io.md) |
+| Outgoing Threading — reply/forward headers; reject line-break IDs at every writer (#221); preserve Gmail folding (ADR-IOS-043) | [read in full](Companion/Memory/Current/067-outgoing-threading-reply-forward-stay-in-thread-on-every-provider-adr-io.md) |
 | Incoming Thread Detection — `ThreadDetection.findRelatedMessages` has NO subject-based fallback (by design) | [read in full](Companion/Memory/Current/068-incoming-thread-detection-threaddetection-findrelatedmessages-has-no-sub.md) |
 | Outbox — Persistent Offline Send Queue (ADR-IOS-019) | [read in full](Companion/Memory/Current/069-outbox-persistent-offline-send-queue-adr-ios-019.md) |
 | Proactive Local Notifications (ADR-IOS-026) | [read in full](Companion/Memory/Current/070-proactive-local-notifications-adr-ios-026.md) |
