@@ -768,6 +768,12 @@ struct InboxGestureActionTests {
             clearOverlay(); resetStagedGlobal()
         }
         clearOverlay(); resetStagedGlobal()
+        // A re-tag outside the tutorial counts toward its part 1 (TutorialDiscovery).
+        let progressKeys = ["tutorial.version", "tutorial.completedLessons", "tutorial.discoveries"]
+        let savedProgress = progressKeys.map { UserDefaults.standard.object(forKey: $0) }
+        defer { for (key, value) in zip(progressKeys, savedProgress) { UserDefaults.standard.set(value, forKey: key) } }
+        for key in progressKeys { UserDefaults.standard.removeObject(forKey: key) }
+        try #require(!TutorialCoordinator.shared.isRunning)
 
         let header = makeDurableHeader(folder: inbox, messageId: "m-tag-retag", isRead: false)
         try await pool.writeWithoutTransaction { db in try header.insert(db) }
@@ -782,7 +788,9 @@ struct InboxGestureActionTests {
             _ = await it.next()
         }
 
+        #expect(TutorialProgress().discoveries.isEmpty)
         vm.applyManualTag(id, tag: .reply)
+        #expect(TutorialProgress().discoveries.contains(.retag), "the inbox re-tag is recorded as found")
         vm.applyManualTag(id, tag: .archive)
         #expect(vm.loadedMessages.first?.actionTag == .archive)
         #expect(AccountManager.shared.overlayOpRefCountForTesting()[id] == 1, "two re-tags on the same id coalesce into ONE cycle")

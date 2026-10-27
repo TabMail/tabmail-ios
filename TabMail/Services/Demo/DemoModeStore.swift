@@ -103,6 +103,18 @@ final class DemoModeStore {
         set { UserDefaults.standard.set(newValue, forKey: Keys.aiEnabled) }
     }
 
+    /// The guided tutorial is running (ADR-IOS-038 amendment 2026-10-21). Its
+    /// steps are scripted and send nothing anywhere (`BackendClient` refuses
+    /// every request), so the seeded, pre-written tags and summaries show
+    /// whatever the demo AI choice. Set by `TutorialCoordinator`, in memory only.
+    var isTutorialPractice = false
+
+    /// Demo AI surfaces render as off: the demo is active and AI was declined,
+    /// outside the tutorial.
+    var hidesAIContent: Bool {
+        isActive && !aiEnabled && !isTutorialPractice
+    }
+
     // MARK: - Counter API
 
     /// Consume one call from the demo budget. Caller MUST check
@@ -218,6 +230,13 @@ final class DemoModeStore {
     /// write itself, so it can't go stale before the write.
     nonisolated static func admits(sessionId: String?, admission: Admission?) -> Bool {
         guard sessionId?.hasPrefix("demo:") == true else { return true }
+        return admits(admission)
+    }
+
+    /// Whether the demo run `admission` was captured in is still the current
+    /// one and still open: false once that demo exited, even after the next one
+    /// started, and false for nil (captured outside a demo).
+    nonisolated static func admits(_ admission: Admission?) -> Bool {
         guard let admission else { return false }
         return admissionState.withLock { $0.open && $0.run == admission.run }
     }
@@ -231,6 +250,7 @@ final class DemoModeStore {
         UserDefaults.standard.set(false, forKey: Keys.hasCompletedConsentGate)
         UserDefaults.standard.set(false, forKey: Keys.hasSeenAIConsent)
         UserDefaults.standard.set(false, forKey: Keys.aiEnabled)
+        isTutorialPractice = false
         isActive = false
         enteredFromDebugMenu = false
         startInProgress = false

@@ -370,6 +370,12 @@ struct MailNavigationView: View {
 
                     // App sections
                     Section {
+                        if let tutorialRowState {
+                            TutorialSidebarRow(state: tutorialRowState) {
+                                startTutorial(tutorialRowState.next)
+                            }
+                        }
+
                         if hasTabMailSession {
                             NavigationLink(value: MailboxSelection.account) {
                                 Label("TabMail Account", systemImage: "person.crop.circle")
@@ -593,12 +599,25 @@ struct MailNavigationView: View {
             templateSheetItem = TemplateSheetItem(id: templateId)
             BackgroundSyncLogger.logDebug("[MailNavigationView] Template pill Open Template: \(templateId.prefix(30))")
         }
+        .sheet(isPresented: Binding(
+            get: { TutorialCoordinator.shared.showsActionRule },
+            set: { TutorialCoordinator.shared.showsActionRule = $0 })) {
+            // Guided tutorial "See rule": where action rules live, with the sample rule.
+            NavigationStack {
+                ActionRulesView(tutorialRule: TutorialCoordinator.sampleDeleteRule)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            TutorialSheetDoneButton { TutorialCoordinator.shared.showsActionRule = false }
+                        }
+                    }
+            }
+        }
         .sheet(item: $templateSheetItem) { item in
             NavigationStack {
                 TemplateDetailView(templateId: item.id)
                     .toolbar {
                         ToolbarItem(placement: .cancellationAction) {
-                            Button("Done") { templateSheetItem = nil }
+                            TutorialSheetDoneButton { templateSheetItem = nil }
                         }
                     }
             }
@@ -708,7 +727,10 @@ struct MailNavigationView: View {
         }
         .onAppear {
             // Consume any deep link stored during cold start (notification tap
-            // before MailNavigationView was mounted).
+            // before MailNavigationView was mounted). Not in the tutorial's
+            // demo: a tap there ends the tutorial (RootView) and the restored
+            // inbox opens the email.
+            guard !TutorialCoordinator.shared.isRunning else { return }
             if let pending = PendingDeepLinkStore.consume() {
                 switch pending {
                 case .message(let id, let accountId):
@@ -725,6 +747,21 @@ struct MailNavigationView: View {
                     BackgroundSyncLogger.logDebug("[MailNav] Cold-start deep link: navigating to inbox")
                 }
             }
+        }
+    }
+
+    // MARK: - Tutorial
+
+    /// The sidebar tutorial row, hidden while the tutorial itself runs.
+    private var tutorialRowState: TutorialRowState? {
+        let tutorial = TutorialCoordinator.shared
+        guard !tutorial.isRunning else { return nil }
+        return tutorial.rowState
+    }
+
+    private func startTutorial(_ lesson: TutorialLesson) {
+        Task {
+            await TutorialCoordinator.shared.start(lesson, hasTabMailSession: TabMailAuthService.hasSession())
         }
     }
 
@@ -751,6 +788,11 @@ struct MailNavigationView: View {
     // MARK: - Deep Link
 
     private func handleNotificationDeepLink(_ userInfo: [AnyHashable: Any]?) {
+        // A notification tap during the guided tutorial ends it (owner V5;
+        // RootView does, as it is mounted through the tutorial's splash and
+        // finish screens too). The pending link stays stored: the restored
+        // inbox's MailNavigationView consumes it on appear and opens the email.
+        guard !TutorialCoordinator.shared.isRunning else { return }
         // Consume the pending store so onAppear doesn't double-navigate
         _ = PendingDeepLinkStore.consume()
 

@@ -289,6 +289,12 @@ struct ActionConfirmationCard: View {
                             .clipShape(RoundedRectangle(cornerRadius: 6))
                     }
                     .buttonStyle(.plain)
+                    .overlay {
+                        // Guided tutorial: the template proposal's Create is the next tap.
+                        if confirmation.action == .templateCreate && TutorialCoordinator.shared.highlightsTemplateCreate {
+                            TutorialPulseRing(shape: RoundedRectangle(cornerRadius: 8), lineWidth: 2, outset: 3)
+                        }
+                    }
                 }
             }
         }

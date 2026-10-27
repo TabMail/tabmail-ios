@@ -24,6 +24,9 @@ struct RootView: View {
     @AppStorage("demo.hasCompletedConsentGate") private var demoHasCompletedConsentGate = false
     @AppStorage("demo.hasSeenAIConsent") private var demoHasSeenAIConsent = false
     @AppStorage("demo.aiEnabled") private var demoAiEnabled = false
+    private var tutorial: TutorialCoordinator { TutorialCoordinator.shared }
+    /// The first-launch tutorial welcome (`TutorialProgress.markWelcomePending`).
+    @State private var showsTutorialWelcome = TutorialProgress().isWelcomePending
     @State private var demoSeedingComplete = false
     @State private var demoStartError: String?
     @Bindable private var demoStore = DemoModeStore.shared
@@ -105,14 +108,16 @@ struct RootView: View {
         } else if demoStore.isActive {
             // Demo mode wins over all other routing. Runs the SAME consent + AI
             // gates as production but writes to demo-prefixed AppStorage so
-            // production flags survive demo entry/exit untouched.
-            if !demoHasCompletedConsentGate {
+            // production flags survive demo entry/exit untouched. The guided
+            // tutorial skips both: it is scripted and sends nothing anywhere
+            // (ADR-IOS-038 amendment 2026-10-21).
+            if !demoHasCompletedConsentGate && !tutorial.isRunning {
                 ConsentGateView(persistsToBackend: false, onComplete: {
                     withAnimation { demoHasCompletedConsentGate = true }
                 }, onIneligible: {
                     await DemoModeService.shared.exit()
                 })
-            } else if !demoHasSeenAIConsent {
+            } else if !demoHasSeenAIConsent && !tutorial.isRunning {
                 AIConsentView { aiEnabled in
                     demoAiEnabled = aiEnabled
                     // Critical: NEVER write to AIService.optOutAllAIKey here.
@@ -121,10 +126,25 @@ struct RootView: View {
                 }
             } else if !demoSeedingComplete {
                 DemoSeedingSplash()
-                    .task(id: demoStore.isActive) {
+                    // Keyed by the demo run, not `isActive`: a demo that ends
+                    // and starts again while this splash is still animating
+                    // out gets the same splash back, with its finished task
+                    // and `isActive` true both times. The new run's id starts
+                    // its setup.
+                    .task(id: demoStore.chatAdmission) {
                         guard demoStore.isActive, !demoSeedingComplete else { return }
+                        // The demo run this setup is for. If it ends during the
+                        // splash (a notification tap ends the tutorial), setup
+                        // stops early and must not mark the next run seeded.
+                        let run = demoStore.chatAdmission
                         do {
                             try await DemoModeService.shared.completeSetup()
+                            guard DemoModeStore.admits(run) else { return }
+                            // The lesson's first step is set BEFORE the inbox
+                            // appears: a view built at `.starting` missed a
+                            // step change made in the same frames, leaving
+                            // the scroll-to-row and tag highlight unset.
+                            tutorial.seedingFinished()
                             withAnimation { demoSeedingComplete = true }
                         } catch {
                             BackgroundSyncLogger.logDebug("[RootView] Demo setup failed: \(error)")
@@ -132,6 +152,8 @@ struct RootView: View {
                             await DemoModeService.shared.exit()
                         }
                     }
+            } else if tutorial.step == .finished {
+                TutorialFinishView(signedIn: tutorial.startedSignedIn)
             } else {
                 MailNavigationView()
             }
@@ -156,6 +178,16 @@ struct RootView: View {
                 // Still loading accounts from GRDB — show splash (not login)
                 // to avoid a flash of LoginView when accounts exist but haven't loaded yet.
                 SplashView()
+            } else if !hasTabMailSession && showsTutorialWelcome {
+                // First launch of a fresh install only: the tutorial welcome
+                // comes before sign-in. Start, Skip and Sign in all dismiss it
+                // for good; Skip and Sign in land on the login below.
+                TutorialWelcomeView(onStart: {
+                    await tutorial.start(.actOnEmail, hasTabMailSession: false)
+                    dismissTutorialWelcome()
+                }, onSkip: {
+                    dismissTutorialWelcome()
+                })
             } else if !hasTabMailSession {
                 // No email accounts AND no session → onboarding login.
                 // Post the SAME notification the sheet-presented login paths
@@ -229,6 +261,20 @@ struct RootView: View {
         }
     }
 
+    private func dismissTutorialWelcome() {
+        TutorialProgress().dismissWelcome()
+        withAnimation { showsTutorialWelcome = false }
+        if !tutorial.isRunning { requestPushPermissionAfterTutorial() }
+    }
+
+    /// The launch-time notification request (TabMailApp.init) waits while the
+    /// first-launch welcome or the tutorial is up: no permission prompt
+    /// during them. Asked here once they are done.
+    private func requestPushPermissionAfterTutorial() {
+        guard !ScreenshotMode.isActive && !ScreenshotMode.isSplashMode else { return }
+        Task { await PushNotificationService.shared.requestPermissionAndRegister() }
+    }
+
     /// True when the user has cleared every onboarding gate. Drives
     /// `OnboardingTipGate.onboardingComplete` so TipKit tips stay
     /// suppressed during the consent flow (each tip has a
@@ -263,11 +309,11 @@ struct RootView: View {
         ZStack {
             routedContent
         }
-        // Demo with AI enabled is treated as having a TabMail session so
-        // chat / inline-edit surfaces don't render "Sign in to TabMail" locks.
-        // Demo without AI keeps the env false, which cooperates with the
-        // AI-disabled rendering of those surfaces.
-        .environment(\.hasTabMailSession, hasTabMailSession || (demoStore.isActive && demoAiEnabled))
+        // Demo with AI enabled (or the tutorial, whose chat is scripted) is
+        // treated as having a TabMail session so chat / inline-edit surfaces
+        // don't render "Sign in to TabMail" locks. Demo without AI keeps the
+        // env false, which cooperates with the AI-disabled rendering of those surfaces.
+        .environment(\.hasTabMailSession, hasTabMailSession || (demoStore.isActive && !demoStore.hidesAIContent))
         .publishSyncStatusEnvironment(phase: syncStatusPhase, last: syncStatusLast, failed: syncStatusFailed, now: syncStatusNow)
         .observeSyncStatus(phase: $syncStatusPhase, last: $syncStatusLast, failed: $syncStatusFailed, now: $syncStatusNow, tag: "Root")
         .task(id: allOnboardingGatesPassed) {
@@ -277,14 +323,15 @@ struct RootView: View {
             // tips behave normally. Setting `false` while gates are
             // pending re-suppresses tips on a fresh install or after
             // a sign-out that reset the gates.
-            // Tips fire normally during demo. The formula is
-            // `passed || isActive` so demo gets ambient discovery cues from
-            // the start without needing to clear production gates.
-            OnboardingTipGate.onboardingComplete = allOnboardingGatesPassed || demoStore.isActive
+            // Tips stay hidden while the demo runs (owner V5, 2026-10-20):
+            // every tip shows once (`MaxDisplayCount(1)`) and TipKit state
+            // outlives the demo, so a tip seen on sample mail would never
+            // appear on the user's own mail.
+            OnboardingTipGate.onboardingComplete = allOnboardingGatesPassed && !demoStore.isActive
         }
         .task(id: demoStore.isActive) {
             // Demo entry/exit also flips the tip gate.
-            OnboardingTipGate.onboardingComplete = allOnboardingGatesPassed || demoStore.isActive
+            OnboardingTipGate.onboardingComplete = allOnboardingGatesPassed && !demoStore.isActive
         }
         // Undo-send toast (Gmail-style) — mounted at RootView so it persists
         // across compose dismiss + navigation. Positioning matches the inbox
@@ -311,21 +358,31 @@ struct RootView: View {
         // banner re-appears on dismiss. Suppressed for debug-menu entry
         // (demo recording) — exit + counter reset live in the debug menu.
         .overlay(alignment: .bottom) {
-            if demoStore.isActive && demoSeedingComplete && !demoStore.enteredFromDebugMenu {
+            // The tutorial's coach cards carry their own Skip, and it makes
+            // no AI calls, so it has no allowance to show.
+            if demoStore.isActive && demoSeedingComplete && !demoStore.enteredFromDebugMenu && !tutorial.isRunning {
                 DemoBanner(aiEnabled: demoAiEnabled)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .ignoresSafeArea(.container, edges: .bottom)
             }
         }
+        // Tutorial: a refused mail action says why, where the app's other
+        // toasts sit (below the inbox's bottom bar).
+        .overlay(alignment: .bottom) {
+            TutorialLockedToast()
+                .ignoresSafeArea(.container, edges: .bottom)
+                .padding(.bottom, -12)
+        }
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: pendingSendService.current?.id)
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: demoStore.isActive)
+        .animation(.spring(response: 0.4, dampingFraction: 0.85), value: tutorial.lockedNotice)
         .alert("Could not start demo", isPresented: Binding(
-            get: { demoStartError != nil },
-            set: { if !$0 { demoStartError = nil } }
+            get: { demoStartError != nil || tutorial.startError != nil },
+            set: { if !$0 { demoStartError = nil; tutorial.startError = nil } }
         )) {
-            Button("OK", role: .cancel) { demoStartError = nil }
+            Button("OK", role: .cancel) { demoStartError = nil; tutorial.startError = nil }
         } message: {
-            Text(demoStartError ?? "")
+            Text(demoStartError ?? tutorial.startError ?? "")
         }
         // Undo-send was not confirmed. `PendingSendService.undo()` made no
         // cancellation change and left the toast in place. The durable Send may
@@ -341,6 +398,19 @@ struct RootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .demoModeDidExit)) { _ in
             demoSeedingComplete = false
+            tutorial.demoDidExit()
+        }
+        .onChange(of: tutorial.isRunning) { _, running in
+            if !running { requestPushPermissionAfterTutorial() }
+        }
+        // A notification tap during the guided tutorial ends it (owner V5),
+        // here because RootView stays mounted through the tutorial's splash
+        // and finish screens, where MailNavigationView is not. The pending
+        // link stays stored for the restored inbox to open.
+        .onReceive(NotificationCenter.default.publisher(for: .proactiveNotificationTapped).receive(on: DispatchQueue.main)) { _ in
+            guard tutorial.isRunning else { return }
+            BackgroundSyncLogger.logDebug("[RootView] Notification tap during the tutorial: ending it first")
+            Task { await tutorial.end() }
         }
         // Undo-Send reopen: the Outbox cancellation was confirmed and the Draft
         // row remains durable. UndoReopenCompose resolves the snapshot's exact

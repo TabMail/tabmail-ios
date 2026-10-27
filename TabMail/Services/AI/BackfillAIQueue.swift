@@ -46,6 +46,10 @@ actor BackfillAIQueue {
     /// same (message, tag) supersedes the earlier snapshot in place.
     /// Errors are caught and logged (matches `AccountManager.queueTagWrite` pattern).
     func enqueueActionRefine(_ snapshot: ActionRefineSnapshot) async {
+        guard !snapshot.isDemoSample else {
+            BackgroundSyncLogger.logBackfillAI("skip actionRefine dedupKey=\(snapshot.dedupKey) reason=demo-sample")
+            return
+        }
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         do {
             let row = try PendingAIRefinement.make(snapshot, now: now)

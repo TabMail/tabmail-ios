@@ -972,6 +972,8 @@ struct ComposeView: View {
         /// replied.
         let resolvedReplyTarget: MessageHeader?
         let isForward: Bool
+        /// The guided tutorial's practice reply: sent with no undo hold.
+        let isTutorialPracticeReply: Bool
         let outbound: DraftMessage
     }
     @State private var recipients = ComposeDraftGuards.Recipients()
@@ -1294,6 +1296,13 @@ struct ComposeView: View {
 
     /// The Close/Send bar's height; the opening spinner's bar matches it (#326).
     static let headerHeight: CGFloat = 66
+
+    /// The guided tutorial's practice reply to Priya (lesson 2).
+    private var isTutorialPracticeReply: Bool {
+        TutorialCoordinator.shared.isRunning
+            && replyTo?.accountId == DemoSeed.demoAccountId
+            && replyTo?.messageId == DemoSeed.TutorialFixture.priyaOffsite
+    }
     @State private var pillAppeared = false
 
     var body: some View {
@@ -1321,6 +1330,14 @@ struct ComposeView: View {
                         .padding(.vertical, 6)
                         .background(Theme.accent.opacity(0.06))
                         Divider()
+                    }
+                    if isTutorialPracticeReply {
+                        TutorialCoachView(host: .compose(showingSuggestion: showingSuggestion))
+                            // The cover does not re-run this card when the edit
+                            // lands (measured: only the inbox card did), while
+                            // compose itself redraws: a new card per edit state.
+                            .id(TutorialCoordinator.shared.replyEdited)
+                            .padding(.vertical, 8)
                     }
 
                     ScrollView {
@@ -1549,6 +1566,12 @@ struct ComposeView: View {
                                     outstandingCarryCount: attachmentCarryGate.outstanding,
                                     hasUnacknowledgedFailure:
                                         attachmentCarryGate.hasUnacknowledgedFailure) != .ready)
+                            .overlay {
+                                // Guided tutorial: Send is the practice reply's last step.
+                                if isTutorialPracticeReply && !showingSuggestion {
+                                    TutorialPulseRing(shape: Capsule(), outset: 8)
+                                }
+                            }
                     }
                 }
                 .padding(.horizontal, 16)
@@ -2036,6 +2059,7 @@ struct ComposeView: View {
                 Spacer()
 
                 Button {
+                    guard TutorialCoordinator.shared.admits(.other) else { return }
                     withAnimation(.easeOut(duration: 0.2)) {
                         showingSuggestion = false
                     }
@@ -2047,6 +2071,9 @@ struct ComposeView: View {
                 .buttonStyle(.plain)
 
                 Button {
+                    // Guided tutorial: after the edit step, not before it.
+                    guard TutorialCoordinator.shared.admits(
+                        .useSuggestion, accountId: replyTo?.accountId, messageId: replyTo?.messageId) else { return }
                     withAnimation(.easeInOut(duration: 0.35)) {
                         acceptVisibleSuggestionIfOffered()
                     }
@@ -2059,6 +2086,11 @@ struct ComposeView: View {
                         .padding(.vertical, 6)
                         .background(Theme.accent)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .overlay {
+                            if isTutorialPracticeReply && TutorialCoordinator.shared.replyEdited {
+                                TutorialPulseRing(shape: RoundedRectangle(cornerRadius: 8), lineWidth: 2, outset: 3)
+                            }
+                        }
                 }
                 .buttonStyle(.plain)
             }
@@ -3434,6 +3466,11 @@ struct ComposeView: View {
         }
 
         let (sendBody, isHTML) = buildSendBody()
+        let isPracticeReply = isTutorialPracticeReply
+        if isPracticeReply {
+            // The template made from this reply uses the text as written.
+            TutorialCoordinator.shared.practiceReplyAuthored(messageBody)
+        }
         // Threading headers for reply / reply-all / forward. Single source of
         // truth (ThreadUtils) builds the In-Reply-To + full References chain and,
         // for Gmail, the conversation threadId (guarded by account + subject
@@ -3471,6 +3508,7 @@ struct ComposeView: View {
             replyToUidValidity: replyTo?.observedUidValidity,
             resolvedReplyTarget: sendTarget,
             isForward: isForward,
+            isTutorialPracticeReply: isPracticeReply,
             outbound: outbound)
 
         // Capture existing draft (server-side metadata preserved through save-before-send).
@@ -3633,7 +3671,9 @@ struct ComposeView: View {
                     return containedMessageId
                 }(),
                 draftId: snapshot.draftId,
-                instanceEpoch: snapshot.instanceEpoch
+                instanceEpoch: snapshot.instanceEpoch,
+                // The tutorial's practice reply goes out at once (owner 2026-10-21).
+                holdsForUndo: !snapshot.isTutorialPracticeReply
             )
         } catch {
             // Persistence failed — the message is NOT queued. Re-enable Send so the

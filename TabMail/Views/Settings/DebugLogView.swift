@@ -47,6 +47,19 @@ struct DebugMenuView: View {
                         Label("Enter Demo Mode", systemImage: "play.rectangle.on.rectangle")
                     }
                 }
+                if !TutorialCoordinator.shared.isRunning {
+                    // Replay: the guided tutorial from part 1, whatever its
+                    // progress, as the first-launch welcome's Start runs it. The
+                    // only replay entry (owner 2026-10-21). A plain demo is
+                    // replaced by the tutorial's fresh one.
+                    Button {
+                        Task {
+                            await TutorialCoordinator.shared.start(.actOnEmail, hasTabMailSession: TabMailAuthService.hasSession())
+                        }
+                    } label: {
+                        Label("Replay Tutorial", systemImage: "graduationcap")
+                    }
+                }
                 if let demoEnterError {
                     Text(demoEnterError)
                         .font(.caption)

@@ -260,12 +260,211 @@ fix gates at shared chokepoints, not per-tool patches:
   `resetCallBudget()` (reset the 50-call counter) live in the debug menu
   instead.
 
+**Amendment 2026-10-21 — guided tutorial, scripted, no AI (owner V5):**
+- **Guided tutorial on the demo.** `TutorialCoordinator` (Services/Tutorial)
+  runs three parts (act on email, reuse a reply, ask anything) on the
+  seeded demo inbox through the native screens, advancing only on real
+  events: the receipt leaves the demo Inbox, DailyTech's tag changes, a
+  local Sent row appears, a confirmed template is persisted, the source
+  email opens. Sample messages are named by `DemoSeed.TutorialFixture`
+  ids, never by rendered strings. Progress lives in `TutorialProgress`
+  (UserDefaults: version, completed parts, discoveries, first-run welcome); an
+  unfinished part restarts from its beginning. The full-screen welcome
+  is armed only by the fresh-install branch of
+  `TabMailApp.prepareSessionStorageForLaunch`; everyone else gets the
+  sidebar row. Finish and Skip tutorial both end in
+  `DemoModeService.exit()`; the run state is cleared only after it, so
+  the plain demo's consent screens never flash in between. Copy says
+  "1 of 3", never "lesson" (owner).
+- **Scripted, no AI, no consent (owner 2026-10-21).** The tutorial makes
+  no AI or backend call and shows no consent screen: the age and terms
+  screen and the AI choice stay where they are (sign-in, and the plain
+  demo before seeding). `DemoModeStore.isTutorialPractice` (in memory,
+  set before the demo activates, cleared on exit) is the switch:
+  `BackendClient.currentAuthToken()` returns nil, so no demo token is
+  minted (`DemoModeService.start(mintToken: false)`), and the two
+  builders that would send without a token (`transcribeDictation`,
+  `makeCompletionsRequest`) throw `.unauthorized` before building.
+  The seeded, pre-written tags and summaries show whatever the demo AI
+  choice (`hidesAIContent`), and `completeSetup` opens the subscription
+  gate so the chat pill is not locked.
+- **Scripted chat.** The inbox chat's input is filled in and read-only
+  (`TutorialChatInputBar`, owner: "in real use you speak or type; here it
+  is filled in"); message and draft chats show only the note. Send runs
+  `TutorialChatScript` in place of the AI call inside `sendAgentChat`, so
+  turns render and persist like an AI reply: the template answer shows
+  the real `TemplateCreateTool` card with the practice reply as written
+  in compose (`practiceReplyAuthored`), the flight answer cites Jordan's
+  seeded email (`[Email](N)` pill), "What can you do?" is a fixed list.
+  Dictation is off in the tutorial (`canDictate`), and no tip events are
+  donated.
+- **No permission prompt during the tutorial.** The launch notification
+  request waits while the welcome is pending; RootView asks once the
+  welcome is skipped or the tutorial ends. Compose skips Contacts
+  access and name lookups while the tutorial runs.
+- **Re-tags of demo samples never teach (bug fix).** A demo re-tag used to
+  enqueue an `actionRefine` row; drains are deferred while the demo runs,
+  so the row drained after exit against the real `user_action` prompt.
+  `BackfillAIQueue.enqueueActionRefine` now refuses a demo sample
+  (`ActionRefineSnapshot.isDemoSample`). The `enqueueActionRefine`
+  chokepoint in the call accounting above therefore no longer consumes a
+  demo call. (A drain-time drop for rows queued by older builds was
+  considered and deleted the same day: that population is rare and it
+  behaves as every shipped build already did.)
+- **Demo sends and actions drain (bug fix).** `registerDemoProviders`
+  gives the demo account a work queue; the outbox and action drains skip
+  accounts without one, so every demo send had stayed queued and never
+  reached Sent. `DemoProvider.send` writes nothing: the outbox's
+  optimistic Sent header is the one sent copy. `DemoProvider.move` is a
+  no-op: the optimistic move already placed the row and the demo has no
+  server. It used to re-key the row to a destination-shaped id, which
+  nothing followed once moves drained, so Undo of a drained demo archive
+  did nothing. Demo rows keep their id for the life of the demo.
+- **Tips hidden in the demo** (supersedes "TipKit shown-state persists"
+  being visible in demo): `OnboardingTipGate.onboardingComplete` is
+  `allOnboardingGatesPassed && !isActive`, so no tip (each shows once) is
+  used up on sample mail. The two user-label tips gained the same rule.
+- **Signed-in replay and notifications.** The sidebar row starts the
+  tutorial next to a live account (banner hidden while the tutorial
+  runs, its coach cards carry Skip). A notification tap during the
+  tutorial ends it; the pending deep link stays stored and the restored
+  inbox's `MailNavigationView` opens the email on appear.
+- **Smoke-test round 2 (owner 2026-10-21).** Replay moved from the
+  sidebar to the debug menu ("Replay Tutorial"); the sidebar row shows
+  progress only and is gone once every part is done. The practice reply
+  is sent with no undo hold (`queueSend(holdsForUndo: false)`, stored
+  `holdUntil` NULL, so the drain claims it at once and the toast offers
+  no Undo); every other send keeps the hold. The coach card is a dark
+  translucent HUD in both appearances.
+- **Parts found on their own count as done (owner 2026-10-25).** Outside
+  the tutorial, doing a part's moves in the real app completes it, as if
+  the part had been taken: part 1 needs both an action-tag tap
+  (`executeTaggedAction`, inbox and message view) and a tag change from
+  the hold menu (`applyManualTag`, both view models), each recorded on
+  its own; part 2 a created template (`PromptStore.addTemplate`, the
+  funnel for settings, marketplace and chat; Device Sync merges do not
+  count); part 3 a message sent in the inbox chat. `TutorialDiscovery`
+  in `TutorialProgress` (UserDefaults, version-gated like completion; a
+  write after a version bump drops the older version's progress first).
+  Ignored while the tutorial runs: its own steps complete their parts.
+  The step's target tag and the Chat pill carry a pulsing glow ring
+  (`TutorialGlowRing`, owner: "blink or a little bit of glow"; replaced
+  by the moving ring below the same day).
+- **Smoke-test round 3 (owner 2026-10-25).** Hints move: every hint is
+  `TutorialPulseRing`, a steady outline plus a ripple that grows outward
+  and fades ("something that's moving is more likely to catch
+  attention"). Rings: the step's tag, the Chat pill, the chat Send
+  button, the compose Send and Use Suggestion buttons, the email pill
+  in the part 3 answer and its Open Email link. No "Finish later" on
+  any card (Skip tutorial is always at the top right); part ends show
+  See rule / See template and Next. Part 1's retag adds a sample delete
+  rule to the demo overlay's `deleteRules` (dropped on exit with the
+  overlay) and See rule opens Settings' Action Classification screen
+  with that rule ringed and a coach card saying it is a sample. The
+  screen shows the rules only: the thresholds (real settings, synced),
+  Compact now (an AI call) and Reset are hidden. No AI, nothing
+  persisted. Part 2's compose step shows an Edit prompt ("Say I
+  can't make it") in the read-only chat input; Send shows the working
+  pulse for a short delay (`TutorialChatScript.editDuration`) and swaps
+  the suggestion for a scripted decline through the compose's own
+  `onDraftUpdate` path; Use Suggestion stays locked until then
+  (`MailGesture.useSuggestion`). The template is "Polite decline".
+  The compose cover did not re-run its coach card when the edit landed
+  (measured with debug logs: the inbox card re-ran, the compose card did
+  not, while ComposeView itself redrew), so the compose card's identity
+  follows `replyEdited` (`.id`).
+- **Smoke-test round 4 (owner 2026-10-25).** Navigation is off while
+  the tutorial runs: the inbox's back button (to the folders) is hidden,
+  and triage, compose, filter and search in the inbox and compose, reply
+  and archive in the message view are disabled and dimmed
+  (`tutorialLockedNavigation`). The message view keeps its back button:
+  a row tap opens any message, and back is the only way out of one
+  without a card. The open inbox chat covers the coach card at full
+  height (it was laid out below the card, too short to read in part 3);
+  the chat-hosted card is gone, and the chat's rings lead instead:
+  Send, the email pill, and the close button when the next move is a
+  card button (`highlightsChatClose`: Template saved, and Ask anything
+  once "What can you do?" was sent, which is now asked once, like the
+  flight question). With the chat closed after the flight question, the
+  inbox card says "Check the original" and the Chat pill is ringed. The
+  email pill's ring goes while its popover is open, so only Open Email
+  is ringed.
+- **Smoke-test round 5 (owner 2026-10-25).** The template proposal's
+  Create is ringed (`highlightsTemplateCreate`), and so is Done on the
+  See rule and See template sheets (`TutorialSheetDoneButton`). The
+  scroll to a tag step's row is re-issued whenever the list's geometry
+  changes while a step targets a row (`TutorialInboxScroll`): on device,
+  a Replay from the debug menu asked for the scroll as the inbox first
+  appeared, while the list was still laying out and the coach card was
+  settling its height, and the offset stayed 0 (debug log, 2026-10-25).
+  A one-shot scroll on appear is not enough; the simulator happened to
+  settle in time.
+- **Review round c1 (Codex, 2026-10-26).** The scripted compose edit
+  belongs to the demo run it began in: `runPracticeReplyEdit` captures
+  `DemoModeStore.chatAdmission` before its wait and applies nothing unless
+  `DemoModeStore.admits(_:)` still holds after it, so Skip and a new run
+  during the wait cannot complete the new run's edit. `start` re-checks,
+  after its exit await, that no other demo start holds the demo
+  (`startInProgress`, `isActive`) before claiming the run, so a Replay
+  during an ordinary demo entry leaves the tutorial off rather than on
+  with no demo under it. A chat turn's script-or-model choice moved into
+  `TutorialChatScript.response(for:invocation:model:)`.
+- **Review round c2 (Codex, 2026-10-26).** The tutorial starts offline,
+  so its practice reply must reach Sent with no network: `drainOutbox`
+  no longer skips the demo account's rows when offline (its provider is
+  local); every other account's rows still wait for the network. Tests
+  added for that and for a failed start's rollback and retry.
+  `DemoModeService.completeSetup` captures its demo run and stops after
+  any suspension once that run has ended: a demo exit during the seeding
+  splash (a notification tap ends the tutorial there, also next to a live
+  account) let it go on to `enterDemoOverlay` with the demo off, which
+  writes the bundled defaults over the real prompts and syncs them. The five
+  tutorial hooks that live in SwiftUI views have no committed test; the
+  owner accepted that as `IOS-TEST-012` rather than adding a UI test.
+- **Review round c3 (Codex, 2026-10-26).** An End that arrives while a
+  start is still wiping the last demo's leftovers (before the demo is on)
+  withdraws that start: `DemoModeService.exit` marks it, and `activate`
+  stops before turning the demo on, so the older start cannot bring back a
+  demo the newer End ended. The tutorial's notification-tap handler moved
+  from `MailNavigationView` to `RootView`, which stays mounted through the
+  seeding splash and the finish page; `MailNavigationView` still leaves the
+  pending link alone while the tutorial runs. RootView's splash setup
+  captures its demo run too, so a setup stopped by an exit does not mark
+  the next run seeded. `OrientationLockModifier`'s geometry error handler is
+  `@Sendable`: UIKit reported a refusal on a background queue, where a
+  main-actor closure traps. Tests added for each, and for a real message's
+  pending Sent copy waiting offline, the flight answer's capsule opening the
+  cited email, and no Contacts prompt during the tutorial.
+- **Review round c4 (Codex, 2026-10-26).** Correctness and robustness
+  clean; coverage only. Three more tutorial hooks in SwiftUI views (Compose's
+  Use Suggestion gate, the chat's scripted-edit send, opening Jordan's email
+  finishing part 3) have no committed test; the owner extended
+  `IOS-TEST-012` to them (eight hooks). The unit-test host now answers every
+  notification and Contacts permission request with a silent "denied" for
+  the whole test process (`TestPermissionPrompts`): the host's RootView asks
+  for notifications when a tutorial run ends, ComposeView asks for Contacts
+  when view tests mount it, and either system alert left the scene
+  inactive, where the next splash's setup task never started. (The Contacts
+  prompt only showed in the first full-suite run on a freshly erased
+  simulator; the simulator then records it as denied.) Found while making that
+  fixture reliable: RootView's splash setup task was keyed by
+  `demoStore.isActive`. A demo that ends and starts again while the
+  splash is still animating out (RootView animates `isActive` with a
+  spring) gets the same splash back, with `isActive` true both times, so
+  the task never restarted and the new run stayed on the splash. It is
+  keyed by the demo run (`demoStore.chatAdmission`) now.
+- **Considered and dropped the same day: consent once.** A variant asked
+  the age/terms and AI screens before the AI parts and carried the
+  outcome to sign-in (`CarriedConsent`). The owner chose a scripted
+  tutorial instead; nothing of it shipped, and the demo-prefixed consent
+  gates above stand.
+
 **Related:**
 - The demo-auth mint/verify/throttle, the admin demo-stats readout, and the
   HMAC secret-rotation tooling all live server-side.
 - ADR-IOS-008 (AI processing architecture — demo replicates the
   short-circuit).
 - ADR-IOS-018 (PendingOperation queue — DemoProvider stubs the drain
-  side).
+  side; since 2026-10-21 the demo drain runs, see above).
 
 ---

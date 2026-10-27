@@ -58,6 +58,9 @@ enum ProcessGlobalTestState {
         // makes that nil unreachable without weakening `rawPool`'s deliberate
         // force-unwrap. See `TestAppDatabaseSink`.
         TestAppDatabaseSink.installIfNeeded()
+        // No system permission alert in the test host: its inactive scene
+        // stops SwiftUI tasks a later test waits on. See the type.
+        TestPermissionPrompts.installIfNeeded()
         try await lock.withLock(
             ownerToken: ownerToken,
             queuedObserver: queuedObserver

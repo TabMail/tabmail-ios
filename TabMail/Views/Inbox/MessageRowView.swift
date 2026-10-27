@@ -25,7 +25,7 @@ struct MessageRowView: View {
     /// surfaces as off regardless of pre-baked content.
     private var anyAISourceEnabled: Bool {
         let demoStore = DemoModeStore.shared
-        if demoStore.isActive && !demoStore.aiEnabled { return false }
+        if demoStore.hidesAIContent { return false }
         return (!optOutAllAI || DeviceSyncService.shared.isAutoEnabled) && AISubscriptionGate.shared.isActive
     }
 
@@ -47,7 +47,7 @@ struct MessageRowView: View {
     /// Hide action chip when demo + AI off.
     private var effectiveTag: ActionTag? {
         let demoStore = DemoModeStore.shared
-        if demoStore.isActive && !demoStore.aiEnabled { return nil }
+        if demoStore.hidesAIContent { return nil }
         if let threadInfo { return threadInfo.threadTag }
         return message.actionTag
     }
@@ -156,6 +156,14 @@ struct MessageRowView: View {
                                     .padding(.vertical, 2)
                                     .actionTagButtonStyle(color: Theme.tagColor(tag))
                                     .aiWorkingShimmer(active: showShimmer)
+                                    .overlay {
+                                        // Guided tutorial: the tag this step asks for.
+                                        if TutorialCoordinator.shared.highlightsTag(
+                                            accountId: message.accountId, messageId: message.messageId) {
+                                            TutorialPulseRing(shape: RoundedRectangle(cornerRadius: 6), lineWidth: 2, outset: 3)
+                                                .accessibilityIdentifier("tutorial-tag-highlight")
+                                        }
+                                    }
                                     .padding(.horizontal, 4)
                                     .padding(.vertical, 4)
                                     .contentShape(Rectangle())
@@ -163,6 +171,8 @@ struct MessageRowView: View {
                                     .sensoryFeedback(.impact(weight: .medium), trigger: tagMenuOpenTick)
                             } primaryAction: {
                                 tagTapTick &+= 1
+                                guard TutorialCoordinator.shared.admits(
+                                    .tagTap, accountId: message.accountId, messageId: message.messageId) else { return }
                                 onTagAction?()
                             }
                             .simultaneousGesture(
@@ -206,20 +216,26 @@ struct MessageRowView: View {
 
     @ViewBuilder
     private var retagMenu: some View {
-        if let onRetag {
-            Button { onRetag(.reply) } label: {
+        if onRetag != nil {
+            Button { retag(.reply) } label: {
                 Label("Tag as Reply", systemImage: "arrowshape.turn.up.left")
             }
-            Button { onRetag(ActionTag.none) } label: {
+            Button { retag(ActionTag.none) } label: {
                 Label("Tag as None", systemImage: "tag.slash")
             }
-            Button { onRetag(.archive) } label: {
+            Button { retag(.archive) } label: {
                 Label("Tag as Archive", systemImage: "archivebox")
             }
-            Button { onRetag(.delete) } label: {
+            Button { retag(.delete) } label: {
                 Label("Tag as Delete", systemImage: "trash")
             }
         }
+    }
+
+    private func retag(_ tag: ActionTag) {
+        guard TutorialCoordinator.shared.admits(
+            .retag, accountId: message.accountId, messageId: message.messageId) else { return }
+        onRetag?(tag)
     }
 
     private var showShimmer: Bool {

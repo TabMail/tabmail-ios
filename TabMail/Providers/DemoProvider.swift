@@ -10,8 +10,8 @@ import GRDB
 ///
 /// Most reads pass through to the existing GRDB tables (the rest of the app
 /// already drives off GRDB anyway). Writes update GRDB and synthesize a
-/// "success" response — no IMAP/SMTP traffic. Sent messages land in the
-/// seeded `SENT` folder so the user can see end-to-end behavior.
+/// "success" response — no IMAP/SMTP traffic. A sent message appears in the
+/// seeded `SENT` folder through the outbox's optimistic Sent header.
 actor DemoProvider: EmailProvider {
     private let accountId: String
 
@@ -154,73 +154,21 @@ actor DemoProvider: EmailProvider {
     }
 
     func move(ids: [String], from: String, to: String) async throws {
-        guard let db = AppDatabase.shared.withLock({ $0 }) else { return }
-        try await db.dbPool.write { conn in
-            let toFolderId = "\(self.accountId):\(to)"
-            let toIsInbox = to.uppercased() == "INBOX"
-            for id in ids {
-                let oldHeaderId = MessageIdentity.headerId(accountId: self.accountId, folderPath: from, messageId: id)
-                guard let existing = try MessageHeader.filter(Column("id") == oldHeaderId).fetchOne(conn) else { continue }
-                let newHeaderId = MessageIdentity.headerId(accountId: self.accountId, folderPath: to, messageId: id)
-                var migrated = existing
-                migrated.id = newHeaderId
-                migrated.folderId = toFolderId
-                migrated.folderPath = to
-                migrated.isInInbox = toIsInbox
-                // 🚨 R17-1 — THE CARRIER IS SHARED, NOT HAND-ROLLED. A demo move is a
-                // header PRIMARY-KEY change, so it is a member of the class *"every
-                // code path that changes a header's primary key"*. This block used to
-                // run its own `delete` → reassign `id` → `insert`, which fires
-                // `ON DELETE CASCADE` on both surviving children of `messageHeader`
-                // (`messageUserLabel`, `messageReference`) and restored neither, and
-                // since `v70_dropMessageBodyHeaderFK` left the `messageBody` row
-                // ORPHANED under the old id rather than cascaded away.
-                //
-                // Demo mode has no server, so nothing re-fetches any of it: the loss
-                // is permanent for the life of the demo account, which is why the
-                // shared carrier matters here even though the data is synthetic.
-                // `apply` carries the body and the labels and rebuilds the references.
-                //
-                // Its `false` return (the new id is already occupied) leaves the old
-                // row deleted and inserts nothing. That is a strict improvement on the
-                // previous behaviour, which threw a UNIQUE violation and rolled the
-                // whole demo move back.
-                try MessageHeaderRekey.apply(from: existing, to: migrated, db: conn)
-            }
-        }
+        // The queue drain is the only caller, and the optimistic move has
+        // already put the row where the user moved it. The demo has no server,
+        // so there is nothing left to move. The row keeps its id, which Undo,
+        // search and chat references name. Until 2026-10-21 this re-keyed the
+        // row to a destination-shaped id that none of them followed, which left
+        // Undo of a drained demo archive doing nothing.
     }
 
     func send(draft: DraftMessage) async throws {
-        // No network — synthesize a sent message in the seeded SENT folder.
-        guard let db = AppDatabase.shared.withLock({ $0 }) else { return }
-        try await db.dbPool.write { conn in
-            let folderId = "\(self.accountId):SENT"
-            let messageId = draft.messageId ?? "demo-sent-\(UUID().uuidString.prefix(8))"
-            var header = MessageHeader(
-                messageId: messageId,
-                subject: draft.subject,
-                from: DemoSeed.demoDisplayName,
-                fromAddress: DemoSeed.demoEmail,
-                to: draft.to.joined(separator: ", "),
-                date: Date(),
-                snippet: String(Self.stripHTML(draft.body).prefix(160)),
-                folderId: folderId,
-                accountId: self.accountId,
-                folderPath: "SENT",
-                isInInbox: false
-            )
-            header.rfc822MessageId = messageId
-            header.isRead = true
-            header.headerComplete = true
-            header.bodyComplete = true
-            try header.insert(conn)
-            try MessageBody(contentKey: ContentKey(rawValue: header.id),
-                            htmlContent: draft.isHTML ? draft.body : "<pre>\(draft.body)</pre>").insert(conn)
-        }
+        // No network and nobody to deliver to. The outbox's optimistic Sent
+        // header is the demo's sent copy, as it is for a real account until sync.
     }
 
     func appendToSentFolder(draft: DraftMessage, sentFolderPath: String, messageId: String) async throws -> Bool {
-        // Already covered by send(); APPEND is a no-op for the demo.
+        // The outbox's optimistic Sent header is the demo's copy; nothing to append.
         true
     }
 

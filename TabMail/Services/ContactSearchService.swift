@@ -25,6 +25,8 @@ final class ContactSearchService {
     func requestAccess() {
         // Skip in screenshot mode to avoid permission dialog on erased simulator
         guard !ScreenshotMode.isActive else { return }
+        // No permission prompt during the guided tutorial (sample mail only).
+        guard !TutorialCoordinator.shared.isRunning else { return }
         Task {
             authorized = (try? await store.requestAccess(for: .contacts)) ?? false
             if authorized { await loadCache() }

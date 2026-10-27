@@ -12,3 +12,4 @@
 ---
 
 ---
+- **Correction (2026-10-26):** the `RootView` demo seeding task above was NOT terminal. A demo ending and restarting inside its splash removal animation reinstated the same splash and the task never restarted; it is keyed by the demo run now. See [138](138-a-task-keyed-on-a-flag-does-not-restart-when-an-animated-branch-comes-back.md).

@@ -556,16 +556,16 @@ struct MessageCardView: View {
 
     private func actionTagBadge(_ tag: ActionTag) -> some View {
         Menu {
-            Button { viewModel.applyManualTag(message, tag: .reply) } label: {
+            Button { retag(.reply) } label: {
                 Label("Tag as Reply", systemImage: "arrowshape.turn.up.left")
             }
-            Button { viewModel.applyManualTag(message, tag: ActionTag.none) } label: {
+            Button { retag(ActionTag.none) } label: {
                 Label("Tag as None", systemImage: "tag.slash")
             }
-            Button { viewModel.applyManualTag(message, tag: .archive) } label: {
+            Button { retag(.archive) } label: {
                 Label("Tag as Archive", systemImage: "archivebox")
             }
-            Button { viewModel.applyManualTag(message, tag: .delete) } label: {
+            Button { retag(.delete) } label: {
                 Label("Tag as Delete", systemImage: "trash")
             }
         } label: {
@@ -584,6 +584,8 @@ struct MessageCardView: View {
                 .sensoryFeedback(.impact(weight: .medium), trigger: tagMenuOpenTick)
         } primaryAction: {
             tagTapTick &+= 1
+            // The tutorial's tag steps happen in the inbox list.
+            guard TutorialCoordinator.shared.admits(.other) else { return }
             onTagAction(message)
         }
         .simultaneousGesture(
@@ -591,6 +593,11 @@ struct MessageCardView: View {
                 .onEnded { _ in tagMenuOpenTick &+= 1 }
         )
         .popoverTip(TagTeachingTip(), arrowEdge: .top)
+    }
+
+    private func retag(_ tag: ActionTag) {
+        guard TutorialCoordinator.shared.admits(.other) else { return }
+        viewModel.applyManualTag(message, tag: tag)
     }
 
     // MARK: - Body Content

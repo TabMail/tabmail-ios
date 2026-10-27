@@ -101,7 +101,10 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-10-25, #326): unchanged at 6 `open` records.** `IOS-DRAFT-025` is
+> **Current tracker census (2026-10-26, guided tutorial): unchanged at 6 `open` records.** `IOS-TEST-012`
+> (`accepted`, owner-blessed) records that eight tutorial hooks in SwiftUI views have no committed test.
+>
+> *Preserved:* **Current tracker census (2026-10-25, #326): unchanged at 6 `open` records.** `IOS-DRAFT-025` is
 > resolved: a draft's cover now opens at once, so an agent compose waits behind it while it is read.
 >
 > *Preserved:* **Current tracker census (2026-10-24, #309): unchanged at 6 `open` records.** `IOS-DRAFT-025`
@@ -288,6 +291,12 @@ regenerated from it; their detail files live in
 | ID | Class | Executive statement |
 |---|---|---|
 | [IOS-GRAPH-005](Companion/Process/Current/KnownIssues/Amendments/ios-graph-005.md) | `resolved` | ✅ **RESOLVED (2026-09-05)** — a second gesture on an Outlook message that was queued behind a move was lost. Graph reallocates a message's default id on every folder move (`IOS-GRAPH-002`; this tree sends no `Prefer: IdType="ImmutableId"`), so the follower named an id the first move had just destroyed, Graph answered `404`, and `executeSingleOp`'s single-message conflict arm read that as provider-authoritative "already done" and DELETED the operation — the user's LATEST intention, gone with nothing recording that they had asked. The same shape covers delete → undo → delete again, because the undo is an ordinary reverse move built from the optimistic row. **Fix:** `MessageHeaderRekey.finishMove` now carries the wire-proven destination address into the queue — in the SAME transaction that re-keys the header and retires the move, every non-cancelled same-account `PendingOperation` whose members name a proven source id has each such member replaced by its mapped destination id — and on an account-scoped provider the re-key FOLLOWS THE ROW, locating it by `(accountId, messageId)` and re-keying it in the folder it currently occupies rather than at the operation's destination path. The drain re-reads each operation by primary key before executing it (no `?? op` fallback) and requeues by COLUMN rather than by saving a pre-drain struct, so a halted lane can no longer write dead ids back over addresses the wire had just proved. Only with that handoff in place is `.outlook` admitted to account-qualified drain lanes, which SUPERSEDES the exclusion recorded under `IOS-QUEUE-008`: serializing without the handoff would have converted an inherited race into a DETERMINISTIC dropped intention, which is strictly worse. The classifier is renamed `immutableIdAccountIds` → `accountScopedIdAccountIds` because the property the lane key needs is "one provider id names one message per ACCOUNT", not "the id survives a move". ⚠️ **Accepted limitation (owner, 2026-09-04), stated in the source beside `readdressQueuedOperations`:** process death between Graph's `2xx` and the retirement commit leaves that move's queued followers on a dead id. It is bounded to one process death inside one write, is strictly narrower than the pre-handoff loss (which needed no crash at all), and is not closable here — re-associating the follower would need RFC identity as a mutation authority, which ADR-IOS-068 D4 bans. The structural fix (Graph immutable ids) is tracked as [#117](https://github.com/TabMail/tabmail-ios/issues/117); the launch-time drop of an interrupted move that the window relies on is [#116](https://github.com/TabMail/tabmail-ios/issues/116). No schema, migration or drain-ordering change |
+
+### TEST (1)
+
+| ID | Class | Executive statement |
+|---|---|---|
+| [IOS-TEST-012](Companion/Process/Current/KnownIssues/Amendments/ios-test-012.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-10-26, owner; extended after review round c4)** — eight guided-tutorial hooks in SwiftUI view code have no committed test (the scripted chat prompt forwarded to the script, the practice reply's no-undo send, the found-on-their-own records for inbox tag taps, message-view tag taps and inbox chat, Compose's Use Suggestion gate, the chat's scripted-edit send, and opening Jordan's email finishing part 3). Unit tests cannot reach a view's private function; the decisions behind each hook are tested at the coordinator and service. A lost hook re-teaches a part, delays the practice send, skips or stalls part 2's edit step, or shows an error in part 3 or leaves it unfinished; nothing is lost |
 
 ## GitHub live trackers (updated 2026-08-20)
 

@@ -432,8 +432,11 @@ final class PromptStore {
         templates.filter { !$0.deleted }
     }
 
+    /// Every template the person creates (settings, marketplace, chat) comes
+    /// through here; Device Sync merges through `mergeTemplates` instead.
     func addTemplate(_ template: ReplyTemplate = ReplyTemplate()) {
         templates.append(template)
+        TutorialCoordinator.shared.discovered(.template)
     }
 
     func deleteTemplate(id: String) {

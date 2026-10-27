@@ -335,6 +335,27 @@ struct TabMailSessionStoreTests {
     }
 
     @MainActor
+    @Test("only a truly fresh install is offered the tutorial welcome")
+    func tutorialWelcomeOnlyOnFreshInstall() {
+        let fresh = makeHarness()
+        _ = TabMailApp.prepareSessionStorageForLaunch(
+            sessionStore: fresh.store, launchDefaults: fresh.launchDefaults, databaseExists: { false })
+        #expect(TutorialProgress(defaults: fresh.launchDefaults).isWelcomePending)
+
+        // UserDefaults reset with a database on disk is an existing install.
+        let spurious = makeHarness()
+        _ = TabMailApp.prepareSessionStorageForLaunch(
+            sessionStore: spurious.store, launchDefaults: spurious.launchDefaults, databaseExists: { true })
+        #expect(!TutorialProgress(defaults: spurious.launchDefaults).isWelcomePending)
+
+        // A later launch never re-arms a welcome that was dismissed.
+        TutorialProgress(defaults: fresh.launchDefaults).dismissWelcome()
+        _ = TabMailApp.prepareSessionStorageForLaunch(
+            sessionStore: fresh.relaunchedStore(), launchDefaults: fresh.launchDefaults, databaseExists: { false })
+        #expect(!TutorialProgress(defaults: fresh.launchDefaults).isWelcomePending)
+    }
+
+    @MainActor
     @Test(
         "bounded seeded real-refresh schedules preserve pointer finality",
         arguments: SessionFinalityFuzzConfig.seeds

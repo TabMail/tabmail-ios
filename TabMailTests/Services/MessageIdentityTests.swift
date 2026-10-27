@@ -89,13 +89,13 @@ struct MessageIdentityTests {
 ///
 /// ⚑ WHY THERE IS NO "'@'-DISJOINTNESS" TEST HERE. It would pin a FALSE spec.
 /// The claim would be that an IMAP-minted provider id never contains `@`, so the
-/// provider-id and RFC tail spaces cannot collide. Three production sites
+/// provider-id and RFC tail spaces cannot collide. Two production sites
 /// disprove it on a `.imap` account: `IMAPFetchMapping.messageIdString(from:)`
 /// returns `"\(localPart)@\(domain)"` whenever the FETCH carried no UID (and it
-/// is the sole IMAP messageId mint, compiled into both targets);
+/// is the sole IMAP messageId mint, compiled into both targets); and
 /// `AccountManager.queueDraftSave` mints an `@`-bearing `draft-` placeholder from
-/// a composite key; and `DemoProvider.send` writes `<uuid@domain>` on the demo
-/// account, whose provider is `.imap`. Each of those derives from the SAME
+/// a composite key. (`DemoProvider.send` was a third until it stopped writing
+/// its own Sent row, 2026-10-21.) Each of those derives from the SAME
 /// message's own RFC id, so both candidate tails are the identical string for the
 /// identical message and zero cross-message collisions exist — but that is a
 /// contingent fact, not a structural guarantee. The collision invariant below is

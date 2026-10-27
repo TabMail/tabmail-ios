@@ -31,28 +31,40 @@ final class DemoModeService {
 
     private init() {}
 
+    /// `exit()` came while a start was still on its way to turning the demo
+    /// on (the tutorial ended during its entry): that start stops before it
+    /// activates, so the older start cannot bring back a demo the newer exit
+    /// ended. Reset by each start.
+    private var startWithdrawn = false
+
     /// Begin the demo. Mints the JWT, primes session storage, and flips
     /// `DemoModeStore.isActive`. Throws on mint failure — caller surfaces
     /// the error and stays on the login screen.
-    func start() async throws {
+    ///
+    /// `mintToken: false` is the guided tutorial: it is scripted and makes no
+    /// backend call (`DemoModeStore.isTutorialPractice`), so it starts offline.
+    func start(mintToken: Bool = true) async throws {
         let store = DemoModeStore.shared
         guard !store.isActive else { return }
         guard !store.startInProgress else { return }
 
         store.startInProgress = true
         defer { store.startInProgress = false }
+        startWithdrawn = false
 
         // Defensive: wipe any prior demo session before minting fresh.
         DemoTokenManager.clearSession()
 
-        let mint = await DemoTokenManager.shared.mint()
-        switch mint {
-        case .success:
-            break
-        case .configMissing:
-            throw DemoError.startFailed("Demo not available right now.")
-        case .transientFailure(let reason):
-            throw DemoError.startFailed(reason)
+        if mintToken {
+            let mint = await DemoTokenManager.shared.mint()
+            switch mint {
+            case .success:
+                break
+            case .configMissing:
+                throw DemoError.startFailed("Demo not available right now.")
+            case .transientFailure(let reason):
+                throw DemoError.startFailed(reason)
+            }
         }
 
         try await activate()
@@ -72,6 +84,11 @@ final class DemoModeService {
             DemoTokenManager.clearSession()
             BackgroundSyncLogger.logDebug("[DemoMode] start(): leftover demo memory not wiped: \(error)")
             throw DemoError.startFailed("Demo not available right now.")
+        }
+        guard !startWithdrawn else {
+            DemoTokenManager.clearSession()
+            BackgroundSyncLogger.logDebug("[DemoMode] start(): withdrawn by exit before activation")
+            return
         }
 
         store.isActive = true
@@ -116,6 +133,13 @@ final class DemoModeService {
     /// session are no-ops.
     func completeSetup() async throws {
         guard DemoModeStore.shared.isActive else { return }
+        // The demo run this setup is for. The demo can end while setup is
+        // suspended (a notification tap ends the tutorial during the splash,
+        // shown next to a live account too): each step after a suspension runs
+        // only while that run is still open. Above all the prompt overlay,
+        // which with the demo off would write the bundled defaults over the
+        // real prompts and sync them to the user's other devices.
+        let run = DemoModeStore.shared.chatAdmission
 
         // Note: the one-time destructive cached-mail resets (StartupMigrations)
         // already ran synchronously at DB-open (AppDatabase.init), long before the
@@ -125,6 +149,7 @@ final class DemoModeService {
         // Seed messages, folders, calendar events. The fixed demo account id is
         // reopened only after the replacement row commits successfully.
         await AccountFieldPersistenceStore.production.discardAccount(DemoSeed.demoAccountId)
+        guard DemoModeStore.admits(run) else { return }
         do {
             try DemoSeed.seed()
             AccountFieldPersistenceStore.production.reactivateAccount(DemoSeed.demoAccountId)
@@ -136,6 +161,7 @@ final class DemoModeService {
 
         // Index seeded headers + bodies in FTS so search works in demo.
         await indexSeededFTS()
+        guard DemoModeStore.admits(run) else { return }
 
         // Register provider mocks. These plug into the existing
         // EmailProvider / CalendarProvider lookups in AccountManager.
@@ -146,11 +172,13 @@ final class DemoModeService {
             calendar: calendar,
             accountId: DemoSeed.demoAccountId
         )
+        guard DemoModeStore.admits(run) else { return }
 
         // Open the AI subscription gate when
         // the user enabled AI in the demo consent gate. Otherwise the chat
-        // pill renders the "Subscribe to unlock AI features" lock bar.
-        if DemoModeStore.shared.aiEnabled {
+        // pill renders the "Subscribe to unlock AI features" lock bar. The
+        // tutorial's scripted chat needs the pill too (it calls no AI).
+        if DemoModeStore.shared.aiEnabled || DemoModeStore.shared.isTutorialPractice {
             AISubscriptionGate.shared.openGate()
         }
 
@@ -186,7 +214,11 @@ final class DemoModeService {
     /// providers, demo GRDB rows, demo FTS entries, demo memory.db entries.
     func exit() async {
         let store = DemoModeStore.shared
-        guard store.isActive else { return }
+        guard store.isActive else {
+            // A start still on its way never turns on (`startWithdrawn`).
+            if store.startInProgress { startWithdrawn = true }
+            return
+        }
 
         // First, before the wipes below: a chat write still running from this
         // demo (a canceled chat task, compose's own user-turn persistence) then
@@ -233,6 +265,7 @@ final class DemoModeService {
 
         store.isActive = false
         store.enteredFromDebugMenu = false
+        store.isTutorialPractice = false
         // Note: callsConsumed and demo gate flags persist.
 
         // Re-establish Device Sync (disconnected on demo entry). connect()

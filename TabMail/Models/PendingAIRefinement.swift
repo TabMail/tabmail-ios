@@ -42,6 +42,12 @@ struct ActionRefineSnapshot: Codable, Sendable {
     var dedupKey: String {
         "actionRefine:\(messageStableId):\(userManualTag ?? "nil")"
     }
+
+    /// A re-tag of a demo sample message (ADR-IOS-038). It must never teach
+    /// the user's action prompt: drains are deferred while the demo runs, so
+    /// a queued demo row would otherwise drain after exit against the REAL
+    /// `user_action.md`, with demo content.
+    var isDemoSample: Bool { accountId == DemoSeed.demoAccountId }
 }
 
 /// Snapshot for `.kbRefine` — session turns in dereferenced plain-text form.

@@ -349,6 +349,40 @@ struct OutboxDoubleSendTests {
             """)
     }
 
+    /// The guided tutorial's practice reply is persisted with NO hold, so it is
+    /// claimable at once (the drain admits `(holdUntil ?? .distantPast) <= now`)
+    /// and the toast offers no Undo. Every other send keeps the default hold.
+    @Test("A send that does not hold for undo stores no hold and is claimable at once")
+    func noUndoHoldStoresNoHold() async throws {
+        let (dir, pool, previous) = try makeOutboxTestDatabase()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        try await insertDraftAuthority(pool, id: "draft-no-hold")
+        try await insertDraftAuthority(pool, id: "draft-default-hold")
+
+        let immediate = try await AccountManager.persistQueuedSend(
+            draft: makeDraft(), accountId: "acc1", replyToHeaderId: nil,
+            isForward: false, serverDraftId: nil,
+            draftId: "draft-no-hold", instanceEpoch: "E1", holdsForUndo: false)
+        #expect(immediate.holdUntil == nil, "a no-hold send must report no hold")
+        let stored = try #require(try await pool.read { db in
+            try OutboxMessage.fetchOne(db, key: immediate.outboxId)
+        })
+        #expect(stored.holdUntil == nil, "a no-hold send must store no hold")
+        #expect(stored.status == OutboxStatus.queued.rawValue)
+        #expect(OutboxCancellationPolicy.undoDeadline(for: stored.holdUntil) < Date(),
+                "a no-hold send must offer no Undo")
+
+        let held = try await AccountManager.persistQueuedSend(
+            draft: makeDraft(), accountId: "acc1", replyToHeaderId: nil,
+            isForward: false, serverDraftId: nil,
+            draftId: "draft-default-hold", instanceEpoch: "E1")
+        let heldUntil = try #require(held.holdUntil, "the default must still hold for undo")
+        #expect(heldUntil > Date())
+    }
+
     /// Reply path: the first send sets optimistic `isReplied` on the original
     /// message and returns its id; a second (double-tap) send dedups WITHOUT
     /// inserting a second row and without re-touching the original. Guards that the

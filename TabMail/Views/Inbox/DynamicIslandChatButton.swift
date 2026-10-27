@@ -74,6 +74,8 @@ struct DynamicIslandChat: View {
     @State private var showDictationPrompt = false
 
     private var isComposeMode: Bool { composeContext != nil }
+    /// The inbox's own chat: not about a message, not editing a draft.
+    private var isInboxChat: Bool { composeContext == nil && message == nil }
     private var isBackfillInProgress: Bool {
         AccountManagerState.shared.backfillProgressByAccount.values.contains { !$0.isFullyComplete }
     }
@@ -276,6 +278,13 @@ struct DynamicIslandChat: View {
                                 .background(Color(.systemGray5))
                                 .clipShape(Circle())
                         }
+                        .overlay {
+                            // Guided tutorial: the open chat covers the card, whose
+                            // button is the next tap.
+                            if isInboxChat && TutorialCoordinator.shared.highlightsChatClose {
+                                TutorialPulseRing(shape: Circle(), lineWidth: 2, outset: 3)
+                            }
+                        }
                         .accessibilityIdentifier("chatClose")
                     }
                 }
@@ -336,6 +345,13 @@ struct DynamicIslandChat: View {
                 if !hasTabMailSession {
                     signInBar
                         .layoutPriority(1)
+                } else if TutorialCoordinator.shared.isRunning {
+                    // Scripted: the input is filled in and read-only.
+                    TutorialChatInputBar(
+                        prompt: tutorialPromptText,
+                        isWorking: isWorking,
+                        send: sendTutorialInput)
+                    .layoutPriority(1)
                 } else if !AISubscriptionGate.shared.isActive {
                     subscribeBar
                         .layoutPriority(1)
@@ -348,6 +364,14 @@ struct DynamicIslandChat: View {
             }
         }
         .glassEffect(.regular, in: RoundedRectangle(cornerRadius: isExpanded ? 24 : 100))
+        .overlay {
+            // Guided tutorial: the step's next move is opening this chat.
+            if !isExpanded
+                && (tutorialPromptText != nil || (isInboxChat && TutorialCoordinator.shared.highlightsEmailReference)) {
+                TutorialPulseRing(shape: Capsule())
+                    .accessibilityIdentifier("tutorial-pill-highlight")
+            }
+        }
         .frame(
             maxWidth: isExpanded ? .infinity : nil,
             maxHeight: isExpanded ? ((UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.bounds.height ?? 800) * expandedHeightFraction : nil
@@ -580,7 +604,7 @@ struct DynamicIslandChat: View {
                         guard !Task.isCancelled, isExpanded, !isTextFieldFocused else { return }
                         startDictation()
                     }
-                } else if !dictationPromptShown {
+                } else if !dictationPromptShown && !TutorialCoordinator.shared.isRunning {
                     dictationPromptShown = true
                     showDictationPrompt = true
                 }
@@ -1240,7 +1264,8 @@ struct DynamicIslandChat: View {
 
     /// Whether the mic can start a dictation (the pill shows it only with AI access).
     private var canDictate: Bool {
-        networkMonitor.isConnected && !optOutAllAI
+        // Off in the guided tutorial: it would ask for the microphone and send audio.
+        networkMonitor.isConnected && !optOutAllAI && !TutorialCoordinator.shared.isRunning
     }
 
     /// What the dictation's cleanup reads as the screen, captured when it starts: what the pill
@@ -1298,6 +1323,52 @@ struct DynamicIslandChat: View {
         canSend || (dictation.phase == .listening && hasTabMailSession && !isWorking && composeReadyToSend)
     }
 
+    /// The practice reply's draft chat (part 2), where the tutorial fills in an edit.
+    private var isTutorialPracticeDraft: Bool {
+        isComposeMode && draftReplyToProviderMessageId == DemoSeed.TutorialFixture.priyaOffsite
+    }
+
+    /// The tutorial's filled-in input in this chat now, if any.
+    private var tutorialPromptText: String? {
+        if isInboxChat { return TutorialCoordinator.shared.chatPrompt?.rawValue }
+        if isTutorialPracticeDraft { return TutorialCoordinator.shared.composeEditPrompt }
+        return nil
+    }
+
+    private func sendTutorialInput() {
+        if isInboxChat, let prompt = TutorialCoordinator.shared.chatPrompt {
+            sendTutorialPrompt(prompt)
+        } else if isTutorialPracticeDraft, TutorialCoordinator.shared.composeEditPrompt != nil {
+            sendTutorialEdit()
+        }
+    }
+
+    /// The practice reply's scripted edit, through the real edit path: the
+    /// chat closes, the draft pulses as during an AI edit, then fades to the
+    /// declined reply.
+    private func sendTutorialEdit() {
+        isTextFieldFocused = false
+        withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+            isExpanded = false
+        }
+        isWorking = true
+        Task { @MainActor in
+            await TutorialCoordinator.shared.runPracticeReplyEdit { reply in
+                onDraftUpdate?(nil, reply, nil, nil, nil)
+            }
+            isWorking = false
+        }
+    }
+
+    /// The tutorial's filled-in input: sent like typed text, answered by
+    /// `TutorialChatScript`. No tip events are donated (TipKit state outlives
+    /// the demo).
+    private func sendTutorialPrompt(_ prompt: TutorialCoordinator.ChatPrompt) {
+        isTextFieldFocused = false
+        TutorialCoordinator.shared.chatPromptSent(prompt)
+        sendAgentChat(prompt.rawValue, script: prompt)
+    }
+
     private func sendMessage() {
         let text = inputText.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { return }
@@ -1328,6 +1399,7 @@ struct DynamicIslandChat: View {
                 MessageChatCollapseTip.hasStartedMessageChat = true
             } else {
                 InboxChatCollapseTip.hasStartedInboxChat = true
+                TutorialCoordinator.shared.discovered(.inboxChat)
             }
             if isComposeMode {
                 sendComposeEdit(text, agentAdmissionAcquired: composeAdmissionAcquired)
@@ -2027,7 +2099,9 @@ struct DynamicIslandChat: View {
         lastStatusChangeTime = .distantPast
     }
 
-    private func sendAgentChat(_ text: String) {
+    /// `script`: a guided-tutorial prompt, answered by `TutorialChatScript`
+    /// on the device instead of the AI.
+    private func sendAgentChat(_ text: String, script: TutorialCoordinator.ChatPrompt? = nil) {
         // If on the "new session" page in multi-session mode, start a fresh session
         if hasSessionHistory, activeSessionIndex < loadedSessions.count,
            loadedSessions[activeSessionIndex].id == "__new__" {
@@ -2212,17 +2286,21 @@ struct DynamicIslandChat: View {
                 // THIS session so any FSM tool's card is delivered to (and rendered
                 // by) the session that launched the turn — never a global slot that
                 // other mounted pills race for.
-                let response = try await AIService.shared.sendChatMessage(
-                    userText: enrichedText,
-                    history: history,
-                    onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
-                    invocation: ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey)
-                )
+                let invocation = ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey)
+                let response: ChatResponse?
+                response = try await TutorialChatScript.response(for: script, invocation: invocation) {
+                    try await AIService.shared.sendChatMessage(
+                        userText: enrichedText,
+                        history: history,
+                        onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
+                        invocation: invocation
+                    )
+                }
 
                 let replyText = response?.text ?? "I couldn't generate a response. Please try again."
                 if response == nil {
                     BackgroundSyncLogger.logChatError("Empty/nil response from LLM", userMessage: text)
-                } else {
+                } else if script == nil {
                     confirmSubscriptionActive()
                 }
                 BackgroundSyncLogger.logDebug("[AIChatDebug] Raw LLM response (\(replyText.count) chars): \(replyText.prefix(300))")

@@ -131,6 +131,7 @@ struct MessageDetailView: View {
 
     var body: some View {
         bodyContent
+            .modifier(TutorialMessageHost(message: viewModel.message, dismiss: dismiss))
             .overlay {
                 if skeletonOverlayVisible && !viewModel.messageNotFound {
                     MessageDetailSkeleton()
@@ -170,6 +171,7 @@ struct MessageDetailView: View {
                         }
                         showCompose = true
                     })
+                    .tutorialLockedNavigation()
                 }
             }
             .fullScreenCover(isPresented: $showCompose) {
@@ -583,6 +585,7 @@ struct MessageDetailView: View {
                 }
                 .tint(.primary)
                 .menuStyle(.button)
+                .tutorialLockedNavigation()
                 .accessibilityIdentifier("replyMenu")
                 .frame(width: showSideButtons ? nil : 0, height: showSideButtons ? nil : 0)
                 .opacity(showSideButtons ? 1 : 0)
@@ -613,6 +616,7 @@ struct MessageDetailView: View {
                         .glassEffect(.regular.interactive(), in: .circle)
                 }
                 .tint(.primary)
+                .tutorialLockedNavigation()
                 .frame(width: showSideButtons ? nil : 0, height: showSideButtons ? nil : 0)
                 .opacity(showSideButtons ? 1 : 0)
                 .offset(y: showSideButtons ? 0 : 30)

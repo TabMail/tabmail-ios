@@ -709,6 +709,14 @@ private struct ChatPillChip: View {
                         lineWidth: 0.5
                     )
                 )
+                .overlay {
+                    // Guided tutorial: the answer's email reference is the next tap
+                    // (its popover's Open Email takes the ring once it is open).
+                    if type == "email" && !isHistory && presentation == nil
+                        && TutorialCoordinator.shared.highlightsEmailReference {
+                        TutorialPulseRing(shape: Capsule(), lineWidth: 2, outset: 3)
+                    }
+                }
         }
         .buttonStyle(.plain)
         .disabled(isHistory)
@@ -896,6 +904,13 @@ private struct EmailPillPopover: View {
                 Label("Open Email", systemImage: "envelope.open")
                     .font(.subheadline)
                     .fontWeight(.medium)
+                    .padding(.horizontal, 4)
+                    .overlay {
+                        // Guided tutorial: opening the cited email is the step.
+                        if TutorialCoordinator.shared.highlightsEmailReference {
+                            TutorialPulseRing(shape: Capsule(), lineWidth: 2, outset: 6)
+                        }
+                    }
             }
             .tint(Theme.accent)
         }
