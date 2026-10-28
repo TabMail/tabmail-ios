@@ -130,11 +130,14 @@ struct SearchDateWindowTests {
         let limit = newer + 20 + 100
         try await withMessages(messages + filler(3 * limit, at: start - Self.day)) {
             let from = start - Self.day, to = start + 100 * Self.day
+            // The total, and a limit the first window cannot fill: the second window gives only what is left.
             for sort in [SearchSort.dateDesc, .dateAsc] {
-                let results = try await search("pangolin", query, from: from, to: to, limit: limit, sort: sort)
-                #expect(ids(results).count == limit, "\(sort)")
-                let exact = try await exactKeyword("pangolin", from: from, to: to, limit: limit, sort: sort)
-                #expect(ids(results) == exact, "\(sort)")
+                for wanted in [limit, newer + 5] {
+                    let results = try await search("pangolin", query, from: from, to: to, limit: wanted, sort: sort)
+                    #expect(ids(results).count == wanted, "\(sort) \(wanted)")
+                    let exact = try await exactKeyword("pangolin", from: from, to: to, limit: wanted, sort: sort)
+                    #expect(ids(results) == exact, "\(sort) \(wanted)")
+                }
             }
         }
     }
@@ -187,20 +190,81 @@ struct SearchDateWindowTests {
         }
     }
 
-    @Test("a date sort with a pool of keyword matches at one date terminates and answers")
+    @Test("a date sort with a pool of keyword matches at one date terminates, answers and walks on")
     func poolOfMatchesAtOneDateTerminates() async throws {
         let start = try Self.start()
         let query = Self.vector(40, 41, cos: 1)
         let pool = SearchConfig.dateSortPool
-        let messages = (0..<(pool + 4)).map { i in
+        var messages = (0..<(pool + 4)).map { i in
             Message(id: "same\(i)", subject: "Pangolin", dateMs: start, vector: i == 0 ? query : nil)
         }
+        // 30 matches before that date: a limit past the pool gets the walk's next window, for either sort.
+        messages += (0..<30).map { i in Message(id: "older\(i)", subject: "Pangolin", dateMs: start - Self.day / 2 + Int64(i) * Self.minute) }
         try await withMessages(messages + filler(2 * pool, at: start - Self.day)) {
             for sort in [SearchSort.dateDesc, .dateAsc] {
                 let results = try await search("pangolin", query, from: start - Self.day, to: start + Self.day, limit: 10, sort: sort)
                 #expect(results.count == 10, "\(sort)")
+                let more = ids(try await search("pangolin", query, from: start - Self.day, to: start + Self.day, limit: pool + 20, sort: sort))
+                #expect(more.count == pool + 20, "\(sort)")
+                guard more.count == pool + 20 else { continue }
+                let older = (0..<30).map { "older\($0)" }
+                #expect(sort == .dateDesc ? Array(more.suffix(20)) == Array(older.reversed().prefix(20)) : Array(more.prefix(30)) == older, "\(sort)")
             }
         }
+    }
+
+    @Test("a date sort answers by keyword, ranks included, when no vector is within the dates")
+    func keywordOnlyWhenNoVectorIsWithinTheDates() async throws {
+        let start = try Self.start()
+        let query = Self.vector(44, 45, cos: 1)
+        let messages = (0..<12).map { i in
+            Message(id: "kw\(i)", subject: "Pangolin " + String(repeating: "weather ", count: i), dateMs: start + Int64(i) * Self.minute)
+        }
+        try await withMessages(messages + filler(60, at: start - Self.day)) {
+            for sort in [SearchSort.dateDesc, .dateAsc] {
+                let results = try await search("pangolin", query, from: start - Self.day, to: start + Self.day, limit: 10, sort: sort)
+                let exact = try await index.searchFTSOnly(ftsQuery: SearchQueryParser.buildFTSMatch("pangolin"), fromDateMs: start - Self.day,
+                                                          toDateMs: start + Self.day, limit: 10, sort: sort)
+                #expect(ids(results) == ids(exact), "\(sort)")
+                #expect(results.map(\.rank) == exact.map(\.rank), "\(sort)")
+            }
+        }
+    }
+
+    @Test("a date sort whose limit is reached before the dates holding the only vector still counts that vector")
+    func vectorOnlyInTheDatesNotWalked() async throws {
+        let start = try Self.start()
+        let pool = SearchConfig.dateSortPool
+        let query = Self.vector(46, 47, cos: 1)
+        for sort in [SearchSort.dateDesc, .dateAsc] {
+            // A pool and more of keyword matches without a vector at the end the sort starts at; the one
+            // vector is on a match at the other end, in the dates the first window does not reach.
+            let vectorDate = sort == .dateDesc ? start : start + Int64(pool + 20) * Self.minute
+            var messages = (0..<(pool + 10)).map { i in
+                Message(id: "kw\(i)", subject: "Pangolin", dateMs: start + Int64(i + 1) * Self.minute)
+            }
+            messages.append(Message(id: "vec", subject: "Pangolin", dateMs: vectorDate, vector: query))
+            try await withMessages(messages + filler(3 * pool, at: start - Self.day)) {
+                let from = start - Self.day, to = start + Int64(pool + 100) * Self.minute
+                let results = try await search("pangolin", query, from: from, to: to, limit: 10, sort: sort)
+                let exact = try await index.searchFTSOnly(ftsQuery: SearchQueryParser.buildFTSMatch("pangolin"), fromDateMs: from,
+                                                          toDateMs: to, limit: 10, sort: sort)
+                #expect(ids(results).count == 10, "\(sort)")
+                // Scored with a vector in the dates (hybrid scores), as a search that reaches it scores them,
+                // not by keyword alone.
+                #expect(results.map(\.rank) != exact.map(\.rank), "\(sort)")
+            }
+        }
+    }
+
+    @Test("a date sort reads the demo mode once, at the start of its walk")
+    func demoModeIsReadOnce() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Search/SearchIndex.swift"), encoding: .utf8)
+        let start = try #require(source.range(of: "private func dateWindowCandidates("))
+        let end = try #require(source.range(of: "// MARK: - Internal Search Helpers", range: start.upperBound..<source.endIndex))
+        let walk = source[start.lowerBound..<end.lowerBound]
+        #expect(walk.components(separatedBy: "DemoModeStore.isDemoActive").count - 1 == 1)
     }
 
     @Test("a date sort in the demo mode finds the demo vectors past a pool of nearer real ones")
