@@ -1887,13 +1887,6 @@ actor SearchIndex {
     func hybridSearch(ftsQuery: String, queryEmbedding: [Float], fromDateMs: Int64?, toDateMs: Int64?,
                       limit: Int, folderIds: [String]?, sort: SearchSort) throws -> [FTSSearchResult] {
         guard let dbPool else { return [] }
-        // A date sort orders all of a larger pool's matches by date, so the newest (oldest) match is
-        // found even when its score is far from the best.
-        let candidateLimit = sort == .relevance ? limit * SearchConfig.candidateMultiplier : SearchConfig.dateSortPool
-
-        // --- FTS5 candidates (UNION ALL across all year shards) ---
-        let ftsCandidates = try searchFTSCandidates(
-            ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: candidateLimit, folderIds: folderIds)
 
         // --- Column-scope filter-first: the vector search looks only among the field's rowids ---
         let eligibleRowids: Set<Int64>?
@@ -1904,30 +1897,30 @@ actor SearchIndex {
             eligibleRowids = nil
         }
 
-        // --- Vector candidates via sqlite-vec KNN, within the dates and the field ---
-        let vectorCandidates = searchVecCandidates(queryEmbedding: queryEmbedding, limit: candidateLimit,
-                                                   fromDateMs: fromDateMs, toDateMs: toDateMs, eligible: eligibleRowids,
-                                                   demoActive: DemoModeStore.isDemoActive)
+        // Relevance reads one pool of the best candidates of each leg. A date sort walks the dates in
+        // windows, so its answer is exact however many messages match (tabmail-ios#294, native-fts #47).
+        let found: HybridFound?
+        switch sort {
+        case .relevance:
+            found = try relevanceCandidates(ftsQuery: ftsQuery, queryEmbedding: queryEmbedding, fromDateMs: fromDateMs,
+                                            toDateMs: toDateMs, limit: limit, folderIds: folderIds, eligible: eligibleRowids)
+        case .dateDesc, .dateAsc:
+            found = try dateWindowCandidates(ftsQuery: ftsQuery, queryEmbedding: queryEmbedding, fromDateMs: fromDateMs,
+                                             toDateMs: toDateMs, limit: limit, folderIds: folderIds, eligible: eligibleRowids,
+                                             sort: sort)
+        }
 
         // Fall back to FTS-only when no vector lies within the dates and the field (or the vec table
         // is empty, e.g. during embedding rebuild). It orders every keyword match, where the merge
         // would order only the keyword leg's candidates.
-        if vectorCandidates.isEmpty {
+        guard let found else {
             BackgroundSyncLogger.logDebug("[SearchIndex] No vector candidates (vec table may be empty), falling back to FTS-only search")
             return try searchFTSOnly(ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: limit,
                                      folderIds: folderIds, sort: sort)
         }
-
-        // --- Merge ---
-        let textPairs = ftsCandidates.map { ($0.rowid, $0.rank) }
-        var dates = Dictionary(ftsCandidates.map { ($0.rowid, $0.dateMs) }, uniquingKeysWith: { first, _ in first })
-        let vectorOnly = vectorCandidates.map(\.0).filter { dates[$0] == nil }
-        dates.merge(try dbPool.read { db in try Self.fetchDates(db, metaTable: "message_meta", rowids: vectorOnly) },
-                    uniquingKeysWith: { first, _ in first })
-        let merged = HybridMerge.mergeResults(
-            textResults: textPairs, vectorResults: vectorCandidates, dates: dates,
-            vectorWeight: SearchConfig.vectorWeight, textWeight: SearchConfig.textWeight,
-            sort: sort, limit: limit)
+        let ftsCandidates = found.keyword
+        let merged = found.merged
+        let vectorCount = found.vectorCount
 
         // --- Assemble results ---
         var ftsMap = [Int64: (contentKey: ContentKey, messageId: String, snippet: String, dateMs: Int64)]()
@@ -1957,9 +1950,171 @@ actor SearchIndex {
 
         if DebugModeManager.isLoggingEnabled() {
             let filterInfo = eligibleRowids != nil ? ", filtered to \(eligibleRowids!.count) eligible" : ""
-            BackgroundSyncLogger.logDebug("[SearchIndex] Hybrid search: \(results.count) results (FTS: \(ftsCandidates.count), Vec: \(vectorCandidates.count)\(filterInfo))")
+            BackgroundSyncLogger.logDebug("[SearchIndex] Hybrid search: \(results.count) results (FTS: \(ftsCandidates.count), Vec: \(vectorCount)\(filterInfo))")
         }
         return results
+    }
+
+    /// A hybrid search's merged matches in sort order (at most its limit), the keyword candidates they
+    /// may come from, and how many vector candidates were read.
+    private struct HybridFound {
+        var merged: [HybridResult] = []
+        var keyword: [FTSCandidate] = []
+        var vectorCount = 0
+    }
+
+    /// A relevance search's candidates: the best `limit` x `candidateMultiplier` of each leg, merged.
+    /// `nil` when no vector is within the dates and the field: the caller answers by keyword.
+    private func relevanceCandidates(ftsQuery: String, queryEmbedding: [Float], fromDateMs: Int64?, toDateMs: Int64?,
+                                     limit: Int, folderIds: [String]?, eligible: Set<Int64>?) throws -> HybridFound? {
+        guard let dbPool else { return nil }
+        let candidateLimit = limit * SearchConfig.candidateMultiplier
+
+        // --- FTS5 candidates (UNION ALL across all year shards) ---
+        let ftsCandidates = try searchFTSCandidates(
+            ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: candidateLimit, folderIds: folderIds,
+            sort: .relevance)
+
+        // --- Vector candidates via sqlite-vec KNN, within the dates and the field ---
+        let vectorCandidates = searchVecCandidates(queryEmbedding: queryEmbedding, limit: candidateLimit,
+                                                   fromDateMs: fromDateMs, toDateMs: toDateMs, eligible: eligible,
+                                                   demoActive: DemoModeStore.isDemoActive)
+        if vectorCandidates.isEmpty { return nil }
+
+        // --- Merge ---
+        var dates = Dictionary(ftsCandidates.map { ($0.rowid, $0.dateMs) }, uniquingKeysWith: { first, _ in first })
+        let vectorOnly = vectorCandidates.map(\.0).filter { dates[$0] == nil }
+        dates.merge(try dbPool.read { db in try Self.fetchDates(db, metaTable: "message_meta", rowids: vectorOnly) },
+                    uniquingKeysWith: { first, _ in first })
+        let merged = HybridMerge.mergeResults(
+            textResults: ftsCandidates.map { ($0.rowid, $0.rank) }, vectorResults: vectorCandidates, dates: dates,
+            vectorWeight: SearchConfig.vectorWeight, textWeight: SearchConfig.textWeight,
+            sort: .relevance, limit: limit)
+        return HybridFound(merged: merged, keyword: ftsCandidates, vectorCount: vectorCandidates.count)
+    }
+
+    /// A date-sorted search's first `limit` matches, exact however many matches there are
+    /// (tabmail-ios#294; native-fts #47, ADR-NF-023). A match is what the relevance search keeps: every
+    /// keyword match, and a match by meaning alone at `SearchConfig.minScore`. The dates are walked in
+    /// windows from the end the sort starts at (the newest for `date_desc`, the oldest for `date_asc`);
+    /// every match in a window comes before every match in the next, so the walk stops once `limit`
+    /// matches are found. A window is merged only when both legs hold all of its candidates:
+    /// - keyword: the next `dateSortPool` keyword matches in sort order (date, then rank), the window
+    ///   ending where they end. The matches at their last date are left to the next window, as they may
+    ///   go on past the pool, so a window never splits a date;
+    /// - vector: sqlite-vec's `dateSortPool` nearest within the window hold every match by meaning alone
+    ///   in it when fewer answered, or the farthest scores under `minScore` by meaning alone. If not,
+    ///   every one of them is a match: every vector's distance within the window is read in one pass
+    ///   (more than the limit match, so the walk ends there). A full pool whose farthest scores above
+    ///   `vectorScoreThreshold` leaves out vectors a keyword match still counts, so the window's keyword
+    ///   matches missing from it are read for their own distances.
+    ///
+    /// So every candidate's score is its own, whatever window found it. `nil` when no vector is within
+    /// the dates and the field, or a vector read failed: the caller answers by keyword.
+    private func dateWindowCandidates(ftsQuery: String, queryEmbedding: [Float], fromDateMs: Int64?, toDateMs: Int64?,
+                                      limit: Int, folderIds: [String]?, eligible: Set<Int64>?,
+                                      sort: SearchSort) throws -> HybridFound? {
+        guard let dbPool else { return nil }
+        let pool = SearchConfig.dateSortPool
+        let newestFirst = sort == .dateDesc
+        let demoActive = DemoModeStore.isDemoActive
+
+        // A failed vector read is logged and answers by keyword only (the relevance path's way).
+        func vectorsWithin(_ lo: Int64, _ hi: Int64, k: Int, among: Set<Int64>?) -> [(Int64, Double)]? {
+            do {
+                return try knnCandidates(queryEmbedding: queryEmbedding, limit: k, fromDateMs: lo, toDateMs: hi,
+                                         eligible: among, demoActive: demoActive, alwaysScoped: true)
+            } catch {
+                BackgroundSyncLogger.logDebug("[SearchIndex] Vec search failed, answering by keyword only: \(error)")
+                return nil
+            }
+        }
+
+        // The dates not walked yet, inclusive.
+        var lo = fromDateMs ?? Int64.min, hi = toDateMs ?? Int64.max
+        var found = HybridFound()
+        var windows = 0, vectorSearches = 0
+        var walkedAll = false
+        while found.merged.count < limit {
+            let end = newestFirst ? lo : hi
+
+            // --- Keyword: the next pool of matches; the window ends where they end ---
+            let rows = try searchFTSCandidates(ftsQuery: ftsQuery, fromDateMs: lo, toDateMs: hi, limit: pool,
+                                               folderIds: folderIds, sort: sort)
+            var edge = end
+            var inWindow = rows
+            if rows.count >= pool, let first = rows.first?.dateMs, let last = rows.last?.dateMs {
+                if first == last {
+                    // More than a pool at one millisecond cannot be split: sort that pool.
+                    BackgroundSyncLogger.logDebug("[SearchIndex] Date-sorted search: \(pool) keyword matches or more at one date (\(last)), sorting \(pool) of them")
+                } else {
+                    // `last` is past `first` in the sort's direction, so one step towards `first` cannot overflow.
+                    edge = newestFirst ? last + 1 : last - 1
+                    inWindow = rows.filter { $0.dateMs != last }
+                }
+            }
+
+            // --- Vector: the window's nearest pool, holding every match by meaning alone unless full of them ---
+            let (windowLo, windowHi) = newestFirst ? (edge, hi) : (lo, edge)
+            guard var vectors = vectorsWithin(windowLo, windowHi, k: pool, among: eligible) else { return nil }
+            vectorSearches += 1
+            let farthest = vectors.map { HybridMerge.cosineDistanceToScore($0.1) }.min() ?? .infinity
+            let full = vectors.count >= pool
+            if full && SearchConfig.vectorWeight * HybridMerge.adjustedVectorScore(farthest) >= SearchConfig.minScore {
+                // Every one of them is a match, and more may be past them: every vector's own distance
+                // within the window, in one pass over its rows.
+                do {
+                    vectors = try vecDistancesWithin(queryEmbedding: queryEmbedding, fromDateMs: windowLo, toDateMs: windowHi,
+                                                     eligible: eligible, demoActive: demoActive)
+                } catch {
+                    BackgroundSyncLogger.logDebug("[SearchIndex] Vec distance read failed, answering by keyword only: \(error)")
+                    return nil
+                }
+                vectorSearches += 1
+            } else if full && farthest > SearchConfig.vectorScoreThreshold {
+                // The pool holds every match by meaning alone, but leaves out vectors scoring up to its
+                // farthest: a keyword match among them still counts its meaning, so read its own distance
+                // (at most a pool of rows).
+                let pooled = Set(vectors.map(\.0))
+                let missing = Set(inWindow.map(\.rowid)).subtracting(pooled)
+                if !missing.isEmpty {
+                    guard let own = vectorsWithin(Int64.min, Int64.max, k: missing.count, among: missing) else { return nil }
+                    vectorSearches += 1
+                    vectors.append(contentsOf: own)
+                }
+            }
+
+            // --- Merge this window's candidates, after the windows before it ---
+            var dates = Dictionary(inWindow.map { ($0.rowid, $0.dateMs) }, uniquingKeysWith: { first, _ in first })
+            let vectorOnly = vectors.map(\.0).filter { dates[$0] == nil }
+            dates.merge(try dbPool.read { db in try Self.fetchDates(db, metaTable: "message_meta", rowids: vectorOnly) },
+                        uniquingKeysWith: { first, _ in first })
+            found.merged += HybridMerge.mergeResults(
+                textResults: inWindow.map { ($0.rowid, $0.rank) }, vectorResults: vectors, dates: dates,
+                vectorWeight: SearchConfig.vectorWeight, textWeight: SearchConfig.textWeight,
+                sort: sort, limit: limit - found.merged.count)
+            found.keyword += inWindow
+            found.vectorCount += vectors.count
+            windows += 1
+
+            // --- The dates left ---
+            let (next, overflow) = newestFirst ? edge.subtractingReportingOverflow(1) : edge.addingReportingOverflow(1)
+            if overflow || edge == end {
+                walkedAll = true
+                break
+            }
+            if newestFirst { hi = next } else { lo = next }
+        }
+        BackgroundSyncLogger.logDebug("[SearchIndex] Date-sorted search walked \(windows) date windows with \(vectorSearches) vector searches")
+
+        // No vector in the windows walked: answer by keyword when none is within the dates at all, as a
+        // relevance search does.
+        if found.vectorCount == 0 {
+            if walkedAll { return nil }
+            guard let any = vectorsWithin(fromDateMs ?? Int64.min, toDateMs ?? Int64.max, k: 1, among: eligible),
+                  !any.isEmpty else { return nil }
+        }
+        return found
     }
 
     // MARK: - Internal Search Helpers
@@ -1977,7 +2132,7 @@ actor SearchIndex {
     /// Get FTS5 candidates with metadata for hybrid merge using a single UNION ALL query.
     /// Matching TB's search_fts_candidates() — sorts by rank ASC (best BM25 first).
     private func searchFTSCandidates(ftsQuery: String, fromDateMs: Int64?, toDateMs: Int64?,
-                                      limit: Int, folderIds: [String]? = nil) throws -> [FTSCandidate] {
+                                      limit: Int, folderIds: [String]? = nil, sort: SearchSort) throws -> [FTSCandidate] {
         guard let dbPool, !knownYears.isEmpty else { return [] }
 
         return try dbPool.read { [self] db in
@@ -2015,10 +2170,11 @@ actor SearchIndex {
             if let ids = nonEmptyFolderIds { args.append(contentsOf: ids) }
             args.append(limit)
 
-            // Equal ranks newer first, as `searchFTSOnly` orders them: every keyword candidate is a
-            // result (#304, native-fts #51), so the pool decides which tied matches are answered.
+            // In `searchFTSOnly`'s order (relevance: equal ranks newer first): every keyword candidate is
+            // a result (#304, native-fts #51), so the pool decides which tied matches are answered.
+            // A date sort takes the first pool in date order, the window's pool (#294).
             let sql = subqueries.joined(separator: " UNION ALL ") +
-                " ORDER BY rank ASC, dateMs DESC LIMIT ?\(limitParam)"
+                " ORDER BY \(Self.keywordOrder(sort)) LIMIT ?\(limitParam)"
 
             // Gated. This arm is the HYBRID path (`search()` ← `EmailSearchTool`), not the
             // per-keystroke typing path — that one is `keywordSearch` → `searchFTSOnly`
@@ -2042,6 +2198,16 @@ actor SearchIndex {
                     rank: row["rank"], dateMs: row["dateMs"]
                 )
             }
+        }
+    }
+
+    /// The SQL order of keyword matches in `sort`: relevance, the best keyword match first and ties newer
+    /// first; a date, ties the better keyword match first.
+    nonisolated static func keywordOrder(_ sort: SearchSort) -> String {
+        switch sort {
+        case .relevance: "rank ASC, dateMs DESC"
+        case .dateDesc: "dateMs DESC, rank ASC"
+        case .dateAsc: "dateMs ASC, rank ASC"
         }
     }
 
@@ -2102,13 +2268,8 @@ actor SearchIndex {
             if let ids = nonEmptyFolderIds { args.append(contentsOf: ids) }
             args.append(limit)
 
-            let order = switch sort {
-            case .relevance: "rank ASC, dateMs DESC"
-            case .dateDesc: "dateMs DESC, rank ASC"
-            case .dateAsc: "dateMs ASC, rank ASC"
-            }
             let sql = subqueries.joined(separator: " UNION ALL ") +
-                " ORDER BY \(order) LIMIT ?\(limitParam)"
+                " ORDER BY \(Self.keywordOrder(sort)) LIMIT ?\(limitParam)"
 
             // Gated for the same reason as `searchFTSCandidates` above: this is THE
             // per-keystroke path (it is the query the Archive-search stall episode was
@@ -2260,17 +2421,36 @@ actor SearchIndex {
     /// the field fill the unfiltered `limit`.
     func searchVecCandidates(queryEmbedding: [Float], limit: Int, fromDateMs: Int64?, toDateMs: Int64?,
                              eligible: Set<Int64>?, demoActive: Bool) -> [(Int64, Double)] {
+        do {
+            return try knnCandidates(queryEmbedding: queryEmbedding, limit: limit, fromDateMs: fromDateMs, toDateMs: toDateMs,
+                                     eligible: eligible, demoActive: demoActive, alwaysScoped: false)
+        } catch {
+            // Graceful fallback — vec table may not exist yet (matching TB's unwrap_or_default)
+            BackgroundSyncLogger.logDebug("[SearchIndex] Vec search failed (table may not exist): \(error)")
+            return []
+        }
+    }
+
+    /// `searchVecCandidates` that throws. `alwaysScoped` searches only the rows of `message_meta` dated
+    /// within the dates, among `eligible` and of the demo mode's accounts (`rowid IN`) even with no dates
+    /// and no field, so the answer holds `limit` rows whenever that many are in scope: a date-sorted
+    /// search decides a window is complete from the count answered (tabmail-ios#294). Otherwise the
+    /// demo mode is applied to the `limit` nearest, which the relevance search merges as before.
+    func knnCandidates(queryEmbedding: [Float], limit: Int, fromDateMs: Int64?, toDateMs: Int64?,
+                       eligible: Set<Int64>?, demoActive: Bool, alwaysScoped: Bool) throws -> [(Int64, Double)] {
         guard let dbPool else { return [] }
         let blob = queryEmbedding.withUnsafeBytes { Data($0) }
+        let scope = Self.demoAccountScopeSQL(demoActive: demoActive, qualifier: "")
         let knn: String
         let arguments: StatementArguments
-        if fromDateMs == nil && toDateMs == nil && eligible == nil {
+        if !alwaysScoped && fromDateMs == nil && toDateMs == nil && eligible == nil {
             knn = "SELECT rowid, distance FROM messages_vec WHERE embedding MATCH ? AND k = ?"
             arguments = [blob, limit]
         } else {
             knn = """
                 SELECT rowid, distance FROM messages_vec WHERE embedding MATCH ? AND k = ? AND rowid IN
                 (SELECT rowid FROM message_meta WHERE dateMs >= ? AND dateMs <= ?
+                 AND \(alwaysScoped ? scope : "1")
                  AND (? IS NULL OR rowid IN (SELECT value FROM json_each(?))))
                 """
             let eligibleJSON = eligible.map { "[" + $0.map(String.init).joined(separator: ",") + "]" }
@@ -2282,19 +2462,38 @@ actor SearchIndex {
             WHERE \(Self.demoAccountScopeSQL(demoActive: demoActive, qualifier: "meta."))
             ORDER BY v.distance
             """
-        do {
-            return try dbPool.writeWithoutTransaction { db in
-                try Row.fetchAll(db, sql: sql, arguments: arguments)
+        return try dbPool.writeWithoutTransaction { db in
+            try Row.fetchAll(db, sql: sql, arguments: arguments)
+            .compactMap { row -> (Int64, Double)? in
+                guard let rowid = row["rowid"] as Int64?,
+                      let distance = row["distance"] as Double? else { return nil }
+                return (rowid, distance)
+            }
+        }
+    }
+
+    /// Every email vector's cosine distance to the query within the dates, among `eligible` and of the
+    /// demo mode's accounts, in one pass over their rows: where a date-sorted search needs more than
+    /// sqlite-vec's `k` nearest (tabmail-ios#294, native-fts `vec_distances_within`). Sorted nearest first.
+    /// Uses the writer connection for the reason `knnCandidates` does.
+    func vecDistancesWithin(queryEmbedding: [Float], fromDateMs: Int64?, toDateMs: Int64?,
+                            eligible: Set<Int64>?, demoActive: Bool) throws -> [(Int64, Double)] {
+        guard let dbPool else { return [] }
+        let blob = queryEmbedding.withUnsafeBytes { Data($0) }
+        let eligibleJSON = eligible.map { "[" + $0.map(String.init).joined(separator: ",") + "]" }
+        let sql = """
+            SELECT rowid, vec_distance_cosine(embedding, ?) AS distance FROM messages_vec WHERE rowid IN
+            (SELECT rowid FROM message_meta WHERE dateMs >= ? AND dateMs <= ?
+             AND \(Self.demoAccountScopeSQL(demoActive: demoActive, qualifier: ""))
+             AND (? IS NULL OR rowid IN (SELECT value FROM json_each(?))))
+            """
+        return try dbPool.writeWithoutTransaction { db in
+            try Row.fetchAll(db, sql: sql, arguments: [blob, fromDateMs ?? Int64.min, toDateMs ?? Int64.max, eligibleJSON, eligibleJSON])
                 .compactMap { row -> (Int64, Double)? in
-                    guard let rowid = row["rowid"] as Int64?,
-                          let distance = row["distance"] as Double? else { return nil }
+                    guard let rowid = row["rowid"] as Int64?, let distance = row["distance"] as Double? else { return nil }
                     return (rowid, distance)
                 }
-            }
-        } catch {
-            // Graceful fallback — vec table may not exist yet (matching TB's unwrap_or_default)
-            BackgroundSyncLogger.logDebug("[SearchIndex] Vec search failed (table may not exist): \(error)")
-            return []
+                .sorted { $0.1 < $1.1 }
         }
     }
 
