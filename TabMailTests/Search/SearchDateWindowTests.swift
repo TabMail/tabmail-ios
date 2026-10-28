@@ -203,6 +203,44 @@ struct SearchDateWindowTests {
         }
     }
 
+    @Test("a date sort in the demo mode finds the demo vectors past a pool of nearer real ones")
+    func demoScopeInsideTheVectorSearch() async throws {
+        let start = try Self.start()
+        let pool = SearchConfig.dateSortPool
+        let query = Self.vector(44, 45, cos: 1)
+        func record(_ key: String, _ dateMs: Int64) -> FTSHeaderRecord {
+            FTSHeaderRecord(contentKey: ContentKey(rawValue: key), headerId: key, messageId: key,
+                            subject: "Quokka", from: "a@example.com", to: "b@example.com", dateMs: dateMs)
+        }
+        // More than a pool of real vectors on the query, and 5 demo vectors farther (matches by meaning
+        // alone): the nearest pool, scoped after the search, holds only real ones, none in the demo mode.
+        let real = (0..<(pool + 904)).map { record("windowrealacct:INBOX:r\($0)", start + Int64($0) * Self.minute) }
+        let demo = (0..<5).map { record("\(DemoSeed.demoAccountId):INBOX:windowdemo\($0)", start + Int64($0) * Self.minute) }
+        let all = real + demo
+        let keys = all.map(\.contentKey)
+        try await index.removeMessages(contentKeys: keys)
+        #expect(try await index.indexHeaders(all) == all.count)
+        try await index.storeEmbeddings(real.map { (contentKey: $0.contentKey, embedding: query) }
+                                        + demo.map { (contentKey: $0.contentKey, embedding: Self.vector(44, 45, cos: 0.8)) })
+        await MainActor.run { DemoModeStore.shared.isActive = true }
+        var answers: [SearchSort: [String]] = [:]
+        do {
+            for sort in [SearchSort.dateDesc, .dateAsc] {
+                answers[sort] = try await search("zyxwvut", query, from: start - Self.day, to: start + 10 * Self.day, limit: 10, sort: sort)
+                    .map(\.contentKey.rawValue)
+            }
+        } catch {
+            await MainActor.run { DemoModeStore.shared.isActive = false }
+            try await index.removeMessages(contentKeys: keys)
+            throw error
+        }
+        await MainActor.run { DemoModeStore.shared.isActive = false }
+        try await index.removeMessages(contentKeys: keys)
+        let d = demo.map(\.contentKey.rawValue)
+        #expect(answers[.dateDesc] == d.reversed(), "\(answers)")
+        #expect(answers[.dateAsc] == d, "\(answers)")
+    }
+
     @Test("a date sort at the ends of time answers nothing outside its dates")
     func endsOfTime() async throws {
         let start = try Self.start()

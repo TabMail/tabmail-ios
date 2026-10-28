@@ -29,12 +29,13 @@ native-fts `date_window_candidates` rule for rule. Relevance is unchanged (one p
    search over at most a pool of rows). So no score depends on the window.
 6. No vector in the windows walked: one k = 1 search over the whole dates (and field). None found, or any
    vector read failing, means the keyword-only answer (`searchFTSOnly`).
-7. Date bounds are one-sided at the ends of time (`Int64.min` / `Int64.max` bound only their own side).
+7. Date bounds at the ends of time (`Int64.min` / `Int64.max`) bound nothing on their own side: the SQL binds them and they are always true.
 
 iOS differences from native-fts, each forced by the app's own index:
 - The demo scope (ADR-IOS-038) is inside the vector search's `rowid IN` (`alwaysScoped`), not a join after
   it: a window is complete when fewer than a pool answered, which holds only if every answer is in scope.
 - A year shard is not a window. The keyword pool and the vector pool choose windows, as in native-fts.
+- The demo mode is read once, at the start of the walk, and used by every keyword and vector read of it.
 - Vector reads go through the writer connection (sqlite-vec's vtab lifecycle), as `searchVecCandidates`
   always has; the walk's reads are not one snapshot with the keyword reads, as the hybrid search's never were.
 
@@ -58,7 +59,7 @@ interactive single-query path (the typing path already is one, and no other inte
 completeness at `vectorScoreThreshold` and narrowing a window full of matches (ADR-NF-023 "Rejected":
 quadratic or many searches on a dense archive).
 
-**Tests:** `SearchDateWindowTests` (exact past the keyword pool, across two windows with an edge date shared
+**Tests:** `SearchDateWindowTests` (exact past the keyword pool, the demo scope inside the vector search, across two windows with an edge date shared
 by 20 matches, exact past the vector pool, a keyword match scored by its own meaning whatever window found
 it, a pool of matches at one date terminates, the ends of time); the 4,096-pool tests and field-only,
 keyword-fallback and demo tests in `SearchSortTests` pass through the walk unchanged.

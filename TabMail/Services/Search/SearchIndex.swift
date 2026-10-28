@@ -1973,7 +1973,7 @@ actor SearchIndex {
         // --- FTS5 candidates (UNION ALL across all year shards) ---
         let ftsCandidates = try searchFTSCandidates(
             ftsQuery: ftsQuery, fromDateMs: fromDateMs, toDateMs: toDateMs, limit: candidateLimit, folderIds: folderIds,
-            sort: .relevance)
+            sort: .relevance, demoActive: DemoModeStore.isDemoActive)
 
         // --- Vector candidates via sqlite-vec KNN, within the dates and the field ---
         let vectorCandidates = searchVecCandidates(queryEmbedding: queryEmbedding, limit: candidateLimit,
@@ -2040,13 +2040,14 @@ actor SearchIndex {
 
             // --- Keyword: the next pool of matches; the window ends where they end ---
             let rows = try searchFTSCandidates(ftsQuery: ftsQuery, fromDateMs: lo, toDateMs: hi, limit: pool,
-                                               folderIds: folderIds, sort: sort)
+                                               folderIds: folderIds, sort: sort, demoActive: demoActive)
             var edge = end
             var inWindow = rows
             if rows.count >= pool, let first = rows.first?.dateMs, let last = rows.last?.dateMs {
                 if first == last {
                     // More than a pool at one millisecond cannot be split: sort that pool.
                     BackgroundSyncLogger.logDebug("[SearchIndex] Date-sorted search: \(pool) keyword matches or more at one date (\(last)), sorting \(pool) of them")
+                    edge = last
                 } else {
                     // `last` is past `first` in the sort's direction, so one step towards `first` cannot overflow.
                     edge = newestFirst ? last + 1 : last - 1
@@ -2132,7 +2133,8 @@ actor SearchIndex {
     /// Get FTS5 candidates with metadata for hybrid merge using a single UNION ALL query.
     /// Matching TB's search_fts_candidates() — sorts by rank ASC (best BM25 first).
     private func searchFTSCandidates(ftsQuery: String, fromDateMs: Int64?, toDateMs: Int64?,
-                                      limit: Int, folderIds: [String]? = nil, sort: SearchSort) throws -> [FTSCandidate] {
+                                      limit: Int, folderIds: [String]? = nil, sort: SearchSort,
+                                      demoActive: Bool) throws -> [FTSCandidate] {
         guard let dbPool, !knownYears.isEmpty else { return [] }
 
         return try dbPool.read { [self] db in
@@ -2156,7 +2158,7 @@ actor SearchIndex {
                     FROM \(table) fts
                     JOIN message_meta meta ON fts.rowid = meta.rowid
                     WHERE \(table) MATCH ?1
-                      AND \(Self.demoAccountScopeSQL(demoActive: DemoModeStore.isDemoActive, qualifier: "meta."))
+                      AND \(Self.demoAccountScopeSQL(demoActive: demoActive, qualifier: "meta."))
                     """
                 if let p = fromParam { sq += " AND meta.dateMs >= ?\(p)" }
                 if let p = toParam { sq += " AND meta.dateMs <= ?\(p)" }
