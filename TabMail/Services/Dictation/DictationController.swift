@@ -97,6 +97,8 @@ final class DictationController {
     /// The dictionary at the start (ADR-IOS-086): its words go with the dictation, and it says
     /// whether the user's corrections of the text are learned.
     @ObservationIgnored private var dictionaryWords: [String] = []
+    /// How many of `dictionaryWords` are typed, the rest learned (`DictationVocabulary`).
+    @ObservationIgnored private var dictionaryTypedCount: Int?
     @ObservationIgnored private var learnsWords = false
     /// The field the text is appended to, read to learn the user's corrections.
     @ObservationIgnored private var readInput: (@MainActor () -> String)?
@@ -220,6 +222,7 @@ final class DictationController {
         self.onText = onText
         let dictionary = dictionary()
         dictionaryWords = dictionary.words
+        dictionaryTypedCount = dictionary.typedCount
         learnsWords = dictionary.learnsWords
         readInput = input
         termsTask = Self.pickTerms(context: context, excluding: dictionary.words, emailBody: emailBody)
@@ -347,12 +350,13 @@ final class DictationController {
     private func uploads(generation current: Int) -> DictationChunkUploads {
         if let chunks { return chunks }
         let words = dictionaryWords
+        let typedCount = dictionaryTypedCount
         let language = language
         let termsTask = termsTask
         let cleanup = cleanupVariables(words: words)
         let uploads = DictationChunkUploads(
             transcribe: transcribeAudio,
-            upload: Task { DictationChunkUploads.Upload(language: language, vocabulary: words + (await Self.terms(from: termsTask)), cleanup: cleanup) },
+            upload: Task { DictationChunkUploads.Upload(language: language, vocabulary: DictationVocabulary.list(words: words, typedCount: typedCount, terms: await Self.terms(from: termsTask), includesOverflow: cleanup != nil), cleanup: cleanup) },
             chunkRetryDelays: chunkRetryDelays,
             lastRetryDelays: transcriptionRetryDelays,
             onLastRetry: { [weak self] in self?.noteRetrying(generation: current) }
@@ -443,13 +447,14 @@ final class DictationController {
     /// in progress is cancelled and the dictation fails (owner, 2026-10-08).
     private func transcribe(_ flac: Data, language: String?, deadline: ContinuousClock.Instant, generation current: Int) async {
         let words = dictionaryWords
+        let typedCount = dictionaryTypedCount
         let terms = await contextTerms()
         guard generation == current, !Task.isCancelled else { return }
         let cleanup = cleanupVariables(words: words)
         BackgroundSyncLogger.logDebug("[Dictation] uploading \(flac.count) bytes of FLAC, \(words.count) dictionary word(s), \(terms.count) term(s)")
         do {
             let transcription = try await withTimeout(seconds: Self.seconds(max(.zero, deadline - ContinuousClock.now))) { [self] in
-                try await self.transcribeRetrying(flac, language, words + terms, cleanup, generation: current)
+                try await self.transcribeRetrying(flac, language, DictationVocabulary.list(words: words, typedCount: typedCount, terms: terms, includesOverflow: cleanup != nil), cleanup, generation: current)
             }
             guard generation == current, !Task.isCancelled else { return }
             let transcript = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)

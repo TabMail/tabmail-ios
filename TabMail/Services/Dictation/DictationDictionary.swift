@@ -42,6 +42,8 @@ final class DictationDictionary {
     struct Snapshot: Equatable, Sendable {
         var words: [String]
         var learnsWords: Bool
+        /// How many of `words` (they go typed first) are typed; nil: all of them.
+        var typedCount: Int? = nil
     }
 
     enum AddResult: Equatable {
@@ -78,7 +80,7 @@ final class DictationDictionary {
             if first.element.lastUsed != second.element.lastUsed { return first.element.lastUsed > second.element.lastUsed }
             return first.offset < second.offset
         }.map(\.element.word)
-        return Snapshot(words: words, learnsWords: learnsWords)
+        return Snapshot(words: words, learnsWords: learnsWords, typedCount: entries.count(where: { !$0.learned }))
     }
 
     /// Adds a typed word, refused (`full`) at `dictionaryMaxTypedWords` typed words. One already
