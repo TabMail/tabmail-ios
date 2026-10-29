@@ -49,7 +49,7 @@ struct PillDictationModeTests {
 
     /// Nothing is sent to TabMail's backend on the opted-out path, and the permission is asked only
     /// from a tap: the recognizer file has no network or backend use, and nothing asks at launch.
-    @Test func theOnDevicePathSendsNothingAndAsksOnlyAtTheTap() throws {
+    @Test func theOnDeviceRecognizerHasNoBackendUseAndNothingElseAsksForSpeechPermission() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let recognizer = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/OnDeviceSpeechRecognizer.swift"), encoding: .utf8)
@@ -68,11 +68,18 @@ struct PillDictationModeTests {
     }
 
     /// The opted-out DictationController still sends nothing to the backend.
-    @Test func theBackendControllerStaysClosedWhenOptedOut() throws {
+    @Test func thePillRoutesOptedOutDictationOnDeviceAndTheControllerStaysClosed() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let view = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Inbox/DynamicIslandChatButton.swift"), encoding: .utf8)
         #expect(view.contains("if dictationMode == .onDevice {"))
+        // The speech permission is asked by the recognizer's start: only a mic tap may reach it.
+        #expect(view.contains("guard !auto, !speech.isRecording, !speech.isStarting else { return }"))
+        #expect(view.components(separatedBy: "startDictation(auto: true)").count == 4)
+        // Every exit releases the recognizer; a recording keeps the screen awake and blocks send.
+        #expect(view.components(separatedBy: "speech.stop()").count == 5)
+        #expect(view.contains("dictation.isActive || speech.isRecording)"))
+        #expect(view.contains("&& !speech.isRecording\n            && composeReadyToSend"))
         #expect(view.contains("PillDictationMode.resolve("))
         let controller = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationController.swift"), encoding: .utf8)
         #expect(controller.contains("guard canUseAI, !isOptedOutOfAI() else {"))

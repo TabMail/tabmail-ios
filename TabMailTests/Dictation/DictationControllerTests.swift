@@ -1716,7 +1716,7 @@ struct DictationOptOutFlagTests {
         let body = try slice(source, from: "if !hasTabMailSession {", to: "expandedInputBar")
         #expect(body.contains("} else if !AISubscriptionGate.shared.isActive {"))
 
-        let start = try slice(source, from: "private func startDictation()", to: "private var canSend: Bool")
+        let start = try slice(source, from: "private func startDictation(auto: Bool = false)", to: "private var canSend: Bool")
         #expect(start.contains("guard canDictate else { return }"))
         #expect(start.contains("let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive"))
         #expect(start.contains("dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText })"))
@@ -1740,14 +1740,18 @@ struct DictationOptOutFlagTests {
         #expect(personalization.contains("Text(\"Voice Dictation Dictionary\")"))
     }
 
-    /// The mic is off offline and when opted out of AI, reading the same App Group flag Settings
-    /// writes; a recording in progress can still be stopped.
+    /// The mic is off offline (backend) and, opted out of AI, on only where the language has an
+    /// on-device model, reading the same App Group flag Settings writes; a recording in progress
+    /// can still be stopped.
     @Test func theMicIsOffOfflineAndWhenOptedOut() throws {
         let source = try pillSource()
         #expect(source.contains("@AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI"))
-        let canDictate = try slice(source, from: "private var canDictate: Bool {", to: "}")
-        #expect(canDictate.contains("networkMonitor.isConnected && !optOutAllAI"))
-        #expect(source.contains(".disabled(isWorking || dictation.phase == .transcribing || (!dictation.isActive && !canDictate))"))
+        let canDictate = try slice(source, from: "private var canDictate: Bool", to: "\n")
+        #expect(canDictate.contains("dictationMode != .off"))
+        let mode = try slice(source, from: "private var dictationMode: PillDictationMode {", to: "}")
+        #expect(mode.contains("optedOutOfAI: optOutAllAI"))
+        #expect(mode.contains("isOnline: networkMonitor.isConnected"))
+        #expect(source.contains("|| (!dictation.isActive && !speech.isRecording && !speech.isStarting && !canDictate))"))
     }
 
     /// While dictating, the input field stays in place with its text dimmed behind the waveform,
@@ -1790,7 +1794,7 @@ struct DictationOptOutFlagTests {
         #expect(transcribing.contains("DictationSpinner(isRetrying: dictation.isRetrying)"))
         #expect(!transcribing.contains("Button"))
 
-        let start = String(try slice(source, from: "private func startDictation()", to: "private var canSend: Bool"))
+        let start = String(try slice(source, from: "private func startDictation(auto: Bool = false)", to: "private var canSend: Bool"))
         let onText = try slice(start, from: "{ text in", to: "scrollPosition.scrollTo(edge: .bottom)")
         let appended = try #require(onText.range(of: "inputText = DictationController.appending(text, to: inputText)"))
         let sent = try #require(onText.range(of: "if sendWhenDictated {\n                sendWhenDictated = false\n                if canSend { sendMessage() }"))
@@ -1821,7 +1825,7 @@ struct DictationOptOutFlagTests {
     /// the email's sender, subject and snippet, with the chat and the input.
     @Test func theCleanupReadsWhatThePillIsAbout() throws {
         let source = try pillSource()
-        let context = try slice(source, from: "private var dictationContext: DictationContext {", to: "private func startDictation()")
+        let context = try slice(source, from: "private var dictationContext: DictationContext {", to: "private func startDictation(auto: Bool = false)")
         #expect(context.contains(#"[draftSubject.map { "Subject: \($0)" }, draftBody]"#))
         #expect(context.contains(#"["From: \(message.from)", "Subject: \(message.subject)", message.snippet]"#))
         #expect(context.components(separatedBy: "messages: chatMessages, input: inputText").count == 4)
@@ -1911,9 +1915,9 @@ struct DictationOptOutFlagTests {
         let source = try pillSource()
         #expect(source.contains(".popoverTip(DictationLanguageTip(), arrowEdge: .bottom)"))
         // Donated only from the text callback, which a dictation calls once its text is back.
-        let beforeStart = try slice(source, from: "private func startDictation()", to: "dictation.start(context:")
+        let beforeStart = try slice(source, from: "private func startDictation(auto: Bool = false)", to: "dictation.start(context:")
         #expect(!beforeStart.contains("donate()"))
-        let start = String(try slice(source, from: "private func startDictation()", to: "private var canSend: Bool"))
+        let start = String(try slice(source, from: "private func startDictation(auto: Bool = false)", to: "private var canSend: Bool"))
         let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in", to: "scrollPosition.scrollTo(edge: .bottom)")
         #expect(onText.contains("DictationLanguageTip.dictationCompleted.donate()"))
         // Nothing after the callback's last statement donates either.

@@ -429,7 +429,7 @@ struct DynamicIslandChat: View {
         // Keep the screen from auto-locking while the user is engaged with the
         // agent: pill expanded, agent working (incl. background sessions — same
         // scope as the wand glow), or dictation listening.
-        .keepScreenAwake(while: isExpanded || isWorking || ActiveAgentTracker.shared.anyWorking || dictation.isActive)
+        .keepScreenAwake(while: isExpanded || isWorking || ActiveAgentTracker.shared.anyWorking || dictation.isActive || speech.isRecording)
         .onChange(of: isExpanded) { _, expanded in
             autoStartTask?.cancel()
             autoStartTask = nil
@@ -606,7 +606,7 @@ struct DynamicIslandChat: View {
                     autoStartTask = Task {
                         try? await Task.sleep(for: .milliseconds(800))
                         guard !Task.isCancelled, isExpanded, !isTextFieldFocused else { return }
-                        startDictation()
+                        startDictation(auto: true)
                     }
                 } else if !dictationPromptShown && !TutorialCoordinator.shared.isRunning {
                     dictationPromptShown = true
@@ -678,7 +678,7 @@ struct DynamicIslandChat: View {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[DynamicIslandChat] dictation-auto-restart: calling startDictation")
                 }
-                startDictation()
+                startDictation(auto: true)
             }
         }
         .task {
@@ -746,7 +746,7 @@ struct DynamicIslandChat: View {
                 autoStartTask = Task {
                     try? await Task.sleep(for: .milliseconds(800))
                     guard !Task.isCancelled, isExpanded, !isTextFieldFocused else { return }
-                    startDictation()
+                    startDictation(auto: true)
                 }
             }
             Button("No Thanks", role: .cancel) { }
@@ -1275,7 +1275,7 @@ struct DynamicIslandChat: View {
         return canDictate ? "mic" : "mic.slash"
     }
 
-    /// Whether the mic can start a dictation (the pill shows it only with AI access).
+    /// Whether the mic can start a dictation: on the backend (online), or on this iPhone when opted out.
     private var canDictate: Bool { dictationMode != .off }
 
     private var speechLocale: Locale {
@@ -1309,11 +1309,14 @@ struct DynamicIslandChat: View {
         return .chatPill(title: "Chat", header: [], messages: chatMessages, input: inputText)
     }
 
-    private func startDictation() {
+    /// `auto`: started by the pill itself (it opened, the agent finished, Auto-Enable Dictation), not
+    /// by a tap on the mic. The on-device recognizer asks for permission, so it starts only from a tap.
+    private func startDictation(auto: Bool = false) {
         // Auto-start follows the mic button: while it is off, nothing starts.
         guard canDictate else { return }
         isTextFieldFocused = false
         if dictationMode == .onDevice {
+            guard !auto, !speech.isRecording, !speech.isStarting else { return }
             speechBase = inputText
             speech.start(locale: speechLocale) { transcript in
                 inputText = DictationController.appending(transcript, to: speechBase)
