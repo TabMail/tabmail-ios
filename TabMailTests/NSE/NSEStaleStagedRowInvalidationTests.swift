@@ -26,7 +26,7 @@ import Synchronization
 /// durable header exists but disagrees — excludes the row from this wake's
 /// write phases, deletes its staging row, scrubs it from the already-published
 /// `latestStagedRows`/`latestStagedBodies` snapshots, and drops its
-/// `stageMemo` entry. PLAN_INBOX_UNIFIED_READ.md §3: the companion
+/// `stageMemo` entry. the unified inbox read (ADR-IOS-055): the companion
 /// `.stagedRowsInvalidated` notification + VM eviction handler
 /// (`InboxViewModel.invalidateStagedRows`) that used to tell a VM which
 /// already-inserted phantom to evict are GONE — the merge-side scrub above is
@@ -347,7 +347,7 @@ struct NSEStaleStagedRowInvalidationTests {
         #expect(stagedRows.contains { $0.headerId == headerId("msg-new") })
     }
 
-    /// G3 audit (PLAN_INBOX_UNIFIED_READ.md): an UNRELATED durable message
+    /// G3 audit (the unified inbox read (ADR-IOS-055)): an UNRELATED durable message
     /// already living in Archive that happens to share the staged row's raw
     /// UID (a legitimate per-folder IMAP UID collision, not a move) must NOT
     /// be mistaken for "the same message moved" — `detectStaleByMoveRows`
@@ -415,7 +415,7 @@ struct NSEStaleStagedRowInvalidationTests {
         #expect(stillArchived?.isInInbox == false)
     }
 
-    /// F1 (PLAN_INBOX_UNIFIED_READ.md audit): a "scrub-only" merge wake — the
+    /// F1 (the unified inbox read (ADR-IOS-055) audit): a "scrub-only" merge wake — the
     /// ONLY staged row this wake is stale-by-move, so after step (a)'s
     /// exclusion `processed` is empty and NO durable write phase runs
     /// (`endOfMergeChanged` never flips true). Before the fix, this meant the

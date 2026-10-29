@@ -7,7 +7,7 @@ import GRDB
 import Testing
 @testable import TabMail
 
-/// PLAN_INBOX_UNIFIED_READ.md §5A.3 — thin shell integration tests for
+/// the unified inbox read (ADR-IOS-055) — thin shell integration tests for
 /// `InboxListReader` against a REAL temp-file GRDB pool (no mocks — the
 /// no-mock import-contract lesson). Only what the pure scenario tests can't
 /// see: the D/P/resolution gather SQL, the fetch/fetchSync parity, and the
@@ -17,7 +17,7 @@ import Testing
 /// `.serialized`: tests swap `AppDatabase.shared` and touch the
 /// `AccountManager.shared` overlay + `NSEDataBridge.latestStagedRows`
 /// process-wide globals (mirrors `InboxListBehaviorPinningTests`).
-@Suite("InboxListReader integration (PLAN_INBOX_UNIFIED_READ §5A.3)", .serialized, .processGlobalState)
+@Suite("InboxListReader integration (the unified inbox read (ADR-IOS-055))", .serialized, .processGlobalState)
 @MainActor
 struct InboxListReaderIntegrationTests {
 

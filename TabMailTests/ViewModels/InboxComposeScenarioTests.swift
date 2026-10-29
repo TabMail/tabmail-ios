@@ -94,7 +94,7 @@ enum SimIdentityMirror {
     }
 }
 
-// MARK: - Simulation world (PLAN_INBOX_UNIFIED_READ.md §5A.1)
+// MARK: - Simulation world (the unified inbox read (ADR-IOS-055))
 
 /// Immutable spec of one simulated message — identity, date, and the AI
 /// fields its push/phase-2 carries.
@@ -562,13 +562,13 @@ struct AITracker {
 
 // MARK: - Suite
 
-/// PLAN_INBOX_UNIFIED_READ.md §5A — the scenario harness that would have
+/// the unified inbox read (ADR-IOS-055) — the scenario harness that would have
 /// caught every 2026-07-09 inbox bug. Pure tests: NO database, NO mocks —
 /// `InboxListComposer.compose` is driven over value `World` states through
 /// lifecycle transitions, with invariants I1–I7 (§5A.2) asserted after EVERY
 /// step of every scenario, plus commutable-pair permutations and a seeded
 /// SplitMix64 fuzz over random legal step sequences.
-@Suite("InboxListComposer scenarios (PLAN_INBOX_UNIFIED_READ §5A)")
+@Suite("InboxListComposer scenarios (the unified inbox read (ADR-IOS-055))")
 struct InboxComposeScenarioTests {
 
     // MARK: Invariants (§5A.2 — each one IS a 2026-07 bug class)
@@ -1266,7 +1266,7 @@ struct InboxComposeScenarioTests {
 
     // MARK: - F2 audit: excludeIds ordering (dedup BEFORE trim, not after)
 
-    /// F2 (PLAN_INBOX_UNIFIED_READ.md audit): `compose` used to trim to
+    /// F2 (the unified inbox read (ADR-IOS-055) audit): `compose` used to trim to
     /// `targetCount` BEFORE the VM's `loadedIds` dedup ran (that dedup lived
     /// entirely in `InboxViewModel.fetchPage`, downstream of the already-
     /// trimmed page). In triage mode the sort is NOT date-monotonic (an old
@@ -1489,7 +1489,7 @@ struct InboxComposeScenarioTests {
 
     // MARK: - F4 audit: same-batch staged-sibling thread adoption
 
-    /// F4 (PLAN_INBOX_UNIFIED_READ.md audit): `compose`'s S-loop adoption
+    /// F4 (the unified inbox read (ADR-IOS-055) audit): `compose`'s S-loop adoption
     /// source used to be `frozenDP` ONLY (frozen before the loop starts), so
     /// a staged reply to a staged sibling in the SAME batch couldn't
     /// chain-adopt — old `insertStagedRows` adopted from the growing
@@ -1741,7 +1741,7 @@ struct InboxComposeScenarioTests {
     }
 
     // MARK: - Determinism (G2 audit — dictionary-iteration-order tie-break,
-    // PLAN_INBOX_UNIFIED_READ.md)
+    // the unified inbox read (ADR-IOS-055))
 
     /// A durable `MessageSnapshot` with a specific id/date/tagSortOrder,
     /// bypassing `SimWorld`'s lifecycle machinery entirely — this test isn't

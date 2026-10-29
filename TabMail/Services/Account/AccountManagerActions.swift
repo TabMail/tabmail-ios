@@ -1410,7 +1410,7 @@ extension AccountManager {
         // either all-rows-vanished (legit) or a genuine read failure — in the
         // latter case this drop is the only trace the gesture ever existed.
         // Distinguishing the two needs a throwing resolve variant — recorded
-        // as a phase-2 consideration in PLAN_OVERLAY_CALLSITE_AUDIT.md §6.
+        // as a phase-2 consideration in the overlay call-site audit
         //
         // T4.V8: because those two causes are NOT distinguishable here, an id
         // the resolve dropped is `retainedForRetry`, never `terminalStale` —

@@ -376,7 +376,7 @@ public enum MessageIdentity {
     /// still covered by the existing ADR-IOS-061 epoch guards.
     ///
     /// It also does NOT synthesize a `synth:<hash>` tail. That supersedes the
-    /// 2026-07-18 draft decision in `PLAN_RFC_KEY_MIGRATION_ADR062.md` §3 (which now
+    /// 2026-07-18 draft decision in the RFC-key migration decision (ADR-IOS-062) (which now
     /// carries a supersession banner), for three reasons: (1) SYNTHESIZE existed so
     /// the epoch guards could be DELETED, and this branch has spent ~15 audit rounds
     /// BUILDING them out (ADR-IOS-061 plus the T4.S6 purge-and-resync reaction), so
@@ -385,7 +385,7 @@ public enum MessageIdentity {
     /// surface between genuinely DIFFERENT messages, strictly worse than the
     /// accepted duplicate-RFC collapse.
     ///
-    /// ACCEPTED LIMITATION (owner-decided, `PLAN_RFC_KEY_MIGRATION_ADR062.md` §1):
+    /// ACCEPTED LIMITATION (owner-decided, the RFC-key migration decision (ADR-IOS-062)):
     /// two messages in ONE folder carrying the same normalized Message-ID collapse
     /// onto a single content key. That matches Thunderbird/Gloda and Gmail, both of
     /// which dedup by Message-ID, and the derived stores already assume it

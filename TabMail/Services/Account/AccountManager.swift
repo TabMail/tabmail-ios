@@ -987,7 +987,7 @@ actor AccountManager {
     /// remain the gesture-time record: `actionTagBaseline` feeds
     /// `applyManualTag`'s previousTag/auto-teach signal, and all three are
     /// groundwork for phase-2 move coalescing
-    /// (`PLAN_OVERLAY_CALLSITE_AUDIT.md` §5).
+    /// (the overlay call-site audit).
     struct IntentCycle: Sendable {
         var isReadTarget: Bool?      // latest registered target
         var isReadBaseline: Bool?    // visualized state when the field FIRST joined this cycle

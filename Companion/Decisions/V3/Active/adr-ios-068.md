@@ -222,6 +222,6 @@ combined clean build plus full suite at 8,080 passed / 0 failures / 0 production
 dimension" principle applied to sync), ADR-IOS-003 / ADR-IOS-018 (the queue charter this keys),
 ADR-IOS-069 (what happens when the id resets), ADR-IOS-070 (the withdrawal record), ADR-IOS-071 (no
 backward compatibility), ADR-IOS-072 (the content side of the two keying schemes), `KNOWN_ISSUES.md`
-(`IOS-IMAP-002` under *Fixed by D4*), `PLAN_IOS_REFACTOR_V3/PLAN_V3_S3_design.md` §3.1–§3.6.
+(`IOS-IMAP-002` under *Fixed by D4*), the v3 refactor design§3.6.
 
 ---

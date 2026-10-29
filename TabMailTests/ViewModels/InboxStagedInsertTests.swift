@@ -293,7 +293,7 @@ struct InboxStagedInsertTests {
         let vm = InboxViewModel(folders: [folder])
         vm.loadInitialPage()
         let row = makeStagedRow(messageId: "m1")
-        // PLAN_INBOX_UNIFIED_READ.md §3: `lookupMessage`'s synthesis fallback
+        // the unified inbox read (ADR-IOS-055): `lookupMessage`'s synthesis fallback
         // now reads `NSEDataBridge.latestStagedRows` directly (the deleted
         // `pendingStagedRows` used to synthesize from whatever
         // `insertStagedRows` had been handed) — seed the global to mirror the

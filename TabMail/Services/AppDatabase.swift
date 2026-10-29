@@ -128,7 +128,7 @@ final class AppDatabase: Sendable {
     /// publish.
     init(pool: DatabasePool, runStartupResets: Bool) throws {
         self.dbPool = pool
-        // Migration timing breadcrumb (RC2 / PLAN_HANG_FIX): the O(mailbox-size)
+        // Migration timing breadcrumb (RC2 / the launch-hang fix): the O(mailbox-size)
         // thread-repair migrations (v9/v27/v47/v53/v54) run here. A multi-second
         // value on a large mailbox after a multi-version jump IS the "hang on
         // boot" — log it so the field can confirm/deny. The gating splash
@@ -2150,7 +2150,7 @@ final class AppDatabase: Sendable {
         // files into the source thread on Gmail web. The value survives app
         // relaunch (outbox drain re-sends with the same binding). Gmail REST send
         // only; IMAP/Exchange thread via In-Reply-To/References headers. See
-        // PLAN_THREAD_FIX.md / ADR-IOS-043.
+        // the outgoing-thread fix (ADR-IOS-043).
         migrator.registerTimedMigration("v60_addOutboxThreadId") { db in
             try db.alter(table: "outboxMessage") { t in
                 t.add(column: "threadId", .text)
@@ -2460,7 +2460,7 @@ final class AppDatabase: Sendable {
             //
             // NO key is re-written here. v3 changes only what NEW content keys are
             // minted, so every surviving key stays byte-identical and there is no
-            // bulk re-key (that is what `PLAN_RFC_KEY_MIGRATION_ADR062.md` §4
+            // bulk re-key (that is what the RFC-key migration decision (ADR-IOS-062)
             // describes for the LARGER design — re-keying `messageHeader.id` itself
             // — which v3 does not do).
             //
@@ -2510,7 +2510,7 @@ final class AppDatabase: Sendable {
             //   this table is unbounded and multi-GB is normal. On a device without
             //   3× headroom it cannot complete at all — the app loops at the
             //   "Updating…" splash, which is this app's documented boot-hang shape
-            //   (see the `PLAN_HANG_FIX` note above).
+            //   (see the launch-hang fix note above).
             // - An in-place `sqlite_master` DDL edit via `PRAGMA writable_schema`
             //   would have been ~0 s and lossless, but it is BLOCKED: Apple's system
             //   SQLite ships `SQLITE_DBCONFIG_DEFENSIVE = 1` by default, which makes

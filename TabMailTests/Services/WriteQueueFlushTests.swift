@@ -8,7 +8,7 @@ import Testing
 @testable import TabMail
 
 /// Pins `AccountManager.awaitWriteQueueDrain()` / `awaitWriteQueueDrainOrTimeout`
-/// (F3, PLAN_OVERLAY_CALLSITE_AUDIT.md §6 follow-ups) — the production-grade
+/// (F3, the overlay call-site audit) — the production-grade
 /// promotion of the `drainWriteQueue` quiescence-barrier pattern proven in
 /// `InboxGestureActionTests`/`MessageDetailStagedFallbackTests`, now used by
 /// `AppDelegate`'s `didEnterBackground` "wal-durability-checkpoint" bracket to

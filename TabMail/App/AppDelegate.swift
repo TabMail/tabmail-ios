@@ -552,7 +552,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         #endif
         return Task { @MainActor in
             // A push can arrive during the one-time migration window; wait
-            // for the DB before touching it (AppStartup / PLAN_HANG_FIX).
+            // for the DB before touching it (AppStartup / the launch-hang fix).
             guard await ready() else { return }
             await merge()
             // willPresent only fires while the app is foreground-active, so request the
@@ -959,7 +959,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         // SwiftUI `WindowGroup` body (and its `.task`, the foreground trigger)
         // never fires. Without this, those background handlers would touch a nil
         // `AppDatabase.shared` (force-unwrapped in `dbPool`) → crash/hang.
-        // Async so it doesn't refreeze launch (RC2 fix, PLAN_HANG_FIX); it's
+        // Async so it doesn't refreeze launch (RC2 fix, the launch-hang fix); it's
         // idempotent with `body.task`'s `runIfNeeded`. NSE staging DB creation +
         // state mirror live inside `ensureDatabaseReady` (they touch AppDatabase),
         // so they still run on every launch as they did before the splash work.

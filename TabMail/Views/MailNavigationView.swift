@@ -718,7 +718,7 @@ struct MailNavigationView: View {
             await PushNotificationService.shared.checkPushConsentStatusForForeground()
         }
         // Separate task so the (local, fast) hint check is NOT blocked behind
-        // the network-gated consent scan above. See PLAN_NSE_ENHANCE §3.4.
+        // the network-gated consent scan above. See the notification-service enhancement
         .task { await refreshVisualAlertsHint() }
         .onChange(of: scenePhase) { _, newPhase in
             // Returning from iOS Settings (where the user may have just toggled
@@ -726,7 +726,7 @@ struct MailNavigationView: View {
             // scenePhase `.active`. Re-check so the Email Accounts warning icon
             // reflects the current settings. Local + non-blocking. (The
             // silent↔nse re-registration rides the foreground resub in
-            // SyncScheduler.startForegroundPolling — see PLAN_NSE_ENHANCE §3.3.)
+            // SyncScheduler.startForegroundPolling — see the notification-service enhancement)
             if newPhase == .active {
                 Task { await refreshVisualAlertsHint() }
             }

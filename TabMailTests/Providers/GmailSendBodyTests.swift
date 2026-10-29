@@ -8,7 +8,7 @@ import Foundation
 
 /// Covers the Gmail `users.messages.send` request body — specifically that a
 /// reply/forward carries `threadId` (so Gmail files it into the source
-/// conversation) and that a plain compose does not. See PLAN_THREAD_FIX.md /
+/// conversation) and that a plain compose does not. See the outgoing-thread fix (ADR-IOS-043) /
 /// ADR-IOS-043.
 @Suite("GmailProvider.buildSendBody")
 struct GmailSendBodyTests {

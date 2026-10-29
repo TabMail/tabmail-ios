@@ -8,7 +8,7 @@ import Synchronization
 import Testing
 @testable import TabMail
 
-// MARK: - PLAN_INBOX_UNIFIED_READ.md §5B Phase 7 — the END-TO-END invariant layer.
+// MARK: - the unified inbox read (ADR-IOS-055) — the END-TO-END invariant layer.
 //
 // The pure-layer harness (`InboxComposeScenarioTests`) drives
 // `InboxListComposer.compose` over VALUE `SimWorld` states — no I/O, no
@@ -61,7 +61,7 @@ import Testing
 // process globals above, but it cannot synchronize notification jobs queued by
 // the scenario itself; those must bound-wait on a scoped witness.
 @Suite(
-    "Inbox end-to-end invariant layer (PLAN_INBOX_UNIFIED_READ §5B Phase 7)",
+    "Inbox end-to-end invariant layer (the unified inbox read (ADR-IOS-055))",
     .serialized, .processGlobalState
 )
 @MainActor
@@ -1152,7 +1152,7 @@ struct InboxEndToEndInvariantTests {
         #expect(!vm.hasMoreMessages, "I9 VIOLATED: hasMoreMessages still true at true exhaustion")
     }
 
-    /// F2 repro shape (PLAN_INBOX_UNIFIED_READ.md audit): one folder carries a
+    /// F2 repro shape (the unified inbox read (ADR-IOS-055) audit): one folder carries a
     /// single very-OLD but tag-first row that sorts AHEAD of everything in
     /// triage mode; the OTHER folder carries enough rows that page 1's trim
     /// bumps exactly one "newer" row into page 2's candidate set. Before the
@@ -1474,7 +1474,7 @@ final class E2EWorld {
         return "\(spec.accountId)|rfc|\(spec.rfc822)"
     }
 
-    // MARK: - Steps (real mechanisms — PLAN_INBOX_UNIFIED_READ.md §5B step vocabulary)
+    // MARK: - Steps (real mechanisms — the unified inbox read (ADR-IOS-055))
 
     enum Step: String, CaseIterable {
         case pushArrives

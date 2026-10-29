@@ -142,7 +142,7 @@ final class InboxViewModel {
     /// Called when the list reappears (e.g., user pops back from detail).
     /// With the overlay, reloadMessages is always safe — just trigger a refresh.
     /// Folder self-heal now happens inside `reloadMessages` via the async
-    /// `selfHealFoldersAsync()` (Half A / PLAN_HANG_FIX). The previous
+    /// `selfHealFoldersAsync()` (Half A / the launch-hang fix). The previous
     /// SYNCHRONOUS `selfHealFolders()` call here did a GRDB read on the main
     /// thread during foreground return — the warm-foreground hang — so it was
     /// removed; `reloadMessages` below heals off-main (and was already healing).
@@ -284,7 +284,7 @@ final class InboxViewModel {
 
     /// Async mirror of `resolveFoldersFromDB`: the GRDB read runs off the main
     /// thread (suspends, never blocks), so a slow/contended/locked read on the
-    /// warm-foreground path can't freeze the UI (Half A / PLAN_HANG_FIX). Same
+    /// warm-foreground path can't freeze the UI (Half A / the launch-hang fix). Same
     /// query and fallbacks as the synchronous version.
     private func resolveFoldersFromDBAsync() async -> [Folder] {
         let demoActive = DemoModeStore.shared.isActive
@@ -342,7 +342,7 @@ final class InboxViewModel {
         // The action's `ensureDurable` gate drains the merge before the
         // optimistic write lands. Mirrors `MessageDetailViewModel`'s exact-id
         // synthesis pattern (`stagedRowFallback`/`seedFromStagedPublish`'s
-        // composite branch) — PLAN_INBOX_UNIFIED_READ.md §3.
+        // composite branch) — the unified inbox read (ADR-IOS-055)
         return NSEDataBridge.latestStagedRows.withLock { rows in
             rows.first { $0.headerId == currentId }
                 ?? (currentId == id ? nil : rows.first { $0.headerId == id })
@@ -813,7 +813,7 @@ final class InboxViewModel {
         // `InboxListReader`'s P-step (which DOES load real labels for pinned
         // rows — its "undo shape", see `gather()`'s `labelsByMessage` comment)
         // would keep it on the very next reload — a fidelity gap
-        // PLAN_INBOX_UNIFIED_READ.md §2.2/§5 Phase 4 closes.
+        // the unified inbox read (ADR-IOS-055) §5 Phase 4 closes.
         let idsToFetch = ids.filter { !loadedIds.contains($0) }
         let headersById: [String: MessageHeader]
         let labelsByMessage: [String: [UserLabel]]
@@ -889,14 +889,14 @@ final class InboxViewModel {
     /// ADR-IOS-049: insert NSE-staged rows into the loaded list IN-MEMORY (no GRDB
     /// read/write) so just-pushed mail appears instantly, before the merge's durable
     /// header write. Sourced from the `.messagesStaged` payload, not GRDB. Mirrors
-    /// `insertUndoneMessages`. PLAN_INBOX_UNIFIED_READ.md §2.2: a pure latency
+    /// `insertUndoneMessages`. the unified inbox read (ADR-IOS-055): a pure latency
     /// optimization, no longer correctness-bearing — any subsequent reload
     /// converges to the same answer because `InboxListReader`/`InboxListComposer`
     /// (the reader) includes staged (S) rows on every fetch, so this insert no
     /// longer needs guard bookkeeping to survive a competing reload.
     func insertStagedRows(_ rows: [StagedInboxRow]) {
         // Query-level label-filter guard, mirroring InboxListComposer step 6
-        // (PLAN_INBOX_UNIFIED_READ.md §2.1 step 3 / §2.2 / §5 Phase 4): staged
+        // (the unified inbox read (ADR-IOS-055) / §2.2 / §5 Phase 4): staged
         // rows synthesize via `toMessageHeader()` with zero `userLabels` (no
         // labels payload in NSE-staged data), so `filterLabelIds.isSubset(of:
         // labels)` can never be satisfied while a filter is active — EVERY row
@@ -990,7 +990,7 @@ final class InboxViewModel {
         resetSnippetState()
         loadedIds = []
         targetWindowSize = SyncConfig.inboxPageSize
-        // PLAN_INBOX_UNIFIED_READ.md §3: `fetchPage(before: nil)` already
+        // the unified inbox read (ADR-IOS-055): `fetchPage(before: nil)` already
         // includes eligible staged (S) rows via InboxListReader/InboxListComposer
         // (the reader reads `NSEDataBridge.latestStagedRows` directly), so the
         // explicit `insertStagedRows` re-seed that used to follow this fetch is
@@ -1011,7 +1011,7 @@ final class InboxViewModel {
     /// checkpoint contention). The diff and @Observable mutations run on
     /// MainActor after the read completes.
     ///
-    /// PLAN_INBOX_UNIFIED_READ.md §3: the fetch below routes through
+    /// the unified inbox read (ADR-IOS-055): the fetch below routes through
     /// `InboxListReader`/`InboxListComposer` (the unified reader), which
     /// applies the overlay, folds in staged (S) and overlay-pinned (P) rows,
     /// sorts, and trims — so Pass 1's diff is an honest one: a row missing
@@ -1022,7 +1022,7 @@ final class InboxViewModel {
     func reloadMessages(animated: Bool = false) async {
         // Heal folders OFF the main thread — the synchronous selfHealFolders()
         // here blocked the UI on a GRDB read during warm-foreground return
-        // (the warm-foreground hang; Half A / PLAN_HANG_FIX).
+        // (the warm-foreground hang; Half A / the launch-hang fix).
         await selfHealFoldersAsync()
         if DebugModeManager.isLoggingEnabled() {
             let folderNames = folders.map { "\($0.name)(\($0.id))" }.joined(separator: ", ")
@@ -1053,7 +1053,7 @@ final class InboxViewModel {
             BootProfiler.mark("[\(instanceTag)] reloadMessages async fetch (rawPool, merge OFF critical path) \(fetchMs)ms fresh=\(freshMessages.count)")
         }
 
-        // PLAN_INBOX_UNIFIED_READ.md §2.1 step 4: `fetchFullRange` now routes
+        // the unified inbox read (ADR-IOS-055): `fetchFullRange` now routes
         // through InboxListReader/InboxListComposer, which snapshots the
         // overlay itself (at the same "before the DB read" point) and applies
         // it internally — so `reloadMessages` no longer needs its own overlay
@@ -1070,7 +1070,7 @@ final class InboxViewModel {
             }()
 
             // Pass 1: remove messages no longer in the fresh set, update changed
-            // ones. PLAN_INBOX_UNIFIED_READ.md §3: an honest diff — the reader
+            // ones. the unified inbox read (ADR-IOS-055): an honest diff — the reader
             // (InboxListReader/InboxListComposer) already supplies staged (S)
             // and overlay-pinned (P) rows, and carries AI fields (actionTag/
             // tagSortOrder/summaryBlurb) from a staged row onto its D-visible
@@ -1083,7 +1083,7 @@ final class InboxViewModel {
             for (i, existing) in loadedMessages.enumerated() {
                 if let fresh = freshById[existing.id] {
                     var assigned = fresh
-                    // G1 audit fix (PLAN_INBOX_UNIFIED_READ.md): an EMPTY
+                    // G1 audit fix (the unified inbox read (ADR-IOS-055)): an EMPTY
                     // fresh field must never clobber a NON-EMPTY on-screen
                     // enrichment — same "non-empty beats empty" principle as
                     // flushAIBatch's documented snippet fallback above. A
@@ -1192,7 +1192,7 @@ final class InboxViewModel {
 
     /// Async self-heal for the warm-foreground path (`reloadMessages`): resolves
     /// folders OFF the main thread so the GRDB read suspends rather than blocks
-    /// the UI (Half A / PLAN_HANG_FIX). Identical healing behavior to
+    /// the UI (Half A / the launch-hang fix). Identical healing behavior to
     /// `selfHealFolders` — only the threading differs.
     private func selfHealFoldersAsync() async {
         applyResolvedFolders(await resolveFoldersFromDBAsync())
@@ -1236,7 +1236,7 @@ final class InboxViewModel {
     /// If nothing is loaded yet, fetches just the first page (synchronous).
     /// Bounded by count: fetches the top N messages (N = targetWindowSize)
     /// in the active sort order. Works for any sort (date, triage tagSortOrder).
-    /// PLAN_INBOX_UNIFIED_READ.md Phase 3: routes through `InboxListReader.fetch`
+    /// the unified inbox read (ADR-IOS-055) Phase 3: routes through `InboxListReader.fetch`
     /// (async, rawPool-backed — same repaint-decoupling rationale this function
     /// used to inline, now owned by the reader/shell) which also folds in
     /// overlay-pinned (P) and staged (S) rows, so a reload no longer needs a
@@ -1364,7 +1364,7 @@ final class InboxViewModel {
     /// Fetch one page of messages across all folders.
     /// Converts to value-type MessageSnapshot immediately.
     /// Bounded: fetches at most `folders.count × pageSize`, then trims to `pageSize`.
-    /// PLAN_INBOX_UNIFIED_READ.md Phase 3: routes through `InboxListReader.fetchSync`
+    /// the unified inbox read (ADR-IOS-055) Phase 3: routes through `InboxListReader.fetchSync`
     /// (the sync `dbPool`-backed gather — status quo I/O, no new main-thread cost;
     /// see InboxListReader.swift §2.1b), which folds in overlay-pinned (P) and
     /// staged (S) rows the same way `fetchFullRange` now does. This is why

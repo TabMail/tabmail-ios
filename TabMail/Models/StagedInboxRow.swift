@@ -7,7 +7,7 @@ import Foundation
 /// A `Sendable` display+action projection of an NSE-staged message, carried in the
 /// `.messagesStaged` notification so the inbox can render just-pushed mail
 /// **in-memory** — without waiting for the merge's (resume-time-slow) durable
-/// header write. See `PLAN_INBOX_INSTANT_INSERT.md` / ADR-IOS-049. No body: the
+/// header write. See the instant inbox insert (ADR-IOS-049). No body: the
 /// list only needs header fields; body render keeps lagging to the merge.
 struct StagedInboxRow: Sendable, Equatable {
     let accountId: String

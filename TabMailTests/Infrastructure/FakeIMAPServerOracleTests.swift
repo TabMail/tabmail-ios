@@ -20,7 +20,7 @@ import Darwin
 /// `EXPUNGE`) resolves its target UID to the mailbox's CURRENT occupant
 /// in-lock, pre-mutation, and records a `WrongMessageViolation` when that
 /// occupant's Message-ID is not one the test declared it was mutating. This is
-/// the primary instrument for C3-I1…C3-I6 (`PLAN_IOS_REFACTOR_V3.md` §3.2):
+/// the primary instrument for C3-I1…C3-I6 (the v3 refactor):
 /// every later Tier-2/Tier-3 test asserts `wrongMessageViolations().isEmpty`,
 /// and an assertion that can never fail proves nothing. These tests are the
 /// positive control for that assertion.

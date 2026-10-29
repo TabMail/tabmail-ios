@@ -20,6 +20,6 @@
 
 **Tests:** `TabMailTests/Shared/ICSSanitizerTests.swift` (16 cases, synthetic fixtures with generic domains + dynamic dates): trigger pathology (X-ALT-DESC dropped, semantics preserved, size under cap), DISPLAY-alarm repair + no-double-DESCRIPTION, EMAIL/PROCEDURE alarm drop with sibling DISPLAY kept, oversized-ATTACH drop, DESCRIPTION truncation at escape-safe boundary, tab/LF folding normalization to ≤75-octet CRLF, multi-byte fold safety, clean-invite preservation, idempotence, non-UTF-8 + non-calendar passthrough, `ICSBuilder.parseIncoming` round-trip parity, control-char strip, organizer-as-attendee drop (keeps organizer + other attendees), and no-drop-when-no-organizer-duplicate.
 
-**Relates:** global CLAUDE.md rule 11 (never truncate stored user content), ADR-IOS-045 (imperative QuickLook/import presentation), `PLAN_ICS_SANITIZER.md`. No TB counterpart — Thunderbird handles incoming invites natively (Lightning); our addon is not in that path.
+**Relates:** global CLAUDE.md rule 11 (never truncate stored user content), ADR-IOS-045 (imperative QuickLook/import presentation), the ICS sanitizer (ADR-IOS-052). No TB counterpart — Thunderbird handles incoming invites natively (Lightning); our addon is not in that path.
 
 ---

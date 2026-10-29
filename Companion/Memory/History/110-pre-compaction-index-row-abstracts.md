@@ -29,7 +29,7 @@ between them is untouched, including emphasis, emoji, and inline code spans.
 ## Source line 148 — Current → `095-v3-provider-id-action-queue-forward-port-resume-state.md`
 
 <!-- BEGIN VERBATIM ROW 148 -->
-v3 provider-id action-queue forward-port — authoritative resume state (2026-08-02): branch `v3`, HEAD `583de7a5d`, **PAUSED BY OWNER**, never pushed; `PLAN_IOS_REFACTOR_V3.md` ROUTING INDEX first then `PLAN_V3_*.md` on demand, never re-merged; T4.T2 landed / T5.9 / T4.T1 next, T4.O5 deferred; baseline 7,994 tests / 1,085 suites @ `35d5b2814`; rules R0–R4; the `v2final` PORT / SUBTRACT / `⚑ NO REFERENCE — INVENTED` classification and its exactly-two invention census (`v74` blanket `PendingOperation` purge)
+v3 provider-id action-queue forward-port — authoritative resume state (2026-08-02): branch `v3`, HEAD `583de7a5d`, **PAUSED BY OWNER**, never pushed; the v3 refactor ROUTING INDEX first then the v3 design notes on demand, never re-merged; T4.T2 landed / T5.9 / T4.T1 next, T4.O5 deferred; baseline 7,994 tests / 1,085 suites @ `35d5b2814`; rules R0–R4; the `v2final` PORT / SUBTRACT / `⚑ NO REFERENCE — INVENTED` classification and its exactly-two invention census (`v74` blanket `PendingOperation` purge)
 <!-- END VERBATIM ROW 148 -->
 
 ---
@@ -258,7 +258,7 @@ Authored after `v1.6.38`, so the pinned compaction has no byte-identical twin. D
 ### Source line 148 — `095-v3-provider-id-action-queue-forward-port-resume-state.md`
 
 <!-- BEGIN VERBATIM ROW 148 (pass 3) -->
-| Current | v3 provider-id action-queue forward-port — resume state: branch `v3`, HEAD `583de7a5d`, **PAUSED BY OWNER**, never pushed; `PLAN_IOS_REFACTOR_V3.md` routing index; T4.T2 landed, T5.9/T4.T1 next; rules R0–R4; `v2final` PORT/SUBTRACT/INVENTED census | [read in full](../Current/095-v3-provider-id-action-queue-forward-port-resume-state.md) |
+| Current | v3 provider-id action-queue forward-port — resume state: branch `v3`, HEAD `583de7a5d`, **PAUSED BY OWNER**, never pushed; the v3 refactor routing index; T4.T2 landed, T5.9/T4.T1 next; rules R0–R4; `v2final` PORT/SUBTRACT/INVENTED census | [read in full](../Current/095-v3-provider-id-action-queue-forward-port-resume-state.md) |
 <!-- END VERBATIM ROW 148 (pass 3) -->
 
 ### Source line 149 — `096-t1-3-new-gesture-fails-closed-on-unknown-uidvalidity-epoch.md`
@@ -333,7 +333,7 @@ Compaction drift list — why a post-`v1.6.38` amendment can differ from its `Co
 ### Source line 144 — Current → `095-v3-provider-id-action-queue-forward-port-resume-state.md`
 
 <!-- BEGIN VERBATIM ROW 144 (pass 4) -->
-v3 provider-id action-queue forward-port — ✅ **COMPLETE, SHIPPED as v1.7.0 (2026-08-07)**; the `v3` branch is **DELETED and `main` IS that line**; rules **R0/R3 RETIRED** — no mandatory `v2final` consult; ⛔ **`v2final` is preserved history, NOT a reference** (a `v1.6.38` SIBLING that never shipped; in-code `PORT — v2final:…` comments are PROVENANCE only); `PLAN_IOS_REFACTOR_V3.md`
+v3 provider-id action-queue forward-port — ✅ **COMPLETE, SHIPPED as v1.7.0 (2026-08-07)**; the `v3` branch is **DELETED and `main` IS that line**; rules **R0/R3 RETIRED** — no mandatory `v2final` consult; ⛔ **`v2final` is preserved history, NOT a reference** (a `v1.6.38` SIBLING that never shipped; in-code `PORT — v2final:…` comments are PROVENANCE only); the v3 refactor
 <!-- END VERBATIM ROW 144 (pass 4) -->
 
 ### Source line 145 — Current → `096-t1-3-new-gesture-fails-closed-on-unknown-uidvalidity-epoch.md`

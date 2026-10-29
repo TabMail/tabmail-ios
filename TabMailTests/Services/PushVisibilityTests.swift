@@ -8,7 +8,7 @@ import UserNotifications
 @testable import TabMail
 
 /// Unit tests for `PushNotificationService.visualAlertsEnabled()` — the
-/// visible-vs-silent decision (PLAN_NSE_ENHANCE §3.1/§3.2). A VISUAL surface
+/// visible-vs-silent decision (the notification-service enhancement§3.2). A VISUAL surface
 /// (Lock Screen / Notification Center / Banner) must be enabled AND
 /// authorization must be granted (or provisional). Sound/Badge do NOT count.
 ///

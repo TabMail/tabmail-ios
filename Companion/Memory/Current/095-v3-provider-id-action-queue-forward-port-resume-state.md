@@ -20,8 +20,8 @@
 
 | file | load it |
 |---|---|
-| `PLAN_IOS_REFACTOR_V3.md` (62 KB) | **always, first** — live state, board census, rules R0–R4, verification baseline, build recipe, retained lessons, and the ROUTING INDEX |
-| `PLAN_IOS_REFACTOR_V3/PLAN_V3_*.md` (11 files, 350 KB) | **on demand only** — the frozen §0–§11, split by section and by §4 tier, plus the live Stage D/E1 inputs |
+| the v3 refactor (62 KB) | **always, first** — live state, board census, rules R0–R4, verification baseline, build recipe, retained lessons, and the ROUTING INDEX |
+| the v3 design notes (11 files, 350 KB) | **on demand only** — the frozen §0–§11, split by section and by §4 tier, plus the live Stage D/E1 inputs |
 
 The root file's ROUTING INDEX says which part answers which question. Do not read the parts
 speculatively and **do not re-merge them** — the whole point is that a routine turn loads ~62 KB
