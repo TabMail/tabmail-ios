@@ -227,7 +227,7 @@ private struct ProviderTestRunner: View {
         for tier in tiers {
             guard let models = catalog[provider]?[tier], !models.isEmpty else { continue }
             for model in models {
-                for profile in BYOKSmokeProfile.allCases where profile.appliesTo(tier: tier) {
+                for profile in BYOKSmokeProfile.profiles(forTier: tier) {
                     out.append(TestKey(tier: tier, model: model, profile: profile))
                 }
             }

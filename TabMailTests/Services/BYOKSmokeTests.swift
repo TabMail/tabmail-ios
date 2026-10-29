@@ -16,12 +16,7 @@ import Foundation
 @Suite("BYOKSmokeProfile")
 struct BYOKSmokeProfileTests {
 
-    @Test("compose maps to system_prompt_compose for background")
-    func composeBackgroundPrompt() {
-        #expect(BYOKSmokeProfile.compose.systemPromptName(tier: "background") == "system_prompt_compose")
-    }
-
-    @Test("compose maps to system_prompt_compose_interactive for interactive")
+    @Test("compose maps to system_prompt_compose_interactive")
     func composeInteractivePrompt() {
         #expect(BYOKSmokeProfile.compose.systemPromptName(tier: "interactive") == "system_prompt_compose_interactive")
     }
@@ -36,10 +31,21 @@ struct BYOKSmokeProfileTests {
         #expect(BYOKSmokeProfile.agentMultiTool.systemPromptName(tier: "interactive") == "system_prompt_agent")
     }
 
-    @Test("compose applies to both tiers")
-    func composeApplies() {
-        #expect(BYOKSmokeProfile.compose.appliesTo(tier: "background") == true)
+    @Test("compose applies to interactive only — compose requests use the Interactive key")
+    func composeAppliesInteractiveOnly() {
+        #expect(BYOKSmokeProfile.compose.appliesTo(tier: "background") == false)
         #expect(BYOKSmokeProfile.compose.appliesTo(tier: "interactive") == true)
+    }
+
+    /// The invariant behind the false failure (#340): a Background model is only ever tested through a
+    /// request that is routed to the Background key, and an Interactive model through the Interactive key.
+    /// Compose, chat and agent run on the Interactive key; only summary runs on the Background key.
+    @Test("each tier's checks are the ones routed to that tier's key")
+    func profilesPerTier() {
+        let background = BYOKSmokeProfile.profiles(forTier: "background")
+        let interactive = BYOKSmokeProfile.profiles(forTier: "interactive")
+        #expect(background == [.summary])
+        #expect(interactive == [.compose, .agentMultiTool])
     }
 
     @Test("summary applies to background only — its system prompt resolves there")
