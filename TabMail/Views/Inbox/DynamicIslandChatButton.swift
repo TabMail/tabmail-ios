@@ -47,6 +47,10 @@ struct DynamicIslandChat: View {
     @State private var inputText = ""
     @State private var inputSelection: TextSelection?
     @State private var dictation = DictationController()
+    /// Dictation for a user opted out of AI: Apple's recognition on this iPhone only (`PillDictationMode`).
+    @State private var speech = OnDeviceSpeechRecognizer()
+    /// The input text the on-device transcript is appended to, captured when it starts.
+    @State private var speechBase = ""
     private let networkMonitor = NetworkMonitor.shared
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
     @State private var autoStartTask: Task<Void, Never>?
@@ -425,7 +429,7 @@ struct DynamicIslandChat: View {
         // Keep the screen from auto-locking while the user is engaged with the
         // agent: pill expanded, agent working (incl. background sessions — same
         // scope as the wand glow), or dictation listening.
-        .keepScreenAwake(while: isExpanded || isWorking || ActiveAgentTracker.shared.anyWorking || dictation.isActive)
+        .keepScreenAwake(while: isExpanded || isWorking || ActiveAgentTracker.shared.anyWorking || dictation.isActive || speech.isRecording)
         .onChange(of: isExpanded) { _, expanded in
             autoStartTask?.cancel()
             autoStartTask = nil
@@ -602,7 +606,7 @@ struct DynamicIslandChat: View {
                     autoStartTask = Task {
                         try? await Task.sleep(for: .milliseconds(800))
                         guard !Task.isCancelled, isExpanded, !isTextFieldFocused else { return }
-                        startDictation()
+                        startDictation(auto: true)
                     }
                 } else if !dictationPromptShown && !TutorialCoordinator.shared.isRunning {
                     dictationPromptShown = true
@@ -611,6 +615,7 @@ struct DynamicIslandChat: View {
             } else {
                 // Collapsing ends the recording; its text is still appended to the input.
                 dictation.finish()
+                speech.stop()
                 isTextFieldFocused = false
                 // Start the 30s idle timer from when chat closes —
                 // but only if agent is NOT working (WIP responses don't count as idle).
@@ -630,6 +635,7 @@ struct DynamicIslandChat: View {
             isInputFocused = focused
             if focused {
                 dictation.finish()
+                speech.stop()
             }
         }
         .onChange(of: isWorking) { wasWorking, nowWorking in
@@ -672,7 +678,7 @@ struct DynamicIslandChat: View {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[DynamicIslandChat] dictation-auto-restart: calling startDictation")
                 }
-                startDictation()
+                startDictation(auto: true)
             }
         }
         .task {
@@ -726,6 +732,7 @@ struct DynamicIslandChat: View {
             // recording or transcription in progress (nowhere left to append it).
             dictation.cancel()
             dictation.stopLearning()
+            speech.stop()
             // No eager cancellation for any session type:
             // - Inbox: pill stays mounted, N/A
             // - Message-detail: user can navigate back to see the result
@@ -739,7 +746,7 @@ struct DynamicIslandChat: View {
                 autoStartTask = Task {
                     try? await Task.sleep(for: .milliseconds(800))
                     guard !Task.isCancelled, isExpanded, !isTextFieldFocused else { return }
-                    startDictation()
+                    startDictation(auto: true)
                 }
             }
             Button("No Thanks", role: .cancel) { }
@@ -776,6 +783,10 @@ struct DynamicIslandChat: View {
     private var expandedInputBar: some View {
         HStack(spacing: 10) {
             Button {
+                if speech.isRecording || speech.isStarting {
+                    speech.stop()
+                    return
+                }
                 switch dictation.phase {
                 case .listening: dictation.finish()
                 case .idle: startDictation()
@@ -785,17 +796,19 @@ struct DynamicIslandChat: View {
                 Image(systemName: micSymbol)
                     .contentTransition(.symbolEffect(.replace))
                     .font(.title3)
-                    .foregroundStyle(dictation.phase == .listening ? .red : Theme.accent)
+                    .foregroundStyle(dictation.phase == .listening || speech.isRecording ? .red : Theme.accent)
                     .frame(width: 28, height: 28)
             }
-            // Dictation is transcribed on the AI backend: off without a connection or opted out of AI.
-            .disabled(isWorking || dictation.phase == .transcribing || (!dictation.isActive && !canDictate))
-            .accessibilityLabel(dictation.phase == .listening ? "Stop dictation" : "Dictate")
+            // Dictation is transcribed on the AI backend (off without a connection), or on this iPhone
+            // when opted out of AI (off if the language has no on-device model).
+            .disabled(isWorking || dictation.phase == .transcribing
+                || (!dictation.isActive && !speech.isRecording && !speech.isStarting && !canDictate))
+            .accessibilityLabel(dictation.phase == .listening || speech.isRecording ? "Stop dictation" : "Dictate")
             .popoverTip(DictationLanguageTip(), arrowEdge: .bottom)
 
             // Dictating: the field's text dims behind the waveform. Tap it to stop listening; the
             // text is appended when it comes back.
-            TextField(isComposeMode ? "Describe your edit..." : "Type or speak...", text: $inputText, selection: $inputSelection, axis: .vertical)
+            TextField(isComposeMode ? "Describe your edit..." : (dictationNoteShown ? PillDictationMode.onDeviceUnavailableNote : "Type or speak..."), text: $inputText, selection: $inputSelection, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(1...6)
                 .focused($isTextFieldFocused)
@@ -1258,14 +1271,28 @@ struct DynamicIslandChat: View {
     }
 
     private var micSymbol: String {
-        if dictation.phase == .listening { return "mic.fill" }
+        if dictation.phase == .listening || speech.isRecording { return "mic.fill" }
         return canDictate ? "mic" : "mic.slash"
     }
 
-    /// Whether the mic can start a dictation (the pill shows it only with AI access).
-    private var canDictate: Bool {
-        // Off in the guided tutorial: it would ask for the microphone and send audio.
-        networkMonitor.isConnected && !optOutAllAI && !TutorialCoordinator.shared.isRunning
+    /// Whether the mic can start a dictation: on the backend (online), or on this iPhone when opted out.
+    private var canDictate: Bool { dictationMode != .off }
+
+    private var speechLocale: Locale {
+        PillDictationMode.speechLocale(dictationLanguage: DictationLanguage.current())
+    }
+
+    private var dictationMode: PillDictationMode {
+        PillDictationMode.resolve(
+            optedOutOfAI: optOutAllAI,
+            isOnline: networkMonitor.isConnected,
+            onDeviceAvailable: optOutAllAI && OnDeviceSpeechRecognizer.isAvailable(locale: speechLocale),
+            tutorialRunning: TutorialCoordinator.shared.isRunning)
+    }
+
+    /// Opted out and the language has no on-device model: the placeholder says why the mic is off.
+    private var dictationNoteShown: Bool {
+        optOutAllAI && !TutorialCoordinator.shared.isRunning && dictationMode == .off
     }
 
     /// What the dictation's cleanup reads as the screen, captured when it starts: what the pill
@@ -1282,10 +1309,21 @@ struct DynamicIslandChat: View {
         return .chatPill(title: "Chat", header: [], messages: chatMessages, input: inputText)
     }
 
-    private func startDictation() {
+    /// `auto`: started by the pill itself (it opened, the agent finished, Auto-Enable Dictation), not
+    /// by a tap on the mic. The on-device recognizer asks for permission, so it starts only from a tap.
+    private func startDictation(auto: Bool = false) {
         // Auto-start follows the mic button: while it is off, nothing starts.
         guard canDictate else { return }
         isTextFieldFocused = false
+        if dictationMode == .onDevice {
+            guard !auto, !speech.isRecording, !speech.isStarting else { return }
+            speechBase = inputText
+            speech.start(locale: speechLocale) { transcript in
+                inputText = DictationController.appending(transcript, to: speechBase)
+                inputSelection = .init(insertionPoint: inputText.endIndex)
+            }
+            return
+        }
         // The same gate that shows the input bar (and so the mic and the waveform) in the body.
         let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive
         dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in
@@ -1310,6 +1348,7 @@ struct DynamicIslandChat: View {
             && !inputText.trimmingCharacters(in: .whitespaces).isEmpty
             && !isWorking
             && !dictation.isActive
+            && !speech.isRecording
             && composeReadyToSend
     }
 
