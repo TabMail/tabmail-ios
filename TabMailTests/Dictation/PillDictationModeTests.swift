@@ -107,6 +107,11 @@ struct PillDictationModeTests {
         #expect(view.contains("dictation.isActive || speech.isRecording)"))
         #expect(view.contains("&& !speech.isRecording\n            && composeReadyToSend"))
         #expect(view.contains("PillDictationMode.resolve("))
+        // A denied or restricted permission reaches the mic and the placeholder through these reads.
+        #expect(view.contains("speech: SFSpeechRecognizer.authorizationStatus(),"))
+        #expect(view.contains("microphone: AVAudioApplication.shared.recordPermission)"))
+        #expect(view.contains("onDevice: onDeviceReadiness,"))
+        #expect(view.contains("(dictationOffNote ?? \"Type or speak...\")"))
         let controller = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationController.swift"), encoding: .utf8)
         #expect(controller.contains("guard canUseAI, !isOptedOutOfAI() else {"))
     }

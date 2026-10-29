@@ -22,7 +22,6 @@ enum PillDictationMode: Equatable {
         return isOnline ? .backend : .off
     }
 
-
     /// The locale the on-device recognizer uses: the Settings dictation language, or the iPhone's
     /// own locale on Automatic.
     static func speechLocale(dictationLanguage: String?, deviceLocale: Locale = .current) -> Locale {
