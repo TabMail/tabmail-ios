@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import AVFoundation
 import Foundation
 import Speech
 import Testing
@@ -9,7 +10,7 @@ import Testing
 
 struct PillDictationModeTests {
     private func mode(optedOut: Bool, online: Bool = true, onDevice: Bool = true, tutorial: Bool = false) -> PillDictationMode {
-        PillDictationMode.resolve(optedOutOfAI: optedOut, isOnline: online, onDeviceAvailable: onDevice, tutorialRunning: tutorial)
+        PillDictationMode.resolve(optedOutOfAI: optedOut, isOnline: online, onDevice: onDevice ? .ready : .noModel, tutorialRunning: tutorial)
     }
 
     /// Not opted out: the backend path, unchanged (needs a connection, ignores the on-device model).
@@ -38,6 +39,31 @@ struct PillDictationModeTests {
         #expect(PillDictationMode.speechLocale(dictationLanguage: nil, deviceLocale: device) == device)
         #expect(PillDictationMode.speechLocale(dictationLanguage: "en", deviceLocale: device) == device)
         #expect(PillDictationMode.speechLocale(dictationLanguage: "de", deviceLocale: device) == Locale(identifier: "de"))
+    }
+
+    /// A denied or restricted permission turns the mic off with a note; one not yet asked does not
+    /// (it is asked at the first tap), and with no model the note is the model's.
+    @Test func aBlockedPermissionTurnsTheOptedOutMicOffWithANote() {
+        func readiness(_ model: Bool, _ speech: SFSpeechRecognizerAuthorizationStatus, _ mic: AVAudioApplication.recordPermission) -> OnDeviceReadiness {
+            OnDeviceReadiness.resolve(modelAvailable: model, speech: speech, microphone: mic)
+        }
+        #expect(readiness(true, .authorized, .granted) == .ready)
+        #expect(readiness(true, .notDetermined, .undetermined) == .ready)
+        #expect(readiness(true, .notDetermined, .granted) == .ready)
+        #expect(readiness(true, .denied, .granted) == .speechBlocked)
+        #expect(readiness(true, .restricted, .undetermined) == .speechBlocked)
+        #expect(readiness(true, .authorized, .denied) == .microphoneBlocked)
+        #expect(readiness(true, .denied, .denied) == .speechBlocked)
+        #expect(readiness(false, .denied, .denied) == .noModel)
+        #expect(OnDeviceReadiness.ready.note == nil)
+        #expect(OnDeviceReadiness.speechBlocked.note?.contains("Speech Recognition access in Settings") == true)
+        #expect(OnDeviceReadiness.microphoneBlocked.note?.contains("Microphone access in Settings") == true)
+        #expect(OnDeviceReadiness.noModel.note?.contains("isn't available for this language") == true)
+        for blocked in [OnDeviceReadiness.noModel, .speechBlocked, .microphoneBlocked] {
+            #expect(PillDictationMode.resolve(optedOutOfAI: true, isOnline: true, onDevice: blocked, tutorialRunning: false) == .off)
+        }
+        // Not opted out is never affected by the on-device state.
+        #expect(PillDictationMode.resolve(optedOutOfAI: false, isOnline: true, onDevice: .speechBlocked, tutorialRunning: false) == .backend)
     }
 
     /// The audio never leaves the phone: the request demands on-device recognition.
@@ -81,6 +107,11 @@ struct PillDictationModeTests {
         #expect(view.contains("dictation.isActive || speech.isRecording)"))
         #expect(view.contains("&& !speech.isRecording\n            && composeReadyToSend"))
         #expect(view.contains("PillDictationMode.resolve("))
+        // A denied or restricted permission reaches the mic and the placeholder through these reads.
+        #expect(view.contains("speech: SFSpeechRecognizer.authorizationStatus(),"))
+        #expect(view.contains("microphone: AVAudioApplication.shared.recordPermission)"))
+        #expect(view.contains("onDevice: onDeviceReadiness,"))
+        #expect(view.contains("(dictationOffNote ?? \"Type or speak...\")"))
         let controller = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationController.swift"), encoding: .utf8)
         #expect(controller.contains("guard canUseAI, !isOptedOutOfAI() else {"))
     }
