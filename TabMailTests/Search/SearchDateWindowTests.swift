@@ -264,7 +264,110 @@ struct SearchDateWindowTests {
         let start = try #require(source.range(of: "private func dateWindowCandidates("))
         let end = try #require(source.range(of: "// MARK: - Internal Search Helpers", range: start.upperBound..<source.endIndex))
         let walk = source[start.lowerBound..<end.lowerBound]
+        // One read, bound once to a constant: a computed property reading it again would pass a count alone.
         #expect(walk.components(separatedBy: "DemoModeStore.isDemoActive").count - 1 == 1)
+        #expect(walk.contains("let demoActive = DemoModeStore.isDemoActive"))
+    }
+
+    @Test("a date sort over more weak semantic matches than a pool stays within its dates and demo mode")
+    func denseWeakSemanticMatchesStayInScope() async throws {
+        let start = try Self.start()
+        let pool = SearchConfig.dateSortPool
+        let query = Self.vector(48, 49, cos: 1)
+        func record(_ key: String, _ dateMs: Int64) -> FTSHeaderRecord {
+            FTSHeaderRecord(contentKey: ContentKey(rawValue: key), headerId: key, messageId: key,
+                            subject: "Quokka", from: "a@example.com", to: "b@example.com", dateMs: dateMs)
+        }
+        // More than a pool of weak matches by meaning alone (just over what such a match needs), and stronger
+        // vectors that are not to be answered: before and after the dates, and of the demo account.
+        let weak = (0..<(pool + 904)).map { record("windowweakacct:INBOX:w\($0)", start + Int64($0) * Self.minute) }
+        let outside = [record("windowweakacct:INBOX:before", start - 3 * Self.day), record("windowweakacct:INBOX:after", start + 20 * Self.day)]
+        let demo = (0..<3).map { record("\(DemoSeed.demoAccountId):INBOX:windowweakdemo\($0)", start + Int64($0) * Self.minute) }
+        let all = weak + outside + demo
+        let keys = all.map(\.contentKey)
+        try await index.removeMessages(contentKeys: keys)
+        #expect(try await index.indexHeaders(all) == all.count)
+        try await index.storeEmbeddings(weak.map { (contentKey: $0.contentKey, embedding: Self.vector(48, 49, cos: 0.53)) }
+                                        + (outside + demo).map { (contentKey: $0.contentKey, embedding: Self.vector(48, 49, cos: 0.9)) })
+        var answers: [SearchSort: [String]] = [:]
+        do {
+            for sort in [SearchSort.dateDesc, .dateAsc] {
+                answers[sort] = try await search("zyxwvut", query, from: start - Self.day, to: start + 10 * Self.day, limit: 10, sort: sort)
+                    .map(\.contentKey.rawValue)
+            }
+        } catch {
+            try await index.removeMessages(contentKeys: keys)
+            throw error
+        }
+        try await index.removeMessages(contentKeys: keys)
+        let w = weak.map(\.contentKey.rawValue)
+        #expect(answers[.dateDesc] == Array(w.suffix(10).reversed()), "\(answers)")
+        #expect(answers[.dateAsc] == Array(w.prefix(10)), "\(answers)")
+    }
+
+    @Test("a date sort that stops early answers by keyword, ranks included, when the only vectors are outside its dates")
+    func keywordOnlyWhenVectorsAreOutsideTheDates() async throws {
+        let start = try Self.start()
+        let pool = SearchConfig.dateSortPool
+        let query = Self.vector(50, 51, cos: 1)
+        for outsideVector in [false, true] {
+            var messages = (0..<(pool + 10)).map { i in
+                Message(id: "kw\(i)", subject: "Pangolin", dateMs: start + Int64(i + 1) * Self.minute)
+            }
+            messages.append(Message(id: "outside", subject: "Quokka", dateMs: start - 5 * Self.day, vector: outsideVector ? query : nil))
+            try await withMessages(messages + filler(3 * pool, at: start - Self.day)) {
+                let from = start - Self.day, to = start + 10 * Self.day
+                for sort in [SearchSort.dateDesc, .dateAsc] {
+                    let results = try await search("pangolin", query, from: from, to: to, limit: 10, sort: sort)
+                    let exact = try await index.searchFTSOnly(ftsQuery: SearchQueryParser.buildFTSMatch("pangolin"), fromDateMs: from,
+                                                              toDateMs: to, limit: 10, sort: sort)
+                    #expect(ids(results).count == 10, "\(sort) \(outsideVector)")
+                    #expect(ids(results) == ids(exact), "\(sort) \(outsideVector)")
+                    #expect(results.map(\.rank) == exact.map(\.rank), "\(sort) \(outsideVector)")
+                }
+            }
+        }
+    }
+
+    @Test("a date sort answers by keyword when the vector read fails")
+    func keywordOnlyWhenTheVectorReadFails() async throws {
+        let start = try Self.start()
+        let messages = (0..<12).map { i in
+            Message(id: "kw\(i)", subject: "Pangolin " + String(repeating: "weather ", count: i), dateMs: start + Int64(i) * Self.minute,
+                    vector: Self.vector(52, 53, cos: 1))
+        }
+        try await withMessages(messages + filler(60, at: start - Self.day)) {
+            // An embedding of the wrong size: sqlite-vec refuses it.
+            let wrongSize = [Float](repeating: 1, count: 8)
+            for sort in [SearchSort.dateDesc, .dateAsc] {
+                let results = try await search("pangolin", wrongSize, from: start - Self.day, to: start + Self.day, limit: 10, sort: sort)
+                let exact = try await index.searchFTSOnly(ftsQuery: SearchQueryParser.buildFTSMatch("pangolin"), fromDateMs: start - Self.day,
+                                                          toDateMs: start + Self.day, limit: 10, sort: sort)
+                #expect(ids(results).count == 10, "\(sort)")
+                #expect(ids(results) == ids(exact), "\(sort)")
+                #expect(results.map(\.rank) == exact.map(\.rank), "\(sort)")
+            }
+        }
+    }
+
+    @Test("every sort keeps a keyword match's snippet and leaves a match by meaning alone without one")
+    func snippetsSurviveEverySort() async throws {
+        let start = try Self.start()
+        let query = Self.vector(54, 55, cos: 1)
+        let messages = [
+            Message(id: "keyword", subject: "Pangolin", dateMs: start + Self.minute, vector: Self.vector(54, 55, cos: 0.9)),
+            Message(id: "meaning", subject: "Quokka", dateMs: start + 2 * Self.minute, vector: Self.vector(54, 55, cos: 0.9)),
+        ]
+        try await withMessages(messages + filler(20, at: start - Self.day)) {
+            for sort in [SearchSort.relevance, .dateDesc, .dateAsc] {
+                let results = try await search("pangolin", query, from: start - Self.day, to: start + Self.day, limit: 10, sort: sort)
+                let byId = Dictionary(uniqueKeysWithValues: results.map { (String($0.contentKey.rawValue.dropFirst(Self.prefix.count)), $0) })
+                #expect(Set(byId.keys) == ["keyword", "meaning"], "\(sort)")
+                #expect(byId["keyword"]?.snippet.contains("[") == true, "\(sort)")
+                #expect(byId["keyword"]?.dateMs == start + Self.minute, "\(sort)")
+                #expect(byId["meaning"]?.snippet == "", "\(sort)")
+            }
+        }
     }
 
     @Test("a date sort in the demo mode finds the demo vectors past a pool of nearer real ones")
