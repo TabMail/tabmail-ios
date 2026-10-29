@@ -72,6 +72,12 @@ struct DictationVocabularyTests {
         #expect(Array(firstHundred.filter { $0.hasPrefix("typed") }) == Array(words("typed", typed).prefix(firstHundred.filter { $0.hasPrefix("typed") }.count)))
     }
 
+    /// A term that is a dictionary word in another case is sent once, as the dictionary's.
+    @Test func aTermMatchingADictionaryWordInAnotherCaseIsSentOnce() {
+        let sent = DictationVocabulary.list(words: ["Xyvora", "Brevalle"], typedCount: 2, terms: ["xyvora", "Kaelthorne"], includesOverflow: true)
+        #expect(sent == ["Xyvora", "Brevalle", "Kaelthorne"])
+    }
+
     /// A snapshot without a typed count reads every word as typed.
     @Test func withoutATypedCountEveryWordIsTyped() {
         let dictionary = words("typed", 10)

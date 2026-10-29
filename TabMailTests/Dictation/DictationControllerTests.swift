@@ -1521,6 +1521,34 @@ struct DictationControllerTests {
         }
     }
 
+    /// Cleanup on, a dictionary of 100 typed and 50 learned words and 80 terms: the first 100 are the
+    /// typed (50), terms (30) and learned (20); the overflow follows up to 200; and the cleanup still
+    /// gets every dictionary word, not just the first 100.
+    @Test func withCleanupTheVocabularyCarriesTheOverflowAndTheCleanupTheWholeDictionary() async throws {
+        let capture = FakeCapture()
+        func name(_ prefix: String, _ i: Int) -> String {
+            let letters = Array("abcdefghijklmnopqrstuvwxyz")
+            return prefix + String(letters[i / letters.count]) + String(letters[i % letters.count])
+        }
+        let words = (0..<150).map { name("Qor", $0) }
+        let terms = (0..<80).map { name("Xyv", $0) }
+        let controller = controller(
+            capture: capture,
+            dictionary: { .init(words: words, learnsWords: false, typedCount: 100) },
+            emailBody: { _ in "ask " + terms.joined(separator: " and ") + " today" }
+        )
+        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
+
+        await dictate(controller, capture: capture, context: context)
+
+        let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
+        let firstHundred = Array(words.prefix(50)) + Array(terms.prefix(30)) + Array(words[100..<120])
+        let overflow = Array(words[50..<100]) + Array(words[120..<150]) + Array(terms[30..<50])
+        #expect(vocabulary == firstHundred + overflow)
+        #expect(Set(vocabulary).count == vocabulary.count)
+        #expect(recorded.cleanups.withLock { $0.first??["dictionary"] } == words.joined(separator: "\n"))
+    }
+
     /// Smart Dictation off: no cleanup to hand the overflow to, so only the first 100 words are sent.
     @Test func withoutCleanupOnlyTheFirstHundredWordsAreSent() async throws {
         let capture = FakeCapture()

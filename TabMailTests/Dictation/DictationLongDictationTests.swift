@@ -568,6 +568,32 @@ struct DictationLongDictationTests {
         #expect(backend.vocabularies.allSatisfy { $0.contains("Brevalle Labs") })
     }
 
+    /// Every chunk goes with the same ordered vocabulary a single recording does: the first 100 words
+    /// (the dictionary's 70, the terms' 30), then the overflow for the cleanup, up to 200.
+    @Test func everyChunkGoesWithTheOrderedVocabularyCappedAtTheBackendsLimit() async {
+        func name(_ prefix: String, _ i: Int) -> String {
+            let letters = Array("abcdefghijklmnopqrstuvwxyz")
+            return prefix + String(letters[i / letters.count]) + String(letters[i % letters.count])
+        }
+        let words = (0..<150).map { name("Qor", $0) }
+        let terms = (0..<80).map { name("Xyv", $0) }
+        let capture = SpeakingCapture()
+        let backend = ChunkBackend()
+        let controller = controller(capture, backend, words: words, emailBody: { _ in "ask " + terms.joined(separator: " and ") + " today" })
+        let pasted = pasted
+        controller.start(context: DictationContext(windowTitle: "Chat", screenText: "Me: hi\n» ‸", emailId: "email-1"), canUseAI: true) { text in pasted.texts.withLock { $0.append(text) } }
+        await waitUntil { capture.starts == 1 }
+
+        await speak(capture, backend, seed: 44, 12, 4)
+        controller.finish()
+        await waitUntil { controller.phase == .idle }
+
+        let expected = Array(words.prefix(70)) + Array(terms.prefix(30)) + Array(words[70..<150]) + Array(terms[30..<50])
+        #expect(backend.vocabularies.count == 2)
+        #expect(backend.vocabularies.allSatisfy { $0 == expected })
+        #expect(expected.count == DictationConfig.vocabularyMaxTerms)
+    }
+
     /// A long dictation marks what its chunks heard as used, for the dictionary's learned words, as
     /// one recording does (ADR-IOS-086).
     @Test func aLongDictationMarksWhatItHeardAsUsed() async {
