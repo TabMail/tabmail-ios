@@ -54,7 +54,7 @@ struct DynamicIslandChat: View {
     /// The input text the on-device transcript is appended to, captured when it starts.
     @State private var speechBase = ""
     /// The speech and microphone permissions, read again when the app becomes active (the user may
-    /// have changed them in Settings, or answered the system prompt) and when a start ends.
+    /// have changed them in Settings, or answered the system prompt) and when a start begins or ends.
     @State private var speechPermission = SFSpeechRecognizer.authorizationStatus()
     @State private var microphonePermission = AVAudioApplication.shared.recordPermission
     @Environment(\.scenePhase) private var scenePhase
