@@ -47,6 +47,12 @@ enum HybridMerge {
         max(0.0, 1.0 - distance)
     }
 
+    /// A vector score rescaled: under `SearchConfig.vectorScoreThreshold` 0, above it 0..1.
+    static func adjustedVectorScore(_ score: Double) -> Double {
+        let th = SearchConfig.vectorScoreThreshold
+        return max(0.0, (score - th) / (1.0 - th))
+    }
+
     /// Merge FTS5 and vector search results into one list in `sort` order, then take `limit`. Every
     /// keyword match is a result; a candidate found by meaning alone needs `SearchConfig.minScore`.
     ///
@@ -92,8 +98,7 @@ enum HybridMerge {
         var results = candidates.values.compactMap { c -> HybridResult? in
             guard let dateMs = dates[c.rowid] else { return nil }
             // Rescale vector score: scores below threshold → 0, above → 0..1
-            let th = SearchConfig.vectorScoreThreshold
-            let adjustedVector = max(0.0, (c.vectorScore - th) / (1.0 - th))
+            let adjustedVector = adjustedVectorScore(c.vectorScore)
             let finalScore = vectorWeight * adjustedVector + textWeight * c.textScore
             // Every keyword match is a result, however low it scores: a word in at least half the rows
             // scores about 0 by keyword (FTS5 clamps its IDF), and dropping those returned fewer

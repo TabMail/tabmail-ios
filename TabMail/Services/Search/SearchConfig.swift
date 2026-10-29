@@ -58,10 +58,11 @@ enum SearchConfig {
     /// Fetch N× candidates from each engine, merge to final limit.
     static let candidateMultiplier = 4
 
-    /// Candidates per engine for a date-sorted search, which orders all of them by date before it
-    /// takes its limit: sqlite-vec's largest `k` (`SQLITE_VEC_VEC0_K_MAX`). Chosen by the
-    /// tabmail-native-fts #46 study (ADR-NF-017) on a 300,357-message archive: right in every dated
-    /// query set and best without dates, at the same median cost as 2,048.
+    /// Candidates per engine in one date window of a date-sorted search, which orders all of a window's
+    /// candidates by date before it takes its limit: sqlite-vec's largest `k` (`SQLITE_VEC_VEC0_K_MAX`).
+    /// Chosen by the tabmail-native-fts #46 study (ADR-NF-017) on a 300,357-message archive. A date sort
+    /// walks windows of this many keyword matches until it has its limit, so it is exact past the pool
+    /// (tabmail-ios#294, ADR-NF-023).
     static let dateSortPool = 4096
 
     /// Minimum combined score to return (filters noise).
