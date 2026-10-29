@@ -47,6 +47,10 @@ itself, on both stacks.
    (relevance default) and `memory_search-v1.9.3.json` (no query lists the most recent conversations,
    which `MemorySearchTool` already handles). `EmailSearchToolSortTests.advertisesRelevanceDefaultVersion`
    pins it.
+   **Amended 2026-10-29:** the protocol version is 1.10.2 now. The backend's `email_search-v1.10.2.json`
+   (same parameters as 1.10.0, new wording) says a date order is exact over every match and needs no
+   date range, which holds since the date sort walks date windows (ADR-IOS-097). It is the only
+   prompt or tool file the backend versions above 1.10.0, so the bump offers iOS nothing else.
 8. The demo scope (ADR-IOS-038) is applied in the vector leg, before the merge:
    `SearchIndex.searchVecCandidates` joins its KNN results to `message_meta` and keeps only the
    mode's account, as `MemoryIndex.searchVecCandidates` does. The filter that dropped out-of-scope
