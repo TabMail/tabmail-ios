@@ -1,7 +1,7 @@
 
 ## ADR-IOS-065: Undo-Send close decision — restore the shipped prompt without rotating the epoch
 
-**Date:** 2026-07-26. **Spec:** `PLAN_F2B_SPEC_V5_CLOSE_STATE.md`.
+**Date:** 2026-07-26. **Spec:** the close-state design.
 
 **Context.** After Undo Send, closing compose without typing **silently discarded the user's draft**. Send initiation removes the Drafts header and admits a `.deleteDraft` for the server copy; nothing restored either. `UndoReopenCompose` passes `prefillTreatAsUnsavedChanges: true` AND `prefillDraftId`, but with the retained row present the row-load branch snapshotted the loaded content as baseline and returned before reaching the guard honouring that flag — so `hasChanges` was false and the close resolved to `.dismiss`.
 

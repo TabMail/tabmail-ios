@@ -442,7 +442,7 @@ final class NavigationStore {
     /// Async + single read: folders AND the overlay-relevant message headers are
     /// fetched in ONE off-main GRDB read. Previously this was a synchronous
     /// folder read followed by an N+1 per-overlay-message header read, all on the
-    /// main thread — a warm-foreground UI-hang source (Half A / PLAN_HANG_FIX).
+    /// main thread — a warm-foreground UI-hang source (Half A / the launch-hang fix).
     /// The overlay unread-count adjustment then runs on the main actor.
     func refreshFolders() async {
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -542,7 +542,7 @@ final class NavigationStore {
     /// Immediate refresh without RenderGate check. Used for initial load
     /// and after user-initiated actions where freshness is required.
     /// The GRDB read runs off the main thread (async) so it can't block the UI
-    /// during the foreground catch-up burst (Half A / PLAN_HANG_FIX); the
+    /// during the foreground catch-up burst (Half A / the launch-hang fix); the
     /// @Observable assignments happen on the main actor after it resolves.
     private func runRefreshFlight() async {
         while refreshAppliedGeneration < refreshRequestedGeneration {

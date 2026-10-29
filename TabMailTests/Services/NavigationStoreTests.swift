@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-// REFACTOR NOTE (PLAN_INTENTION_QUEUE.md): the 3 splitGate_* tests drive
+// REFACTOR NOTE (the intention-queue refactor (ADR-IOS-058)): the 3 splitGate_* tests drive
 // AccountManager.registerMutation directly to seed the overlay before refreshFolders();
 // invariant = badge move-delta source/dest truth table (plan section 4 item 11, must survive).
 // Retarget the SEED call to record(intention:); the store.folders assertions are unaffected.
@@ -152,7 +152,7 @@ struct NavigationStoreTests {
 
 /// Characterizes the actual `NavigationStore.refresh()` / `refreshFolders()`
 /// methods (not just their query patterns) against a real `AppDatabase` so the
-/// sync→async conversion (Half A / PLAN_HANG_FIX) can be verified before/after.
+/// sync→async conversion (Half A / the launch-hang fix) can be verified before/after.
 /// `.serialized` because it swaps the `AppDatabase.shared` singleton.
 @Suite("NavigationStore refresh behavior", .serialized, .processGlobalState)
 struct NavigationStoreRefreshTests {

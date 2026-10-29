@@ -9,7 +9,7 @@ import Synchronization
 @testable import TabMail
 
 /// T0.8 — the provider-id durable action queue's ADVERSARIAL fuzz suite
-/// (global `CLAUDE.md` Testing Rule 11; `PLAN_IOS_REFACTOR_V3.md` §6.3).
+/// (global `CLAUDE.md` Testing Rule 11; the v3 refactor).
 ///
 /// ## Provenance — what is ported and from where (RULE R0)
 /// Structure is ported from the two reference fuzzers named in the T0.8 row:

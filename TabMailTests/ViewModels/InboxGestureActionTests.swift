@@ -859,7 +859,7 @@ struct InboxGestureActionTests {
     // toggle (or, now, an intent cycle) was still in flight for the SAME id
     // when an archive/move's closure completed, the move's unconditional
     // removal stripped the WHOLE coalesced overlay entry, including the
-    // sibling op's still-pending intent (PLAN_OVERLAY_CALLSITE_AUDIT.md §1
+    // sibling op's still-pending intent (the overlay call-site audit
     // "mixed-path refcount bypass"). Both directions are pinned below: the
     // move finishing first must not strip a still-pending toggle intent, and
     // the toggle finishing first must not strip a still-pending move intent.

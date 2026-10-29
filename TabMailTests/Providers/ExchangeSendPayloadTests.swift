@@ -9,7 +9,7 @@ import Foundation
 /// Covers the Microsoft Graph `sendMail` payload threading headers. Exchange
 /// threads purely via the RFC-2822 In-Reply-To / References internet headers
 /// (no thread-id field on `sendMail`), so a populated `references` chain is what
-/// keeps replies/forwards in-thread on Outlook. See PLAN_THREAD_FIX.md / ADR-IOS-043.
+/// keeps replies/forwards in-thread on Outlook. See the outgoing-thread fix (ADR-IOS-043).
 @Suite("ExchangeProvider.buildGraphSendPayload threading headers")
 struct ExchangeSendPayloadTests {
 

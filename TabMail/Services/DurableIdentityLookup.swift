@@ -8,10 +8,10 @@ import GRDB
 /// The NSE merge's durable-identity lookup, extracted to ONE shared helper so
 /// the merge (`NSEDataBridge.verifyDurable` / `detectStaleByMoveRows` /
 /// `performMerge` phase 1 / phase 2) and the upcoming unified inbox reader
-/// (`InboxListComposer`, PLAN_INBOX_UNIFIED_READ.md §2.1/§2.1a) share the
+/// (`InboxListComposer`, the unified inbox read (ADR-IOS-055) §2.1a) share the
 /// EXACT SAME dedup identity by construction, not by convention.
 ///
-/// This IS the merge's dedup identity AND (per PLAN_INBOX_UNIFIED_READ.md
+/// This IS the merge's dedup identity AND (per the unified inbox read (ADR-IOS-055)
 /// §2.1a) the reader's S-row eligibility identity. §4.4 risk 1 names this
 /// divergence explicitly: "Identity parity is load-bearing... Mitigation:
 /// extract ONE shared identity-resolution helper used by BOTH the merge

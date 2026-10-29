@@ -20,7 +20,7 @@ import Testing
 /// could only ever agree with themselves.
 ///
 /// The same cluster was found and repaired on the sibling branch `v2final`
-/// (`PLAN_UNDO_IDENTITY.md` §5, round 51), where the measurement was recorded:
+/// (the undo-identity work (ADR-IOS-059), round 51), where the measurement was recorded:
 /// inverting `providerRekeysIds` in production turned **35 real end-to-end pins
 /// red and left all three old provider tests GREEN**. `v2final` reduced this
 /// file to the two `stableId` tests alone. v3 keeps the file but rebuilds it as
@@ -101,7 +101,7 @@ import Testing
 /// partly-reversed move is worse than an unreversed one, because the user cannot
 /// see which half moved.
 ///
-/// FIXTURE NOTE — test-infra hazard #2 (`PLAN_UNDO_IDENTITY.md` §7):
+/// FIXTURE NOTE — test-infra hazard #2 (the undo-identity work (ADR-IOS-059)):
 /// `AccountManager.shared`'s connected `providers` map OUTLIVES a suite and
 /// `drainPendingQueue` claims any op whose account has a provider, so a sibling
 /// suite's provider can drain this suite's queued ops. Every fixture here uses a

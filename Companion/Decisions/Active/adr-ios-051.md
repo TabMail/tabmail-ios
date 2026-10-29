@@ -21,6 +21,6 @@
 
 **Tests:** `SyncEngineDeletionReconcileTests` — trigger predicate (tolerance boundaries, backfill-normal direction), ghost selection (subset/superset/empty/all-gone), chunk planner (exact multiple/remainder/empty/sorting), walk semantics via injected effects (failed-chunk-skips-deletes, connection-error abort, stored-validity mismatch abort without persist, mid-walk validity-change abort, bootstrap persist-once, validity-0 abort, persist/delete failure aborts, deletion-cap: within-cap proceeds / exceeding chunk aborts undeleted / first-chunk-over-cap deletes nothing / exact boundary allowed), shared deletion path on in-memory GRDB (exact-UID deletes, unknown-UID no-ops, pending-op source+destination protection, recently-completed protection, outbox Sent protection, unrelated-op non-protection), v63 column round-trip.
 
-**Relates:** ADR-IOS-042 (UID not date), ADR-IOS-014 (connection pool / per-batch checkout etiquette), ADR-IOS-041/046 (suspension / abandon-on-suspend), PROJECT_MEMORY "IMAP external-deletion blind spot", `PLAN_IMAP_DELETION_RECONCILE.md`, TB counterpart `../tabmail-thunderbird/PLAN_FOLDER_SET_RECONCILE.md`.
+**Relates:** ADR-IOS-042 (UID not date), ADR-IOS-014 (connection pool / per-batch checkout etiquette), ADR-IOS-041/046 (suspension / abandon-on-suspend), PROJECT_MEMORY "IMAP external-deletion blind spot", the Thunderbird add-on's folder-set reconcile (its counterpart).
 
 ---

@@ -280,7 +280,7 @@ enum ThreadUtils {
     // MARK: - Outgoing Threading Headers (send path)
 
     /// The threading fields a reply/forward must carry so the provider files it
-    /// into the source conversation. See `PLAN_THREAD_FIX.md` and ADR-IOS-043.
+    /// into the source conversation. See the outgoing-thread fix (ADR-IOS-043) and ADR-IOS-043.
     ///
     /// - `inReplyTo` / `references` are bare (normalized) RFC 2822 message IDs;
     ///   each provider adds the `<…>` brackets at the wire boundary.

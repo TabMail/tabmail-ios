@@ -20,6 +20,6 @@ Forward semantics were verified against Gmail (web research, 2026-06-23): Gmail 
 - `threadId` is intentionally dropped when the user switches the From account or materially changes the subject → those start a new Gmail thread (correct).
 - IMAP parents lacking a Message-ID produce a best-effort (possibly empty) chain — same as before, no regression.
 - Local receive-side grouping (`ThreadUtils.assignComputedThreadId`) is untouched; this ADR governs **outgoing** headers only.
-- Regression: `OutgoingThreadHeadersTests` (builder), `GmailSendBodyTests` (threadId in/out of send body), `ExchangeSendPayloadTests` (References emission), `DatabaseOutboxTests` (v60 column + round-trip), plus existing `IMAPProviderBuildEmailTests` (References). See `PLAN_THREAD_FIX.md`.
+- Regression: `OutgoingThreadHeadersTests` (builder), `GmailSendBodyTests` (threadId in/out of send body), `ExchangeSendPayloadTests` (References emission), `DatabaseOutboxTests` (v60 column + round-trip), plus existing `IMAPProviderBuildEmailTests` (References). See the outgoing-thread fix (ADR-IOS-043).
 
 ---

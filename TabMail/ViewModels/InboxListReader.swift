@@ -5,7 +5,7 @@
 import Foundation
 import GRDB
 
-/// Thin I/O shell for `InboxListComposer` — PLAN_INBOX_UNIFIED_READ.md
+/// Thin I/O shell for `InboxListComposer` — the unified inbox read (ADR-IOS-055)
 /// §2.1/§2.1b.
 ///
 /// ⚠ **PHASE 3 HAS LANDED — this doc used to say "NOT wired into any production
@@ -284,7 +284,7 @@ enum InboxListReader {
             allHeaders.append(contentsOf: try MessageHeader.fetchAll(db, sql: sql, arguments: arguments))
         }
 
-        // §4.4-2 instrumentation (PLAN_INBOX_UNIFIED_READ.md): time everything
+        // §4.4-2 instrumentation (the unified inbox read (ADR-IOS-055)): time everything
         // AFTER the D query — the P-step, its label batch load, and the S
         // identity-resolution loop — NOT the D query above (that's the
         // pre-existing, already-profiled cost). `BootProfiler.mark` is
@@ -293,7 +293,7 @@ enum InboxListReader {
         let unionStepStart = CFAbsoluteTimeGetCurrent()
 
         // MARK: P — overlay-pinned rows (Q1: folderId-driven selection, per
-        // PLAN_INBOX_UNIFIED_READ.md §6). `isInInbox`-only mutations never
+        // the unified inbox read (ADR-IOS-055)). `isInInbox`-only mutations never
         // *restore* a row into a folder set, so they don't select for
         // pinning here — they're field overrides on rows already in D/S.
         let durableIds = Set(allHeaders.map(\.id))

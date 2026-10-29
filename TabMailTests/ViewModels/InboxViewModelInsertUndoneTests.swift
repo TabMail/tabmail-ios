@@ -125,7 +125,7 @@ struct InboxViewModelInsertUndoneTests {
             isInInbox: false
         )
 
-        // VM created BEFORE the overlay mutation exists (PLAN_INBOX_UNIFIED_READ.md
+        // VM created BEFORE the overlay mutation exists (the unified inbox read (ADR-IOS-055)
         // Phase 3: `InboxViewModel(folders:)` -> resetMessages() -> fetchPage(before: nil)
         // now routes through InboxListReader, whose P-step fetches ANY
         // overlay-pinned row by id on every read — see §2.1/§4.1's "improvement".

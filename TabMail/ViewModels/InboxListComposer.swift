@@ -168,7 +168,7 @@ struct InboxPageCursor: Equatable, Sendable {
 
 /// Everything the composer needs to know about "what list is being asked
 /// for" — folder scope, filters, sort mode, and window size.
-/// PLAN_INBOX_UNIFIED_READ.md §2.1.
+/// the unified inbox read (ADR-IOS-055)
 struct InboxListQuery: Equatable, Sendable {
     /// `Set(folders.map(\.id))` — the currently displayed folder set.
     let displayedFolderIds: Set<String>
@@ -282,7 +282,7 @@ struct ComposeInputs: Sendable {
     }
 }
 
-/// PURE composer for the inbox list — PLAN_INBOX_UNIFIED_READ.md §2.1/§2.1a.
+/// PURE composer for the inbox list — the unified inbox read (ADR-IOS-055) §2.1a.
 ///
 /// NO I/O, NO clocks, NO singletons, NO GRDB. Everything here is a
 /// deterministic function of value inputs, which is what makes the whole
@@ -423,7 +423,7 @@ enum InboxListComposer {
         // MARK: Step 6 — label filter, uniformly over D, P, and S. S rows
         // synthesize with `userLabels == []`, so an active label filter
         // always drops them — the deliberate unification called out in
-        // PLAN_INBOX_UNIFIED_READ.md §2.1 step 3 (today's `insertStagedRows`
+        // the unified inbox read (ADR-IOS-055) (today's `insertStagedRows`
         // skips this filter entirely; the reader unifies it).
         //
         // For D this is now a BELT: `InboxListReader.durableQuerySQL` applies the same
@@ -441,7 +441,7 @@ enum InboxListComposer {
         }
 
         // MARK: Step 7 — sort (mode-aware), dedup by id, trim to window.
-        // G2 audit fix (PLAN_INBOX_UNIFIED_READ.md): the comparator ends in a
+        // G2 audit fix (the unified inbox read (ADR-IOS-055)): the comparator ends in a
         // total-order `id` tie-break. `byId.values` (step 1) iterates a
         // Swift `Dictionary` — its order is NOT a function of insertion
         // order alone and is not guaranteed stable across otherwise-identical

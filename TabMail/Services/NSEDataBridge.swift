@@ -99,7 +99,7 @@ enum NSEDataBridge {
 
     /// The staged rows the most recent merge read (replace-all per merge; empty
     /// when staging is drained). ADR-IOS-049. Consumers: `InboxListReader` (the
-    /// unified inbox-list render path, PLAN_INBOX_UNIFIED_READ.md §2.1 — reads
+    /// unified inbox-list render path, the unified inbox read (ADR-IOS-055) — reads
     /// this directly as the S source on every fetch) and the NON-render
     /// fallbacks that need to resolve a message that is staged but not yet
     /// durable in GRDB: notification deep-link id resolution
@@ -1507,7 +1507,7 @@ enum NSEDataBridge {
         // past the header doesn't fire a redundant reload. Phase 1's own render is
         // gated separately on headers becoming newly visible.
         var endOfMergeChanged = false
-        // F1 (PLAN_INBOX_UNIFIED_READ.md audit): set true when the stale-by-move
+        // F1 (the unified inbox read (ADR-IOS-055) audit): set true when the stale-by-move
         // scrub below removes rows the pre-detection `.messagesStaged` post
         // already published. If the rest of this wake does no durable work
         // (`endOfMergeChanged` stays false), there is otherwise NO eviction
@@ -1668,7 +1668,7 @@ enum NSEDataBridge {
             // `.messagesStaged` post above already fired with these rows
             // included (deliberately not delayed for this check), so the VM
             // may have just inserted the phantom via `insertStagedRows`.
-            // PLAN_INBOX_UNIFIED_READ.md §3: no eviction notification needed —
+            // the unified inbox read (ADR-IOS-055): no eviction notification needed —
             // `scrubbedStaleStagedRows` (set above) drives an explicit
             // immediate-reload post at the end-of-merge signal site below (F1:
             // the scrub-only-wake branch) so a reload is guaranteed even when
@@ -2802,7 +2802,7 @@ enum NSEDataBridge {
                 Task { await ActiveBodyQueue.shared.repopulateFromDatabase() }
             }
         } else if scrubbedStaleStagedRows {
-            // F1 (PLAN_INBOX_UNIFIED_READ.md audit): scrub-only wake — the
+            // F1 (the unified inbox read (ADR-IOS-055) audit): scrub-only wake — the
             // stale-by-move block above scrubbed rows the pre-detection
             // `.messagesStaged` post already published, but nothing durable
             // happened this wake (`endOfMergeChanged` is false), so there is

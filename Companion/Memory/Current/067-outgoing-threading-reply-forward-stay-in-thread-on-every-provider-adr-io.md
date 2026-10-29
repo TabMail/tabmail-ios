@@ -6,7 +6,7 @@
 - **Gmail `threadId` is guarded twice** (in the builder): parent account == sending account, AND `normalizeSubject(sendSubject) == normalizeSubject(parentSubject)`. A failed guard → `nil` → a fresh thread (correct for cross-account / changed-subject). Preconditions, not a fallback (ADR-003).
 - **Plumbing:** `threadId` added to `DraftMessage` + persisted on `OutboxMessage` (**v60** migration, so a post-relaunch drain re-sends with the same binding). `Draft` GRDB record UNCHANGED — derived from the resolved `replyTo` at send, like `inReplyTo` always was.
 - **Provider responsibilities:** Gmail send includes `threadId` (`GmailProvider.buildSendBody`, extracted for tests). Exchange (`internetMessageHeaders`) + IMAP/SMTP (`buildEmail`) already emit In-Reply-To/References — NO code change, they just receive a populated chain now. `ExchangeProvider.buildGraphSendPayload` is `nonisolated` (pure, so unit tests can call it synchronously without crossing the actor boundary — `[String:Any]` is non-Sendable).
-- Tests: `OutgoingThreadHeadersTests`, `GmailSendBodyTests`, `ExchangeSendPayloadTests`, `DatabaseOutboxTests` (v60 + round-trip), existing `IMAPProviderBuildEmailTests`. Plan: `PLAN_THREAD_FIX.md`.
+- Tests: `OutgoingThreadHeadersTests`, `GmailSendBodyTests`, `ExchangeSendPayloadTests`, `DatabaseOutboxTests` (v60 + round-trip), existing `IMAPProviderBuildEmailTests`. Plan: the outgoing-thread fix (ADR-IOS-043).
 
 ## Outgoing threading IDs containing line breaks (#221)
 

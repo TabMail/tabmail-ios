@@ -16,7 +16,7 @@ struct TabMailApp: App {
     @State private var storeKitManager = StoreKitManager()
     /// Drives the one-time "Updating…" migration splash. The DB (schema +
     /// data-repair migrations) is built here, off the synchronous init path,
-    /// so a long migration no longer freezes launch (RC2 fix, PLAN_HANG_FIX).
+    /// so a long migration no longer freezes launch (RC2 fix, the launch-hang fix).
     @State private var startup = AppStartup.shared
     /// Flips true ~1s into a launch that hasn't reached the inbox yet, to show the
     /// branded loading splash. The delay means a fast resume (inbox in <1s) never
@@ -119,7 +119,7 @@ struct TabMailApp: App {
         // wasting resources and risking vtab lifecycle crashes).
 
         // DATABASE STARTUP MOVED OFF THE SYNCHRONOUS INIT PATH (RC2 fix,
-        // PLAN_HANG_FIX). Constructing `AppDatabase` runs the GRDB schema
+        // the launch-hang fix). Constructing `AppDatabase` runs the GRDB schema
         // migrator + one-time data resets, and the O(mailbox-size) thread-repair
         // migrations (v9/v27/v47/v53/v54) can take minutes after a multi-version
         // jump — doing that here froze launch with no UI ("hang on boot"). It
@@ -455,7 +455,7 @@ struct TabMailApp: App {
                     // ONLY shown once we've confirmed real (and potentially slow)
                     // migration work on an existing database. The gating splash
                     // reads as honest progress, not a frozen launch (RC2 fix,
-                    // PLAN_HANG_FIX).
+                    // the launch-hang fix).
                     SplashView(mode: .migrating)
                 } else if showDelayedSplash {
                     // The launch has crossed the 600ms threshold (see below) without
@@ -505,7 +505,7 @@ struct TabMailApp: App {
 
 /// Coordinates the one-time, potentially-slow database startup so it runs OFF
 /// the synchronous launch path, instead of freezing `TabMailApp.init` (RC2 fix —
-/// see PLAN_HANG_FIX).
+/// see the launch-hang fix).
 ///
 /// The GRDB schema migrator + one-time data resets include O(mailbox-size)
 /// thread-repair migrations (v9/v27/v47/v53/v54) that can take minutes after a

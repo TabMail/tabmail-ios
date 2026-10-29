@@ -637,7 +637,7 @@ extension SyncEngine {
     ///
     /// `bodyComplete` stays truthful per row: the survivor keeps its OWN flag
     /// (no OR-merge from losers — that would claim an FTS body the survivor's
-    /// row doesn't have, the PLAN_FTS_BODY_LOSS class). A survivor with
+    /// row doesn't have, the FTS body-loss class). A survivor with
     /// `bodyComplete = 0` re-enters the standard body pipeline naturally.
     ///
     /// `v2final` supplies the merge/delete/re-key control-flow shape, but its

@@ -2345,7 +2345,7 @@ private struct CollapseChatOnNavigateModifier: ViewModifier {
 }
 
 /// ADR-IOS-049: receives `.messagesStaged` (NSE-staged mail) and inserts the rows
-/// into the inbox IN-MEMORY, before the merge's durable write. PLAN_INBOX_UNIFIED_READ.md
+/// into the inbox IN-MEMORY, before the merge's durable write. the unified inbox read (ADR-IOS-055)
 /// §3: the companion `.stagedRowsInvalidated` eviction path is gone — a staged
 /// row later found STALE-BY-MOVE is scrubbed from `NSEDataBridge.latestStagedRows`
 /// and suppressed by the reader on the next reload instead (§2.1a). Kept as its

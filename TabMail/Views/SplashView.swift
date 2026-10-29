@@ -7,7 +7,7 @@ import SwiftUI
 struct SplashView: View {
     /// Visual variant. `.loading` is the normal returning-user splash;
     /// `.migrating` is shown while a one-time database migration runs behind a
-    /// gating splash (RC2 fix, PLAN_HANG_FIX) — adds a progress bar and a
+    /// gating splash (RC2 fix, the launch-hang fix) — adds a progress bar and a
     /// "keep the app open" notice so a long migration reads as honest progress
     /// instead of a frozen launch.
     enum Mode {

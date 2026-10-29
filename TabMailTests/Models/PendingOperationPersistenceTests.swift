@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-// REFACTOR NOTE (PLAN_INTENTION_QUEUE.md): model-level round-trips, independent of the
+// REFACTOR NOTE (the intention-queue refactor (ADR-IOS-058)): model-level round-trips, independent of the
 // drain-loop/register shape — no retargeting expected in the intention-queue refactor.
 
 import Testing

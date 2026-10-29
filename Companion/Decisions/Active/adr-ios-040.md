@@ -3,7 +3,7 @@
 
 **Date:** 2026-06-10
 **Status:** Accepted
-**Context:** PLAN_BYOK_PRICING_PAGES.md Phase 3; global ADR-025 (explicit-zero
+**Context:** the BYOK pricing pages work Phase 3; global ADR-025 (explicit-zero
 priority budget → slow queue). The BYOK plan (Apple products
 `ai.tabmail.byok.monthly`/`.yearly`) ships as the cheapest, first-listed tier:
 no priority AI budget, AI via the user's own keys or the throttled queue.
@@ -18,8 +18,8 @@ no priority AI budget, AI via the user's own keys or the throttled queue.
    `StoreKitManager.displayPlanName(forTier:)` maps "BYOK"→"Zero" at render
    time ONLY. `planName(for:)` keeps returning backend-facing "BYOK" because it
    must equal `AccountInfo.planTier`. Internal ids stay byok/BYOK everywhere
-   (product IDs, KV plan_name, planQuotas). Site precedent: PLAN_DISPLAY
-   (pricing.js), PLAN_TIER_DISPLAY (dashboard.js).
+   (product IDs, KV plan_name, planQuotas). Site precedent: the site's pricing display
+   (pricing.js), the site's tier display (dashboard.js).
 3. **Plan picker sorts by explicit tier order** (Zero → Basic → Pro), not by
    price — "BYOK happens to be cheapest" is not a contract.
 4. **Trial gating is per-product intro offer, not group eligibility alone:**
@@ -47,6 +47,6 @@ no priority AI budget, AI via the user's own keys or the throttled queue.
    prices. The file remains for optional manual StoreKit-testing in Xcode
    (e.g. sandbox-verifying group-level upgrade/downgrade direction).
 
-**Related:** global DECISIONS.md ADR-025; PLAN_BYOK_PRICING_PAGES.md §6/§7.
+**Related:** global DECISIONS.md ADR-025; the BYOK pricing pages work§7.
 
 ---

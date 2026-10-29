@@ -7,7 +7,7 @@ import GRDB
 import Testing
 @testable import TabMail
 
-/// PLAN_INBOX_UNIFIED_READ.md — Phase 1 ("Pin current behavior", §5 Migration
+/// the unified inbox read (ADR-IOS-055) — Phase 1 ("Pin current behavior", §5 Migration
 /// phases item 1): a table-driven pinning suite over TODAY'S observable
 /// inbox-list behavior, exercised entirely through `InboxViewModel`'s public
 /// surface (`insertStagedRows` / `reloadMessages` / `resetMessages` /
@@ -31,7 +31,7 @@ import Testing
 /// overlay and `NSEDataBridge.latestStagedRows` — both process-wide globals —
 /// so tests must not interleave (mirrors `InboxStagedRowGuardTests` /
 /// `NSEStaleStagedRowInvalidationTests`).
-@Suite("Inbox list behavior pinning (PLAN_INBOX_UNIFIED_READ Phase 1)", .serialized, .processGlobalState)
+@Suite("Inbox list behavior pinning (the unified inbox read (ADR-IOS-055) Phase 1)", .serialized, .processGlobalState)
 @MainActor
 struct InboxListBehaviorPinningTests {
 
@@ -215,7 +215,7 @@ struct InboxListBehaviorPinningTests {
     // MARK: - 4. Folder-move overlay releases the row; once the durable write
     // lands, a stale zero-I/O re-insert is a bounded, reload-correcting
     // transient (§2.2 accepted transient — the tombstone that used to block
-    // this outright is gone, PLAN_INBOX_UNIFIED_READ.md §3)
+    // this outright is gone, the unified inbox read (ADR-IOS-055))
 
     @Test("a folderId overlay mutation moving a staged row out of the displayed set releases it on reload; once the durable write lands in the new folder, a stale zero-I/O re-insert flashes back but the next reload evicts it for good (stale-by-move suppression, §2.2 accepted transient)")
     func folderMoveOverlayReleasesRowAndReloadConverges() async throws {
@@ -278,7 +278,7 @@ struct InboxListBehaviorPinningTests {
         #expect(!vm.loadedMessages.contains { $0.id == id })
     }
 
-    // MARK: - 5. Merge-side scrub (PLAN_INBOX_UNIFIED_READ.md §3 — replaces
+    // MARK: - 5. Merge-side scrub (the unified inbox read (ADR-IOS-055) — replaces
     // invalidateStagedRows/.stagedRowsInvalidated): once the merge scrubs a
     // stale-by-move row from NSEDataBridge.latestStagedRows, the reader's own
     // stale-by-move suppression evicts it on the next reload — no VM-side
@@ -423,7 +423,7 @@ struct InboxListBehaviorPinningTests {
 
     // Verified-failing pre-Phase-3 (2026-07-09): both expectations failed,
     // loadedMessages.count → 0 after reloadMessages() (the latent undo hole —
-    // insertUndoneMessages had no reload-survival guarantee). PLAN_INBOX_UNIFIED_READ.md
+    // insertUndoneMessages had no reload-survival guarantee). the unified inbox read (ADR-IOS-055)
     // §2.1 step 2's P-step (InboxListReader's overlay-pinned-row fetch) closes
     // it: every reload now re-fetches an undone-but-not-yet-durable row by id
     // as long as its overlay folderId mutation points into the displayed set.
@@ -501,7 +501,7 @@ struct InboxListBehaviorPinningTests {
 
     // MARK: - 10. Label filter — unified across every path (Phase 4 closes the divergence)
 
-    // PLAN_INBOX_UNIFIED_READ.md Phase 3 unified the label filter INSIDE the
+    // the unified inbox read (ADR-IOS-055) Phase 3 unified the label filter INSIDE the
     // reader (InboxListComposer step 6 — applies to D/P/S alike; S rows
     // synthesize with `userLabels == []`, so an active label filter always
     // drops them). Phase 4 gives `insertStagedRows` the same query-level
@@ -663,7 +663,7 @@ struct InboxListBehaviorPinningTests {
 
     // MARK: - 13. resetMessages surfaces staged-but-not-yet-durable rows via the reader
 
-    // PLAN_INBOX_UNIFIED_READ.md §3 deleted `resetMessages`' explicit
+    // the unified inbox read (ADR-IOS-055) deleted `resetMessages`' explicit
     // `insertStagedRows(NSEDataBridge.latestStagedRows...)` re-seed call — the
     // observable behavior this test pins is UNCHANGED, because
     // `resetMessages`' `fetchPage(before: nil)` already routes through
@@ -702,7 +702,7 @@ struct InboxListBehaviorPinningTests {
     // MARK: - 14. Undo + label filter — insertUndoneMessages honors the active label filter
 
     // `insertUndoneMessages` is NOT the zero-I/O staged path — it already
-    // reads the durable header by id, by design (PLAN_INBOX_UNIFIED_READ.md
+    // reads the durable header by id, by design (the unified inbox read (ADR-IOS-055)
     // §5 Phase 4). Loading real labels alongside that fetch (via
     // `UserLabelStore.loadLabels`, the same helper `InboxListReader`'s P-step
     // uses for its "undo shape") lets it honor an active label filter with
@@ -751,7 +751,7 @@ struct InboxListBehaviorPinningTests {
     }
 
     // MARK: - 15. F2 audit: loadMoreMessages excludeIds ordering, 2 folders,
-    // real pageSize (PLAN_INBOX_UNIFIED_READ.md audit). Reproduces the exact
+    // real pageSize (the unified inbox read (ADR-IOS-055) audit). Reproduces the exact
     // `fetchPage`/`compose` trace: an already-loaded, tag-first (triage mode)
     // row from one folder legitimately re-enters a later page's D query —
     // its date is older than the pagination cursor, which in triage mode is

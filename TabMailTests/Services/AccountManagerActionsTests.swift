@@ -658,7 +658,7 @@ struct AccountManagerActionsTests {
 
     // MARK: - Tag removal on inbox exit
     //
-    // F6 (PLAN_OVERLAY_CALLSITE_AUDIT.md §6): `optimisticMoveToFolder` no
+    // F6 (the overlay call-site audit): `optimisticMoveToFolder` no
     // longer queues a `.removeTag` PendingOperation — tags are local-only
     // (ADR-IOS-036), so leaving the inbox clears `actionTag`/`tagSortOrder`
     // directly in the move's own write. See `AccountManagerActionsTagClearTests`
@@ -1154,7 +1154,7 @@ struct AccountManagerActionsTests {
     // and live state agree, so neither discriminated between the two rules.
 }
 
-/// F6 (PLAN_OVERLAY_CALLSITE_AUDIT.md §6): actionTag clears locally the moment
+/// F6 (the overlay call-site audit): actionTag clears locally the moment
 /// a message leaves the inbox (archive/delete/move-out), in the SAME write as
 /// the folder move — no `.removeTag` PendingOperation is queued (tags are
 /// local-only, ADR-IOS-036). Unlike `AccountManagerActionsTests` above (which

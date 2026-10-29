@@ -9,7 +9,7 @@ import Foundation
 /// Covers `ThreadUtils.outgoingThreadHeaders` — the single source of truth for
 /// the In-Reply-To / References / Gmail-threadId fields a reply or forward must
 /// carry so the provider files it into the source conversation.
-/// See `PLAN_THREAD_FIX.md` / ADR-IOS-043.
+/// See the outgoing-thread fix (ADR-IOS-043).
 @Suite("ThreadUtils.outgoingThreadHeaders")
 struct OutgoingThreadHeadersTests {
 

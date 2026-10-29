@@ -8,7 +8,7 @@ import GRDB
 @testable import TabMail
 
 /// Unit coverage for the shared `DurableIdentityLookup` helper
-/// (PLAN_INBOX_UNIFIED_READ.md §2.1a/§4.4 item 1) — the merge's dedup
+/// (the unified inbox read (ADR-IOS-055) §4.4 item 1) — the merge's dedup
 /// identity, extracted so the NSE merge (`NSEDataBridge.verifyDurable` /
 /// `detectStaleByMoveRows` / phase 1 / phase 2) and the upcoming unified
 /// inbox reader resolve durable headers identically. Runs against a real

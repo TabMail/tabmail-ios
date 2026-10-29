@@ -7,7 +7,7 @@ import GRDB
 import Testing
 @testable import TabMail
 
-/// Pins `AccountManager.performCoordinatedRoleMove` (F4 — PLAN_OVERLAY_CALLSITE_AUDIT.md
+/// Pins `AccountManager.performCoordinatedRoleMove` (F4 — the overlay call-site audit
 /// §6): the coordinated path agent tools (`EmailArchiveTool`/`EmailDeleteTool`) use in
 /// place of a direct `archive(resolved)`/`delete(resolved)` call on a confirmation-time
 /// header snapshot. Three properties are pinned:

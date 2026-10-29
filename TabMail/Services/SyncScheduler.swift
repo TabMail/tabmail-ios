@@ -690,7 +690,7 @@ final class SyncScheduler {
                 // notification settings: subscribeAccount reads visualAlertsEnabled()
                 // live, and settings can only change while the app is backgrounded,
                 // so this foreground resub always re-registers with the current
-                // capability (worker upserts idempotently). See PLAN_NSE_ENHANCE §3.3.
+                // capability (worker upserts idempotently). See the notification-service enhancement
                 await PushNotificationService.shared.subscribeAllAccounts()
                 // Non-interactive check: does the push worker have a pending
                 // classification error for any of our Gmail/Outlook accounts?
