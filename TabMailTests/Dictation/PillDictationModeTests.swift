@@ -108,8 +108,15 @@ struct PillDictationModeTests {
         #expect(view.contains("&& !speech.isRecording\n            && composeReadyToSend"))
         #expect(view.contains("PillDictationMode.resolve("))
         // A denied or restricted permission reaches the mic and the placeholder through these reads.
-        #expect(view.contains("speech: SFSpeechRecognizer.authorizationStatus(),"))
-        #expect(view.contains("microphone: AVAudioApplication.shared.recordPermission)"))
+        #expect(view.contains("speech: speechPermission,"))
+        #expect(view.contains("microphone: microphonePermission)"))
+        // The statuses are read again when the app becomes active (back from Settings or the system
+        // prompt) and when a start ends, so a mic that was off for a denied permission can come back.
+        #expect(view.contains("@State private var speechPermission = SFSpeechRecognizer.authorizationStatus()"))
+        #expect(view.contains("@State private var microphonePermission = AVAudioApplication.shared.recordPermission"))
+        #expect(view.contains("if phase == .active { refreshDictationPermissions() }"))
+        #expect(view.contains(".onChange(of: speech.isStarting) { _, _ in refreshDictationPermissions() }"))
+        #expect(view.contains("speechPermission = SFSpeechRecognizer.authorizationStatus()\n        microphonePermission = AVAudioApplication.shared.recordPermission"))
         #expect(view.contains("onDevice: onDeviceReadiness,"))
         #expect(view.contains("(dictationOffNote ?? \"Type or speak...\")"))
         let controller = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationController.swift"), encoding: .utf8)
