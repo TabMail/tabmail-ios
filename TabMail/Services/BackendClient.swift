@@ -509,23 +509,26 @@ struct BYOKListModelsResult: Decodable, Sendable {
 /// their allow-listed tools — no new prompts shipped just for the smoke.
 /// `byokTierFor()` on the backend determines which BYOK tier each system
 /// prompt resolves to; `appliesTo(tier:)` mirrors that gate so the runner
-/// doesn't issue requests that'd route to the wrong tier.
+/// doesn't issue requests that'd route to the wrong tier. Chat, agent and
+/// compose run on the user's Interactive key; background jobs (summary) run on
+/// the Background key (owner 2026-10-28).
 enum BYOKSmokeProfile: String, CaseIterable, Sendable {
-    /// Single server-tool call (`date_to_day`) via `system_prompt_compose`
-    /// (background tier) or `system_prompt_compose_interactive` (interactive
-    /// tier). Both already allow `date_to_day`.
+    /// Single server-tool call (`date_to_day`) via
+    /// `system_prompt_compose_interactive`, which allows `date_to_day`.
+    /// Interactive tier only: compose requests use the user's Interactive key,
+    /// so a Background model is never routed through compose.
     case compose
 
     /// Single server-tool call (`time_delta`) via `system_prompt_summary`.
     /// Different tool, different prompt — exercises a separate allow-list and
     /// arithmetic codepath. Background tier only (system_prompt_summary is
-    /// tabmail-tier=heavy → BYOK background).
+    /// declared BYOK tier: background).
     case summary
 
     /// Multi-tool sequence — `date_to_day` then `time_delta` via
     /// `system_prompt_agent`. Exercises the multi-turn tool loop end-to-end
     /// (two server-tool round-trips inside a single chat). Interactive tier
-    /// only (system_prompt_agent is tabmail-tier=heaviest → BYOK interactive).
+    /// only (system_prompt_agent is declared BYOK tier: interactive).
     case agentMultiTool
 
     var displayName: String {
@@ -539,7 +542,7 @@ enum BYOKSmokeProfile: String, CaseIterable, Sendable {
     func systemPromptName(tier: String) -> String {
         switch self {
         case .compose:
-            return tier == "interactive" ? "system_prompt_compose_interactive" : "system_prompt_compose"
+            return "system_prompt_compose_interactive"
         case .summary:
             return "system_prompt_summary"
         case .agentMultiTool:
@@ -553,10 +556,15 @@ enum BYOKSmokeProfile: String, CaseIterable, Sendable {
     /// must gate on this.
     func appliesTo(tier: String) -> Bool {
         switch self {
-        case .compose:        return true
+        case .compose:        return tier == "interactive"
         case .summary:        return tier == "background"
         case .agentMultiTool: return tier == "interactive"
         }
+    }
+
+    /// The checks the Settings runner executes for a model of `tier`, in declaration order.
+    static func profiles(forTier tier: String) -> [BYOKSmokeProfile] {
+        allCases.filter { $0.appliesTo(tier: tier) }
     }
 
     /// The user message for this profile, built around a `BYOKSmokeFixture`.
