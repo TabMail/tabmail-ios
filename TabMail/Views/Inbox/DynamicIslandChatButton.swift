@@ -53,6 +53,11 @@ struct DynamicIslandChat: View {
     @State private var speech = OnDeviceSpeechRecognizer()
     /// The input text the on-device transcript is appended to, captured when it starts.
     @State private var speechBase = ""
+    /// The speech and microphone permissions, read again when the app becomes active (the user may
+    /// have changed them in Settings, or answered the system prompt) and when a start ends.
+    @State private var speechPermission = SFSpeechRecognizer.authorizationStatus()
+    @State private var microphonePermission = AVAudioApplication.shared.recordPermission
+    @Environment(\.scenePhase) private var scenePhase
     private let networkMonitor = NetworkMonitor.shared
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
     @State private var autoStartTask: Task<Void, Never>?
@@ -633,6 +638,10 @@ struct DynamicIslandChat: View {
             // been delivered (and sent) by the time this runs.
             if !active { sendWhenDictated = false }
         }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { refreshDictationPermissions() }
+        }
+        .onChange(of: speech.isStarting) { _, _ in refreshDictationPermissions() }
         .onChange(of: isTextFieldFocused) { _, focused in
             isInputFocused = focused
             if focused {
@@ -1280,6 +1289,11 @@ struct DynamicIslandChat: View {
     /// Whether the mic can start a dictation: on the backend (online), or on this iPhone when opted out.
     private var canDictate: Bool { dictationMode != .off }
 
+    private func refreshDictationPermissions() {
+        speechPermission = SFSpeechRecognizer.authorizationStatus()
+        microphonePermission = AVAudioApplication.shared.recordPermission
+    }
+
     private var speechLocale: Locale {
         PillDictationMode.speechLocale(dictationLanguage: DictationLanguage.current())
     }
@@ -1298,8 +1312,8 @@ struct DynamicIslandChat: View {
         guard optOutAllAI else { return .ready }
         return OnDeviceReadiness.resolve(
             modelAvailable: OnDeviceSpeechRecognizer.isAvailable(locale: speechLocale),
-            speech: SFSpeechRecognizer.authorizationStatus(),
-            microphone: AVAudioApplication.shared.recordPermission)
+            speech: speechPermission,
+            microphone: microphonePermission)
     }
 
     /// Opted out and the mic is off: the placeholder says why.
