@@ -1512,7 +1512,37 @@ struct DictationControllerTests {
         await dictate(controller, capture: capture, context: context)
 
         let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
-        #expect(vocabulary == words + terms.prefix(DictationConfig.vocabularyMaxTerms - dictionaryCount))
+        if dictionaryCount == DictationConfig.dictionaryMaxEntries {
+            // A full dictionary leaves the terms their 30 of the first 100; the rest of the dictionary
+            // and the remaining terms follow, for the cleanup (every word here is typed).
+            #expect(vocabulary == Array(words.prefix(70)) + Array(terms.prefix(30)) + Array(words.dropFirst(70)) + Array(terms[30..<50]))
+        } else {
+            #expect(vocabulary == words + terms.prefix(DictationConfig.vocabularyMaxTerms - dictionaryCount))
+        }
+    }
+
+    /// Smart Dictation off: no cleanup to hand the overflow to, so only the first 100 words are sent.
+    @Test func withoutCleanupOnlyTheFirstHundredWordsAreSent() async throws {
+        let capture = FakeCapture()
+        func name(_ prefix: String, _ i: Int) -> String {
+            let letters = Array("abcdefghijklmnopqrstuvwxyz")
+            return prefix + String(letters[i / letters.count]) + String(letters[i % letters.count])
+        }
+        let words = (0..<150).map { name("Qor", $0) }
+        let terms = (0..<80).map { name("Xyv", $0) }
+        let controller = controller(
+            capture: capture,
+            smartDictation: false,
+            dictionary: { .init(words: words, learnsWords: false, typedCount: 100) },
+            emailBody: { _ in "ask " + terms.joined(separator: " and ") + " today" }
+        )
+        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
+
+        await dictate(controller, capture: capture, context: context)
+
+        let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
+        #expect(vocabulary == Array(words.prefix(50)) + Array(terms.prefix(30)) + Array(words[100..<120]))
+        #expect(recorded.cleanups.withLock { $0.first ?? nil } == nil)
     }
 
     /// With no dictionary and nothing to pick, no words are sent.

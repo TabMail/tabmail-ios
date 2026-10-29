@@ -174,11 +174,23 @@ enum DictationConfig {
     /// The words sent with each dictation: the backend takes at most 200 (backend ADR-025), and the
     /// speech model heeds a list of 200 real words or names (measured 2026-10-02 in TabMail Voice's
     /// `Scripts/stt-compare/vocabulary_limit.py`). The user's dictionary goes first, at most 150
-    /// words, all of them always sent: at most 100 typed, learned words in the rest, all 150 when
-    /// none is typed; the terms picked from what the dictation is about (`DictationContextTerms`)
-    /// fill the rest, room for at least 50 and all 200 when the dictionary is empty, so every
-    /// dictation sends as many as it can (owner, 2026-10-02; TabMail Voice's ADR-DESK-038).
+    /// words: at most 100 typed, learned words in the rest, all 150 when none is typed; the terms
+    /// picked from what the dictation is about (`DictationContextTerms`) fill the rest, room for at
+    /// least 50 and all 200 when the dictionary is empty, so every dictation sends as many as it can
+    /// (owner, 2026-10-02; TabMail Voice's ADR-DESK-038). Only the first `speechVocabularyTerms` of
+    /// them reach the speech models, in an order that puts the typed words and the terms first
+    /// (2026-10-29); the cleanup gets all of the dictionary.
     static let vocabularyMaxTerms = 200
+    /// The speech models take a prefix of the list and never reorder, and heed about 100 words
+    /// (measured 2026-10-28: every keyword caught at 100, 87% at 150, 79-87% at 200), so the first
+    /// 100 are the most important and the rest goes only to the AI cleanup (`DictationVocabulary`):
+    /// the typed words, then the context's terms (room for at least 30), then the learned words (at
+    /// least 20; the dictionary at most 70 while the terms fill their 30). A group with fewer words
+    /// leaves its room to the others, and every dictionary word stays in the cleanup's `dictionary`.
+    static let speechVocabularyTerms = 100
+    static let speechVocabularyMinContextTerms = 30
+    static let speechVocabularyMinLearnedWords = 20
+    static let speechVocabularyMaxDictionaryWords = 70
     static let dictionaryMaxEntries = 150
     static let dictionaryMaxTypedWords = 100
     /// Longest a transcription waits for the context terms (seconds), which are picked while the

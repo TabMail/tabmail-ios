@@ -19,7 +19,16 @@ struct DictationDictionaryTests {
     @Test func isEmptyAndLearnsWordsByDefault() {
         let dictionary = DictationDictionary(defaults: defaults)
         #expect(dictionary.entries.isEmpty)
-        #expect(dictionary.snapshot == .init(words: [], learnsWords: true))
+        #expect(dictionary.snapshot == .init(words: [], learnsWords: true, typedCount: 0))
+    }
+
+    /// The snapshot says how many of its words are typed (they go first), which the vocabulary needs.
+    @Test func theSnapshotCountsItsTypedWords() {
+        let dictionary = DictationDictionary(defaults: defaults)
+        #expect(dictionary.learn(["Kaelthorne Drake"]) == ["Kaelthorne Drake"])
+        #expect(dictionary.add("Xyvora") == .added)
+        #expect(dictionary.snapshot.words == ["Xyvora", "Kaelthorne Drake"])
+        #expect(dictionary.snapshot.typedCount == 1)
     }
 
     @Test func keepsTypedAndLearnedWordsInOrderAcrossALaunch() {
@@ -30,7 +39,7 @@ struct DictationDictionaryTests {
 
         let relaunched = DictationDictionary(defaults: defaults)
         #expect(relaunched.entries == [.init(word: "Xyvora", learned: false, lastUsed: 1), .init(word: "Kaelthorne Drake", learned: true, lastUsed: 2)])
-        #expect(relaunched.snapshot == .init(words: ["Xyvora", "Kaelthorne Drake"], learnsWords: false))
+        #expect(relaunched.snapshot == .init(words: ["Xyvora", "Kaelthorne Drake"], learnsWords: false, typedCount: 1))
     }
 
     /// Owner, 2026-10-07: a dictation sends the words most important first, since the backend gives
