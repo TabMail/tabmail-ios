@@ -383,14 +383,14 @@ struct DictationControllerTests {
         #expect(recorded.cleanups.withLock { $0.map { $0 != nil } } == [false, true])
     }
 
-    /// The stored choice reads as off until set, then as set.
-    @Test func smartDictationIsOffUntilTurnedOn() throws {
+    /// The choice reads as on until stored; a stored off stays off, and a stored on reads as on.
+    @Test func smartDictationIsOnUntilTurnedOff() throws {
         let defaults = try #require(UserDefaults(suiteName: "SmartDictationTests-\(UUID().uuidString)"))
-        #expect(!SmartDictation.isOn(defaults: defaults))
-        defaults.set(true, forKey: SmartDictation.settingKey)
         #expect(SmartDictation.isOn(defaults: defaults))
         defaults.set(false, forKey: SmartDictation.settingKey)
         #expect(!SmartDictation.isOn(defaults: defaults))
+        defaults.set(true, forKey: SmartDictation.settingKey)
+        #expect(SmartDictation.isOn(defaults: defaults))
     }
 
     /// Dictation is transcribed on the backend: offline, nothing is recorded.
@@ -1840,7 +1840,7 @@ struct DictationOptOutFlagTests {
         #expect(controller.contains("useWords: @escaping @MainActor ([String]) -> Void = { DictationDictionary.shared.use($0) },"))
     }
 
-    /// Settings' Smart Dictation toggle writes the key the app's controller reads, off by default.
+    /// Settings' Smart Dictation toggle writes the key the app's controller reads, on by default.
     @Test func theSmartDictationToggleIsWired() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -1851,7 +1851,7 @@ struct DictationOptOutFlagTests {
         let settings = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Settings/TabMailSettingsView.swift"), encoding: .utf8)
         #expect(settings.contains("@AppStorage(SmartDictation.settingKey) private var smartDictation = SmartDictation.defaultValue"))
         #expect(settings.contains("Toggle(isOn: $smartDictation)"))
-        #expect(!SmartDictation.defaultValue)
+        #expect(SmartDictation.defaultValue)
     }
 
     /// The Settings menu writes the key the controller reads, the waveform shows no language, and
@@ -2130,7 +2130,7 @@ struct DictationLanguageSettingTests {
     }
 
     /// The app's controller (no `smartDictation:` injected) reads Settings' toggle as `@AppStorage`
-    /// stores it: never set, no cleanup is sent; turned on, the next dictation sends it.
+    /// stores it: never set, the cleanup is sent; turned off, the next dictation sends none.
     @Test func theStoredSmartDictationChoiceDecidesTheCleanup() async {
         let defaults = UserDefaults.standard
         let previous = defaults.object(forKey: SmartDictation.settingKey)
@@ -2166,12 +2166,12 @@ struct DictationLanguageSettingTests {
         }
 
         let stored = AppStorage(wrappedValue: SmartDictation.defaultValue, SmartDictation.settingKey)
-        #expect(!stored.wrappedValue)
+        #expect(stored.wrappedValue)
         await dictate()
-        stored.wrappedValue = true
+        stored.wrappedValue = false
         await dictate()
 
-        #expect(cleanups.withLock { $0.map { $0 != nil } } == [false, true])
+        #expect(cleanups.withLock { $0.map { $0 != nil } } == [true, false])
     }
 
     @Test func automaticIsTheIPhonesLanguage() async {

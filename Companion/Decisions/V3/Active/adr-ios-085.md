@@ -350,6 +350,8 @@ itself. A recording tries that 429 again as it did the 502 (`isServerError`); on
 not retried (`backendTimedOut`, formerly `backendWaited`). A long dictation's chunk retries both, as
 before. As TabMail Voice.)*
 
+**Amendment 2026-10-29 — Smart Dictation is ON by default (owner): the AI cleanup fixes most typos, which is simpler than other guards. `SmartDictation.defaultValue` is true; a user who switched it off keeps it off, since `@AppStorage` and `SmartDictation.isOn` fall back to the default only when nothing is stored. As TabMail Voice. The paragraph below records the original off-by-default decision.**
+
 **Amendment 2026-10-05 — Smart Dictation, a Settings toggle, off by default (owner).** The backend
 cleanup costs about a second per dictation (measured 0.4–1.8 s on Groq, 2026-10-05). Owner: "default
 off, but an option to have that cleanup on", a toggle in TabMail Settings just below Dictation Language,

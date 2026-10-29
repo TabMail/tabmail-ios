@@ -322,7 +322,7 @@ struct TabMailSettingsView: View {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Smart Dictation")
-                            Text("Allow AI to clean up your dictations. Adds about a 1-second delay.")
+                            Text("AI cleans up your dictations, fixing typos and punctuation. Adds about a 1-second delay.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
