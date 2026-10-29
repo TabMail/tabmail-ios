@@ -6,12 +6,14 @@ import Foundation
 
 /// Settings' "Smart Dictation": whether a dictation is cleaned up by AI (the backend's cleanup in
 /// the transcription request, and a long dictation's polish), at the cost of about a second.
-/// Off, the default, appends the transcript as heard (owner, 2026-10-05). As TabMail Voice's
+/// On by default, since AI cleanup fixes most typos (owner, 2026-10-29; it was off by default
+/// from 2026-10-05); a user who turned it off keeps it off, because only a stored choice
+/// overrides the default. Off appends the transcript as heard. As TabMail Voice's
 /// `smartDictation` setting.
 enum SmartDictation {
     /// UserDefaults key of the Settings toggle.
     static let settingKey = "smartDictation"
-    static let defaultValue = false
+    static let defaultValue = true
 
     /// The Settings choice now.
     static func isOn(defaults: UserDefaults = .standard) -> Bool {
