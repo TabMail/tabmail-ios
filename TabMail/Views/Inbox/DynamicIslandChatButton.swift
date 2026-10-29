@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import AVFoundation
+import Speech
 import SwiftUI
 import TipKit
 
@@ -808,7 +810,7 @@ struct DynamicIslandChat: View {
 
             // Dictating: the field's text dims behind the waveform. Tap it to stop listening; the
             // text is appended when it comes back.
-            TextField(isComposeMode ? "Describe your edit..." : (dictationNoteShown ? PillDictationMode.onDeviceUnavailableNote : "Type or speak..."), text: $inputText, selection: $inputSelection, axis: .vertical)
+            TextField(isComposeMode ? "Describe your edit..." : (dictationOffNote ?? "Type or speak..."), text: $inputText, selection: $inputSelection, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(1...6)
                 .focused($isTextFieldFocused)
@@ -1286,13 +1288,24 @@ struct DynamicIslandChat: View {
         PillDictationMode.resolve(
             optedOutOfAI: optOutAllAI,
             isOnline: networkMonitor.isConnected,
-            onDeviceAvailable: optOutAllAI && OnDeviceSpeechRecognizer.isAvailable(locale: speechLocale),
+            onDevice: onDeviceReadiness,
             tutorialRunning: TutorialCoordinator.shared.isRunning)
     }
 
-    /// Opted out and the language has no on-device model: the placeholder says why the mic is off.
-    private var dictationNoteShown: Bool {
-        optOutAllAI && !TutorialCoordinator.shared.isRunning && dictationMode == .off
+    /// Opted out: whether this iPhone can dictate (an on-device model for the language, and the
+    /// speech and microphone permissions not denied). Not opted out, `.ready`: the backend decides.
+    private var onDeviceReadiness: OnDeviceReadiness {
+        guard optOutAllAI else { return .ready }
+        return OnDeviceReadiness.resolve(
+            modelAvailable: OnDeviceSpeechRecognizer.isAvailable(locale: speechLocale),
+            speech: SFSpeechRecognizer.authorizationStatus(),
+            microphone: AVAudioApplication.shared.recordPermission)
+    }
+
+    /// Opted out and the mic is off: the placeholder says why.
+    private var dictationOffNote: String? {
+        guard optOutAllAI, !TutorialCoordinator.shared.isRunning, dictationMode == .off else { return nil }
+        return onDeviceReadiness.note
     }
 
     /// What the dictation's cleanup reads as the screen, captured when it starts: what the pill
