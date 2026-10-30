@@ -618,6 +618,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 // The bullet fields always go out on connect, read through the prompt store (DS-SEND),
                 // then the prompt_state fields.
                 PromptStore.shared.bullets.send = { [weak self] message in self?.sendBulletMessage(message) }
+                guard !DemoModeStore.isDemoActive else { break }
                 applyReceived("connected") { [weak self] access in
                     try access.sendAll()
                     self?.broadcastAllFields()
@@ -632,7 +633,13 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 // A released device's state, applied whole through the prompt store (DS-RECEIVE): its bullet
                 // texts imported (DS-LEGACY-IN), then its other fields merged; applied again whole while busy.
                 if let stateData = msg.data {
-                    let legacy = DemoModeStore.isDemoActive ? nil : object
+                    // DS-DEMO: Device Sync does not run in demo; a message still in flight when demo started
+                    // writes nothing (the demo flag is snapshotted here, when the operation starts).
+                    guard !DemoModeStore.isDemoActive else {
+                        BackgroundSyncLogger.logDebug("[DeviceSync] A prompt_state received in demo mode was dropped")
+                        return
+                    }
+                    let legacy = object
                     applyReceived("prompt_state") { [weak self] access in
                         if let legacy { try access.receive(legacy) }
                         try self?.applyIncomingStateWithMerge(stateData, access: access)
