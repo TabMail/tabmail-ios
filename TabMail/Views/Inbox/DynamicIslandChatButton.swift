@@ -640,6 +640,8 @@ struct DynamicIslandChat: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { refreshDictationPermissions() }
+            // The microphone never outlives the app on screen.
+            if phase == .background { speech.stop() }
         }
         .onChange(of: speech.isStarting) { _, _ in refreshDictationPermissions() }
         .onChange(of: isTextFieldFocused) { _, focused in
@@ -819,7 +821,7 @@ struct DynamicIslandChat: View {
 
             // Dictating: the field's text dims behind the waveform. Tap it to stop listening; the
             // text is appended when it comes back.
-            TextField(isComposeMode ? "Describe your edit..." : (dictationOffNote ?? "Type or speak..."), text: $inputText, selection: $inputSelection, axis: .vertical)
+            TextField(PillDictationMode.placeholder(isCompose: isComposeMode, offNote: dictationOffNote), text: $inputText, selection: $inputSelection, axis: .vertical)
                 .textFieldStyle(.plain)
                 .lineLimit(1...6)
                 .focused($isTextFieldFocused)

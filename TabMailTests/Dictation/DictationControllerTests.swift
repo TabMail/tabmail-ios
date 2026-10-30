@@ -1816,10 +1816,10 @@ struct DictationOptOutFlagTests {
     /// can't be edited, and a tap on it stops listening; otherwise nothing covers it.
     @Test func theWaveformDimsTheInputInPlace() throws {
         let source = try pillSource()
-        let field = String(try slice(source, from: "TextField(isComposeMode ?", to: "if isWorking {"))
+        let field = String(try slice(source, from: "TextField(PillDictationMode.placeholder(", to: "if isWorking {"))
         // The field dims and ignores touches beneath the overlay, which stays full strength and
         // tappable: both modifiers come before it.
-        let beneath = try slice(field, from: "TextField(isComposeMode ?", to: ".overlay {")
+        let beneath = try slice(field, from: "TextField(PillDictationMode.placeholder(", to: ".overlay {")
         #expect(beneath.contains(".opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)"))
         #expect(beneath.contains(".allowsHitTesting(!dictation.isActive)"))
         #expect(beneath.contains(".accessibilityHidden(dictation.isActive)"))
