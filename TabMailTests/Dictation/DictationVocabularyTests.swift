@@ -72,6 +72,25 @@ struct DictationVocabularyTests {
         #expect(Array(firstHundred.filter { $0.hasPrefix("typed") }) == Array(words("typed", typed).prefix(firstHundred.filter { $0.hasPrefix("typed") }.count)))
     }
 
+    /// No typed words, only learned ones, with the context competing: the terms keep their 30 and the
+    /// learned words take the other 70; a learned word is never promoted ahead of the terms.
+    @Test func learnedWordsAloneLeaveTheTermsTheirThirty() {
+        let off = list(typed: 0, learned: 150, terms: 50, overflow: false)
+        #expect(off == words("term", 30) + words("learned", 70))
+        let on = list(typed: 0, learned: 150, terms: 50, overflow: true)
+        #expect(on == words("term", 30) + words("learned", 70) + Array(words("learned", 150).dropFirst(70)) + Array(words("term", 50).dropFirst(30)))
+        #expect(on.count == DictationConfig.vocabularyMaxTerms)
+    }
+
+    /// Fewer than 20 learned words under typed pressure: the learned words keep only what exist, and the
+    /// typed words take the rest (65 typed, 30 terms, 5 learned), in that order.
+    @Test func fewLearnedWordsReserveOnlyWhatExists() {
+        let off = list(typed: 100, learned: 5, terms: 50, overflow: false)
+        #expect(off == words("typed", 65) + words("term", 30) + words("learned", 5))
+        let on = list(typed: 100, learned: 5, terms: 50, overflow: true)
+        #expect(on == off + Array(words("typed", 100).dropFirst(65)) + Array(words("term", 50).dropFirst(30)))
+    }
+
     /// A term that is a dictionary word in another case is sent once, as the dictionary's.
     @Test func aTermMatchingADictionaryWordInAnotherCaseIsSentOnce() {
         let sent = DictationVocabulary.list(words: ["Xyvora", "Brevalle"], typedCount: 2, terms: ["xyvora", "Kaelthorne"], includesOverflow: true)

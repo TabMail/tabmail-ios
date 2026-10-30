@@ -240,6 +240,7 @@ struct DictationLongDictationTests {
         retryNoticeDelay: Duration = .seconds(60),
         language: String? = nil,
         words: [String] = [],
+        typedCount: Int? = nil,
         emailBody: @escaping DictationController.EmailBody = { _ in nil },
         useWords: @escaping @MainActor ([String]) -> Void = { _ in },
         polisher: Polisher = Polisher(),
@@ -254,7 +255,7 @@ struct DictationLongDictationTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
             smartDictation: { smartDictation },
-            dictionary: { .init(words: words, learnsWords: false) },
+            dictionary: { .init(words: words, learnsWords: false, typedCount: typedCount) },
             emailBody: emailBody,
             corrections: nil,
             useWords: useWords,
@@ -568,9 +569,12 @@ struct DictationLongDictationTests {
         #expect(backend.vocabularies.allSatisfy { $0.contains("Brevalle Labs") })
     }
 
-    /// Every chunk goes with the same ordered vocabulary a single recording does: the first 100 words
-    /// (the dictionary's 70, the terms' 30), then the overflow for the cleanup, up to 200.
-    @Test func everyChunkGoesWithTheOrderedVocabularyCappedAtTheBackendsLimit() async {
+    /// Every chunk goes with the same ordered vocabulary a single recording does, for a dictionary of
+    /// 100 typed and 50 learned words and 80 context terms: the first 100 are the typed (50), terms (30)
+    /// and learned (20) words; with Smart Dictation on the overflow follows up to 200 and the cleanup
+    /// gets every dictionary word; off, only the first 100 are sent and there is no cleanup.
+    @Test(arguments: [true, false])
+    func everyChunkGoesWithTheOrderedVocabularyCappedAtTheBackendsLimit(smartDictation: Bool) async {
         func name(_ prefix: String, _ i: Int) -> String {
             let letters = Array("abcdefghijklmnopqrstuvwxyz")
             return prefix + String(letters[i / letters.count]) + String(letters[i % letters.count])
@@ -579,7 +583,9 @@ struct DictationLongDictationTests {
         let terms = (0..<80).map { name("Xyv", $0) }
         let capture = SpeakingCapture()
         let backend = ChunkBackend()
-        let controller = controller(capture, backend, words: words, emailBody: { _ in "ask " + terms.joined(separator: " and ") + " today" })
+        let controller = controller(
+            capture, backend, words: words, typedCount: 100,
+            emailBody: { _ in "ask " + terms.joined(separator: " and ") + " today" }, smartDictation: smartDictation)
         let pasted = pasted
         controller.start(context: DictationContext(windowTitle: "Chat", screenText: "Me: hi\n» ‸", emailId: "email-1"), canUseAI: true) { text in pasted.texts.withLock { $0.append(text) } }
         await waitUntil { capture.starts == 1 }
@@ -588,10 +594,20 @@ struct DictationLongDictationTests {
         controller.finish()
         await waitUntil { controller.phase == .idle }
 
-        let expected = Array(words.prefix(70)) + Array(terms.prefix(30)) + Array(words[70..<150]) + Array(terms[30..<50])
+        let firstHundred = Array(words.prefix(50)) + Array(terms.prefix(30)) + Array(words[100..<120])
+        let overflow = Array(words[50..<100]) + Array(words[120..<150]) + Array(terms[30..<50])
         #expect(backend.vocabularies.count == 2)
-        #expect(backend.vocabularies.allSatisfy { $0 == expected })
-        #expect(expected.count == DictationConfig.vocabularyMaxTerms)
+        guard backend.vocabularies.count == 2 else { return }
+        if smartDictation {
+            #expect(backend.vocabularies.allSatisfy { $0 == firstHundred + overflow })
+            #expect((firstHundred + overflow).count == DictationConfig.vocabularyMaxTerms)
+            #expect(backend.cleanups.allSatisfy { $0?["dictionary"] == words.joined(separator: "\n") })
+        } else {
+            #expect(backend.vocabularies.allSatisfy { $0 == firstHundred })
+            #expect(firstHundred.count == DictationConfig.speechVocabularyTerms)
+            #expect(backend.cleanups.allSatisfy { $0 == nil })
+        }
+        #expect(pasted.texts.withLock { $0 }.count == 1)
     }
 
     /// A long dictation marks what its chunks heard as used, for the dictionary's learned words, as
