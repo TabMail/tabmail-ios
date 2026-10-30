@@ -172,6 +172,12 @@ final class BulletSync {
         return write(states, kind: .reset) ? BulletCommitResult(outcome: .saved, fields: ordered) : BulletCommitResult(outcome: .unsaved, fields: [])
     }
 
+    /// The parts held for incomplete snapshots (DS-CHUNK): each counts toward the receive bound
+    /// (DS-RECEIVE, Bound) as one waiting message.
+    func heldParts() -> Int {
+        buffers.values.reduce(0) { $0 + $1.received.count }
+    }
+
     /// The connection ended: incomplete snapshots are dropped (DS-CHUNK).
     func disconnected() {
         buffers.removeAll()

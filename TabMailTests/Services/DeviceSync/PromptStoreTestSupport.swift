@@ -61,4 +61,15 @@ enum ForeignBulletMessage {
         let snap = String(format: "%016x", sequence)
         return #"{"type":"bullet_state","v":1,"field":"kb","sender":"\#(sender)","snap":"\#(snap)","part":1,"parts":1,"bullets":[["","\#(text)","\#(name)",1]],"seen":{"\#(name)":1}}"#
     }
+
+    /// One part of a snapshot of two bullets (texts `first` and `second`): part 1 holds the first bullet,
+    /// part 2 the second. `sender` and `snap` are 16 lowercase hex digits; the bullets' names derive from
+    /// `snap`, so both parts agree on them and on the seen map.
+    static func kbPart(_ part: Int, first: String, second: String, sender: String, snap: String) -> String {
+        let one = "a1a1" + snap.suffix(12)
+        let two = "a2a2" + snap.suffix(12)
+        let text = part == 1 ? first : second
+        let name = part == 1 ? one : two
+        return #"{"type":"bullet_state","v":1,"field":"kb","sender":"\#(sender)","snap":"\#(snap)","part":\#(part),"parts":2,"bullets":[["","\#(text)","\#(name)",1]],"seen":{"\#(one)":1,"\#(two)":1}}"#
+    }
 }

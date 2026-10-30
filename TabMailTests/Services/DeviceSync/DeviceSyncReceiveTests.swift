@@ -100,6 +100,42 @@ struct DeviceSyncReceiveTests {
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
+    @Test("Parts held for incomplete snapshots count toward the bound: a sender that restarts with a part lost each time cannot grow the receiver without limit (DS-RECEIVE, Bound)")
+    func heldPartsCountTowardTheBound() async throws {
+        quietDevice()
+        let tag = PromptStoreTestCleanup.tag()
+        let restarts = BulletSyncConfig.maxWaitingReceives + 44
+        for index in 0..<restarts {
+            let id = String(format: "%016x", index + 1)
+            sync.handleMessage(ForeignBulletMessage.kbPart(1, first: "\(tag) lost \(index)", second: "\(tag) never", sender: id, snap: id))
+        }
+        // Wait until the held count stops moving.
+        var last = -1
+        while true {
+            try await Task.sleep(for: .milliseconds(400))
+            let now = store.bullets.heldParts
+            if now == last { break }
+            last = now
+        }
+        let held = store.bullets.heldParts
+        #expect(held < BulletSyncConfig.maxWaitingReceives, "the receiver holds fewer parts than the bound: \(held)")
+        #expect(held > 0 && held < restarts, "the connection was renewed once and the parts after it are held again: \(held)")
+        // A whole split snapshot sent after the renewal still lands.
+        let id = String(format: "%016x", restarts + 1)
+        sync.handleMessage(ForeignBulletMessage.kbPart(1, first: "\(tag) whole one", second: "\(tag) whole two", sender: id, snap: id))
+        sync.handleMessage(ForeignBulletMessage.kbPart(2, first: "\(tag) whole one", second: "\(tag) whole two", sender: id, snap: id))
+        #expect(try await waitUntil(5) { has("\(tag) whole one") && has("\(tag) whole two") })
+        // The control: a snapshot whose parts all arrive holds nothing once it is complete.
+        let before = store.bullets.heldParts
+        let control = String(format: "%016x", restarts + 2)
+        sync.handleMessage(ForeignBulletMessage.kbPart(1, first: "\(tag) control one", second: "\(tag) control two", sender: control, snap: control))
+        sync.handleMessage(ForeignBulletMessage.kbPart(2, first: "\(tag) control one", second: "\(tag) control two", sender: control, snap: control))
+        #expect(try await waitUntil(5) { has("\(tag) control one") && has("\(tag) control two") })
+        #expect(store.bullets.heldParts == before, "a complete snapshot leaves no part held")
+        store.bullets.disconnected()
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
     // MARK: - TB #194, on iOS: nothing older lands on a newer local edit
 
     private static let configKeys = [PromptStore.actionCompactThresholdKey, PromptStore.actionCompactThresholdCharsKey, ActionCompactConfig.updatedAtKey]

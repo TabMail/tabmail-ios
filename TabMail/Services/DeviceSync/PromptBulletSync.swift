@@ -15,9 +15,10 @@ enum BulletSyncConfig {
     /// this, and again while it stays busy, until it applies or the connection ends (R32). The same as
     /// Thunderbird's `SETTINGS.deviceSync.busyReapplyMs`.
     static let busyReapplySeconds: Double = 2
-    /// Received messages waiting to be applied on one connection, at most (R32): a store held so long
-    /// that more pile up ends the connection, which drops them all, and every peer sends its state again
-    /// on the next connect (R12). A connect brings a few messages per peer and field.
+    /// Received messages waiting to be applied on one connection, at most (R32), each part held for an
+    /// incomplete snapshot counting as one: a store held so long that more pile up, or a sender that keeps
+    /// restarting with a part lost each time, ends the connection, which drops them all, and every peer
+    /// sends its state again on the next connect (R12). A connect brings a few messages per peer and field.
     static let maxWaitingReceives = 256
 }
 
@@ -186,6 +187,9 @@ final class PromptBulletSync {
     func disconnected() {
         engine.disconnected()
     }
+
+    /// The parts held for incomplete snapshots now (DS-RECEIVE, Bound).
+    var heldParts: Int { engine.heldParts() }
 
     /// Sends `fields`' full state (DS-SEND). A field with one bullet over the relay's budget is not
     /// sent (logged by the engine).

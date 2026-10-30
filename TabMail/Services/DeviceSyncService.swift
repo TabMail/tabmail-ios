@@ -76,6 +76,9 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     /// The received messages of this connection in `receiveChain` not yet finished, at most
     /// `BulletSyncConfig.maxWaitingReceives`.
     private var waitingReceives = 0
+    /// The parts the engine held for incomplete snapshots after the last `bullet_state` applied on this
+    /// connection; they count toward the same bound as waiting messages (DS-RECEIVE, Bound).
+    private var heldParts = 0
     /// Renewed when the connection ends: a message received on an earlier connection is never applied
     /// again (peers send their state on every connect).
     private var connectionID = UUID()
@@ -682,8 +685,9 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     /// (DS-VALIDATE); the parts of a snapshot apply in arrival order, after every message received before
     /// them (DS-CHUNK).
     private func receiveBulletState(_ message: [String: Any]) {
-        applyReceived("bullet_state \(message["sender"] ?? "") \(message["field"] ?? "") \(message["snap"] ?? "") \(message["part"] ?? "")") { access in
+        applyReceived("bullet_state \(message["sender"] ?? "") \(message["field"] ?? "") \(message["snap"] ?? "") \(message["part"] ?? "")") { [weak self] access in
             try access.receive(message)
+            self?.heldParts = PromptStore.shared.bullets.heldParts
         }
     }
 
@@ -692,8 +696,8 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     private func applyReceived(_ key: String, _ apply: @escaping @MainActor (PromptAccess) throws -> Void) {
         // Never a queue without limit behind a busy store: past the bound the connection ends, dropping
         // every message waiting on it, and the next connect brings every peer's state again.
-        guard waitingReceives < BulletSyncConfig.maxWaitingReceives else {
-            BackgroundSyncLogger.logDebug("[DeviceSync] \(waitingReceives) received messages wait for the prompt store: the connection is renewed")
+        guard waitingReceives + heldParts < BulletSyncConfig.maxWaitingReceives else {
+            BackgroundSyncLogger.logDebug("[DeviceSync] \(waitingReceives) received messages wait for the prompt store and \(heldParts) parts of incomplete snapshots are held: the connection is renewed")
             connectionEnded()
             forceReconnect()
             return
@@ -747,6 +751,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         PromptStore.shared.bullets.disconnected()
         connectionID = UUID()
         waitingReceives = 0
+        heldParts = 0
     }
 
     /// Sends one `bullet_state` message while connected.
