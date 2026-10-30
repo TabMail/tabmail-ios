@@ -155,6 +155,22 @@ struct PromptStoreBoundaryTests {
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
+    @Test("A hung AI call holds nothing: another edit saves while the model runs, and the late write is dropped (DS-AI, I4)")
+    func aHungAICallDoesNotBlockTheStore() async throws {
+        let tag = PromptStoreTestCleanup.tag()
+        let capture = try await read(.kb)
+        // The model call is out and never answers in this test; it must hold neither the semaphore nor a second queue.
+        try await Task.sleep(for: .milliseconds(1500))
+        let started = ContinuousClock.now
+        let local = await store.edit("while the model runs") { try $0.addBullet("\(tag) while", to: .knowledgeBase) }
+        #expect(local == .saved)
+        #expect(ContinuousClock.now - started < .seconds(1))
+        let otherField = await store.edit("other field") { try $0.addBullet("\(tag) rule", to: .noneRules) }
+        #expect(otherField == .saved)
+        #expect(await store.writeAfterRead(capture, text: capture.text + "\n- \(tag) late", "late write") == .dropped)
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
     @Test("Disconnect and a nested call never wait: the second is refused at once (I4, DS-NESTED)")
     func neverAnInfiniteBlock() async throws {
         let holder = await PromptStoreHolder(store)
