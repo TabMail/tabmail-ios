@@ -6,7 +6,7 @@ import Foundation
 
 /// Why the prompt store refused a call (DS-SEMAPHORE, DS-COUNTER).
 enum PromptRefusal: Error, Equatable, Sendable {
-    /// Another caller held the semaphore through every retry, or the call was made inside a hold (DS-NESTED).
+    /// Another caller held the semaphore for the whole wait, or the call was made inside a hold (DS-NESTED).
     case busy
     /// An AI writer's counter moved since it read (DS-AI), or its hold ran past its lease (DS-LEASE).
     case changed
@@ -37,7 +37,8 @@ struct PromptHold {
 ///
 /// Never an infinite block: a hold is released on every exit of its body (DS-SEMAPHORE); a hold past
 /// its lease loses the semaphore (DS-LEASE); a call made inside a hold is refused at once (DS-NESTED,
-/// a task-local marks the holding task); a waiting caller retries a capped number of times. Sign-in
+/// a task-local marks the holding task); a waiting caller waits in one first-in-first-out queue for a
+/// capped time, so the user's later gesture never lands before an earlier one. Sign-in
 /// state never refuses a hold: the texts are the device's, and only the AI calls and Device Sync need
 /// an account (DS-DEVICE).
 ///
@@ -48,14 +49,11 @@ final class PromptSemaphore {
     struct Config: Sendable {
         /// DS-LEASE: a hold running longer than this loses the semaphore.
         var leaseSeconds: Double
-        /// DS-SEMAPHORE: retries after the first busy refusal. The waits double from `retryBaseDelayMs`,
-        /// each plus up to `retryJitterMs` at random, so with the standard values a caller gives up as
-        /// busy within about 6.7 s (200 + 400 + 800 + 1600 + 3200 ms, plus up to 5 x 100 ms).
-        var retries: Int
-        var retryBaseDelayMs: Int
-        var retryJitterMs: Int
+        /// DS-SEMAPHORE, request order: how long a caller refused because another holds the semaphore
+        /// waits, in one first-in-first-out queue, before it is refused as busy.
+        var acquireWaitSeconds: Double
 
-        static let standard = Config(leaseSeconds: 15, retries: 5, retryBaseDelayMs: 200, retryJitterMs: 100)
+        static let standard = Config(leaseSeconds: 15, acquireWaitSeconds: 6)
     }
 
     /// DS-NESTED: the holding task's hold, so a nested call is refused instead of waiting on itself.
@@ -70,35 +68,36 @@ final class PromptSemaphore {
 
     private var holder: (token: UUID, label: String, lease: Task<Void, Never>)?
 
+    /// DS-SEMAPHORE, request order: the callers waiting, oldest first. A request never takes the
+    /// semaphore while an earlier one still waits; a release hands it to the head.
+    private struct Waiter {
+        let token: UUID
+        let label: String
+        let resolve: (Bool) -> Void
+    }
+
+    private var queue: [Waiter] = []
+
     init(config: Config = .standard) {
         self.config = config
     }
 
-    /// Runs `body` holding the semaphore, waiting for it with capped backoff while another caller holds
-    /// it, and releasing it on every exit.
+    /// Runs `body` holding the semaphore, waiting for its turn in the queue for at most
+    /// `config.acquireWaitSeconds` while another caller holds it, and releasing it on every exit.
     func hold<T>(_ label: String, _ body: (PromptHold) async throws -> T) async throws -> T {
         if let outer = Self.holding {
             BackgroundSyncLogger.logDebug("[PromptStore] \(label) refused: called inside the hold \(outer.uuidString.prefix(8))")
             throw PromptRefusal.busy
         }
-        var retry = 0
-        while let current = holder {
-            guard retry < config.retries else {
-                BackgroundSyncLogger.logDebug("[PromptStore] \(label) refused: \(current.label) held the prompt store through every retry")
+        let token = UUID()
+        if holder != nil {
+            guard await waitForTurn(token, label) else {
+                BackgroundSyncLogger.logDebug("[PromptStore] \(label) refused: the prompt store stayed held for \(config.acquireWaitSeconds) s")
                 throw PromptRefusal.busy
             }
-            let wait = (config.retryBaseDelayMs << retry) + Int.random(in: 0...max(0, config.retryJitterMs))
-            retry += 1
-            try? await Task.sleep(for: .milliseconds(wait))
+        } else {
+            acquire(token, label)
         }
-        let token = UUID()
-        let lease = Task { [weak self, leaseSeconds = config.leaseSeconds] in
-            try? await Task.sleep(for: .seconds(leaseSeconds))
-            guard !Task.isCancelled, let self, self.holder?.token == token else { return }
-            BackgroundSyncLogger.logDebug("[PromptStore] \(label) ran past its lease: it lost the prompt store")
-            self.holder = nil
-        }
-        holder = (token, label, lease)
         defer { release(token) }
         return try await Self.$holding.withValue(token) { try await body(PromptHold(token: token, semaphore: self)) }
     }
@@ -113,9 +112,56 @@ final class PromptSemaphore {
         counter = UUID()
     }
 
+    /// Takes the semaphore for `token` with its lease.
+    private func acquire(_ token: UUID, _ label: String) {
+        let lease = Task { [weak self, leaseSeconds = config.leaseSeconds] in
+            try? await Task.sleep(for: .seconds(leaseSeconds))
+            guard !Task.isCancelled, let self, self.holder?.token == token else { return }
+            BackgroundSyncLogger.logDebug("[PromptStore] \(label) ran past its lease: it lost the prompt store")
+            self.holder = nil
+            self.grantNext()
+        }
+        holder = (token, label, lease)
+    }
+
+    /// Waits in the queue; true when the semaphore was handed over, false at the deadline or when the
+    /// waiting task was cancelled (the waiter is then dropped from the queue).
+    private func waitForTurn(_ token: UUID, _ label: String) async -> Bool {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                guard !Task.isCancelled else { return continuation.resume(returning: false) }
+                let deadline = Task { [weak self, wait = config.acquireWaitSeconds] in
+                    try? await Task.sleep(for: .seconds(wait))
+                    self?.drop(token)
+                }
+                queue.append(Waiter(token: token, label: label) { granted in
+                    deadline.cancel()
+                    continuation.resume(returning: granted)
+                })
+            }
+        } onCancel: {
+            Task { @MainActor in self.drop(token) }
+        }
+    }
+
+    /// Removes `token` from the queue and refuses it, when it still waits.
+    private func drop(_ token: UUID) {
+        guard let at = queue.firstIndex(where: { $0.token == token }) else { return }
+        queue.remove(at: at).resolve(false)
+    }
+
+    /// Hands the free semaphore to the oldest waiter.
+    private func grantNext() {
+        guard holder == nil, !queue.isEmpty else { return }
+        let next = queue.removeFirst()
+        acquire(next.token, next.label)
+        next.resolve(true)
+    }
+
     private func release(_ token: UUID) {
         guard let current = holder, current.token == token else { return }
         current.lease.cancel()
         holder = nil
+        grantNext()
     }
 }

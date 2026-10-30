@@ -123,7 +123,7 @@ struct PromptStoreBoundaryTests {
         // The seed's own debounced history entry (2 s) lands first, so the baselines below are settled.
         try await Task.sleep(for: .milliseconds(2500))
         let config = store.semaphore.config
-        store.semaphore.config = PromptSemaphore.Config(leaseSeconds: 0.05, retries: config.retries, retryBaseDelayMs: config.retryBaseDelayMs, retryJitterMs: config.retryJitterMs)
+        store.semaphore.config = PromptSemaphore.Config(leaseSeconds: 0.05, acquireWaitSeconds: config.acquireWaitSeconds)
         defer { store.semaphore.config = config }
         let ops = operations(tag: tag, capture: capture, shown: shown)
         for (name, run) in ops {
@@ -171,11 +171,70 @@ struct PromptStoreBoundaryTests {
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
+    // MARK: - DS-SEMAPHORE request order: the user's later gesture wins
+
+    /// The knowledge base's bullet texts as a person sees them.
+    private func kbTexts() -> [String] {
+        store.shown(.knowledgeBase).map(\.text)
+    }
+
+    @Test("An older delete of a line and a newer add of it, both refused while the store is held, end with the line present (request order)")
+    func deleteThenAddEndsAdded() async throws {
+        let tag = PromptStoreTestCleanup.tag()
+        let line = "\(tag) inversion"
+        #expect(await store.edit("seed") { try $0.addBullet(line, to: .knowledgeBase) } == .saved)
+        guard let shown = store.shown(.knowledgeBase).first(where: { $0.text == line }) else {
+            Issue.record("the seeded line is not shown")
+            return
+        }
+        let holder = await PromptStoreHolder(store)
+        let config = store.semaphore.config
+        store.semaphore.config = PromptSemaphore.Config(leaseSeconds: config.leaseSeconds, acquireWaitSeconds: 5)
+        defer { store.semaphore.config = config }
+        // The older gesture: a page delete of the line it showed.
+        let older = Task { @MainActor in await store.edit("older delete") { try $0.deleteShown(shown, from: .knowledgeBase) } }
+        try await Task.sleep(for: .milliseconds(50))
+        // The newer gesture: a tool add of the same line (it found the line still there before the delete landed).
+        let newer = Task { @MainActor in await store.edit("newer add") { try $0.addBullet(line, to: .knowledgeBase) } }
+        try await Task.sleep(for: .milliseconds(50))
+        try await holder.end()
+        #expect(await older.value == .saved)
+        _ = await newer.value
+        #expect(kbTexts().contains(line), "the newer add landed last and the line is present")
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
+    @Test("An older add of a line and a newer delete of it by a tool that reads inside its hold end with the line absent (request order)")
+    func addThenDeleteEndsDeleted() async throws {
+        let tag = PromptStoreTestCleanup.tag()
+        let line = "\(tag) inversion"
+        let holder = await PromptStoreHolder(store)
+        let config = store.semaphore.config
+        store.semaphore.config = PromptSemaphore.Config(leaseSeconds: config.leaseSeconds, acquireWaitSeconds: 5)
+        defer { store.semaphore.config = config }
+        let older = Task { @MainActor in await store.edit("older add") { try $0.addBullet(line, to: .knowledgeBase) } }
+        try await Task.sleep(for: .milliseconds(50))
+        let newer = Task { @MainActor in
+            await store.edit("newer tool delete") { access in
+                try access.editText(.kb) { text in
+                    let kept = text.split(separator: "\n", omittingEmptySubsequences: false).filter { !$0.contains(line) }
+                    return kept.joined(separator: "\n")
+                }
+            }
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        try await holder.end()
+        #expect(await older.value == .saved)
+        _ = await newer.value
+        #expect(!kbTexts().contains(line), "the newer delete landed last and the line is absent")
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
     @Test("Disconnect and a nested call never wait: the second is refused at once (I4, DS-NESTED)")
     func neverAnInfiniteBlock() async throws {
         let holder = await PromptStoreHolder(store)
         let config = store.semaphore.config
-        store.semaphore.config = PromptSemaphore.Config(leaseSeconds: config.leaseSeconds, retries: 1, retryBaseDelayMs: 10, retryJitterMs: 0)
+        store.semaphore.config = PromptSemaphore.Config(leaseSeconds: config.leaseSeconds, acquireWaitSeconds: 0.05)
         defer { store.semaphore.config = config }
         let started = ContinuousClock.now
         let outcome = await store.edit("busy") { _ in .saved }

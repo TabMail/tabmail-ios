@@ -16,10 +16,10 @@ struct DeviceSyncReceiveTests {
     private let store = PromptStore.shared
     private let sync = DeviceSyncService.shared
 
-    /// Short retries so a busy refusal comes in milliseconds; the 2 s re-apply is the production value.
+    /// A short wait so a busy refusal comes in milliseconds; the 2 s re-apply is the production value.
     private func shortRetries() -> PromptSemaphore.Config {
         let config = store.semaphore.config
-        store.semaphore.config = PromptSemaphore.Config(leaseSeconds: 15, retries: 1, retryBaseDelayMs: 10, retryJitterMs: 0)
+        store.semaphore.config = PromptSemaphore.Config(leaseSeconds: 15, acquireWaitSeconds: 0.05)
         return config
     }
 

@@ -137,7 +137,7 @@ enum PromptEditOutcome: Equatable, Sendable {
     /// An AI writer's counter moved since its read (DS-AI), the hold ran past its lease (DS-LEASE), or demo
     /// mode started or ended since the read (DS-DEMO): the write is dropped.
     case dropped
-    /// The prompt store stayed busy through every retry (DS-SEMAPHORE): nothing changed; try again in a
+    /// The prompt store stayed held for the whole wait (DS-SEMAPHORE): nothing changed; try again in a
     /// moment.
     case busy
 }
@@ -447,7 +447,7 @@ final class PromptStore {
     // MARK: - The one way in (DS-SEMAPHORE)
 
     /// The one way to read or write the three bullet fields and their history (DS-SEMAPHORE): `body` runs
-    /// holding this device's prompt semaphore, waiting for it with capped backoff
+    /// holding this device's prompt semaphore, waiting for it in request order for a capped time
     /// (`PromptSemaphore.Config`), and releases it on every exit. It must be brief and must never wait on
     /// the AI: an AI writer reads with `readBeforeAI`, calls the AI holding nothing, and writes with
     /// `writeAfterRead`. Throws `PromptRefusal` (busy, or the hold lost the semaphore).

@@ -8,14 +8,14 @@ import Testing
 
 /// The prompt store's one semaphore (DS-SEMAPHORE): never an infinite block. A hold is released on every
 /// exit (DS-SEMAPHORE), a hold past its lease loses it and its write is refused (DS-LEASE), a nested call
-/// is refused at once (DS-NESTED), and a waiting caller gives up after capped retries.
+/// is refused at once (DS-NESTED), and a waiting caller waits in one first-in-first-out queue for a capped time (DS-SEMAPHORE, request order).
 @MainActor
 @Suite("Prompt semaphore", .serialized)
 struct PromptSemaphoreTests {
     private struct Failure: Error {}
 
     /// Short waits, so a busy refusal comes within milliseconds.
-    private static let fast = PromptSemaphore.Config(leaseSeconds: 15, retries: 2, retryBaseDelayMs: 10, retryJitterMs: 0)
+    private static let fast = PromptSemaphore.Config(leaseSeconds: 15, acquireWaitSeconds: 0.05)
 
     /// Holds `semaphore` from another task until `end()`.
     @MainActor
@@ -50,7 +50,7 @@ struct PromptSemaphoreTests {
     /// Whether a new hold is taken at once (nothing holds the semaphore).
     private func free(_ semaphore: PromptSemaphore) async -> Bool {
         let config = semaphore.config
-        semaphore.config = PromptSemaphore.Config(leaseSeconds: config.leaseSeconds, retries: 0, retryBaseDelayMs: 0, retryJitterMs: 0)
+        semaphore.config = PromptSemaphore.Config(leaseSeconds: config.leaseSeconds, acquireWaitSeconds: 0)
         defer { semaphore.config = config }
         return (try? await semaphore.hold("probe") { _ in true }) == true
     }
@@ -80,7 +80,7 @@ struct PromptSemaphoreTests {
 
     @Test("A hold past its lease loses the semaphore: its write check fails, and the counter does not move")
     func leaseExpiry() async throws {
-        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 0.05, retries: 0, retryBaseDelayMs: 0, retryJitterMs: 0))
+        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 0.05, acquireWaitSeconds: 0))
         let counter = semaphore.counter
         let (heldAtStart, heldAfter, refused) = try await semaphore.hold("slow") { hold in
             let start = hold.isHolder
@@ -101,7 +101,7 @@ struct PromptSemaphoreTests {
     @Test("A call made inside a hold is refused as busy at once, never waiting on itself")
     func nestedCallRefusedAtOnce() async throws {
         // Long waits: a nested call that waited would take seconds.
-        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 15, retries: 5, retryBaseDelayMs: 1000, retryJitterMs: 0))
+        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 15, acquireWaitSeconds: 1))
         let started = ContinuousClock.now
         try await semaphore.hold("outer") { _ in
             await #expect(throws: PromptRefusal.busy) {
@@ -118,7 +118,7 @@ struct PromptSemaphoreTests {
 
     @Test("A task created inside a hold under the cleared mark waits for the hold instead of being refused as nested")
     func taskUnderClearedMarkIsNotNested() async throws {
-        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 15, retries: 5, retryBaseDelayMs: 20, retryJitterMs: 0))
+        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 15, acquireWaitSeconds: 5))
         let later: Task<String, Error> = try await semaphore.hold("outer") { _ in
             PromptSemaphore.$holding.withValue(nil) {
                 Task { @MainActor in try await semaphore.hold("later") { _ in "ran" } }
@@ -127,8 +127,8 @@ struct PromptSemaphoreTests {
         #expect(try await later.value == "ran")
     }
 
-    @Test("A waiting caller gives up as busy after its capped retries, within the bounded wait")
-    func cappedRetries() async throws {
+    @Test("A waiting caller gives up as busy at the end of its wait")
+    func cappedWait() async throws {
         let semaphore = PromptSemaphore(config: Self.fast)
         let holder = await Holder(semaphore)
         let started = ContinuousClock.now
@@ -136,26 +136,119 @@ struct PromptSemaphoreTests {
             try await semaphore.hold("waiter") { _ in }
         }
         let waited = ContinuousClock.now - started
-        // 10 + 20 ms of backoff, no jitter.
-        #expect(waited >= .milliseconds(30))
+        #expect(waited >= .milliseconds(45))
         #expect(waited < .seconds(2))
         try await holder.end()
         #expect(await free(semaphore))
     }
 
-    @Test("The standard retry schedule is 5 retries doubling from 200 ms, 15 s lease (DS-SEMAPHORE, DS-LEASE)")
+    @Test("The standard wait is 6 s in one queue, with a 15 s lease (DS-SEMAPHORE, DS-LEASE)")
     func standardConfig() {
         let standard = PromptSemaphore.Config.standard
         #expect(standard.leaseSeconds == 15)
-        #expect(standard.retries == 5)
-        #expect(standard.retryBaseDelayMs == 200)
-        #expect(standard.retryJitterMs == 100)
-        #expect((0..<standard.retries).reduce(0) { $0 + (standard.retryBaseDelayMs << $1) } == 6200)
+        #expect(standard.acquireWaitSeconds == 6)
+    }
+
+    /// Starts `label` waiting for `semaphore`, appending to `order` when it runs, and returns once it queues.
+    private func waiter(_ semaphore: PromptSemaphore, _ label: String, order: OrderLog) async throws -> Task<Void, Error> {
+        let task = Task { @MainActor in
+            try await semaphore.hold(label) { _ in order.entries.append(label) }
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        return task
+    }
+
+    @MainActor
+    private final class OrderLog {
+        var entries: [String] = []
+    }
+
+    @Test("Waiters take the semaphore in the order they asked, whichever way they are scheduled (DS-SEMAPHORE, request order)")
+    func firstInFirstOut() async throws {
+        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 15, acquireWaitSeconds: 5))
+        let order = OrderLog()
+        let holder = await Holder(semaphore)
+        var tasks: [Task<Void, Error>] = []
+        for label in ["first", "second", "third", "fourth"] {
+            tasks.append(try await waiter(semaphore, label, order: order))
+        }
+        try await holder.end()
+        for task in tasks { try await task.value }
+        #expect(order.entries == ["first", "second", "third", "fourth"])
+    }
+
+    @Test("A request made as the holder releases queues behind the waiter instead of taking the semaphore")
+    func newcomerNeverJumpsTheQueue() async throws {
+        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 15, acquireWaitSeconds: 5))
+        let order = OrderLog()
+        var newcomer: Task<Void, Error>?
+        let early = Task { @MainActor in
+            try await semaphore.hold("holder") { _ in
+                // A waiter queues behind the holder; a newcomer asks while the holder is still in its body.
+                try await Task.sleep(for: .milliseconds(80))
+            }
+        }
+        try await Task.sleep(for: .milliseconds(20))
+        let older = try await waiter(semaphore, "older", order: order)
+        // The holder releases in ~30 ms; ask for the semaphore from a task that runs right after it.
+        newcomer = Task { @MainActor in
+            try await early.value
+            try await semaphore.hold("newcomer") { _ in order.entries.append("newcomer") }
+        }
+        try await older.value
+        try await newcomer?.value
+        #expect(order.entries == ["older", "newcomer"])
+    }
+
+    @Test("A cancelled waiter is dropped at once and never handed the semaphore; the next waiter is")
+    func cancelledWaiterIsDropped() async throws {
+        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 15, acquireWaitSeconds: 30))
+        let order = OrderLog()
+        let holder = await Holder(semaphore)
+        let doomed = try await waiter(semaphore, "doomed", order: order)
+        let next = try await waiter(semaphore, "next", order: order)
+        let started = ContinuousClock.now
+        doomed.cancel()
+        await #expect(throws: PromptRefusal.busy) { try await doomed.value }
+        #expect(ContinuousClock.now - started < .seconds(2), "a cancelled waiter does not wait out its deadline")
+        try await holder.end()
+        try await next.value
+        #expect(order.entries == ["next"])
+        #expect(await free(semaphore))
+    }
+
+    @Test("A waiter that reaches its deadline is dropped and the ones behind it keep their place")
+    func deadlineDropsOnlyThatWaiter() async throws {
+        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 15, acquireWaitSeconds: 0.2))
+        let order = OrderLog()
+        let holder = await Holder(semaphore)
+        let early = Task { @MainActor in try await semaphore.hold("early") { _ in order.entries.append("early") } }
+        try await Task.sleep(for: .milliseconds(120))
+        let late = Task { @MainActor in try await semaphore.hold("late") { _ in order.entries.append("late") } }
+        try await Task.sleep(for: .milliseconds(150))
+        // The early waiter's 200 ms passed; the late one has about 170 ms left.
+        await #expect(throws: PromptRefusal.busy) { try await early.value }
+        try await holder.end()
+        try await late.value
+        #expect(order.entries == ["late"])
+    }
+
+    @Test("A holder that never releases hands the semaphore on at its lease: the queue never blocks for good (I4)")
+    func leaseHandsOver() async throws {
+        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 0.1, acquireWaitSeconds: 5))
+        let order = OrderLog()
+        let holder = await Holder(semaphore)
+        let started = ContinuousClock.now
+        let next = try await waiter(semaphore, "next", order: order)
+        try await next.value
+        #expect(order.entries == ["next"])
+        #expect(ContinuousClock.now - started < .seconds(2))
+        try await holder.end()
     }
 
     @Test("A waiting caller takes the semaphore once the holder releases it")
     func waiterTakesItAfterRelease() async throws {
-        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 15, retries: 5, retryBaseDelayMs: 20, retryJitterMs: 0))
+        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 15, acquireWaitSeconds: 5))
         let holder = await Holder(semaphore)
         let waiter = Task { @MainActor in try await semaphore.hold("waiter") { _ in "ran" } }
         try await Task.sleep(for: .milliseconds(10))
