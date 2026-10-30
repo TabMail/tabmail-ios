@@ -370,7 +370,15 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             }
             return
         }
-        broadcastAllFields()
+        // DS-NO-REQUEST: Sync Now sends all three bullet fields, as on connect, then the prompt_state fields.
+        if !DemoModeStore.isDemoActive {
+            applyReceived("sync now") { [weak self] access in
+                try access.sendAll()
+                self?.broadcastAllFields()
+            }
+        } else {
+            broadcastAllFields()
+        }
         probeAllFields()
     }
 
@@ -693,7 +701,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
     /// Applies a received message through the prompt store after every message received before it, only
     /// while the connection it was received on lasts.
-    private func applyReceived(_ key: String, _ apply: @escaping @MainActor (PromptAccess) throws -> Void) {
+    func applyReceived(_ key: String, _ apply: @escaping @MainActor (PromptAccess) throws -> Void) {
         // Never a queue without limit behind a busy store: past the bound the connection ends, dropping
         // every message waiting on it, and the next connect brings every peer's state again.
         guard waitingReceives + heldParts < BulletSyncConfig.maxWaitingReceives else {
@@ -734,8 +742,10 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                     try apply(access)
                 }
                 return
-            } catch PromptRefusal.busy {
-                BackgroundSyncLogger.logDebug("[DeviceSync] The prompt store stayed busy: a received message (\(key.prefix(48))) is applied again shortly")
+            } catch let refusal as PromptRefusal {
+                // Busy after its wait in line, or the hold ended (its lease) before the message was applied:
+                // the message is stale, not unsaved, and is applied again (DS-RECEIVE, DS-LEASE).
+                BackgroundSyncLogger.logDebug("[DeviceSync] A received message (\(key.prefix(48))) was refused (\(refusal)): it is applied again shortly")
                 try? await Task.sleep(for: .seconds(BulletSyncConfig.busyReapplySeconds))
             } catch {
                 BackgroundSyncLogger.logDebug("[DeviceSync] A received message (\(key.prefix(48))) was not applied: \(error)")

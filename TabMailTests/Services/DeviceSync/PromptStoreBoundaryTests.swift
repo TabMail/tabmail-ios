@@ -230,6 +230,19 @@ struct PromptStoreBoundaryTests {
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
+    @Test("A reset records the text it replaces in the history, before it replaces it (DS-HISTORY)")
+    func resetRecordsTheReplacedText() async throws {
+        let tag = PromptStoreTestCleanup.tag()
+        #expect(await store.edit("seed") { try $0.addBullet("\(tag) before reset", to: .knowledgeBase) } == .saved)
+        // Let the debounced local-edit entry land first, so the entry looked for is the reset's.
+        try await Task.sleep(for: .milliseconds(2600))
+        #expect(await store.edit("reset") { try $0.reset(.kb); return .saved } == .saved)
+        let history = try await store.withPromptStore("read history") { try $0.loadHistory() }
+        let entry = history.last { $0.source == "reset" && $0.kb.contains("\(tag) before reset") }
+        #expect(entry != nil, "a reset entry holds the text the reset replaced")
+        #expect(!store.rawKB.contains(tag))
+    }
+
     @Test("Disconnect and a nested call never wait: the second is refused at once (I4, DS-NESTED)")
     func neverAnInfiniteBlock() async throws {
         let holder = await PromptStoreHolder(store)

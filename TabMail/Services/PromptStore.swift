@@ -418,14 +418,16 @@ final class PromptStore {
 
     // MARK: - Bullet commits
 
-    private func willCommitBullets(_ kind: BulletCommitKind, changedText: [BulletField]) {
-        guard !changedText.isEmpty else { return }
+    /// False vetoes the commit: DS-HISTORY, a history save that fails fails the reset or merge it comes
+    /// before, so nothing is replaced without its record.
+    private func willCommitBullets(_ kind: BulletCommitKind, changedText: [BulletField]) -> Bool {
+        guard !changedText.isEmpty else { return true }
         // DS-HISTORY: a reset records the text it replaces, a merge the text before the merge, in the
         // committing hold and before the commit.
         switch kind {
-        case .reset: recordHistory(source: "reset", fields: changedText.map(\.rawValue))
-        case .sync: recordHistory(source: "sync_receive", fields: changedText.map(\.rawValue))
-        case .edit, .upgrade: break
+        case .reset: return recordHistory(source: "reset", fields: changedText.map(\.rawValue))
+        case .sync: return recordHistory(source: "sync_receive", fields: changedText.map(\.rawValue))
+        case .edit, .upgrade: return true
         }
     }
 
@@ -694,7 +696,7 @@ final class PromptStore {
 
     func resetTemplates() {
         if DemoModeStore.isDemoActive { templates = Defaults.templates; return }
-        recordHistory(source: "reset", fields: ["templates"])
+        guard recordHistory(source: "reset", fields: ["templates"]) else { return }
         isSyncApplying = true
         templates = Defaults.templates
         isSyncApplying = false
@@ -883,11 +885,16 @@ final class PromptStore {
 
     /// Record a snapshot of the current state in history: the bullet fields' stored text. Never in demo,
     /// whose history reads as empty: the real history is kept as it is.
-    fileprivate func recordHistory(source: String, fields: [String]) {
-        guard !DemoModeStore.isDemoActive else { return }
+    /// False when the entry could not be saved (DS-HISTORY).
+    @discardableResult
+    fileprivate func recordHistory(source: String, fields: [String]) -> Bool {
+        guard !DemoModeStore.isDemoActive else { return true }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        let templatesStr = (try? encoder.encode(templates)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        guard let templatesData = try? encoder.encode(templates), let templatesStr = String(data: templatesData, encoding: .utf8) else {
+            BackgroundSyncLogger.logDebug("[PromptStore] history entry not recorded: the templates could not be encoded")
+            return false
+        }
 
         let entry = PromptHistoryEntry(
             id: UUID().uuidString,
@@ -905,7 +912,7 @@ final class PromptStore {
         if history.count > Self.maxHistoryEntries {
             history = Array(history.suffix(Self.maxHistoryEntries))
         }
-        saveHistory(history)
+        return saveHistory(history)
     }
 
     /// Load all history entries (newest last). Empty during demo — the real prompt history must not be
@@ -925,7 +932,7 @@ final class PromptStore {
     /// templates as before, with a fresh timestamp so the restore propagates to other devices.
     fileprivate func restoreFromHistory(_ entry: PromptHistoryEntry) {
         guard !DemoModeStore.isDemoActive else { return }
-        recordHistory(source: "reset", fields: ["composition", "action", "kb", "templates"])
+        guard recordHistory(source: "reset", fields: ["composition", "action", "kb", "templates"]) else { return }
         bullets.restore([.composition: entry.composition, .action: entry.action, .kb: entry.kb])
         applySyncedTemplates(entry.decodedTemplates)
         DeviceSyncService.shared.debouncedBroadcast(fields: [.templates])
@@ -939,10 +946,14 @@ final class PromptStore {
         }
     }
 
-    fileprivate func saveHistory(_ entries: [PromptHistoryEntry]) {
-        if let data = try? JSONEncoder().encode(entries) {
-            defaults.set(data, forKey: Self.historyKey)
+    @discardableResult
+    fileprivate func saveHistory(_ entries: [PromptHistoryEntry]) -> Bool {
+        guard let data = try? JSONEncoder().encode(entries) else {
+            BackgroundSyncLogger.logDebug("[PromptStore] history not saved: the entries could not be encoded")
+            return false
         }
+        defaults.set(data, forKey: Self.historyKey)
+        return true
     }
 
     /// One-time migration of existing device_sync_backups into prompt_history.

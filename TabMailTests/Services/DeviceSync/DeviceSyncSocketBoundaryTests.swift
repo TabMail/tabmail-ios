@@ -15,6 +15,8 @@ private final class LoopbackWebSocketServer: @unchecked Sendable {
     /// Read and written on `queue` only.
     private var connection: NWConnection?
     private var open = false
+    /// The text messages the client sent, in order. Read and written on `queue` only.
+    private var received: [String] = []
 
     init() throws {
         let parameters = NWParameters.tcp
@@ -29,7 +31,10 @@ private final class LoopbackWebSocketServer: @unchecked Sendable {
             guard let self else { return }
             self.connection = connection
             connection.stateUpdateHandler = { [weak self] state in
-                if case .ready = state { self?.open = true }
+                if case .ready = state {
+                    self?.open = true
+                    self?.receiveNext(on: connection)
+                }
             }
             connection.start(queue: self.queue)
         }
@@ -49,6 +54,28 @@ private final class LoopbackWebSocketServer: @unchecked Sendable {
             }
             listener.start(queue: queue)
         }
+    }
+
+    private func receiveNext(on connection: NWConnection) {
+        connection.receiveMessage { [weak self] data, _, _, error in
+            guard let self, error == nil else { return }
+            if let data, let text = String(data: data, encoding: .utf8) { self.received.append(text) }
+            self.receiveNext(on: connection)
+        }
+    }
+
+    /// The `field` of every `bullet_state` message received so far.
+    var bulletFields: [String] {
+        queue.sync {
+            received.compactMap { text in
+                guard let object = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any], object["type"] as? String == "bullet_state" else { return nil }
+                return object["field"] as? String
+            }
+        }
+    }
+
+    func forgetReceived() {
+        queue.sync { received.removeAll() }
     }
 
     /// Whether a client's handshake has completed.
@@ -124,6 +151,49 @@ struct DeviceSyncSocketBoundaryTests {
         session.invalidateAndCancel()
         server.stop()
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
+        if let failure { throw failure }
+    }
+
+    @Test("Sync Now on a connected device sends all three bullet fields, as on connect (DS-NO-REQUEST)")
+    func syncNowSendsTheBulletFields() async throws {
+        let defaults = UserDefaults.standard
+        let savedAuto = defaults.object(forKey: "device_sync_auto_enabled")
+        defer { defaults.set(savedAuto, forKey: "device_sync_auto_enabled") }
+        let sync = DeviceSyncService.shared
+        defaults.set(false, forKey: "device_sync_auto_enabled")
+        sync.disconnect()
+        let server = try LoopbackWebSocketServer()
+        let session = URLSession(configuration: .ephemeral)
+        var failure: Error?
+        do {
+            let port = try await server.start()
+            let socket = session.webSocketTask(with: try #require(URL(string: "ws://127.0.0.1:\(port)")))
+            sync.webSocket = socket
+            socket.resume()
+            let deadline = ContinuousClock.now + .seconds(3)
+            while ContinuousClock.now < deadline, !server.isOpen {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            #expect(server.isOpen)
+            // The relay's greeting: the device is connected, and its three fields go out (the control).
+            sync.handleMessage(#"{"type":"connected","userId":"00000000-0000-0000-0000-000000000000"}"#)
+            func fieldsSent() async throws -> Set<String> {
+                let limit = ContinuousClock.now + .seconds(5)
+                while ContinuousClock.now < limit, Set(server.bulletFields).count < 3 {
+                    try await Task.sleep(for: .milliseconds(25))
+                }
+                return Set(server.bulletFields)
+            }
+            #expect(try await fieldsSent() == ["kb", "composition", "action"], "on connect")
+            server.forgetReceived()
+            sync.syncNow()
+            #expect(try await fieldsSent() == ["kb", "composition", "action"], "Sync Now")
+        } catch {
+            failure = error
+        }
+        sync.disconnect()
+        session.invalidateAndCancel()
+        server.stop()
         if let failure { throw failure }
     }
 }

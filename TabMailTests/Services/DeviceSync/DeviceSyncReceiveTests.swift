@@ -105,8 +105,11 @@ struct DeviceSyncReceiveTests {
         quietDevice()
         let tag = PromptStoreTestCleanup.tag()
         let restarts = BulletSyncConfig.maxWaitingReceives + 44
+        // Fresh labels each run: a label this device saw and deleted in an earlier run is rejected (DS-MERGE-1).
+        let base = UInt64.random(in: (1 << 40)..<(1 << 56))
+        func id(_ index: Int) -> String { String(format: "%016llx", base + UInt64(index)) }
         for index in 0..<restarts {
-            let id = String(format: "%016x", index + 1)
+            let id = id(index)
             sync.handleMessage(ForeignBulletMessage.kbPart(1, first: "\(tag) lost \(index)", second: "\(tag) never", sender: id, snap: id))
         }
         // Wait until the held count stops moving.
@@ -121,19 +124,41 @@ struct DeviceSyncReceiveTests {
         #expect(held < BulletSyncConfig.maxWaitingReceives, "the receiver holds fewer parts than the bound: \(held)")
         #expect(held > 0 && held < restarts, "the connection was renewed once and the parts after it are held again: \(held)")
         // A whole split snapshot sent after the renewal still lands.
-        let id = String(format: "%016x", restarts + 1)
-        sync.handleMessage(ForeignBulletMessage.kbPart(1, first: "\(tag) whole one", second: "\(tag) whole two", sender: id, snap: id))
-        sync.handleMessage(ForeignBulletMessage.kbPart(2, first: "\(tag) whole one", second: "\(tag) whole two", sender: id, snap: id))
+        let whole = id(restarts + 1)
+        sync.handleMessage(ForeignBulletMessage.kbPart(1, first: "\(tag) whole one", second: "\(tag) whole two", sender: whole, snap: whole))
+        sync.handleMessage(ForeignBulletMessage.kbPart(2, first: "\(tag) whole one", second: "\(tag) whole two", sender: whole, snap: whole))
         #expect(try await waitUntil(5) { has("\(tag) whole one") && has("\(tag) whole two") })
         // The control: a snapshot whose parts all arrive holds nothing once it is complete.
         let before = store.bullets.heldParts
-        let control = String(format: "%016x", restarts + 2)
+        let control = id(restarts + 2)
         sync.handleMessage(ForeignBulletMessage.kbPart(1, first: "\(tag) control one", second: "\(tag) control two", sender: control, snap: control))
         sync.handleMessage(ForeignBulletMessage.kbPart(2, first: "\(tag) control one", second: "\(tag) control two", sender: control, snap: control))
         #expect(try await waitUntil(5) { has("\(tag) control one") && has("\(tag) control two") })
         #expect(store.bullets.heldParts == before, "a complete snapshot leaves no part held")
         store.bullets.disconnected()
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
+    private struct Unreadable: Error {}
+
+    @Test("A message whose hold ended before it was applied is applied again; any other failure drops it (DS-RECEIVE, DS-LEASE)")
+    func lapsedHoldIsReappliedOtherFailureDropped() async throws {
+        quietDevice()
+        var lapsed = 0
+        var failed = 0
+        sync.applyReceived("lapsed hold") { _ in
+            lapsed += 1
+            if lapsed == 1 { throw PromptRefusal.changed }
+        }
+        sync.applyReceived("failing apply") { _ in
+            failed += 1
+            throw Unreadable()
+        }
+        // The re-apply comes after BulletSyncConfig.busyReapplySeconds.
+        #expect(try await waitUntil(BulletSyncConfig.busyReapplySeconds + 3) { lapsed == 2 }, "the message is applied again after its hold lapsed")
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(lapsed == 2, "and only once more")
+        #expect(failed == 1, "a failure that is not a refusal drops the message")
     }
 
     // MARK: - TB #194, on iOS: nothing older lands on a newer local edit

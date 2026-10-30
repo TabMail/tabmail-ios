@@ -42,8 +42,9 @@ final class UserDefaultsBulletStore: BulletStore {
     ]
 
     private let defaults: UserDefaults
-    /// Called before a commit is written, with the fields whose text it changes (prompt history).
-    var willCommit: ((BulletCommitKind, [BulletField]) -> Void)?
+    /// Called before a commit is written, with the fields whose text it changes (prompt history). False
+    /// stops the commit: it writes nothing and reports itself unsaved (DS-HISTORY).
+    var willCommit: ((BulletCommitKind, [BulletField]) -> Bool)?
     /// Called once a commit is written.
     var didCommit: ((BulletCommitKind, [BulletField]) -> Void)?
 
@@ -70,7 +71,10 @@ final class UserDefaultsBulletStore: BulletStore {
         let fields = BulletField.allCases.filter { states[$0] != nil }
         var texts: [BulletField: String] = [:]
         for field in fields { texts[field] = states[field].map { Bullets.render(field, $0) } }
-        willCommit?(kind, fields.filter { field in !Bullets.same(texts[field] ?? "", legacyText(field) ?? "") })
+        if willCommit?(kind, fields.filter { field in !Bullets.same(texts[field] ?? "", legacyText(field) ?? "") }) == false {
+            BackgroundSyncLogger.logDebug("[DeviceSync] a commit of \(fields.map(\.rawValue)) was stopped: its history entry was not saved")
+            return false
+        }
         var all = stored() ?? [:]
         for field in fields {
             guard let state = states[field] else { continue }
