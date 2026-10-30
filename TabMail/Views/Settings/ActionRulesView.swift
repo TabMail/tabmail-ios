@@ -39,7 +39,7 @@ final class ActionCompactionMonitor {
     func start() {
         guard !isRunning else { return }
         isRunning = true
-        statusMessage = nil
+        statusMessage = "Compacting…"
         Task {
             let result = await AIService.shared.compactActionRulesNow()
             switch result {
@@ -176,17 +176,9 @@ struct ActionRulesView: View {
                     Button {
                         compaction.start()
                     } label: {
-                        HStack {
-                            if compaction.isRunning {
-                                ProgressView()
-                                    .controlSize(.small)
-                                Text("Compacting…")
-                            } else {
-                                Label("Compact now", systemImage: "arrow.triangle.merge")
-                            }
-                        }
+                        // DS-NO-BUSY-UI: nothing is greyed for working; the start and the result are on the status line.
+                        Label("Compact now", systemImage: "arrow.triangle.merge")
                     }
-                    .disabled(compaction.isRunning)
 
                     if let msg = compaction.statusMessage {
                         Text(msg)
