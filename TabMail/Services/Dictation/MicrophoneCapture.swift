@@ -14,6 +14,43 @@ protocol AudioCapturing: AnyObject, Sendable {
     func stop()
 }
 
+/// Where one start's buffers go. The tap a start installs keeps this route for as long as it lives,
+/// so a tap that outlives its stop (the queue tears it down a moment later) can never reach a newer
+/// start's handler: cancelling the route silences exactly that tap.
+final class CaptureRoute: Sendable {
+    private let handler: Mutex<(@Sendable (AVAudioPCMBuffer) -> Void)?>
+
+    init(_ onBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void) {
+        handler = Mutex(onBuffer)
+    }
+
+    func deliver(_ buffer: AVAudioPCMBuffer) { handler.withLock { $0 }?(buffer) }
+
+    func cancel() { handler.withLock { $0 = nil } }
+}
+
+/// The one live route of a capture. Opening a route (a start) or closing it (a stop) cancels the
+/// route before it, so at most one route delivers, and it is the newest.
+final class CaptureRoutes: Sendable {
+    private let current = Mutex<CaptureRoute?>(nil)
+
+    func open(_ onBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void) -> CaptureRoute {
+        let route = CaptureRoute(onBuffer)
+        current.withLock {
+            $0?.cancel()
+            $0 = route
+        }
+        return route
+    }
+
+    func closeCurrent() {
+        current.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+    }
+}
+
 /// Streams buffers from the microphone while one dictation records.
 ///
 /// All audio-session and engine work runs on one serial queue, never the main thread (iOS 26
@@ -37,7 +74,7 @@ final class MicrophoneCapture: AudioCapturing {
     }
 
     private let queue = DispatchQueue(label: "ai.tabmail.dictation.microphone", qos: .userInitiated)
-    private let handler = Mutex<(@Sendable (AVAudioPCMBuffer) -> Void)?>(nil)
+    private let routes = CaptureRoutes()
     private let audio = Mutex(Audio())
 
     /// Starts the microphone. `onBuffer` runs on the audio render thread; `completion` on the
@@ -46,7 +83,7 @@ final class MicrophoneCapture: AudioCapturing {
         onBuffer: @escaping @Sendable (AVAudioPCMBuffer) -> Void,
         completion: @escaping @Sendable ((any Error)?) -> Void
     ) {
-        handler.withLock { $0 = onBuffer }
+        let route = routes.open(onBuffer)
         queue.async { [self] in
             do {
                 let session = AVAudioSession.sharedInstance()
@@ -60,16 +97,16 @@ final class MicrophoneCapture: AudioCapturing {
                 guard format.sampleRate > 0, format.channelCount > 0 else {
                     throw CaptureError.noInputDevice
                 }
-                input.installTap(onBus: 0, bufferSize: DictationConfig.audioTapBufferSize, format: format) { [weak self] buffer, _ in
-                    self?.handler.withLock { $0 }?(buffer)
+                input.installTap(onBus: 0, bufferSize: DictationConfig.audioTapBufferSize, format: format) { buffer, _ in
+                    route.deliver(buffer)
                 }
                 engine.prepare()
                 try engine.start()
                 self.audio.withLock { $0.running = engine }
                 completion(nil)
             } catch {
-                // The handler stays: a newer start may already have replaced it, and the owner's
-                // stop() (every failed start ends in one) clears it.
+                // The route stays: a newer start may already have replaced it, and the owner's
+                // stop() (every failed start ends in one) closes it.
                 self.teardownOnQueue()
                 completion(error)
             }
@@ -78,7 +115,7 @@ final class MicrophoneCapture: AudioCapturing {
 
     /// Stops the microphone, if running, and releases the audio session.
     func stop() {
-        handler.withLock { $0 = nil }
+        routes.closeCurrent()
         queue.async { self.teardownOnQueue() }
     }
 
