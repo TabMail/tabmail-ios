@@ -13,12 +13,12 @@ import Foundation
 struct PromptStoreMergeTemplatesTests {
 
     /// Save current templates, run body, restore originals.
-    /// Uses applySync(skipHistory: true) to avoid Device Sync broadcast side effects.
+    /// Uses applySyncedTemplates to avoid Device Sync broadcast side effects.
     private func withCleanTemplates(_ body: () -> Void) {
         let store = PromptStore.shared
         let saved = store.templates
-        store.applySync(templates: [], skipHistory: true)
-        defer { store.applySync(templates: saved, skipHistory: true) }
+        store.applySyncedTemplates([])
+        defer { store.applySyncedTemplates(saved) }
         body()
     }
 
@@ -30,7 +30,7 @@ struct PromptStoreMergeTemplatesTests {
             let newDate = Date(timeIntervalSince1970: 2000)
 
             let local = ReplyTemplate(id: "t1", name: "Local", updatedAt: oldDate)
-            store.applySync(templates: [local], skipHistory: true)
+            store.applySyncedTemplates([local])
 
             let remote = ReplyTemplate(id: "t1", name: "Remote", updatedAt: newDate)
             store.mergeTemplates([remote])
@@ -48,7 +48,7 @@ struct PromptStoreMergeTemplatesTests {
             let newDate = Date(timeIntervalSince1970: 2000)
 
             let local = ReplyTemplate(id: "t1", name: "Local", updatedAt: newDate)
-            store.applySync(templates: [local], skipHistory: true)
+            store.applySyncedTemplates([local])
 
             let remote = ReplyTemplate(id: "t1", name: "Remote", updatedAt: oldDate)
             store.mergeTemplates([remote])
@@ -63,7 +63,7 @@ struct PromptStoreMergeTemplatesTests {
         withCleanTemplates {
             let store = PromptStore.shared
             let local = ReplyTemplate(id: "t1", name: "Existing", updatedAt: Date(timeIntervalSince1970: 1000))
-            store.applySync(templates: [local], skipHistory: true)
+            store.applySyncedTemplates([local])
 
             let remote = ReplyTemplate(id: "t2", name: "Brand New", updatedAt: Date(timeIntervalSince1970: 500))
             store.mergeTemplates([remote])
@@ -81,7 +81,7 @@ struct PromptStoreMergeTemplatesTests {
             let store = PromptStore.shared
             let date = Date(timeIntervalSince1970: 1000)
             let local = ReplyTemplate(id: "t1", name: "Original", updatedAt: date)
-            store.applySync(templates: [local], skipHistory: true)
+            store.applySyncedTemplates([local])
 
             let remote = ReplyTemplate(id: "t1", name: "Updated", updatedAt: date.addingTimeInterval(1))
             store.mergeTemplates([remote])
@@ -96,7 +96,7 @@ struct PromptStoreMergeTemplatesTests {
         withCleanTemplates {
             let store = PromptStore.shared
             let local = ReplyTemplate(id: "t1", name: "Stays", updatedAt: Date(timeIntervalSince1970: 1000))
-            store.applySync(templates: [local], skipHistory: true)
+            store.applySyncedTemplates([local])
 
             store.mergeTemplates([])
 
@@ -115,8 +115,8 @@ struct PromptStoreGCDeletedTemplatesTests {
     private func withCleanTemplates(_ body: () -> Void) {
         let store = PromptStore.shared
         let saved = store.templates
-        store.applySync(templates: [], skipHistory: true)
-        defer { store.applySync(templates: saved, skipHistory: true) }
+        store.applySyncedTemplates([])
+        defer { store.applySyncedTemplates(saved) }
         body()
     }
 
@@ -126,7 +126,7 @@ struct PromptStoreGCDeletedTemplatesTests {
             let store = PromptStore.shared
             let longAgo = Date().addingTimeInterval(-91 * 86400)
             let template = ReplyTemplate(id: "old", name: "Old", deleted: true, deletedAt: longAgo)
-            store.applySync(templates: [template], skipHistory: true)
+            store.applySyncedTemplates([template])
 
             store.gcDeletedTemplates()
 
@@ -140,7 +140,7 @@ struct PromptStoreGCDeletedTemplatesTests {
             let store = PromptStore.shared
             let recent = Date().addingTimeInterval(-30 * 86400)
             let template = ReplyTemplate(id: "recent", name: "Recent", deleted: true, deletedAt: recent)
-            store.applySync(templates: [template], skipHistory: true)
+            store.applySyncedTemplates([template])
 
             store.gcDeletedTemplates()
 
@@ -154,7 +154,7 @@ struct PromptStoreGCDeletedTemplatesTests {
         withCleanTemplates {
             let store = PromptStore.shared
             let template = ReplyTemplate(id: "alive", name: "Alive", deleted: false)
-            store.applySync(templates: [template], skipHistory: true)
+            store.applySyncedTemplates([template])
 
             store.gcDeletedTemplates()
 
@@ -168,7 +168,7 @@ struct PromptStoreGCDeletedTemplatesTests {
         withCleanTemplates {
             let store = PromptStore.shared
             let template = ReplyTemplate(id: "no-ts", name: "NoTimestamp", deleted: true, deletedAt: nil)
-            store.applySync(templates: [template], skipHistory: true)
+            store.applySyncedTemplates([template])
 
             store.gcDeletedTemplates()
 
@@ -187,8 +187,8 @@ struct PromptStoreTemplatesAsPromptTests {
     private func withCleanTemplates(_ body: () -> Void) {
         let store = PromptStore.shared
         let saved = store.templates
-        store.applySync(templates: [], skipHistory: true)
-        defer { store.applySync(templates: saved, skipHistory: true) }
+        store.applySyncedTemplates([])
+        defer { store.applySyncedTemplates(saved) }
         body()
     }
 
@@ -204,7 +204,7 @@ struct PromptStoreTemplatesAsPromptTests {
                 createdAt: Date(timeIntervalSince1970: 0),
                 updatedAt: Date(timeIntervalSince1970: 0)
             )
-            store.applySync(templates: [template], skipHistory: true)
+            store.applySyncedTemplates([template])
 
             let result = store.templatesAsPrompt()
 
@@ -228,7 +228,7 @@ struct PromptStoreTemplatesAsPromptTests {
                 createdAt: Date(timeIntervalSince1970: 0),
                 updatedAt: Date(timeIntervalSince1970: 0)
             )
-            store.applySync(templates: [template], skipHistory: true)
+            store.applySyncedTemplates([template])
 
             let result = store.templatesAsPrompt()
             #expect(result.isEmpty)
@@ -246,7 +246,7 @@ struct PromptStoreTemplatesAsPromptTests {
                 updatedAt: Date(timeIntervalSince1970: 0),
                 deleted: true, deletedAt: Date()
             )
-            store.applySync(templates: [template], skipHistory: true)
+            store.applySyncedTemplates([template])
 
             let result = store.templatesAsPrompt()
             #expect(result.isEmpty)
@@ -272,7 +272,7 @@ struct PromptStoreTemplatesAsPromptTests {
                 createdAt: Date(timeIntervalSince1970: 0),
                 updatedAt: Date(timeIntervalSince1970: 0)
             )
-            store.applySync(templates: [template], skipHistory: true)
+            store.applySyncedTemplates([template])
 
             let result = store.templatesAsPrompt()
 
@@ -290,18 +290,19 @@ struct PromptStoreTemplatesAsPromptTests {
 @Suite("PromptStore compositionMarkdown")
 struct PromptStoreCompositionMarkdownTests {
 
-    private func withCleanState(_ body: () -> Void) {
+    private func withCleanTemplates(_ body: () -> Void) {
         let store = PromptStore.shared
         let savedTemplates = store.templates
-        let savedComposition = store.rawComposition
-        store.applySync(composition: "", templates: [], skipHistory: true)
-        defer { store.applySync(composition: savedComposition, templates: savedTemplates, skipHistory: true) }
+        store.applySyncedTemplates([])
+        defer { store.applySyncedTemplates(savedTemplates) }
         body()
     }
 
+    private let endMarker = "====END USER INSTRUCTIONS===="
+
     @Test("With templates, prompt is inserted before END marker")
-    func templatesInsertedBeforeEnd() {
-        withCleanState {
+    func templatesInsertedBeforeEnd() throws {
+        try withCleanTemplatesThrowing {
             let store = PromptStore.shared
             let template = ReplyTemplate(
                 id: "ins", name: "Inserted",
@@ -309,58 +310,36 @@ struct PromptStoreCompositionMarkdownTests {
                 createdAt: Date(timeIntervalSince1970: 0),
                 updatedAt: Date(timeIntervalSince1970: 0)
             )
-            store.applySync(
-                composition: "Some preamble\n\n====END USER INSTRUCTIONS====\n\nFooter text",
-                templates: [template],
-                skipHistory: true
-            )
+            // The rendered composition always carries the END marker (it is part of the field's skeleton).
+            try #require(store.rawComposition.contains(endMarker))
+            store.applySyncedTemplates([template])
 
             let result = store.compositionMarkdown()
 
             #expect(result.contains("## Inserted"))
             #expect(result.contains("- Insert me"))
-            #expect(result.contains("====END USER INSTRUCTIONS===="))
+            #expect(result.contains(endMarker))
             // Template content should appear before the END marker
-            let endRange = result.range(of: "====END USER INSTRUCTIONS====")!
-            let templateRange = result.range(of: "## Inserted")!
+            let endRange = try #require(result.range(of: endMarker))
+            let templateRange = try #require(result.range(of: "## Inserted"))
             #expect(templateRange.lowerBound < endRange.lowerBound)
         }
     }
 
     @Test("Without templates, rawComposition is returned unchanged")
     func noTemplatesReturnsRaw() {
-        withCleanState {
+        withCleanTemplates {
             let store = PromptStore.shared
-            let raw = "My composition\n\n====END USER INSTRUCTIONS====\n\nFooter"
-            store.applySync(composition: raw, templates: [], skipHistory: true)
-
-            let result = store.compositionMarkdown()
-            #expect(result == raw)
+            #expect(store.compositionMarkdown() == store.rawComposition)
         }
     }
 
-    @Test("Missing END marker appends templates at end")
-    func missingEndMarkerAppendsAtEnd() {
-        withCleanState {
-            let store = PromptStore.shared
-            let template = ReplyTemplate(
-                id: "end", name: "Appended",
-                enabled: true, instructions: ["Append me"],
-                createdAt: Date(timeIntervalSince1970: 0),
-                updatedAt: Date(timeIntervalSince1970: 0)
-            )
-            store.applySync(
-                composition: "Just some content without an end marker",
-                templates: [template],
-                skipHistory: true
-            )
-
-            let result = store.compositionMarkdown()
-
-            #expect(result.contains("Just some content without an end marker"))
-            #expect(result.contains("## Appended"))
-            #expect(result.contains("- Append me"))
-        }
+    private func withCleanTemplatesThrowing(_ body: () throws -> Void) throws {
+        let store = PromptStore.shared
+        let savedTemplates = store.templates
+        store.applySyncedTemplates([])
+        defer { store.applySyncedTemplates(savedTemplates) }
+        try body()
     }
 }
 
@@ -373,8 +352,8 @@ struct PromptStoreVisibleTemplatesTests {
     private func withCleanTemplates(_ body: () -> Void) {
         let store = PromptStore.shared
         let saved = store.templates
-        store.applySync(templates: [], skipHistory: true)
-        defer { store.applySync(templates: saved, skipHistory: true) }
+        store.applySyncedTemplates([])
+        defer { store.applySyncedTemplates(saved) }
         body()
     }
 
@@ -382,10 +361,10 @@ struct PromptStoreVisibleTemplatesTests {
     func deletedExcluded() {
         withCleanTemplates {
             let store = PromptStore.shared
-            store.applySync(templates: [
+            store.applySyncedTemplates([
                 ReplyTemplate(id: "alive", name: "Alive", deleted: false),
                 ReplyTemplate(id: "dead", name: "Dead", deleted: true, deletedAt: Date()),
-            ], skipHistory: true)
+            ])
 
             let visible = store.visibleTemplates
             #expect(visible.count == 1)
@@ -397,10 +376,10 @@ struct PromptStoreVisibleTemplatesTests {
     func nonDeletedIncluded() {
         withCleanTemplates {
             let store = PromptStore.shared
-            store.applySync(templates: [
+            store.applySyncedTemplates([
                 ReplyTemplate(id: "v1", name: "First", deleted: false),
                 ReplyTemplate(id: "v2", name: "Second", deleted: false),
-            ], skipHistory: true)
+            ])
 
             let visible = store.visibleTemplates
             #expect(visible.count == 2)
@@ -417,8 +396,8 @@ struct PromptStoreDeleteTemplateTests {
     private func withCleanTemplates(_ body: () -> Void) {
         let store = PromptStore.shared
         let saved = store.templates
-        store.applySync(templates: [], skipHistory: true)
-        defer { store.applySync(templates: saved, skipHistory: true) }
+        store.applySyncedTemplates([])
+        defer { store.applySyncedTemplates(saved) }
         body()
     }
 
@@ -432,7 +411,7 @@ struct PromptStoreDeleteTemplateTests {
                 createdAt: Date(timeIntervalSince1970: 1000),
                 updatedAt: Date(timeIntervalSince1970: 1000)
             )
-            store.applySync(templates: [template], skipHistory: true)
+            store.applySyncedTemplates([template])
 
             store.deleteTemplate(id: "to-del")
 
@@ -449,7 +428,7 @@ struct PromptStoreDeleteTemplateTests {
         withCleanTemplates {
             let store = PromptStore.shared
             let template = ReplyTemplate(id: "keep", name: "KeepMe")
-            store.applySync(templates: [template], skipHistory: true)
+            store.applySyncedTemplates([template])
 
             store.deleteTemplate(id: "nonexistent")
 

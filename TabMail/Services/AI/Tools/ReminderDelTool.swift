@@ -24,37 +24,36 @@ struct ReminderDelTool: AgentTool, Sendable {
 
         BackgroundSyncLogger.logDebug("[ReminderDelTool] Searching for reminder matching '\(text.prefix(140))'")
 
-        // Load current KB
-        let current = PromptStore.kbTextSnapshot()
-
-        // Find KB lines matching reminders that contain the search text
+        // The search and the delete in one hold of the prompt store: the reminder deleted is one the
+        // search found in the knowledge base as it is now, never one that arrived after an earlier read
+        // (DS-CAPTURE). The commit sends it (Device Sync).
         let textLower = text.lowercased()
-        let lines = current.components(separatedBy: "\n")
-        let reminderPattern = /^-\s*(?:Reminder:|\[Reminder\])/.ignoresCase()
-
-        var matches: [String] = []
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            // Match lines that start with "- Reminder:" or "- [Reminder]"
-            guard trimmed.prefixMatch(of: reminderPattern) != nil else { continue }
-            // Check if the reminder content contains the search text (case-insensitive)
-            if trimmed.lowercased().contains(textLower) {
-                // Extract the raw statement (without leading "- ")
-                let statement = trimmed.replacingOccurrences(of: "^-\\s*", with: "", options: .regularExpression)
-                matches.append(statement)
+        let found = await { @MainActor () async -> (matches: [String], outcome: PromptEditOutcome) in
+            var matches: [String] = []
+            let outcome = await PromptStore.shared.edit("reminder_del tool") { hold in
+                try hold.editText(.kb) { current in
+                    matches = Self.reminderStatements(in: current, matching: textLower)
+                    guard matches.count == 1 else { return nil }
+                    BackgroundSyncLogger.logDebug("[ReminderDelTool] Found match, deleting: '\(matches[0].prefix(140))'")
+                    return KBPatchApplier.applyKBPatch(content: current, patchText: "DEL\n\(matches[0])")
+                }
             }
-        }
+            return (matches, outcome)
+        }()
 
-        if matches.isEmpty {
+        // Refused before the search ran: the model is told why.
+        if let refusal = KBToolEdit.refusal(found.outcome) { return refusal }
+
+        if found.matches.isEmpty && found.outcome == .unchanged {
             // No KB match — search email-based (message) reminders and snooze if found
             BackgroundSyncLogger.logDebug("[ReminderDelTool] No KB match, searching message reminders...")
             return await handleMessageReminderDeletion(text: text, textLower: textLower)
         }
 
-        if matches.count > 1 {
-            BackgroundSyncLogger.logDebug("[ReminderDelTool] \(matches.count) matching reminders found, returning list for clarification")
+        if found.matches.count > 1 {
+            BackgroundSyncLogger.logDebug("[ReminderDelTool] \(found.matches.count) matching reminders found, returning list for clarification")
             // Strip [Reminder] prefix for cleaner display
-            let cleaned = matches.map { m in
+            let cleaned = found.matches.map { m in
                 m.replacingOccurrences(of: "^(?:Reminder:\\s*|\\[Reminder\\]\\s*)", with: "", options: .regularExpression)
             }
             let resultDict: [String: Any] = [
@@ -64,24 +63,30 @@ struct ReminderDelTool: AgentTool, Sendable {
             return ToolJSON.string(from: resultDict)
         }
 
-        // Exactly one match — delete it
-        let statement = matches[0]
-        BackgroundSyncLogger.logDebug("[ReminderDelTool] Found match, deleting: '\(statement.prefix(140))'")
-
-        let patchText = "DEL\n\(statement)"
-        guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText),
-              updated != current else {
-            BackgroundSyncLogger.logDebug("[ReminderDelTool] applyKBPatch failed or no change")
+        guard found.outcome == .saved, let statement = found.matches.first else {
+            BackgroundSyncLogger.logDebug("[ReminderDelTool] applyKBPatch failed or no change (\(found.outcome))")
             return #"{"error": "failed to delete reminder from knowledge base"}"#
         }
-
-        // Persist
-        await MainActor.run { PromptStore.shared.rawKB = updated }
-        BackgroundSyncLogger.logDebug("[ReminderDelTool] Persisted user_kb.md (\(updated.count) chars)")
+        BackgroundSyncLogger.logDebug("[ReminderDelTool] Persisted user_kb.md")
 
         BackgroundSyncLogger.logDebug("[ReminderDelTool] Success")
         let resultDict: [String: Any] = ["ok": true, "removed": statement]
         return ToolJSON.string(from: resultDict)
+    }
+
+    /// The KB reminder lines ("- Reminder: …" or "- [Reminder] …") containing `textLower`, without their
+    /// leading "- ".
+    private static func reminderStatements(in kb: String, matching textLower: String) -> [String] {
+        let reminderPattern = /^-\s*(?:Reminder:|\[Reminder\])/.ignoresCase()
+        var matches: [String] = []
+        for line in kb.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.prefixMatch(of: reminderPattern) != nil else { continue }
+            if trimmed.lowercased().contains(textLower) {
+                matches.append(trimmed.replacingOccurrences(of: "^-\\s*", with: "", options: .regularExpression))
+            }
+        }
+        return matches
     }
 
     // MARK: - Message Reminder Snoozing

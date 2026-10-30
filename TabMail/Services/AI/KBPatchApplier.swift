@@ -98,3 +98,18 @@ enum KBPatchApplier {
         return contentLines.joined(separator: "\n")
     }
 }
+
+/// A chat tool's KB patch saved through `PromptAccess.editText`: whether the patch applied, and what the
+/// save did.
+struct KBToolEdit: Sendable {
+    let patched: Bool
+    let outcome: PromptEditOutcome
+
+    /// What a chat tool tells the model when the prompt store refused the edit, or nil.
+    static func refusal(_ outcome: PromptEditOutcome) -> String? {
+        switch outcome {
+        case .busy: return #"{"error": "the knowledge base is busy, try again in a moment"}"#
+        case .saved, .unchanged, .unsaved, .dropped: return nil
+        }
+    }
+}

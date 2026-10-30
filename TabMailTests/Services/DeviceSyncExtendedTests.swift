@@ -454,23 +454,11 @@ struct SyncFieldTimestampKeyTests {
         #expect(Set(rawValues).count == rawValues.count)
     }
 
-    @Test("promptFields is a strict subset of allCases")
-    func promptFieldsSubset() {
-        let allSet = Set(SyncField.allCases)
-        for field in SyncField.promptFields {
-            #expect(allSet.contains(field))
-        }
-    }
-
-    @Test("promptFields count is allCases minus 2")
-    func promptFieldsCountRelation() {
-        #expect(SyncField.promptFields.count == SyncField.allCases.count - 2)
-    }
-
-    @Test("disabledReminders and actionConfig are the only non-prompt fields")
-    func nonPromptFields() {
-        let nonPrompt = Set(SyncField.allCases).subtracting(SyncField.promptFields)
-        #expect(nonPrompt == [.disabledReminders, .actionConfig])
+    @Test("legacyFields are the prompt_state fields: the bullet fields sync as bullet_state")
+    func legacyFieldsAreThePromptStateFields() {
+        #expect(SyncField.legacyFields == [.templates, .disabledReminders, .actionConfig])
+        let bulletFields = Set(SyncField.allCases).subtracting(SyncField.legacyFields)
+        #expect(bulletFields == [.composition, .action, .kb])
     }
 }
 
@@ -655,12 +643,19 @@ struct ActionCompactConfigLocalStateTests {
     private func iso(daysFromNow days: Double) -> String { Date().addingTimeInterval(days * 86_400).ISO8601Format() }
 
     /// Runs `body` with the given stored values (nil = absent), then restores the previous values.
-    private func withStored(rules: Int?, chars: Int?, updatedAt: String?, _ body: () throws -> Void) rethrows {
+    private func withStored(rules: Int?, chars: Int?, updatedAt: String?, _ body: () async throws -> Void) async rethrows {
         let defaults = UserDefaults.standard
         let saved = keys.map { defaults.object(forKey: $0) }
         defer { for (key, value) in zip(keys, saved) { defaults.set(value, forKey: key) } }
         for (key, value) in zip(keys, [rules as Any?, chars as Any?, updatedAt as Any?]) { defaults.set(value, forKey: key) }
-        try body()
+        try await body()
+    }
+
+    /// A received `prompt_state`'s merge, applied inside a hold as a received message is (DS-RECEIVE).
+    private func apply(_ incoming: PromptStateData) async throws {
+        try await PromptStore.shared.withPromptStore("test receive") { access in
+            try DeviceSyncService.shared.applyIncomingStateWithMerge(incoming, access: access)
+        }
     }
 
     private func storedConfig() -> (rules: Int?, chars: Int?, updatedAt: String?) {
@@ -669,28 +664,28 @@ struct ActionCompactConfigLocalStateTests {
     }
 
     @Test("local() resolves the stored values against the stored sync timestamp")
-    func localResolvesStoredState() {
-        withStored(rules: nil, chars: nil, updatedAt: nil) {
+    func localResolvesStoredState() async throws {
+        await withStored(rules: nil, chars: nil, updatedAt: nil) {
             #expect(ActionCompactConfig.local() == ActionCompactConfig(compactThreshold: 200, compactThresholdChars: 32000))
         }
         for neverEdited in [nil, epochZero] {
-            withStored(rules: 100, chars: 16000, updatedAt: neverEdited) {
+            await withStored(rules: 100, chars: 16000, updatedAt: neverEdited) {
                 #expect(ActionCompactConfig.local() == ActionCompactConfig(compactThreshold: 200, compactThresholdChars: 32000))
             }
         }
-        withStored(rules: 100, chars: 16000, updatedAt: iso(daysFromNow: -1)) {
+        await withStored(rules: 100, chars: 16000, updatedAt: iso(daysFromNow: -1)) {
             #expect(ActionCompactConfig.local() == ActionCompactConfig(compactThreshold: 100, compactThresholdChars: 16000))
         }
-        withStored(rules: 900, chars: 6000, updatedAt: iso(daysFromNow: -1)) {
+        await withStored(rules: 900, chars: 6000, updatedAt: iso(daysFromNow: -1)) {
             #expect(ActionCompactConfig.local() == ActionCompactConfig(compactThreshold: 500, compactThresholdChars: 16000))
         }
     }
 
     @Test("A newer peer config becomes this device's effective thresholds with the peer's timestamp")
-    func applyNewerPeerConfig() {
+    func applyNewerPeerConfig() async throws {
         let incomingTs = iso(daysFromNow: -1)
-        withStored(rules: 400, chars: 30000, updatedAt: iso(daysFromNow: -2)) {
-            DeviceSyncService.shared.applyIncomingStateWithMerge(PromptStateData(
+        try await withStored(rules: 400, chars: 30000, updatedAt: iso(daysFromNow: -2)) {
+            try await apply(PromptStateData(
                 actionConfig: ActionCompactConfig(compactThreshold: 100, compactThresholdChars: 16000),
                 actionConfigUpdatedAt: incomingTs
             ))
@@ -704,7 +699,7 @@ struct ActionCompactConfigLocalStateTests {
     }
 
     @Test("An older, equal, never-edited, untimestamped or malformed peer config changes nothing")
-    func rejectPeerConfig() {
+    func rejectPeerConfig() async throws {
         let localTs = iso(daysFromNow: -1)
         let valid = ActionCompactConfig(compactThreshold: 300, compactThresholdChars: 40000)
         let cases: [PromptStateData] = [
@@ -717,8 +712,8 @@ struct ActionCompactConfigLocalStateTests {
             PromptStateData(actionConfig: ActionCompactConfig(compactThreshold: 300, compactThresholdChars: 0), actionConfigUpdatedAt: iso(daysFromNow: 0)),
         ]
         for incoming in cases {
-            withStored(rules: 250, chars: 20000, updatedAt: localTs) {
-                DeviceSyncService.shared.applyIncomingStateWithMerge(incoming)
+            try await withStored(rules: 250, chars: 20000, updatedAt: localTs) {
+                try await apply(incoming)
                 let stored = storedConfig()
                 #expect(stored.rules == 250)
                 #expect(stored.chars == 20000)
@@ -728,9 +723,9 @@ struct ActionCompactConfigLocalStateTests {
     }
 
     @Test("Every sync payload carries the effective thresholds and the stored timestamp")
-    func payloadCarriesEffectiveThresholds() {
+    func payloadCarriesEffectiveThresholds() async {
         let localTs = iso(daysFromNow: -1)
-        withStored(rules: 350, chars: 90000, updatedAt: localTs) {
+        await withStored(rules: 350, chars: 90000, updatedAt: localTs) {
             let single = DeviceSyncService.shared.promptState(for: [.actionConfig])
             #expect(single.actionConfig == ActionCompactConfig(compactThreshold: 350, compactThresholdChars: 80000))
             #expect(single.actionConfigUpdatedAt == localTs)
@@ -742,7 +737,7 @@ struct ActionCompactConfigLocalStateTests {
             #expect(all.actionConfigUpdatedAt == localTs)
         }
         // A never-edited device sends resolved defaults at epoch zero, which no peer accepts.
-        withStored(rules: 100, chars: 16000, updatedAt: nil) {
+        await withStored(rules: 100, chars: 16000, updatedAt: nil) {
             let state = DeviceSyncService.shared.promptState(for: [.actionConfig])
             #expect(state.actionConfig == ActionCompactConfig(compactThreshold: 200, compactThresholdChars: 32000))
             #expect(state.actionConfigUpdatedAt == epochZero)

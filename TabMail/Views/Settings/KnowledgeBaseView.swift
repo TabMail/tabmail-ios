@@ -19,7 +19,7 @@ struct KnowledgeBaseView: View {
             }
 
             Section {
-                BulletListEditor(text: $store.knowledgeBase)
+                BulletListEditor(store: store, section: .knowledgeBase)
             }
             }
             .listRowBackground(Palette.boxBg)
@@ -42,7 +42,10 @@ struct KnowledgeBaseView: View {
         }
         .confirmationDialog("Reset to Default?", isPresented: $showResetConfirmation) {
             Button("Reset", role: .destructive) {
-                store.resetKB()
+                store.gesture("reset knowledge base") { hold in
+                    try hold.reset(.kb)
+                    return .saved
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {

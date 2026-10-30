@@ -6,6 +6,9 @@ import SwiftUI
 
 struct RemindersSettingsView: View {
     @State private var reminders: [Reminder] = []
+    /// The knowledge-base bullets, with their labels, as read with the reminder list (DS-DISPLAYED): a
+    /// delete commits against exactly these labels.
+    @State private var shownKB: [ShownBullet] = []
     @State private var isLoading = true
 
     private var kbReminders: [Reminder] { reminders.filter { $0.source == "kb" } }
@@ -91,7 +94,9 @@ struct RemindersSettingsView: View {
     }
 
     private func loadReminders() async {
+        let shown = PromptStore.shared.shown(.knowledgeBase)
         reminders = await ReminderBuilder.buildReminderList(includeDisabled: true)
+        shownKB = shown
         isLoading = false
     }
 
@@ -120,45 +125,34 @@ struct RemindersSettingsView: View {
         )
     }
 
-    /// Permanently delete a KB reminder by applying a DEL patch to the knowledge base text.
-    /// Same approach as `ReminderDelTool`: find the matching KB line, build a DEL patch, apply via KBPatchApplier.
+    /// Permanently delete a KB reminder: the knowledge-base bullet that was shown with it, by the labels it
+    /// was shown with (DS-DISPLAYED), never by re-reading the text.
     private func deleteKBReminder(at index: Int) {
         let reminder = reminders[index]
         guard reminder.source == "kb" else { return }
 
-        let current = PromptStore.shared.kbText()
-        let lines = current.components(separatedBy: "\n")
-        let reminderPattern = /^-\s*(?:Reminder:|\[Reminder\])/.ignoresCase()
-
-        // Find the KB line whose content matches this reminder
+        let reminderPattern = /^(?:Reminder:|\[Reminder\])/.ignoresCase()
         let contentLower = reminder.content.lowercased()
-        var matchedStatement: String?
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.prefixMatch(of: reminderPattern) != nil else { continue }
-            if trimmed.lowercased().contains(contentLower) {
-                // Extract statement without leading "- "
-                matchedStatement = trimmed.replacingOccurrences(of: "^-\\s*", with: "", options: .regularExpression)
-                break
-            }
-        }
-
-        guard let statement = matchedStatement else {
+        guard let shown = shownKB.first(where: { bullet in
+            bullet.text.prefixMatch(of: reminderPattern) != nil && bullet.text.lowercased().contains(contentLower)
+        }) else {
             BackgroundSyncLogger.logDebug("[RemindersSettings] KB line not found for reminder: \(reminder.content.prefix(80))")
             reminders.remove(at: index)
             return
         }
 
-        let patchText = "DEL\n\(statement)"
-        guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText),
-              updated != current else {
-            BackgroundSyncLogger.logDebug("[RemindersSettings] KBPatchApplier DEL failed for: \(statement.prefix(80))")
-            return
+        let content = reminder.content
+        let deleting = PromptStore.shared.gesture("delete KB reminder") { try $0.deleteShown(shown, from: .knowledgeBase) }
+        Task {
+            let outcome = await deleting.value
+            guard outcome == .saved || outcome == .unchanged else {
+                BackgroundSyncLogger.logDebug("[RemindersSettings] KB reminder delete failed for: \(shown.text.prefix(80)) (\(outcome))")
+                return
+            }
+            // `.unchanged`: the labels were already removed.
+            reminders.removeAll { $0.source == "kb" && $0.content == content }
+            BackgroundSyncLogger.logDebug("[RemindersSettings] Deleted KB reminder: \(shown.text.prefix(80))")
         }
-
-        PromptStore.shared.rawKB = updated
-        reminders.remove(at: index)
-        BackgroundSyncLogger.logDebug("[RemindersSettings] Deleted KB reminder: \(statement.prefix(80))")
     }
 
 }

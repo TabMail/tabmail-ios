@@ -23,7 +23,8 @@ actor KBRefinementService {
 
     // MARK: - Public API
 
-    /// Refine the KB with turns from a completed chat session.
+    /// Refine the KB with turns from a completed chat session. A refine whose event came before a reset still
+    /// runs after it (DS-REFINE-QUEUE).
     /// Matches TB's `kbUpdate(conversationHistory)`.
     /// Fire-and-forget safe — logs errors internally.
     func refineKB(sessionTurns: [ChatTurn]) async {
@@ -58,8 +59,15 @@ actor KBRefinementService {
         // Build chat history text from session turns (matches TB's format)
         let chatHistory = buildChatHistory(from: meaningful)
 
-        // Get current KB text
-        let currentKB = PromptStore.kbTextSnapshot()
+        // Current KB text, and the labels it shows, read in one brief hold of the prompt store: the
+        // refine deletes only those whose text it drops, never a bullet that arrives while it runs
+        // (DS-CAPTURE, DS-REFINE). Refused while the KB's upgrade is unsaved (DS-UNSAVED-UPGRADE) or while busy:
+        // this pass is skipped, and the next refine runs as usual.
+        guard case .read(let capture) = await PromptStore.shared.readBeforeAI(.kb, "KB refine") else {
+            BackgroundSyncLogger.logDebug("[KBRefine] Skipped: the KB could not be read for editing")
+            return
+        }
+        let currentKB = capture.text
 
         // Build system message matching TB's system_prompt_kb_refine format
         let currentTime = AIService.formatTimestampForAgent(Date())
@@ -99,36 +107,14 @@ actor KBRefinementService {
                 return
             }
 
-            // 3-way merge: treat refinement as a "remote" change.
-            // base = KB snapshot before backend call (currentKB)
-            // local = current KB (may have changed via sync/tools during the flight)
-            // remote = refined KB from backend
-            let currentKBNow = PromptStore.kbTextSnapshot()
-            let mergedKB = PromptParser.mergeFlatField(base: currentKB, local: currentKBNow, remote: refinedKB)
+            // The refined KB written in a second hold, refused with nothing written when the store
+            // moved since the read (any edit, synced change, reset or restore) or demo
+            // mode started or ended (DS-DEMO): the refine result is expendable. A saved write sends it
+            // (Device Sync) and updates rawKB, which re-parses reminders via .onChange(of: rawKB) in
+            // DynamicIslandChat.
+            let outcome = await PromptStore.shared.writeAfterRead(capture, text: refinedKB, "KB refine")
 
-            if mergedKB == currentKBNow {
-                BackgroundSyncLogger.logDebug("[KBRefine] KB unchanged after 3-way merge")
-                return
-            }
-
-            BackgroundSyncLogger.logDebug("[KBRefine] KB updated via 3-way merge (\(currentKBNow.count) → \(mergedKB.count) chars)")
-
-            // Persist merged KB — this triggers Device Sync broadcast + UI reactivity via PromptStore.rawKB didSet.
-            // PromptStore.rawKB didSet also triggers reminder re-parse via .onChange(of: rawKB) in DynamicIslandChat,
-            // which calls ReminderBuilder.getRandomReminders() (parses KB reminders on demand).
-            // Demo guard (ADR-IOS-038): a refine dispatched BEFORE demo entry can
-            // complete DURING demo — saving would splice the user's real refined
-            // KB into the demo overlay (visible in a recording). Drop instead;
-            // the refine result is expendable.
-            await MainActor.run {
-                guard !DemoModeStore.shared.isActive else {
-                    BackgroundSyncLogger.logDebug("[KBRefine] Dropped refine result — demo mode became active mid-flight")
-                    return
-                }
-                PromptStore.shared.rawKB = mergedKB
-            }
-
-            BackgroundSyncLogger.logDebug("[KBRefine] KB refinement complete (changed=true)")
+            BackgroundSyncLogger.logDebug("[KBRefine] KB refinement complete (\(outcome))")
         } catch {
             let duration = Date().timeIntervalSince(startTime)
             BackgroundSyncLogger.logDebug("[KBRefine] Failed after \(String(format: "%.1f", duration))s: \(error)")

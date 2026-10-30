@@ -122,6 +122,17 @@ final class BulletSync {
         commit([(field, { Bullets.add($0, items, self.labels()) })], kind: .edit)
     }
 
+    /// DS-DISPLAYED: the shown `labels` deleted when still live, nothing else; nothing changes (and
+    /// `.unchanged` says "already removed") when none of them is live any more.
+    func delete(_ field: BulletField, labels shown: [Bullet]) -> BulletCommitResult {
+        let gone = Set(shown.map(BulletLabelKey.init))
+        return commit([(field, { state in
+            var next = state
+            next.bullets.removeAll { gone.contains(BulletLabelKey($0)) }
+            return next
+        })], kind: .edit)
+    }
+
     /// DS-CAPTURE: the field as it is now and the live labels of `sections` (all when nil), to commit
     /// against later. While a DS-UPGRADE is unsaved there are no labels to commit against (R22): the
     /// upgrade, once saved, names its bullets anew, so the state is for showing only.
@@ -159,14 +170,6 @@ final class BulletSync {
         }
         let ordered = BulletField.allCases.filter { states[$0] != nil }
         return write(states, kind: .reset) ? BulletCommitResult(outcome: .saved, fields: ordered) : BulletCommitResult(outcome: .unsaved, fields: [])
-    }
-
-    /// `removeStored()` (which removes the stored fields), then the writer name abandoned and what was
-    /// merged forgotten, as a reload: the next read is the defaults.
-    func forget(_ removeStored: () -> Void) {
-        removeStored()
-        abandonName()
-        lastMerged.removeAll()
     }
 
     /// The connection ended: incomplete snapshots are dropped (DS-CHUNK).

@@ -416,7 +416,14 @@ actor BackfillAIQueue {
     // MARK: - Dispatchers (call existing refinement functions unchanged)
 
     private func dispatchActionRefine(_ s: ActionRefineSnapshot) async {
-        let currentActionMd = PromptStore.actionMarkdownSnapshot()
+        // DS-AI step 1: the rules read in one brief hold of the prompt store. Skipped while their upgrade is
+        // unsaved (DS-UNSAVED-UPGRADE) or while busy: the refine is expendable. The queue only orders the AI
+        // calls and holds nothing of the store (DS-REFINE-QUEUE).
+        let read = await PromptStore.shared.readBeforeAI(.action, "action-rule refine")
+        guard case .read(let actionCapture) = read else {
+            BackgroundSyncLogger.logBackfillAI("skip actionRefine dedupKey=\(s.dedupKey) reason=\(read)")
+            return
+        }
         await AIService.shared.autoUpdateUserPromptOnTag(
             subject: s.subject,
             from: s.from,
@@ -424,7 +431,7 @@ actor BackfillAIQueue {
             summaryTodos: s.summaryTodos,
             originalAction: s.originalAction,
             userManualTag: s.userManualTag ?? "",
-            currentUserActionMd: currentActionMd
+            actionCapture: actionCapture
         )
     }
 

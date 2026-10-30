@@ -204,31 +204,31 @@ struct ActionRulesView: View {
 
             Group {
             Section {
-                BulletListEditor(text: $store.deleteRules, highlightedItem: tutorialRule)
+                BulletListEditor(store: store, section: .deleteRules, highlightedItem: tutorialRule)
                     .background(sectionTracker("delete"))
             } header: {
-                sectionHeader(title: "Emails to Delete", count: ruleCount(store.deleteRules), subtitle: "Emails matching these rules will be suggested for deletion. Swipe to delete.", color: Theme.tagColor(.delete))
+                sectionHeader(title: "Emails to Delete", count: store.bullets(.deleteRules).count, subtitle: "Emails matching these rules will be suggested for deletion. Swipe to delete.", color: Theme.tagColor(.delete))
             }
 
             Section {
-                BulletListEditor(text: $store.archiveRules)
+                BulletListEditor(store: store, section: .archiveRules)
                     .background(sectionTracker("archive"))
             } header: {
-                sectionHeader(title: "Emails to Archive", count: ruleCount(store.archiveRules), subtitle: "Emails matching these rules will be suggested for archiving.", color: Theme.tagColor(.archive))
+                sectionHeader(title: "Emails to Archive", count: store.bullets(.archiveRules).count, subtitle: "Emails matching these rules will be suggested for archiving.", color: Theme.tagColor(.archive))
             }
 
             Section {
-                BulletListEditor(text: $store.replyRules)
+                BulletListEditor(store: store, section: .replyRules)
                     .background(sectionTracker("reply"))
             } header: {
-                sectionHeader(title: "Emails to Reply", count: ruleCount(store.replyRules), subtitle: "Emails matching these rules will be flagged as needing a reply.", color: Theme.tagColor(.reply))
+                sectionHeader(title: "Emails to Reply", count: store.bullets(.replyRules).count, subtitle: "Emails matching these rules will be flagged as needing a reply.", color: Theme.tagColor(.reply))
             }
 
             Section {
-                BulletListEditor(text: $store.noneRules)
+                BulletListEditor(store: store, section: .noneRules)
                     .background(sectionTracker("none"))
             } header: {
-                sectionHeader(title: "Emails to Mark as None", count: ruleCount(store.noneRules), subtitle: "Emails that don't fit other categories.", color: Theme.tagColor(.none))
+                sectionHeader(title: "Emails to Mark as None", count: store.bullets(.noneRules).count, subtitle: "Emails that don't fit other categories.", color: Theme.tagColor(.none))
             }
             }
             .listRowBackground(Palette.boxBg)
@@ -293,7 +293,10 @@ struct ActionRulesView: View {
         }
         .confirmationDialog("Reset to Default?", isPresented: $showResetConfirmation) {
             Button("Reset", role: .destructive) {
-                store.resetAction()
+                store.gesture("reset action rules") { hold in
+                    try hold.reset(.action)
+                    return .saved
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -309,14 +312,6 @@ struct ActionRulesView: View {
                 value: [SectionVisibility(id: id, minY: frame.minY, maxY: frame.maxY)]
             )
         }
-    }
-
-    /// Count the rules in a section's markdown: one non-empty line per rule
-    /// (bulleted "- " or plain — the editor round-trips both shapes).
-    private func ruleCount(_ section: String) -> Int {
-        section.split(separator: "\n")
-            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-            .count
     }
 
     private func sectionHeader(title: String, count: Int, subtitle: String, color: Color) -> some View {

@@ -8,15 +8,20 @@ import UIKit
 
 /// Device Sync always-on sync service using WebSocket relay.
 /// Syncs prompt settings between TabMail instances (iOS ↔ TB) automatically.
-/// Uses per-field timestamps for git-like merge (newer wins per field).
 ///
 /// Protocol:
 /// 1. Connect to Device Sync worker via WebSocket (wss://sync.tabmail.ai/ws)
 /// 2. Authenticate with TabMail session JWT token
-/// 3. On connect: broadcast all fields with per-field timestamps
-/// 4. On local edit: debounced broadcast of changed fields
-/// 5. On receive prompt_state: per-field timestamp merge (newer wins)
-/// 6. On receive request_state: respond with requested fields
+/// 3. The knowledge base, composition rules and action rules sync as labelled bullets
+///    (`bullet_state`, `PromptBulletSync`): each is sent on connect, after a local change, and after
+///    a merge of a peer's state that differed from this device's (DS-SEND, DS-MERGE).
+/// 4. Templates, disabled reminders and the action config sync in `prompt_state`: on connect
+///    broadcast with per-field timestamps, on local edit debounced, on receive per-field merge (newer
+///    wins). Its three text fields go out empty at epoch zero, which released apps skip; a released
+///    app's texts are imported as additions only (DS-LEGACY-OUT, DS-LEGACY-IN).
+/// 5. On receive request_state: respond with requested fields
+///
+/// Every received message is applied inside a hold of the prompt store (DS-RECEIVE), in arrival order.
 @MainActor @Observable
 final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     static let shared = DeviceSyncService()
@@ -47,7 +52,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
-    private var webSocket: URLSessionWebSocketTask?
+    var webSocket: URLSessionWebSocketTask?
     private var urlSession: URLSession?
     private var pingTimer: Timer?
     private var probeTimer: Timer?
@@ -65,6 +70,16 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     /// When true, the receive loop should NOT schedule a reconnect (user pressed disconnect or app backgrounded).
     private var intentionalDisconnect = false
 
+    /// The received messages for the prompt store, applied one after another in arrival order (DS-RECEIVE):
+    /// one the store refused as busy is applied again before any received after it.
+    private var receiveChain: Task<Void, Never>?
+    /// The received messages of this connection in `receiveChain` not yet finished, at most
+    /// `BulletSyncConfig.maxWaitingReceives`.
+    private var waitingReceives = 0
+    /// Renewed when the connection ends: a message received on an earlier connection is never applied
+    /// again (peers send their state on every connect).
+    private var connectionID = UUID()
+
     /// Debounce task for auto-broadcast on local edits (500ms).
     private var broadcastDebounceTask: Task<Void, Never>?
     /// Fields accumulated during debounce window.
@@ -75,9 +90,6 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     var aiCacheProbeHandler: (([String], [String]?) async -> [String: AICacheResult])?
 
     private let broadcastDebounceMs: UInt64 = 500
-
-    /// Maximum backup snapshots to keep in ring buffer.
-    private let maxBackups = 10
 
     private var baseURL: String { BackendConfig.syncWebSocketURL }
 
@@ -170,10 +182,6 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             BackgroundSyncLogger.logDebug("[DeviceSync] Demo mode active — skipping connect")
             return
         }
-        // Records the owner on installs from before ownership existed.
-        if let userId = TabMailAuthService.getSession()?.userId {
-            claimLocalState(for: userId)
-        }
         guard isAutoEnabled else {
             BackgroundSyncLogger.logDebug("[DeviceSync] Auto-sync disabled, skipping connect")
             return
@@ -229,6 +237,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         urlSession = nil
         isConnected = false
         isConnecting = false
+        connectionEnded()
         reconnectAttempts = 0 // fresh network, reset backoff
         BackgroundSyncLogger.logDebug("[DeviceSync] Force reconnect — network interface changed")
         connect()
@@ -343,6 +352,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         urlSession = nil
         isConnecting = false
         isConnected = false
+        connectionEnded()
         reconnectAttempts = 0
         BackgroundSyncLogger.logDebug("[DeviceSync] Disconnected")
     }
@@ -361,11 +371,11 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         probeAllFields()
     }
 
-    /// Request all prompt fields from peers (routine probe).
+    /// Request every `prompt_state` field from peers (routine probe), never the bullet fields: those
+    /// arrive as `bullet_state` when a peer connects or changes them.
     private func probeAllFields() {
-        let allFields = SyncField.allCases.map(\.rawValue)
-        requestStateFromPeers(fields: allFields)
-        BackgroundSyncLogger.logDebug("[DeviceSync] Probe: requested all fields from peers")
+        requestStateFromPeers(fields: SyncField.legacyFields.map(\.rawValue))
+        BackgroundSyncLogger.logDebug("[DeviceSync] Probe: requested the prompt_state fields from peers")
     }
 
     // MARK: - Per-Field Timestamps
@@ -398,72 +408,16 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         UserDefaults.standard.set(ts, forKey: TimestampKey.key(for: field))
     }
 
-    /// Public timestamp write — used by PromptStore.restoreFromHistory to set fresh timestamps.
-    func writeTimestampPublic(_ ts: String, for field: SyncField) {
-        writeTimestamp(ts, for: field)
-    }
-
-    // MARK: - Account ownership
-
-    /// The TabMail account whose synced state (prompts, KB, templates, disabled reminders,
-    /// compaction thresholds) this device holds.
-    nonisolated static let ownerUserIdKey = "device_sync_owner_user_id"
-
-    /// Binds this device's synced state to `userId`, at every session install and connect.
-    /// The same account keeps everything. A different account gets the defaults and no
-    /// sync timestamps, so this device probes the new account's peers like a new device and
-    /// never broadcasts the previous account's data into it. With no recorded owner (an
-    /// install from before this existed) the current state is adopted as-is.
-    func claimLocalState(for userId: String) {
-        let defaults = UserDefaults.standard
-        let owner = defaults.string(forKey: Self.ownerUserIdKey)
-        defaults.set(userId, forKey: Self.ownerUserIdKey)
-        guard let owner, owner != userId else { return }
-        BackgroundSyncLogger.logDebug("[DeviceSync] Different account signed in — clearing the previous account's synced state")
-        disconnect()
-        PromptStore.shared.resetForNewAccount()
-        DisabledRemindersStore.removeAllForNewAccount()
-        let keys = [PromptStore.actionCompactThresholdKey, PromptStore.actionCompactThresholdCharsKey,
-                    backupKey, "device_sync_auto_enabled"] + SyncField.allCases.map(TimestampKey.key(for:))
-        for key in keys {
-            defaults.removeObject(forKey: key)
-        }
-    }
-
     /// If no per-field timestamps exist, initialize all to epoch 0 (new device).
     private func initTimestampsIfNeeded() {
         let defaults = UserDefaults.standard
-        let anyExists = SyncField.allCases.contains { defaults.string(forKey: TimestampKey.key(for: $0)) != nil }
+        let anyExists = SyncField.legacyFields.contains { defaults.string(forKey: TimestampKey.key(for: $0)) != nil }
         if !anyExists {
             BackgroundSyncLogger.logDebug("[DeviceSync] New device — initializing per-field timestamps to epoch 0")
-            for field in SyncField.allCases {
+            for field in SyncField.legacyFields {
                 writeTimestamp(Self.epochZero, for: field)
             }
         }
-    }
-
-    // MARK: - Auto-Backup
-
-    private let backupKey = "device_sync_backups"
-
-    private func backupCurrentState() {
-        let store = PromptStore.shared
-        let snapshot: [String: Any] = [
-            "composition": store.rawComposition,
-            "action": store.rawAction,
-            "kb": store.rawKB,
-            "templates": (try? { let e = JSONEncoder(); e.dateEncodingStrategy = .iso8601; return e }().encode(store.templates)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]",
-            "timestamp": Date().ISO8601Format()
-        ]
-
-        let defaults = UserDefaults.standard
-        var backups = defaults.array(forKey: backupKey) as? [[String: Any]] ?? []
-        backups.append(snapshot)
-        if backups.count > maxBackups {
-            backups = Array(backups.suffix(maxBackups))
-        }
-        defaults.set(backups, forKey: backupKey)
-        BackgroundSyncLogger.logDebug("[DeviceSync] Backed up current state (\(backups.count) snapshots)")
     }
 
     // MARK: - Debounced Broadcast (called from PromptStore.didSet)
@@ -486,9 +440,10 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
-    /// Mark a field as "reset to defaults" — sets epoch-zero timestamp so the default
-    /// content never overwrites customized rules on other devices, then requests the
-    /// field from peers so they send back their (presumably newer) data.
+    /// Mark a `prompt_state` field as "reset to defaults" — sets epoch-zero timestamp so the default
+    /// content never overwrites customized data on other devices, then requests the field from
+    /// peers so they send back their (presumably newer) data. The bullet fields reset through
+    /// `PromptStore` (DS-RESET), with no request.
     func markFieldAsReset(_ field: SyncField) {
         writeTimestamp(Self.epochZero, for: field)
         requestStateFromPeers(fields: [field.rawValue])
@@ -518,6 +473,8 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
     /// This device's current value and per-field timestamp for each of `fields` — the one
     /// payload builder for auto-broadcasts, `request_state` replies and the connect broadcast.
+    /// The bullet fields go out empty at epoch zero (DS-LEGACY-OUT): released apps skip them, and never
+    /// receive this app's texts, which could make a released receiver remove its own bullets.
     func promptState(for fields: [SyncField]) -> PromptStateData {
         let store = PromptStore.shared
         var state = PromptStateData()
@@ -525,14 +482,14 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         for field in fields {
             switch field {
             case .composition:
-                state.composition = store.rawComposition
-                state.compositionUpdatedAt = readTimestamp(for: .composition)
+                state.composition = ""
+                state.compositionUpdatedAt = Self.epochZero
             case .action:
-                state.action = store.rawAction
-                state.actionUpdatedAt = readTimestamp(for: .action)
+                state.action = ""
+                state.actionUpdatedAt = Self.epochZero
             case .kb:
-                state.kb = store.rawKB
-                state.kbUpdatedAt = readTimestamp(for: .kb)
+                state.kb = ""
+                state.kbUpdatedAt = Self.epochZero
             case .templates:
                 state.templates = store.templates
                 state.templatesUpdatedAt = readTimestamp(for: .templates)
@@ -547,21 +504,22 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         return state
     }
 
-    /// Broadcast all fields with per-field timestamps (used on connect).
-    /// Virgin devices (all timestamps epoch-zero) skip broadcasting defaults
+    /// Broadcast all `prompt_state` fields with per-field timestamps (used on connect).
+    /// Virgin devices (all of those timestamps epoch-zero) skip broadcasting defaults
     /// and probe peers instead — prevents default content from clobbering
-    /// customized prompts on established devices via LWW.
+    /// customized data on established devices via LWW. The bullet fields are not
+    /// part of this: they always go out as `bullet_state`.
     private func broadcastAllFields() {
         guard let ws = webSocket else { return }
 
-        let allEpochZero = SyncField.allCases.allSatisfy { readTimestamp(for: $0) == Self.epochZero }
+        let allEpochZero = SyncField.legacyFields.allSatisfy { readTimestamp(for: $0) == Self.epochZero }
         if allEpochZero {
             BackgroundSyncLogger.logDebug("[DeviceSync] Virgin device — skipping broadcast, probing peers instead")
             probeAllFields()
             return
         }
 
-        sendPromptState(promptState(for: SyncField.allCases), via: ws)
+        sendPromptState(promptState(for: SyncField.legacyFields), via: ws)
         BackgroundSyncLogger.logDebug("[DeviceSync] Broadcast all fields on connect")
     }
 
@@ -582,12 +540,18 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
-    private func receiveLoop() async {
+    func receiveLoop() async {
         guard let ws = webSocket else { return }
 
         while !Task.isCancelled {
             do {
                 let message = try await ws.receive()
+                // A message read from a socket that has since ended is never handled: the connection that
+                // renewed it would otherwise take it as its own (DS-RECEIVE).
+                guard webSocket === ws, !Task.isCancelled else {
+                    BackgroundSyncLogger.logDebug("[DeviceSync] A message received on an ended connection was dropped")
+                    return
+                }
                 switch message {
                 case .string(let text):
                     handleMessage(text)
@@ -608,6 +572,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 isConnecting = false
                 isConnected = false
                 webSocket = nil
+                connectionEnded()
                 if !intentionalDisconnect {
                     scheduleReconnect()
                 }
@@ -616,8 +581,17 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
-    private func handleMessage(_ text: String) {
+    func handleMessage(_ text: String) {
         guard let data = text.data(using: .utf8) else { return }
+
+        // The bullet fields read the message as JSON values (DS-VALIDATE); demo never syncs them (DS-DEMO).
+        // A bullet_state is theirs alone, applied through the prompt store (DS-RECEIVE); everything else
+        // decodes below.
+        let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        if let object, object["type"] as? String == "bullet_state" {
+            if !DemoModeStore.isDemoActive { receiveBulletState(object) }
+            return
+        }
 
         struct IncomingMessage: Decodable {
             let type: String
@@ -641,8 +615,13 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 isConnecting = false
                 isConnected = true
                 reconnectAttempts = 0
-                // Auto-broadcast all fields on connect
-                broadcastAllFields()
+                // The bullet fields always go out on connect, read through the prompt store (DS-SEND),
+                // then the prompt_state fields.
+                PromptStore.shared.bullets.send = { [weak self] message in self?.sendBulletMessage(message) }
+                applyReceived("connected") { [weak self] access in
+                    try access.sendAll()
+                    self?.broadcastAllFields()
+                }
 
             case "request_state":
                 // Another client asked for our state — respond with requested fields (or all)
@@ -650,8 +629,14 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 respondToRequestState(fields: msg.fields)
 
             case "prompt_state":
+                // A released device's state, applied whole through the prompt store (DS-RECEIVE): its bullet
+                // texts imported (DS-LEGACY-IN), then its other fields merged; applied again whole while busy.
                 if let stateData = msg.data {
-                    applyIncomingStateWithMerge(stateData)
+                    let legacy = DemoModeStore.isDemoActive ? nil : object
+                    applyReceived("prompt_state") { [weak self] access in
+                        if let legacy { try access.receive(legacy) }
+                        try self?.applyIncomingStateWithMerge(stateData, access: access)
+                    }
                 }
 
             case "pong":
@@ -684,172 +669,102 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
-    /// Per-field merge using state-based delta merge (git-style) for text fields,
-    /// CRDT per-item merge for collections.
+    // MARK: - Received messages through the prompt store (DS-RECEIVE)
+
+    /// A received `bullet_state` part, merged through the prompt store (DS-MERGE). The engine validates it
+    /// (DS-VALIDATE); the parts of a snapshot apply in arrival order, after every message received before
+    /// them (DS-CHUNK).
+    private func receiveBulletState(_ message: [String: Any]) {
+        applyReceived("bullet_state \(message["sender"] ?? "") \(message["field"] ?? "") \(message["snap"] ?? "") \(message["part"] ?? "")") { access in
+            try access.receive(message)
+        }
+    }
+
+    /// Applies a received message through the prompt store after every message received before it, only
+    /// while the connection it was received on lasts.
+    private func applyReceived(_ key: String, _ apply: @escaping @MainActor (PromptAccess) throws -> Void) {
+        // Never a queue without limit behind a busy store: past the bound the connection ends, dropping
+        // every message waiting on it, and the next connect brings every peer's state again.
+        guard waitingReceives < BulletSyncConfig.maxWaitingReceives else {
+            BackgroundSyncLogger.logDebug("[DeviceSync] \(waitingReceives) received messages wait for the prompt store: the connection is renewed")
+            connectionEnded()
+            forceReconnect()
+            return
+        }
+        waitingReceives += 1
+        let previous = receiveChain
+        let connection = connectionID
+        // Created outside any hold: a task created inside one would inherit its mark (MIS-IOS-028).
+        receiveChain = PromptSemaphore.$holding.withValue(nil) {
+            Task { [weak self] in
+                await previous?.value
+                await self?.applyWhenFree(key, connection: connection, apply)
+                if let self, connection == self.connectionID { self.waitingReceives -= 1 }
+            }
+        }
+    }
+
+    /// One received message applied. While the prompt store stays busy through every retry it is applied
+    /// again after `BulletSyncConfig.busyReapplySeconds`, holding nothing while it waits, until it applies or
+    /// its connection ends (DS-RECEIVE): with both peers connected and nobody editing, nothing waits for the
+    /// next connect, and every message received after it waits for it, so they apply in arrival order. Any
+    /// other refusal drops it: peers send their state on the next connect.
+    private func applyWhenFree(_ key: String, connection: UUID,
+                               _ apply: @escaping @MainActor (PromptAccess) throws -> Void) async {
+        while connection == connectionID {
+            do {
+                // Checked inside the hold, where the message is applied: one received before the connection
+                // ended is never applied after it.
+                try await PromptStore.shared.withPromptStore("sync receive") { [weak self] access in
+                    guard connection == self?.connectionID else {
+                        BackgroundSyncLogger.logDebug("[DeviceSync] A received message (\(key.prefix(48))) was dropped: its connection ended")
+                        return
+                    }
+                    try apply(access)
+                }
+                return
+            } catch PromptRefusal.busy {
+                BackgroundSyncLogger.logDebug("[DeviceSync] The prompt store stayed busy: a received message (\(key.prefix(48))) is applied again shortly")
+                try? await Task.sleep(for: .seconds(BulletSyncConfig.busyReapplySeconds))
+            } catch {
+                BackgroundSyncLogger.logDebug("[DeviceSync] A received message (\(key.prefix(48))) was not applied: \(error)")
+                return
+            }
+        }
+        BackgroundSyncLogger.logDebug("[DeviceSync] A received message (\(key.prefix(48))) was dropped: its connection ended")
+    }
+
+    /// The connection ended: the engine forgets incomplete snapshots, and a message received on it is never
+    /// applied (DS-RECEIVE): peers send their state on the next connect.
+    private func connectionEnded() {
+        PromptStore.shared.bullets.disconnected()
+        connectionID = UUID()
+        waitingReceives = 0
+    }
+
+    /// Sends one `bullet_state` message while connected.
+    private func sendBulletMessage(_ text: String) {
+        guard let ws = webSocket, isConnected else { return }
+        ws.send(.string(text)) { error in
+            if let error { BackgroundSyncLogger.logDebug("[DeviceSync] bullet_state send failed: \(Self.redactedTransportError(error))") }
+        }
+    }
+
+    /// Per-field merge of the `prompt_state` fields: CRDT per-item merge for collections,
+    /// last-write-wins for the action config. Its text fields are imported before this
+    /// (`PromptBulletSync.receiveLegacy`), in the same hold of the prompt store (DS-RECEIVE).
     ///
-    /// Text fields (composition, action, kb) — 3-way merge with peer-received base:
-    ///   1. Epoch-zero → skip (virgin/reset device)
-    ///   2. Stale (incoming_ts <= peer_base_ts) → skip
-    ///   3. No peer_base yet (first sync) → LWW (newer timestamp wins)
-    ///   4. No local changes since last sync (local == peer_base) → fast-forward
-    ///   5. Both sides changed → 3-way merge using peer_base as common ancestor
-    ///   6. CRITICAL: always save peer_base = incoming (NOT merged result)
+    /// Everything here runs synchronously on the MainActor inside the hold, with no await between a store's
+    /// read and its write, and reads the timestamps it compares in the same step it writes (the local
+    /// writers of these stores are synchronous MainActor code too, so none can interleave).
     ///
     /// Templates: per-template CRDT merge by id (newer updatedAt wins per template).
     /// DisabledReminders: per-hash CRDT merge (newer ts wins per hash).
-    func applyIncomingStateWithMerge(_ incoming: PromptStateData) {
+    func applyIncomingStateWithMerge(_ incoming: PromptStateData, access: PromptAccess) throws {
         let store = PromptStore.shared
 
         // Capture pre-merge snapshot for history (before any merges modify state)
-        let preMergeComposition = store.rawComposition
-        let preMergeAction = store.rawAction
-        let preMergeKB = store.rawKB
         let preMergeTemplates = store.templates
-
-        var appliedFields: [SyncField] = []
-
-        // --- Text fields: state-based delta merge ---
-        var mergedComposition: String?
-        var mergedAction: String?
-        var mergedKB: String?
-
-        // Helper: resolve incoming timestamp for a text field
-        func incomingTimestamp(for field: SyncField) -> String {
-            switch field {
-            case .composition: return incoming.compositionUpdatedAt ?? incoming.updatedAt ?? Self.epochZero
-            case .action: return incoming.actionUpdatedAt ?? incoming.updatedAt ?? Self.epochZero
-            case .kb: return incoming.kbUpdatedAt ?? incoming.updatedAt ?? Self.epochZero
-            default: return Self.epochZero
-            }
-        }
-
-        // Helper: get the incoming content for a text field
-        func incomingContent(for field: SyncField) -> String? {
-            switch field {
-            case .composition: return incoming.composition
-            case .action: return incoming.action
-            case .kb: return incoming.kb
-            default: return nil
-            }
-        }
-
-        // Helper: get the local content for a text field
-        func localContent(for field: SyncField) -> String {
-            switch field {
-            case .composition: return store.rawComposition
-            case .action: return store.rawAction
-            case .kb: return store.rawKB
-            default: return ""
-            }
-        }
-
-        // Helper: log git-style unified diff between old and new content
-        func logDiff(field: SyncField, old: String, new: String, mergeType: String) {
-            guard DebugModeManager.isLoggingEnabled() else { return }
-            let oldLines = old.components(separatedBy: "\n")
-            let newLines = new.components(separatedBy: "\n")
-            let oldSet = Set(oldLines)
-            let newSet = Set(newLines)
-            let removed = oldLines.filter { !newSet.contains($0) }
-            let added = newLines.filter { !oldSet.contains($0) }
-            if removed.isEmpty && added.isEmpty {
-                BackgroundSyncLogger.logDebug("[DeviceSync] \(field.rawValue) (\(mergeType)): no visible diff (reordering only)")
-                return
-            }
-            var lines = ["[DeviceSync] \(field.rawValue) (\(mergeType)) diff:"]
-            for r in removed { lines.append("  - \(r)") }
-            for a in added { lines.append("  + \(a)") }
-            BackgroundSyncLogger.logDebug(lines.joined(separator: "\n"))
-        }
-
-        // Helper: 3-way merge dispatcher per field type
-        func merge3way(base: String, local: String, remote: String, field: SyncField) -> String {
-            switch field {
-            case .composition:
-                return PromptParser.mergeSectionedField(
-                    base: base, local: local, remote: remote,
-                    sectionHeaders: PromptParser.compositionSectionHeaders
-                )
-            case .action:
-                return PromptParser.mergeSectionedField(
-                    base: base, local: local, remote: remote,
-                    sectionHeaders: PromptParser.actionSectionHeaders
-                )
-            case .kb:
-                return PromptParser.mergeFlatField(base: base, local: local, remote: remote)
-            default:
-                return local
-            }
-        }
-
-        for field in [SyncField.composition, .action, .kb] {
-            guard let remote = incomingContent(for: field) else { continue }
-            let incomingTs = incomingTimestamp(for: field)
-
-            // 1. Epoch-zero → skip (virgin/reset device)
-            if incomingTs == Self.epochZero {
-                BackgroundSyncLogger.logDebug("[DeviceSync] Skipping \(field.rawValue) — epoch-zero timestamp (virgin/reset)")
-                continue
-            }
-
-            let (peerBase, peerBaseTs) = store.readPeerBase(for: field)
-            let local = localContent(for: field)
-            let localTs = readTimestamp(for: field)
-
-            // 2. Stale — already processed this or newer from the peer
-            if incomingTs <= peerBaseTs {
-                BackgroundSyncLogger.logDebug("[DeviceSync] Skipping \(field.rawValue) — stale (incoming \(incomingTs) <= peer_base \(peerBaseTs))")
-                continue
-            }
-
-            var result: String?
-
-            if peerBase == nil {
-                // 3. First sync — no common ancestor, use LWW
-                if incomingTs > localTs {
-                    result = remote
-                    BackgroundSyncLogger.logDebug("[DeviceSync] \(field.rawValue): first sync, LWW accept (incoming \(incomingTs) > local \(localTs))")
-                } else {
-                    BackgroundSyncLogger.logDebug("[DeviceSync] \(field.rawValue): first sync, LWW keep local (local \(localTs) >= incoming \(incomingTs))")
-                }
-            } else if local == peerBase {
-                // 4. Fast-forward — no local changes since last sync
-                result = remote
-                BackgroundSyncLogger.logDebug("[DeviceSync] \(field.rawValue): fast-forward (no local changes since last sync)")
-            } else {
-                // 5. Both sides changed — 3-way merge using peer_base as common ancestor
-                let merged = merge3way(base: peerBase!, local: local, remote: remote, field: field)
-                if merged != local {
-                    result = merged
-                    BackgroundSyncLogger.logDebug("[DeviceSync] \(field.rawValue): 3-way merge (both sides changed)")
-                } else {
-                    BackgroundSyncLogger.logDebug("[DeviceSync] \(field.rawValue): 3-way merge produced no change")
-                }
-            }
-
-            // 6. ALWAYS save peer_base = incoming (NOT merged result)
-            store.savePeerBase(remote, ts: incomingTs, for: field)
-
-            if let result, result != local {
-                let mergeType: String
-                if peerBase == nil { mergeType = "LWW" }
-                else if local == peerBase { mergeType = "fast-forward" }
-                else { mergeType = "3-way merge" }
-                logDiff(field: field, old: local, new: result, mergeType: mergeType)
-
-                switch field {
-                case .composition: mergedComposition = result
-                case .action: mergedAction = result
-                case .kb: mergedKB = result
-                default: break
-                }
-                appliedFields.append(field)
-                // Update field timestamp to max of local and incoming
-                if incomingTs > localTs {
-                    writeTimestamp(incomingTs, for: field)
-                }
-            }
-        }
 
         // --- Templates: per-template CRDT merge — skip if epoch-zero ---
         if let incomingTemplates = incoming.templates {
@@ -863,12 +778,8 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                     BackgroundSyncLogger.logDebug("[DeviceSync] Skipped \(skipped) invalid templates (missing id/name)")
                 }
                 if !validTemplates.isEmpty {
-                    let before = store.templates
                     store.mergeTemplates(validTemplates)
                     store.gcDeletedTemplates()
-                    if store.templates != before {
-                        appliedFields.append(.templates)
-                    }
                 }
             }
         }
@@ -883,7 +794,6 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 DisabledRemindersStore.mergeIncoming(incomingMap)
                 let afterHashes = DisabledRemindersStore.getDisabledHashes()
                 if beforeHashes != afterHashes {
-                    appliedFields.append(.disabledReminders)
                     NotificationCenter.default.post(name: .remindersDidChange, object: nil)
                 }
             }
@@ -904,29 +814,13 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             }
         }
 
-        // Apply text field results (skip internal history — we record below)
-        if mergedComposition != nil || mergedAction != nil || mergedKB != nil {
-            store.applySync(
-                composition: mergedComposition,
-                action: mergedAction,
-                kb: mergedKB,
-                skipHistory: true
-            )
-        }
-
-        // Compare pre-merge vs post-merge — only record history if something actually changed
-        var changedFieldNames: [String] = []
-        if store.rawComposition != preMergeComposition { changedFieldNames.append("composition") }
-        if store.rawAction != preMergeAction { changedFieldNames.append("action") }
-        if store.rawKB != preMergeKB { changedFieldNames.append("kb") }
-        if store.templates != preMergeTemplates { changedFieldNames.append("templates") }
-
-        guard !changedFieldNames.isEmpty else {
-            BackgroundSyncLogger.logDebug("[DeviceSync] No actual changes after merge — skipping history")
+        // Only record history if the templates actually changed (the bullet fields record their own).
+        guard store.templates != preMergeTemplates else {
+            BackgroundSyncLogger.logDebug("[DeviceSync] No template changes after merge — skipping history")
             return
         }
 
-        // Record pre-merge snapshot so diff view can show before→after
+        // Record the pre-merge templates so the diff view can show before→after
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let templatesStr = (try? encoder.encode(preMergeTemplates)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
@@ -934,20 +828,20 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             id: UUID().uuidString,
             timestamp: Date().ISO8601Format(),
             source: "sync_receive",
-            fields: changedFieldNames,
-            composition: preMergeComposition,
-            action: preMergeAction,
-            kb: preMergeKB,
+            fields: ["templates"],
+            composition: store.rawComposition,
+            action: store.rawAction,
+            kb: store.rawKB,
             templatesJSON: templatesStr
         )
-        var history = store.loadHistory()
+        var history = try access.loadHistory()
         history.append(entry)
         if history.count > 100 {
             history = Array(history.suffix(100))
         }
-        store.saveHistory(history)
+        try access.saveHistory(history)
 
-        BackgroundSyncLogger.logDebug("[DeviceSync] Applied sync: \(changedFieldNames.joined(separator: ", "))")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Applied sync: templates")
     }
 
     /// The thresholds to adopt from a peer, or nil to keep local. Last-write-wins by
@@ -1103,8 +997,8 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 enum SyncField: String, CaseIterable {
     case composition, action, kb, templates, disabledReminders, actionConfig
 
-    /// Prompt-only fields (excludes disabledReminders). Used for history/backup/UI that only cares about prompt settings.
-    static let promptFields: [SyncField] = [.composition, .action, .kb, .templates]
+    /// The fields `prompt_state` still syncs: the bullet fields go in `bullet_state`.
+    static let legacyFields: [SyncField] = [.templates, .disabledReminders, .actionConfig]
 
     var displayName: String {
         switch self {

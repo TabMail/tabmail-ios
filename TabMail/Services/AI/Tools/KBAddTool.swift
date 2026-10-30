@@ -25,26 +25,42 @@ struct KBAddTool: AgentTool, Sendable {
 
         BackgroundSyncLogger.logDebug("[KBAddTool] Starting with statement='\(statement.prefix(140))' len=\(statement.count)")
 
-        // Load current KB
-        let current = PromptStore.kbTextSnapshot()
-
         // Prefix with [Pinned] since kb_add is for explicit user requests (matching TB)
         let pinned = statement.hasPrefix("[Pinned]") ? statement : "[Pinned] \(statement)"
         let patchText = "ADD\n\(pinned)"
 
-        guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText) else {
+        // One read-change-save of the KB through the prompt store (DS-CAPTURE); the commit sends it
+        // (Device Sync).
+        let edit = await { @MainActor () async -> KBToolEdit in
+            var patched = false
+            let outcome = await PromptStore.shared.edit("kb_add tool") { hold in
+                try hold.editText(.kb) { current in
+                    guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText) else { return nil }
+                    patched = true
+                    return updated
+                }
+            }
+            return KBToolEdit(patched: patched, outcome: outcome)
+        }()
+
+        // Refused before the patch ran: the model is told why.
+        if let refusal = KBToolEdit.refusal(edit.outcome) { return refusal }
+
+        guard edit.patched else {
             BackgroundSyncLogger.logDebug("[KBAddTool] applyKBPatch returned nil")
             return #"{"error": "failed to update knowledge base"}"#
         }
 
-        if updated == current {
+        switch edit.outcome {
+        case .saved:
+            BackgroundSyncLogger.logDebug("[KBAddTool] Persisted user_kb.md")
+        case .unchanged:
             BackgroundSyncLogger.logDebug("[KBAddTool] No-op (duplicate or unchanged)")
             return "No change (duplicate or unchanged)."
+        case .unsaved, .dropped, .busy:
+            BackgroundSyncLogger.logDebug("[KBAddTool] Not saved (\(edit.outcome))")
+            return #"{"error": "failed to update knowledge base"}"#
         }
-
-        // Persist — Device Sync triggers automatically via PromptStore's rawKB didSet
-        await MainActor.run { PromptStore.shared.rawKB = updated }
-        BackgroundSyncLogger.logDebug("[KBAddTool] Persisted user_kb.md (\(updated.count) chars)")
 
         BackgroundSyncLogger.logDebug("[KBAddTool] Success")
         return "Added to knowledge base."

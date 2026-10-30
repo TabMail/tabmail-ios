@@ -21,24 +21,15 @@ struct SyncFieldExtendedTests {
         #expect(cases.contains(.actionConfig))
     }
 
-    @Test("promptFields has exactly 4 elements")
-    func promptFieldsCount() {
-        #expect(SyncField.promptFields.count == 4)
-    }
-
-    @Test("promptFields excludes disabledReminders")
-    func promptFieldsExcludesNonPromptFields() {
-        #expect(!SyncField.promptFields.contains(.disabledReminders))
-        #expect(!SyncField.promptFields.contains(.actionConfig))
-    }
-
-    @Test("promptFields includes all prompt-related cases")
-    func promptFieldsContent() {
-        let prompt = SyncField.promptFields
-        #expect(prompt.contains(.composition))
-        #expect(prompt.contains(.action))
-        #expect(prompt.contains(.kb))
-        #expect(prompt.contains(.templates))
+    @Test("legacyFields are the prompt_state fields, without the bullet fields")
+    func legacyFieldsContent() {
+        #expect(SyncField.legacyFields.count == 3)
+        #expect(SyncField.legacyFields.contains(.templates))
+        #expect(SyncField.legacyFields.contains(.disabledReminders))
+        #expect(SyncField.legacyFields.contains(.actionConfig))
+        #expect(!SyncField.legacyFields.contains(.composition))
+        #expect(!SyncField.legacyFields.contains(.action))
+        #expect(!SyncField.legacyFields.contains(.kb))
     }
 
     @Test("displayName values are all unique")

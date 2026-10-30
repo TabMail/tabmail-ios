@@ -1145,15 +1145,15 @@ struct TutorialLifecycleTests {
         let store = DemoModeStore.shared
         let prompts = PromptStore.shared
         let kbKey = "user_prompts:user_kb.md"
-        let savedKB = prompts.rawKB
         defer {
             store._resetForTests()
-            prompts.rawKB = savedKB
             InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
         }
         store._resetForTests()
-        let realKB = "- real kb \(UUID().uuidString)"
-        prompts.rawKB = realKB
+        let realBullet = "real kb \(UUID().uuidString)"
+        let added = await prompts.edit("tutorial test real kb") { try $0.addBullet(realBullet, to: .knowledgeBase) }
+        try #require(added == .saved)
+        let realKB = prompts.rawKB
         let realTemplateIds = prompts.templates.map(\.id)
 
         try await DemoModeService.shared.start(mintToken: false)
@@ -1195,6 +1195,12 @@ struct TutorialLifecycleTests {
                 "no demo provider is left registered")
         let demoAccount = try await pool.read { try Account.fetchOne($0, key: DemoSeed.demoAccountId) }
         #expect(demoAccount == nil, "no demo mail is left behind")
+
+        // Remove exactly the bullet this test added, by the labels the store shows for it (DS-DISPLAYED).
+        if let shown = prompts.shown(.knowledgeBase).first(where: { $0.text == realBullet }) {
+            let removed = await prompts.edit("tutorial test cleanup") { try $0.deleteShown(shown, from: .knowledgeBase) }
+            #expect(removed == .saved)
+        }
     }
 
     /// Waits on a background thread until `semaphore` is signalled.

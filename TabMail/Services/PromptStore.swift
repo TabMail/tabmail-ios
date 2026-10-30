@@ -90,9 +90,168 @@ struct ReplyTemplate: Identifiable, Codable, Hashable, Sendable {
 
 // MARK: - Prompt Store
 
-/// Stores user prompts as raw markdown strings matching TB's `browser.storage.local` format.
-/// The raw markdown is the source of truth — UI sections are parsed from and reconstructed into it.
-/// This makes cross-platform sync trivial: just push/pull the raw strings.
+/// The sections the Settings lists show, and where each one lives in its field (DS-SECTION).
+enum PromptSection: CaseIterable, Sendable {
+    case writingStyle, language, usefulLinks, deleteRules, archiveRules, replyRules, noneRules, knowledgeBase
+
+    var field: BulletField {
+        switch self {
+        case .writingStyle, .language, .usefulLinks: return .composition
+        case .deleteRules, .archiveRules, .replyRules, .noneRules: return .action
+        case .knowledgeBase: return .kb
+        }
+    }
+
+    /// The section's key (DS-SECTION).
+    var key: String {
+        switch self {
+        case .writingStyle: return "general"
+        case .language: return "language"
+        case .usefulLinks: return "links"
+        case .deleteRules: return "delete"
+        case .archiveRules: return "archive"
+        case .replyRules: return "reply"
+        case .noneRules: return "none"
+        case .knowledgeBase: return ""
+        }
+    }
+}
+
+/// A field as an editor read it, with the labels it showed (DS-CAPTURE, DS-DISPLAYED): `commitEdit`
+/// deletes only those of them whose text the edit removed, so a bullet that arrives while it is open is
+/// never deleted by it. It carries the store's change counter as it was read (DS-COUNTER): an AI writer's
+/// commit (DS-AI) is refused once that moved. The demo flag is snapshotted here (DS-DEMO): a capture taken
+/// in the demo commits only to the demo, and one taken outside it only outside.
+struct PromptCapture: Sendable {
+    let field: BulletField
+    let text: String
+    fileprivate let labels: [Bullet]
+    fileprivate let demo: Bool
+    fileprivate let counter: UUID
+}
+
+enum PromptEditOutcome: Equatable, Sendable {
+    case saved, unchanged
+    /// It couldn't be saved; nothing changed.
+    case unsaved
+    /// An AI writer's counter moved since its read (DS-AI), the hold ran past its lease (DS-LEASE), or demo
+    /// mode started or ended since the read (DS-DEMO): the write is dropped.
+    case dropped
+    /// The prompt store stayed busy through every retry (DS-SEMAPHORE): nothing changed; try again in a
+    /// moment.
+    case busy
+}
+
+/// What an AI writer's read gave (DS-AI step 1): the capture, or why there is none (`.unsaved` while the
+/// field's upgrade is unsaved, DS-UNSAVED-UPGRADE; `.busy`).
+enum PromptReadOutcome: Sendable {
+    case read(PromptCapture)
+    case refused(PromptEditOutcome)
+}
+
+/// The prompt store inside a hold (DS-SEMAPHORE), given to `PromptStore.withPromptStore`'s body: the only
+/// way to read or write the three bullet fields and their history. Every call checks that the hold is
+/// still the holder immediately before it reads or writes (DS-LEASE) and throws `PromptRefusal.changed`
+/// when it is not.
+@MainActor
+struct PromptAccess {
+    fileprivate let store: PromptStore
+    let hold: PromptHold
+
+    private func check() throws {
+        guard hold.isHolder else { throw PromptRefusal.changed }
+    }
+
+    /// `field`'s text now, and the labels it shows, to change and pass to `commitEdit`. Nil while an
+    /// upgrade is unsaved (DS-UNSAVED-UPGRADE).
+    func readForEdit(_ field: BulletField) throws -> PromptCapture? {
+        try check()
+        return store.readForEdit(field, counter: hold.counter)
+    }
+
+    /// Saves `text` as the captured field's new text (DS-CAPTURE).
+    func commitEdit(_ capture: PromptCapture, text: String) throws -> PromptEditOutcome {
+        try check()
+        return store.commitEdit(capture, text: text)
+    }
+
+    /// DS-AI step 3: as `commitEdit`, refused with nothing written when the counter moved since the read.
+    func commitAIEdit(_ capture: PromptCapture, text: String) throws -> PromptEditOutcome {
+        try hold.requireUnchanged(since: capture.counter)
+        return store.commitEdit(capture, text: text)
+    }
+
+    /// One read-change-save of `field`'s text: `transform` gets the text as it is now and returns the new
+    /// one, or nil to leave it.
+    func editText(_ field: BulletField, _ transform: (String) -> String?) throws -> PromptEditOutcome {
+        try check()
+        guard let capture = store.readForEdit(field, counter: hold.counter) else { return .unsaved }
+        guard let updated = transform(capture.text) else { return .unchanged }
+        return store.commitEdit(capture, text: updated)
+    }
+
+    func addBullet(_ text: String, to section: PromptSection) throws -> PromptEditOutcome {
+        try check()
+        return store.addBullet(text, to: section)
+    }
+
+    /// DS-DISPLAYED: deletes exactly the labels `shown` carried when it was displayed, those still live.
+    /// `.unchanged` means they were already removed.
+    func deleteShown(_ shown: ShownBullet, from section: PromptSection) throws -> PromptEditOutcome {
+        try check()
+        return store.deleteShown(shown, from: section)
+    }
+
+    /// DS-RESET of `field`.
+    func reset(_ field: BulletField) throws {
+        try check()
+        store.resetBullets(field)
+    }
+
+    /// A history entry of the stored values now (DS-HISTORY).
+    func recordHistory(source: String, fields: [String]) throws {
+        try check()
+        store.recordHistory(source: source, fields: fields)
+    }
+
+    func loadHistory() throws -> [PromptHistoryEntry] {
+        try check()
+        return store.loadHistory()
+    }
+
+    func saveHistory(_ entries: [PromptHistoryEntry]) throws {
+        try check()
+        store.saveHistory(entries)
+    }
+
+    /// DS-RESTORE.
+    func restoreFromHistory(_ entry: PromptHistoryEntry) throws {
+        try check()
+        store.restoreFromHistory(entry)
+    }
+
+    /// A message from the connection (DS-VALIDATE): a `bullet_state` merged, a released device's
+    /// `prompt_state` bullet texts imported (DS-LEGACY-IN).
+    @discardableResult
+    func receive(_ message: [String: Any]) throws -> BulletReceiveResult {
+        try check()
+        return store.bullets.receive(message)
+    }
+
+    /// Connected: every bullet field's state goes out (DS-SEND).
+    func sendAll() throws {
+        try check()
+        store.bullets.connected()
+    }
+}
+
+/// The knowledge base, the composition rules and the action rules, and the reply templates.
+///
+/// The three bullet fields are kept as labelled bullets by Device Sync's engine (`PromptBulletSync`),
+/// which is the one way they change: every edit, reset, restore and merge is one read-change-save commit
+/// of their bullets and, in the same commit, of their rendered markdown in TB's keys (DS-ATOMIC), which
+/// every reader reads. `rawComposition`, `rawAction` and `rawKB` are that text. Every commit runs in a
+/// hold of the device's one semaphore (`withPromptStore`, DS-LOCK).
 ///
 /// Storage keys mirror TB's:
 ///   - `user_prompts:user_composition.md`
@@ -105,76 +264,37 @@ final class PromptStore {
 
     private let defaults = UserDefaults.standard
 
+    @ObservationIgnored private let bulletStore: UserDefaultsBulletStore
+    /// Device Sync of the three bullet fields; DeviceSyncService connects it.
+    @ObservationIgnored let bullets: PromptBulletSync
+    @ObservationIgnored private let catalog: DefaultCatalog
     /// DS-SEMAPHORE: this device's one semaphore for the knowledge base, writing style and action rules.
-    let semaphore = PromptSemaphore()
+    @ObservationIgnored let semaphore: PromptSemaphore
 
-    /// DS-SEMAPHORE: the ONE API through which the three fields are read-changed-written. Sync, edits,
-    /// resets, restores, tools, refines and history all come through here.
-    func withPromptStore<T>(_ label: String, _ body: (PromptHold) async throws -> T) async throws -> T {
-        try await semaphore.hold(label, body)
-    }
-
-    /// When true, incoming sync is being applied — suppress broadcasting back to peers.
+    /// When true, incoming template sync is being applied — suppress broadcasting back to peers.
     private(set) var isSyncApplying = false
 
     /// Debounce task for recording history on local edits (2s quiet period).
     private var historyDebounceTask: Task<Void, Never>?
     private var pendingHistoryFields: Set<String> = []
 
-    // MARK: - Raw markdown (source of truth, sync-compatible with TB)
+    // MARK: - Rendered markdown (TB's format)
 
     /// Full composition markdown (writing style + language + links).
-    /// Set this directly when receiving sync data from another TabMail instance.
-    var rawComposition: String {
-        didSet {
-            defaults.set(rawComposition, forKey: Self.storageKey(Keys.composition))
-            // Demo overlay (ADR-IOS-038): demo writes go to the demo key only —
-            // no NSE mirror, no Device Sync broadcast/timestamps, no history.
-            guard !DemoModeStore.isDemoActive else { return }
-            NSEDataBridge.mirrorPrompts()
-            if !isSyncApplying {
-                DeviceSyncService.shared.debouncedBroadcast(fields: [.composition])
-                debouncedRecordHistory(field: "composition")
-            }
-        }
-    }
+    private(set) var rawComposition: String
 
     /// Full action classification markdown (delete/archive/reply/none rules).
-    /// Set this directly when receiving sync data from another TabMail instance.
-    var rawAction: String {
-        didSet {
-            defaults.set(rawAction, forKey: Self.storageKey(Keys.action))
-            // Demo overlay — see rawComposition.
-            guard !DemoModeStore.isDemoActive else { return }
-            NSEDataBridge.mirrorPrompts()
-            if !isSyncApplying {
-                DeviceSyncService.shared.debouncedBroadcast(fields: [.action])
-                debouncedRecordHistory(field: "action")
-            }
-        }
-    }
+    private(set) var rawAction: String
 
     /// Knowledge base text.
-    /// Set this directly when receiving sync data from another TabMail instance.
-    var rawKB: String {
-        didSet {
-            ReminderBuilder.invalidateCache()
-            defaults.set(rawKB, forKey: Self.storageKey(Keys.kb))
-            // Demo overlay — see rawComposition.
-            guard !DemoModeStore.isDemoActive else { return }
-            NSEDataBridge.mirrorPrompts()
-            if !isSyncApplying {
-                DeviceSyncService.shared.debouncedBroadcast(fields: [.kb])
-                debouncedRecordHistory(field: "kb")
-            }
-        }
-    }
+    private(set) var rawKB: String
 
     /// Reply templates (JSON-encoded, same format as TB's `user_templates`).
     var templates: [ReplyTemplate] {
         didSet {
             saveTemplates()
-            // Demo overlay — see rawComposition.
+            // Demo overlay (ADR-IOS-038): demo writes go to the demo key only —
+            // no Device Sync broadcast/timestamps, no history.
             guard !DemoModeStore.isDemoActive else { return }
             if !isSyncApplying {
                 DeviceSyncService.shared.debouncedBroadcast(fields: [.templates])
@@ -183,67 +303,54 @@ final class PromptStore {
         }
     }
 
-    // MARK: - Parsed section accessors (for UI bindings)
-    // These parse from / reconstruct into the raw markdown.
+    // MARK: - Sections (for Settings)
 
-    var writingStyle: String {
-        get { PromptParser.extractSection(from: rawComposition, header: SectionHeaders.writingStyle) }
-        set { rawComposition = PromptParser.replaceSection(in: rawComposition, header: SectionHeaders.writingStyle, with: newValue) }
+    /// The bullets of `section` as shown.
+    func bullets(_ section: PromptSection) -> [String] {
+        Bullets.parse(section.field, raw(section.field)).bullets
+            .filter { Bullets.same($0.section, section.key) }
+            .map(\.text)
     }
 
-    var language: String {
-        get { PromptParser.extractSection(from: rawComposition, header: SectionHeaders.language) }
-        set { rawComposition = PromptParser.replaceSection(in: rawComposition, header: SectionHeaders.language, with: newValue) }
+    /// The bullets of `section` as a screen shows them, each with the labels it carries now
+    /// (DS-DISPLAYED). In demo the overlay has no labels.
+    func shown(_ section: PromptSection) -> [ShownBullet] {
+        if DemoModeStore.isDemoActive { return bullets(section).map { ShownBullet(text: $0, labels: []) } }
+        return bullets.shown(section.field, section: section.key)
     }
 
-    var usefulLinks: String {
-        get { PromptParser.extractSection(from: rawComposition, header: SectionHeaders.usefulLinks) }
-        set { rawComposition = PromptParser.replaceSection(in: rawComposition, header: SectionHeaders.usefulLinks, with: newValue) }
-    }
+    var writingStyle: String { sectionText(.writingStyle) }
+    var language: String { sectionText(.language) }
+    var usefulLinks: String { sectionText(.usefulLinks) }
+    var deleteRules: String { sectionText(.deleteRules) }
+    var archiveRules: String { sectionText(.archiveRules) }
+    var replyRules: String { sectionText(.replyRules) }
+    var noneRules: String { sectionText(.noneRules) }
+    var knowledgeBase: String { rawKB }
 
-    var deleteRules: String {
-        get { PromptParser.extractSection(from: rawAction, header: SectionHeaders.deleteRules) }
-        set { rawAction = PromptParser.replaceSection(in: rawAction, header: SectionHeaders.deleteRules, with: newValue) }
-    }
-
-    var archiveRules: String {
-        get { PromptParser.extractSection(from: rawAction, header: SectionHeaders.archiveRules) }
-        set { rawAction = PromptParser.replaceSection(in: rawAction, header: SectionHeaders.archiveRules, with: newValue) }
-    }
-
-    var replyRules: String {
-        get { PromptParser.extractSection(from: rawAction, header: SectionHeaders.replyRules) }
-        set { rawAction = PromptParser.replaceSection(in: rawAction, header: SectionHeaders.replyRules, with: newValue) }
-    }
-
-    var noneRules: String {
-        get { PromptParser.extractSection(from: rawAction, header: SectionHeaders.noneRules) }
-        set { rawAction = PromptParser.replaceSection(in: rawAction, header: SectionHeaders.noneRules, with: newValue) }
-    }
-
-    var knowledgeBase: String {
-        get { rawKB }
-        set { rawKB = newValue }
+    private func sectionText(_ section: PromptSection) -> String {
+        bullets(section).map { "- " + $0 }.joined(separator: "\n")
     }
 
     // MARK: - Init
 
     private init() {
+        guard let url = Bundle.main.url(forResource: "device-sync-default-catalog", withExtension: "json"),
+              let data = try? Data(contentsOf: url), let catalog = try? DefaultCatalog.decode(data) else {
+            fatalError("The bundled Device Sync default catalog is missing or unreadable")
+        }
+        let bulletStore = UserDefaultsBulletStore(defaults: defaults)
+        Self.writeMissingDefaults(bulletStore, defaults: defaults, catalog: catalog)
+        let bullets = PromptBulletSync(store: bulletStore, catalog: catalog, skeleton: Self.skeleton)
+        self.catalog = catalog
+        self.bulletStore = bulletStore
+        self.bullets = bullets
+        semaphore = PromptSemaphore()
+        rawComposition = bullets.rendered(.composition)
+        rawAction = bullets.rendered(.action)
+        rawKB = bullets.rendered(.kb)
+
         let d = UserDefaults.standard
-
-        // Flush defaults to UserDefaults on first run — didSet does not fire in init,
-        // so without this, nonisolated snapshot readers (actionMarkdownSnapshot,
-        // kbTextSnapshot) and the NSE mirror see "" until the user first edits.
-        let storedComposition = d.string(forKey: Keys.composition)
-        let storedAction = d.string(forKey: Keys.action)
-        let storedKB = d.string(forKey: Keys.kb)
-        self.rawComposition = storedComposition ?? Defaults.composition
-        self.rawAction = storedAction ?? Defaults.action
-        self.rawKB = storedKB ?? Defaults.kb
-        if storedComposition == nil { d.set(Defaults.composition, forKey: Keys.composition) }
-        if storedAction == nil { d.set(Defaults.action, forKey: Keys.action) }
-        if storedKB == nil { d.set(Defaults.kb, forKey: Keys.kb) }
-
         if let data = d.data(forKey: Keys.templates),
            let decoded = try? JSONDecoder().decode([ReplyTemplate].self, from: data) {
             self.templates = decoded
@@ -259,8 +366,218 @@ final class PromptStore {
             self.templates = []
         }
 
-        // Migrate old sync base → peer base (one-time, from v1 3-way merge era)
-        migrateSyncBaseToPeerBase()
+        bulletStore.willCommit = { [unowned self] kind, changedText in
+            self.willCommitBullets(kind, changedText: changedText)
+        }
+        bulletStore.didCommit = { [unowned self] kind, fields in
+            self.didCommitBullets(kind, fields: fields)
+        }
+        NSEDataBridge.mirrorPrompts()
+    }
+
+    /// A field with no stored text gets the defaults' text, which DS-UPGRADE then labels as the catalog
+    /// defaults (DS-DEFAULT): the state a new install or a reset holds.
+    static func writeMissingDefaults(_ store: UserDefaultsBulletStore, defaults: UserDefaults, catalog: DefaultCatalog) {
+        for field in BulletField.allCases where store.read(field) == nil && store.legacyText(field) == nil {
+            guard let key = UserDefaultsBulletStore.renderedKeys[field] else { continue }
+            defaults.set(defaultText(field, catalog: catalog), forKey: key)
+        }
+    }
+
+    /// The built-in skeleton (DS-SKELETON): the lines around the sections of TB's bundled prompt files.
+    static func skeleton(_ field: BulletField) -> FieldSkeleton {
+        let parsed: Bullets.Parsed
+        switch field {
+        case .kb: return .none
+        case .composition: parsed = Bullets.parse(field, Defaults.composition)
+        case .action: parsed = Bullets.parse(field, Defaults.action)
+        }
+        return FieldSkeleton(head: parsed.head, tail: parsed.tail)
+    }
+
+    /// `field`'s text as a new install holds it.
+    static func defaultText(_ field: BulletField, catalog: DefaultCatalog) -> String {
+        Bullets.render(field, Bullets.defaultState(field, skeleton: skeleton(field), catalog: catalog))
+    }
+
+    private func raw(_ field: BulletField) -> String {
+        switch field {
+        case .kb: return rawKB
+        case .composition: return rawComposition
+        case .action: return rawAction
+        }
+    }
+
+    private func setRaw(_ field: BulletField, _ text: String) {
+        switch field {
+        case .kb: rawKB = text
+        case .composition: rawComposition = text
+        case .action: rawAction = text
+        }
+    }
+
+    // MARK: - Bullet commits
+
+    private func willCommitBullets(_ kind: BulletCommitKind, changedText: [BulletField]) {
+        guard !changedText.isEmpty else { return }
+        // DS-HISTORY: a reset records the text it replaces, a merge the text before the merge, in the
+        // committing hold and before the commit.
+        switch kind {
+        case .reset: recordHistory(source: "reset", fields: changedText.map(\.rawValue))
+        case .sync: recordHistory(source: "sync_receive", fields: changedText.map(\.rawValue))
+        case .edit, .upgrade: break
+        }
+    }
+
+    private func didCommitBullets(_ kind: BulletCommitKind, fields: [BulletField]) {
+        // DS-COUNTER: an upgrade's save does not renew the counter.
+        if kind != .upgrade { semaphore.renewCounter() }
+        if fields.contains(.kb) { ReminderBuilder.invalidateCache() }
+        NSEDataBridge.mirrorPrompts()
+        // The demo shows its overlay; the real text is shown again on exit.
+        guard !DemoModeStore.isDemoActive else { return }
+        for field in fields {
+            setRaw(field, UserDefaultsBulletStore.renderedKeys[field].flatMap { defaults.string(forKey: $0) } ?? "")
+        }
+        if kind == .edit {
+            for field in fields { debouncedRecordHistory(field: field.rawValue) }
+        }
+    }
+
+    // MARK: - The one way in (DS-SEMAPHORE)
+
+    /// The one way to read or write the three bullet fields and their history (DS-SEMAPHORE): `body` runs
+    /// holding this device's prompt semaphore, waiting for it with capped backoff
+    /// (`PromptSemaphore.Config`), and releases it on every exit. It must be brief and must never wait on
+    /// the AI: an AI writer reads with `readBeforeAI`, calls the AI holding nothing, and writes with
+    /// `writeAfterRead`. Throws `PromptRefusal` (busy, or the hold lost the semaphore).
+    func withPromptStore<T>(_ label: String, _ body: @MainActor (PromptAccess) async throws -> T) async throws -> T {
+        try await semaphore.hold(label) { hold in
+            try await body(PromptAccess(store: self, hold: hold))
+        }
+    }
+
+    /// One brief read-change-save through `withPromptStore`, its refusal as the outcome.
+    func edit(_ label: String, _ body: @MainActor (PromptAccess) throws -> PromptEditOutcome) async -> PromptEditOutcome {
+        do {
+            return try await withPromptStore(label) { try body($0) }
+        } catch {
+            return Self.outcome(error)
+        }
+    }
+
+    /// An edit a gesture (a tap, a swipe, a confirmation) starts: it runs in a task, so the gesture's
+    /// handler stays synchronous.
+    @discardableResult
+    func gesture(_ label: String, _ body: @escaping @MainActor (PromptAccess) throws -> PromptEditOutcome) -> Task<PromptEditOutcome, Never> {
+        Task { await self.edit(label, body) }
+    }
+
+    /// An AI writer's read (DS-AI step 1), in one brief hold: `field` now and the labels it shows, with
+    /// the change counter as read.
+    func readBeforeAI(_ field: BulletField, _ label: String) async -> PromptReadOutcome {
+        do {
+            return try await withPromptStore(label) { access in
+                guard let capture = try access.readForEdit(field) else { return .refused(.unsaved) }
+                return .read(capture)
+            }
+        } catch {
+            return .refused(Self.outcome(error))
+        }
+    }
+
+    /// An AI writer's write (DS-AI step 3), in a second brief hold: refused with nothing written when the
+    /// counter moved since `readBeforeAI`. The result is then dropped.
+    func writeAfterRead(_ capture: PromptCapture, text: String, _ label: String) async -> PromptEditOutcome {
+        await edit(label) { try $0.commitAIEdit(capture, text: text) }
+    }
+
+    /// A refusal as an edit's outcome.
+    static func outcome(_ error: Error) -> PromptEditOutcome {
+        switch error as? PromptRefusal {
+        case .busy: return .busy
+        case .changed: return .dropped
+        case nil:
+            BackgroundSyncLogger.logDebug("[PromptStore] unexpected error: \(error)")
+            return .unsaved
+        }
+    }
+
+    /// The change counter now, read with what a person sees (DS-COUNTER). Synchronous MainActor code that
+    /// reads and writes with no await between needs nothing more.
+    var changeSeen: UUID { semaphore.counter }
+
+    // MARK: - Edits
+
+    /// `field`'s text now, and the labels it shows, to change and pass to `commitEdit`. Nil while an
+    /// upgrade is unsaved (DS-UNSAVED-UPGRADE): the field can't be saved, so the caller reports that and
+    /// stops.
+    fileprivate func readForEdit(_ field: BulletField, counter: UUID) -> PromptCapture? {
+        if DemoModeStore.isDemoActive {
+            return PromptCapture(field: field, text: raw(field), labels: [], demo: true, counter: counter)
+        }
+        let (text, captured) = bullets.readForEdit(field)
+        guard let captured else {
+            BackgroundSyncLogger.logDebug("[PromptStore] \(field.rawValue) read for editing refused: its upgrade is unsaved")
+            return nil
+        }
+        return PromptCapture(field: field, text: text, labels: captured, demo: false, counter: counter)
+    }
+
+    /// Saves `text` as the captured field's new text (DS-CAPTURE). Device Sync sends it.
+    fileprivate func commitEdit(_ capture: PromptCapture, text: String) -> PromptEditOutcome {
+        guard capture.demo == DemoModeStore.isDemoActive else {
+            BackgroundSyncLogger.logDebug("[PromptStore] \(capture.field.rawValue) edit dropped: demo mode \(capture.demo ? "ended" : "started") since it was read")
+            return .dropped
+        }
+        if capture.demo {
+            guard !Bullets.same(text, raw(capture.field)) else { return .unchanged }
+            setDemoText(capture.field, text)
+            return .saved
+        }
+        return Self.outcome(bullets.commitEdit(capture.field, captured: capture.labels, text: text))
+    }
+
+    /// What Settings says when a line holds a section-header mark or the END marker.
+    static let sectionMarkerRefusal = "A line can't contain \"DO NOT EDIT/DELETE THIS SECTION HEADER\" or \"====END USER INSTRUCTIONS====\", so nothing changed."
+
+    /// Whether `text` holds a line with the section-header mark or the END marker, which `section`'s
+    /// field would read back as a header or the skeleton: Settings refuses it.
+    static func holdsSectionMarker(_ text: String, in section: PromptSection) -> Bool {
+        Bullets.parse(.kb, text).bullets.contains { Bullets.isMarkerText(section.field, $0.text) }
+    }
+
+    /// DS-ADD of `text`'s lines to `section`, each not already there; nothing when a line holds a
+    /// section marker.
+    fileprivate func addBullet(_ text: String, to section: PromptSection) -> PromptEditOutcome {
+        let items = Bullets.parse(.kb, text).bullets.map { BulletItem(section: section.key, text: $0.text) }
+        guard !items.isEmpty else { return .unchanged }
+        guard !Self.holdsSectionMarker(text, in: section) else {
+            BackgroundSyncLogger.logDebug("[PromptStore] \(section.key) line refused: it holds a section marker")
+            return .unchanged
+        }
+        if DemoModeStore.isDemoActive {
+            return editSectionInDemo(section) { texts in
+                texts + items.map(\.text).filter { text in !texts.contains { Bullets.same($0, text) } }
+            }
+        }
+        return Self.outcome(bullets.add(section.field, items))
+    }
+
+    /// DS-DISPLAYED of a shown bullet: exactly its labels, never a re-capture by text.
+    fileprivate func deleteShown(_ shown: ShownBullet, from section: PromptSection) -> PromptEditOutcome {
+        if DemoModeStore.isDemoActive {
+            return editSectionInDemo(section) { texts in texts.filter { !Bullets.same($0, shown.text) } }
+        }
+        return Self.outcome(bullets.deleteShown(section.field, labels: shown.labels))
+    }
+
+    private static func outcome(_ result: BulletCommitResult) -> PromptEditOutcome {
+        switch result.outcome {
+        case .saved: return .saved
+        case .unchanged: return .unchanged
+        case .unsaved: return .unsaved
+        }
     }
 
     // MARK: - Full prompt output (for LLM calls)
@@ -362,36 +679,17 @@ final class PromptStore {
     }
 
     // MARK: - Reset
-    // Records pre-reset state in history, then resets with epoch-zero timestamps
-    // so defaults never overwrite customized rules on other devices via Device Sync.
+    // A bullet field's reset is DS-RESET: its bullets and seen map cleared together, the defaults added,
+    // then sent, so peers' bullets come back (DS-MERGE). The templates keep an epoch-zero timestamp and
+    // ask peers.
 
-    func resetComposition() {
-        // Demo overlay: reset the overlay only — no history, no sync-reset
-        // timestamps (those belong to the real prompts).
-        if DemoModeStore.isDemoActive { rawComposition = Defaults.composition; return }
-        recordHistory(source: "reset", fields: ["composition"])
-        isSyncApplying = true
-        rawComposition = Defaults.composition
-        isSyncApplying = false
-        DeviceSyncService.shared.markFieldAsReset(.composition)
-    }
-
-    func resetAction() {
-        if DemoModeStore.isDemoActive { rawAction = Defaults.action; return }
-        recordHistory(source: "reset", fields: ["action"])
-        isSyncApplying = true
-        rawAction = Defaults.action
-        isSyncApplying = false
-        DeviceSyncService.shared.markFieldAsReset(.action)
-    }
-
-    func resetKB() {
-        if DemoModeStore.isDemoActive { rawKB = Defaults.kb; return }
-        recordHistory(source: "reset", fields: ["kb"])
-        isSyncApplying = true
-        rawKB = Defaults.kb
-        isSyncApplying = false
-        DeviceSyncService.shared.markFieldAsReset(.kb)
+    fileprivate func resetBullets(_ field: BulletField) {
+        // Demo overlay: reset the overlay only — no history, no sync.
+        if DemoModeStore.isDemoActive {
+            setDemoText(field, Self.defaultText(field, catalog: catalog))
+            return
+        }
+        bullets.reset([field])
     }
 
     func resetTemplates() {
@@ -401,37 +699,6 @@ final class PromptStore {
         templates = Defaults.templates
         isSyncApplying = false
         DeviceSyncService.shared.markFieldAsReset(.templates)
-    }
-
-    /// A different TabMail account signed in on this device
-    /// (`DeviceSyncService.claimLocalState`): every synced prompt field goes back to its
-    /// default, and the previous account's prompt history and merge bases are dropped. No
-    /// history entry and no broadcast. The real keys are written directly, so this holds
-    /// even if demo mode is active.
-    func resetForNewAccount() {
-        historyDebounceTask?.cancel()
-        historyDebounceTask = nil
-        pendingHistoryFields = []
-        defaults.set(Defaults.composition, forKey: Keys.composition)
-        defaults.set(Defaults.action, forKey: Keys.action)
-        defaults.set(Defaults.kb, forKey: Keys.kb)
-        if let data = try? JSONEncoder().encode(Defaults.templates) {
-            defaults.set(data, forKey: Keys.templates)
-            defaults.set(true, forKey: Keys.templatesInitialized)
-        }
-        for key in [Self.historyKey,
-                    PeerBaseKeys.composition, PeerBaseKeys.action, PeerBaseKeys.kb,
-                    PeerBaseKeys.compositionTs, PeerBaseKeys.actionTs, PeerBaseKeys.kbTs] {
-            defaults.removeObject(forKey: key)
-        }
-        // Demo holds the overlay in memory; the real values above load when it exits.
-        guard !DemoModeStore.isDemoActive else { return }
-        isSyncApplying = true
-        rawComposition = Defaults.composition
-        rawAction = Defaults.action
-        rawKB = Defaults.kb
-        templates = Defaults.templates
-        isSyncApplying = false
     }
 
     // MARK: - Template CRUD
@@ -504,42 +771,18 @@ final class PromptStore {
         }
     }
 
-    // MARK: - Device Sync Sync
+    // MARK: - Device Sync of the templates
 
-    /// Apply incoming sync data from another TabMail instance.
-    /// Only non-nil fields are applied, allowing per-item sync.
-    /// Wrapped in `isSyncApplying` to prevent echo broadcasting.
-    /// Records pre-sync state in history for rollback.
-    func applySync(composition: String? = nil, action: String? = nil, kb: String? = nil, templates: [ReplyTemplate]? = nil, skipHistory: Bool = false) {
-        // Demo overlay: incoming sync must never be applied while demo is
-        // active — it would land in the demo keys and be deleted on exit.
-        // Device Sync is disconnected on demo entry, so this is defensive.
+    /// Replaces the templates (a history restore, a received merge's result), wrapped in `isSyncApplying`
+    /// to prevent echo broadcasting. The callers record the history entry (DS-HISTORY).
+    func applySyncedTemplates(_ templates: [ReplyTemplate]) {
         guard !DemoModeStore.isDemoActive else {
-            BackgroundSyncLogger.logDebug("[PromptStore] applySync ignored during demo mode")
+            BackgroundSyncLogger.logDebug("[PromptStore] applySyncedTemplates ignored during demo mode")
             return
         }
-        if !skipHistory {
-            // Only record fields that actually differ from current state
-            var changedFields: [String] = []
-            if let composition, composition != rawComposition { changedFields.append("composition") }
-            if let action, action != rawAction { changedFields.append("action") }
-            if let kb, kb != rawKB { changedFields.append("kb") }
-            if let templates, templates != self.templates { changedFields.append("templates") }
-            if !changedFields.isEmpty {
-                recordHistory(source: "sync_receive", fields: changedFields)
-            }
-        }
-
         isSyncApplying = true
-        defer {
-            isSyncApplying = false
-            // didSet handlers are suppressed during sync — mirror explicitly
-            NSEDataBridge.mirrorPrompts()
-        }
-        if let composition { rawComposition = composition }
-        if let action { rawAction = action }
-        if let kb { rawKB = kb }
-        if let templates { self.templates = templates }
+        self.templates = templates
+        isSyncApplying = false
     }
 
     // MARK: - Demo overlay lifecycle (ADR-IOS-038)
@@ -558,16 +801,13 @@ final class PromptStore {
         BackgroundSyncLogger.logDebug("[PromptStore] Demo prompt overlay ACTIVE (defaults seeded)")
     }
 
-    /// Exit the demo prompt overlay: restore the real values from the real
-    /// keys and delete the demo keys. MUST be called while demo is STILL
-    /// active (before `DemoModeStore.isActive` flips false) — the restore
-    /// writes then route to the about-to-be-deleted demo keys instead of
-    /// re-firing NSE mirror / Device Sync / history with unchanged real values.
+    /// Exit the demo prompt overlay: restore the real values from the real keys and delete the demo keys.
+    /// MUST be called while demo is STILL active (before `DemoModeStore.isActive` flips false).
     func exitDemoOverlay() {
         assert(DemoModeStore.isDemoActive, "exitDemoOverlay requires demo still active")
-        rawComposition = defaults.string(forKey: Keys.composition) ?? Defaults.composition
-        rawAction = defaults.string(forKey: Keys.action) ?? Defaults.action
-        rawKB = defaults.string(forKey: Keys.kb) ?? Defaults.kb
+        rawComposition = bullets.rendered(.composition)
+        rawAction = bullets.rendered(.action)
+        rawKB = bullets.rendered(.kb)
         if let data = defaults.data(forKey: Keys.templates),
            let decoded = try? JSONDecoder().decode([ReplyTemplate].self, from: data) {
             templates = decoded
@@ -576,6 +816,30 @@ final class PromptStore {
         }
         Self.removeDemoOverlayKeys()
         BackgroundSyncLogger.logDebug("[PromptStore] Demo prompt overlay REMOVED (real prompts restored)")
+    }
+
+    /// A demo write of a bullet field (DS-DEMO): the shown text and the demo key only.
+    private func setDemoText(_ field: BulletField, _ text: String) {
+        guard let key = UserDefaultsBulletStore.renderedKeys[field] else { return }
+        semaphore.renewCounter()
+        setRaw(field, text)
+        defaults.set(text, forKey: "demo.\(key)")
+        if field == .kb { ReminderBuilder.invalidateCache() }
+    }
+
+    /// One section of the demo's text changed by `change` (its bullets' texts in, the new ones out).
+    private func editSectionInDemo(_ section: PromptSection, _ change: ([String]) -> [String]) -> PromptEditOutcome {
+        let field = section.field
+        let parsed = Bullets.parse(field, raw(field))
+        let shown = parsed.bullets.filter { Bullets.same($0.section, section.key) }.map(\.text)
+        let changed = change(shown)
+        guard !Bullets.sameLines(changed, shown) else { return .unchanged }
+        // Render puts each section's bullets under its header; the order of the others is kept.
+        var items = parsed.bullets.filter { !Bullets.same($0.section, section.key) }
+        items.append(contentsOf: changed.map { BulletItem(section: section.key, text: $0) })
+        let unlabelled = items.map { Bullet(section: $0.section, text: $0.text, name: "", n: 0) }
+        setDemoText(field, Bullets.render(field, head: parsed.head, tail: parsed.tail, bullets: unlabelled))
+        return .saved
     }
 
     /// Delete the demo overlay UserDefaults keys. Safe to call anytime —
@@ -595,21 +859,32 @@ final class PromptStore {
     private static let maxHistoryEntries = 100
     private static let historyMigratedKey = "prompt_history_migrated"
 
-    /// Debounced history recording for local edits — waits 2s of quiet before creating entry.
+    /// Debounced history recording for local edits (DS-HISTORY): waits 2 s of quiet, then records the
+    /// state in its own hold.
     private func debouncedRecordHistory(field: String) {
         pendingHistoryFields.insert(field)
         historyDebounceTask?.cancel()
-        historyDebounceTask = Task { [weak self] in
+        // Scheduled from inside the edit's hold: the timer runs outside it, so its own hold is not refused
+        // as nested (a task inherits the holder's task-local mark, MIS-IOS-028).
+        historyDebounceTask = PromptSemaphore.$holding.withValue(nil) { Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(2000))
             guard !Task.isCancelled, let self else { return }
             let fields = Array(self.pendingHistoryFields)
             self.pendingHistoryFields = []
-            self.recordHistory(source: "local_edit", fields: fields)
-        }
+            do {
+                try await self.withPromptStore("history record") { access in
+                    try access.recordHistory(source: "local_edit", fields: fields)
+                }
+            } catch {
+                BackgroundSyncLogger.logDebug("[PromptStore] local edit history entry not recorded: \(error)")
+            }
+        } }
     }
 
-    /// Record a snapshot of current state in history.
-    func recordHistory(source: String, fields: [String]) {
+    /// Record a snapshot of the current state in history: the bullet fields' stored text. Never in demo,
+    /// whose history reads as empty: the real history is kept as it is.
+    fileprivate func recordHistory(source: String, fields: [String]) {
+        guard !DemoModeStore.isDemoActive else { return }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         let templatesStr = (try? encoder.encode(templates)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
@@ -619,9 +894,9 @@ final class PromptStore {
             timestamp: Date().ISO8601Format(),
             source: source,
             fields: fields,
-            composition: rawComposition,
-            action: rawAction,
-            kb: rawKB,
+            composition: defaults.string(forKey: Keys.composition) ?? "",
+            action: defaults.string(forKey: Keys.action) ?? "",
+            kb: defaults.string(forKey: Keys.kb) ?? "",
             templatesJSON: templatesStr
         )
 
@@ -633,10 +908,9 @@ final class PromptStore {
         saveHistory(history)
     }
 
-    /// Load all history entries (newest last).
-    /// Empty during demo — the real prompt history must not be visible (or
-    /// restorable) from a demo recording.
-    func loadHistory() -> [PromptHistoryEntry] {
+    /// Load all history entries (newest last). Empty during demo — the real prompt history must not be
+    /// visible (or restorable) from a demo recording.
+    fileprivate func loadHistory() -> [PromptHistoryEntry] {
         guard !DemoModeStore.isDemoActive else { return [] }
         migrateBackupsIfNeeded()
         guard let data = defaults.data(forKey: Self.historyKey),
@@ -646,27 +920,15 @@ final class PromptStore {
         return entries
     }
 
-    /// Restore all prompt fields from a history entry.
-    /// Applies as a sync (suppresses broadcast), then writes fresh timestamps
-    /// so the restore propagates to other devices as a normal edit.
-    func restoreFromHistory(_ entry: PromptHistoryEntry) {
-        // Demo overlay: unreachable in practice (loadHistory is empty in demo)
-        // but guard anyway — a restore would write real timestamps + broadcast.
+    /// Restore all prompt fields from a history entry (DS-RESTORE): the bullet fields as one captured
+    /// edit of the sections this app shows, keeping the writer name (Device Sync sends them); the
+    /// templates as before, with a fresh timestamp so the restore propagates to other devices.
+    fileprivate func restoreFromHistory(_ entry: PromptHistoryEntry) {
         guard !DemoModeStore.isDemoActive else { return }
         recordHistory(source: "reset", fields: ["composition", "action", "kb", "templates"])
-        applySync(
-            composition: entry.composition,
-            action: entry.action,
-            kb: entry.kb,
-            templates: entry.decodedTemplates,
-            skipHistory: true
-        )
-        // Write fresh timestamps so the restore syncs to peers (prompt fields only)
-        let now = Date().ISO8601Format()
-        for field in SyncField.promptFields {
-            DeviceSyncService.shared.writeTimestampPublic(now, for: field)
-        }
-        DeviceSyncService.shared.debouncedBroadcast(fields: Set(SyncField.promptFields))
+        bullets.restore([.composition: entry.composition, .action: entry.action, .kb: entry.kb])
+        applySyncedTemplates(entry.decodedTemplates)
+        DeviceSyncService.shared.debouncedBroadcast(fields: [.templates])
     }
 
     // MARK: - Private
@@ -677,7 +939,7 @@ final class PromptStore {
         }
     }
 
-    func saveHistory(_ entries: [PromptHistoryEntry]) {
+    fileprivate func saveHistory(_ entries: [PromptHistoryEntry]) {
         if let data = try? JSONEncoder().encode(entries) {
             defaults.set(data, forKey: Self.historyKey)
         }
@@ -710,161 +972,6 @@ final class PromptStore {
     }
 }
 
-// MARK: - Section Parser
-
-/// Parses and reconstructs TB-format markdown prompt files.
-/// Sections are identified by `# <title> (DO NOT EDIT/DELETE THIS SECTION HEADER)`.
-/// Content between two section headers (or between a header and the end marker) is the section body.
-enum PromptParser {
-
-    /// Extract the content body of a section identified by its header text.
-    static func extractSection(from markdown: String, header: String) -> String {
-        let lines = markdown.components(separatedBy: "\n")
-        var capturing = false
-        var content: [String] = []
-
-        for line in lines {
-            if line.contains(header) && line.contains("DO NOT EDIT/DELETE THIS SECTION HEADER") {
-                capturing = true
-                continue
-            }
-            if capturing {
-                // Stop at next section header or end marker
-                if (line.hasPrefix("# ") && line.contains("DO NOT EDIT/DELETE THIS SECTION HEADER"))
-                    || line.contains("====END USER INSTRUCTIONS====") {
-                    break
-                }
-                content.append(line)
-            }
-        }
-
-        // Trim leading/trailing blank lines
-        while content.first?.trimmingCharacters(in: .whitespaces).isEmpty == true { content.removeFirst() }
-        while content.last?.trimmingCharacters(in: .whitespaces).isEmpty == true { content.removeLast() }
-        return content.joined(separator: "\n")
-    }
-
-    /// Section headers for composition markdown.
-    static let compositionSectionHeaders = [
-        "General writing style",
-        "Language",
-        "Useful links to personal website and other resources",
-    ]
-
-    /// Section headers for action markdown.
-    static let actionSectionHeaders = [
-        "Emails to be marked as `delete`",
-        "Emails to be marked as `archive`",
-        "Emails to be marked as `reply`",
-        "Emails to be marked as `none`",
-    ]
-
-    // MARK: - 3-Way Bullet Merge (with peer-received base)
-
-    /// Extract bullets from a section's content text.
-    /// Bullets are lines starting with `- `, trimmed.
-    static func extractBullets(from text: String) -> [String] {
-        text.components(separatedBy: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { $0.hasPrefix("- ") }
-            .map { String($0.dropFirst(2)) }
-    }
-
-    /// 3-way merge for a flat bullet list.
-    /// Uses set-based merge: local ordering preserved, remote removals applied, remote additions appended.
-    static func mergeBullets(base: [String], local: [String], remote: [String]) -> [String] {
-        let baseSet = Set(base)
-        let remoteSet = Set(remote)
-
-        let remoteRemoved = baseSet.subtracting(remoteSet)
-        let remoteAdded = remoteSet.subtracting(baseSet)
-
-        // Start with local (preserves local ordering + local changes)
-        var result = local.filter { !remoteRemoved.contains($0) }
-
-        // Append remote additions not already present
-        let resultSet = Set(result)
-        for bullet in remote where remoteAdded.contains(bullet) && !resultSet.contains(bullet) {
-            result.append(bullet)
-        }
-
-        return result
-    }
-
-    /// 3-way merge for a sectioned markdown field (composition/action).
-    /// Merges bullets per section independently, preserving markdown structure.
-    static func mergeSectionedField(base: String, local: String, remote: String, sectionHeaders: [String]) -> String {
-        var result = local
-        for header in sectionHeaders {
-            let baseBullets = extractBullets(from: extractSection(from: base, header: header))
-            let localBullets = extractBullets(from: extractSection(from: local, header: header))
-            let remoteBullets = extractBullets(from: extractSection(from: remote, header: header))
-
-            let merged = mergeBullets(base: baseBullets, local: localBullets, remote: remoteBullets)
-
-            if merged != localBullets {
-                let newContent = merged.map { "- \($0)" }.joined(separator: "\n")
-                result = replaceSection(in: result, header: header, with: newContent)
-            }
-        }
-        return result
-    }
-
-    /// 3-way merge for a flat bullet field (kb).
-    /// Merges the entire field as one bullet list.
-    static func mergeFlatField(base: String, local: String, remote: String) -> String {
-        let baseBullets = extractBullets(from: base)
-        let localBullets = extractBullets(from: local)
-        let remoteBullets = extractBullets(from: remote)
-
-        let merged = mergeBullets(base: baseBullets, local: localBullets, remote: remoteBullets)
-
-        if merged == localBullets { return local }
-        return merged.map { "- \($0)" }.joined(separator: "\n")
-    }
-
-    /// Replace the content body of a section, preserving the markdown structure.
-    static func replaceSection(in markdown: String, header: String, with newContent: String) -> String {
-        let lines = markdown.components(separatedBy: "\n")
-        var result: [String] = []
-        var skipping = false
-
-        for line in lines {
-            if line.contains(header) && line.contains("DO NOT EDIT/DELETE THIS SECTION HEADER") {
-                result.append(line)
-                result.append(newContent)
-                skipping = true
-                continue
-            }
-            if skipping {
-                // Resume at next section header or end marker
-                if (line.hasPrefix("# ") && line.contains("DO NOT EDIT/DELETE THIS SECTION HEADER"))
-                    || line.contains("====END USER INSTRUCTIONS====") {
-                    result.append("")
-                    result.append(line)
-                    skipping = false
-                }
-                continue
-            }
-            result.append(line)
-        }
-
-        return result.joined(separator: "\n")
-    }
-}
-
-// MARK: - Section Header Constants
-
-private enum SectionHeaders {
-    static let writingStyle = "General writing style"
-    static let language = "Language"
-    static let usefulLinks = "Useful links to personal website and other resources"
-    static let deleteRules = "Emails to be marked as `delete`"
-    static let archiveRules = "Emails to be marked as `archive`"
-    static let replyRules = "Emails to be marked as `reply`"
-    static let noneRules = "Emails to be marked as `none`"
-}
-
 // MARK: - Storage Keys (match TB's browser.storage.local keys for sync compatibility)
 
 private extension PromptStore {
@@ -874,75 +981,6 @@ private extension PromptStore {
         static let kb = "user_prompts:user_kb.md"
         static let templates = "user_templates"
         static let templatesInitialized = "user_templates_initialized"
-    }
-}
-
-// MARK: - Peer Base State (for delta merge)
-//
-// Stores the last STATE RECEIVED from any peer. This is the correct "common ancestor"
-// for 3-way merge — unlike the old sync base which stored the merged result (wrong because
-// the merged result includes local changes the peer hasn't seen).
-//
-// CRITICAL: peer_base is ALWAYS set to `incoming` (what the peer sent), NEVER to the
-// merged result. This ensures the diff between peer_base and the next incoming accurately
-// captures only the peer's new changes.
-
-extension PromptStore {
-    private enum PeerBaseKeys {
-        static let composition = "device_peer_base:composition"
-        static let action = "device_peer_base:action"
-        static let kb = "device_peer_base:kb"
-        static let compositionTs = "device_peer_base_ts:composition"
-        static let actionTs = "device_peer_base_ts:action"
-        static let kbTs = "device_peer_base_ts:kb"
-
-        static func contentKey(for field: SyncField) -> String {
-            switch field {
-            case .composition: return composition
-            case .action: return action
-            case .kb: return kb
-            default: fatalError("Peer base only for text fields")
-            }
-        }
-
-        static func tsKey(for field: SyncField) -> String {
-            switch field {
-            case .composition: return compositionTs
-            case .action: return actionTs
-            case .kb: return kbTs
-            default: fatalError("Peer base only for text fields")
-            }
-        }
-    }
-
-    /// Read the last-received peer state for a text field.
-    /// Returns (content, timestamp) or (nil, epochZero) if never received.
-    func readPeerBase(for field: SyncField) -> (content: String?, ts: String) {
-        let content = defaults.string(forKey: PeerBaseKeys.contentKey(for: field))
-        let ts = defaults.string(forKey: PeerBaseKeys.tsKey(for: field)) ?? "1970-01-01T00:00:00.000Z"
-        return (content, ts)
-    }
-
-    /// Save the peer's incoming state as the new base.
-    /// MUST be called with the raw incoming content (NOT the merged result).
-    func savePeerBase(_ content: String, ts: String, for field: SyncField) {
-        defaults.set(content, forKey: PeerBaseKeys.contentKey(for: field))
-        defaults.set(ts, forKey: PeerBaseKeys.tsKey(for: field))
-    }
-
-    /// Migrate old sync base keys to new peer base keys (one-time).
-    /// If old sync base exists but new peer base doesn't, adopt the old value.
-    /// Then clean up old keys.
-    func migrateSyncBaseToPeerBase() {
-        let oldKeys = ["device_sync_base:composition", "device_sync_base:action", "device_sync_base:kb"]
-        let fields: [SyncField] = [.composition, .action, .kb]
-        for (oldKey, field) in zip(oldKeys, fields) {
-            if let oldContent = defaults.string(forKey: oldKey),
-               defaults.string(forKey: PeerBaseKeys.contentKey(for: field)) == nil {
-                defaults.set(oldContent, forKey: PeerBaseKeys.contentKey(for: field))
-            }
-            defaults.removeObject(forKey: oldKey)
-        }
     }
 }
 
