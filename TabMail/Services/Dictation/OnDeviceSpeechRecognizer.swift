@@ -5,30 +5,51 @@
 import Foundation
 @preconcurrency import Speech
 @preconcurrency import AVFoundation
-import Synchronization
+
+/// A running on-device recognition: audio goes in, text comes out through the handler it was started
+/// with. Tests substitute it.
+protocol SpeechRecognition: AnyObject, Sendable {
+    func append(_ buffer: AVAudioPCMBuffer)
+    /// Cancels the task and ends the audio.
+    func finish()
+}
 
 /// Dictation for a user who opted out of AI (ADR-IOS-085 amendment 2026-10-29): Apple's
 /// `SFSpeechRecognizer`, on this iPhone only. Nothing is sent to TabMail's backend, and
 /// `requiresOnDeviceRecognition` keeps the audio from leaving the phone; where the language has no
 /// on-device model, `isAvailable(locale:)` is false and the mic stays off. The speech-recognition
 /// permission is asked at the first tap, never earlier.
+///
+/// The microphone and the audio session belong to `AudioCapturing` (the backend dictation's own
+/// `MicrophoneCapture`): its serial queue orders a stop after the start it follows and releases the
+/// session on every stop. This class only owns the recognition and the generation that tells a
+/// superseded start, stop or callback from the current one: every callback checks its generation
+/// before it changes anything, so an older recording can never touch a newer one.
 @MainActor
 @Observable
 final class OnDeviceSpeechRecognizer {
     var isRecording = false
     private(set) var isStarting = false
 
-    // Mutex protects audio state accessed from both background queue (setup) and MainActor (stop).
-    // Audio types aren't Sendable, so we wrap them in @unchecked Sendable struct + Mutex.
-    // Generation counter detects stale completions from previous start/stop cycles —
-    // prevents zombie recordings when stop() races with in-flight beginRecording().
-    nonisolated private let _audioState = Mutex(AudioState())
+    /// Starts a recognition for `locale`, or nil when the language has no on-device model. The handler
+    /// gets each result's text and whether the recognition ended (final result or error).
+    typealias RecognitionStarter = @Sendable (Locale, @escaping @Sendable (_ transcript: String?, _ ended: Bool) -> Void) -> (any SpeechRecognition)?
 
-    private struct AudioState: @unchecked Sendable {
-        var audioEngine: AVAudioEngine?
-        var recognitionTask: SFSpeechRecognitionTask?
-        var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-        var generation: UInt = 0
+    private let capture: any AudioCapturing
+    private let startRecognition: RecognitionStarter
+    private let requestPermissions: @Sendable () async -> Bool
+    private var recognition: (any SpeechRecognition)?
+    /// Advances at every start and stop; main actor only.
+    private var generation: UInt = 0
+
+    init(
+        capture: any AudioCapturing = MicrophoneCapture(),
+        startRecognition: @escaping RecognitionStarter = OnDeviceSpeechRecognizer.startSystemRecognition,
+        requestPermissions: @escaping @Sendable () async -> Bool = OnDeviceSpeechRecognizer.requestSystemPermissions
+    ) {
+        self.capture = capture
+        self.startRecognition = startRecognition
+        self.requestPermissions = requestPermissions
     }
 
     /// Whether this iPhone can recognise `locale` without the network.
@@ -45,8 +66,36 @@ final class OnDeviceSpeechRecognizer {
         return request
     }
 
+    private final class SystemRecognition: SpeechRecognition, @unchecked Sendable {
+        let request: SFSpeechAudioBufferRecognitionRequest
+        var task: SFSpeechRecognitionTask?
+
+        init(request: SFSpeechAudioBufferRecognitionRequest) { self.request = request }
+
+        func append(_ buffer: AVAudioPCMBuffer) { request.append(buffer) }
+
+        func finish() {
+            task?.cancel()
+            request.endAudio()
+        }
+    }
+
+    nonisolated private static func startSystemRecognition(
+        locale: Locale,
+        handler: @escaping @Sendable (String?, Bool) -> Void
+    ) -> (any SpeechRecognition)? {
+        guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable, recognizer.supportsOnDeviceRecognition else {
+            return nil
+        }
+        let recognition = SystemRecognition(request: makeRequest())
+        recognition.task = recognizer.recognitionTask(with: recognition.request) { result, error in
+            handler(result?.bestTranscription.formattedString, error != nil || (result?.isFinal ?? false))
+        }
+        return recognition
+    }
+
     /// Asks for speech recognition and the microphone (each only when not yet decided).
-    nonisolated private static func requestPermissions() async -> Bool {
+    nonisolated private static func requestSystemPermissions() async -> Bool {
         let speech = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
             if SFSpeechRecognizer.authorizationStatus() != .notDetermined {
                 c.resume(returning: SFSpeechRecognizer.authorizationStatus() == .authorized)
@@ -62,233 +111,69 @@ final class OnDeviceSpeechRecognizer {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[Speech] start() entry: isRecording=\(isRecording) isStarting=\(isStarting)")
         }
-        guard !isRecording, !isStarting else {
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[Speech] start(): skip — already recording or starting")
-            }
-            return
-        }
+        guard !isRecording, !isStarting else { return }
 
         isStarting = true
-        let gen = _audioState.withLock { state in
-            state.generation &+= 1
-            return state.generation
-        }
+        generation &+= 1
+        let current = generation
         Task {
-            let granted = await Self.requestPermissions()
-            let stillCurrent = self._audioState.withLock { $0.generation == gen }
-            guard stillCurrent else { return }
+            let granted = await requestPermissions()
+            guard current == generation else { return }
             guard granted else {
                 BackgroundSyncLogger.logDebug("[Speech] Permissions not granted")
-                self.isStarting = false
+                isStarting = false
                 return
             }
-            self.beginRecording(generation: gen, locale: locale, onTranscript: onTranscript)
+            begin(generation: current, locale: locale, onTranscript: onTranscript)
         }
     }
 
+    /// Ends the recording, or a start still waiting for a permission or the microphone. Safe to call
+    /// at any time and more than once: the capture releases the audio session on every stop.
     func stop() {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[Speech] stop() entry: isRecording=\(isRecording) isStarting=\(isStarting)")
         }
-        // Extract resources from mutex quickly, update UI state immediately.
-        // Heavy audio teardown (engine.stop, removeTap, session deactivation)
-        // runs off the main thread to avoid blocking keyboard animation on the
-        // dictation→keyboard switch, and because iOS 26 requires AVAudioSession
-        // mutations off the main actor.
-        let (engine, task, request, stopGeneration) = _audioState.withLock { state -> (AVAudioEngine?, SFSpeechRecognitionTask?, SFSpeechAudioBufferRecognitionRequest?, UInt) in
-            state.generation &+= 1  // Invalidate any in-flight beginRecording
-            let engine = state.audioEngine
-            let task = state.recognitionTask
-            let request = state.recognitionRequest
-            state.audioEngine = nil
-            state.recognitionTask = nil
-            state.recognitionRequest = nil
-            return (engine, task, request, state.generation)
-        }
+        generation &+= 1
         isRecording = false
         isStarting = false
-
-        if engine != nil || task != nil || request != nil {
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[Speech] stop(): teardown path — async engine/task/request cleanup, generation=\(stopGeneration)")
-            }
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                task?.cancel()
-                request?.endAudio()
-                if let engine {
-                    engine.stop()
-                    engine.inputNode.removeTap(onBus: 0)
-                }
-                // Release the audio session. Without this the .playAndRecord
-                // session stays active for the rest of the process, which makes
-                // iOS mute UIFeedbackGenerator/.sensoryFeedback haptics (and keeps
-                // other apps' audio interrupted) until the app is relaunched.
-                // Guarded by `generation`: if a newer start/stop cycle has begun,
-                // skip — that cycle now owns the session and we must not deactivate
-                // a recording it just activated.
-                guard let self else { return }
-                let stillCurrent = self._audioState.withLock { $0.generation == stopGeneration }
-                if stillCurrent {
-                    self.deactivateAudioSession()
-                } else if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[Speech] stop(): teardown skip deactivate — generation advanced past \(stopGeneration)")
-                }
-            }
-        } else if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[Speech] stop(): teardown path — nothing to tear down (no engine/task/request)")
-        }
+        capture.stop()
+        recognition?.finish()
+        recognition = nil
     }
 
-    /// Deactivates the shared audio session so the system stops muting haptics
-    /// and other apps can resume audio. MUST be called off the main actor (iOS 26
-    /// requires AVAudioSession mutations off main). `setActive(false)` can throw
-    /// `AVAudioSessionErrorCodeIsBusy` if audio I/O hasn't fully stopped; log and
-    /// move on — the next `start()` re-activates the session regardless.
-    nonisolated private func deactivateAudioSession() {
-        let start = Date()
-        do {
-            try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-            if DebugModeManager.isLoggingEnabled() {
-                let ms = Int(Date().timeIntervalSince(start) * 1000)
-                BackgroundSyncLogger.logDebug("[Speech] deactivateAudioSession(): succeeded in \(ms)ms")
-            }
-        } catch {
-            if DebugModeManager.isLoggingEnabled() {
-                let ms = Int(Date().timeIntervalSince(start) * 1000)
-                BackgroundSyncLogger.logDebug("[Speech] Failed to deactivate audio session (\(ms)ms): \(error)")
+    private func begin(generation current: UInt, locale: Locale, onTranscript: @escaping @MainActor @Sendable (String) -> Void) {
+        let started = startRecognition(locale) { [weak self] transcript, ended in
+            DispatchQueue.main.async {
+                self?.received(generation: current, transcript: transcript, ended: ended, onTranscript: onTranscript)
             }
         }
+        guard let started else {
+            BackgroundSyncLogger.logDebug("[Speech] Speech recognizer not available")
+            isStarting = false
+            return
+        }
+        recognition = started
+        capture.start(onBuffer: { started.append($0) }, completion: { [weak self] error in
+            DispatchQueue.main.async { self?.captureStarted(generation: current, error: error) }
+        })
     }
 
-    /// Audio setup runs on a background queue (iOS 26 AVAudioSession requirement).
-    /// All property writes go through DispatchQueue.main.async to stay on @MainActor.
-    /// `generation` tracks the start/stop cycle — if stop() was called during setup,
-    /// the generation will have advanced and we tear down instead of committing.
-    private func beginRecording(generation: UInt, locale: Locale, onTranscript: @escaping @MainActor @Sendable (String) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let recognizer = SFSpeechRecognizer(locale: locale)
-            guard let recognizer, recognizer.isAvailable, recognizer.supportsOnDeviceRecognition else {
-                BackgroundSyncLogger.logDebug("[Speech] Speech recognizer not available")
-                DispatchQueue.main.async { [weak self] in self?.isStarting = false }
-                return
-            }
+    /// A result from the recognition of `generation`; ignored once another start or stop has begun.
+    private func received(generation current: UInt, transcript: String?, ended: Bool, onTranscript: @MainActor (String) -> Void) {
+        guard current == generation else { return }
+        if let transcript, isRecording { onTranscript(transcript) }
+        if ended { stop() }
+    }
 
-            guard AVAudioSession.sharedInstance().isInputAvailable else {
-                BackgroundSyncLogger.logDebug("[Speech] No audio input available")
-                DispatchQueue.main.async { [weak self] in self?.isStarting = false }
-                return
-            }
-
-            do {
-                let audioSession = AVAudioSession.sharedInstance()
-                try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetoothHFP])
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[Speech] beginRecording: setCategory done (generation=\(generation))")
-                }
-                let setActiveStart = Date()
-                do {
-                    try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-                    if DebugModeManager.isLoggingEnabled() {
-                        let ms = Int(Date().timeIntervalSince(setActiveStart) * 1000)
-                        BackgroundSyncLogger.logDebug("[Speech] beginRecording: setActive(true) done in \(ms)ms")
-                    }
-                } catch {
-                    if DebugModeManager.isLoggingEnabled() {
-                        let ms = Int(Date().timeIntervalSince(setActiveStart) * 1000)
-                        BackgroundSyncLogger.logDebug("[Speech] beginRecording: setActive(true) threw after \(ms)ms: \(error)")
-                    }
-                    throw error
-                }
-
-                let engine = AVAudioEngine()
-                let request = Self.makeRequest()
-
-                let inputNode = engine.inputNode
-                let recordingFormat = inputNode.outputFormat(forBus: 0)
-                guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
-                    BackgroundSyncLogger.logDebug("[Speech] No valid audio input format available")
-                    // Session was activated above but we're bailing before any
-                    // recording starts — release it so haptics aren't left muted.
-                    self?.deactivateAudioSession()
-                    DispatchQueue.main.async { [weak self] in self?.isStarting = false }
-                    return
-                }
-
-                let task = recognizer.recognitionTask(with: request) { result, error in
-                    let transcript = result?.bestTranscription.formattedString
-                    let isFinal = result?.isFinal ?? false
-                    let hasError = error != nil
-                    DispatchQueue.main.async { [weak self] in
-                        // Only forward transcripts while still recording — cancel() can fire
-                        // a stale/empty callback after stop() set isRecording=false.
-                        if let transcript, self?.isRecording == true {
-                            onTranscript(transcript)
-                        }
-                        if hasError || isFinal {
-                            self?.stop()
-                        }
-                    }
-                }
-
-                inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
-                    request.append(buffer)
-                }
-
-                engine.prepare()
-                try engine.start()
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[Speech] beginRecording: engine.start() succeeded (generation=\(generation))")
-                }
-
-                // Atomically check generation before committing — if stop() was called
-                // during setup, the generation will have advanced.
-                guard let self else { return }
-                let shouldCommit = self._audioState.withLock { state in
-                    guard state.generation == generation else { return false }
-                    state.audioEngine = engine
-                    state.recognitionRequest = request
-                    state.recognitionTask = task
-                    return true
-                }
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[Speech] beginRecording: generation=\(generation) shouldCommit=\(shouldCommit)")
-                }
-
-                if !shouldCommit {
-                    // Stale — stop() was called during setup. Tear down. stop()
-                    // couldn't release the session (our engine was never committed
-                    // to state, so its teardown was skipped), so deactivate here.
-                    engine.stop()
-                    inputNode.removeTap(onBus: 0)
-                    task.cancel()
-                    request.endAudio()
-                    self.deactivateAudioSession()
-                    return
-                }
-
-                // isRecording is @Observable — must be set on MainActor.
-                // Re-check generation to catch stop() between mutex release and dispatch.
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    let stillValid = self._audioState.withLock { $0.generation == generation }
-                    if stillValid {
-                        self.isRecording = true
-                        self.isStarting = false
-                    } else {
-                        self.stop()
-                    }
-                }
-            } catch {
-                BackgroundSyncLogger.logDebug("[Speech] Failed to start recording: \(error)")
-                // setActive(true) above may have succeeded before the failure
-                // (e.g. engine.start() threw) — release the session so haptics
-                // aren't left muted.
-                self?.deactivateAudioSession()
-                DispatchQueue.main.async { [weak self] in
-                    self?.stop()
-                }
-            }
+    private func captureStarted(generation current: UInt, error: (any Error)?) {
+        guard current == generation else { return }
+        if let error {
+            BackgroundSyncLogger.logDebug("[Speech] Failed to start recording: \(error)")
+            stop()
+            return
         }
+        isRecording = true
+        isStarting = false
     }
 }

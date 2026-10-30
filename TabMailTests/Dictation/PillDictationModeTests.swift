@@ -102,8 +102,8 @@ struct PillDictationModeTests {
         // The speech permission is asked by the recognizer's start: only a mic tap may reach it.
         #expect(view.contains("guard !auto, !speech.isRecording, !speech.isStarting else { return }"))
         #expect(view.components(separatedBy: "startDictation(auto: true)").count == 4)
-        // Every exit releases the recognizer; a recording keeps the screen awake and blocks send.
-        #expect(view.components(separatedBy: "speech.stop()").count == 5)
+        // Going to the background releases the recognizer; a recording keeps the screen awake and blocks send.
+        #expect(view.contains("if phase == .background { speech.stop() }"))
         #expect(view.contains("dictation.isActive || speech.isRecording)"))
         #expect(view.contains("&& !speech.isRecording\n            && composeReadyToSend"))
         #expect(view.contains("PillDictationMode.resolve("))
@@ -118,8 +118,17 @@ struct PillDictationModeTests {
         #expect(view.contains(".onChange(of: speech.isStarting) { _, _ in refreshDictationPermissions() }"))
         #expect(view.contains("speechPermission = SFSpeechRecognizer.authorizationStatus()\n        microphonePermission = AVAudioApplication.shared.recordPermission"))
         #expect(view.contains("onDevice: onDeviceReadiness,"))
-        #expect(view.contains("(dictationOffNote ?? \"Type or speak...\")"))
+        #expect(view.contains("PillDictationMode.placeholder(isCompose: isComposeMode, offNote: dictationOffNote)"))
         let controller = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationController.swift"), encoding: .utf8)
         #expect(controller.contains("guard canUseAI, !isOptedOutOfAI() else {"))
+    }
+
+    /// Why the mic is off comes first in either bar; without a reason each bar keeps its own hint.
+    @Test func theReadinessNoteOutranksTheBarsOwnPlaceholder() throws {
+        let note = try #require(OnDeviceReadiness.microphoneBlocked.note)
+        #expect(PillDictationMode.placeholder(isCompose: true, offNote: note) == note)
+        #expect(PillDictationMode.placeholder(isCompose: false, offNote: note) == note)
+        #expect(PillDictationMode.placeholder(isCompose: true, offNote: nil) == "Describe your edit...")
+        #expect(PillDictationMode.placeholder(isCompose: false, offNote: nil) == "Type or speak...")
     }
 }
