@@ -105,6 +105,15 @@ final class PromptStore {
 
     private let defaults = UserDefaults.standard
 
+    /// DS-SEMAPHORE: this device's one semaphore for the knowledge base, writing style and action rules.
+    let semaphore = PromptSemaphore()
+
+    /// DS-SEMAPHORE: the ONE API through which the three fields are read-changed-written. Sync, edits,
+    /// resets, restores, tools, refines and history all come through here.
+    func withPromptStore<T>(_ label: String, _ body: (PromptHold) async throws -> T) async throws -> T {
+        try await semaphore.hold(label, body)
+    }
+
     /// When true, incoming sync is being applied — suppress broadcasting back to peers.
     private(set) var isSyncApplying = false
 
