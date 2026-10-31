@@ -155,9 +155,10 @@ enum DisabledRemindersStore {
 
     // MARK: - Read/Write (v2 CRDT Map)
 
-    /// Get the full CRDT map in the live mode: the real choices, or the demo's own.
+    /// Get the full CRDT map in the live mode: the real choices, or the demo's own. Read in a transaction,
+    /// like every writer's read, so it never returns a map a writer is part-way through replacing.
     static func getDisabledMap() -> [String: DisabledEntry] {
-        getDisabledMap(key: currentKey)
+        transaction { getDisabledMap(key: currentKey) }
     }
 
     /// Deletes the demo's map when no demo is running (the launch wipe of a force-quit demo's leftovers,
@@ -272,26 +273,33 @@ enum DisabledRemindersStore {
     /// Bulk-disable hashes with epoch-zero timestamps. Used by first-launch overdue
     /// suppression so that any Device Sync state (real timestamps) always wins in CRDT merge.
     /// Does NOT broadcast to Device Sync or post notifications — caller handles that.
-    /// False when `since` moved (see `setEnabled`): nothing was written.
+    /// False when `since` moved (see `setEnabled`), an empty list included: nothing was written and
+    /// `completing` did not run. `completing` runs in the same transaction as the write, so the caller's
+    /// record that the work is done is never saved for a write that was refused.
     @discardableResult
-    static func bulkDisableWithEpochZero(hashes: [String], since started: UUID? = nil) -> Bool {
-        guard !hashes.isEmpty else { return true }
+    static func bulkDisableWithEpochZero(hashes: [String], since started: UUID? = nil,
+                                         completing: (() -> Void)? = nil) -> Bool {
         let epochZero = "1970-01-01T00:00:00Z"
         let written = transaction { () -> Bool in
             guard !moved(since: started) else { return false }
-            let key = currentKey
-            var map = getDisabledMap(key: key)
-            for hash in hashes {
-                // Only write if no existing entry — preserve any prior state from sync/user action
-                if map[hash] == nil {
-                    map[hash] = DisabledEntry(enabled: false, ts: epochZero)
+            if !hashes.isEmpty {
+                let key = currentKey
+                var map = getDisabledMap(key: key)
+                for hash in hashes {
+                    // Only write if no existing entry — preserve any prior state from sync/user action
+                    if map[hash] == nil {
+                        map[hash] = DisabledEntry(enabled: false, ts: epochZero)
+                    }
                 }
+                saveDisabledMap(map, key: key)
             }
-            saveDisabledMap(map, key: key)
+            completing?()
             return true
         }
         guard written else { return false }
-        BackgroundSyncLogger.logDebug("[DisabledRemindersStore] Bulk-disabled \(hashes.count) hashes with epoch-zero timestamps")
+        if !hashes.isEmpty {
+            BackgroundSyncLogger.logDebug("[DisabledRemindersStore] Bulk-disabled \(hashes.count) hashes with epoch-zero timestamps")
+        }
         return true
     }
 

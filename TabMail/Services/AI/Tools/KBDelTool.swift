@@ -11,6 +11,9 @@ struct KBDelTool: AgentTool, Sendable {
     let name = "kb_del"
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        // The call belongs to the mode it started in (DS-DEMO): the demo-switch count is taken before anything
+        // awaits and the prompt store compares it when the call's turn comes.
+        let entered = PromptStore.switchesSeen
         guard case .string(let raw) = arguments["statement"] else {
             BackgroundSyncLogger.logDebug("[KBDelTool] Missing or empty 'statement'")
             return #"{"error": "missing statement"}"#
@@ -31,7 +34,7 @@ struct KBDelTool: AgentTool, Sendable {
         let edit = await { @MainActor () async -> (empty: Bool, edit: KBToolEdit) in
             var empty = false
             var patched = false
-            let outcome = await PromptStore.shared.edit("kb_del tool") { hold in
+            let outcome = await PromptStore.shared.edit("kb_del tool", entered: entered) { hold in
                 try hold.editText(.kb) { current in
                     guard !current.isEmpty else {
                         empty = true

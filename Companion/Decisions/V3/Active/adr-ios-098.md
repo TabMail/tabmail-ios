@@ -42,13 +42,15 @@ back bullets nobody had touched.
 - **No section marker in a rule.** A rule holding the END marker or the section-header mark would be read
   back as the end of the rules or a header, so no writer saves one (`ActionPatchApplier`).
 - **Demo mode** shows an overlay under `demo.` keys and writes nothing to the bullets or their history; a
-  **history restore** is one captured edit of the shown sections. An operation's demo-or-real target is fixed
-  when it starts and is the only authority through its reads and writes: a real operation that a demo entry
-  catches mid-flight still lands in the real store (its history, labelled state and rendered keys; the demo's
-  shown text is not touched and the demo's exit shows the real values again), and a demo operation is refused
-  once the demo ended, since its overlay is discarded. Reads of the live setting remain only where a slot
-  holds the overlay (the shown text, the shown templates, the background snapshots) or where Device Sync
-  does not run in the demo.
+  **history restore** is one captured edit of the shown sections. Entering or leaving the demo is one
+  operation on the prompt semaphore, and an operation belongs to the mode it started in: a call counts the
+  switches when it is made and the prompt store compares the count when it gets its turn, so a gesture or
+  tool that waited behind a switch is refused ("could not save"), and an AI, download or confirmation
+  writer that awaited carries the change counter and is refused when it moved. Nothing is saved across a
+  switch, in either direction (ADR-IOS-038, amendment 2026-10-31, which replaced the earlier captured
+  demo-or-real target). Inside one hold the live mode is stable, so reads of the live setting are right
+  where a slot holds the overlay (the shown text, the shown templates, the background snapshots) or where
+  Device Sync does not run in the demo.
 
 **Consequences:** No bullet a user did not delete is lost by syncing, in any order of delivery, loss,
 restart, restore or new install; this is fuzzed with seeded runs and checked against the shared vectors.

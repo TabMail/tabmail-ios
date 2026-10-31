@@ -41,6 +41,12 @@ private final class DefaultsBox: @unchecked Sendable {
     init(_ value: ParkingDefaults) { self.value = value }
 }
 
+private final class ReadCapture: Sendable {
+    private let value = Mutex<[String: DisabledRemindersStore.DisabledEntry]?>(nil)
+    var map: [String: DisabledRemindersStore.DisabledEntry]? { value.withLock { $0 } }
+    func set(_ map: [String: DisabledRemindersStore.DisabledEntry]) { value.withLock { $0 = map } }
+}
+
 private final class Flag: Sendable {
     private let value = Mutex(false)
     var isSet: Bool { value.withLock { $0 } }
@@ -152,6 +158,21 @@ struct DisabledRemindersWriterRaceTests {
         }
         #expect(result["k:peer"]?.enabled == false, "the merge committed")
         #expect(result["k:newer"]?.enabled == false, "the user's later disable remains")
+    }
+
+    @Test("A read made while a writer is part-way through its change returns the writer's whole change")
+    func readerSeesTheWholeChange() async throws {
+        let (defaults, suite) = try isolatedDefaults(seed: ["k:seed": .init(enabled: false, ts: Date().ISO8601Format())])
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let read = ReadCapture()
+        let final = try await race(defaults, parked: {
+            DisabledRemindersStore.setEnabled(hash: "k:choice", enabled: false)
+        }, other: {
+            read.set(DisabledRemindersStore.getDisabledMap())
+        })
+        #expect(read.map?["k:choice"]?.enabled == false, "the read returned the map from before the change it was ordered behind")
+        #expect(read.map?["k:seed"]?.enabled == false)
+        #expect(final["k:choice"]?.enabled == false, "control: the choice is stored")
     }
 
     // MARK: - DS-DEMO: a writer that started before a demo switch is refused after it

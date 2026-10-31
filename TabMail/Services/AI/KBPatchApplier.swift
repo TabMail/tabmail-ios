@@ -109,7 +109,9 @@ struct KBToolEdit: Sendable {
     static func refusal(_ outcome: PromptEditOutcome) -> String? {
         switch outcome {
         case .busy: return #"{"error": "the knowledge base is busy, try again in a moment"}"#
-        case .saved, .unchanged, .unsaved, .dropped: return nil
+        // A demo switch came while the call waited, or its hold ran past its lease: nothing was saved.
+        case .dropped: return #"{"error": "could not save the change; try again"}"#
+        case .saved, .unchanged, .unsaved: return nil
         }
     }
 }

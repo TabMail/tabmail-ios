@@ -38,7 +38,7 @@ enum BulletReceiveResult: Equatable, Sendable {
 
 enum BulletOutgoing: Equatable, Sendable {
     case messages([String])
-    /// One bullet alone is over the budget (DS-OVERSIZE).
+    /// One bullet alone, or the message with no bullet in it (the seen list alone), is over the budget (DS-OVERSIZE).
     case oversize(bytes: Int, budget: Int)
 }
 
@@ -279,6 +279,12 @@ final class BulletSync {
         // Measured with the largest part number there can be, so a part's number never takes it over.
         let most = max(1, state.bullets.count)
         let envelope = BulletJSON.byteLength(message(most, most, []))
+        // The seen list alone can make the envelope too big for the relay (a field with no live bullet left
+        // sends one empty group): nothing is sent, as when one bullet is too big.
+        if envelope > budget {
+            options.error("DeviceSync: \(field.rawValue) not sent: the message with no bullet is \(envelope) bytes, over the relay's \(budget)")
+            return .oversize(bytes: envelope, budget: budget)
+        }
         var groups: [[Bullet]] = []
         var group: [Bullet] = []
         var size = envelope

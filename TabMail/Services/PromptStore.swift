@@ -457,30 +457,47 @@ final class PromptStore {
     /// `writeAfterRead`. Throws `PromptRefusal` (busy, or the hold lost the semaphore).
     ///
     /// Inside a hold the mode cannot change (a demo switch is a hold too, DS-DEMO), so a brief body reads
-    /// the live mode.
-    func withPromptStore<T>(_ label: String,
+    /// the live mode. The call belongs to the mode it started in (DS-DEMO): the demo-switch count is taken
+    /// when this is called, or passed as `entered` by a caller that took it earlier (before a task, a
+    /// hop), and compared when the hold is granted: a switch that ran while the call waited in line
+    /// refuses it with `PromptRefusal.changed`, and nothing is read or written. This is the one place the
+    /// rule lives; no caller carries a check of its own.
+    func withPromptStore<T>(_ label: String, entered: Int? = nil,
                             _ body: @MainActor (PromptAccess) async throws -> T) async throws -> T {
-        try await semaphore.hold(label) { hold in
-            try await body(PromptAccess(store: self, hold: hold))
+        let entered = entered ?? semaphore.switches
+        return try await semaphore.hold(label) { hold in
+            guard semaphore.switches == entered else {
+                BackgroundSyncLogger.logDebug("[PromptStore] \(label) refused: the demo was entered or left while it waited")
+                throw PromptRefusal.changed
+            }
+            return try await body(PromptAccess(store: self, hold: hold))
         }
     }
 
-    /// One brief read-change-save through `withPromptStore`, its refusal as the outcome.
-    func edit(_ label: String,
+    /// One brief read-change-save through `withPromptStore`, its refusal as the outcome. `entered` is as
+    /// for `withPromptStore`.
+    func edit(_ label: String, entered: Int? = nil,
               _ body: @MainActor (PromptAccess) throws -> PromptEditOutcome) async -> PromptEditOutcome {
+        let entered = entered ?? semaphore.switches
         do {
-            return try await withPromptStore(label) { try body($0) }
+            return try await withPromptStore(label, entered: entered) { try body($0) }
         } catch {
             return Self.outcome(error)
         }
     }
 
     /// An edit a gesture (a tap, a swipe, a confirmation) starts: it runs in a task, so the gesture's
-    /// handler stays synchronous.
+    /// handler stays synchronous. The demo-switch count is taken here, before the task, so the gesture
+    /// belongs to the mode it was made in.
     @discardableResult
     func gesture(_ label: String, _ body: @escaping @MainActor (PromptAccess) throws -> PromptEditOutcome) -> Task<PromptEditOutcome, Never> {
-        Task { await self.edit(label, body) }
+        let entered = semaphore.switches
+        return Task { await self.edit(label, entered: entered, body) }
     }
+
+    /// The demo-switch count now, for a caller that takes it before an await or a hop and passes it as
+    /// `entered` (DS-DEMO). Readable from any thread.
+    nonisolated static var switchesSeen: Int { ChangeCounter.device.switches }
 
     /// An AI writer's read (DS-AI step 1), in one brief hold: `field` now and the labels it shows, with
     /// the change counter as read.
@@ -834,7 +851,7 @@ final class PromptStore {
         try await switchDemo(label: "demo enter") {
             DisabledRemindersStore.switching(toDemo: true) {
                 DemoModeStore.shared.isActive = true
-                semaphore.renewCounter()
+                semaphore.renewCounterForSwitch()
             }
             enterDemoOverlay()
         }
@@ -847,7 +864,7 @@ final class PromptStore {
             exitDemoOverlay()
             DisabledRemindersStore.switching(toDemo: false) {
                 DemoModeStore.shared.isActive = false
-                semaphore.renewCounter()
+                semaphore.renewCounterForSwitch()
             }
         }
     }
@@ -856,7 +873,8 @@ final class PromptStore {
         var attempt = 1
         while true {
             do {
-                try await withPromptStore(label) { _ in
+                // A switch is the operation that moves the count, so it does not check it.
+                try await semaphore.hold(label) { _ in
                     body()
                     // A cached reminder list is of the mode it was built in.
                     ReminderBuilder.invalidateCache()

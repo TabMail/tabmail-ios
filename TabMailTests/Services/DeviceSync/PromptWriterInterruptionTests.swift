@@ -26,29 +26,6 @@ private final class ResponseGate: @unchecked Sendable {
 /// A writer whose model call another edit interrupts (DS-AI, DS-COUNTER): the response arrives after the
 /// user's newer edit and must not replace it. Each runs the real writer against a mock backend that parks
 /// the response, with an uninterrupted control that persists the same response.
-/// Parks the first off-main read of the demo's reminder map, once, until the test releases it.
-private final class DemoMapParkingDefaults: UserDefaults {
-    private let state = Mutex((armed: true, parked: false, timedOut: false))
-    private let signal = DispatchSemaphore(value: 0)
-    var parked: Bool { state.withLock { $0.parked } }
-    var timedOut: Bool { state.withLock { $0.timedOut } }
-    func release() { signal.signal() }
-
-    override func data(forKey key: String) -> Data? {
-        let value = super.data(forKey: key)
-        if key == DisabledRemindersStore.demoStorageKeyV2, !Thread.isMainThread {
-            let park = state.withLock { s -> Bool in
-                guard s.armed else { return false }
-                s.armed = false
-                s.parked = true
-                return true
-            }
-            if park, signal.wait(timeout: .now() + 30) == .timedOut { state.withLock { $0.timedOut = true } }
-        }
-        return value
-    }
-}
-
 @MainActor
 @Suite("Prompt store writers interrupted by an edit", .serialized, .processGlobalState)
 struct PromptWriterInterruptionTests {
@@ -456,6 +433,7 @@ struct EmailReminderSnoozeTargetTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var config = Configuration()
         config.foreignKeysEnabled = true
+        config.maximumReaderCount = 1
         let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
         let app = try AppDatabase(dbPool: pool)
         let previous = AppDatabase.shared.withLock { s in
@@ -469,42 +447,46 @@ struct EmailReminderSnoozeTargetTests {
             try await DemoModeService.shared.start(mintToken: false)
             PromptStore.shared.enterDemoOverlay()
             let tag = "snooze-" + UUID().uuidString
-            try await pool.write { db in
-                var account = Account(emailAddress: "demo@example.com", displayName: "Demo", provider: .gmail)
-                account.id = DemoSeed.demoAccountId
-                try account.save(db)
-                let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: account.id)
-                try folder.save(db)
-                var header = MessageHeader(messageId: tag, subject: "Reminder", from: "Sender", fromAddress: "sender@example.com", to: "demo@example.com", date: Date(), snippet: "", folderId: folder.id, accountId: account.id, folderPath: "INBOX", isInInbox: true)
-                header.reminderContent = tag
-                header.rfc822MessageId = "<" + tag + "@example.com>"
-                try header.insert(db)
+            // Leaving the demo deletes its rows; the build that was waiting reads them after, so they are put back.
+            func seedDemoRow() async throws {
+                try await pool.write { db in
+                    var account = Account(emailAddress: "demo@example.com", displayName: "Demo", provider: .gmail)
+                    account.id = DemoSeed.demoAccountId
+                    try account.save(db)
+                    let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: account.id)
+                    try folder.save(db)
+                    var header = MessageHeader(messageId: tag, subject: "Reminder", from: "Sender", fromAddress: "sender@example.com", to: "demo@example.com", date: Date(), snippet: "", folderId: folder.id, accountId: account.id, folderPath: "INBOX", isInInbox: true)
+                    header.reminderContent = tag
+                    header.rfc822MessageId = "<" + tag + "@example.com>"
+                    try header.save(db)
+                }
             }
+            try await seedDemoRow()
             ReminderBuilder.invalidateCache()
             let suite = "snooze-target-" + UUID().uuidString
-            let defaults = try #require(DemoMapParkingDefaults(suiteName: suite))
+            let defaults = try #require(UserDefaults(suiteName: suite))
             defer { defaults.removePersistentDomain(forName: suite) }
             defaults.set(Data("{}".utf8), forKey: "disabled_reminders_v2")
             defaults.set(Data("{}".utf8), forKey: DisabledRemindersStore.demoStorageKeyV2)
-            let pending = DisabledRemindersStore.withTestDefaults(defaults) {
-                Task { try await ReminderDelTool().execute(arguments: ["text": .string(tag)]) }
-            }
-            let deadline = ContinuousClock.now + .seconds(10)
-            while !defaults.parked, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
-            guard defaults.parked else {
-                defaults.release()
-                _ = try await pending.value
-                Issue.record("the snooze never reached its map read")
+            // The snooze awaits the reminder build, which reads the database first; holding the pool's only reader
+            // keeps it there while the demo is (or is not) left.
+            let gate = DatabaseReaderGate(pool)
+            guard await gate.waitUntilHeld() else {
+                Issue.record("the reader was never taken")
                 await DemoModeService.shared.exit()
                 return
             }
+            let pending = DisabledRemindersStore.withTestDefaults(defaults) {
+                Task { try await ReminderDelTool().execute(arguments: ["text": .string(tag)]) }
+            }
+            try await Task.sleep(for: .seconds(1))
             if interrupt {
                 await DemoModeService.shared.exit()
                 #expect(!DemoModeStore.isDemoActive, "the demo ended")
+                try await seedDemoRow()
             }
-            defaults.release()
+            await gate.release()
             let result = try await pending.value
-            #expect(!defaults.timedOut)
             let real = try JSONDecoder().decode([String: DisabledRemindersStore.DisabledEntry].self, from: try #require(defaults.data(forKey: "disabled_reminders_v2")))
             #expect(real.isEmpty, "the demo's snooze reached the real map: \(result)")
             if interrupt {

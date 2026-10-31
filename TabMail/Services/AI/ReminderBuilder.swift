@@ -426,13 +426,16 @@ enum ReminderBuilder {
         }
 
         // Epoch-zero timestamps ensure Device Sync always overrides these entries
-        // Refused when a demo switch came since the build started: nothing is marked done, the next build redoes it.
-        guard DisabledRemindersStore.bulkDisableWithEpochZero(hashes: hashesToDisable, since: started) else { return false }
+        // Refused when a demo switch came since the build started, an empty list included: nothing is marked
+        // done, the next build redoes it. The mark is saved in the suppression's own transaction.
+        guard DisabledRemindersStore.bulkDisableWithEpochZero(
+            hashes: hashesToDisable, since: started,
+            completing: { defaults.set(true, forKey: didAutoDisableKey) }
+        ) else { return false }
         if !hashesToDisable.isEmpty {
             NotificationCenter.default.post(name: .remindersDidChange, object: nil)
         }
 
-        defaults.set(true, forKey: didAutoDisableKey)
         BackgroundSyncLogger.logDebug("[ReminderBuilder] First-launch overdue suppression: disabled \(hashesToDisable.count) reminders with due dates before \(cutoff)")
         return !hashesToDisable.isEmpty
     }

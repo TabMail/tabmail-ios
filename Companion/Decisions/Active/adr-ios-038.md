@@ -498,3 +498,16 @@ at call start across an `await` kept producing a late-read sibling in every revi
 `demo.`-prefixed overlay keys, and demo writes never touch bullet state, labels, seen or history. Tests pin
 the invariant for each multi-step writer: a switch in either direction mid-flight leaves both stores
 unchanged and reports failure, and an uninterrupted control saves.
+
+**Amendment 2026-10-31 (round 1 review) — brief operations carry the demo-switch count, not the change counter:**
+A brief operation that waits in line (a gesture, a KB or reminder tool, a sync receive) must not carry the
+change counter: ordinary commits move it, so an operation queued behind another real edit would be refused,
+which breaks "wait in line". The prompt semaphore counts demo switches (`ChangeCounter.switches`, moved only by
+`enterDemo`/`leaveDemo` inside their hold). `PromptStore.withPromptStore` / `edit` take the count when called,
+or `entered` from a caller that took it earlier (`gesture` before its task, a tool before its first await,
+`PromptStore.switchesSeen`), and compare it when the hold is granted; a switch in between refuses the call
+(`PromptRefusal.changed`, outcome `.dropped`, "could not save"). The rule lives in that one function, so no
+caller carries a check of its own. Multi-step writers keep the change-counter compare (AI staleness). Also
+fixed in the same round: the first-launch overdue suppression refuses an empty list across a switch and saves
+its done-mark in the suppression's own transaction; the public disabled-reminders readers read in the map
+transaction.

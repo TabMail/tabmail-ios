@@ -3,6 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import GRDB
+import Synchronization
 @testable import TabMail
 
 /// Holds the prompt store's semaphore from a task of its own until `end()`, as a slow caller would.
@@ -71,5 +73,44 @@ enum ForeignBulletMessage {
         let text = part == 1 ? first : second
         let name = part == 1 ? one : two
         return #"{"type":"bullet_state","v":1,"field":"kb","sender":"\#(sender)","snap":"\#(snap)","part":\#(part),"parts":2,"bullets":[["","\#(text)","\#(name)",1]],"seen":{"\#(one)":1,"\#(two)":1}}"#
+    }
+}
+
+/// Holds a database pool's only reader until `release()`, so a build that reads the database after that waits there:
+/// a reminder build part-way through while a test switches the demo. The pool must be made with
+/// `maximumReaderCount = 1`. The wait is not under the reminder map's lock, which a switch takes.
+final class DatabaseReaderGate: Sendable {
+    private final class Progress: Sendable {
+        let value = Mutex((held: false, finished: false))
+    }
+
+    private let progress = Progress()
+    private let gate = DispatchSemaphore(value: 0)
+
+    init(_ pool: DatabasePool) {
+        DispatchQueue.global().async { [progress, gate] in
+            try? pool.read { _ in
+                progress.value.withLock { $0.held = true }
+                _ = gate.wait(timeout: .now() + 30)
+            }
+            progress.value.withLock { $0.finished = true }
+        }
+    }
+
+    /// True once the reader is taken.
+    func waitUntilHeld() async -> Bool { await poll { $0.held } }
+
+    func release() async {
+        gate.signal()
+        _ = await poll { $0.finished }
+    }
+
+    private func poll(_ done: ((held: Bool, finished: Bool)) -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(10)
+        while ContinuousClock.now < deadline {
+            if progress.value.withLock({ done($0) }) { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
     }
 }

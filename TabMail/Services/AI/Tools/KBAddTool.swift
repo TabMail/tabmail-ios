@@ -12,6 +12,9 @@ struct KBAddTool: AgentTool, Sendable {
     let name = "kb_add"
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        // The call belongs to the mode it started in (DS-DEMO): the demo-switch count is taken before anything
+        // awaits and the prompt store compares it when the call's turn comes.
+        let entered = PromptStore.switchesSeen
         guard case .string(let raw) = arguments["statement"] else {
             BackgroundSyncLogger.logDebug("[KBAddTool] Missing or empty 'statement'")
             return #"{"error": "missing statement"}"#
@@ -33,7 +36,7 @@ struct KBAddTool: AgentTool, Sendable {
         // (Device Sync).
         let edit = await { @MainActor () async -> KBToolEdit in
             var patched = false
-            let outcome = await PromptStore.shared.edit("kb_add tool") { hold in
+            let outcome = await PromptStore.shared.edit("kb_add tool", entered: entered) { hold in
                 try hold.editText(.kb) { current in
                     guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText) else { return nil }
                     patched = true

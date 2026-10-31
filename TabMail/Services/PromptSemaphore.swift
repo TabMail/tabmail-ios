@@ -20,10 +20,21 @@ final class ChangeCounter: Sendable {
     static let device = ChangeCounter()
 
     private let value = Mutex(UUID())
+    private let switchValue = Mutex(0)
 
     var current: UUID { value.withLock { $0 } }
 
+    /// How many times the demo was entered or left (DS-DEMO). Unlike `current`, ordinary commits leave it
+    /// alone, so a brief operation that waited in line behind other edits is still of its mode.
+    var switches: Int { switchValue.withLock { $0 } }
+
     func renew() { value.withLock { $0 = UUID() } }
+
+    /// The demo was entered or left: moves the count and renews the counter, together.
+    func renewForSwitch() {
+        switchValue.withLock { $0 += 1 }
+        renew()
+    }
 }
 
 /// A caller's hold of the semaphore (DS-LEASE): a write checks `isHolder` immediately before the storage
@@ -130,9 +141,18 @@ final class PromptSemaphore {
         return ContinuousClock.now < current.deadline
     }
 
+    /// DS-DEMO: how many times the demo was entered or left, as `ChangeCounter.switches`.
+    var switches: Int { changeCounter.switches }
+
     /// DS-COUNTER: a commit saved a change; a write that read the previous value is refused.
     func renewCounter() {
         changeCounter.renew()
+    }
+
+    /// DS-DEMO: the demo was entered or left, inside the switch's hold: the counter moves and so does
+    /// the switch count.
+    func renewCounterForSwitch() {
+        changeCounter.renewForSwitch()
     }
 
     /// Takes the semaphore for `token` with its lease.
