@@ -113,6 +113,24 @@ struct PromptStoreInvariantTests {
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
+    @Test("A demo gesture is a demo gesture even when the demo ends before its task first runs (DS-DEMO)")
+    func gestureTargetIsFixedWhenMade() async throws {
+        quiet()
+        DemoModeStore.shared._resetForTests()
+        let tag = PromptStoreTestCleanup.tag()
+        let realBefore = realStorage()
+        DemoModeStore.shared.isActive = true
+        store.enterDemoOverlay()
+        // No await between the gesture and the end of the demo: the gesture's task has not run yet.
+        let pending = store.gesture("demo gesture") { try $0.addBullet(tag, to: .knowledgeBase) }
+        store.exitDemoOverlay()
+        DemoModeStore.shared._resetForTests()
+        PromptStore.removeDemoOverlayKeys()
+        #expect(await pending.value == .dropped)
+        #expect(realStorage() == realBefore)
+        #expect(!store.rawKB.contains(tag))
+    }
+
     @Test("A real gesture waiting on the semaphore when the demo starts writes nothing to the demo (DS-DEMO)")
     func queuedRealGestureStaysOutOfTheDemo() async throws {
         quiet()
