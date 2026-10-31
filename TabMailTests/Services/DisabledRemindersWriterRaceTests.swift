@@ -151,4 +151,26 @@ struct DisabledRemindersWriterRaceTests {
         #expect(result["k:peer"]?.enabled == false, "the merge committed")
         #expect(result["k:newer"]?.enabled == false, "the user's later disable remains")
     }
+
+    @Test("In the demo the reminder map is the demo's own; the real map is untouched and reads back after")
+    func demoMapIsSeparate() {
+        UserDefaults.standard.set(false, forKey: "device_sync_auto_enabled")
+        DeviceSyncService.shared.disconnect()
+        let suite = "DemoReminderMap." + UUID().uuidString
+        guard let defaults = UserDefaults(suiteName: suite) else { Issue.record("no suite"); return }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let demo = DemoModeStore.shared
+        demo._resetForTests()
+        defer { demo._resetForTests() }
+        DisabledRemindersStore.withTestDefaults(defaults) {
+            DisabledRemindersStore.setEnabled(hash: "k:real", enabled: false)
+            demo.isActive = true
+            #expect(DisabledRemindersStore.getDisabledMap()["k:real"] == nil, "the demo does not show the real choices")
+            DisabledRemindersStore.setEnabled(hash: "k:demo", enabled: false)
+            #expect(DisabledRemindersStore.getDisabledMap()["k:demo"]?.enabled == false, "the demo shows its own choice")
+            demo.isActive = false
+            #expect(DisabledRemindersStore.getDisabledMap()["k:demo"] == nil, "the demo's choice does not outlive it")
+            #expect(DisabledRemindersStore.getDisabledMap()["k:real"]?.enabled == false, "the real choice reads back")
+        }
+    }
 }

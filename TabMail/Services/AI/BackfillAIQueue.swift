@@ -336,14 +336,7 @@ actor BackfillAIQueue {
 
         // Dispatch.
         do {
-            switch jobType {
-            case .actionRefine:
-                let snap = try row.decodeActionRefine()
-                await dispatchActionRefine(snap)
-            case .kbRefine:
-                let snap = try row.decodeKBRefine()
-                await dispatchKBRefine(snap)
-            }
+            try await dispatch(row, jobType: jobType)
         } catch {
             // Decode error is permanent — drop.
             BackgroundSyncLogger.logBackfillAI("drop dedupKey=\(dedupKey) reason=decode-error error=\(error)")
@@ -414,6 +407,19 @@ actor BackfillAIQueue {
     }
 
     // MARK: - Dispatchers (call existing refinement functions unchanged)
+
+    /// Runs `row`'s job. `ai` is the service an action refine runs on; tests pass one with a mock backend.
+    /// Throws when the row's payload does not decode (permanent: the caller drops the row).
+    func dispatch(_ row: PendingAIRefinement, jobType: BackfillAIJobType, ai: AIService = .shared) async throws {
+        switch jobType {
+        case .actionRefine:
+            let snap = try row.decodeActionRefine()
+            await dispatchActionRefine(snap, ai: ai)
+        case .kbRefine:
+            let snap = try row.decodeKBRefine()
+            await dispatchKBRefine(snap)
+        }
+    }
 
     /// `ai` is the service the refine runs on; tests pass one with a mock backend.
     func dispatchActionRefine(_ s: ActionRefineSnapshot, ai: AIService = .shared) async {

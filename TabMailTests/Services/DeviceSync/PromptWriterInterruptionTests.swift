@@ -262,3 +262,92 @@ struct BulletListEditorActionsTests {
         #expect(await BulletListEditorActions.delete(shown, from: .deleteRules, in: store).value == .unchanged)
     }
 }
+
+/// A mock model that answers every completion with `patch` as its patch.
+private func mockModel(patch: String) throws -> (AIService, FakeHTTP.Scenario) {
+    let assistant = String(decoding: try JSONSerialization.data(withJSONObject: ["patch": patch]), as: UTF8.self)
+    let data = try JSONSerialization.data(withJSONObject: ["assistant": assistant])
+    let body = Data(("event: final\ndata: " + String(decoding: data, as: UTF8.self) + "\n\n").utf8)
+    let http = FakeHTTP.Scenario()
+    http.register(path: "/completions/chat", method: "POST") { _ in .bytes(body, contentType: "text/event-stream") }
+    return (AIService(backendClient: BackendClient(llmSession: http.session)), http)
+}
+
+/// The action-rule writers decide "the patch changed nothing" on bytes (`Bullets.same`), as the store does: a patch
+/// that replaces a rule with a canonically equivalent but byte-different one is a change and is saved. The queue's
+/// dispatch runs the refine for the snapshot it holds.
+@MainActor
+@Suite("Action rule writers compare bytes", .serialized, .processGlobalState)
+struct ActionRuleExactByteTests {
+    let store = PromptStore.shared
+
+    private func quiet() {
+        UserDefaults.standard.set(false, forKey: "device_sync_auto_enabled")
+        DeviceSyncService.shared.disconnect()
+        AIService.writeOptOutFlag(false)
+    }
+
+    private func persisted() -> String {
+        UserDefaults.standard.string(forKey: UserDefaultsBulletStore.renderedKeys[.action] ?? "") ?? ""
+    }
+
+    /// Byte containment: `String.contains` would call canonically equivalent text equal.
+    private func hasBytes(_ haystack: String, _ needle: String) -> Bool {
+        Array(haystack.utf8).firstRange(of: Array(needle.utf8)) != nil
+    }
+
+    private func snapshot(_ tag: String) -> ActionRefineSnapshot {
+        ActionRefineSnapshot(messageStableId: "msg-\(tag)", accountId: "acc-\(tag)", subject: "\(tag) subject", from: "sender@example.com",
+                             summaryBlurb: "Planning notes.", summaryTodos: nil, originalAction: "archive", userManualTag: "delete")
+    }
+
+    /// Seeds a rule in its precomposed form and returns it with the decomposed form of the same text.
+    private func seedRule(_ tag: String) async -> (composed: String, decomposed: String) {
+        let composed = "\(tag) Caf\u{E9} news."
+        let decomposed = "\(tag) Cafe\u{301} news."
+        #expect(await store.edit("seed rule") { try $0.addBullet(composed, to: .deleteRules) } == .saved)
+        return (composed, decomposed)
+    }
+
+    @Test("A refine patch that only re-spells a rule in canonically equivalent bytes is saved")
+    func refineSavesByteDifferentRule() async throws {
+        quiet()
+        let tag = PromptStoreTestCleanup.tag()
+        let rule = await seedRule(tag)
+        let (ai, http) = try mockModel(patch: "DEL\ndelete\n\(rule.decomposed)\nADD\ndelete\n\(rule.decomposed)")
+        defer { http.close() }
+        await BackfillAIQueue.shared.dispatchActionRefine(snapshot(tag), ai: ai)
+        #expect(hasBytes(persisted(), rule.decomposed), "the re-spelled rule was saved")
+        #expect(!hasBytes(persisted(), rule.composed), "the old spelling is gone")
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
+    @Test("A compaction patch that only re-spells a rule in canonically equivalent bytes is saved")
+    func compactionSavesByteDifferentRule() async throws {
+        quiet()
+        let tag = PromptStoreTestCleanup.tag()
+        let rule = await seedRule(tag)
+        let (ai, http) = try mockModel(patch: "DEL\ndelete\n\(rule.decomposed)\nADD\ndelete\n\(rule.decomposed)")
+        defer { http.close() }
+        let result = await ai.compactActionRulesNow()
+        if case .applied = result {} else { Issue.record("the compaction did not apply: \(result)") }
+        #expect(hasBytes(persisted(), rule.decomposed), "the re-spelled rule was saved")
+        #expect(!hasBytes(persisted(), rule.composed), "the old spelling is gone")
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
+    @Test("The queue's dispatch of an action-refine row runs the refine and persists its patch; an undecodable row throws")
+    func dispatchRunsTheRefine() async throws {
+        quiet()
+        let tag = PromptStoreTestCleanup.tag()
+        let (ai, http) = try mockModel(patch: "ADD\ndelete\n\(tag) queued rule")
+        defer { http.close() }
+        let row = try PendingAIRefinement.make(snapshot(tag), now: Int64(Date().timeIntervalSince1970 * 1000))
+        try await BackfillAIQueue.shared.dispatch(row, jobType: .actionRefine, ai: ai)
+        #expect(persisted().contains("\(tag) queued rule"), "the refine ran and its patch was saved")
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+
+        let broken = PendingAIRefinement(dedupKey: "broken-\(tag)", jobType: .actionRefine, payloadJSON: "{", createdAt: 0)
+        await #expect(throws: (any Error).self) { try await BackfillAIQueue.shared.dispatch(broken, jobType: .actionRefine, ai: ai) }
+    }
+}

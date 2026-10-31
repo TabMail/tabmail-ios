@@ -519,7 +519,7 @@ final class PromptStore {
     /// An AI writer's write (DS-AI step 3), in a second brief hold: refused with nothing written when the
     /// counter moved since `readBeforeAI`. The result is then dropped.
     func writeAfterRead(_ capture: PromptCapture, text: String, _ label: String) async -> PromptEditOutcome {
-        await edit(label, demo: capture.demo) { try $0.commitAIEdit(capture, text: text) }
+        await edit(label) { try $0.commitAIEdit(capture, text: text) }
     }
 
     /// A refusal as an edit's outcome.
