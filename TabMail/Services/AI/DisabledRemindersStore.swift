@@ -65,6 +65,25 @@ enum DisabledRemindersStore {
         taskLocalTestDefaults?.value ?? .standard
     }
 
+    // MARK: - Map transaction lock
+
+    /// Every writer replaces the WHOLE map (read, change, encode, save), and the
+    /// writers run on different threads: the user toggles on the MainActor, a
+    /// Device Sync receive merges on the MainActor, and `ReminderBuilder`'s detached
+    /// rebuild runs `bulkDisableWithEpochZero` and `gcStaleEntries` off it. Without a
+    /// single line through the map, an older writer saves its captured copy over a
+    /// newer writer's entry, and an absent entry means ENABLED, so the user's disable
+    /// is lost for good. Each writer therefore holds this lock for its WHOLE
+    /// transaction and decides from the map it reads under the lock. Recursive because
+    /// `getDisabledMap(key:)` may run the v1 migration inside a held transaction.
+    private static let mapLock = NSRecursiveLock()
+
+    private static func transaction<T>(_ body: () -> T) -> T {
+        mapLock.lock()
+        defer { mapLock.unlock() }
+        return body()
+    }
+
     // MARK: - CRDT Entry
 
     struct DisabledEntry: Codable, Sendable {
@@ -118,6 +137,10 @@ enum DisabledRemindersStore {
     private static func migrateIfNeeded() {
         // Never migrate into (or based on) the demo map.
         guard !DemoModeStore.isDemoActive else { return }
+        transaction { migrateLocked() }
+    }
+
+    private static func migrateLocked() {
         let d = defaults
         guard d.data(forKey: storageKeyV2) == nil else { return }
 
@@ -171,9 +194,12 @@ enum DisabledRemindersStore {
     /// Broadcasts change to Device Sync peers (local user action).
     static func setEnabled(hash: String, enabled: Bool) {
         let key = activeKeyV2  // captured once — see getDisabledMap(key:)
-        var map = getDisabledMap(key: key)
-        map[hash] = DisabledEntry(enabled: enabled, ts: Date().ISO8601Format())
-        saveDisabledMap(map, key: key)
+        let map: [String: DisabledEntry] = transaction {
+            var map = getDisabledMap(key: key)
+            map[hash] = DisabledEntry(enabled: enabled, ts: Date().ISO8601Format())
+            saveDisabledMap(map, key: key)
+            return map
+        }
         BackgroundSyncLogger.logDebug("[DisabledRemindersStore] Set \(hash) enabled=\(enabled) (disabled count: \(map.filter { !$0.value.enabled }.count))")
 
         // Broadcast to Device Sync peers. Demo dismiss/snooze stays local to
@@ -193,25 +219,28 @@ enum DisabledRemindersStore {
     /// Does NOT trigger a broadcast (used for incoming Device Sync).
     static func mergeIncoming(_ incomingMap: [String: DisabledEntry]) {
         let key = activeKeyV2  // captured once — see getDisabledMap(key:)
-        var localMap = getDisabledMap(key: key)
-        var merged = 0
+        let (merged, total) = transaction { () -> (Int, Int) in
+            var localMap = getDisabledMap(key: key)
+            var merged = 0
 
-        for (hash, inEntry) in incomingMap {
-            if let localEntry = localMap[hash] {
-                if inEntry.ts > localEntry.ts {
+            for (hash, inEntry) in incomingMap {
+                if let localEntry = localMap[hash] {
+                    if inEntry.ts > localEntry.ts {
+                        localMap[hash] = inEntry
+                        merged += 1
+                    }
+                } else {
                     localMap[hash] = inEntry
                     merged += 1
                 }
-            } else {
-                localMap[hash] = inEntry
-                merged += 1
             }
-        }
 
-        if merged > 0 {
-            saveDisabledMap(localMap, key: key)
+            if merged > 0 {
+                saveDisabledMap(localMap, key: key)
+            }
+            return (merged, localMap.count)
         }
-        BackgroundSyncLogger.logDebug("[DisabledRemindersStore] CRDT merge: \(merged) entries adopted from \(incomingMap.count) incoming (local total: \(localMap.count))")
+        BackgroundSyncLogger.logDebug("[DisabledRemindersStore] CRDT merge: \(merged) entries adopted from \(incomingMap.count) incoming (local total: \(total))")
     }
 
     /// Bulk-disable hashes with epoch-zero timestamps. Used by first-launch overdue
@@ -220,15 +249,17 @@ enum DisabledRemindersStore {
     static func bulkDisableWithEpochZero(hashes: [String]) {
         guard !hashes.isEmpty else { return }
         let key = activeKeyV2  // captured once — see getDisabledMap(key:)
-        var map = getDisabledMap(key: key)
         let epochZero = "1970-01-01T00:00:00Z"
-        for hash in hashes {
-            // Only write if no existing entry — preserve any prior state from sync/user action
-            if map[hash] == nil {
-                map[hash] = DisabledEntry(enabled: false, ts: epochZero)
+        transaction {
+            var map = getDisabledMap(key: key)
+            for hash in hashes {
+                // Only write if no existing entry — preserve any prior state from sync/user action
+                if map[hash] == nil {
+                    map[hash] = DisabledEntry(enabled: false, ts: epochZero)
+                }
             }
+            saveDisabledMap(map, key: key)
         }
-        saveDisabledMap(map, key: key)
         BackgroundSyncLogger.logDebug("[DisabledRemindersStore] Bulk-disabled \(hashes.count) hashes with epoch-zero timestamps")
     }
 
@@ -253,25 +284,29 @@ enum DisabledRemindersStore {
     /// own side, so nothing is gained by trying to decide when one is "really" stale.
     static func gcStaleEntries(freshHashes: Set<String>) {
         let key = activeKeyV2  // captured once — see getDisabledMap(key:)
-        var map = getDisabledMap(key: key)
-        guard !map.isEmpty else { return }
-
         let now = Date()
-        var removed = 0
+        let removed = transaction { () -> Int in
+            var map = getDisabledMap(key: key)
+            guard !map.isEmpty else { return 0 }
+            var removed = 0
 
-        for (hash, entry) in map {
-            guard !hash.hasPrefix(nonDerivableHashPrefix) else { continue }
-            if !freshHashes.contains(hash) {
-                if let entryDate = Date.fromISO8601(entry.ts),
-                   now.timeIntervalSince(entryDate) > Double(gcAgeDays * 86400) {
-                    map.removeValue(forKey: hash)
-                    removed += 1
+            for (hash, entry) in map {
+                guard !hash.hasPrefix(nonDerivableHashPrefix) else { continue }
+                if !freshHashes.contains(hash) {
+                    if let entryDate = Date.fromISO8601(entry.ts),
+                       now.timeIntervalSince(entryDate) > Double(gcAgeDays * 86400) {
+                        map.removeValue(forKey: hash)
+                        removed += 1
+                    }
                 }
             }
-        }
 
+            if removed > 0 {
+                saveDisabledMap(map, key: key)
+            }
+            return removed
+        }
         if removed > 0 {
-            saveDisabledMap(map, key: key)
             BackgroundSyncLogger.logDebug("[DisabledRemindersStore] GC removed \(removed) entries older than \(gcAgeDays) days")
         }
     }

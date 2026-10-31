@@ -4,6 +4,32 @@
 
 import SwiftUI
 
+/// What the editor's Add and Delete controls do, apart from the view: a hosted SwiftUI control publishes
+/// no element a test can tap, so the tests call these, and the controls' closures only call them.
+@MainActor
+enum BulletListEditorActions {
+    /// DS-DISPLAYED: deletes exactly the labels the row showed.
+    static func delete(_ shown: ShownBullet, from section: PromptSection, in store: PromptStore) -> Task<PromptEditOutcome, Never> {
+        store.gesture("delete \(section.key) bullet") { try $0.deleteShown(shown, from: section) }
+    }
+
+    enum Add {
+        /// Nothing typed.
+        case nothing
+        /// The line was not added; the text is shown under the field.
+        case refused(String)
+        /// Being added; the field is cleared once it is `.saved` or `.unchanged`.
+        case adding(Task<PromptEditOutcome, Never>)
+    }
+
+    static func add(_ typed: String, to section: PromptSection, in store: PromptStore) -> Add {
+        let trimmed = typed.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return .nothing }
+        guard !PromptStore.holdsSectionMarker(trimmed, in: section) else { return .refused(PromptStore.sectionMarkerRefusal) }
+        return .adding(store.gesture("add \(section.key) bullet") { try $0.addBullet(trimmed, to: section) })
+    }
+}
+
 /// Editor for one section's bullets. Each add or delete is its own change to that bullet (Device Sync's
 /// DS-ADD and DS-DISPLAYED): a bullet that arrived from another device while this is open is never
 /// removed by it. Same UX as template instructions.
@@ -31,8 +57,7 @@ struct BulletListEditor: View {
                 }
                 .swipeActions(edge: .trailing) {
                     Button(role: .destructive) {
-                        // DS-DISPLAYED: deletes exactly the labels this row showed.
-                        store.gesture("delete \(section.key) bullet") { try $0.deleteShown(shown, from: section) }
+                        _ = BulletListEditorActions.delete(shown, from: section, in: store)
                     } label: {
                         Label("Delete", systemImage: "trash")
                     }
@@ -62,19 +87,19 @@ struct BulletListEditor: View {
     }
 
     private func addItem() {
-        let trimmed = newItem.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
-        guard !PromptStore.holdsSectionMarker(trimmed, in: section) else {
-            refusal = PromptStore.sectionMarkerRefusal
+        switch BulletListEditorActions.add(newItem, to: section, in: store) {
+        case .nothing:
             return
-        }
-        refusal = nil
-        let adding = store.gesture("add \(section.key) bullet") { try $0.addBullet(trimmed, to: section) }
-        Task {
-            let outcome = await adding.value
-            guard outcome == .saved || outcome == .unchanged else { return }
-            newItem = ""
-            fieldFocused = true
+        case .refused(let text):
+            refusal = text
+        case .adding(let adding):
+            refusal = nil
+            Task {
+                let outcome = await adding.value
+                guard outcome == .saved || outcome == .unchanged else { return }
+                newItem = ""
+                fieldFocused = true
+            }
         }
     }
 }
