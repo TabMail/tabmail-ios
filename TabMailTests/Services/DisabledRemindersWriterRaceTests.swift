@@ -17,13 +17,13 @@ private final class ParkingDefaults: UserDefaults {
     var timedOut: Bool { state.withLock { $0.timedOut } }
     func release() { unblock.signal() }
 
-    /// A writer's reads are the migration check, then the map: the second off-main read is the map.
+    /// A writer's one read of the map is its first off-main read of the key.
     override func data(forKey key: String) -> Data? {
         let snapshot = super.data(forKey: key)
         if key == "disabled_reminders_v2", !Thread.isMainThread {
             let park = state.withLock { s -> Bool in
                 s.reads += 1
-                return s.reads == 2
+                return s.reads == 1
             }
             if park {
                 state.withLock { $0.parked = true }
@@ -171,6 +171,29 @@ struct DisabledRemindersWriterRaceTests {
             demo.isActive = false
             #expect(DisabledRemindersStore.getDisabledMap()["k:demo"] == nil, "the demo's choice does not outlive it")
             #expect(DisabledRemindersStore.getDisabledMap()["k:real"]?.enabled == false, "the real choice reads back")
+        }
+    }
+
+    @Test("The v1 list is the real map only: the demo does not read it, a demo change does not store it, and it reads again after")
+    func v1ListIsNotTheDemosMap() {
+        UserDefaults.standard.set(false, forKey: "device_sync_auto_enabled")
+        DeviceSyncService.shared.disconnect()
+        let suite = "DemoReminderV1." + UUID().uuidString
+        guard let defaults = UserDefaults(suiteName: suite) else { Issue.record("no suite"); return }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let demo = DemoModeStore.shared
+        demo._resetForTests()
+        defer { demo._resetForTests() }
+        defaults.set(["k:legacy"], forKey: "disabled_reminders")
+        DisabledRemindersStore.withTestDefaults(defaults) {
+            #expect(DisabledRemindersStore.getDisabledMap()["k:legacy"]?.enabled == false, "control: the real map reads the v1 list")
+            demo.isActive = true
+            #expect(DisabledRemindersStore.getDisabledMap()["k:legacy"] == nil, "the demo does not read the v1 list")
+            DisabledRemindersStore.setEnabled(hash: "k:demo", enabled: false)
+            #expect(defaults.data(forKey: "disabled_reminders_v2") == nil, "a demo change stores no real map")
+            demo.isActive = false
+            #expect(DisabledRemindersStore.getDisabledMap()["k:legacy"]?.enabled == false, "the v1 list reads again after the demo")
+            #expect(DisabledRemindersStore.getDisabledMap()["k:demo"] == nil)
         }
     }
 }

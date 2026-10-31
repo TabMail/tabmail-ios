@@ -74,6 +74,16 @@ private final class LoopbackWebSocketServer: @unchecked Sendable {
         }
     }
 
+    /// The text of every `bullet_state` message of `field` received so far, in order.
+    func bulletMessages(_ field: String) -> [String] {
+        queue.sync {
+            received.filter { text in
+                guard let object = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else { return false }
+                return object["type"] as? String == "bullet_state" && object["field"] as? String == field
+            }
+        }
+    }
+
     func forgetReceived() {
         queue.sync { received.removeAll() }
     }
@@ -99,6 +109,12 @@ private final class LoopbackWebSocketServer: @unchecked Sendable {
 @MainActor
 @Suite("Device Sync socket boundary", .serialized, .processGlobalState)
 struct DeviceSyncSocketBoundaryTests {
+    private static func canonical(_ state: FieldState) -> String {
+        let bullets = state.bullets.map { "\($0.section)|\($0.text)|\($0.name)|\($0.n)" }
+        let seen = state.seen.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }
+        return (state.head + ["--"] + bullets + ["--"] + seen + ["--"] + state.tail).joined(separator: "\n")
+    }
+
     private func stored(_ text: String) -> Bool {
         PromptStore.shared.rawKB.contains(text)
     }
@@ -194,6 +210,79 @@ struct DeviceSyncSocketBoundaryTests {
         sync.disconnect()
         session.invalidateAndCancel()
         server.stop()
+        if let failure { throw failure }
+    }
+
+    @Test("What Sync Now puts on the socket carries the device's bullets: a separate device that imports it holds them (DS-SEND)")
+    func socketPayloadReachesADurablePeer() async throws {
+        let defaults = UserDefaults.standard
+        let savedAuto = defaults.object(forKey: "device_sync_auto_enabled")
+        defer { defaults.set(savedAuto, forKey: "device_sync_auto_enabled") }
+        let store = PromptStore.shared
+        let sync = DeviceSyncService.shared
+        defaults.set(false, forKey: "device_sync_auto_enabled")
+        sync.disconnect()
+        let tag = PromptStoreTestCleanup.tag()
+        let text = "\(tag) socket payload bullet"
+        #expect(await store.edit("seed KB bullet") { try $0.addBullet(text, to: .knowledgeBase) } == .saved)
+        let senderBefore = store.bullets.engine.state(.kb)
+        let ours = senderBefore.bullets.filter { $0.text == text }
+        let server = try LoopbackWebSocketServer()
+        let session = URLSession(configuration: .ephemeral)
+        let peerDefaults = DeviceDefaults()
+        var failure: Error?
+        do {
+            guard ours.count == 1, let bullet = ours.first else {
+                Issue.record("the seeded bullet is not in the sender's state")
+                throw CancellationError()
+            }
+            let port = try await server.start()
+            let socket = session.webSocketTask(with: try #require(URL(string: "ws://127.0.0.1:\(port)")))
+            sync.webSocket = socket
+            socket.resume()
+            let deadline = ContinuousClock.now + .seconds(3)
+            while ContinuousClock.now < deadline, !server.isOpen {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            #expect(server.isOpen)
+            sync.handleMessage(#"{"type":"connected","userId":"00000000-0000-0000-0000-000000000000"}"#)
+            let limit = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < limit, Set(server.bulletFields).count < 3 {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            server.forgetReceived()
+            sync.syncNow()
+            let sent = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < sent, server.bulletMessages("kb").isEmpty {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            let messages = server.bulletMessages("kb")
+            #expect(!messages.isEmpty, "Sync Now sent no kb message")
+
+            // A device of its own, on defaults of its own, imports the messages as they came off the socket.
+            let peer = BulletDevice(id: "A", store: peerDefaults, relay: BulletRelay(), name: { String(format: "b0b0%04x%08x", 1, $0) },
+                                    budget: BulletSyncConfig.messageMaxBytes, catalog: DeviceSyncSharedFiles.catalog)
+            peer.start()
+            for message in messages { peer.receive(text: message) }
+            let received = peer.state(.kb)
+            let imported = received.bullets.filter { $0.name == bullet.name }
+            #expect(imported.map(\.text) == [text], "the peer holds the sender's bullet under its label")
+            #expect(imported.map(\.n) == [bullet.n])
+            #expect(received.seen[bullet.name] == senderBefore.seen[bullet.name], "the peer incorporated the sender's seen count")
+            #expect(senderBefore.seen[bullet.name] != nil)
+            let rendered = peerDefaults.defaults.string(forKey: UserDefaultsBulletStore.renderedKeys[.kb]!) ?? ""
+            #expect(rendered.contains(text), "the peer's rendered text carries the bullet")
+            #expect(peerDefaults.storedState(.kb)?.bullets.contains { $0.name == bullet.name && $0.text == text } == true, "the peer stored the bullet")
+            let senderAfter = store.bullets.engine.state(.kb)
+            #expect(Self.canonical(senderAfter) == Self.canonical(senderBefore), "sending changes nothing in the sender")
+        } catch {
+            failure = error
+        }
+        sync.disconnect()
+        session.invalidateAndCancel()
+        server.stop()
+        peerDefaults.dispose()
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
         if let failure { throw failure }
     }
 }

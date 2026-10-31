@@ -104,6 +104,7 @@ struct PromptStoreBoundaryTests {
             ("sendAll", { try $0.sendAll() }),
             ("recordHistory", { try $0.recordHistory(source: "local_edit", fields: ["kb"]) }),
             ("saveHistory", { try $0.saveHistory([]) }),
+            ("loadHistory", { _ = try $0.loadHistory() }),
             ("readForEdit", { _ = try $0.readForEdit(.kb) }),
             // Last: its live control replaces the knowledge base with the entry's text.
             ("restoreFromHistory", { try $0.restoreFromHistory(restoreEntry(tag: tag)) }),
@@ -165,6 +166,9 @@ struct PromptStoreBoundaryTests {
                 Issue.record("\(name): the uninterrupted control failed: \(error)")
             }
         }
+        // The history read's live control has something to read: the entry the recordHistory control wrote.
+        let live = try await store.withPromptStore("control history read") { try $0.loadHistory() }
+        #expect(!live.isEmpty, "a live history read returns the stored entries")
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 

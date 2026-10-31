@@ -142,22 +142,43 @@ struct DisabledRemindersCRDTTests {
         }
     }
 
-    // MARK: - v1 migration
+    // MARK: - v1 list
 
-    @Test("A v1 list is imported as disabled entries and saved, so a reopened store has them")
-    func v1ListIsImportedAndSaved() {
+    @Test("A device with only the v1 list reads it as the map at the field's timestamp, and the next change stores it as v2")
+    func v1ListIsReadAsTheMap() {
         Self.withIsolatedDefaults { defaults in
             defaults.set(["h1", "h2"], forKey: "disabled_reminders")
+            let epochZero = "1970-01-01T00:00:00.000Z"
+            let read = DisabledRemindersStore.getDisabledMap()
+            #expect(read.keys.sorted() == ["h1", "h2"])
+            #expect(read["h1"]?.enabled == false)
+            #expect(read["h1"]?.ts == epochZero, "no field timestamp: epoch zero, so any peer entry wins")
             #expect(DisabledRemindersStore.getDisabledHashes() == ["h1", "h2"])
+            #expect(defaults.data(forKey: "disabled_reminders_v2") == nil, "a read stores nothing")
+
+            // With a field timestamp, the entries carry it.
+            let stamp = "2026-05-01T00:00:00.000Z"
+            defaults.set(stamp, forKey: "device_sync_ts:disabledReminders")
+            #expect(DisabledRemindersStore.getDisabledMap()["h2"]?.ts == stamp)
+
+            // The next change stores the whole map as v2, the legacy choices with it.
+            DisabledRemindersStore.setEnabled(hash: "new", enabled: false)
             let saved = defaults.data(forKey: "disabled_reminders_v2").flatMap {
                 try? JSONDecoder().decode([String: DisabledRemindersStore.DisabledEntry].self, from: $0)
             }
-            #expect(saved?.keys.sorted() == ["h1", "h2"], "the v2 map is persisted")
-            #expect(saved?["h1"]?.enabled == false)
-            // Control: with no v1 list nothing is written.
-            defaults.removeObject(forKey: "disabled_reminders_v2")
-            defaults.removeObject(forKey: "disabled_reminders")
-            #expect(DisabledRemindersStore.getDisabledHashes().isEmpty)
+            #expect(saved?.keys.sorted() == ["h1", "h2", "new"], "the change kept the legacy choices")
+            #expect(saved?["h1"]?.ts == stamp)
+
+            // Once v2 exists it alone is read: re-enabling a legacy hash is not undone by the v1 list.
+            DisabledRemindersStore.setEnabled(hash: "h1", enabled: true)
+            #expect(DisabledRemindersStore.getDisabledHashes() == ["h2", "new"])
+        }
+    }
+
+    @Test("With no v1 list nothing is read or stored")
+    func noV1ListMeansNoMap() {
+        Self.withIsolatedDefaults { defaults in
+            #expect(DisabledRemindersStore.getDisabledMap().isEmpty)
             #expect(defaults.data(forKey: "disabled_reminders_v2") == nil)
         }
     }

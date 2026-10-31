@@ -38,7 +38,6 @@ struct DemoFlagReadSitesTests {
         ],
         "TabMail/Services/AI/DisabledRemindersStore.swift": [
             // Each takes the demo map or the real one at the start of one synchronous whole-map transaction.
-            "guard !DemoModeStore.isDemoActive else { return }",
             "getDisabledMap(key: keyV2(demo: DemoModeStore.isDemoActive))",
             "let demo = DemoModeStore.isDemoActive  // captured once — see getDisabledMap(key:)",
             "let key = keyV2(demo: DemoModeStore.isDemoActive)  // captured once — see getDisabledMap(key:)",

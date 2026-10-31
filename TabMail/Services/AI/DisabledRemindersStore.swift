@@ -16,6 +16,8 @@ enum DisabledRemindersStore {
 
     private static let storageKeyV1 = "disabled_reminders"
     private static let storageKeyV2 = "disabled_reminders_v2"
+    /// The field's Device Sync timestamp (`DeviceSyncService.TimestampKey.disabledReminders`).
+    private static let fieldTimestampKey = "device_sync_ts:disabledReminders"
 
     /// Demo-scoped map key (ADR-IOS-038). Deleted on demo exit by
     /// `DemoModeService`. Public so the service can remove it.
@@ -74,9 +76,9 @@ enum DisabledRemindersStore {
     /// single line through the map, an older writer saves its captured copy over a
     /// newer writer's entry, and an absent entry means ENABLED, so the user's disable
     /// is lost for good. Each writer therefore holds this lock for its WHOLE
-    /// transaction and decides from the map it reads under the lock. Recursive because
-    /// `getDisabledMap(key:)` may run the v1 migration inside a held transaction.
-    private static let mapLock = NSRecursiveLock()
+    /// transaction and decides from the map it reads under the lock. No transaction
+    /// calls another, so the lock is not recursive.
+    private static let mapLock = NSLock()
 
     private static func transaction<T>(_ body: () -> T) -> T {
         mapLock.lock()
@@ -133,29 +135,6 @@ enum DisabledRemindersStore {
 
     // MARK: - Read/Write (v2 CRDT Map)
 
-    /// Migrate v1 array to v2 map on first access.
-    private static func migrateIfNeeded() {
-        // Never migrate into (or based on) the demo map.
-        guard !DemoModeStore.isDemoActive else { return }
-        transaction { migrateLocked() }
-    }
-
-    private static func migrateLocked() {
-        let d = defaults
-        guard d.data(forKey: storageKeyV2) == nil else { return }
-
-        let oldHashes = d.stringArray(forKey: storageKeyV1) ?? []
-        if !oldHashes.isEmpty {
-            let now = Date().ISO8601Format()
-            var map: [String: DisabledEntry] = [:]
-            for hash in oldHashes {
-                map[hash] = DisabledEntry(enabled: false, ts: now)
-            }
-            saveDisabledMap(map, key: storageKeyV2)
-            BackgroundSyncLogger.logDebug("[DisabledRemindersStore] Migrated \(oldHashes.count) entries from v1 to v2 CRDT format")
-        }
-    }
-
     /// Get the full CRDT map.
     static func getDisabledMap() -> [String: DisabledEntry] {
         getDisabledMap(key: keyV2(demo: DemoModeStore.isDemoActive))
@@ -165,11 +144,26 @@ enum DisabledRemindersStore {
     /// pass it to both load and save, so a demo entry/exit flipping the mode
     /// between the read and the write can't route a real map into the demo
     /// key (or vice versa).
+    ///
+    /// A device with only the v1 list (no v2 map yet) reads it as the real map: every hash disabled, each
+    /// at the field's Device Sync timestamp (epoch zero when it has none), as TB's `readStoredField` does.
+    /// The next change to the real map stores it as v2. Nothing migrates, so no transaction decides by
+    /// the mode whether to; the choice is the key the caller captured.
     private static func getDisabledMap(key: String) -> [String: DisabledEntry] {
-        migrateIfNeeded()
-        guard let data = defaults.data(forKey: key),
-              let map = try? JSONDecoder().decode([String: DisabledEntry].self, from: data) else {
+        guard let data = defaults.data(forKey: key) else {
+            return key == storageKeyV2 ? legacyMap() : [:]
+        }
+        guard let map = try? JSONDecoder().decode([String: DisabledEntry].self, from: data) else {
             return [:]
+        }
+        return map
+    }
+
+    private static func legacyMap() -> [String: DisabledEntry] {
+        let ts = defaults.string(forKey: fieldTimestampKey) ?? Bullets.epochZero
+        var map: [String: DisabledEntry] = [:]
+        for hash in defaults.stringArray(forKey: storageKeyV1) ?? [] {
+            map[hash] = DisabledEntry(enabled: false, ts: ts)
         }
         return map
     }
