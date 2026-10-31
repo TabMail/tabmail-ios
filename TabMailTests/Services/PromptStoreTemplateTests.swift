@@ -334,6 +334,19 @@ struct PromptStoreCompositionMarkdownTests {
         }
     }
 
+    @Test("A composition without the END marker gets the template prompt at its end; none leaves it unchanged")
+    func compositionWithoutEndMarker() {
+        let composition = "Some legacy composition text"
+        let prompt = "# Email template\n## Name"
+        let injected = PromptStore.injectingTemplates(prompt, into: composition)
+        #expect(injected == composition + "\n\n" + prompt)
+        #expect(PromptStore.injectingTemplates("", into: composition) == composition)
+        // Control: with the marker the prompt goes before it.
+        let withMarker = "Head\n====END USER INSTRUCTIONS====\nTail"
+        let placed = PromptStore.injectingTemplates(prompt, into: withMarker)
+        #expect(placed == "Head\n\n" + prompt + "\n\n====END USER INSTRUCTIONS====\nTail")
+    }
+
     private func withCleanTemplatesThrowing(_ body: () throws -> Void) throws {
         let store = PromptStore.shared
         let savedTemplates = store.templates

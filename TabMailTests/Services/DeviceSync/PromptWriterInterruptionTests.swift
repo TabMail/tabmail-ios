@@ -121,6 +121,59 @@ struct PromptWriterInterruptionTests {
     }
 }
 
+/// The queue's action-refine dispatch, run as the drain runs it with a mock backend: the snapshot's input reaches the
+/// request, the returned patch changes the stored rules, and a result answered after a newer edit is dropped.
+@MainActor
+@Suite("Queued action refine", .serialized, .processGlobalState)
+struct QueuedActionRefineTests {
+    let store = PromptStore.shared
+
+    private func persisted() -> String {
+        UserDefaults.standard.string(forKey: UserDefaultsBulletStore.renderedKeys[.action] ?? "") ?? ""
+    }
+
+    private func snapshot(_ tag: String) -> ActionRefineSnapshot {
+        ActionRefineSnapshot(messageStableId: "msg-\(tag)", accountId: "acc-\(tag)", subject: "\(tag) subject", from: "sender@example.com",
+                             summaryBlurb: "Planning notes.", summaryTodos: nil, originalAction: "archive", userManualTag: "delete")
+    }
+
+    @Test("A dispatched refine sends the snapshot's input and persists its patch; one answered after a newer edit is dropped")
+    func dispatchPersistsOrDrops() async throws {
+        UserDefaults.standard.set(false, forKey: "device_sync_auto_enabled")
+        DeviceSyncService.shared.disconnect()
+        AIService.writeOptOutFlag(false)
+        for interrupt in [false, true] {
+            let tag = PromptStoreTestCleanup.tag()
+            let gate = ResponseGate()
+            let assistant = String(decoding: try JSONSerialization.data(withJSONObject: ["patch": "ADD\ndelete\n\(tag) old AI result"]), as: UTF8.self)
+            let data = try JSONSerialization.data(withJSONObject: ["assistant": assistant])
+            let body = Data(("event: final\ndata: " + String(decoding: data, as: UTF8.self) + "\n\n").utf8)
+            let http = FakeHTTP.Scenario()
+            http.register(path: "/completions/chat", method: "POST") { _ in
+                .parked { gate.park(); return .bytes(body, contentType: "text/event-stream") }
+            }
+            defer { http.close() }
+            let service = AIService(backendClient: BackendClient(llmSession: http.session))
+            let pending = Task { await BackfillAIQueue.shared.dispatchActionRefine(snapshot(tag), ai: service) }
+            let end = ContinuousClock.now + .seconds(10)
+            while !gate.started, ContinuousClock.now < end { try await Task.sleep(for: .milliseconds(20)) }
+            guard gate.started else {
+                gate.release(); await pending.value
+                Issue.record("the dispatch did not reach the parked backend")
+                return
+            }
+            if interrupt { #expect(await store.edit("newer rule edit") { try $0.addBullet("\(tag) newer user edit", to: .archiveRules) } == .saved) }
+            gate.release(); await pending.value
+            #expect(!gate.timedOut)
+            let sent = http.recordedCalls().compactMap(\.body).map { String(decoding: $0, as: UTF8.self) }
+            #expect(sent.contains { $0.contains("\(tag) subject") }, "the snapshot's subject reached the request")
+            #expect(persisted().contains("\(tag) old AI result") == !interrupt)
+            if interrupt { #expect(persisted().contains("\(tag) newer user edit"), "the newer edit is durable") }
+            await PromptStoreTestCleanup.remove(tag: tag, from: store)
+        }
+    }
+}
+
 /// The Settings editor's Add and Delete, called as its controls call them, read back from the store: a hosted
 /// SwiftUI control publishes no element a test can tap, so only the control's one-line closure is not run.
 @MainActor
@@ -172,6 +225,31 @@ struct BulletListEditorActionsTests {
             Issue.record("a marker line was not refused")
         }
         #expect(persisted(.action) == before, "neither changed the stored text")
+    }
+
+    private func reminder(_ content: String) -> Reminder {
+        Reminder(type: "reminder", content: content, dueDate: nil, dueTime: nil, source: "kb", hash: "k:" + content, enabled: true,
+                 action: nil, messageId: nil, uniqueId: nil, subject: nil, from: nil, instruction: nil, scheduleDays: nil,
+                 scheduleDate: nil, scheduleTime: nil, timezone: nil, rawLine: nil)
+    }
+
+    @Test("Deleting a KB reminder removes the labels its bullet was shown with and keeps a bullet added since")
+    func reminderDeletionUsesTheShownLabels() async throws {
+        quiet()
+        let tag = PromptStoreTestCleanup.tag()
+        let line = "Reminder: \(tag) pay rent"
+        #expect(await store.edit("add reminder") { try $0.addBullet(line, to: .knowledgeBase) } == .saved)
+        let shownKB = store.shown(.knowledgeBase)
+        let found = try #require(KBReminderDeletion.shown(for: reminder("\(tag) pay rent"), in: shownKB))
+        #expect(found.text == line)
+        #expect(KBReminderDeletion.shown(for: reminder("\(tag) other"), in: shownKB) == nil, "a reminder with no bullet is not matched")
+        // An unrelated bullet and a later bullet with the same words in other case.
+        #expect(await store.edit("add unrelated") { try $0.addBullet("\(tag) unrelated", to: .knowledgeBase) } == .saved)
+        #expect(await KBReminderDeletion.delete(found, in: store).value == .saved)
+        #expect(!store.rawKB.contains(line), "the reminder bullet is gone from the stored text")
+        #expect(store.rawKB.contains("\(tag) unrelated"), "an unrelated bullet is kept")
+        #expect(await KBReminderDeletion.delete(found, in: store).value == .unchanged, "deleting it again changes nothing")
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
     @Test("Delete of a row that is already gone changes nothing")

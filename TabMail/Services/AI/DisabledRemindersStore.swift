@@ -24,8 +24,8 @@ enum DisabledRemindersStore {
     /// Active map key: demo mode operates entirely on its own (initially
     /// empty) map so demo dismiss/snooze never touches — or broadcasts —
     /// the real user's disabled-reminder state.
-    private static var activeKeyV2: String {
-        DemoModeStore.isDemoActive ? demoStorageKeyV2 : storageKeyV2
+    private static func keyV2(demo: Bool) -> String {
+        demo ? demoStorageKeyV2 : storageKeyV2
     }
 
     /// GC age threshold — entries not in fresh set and older than this are removed.
@@ -158,10 +158,10 @@ enum DisabledRemindersStore {
 
     /// Get the full CRDT map.
     static func getDisabledMap() -> [String: DisabledEntry] {
-        getDisabledMap(key: activeKeyV2)
+        getDisabledMap(key: keyV2(demo: DemoModeStore.isDemoActive))
     }
 
-    /// Keyed load — read-modify-write callers capture `activeKeyV2` ONCE and
+    /// Keyed load — read-modify-write callers capture the demo flag ONCE (`keyV2(demo:)`) and
     /// pass it to both load and save, so a demo entry/exit flipping the mode
     /// between the read and the write can't route a real map into the demo
     /// key (or vice versa).
@@ -193,7 +193,8 @@ enum DisabledRemindersStore {
     /// Matches TB's `setEnabled()`.
     /// Broadcasts change to Device Sync peers (local user action).
     static func setEnabled(hash: String, enabled: Bool) {
-        let key = activeKeyV2  // captured once — see getDisabledMap(key:)
+        let demo = DemoModeStore.isDemoActive  // captured once — see getDisabledMap(key:)
+        let key = keyV2(demo: demo)
         let map: [String: DisabledEntry] = transaction {
             var map = getDisabledMap(key: key)
             map[hash] = DisabledEntry(enabled: enabled, ts: Date().ISO8601Format())
@@ -205,7 +206,7 @@ enum DisabledRemindersStore {
         // Broadcast to Device Sync peers. Demo dismiss/snooze stays local to
         // the demo map — broadcasting would also stamp the real
         // device_sync_ts:disabledReminders bookkeeping.
-        if !DemoModeStore.isDemoActive {
+        if !demo {
             Task { @MainActor in
                 DeviceSyncService.shared.debouncedBroadcast(fields: [.disabledReminders])
             }
@@ -218,7 +219,7 @@ enum DisabledRemindersStore {
     /// CRDT merge: per-hash, newer timestamp wins.
     /// Does NOT trigger a broadcast (used for incoming Device Sync).
     static func mergeIncoming(_ incomingMap: [String: DisabledEntry]) {
-        let key = activeKeyV2  // captured once — see getDisabledMap(key:)
+        let key = keyV2(demo: DemoModeStore.isDemoActive)  // captured once — see getDisabledMap(key:)
         let (merged, total) = transaction { () -> (Int, Int) in
             var localMap = getDisabledMap(key: key)
             var merged = 0
@@ -248,7 +249,7 @@ enum DisabledRemindersStore {
     /// Does NOT broadcast to Device Sync or post notifications — caller handles that.
     static func bulkDisableWithEpochZero(hashes: [String]) {
         guard !hashes.isEmpty else { return }
-        let key = activeKeyV2  // captured once — see getDisabledMap(key:)
+        let key = keyV2(demo: DemoModeStore.isDemoActive)  // captured once — see getDisabledMap(key:)
         let epochZero = "1970-01-01T00:00:00Z"
         transaction {
             var map = getDisabledMap(key: key)
@@ -283,7 +284,7 @@ enum DisabledRemindersStore {
     /// They are tiny, and the platform that does derive them still collects them on its
     /// own side, so nothing is gained by trying to decide when one is "really" stale.
     static func gcStaleEntries(freshHashes: Set<String>) {
-        let key = activeKeyV2  // captured once — see getDisabledMap(key:)
+        let key = keyV2(demo: DemoModeStore.isDemoActive)  // captured once — see getDisabledMap(key:)
         let now = Date()
         let removed = transaction { () -> Int in
             var map = getDisabledMap(key: key)

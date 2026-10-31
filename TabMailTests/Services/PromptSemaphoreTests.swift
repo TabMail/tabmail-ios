@@ -55,6 +55,19 @@ struct PromptSemaphoreTests {
         return (try? await semaphore.hold("probe") { _ in true }) == true
     }
 
+    @Test("A holder past its lease has no write authority even when the lease timer has not run yet (DS-LEASE)")
+    func overdueHolderIsNotTheHolderBeforeItsTimerRuns() async throws {
+        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 0.03, acquireWaitSeconds: 0.05))
+        try await semaphore.hold("overdue") { hold in
+            #expect(hold.isHolder, "positive control: inside its lease it is the holder")
+            // A synchronous MainActor delay past the lease: the lease timer cannot run during it.
+            let end = ContinuousClock.now + .milliseconds(100)
+            while ContinuousClock.now < end {}
+            #expect(!hold.isHolder, "past its lease it is not, whether or not the timer has run")
+            #expect(throws: PromptRefusal.self) { try hold.requireUnchanged(since: semaphore.counter) }
+        }
+    }
+
     @Test("A hold is released when its body returns, throws, or is cancelled")
     func releasedOnEveryExit() async throws {
         let semaphore = PromptSemaphore(config: Self.fast)

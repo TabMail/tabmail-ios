@@ -111,7 +111,7 @@ extension AIService {
                 return
             }
 
-            guard updated != currentUserActionMd else {
+            guard !Bullets.same(updated, currentUserActionMd) else {
                 BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: patch produced no change")
                 return
             }
@@ -283,7 +283,7 @@ extension AIService {
                 return .failed(message: "Could not apply compaction patch")
             }
 
-            guard updated != currentUserActionMd else {
+            guard !Bullets.same(updated, currentUserActionMd) else {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[AIService] compactActionRules: patch produced no change")
                 }

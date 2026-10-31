@@ -415,7 +415,8 @@ actor BackfillAIQueue {
 
     // MARK: - Dispatchers (call existing refinement functions unchanged)
 
-    private func dispatchActionRefine(_ s: ActionRefineSnapshot) async {
+    /// `ai` is the service the refine runs on; tests pass one with a mock backend.
+    func dispatchActionRefine(_ s: ActionRefineSnapshot, ai: AIService = .shared) async {
         // DS-AI step 1: the rules read in one brief hold of the prompt store. Skipped while their upgrade is
         // unsaved (DS-UNSAVED-UPGRADE) or while busy: the refine is expendable. The queue only orders the AI
         // calls and holds nothing of the store (DS-REFINE-QUEUE).
@@ -424,7 +425,7 @@ actor BackfillAIQueue {
             BackgroundSyncLogger.logBackfillAI("skip actionRefine dedupKey=\(s.dedupKey) reason=\(read)")
             return
         }
-        await AIService.shared.autoUpdateUserPromptOnTag(
+        await ai.autoUpdateUserPromptOnTag(
             subject: s.subject,
             from: s.from,
             summaryBlurb: s.summaryBlurb,

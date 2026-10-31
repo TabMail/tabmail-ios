@@ -9,7 +9,7 @@ import Testing
 
 /// `UserDefaults` that parks the first off-main writer, once, right after it read the reminder map: the
 /// moment a detached rebuild holds an older copy of the map while a user toggle commits.
-private final class ParkingDefaults: UserDefaults, @unchecked Sendable {
+private final class ParkingDefaults: UserDefaults {
     private let state = Mutex((reads: 0, parked: false, timedOut: false))
     private let unblock = DispatchSemaphore(value: 0)
 

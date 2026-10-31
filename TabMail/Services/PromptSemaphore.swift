@@ -66,7 +66,9 @@ final class PromptSemaphore {
     /// are AI writers (DS-AI). Sign-in, sign-out, an upgrade's save and lease expiry do not renew it.
     private(set) var counter = UUID()
 
-    private var holder: (token: UUID, label: String, lease: Task<Void, Never>)?
+    /// `deadline` is when the lease ends on the monotonic clock: the lease timer hands the semaphore over, but
+    /// a timer the MainActor runs late must not leave an overdue holder with write authority (DS-LEASE).
+    private var holder: (token: UUID, label: String, lease: Task<Void, Never>, deadline: ContinuousClock.Instant)?
 
     /// DS-SEMAPHORE, request order: the callers waiting, oldest first. A request never takes the
     /// semaphore while an earlier one still waits; a release hands it to the head.
@@ -104,7 +106,8 @@ final class PromptSemaphore {
 
     /// Whether `token` still holds the semaphore (not released, not past its lease).
     func holds(_ token: UUID) -> Bool {
-        holder?.token == token
+        guard let current = holder, current.token == token else { return false }
+        return ContinuousClock.now < current.deadline
     }
 
     /// DS-COUNTER: a commit saved a change; a write that read the previous value is refused.
@@ -121,7 +124,7 @@ final class PromptSemaphore {
             self.holder = nil
             self.grantNext()
         }
-        holder = (token, label, lease)
+        holder = (token, label, lease, ContinuousClock.now + .seconds(config.leaseSeconds))
     }
 
     /// Waits in the queue; true when the semaphore was handed over, false at the deadline or when the

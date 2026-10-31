@@ -131,7 +131,7 @@ struct PromptStoreInvariantTests {
         #expect(!store.rawKB.contains(tag))
     }
 
-    @Test("A real gesture waiting on the semaphore when the demo starts writes nothing to the demo (DS-DEMO)")
+    @Test("A real gesture waiting on the semaphore when the demo starts lands in the real store and never in the demo (DS-DEMO)")
     func queuedRealGestureStaysOutOfTheDemo() async throws {
         quiet()
         DemoModeStore.shared._resetForTests()
@@ -141,16 +141,46 @@ struct PromptStoreInvariantTests {
         try await Task.sleep(for: .milliseconds(100))
         DemoModeStore.shared.isActive = true
         store.enterDemoOverlay()
-        let realBefore = realStorage()
         let overlay = store.rawKB
         try await holder.end()
-        #expect(await pending.value == .dropped)
-        #expect(store.rawKB == overlay, "the overlay shows no real text")
-        #expect(realStorage() == realBefore)
+        #expect(await pending.value == .saved, "its target was chosen when it was made")
+        #expect(store.rawKB == overlay, "the demo shows no real text")
+        #expect(UserDefaults.standard.string(forKey: "demo.user_prompts:user_kb.md") == overlay, "nothing reached the demo's key")
+        #expect(UserDefaults.standard.string(forKey: "user_prompts:user_kb.md")?.contains(tag) == true, "the real text has it")
         store.exitDemoOverlay()
         DemoModeStore.shared._resetForTests()
         PromptStore.removeDemoOverlayKeys()
-        #expect(!store.rawKB.contains(tag))
+        #expect(store.rawKB.contains(tag), "the real text is shown again on exit")
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
+    @Test("An AI result read before the demo started lands in the real store when the demo has started (DS-DEMO, DS-AI)")
+    func realAIResultSurvivesDemoEntry() async throws {
+        quiet()
+        DemoModeStore.shared._resetForTests()
+        let tag = PromptStoreTestCleanup.tag()
+        let capture = try await read()
+        DemoModeStore.shared.isActive = true
+        store.enterDemoOverlay()
+        let overlay = store.rawKB
+        #expect(await store.writeAfterRead(capture, text: capture.text + "\n- \(tag)\n", "real AI write") == .saved)
+        #expect(store.rawKB == overlay, "the demo shows no real text")
+        #expect(UserDefaults.standard.string(forKey: "user_prompts:user_kb.md")?.contains(tag) == true)
+        store.exitDemoOverlay()
+        DemoModeStore.shared._resetForTests()
+        PromptStore.removeDemoOverlayKeys()
+        #expect(store.rawKB.contains(tag))
+        // Control: a demo-captured result is dropped once the demo is over, and writes nothing real.
+        DemoModeStore.shared.isActive = true
+        store.enterDemoOverlay()
+        let demoCapture = try await read()
+        store.exitDemoOverlay()
+        DemoModeStore.shared._resetForTests()
+        PromptStore.removeDemoOverlayKeys()
+        let realBefore = realStorage()
+        #expect(await store.writeAfterRead(demoCapture, text: demoCapture.text + "\n- \(tag) demo\n", "demo AI write") == .dropped)
+        #expect(realStorage() == realBefore)
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
     @Test("Entering the demo seeds all three rendered texts, so the background snapshots read the overlay (DS-DEMO)")
@@ -253,6 +283,25 @@ struct PromptStoreInvariantTests {
         // Control: a store that is already consistent is left as it is.
         PromptStore.syncRenderedKeys(UserDefaultsBulletStore(defaults: defaults), defaults: defaults, catalog: catalog)
         #expect(defaults.string(forKey: key) == current)
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
+    @Test("A rendered text that differs from the labelled state only in canonically equivalent bytes is replaced by its exact bytes (DS-ATOMIC)")
+    func repairReplacesByteDifferentCanonicallyEqualText() async throws {
+        quiet()
+        let tag = PromptStoreTestCleanup.tag()
+        let defaults = UserDefaults.standard
+        let key = "user_prompts:user_kb.md"
+        #expect(await store.edit("composed add") { try $0.addBullet("\(tag) caf\u{E9}", to: .knowledgeBase) } == .saved)
+        let current = try #require(defaults.string(forKey: key))
+        let decomposed = current.decomposedStringWithCanonicalMapping
+        #expect(decomposed == current, "canonically equal")
+        #expect(Array(decomposed.utf8) != Array(current.utf8), "but not the same bytes")
+        defaults.set(decomposed, forKey: key)
+        let catalog = try #require(Bundle.main.url(forResource: "device-sync-default-catalog", withExtension: "json")
+            .flatMap { try? Data(contentsOf: $0) }.flatMap { try? DefaultCatalog.decode($0) })
+        PromptStore.syncRenderedKeys(UserDefaultsBulletStore(defaults: defaults), defaults: defaults, catalog: catalog)
+        #expect(Array(try #require(defaults.string(forKey: key)).utf8) == Array(current.utf8), "the state's exact bytes are rendered again")
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 

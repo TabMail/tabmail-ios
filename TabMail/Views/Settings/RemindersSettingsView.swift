@@ -4,6 +4,24 @@
 
 import SwiftUI
 
+/// What the Reminders screen's Delete does to a knowledge-base reminder, apart from the view, so a test can run it.
+@MainActor
+enum KBReminderDeletion {
+    /// The knowledge-base bullet shown with `reminder`: the first whose text is a reminder line holding its content.
+    static func shown(for reminder: Reminder, in shownKB: [ShownBullet]) -> ShownBullet? {
+        let reminderPattern = /^(?:Reminder:|\[Reminder\])/.ignoresCase()
+        let contentLower = reminder.content.lowercased()
+        return shownKB.first { bullet in
+            bullet.text.prefixMatch(of: reminderPattern) != nil && bullet.text.lowercased().contains(contentLower)
+        }
+    }
+
+    /// DS-DISPLAYED: deletes exactly the labels the bullet was shown with.
+    static func delete(_ shown: ShownBullet, in store: PromptStore) -> Task<PromptEditOutcome, Never> {
+        store.gesture("delete KB reminder") { try $0.deleteShown(shown, from: .knowledgeBase) }
+    }
+}
+
 struct RemindersSettingsView: View {
     @State private var reminders: [Reminder] = []
     /// The knowledge-base bullets, with their labels, as read with the reminder list (DS-DISPLAYED): a
@@ -94,9 +112,10 @@ struct RemindersSettingsView: View {
     }
 
     private func loadReminders() async {
-        let shown = PromptStore.shared.shown(.knowledgeBase)
         reminders = await ReminderBuilder.buildReminderList(includeDisabled: true)
-        shownKB = shown
+        // Read after the build, which reads the knowledge base last: a reminder it lists has its labels here
+        // (unless it was removed since, which the delete then reports as gone).
+        shownKB = PromptStore.shared.shown(.knowledgeBase)
         isLoading = false
     }
 
@@ -131,18 +150,14 @@ struct RemindersSettingsView: View {
         let reminder = reminders[index]
         guard reminder.source == "kb" else { return }
 
-        let reminderPattern = /^(?:Reminder:|\[Reminder\])/.ignoresCase()
-        let contentLower = reminder.content.lowercased()
-        guard let shown = shownKB.first(where: { bullet in
-            bullet.text.prefixMatch(of: reminderPattern) != nil && bullet.text.lowercased().contains(contentLower)
-        }) else {
+        guard let shown = KBReminderDeletion.shown(for: reminder, in: shownKB) else {
             BackgroundSyncLogger.logDebug("[RemindersSettings] KB line not found for reminder: \(reminder.content.prefix(80))")
             reminders.remove(at: index)
             return
         }
 
         let content = reminder.content
-        let deleting = PromptStore.shared.gesture("delete KB reminder") { try $0.deleteShown(shown, from: .knowledgeBase) }
+        let deleting = KBReminderDeletion.delete(shown, in: PromptStore.shared)
         Task {
             let outcome = await deleting.value
             guard outcome == .saved || outcome == .unchanged else {

@@ -142,6 +142,26 @@ struct DisabledRemindersCRDTTests {
         }
     }
 
+    // MARK: - v1 migration
+
+    @Test("A v1 list is imported as disabled entries and saved, so a reopened store has them")
+    func v1ListIsImportedAndSaved() {
+        Self.withIsolatedDefaults { defaults in
+            defaults.set(["h1", "h2"], forKey: "disabled_reminders")
+            #expect(DisabledRemindersStore.getDisabledHashes() == ["h1", "h2"])
+            let saved = defaults.data(forKey: "disabled_reminders_v2").flatMap {
+                try? JSONDecoder().decode([String: DisabledRemindersStore.DisabledEntry].self, from: $0)
+            }
+            #expect(saved?.keys.sorted() == ["h1", "h2"], "the v2 map is persisted")
+            #expect(saved?["h1"]?.enabled == false)
+            // Control: with no v1 list nothing is written.
+            defaults.removeObject(forKey: "disabled_reminders_v2")
+            defaults.removeObject(forKey: "disabled_reminders")
+            #expect(DisabledRemindersStore.getDisabledHashes().isEmpty)
+            #expect(defaults.data(forKey: "disabled_reminders_v2") == nil)
+        }
+    }
+
     // MARK: - gcStaleEntries
 
     @Test("Entry not in freshHashes and older than 90 days is removed")
