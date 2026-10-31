@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import GRDB
 import Synchronization
 import Testing
 @testable import TabMail
@@ -154,7 +155,7 @@ struct QueuedActionRefineTests {
             }
             defer { http.close() }
             let service = AIService(backendClient: BackendClient(llmSession: http.session))
-            let pending = Task { await BackfillAIQueue.shared.dispatchActionRefine(snapshot(tag), ai: service) }
+            let pending = Task { await BackfillAIQueue(ai: service).dispatchActionRefine(snapshot(tag)) }
             let end = ContinuousClock.now + .seconds(10)
             while !gate.started, ContinuousClock.now < end { try await Task.sleep(for: .milliseconds(20)) }
             guard gate.started else {
@@ -252,6 +253,38 @@ struct BulletListEditorActionsTests {
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
+    @Test("Deleting the reminder whose text another reminder contains removes only the selected bullet")
+    func overlappingReminderTextsDeleteOnlyTheSelectedRow() async throws {
+        quiet()
+        let tag = PromptStoreTestCleanup.tag()
+        let longer = "[Reminder] \(tag) pay bill tomorrow"
+        let shorter = "[Reminder] \(tag) pay bill"
+        #expect(await store.edit("add longer") { try $0.addBullet(longer, to: .knowledgeBase) } == .saved)
+        #expect(await store.edit("add shorter") { try $0.addBullet(shorter, to: .knowledgeBase) } == .saved)
+        let found = try #require(KBReminderDeletion.shown(for: reminder("\(tag) pay bill"), in: store.shown(.knowledgeBase)))
+        #expect(found.text == shorter, "the shorter reminder selects its own bullet")
+        #expect(await KBReminderDeletion.delete(found, in: store).value == .saved)
+        #expect(store.rawKB.contains(longer), "the other reminder is kept")
+        #expect(!store.rawKB.contains(shorter + "\n") && !store.shown(.knowledgeBase).contains { $0.text == shorter }, "the selected one is gone")
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
+    @Test("A row removed and added again since it was shown is not deleted by the older Delete")
+    func olderDeleteNeverBeatsANewerAdd() async throws {
+        quiet()
+        let tag = PromptStoreTestCleanup.tag()
+        #expect(await added(tag, to: .deleteRules) == .saved)
+        let older = try #require(store.shown(.deleteRules).first { $0.text == tag })
+        #expect(await BulletListEditorActions.delete(older, from: .deleteRules, in: store).value == .saved)
+        #expect(await added(tag, to: .deleteRules) == .saved, "the same text added again is a newer row")
+        #expect(await BulletListEditorActions.delete(older, from: .deleteRules, in: store).value == .unchanged)
+        #expect(store.shown(.deleteRules).contains { $0.text == tag }, "the newer row is kept")
+        // Control: the newer row's own delete removes it.
+        let newer = try #require(store.shown(.deleteRules).first { $0.text == tag })
+        #expect(await BulletListEditorActions.delete(newer, from: .deleteRules, in: store).value == .saved)
+        #expect(!store.shown(.deleteRules).contains { $0.text == tag })
+    }
+
     @Test("Delete of a row that is already gone changes nothing")
     func deleteOfAGoneRow() async throws {
         quiet()
@@ -316,7 +349,7 @@ struct ActionRuleExactByteTests {
         let rule = await seedRule(tag)
         let (ai, http) = try mockModel(patch: "DEL\ndelete\n\(rule.decomposed)\nADD\ndelete\n\(rule.decomposed)")
         defer { http.close() }
-        await BackfillAIQueue.shared.dispatchActionRefine(snapshot(tag), ai: ai)
+        await BackfillAIQueue(ai: ai).dispatchActionRefine(snapshot(tag))
         #expect(hasBytes(persisted(), rule.decomposed), "the re-spelled rule was saved")
         #expect(!hasBytes(persisted(), rule.composed), "the old spelling is gone")
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
@@ -336,6 +369,41 @@ struct ActionRuleExactByteTests {
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
+    /// A temporary `AppDatabase.shared`, which the queue writes through.
+    private func installDatabase() throws -> (DatabasePool, URL, AppDatabase?) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("action-refine-drain-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: directory.appendingPathComponent("test.sqlite").path, configuration: configuration)
+        let appDatabase = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let saved = current
+            current = appDatabase
+            return saved
+        }
+        return (pool, directory, previous)
+    }
+
+    @Test("The queue's own drain step runs a persisted action-refine row's refine and then retires the row")
+    func drainStepRunsThenRetires() async throws {
+        quiet()
+        let (pool, directory, previous) = try installDatabase()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let tag = PromptStoreTestCleanup.tag()
+        let (ai, http) = try mockModel(patch: "ADD\ndelete\n\(tag) drained rule")
+        defer { http.close() }
+        let snap = snapshot(tag)
+        let row = try PendingAIRefinement.make(snap, now: Int64(Date().timeIntervalSince1970 * 1000))
+        try await pool.write { db in try row.insert(db) }
+        await BackfillAIQueue(ai: ai).processOne(dedupKey: snap.dedupKey)
+        #expect(persisted().contains("\(tag) drained rule"), "the drain ran the refine")
+        let left = try await pool.read { try PendingAIRefinement.fetchCount($0) }
+        #expect(left == 0, "the row was retired after it ran")
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
     @Test("The queue's dispatch of an action-refine row runs the refine and persists its patch; an undecodable row throws")
     func dispatchRunsTheRefine() async throws {
         quiet()
@@ -343,11 +411,11 @@ struct ActionRuleExactByteTests {
         let (ai, http) = try mockModel(patch: "ADD\ndelete\n\(tag) queued rule")
         defer { http.close() }
         let row = try PendingAIRefinement.make(snapshot(tag), now: Int64(Date().timeIntervalSince1970 * 1000))
-        try await BackfillAIQueue.shared.dispatch(row, jobType: .actionRefine, ai: ai)
+        try await BackfillAIQueue(ai: ai).dispatch(row, jobType: .actionRefine)
         #expect(persisted().contains("\(tag) queued rule"), "the refine ran and its patch was saved")
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
 
         let broken = PendingAIRefinement(dedupKey: "broken-\(tag)", jobType: .actionRefine, payloadJSON: "{", createdAt: 0)
-        await #expect(throws: (any Error).self) { try await BackfillAIQueue.shared.dispatch(broken, jobType: .actionRefine, ai: ai) }
+        await #expect(throws: (any Error).self) { try await BackfillAIQueue(ai: ai).dispatch(broken, jobType: .actionRefine) }
     }
 }

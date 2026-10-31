@@ -5,6 +5,17 @@
 import Foundation
 @testable import TabMail
 
+/// The tests' operations take the demo target as they start, as the app's callers do: production code states it.
+extension PromptStore {
+    func withPromptStore<T>(_ label: String, _ body: @MainActor (PromptAccess) async throws -> T) async throws -> T {
+        try await withPromptStore(label, demo: DemoModeStore.isDemoActive, body)
+    }
+
+    func edit(_ label: String, _ body: @MainActor (PromptAccess) throws -> PromptEditOutcome) async -> PromptEditOutcome {
+        await edit(label, demo: DemoModeStore.isDemoActive, body)
+    }
+}
+
 /// Holds the prompt store's semaphore from a task of its own until `end()`, as a slow caller would.
 @MainActor
 final class PromptStoreHolder {

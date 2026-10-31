@@ -11,6 +11,8 @@ struct ReminderDelTool: AgentTool, Sendable {
     let name = "reminder_del"
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        // The target is fixed here, before the call's first suspension (DS-DEMO).
+        let demo = DemoModeStore.isDemoActive
         guard case .string(let rawText) = arguments["text"] else {
             BackgroundSyncLogger.logDebug("[ReminderDelTool] Missing or empty 'text'")
             return #"{"error": "missing text"}"#
@@ -30,7 +32,7 @@ struct ReminderDelTool: AgentTool, Sendable {
         let textLower = text.lowercased()
         let found = await { @MainActor () async -> (matches: [String], outcome: PromptEditOutcome) in
             var matches: [String] = []
-            let outcome = await PromptStore.shared.edit("reminder_del tool") { hold in
+            let outcome = await PromptStore.shared.edit("reminder_del tool", demo: demo) { hold in
                 try hold.editText(.kb) { current in
                     matches = Self.reminderStatements(in: current, matching: textLower)
                     guard matches.count == 1 else { return nil }

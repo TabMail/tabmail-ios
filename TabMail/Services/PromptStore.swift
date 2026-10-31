@@ -477,7 +477,7 @@ final class PromptStore {
     ///
     /// `demo` is the target, fixed when the operation is created (DS-DEMO), before it waits for the
     /// semaphore: if the mode changed by the time it runs, every call of its access is refused.
-    func withPromptStore<T>(_ label: String, demo: Bool = DemoModeStore.isDemoActive,
+    func withPromptStore<T>(_ label: String, demo: Bool,
                             _ body: @MainActor (PromptAccess) async throws -> T) async throws -> T {
         try await semaphore.hold(label) { hold in
             try await body(PromptAccess(store: self, hold: hold, demo: demo))
@@ -485,7 +485,7 @@ final class PromptStore {
     }
 
     /// One brief read-change-save through `withPromptStore`, its refusal as the outcome.
-    func edit(_ label: String, demo: Bool = DemoModeStore.isDemoActive,
+    func edit(_ label: String, demo: Bool,
               _ body: @MainActor (PromptAccess) throws -> PromptEditOutcome) async -> PromptEditOutcome {
         do {
             return try await withPromptStore(label, demo: demo) { try body($0) }
@@ -507,7 +507,7 @@ final class PromptStore {
     /// the change counter as read.
     func readBeforeAI(_ field: BulletField, _ label: String) async -> PromptReadOutcome {
         do {
-            return try await withPromptStore(label) { access in
+            return try await withPromptStore(label, demo: DemoModeStore.isDemoActive) { access in
                 guard let capture = try access.readForEdit(field) else { return .refused(.unsaved) }
                 return .read(capture)
             }
@@ -519,7 +519,7 @@ final class PromptStore {
     /// An AI writer's write (DS-AI step 3), in a second brief hold: refused with nothing written when the
     /// counter moved since `readBeforeAI`. The result is then dropped.
     func writeAfterRead(_ capture: PromptCapture, text: String, _ label: String) async -> PromptEditOutcome {
-        await edit(label) { try $0.commitAIEdit(capture, text: text) }
+        await edit(label, demo: capture.demo) { try $0.commitAIEdit(capture, text: text) }
     }
 
     /// A refusal as an edit's outcome.
@@ -911,7 +911,7 @@ final class PromptStore {
             let fields = Array(self.pendingHistoryFields)
             self.pendingHistoryFields = []
             do {
-                try await self.withPromptStore("history record") { access in
+                try await self.withPromptStore("history record", demo: false) { access in
                     try access.recordHistory(source: "local_edit", fields: fields)
                 }
             } catch {

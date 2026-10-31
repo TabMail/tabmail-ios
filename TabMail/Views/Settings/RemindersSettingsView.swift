@@ -7,12 +7,13 @@ import SwiftUI
 /// What the Reminders screen's Delete does to a knowledge-base reminder, apart from the view, so a test can run it.
 @MainActor
 enum KBReminderDeletion {
-    /// The knowledge-base bullet shown with `reminder`: the first whose text is a reminder line holding its content.
+    /// The knowledge-base bullet `reminder` was parsed from: the first whose reminder has exactly its content and
+    /// due date and time, so a reminder whose text another one contains never selects the other's bullet.
     static func shown(for reminder: Reminder, in shownKB: [ShownBullet]) -> ShownBullet? {
-        let reminderPattern = /^(?:Reminder:|\[Reminder\])/.ignoresCase()
-        let contentLower = reminder.content.lowercased()
-        return shownKB.first { bullet in
-            bullet.text.prefixMatch(of: reminderPattern) != nil && bullet.text.lowercased().contains(contentLower)
+        shownKB.first { bullet in
+            KBReminderParser.parse("- " + bullet.text).contains {
+                Bullets.same($0.content, reminder.content) && $0.dueDate == reminder.dueDate && $0.dueTime == reminder.dueTime
+            }
         }
     }
 

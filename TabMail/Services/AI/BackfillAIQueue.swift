@@ -21,6 +21,13 @@ import GRDB
 actor BackfillAIQueue {
     static let shared = BackfillAIQueue()
 
+    /// The service an action refine runs on; tests give the queue one with a mock backend.
+    private let ai: AIService
+
+    init(ai: AIService = .shared) {
+        self.ai = ai
+    }
+
     // MARK: - State
 
     /// dedupKeys awaiting drain. FIFO, in-memory only; GRDB is the durability layer.
@@ -293,7 +300,7 @@ actor BackfillAIQueue {
 
     // MARK: - Per-item processing
 
-    private func processOne(dedupKey: String) async {
+    func processOne(dedupKey: String) async {
         let t0 = CFAbsoluteTimeGetCurrent()
         let retryCount = storage.retryCount(for: dedupKey)
         BackgroundSyncLogger.logBackfillAI("claim dedupKey=\(dedupKey) retry=\(retryCount)")
@@ -408,21 +415,20 @@ actor BackfillAIQueue {
 
     // MARK: - Dispatchers (call existing refinement functions unchanged)
 
-    /// Runs `row`'s job. `ai` is the service an action refine runs on; tests pass one with a mock backend.
+    /// Runs `row`'s job.
     /// Throws when the row's payload does not decode (permanent: the caller drops the row).
-    func dispatch(_ row: PendingAIRefinement, jobType: BackfillAIJobType, ai: AIService = .shared) async throws {
+    func dispatch(_ row: PendingAIRefinement, jobType: BackfillAIJobType) async throws {
         switch jobType {
         case .actionRefine:
             let snap = try row.decodeActionRefine()
-            await dispatchActionRefine(snap, ai: ai)
+            await dispatchActionRefine(snap)
         case .kbRefine:
             let snap = try row.decodeKBRefine()
             await dispatchKBRefine(snap)
         }
     }
 
-    /// `ai` is the service the refine runs on; tests pass one with a mock backend.
-    func dispatchActionRefine(_ s: ActionRefineSnapshot, ai: AIService = .shared) async {
+    func dispatchActionRefine(_ s: ActionRefineSnapshot) async {
         // DS-AI step 1: the rules read in one brief hold of the prompt store. Skipped while their upgrade is
         // unsaved (DS-UNSAVED-UPGRADE) or while busy: the refine is expendable. The queue only orders the AI
         // calls and holds nothing of the store (DS-REFINE-QUEUE).

@@ -337,6 +337,48 @@ struct PromptStoreInvariantTests {
         #expect(ActionPatchApplier.applyActionPatch(content: content, patchText: "ADD\ndelete\n" + tag + " ordinary") != nil)
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
+
+    @Test("A real AI result queued behind a holder while the demo starts and ends lands in the real store (DS-DEMO, DS-AI)")
+    func queuedRealAIResultSurvivesDemoStartAndEnd() async throws {
+        quiet()
+        DemoModeStore.shared._resetForTests()
+        let tag = PromptStoreTestCleanup.tag()
+        let capture = try await read()
+        DemoModeStore.shared.isActive = true
+        store.enterDemoOverlay()
+        let holder = await PromptStoreHolder(store)
+        let pending = Task { await store.writeAfterRead(capture, text: capture.text + "\n- \(tag)\n", "queued real AI write") }
+        try await Task.sleep(for: .milliseconds(100))
+        store.exitDemoOverlay()
+        DemoModeStore.shared._resetForTests()
+        PromptStore.removeDemoOverlayKeys()
+        try await holder.end()
+        #expect(await pending.value == .saved, "its target is the capture's, not the mode when it runs")
+        #expect(UserDefaults.standard.string(forKey: "user_prompts:user_kb.md")?.contains(tag) == true)
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
+    @Test("A knowledge-base tool call made before the demo starts writes the real store even if the demo starts first (DS-DEMO)")
+    func toolTargetIsFixedWhenCalled() async throws {
+        quiet()
+        DemoModeStore.shared._resetForTests()
+        let tag = PromptStoreTestCleanup.tag()
+        let holder = await PromptStoreHolder(store)
+        let call = Task { try await KBAddTool().execute(arguments: ["statement": .string("\(tag) tool fact")]) }
+        try await Task.sleep(for: .milliseconds(100))
+        DemoModeStore.shared.isActive = true
+        store.enterDemoOverlay()
+        let overlay = store.rawKB
+        try await holder.end()
+        _ = try await call.value
+        #expect(store.rawKB == overlay, "the demo shows no real text")
+        #expect(UserDefaults.standard.string(forKey: "demo.user_prompts:user_kb.md") == overlay, "nothing reached the demo's key")
+        #expect(UserDefaults.standard.string(forKey: "user_prompts:user_kb.md")?.contains("\(tag) tool fact") == true, "the real text has it")
+        store.exitDemoOverlay()
+        DemoModeStore.shared._resetForTests()
+        PromptStore.removeDemoOverlayKeys()
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
 }
 
 /// A `bullet_state` message as the JSON object the engine receives.

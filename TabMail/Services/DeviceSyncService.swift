@@ -741,7 +741,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             do {
                 // Checked inside the hold, where the message is applied: one received before the connection
                 // ended is never applied after it.
-                try await PromptStore.shared.withPromptStore("sync receive") { [weak self] access in
+                try await PromptStore.shared.withPromptStore("sync receive", demo: false) { [weak self] access in
                     guard connection == self?.connectionID else {
                         BackgroundSyncLogger.logDebug("[DeviceSync] A received message (\(key.prefix(48))) was dropped: its connection ended")
                         return
