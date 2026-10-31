@@ -363,13 +363,13 @@ struct PromptStoreInvariantTests {
         quiet()
         DemoModeStore.shared._resetForTests()
         let tag = PromptStoreTestCleanup.tag()
-        let holder = await PromptStoreHolder(store)
-        let call = Task { try await KBAddTool().execute(arguments: ["statement": .string("\(tag) tool fact")]) }
-        try await Task.sleep(for: .milliseconds(100))
+        let call = Task.detached { try await KBAddTool().execute(arguments: ["statement": .string("\(tag) tool fact")]) }
+        // Hold the main actor, so the call runs as far as its hop onto it and no further, and then start the demo.
+        let until = ContinuousClock.now + .milliseconds(300)
+        while ContinuousClock.now < until {}
         DemoModeStore.shared.isActive = true
         store.enterDemoOverlay()
         let overlay = store.rawKB
-        try await holder.end()
         _ = try await call.value
         #expect(store.rawKB == overlay, "the demo shows no real text")
         #expect(UserDefaults.standard.string(forKey: "demo.user_prompts:user_kb.md") == overlay, "nothing reached the demo's key")
