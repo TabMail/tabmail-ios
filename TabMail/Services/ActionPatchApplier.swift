@@ -61,6 +61,13 @@ enum ActionPatchApplier {
             return nil
         }
 
+        // A model's patch is untrusted text: a line holding a section-header mark or the END marker would
+        // read back as a header or the skeleton and take the sections after it out of the field with it.
+        guard !Bullets.isMarkerText(.action, contentText) else {
+            BackgroundSyncLogger.logDebug("[PatchApplier] Content refused: it holds a section marker")
+            return nil
+        }
+
         let normalizedContent = PatchApplierUtils.normalizeContent(contentText)
         var contentLines = content.components(separatedBy: "\n")
 

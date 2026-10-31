@@ -183,8 +183,8 @@ struct NSEDataBridgeTests {
         let marker = "ROUNDTRIP-\(UUID().uuidString)"
         let outcome = await PromptStore.shared.edit("mirror test add") { try $0.addBullet(marker, to: .deleteRules) }
         #expect(outcome == .saved)
-        // The commit already mirrored; call again explicitly to prove read-side parity.
-        NSEDataBridge.mirrorPrompts()
+        // No explicit mirror call here: the mirror is the commit's own (DS-NSE), so a commit that did not
+        // mirror leaves the suite without the bullet.
 
         let mirrored = suite?.string(forKey: "nse.actionPrompt")
         #expect(mirrored?.contains(marker) == true)

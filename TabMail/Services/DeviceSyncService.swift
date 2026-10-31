@@ -693,7 +693,14 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     /// (DS-VALIDATE); the parts of a snapshot apply in arrival order, after every message received before
     /// them (DS-CHUNK).
     private func receiveBulletState(_ message: [String: Any]) {
-        applyReceived("bullet_state \(message["sender"] ?? "") \(message["field"] ?? "") \(message["snap"] ?? "") \(message["part"] ?? "")") { [weak self] access in
+        // DS-VALIDATE: a message with no string sender, field and snapshot id is not one a peer sends, and
+        // is rejected before it waits in line, where it would displace valid ones.
+        guard let sender = message["sender"] as? String, let field = message["field"] as? String,
+              let snap = message["snap"] as? String else {
+            BackgroundSyncLogger.logDebug("[DeviceSync] A bullet_state without a string sender, field and snap was dropped")
+            return
+        }
+        applyReceived("bullet_state \(sender) \(field) \(snap) \(message["part"] ?? "")") { [weak self] access in
             try access.receive(message)
             self?.heldParts = PromptStore.shared.bullets.heldParts
         }

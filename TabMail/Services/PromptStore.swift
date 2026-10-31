@@ -157,9 +157,12 @@ enum PromptReadOutcome: Sendable {
 struct PromptAccess {
     fileprivate let store: PromptStore
     let hold: PromptHold
+    /// The target this access was asked for, demo or real, fixed when the operation was created and never
+    /// re-read (DS-DEMO): a call finds the mode it was created for or is refused.
+    fileprivate let demo: Bool
 
     private func check() throws {
-        guard hold.isHolder else { throw PromptRefusal.changed }
+        guard hold.isHolder, demo == DemoModeStore.isDemoActive else { throw PromptRefusal.changed }
     }
 
     /// `field`'s text now, and the labels it shows, to change and pass to `commitEdit`. Nil while an
@@ -177,6 +180,7 @@ struct PromptAccess {
 
     /// DS-AI step 3: as `commitEdit`, refused with nothing written when the counter moved since the read.
     func commitAIEdit(_ capture: PromptCapture, text: String) throws -> PromptEditOutcome {
+        try check()
         try hold.requireUnchanged(since: capture.counter)
         return store.commitEdit(capture, text: text)
     }
@@ -235,12 +239,14 @@ struct PromptAccess {
     @discardableResult
     func receive(_ message: [String: Any]) throws -> BulletReceiveResult {
         try check()
+        guard !demo else { throw PromptRefusal.changed }
         return store.bullets.receive(message)
     }
 
     /// Connected: every bullet field's state goes out (DS-SEND).
     func sendAll() throws {
         try check()
+        guard !demo else { throw PromptRefusal.changed }
         store.bullets.connected()
     }
 }
@@ -315,6 +321,9 @@ final class PromptStore {
     /// The bullets of `section` as a screen shows them, each with the labels it carries now
     /// (DS-DISPLAYED). In demo the overlay has no labels.
     func shown(_ section: PromptSection) -> [ShownBullet] {
+        // The engine is not observed: the rendered text, which every commit sets, is, so a view reading
+        // the shown bullets is invalidated by a change.
+        _ = raw(section.field)
         if DemoModeStore.isDemoActive { return bullets(section).map { ShownBullet(text: $0, labels: []) } }
         return bullets.shown(section.field, section: section.key)
     }
@@ -453,16 +462,21 @@ final class PromptStore {
     /// (`PromptSemaphore.Config`), and releases it on every exit. It must be brief and must never wait on
     /// the AI: an AI writer reads with `readBeforeAI`, calls the AI holding nothing, and writes with
     /// `writeAfterRead`. Throws `PromptRefusal` (busy, or the hold lost the semaphore).
-    func withPromptStore<T>(_ label: String, _ body: @MainActor (PromptAccess) async throws -> T) async throws -> T {
+    ///
+    /// `demo` is the target, fixed when the operation is created (DS-DEMO), before it waits for the
+    /// semaphore: if the mode changed by the time it runs, every call of its access is refused.
+    func withPromptStore<T>(_ label: String, demo: Bool = DemoModeStore.isDemoActive,
+                            _ body: @MainActor (PromptAccess) async throws -> T) async throws -> T {
         try await semaphore.hold(label) { hold in
-            try await body(PromptAccess(store: self, hold: hold))
+            try await body(PromptAccess(store: self, hold: hold, demo: demo))
         }
     }
 
     /// One brief read-change-save through `withPromptStore`, its refusal as the outcome.
-    func edit(_ label: String, _ body: @MainActor (PromptAccess) throws -> PromptEditOutcome) async -> PromptEditOutcome {
+    func edit(_ label: String, demo: Bool = DemoModeStore.isDemoActive,
+              _ body: @MainActor (PromptAccess) throws -> PromptEditOutcome) async -> PromptEditOutcome {
         do {
-            return try await withPromptStore(label) { try body($0) }
+            return try await withPromptStore(label, demo: demo) { try body($0) }
         } catch {
             return Self.outcome(error)
         }
@@ -472,7 +486,9 @@ final class PromptStore {
     /// handler stays synchronous.
     @discardableResult
     func gesture(_ label: String, _ body: @escaping @MainActor (PromptAccess) throws -> PromptEditOutcome) -> Task<PromptEditOutcome, Never> {
-        Task { await self.edit(label, body) }
+        // The target is fixed here, when the gesture is made, not when its task first runs (DS-DEMO).
+        let demo = DemoModeStore.isDemoActive
+        return Task { await self.edit(label, demo: demo, body) }
     }
 
     /// An AI writer's read (DS-AI step 1), in one brief hold: `field` now and the labels it shows, with
@@ -796,9 +812,11 @@ final class PromptStore {
     /// stay untouched in their real UserDefaults keys.
     func enterDemoOverlay() {
         assert(DemoModeStore.isDemoActive, "enterDemoOverlay requires demo active")
-        rawComposition = Defaults.composition
-        rawAction = Defaults.action
-        rawKB = Defaults.kb
+        // The three rendered keys are written with the shown text, so the background snapshots read the
+        // overlay from the first moment (DS-DEMO).
+        setDemoText(.composition, Defaults.composition)
+        setDemoText(.action, Defaults.action)
+        setDemoText(.kb, Defaults.kb)
         templates = Defaults.templates
         BackgroundSyncLogger.logDebug("[PromptStore] Demo prompt overlay ACTIVE (defaults seeded)")
     }
@@ -823,7 +841,6 @@ final class PromptStore {
     /// A demo write of a bullet field (DS-DEMO): the shown text and the demo key only.
     private func setDemoText(_ field: BulletField, _ text: String) {
         guard let key = UserDefaultsBulletStore.renderedKeys[field] else { return }
-        semaphore.renewCounter()
         setRaw(field, text)
         defaults.set(text, forKey: "demo.\(key)")
         if field == .kb { ReminderBuilder.invalidateCache() }
@@ -933,6 +950,9 @@ final class PromptStore {
     fileprivate func restoreFromHistory(_ entry: PromptHistoryEntry) {
         guard !DemoModeStore.isDemoActive else { return }
         guard recordHistory(source: "reset", fields: ["composition", "action", "kb", "templates"]) else { return }
+        // DS-COUNTER: an accepted restore renews the counter even when it changes no bullet text (the
+        // commit renews it only when something was committed), so an AI write read before it is refused.
+        semaphore.renewCounter()
         bullets.restore([.composition: entry.composition, .action: entry.action, .kb: entry.kb])
         applySyncedTemplates(entry.decodedTemplates)
         DeviceSyncService.shared.debouncedBroadcast(fields: [.templates])
