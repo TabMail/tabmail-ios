@@ -66,9 +66,19 @@ struct DisabledRemindersWriterRaceTests {
     private func raceWithUserDisable(
         _ defaults: ParkingDefaults, maintenance: @escaping @Sendable () -> Void
     ) async throws -> [String: DisabledRemindersStore.DisabledEntry] {
+        try await race(defaults, parked: maintenance) {
+            DisabledRemindersStore.setEnabled(hash: "k:newer", enabled: false)
+        }
+    }
+
+    /// Runs `parked` off the main thread until it has read the map, then runs `other` from another thread,
+    /// and finishes both. Returns the final map.
+    private func race(
+        _ defaults: ParkingDefaults, parked: @escaping @Sendable () -> Void, other: @escaping @Sendable () -> Void
+    ) async throws -> [String: DisabledRemindersStore.DisabledEntry] {
         let box = DefaultsBox(defaults)
         let older = Task.detached { @Sendable [box] in
-            DisabledRemindersStore.withTestDefaults(box.value, maintenance)
+            DisabledRemindersStore.withTestDefaults(box.value, parked)
         }
         let end = ContinuousClock.now + .seconds(10)
         while !defaults.parked, ContinuousClock.now < end { try await Task.sleep(for: .milliseconds(20)) }
@@ -79,9 +89,7 @@ struct DisabledRemindersWriterRaceTests {
         }
         let userDone = Flag()
         let user = Task.detached { @Sendable [box] in
-            DisabledRemindersStore.withTestDefaults(box.value) {
-                DisabledRemindersStore.setEnabled(hash: "k:newer", enabled: false)
-            }
+            DisabledRemindersStore.withTestDefaults(box.value, other)
             userDone.set()
         }
         // A store that lets the user's write through while the older writer holds its copy finishes it
@@ -117,6 +125,20 @@ struct DisabledRemindersWriterRaceTests {
         }
         #expect(result["k:seed"] == nil, "the collection committed its removal")
         #expect(result["k:newer"]?.enabled == false, "the user's later disable remains")
+    }
+
+    @Test("A user disable that read the map cannot replace a maintenance write that committed meanwhile")
+    func userDisableDoesNotReplaceMaintenanceWrite() async throws {
+        let (defaults, suite) = try isolatedDefaults(seed: ["k:seed": .init(enabled: false, ts: Date().ISO8601Format())])
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let result = try await race(defaults, parked: {
+            DisabledRemindersStore.setEnabled(hash: "k:newer", enabled: false)
+        }, other: {
+            DisabledRemindersStore.bulkDisableWithEpochZero(hashes: ["k:older"])
+        })
+        #expect(result["k:newer"]?.enabled == false, "the user's disable committed")
+        #expect(result["k:older"]?.enabled == false, "the maintenance write remains")
+        #expect(result["k:seed"]?.enabled == false, "the baseline entry remains")
     }
 
     @Test("A received merge cannot replace a later user disable")
