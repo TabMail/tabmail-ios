@@ -274,9 +274,10 @@ struct DisabledRemindersWriterRaceTests {
         // The writer is admitted and holds the lock. It is let go only once the flag is off: a removal that
         // runs before the flip waits on the lock the writer still holds, so nothing releases the writer.
         let releaser = Task.detached { @Sendable [box] in
-            let deadline = ContinuousClock.now + .seconds(10)
+            let deadline = ContinuousClock.now + .seconds(60)
             while DemoModeStore.isDemoActive, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(10)) }
-            box.value.release()
+            // Never released while the flag is on: the writer's own park timeout then fails the test.
+            if !DemoModeStore.isDemoActive { box.value.release() }
         }
         let exiting = DisabledRemindersStore.withTestDefaults(defaults) { Task { await DemoModeService.shared.exit() } }
         await exiting.value
