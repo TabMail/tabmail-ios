@@ -122,7 +122,7 @@ struct RemindersSettingsView: View {
 
     private func toggleReminder(at index: Int, enabled: Bool) {
         let reminder = reminders[index]
-        DisabledRemindersStore.setEnabled(hash: reminder.hash, enabled: enabled)
+        DisabledRemindersStore.setEnabled(hash: reminder.hash, enabled: enabled, demo: DemoModeStore.isDemoActive)
         reminders[index] = Reminder(
             type: reminder.type,
             content: reminder.content,

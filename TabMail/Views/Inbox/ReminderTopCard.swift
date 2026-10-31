@@ -225,12 +225,12 @@ struct ReminderTopCard: View {
     private var dismissButton: some View {
         Button {
             if isHidden {
-                DisabledRemindersStore.setEnabled(hash: reminder.hash, enabled: true)
+                DisabledRemindersStore.setEnabled(hash: reminder.hash, enabled: true, demo: DemoModeStore.isDemoActive)
                 withAnimation(.easeInOut(duration: 0.25)) {
                     _ = hiddenReminderHashes.remove(reminder.hash)
                 }
             } else {
-                DisabledRemindersStore.setEnabled(hash: reminder.hash, enabled: false)
+                DisabledRemindersStore.setEnabled(hash: reminder.hash, enabled: false, demo: DemoModeStore.isDemoActive)
                 withAnimation(.easeInOut(duration: 0.25)) {
                     _ = hiddenReminderHashes.insert(reminder.hash)
                 }

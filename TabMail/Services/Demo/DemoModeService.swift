@@ -261,9 +261,11 @@ final class DemoModeService {
         // isActive is still true (see PromptStore.exitDemoOverlay). The demo
         // disabled-reminders map is deleted the same way.
         PromptStore.shared.exitDemoOverlay()
-        UserDefaults.standard.removeObject(forKey: DisabledRemindersStore.demoStorageKeyV2)
 
         store.isActive = false
+        // After the flag is off: a demo reminder writer in the map lock lands before this removal, any later
+        // one is refused, so none leaves a map for the next demo.
+        DisabledRemindersStore.removeDemoMap()
         store.enteredFromDebugMenu = false
         store.isTutorialPractice = false
         // Note: callsConsumed and demo gate flags persist.
@@ -327,7 +329,7 @@ final class DemoModeService {
         // Stale demo overlay keys from a force-quit mid-demo (harmless while
         // demo is inactive — all readers use the real keys — but clean up).
         PromptStore.removeDemoOverlayKeys()
-        UserDefaults.standard.removeObject(forKey: DisabledRemindersStore.demoStorageKeyV2)
+        DisabledRemindersStore.removeDemoMap()
         if let memoryError { throw memoryError }
     }
 

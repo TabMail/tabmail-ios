@@ -81,7 +81,7 @@ struct TemplatesListView: View {
                             set: { newValue in
                                 var updated = template
                                 updated.enabled = newValue
-                                store.updateTemplate(updated)
+                                store.updateTemplate(updated, demo: DemoModeStore.isDemoActive)
                             }
                         ))
                             .labelsHidden()
@@ -92,7 +92,7 @@ struct TemplatesListView: View {
             .onDelete { offsets in
                 let visible = store.visibleTemplates
                 for offset in offsets {
-                    store.deleteTemplate(id: visible[offset].id)
+                    store.deleteTemplate(id: visible[offset].id, demo: DemoModeStore.isDemoActive)
                 }
             }
             .listRowBackground(Palette.boxBg)
@@ -105,7 +105,7 @@ struct TemplatesListView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    store.addTemplate()
+                    store.addTemplate(ReplyTemplate(), demo: DemoModeStore.isDemoActive)
                 } label: {
                     Image(systemName: "plus")
                 }

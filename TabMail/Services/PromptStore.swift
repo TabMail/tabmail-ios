@@ -279,8 +279,10 @@ final class PromptStore {
     /// DS-SEMAPHORE: this device's one semaphore for the knowledge base, writing style and action rules.
     @ObservationIgnored let semaphore: PromptSemaphore
 
-    /// When true, incoming template sync is being applied — suppress broadcasting back to peers.
-    private(set) var isSyncApplying = false
+    /// Whether the demo's templates are the ones `templates` holds: true from `enterDemoOverlay` to
+    /// `exitDemoOverlay`. The store's own record of what it shows, so a template change decides where to land by
+    /// this and by the target its caller took (DS-DEMO), never by a read of the live demo flag.
+    @ObservationIgnored private(set) var showsDemoOverlay = false
 
     /// Debounce task for recording history on local edits (2s quiet period).
     private var historyDebounceTask: Task<Void, Never>?
@@ -297,19 +299,9 @@ final class PromptStore {
     /// Knowledge base text.
     private(set) var rawKB: String
 
-    /// Reply templates (JSON-encoded, same format as TB's `user_templates`).
-    var templates: [ReplyTemplate] {
-        didSet {
-            saveTemplates()
-            // Demo overlay (ADR-IOS-038): demo writes go to the demo key only —
-            // no Device Sync broadcast/timestamps, no history.
-            guard !DemoModeStore.isDemoActive else { return }
-            if !isSyncApplying {
-                DeviceSyncService.shared.debouncedBroadcast(fields: [.templates])
-                debouncedRecordHistory(field: "templates")
-            }
-        }
-    }
+    /// Reply templates as shown (JSON-encoded, same format as TB's `user_templates`): the demo's while the demo
+    /// overlay is shown. Changed only by `commitTemplates`.
+    private(set) var templates: [ReplyTemplate]
 
     // MARK: - Sections (for Settings)
 
@@ -728,12 +720,10 @@ final class PromptStore {
         bullets.reset([field])
     }
 
-    func resetTemplates() {
-        if DemoModeStore.isDemoActive { templates = Defaults.templates; return }
+    func resetTemplates(demo: Bool) {
+        if demo { commitTemplates(Defaults.templates, demo: true, echo: false); return }
         guard recordHistory(source: "reset", fields: ["templates"], demo: false) else { return }
-        isSyncApplying = true
-        templates = Defaults.templates
-        isSyncApplying = false
+        commitTemplates(Defaults.templates, demo: false, echo: false)
         DeviceSyncService.shared.markFieldAsReset(.templates)
     }
 
@@ -746,32 +736,41 @@ final class PromptStore {
 
     /// Every template the person creates (settings, marketplace, chat) comes
     /// through here; Device Sync merges through `mergeTemplates` instead.
-    func addTemplate(_ template: ReplyTemplate = ReplyTemplate()) {
-        templates.append(template)
+    @discardableResult
+    func addTemplate(_ template: ReplyTemplate, demo: Bool) -> Bool {
+        guard commitTemplates(templates(for: demo) + [template], demo: demo, echo: true) else { return false }
         TutorialCoordinator.shared.discovered(.template)
+        return true
     }
 
-    func deleteTemplate(id: String) {
-        guard let index = templates.firstIndex(where: { $0.id == id }) else { return }
-        var template = templates[index]
+    @discardableResult
+    func deleteTemplate(id: String, demo: Bool) -> Bool {
+        var all = templates(for: demo)
+        guard let index = all.firstIndex(where: { $0.id == id }) else { return false }
+        var template = all[index]
         template.deleted = true
         template.deletedAt = .now
         template.updatedAt = .now
-        templates[index] = template
+        all[index] = template
+        return commitTemplates(all, demo: demo, echo: true)
     }
 
-    func updateTemplate(_ template: ReplyTemplate) {
-        guard let index = templates.firstIndex(where: { $0.id == template.id }) else { return }
+    @discardableResult
+    func updateTemplate(_ template: ReplyTemplate, demo: Bool) -> Bool {
+        var all = templates(for: demo)
+        guard let index = all.firstIndex(where: { $0.id == template.id }) else { return false }
         var updated = template
         updated.updatedAt = .now
-        templates[index] = updated
+        all[index] = updated
+        return commitTemplates(all, demo: demo, echo: true)
     }
 
     /// CRDT per-template merge: per-id, newer updatedAt wins.
     /// Used for incoming Device Sync instead of full-array replacement.
-    func mergeTemplates(_ incoming: [ReplyTemplate]) {
+    func mergeTemplates(_ incoming: [ReplyTemplate], demo: Bool) {
+        let local = templates(for: demo)
         var localMap: [String: ReplyTemplate] = [:]
-        for t in templates { localMap[t.id] = t }
+        for t in local { localMap[t.id] = t }
 
         var merged = 0
         for inTemplate in incoming {
@@ -787,47 +786,78 @@ final class PromptStore {
         }
 
         if merged > 0 {
-            templates = Array(localMap.values)
+            commitTemplates(Array(localMap.values), demo: demo, echo: true)
         }
         BackgroundSyncLogger.logDebug("[PromptStore] CRDT template merge: \(merged) adopted from \(incoming.count) incoming (total: \(localMap.count))")
     }
 
     /// GC deleted template tombstones older than 90 days.
-    func gcDeletedTemplates() {
+    func gcDeletedTemplates(demo: Bool) {
         let now = Date()
         let gcAgeDays = 90
-        let before = templates.count
-        templates.removeAll { t in
-            guard t.deleted, let deletedAt = t.deletedAt else { return false }
-            return now.timeIntervalSince(deletedAt) > Double(gcAgeDays * 86400)
+        let all = templates(for: demo)
+        let kept = all.filter { t in
+            guard t.deleted, let deletedAt = t.deletedAt else { return true }
+            return now.timeIntervalSince(deletedAt) <= Double(gcAgeDays * 86400)
         }
-        let removed = before - templates.count
+        let removed = all.count - kept.count
         if removed > 0 {
+            commitTemplates(kept, demo: demo, echo: true)
             BackgroundSyncLogger.logDebug("[PromptStore] GC removed \(removed) deleted template tombstones older than \(gcAgeDays) days")
         }
     }
 
     // MARK: - Device Sync of the templates
 
-    /// Replaces the templates (a history restore, a received merge's result), wrapped in `isSyncApplying`
-    /// to prevent echo broadcasting. The callers record the history entry (DS-HISTORY).
-    func applySyncedTemplates(_ templates: [ReplyTemplate]) {
-        // While the demo shows its own templates the real ones are saved to their key only; the demo's exit
-        // reads them back.
-        guard !DemoModeStore.isDemoActive else {
-            if let data = try? JSONEncoder().encode(templates) { defaults.set(data, forKey: Keys.templates) }
-            return
+    /// Replaces the templates (a history restore) without sending them. The callers record the history entry
+    /// (DS-HISTORY).
+    func applySyncedTemplates(_ templates: [ReplyTemplate], demo: Bool) {
+        commitTemplates(templates, demo: demo, echo: false)
+    }
+
+    /// The templates a change with target `demo` starts from: the real ones, from their key while the demo
+    /// overlay is the one shown.
+    private func templates(for demo: Bool) -> [ReplyTemplate] {
+        if demo || !showsDemoOverlay { return templates }
+        return realTemplatesFromStorage()
+    }
+
+    private func realTemplatesFromStorage() -> [ReplyTemplate] {
+        defaults.data(forKey: Keys.templates).flatMap { try? JSONDecoder().decode([ReplyTemplate].self, from: $0) } ?? []
+    }
+
+    private func persistTemplates(_ all: [ReplyTemplate], demo: Bool) {
+        guard let data = try? JSONEncoder().encode(all) else { return }
+        defaults.set(data, forKey: demo ? "demo.\(Keys.templates)" : Keys.templates)
+    }
+
+    /// The one place the templates change (DS-DEMO). A demo-targeted change lands only while the demo's
+    /// templates are the ones shown, and is refused (false) after the demo ended. A real-targeted change is
+    /// saved to the real key always; it is shown, sent and recorded only while the real templates are the ones
+    /// shown, and while the demo's are shown the real ones are shown again at the demo's exit.
+    @discardableResult
+    private func commitTemplates(_ all: [ReplyTemplate], demo: Bool, echo: Bool) -> Bool {
+        if demo {
+            guard showsDemoOverlay else { return false }
+            templates = all
+            persistTemplates(all, demo: true)
+            return true
         }
-        isSyncApplying = true
-        self.templates = templates
-        isSyncApplying = false
+        persistTemplates(all, demo: false)
+        guard !showsDemoOverlay else { return true }
+        templates = all
+        if echo {
+            DeviceSyncService.shared.debouncedBroadcast(fields: [.templates])
+            debouncedRecordHistory(field: "templates")
+        }
+        return true
     }
 
     // MARK: - Demo overlay lifecycle (ADR-IOS-038)
 
     /// Enter the demo prompt overlay: swap all four prompt fields to the
     /// bundled defaults. MUST be called with demo already active
-    /// (`DemoModeStore.isDemoActive == true`) so the `didSet`s persist to the
+    /// (`DemoModeStore.isDemoActive == true`) so the demo-targeted commits persist to the
     /// demo keys and skip NSE mirror / Device Sync / history. The real values
     /// stay untouched in their real UserDefaults keys.
     func enterDemoOverlay() {
@@ -837,7 +867,8 @@ final class PromptStore {
         setDemoText(.composition, Defaults.composition)
         setDemoText(.action, Defaults.action)
         setDemoText(.kb, Defaults.kb)
-        templates = Defaults.templates
+        showsDemoOverlay = true
+        commitTemplates(Defaults.templates, demo: true, echo: false)
         BackgroundSyncLogger.logDebug("[PromptStore] Demo prompt overlay ACTIVE (defaults seeded)")
     }
 
@@ -848,12 +879,8 @@ final class PromptStore {
         rawComposition = bullets.rendered(.composition)
         rawAction = bullets.rendered(.action)
         rawKB = bullets.rendered(.kb)
-        if let data = defaults.data(forKey: Keys.templates),
-           let decoded = try? JSONDecoder().decode([ReplyTemplate].self, from: data) {
-            templates = decoded
-        } else {
-            templates = []
-        }
+        showsDemoOverlay = false
+        templates = realTemplatesFromStorage()
         Self.removeDemoOverlayKeys()
         BackgroundSyncLogger.logDebug("[PromptStore] Demo prompt overlay REMOVED (real prompts restored)")
     }
@@ -929,7 +956,7 @@ final class PromptStore {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         // The templates as saved under their real key: while a demo is shown, `templates` holds the overlay.
-        let realTemplates = defaults.data(forKey: Keys.templates).flatMap { try? JSONDecoder().decode([ReplyTemplate].self, from: $0) } ?? []
+        let realTemplates = realTemplatesFromStorage()
         guard let templatesData = try? encoder.encode(realTemplates), let templatesStr = String(data: templatesData, encoding: .utf8) else {
             BackgroundSyncLogger.logDebug("[PromptStore] history entry not recorded: the templates could not be encoded")
             return false
@@ -976,17 +1003,11 @@ final class PromptStore {
         // commit renews it only when something was committed), so an AI write read before it is refused.
         semaphore.renewCounter()
         bullets.restore([.composition: entry.composition, .action: entry.action, .kb: entry.kb])
-        applySyncedTemplates(entry.decodedTemplates)
+        applySyncedTemplates(entry.decodedTemplates, demo: false)
         DeviceSyncService.shared.debouncedBroadcast(fields: [.templates])
     }
 
     // MARK: - Private
-
-    private func saveTemplates() {
-        if let data = try? JSONEncoder().encode(templates) {
-            defaults.set(data, forKey: Self.storageKey(Keys.templates))
-        }
-    }
 
     @discardableResult
     fileprivate func saveHistory(_ entries: [PromptHistoryEntry]) -> Bool {

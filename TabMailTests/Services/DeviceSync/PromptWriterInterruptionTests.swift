@@ -26,6 +26,29 @@ private final class ResponseGate: @unchecked Sendable {
 /// A writer whose model call another edit interrupts (DS-AI, DS-COUNTER): the response arrives after the
 /// user's newer edit and must not replace it. Each runs the real writer against a mock backend that parks
 /// the response, with an uninterrupted control that persists the same response.
+/// Parks the first off-main read of the demo's reminder map, once, until the test releases it.
+private final class DemoMapParkingDefaults: UserDefaults {
+    private let state = Mutex((armed: true, parked: false, timedOut: false))
+    private let signal = DispatchSemaphore(value: 0)
+    var parked: Bool { state.withLock { $0.parked } }
+    var timedOut: Bool { state.withLock { $0.timedOut } }
+    func release() { signal.signal() }
+
+    override func data(forKey key: String) -> Data? {
+        let value = super.data(forKey: key)
+        if key == DisabledRemindersStore.demoStorageKeyV2, !Thread.isMainThread {
+            let park = state.withLock { s -> Bool in
+                guard s.armed else { return false }
+                s.armed = false
+                s.parked = true
+                return true
+            }
+            if park, signal.wait(timeout: .now() + 30) == .timedOut { state.withLock { $0.timedOut = true } }
+        }
+        return value
+    }
+}
+
 @MainActor
 @Suite("Prompt store writers interrupted by an edit", .serialized, .processGlobalState)
 struct PromptWriterInterruptionTests {
@@ -417,5 +440,82 @@ struct ActionRuleExactByteTests {
 
         let broken = PendingAIRefinement(dedupKey: "broken-\(tag)", jobType: .actionRefine, payloadJSON: "{", createdAt: 0)
         await #expect(throws: (any Error).self) { try await BackfillAIQueue(ai: ai).dispatch(broken, jobType: .actionRefine) }
+    }
+}
+
+/// The model's email-reminder snooze (the fallback of `reminder_del`) awaits the reminder build, then writes the
+/// choice. It writes where the call began (DS-DEMO): a demo call whose demo ended meanwhile writes nothing.
+@MainActor
+@Suite("Email reminder snooze keeps its target", .serialized, .processGlobalState)
+struct EmailReminderSnoozeTargetTests {
+    @Test("A demo snooze finishing after the demo ended never writes the real map; the uninterrupted one lands in the demo's")
+    func demoSnoozeDoesNotEscapeItsOverlay() async throws {
+        UserDefaults.standard.set(false, forKey: "device_sync_auto_enabled")
+        DeviceSyncService.shared.disconnect()
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("snooze-target-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+        let app = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { s in
+            let old = s
+            s = app
+            return old
+        }
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir) }
+        for interrupt in [false, true] {
+            DemoModeStore.shared._resetForTests()
+            try await DemoModeService.shared.start(mintToken: false)
+            PromptStore.shared.enterDemoOverlay()
+            let tag = "snooze-" + UUID().uuidString
+            try await pool.write { db in
+                var account = Account(emailAddress: "demo@example.com", displayName: "Demo", provider: .gmail)
+                account.id = DemoSeed.demoAccountId
+                try account.save(db)
+                let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: account.id)
+                try folder.save(db)
+                var header = MessageHeader(messageId: tag, subject: "Reminder", from: "Sender", fromAddress: "sender@example.com", to: "demo@example.com", date: Date(), snippet: "", folderId: folder.id, accountId: account.id, folderPath: "INBOX", isInInbox: true)
+                header.reminderContent = tag
+                header.rfc822MessageId = "<" + tag + "@example.com>"
+                try header.insert(db)
+            }
+            ReminderBuilder.invalidateCache()
+            let suite = "snooze-target-" + UUID().uuidString
+            let defaults = try #require(DemoMapParkingDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.set(Data("{}".utf8), forKey: "disabled_reminders_v2")
+            defaults.set(Data("{}".utf8), forKey: DisabledRemindersStore.demoStorageKeyV2)
+            let pending = DisabledRemindersStore.withTestDefaults(defaults) {
+                Task { try await ReminderDelTool().execute(arguments: ["text": .string(tag)]) }
+            }
+            let deadline = ContinuousClock.now + .seconds(10)
+            while !defaults.parked, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(20)) }
+            guard defaults.parked else {
+                defaults.release()
+                _ = try await pending.value
+                Issue.record("the snooze never reached its map read")
+                await DemoModeService.shared.exit()
+                return
+            }
+            if interrupt {
+                await DemoModeService.shared.exit()
+                #expect(!DemoModeStore.isDemoActive, "the demo ended")
+            }
+            defaults.release()
+            let result = try await pending.value
+            #expect(!defaults.timedOut)
+            let real = try JSONDecoder().decode([String: DisabledRemindersStore.DisabledEntry].self, from: try #require(defaults.data(forKey: "disabled_reminders_v2")))
+            #expect(real.isEmpty, "the demo's snooze reached the real map: \(result)")
+            if interrupt {
+                #expect(result.contains("the demo ended"), "the snooze is reported as refused: \(result)")
+            } else {
+                #expect(!result.contains("the demo ended") && result.contains("snoozed"), "the uninterrupted snooze succeeds: \(result)")
+                let overlay = try JSONDecoder().decode([String: DisabledRemindersStore.DisabledEntry].self, from: try #require(defaults.data(forKey: DisabledRemindersStore.demoStorageKeyV2)))
+                #expect(overlay.values.contains { !$0.enabled }, "the demo's choice is in its own map")
+                await DemoModeService.shared.exit()
+            }
+        }
+        DemoModeStore.shared._resetForTests()
     }
 }

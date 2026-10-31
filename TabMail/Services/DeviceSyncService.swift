@@ -505,7 +505,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 state.templates = store.templates
                 state.templatesUpdatedAt = readTimestamp(for: .templates)
             case .disabledReminders:
-                state.disabledReminders = DisabledRemindersStore.getDisabledMap()
+                state.disabledReminders = DisabledRemindersStore.getDisabledMap(demo: false)
                 state.disabledRemindersUpdatedAt = readTimestamp(for: .disabledReminders)
             case .actionConfig:
                 state.actionConfig = ActionCompactConfig.local()
@@ -807,8 +807,8 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                     BackgroundSyncLogger.logDebug("[DeviceSync] Skipped \(skipped) invalid templates (missing id/name)")
                 }
                 if !validTemplates.isEmpty {
-                    store.mergeTemplates(validTemplates)
-                    store.gcDeletedTemplates()
+                    store.mergeTemplates(validTemplates, demo: false)
+                    store.gcDeletedTemplates(demo: false)
                 }
             }
         }
@@ -819,9 +819,9 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             if incomingTs == Self.epochZero {
                 BackgroundSyncLogger.logDebug("[DeviceSync] Skipping disabledReminders merge — epoch-zero timestamp (virgin device)")
             } else {
-                let beforeHashes = DisabledRemindersStore.getDisabledHashes()
-                DisabledRemindersStore.mergeIncoming(incomingMap)
-                let afterHashes = DisabledRemindersStore.getDisabledHashes()
+                let beforeHashes = DisabledRemindersStore.getDisabledHashes(demo: false)
+                DisabledRemindersStore.mergeIncoming(incomingMap, demo: false)
+                let afterHashes = DisabledRemindersStore.getDisabledHashes(demo: false)
                 if beforeHashes != afterHashes {
                     NotificationCenter.default.post(name: .remindersDidChange, object: nil)
                 }

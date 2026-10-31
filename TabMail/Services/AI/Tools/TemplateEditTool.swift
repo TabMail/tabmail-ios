@@ -21,6 +21,8 @@ struct TemplateEditTool: AgentTool, Sendable {
     /// ADR-IOS-053: real entry point — delivers the confirmation card to the
     /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
+        // The target is fixed here, before the call's first suspension (DS-DEMO).
+        let demo = DemoModeStore.isDemoActive
         // Resolve numeric ID to real template UUID
         let numericTemplateId = TemplateToolHelpers.intArg(arguments, "template_id")
         guard let templateId = await TemplateToolHelpers.resolveTemplateId(arguments, translator: ctx.translator) else {
@@ -88,8 +90,7 @@ struct TemplateEditTool: AgentTool, Sendable {
             if let n = newName { t.name = n }
             if let ins = newInstructions { t.instructions = ins }
             if let ex = newExampleReply { t.exampleReply = ex }
-            PromptStore.shared.updateTemplate(t)
-            return true
+            return PromptStore.shared.updateTemplate(t, demo: demo)
         }
 
         guard updated else {

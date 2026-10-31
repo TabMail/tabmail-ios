@@ -137,7 +137,7 @@ struct MarketplaceTemplateDetailView: View {
                 instructions: downloaded.instructions,
                 exampleReply: downloaded.exampleReply
             )
-            store.addTemplate(localTemplate)
+            store.addTemplate(localTemplate, demo: DemoModeStore.isDemoActive)
             didInstall = true
             onInstall(downloaded.id)
         } catch {

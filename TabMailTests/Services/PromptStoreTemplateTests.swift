@@ -450,3 +450,52 @@ struct PromptStoreDeleteTemplateTests {
         }
     }
 }
+
+// MARK: - A template change lands where its caller aimed it (DS-DEMO)
+
+@MainActor
+@Suite("PromptStore templates keep their target", .serialized, .processGlobalState)
+struct PromptStoreTemplateTargetTests {
+    private func realStored() -> [ReplyTemplate] {
+        UserDefaults.standard.data(forKey: "user_templates")
+            .flatMap { try? JSONDecoder().decode([ReplyTemplate].self, from: $0) } ?? []
+    }
+
+    @Test("A demo-targeted change after the demo overlay was removed is refused and saves nothing; a real one while it is shown is saved to the real key only")
+    func targetsFollowTheOverlay() {
+        let store = PromptStore.shared
+        let saved = store.templates
+        DemoModeStore.shared._resetForTests()
+        defer {
+            DemoModeStore.shared._resetForTests()
+            store.applySyncedTemplates(saved, demo: false)
+        }
+        store.applySyncedTemplates([ReplyTemplate(id: "real1", name: "Real")], demo: false)
+
+        // No overlay shown: a demo-targeted change is refused (the demo is over, or its overlay is not up).
+        #expect(!store.addTemplate(ReplyTemplate(id: "late", name: "Late"), demo: true))
+        #expect(realStored().map(\.id) == ["real1"])
+        #expect(store.templates.map(\.id) == ["real1"])
+        #expect(UserDefaults.standard.data(forKey: "demo.user_templates") == nil)
+
+        // Overlay shown: a demo-targeted change lands in the demo's templates and key.
+        DemoModeStore.shared.isActive = true
+        store.enterDemoOverlay()
+        #expect(store.addTemplate(ReplyTemplate(id: "demo1", name: "Demo"), demo: true))
+        #expect(store.templates.contains { $0.id == "demo1" })
+        #expect(!realStored().contains { $0.id == "demo1" }, "the demo's template is not in the real key")
+
+        // A real-targeted change while the overlay is shown: saved to the real key, not shown, and the demo's are kept.
+        #expect(store.updateTemplate(ReplyTemplate(id: "real1", name: "Renamed"), demo: false))
+        #expect(realStored().first { $0.id == "real1" }?.name == "Renamed")
+        #expect(!store.templates.contains { $0.id == "real1" }, "the real templates are not shown over the demo's")
+        #expect(store.templates.contains { $0.id == "demo1" })
+
+        // The demo's exit shows the real templates again, with the change.
+        store.exitDemoOverlay()
+        DemoModeStore.shared.isActive = false
+        #expect(store.templates.first { $0.id == "real1" }?.name == "Renamed")
+        #expect(!store.templates.contains { $0.id == "demo1" })
+        #expect(!store.addTemplate(ReplyTemplate(id: "after", name: "After"), demo: true), "refused after the exit")
+    }
+}

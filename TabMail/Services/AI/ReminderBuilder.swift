@@ -123,7 +123,7 @@ enum ReminderBuilder {
         let messageReminders = await collectMessageReminders(demoActive: demoActive)
         let kbText = PromptStore.kbTextSnapshot()
         let kbParsed = KBReminderParser.parse(kbText)
-        var disabledHashes = DisabledRemindersStore.getDisabledHashes()
+        var disabledHashes = DisabledRemindersStore.getDisabledHashes(demo: demoActive)
 
         BackgroundSyncLogger.logDebug("[ReminderBuilder] Collected \(messageReminders.count) message reminders and \(kbParsed.count) KB reminders")
 
@@ -151,9 +151,9 @@ enum ReminderBuilder {
             if let rfc822 = r.rfc822MessageId, !rfc822.isEmpty, let uid = r.uniqueId {
                 let oldHash = "m:\(uid)"
                 if oldHash != hash && disabledHashes.contains(oldHash) {
-                    let oldEntry = DisabledRemindersStore.getDisabledMap()[oldHash]
+                    let oldEntry = DisabledRemindersStore.getDisabledMap(demo: demoActive)[oldHash]
                     let isDisabled = !(oldEntry?.enabled ?? true)
-                    DisabledRemindersStore.setEnabled(hash: hash, enabled: !isDisabled)
+                    DisabledRemindersStore.setEnabled(hash: hash, enabled: !isDisabled, demo: demoActive)
                     if isDisabled { disabledHashes.insert(hash) }
                     BackgroundSyncLogger.logDebug("[ReminderBuilder] Migrated disabled hash: \(oldHash) → \(hash)")
                 }
@@ -180,10 +180,10 @@ enum ReminderBuilder {
 
         // One-time: auto-disable overdue reminders on first launch (v1.0.1).
         // Prevents a flood of overdue notifications for users with large inboxes.
-        let didAutoDisable = autoDisableOverdueOnFirstLaunch(allReminders)
+        let didAutoDisable = autoDisableOverdueOnFirstLaunch(allReminders, demo: demoActive)
         if didAutoDisable {
             // Re-read disabled hashes — the array was built before auto-disable wrote entries
-            let updatedDisabled = DisabledRemindersStore.getDisabledHashes()
+            let updatedDisabled = DisabledRemindersStore.getDisabledHashes(demo: demoActive)
             allReminders = allReminders.map { r in
                 guard r.enabled, updatedDisabled.contains(r.hash) else { return r }
                 return Reminder(
@@ -200,7 +200,7 @@ enum ReminderBuilder {
 
         // Time-based GC of stale disabled entries (non-blocking)
         let freshHashes = Set(allReminders.map(\.hash))
-        DisabledRemindersStore.gcStaleEntries(freshHashes: freshHashes)
+        DisabledRemindersStore.gcStaleEntries(freshHashes: freshHashes, demo: demoActive)
 
         // Sort: due-dated reminders ascending, then undated
         allReminders.sort { a, b in
@@ -389,6 +389,7 @@ enum ReminderBuilder {
     @discardableResult
     private static func autoDisableOverdueOnFirstLaunch(
         _ reminders: [Reminder],
+        demo: Bool,
         defaults: UserDefaults = .standard
     ) -> Bool {
         guard !defaults.bool(forKey: didAutoDisableKey) else { return false }
@@ -419,7 +420,7 @@ enum ReminderBuilder {
         }
 
         // Epoch-zero timestamps ensure Device Sync always overrides these entries
-        DisabledRemindersStore.bulkDisableWithEpochZero(hashes: hashesToDisable)
+        DisabledRemindersStore.bulkDisableWithEpochZero(hashes: hashesToDisable, demo: demo)
         if !hashesToDisable.isEmpty {
             NotificationCenter.default.post(name: .remindersDidChange, object: nil)
         }
@@ -435,9 +436,10 @@ enum ReminderBuilder {
     @discardableResult
     static func testAutoDisableOverdue(
         _ reminders: [Reminder],
+        demo: Bool,
         defaults: UserDefaults = .standard
     ) -> Bool {
-        autoDisableOverdueOnFirstLaunch(reminders, defaults: defaults)
+        autoDisableOverdueOnFirstLaunch(reminders, demo: demo, defaults: defaults)
     }
 
     // MARK: - Message Reminder Collection

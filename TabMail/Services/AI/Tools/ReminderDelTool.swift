@@ -49,7 +49,7 @@ struct ReminderDelTool: AgentTool, Sendable {
         if found.matches.isEmpty && found.outcome == .unchanged {
             // No KB match — search email-based (message) reminders and snooze if found
             BackgroundSyncLogger.logDebug("[ReminderDelTool] No KB match, searching message reminders...")
-            return await handleMessageReminderDeletion(text: text, textLower: textLower)
+            return await handleMessageReminderDeletion(text: text, textLower: textLower, demo: demo)
         }
 
         if found.matches.count > 1 {
@@ -95,7 +95,7 @@ struct ReminderDelTool: AgentTool, Sendable {
 
     /// Search message reminders and snooze (disable) if found.
     /// Matches TB's email-reminder fallback path in `reminder_del.js`.
-    private func handleMessageReminderDeletion(text: String, textLower: String) async -> String {
+    private func handleMessageReminderDeletion(text: String, textLower: String, demo: Bool) async -> String {
         let allReminders = await ReminderBuilder.buildReminderList(includeDisabled: false)
         let messageMatches = allReminders.filter {
             $0.source == "message" && $0.content.lowercased().contains(textLower)
@@ -104,7 +104,11 @@ struct ReminderDelTool: AgentTool, Sendable {
         if messageMatches.count == 1 {
             let reminder = messageMatches[0]
             BackgroundSyncLogger.logDebug("[ReminderDelTool] Found email-reminder, snoozing: '\(reminder.content.prefix(140))'")
-            DisabledRemindersStore.setEnabled(hash: reminder.hash, enabled: false)
+            // The call's own target (DS-DEMO): a demo call whose demo ended while the reminders were built
+            // writes nothing and says so.
+            guard DisabledRemindersStore.setEnabled(hash: reminder.hash, enabled: false, demo: demo) else {
+                return #"{"error": "the demo ended before the reminder could be snoozed"}"#
+            }
             BackgroundSyncLogger.logDebug("[ReminderDelTool] Success (email-reminder snoozed)")
             let resultDict: [String: Any] = ["ok": true, "snoozed": reminder.content, "source": "email"]
             return ToolJSON.string(from: resultDict)

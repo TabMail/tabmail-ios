@@ -14,6 +14,34 @@ extension PromptStore {
     func edit(_ label: String, _ body: @MainActor (PromptAccess) throws -> PromptEditOutcome) async -> PromptEditOutcome {
         await edit(label, demo: DemoModeStore.isDemoActive, body)
     }
+
+    @discardableResult
+    func addTemplate(_ template: ReplyTemplate = ReplyTemplate()) -> Bool { addTemplate(template, demo: DemoModeStore.isDemoActive) }
+    @discardableResult
+    func deleteTemplate(id: String) -> Bool { deleteTemplate(id: id, demo: DemoModeStore.isDemoActive) }
+    @discardableResult
+    func updateTemplate(_ template: ReplyTemplate) -> Bool { updateTemplate(template, demo: DemoModeStore.isDemoActive) }
+    func mergeTemplates(_ incoming: [ReplyTemplate]) { mergeTemplates(incoming, demo: DemoModeStore.isDemoActive) }
+    func gcDeletedTemplates() { gcDeletedTemplates(demo: DemoModeStore.isDemoActive) }
+    func resetTemplates() { resetTemplates(demo: DemoModeStore.isDemoActive) }
+    func applySyncedTemplates(_ templates: [ReplyTemplate]) { applySyncedTemplates(templates, demo: DemoModeStore.isDemoActive) }
+}
+
+/// The same for the disabled-reminder map: a test that does not choose a target uses the one in force as it calls.
+extension DisabledRemindersStore {
+    static func getDisabledMap() -> [String: DisabledEntry] { getDisabledMap(demo: DemoModeStore.isDemoActive) }
+    static func getDisabledHashes() -> Set<String> { getDisabledHashes(demo: DemoModeStore.isDemoActive) }
+    static func setEnabled(hash: String, enabled: Bool) { setEnabled(hash: hash, enabled: enabled, demo: DemoModeStore.isDemoActive) }
+    static func mergeIncoming(_ map: [String: DisabledEntry]) { mergeIncoming(map, demo: DemoModeStore.isDemoActive) }
+    static func bulkDisableWithEpochZero(hashes: [String]) { bulkDisableWithEpochZero(hashes: hashes, demo: DemoModeStore.isDemoActive) }
+    static func gcStaleEntries(freshHashes: Set<String>) { gcStaleEntries(freshHashes: freshHashes, demo: DemoModeStore.isDemoActive) }
+}
+
+extension ReminderBuilder {
+    @discardableResult
+    static func testAutoDisableOverdue(_ reminders: [Reminder], defaults: UserDefaults = .standard) -> Bool {
+        testAutoDisableOverdue(reminders, demo: DemoModeStore.isDemoActive, defaults: defaults)
+    }
 }
 
 /// Holds the prompt store's semaphore from a task of its own until `end()`, as a slow caller would.

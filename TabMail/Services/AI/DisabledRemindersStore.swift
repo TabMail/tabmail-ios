@@ -135,15 +135,27 @@ enum DisabledRemindersStore {
 
     // MARK: - Read/Write (v2 CRDT Map)
 
-    /// Get the full CRDT map.
-    static func getDisabledMap() -> [String: DisabledEntry] {
-        getDisabledMap(key: keyV2(demo: DemoModeStore.isDemoActive))
+    /// Get the full CRDT map of the real choices (`demo: false`) or the demo's own.
+    static func getDisabledMap(demo: Bool) -> [String: DisabledEntry] {
+        getDisabledMap(key: keyV2(demo: demo))
     }
 
-    /// Keyed load — read-modify-write callers capture the demo flag ONCE (`keyV2(demo:)`) and
-    /// pass it to both load and save, so a demo entry/exit flipping the mode
-    /// between the read and the write can't route a real map into the demo
-    /// key (or vice versa).
+    /// A demo-targeted write is refused once the demo has ended: its map is deleted at exit, and a write
+    /// after that would leave a stale one for the next demo. The only read of the live demo flag in this
+    /// file (DS-DEMO); a real-targeted write is never refused. Called inside the transaction, so a write
+    /// either lands before `removeDemoMap` or is refused.
+    private static func admits(demo: Bool) -> Bool {
+        !demo || DemoModeStore.isDemoActive
+    }
+
+    /// Deletes the demo's map, at the demo's exit once the demo flag is off: a demo-targeted writer in the
+    /// lock before it lands first and is removed, one after it is refused.
+    static func removeDemoMap() {
+        transaction { defaults.removeObject(forKey: demoStorageKeyV2) }
+    }
+
+    /// Keyed load — every API takes its target (`demo:`) from its caller, who took it as the operation
+    /// began, and uses it for both load and save: no API reads the live flag to choose a map.
     ///
     /// A device with only the v1 list (no v2 map yet) reads it as the real map: every hash disabled, each
     /// at the field's Device Sync timestamp (epoch zero when it has none), as TB's `readStoredField` does.
@@ -177,8 +189,8 @@ enum DisabledRemindersStore {
 
     /// Get set of disabled hashes (entries where enabled == false).
     /// Matches TB's `getDisabledHashes()`.
-    static func getDisabledHashes() -> Set<String> {
-        let map = getDisabledMap()
+    static func getDisabledHashes(demo: Bool) -> Set<String> {
+        let map = getDisabledMap(demo: demo)
         return Set(map.filter { !$0.value.enabled }.map(\.key))
     }
 
@@ -186,14 +198,20 @@ enum DisabledRemindersStore {
     /// Writes a CRDT entry with current timestamp.
     /// Matches TB's `setEnabled()`.
     /// Broadcasts change to Device Sync peers (local user action).
-    static func setEnabled(hash: String, enabled: Bool) {
-        let demo = DemoModeStore.isDemoActive  // captured once — see getDisabledMap(key:)
+    /// Returns false when a demo-targeted write finds the demo ended (see `admits`): nothing was written.
+    @discardableResult
+    static func setEnabled(hash: String, enabled: Bool, demo: Bool) -> Bool {
         let key = keyV2(demo: demo)
-        let map: [String: DisabledEntry] = transaction {
+        let written: [String: DisabledEntry]? = transaction {
+            guard admits(demo: demo) else { return nil }
             var map = getDisabledMap(key: key)
             map[hash] = DisabledEntry(enabled: enabled, ts: Date().ISO8601Format())
             saveDisabledMap(map, key: key)
             return map
+        }
+        guard let map = written else {
+            BackgroundSyncLogger.logDebug("[DisabledRemindersStore] A demo change for \(hash) was refused: the demo ended")
+            return false
         }
         BackgroundSyncLogger.logDebug("[DisabledRemindersStore] Set \(hash) enabled=\(enabled) (disabled count: \(map.filter { !$0.value.enabled }.count))")
 
@@ -208,13 +226,15 @@ enum DisabledRemindersStore {
 
         // Notify local observers (chat pill regenerates reminders)
         NotificationCenter.default.post(name: .remindersDidChange, object: nil)
+        return true
     }
 
     /// CRDT merge: per-hash, newer timestamp wins.
     /// Does NOT trigger a broadcast (used for incoming Device Sync).
-    static func mergeIncoming(_ incomingMap: [String: DisabledEntry]) {
-        let key = keyV2(demo: DemoModeStore.isDemoActive)  // captured once — see getDisabledMap(key:)
+    static func mergeIncoming(_ incomingMap: [String: DisabledEntry], demo: Bool) {
+        let key = keyV2(demo: demo)
         let (merged, total) = transaction { () -> (Int, Int) in
+            guard admits(demo: demo) else { return (0, 0) }
             var localMap = getDisabledMap(key: key)
             var merged = 0
 
@@ -241,11 +261,12 @@ enum DisabledRemindersStore {
     /// Bulk-disable hashes with epoch-zero timestamps. Used by first-launch overdue
     /// suppression so that any Device Sync state (real timestamps) always wins in CRDT merge.
     /// Does NOT broadcast to Device Sync or post notifications — caller handles that.
-    static func bulkDisableWithEpochZero(hashes: [String]) {
+    static func bulkDisableWithEpochZero(hashes: [String], demo: Bool) {
         guard !hashes.isEmpty else { return }
-        let key = keyV2(demo: DemoModeStore.isDemoActive)  // captured once — see getDisabledMap(key:)
+        let key = keyV2(demo: demo)
         let epochZero = "1970-01-01T00:00:00Z"
         transaction {
+            guard admits(demo: demo) else { return }
             var map = getDisabledMap(key: key)
             for hash in hashes {
                 // Only write if no existing entry — preserve any prior state from sync/user action
@@ -277,10 +298,11 @@ enum DisabledRemindersStore {
     /// The guard is deliberately unconditional: `t:` entries are retained forever here.
     /// They are tiny, and the platform that does derive them still collects them on its
     /// own side, so nothing is gained by trying to decide when one is "really" stale.
-    static func gcStaleEntries(freshHashes: Set<String>) {
-        let key = keyV2(demo: DemoModeStore.isDemoActive)  // captured once — see getDisabledMap(key:)
+    static func gcStaleEntries(freshHashes: Set<String>, demo: Bool) {
+        let key = keyV2(demo: demo)
         let now = Date()
         let removed = transaction { () -> Int in
+            guard admits(demo: demo) else { return 0 }
             var map = getDisabledMap(key: key)
             guard !map.isEmpty else { return 0 }
             var removed = 0

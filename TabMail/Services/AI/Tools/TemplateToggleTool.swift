@@ -15,6 +15,8 @@ struct TemplateToggleTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        // The target is fixed here, before the call's first suspension (DS-DEMO).
+        let demo = DemoModeStore.isDemoActive
         guard let templateId = await TemplateToolHelpers.resolveTemplateId(arguments, translator: ctx.translator) else {
             return ToolJSON.string(from: ["error": "Template ID is required."])
         }
@@ -37,11 +39,12 @@ struct TemplateToggleTool: AgentTool, Sendable {
             ] as [String: Any])
         }
 
-        await MainActor.run {
+        let saved = await MainActor.run {
             var updated = template
             updated.enabled = enabled
-            PromptStore.shared.updateTemplate(updated)
+            return PromptStore.shared.updateTemplate(updated, demo: demo)
         }
+        guard saved else { return ToolJSON.string(from: ["error": "The demo ended before the change could be saved."]) }
 
         let verb = enabled ? "enabled" : "disabled"
         return ToolJSON.string(from: [

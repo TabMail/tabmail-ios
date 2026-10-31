@@ -21,6 +21,8 @@ struct TemplateDownloadTool: AgentTool, Sendable {
     /// ADR-IOS-053: real entry point — delivers the confirmation card to the
     /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
+        // The target is fixed here, before the call's first suspension (DS-DEMO).
+        let demo = DemoModeStore.isDemoActive
         guard let templateId = await TemplateToolHelpers.resolveTemplateId(arguments, translator: ctx.translator) else {
             return ToolJSON.string(from: ["error": "Template ID is required."])
         }
@@ -95,9 +97,10 @@ struct TemplateDownloadTool: AgentTool, Sendable {
             exampleReply: exampleReply
         )
 
-        await MainActor.run {
-            PromptStore.shared.addTemplate(newTemplate)
+        let saved = await MainActor.run {
+            PromptStore.shared.addTemplate(newTemplate, demo: demo)
         }
+        guard saved else { return ToolJSON.string(from: ["error": "The demo ended before the change could be saved."]) }
 
         // Register in translator for pill rendering
         let numericId = await ctx.translator.toNumericId(localId)
