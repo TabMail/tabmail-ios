@@ -505,7 +505,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 state.templates = store.templates
                 state.templatesUpdatedAt = readTimestamp(for: .templates)
             case .disabledReminders:
-                state.disabledReminders = DisabledRemindersStore.getDisabledMap(demo: false)
+                state.disabledReminders = DisabledRemindersStore.getDisabledMap()
                 state.disabledRemindersUpdatedAt = readTimestamp(for: .disabledReminders)
             case .actionConfig:
                 state.actionConfig = ActionCompactConfig.local()
@@ -741,7 +741,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             do {
                 // Checked inside the hold, where the message is applied: one received before the connection
                 // ended is never applied after it.
-                try await PromptStore.shared.withPromptStore("sync receive", demo: false) { [weak self] access in
+                try await PromptStore.shared.withPromptStore("sync receive") { [weak self] access in
                     guard connection == self?.connectionID else {
                         BackgroundSyncLogger.logDebug("[DeviceSync] A received message (\(key.prefix(48))) was dropped: its connection ended")
                         return
@@ -807,8 +807,8 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                     BackgroundSyncLogger.logDebug("[DeviceSync] Skipped \(skipped) invalid templates (missing id/name)")
                 }
                 if !validTemplates.isEmpty {
-                    store.mergeTemplates(validTemplates, demo: false)
-                    store.gcDeletedTemplates(demo: false)
+                    store.mergeTemplates(validTemplates)
+                    store.gcDeletedTemplates()
                 }
             }
         }
@@ -819,9 +819,9 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             if incomingTs == Self.epochZero {
                 BackgroundSyncLogger.logDebug("[DeviceSync] Skipping disabledReminders merge — epoch-zero timestamp (virgin device)")
             } else {
-                let beforeHashes = DisabledRemindersStore.getDisabledHashes(demo: false)
-                DisabledRemindersStore.mergeIncoming(incomingMap, demo: false)
-                let afterHashes = DisabledRemindersStore.getDisabledHashes(demo: false)
+                let beforeHashes = DisabledRemindersStore.getDisabledHashes()
+                DisabledRemindersStore.mergeIncoming(incomingMap)
+                let afterHashes = DisabledRemindersStore.getDisabledHashes()
                 if beforeHashes != afterHashes {
                     NotificationCenter.default.post(name: .remindersDidChange, object: nil)
                 }

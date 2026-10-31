@@ -118,9 +118,17 @@ struct MarketplaceTemplateDetailView: View {
         guard !isInstalling else { return }
         isInstalling = true
         installError = nil
+        // The download awaits before the template is saved, so the install carries the change counter it
+        // started with (DS-DEMO): a demo switch in between refuses it.
+        let started = store.changeSeen
 
         do {
             let downloaded = try await TemplateMarketplaceClient.shared.downloadTemplate(id: template.id)
+            guard store.changeSeen == started else {
+                installError = "Could not save the template. Please try again."
+                isInstalling = false
+                return
+            }
 
             // Dedup: skip if template with this ID already exists (not soft-deleted)
             guard !store.visibleTemplates.contains(where: { $0.id == downloaded.id }) else {
@@ -137,7 +145,11 @@ struct MarketplaceTemplateDetailView: View {
                 instructions: downloaded.instructions,
                 exampleReply: downloaded.exampleReply
             )
-            store.addTemplate(localTemplate, demo: DemoModeStore.isDemoActive)
+            guard store.addTemplate(localTemplate, since: started) else {
+                installError = "Could not save the template. Please try again."
+                isInstalling = false
+                return
+            }
             didInstall = true
             onInstall(downloaded.id)
         } catch {

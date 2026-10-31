@@ -451,51 +451,82 @@ struct PromptStoreDeleteTemplateTests {
     }
 }
 
-// MARK: - A template change lands where its caller aimed it (DS-DEMO)
+// MARK: - A template write that began before a demo switch is refused after it (DS-DEMO)
 
 @MainActor
-@Suite("PromptStore templates keep their target", .serialized, .processGlobalState)
-struct PromptStoreTemplateTargetTests {
-    private func realStored() -> [ReplyTemplate] {
-        UserDefaults.standard.data(forKey: "user_templates")
-            .flatMap { try? JSONDecoder().decode([ReplyTemplate].self, from: $0) } ?? []
+@Suite("PromptStore template writers are refused across a demo switch", .serialized, .processGlobalState)
+struct PromptStoreTemplateSwitchTests {
+    fileprivate enum Change: String, CaseIterable, CustomStringConvertible {
+        case add, update, delete
+        var description: String { rawValue }
+
+        @MainActor
+        func run(_ store: PromptStore, since started: UUID) -> Bool {
+            switch self {
+            case .add: store.addTemplate(ReplyTemplate(id: "fresh", name: "Fresh"), since: started)
+            case .update: store.updateTemplate(ReplyTemplate(id: "real1", name: "Renamed"), since: started)
+            case .delete: store.deleteTemplate(id: "real1", since: started)
+            }
+        }
     }
 
-    @Test("A demo-targeted change after the demo overlay was removed is refused and saves nothing; a real one while it is shown is saved to the real key only")
-    func targetsFollowTheOverlay() {
-        let store = PromptStore.shared
+    private func stored(_ key: String) -> Data? { UserDefaults.standard.data(forKey: key) }
+
+    private func prepare(_ store: PromptStore) -> [ReplyTemplate] {
         let saved = store.templates
         DemoModeStore.shared._resetForTests()
+        store.applySyncedTemplates([ReplyTemplate(id: "real1", name: "Real")])
+        return saved
+    }
+
+    @Test("A change that began before the demo was entered saves nothing in either store; a fresh one saves", arguments: Change.allCases)
+    fileprivate func refusedAfterEntry(_ change: Change) async throws {
+        let store = PromptStore.shared
+        let saved = prepare(store)
         defer {
             DemoModeStore.shared._resetForTests()
-            store.applySyncedTemplates(saved, demo: false)
+            store.applySyncedTemplates(saved)
         }
-        store.applySyncedTemplates([ReplyTemplate(id: "real1", name: "Real")], demo: false)
+        let realBefore = stored("user_templates")
+        let started = store.changeSeen
+        try await store.enterDemo()
+        let demoBefore = stored("demo.user_templates")
+        let shownBefore = store.templates.map(\.id)
 
-        // No overlay shown: a demo-targeted change is refused (the demo is over, or its overlay is not up).
-        #expect(!store.addTemplate(ReplyTemplate(id: "late", name: "Late"), demo: true))
-        #expect(realStored().map(\.id) == ["real1"])
-        #expect(store.templates.map(\.id) == ["real1"])
-        #expect(UserDefaults.standard.data(forKey: "demo.user_templates") == nil)
+        #expect(!change.run(store, since: started), "\(change): refused")
+        #expect(stored("user_templates") == realBefore, "\(change): the real templates are unchanged")
+        #expect(stored("demo.user_templates") == demoBefore, "\(change): the demo's templates are unchanged")
+        #expect(store.templates.map(\.id) == shownBefore, "\(change): the shown templates are unchanged")
 
-        // Overlay shown: a demo-targeted change lands in the demo's templates and key.
-        DemoModeStore.shared.isActive = true
-        store.enterDemoOverlay()
-        #expect(store.addTemplate(ReplyTemplate(id: "demo1", name: "Demo"), demo: true))
-        #expect(store.templates.contains { $0.id == "demo1" })
-        #expect(!realStored().contains { $0.id == "demo1" }, "the demo's template is not in the real key")
+        // Control: the same change begun in the demo saves to the demo's templates, never to the real ones.
+        if change == .add {
+            #expect(change.run(store, since: store.changeSeen), "\(change): control saves")
+            #expect(stored("demo.user_templates") != demoBefore, "\(change): the control changed the demo's templates")
+        }
+        #expect(stored("user_templates") == realBefore, "\(change): the real templates are still unchanged")
+        try await store.leaveDemo()
+    }
 
-        // A real-targeted change while the overlay is shown: saved to the real key, not shown, and the demo's are kept.
-        #expect(store.updateTemplate(ReplyTemplate(id: "real1", name: "Renamed"), demo: false))
-        #expect(realStored().first { $0.id == "real1" }?.name == "Renamed")
-        #expect(!store.templates.contains { $0.id == "real1" }, "the real templates are not shown over the demo's")
-        #expect(store.templates.contains { $0.id == "demo1" })
+    @Test("A change that began in the demo saves nothing in either store after the demo was left; a fresh one saves", arguments: Change.allCases)
+    fileprivate func refusedAfterExit(_ change: Change) async throws {
+        let store = PromptStore.shared
+        let saved = prepare(store)
+        defer {
+            DemoModeStore.shared._resetForTests()
+            store.applySyncedTemplates(saved)
+        }
+        try await store.enterDemo()
+        let started = store.changeSeen
+        try await store.leaveDemo()
+        let realBefore = stored("user_templates")
 
-        // The demo's exit shows the real templates again, with the change.
-        store.exitDemoOverlay()
-        DemoModeStore.shared.isActive = false
-        #expect(store.templates.first { $0.id == "real1" }?.name == "Renamed")
-        #expect(!store.templates.contains { $0.id == "demo1" })
-        #expect(!store.addTemplate(ReplyTemplate(id: "after", name: "After"), demo: true), "refused after the exit")
+        #expect(!change.run(store, since: started), "\(change): refused")
+        #expect(stored("user_templates") == realBefore, "\(change): the real templates are unchanged")
+        #expect(stored("demo.user_templates") == nil, "\(change): nothing reached the demo's key")
+        #expect(store.templates.map(\.id) == ["real1"], "\(change): the shown templates are the real ones")
+
+        // Control: the same change begun after the exit saves.
+        #expect(change.run(store, since: store.changeSeen), "\(change): control saves")
+        #expect(stored("user_templates") != realBefore, "\(change): the control changed the real templates")
     }
 }

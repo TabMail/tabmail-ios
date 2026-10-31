@@ -17,7 +17,7 @@ struct TemplateDetailView: View {
     private var templateBinding: Binding<ReplyTemplate> {
         Binding(
             get: { store.templates.first { $0.id == templateId } ?? ReplyTemplate() },
-            set: { store.updateTemplate($0, demo: DemoModeStore.isDemoActive) }
+            set: { store.updateTemplate($0) }
         )
     }
 
@@ -39,7 +39,7 @@ struct TemplateDetailView: View {
                             Button(role: .destructive) {
                                 var updated = templateBinding.wrappedValue
                                 updated.instructions.remove(at: index)
-                                store.updateTemplate(updated, demo: DemoModeStore.isDemoActive)
+                                store.updateTemplate(updated)
                             } label: {
                                 Label("Delete", systemImage: "trash")
                             }
@@ -138,7 +138,7 @@ struct TemplateDetailView: View {
         guard !text.isEmpty else { return }
         var updated = templateBinding.wrappedValue
         updated.instructions.append(text)
-        store.updateTemplate(updated, demo: DemoModeStore.isDemoActive)
+        store.updateTemplate(updated)
         newInstruction = ""
         instructionFieldFocused = true
     }

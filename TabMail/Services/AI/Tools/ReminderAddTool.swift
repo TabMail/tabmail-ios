@@ -12,8 +12,6 @@ struct ReminderAddTool: AgentTool, Sendable {
     let name = "reminder_add"
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
-        // The target is fixed here, before the call's first suspension (DS-DEMO).
-        let demo = DemoModeStore.isDemoActive
         // Extract text (required)
         guard case .string(let rawText) = arguments["text"] else {
             BackgroundSyncLogger.logDebug("[ReminderAddTool] Missing or empty 'text'")
@@ -64,7 +62,7 @@ struct ReminderAddTool: AgentTool, Sendable {
         // (Device Sync).
         let edit = await { @MainActor () async -> KBToolEdit in
             var patched = false
-            let outcome = await PromptStore.shared.edit("reminder_add tool", demo: demo) { hold in
+            let outcome = await PromptStore.shared.edit("reminder_add tool") { hold in
                 try hold.editText(.kb) { current in
                     guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText) else { return nil }
                     patched = true

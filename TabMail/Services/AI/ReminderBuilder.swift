@@ -98,8 +98,9 @@ enum ReminderBuilder {
             return includeDisabled ? cached : cached.filter(\.enabled)
         }
 
-        let result = await performBuild()
-        cachedList.withLock { $0 = result }
+        let (result, started) = await performBuild()
+        // DS-DEMO: a list built across a demo switch is of the mode it started in; it is not kept.
+        cachedList.withLock { if ChangeCounter.device.current == started { $0 = result } }
         return includeDisabled ? result : result.filter(\.enabled)
     }
 
@@ -111,10 +112,15 @@ enum ReminderBuilder {
     /// directions: real reminders never surface in demo, demo reminders never
     /// surface for the user. The cache is invalidated on demo entry/exit via
     /// the `.remindersDidChange` posts in DemoModeService.
-    private static func performBuild() async -> [Reminder] {
+    ///
+    /// A build awaits between its start and its writes (DS-DEMO): it takes the change counter FIRST, then
+    /// the mode, and every write it makes (the migrated hash, first-launch suppression, GC) carries that
+    /// counter, so a demo switch in between refuses them.
+    private static func performBuild() async -> (reminders: [Reminder], started: UUID) {
         BackgroundSyncLogger.logDebug("[ReminderBuilder] Building complete reminder list...")
 
-        let demoActive = await MainActor.run { DemoModeStore.shared.isActive }
+        let started = ChangeCounter.device.current
+        let demoActive = DemoModeStore.isDemoActive
 
         // Collect reminders from both sources. kbTextSnapshot is demo-aware
         // (PromptStore demo overlay): in demo it returns the demo KB, so
@@ -123,7 +129,7 @@ enum ReminderBuilder {
         let messageReminders = await collectMessageReminders(demoActive: demoActive)
         let kbText = PromptStore.kbTextSnapshot()
         let kbParsed = KBReminderParser.parse(kbText)
-        var disabledHashes = DisabledRemindersStore.getDisabledHashes(demo: demoActive)
+        var disabledHashes = DisabledRemindersStore.getDisabledHashes()
 
         BackgroundSyncLogger.logDebug("[ReminderBuilder] Collected \(messageReminders.count) message reminders and \(kbParsed.count) KB reminders")
 
@@ -151,9 +157,9 @@ enum ReminderBuilder {
             if let rfc822 = r.rfc822MessageId, !rfc822.isEmpty, let uid = r.uniqueId {
                 let oldHash = "m:\(uid)"
                 if oldHash != hash && disabledHashes.contains(oldHash) {
-                    let oldEntry = DisabledRemindersStore.getDisabledMap(demo: demoActive)[oldHash]
+                    let oldEntry = DisabledRemindersStore.getDisabledMap()[oldHash]
                     let isDisabled = !(oldEntry?.enabled ?? true)
-                    DisabledRemindersStore.setEnabled(hash: hash, enabled: !isDisabled, demo: demoActive)
+                    DisabledRemindersStore.setEnabled(hash: hash, enabled: !isDisabled, since: started)
                     if isDisabled { disabledHashes.insert(hash) }
                     BackgroundSyncLogger.logDebug("[ReminderBuilder] Migrated disabled hash: \(oldHash) → \(hash)")
                 }
@@ -180,10 +186,10 @@ enum ReminderBuilder {
 
         // One-time: auto-disable overdue reminders on first launch (v1.0.1).
         // Prevents a flood of overdue notifications for users with large inboxes.
-        let didAutoDisable = autoDisableOverdueOnFirstLaunch(allReminders, demo: demoActive)
+        let didAutoDisable = autoDisableOverdueOnFirstLaunch(allReminders, since: started)
         if didAutoDisable {
             // Re-read disabled hashes — the array was built before auto-disable wrote entries
-            let updatedDisabled = DisabledRemindersStore.getDisabledHashes(demo: demoActive)
+            let updatedDisabled = DisabledRemindersStore.getDisabledHashes()
             allReminders = allReminders.map { r in
                 guard r.enabled, updatedDisabled.contains(r.hash) else { return r }
                 return Reminder(
@@ -200,7 +206,7 @@ enum ReminderBuilder {
 
         // Time-based GC of stale disabled entries (non-blocking)
         let freshHashes = Set(allReminders.map(\.hash))
-        DisabledRemindersStore.gcStaleEntries(freshHashes: freshHashes, demo: demoActive)
+        DisabledRemindersStore.gcStaleEntries(freshHashes: freshHashes, since: started)
 
         // Sort: due-dated reminders ascending, then undated
         allReminders.sort { a, b in
@@ -233,7 +239,7 @@ enum ReminderBuilder {
             BackgroundSyncLogger.logDebug("[ReminderBuilder] Built reminder list: \(allReminders.count) total (\(messageCount) message + \(kbCount) KB, \(disabledCount) disabled)")
         }
 
-        return allReminders
+        return (allReminders, started)
     }
 
     // MARK: - Format for System Prompt
@@ -389,7 +395,7 @@ enum ReminderBuilder {
     @discardableResult
     private static func autoDisableOverdueOnFirstLaunch(
         _ reminders: [Reminder],
-        demo: Bool,
+        since started: UUID? = nil,
         defaults: UserDefaults = .standard
     ) -> Bool {
         guard !defaults.bool(forKey: didAutoDisableKey) else { return false }
@@ -420,7 +426,8 @@ enum ReminderBuilder {
         }
 
         // Epoch-zero timestamps ensure Device Sync always overrides these entries
-        DisabledRemindersStore.bulkDisableWithEpochZero(hashes: hashesToDisable, demo: demo)
+        // Refused when a demo switch came since the build started: nothing is marked done, the next build redoes it.
+        guard DisabledRemindersStore.bulkDisableWithEpochZero(hashes: hashesToDisable, since: started) else { return false }
         if !hashesToDisable.isEmpty {
             NotificationCenter.default.post(name: .remindersDidChange, object: nil)
         }
@@ -436,10 +443,10 @@ enum ReminderBuilder {
     @discardableResult
     static func testAutoDisableOverdue(
         _ reminders: [Reminder],
-        demo: Bool,
+        since started: UUID? = nil,
         defaults: UserDefaults = .standard
     ) -> Bool {
-        autoDisableOverdueOnFirstLaunch(reminders, demo: demo, defaults: defaults)
+        autoDisableOverdueOnFirstLaunch(reminders, since: started, defaults: defaults)
     }
 
     // MARK: - Message Reminder Collection

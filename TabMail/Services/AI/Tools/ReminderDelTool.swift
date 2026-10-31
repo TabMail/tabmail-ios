@@ -11,8 +11,9 @@ struct ReminderDelTool: AgentTool, Sendable {
     let name = "reminder_del"
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
-        // The target is fixed here, before the call's first suspension (DS-DEMO).
-        let demo = DemoModeStore.isDemoActive
+        // The email-reminder fallback awaits the reminder build before it writes, so it carries the change
+        // counter the call started with (DS-DEMO): a demo switch in between refuses its write.
+        let started = ChangeCounter.device.current
         guard case .string(let rawText) = arguments["text"] else {
             BackgroundSyncLogger.logDebug("[ReminderDelTool] Missing or empty 'text'")
             return #"{"error": "missing text"}"#
@@ -32,7 +33,7 @@ struct ReminderDelTool: AgentTool, Sendable {
         let textLower = text.lowercased()
         let found = await { @MainActor () async -> (matches: [String], outcome: PromptEditOutcome) in
             var matches: [String] = []
-            let outcome = await PromptStore.shared.edit("reminder_del tool", demo: demo) { hold in
+            let outcome = await PromptStore.shared.edit("reminder_del tool") { hold in
                 try hold.editText(.kb) { current in
                     matches = Self.reminderStatements(in: current, matching: textLower)
                     guard matches.count == 1 else { return nil }
@@ -49,7 +50,7 @@ struct ReminderDelTool: AgentTool, Sendable {
         if found.matches.isEmpty && found.outcome == .unchanged {
             // No KB match — search email-based (message) reminders and snooze if found
             BackgroundSyncLogger.logDebug("[ReminderDelTool] No KB match, searching message reminders...")
-            return await handleMessageReminderDeletion(text: text, textLower: textLower, demo: demo)
+            return await handleMessageReminderDeletion(text: text, textLower: textLower, since: started)
         }
 
         if found.matches.count > 1 {
@@ -95,7 +96,7 @@ struct ReminderDelTool: AgentTool, Sendable {
 
     /// Search message reminders and snooze (disable) if found.
     /// Matches TB's email-reminder fallback path in `reminder_del.js`.
-    private func handleMessageReminderDeletion(text: String, textLower: String, demo: Bool) async -> String {
+    private func handleMessageReminderDeletion(text: String, textLower: String, since started: UUID) async -> String {
         let allReminders = await ReminderBuilder.buildReminderList(includeDisabled: false)
         let messageMatches = allReminders.filter {
             $0.source == "message" && $0.content.lowercased().contains(textLower)
@@ -104,10 +105,9 @@ struct ReminderDelTool: AgentTool, Sendable {
         if messageMatches.count == 1 {
             let reminder = messageMatches[0]
             BackgroundSyncLogger.logDebug("[ReminderDelTool] Found email-reminder, snoozing: '\(reminder.content.prefix(140))'")
-            // The call's own target (DS-DEMO): a demo call whose demo ended while the reminders were built
-            // writes nothing and says so.
-            guard DisabledRemindersStore.setEnabled(hash: reminder.hash, enabled: false, demo: demo) else {
-                return #"{"error": "the demo ended before the reminder could be snoozed"}"#
+            // Refused, with nothing written, when the change counter moved since the call started (DS-DEMO).
+            guard DisabledRemindersStore.setEnabled(hash: reminder.hash, enabled: false, since: started) else {
+                return #"{"error": "could not save the change; try again"}"#
             }
             BackgroundSyncLogger.logDebug("[ReminderDelTool] Success (email-reminder snoozed)")
             let resultDict: [String: Any] = ["ok": true, "snoozed": reminder.content, "source": "email"]

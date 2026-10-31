@@ -15,8 +15,9 @@ struct TemplateToggleTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
-        // The target is fixed here, before the call's first suspension (DS-DEMO).
-        let demo = DemoModeStore.isDemoActive
+        // The call awaits (a confirmation, a lookup) before it writes, so it carries the change counter it started
+        // with (DS-DEMO): a demo switch, or any other change to the store, in between refuses its write.
+        let started = ChangeCounter.device.current
         guard let templateId = await TemplateToolHelpers.resolveTemplateId(arguments, translator: ctx.translator) else {
             return ToolJSON.string(from: ["error": "Template ID is required."])
         }
@@ -42,9 +43,9 @@ struct TemplateToggleTool: AgentTool, Sendable {
         let saved = await MainActor.run {
             var updated = template
             updated.enabled = enabled
-            return PromptStore.shared.updateTemplate(updated, demo: demo)
+            return PromptStore.shared.updateTemplate(updated, since: started)
         }
-        guard saved else { return ToolJSON.string(from: ["error": "The demo ended before the change could be saved."]) }
+        guard saved else { return ToolJSON.string(from: ["error": "Could not save the change; try again."]) }
 
         let verb = enabled ? "enabled" : "disabled"
         return ToolJSON.string(from: [

@@ -60,7 +60,7 @@ struct PromptHistoryView: View {
     /// The history, newest first, read through the prompt store; none when it refused.
     private func loadEntries() async {
         do {
-            entries = try await PromptStore.shared.withPromptStore("load prompt history", demo: DemoModeStore.isDemoActive) { try $0.loadHistory() }
+            entries = try await PromptStore.shared.withPromptStore("load prompt history") { try $0.loadHistory() }
                 .sorted(by: { $0.date > $1.date })
         } catch {
             BackgroundSyncLogger.logDebug("[PromptHistory] history not loaded: \(error)")

@@ -11,8 +11,6 @@ struct KBDelTool: AgentTool, Sendable {
     let name = "kb_del"
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
-        // The target is fixed here, before the call's first suspension (DS-DEMO).
-        let demo = DemoModeStore.isDemoActive
         guard case .string(let raw) = arguments["statement"] else {
             BackgroundSyncLogger.logDebug("[KBDelTool] Missing or empty 'statement'")
             return #"{"error": "missing statement"}"#
@@ -33,7 +31,7 @@ struct KBDelTool: AgentTool, Sendable {
         let edit = await { @MainActor () async -> (empty: Bool, edit: KBToolEdit) in
             var empty = false
             var patched = false
-            let outcome = await PromptStore.shared.edit("kb_del tool", demo: demo) { hold in
+            let outcome = await PromptStore.shared.edit("kb_del tool") { hold in
                 try hold.editText(.kb) { current in
                     guard !current.isEmpty else {
                         empty = true

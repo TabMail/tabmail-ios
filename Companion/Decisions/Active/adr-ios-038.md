@@ -477,3 +477,24 @@ This reverses the 2026-10-21 "replay lives only in the debug menu" decision. Wel
 Less time on email", button "Take the tour".
 
 ---
+
+**Amendment 2026-10-31 — a demo switch is one operation on the prompt semaphore; a switch in flight drops the work in flight (owner):**
+Entering or leaving the demo is a single hold on the prompt store's semaphore (`PromptStore.enterDemo()` /
+`leaveDemo()`): inside it the mode flag flips, the overlay is created (entry) or discarded (exit), the
+demo's reminder map is deleted at exit, and the change counter moves. The reminder map's flip and counter
+move happen together under its leaf lock (`DisabledRemindersStore.switching`), so no transaction sees the
+new mode with the old counter. Busy at the semaphore is retried (`switchAttempts`); a switch that still
+cannot take the hold leaves the mode unchanged.
+
+Every writer that waits between starting and writing (AI calls, marketplace download, tool confirmations,
+reminder builds, the email-snooze fallback) carries the counter it started with, and its write is refused if
+the counter moved; a refused write saves nothing and reports "could not save". The disabled-reminders
+writers compare the counter inside their lock transaction. Inside one hold the live mode is stable, so reads
+and display follow the live mode.
+
+This replaces the earlier mechanism of a required `demo:` argument on every store API, captured-target
+checks, `admits(demo:)` guards and the source-scanning `DemoFlagReadSitesTests` allowlist: capturing a mode
+at call start across an `await` kept producing a late-read sibling in every review round. Unchanged: the
+`demo.`-prefixed overlay keys, and demo writes never touch bullet state, labels, seen or history. Tests pin
+the invariant for each multi-step writer: a switch in either direction mid-flight leaves both stores
+unchanged and reports failure, and an uninterrupted control saves.

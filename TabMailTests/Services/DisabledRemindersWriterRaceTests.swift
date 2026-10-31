@@ -69,16 +69,15 @@ struct DisabledRemindersWriterRaceTests {
         _ defaults: ParkingDefaults, maintenance: @escaping @Sendable () -> Void
     ) async throws -> [String: DisabledRemindersStore.DisabledEntry] {
         try await race(defaults, parked: maintenance) {
-            DisabledRemindersStore.setEnabled(hash: "k:newer", enabled: false, demo: false)
-        }.real
+            DisabledRemindersStore.setEnabled(hash: "k:newer", enabled: false)
+        }
     }
 
     /// Runs `parked` off the main thread until it has read the map, then runs `other` from another thread,
-    /// and finishes both. With `enterDemo`, the demo starts while `other` waits for the lock and ends after
-    /// both finished. Returns the final real map and the demo's.
+    /// and finishes both. Returns the final map.
     private func race(
-        _ defaults: ParkingDefaults, enterDemo: Bool = false, parked: @escaping @Sendable () -> Void, other: @escaping @Sendable () -> Void
-    ) async throws -> (real: [String: DisabledRemindersStore.DisabledEntry], demo: [String: DisabledRemindersStore.DisabledEntry]) {
+        _ defaults: ParkingDefaults, parked: @escaping @Sendable () -> Void, other: @escaping @Sendable () -> Void
+    ) async throws -> [String: DisabledRemindersStore.DisabledEntry] {
         let box = DefaultsBox(defaults)
         let older = Task.detached { @Sendable [box] in
             DisabledRemindersStore.withTestDefaults(box.value, parked)
@@ -88,7 +87,7 @@ struct DisabledRemindersWriterRaceTests {
         guard defaults.parked else {
             defaults.release(); await older.value
             Issue.record("the maintenance writer never reached its read")
-            return ([:], [:])
+            return [:]
         }
         let userDone = Flag()
         let user = Task.detached { @Sendable [box] in
@@ -99,15 +98,11 @@ struct DisabledRemindersWriterRaceTests {
         // here; one that serializes the writers finishes it after the older one is released.
         let wait = ContinuousClock.now + .seconds(1)
         while !userDone.isSet, ContinuousClock.now < wait { try await Task.sleep(for: .milliseconds(20)) }
-        if enterDemo { DemoModeStore.shared.isActive = true }
         defaults.release()
         await older.value
         await user.value
-        if enterDemo { DemoModeStore.shared.isActive = false }
         #expect(!defaults.timedOut)
-        return DisabledRemindersStore.withTestDefaults(defaults) {
-            (DisabledRemindersStore.getDisabledMap(demo: false), DisabledRemindersStore.getDisabledMap(demo: true))
-        }
+        return DisabledRemindersStore.withTestDefaults(defaults) { DisabledRemindersStore.getDisabledMap() }
     }
 
     @Test("A first-launch suppression cannot replace a later user disable")
@@ -139,10 +134,10 @@ struct DisabledRemindersWriterRaceTests {
         let (defaults, suite) = try isolatedDefaults(seed: ["k:seed": .init(enabled: false, ts: Date().ISO8601Format())])
         defer { defaults.removePersistentDomain(forName: suite) }
         let result = try await race(defaults, parked: {
-            DisabledRemindersStore.setEnabled(hash: "k:newer", enabled: false, demo: false)
+            DisabledRemindersStore.setEnabled(hash: "k:newer", enabled: false)
         }, other: {
-            DisabledRemindersStore.bulkDisableWithEpochZero(hashes: ["k:older"], demo: false)
-        }).real
+            DisabledRemindersStore.bulkDisableWithEpochZero(hashes: ["k:older"])
+        })
         #expect(result["k:newer"]?.enabled == false, "the user's disable committed")
         #expect(result["k:older"]?.enabled == false, "the maintenance write remains")
         #expect(result["k:seed"]?.enabled == false, "the baseline entry remains")
@@ -159,108 +154,115 @@ struct DisabledRemindersWriterRaceTests {
         #expect(result["k:newer"]?.enabled == false, "the user's later disable remains")
     }
 
-    // MARK: - The writer's target is the one it took before it waited
+    // MARK: - DS-DEMO: a writer that started before a demo switch is refused after it
 
-    /// Each writer takes its target as its caller states it (`demo: false`), before it waits for the map lock; a demo
-    /// that starts while it waits must not move its write to the demo's map or its saved entries out of the real one.
-    private func writesTheRealMapWhenTheDemoStartsWhileItWaits(
-        seed: [String: DisabledRemindersStore.DisabledEntry], hash: String, writer: @escaping @Sendable () -> Void
-    ) async throws {
-        let (defaults, suite) = try isolatedDefaults(seed: seed)
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let demo = DemoModeStore.shared
-        demo._resetForTests()
-        defer { demo._resetForTests() }
-        let result = try await race(defaults, enterDemo: true, parked: {
-            DisabledRemindersStore.setEnabled(hash: "k:first", enabled: false, demo: false)
-        }, other: writer)
-        #expect(result.real["k:first"]?.enabled == false, "the writer that held the lock committed")
-        #expect(result.real["k:seed"]?.enabled == false, "the earlier entries remain")
-        #expect(result.real[hash]?.enabled == false, "the writer's entry is in the real map")
-        #expect(result.demo.isEmpty, "the demo's map stays empty: nothing moved there")
-    }
+    fileprivate enum Writer: String, CaseIterable, CustomStringConvertible {
+        case toggle, suppress, collect
+        var description: String { rawValue }
+        /// The entry this writer leaves in a map that holds `k:seed` and the stale `k:stale`.
+        var hash: String { self == .toggle ? "k:toggled" : self == .suppress ? "k:suppressed" : "k:stale" }
 
-    @Test("A first-launch suppression that waits for the lock writes the real map though the demo starts meanwhile")
-    func suppressionKeepsItsTarget() async throws {
-        try await writesTheRealMapWhenTheDemoStartsWhileItWaits(seed: ["k:seed": .init(enabled: false, ts: Date().ISO8601Format())], hash: "k:suppressed") {
-            DisabledRemindersStore.bulkDisableWithEpochZero(hashes: ["k:suppressed"], demo: false)
+        func run(since started: UUID) -> Bool {
+            switch self {
+            case .toggle: DisabledRemindersStore.setEnabled(hash: "k:toggled", enabled: false, since: started)
+            case .suppress: DisabledRemindersStore.bulkDisableWithEpochZero(hashes: ["k:suppressed"], since: started)
+            case .collect: DisabledRemindersStore.gcStaleEntries(freshHashes: [], since: started)
+            }
         }
     }
 
-    @Test("A received merge that waits for the lock writes the real map though the demo starts meanwhile")
-    func mergeKeepsItsTarget() async throws {
-        try await writesTheRealMapWhenTheDemoStartsWhileItWaits(seed: ["k:seed": .init(enabled: false, ts: Date().ISO8601Format())], hash: "k:peer") {
-            DisabledRemindersStore.mergeIncoming(["k:peer": .init(enabled: false, ts: Date().ISO8601Format())], demo: false)
+    private static let realKey = "disabled_reminders_v2"
+
+    /// The mode flips and the change counter moves in one transaction on the map lock, as a demo switch does.
+    private func flip(toDemo entering: Bool) {
+        DisabledRemindersStore.switching(toDemo: entering) {
+            DemoModeStore.shared.isActive = entering
+            ChangeCounter.device.renew()
         }
     }
 
-    @Test("A garbage collection that waits for the lock collects the real map though the demo starts meanwhile")
-    func collectionKeepsItsTarget() async throws {
-        let stale = Date().addingTimeInterval(-91 * 86400).ISO8601Format()
-        let (defaults, suite) = try isolatedDefaults(seed: ["k:stale": .init(enabled: false, ts: stale)])
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let demo = DemoModeStore.shared
-        demo._resetForTests()
-        defer { demo._resetForTests() }
-        let result = try await race(defaults, enterDemo: true, parked: {
-            DisabledRemindersStore.setEnabled(hash: "k:first", enabled: false, demo: false)
-        }, other: {
-            DisabledRemindersStore.gcStaleEntries(freshHashes: [], demo: false)
-        })
-        #expect(result.real["k:stale"] == nil, "the collection removed the stale entry from the real map")
-        #expect(result.real["k:first"]?.enabled == false)
-        #expect(result.demo.isEmpty)
-    }
-
-    @Test("A user toggle that waits for the lock writes the real map though the demo starts meanwhile")
-    func toggleKeepsItsTarget() async throws {
-        try await writesTheRealMapWhenTheDemoStartsWhileItWaits(seed: ["k:seed": .init(enabled: false, ts: Date().ISO8601Format())], hash: "k:toggled") {
-            DisabledRemindersStore.setEnabled(hash: "k:toggled", enabled: false, demo: false)
-        }
-    }
-
-    @Test("A demo-targeted change after the demo ended is refused and writes nothing, for every writer")
-    func demoWritesAreRefusedAfterTheDemoEnded() throws {
+    private func seededDefaults() throws -> (UserDefaults, String) {
         UserDefaults.standard.set(false, forKey: "device_sync_auto_enabled")
         DeviceSyncService.shared.disconnect()
-        let suite = "DemoEndedWrites." + UUID().uuidString
+        let suite = "tabmail.tests.disabled-reminders-switch." + UUID().uuidString
         let defaults = try #require(UserDefaults(suiteName: suite))
-        defer { defaults.removePersistentDomain(forName: suite) }
-        let demo = DemoModeStore.shared
-        demo._resetForTests()
-        defer { demo._resetForTests() }
-        DisabledRemindersStore.withTestDefaults(defaults) {
-            // Control: while the demo runs a demo-targeted change lands in the demo's map.
-            demo.isActive = true
-            #expect(DisabledRemindersStore.setEnabled(hash: "k:during", enabled: false, demo: true))
-            DisabledRemindersStore.mergeIncoming(["k:merged": .init(enabled: false, ts: Date().ISO8601Format())], demo: true)
-            DisabledRemindersStore.bulkDisableWithEpochZero(hashes: ["k:bulk"], demo: true)
-            #expect(DisabledRemindersStore.getDisabledMap(demo: true).keys.sorted() == ["k:bulk", "k:during", "k:merged"])
-            demo.isActive = false
-            DisabledRemindersStore.removeDemoMap()
+        let stale = Date().addingTimeInterval(-91 * 86400).ISO8601Format()
+        let seed: [String: DisabledRemindersStore.DisabledEntry] = [
+            "k:seed": .init(enabled: false, ts: Date().ISO8601Format()),
+            "k:stale": .init(enabled: false, ts: stale),
+        ]
+        defaults.set(try JSONEncoder().encode(seed), forKey: Self.realKey)
+        return (defaults, suite)
+    }
 
-            // After the demo: nothing is written to the demo's map, and the real map is untouched.
-            #expect(!DisabledRemindersStore.setEnabled(hash: "k:after", enabled: false, demo: true))
-            DisabledRemindersStore.mergeIncoming(["k:merged": .init(enabled: false, ts: Date().ISO8601Format())], demo: true)
-            DisabledRemindersStore.bulkDisableWithEpochZero(hashes: ["k:bulk"], demo: true)
-            DisabledRemindersStore.gcStaleEntries(freshHashes: [], demo: true)
-            #expect(defaults.data(forKey: DisabledRemindersStore.demoStorageKeyV2) == nil, "no demo map was left behind")
-            #expect(DisabledRemindersStore.getDisabledMap(demo: false).isEmpty)
+    @Test("A writer that started before the demo was entered is refused after it and changes neither map; a fresh one saves", arguments: Writer.allCases)
+    fileprivate func refusedAfterEntry(_ writer: Writer) throws {
+        let (defaults, suite) = try seededDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        DemoModeStore.shared._resetForTests()
+        defer { DemoModeStore.shared._resetForTests() }
+        DisabledRemindersStore.withTestDefaults(defaults) {
+            let realBefore = defaults.data(forKey: Self.realKey)
+            let started = ChangeCounter.device.current
+            flip(toDemo: true)
+            #expect(!writer.run(since: started), "\(writer): the switch moved the counter, so the write is refused")
+            #expect(defaults.data(forKey: Self.realKey) == realBefore, "\(writer): the real map is unchanged")
+            #expect(defaults.data(forKey: DisabledRemindersStore.demoStorageKeyV2) == nil, "\(writer): nothing reached the demo's map")
+            // Control: a writer that started in the demo saves to the demo's map, and only there.
+            #expect(writer.run(since: ChangeCounter.device.current), "\(writer): control saves")
+            #expect(defaults.data(forKey: Self.realKey) == realBefore, "\(writer): the control left the real map alone")
+            flip(toDemo: false)
         }
     }
 
-    @Test("A demo writer holding the map when the demo ends lands before the demo's map is removed, so none outlives the demo")
+    @Test("A writer that started in the demo is refused after it was left and changes neither map; a fresh one saves", arguments: Writer.allCases)
+    fileprivate func refusedAfterExit(_ writer: Writer) throws {
+        let (defaults, suite) = try seededDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        DemoModeStore.shared._resetForTests()
+        defer { DemoModeStore.shared._resetForTests() }
+        DisabledRemindersStore.withTestDefaults(defaults) {
+            flip(toDemo: true)
+            let realBefore = defaults.data(forKey: Self.realKey)
+            let started = ChangeCounter.device.current
+            flip(toDemo: false)
+            #expect(!writer.run(since: started), "\(writer): the switch moved the counter, so the write is refused")
+            #expect(defaults.data(forKey: Self.realKey) == realBefore, "\(writer): the real map is unchanged")
+            #expect(defaults.data(forKey: DisabledRemindersStore.demoStorageKeyV2) == nil, "\(writer): no demo map was left behind")
+            // Control: a writer that started after the exit saves to the real map.
+            #expect(writer.run(since: ChangeCounter.device.current), "\(writer): control saves")
+            #expect(defaults.data(forKey: Self.realKey) != realBefore, "\(writer): the control changed the real map")
+        }
+    }
+
+    @Test("Leaving the demo deletes the demo's map in the same transaction as the flip")
+    func leavingDeletesTheDemoMap() throws {
+        let (defaults, suite) = try seededDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        DemoModeStore.shared._resetForTests()
+        defer { DemoModeStore.shared._resetForTests() }
+        DisabledRemindersStore.withTestDefaults(defaults) {
+            flip(toDemo: true)
+            #expect(DisabledRemindersStore.setEnabled(hash: "k:demo", enabled: false))
+            #expect(defaults.data(forKey: DisabledRemindersStore.demoStorageKeyV2) != nil)
+            flip(toDemo: false)
+            #expect(defaults.data(forKey: DisabledRemindersStore.demoStorageKeyV2) == nil, "the demo's map did not survive the exit")
+            #expect(!DemoModeStore.isDemoActive)
+        }
+    }
+
+    @Test("A demo writer holding the map when the demo is left lands first, so no demo map outlives the demo")
     func demoMapDoesNotOutliveTheDemo() async throws {
         let (defaults, suite) = try isolatedDefaults(seed: [:])
         defaults.parkKey = DisabledRemindersStore.demoStorageKeyV2
         defer { defaults.removePersistentDomain(forName: suite); DemoModeStore.shared._resetForTests() }
         DemoModeStore.shared._resetForTests()
-        try await DemoModeService.shared.start(mintToken: false)
-        PromptStore.shared.enterDemoOverlay()
+        try await PromptStore.shared.enterDemo()
         let box = DefaultsBox(defaults)
+        let started = ChangeCounter.device.current
         let writer = Task.detached { @Sendable [box] in
             DisabledRemindersStore.withTestDefaults(box.value) {
-                _ = DisabledRemindersStore.setEnabled(hash: "k:demo", enabled: false, demo: true)
+                _ = DisabledRemindersStore.setEnabled(hash: "k:demo", enabled: false, since: started)
             }
         }
         let end = ContinuousClock.now + .seconds(10)
@@ -268,22 +270,22 @@ struct DisabledRemindersWriterRaceTests {
         guard defaults.parked else {
             defaults.release(); await writer.value
             Issue.record("the demo writer never reached its read")
-            await DemoModeService.shared.exit()
+            try await PromptStore.shared.leaveDemo()
             return
         }
-        // The writer is admitted and holds the lock. It is let go only once the flag is off: a removal that
-        // runs before the flip waits on the lock the writer still holds, so nothing releases the writer.
+        // The writer holds the map lock; the exit's flip waits for it, so the writer's own compare sees the old
+        // counter and it commits to the demo's map before the flip removes that map.
+        // The release comes from a task off the main actor: the exit's flip blocks the main thread on the lock.
         let releaser = Task.detached { @Sendable [box] in
-            let deadline = ContinuousClock.now + .seconds(60)
-            while DemoModeStore.isDemoActive, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(10)) }
-            // Never released while the flag is on: the writer's own park timeout then fails the test.
-            if !DemoModeStore.isDemoActive { box.value.release() }
+            try? await Task.sleep(for: .milliseconds(300))
+            box.value.release()
         }
-        let exiting = DisabledRemindersStore.withTestDefaults(defaults) { Task { await DemoModeService.shared.exit() } }
-        await exiting.value
-        await writer.value
+        let leaving = DisabledRemindersStore.withTestDefaults(defaults) { Task { @MainActor in try await PromptStore.shared.leaveDemo() } }
+        try await leaving.value
         await releaser.value
-        #expect(!defaults.timedOut, "the demo's end waited for a writer that waited for it")
+        await writer.value
+        #expect(!defaults.timedOut)
+        #expect(!DemoModeStore.isDemoActive)
         #expect(defaults.data(forKey: DisabledRemindersStore.demoStorageKeyV2) == nil, "a demo map outlived the demo")
     }
 

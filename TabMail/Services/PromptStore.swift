@@ -120,13 +120,11 @@ enum PromptSection: CaseIterable, Sendable {
 /// A field as an editor read it, with the labels it showed (DS-CAPTURE, DS-DISPLAYED): `commitEdit`
 /// deletes only those of them whose text the edit removed, so a bullet that arrives while it is open is
 /// never deleted by it. It carries the store's change counter as it was read (DS-COUNTER): an AI writer's
-/// commit (DS-AI) is refused once that moved. The demo flag is snapshotted here (DS-DEMO): a capture taken
-/// in the demo commits only to the demo, and one taken outside it only outside.
+/// commit (DS-AI) is refused once that moved, which a demo switch does too (DS-DEMO).
 struct PromptCapture: Sendable {
     let field: BulletField
     let text: String
     fileprivate let labels: [Bullet]
-    fileprivate let demo: Bool
     fileprivate let counter: UUID
 }
 
@@ -134,8 +132,8 @@ enum PromptEditOutcome: Equatable, Sendable {
     case saved, unchanged
     /// It couldn't be saved; nothing changed.
     case unsaved
-    /// An AI writer's counter moved since its read (DS-AI), the hold ran past its lease (DS-LEASE), or demo
-    /// mode started or ended since the read (DS-DEMO): the write is dropped.
+    /// A writer's counter moved since its read (DS-AI), which a demo switch does too (DS-DEMO), or the hold ran
+    /// past its lease (DS-LEASE): the write is dropped.
     case dropped
     /// The prompt store stayed held for the whole wait (DS-SEMAPHORE): nothing changed; try again in a
     /// moment.
@@ -157,20 +155,16 @@ enum PromptReadOutcome: Sendable {
 struct PromptAccess {
     fileprivate let store: PromptStore
     let hold: PromptHold
-    /// The target this access was asked for, demo or real, fixed when the operation was created and never
-    /// re-read (DS-DEMO): every call goes to that target. A demo access is refused once the demo ended (its
-    /// overlay is discarded); a real access is not affected by a demo that started since.
-    fileprivate let demo: Bool
 
     private func check() throws {
-        guard hold.isHolder, !demo || DemoModeStore.isDemoActive else { throw PromptRefusal.changed }
+        guard hold.isHolder else { throw PromptRefusal.changed }
     }
 
     /// `field`'s text now, and the labels it shows, to change and pass to `commitEdit`. Nil while an
     /// upgrade is unsaved (DS-UNSAVED-UPGRADE).
     func readForEdit(_ field: BulletField) throws -> PromptCapture? {
         try check()
-        return store.readForEdit(field, counter: hold.counter, demo: demo)
+        return store.readForEdit(field, counter: hold.counter)
     }
 
     /// Saves `text` as the captured field's new text (DS-CAPTURE).
@@ -190,50 +184,50 @@ struct PromptAccess {
     /// one, or nil to leave it.
     func editText(_ field: BulletField, _ transform: (String) -> String?) throws -> PromptEditOutcome {
         try check()
-        guard let capture = store.readForEdit(field, counter: hold.counter, demo: demo) else { return .unsaved }
+        guard let capture = store.readForEdit(field, counter: hold.counter) else { return .unsaved }
         guard let updated = transform(capture.text) else { return .unchanged }
         return store.commitEdit(capture, text: updated)
     }
 
     func addBullet(_ text: String, to section: PromptSection) throws -> PromptEditOutcome {
         try check()
-        return store.addBullet(text, to: section, demo: demo)
+        return store.addBullet(text, to: section)
     }
 
     /// DS-DISPLAYED: deletes exactly the labels `shown` carried when it was displayed, those still live.
     /// `.unchanged` means they were already removed.
     func deleteShown(_ shown: ShownBullet, from section: PromptSection) throws -> PromptEditOutcome {
         try check()
-        return store.deleteShown(shown, from: section, demo: demo)
+        return store.deleteShown(shown, from: section)
     }
 
     /// DS-RESET of `field`.
     func reset(_ field: BulletField) throws {
         try check()
-        store.resetBullets(field, demo: demo)
+        store.resetBullets(field)
     }
 
     /// A history entry of the stored values now (DS-HISTORY).
     func recordHistory(source: String, fields: [String]) throws {
         try check()
-        store.recordHistory(source: source, fields: fields, demo: demo)
+        store.recordHistory(source: source, fields: fields)
     }
 
     func loadHistory() throws -> [PromptHistoryEntry] {
         try check()
-        return store.loadHistory(demo: demo)
+        return store.loadHistory()
     }
 
     func saveHistory(_ entries: [PromptHistoryEntry]) throws {
         try check()
-        guard !demo else { throw PromptRefusal.changed }
+        guard !DemoModeStore.isDemoActive else { throw PromptRefusal.changed }
         store.saveHistory(entries)
     }
 
     /// DS-RESTORE.
     func restoreFromHistory(_ entry: PromptHistoryEntry) throws {
         try check()
-        store.restoreFromHistory(entry, demo: demo)
+        store.restoreFromHistory(entry)
     }
 
     /// A message from the connection (DS-VALIDATE): a `bullet_state` merged, a released device's
@@ -241,14 +235,14 @@ struct PromptAccess {
     @discardableResult
     func receive(_ message: [String: Any]) throws -> BulletReceiveResult {
         try check()
-        guard !demo else { throw PromptRefusal.changed }
+        guard !DemoModeStore.isDemoActive else { throw PromptRefusal.changed }
         return store.bullets.receive(message)
     }
 
     /// Connected: every bullet field's state goes out (DS-SEND).
     func sendAll() throws {
         try check()
-        guard !demo else { throw PromptRefusal.changed }
+        guard !DemoModeStore.isDemoActive else { throw PromptRefusal.changed }
         store.bullets.connected()
     }
 }
@@ -279,11 +273,6 @@ final class PromptStore {
     /// DS-SEMAPHORE: this device's one semaphore for the knowledge base, writing style and action rules.
     @ObservationIgnored let semaphore: PromptSemaphore
 
-    /// Whether the demo's templates are the ones `templates` holds: true from `enterDemoOverlay` to
-    /// `exitDemoOverlay`. The store's own record of what it shows, so a template change decides where to land by
-    /// this and by the target its caller took (DS-DEMO), never by a read of the live demo flag.
-    @ObservationIgnored private(set) var showsDemoOverlay = false
-
     /// Debounce task for recording history on local edits (2s quiet period).
     private var historyDebounceTask: Task<Void, Never>?
     private var pendingHistoryFields: Set<String> = []
@@ -300,7 +289,7 @@ final class PromptStore {
     private(set) var rawKB: String
 
     /// Reply templates as shown (JSON-encoded, same format as TB's `user_templates`): the demo's while the demo
-    /// overlay is shown. Changed only by `commitTemplates`.
+    /// is active. Changed only by `commitTemplates` and the demo switch.
     private(set) var templates: [ReplyTemplate]
 
     // MARK: - Sections (for Settings)
@@ -348,7 +337,7 @@ final class PromptStore {
         self.catalog = catalog
         self.bulletStore = bulletStore
         self.bullets = bullets
-        semaphore = PromptSemaphore()
+        semaphore = PromptSemaphore(counter: .device)
         rawComposition = bullets.rendered(.composition)
         rawAction = bullets.rendered(.action)
         rawKB = bullets.rendered(.kb)
@@ -438,8 +427,8 @@ final class PromptStore {
         // DS-HISTORY: a reset records the text it replaces, a merge the text before the merge, in the
         // committing hold and before the commit.
         switch kind {
-        case .reset: return recordHistory(source: "reset", fields: changedText.map(\.rawValue), demo: false)
-        case .sync: return recordHistory(source: "sync_receive", fields: changedText.map(\.rawValue), demo: false)
+        case .reset: return recordHistory(source: "reset", fields: changedText.map(\.rawValue))
+        case .sync: return recordHistory(source: "sync_receive", fields: changedText.map(\.rawValue))
         case .edit, .upgrade: return true
         }
     }
@@ -467,20 +456,20 @@ final class PromptStore {
     /// the AI: an AI writer reads with `readBeforeAI`, calls the AI holding nothing, and writes with
     /// `writeAfterRead`. Throws `PromptRefusal` (busy, or the hold lost the semaphore).
     ///
-    /// `demo` is the target, fixed when the operation is created (DS-DEMO), before it waits for the
-    /// semaphore: if the mode changed by the time it runs, every call of its access is refused.
-    func withPromptStore<T>(_ label: String, demo: Bool,
+    /// Inside a hold the mode cannot change (a demo switch is a hold too, DS-DEMO), so a brief body reads
+    /// the live mode.
+    func withPromptStore<T>(_ label: String,
                             _ body: @MainActor (PromptAccess) async throws -> T) async throws -> T {
         try await semaphore.hold(label) { hold in
-            try await body(PromptAccess(store: self, hold: hold, demo: demo))
+            try await body(PromptAccess(store: self, hold: hold))
         }
     }
 
     /// One brief read-change-save through `withPromptStore`, its refusal as the outcome.
-    func edit(_ label: String, demo: Bool,
+    func edit(_ label: String,
               _ body: @MainActor (PromptAccess) throws -> PromptEditOutcome) async -> PromptEditOutcome {
         do {
-            return try await withPromptStore(label, demo: demo) { try body($0) }
+            return try await withPromptStore(label) { try body($0) }
         } catch {
             return Self.outcome(error)
         }
@@ -490,16 +479,14 @@ final class PromptStore {
     /// handler stays synchronous.
     @discardableResult
     func gesture(_ label: String, _ body: @escaping @MainActor (PromptAccess) throws -> PromptEditOutcome) -> Task<PromptEditOutcome, Never> {
-        // The target is fixed here, when the gesture is made, not when its task first runs (DS-DEMO).
-        let demo = DemoModeStore.isDemoActive
-        return Task { await self.edit(label, demo: demo, body) }
+        Task { await self.edit(label, body) }
     }
 
     /// An AI writer's read (DS-AI step 1), in one brief hold: `field` now and the labels it shows, with
     /// the change counter as read.
     func readBeforeAI(_ field: BulletField, _ label: String) async -> PromptReadOutcome {
         do {
-            return try await withPromptStore(label, demo: DemoModeStore.isDemoActive) { access in
+            return try await withPromptStore(label) { access in
                 guard let capture = try access.readForEdit(field) else { return .refused(.unsaved) }
                 return .read(capture)
             }
@@ -511,7 +498,7 @@ final class PromptStore {
     /// An AI writer's write (DS-AI step 3), in a second brief hold: refused with nothing written when the
     /// counter moved since `readBeforeAI`. The result is then dropped.
     func writeAfterRead(_ capture: PromptCapture, text: String, _ label: String) async -> PromptEditOutcome {
-        await edit(label, demo: capture.demo) { try $0.commitAIEdit(capture, text: text) }
+        await edit(label) { try $0.commitAIEdit(capture, text: text) }
     }
 
     /// A refusal as an edit's outcome.
@@ -534,26 +521,21 @@ final class PromptStore {
     /// `field`'s text now, and the labels it shows, to change and pass to `commitEdit`. Nil while an
     /// upgrade is unsaved (DS-UNSAVED-UPGRADE): the field can't be saved, so the caller reports that and
     /// stops.
-    fileprivate func readForEdit(_ field: BulletField, counter: UUID, demo: Bool) -> PromptCapture? {
-        if demo {
-            return PromptCapture(field: field, text: raw(field), labels: [], demo: true, counter: counter)
+    fileprivate func readForEdit(_ field: BulletField, counter: UUID) -> PromptCapture? {
+        if DemoModeStore.isDemoActive {
+            return PromptCapture(field: field, text: raw(field), labels: [], counter: counter)
         }
         let (text, captured) = bullets.readForEdit(field)
         guard let captured else {
             BackgroundSyncLogger.logDebug("[PromptStore] \(field.rawValue) read for editing refused: its upgrade is unsaved")
             return nil
         }
-        return PromptCapture(field: field, text: text, labels: captured, demo: false, counter: counter)
+        return PromptCapture(field: field, text: text, labels: captured, counter: counter)
     }
 
     /// Saves `text` as the captured field's new text (DS-CAPTURE). Device Sync sends it.
     fileprivate func commitEdit(_ capture: PromptCapture, text: String) -> PromptEditOutcome {
-        if capture.demo {
-            // The demo overlay it was read from is discarded when the demo ends.
-            guard DemoModeStore.isDemoActive else {
-                BackgroundSyncLogger.logDebug("[PromptStore] \(capture.field.rawValue) demo edit dropped: the demo ended since it was read")
-                return .dropped
-            }
+        if DemoModeStore.isDemoActive {
             guard !Bullets.same(text, raw(capture.field)) else { return .unchanged }
             setDemoText(capture.field, text)
             return .saved
@@ -572,14 +554,14 @@ final class PromptStore {
 
     /// DS-ADD of `text`'s lines to `section`, each not already there; nothing when a line holds a
     /// section marker.
-    fileprivate func addBullet(_ text: String, to section: PromptSection, demo: Bool) -> PromptEditOutcome {
+    fileprivate func addBullet(_ text: String, to section: PromptSection) -> PromptEditOutcome {
         let items = Bullets.parse(.kb, text).bullets.map { BulletItem(section: section.key, text: $0.text) }
         guard !items.isEmpty else { return .unchanged }
         guard !Self.holdsSectionMarker(text, in: section) else {
             BackgroundSyncLogger.logDebug("[PromptStore] \(section.key) line refused: it holds a section marker")
             return .unchanged
         }
-        if demo {
+        if DemoModeStore.isDemoActive {
             return editSectionInDemo(section) { texts in
                 texts + items.map(\.text).filter { text in !texts.contains { Bullets.same($0, text) } }
             }
@@ -588,8 +570,8 @@ final class PromptStore {
     }
 
     /// DS-DISPLAYED of a shown bullet: exactly its labels, never a re-capture by text.
-    fileprivate func deleteShown(_ shown: ShownBullet, from section: PromptSection, demo: Bool) -> PromptEditOutcome {
-        if demo {
+    fileprivate func deleteShown(_ shown: ShownBullet, from section: PromptSection) -> PromptEditOutcome {
+        if DemoModeStore.isDemoActive {
             return editSectionInDemo(section) { texts in texts.filter { !Bullets.same($0, shown.text) } }
         }
         return Self.outcome(bullets.deleteShown(section.field, labels: shown.labels))
@@ -711,19 +693,19 @@ final class PromptStore {
     // then sent, so peers' bullets come back (DS-MERGE). The templates keep an epoch-zero timestamp and
     // ask peers.
 
-    fileprivate func resetBullets(_ field: BulletField, demo: Bool) {
+    fileprivate func resetBullets(_ field: BulletField) {
         // Demo overlay: reset the overlay only — no history, no sync.
-        if demo {
+        if DemoModeStore.isDemoActive {
             setDemoText(field, Self.defaultText(field, catalog: catalog))
             return
         }
         bullets.reset([field])
     }
 
-    func resetTemplates(demo: Bool) {
-        if demo { commitTemplates(Defaults.templates, demo: true, echo: false); return }
-        guard recordHistory(source: "reset", fields: ["templates"], demo: false) else { return }
-        commitTemplates(Defaults.templates, demo: false, echo: false)
+    func resetTemplates() {
+        if DemoModeStore.isDemoActive { commitTemplates(Defaults.templates, echo: false); return }
+        guard recordHistory(source: "reset", fields: ["templates"]) else { return }
+        commitTemplates(Defaults.templates, echo: false)
         DeviceSyncService.shared.markFieldAsReset(.templates)
     }
 
@@ -736,41 +718,44 @@ final class PromptStore {
 
     /// Every template the person creates (settings, marketplace, chat) comes
     /// through here; Device Sync merges through `mergeTemplates` instead.
+    ///
+    /// A template writer that awaited between its start and its write (a download, a confirmation) passes the
+    /// change counter it started with as `since` (DS-DEMO, DS-AI): false when that moved, and nothing was
+    /// written. A brief writer (a tap) passes nothing.
     @discardableResult
-    func addTemplate(_ template: ReplyTemplate, demo: Bool) -> Bool {
-        guard commitTemplates(templates(for: demo) + [template], demo: demo, echo: true) else { return false }
+    func addTemplate(_ template: ReplyTemplate, since started: UUID? = nil) -> Bool {
+        guard commitTemplates(templates + [template], since: started, echo: true) else { return false }
         TutorialCoordinator.shared.discovered(.template)
         return true
     }
 
     @discardableResult
-    func deleteTemplate(id: String, demo: Bool) -> Bool {
-        var all = templates(for: demo)
+    func deleteTemplate(id: String, since started: UUID? = nil) -> Bool {
+        var all = templates
         guard let index = all.firstIndex(where: { $0.id == id }) else { return false }
         var template = all[index]
         template.deleted = true
         template.deletedAt = .now
         template.updatedAt = .now
         all[index] = template
-        return commitTemplates(all, demo: demo, echo: true)
+        return commitTemplates(all, since: started, echo: true)
     }
 
     @discardableResult
-    func updateTemplate(_ template: ReplyTemplate, demo: Bool) -> Bool {
-        var all = templates(for: demo)
+    func updateTemplate(_ template: ReplyTemplate, since started: UUID? = nil) -> Bool {
+        var all = templates
         guard let index = all.firstIndex(where: { $0.id == template.id }) else { return false }
         var updated = template
         updated.updatedAt = .now
         all[index] = updated
-        return commitTemplates(all, demo: demo, echo: true)
+        return commitTemplates(all, since: started, echo: true)
     }
 
     /// CRDT per-template merge: per-id, newer updatedAt wins.
     /// Used for incoming Device Sync instead of full-array replacement.
-    func mergeTemplates(_ incoming: [ReplyTemplate], demo: Bool) {
-        let local = templates(for: demo)
+    func mergeTemplates(_ incoming: [ReplyTemplate]) {
         var localMap: [String: ReplyTemplate] = [:]
-        for t in local { localMap[t.id] = t }
+        for t in templates { localMap[t.id] = t }
 
         var merged = 0
         for inTemplate in incoming {
@@ -786,23 +771,22 @@ final class PromptStore {
         }
 
         if merged > 0 {
-            commitTemplates(Array(localMap.values), demo: demo, echo: true)
+            commitTemplates(Array(localMap.values), echo: true)
         }
         BackgroundSyncLogger.logDebug("[PromptStore] CRDT template merge: \(merged) adopted from \(incoming.count) incoming (total: \(localMap.count))")
     }
 
     /// GC deleted template tombstones older than 90 days.
-    func gcDeletedTemplates(demo: Bool) {
+    func gcDeletedTemplates() {
         let now = Date()
         let gcAgeDays = 90
-        let all = templates(for: demo)
-        let kept = all.filter { t in
+        let kept = templates.filter { t in
             guard t.deleted, let deletedAt = t.deletedAt else { return true }
             return now.timeIntervalSince(deletedAt) <= Double(gcAgeDays * 86400)
         }
-        let removed = all.count - kept.count
+        let removed = templates.count - kept.count
         if removed > 0 {
-            commitTemplates(kept, demo: demo, echo: true)
+            commitTemplates(kept, echo: true)
             BackgroundSyncLogger.logDebug("[PromptStore] GC removed \(removed) deleted template tombstones older than \(gcAgeDays) days")
         }
     }
@@ -811,76 +795,100 @@ final class PromptStore {
 
     /// Replaces the templates (a history restore) without sending them. The callers record the history entry
     /// (DS-HISTORY).
-    func applySyncedTemplates(_ templates: [ReplyTemplate], demo: Bool) {
-        commitTemplates(templates, demo: demo, echo: false)
+    func applySyncedTemplates(_ templates: [ReplyTemplate]) {
+        commitTemplates(templates, echo: false)
     }
 
-    /// The templates a change with target `demo` starts from: the real ones, from their key while the demo
-    /// overlay is the one shown.
-    private func templates(for demo: Bool) -> [ReplyTemplate] {
-        if demo || !showsDemoOverlay { return templates }
-        return realTemplatesFromStorage()
-    }
-
-    private func realTemplatesFromStorage() -> [ReplyTemplate] {
+    private func storedTemplates() -> [ReplyTemplate] {
         defaults.data(forKey: Keys.templates).flatMap { try? JSONDecoder().decode([ReplyTemplate].self, from: $0) } ?? []
     }
 
-    private func persistTemplates(_ all: [ReplyTemplate], demo: Bool) {
-        guard let data = try? JSONEncoder().encode(all) else { return }
-        defaults.set(data, forKey: demo ? "demo.\(Keys.templates)" : Keys.templates)
-    }
-
-    /// The one place the templates change (DS-DEMO). A demo-targeted change lands only while the demo's
-    /// templates are the ones shown, and is refused (false) after the demo ended. A real-targeted change is
-    /// saved to the real key always; it is shown, sent and recorded only while the real templates are the ones
-    /// shown, and while the demo's are shown the real ones are shown again at the demo's exit.
+    /// The one place the templates change. In the demo they are the overlay's, saved under the demo's key and
+    /// never sent or recorded; the mode cannot change between a caller's read and this write, because a switch
+    /// is a hold and a MainActor caller does not suspend between them (DS-DEMO). False, with nothing written,
+    /// when `since` moved: the change counter a writer that awaited took when it started.
     @discardableResult
-    private func commitTemplates(_ all: [ReplyTemplate], demo: Bool, echo: Bool) -> Bool {
-        if demo {
-            guard showsDemoOverlay else { return false }
-            templates = all
-            persistTemplates(all, demo: true)
-            return true
+    private func commitTemplates(_ all: [ReplyTemplate], since started: UUID? = nil, echo: Bool) -> Bool {
+        if let started, semaphore.counter != started {
+            BackgroundSyncLogger.logDebug("[PromptStore] A template change was refused: the store changed since it started")
+            return false
         }
-        persistTemplates(all, demo: false)
-        guard !showsDemoOverlay else { return true }
+        guard let data = try? JSONEncoder().encode(all) else { return false }
+        let demo = DemoModeStore.isDemoActive
+        defaults.set(data, forKey: demo ? "demo.\(Keys.templates)" : Keys.templates)
         templates = all
-        if echo {
+        if echo && !demo {
             DeviceSyncService.shared.debouncedBroadcast(fields: [.templates])
             debouncedRecordHistory(field: "templates")
         }
         return true
     }
 
-    // MARK: - Demo overlay lifecycle (ADR-IOS-038)
+    // MARK: - Demo switch and overlay (ADR-IOS-038)
 
-    /// Enter the demo prompt overlay: swap all four prompt fields to the
-    /// bundled defaults. MUST be called with demo already active
-    /// (`DemoModeStore.isDemoActive == true`) so the demo-targeted commits persist to the
-    /// demo keys and skip NSE mirror / Device Sync / history. The real values
-    /// stay untouched in their real UserDefaults keys.
+    /// DS-DEMO: entering the demo is an operation on the semaphore, like every write. In its hold the mode
+    /// flips, the overlay is created and the change counter moves, so nothing started before the switch
+    /// (an AI call, a download, a confirmation, a reminder build) saves after it. Throws when the semaphore
+    /// stayed held through every attempt: the demo stays off.
+    func enterDemo() async throws {
+        try await switchDemo(label: "demo enter") {
+            DisabledRemindersStore.switching(toDemo: true) {
+                DemoModeStore.shared.isActive = true
+                semaphore.renewCounter()
+            }
+            enterDemoOverlay()
+        }
+    }
+
+    /// DS-DEMO: leaving the demo, in a hold as `enterDemo`: the overlay is discarded, the mode flips and
+    /// the demo's reminder map is deleted, and the change counter moves.
+    func leaveDemo() async throws {
+        try await switchDemo(label: "demo exit") {
+            exitDemoOverlay()
+            DisabledRemindersStore.switching(toDemo: false) {
+                DemoModeStore.shared.isActive = false
+                semaphore.renewCounter()
+            }
+        }
+    }
+
+    private func switchDemo(label: String, _ body: @MainActor () -> Void) async throws {
+        var attempt = 1
+        while true {
+            do {
+                try await withPromptStore(label) { _ in
+                    body()
+                    // A cached reminder list is of the mode it was built in.
+                    ReminderBuilder.invalidateCache()
+                }
+                return
+            } catch let refusal as PromptRefusal where refusal == .busy && attempt < semaphore.config.switchAttempts {
+                attempt += 1
+            }
+        }
+    }
+
+    /// Swap all four prompt fields to the bundled defaults, with the demo already active, so the commits
+    /// persist to the demo keys and skip NSE mirror / Device Sync / history. The real values stay untouched
+    /// in their real UserDefaults keys.
     func enterDemoOverlay() {
         assert(DemoModeStore.isDemoActive, "enterDemoOverlay requires demo active")
         // The three rendered keys are written with the shown text, so the background snapshots read the
-        // overlay from the first moment (DS-DEMO).
+        // overlay from the first moment.
         setDemoText(.composition, Defaults.composition)
         setDemoText(.action, Defaults.action)
         setDemoText(.kb, Defaults.kb)
-        showsDemoOverlay = true
-        commitTemplates(Defaults.templates, demo: true, echo: false)
+        commitTemplates(Defaults.templates, echo: false)
         BackgroundSyncLogger.logDebug("[PromptStore] Demo prompt overlay ACTIVE (defaults seeded)")
     }
 
-    /// Exit the demo prompt overlay: restore the real values from the real keys and delete the demo keys.
-    /// MUST be called while demo is STILL active (before `DemoModeStore.isActive` flips false).
+    /// Restore the real values from the real keys and delete the demo keys, while the demo is still active.
     func exitDemoOverlay() {
         assert(DemoModeStore.isDemoActive, "exitDemoOverlay requires demo still active")
         rawComposition = bullets.rendered(.composition)
         rawAction = bullets.rendered(.action)
         rawKB = bullets.rendered(.kb)
-        showsDemoOverlay = false
-        templates = realTemplatesFromStorage()
+        templates = storedTemplates()
         Self.removeDemoOverlayKeys()
         BackgroundSyncLogger.logDebug("[PromptStore] Demo prompt overlay REMOVED (real prompts restored)")
     }
@@ -938,7 +946,7 @@ final class PromptStore {
             let fields = Array(self.pendingHistoryFields)
             self.pendingHistoryFields = []
             do {
-                try await self.withPromptStore("history record", demo: false) { access in
+                try await self.withPromptStore("history record") { access in
                     try access.recordHistory(source: "local_edit", fields: fields)
                 }
             } catch {
@@ -951,13 +959,11 @@ final class PromptStore {
     /// whose history reads as empty: the real history is kept as it is.
     /// False when the entry could not be saved (DS-HISTORY).
     @discardableResult
-    fileprivate func recordHistory(source: String, fields: [String], demo: Bool) -> Bool {
-        guard !demo else { return true }
+    fileprivate func recordHistory(source: String, fields: [String]) -> Bool {
+        guard !DemoModeStore.isDemoActive else { return true }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        // The templates as saved under their real key: while a demo is shown, `templates` holds the overlay.
-        let realTemplates = realTemplatesFromStorage()
-        guard let templatesData = try? encoder.encode(realTemplates), let templatesStr = String(data: templatesData, encoding: .utf8) else {
+        guard let templatesData = try? encoder.encode(templates), let templatesStr = String(data: templatesData, encoding: .utf8) else {
             BackgroundSyncLogger.logDebug("[PromptStore] history entry not recorded: the templates could not be encoded")
             return false
         }
@@ -973,7 +979,7 @@ final class PromptStore {
             templatesJSON: templatesStr
         )
 
-        var history = loadHistory(demo: false)
+        var history = loadHistory()
         history.append(entry)
         if history.count > Self.maxHistoryEntries {
             history = Array(history.suffix(Self.maxHistoryEntries))
@@ -983,8 +989,8 @@ final class PromptStore {
 
     /// Load all history entries (newest last). Empty during demo — the real prompt history must not be
     /// visible (or restorable) from a demo recording.
-    fileprivate func loadHistory(demo: Bool) -> [PromptHistoryEntry] {
-        guard !demo else { return [] }
+    fileprivate func loadHistory() -> [PromptHistoryEntry] {
+        guard !DemoModeStore.isDemoActive else { return [] }
         migrateBackupsIfNeeded()
         guard let data = defaults.data(forKey: Self.historyKey),
               let entries = try? JSONDecoder().decode([PromptHistoryEntry].self, from: data) else {
@@ -996,14 +1002,14 @@ final class PromptStore {
     /// Restore all prompt fields from a history entry (DS-RESTORE): the bullet fields as one captured
     /// edit of the sections this app shows, keeping the writer name (Device Sync sends them); the
     /// templates as before, with a fresh timestamp so the restore propagates to other devices.
-    fileprivate func restoreFromHistory(_ entry: PromptHistoryEntry, demo: Bool) {
-        guard !demo else { return }
-        guard recordHistory(source: "reset", fields: ["composition", "action", "kb", "templates"], demo: false) else { return }
+    fileprivate func restoreFromHistory(_ entry: PromptHistoryEntry) {
+        guard !DemoModeStore.isDemoActive else { return }
+        guard recordHistory(source: "reset", fields: ["composition", "action", "kb", "templates"]) else { return }
         // DS-COUNTER: an accepted restore renews the counter even when it changes no bullet text (the
         // commit renews it only when something was committed), so an AI write read before it is refused.
         semaphore.renewCounter()
         bullets.restore([.composition: entry.composition, .action: entry.action, .kb: entry.kb])
-        applySyncedTemplates(entry.decodedTemplates, demo: false)
+        applySyncedTemplates(entry.decodedTemplates)
         DeviceSyncService.shared.debouncedBroadcast(fields: [.templates])
     }
 

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Synchronization
 
 /// Why the prompt store refused a call (DS-SEMAPHORE, DS-COUNTER).
 enum PromptRefusal: Error, Equatable, Sendable {
@@ -10,6 +11,19 @@ enum PromptRefusal: Error, Equatable, Sendable {
     case busy
     /// An AI writer's counter moved since it read (DS-AI), or its hold ran past its lease (DS-LEASE).
     case changed
+}
+
+/// DS-COUNTER: the device's change counter, an opaque value, readable from any thread. The disabled-reminders
+/// map, which is not a prompt field and has its own lock, compares it inside its transaction (DS-DEMO).
+final class ChangeCounter: Sendable {
+    /// The one counter of this device's prompt store.
+    static let device = ChangeCounter()
+
+    private let value = Mutex(UUID())
+
+    var current: UUID { value.withLock { $0 } }
+
+    func renew() { value.withLock { $0 = UUID() } }
 }
 
 /// A caller's hold of the semaphore (DS-LEASE): a write checks `isHolder` immediately before the storage
@@ -53,6 +67,10 @@ final class PromptSemaphore {
         /// waits, in one first-in-first-out queue, before it is refused as busy.
         var acquireWaitSeconds: Double
 
+        /// DS-DEMO: how many times entering or leaving the demo asks for the semaphore before it gives up: enough
+        /// waits to outlast one lease.
+        var switchAttempts: Int = 3
+
         static let standard = Config(leaseSeconds: 15, acquireWaitSeconds: 6)
     }
 
@@ -64,7 +82,8 @@ final class PromptSemaphore {
     /// DS-COUNTER: an opaque value renewed on every commit that saved a change (an edit, a refine, a
     /// merge or legacy import that changed a field, a reset, every accepted restore). Its only users
     /// are AI writers (DS-AI). Sign-in, sign-out, an upgrade's save and lease expiry do not renew it.
-    private(set) var counter = UUID()
+    var counter: UUID { changeCounter.current }
+    private let changeCounter: ChangeCounter
 
     /// `deadline` is when the lease ends on the monotonic clock: the lease timer hands the semaphore over, but
     /// a timer the MainActor runs late must not leave an overdue holder with write authority (DS-LEASE).
@@ -80,8 +99,9 @@ final class PromptSemaphore {
 
     private var queue: [Waiter] = []
 
-    init(config: Config = .standard) {
+    init(config: Config = .standard, counter: ChangeCounter = ChangeCounter()) {
         self.config = config
+        changeCounter = counter
     }
 
     /// Runs `body` holding the semaphore, waiting for its turn in the queue for at most
@@ -112,7 +132,7 @@ final class PromptSemaphore {
 
     /// DS-COUNTER: a commit saved a change; a write that read the previous value is refused.
     func renewCounter() {
-        counter = UUID()
+        changeCounter.renew()
     }
 
     /// Takes the semaphore for `token` with its lease.

@@ -40,17 +40,18 @@ struct PromptStoreInvariantTests {
         })
     }
 
-    /// Runs `body` with the demo overlay entered, and leaves the demo as it was found.
-    private func inDemo(_ body: () async throws -> Void) async rethrows {
+    /// Runs `body` in the demo, entered and left as the app does (one operation on the semaphore each), and
+    /// leaves the demo as it was found.
+    private func inDemo(_ body: () async throws -> Void) async throws {
         DemoModeStore.shared._resetForTests()
-        DemoModeStore.shared.isActive = true
-        store.enterDemoOverlay()
-        defer {
-            if DemoModeStore.isDemoActive { store.exitDemoOverlay() }
-            DemoModeStore.shared._resetForTests()
-            PromptStore.removeDemoOverlayKeys()
+        try await store.enterDemo()
+        do {
+            try await body()
+        } catch {
+            if DemoModeStore.isDemoActive { try? await store.leaveDemo() }
+            throw error
         }
-        try await body()
+        if DemoModeStore.isDemoActive { try await store.leaveDemo() }
     }
 
     @Test("A saved change invalidates a view that read the displayed bullets (DS-DISPLAYED)")
@@ -90,103 +91,112 @@ struct PromptStoreInvariantTests {
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
-    @Test("A demo gesture waiting on the semaphore when the demo ends writes nothing real (DS-DEMO)")
-    func queuedDemoGestureStaysInDemo() async throws {
-        quiet()
-        DemoModeStore.shared._resetForTests()
-        let tag = PromptStoreTestCleanup.tag()
-        let realBefore = realStorage()
-        DemoModeStore.shared.isActive = true
-        store.enterDemoOverlay()
-        let holder = await PromptStoreHolder(store)
-        let pending = store.gesture("demo gesture") { try $0.addBullet(tag, to: .knowledgeBase) }
-        try await Task.sleep(for: .milliseconds(100))
-        store.exitDemoOverlay()
-        DemoModeStore.shared._resetForTests()
-        PromptStore.removeDemoOverlayKeys()
-        try await holder.end()
-        #expect(await pending.value == .dropped)
-        #expect(realStorage() == realBefore)
-        #expect(!store.rawKB.contains(tag), "demo work never becomes real device data")
-        // Positive control: the same gesture made outside the demo saves.
-        #expect(await store.gesture("real gesture") { try $0.addBullet(tag, to: .knowledgeBase) }.value == .saved)
-        await PromptStoreTestCleanup.remove(tag: tag, from: store)
-    }
-
-    @Test("A demo gesture is a demo gesture even when the demo ends before its task first runs (DS-DEMO)")
-    func gestureTargetIsFixedWhenMade() async throws {
-        quiet()
-        DemoModeStore.shared._resetForTests()
-        let tag = PromptStoreTestCleanup.tag()
-        let realBefore = realStorage()
-        DemoModeStore.shared.isActive = true
-        store.enterDemoOverlay()
-        // No await between the gesture and the end of the demo: the gesture's task has not run yet.
-        let pending = store.gesture("demo gesture") { try $0.addBullet(tag, to: .knowledgeBase) }
-        store.exitDemoOverlay()
-        DemoModeStore.shared._resetForTests()
-        PromptStore.removeDemoOverlayKeys()
-        #expect(await pending.value == .dropped)
-        #expect(realStorage() == realBefore)
-        #expect(!store.rawKB.contains(tag))
-    }
-
-    @Test("A real gesture waiting on the semaphore when the demo starts lands in the real store and never in the demo (DS-DEMO)")
-    func queuedRealGestureStaysOutOfTheDemo() async throws {
+    @Test("A gesture queued before the demo is entered runs in the real mode and the demo shows none of it (DS-DEMO)")
+    func gestureQueuedBeforeEntryRunsReal() async throws {
         quiet()
         DemoModeStore.shared._resetForTests()
         let tag = PromptStoreTestCleanup.tag()
         let holder = await PromptStoreHolder(store)
         let pending = store.gesture("real gesture") { try $0.addBullet(tag, to: .knowledgeBase) }
         try await Task.sleep(for: .milliseconds(100))
-        DemoModeStore.shared.isActive = true
-        store.enterDemoOverlay()
-        let overlay = store.rawKB
+        let entering = Task { @MainActor in try await store.enterDemo() }
+        try await Task.sleep(for: .milliseconds(100))
         try await holder.end()
-        #expect(await pending.value == .saved, "its target was chosen when it was made")
-        #expect(store.rawKB == overlay, "the demo shows no real text")
-        #expect(UserDefaults.standard.string(forKey: "demo.user_prompts:user_kb.md") == overlay, "nothing reached the demo's key")
-        #expect(UserDefaults.standard.string(forKey: "user_prompts:user_kb.md")?.contains(tag) == true, "the real text has it")
-        store.exitDemoOverlay()
-        DemoModeStore.shared._resetForTests()
-        PromptStore.removeDemoOverlayKeys()
+        #expect(await pending.value == .saved, "it ran first, in the mode that was live in its hold")
+        try await entering.value
+        #expect(!store.rawKB.contains(tag), "the demo shows no real text")
+        #expect(UserDefaults.standard.string(forKey: "demo.user_prompts:user_kb.md")?.contains(tag) != true, "nothing reached the demo's key")
+        try await store.leaveDemo()
         #expect(store.rawKB.contains(tag), "the real text is shown again on exit")
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
-    @Test("An AI result read before the demo started lands in the real store when the demo has started (DS-DEMO, DS-AI)")
-    func realAIResultSurvivesDemoEntry() async throws {
+    @Test("A gesture queued before the demo is left runs in the demo and writes nothing real (DS-DEMO)")
+    func gestureQueuedBeforeExitRunsDemo() async throws {
+        quiet()
+        DemoModeStore.shared._resetForTests()
+        let tag = PromptStoreTestCleanup.tag()
+        let realBefore = realStorage()
+        try await store.enterDemo()
+        let holder = await PromptStoreHolder(store)
+        let pending = store.gesture("demo gesture") { try $0.addBullet(tag, to: .knowledgeBase) }
+        try await Task.sleep(for: .milliseconds(100))
+        let leaving = Task { @MainActor in try await store.leaveDemo() }
+        try await Task.sleep(for: .milliseconds(100))
+        try await holder.end()
+        #expect(await pending.value == .saved, "it ran first, in the demo")
+        try await leaving.value
+        #expect(realStorage() == realBefore, "demo work never becomes real device data")
+        #expect(!store.rawKB.contains(tag))
+        // Positive control: the same gesture made outside the demo saves.
+        #expect(await store.gesture("real gesture") { try $0.addBullet(tag, to: .knowledgeBase) }.value == .saved)
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
+    @Test("An AI result read before the demo was entered is dropped after it and saves nothing in either store; a fresh one saves (DS-DEMO, DS-AI)")
+    func aiResultReadBeforeEntryIsDropped() async throws {
         quiet()
         DemoModeStore.shared._resetForTests()
         let tag = PromptStoreTestCleanup.tag()
         let capture = try await read()
-        DemoModeStore.shared.isActive = true
-        store.enterDemoOverlay()
-        let overlay = store.rawKB
-        #expect(await store.writeAfterRead(capture, text: capture.text + "\n- \(tag)\n", "real AI write") == .saved)
-        #expect(store.rawKB == overlay, "the demo shows no real text")
-        #expect(UserDefaults.standard.string(forKey: "user_prompts:user_kb.md")?.contains(tag) == true)
-        store.exitDemoOverlay()
-        DemoModeStore.shared._resetForTests()
-        PromptStore.removeDemoOverlayKeys()
-        #expect(store.rawKB.contains(tag))
-        // Control: a demo-captured result is dropped once the demo is over, and writes nothing real.
-        DemoModeStore.shared.isActive = true
-        store.enterDemoOverlay()
-        let demoCapture = try await read()
-        store.exitDemoOverlay()
-        DemoModeStore.shared._resetForTests()
-        PromptStore.removeDemoOverlayKeys()
         let realBefore = realStorage()
-        #expect(await store.writeAfterRead(demoCapture, text: demoCapture.text + "\n- \(tag) demo\n", "demo AI write") == .dropped)
-        #expect(realStorage() == realBefore)
+        try await store.enterDemo()
+        let overlay = store.rawKB
+        let demoKey = UserDefaults.standard.string(forKey: "demo.user_prompts:user_kb.md")
+        #expect(await store.writeAfterRead(capture, text: capture.text + "\n- \(tag)\n", "real AI write") == .dropped)
+        #expect(realStorage() == realBefore, "the real store is unchanged")
+        #expect(store.rawKB == overlay, "the demo shows no change")
+        #expect(UserDefaults.standard.string(forKey: "demo.user_prompts:user_kb.md") == demoKey, "the demo's key is unchanged")
+        try await store.leaveDemo()
+        #expect(!store.rawKB.contains(tag))
+        // Control: read and write with no switch between saves.
+        let fresh = try await read()
+        #expect(await store.writeAfterRead(fresh, text: fresh.text + "\n- \(tag)\n", "fresh AI write") == .saved)
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
-    @Test("Entering the demo seeds all three rendered texts, so the background snapshots read the overlay (DS-DEMO)")
-    func demoEntrySeedsTheSnapshots() async {
+    @Test("An AI result read in the demo is dropped after the demo was left and saves nothing real; a fresh one saves (DS-DEMO, DS-AI)")
+    func aiResultReadBeforeExitIsDropped() async throws {
         quiet()
-        await inDemo {
+        DemoModeStore.shared._resetForTests()
+        let tag = PromptStoreTestCleanup.tag()
+        try await store.enterDemo()
+        let demoCapture = try await read()
+        try await store.leaveDemo()
+        let realBefore = realStorage()
+        #expect(await store.writeAfterRead(demoCapture, text: demoCapture.text + "\n- \(tag) demo\n", "demo AI write") == .dropped)
+        #expect(realStorage() == realBefore, "the real store is unchanged")
+        #expect(UserDefaults.standard.string(forKey: "demo.user_prompts:user_kb.md") == nil, "no demo key came back")
+        // Control: read and write with no switch between saves.
+        let fresh = try await read()
+        #expect(await store.writeAfterRead(fresh, text: fresh.text + "\n- \(tag)\n", "fresh AI write") == .saved)
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
+    @Test("A demo switch is one hold on the semaphore: it waits its turn behind a holder and moves the counter (DS-DEMO)")
+    func switchIsASemaphoreOperation() async throws {
+        quiet()
+        DemoModeStore.shared._resetForTests()
+        let before = store.semaphore.counter
+        let holder = await PromptStoreHolder(store)
+        let entering = Task { @MainActor in try await store.enterDemo() }
+        try await Task.sleep(for: .milliseconds(200))
+        #expect(!DemoModeStore.isDemoActive, "the switch waits behind the holder")
+        #expect(store.semaphore.counter == before)
+        try await holder.end()
+        try await entering.value
+        #expect(DemoModeStore.isDemoActive)
+        #expect(store.semaphore.counter != before, "entering moved the counter")
+        let inside = store.semaphore.counter
+        try await store.leaveDemo()
+        #expect(!DemoModeStore.isDemoActive)
+        #expect(store.semaphore.counter != inside, "leaving moved the counter")
+    }
+
+    @Test("Entering the demo seeds all three rendered texts, so the background snapshots read the overlay (DS-DEMO)")
+    func demoEntrySeedsTheSnapshots() async throws {
+        quiet()
+        try await inDemo {
             #expect(!store.rawKB.isEmpty)
             #expect(PromptStore.kbTextSnapshot() == store.rawKB)
             #expect(PromptStore.actionMarkdownSnapshot() == store.rawAction)
@@ -199,7 +209,6 @@ struct PromptStoreInvariantTests {
         quiet()
         let tag = PromptStoreTestCleanup.tag()
         let realBefore = realStorage()
-        let counter = store.semaphore.counter
         var writers: [(String, () async throws -> Void)] = []
         for section in PromptSection.allCases {
             writers.append(("add \(section.key)", { _ = await store.edit("demo add") { try $0.addBullet(tag, to: section) } }))
@@ -228,7 +237,7 @@ struct PromptStoreInvariantTests {
                                            composition: "", action: "", kb: "", templatesJSON: "[]")
             _ = await store.edit("demo restore") { try $0.restoreFromHistory(entry); return .saved }
         }))
-        writers.append(("add template", { store.addTemplate() }))
+        writers.append(("add template", { _ = store.addTemplate(ReplyTemplate()) }))
         writers.append(("reset templates", { store.resetTemplates() }))
         writers.append(("receive", {
             await #expect(throws: PromptRefusal.changed) {
@@ -240,6 +249,7 @@ struct PromptStoreInvariantTests {
         }))
 
         try await inDemo {
+            let counter = store.semaphore.counter   // after the switch: the writers below move nothing
             // Positive control: a demo writer writes, to the overlay.
             _ = await store.edit("demo control") { try $0.addBullet(tag, to: .knowledgeBase) }
             #expect(store.rawKB.contains(tag))
@@ -335,48 +345,6 @@ struct PromptStoreInvariantTests {
         #expect(store.bullets(.archiveRules).contains(tag), "an ADD cannot remove a rule from another section")
         // Positive control: an ordinary patch applies.
         #expect(ActionPatchApplier.applyActionPatch(content: content, patchText: "ADD\ndelete\n" + tag + " ordinary") != nil)
-        await PromptStoreTestCleanup.remove(tag: tag, from: store)
-    }
-
-    @Test("A real AI result queued behind a holder while the demo starts and ends lands in the real store (DS-DEMO, DS-AI)")
-    func queuedRealAIResultSurvivesDemoStartAndEnd() async throws {
-        quiet()
-        DemoModeStore.shared._resetForTests()
-        let tag = PromptStoreTestCleanup.tag()
-        let capture = try await read()
-        DemoModeStore.shared.isActive = true
-        store.enterDemoOverlay()
-        let holder = await PromptStoreHolder(store)
-        let pending = Task { await store.writeAfterRead(capture, text: capture.text + "\n- \(tag)\n", "queued real AI write") }
-        try await Task.sleep(for: .milliseconds(100))
-        store.exitDemoOverlay()
-        DemoModeStore.shared._resetForTests()
-        PromptStore.removeDemoOverlayKeys()
-        try await holder.end()
-        #expect(await pending.value == .saved, "its target is the capture's, not the mode when it runs")
-        #expect(UserDefaults.standard.string(forKey: "user_prompts:user_kb.md")?.contains(tag) == true)
-        await PromptStoreTestCleanup.remove(tag: tag, from: store)
-    }
-
-    @Test("A knowledge-base tool call made before the demo starts writes the real store even if the demo starts first (DS-DEMO)")
-    func toolTargetIsFixedWhenCalled() async throws {
-        quiet()
-        DemoModeStore.shared._resetForTests()
-        let tag = PromptStoreTestCleanup.tag()
-        let call = Task.detached { try await KBAddTool().execute(arguments: ["statement": .string("\(tag) tool fact")]) }
-        // Hold the main actor, so the call runs as far as its hop onto it and no further, and then start the demo.
-        let until = ContinuousClock.now + .milliseconds(300)
-        while ContinuousClock.now < until {}
-        DemoModeStore.shared.isActive = true
-        store.enterDemoOverlay()
-        let overlay = store.rawKB
-        _ = try await call.value
-        #expect(store.rawKB == overlay, "the demo shows no real text")
-        #expect(UserDefaults.standard.string(forKey: "demo.user_prompts:user_kb.md") == overlay, "nothing reached the demo's key")
-        #expect(UserDefaults.standard.string(forKey: "user_prompts:user_kb.md")?.contains("\(tag) tool fact") == true, "the real text has it")
-        store.exitDemoOverlay()
-        DemoModeStore.shared._resetForTests()
-        PromptStore.removeDemoOverlayKeys()
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 }

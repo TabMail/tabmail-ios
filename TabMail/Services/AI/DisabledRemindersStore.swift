@@ -25,9 +25,10 @@ enum DisabledRemindersStore {
 
     /// Active map key: demo mode operates entirely on its own (initially
     /// empty) map so demo dismiss/snooze never touches — or broadcasts —
-    /// the real user's disabled-reminder state.
-    private static func keyV2(demo: Bool) -> String {
-        demo ? demoStorageKeyV2 : storageKeyV2
+    /// the real user's disabled-reminder state. Follows the live mode (DS-DEMO): a transaction reads it under
+    /// the map lock, where the mode cannot change (`switching`).
+    private static var currentKey: String {
+        DemoModeStore.isDemoActive ? demoStorageKeyV2 : storageKeyV2
     }
 
     /// GC age threshold — entries not in fresh set and older than this are removed.
@@ -86,6 +87,25 @@ enum DisabledRemindersStore {
         return body()
     }
 
+    /// DS-DEMO: whether the change counter moved since a multi-step writer read it (the existing DS-AI
+    /// compare). Checked inside the transaction, where the mode and the counter change together only in
+    /// `switching`, so a write that started before a demo switch never lands after it. Nil is a brief
+    /// writer, which reads and writes with no await between.
+    private static func moved(since started: UUID?) -> Bool {
+        guard let started else { return false }
+        return ChangeCounter.device.current != started
+    }
+
+    /// DS-DEMO: the demo is entered or left. `flip` sets the mode and moves the change counter; both happen
+    /// under the map lock, so no transaction sees the new mode with the old counter. Leaving also deletes
+    /// the demo's map, after the flip.
+    static func switching(toDemo entering: Bool, _ flip: () -> Void) {
+        transaction {
+            flip()
+            if !entering { defaults.removeObject(forKey: demoStorageKeyV2) }
+        }
+    }
+
     // MARK: - CRDT Entry
 
     struct DisabledEntry: Codable, Sendable {
@@ -135,32 +155,23 @@ enum DisabledRemindersStore {
 
     // MARK: - Read/Write (v2 CRDT Map)
 
-    /// Get the full CRDT map of the real choices (`demo: false`) or the demo's own.
-    static func getDisabledMap(demo: Bool) -> [String: DisabledEntry] {
-        getDisabledMap(key: keyV2(demo: demo))
+    /// Get the full CRDT map in the live mode: the real choices, or the demo's own.
+    static func getDisabledMap() -> [String: DisabledEntry] {
+        getDisabledMap(key: currentKey)
     }
 
-    /// A demo-targeted write is refused once the demo has ended: its map is deleted at exit, and a write
-    /// after that would leave a stale one for the next demo. The only read of the live demo flag in this
-    /// file (DS-DEMO); a real-targeted write is never refused. Called inside the transaction, so a write
-    /// either lands before `removeDemoMap` or is refused.
-    private static func admits(demo: Bool) -> Bool {
-        !demo || DemoModeStore.isDemoActive
-    }
-
-    /// Deletes the demo's map, at the demo's exit once the demo flag is off: a demo-targeted writer in the
-    /// lock before it lands first and is removed, one after it is refused.
+    /// Deletes the demo's map when no demo is running (the launch wipe of a force-quit demo's leftovers,
+    /// and the start of a demo). A demo's exit deletes it in `switching`.
     static func removeDemoMap() {
         transaction { defaults.removeObject(forKey: demoStorageKeyV2) }
     }
 
-    /// Keyed load — every API takes its target (`demo:`) from its caller, who took it as the operation
-    /// began, and uses it for both load and save: no API reads the live flag to choose a map.
+    /// Keyed load: the caller passes the key it is working on, read in the same transaction as the save.
     ///
     /// A device with only the v1 list (no v2 map yet) reads it as the real map: every hash disabled, each
     /// at the field's Device Sync timestamp (epoch zero when it has none), as TB's `readStoredField` does.
     /// The next change to the real map stores it as v2. Nothing migrates, so no transaction decides by
-    /// the mode whether to; the choice is the key the caller captured.
+    /// the mode whether to; the choice is the key.
     private static func getDisabledMap(key: String) -> [String: DisabledEntry] {
         guard let data = defaults.data(forKey: key) else {
             return key == storageKeyV2 ? legacyMap() : [:]
@@ -180,7 +191,7 @@ enum DisabledRemindersStore {
         return map
     }
 
-    /// Save the CRDT map (see getDisabledMap(key:) for the key contract).
+    /// Save the CRDT map.
     private static func saveDisabledMap(_ map: [String: DisabledEntry], key: String) {
         if let data = try? JSONEncoder().encode(map) {
             defaults.set(data, forKey: key)
@@ -189,8 +200,8 @@ enum DisabledRemindersStore {
 
     /// Get set of disabled hashes (entries where enabled == false).
     /// Matches TB's `getDisabledHashes()`.
-    static func getDisabledHashes(demo: Bool) -> Set<String> {
-        let map = getDisabledMap(demo: demo)
+    static func getDisabledHashes() -> Set<String> {
+        let map = getDisabledMap()
         return Set(map.filter { !$0.value.enabled }.map(\.key))
     }
 
@@ -198,19 +209,20 @@ enum DisabledRemindersStore {
     /// Writes a CRDT entry with current timestamp.
     /// Matches TB's `setEnabled()`.
     /// Broadcasts change to Device Sync peers (local user action).
-    /// Returns false when a demo-targeted write finds the demo ended (see `admits`): nothing was written.
+    /// A writer that awaited between its start and this write passes the change counter it started with
+    /// (`since`, DS-DEMO): false when that moved, and nothing was written.
     @discardableResult
-    static func setEnabled(hash: String, enabled: Bool, demo: Bool) -> Bool {
-        let key = keyV2(demo: demo)
-        let written: [String: DisabledEntry]? = transaction {
-            guard admits(demo: demo) else { return nil }
+    static func setEnabled(hash: String, enabled: Bool, since started: UUID? = nil) -> Bool {
+        let written: (map: [String: DisabledEntry], demo: Bool)? = transaction {
+            guard !moved(since: started) else { return nil }
+            let key = currentKey
             var map = getDisabledMap(key: key)
             map[hash] = DisabledEntry(enabled: enabled, ts: Date().ISO8601Format())
             saveDisabledMap(map, key: key)
-            return map
+            return (map, key == demoStorageKeyV2)
         }
-        guard let map = written else {
-            BackgroundSyncLogger.logDebug("[DisabledRemindersStore] A demo change for \(hash) was refused: the demo ended")
+        guard let (map, demo) = written else {
+            BackgroundSyncLogger.logDebug("[DisabledRemindersStore] A change for \(hash) was refused: the demo was entered or left since it started")
             return false
         }
         BackgroundSyncLogger.logDebug("[DisabledRemindersStore] Set \(hash) enabled=\(enabled) (disabled count: \(map.filter { !$0.value.enabled }.count))")
@@ -231,10 +243,9 @@ enum DisabledRemindersStore {
 
     /// CRDT merge: per-hash, newer timestamp wins.
     /// Does NOT trigger a broadcast (used for incoming Device Sync).
-    static func mergeIncoming(_ incomingMap: [String: DisabledEntry], demo: Bool) {
-        let key = keyV2(demo: demo)
+    static func mergeIncoming(_ incomingMap: [String: DisabledEntry]) {
         let (merged, total) = transaction { () -> (Int, Int) in
-            guard admits(demo: demo) else { return (0, 0) }
+            let key = currentKey
             var localMap = getDisabledMap(key: key)
             var merged = 0
 
@@ -261,12 +272,14 @@ enum DisabledRemindersStore {
     /// Bulk-disable hashes with epoch-zero timestamps. Used by first-launch overdue
     /// suppression so that any Device Sync state (real timestamps) always wins in CRDT merge.
     /// Does NOT broadcast to Device Sync or post notifications — caller handles that.
-    static func bulkDisableWithEpochZero(hashes: [String], demo: Bool) {
-        guard !hashes.isEmpty else { return }
-        let key = keyV2(demo: demo)
+    /// False when `since` moved (see `setEnabled`): nothing was written.
+    @discardableResult
+    static func bulkDisableWithEpochZero(hashes: [String], since started: UUID? = nil) -> Bool {
+        guard !hashes.isEmpty else { return true }
         let epochZero = "1970-01-01T00:00:00Z"
-        transaction {
-            guard admits(demo: demo) else { return }
+        let written = transaction { () -> Bool in
+            guard !moved(since: started) else { return false }
+            let key = currentKey
             var map = getDisabledMap(key: key)
             for hash in hashes {
                 // Only write if no existing entry — preserve any prior state from sync/user action
@@ -275,8 +288,11 @@ enum DisabledRemindersStore {
                 }
             }
             saveDisabledMap(map, key: key)
+            return true
         }
+        guard written else { return false }
         BackgroundSyncLogger.logDebug("[DisabledRemindersStore] Bulk-disabled \(hashes.count) hashes with epoch-zero timestamps")
+        return true
     }
 
     /// Time-based GC: remove entries NOT in fresh set AND older than gcAgeDays.
@@ -298,11 +314,13 @@ enum DisabledRemindersStore {
     /// The guard is deliberately unconditional: `t:` entries are retained forever here.
     /// They are tiny, and the platform that does derive them still collects them on its
     /// own side, so nothing is gained by trying to decide when one is "really" stale.
-    static func gcStaleEntries(freshHashes: Set<String>, demo: Bool) {
-        let key = keyV2(demo: demo)
+    /// False when `since` moved (see `setEnabled`): nothing was collected.
+    @discardableResult
+    static func gcStaleEntries(freshHashes: Set<String>, since started: UUID? = nil) -> Bool {
         let now = Date()
-        let removed = transaction { () -> Int in
-            guard admits(demo: demo) else { return 0 }
+        let result = transaction { () -> Int? in
+            guard !moved(since: started) else { return nil }
+            let key = currentKey
             var map = getDisabledMap(key: key)
             guard !map.isEmpty else { return 0 }
             var removed = 0
@@ -323,8 +341,10 @@ enum DisabledRemindersStore {
             }
             return removed
         }
+        guard let removed = result else { return false }
         if removed > 0 {
             BackgroundSyncLogger.logDebug("[DisabledRemindersStore] GC removed \(removed) entries older than \(gcAgeDays) days")
         }
+        return true
     }
 }

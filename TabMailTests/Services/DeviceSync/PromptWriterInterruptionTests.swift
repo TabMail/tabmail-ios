@@ -444,7 +444,7 @@ struct ActionRuleExactByteTests {
 }
 
 /// The model's email-reminder snooze (the fallback of `reminder_del`) awaits the reminder build, then writes the
-/// choice. It writes where the call began (DS-DEMO): a demo call whose demo ended meanwhile writes nothing.
+/// choice. It carries the change counter it started with (DS-DEMO): a call whose demo ended meanwhile writes nothing.
 @MainActor
 @Suite("Email reminder snooze keeps its target", .serialized, .processGlobalState)
 struct EmailReminderSnoozeTargetTests {
@@ -508,9 +508,9 @@ struct EmailReminderSnoozeTargetTests {
             let real = try JSONDecoder().decode([String: DisabledRemindersStore.DisabledEntry].self, from: try #require(defaults.data(forKey: "disabled_reminders_v2")))
             #expect(real.isEmpty, "the demo's snooze reached the real map: \(result)")
             if interrupt {
-                #expect(result.contains("the demo ended"), "the snooze is reported as refused: \(result)")
+                #expect(result.contains("could not save") && !result.contains("snoozed"), "the snooze is reported as refused: \(result)")
             } else {
-                #expect(!result.contains("the demo ended") && result.contains("snoozed"), "the uninterrupted snooze succeeds: \(result)")
+                #expect(!result.contains("could not save") && result.contains("snoozed"), "the uninterrupted snooze succeeds: \(result)")
                 let overlay = try JSONDecoder().decode([String: DisabledRemindersStore.DisabledEntry].self, from: try #require(defaults.data(forKey: DisabledRemindersStore.demoStorageKeyV2)))
                 #expect(overlay.values.contains { !$0.enabled }, "the demo's choice is in its own map")
                 await DemoModeService.shared.exit()

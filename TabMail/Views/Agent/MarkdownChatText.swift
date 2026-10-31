@@ -305,13 +305,13 @@ struct MarkdownChatText: View {
                 Button {
                     if isDismissed {
                         // Unhide — re-enable the reminder
-                        DisabledRemindersStore.setEnabled(hash: hash, enabled: true, demo: DemoModeStore.isDemoActive)
+                        DisabledRemindersStore.setEnabled(hash: hash, enabled: true)
                         _ = withAnimation(.easeInOut(duration: 0.3)) {
                             dismissedHashes.remove(hash)
                         }
                     } else {
                         // Hide — disable but keep visible as crossed out
-                        DisabledRemindersStore.setEnabled(hash: hash, enabled: false, demo: DemoModeStore.isDemoActive)
+                        DisabledRemindersStore.setEnabled(hash: hash, enabled: false)
                         _ = withAnimation(.easeInOut(duration: 0.3)) {
                             dismissedHashes.insert(hash)
                         }
