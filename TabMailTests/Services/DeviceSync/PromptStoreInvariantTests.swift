@@ -154,9 +154,9 @@ struct PromptStoreInvariantTests {
     }
 
     @Test("Entering the demo seeds all three rendered texts, so the background snapshots read the overlay (DS-DEMO)")
-    func demoEntrySeedsTheSnapshots() async throws {
+    func demoEntrySeedsTheSnapshots() async {
         quiet()
-        try await inDemo {
+        await inDemo {
             #expect(!store.rawKB.isEmpty)
             #expect(PromptStore.kbTextSnapshot() == store.rawKB)
             #expect(PromptStore.actionMarkdownSnapshot() == store.rawAction)
@@ -220,6 +220,28 @@ struct PromptStoreInvariantTests {
             }
         }
         #expect(realStorage() == realBefore)
+    }
+
+    @Test("A write interrupted between the labelled state and the rendered text is repaired when the store opens (DS-ATOMIC)")
+    func interruptedWriteIsRepairedAtOpen() async throws {
+        quiet()
+        let tag = PromptStoreTestCleanup.tag()
+        let defaults = UserDefaults.standard
+        let key = "user_prompts:user_kb.md"
+        let stale = try #require(defaults.string(forKey: key))
+        #expect(await store.edit("interrupted add") { try $0.addBullet(tag, to: .knowledgeBase) } == .saved)
+        let current = try #require(defaults.string(forKey: key))
+        #expect(current.contains(tag))
+        // The interruption: the labelled state holds the new bullet, the rendered text is the old one.
+        defaults.set(stale, forKey: key)
+        let catalog = try #require(Bundle.main.url(forResource: "device-sync-default-catalog", withExtension: "json")
+            .flatMap { try? Data(contentsOf: $0) }.flatMap { try? DefaultCatalog.decode($0) })
+        PromptStore.syncRenderedKeys(UserDefaultsBulletStore(defaults: defaults), defaults: defaults, catalog: catalog)
+        #expect(defaults.string(forKey: key) == current, "the rendered text is the labelled state's again")
+        // Control: a store that is already consistent is left as it is.
+        PromptStore.syncRenderedKeys(UserDefaultsBulletStore(defaults: defaults), defaults: defaults, catalog: catalog)
+        #expect(defaults.string(forKey: key) == current)
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
     @Test("A message without a string sender, field and snapshot id is dropped before it waits in line (DS-VALIDATE)")

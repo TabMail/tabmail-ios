@@ -105,7 +105,20 @@ struct PromptStoreBoundaryTests {
             ("recordHistory", { try $0.recordHistory(source: "local_edit", fields: ["kb"]) }),
             ("saveHistory", { try $0.saveHistory([]) }),
             ("readForEdit", { _ = try $0.readForEdit(.kb) }),
+            // Last: its live control replaces the knowledge base with the entry's text.
+            ("restoreFromHistory", { try $0.restoreFromHistory(restoreEntry(tag: tag)) }),
         ]
+    }
+
+    /// A history entry whose knowledge base differs from the current one, so a restore that is not refused
+    /// is seen in the stored state; the other texts and the templates are the current ones.
+    private func restoreEntry(tag: String) -> PromptHistoryEntry {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let templates = (try? encoder.encode(store.templates)).map { String(decoding: $0, as: UTF8.self) } ?? "[]"
+        return PromptHistoryEntry(id: UUID().uuidString, timestamp: Date().ISO8601Format(), source: "local_edit", fields: ["kb"],
+                                  composition: store.rawComposition, action: store.rawAction,
+                                  kb: "- \(tag) lease restore\n", templatesJSON: templates)
     }
 
     private static func object(_ text: String) -> [String: Any] {

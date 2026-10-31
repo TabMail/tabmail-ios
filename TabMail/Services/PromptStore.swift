@@ -349,7 +349,7 @@ final class PromptStore {
             fatalError("The bundled Device Sync default catalog is missing or unreadable")
         }
         let bulletStore = UserDefaultsBulletStore(defaults: defaults)
-        Self.writeMissingDefaults(bulletStore, defaults: defaults, catalog: catalog)
+        Self.syncRenderedKeys(bulletStore, defaults: defaults, catalog: catalog)
         let bullets = PromptBulletSync(store: bulletStore, catalog: catalog, skeleton: Self.skeleton)
         self.catalog = catalog
         self.bulletStore = bulletStore
@@ -384,12 +384,21 @@ final class PromptStore {
         NSEDataBridge.mirrorPrompts()
     }
 
-    /// A field with no stored text gets the defaults' text, which DS-UPGRADE then labels as the catalog
-    /// defaults (DS-DEFAULT): the state a new install or a reset holds.
-    static func writeMissingDefaults(_ store: UserDefaultsBulletStore, defaults: UserDefaults, catalog: DefaultCatalog) {
-        for field in BulletField.allCases where store.read(field) == nil && store.legacyText(field) == nil {
+    /// Each field's rendered text is made to match its labelled state before any reader reads it: the two
+    /// are separate writes, so a write interrupted between them leaves the text a reader reads behind the
+    /// state (DS-ATOMIC). The state is the authority; the text is the recovery source only for a state that
+    /// can't be read (DS-UNREADABLE), which is why it is regenerated and not removed. A field with no
+    /// state keeps its stored text, or, with none, gets the defaults' text, which DS-UPGRADE then labels as
+    /// the catalog defaults (DS-DEFAULT): the state a new install or a reset holds.
+    static func syncRenderedKeys(_ store: UserDefaultsBulletStore, defaults: UserDefaults, catalog: DefaultCatalog) {
+        for field in BulletField.allCases {
             guard let key = UserDefaultsBulletStore.renderedKeys[field] else { continue }
-            defaults.set(defaultText(field, catalog: catalog), forKey: key)
+            if let state = store.read(field) {
+                let text = Bullets.render(field, state)
+                if defaults.string(forKey: key) != text { defaults.set(text, forKey: key) }
+            } else if store.legacyText(field) == nil {
+                defaults.set(defaultText(field, catalog: catalog), forKey: key)
+            }
         }
     }
 

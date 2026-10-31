@@ -12,7 +12,12 @@ import Foundation
 actor KBRefinementService {
     static let shared = KBRefinementService()
 
-    private let backendClient = BackendClient()
+    private let backendClient: BackendClient
+
+    /// Test seam, as `AIService.init(backendClient:)`: a client over a mock session.
+    init(backendClient: BackendClient = BackendClient()) {
+        self.backendClient = backendClient
+    }
 
     /// Minimum exchanges (user+assistant pairs) before triggering refinement.
     /// Matches TB's `KB_PERIODIC.minPendingExchanges`.

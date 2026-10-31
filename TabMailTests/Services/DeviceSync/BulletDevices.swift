@@ -240,7 +240,7 @@ final class BulletDevice {
     /// Starts the process as PromptStore does: a field with no text gets the defaults', then DS-UPGRADE.
     func start() {
         let base = UserDefaultsBulletStore(defaults: store.defaults)
-        PromptStore.writeMissingDefaults(base, defaults: store.defaults, catalog: catalog)
+        PromptStore.syncRenderedKeys(base, defaults: store.defaults, catalog: catalog)
         let budget = budget
         prompts = PromptBulletSync(
             store: FailableBulletStore(base: base, device: store),

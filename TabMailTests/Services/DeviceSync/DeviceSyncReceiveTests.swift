@@ -215,4 +215,55 @@ struct DeviceSyncReceiveTests {
         #expect(try await waitUntil(3) { stored().rules == 150 }, "the newer peer value applies")
         #expect(stored().updatedAt == newer)
     }
+
+    /// A `bullet_state` of one bullet whose numbers are written as given (JSON text, as a peer sends it).
+    private func numberedMessage(_ text: String, version: String = "1", part: String = "1", parts: String = "1",
+                                 counter: String = "1", seen: String = "1") -> String {
+        let name = "b1b1" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(12)
+        let sender = "c1c1" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(12)
+        let snap = "d1d1" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(12)
+        return #"{"type":"bullet_state","v":\#(version),"field":"kb","sender":"\#(sender)","snap":"\#(snap)","part":\#(part),"parts":\#(parts),"bullets":[["","\#(text)","\#(name)",\#(counter)]],"seen":{"\#(name)":\#(seen)}}"#
+    }
+
+    @Test("A JSON true or false where the wire needs a number is rejected: nothing is stored, rendered or sent (DS-VALIDATE)")
+    func booleanWhereANumberIsExpected() async throws {
+        quietDevice()
+        let tag = PromptStoreTestCleanup.tag()
+        let defaults = UserDefaults.standard
+        var sent: [String] = []
+        let previousSend = store.bullets.send
+        store.bullets.send = { sent.append($0) }
+        defer { store.bullets.send = previousSend }
+        let malformed: [(String, String)] = [
+            ("version", numberedMessage("\(tag) bad", version: "true")),
+            ("part", numberedMessage("\(tag) bad", part: "true")),
+            ("parts", numberedMessage("\(tag) bad", parts: "true")),
+            ("counter", numberedMessage("\(tag) bad", counter: "true")),
+            ("seen true", numberedMessage("\(tag) bad", seen: "true")),
+            ("seen false", numberedMessage("\(tag) bad", seen: "false")),
+        ]
+        for (position, text) in malformed {
+            let object = try #require(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+            let stateBefore = defaults.data(forKey: UserDefaultsBulletStore.stateKey)
+            let renderedBefore = store.rawKB
+            let result = try await store.withPromptStore("boolean \(position)") { try $0.receive(object) }
+            guard case .invalid = result else {
+                Issue.record("\(position): the message was not rejected (\(result))")
+                continue
+            }
+            #expect(defaults.data(forKey: UserDefaultsBulletStore.stateKey) == stateBefore, "\(position): the stored state changed")
+            #expect(store.rawKB == renderedBefore, "\(position): the rendered text changed")
+            #expect(sent.isEmpty, "\(position): a reply was sent")
+        }
+        // Positive control: the same message with numbers merges.
+        let control = try #require(try JSONSerialization.jsonObject(with: Data(numberedMessage("\(tag) ok").utf8)) as? [String: Any])
+        let result = try await store.withPromptStore("boolean control") { try $0.receive(control) }
+        guard case .merged = result else {
+            Issue.record("the numeric control was not merged (\(result))")
+            return
+        }
+        #expect(has("\(tag) ok"))
+        #expect(!has("\(tag) bad"))
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
 }

@@ -137,7 +137,9 @@ struct ShownBullet: Identifiable, Sendable {
     let text: String
     fileprivate(set) var labels: [Bullet]
 
-    var id: String { text }
+    /// Exact UTF-8 bytes, not the text as a `String`, whose equality treats canonically equivalent texts as
+    /// one: two bullets whose texts differ only that way are two rows (`Bullets.same` keeps them apart).
+    var id: [UInt8] { Array(text.utf8) }
 
     init(text: String, labels: [Bullet]) {
         self.text = text
