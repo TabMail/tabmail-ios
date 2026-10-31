@@ -24,8 +24,17 @@ actor MockChatIdTranslator: ChatIdTranslating {
         return numericId
     }
 
-    func toRealId(_ numericId: Int) -> String? {
-        idMap[numericId]
+    /// Runs once, at the next lookup, before it answers: a test's way to act while a tool is mid-call.
+    private var onResolve: (@Sendable () async -> Void)?
+
+    func setOnResolve(_ hook: (@Sendable () async -> Void)?) { onResolve = hook }
+
+    func toRealId(_ numericId: Int) async -> String? {
+        if let hook = onResolve {
+            onResolve = nil
+            await hook()
+        }
+        return idMap[numericId]
     }
 
     /// Seed a known mapping for tests that need predictable IDs.

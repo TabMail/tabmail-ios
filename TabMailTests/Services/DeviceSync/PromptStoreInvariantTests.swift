@@ -193,6 +193,31 @@ struct PromptStoreInvariantTests {
         #expect(store.semaphore.counter != inside, "leaving moved the counter")
     }
 
+    @Test("A demo switch that finds the semaphore busy asks again, and gives up with the mode unchanged after its attempts (DS-DEMO)")
+    func switchRetriesWhenBusy() async throws {
+        quiet()
+        DemoModeStore.shared._resetForTests()
+        let config = store.semaphore.config
+        store.semaphore.config.acquireWaitSeconds = 0.3
+        defer { store.semaphore.config = config }
+        // A holder that ends after one wait but within the attempts: the second ask gets the semaphore.
+        let brief = await PromptStoreHolder(store)
+        let entering = Task { @MainActor in try await store.enterDemo() }
+        try await Task.sleep(for: .milliseconds(450))
+        try await brief.end()
+        try await entering.value
+        #expect(DemoModeStore.isDemoActive, "the switch asked again and entered")
+        try await store.leaveDemo()
+        // A holder that outlasts every attempt: the switch is refused and the mode is as it was.
+        let long = await PromptStoreHolder(store)
+        let refused = Task { @MainActor in try await store.enterDemo() }
+        try await Task.sleep(for: .seconds(Double(config.switchAttempts) * 0.3 + 0.6))
+        let outcome = await refused.result
+        try await long.end()
+        if case .success = outcome { Issue.record("the switch entered with the semaphore held throughout") }
+        #expect(!DemoModeStore.isDemoActive, "a refused switch leaves the mode as it was")
+    }
+
     @Test("Entering the demo seeds all three rendered texts, so the background snapshots read the overlay (DS-DEMO)")
     func demoEntrySeedsTheSnapshots() async throws {
         quiet()

@@ -9,9 +9,49 @@ import Foundation
 struct TemplateDownloadTool: AgentTool, Sendable {
     let name = "template_download"
     private let ctx: ToolContext
+    private let fetch: @Sendable (String) async -> Fetched
 
-    init(context: ToolContext? = nil) {
+    /// What the marketplace answered: the response body, or the error the tool reports.
+    enum Fetched: Sendable {
+        case body(Data)
+        case failure(String)
+    }
+
+    /// `fetch` is the marketplace request; tests pass their own.
+    init(context: ToolContext? = nil, fetch: (@Sendable (String) async -> Fetched)? = nil) {
         self.ctx = context ?? ToolContext()
+        self.fetch = fetch ?? Self.fetchFromMarketplace
+    }
+
+    private static func fetchFromMarketplace(_ templateId: String) async -> Fetched {
+        let baseURL = BackendConfig.templatesBaseURL
+        guard let url = URL(string: "\(baseURL.absoluteString)/download/\(templateId)") else {
+            return .failure("Failed to build marketplace URL.")
+        }
+
+        let token: String
+        switch await TabMailTokenCoordinator.shared.validToken() {
+        case .success(let t): token = t
+        default: return .failure("Authentication not available. Please sign in first.")
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await sharedEphemeralSession.data(for: request)
+        } catch {
+            return .failure("Failed to connect to template marketplace.")
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            return .failure("Marketplace returned error: \(statusCode)")
+        }
+        return .body(data)
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
@@ -29,32 +69,10 @@ struct TemplateDownloadTool: AgentTool, Sendable {
         }
 
         // Fetch template from marketplace
-        let baseURL = BackendConfig.templatesBaseURL
-        guard let url = URL(string: "\(baseURL.absoluteString)/download/\(templateId)") else {
-            return ToolJSON.string(from: ["error": "Failed to build marketplace URL."])
-        }
-
-        let token: String
-        switch await TabMailTokenCoordinator.shared.validToken() {
-        case .success(let t): token = t
-        default: return ToolJSON.string(from: ["error": "Authentication not available. Please sign in first."])
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-
         let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await sharedEphemeralSession.data(for: request)
-        } catch {
-            return ToolJSON.string(from: ["error": "Failed to connect to template marketplace."])
-        }
-
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            return ToolJSON.string(from: ["error": "Marketplace returned error: \(statusCode)"])
+        switch await fetch(templateId) {
+        case .body(let body): data = body
+        case .failure(let message): return ToolJSON.string(from: ["error": message])
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
