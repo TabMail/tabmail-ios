@@ -70,7 +70,10 @@ struct DemoSwitchQueuedWriterTests {
 
     // MARK: - Short tools
 
-    private func run(_ tool: String, tag: String, statement: String) async throws -> String {
+    /// Blocks the calling (main) thread, which `Task.sleep` would not.
+    private static func blockTheMainActor(seconds: Double) { Thread.sleep(forTimeInterval: seconds) }
+
+    nonisolated private static func run(_ tool: String, tag: String, statement: String) async throws -> String {
         switch tool {
         case "kb_add": return try await KBAddTool().execute(arguments: ["statement": .string(tag + " new")])
         case "kb_del": return try await KBDelTool().execute(arguments: ["statement": .string(statement)])
@@ -97,10 +100,36 @@ struct DemoSwitchQueuedWriterTests {
         try await Task.sleep(for: .milliseconds(100))
         #expect(DemoModeStore.isDemoActive == !entering, "the switch has not run yet")
         let realBefore = realStorage()
-        let pending = Task { try await run(tool, tag: tag, statement: statement) }
+        let pending = Task { try await Self.run(tool, tag: tag, statement: statement) }
         try await Task.sleep(for: .milliseconds(100))
         try await holder.end()
         try await switching.value
+        let result = try await pending.value
+        #expect(result.lowercased().contains("could not save"), "the model is told nothing was saved: \(result)")
+        #expect(realStorage() == realBefore, "the old call changed real state")
+        let demoKB = UserDefaults.standard.string(forKey: "demo.user_prompts:user_kb.md") ?? ""
+        #expect(!demoKB.contains(tag + " new"), "the old call added to the demo")
+        if DemoModeStore.isDemoActive { try await store.leaveDemo() }
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
+    @Test("A KB or reminder tool whose first hop to the main actor is overtaken by a switch is refused",
+          arguments: ["kb_add", "kb_del", "reminder_add", "reminder_del"], [true, false])
+    func toolOvertakenBeforeItsFirstHopIsRefused(tool: String, entering: Bool) async throws {
+        quiet()
+        let tag = PromptStoreTestCleanup.tag()
+        let statement = tool.hasPrefix("reminder") ? "[Reminder] \(tag)" : "[Pinned] \(tag)"
+        #expect(await store.edit("real seed") { try $0.addBullet(statement, to: .knowledgeBase) } == .saved)
+        if !entering {
+            try await store.enterDemo()
+            #expect(await store.edit("demo seed") { try $0.addBullet(statement, to: .knowledgeBase) } == .saved)
+        }
+        let realBefore = realStorage()
+        let pending = Task.detached { try await Self.run(tool, tag: tag, statement: statement) }
+        // The test holds the main actor while the tool runs up to its first hop onto it, then switches without
+        // suspending, so the switch is over before the tool's turn on the main actor.
+        Self.blockTheMainActor(seconds: 0.3)
+        if entering { try await store.enterDemo() } else { try await store.leaveDemo() }
         let result = try await pending.value
         #expect(result.lowercased().contains("could not save"), "the model is told nothing was saved: \(result)")
         #expect(realStorage() == realBefore, "the old call changed real state")
