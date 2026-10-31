@@ -222,6 +222,18 @@ struct PromptStoreInvariantTests {
         #expect(realStorage() == realBefore)
     }
 
+    @Test("Two bullets whose texts differ only by Unicode normalization are two rows with two identities (DS-DISPLAYED)")
+    func canonicallyEquivalentBulletsAreTwoRows() async {
+        quiet()
+        let tag = PromptStoreTestCleanup.tag()
+        #expect(await store.edit("add composed") { try $0.addBullet("\(tag) caf\u{E9}", to: .knowledgeBase) } == .saved)
+        #expect(await store.edit("add decomposed") { try $0.addBullet("\(tag) cafe\u{301}", to: .knowledgeBase) } == .saved)
+        let rows = store.shown(.knowledgeBase).filter { $0.text.contains(tag) }
+        #expect(rows.count == 2, "the store keeps both")
+        #expect(Set(rows.map(\.id)).count == 2, "a list of them has two row identities")
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
     @Test("A write interrupted between the labelled state and the rendered text is repaired when the store opens (DS-ATOMIC)")
     func interruptedWriteIsRepairedAtOpen() async throws {
         quiet()
