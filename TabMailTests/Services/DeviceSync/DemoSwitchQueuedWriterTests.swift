@@ -54,6 +54,24 @@ struct DemoSwitchQueuedWriterTests {
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
+    @Test("A gesture whose task has not started when the switch runs is refused", arguments: [true, false])
+    func gestureOvertakenBeforeItsTaskStartsIsRefused(entering: Bool) async throws {
+        quiet()
+        let tag = PromptStoreTestCleanup.tag()
+        if !entering { try await store.enterDemo() }
+        let realBefore = realStorage()
+        // The gesture's task cannot start until the test suspends, and the switch does not suspend: the switch is
+        // over before the gesture's task runs, so only the count taken in the gesture's call can tell.
+        let pending = store.gesture("made before an immediate switch") { try $0.addBullet(tag, to: .knowledgeBase) }
+        if entering { try await store.enterDemo() } else { try await store.leaveDemo() }
+        #expect(await pending.value == .dropped, "work made before the switch is refused")
+        #expect(!store.rawKB.contains(tag), "the mode now live received none of it")
+        #expect(realStorage() == realBefore, "no real state changed")
+        #expect(UserDefaults.standard.string(forKey: "demo.user_prompts:user_kb.md")?.contains(tag) != true, "the demo received none of it")
+        if DemoModeStore.isDemoActive { try await store.leaveDemo() }
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+    }
+
     @Test("A gesture queued behind another edit still saves: only a switch refuses it")
     func gestureBehindAnotherEditSaves() async throws {
         quiet()
