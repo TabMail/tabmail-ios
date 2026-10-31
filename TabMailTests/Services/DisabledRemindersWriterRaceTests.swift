@@ -12,6 +12,8 @@ import Testing
 private final class ParkingDefaults: UserDefaults {
     private let state = Mutex((reads: 0, parked: false, timedOut: false))
     private let unblock = DispatchSemaphore(value: 0)
+    /// The key whose first off-main read parks (the real map unless a test aims at the demo's).
+    var parkKey = "disabled_reminders_v2"
 
     var parked: Bool { state.withLock { $0.parked } }
     var timedOut: Bool { state.withLock { $0.timedOut } }
@@ -20,7 +22,7 @@ private final class ParkingDefaults: UserDefaults {
     /// A writer's one read of the map is its first off-main read of the key.
     override func data(forKey key: String) -> Data? {
         let snapshot = super.data(forKey: key)
-        if key == "disabled_reminders_v2", !Thread.isMainThread {
+        if key == parkKey, !Thread.isMainThread {
             let park = state.withLock { s -> Bool in
                 s.reads += 1
                 return s.reads == 1
@@ -245,6 +247,43 @@ struct DisabledRemindersWriterRaceTests {
             #expect(defaults.data(forKey: DisabledRemindersStore.demoStorageKeyV2) == nil, "no demo map was left behind")
             #expect(DisabledRemindersStore.getDisabledMap(demo: false).isEmpty)
         }
+    }
+
+    @Test("A demo writer holding the map when the demo ends lands before the demo's map is removed, so none outlives the demo")
+    func demoMapDoesNotOutliveTheDemo() async throws {
+        let (defaults, suite) = try isolatedDefaults(seed: [:])
+        defaults.parkKey = DisabledRemindersStore.demoStorageKeyV2
+        defer { defaults.removePersistentDomain(forName: suite); DemoModeStore.shared._resetForTests() }
+        DemoModeStore.shared._resetForTests()
+        try await DemoModeService.shared.start(mintToken: false)
+        PromptStore.shared.enterDemoOverlay()
+        let box = DefaultsBox(defaults)
+        let writer = Task.detached { @Sendable [box] in
+            DisabledRemindersStore.withTestDefaults(box.value) {
+                _ = DisabledRemindersStore.setEnabled(hash: "k:demo", enabled: false, demo: true)
+            }
+        }
+        let end = ContinuousClock.now + .seconds(10)
+        while !defaults.parked, ContinuousClock.now < end { try await Task.sleep(for: .milliseconds(20)) }
+        guard defaults.parked else {
+            defaults.release(); await writer.value
+            Issue.record("the demo writer never reached its read")
+            await DemoModeService.shared.exit()
+            return
+        }
+        // The writer is admitted and holds the lock. It is let go only once the flag is off: a removal that
+        // runs before the flip waits on the lock the writer still holds, so nothing releases the writer.
+        let releaser = Task.detached { @Sendable [box] in
+            let deadline = ContinuousClock.now + .seconds(10)
+            while DemoModeStore.isDemoActive, ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(10)) }
+            box.value.release()
+        }
+        let exiting = DisabledRemindersStore.withTestDefaults(defaults) { Task { await DemoModeService.shared.exit() } }
+        await exiting.value
+        await writer.value
+        await releaser.value
+        #expect(!defaults.timedOut, "the demo's end waited for a writer that waited for it")
+        #expect(defaults.data(forKey: DisabledRemindersStore.demoStorageKeyV2) == nil, "a demo map outlived the demo")
     }
 
     @Test("In the demo the reminder map is the demo's own; the real map is untouched and reads back after")
