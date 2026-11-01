@@ -9,32 +9,30 @@ import Foundation
 struct TemplateDownloadTool: AgentTool, Sendable {
     let name = "template_download"
     private let ctx: ToolContext
+    private let fetch: @Sendable (String) async -> Fetched
 
-    init(context: ToolContext? = nil) {
+    /// What the marketplace answered: the response body, or the error the tool reports.
+    enum Fetched: Sendable {
+        case body(Data)
+        case failure(String)
+    }
+
+    /// `fetch` is the marketplace request; tests pass their own.
+    init(context: ToolContext? = nil, fetch: (@Sendable (String) async -> Fetched)? = nil) {
         self.ctx = context ?? ToolContext()
+        self.fetch = fetch ?? Self.fetchFromMarketplace
     }
 
-    func execute(arguments: [String: JSONValue]) async throws -> String {
-        try await execute(arguments: arguments, invocation: .noninteractive)
-    }
-
-    /// ADR-IOS-053: real entry point — delivers the confirmation card to the
-    /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
-    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
-        guard let templateId = await TemplateToolHelpers.resolveTemplateId(arguments, translator: ctx.translator) else {
-            return ToolJSON.string(from: ["error": "Template ID is required."])
-        }
-
-        // Fetch template from marketplace
+    private static func fetchFromMarketplace(_ templateId: String) async -> Fetched {
         let baseURL = BackendConfig.templatesBaseURL
         guard let url = URL(string: "\(baseURL.absoluteString)/download/\(templateId)") else {
-            return ToolJSON.string(from: ["error": "Failed to build marketplace URL."])
+            return .failure("Failed to build marketplace URL.")
         }
 
         let token: String
         switch await TabMailTokenCoordinator.shared.validToken() {
         case .success(let t): token = t
-        default: return ToolJSON.string(from: ["error": "Authentication not available. Please sign in first."])
+        default: return .failure("Authentication not available. Please sign in first.")
         }
 
         var request = URLRequest(url: url)
@@ -46,12 +44,35 @@ struct TemplateDownloadTool: AgentTool, Sendable {
         do {
             (data, response) = try await sharedEphemeralSession.data(for: request)
         } catch {
-            return ToolJSON.string(from: ["error": "Failed to connect to template marketplace."])
+            return .failure("Failed to connect to template marketplace.")
         }
 
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            return ToolJSON.string(from: ["error": "Marketplace returned error: \(statusCode)"])
+            return .failure("Marketplace returned error: \(statusCode)")
+        }
+        return .body(data)
+    }
+
+    func execute(arguments: [String: JSONValue]) async throws -> String {
+        try await execute(arguments: arguments, invocation: .noninteractive)
+    }
+
+    /// ADR-IOS-053: real entry point — delivers the confirmation card to the
+    /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
+    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
+        // The call awaits (a confirmation, a lookup) before it writes, so it carries the change counter it started
+        // with (DS-DEMO): a demo switch, or any other change to the store, in between refuses its write.
+        let started = ChangeCounter.device.current
+        guard let templateId = await TemplateToolHelpers.resolveTemplateId(arguments, translator: ctx.translator) else {
+            return ToolJSON.string(from: ["error": "Template ID is required."])
+        }
+
+        // Fetch template from marketplace
+        let data: Data
+        switch await fetch(templateId) {
+        case .body(let body): data = body
+        case .failure(let message): return ToolJSON.string(from: ["error": message])
         }
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -95,9 +116,10 @@ struct TemplateDownloadTool: AgentTool, Sendable {
             exampleReply: exampleReply
         )
 
-        await MainActor.run {
-            PromptStore.shared.addTemplate(newTemplate)
+        let saved = await MainActor.run {
+            PromptStore.shared.addTemplate(newTemplate, since: started)
         }
+        guard saved else { return ToolJSON.string(from: ["error": "Could not save the change; try again."]) }
 
         // Register in translator for pill rendering
         let numericId = await ctx.translator.toNumericId(localId)

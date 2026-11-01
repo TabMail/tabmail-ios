@@ -50,15 +50,14 @@ struct SyncFieldTests {
         #expect(SyncField(rawValue: "nonexistent") == nil)
     }
 
-    @Test("promptFields excludes disabledReminders")
-    func promptFields() {
-        let promptFields = SyncField.promptFields
-        #expect(promptFields.count == 4)
-        #expect(promptFields.contains(.composition))
-        #expect(promptFields.contains(.action))
-        #expect(promptFields.contains(.kb))
-        #expect(promptFields.contains(.templates))
-        #expect(!promptFields.contains(.disabledReminders))
+    @Test("legacyFields keeps templates, disabledReminders and actionConfig only")
+    func legacyFields() {
+        let legacyFields = SyncField.legacyFields
+        #expect(legacyFields.count == 3)
+        #expect(legacyFields.contains(.templates))
+        #expect(legacyFields.contains(.disabledReminders))
+        #expect(legacyFields.contains(.actionConfig))
+        #expect(!legacyFields.contains(.kb))
     }
 
     @Test("displayName returns non-empty strings for all cases")

@@ -65,3 +65,15 @@ or stalls, or part 3 shows an error or does not finish and the person taps Skip.
 
 Reopen when a committed UI test target for the tutorial exists, or when one of these hooks is
 reported broken.
+
+## Amendment 2026-10-31 - the Device Sync view hooks (owner)
+
+The owner accepted, for the Device Sync prompt-store work, that the SwiftUI button hookup of the
+settings editors (Add, Delete, Reset, Restore) is not unit-tested: each button's closure only calls a
+prompt-store operation that has its own invariant tests, and the only test that kills a mutation in the
+closure is a hosted-view UI test. If a hook is lost the result is a recoverable product defect (the button
+does nothing, or the gesture is not recorded); nothing is lost and no real mail is touched. Reopen under the
+same condition as above.
+
+Related decision, recorded in ADR-IOS-038 (amendment 2026-10-31): work in flight across a demo switch is
+dropped (owner), not completed against the new mode.

@@ -105,7 +105,7 @@ struct TemplatesListView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
-                    store.addTemplate()
+                    store.addTemplate(ReplyTemplate())
                 } label: {
                     Image(systemName: "plus")
                 }

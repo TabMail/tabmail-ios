@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "defaults": [
+    {
+      "id": "kb-1",
+      "field": "kb",
+      "section": "",
+      "text": "User is using TabMail as their AI assistant for emails."
+    },
+    {
+      "id": "kb-2",
+      "field": "kb",
+      "section": "",
+      "text": "TabMail documentation is available at [TabMail Website's help page](https://tabmail.ai/docs/)."
+    },
+    {
+      "id": "kb-3",
+      "field": "kb",
+      "section": "",
+      "text": "TabMail support is available at [TabMail Support](https://tabmail.ai/support)."
+    },
+    {
+      "id": "composition-general-1",
+      "field": "composition",
+      "section": "general",
+      "text": "ALWAYS sign off as the user using the **First Name Only**."
+    },
+    {
+      "id": "composition-general-2",
+      "field": "composition",
+      "section": "general",
+      "text": "I want to sound friendly and professional, but not too formal."
+    },
+    {
+      "id": "composition-general-3",
+      "field": "composition",
+      "section": "general",
+      "text": "ALWAYS start with a greeting."
+    },
+    {
+      "id": "composition-general-4",
+      "field": "composition",
+      "section": "general",
+      "text": "I generally use Cheers or Best, depending on the context. Or if I really want to be formal, I use Sincerely or Best regards. For replying to application enquiries, I use Best wishes."
+    },
+    {
+      "id": "composition-language-1",
+      "field": "composition",
+      "section": "language",
+      "text": "I write in English Only."
+    },
+    {
+      "id": "composition-links-1",
+      "field": "composition",
+      "section": "links",
+      "text": "[TabMail Website](https://tabmail.ai)"
+    },
+    {
+      "id": "composition-links-2",
+      "field": "composition",
+      "section": "links",
+      "text": "[TabMail Support](https://tabmail.ai/support)"
+    },
+    {
+      "id": "action-delete-1",
+      "field": "action",
+      "section": "delete",
+      "text": "All emails from spammy senders."
+    },
+    {
+      "id": "action-archive-1",
+      "field": "action",
+      "section": "archive",
+      "text": "Professional newsletters digests."
+    },
+    {
+      "id": "action-archive-2",
+      "field": "action",
+      "section": "archive",
+      "text": "Bugzilla bug update notifications sent to CC lists."
+    },
+    {
+      "id": "action-archive-3",
+      "field": "action",
+      "section": "archive",
+      "text": "Financial documents."
+    },
+    {
+      "id": "action-archive-4",
+      "field": "action",
+      "section": "archive",
+      "text": "Bank account notifications."
+    },
+    {
+      "id": "action-archive-5",
+      "field": "action",
+      "section": "archive",
+      "text": "Shipment notifications."
+    },
+    {
+      "id": "action-reply-1",
+      "field": "action",
+      "section": "reply",
+      "text": "Urgent requests for action."
+    },
+    {
+      "id": "action-reply-2",
+      "field": "action",
+      "section": "reply",
+      "text": "Notifications about account compromise or data breaches that ask the user to review breach details and secure accounts."
+    },
+    {
+      "id": "action-none-1",
+      "field": "action",
+      "section": "none",
+      "text": "Emails that do not clearly fit into any of the other categories."
+    }
+  ]
+}

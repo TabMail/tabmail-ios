@@ -21,6 +21,9 @@ struct TemplateCreateTool: AgentTool, Sendable {
     /// ADR-IOS-053: real entry point — delivers the confirmation card to the
     /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
+        // The call awaits (a confirmation, a lookup) before it writes, so it carries the change counter it started
+        // with (DS-DEMO): a demo switch, or any other change to the store, in between refuses its write.
+        let started = ChangeCounter.device.current
         let templateName = TemplateToolHelpers.stringArg(arguments, "name")
         guard !templateName.isEmpty else {
             return ToolJSON.string(from: ["error": "Template name is required."])
@@ -58,7 +61,7 @@ struct TemplateCreateTool: AgentTool, Sendable {
             ] as [String: Any]))
         }
 
-        // Create template in PromptStore (didSet triggers persistence + Device Sync)
+        // Create template in PromptStore (persisted and sent to Device Sync by its commit)
         let templateId = UUID().uuidString
         let newTemplate = ReplyTemplate(
             id: templateId,
@@ -68,9 +71,10 @@ struct TemplateCreateTool: AgentTool, Sendable {
             exampleReply: exampleReply
         )
 
-        await MainActor.run {
-            PromptStore.shared.addTemplate(newTemplate)
+        let saved = await MainActor.run {
+            PromptStore.shared.addTemplate(newTemplate, since: started)
         }
+        guard saved else { return ToolJSON.string(from: ["error": "Could not save the change; try again."]) }
 
         // Register new template in ChatIdTranslator so LLM gets a numeric ID + pill rendering
         let numericId = await ctx.translator.toNumericId(templateId)

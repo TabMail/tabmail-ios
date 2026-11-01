@@ -18,8 +18,11 @@ extension AIService {
         summaryTodos: String?,
         originalAction: String,
         userManualTag: String,
-        currentUserActionMd: String
+        actionCapture: PromptCapture
     ) async {
+        // user_action.md as read before the backend call, and the labels it shows: the patch deletes
+        // only those whose text it removes (DS-CAPTURE).
+        let currentUserActionMd = actionCapture.text
         BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: START original=\(originalAction) userTag=\(userManualTag)")
         BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: subject=\(subject.prefix(60)) from=\(from.prefix(40))")
         BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: blurb=\(summaryBlurb?.prefix(80) ?? "nil") todos=\(summaryTodos?.prefix(80) ?? "nil")")
@@ -102,39 +105,25 @@ extension AIService {
 
             BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: parsed patch:\n\(patchText)")
 
-            // Re-read current prompt — another tag correction may have mutated it during the await.
-            // If it changed, skip this patch to avoid overwriting a concurrent update.
-            let latestActionMd = PromptStore.actionMarkdownSnapshot()
-            guard latestActionMd == currentUserActionMd else {
-                BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: SKIP prompt changed concurrently (was \(currentUserActionMd.count) now \(latestActionMd.count))")
-                return
-            }
-
             // Apply the patch to current user_action.md
             guard let updated = ActionPatchApplier.applyActionPatch(content: currentUserActionMd, patchText: patchText) else {
                 BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: FAIL patch application failed")
                 return
             }
 
-            guard updated != currentUserActionMd else {
+            guard !Bullets.same(updated, currentUserActionMd) else {
                 BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: patch produced no change")
                 return
             }
 
-            // Persist updated guidelines — must happen on MainActor since PromptStore is @MainActor.
-            // Demo guard (ADR-IOS-038): a refine dispatched before demo entry can
-            // complete during demo — saving would write into the demo overlay
-            // (discarded on exit). Drop instead.
+            // Persist the updated guidelines against the captured labels in a second hold of the prompt
+            // store: refused with nothing written when the counter moved since the read (an edit,
+            // a synced change, a reset or a restore) or demo mode started
+            // or ended (ADR-IOS-038), and the patch is dropped.
             let beforeLen = currentUserActionMd.count
             let afterLen = updated.count
-            await MainActor.run {
-                guard !DemoModeStore.shared.isActive else {
-                    BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: dropped — demo mode became active mid-flight")
-                    return
-                }
-                PromptStore.shared.rawAction = updated
-                BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: SUCCESS user_action.md updated (before=\(beforeLen) after=\(afterLen))")
-            }
+            let outcome = await PromptStore.shared.writeAfterRead(actionCapture, text: updated, "action-rule refine")
+            BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: user_action.md \(outcome) (before=\(beforeLen) after=\(afterLen))")
 
         } catch {
             BackgroundSyncLogger.logDebug("[AIService] autoUpdatePrompt: ERROR \(error)")
@@ -142,6 +131,18 @@ extension AIService {
     }
 
     // MARK: - Manual Compact Action Rules
+
+    /// What the person is told of a compaction's read or write. Dropped: the rules changed while it
+    /// ran (an edit, a synced rule, a reset, sign-out or another account), so nothing was saved.
+    nonisolated static func compactResult(_ outcome: PromptEditOutcome, opsCount: Int) -> CompactResult {
+        switch outcome {
+        case .saved: return .applied(opsCount: opsCount)
+        case .unchanged: return .nothingToCompact
+        case .unsaved: return .failed(message: "The rules could not be saved")
+        case .dropped: return .skipped(reason: "Rules changed while compacting — try again")
+        case .busy: return .skipped(reason: "Rules are busy — try again in a moment")
+        }
+    }
 
     /// Result type for compactActionRulesNow.
     enum CompactResult {
@@ -154,8 +155,9 @@ extension AIService {
     /// Manually trigger a compact-only action-rules refinement.
     /// Sends `action_compact_only: true` so the backend runs compaction only,
     /// bypassing thresholds, and returns patch ops or an empty patch when nothing
-    /// is mergeable. Fire-and-return — returns a CompactResult describing what happened.
-    func compactActionRulesNow() async -> CompactResult {
+    /// is mergeable. Fire-and-return — returns a CompactResult describing what happened. The tap passes the
+    /// `entered` demo-switch count it took before it made the task that calls this (DS-DEMO).
+    func compactActionRulesNow(entered: Int? = nil) async -> CompactResult {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[AIService] compactActionRules: START disableLLM=\(disableLLMCalls)")
         }
@@ -168,8 +170,14 @@ extension AIService {
             return .skipped(reason: "AI is disabled")
         }
 
-        // Read current snapshot (nonisolated, safe from actor)
-        let currentUserActionMd = PromptStore.actionMarkdownSnapshot()
+        // Current user_action.md, and the labels it shows, read in one brief hold of the prompt store
+        //: the patch deletes only those whose text it removes (DS-CAPTURE).
+        let actionCapture: PromptCapture
+        switch await PromptStore.shared.readBeforeAI(.action, "compact action rules", entered: entered) {
+        case .read(let capture): actionCapture = capture
+        case .refused(let outcome): return Self.compactResult(outcome, opsCount: 0)
+        }
+        let currentUserActionMd = actionCapture.text
 
         // Skip if user_action.md is empty
         guard !currentUserActionMd.isEmpty else {
@@ -268,15 +276,6 @@ extension AIService {
                 BackgroundSyncLogger.logDebug("[AIService] compactActionRules: parsed patch:\n\(patchText)")
             }
 
-            // Drift guard: re-read snapshot; if changed since we started, abort.
-            let latestActionMd = PromptStore.actionMarkdownSnapshot()
-            guard latestActionMd == currentUserActionMd else {
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[AIService] compactActionRules: SKIP prompt changed concurrently (was \(currentUserActionMd.count) now \(latestActionMd.count))")
-                }
-                return .skipped(reason: "Rules changed while compacting — try again")
-            }
-
             // Apply the patch
             guard let updated = ActionPatchApplier.applyActionPatch(content: currentUserActionMd, patchText: patchText) else {
                 if DebugModeManager.isLoggingEnabled() {
@@ -285,7 +284,7 @@ extension AIService {
                 return .failed(message: "Could not apply compaction patch")
             }
 
-            guard updated != currentUserActionMd else {
+            guard !Bullets.same(updated, currentUserActionMd) else {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[AIService] compactActionRules: patch produced no change")
                 }
@@ -297,29 +296,15 @@ extension AIService {
                 .filter { $0.trimmingCharacters(in: .whitespaces) == "DEL" || $0.trimmingCharacters(in: .whitespaces) == "ADD" }
                 .count
 
-            // Persist on MainActor; demo guard mirrors autoUpdateUserPromptOnTag.
-            // The closure returns whether the persist actually happened so the
-            // caller never reports "Merged N rules" for a demo-dropped write.
+            // Persist in a second hold of the prompt store, mirroring autoUpdateUserPromptOnTag: the
+            // caller never reports "Merged N rules" for a dropped write.
             let beforeLen = currentUserActionMd.count
             let afterLen = updated.count
-            let persisted = await MainActor.run { () -> Bool in
-                guard !DemoModeStore.shared.isActive else {
-                    if DebugModeManager.isLoggingEnabled() {
-                        BackgroundSyncLogger.logDebug("[AIService] compactActionRules: dropped — demo mode became active mid-flight")
-                    }
-                    return false
-                }
-                PromptStore.shared.rawAction = updated
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[AIService] compactActionRules: SUCCESS user_action.md updated (before=\(beforeLen) after=\(afterLen) ops=\(opsCount))")
-                }
-                return true
+            let outcome = await PromptStore.shared.writeAfterRead(actionCapture, text: updated, "compact action rules")
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[AIService] compactActionRules: user_action.md \(outcome) (before=\(beforeLen) after=\(afterLen) ops=\(opsCount))")
             }
-
-            guard persisted else {
-                return .skipped(reason: "Demo mode active")
-            }
-            return .applied(opsCount: opsCount)
+            return Self.compactResult(outcome, opsCount: opsCount)
 
         } catch {
             if DebugModeManager.isLoggingEnabled() {

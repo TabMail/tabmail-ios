@@ -1,0 +1,288 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+
+import Darwin
+import Foundation
+import Network
+import Testing
+@testable import TabMail
+
+/// A WebSocket server on the loopback interface, in this process, that sends a text message when asked.
+private final class LoopbackWebSocketServer: @unchecked Sendable {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "loopback-websocket")
+    /// Read and written on `queue` only.
+    private var connection: NWConnection?
+    private var open = false
+    /// The text messages the client sent, in order. Read and written on `queue` only.
+    private var received: [String] = []
+
+    init() throws {
+        let parameters = NWParameters.tcp
+        parameters.requiredInterfaceType = .loopback
+        parameters.defaultProtocolStack.applicationProtocols.insert(NWProtocolWebSocket.Options(), at: 0)
+        listener = try NWListener(using: parameters, on: .any)
+    }
+
+    /// Starts listening; the port it listens on.
+    func start() async throws -> UInt16 {
+        listener.newConnectionHandler = { [weak self] connection in
+            guard let self else { return }
+            self.connection = connection
+            connection.stateUpdateHandler = { [weak self] state in
+                if case .ready = state {
+                    self?.open = true
+                    self?.receiveNext(on: connection)
+                }
+            }
+            connection.start(queue: self.queue)
+        }
+        let listener = listener
+        return try await withCheckedThrowingContinuation { continuation in
+            listener.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(returning: listener.port?.rawValue ?? 0)
+                case .failed(let error):
+                    listener.stateUpdateHandler = nil
+                    continuation.resume(throwing: error)
+                default:
+                    break
+                }
+            }
+            listener.start(queue: queue)
+        }
+    }
+
+    private func receiveNext(on connection: NWConnection) {
+        connection.receiveMessage { [weak self] data, _, _, error in
+            guard let self, error == nil else { return }
+            if let data, let text = String(data: data, encoding: .utf8) { self.received.append(text) }
+            self.receiveNext(on: connection)
+        }
+    }
+
+    /// The `field` of every `bullet_state` message received so far.
+    var bulletFields: [String] {
+        queue.sync {
+            received.compactMap { text in
+                guard let object = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any], object["type"] as? String == "bullet_state" else { return nil }
+                return object["field"] as? String
+            }
+        }
+    }
+
+    /// The text of every `bullet_state` message of `field` received so far, in order.
+    func bulletMessages(_ field: String) -> [String] {
+        queue.sync {
+            received.filter { text in
+                guard let object = try? JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any] else { return false }
+                return object["type"] as? String == "bullet_state" && object["field"] as? String == field
+            }
+        }
+    }
+
+    func forgetReceived() {
+        queue.sync { received.removeAll() }
+    }
+
+    /// Whether a client's handshake has completed.
+    var isOpen: Bool { queue.sync { open } }
+
+    func send(_ text: String) {
+        queue.async { [self] in
+            let context = NWConnection.ContentContext(identifier: "message", metadata: [NWProtocolWebSocket.Metadata(opcode: .text)])
+            connection?.send(content: Data(text.utf8), contentContext: context, isComplete: true, completion: .idempotent)
+        }
+    }
+
+    func stop() {
+        queue.sync { connection?.cancel() }
+        listener.cancel()
+    }
+}
+
+/// A message a socket read after its connection ended never reaches the prompt store (DS-RECEIVE): the
+/// connection that replaced it would otherwise take it as its own.
+@MainActor
+@Suite("Device Sync socket boundary", .serialized, .processGlobalState)
+struct DeviceSyncSocketBoundaryTests {
+    private static func canonical(_ state: FieldState) -> String {
+        let bullets = state.bullets.map { "\($0.section)|\($0.text)|\($0.name)|\($0.n)" }
+        let seen = state.seen.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }
+        return (state.head + ["--"] + bullets + ["--"] + seen + ["--"] + state.tail).joined(separator: "\n")
+    }
+
+    private func stored(_ text: String) -> Bool {
+        PromptStore.shared.rawKB.contains(text)
+    }
+
+    @Test("A message the socket received after a disconnect is never applied; a message received afterwards is")
+    func receiveAfterDisconnectIsDropped() async throws {
+        let defaults = UserDefaults.standard
+        let savedAuto = defaults.object(forKey: "device_sync_auto_enabled")
+        defer { defaults.set(savedAuto, forKey: "device_sync_auto_enabled") }
+        let store = PromptStore.shared
+        let sync = DeviceSyncService.shared
+        defaults.set(false, forKey: "device_sync_auto_enabled")
+        sync.disconnect()
+        let tag = PromptStoreTestCleanup.tag()
+        let server = try LoopbackWebSocketServer()
+        let session = URLSession(configuration: .ephemeral)
+        var failure: Error?
+        do {
+            let port = try await server.start()
+            let socket = session.webSocketTask(with: try #require(URL(string: "ws://127.0.0.1:\(port)")))
+            sync.webSocket = socket
+            socket.resume()
+            let receiver = Task { await sync.receiveLoop() }
+            let deadline = ContinuousClock.now + .seconds(3)
+            while ContinuousClock.now < deadline, !server.isOpen {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            #expect(server.isOpen)
+            // The loop waits in its receive. The message arrives while the main actor stays busy, so the
+            // receive's result is queued behind the disconnect below.
+            try await Task.sleep(for: .milliseconds(100))
+            server.send(ForeignBulletMessage.kb("\(tag) old socket message after disconnect"))
+            usleep(1_000_000)
+            sync.disconnect()
+            await receiver.value
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(!stored("\(tag) old socket message after disconnect"))
+
+            // Control: a message received afterwards is applied.
+            sync.handleMessage(ForeignBulletMessage.kb("\(tag) message after the disconnect"))
+            let applied = ContinuousClock.now + .seconds(2)
+            while ContinuousClock.now < applied, !stored("\(tag) message after the disconnect") {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            #expect(stored("\(tag) message after the disconnect"))
+        } catch {
+            failure = error
+        }
+        sync.disconnect()
+        session.invalidateAndCancel()
+        server.stop()
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+        if let failure { throw failure }
+    }
+
+    @Test("Sync Now on a connected device sends all three bullet fields, as on connect (DS-NO-REQUEST)")
+    func syncNowSendsTheBulletFields() async throws {
+        let defaults = UserDefaults.standard
+        let savedAuto = defaults.object(forKey: "device_sync_auto_enabled")
+        defer { defaults.set(savedAuto, forKey: "device_sync_auto_enabled") }
+        let sync = DeviceSyncService.shared
+        defaults.set(false, forKey: "device_sync_auto_enabled")
+        sync.disconnect()
+        let server = try LoopbackWebSocketServer()
+        let session = URLSession(configuration: .ephemeral)
+        var failure: Error?
+        do {
+            let port = try await server.start()
+            let socket = session.webSocketTask(with: try #require(URL(string: "ws://127.0.0.1:\(port)")))
+            sync.webSocket = socket
+            socket.resume()
+            let deadline = ContinuousClock.now + .seconds(3)
+            while ContinuousClock.now < deadline, !server.isOpen {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            #expect(server.isOpen)
+            // The relay's greeting: the device is connected, and its three fields go out (the control).
+            sync.handleMessage(#"{"type":"connected","userId":"00000000-0000-0000-0000-000000000000"}"#)
+            func fieldsSent() async throws -> Set<String> {
+                let limit = ContinuousClock.now + .seconds(5)
+                while ContinuousClock.now < limit, Set(server.bulletFields).count < 3 {
+                    try await Task.sleep(for: .milliseconds(25))
+                }
+                return Set(server.bulletFields)
+            }
+            #expect(try await fieldsSent() == ["kb", "composition", "action"], "on connect")
+            server.forgetReceived()
+            sync.syncNow()
+            #expect(try await fieldsSent() == ["kb", "composition", "action"], "Sync Now")
+        } catch {
+            failure = error
+        }
+        sync.disconnect()
+        session.invalidateAndCancel()
+        server.stop()
+        if let failure { throw failure }
+    }
+
+    @Test("What Sync Now puts on the socket carries the device's bullets: a separate device that imports it holds them (DS-SEND)")
+    func socketPayloadReachesADurablePeer() async throws {
+        let defaults = UserDefaults.standard
+        let savedAuto = defaults.object(forKey: "device_sync_auto_enabled")
+        defer { defaults.set(savedAuto, forKey: "device_sync_auto_enabled") }
+        let store = PromptStore.shared
+        let sync = DeviceSyncService.shared
+        defaults.set(false, forKey: "device_sync_auto_enabled")
+        sync.disconnect()
+        let tag = PromptStoreTestCleanup.tag()
+        let text = "\(tag) socket payload bullet"
+        #expect(await store.edit("seed KB bullet") { try $0.addBullet(text, to: .knowledgeBase) } == .saved)
+        let senderBefore = store.bullets.engine.state(.kb)
+        let ours = senderBefore.bullets.filter { $0.text == text }
+        let server = try LoopbackWebSocketServer()
+        let session = URLSession(configuration: .ephemeral)
+        let peerDefaults = DeviceDefaults()
+        var failure: Error?
+        do {
+            guard ours.count == 1, let bullet = ours.first else {
+                Issue.record("the seeded bullet is not in the sender's state")
+                throw CancellationError()
+            }
+            let port = try await server.start()
+            let socket = session.webSocketTask(with: try #require(URL(string: "ws://127.0.0.1:\(port)")))
+            sync.webSocket = socket
+            socket.resume()
+            let deadline = ContinuousClock.now + .seconds(3)
+            while ContinuousClock.now < deadline, !server.isOpen {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            #expect(server.isOpen)
+            sync.handleMessage(#"{"type":"connected","userId":"00000000-0000-0000-0000-000000000000"}"#)
+            let limit = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < limit, Set(server.bulletFields).count < 3 {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            server.forgetReceived()
+            sync.syncNow()
+            let sent = ContinuousClock.now + .seconds(5)
+            while ContinuousClock.now < sent, server.bulletMessages("kb").isEmpty {
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            let messages = server.bulletMessages("kb")
+            #expect(!messages.isEmpty, "Sync Now sent no kb message")
+
+            // A device of its own, on defaults of its own, imports the messages as they came off the socket.
+            let peer = BulletDevice(id: "A", store: peerDefaults, relay: BulletRelay(), name: { String(format: "b0b0%04x%08x", 1, $0) },
+                                    budget: BulletSyncConfig.messageMaxBytes, catalog: DeviceSyncSharedFiles.catalog)
+            peer.start()
+            for message in messages { peer.receive(text: message) }
+            let received = peer.state(.kb)
+            let imported = received.bullets.filter { $0.name == bullet.name }
+            #expect(imported.map(\.text) == [text], "the peer holds the sender's bullet under its label")
+            #expect(imported.map(\.n) == [bullet.n])
+            #expect(received.seen[bullet.name] == senderBefore.seen[bullet.name], "the peer incorporated the sender's seen count")
+            #expect(senderBefore.seen[bullet.name] != nil)
+            let rendered = peerDefaults.defaults.string(forKey: UserDefaultsBulletStore.renderedKeys[.kb]!) ?? ""
+            #expect(rendered.contains(text), "the peer's rendered text carries the bullet")
+            #expect(peerDefaults.storedState(.kb)?.bullets.contains { $0.name == bullet.name && $0.text == text } == true, "the peer stored the bullet")
+            let senderAfter = store.bullets.engine.state(.kb)
+            #expect(Self.canonical(senderAfter) == Self.canonical(senderBefore), "sending changes nothing in the sender")
+        } catch {
+            failure = error
+        }
+        sync.disconnect()
+        session.invalidateAndCancel()
+        server.stop()
+        peerDefaults.dispose()
+        await PromptStoreTestCleanup.remove(tag: tag, from: store)
+        if let failure { throw failure }
+    }
+}

@@ -18,19 +18,19 @@ struct CompositionPromptView: View {
 
             Group {
             Section {
-                BulletListEditor(text: $store.writingStyle)
+                BulletListEditor(store: store, section: .writingStyle)
             } header: {
                 sectionHeader(title: "General Writing Style", subtitle: "Describe your preferred tone, sign-off style, and writing conventions. Swipe to delete.")
             }
 
             Section {
-                BulletListEditor(text: $store.language)
+                BulletListEditor(store: store, section: .language)
             } header: {
                 sectionHeader(title: "Language", subtitle: "Specify which language(s) the AI should use when composing emails.")
             }
 
             Section {
-                BulletListEditor(text: $store.usefulLinks, placeholder: "Add link...")
+                BulletListEditor(store: store, section: .usefulLinks, placeholder: "Add link...")
             } header: {
                 sectionHeader(title: "Useful Links", subtitle: "Personal or company links the AI can reference in replies (e.g., website, support page).")
             }
@@ -55,7 +55,10 @@ struct CompositionPromptView: View {
         }
         .confirmationDialog("Reset to Default?", isPresented: $showResetConfirmation) {
             Button("Reset", role: .destructive) {
-                store.resetComposition()
+                store.gesture("reset composition") { hold in
+                    try hold.reset(.composition)
+                    return .saved
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {

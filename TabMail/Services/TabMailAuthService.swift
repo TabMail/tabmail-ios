@@ -373,7 +373,6 @@ final class TabMailAuthService: NSObject {
         let encoded = try JSONEncoder().encode(session)
         _ = try TabMailSessionStore.shared.installNewSession(encoded)
         AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
-        DeviceSyncService.shared.claimLocalState(for: session.userId)
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
 
@@ -477,7 +476,6 @@ final class TabMailAuthService: NSObject {
         let encoded = try JSONEncoder().encode(session)
         _ = try TabMailSessionStore.shared.installNewSession(encoded)
         AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
-        DeviceSyncService.shared.claimLocalState(for: session.userId)
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
 
@@ -576,7 +574,6 @@ final class TabMailAuthService: NSObject {
         let encoded = try JSONEncoder().encode(session)
         _ = try TabMailSessionStore.shared.installNewSession(encoded)
         AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
-        DeviceSyncService.shared.claimLocalState(for: session.userId)
         // Session identity changed — re-evaluate the debug-logging gate.
         DebugModeManager.invalidateLoggingCache()
 

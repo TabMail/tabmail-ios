@@ -4,8 +4,30 @@
 
 import SwiftUI
 
+/// What the Reminders screen's Delete does to a knowledge-base reminder, apart from the view, so a test can run it.
+@MainActor
+enum KBReminderDeletion {
+    /// The knowledge-base bullet `reminder` was parsed from: the first whose reminder has exactly its content and
+    /// due date and time, so a reminder whose text another one contains never selects the other's bullet.
+    static func shown(for reminder: Reminder, in shownKB: [ShownBullet]) -> ShownBullet? {
+        shownKB.first { bullet in
+            KBReminderParser.parse("- " + bullet.text).contains {
+                Bullets.same($0.content, reminder.content) && $0.dueDate == reminder.dueDate && $0.dueTime == reminder.dueTime
+            }
+        }
+    }
+
+    /// DS-DISPLAYED: deletes exactly the labels the bullet was shown with.
+    static func delete(_ shown: ShownBullet, in store: PromptStore) -> Task<PromptEditOutcome, Never> {
+        store.gesture("delete KB reminder") { try $0.deleteShown(shown, from: .knowledgeBase) }
+    }
+}
+
 struct RemindersSettingsView: View {
     @State private var reminders: [Reminder] = []
+    /// The knowledge-base bullets, with their labels, as read with the reminder list (DS-DISPLAYED): a
+    /// delete commits against exactly these labels.
+    @State private var shownKB: [ShownBullet] = []
     @State private var isLoading = true
 
     private var kbReminders: [Reminder] { reminders.filter { $0.source == "kb" } }
@@ -92,6 +114,9 @@ struct RemindersSettingsView: View {
 
     private func loadReminders() async {
         reminders = await ReminderBuilder.buildReminderList(includeDisabled: true)
+        // Read after the build, which reads the knowledge base last: a reminder it lists has its labels here
+        // (unless it was removed since, which the delete then reports as gone).
+        shownKB = PromptStore.shared.shown(.knowledgeBase)
         isLoading = false
     }
 
@@ -120,45 +145,30 @@ struct RemindersSettingsView: View {
         )
     }
 
-    /// Permanently delete a KB reminder by applying a DEL patch to the knowledge base text.
-    /// Same approach as `ReminderDelTool`: find the matching KB line, build a DEL patch, apply via KBPatchApplier.
+    /// Permanently delete a KB reminder: the knowledge-base bullet that was shown with it, by the labels it
+    /// was shown with (DS-DISPLAYED), never by re-reading the text.
     private func deleteKBReminder(at index: Int) {
         let reminder = reminders[index]
         guard reminder.source == "kb" else { return }
 
-        let current = PromptStore.shared.kbText()
-        let lines = current.components(separatedBy: "\n")
-        let reminderPattern = /^-\s*(?:Reminder:|\[Reminder\])/.ignoresCase()
-
-        // Find the KB line whose content matches this reminder
-        let contentLower = reminder.content.lowercased()
-        var matchedStatement: String?
-        for line in lines {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.prefixMatch(of: reminderPattern) != nil else { continue }
-            if trimmed.lowercased().contains(contentLower) {
-                // Extract statement without leading "- "
-                matchedStatement = trimmed.replacingOccurrences(of: "^-\\s*", with: "", options: .regularExpression)
-                break
-            }
-        }
-
-        guard let statement = matchedStatement else {
+        guard let shown = KBReminderDeletion.shown(for: reminder, in: shownKB) else {
             BackgroundSyncLogger.logDebug("[RemindersSettings] KB line not found for reminder: \(reminder.content.prefix(80))")
             reminders.remove(at: index)
             return
         }
 
-        let patchText = "DEL\n\(statement)"
-        guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText),
-              updated != current else {
-            BackgroundSyncLogger.logDebug("[RemindersSettings] KBPatchApplier DEL failed for: \(statement.prefix(80))")
-            return
+        let content = reminder.content
+        let deleting = KBReminderDeletion.delete(shown, in: PromptStore.shared)
+        Task {
+            let outcome = await deleting.value
+            guard outcome == .saved || outcome == .unchanged else {
+                BackgroundSyncLogger.logDebug("[RemindersSettings] KB reminder delete failed for: \(shown.text.prefix(80)) (\(outcome))")
+                return
+            }
+            // `.unchanged`: the labels were already removed.
+            reminders.removeAll { $0.source == "kb" && $0.content == content }
+            BackgroundSyncLogger.logDebug("[RemindersSettings] Deleted KB reminder: \(shown.text.prefix(80))")
         }
-
-        PromptStore.shared.rawKB = updated
-        reminders.remove(at: index)
-        BackgroundSyncLogger.logDebug("[RemindersSettings] Deleted KB reminder: \(statement.prefix(80))")
     }
 
 }

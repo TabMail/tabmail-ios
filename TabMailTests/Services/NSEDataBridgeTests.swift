@@ -175,22 +175,29 @@ struct NSEDataBridgeTests {
         UserDefaults.standard.removeObject(forKey: "userKB")
     }
 
-    @Test("PromptStore → mirrorPrompts round-trip — setter flows to NSE suite")
+    @Test("PromptStore → mirrorPrompts round-trip — a committed edit flows to the NSE suite")
     @MainActor
-    func promptStoreRoundTripToMirror() {
+    func promptStoreRoundTripToMirror() async {
         cleanupSuite()
-        // Mutate via PromptStore's public setter (triggers didSet → writes UserDefaults → calls mirrorPrompts).
+        // An edit through the prompt store commits the rendered text and mirrors it (DS-NSE).
         let marker = "ROUNDTRIP-\(UUID().uuidString)"
-        let original = PromptStore.shared.rawAction
-        PromptStore.shared.rawAction = marker
-        defer { PromptStore.shared.rawAction = original }
+        let outcome = await PromptStore.shared.edit("mirror test add") { try $0.addBullet(marker, to: .deleteRules) }
+        #expect(outcome == .saved)
+        // No explicit mirror call here: the mirror is the commit's own (DS-NSE), so a commit that did not
+        // mirror leaves the suite without the bullet.
 
-        // didSet already called mirrorPrompts; still, call again explicitly to prove read-side parity.
-        NSEDataBridge.mirrorPrompts()
-
-        #expect(suite?.string(forKey: "nse.actionPrompt") == marker)
+        let mirrored = suite?.string(forKey: "nse.actionPrompt")
+        #expect(mirrored?.contains(marker) == true)
+        #expect(mirrored == PromptStore.shared.rawAction)
         // And snapshot reader (used by main-app action pipeline) agrees.
-        #expect(PromptStore.actionMarkdownSnapshot() == marker)
+        #expect(PromptStore.actionMarkdownSnapshot() == PromptStore.shared.rawAction)
+
+        // Remove exactly the bullet this test added, by the labels the store shows for it (DS-DISPLAYED).
+        if let shown = PromptStore.shared.shown(.deleteRules).first(where: { $0.text == marker }) {
+            let removed = await PromptStore.shared.edit("mirror test cleanup") { try $0.deleteShown(shown, from: .deleteRules) }
+            #expect(removed == .saved)
+        }
+        #expect(!PromptStore.shared.rawAction.contains(marker))
     }
 
     @Test("mirrorUserName uses 'userName' key")

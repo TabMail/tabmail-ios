@@ -53,7 +53,12 @@ struct MarketplaceTemplateDetailView: View {
                             .foregroundStyle(.green)
                     } else {
                         Button {
-                            Task { await installTemplate() }
+                            guard !isInstalling else { return }
+                            isInstalling = true
+                            installError = nil
+                            // The install starts at the tap: the store takes the change counter here, before the task.
+                            let installing = store.beginMarketplaceInstall(id: template.id, download: { try await TemplateMarketplaceClient.shared.downloadTemplate(id: $0) })
+                            Task { await finishInstall(installing) }
                         } label: {
                             HStack {
                                 if isInstalling {
@@ -114,32 +119,15 @@ struct MarketplaceTemplateDetailView: View {
     }
 
     @MainActor
-    private func installTemplate() async {
-        guard !isInstalling else { return }
-        isInstalling = true
-        installError = nil
-
+    private func finishInstall(_ installing: Task<PromptStore.MarketplaceInstall, Error>) async {
         do {
-            let downloaded = try await TemplateMarketplaceClient.shared.downloadTemplate(id: template.id)
-
-            // Dedup: skip if template with this ID already exists (not soft-deleted)
-            guard !store.visibleTemplates.contains(where: { $0.id == downloaded.id }) else {
+            switch try await installing.value {
+            case .installed(let id), .alreadyInstalled(let id):
                 didInstall = true
-                onInstall(downloaded.id)
-                isInstalling = false
-                return
+                onInstall(id)
+            case .notSaved:
+                installError = "Could not save the template. Please try again."
             }
-
-            let localTemplate = ReplyTemplate(
-                id: downloaded.id,
-                name: downloaded.name,
-                enabled: downloaded.enabled,
-                instructions: downloaded.instructions,
-                exampleReply: downloaded.exampleReply
-            )
-            store.addTemplate(localTemplate)
-            didInstall = true
-            onInstall(downloaded.id)
         } catch {
             installError = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : error.localizedDescription
         }

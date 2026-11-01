@@ -35,10 +35,14 @@ actor BackendClient {
     /// large user_action.md can legitimately run for minutes. Stall detection
     /// remains the SSE heartbeat watchdog.
     private lazy var llmLongOpSession: URLSession = {
+        if let longOpSessionOverride { return longOpSessionOverride }
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForResource = SyncConfig.llmLongOpResourceTimeoutSeconds
         return URLSession(configuration: config)
     }()
+
+    /// The injected session also serves the maintenance-class calls, so a manual compaction is testable.
+    private let longOpSessionOverride: URLSession?
 
     init(llmSession: URLSession? = nil) {
         self.llmSession = llmSession ?? {
@@ -46,6 +50,7 @@ actor BackendClient {
             config.timeoutIntervalForResource = SyncConfig.llmResourceTimeoutSeconds
             return URLSession(configuration: config)
         }()
+        longOpSessionOverride = llmSession
     }
 
     // 403 exponential backoff state — shared across all completions requests.

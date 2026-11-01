@@ -15,6 +15,9 @@ struct TemplateToggleTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        // The call awaits (a confirmation, a lookup) before it writes, so it carries the change counter it started
+        // with (DS-DEMO): a demo switch, or any other change to the store, in between refuses its write.
+        let started = ChangeCounter.device.current
         guard let templateId = await TemplateToolHelpers.resolveTemplateId(arguments, translator: ctx.translator) else {
             return ToolJSON.string(from: ["error": "Template ID is required."])
         }
@@ -27,21 +30,12 @@ struct TemplateToggleTool: AgentTool, Sendable {
             return ToolJSON.string(from: ["error": "Template not found."])
         }
 
-        if template.enabled == enabled {
-            return ToolJSON.string(from: [
-                "ok": true,
-                "result": "Template \"\(template.name)\" is already \(enabled ? "enabled" : "disabled").",
-                "template_id": templateId,
-                "template_name": template.name,
-                "enabled": enabled,
-            ] as [String: Any])
-        }
-
-        await MainActor.run {
+        let saved = await MainActor.run {
             var updated = template
             updated.enabled = enabled
-            PromptStore.shared.updateTemplate(updated)
+            return PromptStore.shared.updateTemplate(updated, since: started)
         }
+        guard saved else { return ToolJSON.string(from: ["error": "Could not save the change; try again."]) }
 
         let verb = enabled ? "enabled" : "disabled"
         return ToolJSON.string(from: [

@@ -12,6 +12,9 @@ struct ReminderAddTool: AgentTool, Sendable {
     let name = "reminder_add"
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        // The call belongs to the mode it started in (DS-DEMO): the demo-switch count is taken before anything
+        // awaits and the prompt store compares it when the call's turn comes.
+        let entered = PromptStore.switchesSeen
         // Extract text (required)
         guard case .string(let rawText) = arguments["text"] else {
             BackgroundSyncLogger.logDebug("[ReminderAddTool] Missing or empty 'text'")
@@ -56,23 +59,40 @@ struct ReminderAddTool: AgentTool, Sendable {
         let entry = formatReminderEntry(text: text, dueDate: dueDate, dueTime: dueTime)
         BackgroundSyncLogger.logDebug("[ReminderAddTool] Formatted entry='\(entry.prefix(140))' len=\(entry.count)")
 
-        // Load current KB
-        let current = PromptStore.kbTextSnapshot()
-
         let patchText = "ADD\n\(entry)"
-        guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText) else {
+
+        // One read-change-save of the KB through the prompt store (DS-CAPTURE); the commit sends it
+        // (Device Sync).
+        let edit = await { @MainActor () async -> KBToolEdit in
+            var patched = false
+            let outcome = await PromptStore.shared.edit("reminder_add tool", entered: entered) { hold in
+                try hold.editText(.kb) { current in
+                    guard let updated = KBPatchApplier.applyKBPatch(content: current, patchText: patchText) else { return nil }
+                    patched = true
+                    return updated
+                }
+            }
+            return KBToolEdit(patched: patched, outcome: outcome)
+        }()
+
+        // Refused before the patch ran: the model is told why.
+        if let refusal = KBToolEdit.refusal(edit.outcome) { return refusal }
+
+        guard edit.patched else {
             BackgroundSyncLogger.logDebug("[ReminderAddTool] applyKBPatch returned nil")
             return #"{"error": "failed to update knowledge base"}"#
         }
 
-        if updated == current {
+        switch edit.outcome {
+        case .saved:
+            BackgroundSyncLogger.logDebug("[ReminderAddTool] Persisted user_kb.md")
+        case .unchanged:
             BackgroundSyncLogger.logDebug("[ReminderAddTool] No-op (duplicate)")
             return "No change (duplicate reminder)."
+        case .unsaved, .dropped, .busy:
+            BackgroundSyncLogger.logDebug("[ReminderAddTool] Not saved (\(edit.outcome))")
+            return #"{"error": "failed to update knowledge base"}"#
         }
-
-        // Persist — Device Sync triggers automatically
-        await MainActor.run { PromptStore.shared.rawKB = updated }
-        BackgroundSyncLogger.logDebug("[ReminderAddTool] Persisted user_kb.md (\(updated.count) chars)")
 
         BackgroundSyncLogger.logDebug("[ReminderAddTool] Success")
         // Return JSON matching TB's return format

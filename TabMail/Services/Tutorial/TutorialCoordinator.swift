@@ -221,10 +221,9 @@ final class TutorialCoordinator {
 
     private func addSampleRule() {
         guard DemoModeStore.isDemoActive else { return }
-        let store = PromptStore.shared
-        let line = "- \(Self.sampleDeleteRule)"
-        guard !store.deleteRules.contains(line) else { return }
-        store.deleteRules = store.deleteRules.isEmpty ? line : store.deleteRules + "\n" + line
+        // Begun in the demo: the demo flag is read when the add runs (DS-DEMO), so it lands in the overlay or
+        // is not made at all once the demo ended.
+        PromptStore.shared.gesture("tutorial sample rule") { try $0.addBullet(Self.sampleDeleteRule, to: .deleteRules) }
     }
 
     private func complete(_ finished: TutorialLesson, step done: Step) {

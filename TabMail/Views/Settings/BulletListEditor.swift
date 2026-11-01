@@ -4,33 +4,50 @@
 
 import SwiftUI
 
-/// Reusable editor for markdown bullet items (`- item`).
-/// Takes a `Binding<String>` (raw markdown), parses into individual rows,
-/// and serializes back on changes. Same UX as template instructions.
+/// What the editor's Add and Delete controls do, apart from the view: a hosted SwiftUI control publishes
+/// no element a test can tap, so the tests call these, and the controls' closures only call them.
+@MainActor
+enum BulletListEditorActions {
+    /// DS-DISPLAYED: deletes exactly the labels the row showed.
+    static func delete(_ shown: ShownBullet, from section: PromptSection, in store: PromptStore) -> Task<PromptEditOutcome, Never> {
+        store.gesture("delete \(section.key) bullet") { try $0.deleteShown(shown, from: section) }
+    }
+
+    enum Add {
+        /// Nothing typed.
+        case nothing
+        /// The line was not added; the text is shown under the field.
+        case refused(String)
+        /// Being added; the field is cleared once it is `.saved` or `.unchanged`.
+        case adding(Task<PromptEditOutcome, Never>)
+    }
+
+    static func add(_ typed: String, to section: PromptSection, in store: PromptStore) -> Add {
+        let trimmed = typed.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return .nothing }
+        guard !PromptStore.holdsSectionMarker(trimmed, in: section) else { return .refused(PromptStore.sectionMarkerRefusal) }
+        return .adding(store.gesture("add \(section.key) bullet") { try $0.addBullet(trimmed, to: section) })
+    }
+}
+
+/// Editor for one section's bullets. Each add or delete is its own change to that bullet (Device Sync's
+/// DS-ADD and DS-DISPLAYED): a bullet that arrived from another device while this is open is never
+/// removed by it. Same UX as template instructions.
 struct BulletListEditor: View {
-    @Binding var text: String
+    let store: PromptStore
+    let section: PromptSection
     var placeholder: String = "Add item..."
     /// An item the guided tutorial points at (its sample action rule).
     var highlightedItem: String?
 
     @State private var newItem = ""
+    /// Why the line typed was not added , shown under the field.
+    @State private var refusal: String?
     @FocusState private var fieldFocused: Bool
 
-    /// Parse "- item1\n- item2" → ["item1", "item2"]
-    private var items: [String] {
-        text.components(separatedBy: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { $0.hasPrefix("- ") }
-            .map { String($0.dropFirst(2)) }
-    }
-
-    /// Serialize ["item1", "item2"] → "- item1\n- item2"
-    private func setItems(_ newItems: [String]) {
-        text = newItems.map { "- \($0)" }.joined(separator: "\n")
-    }
-
     var body: some View {
-        ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+        ForEach(store.shown(section)) { shown in
+            let item = shown.text
             Text(item)
                 .padding(.horizontal, item == highlightedItem ? 6 : 0)
                 .overlay {
@@ -40,9 +57,7 @@ struct BulletListEditor: View {
                 }
                 .swipeActions(edge: .trailing) {
                     Button(role: .destructive) {
-                        var current = items
-                        current.remove(at: index)
-                        setItems(current)
+                        _ = BulletListEditorActions.delete(shown, from: section, in: store)
                     } label: {
                         Label("Delete", systemImage: "trash")
                     }
@@ -63,15 +78,28 @@ struct BulletListEditor: View {
             }
             .disabled(newItem.trimmingCharacters(in: .whitespaces).isEmpty)
         }
+
+        if let refusal {
+            Text(refusal)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
     }
 
     private func addItem() {
-        let trimmed = newItem.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
-        var current = items
-        current.append(trimmed)
-        setItems(current)
-        newItem = ""
-        fieldFocused = true
+        switch BulletListEditorActions.add(newItem, to: section, in: store) {
+        case .nothing:
+            return
+        case .refused(let text):
+            refusal = text
+        case .adding(let adding):
+            refusal = nil
+            Task {
+                let outcome = await adding.value
+                guard outcome == .saved || outcome == .unchanged else { return }
+                newItem = ""
+                fieldFocused = true
+            }
+        }
     }
 }

@@ -21,6 +21,13 @@ import GRDB
 actor BackfillAIQueue {
     static let shared = BackfillAIQueue()
 
+    /// The service an action refine runs on; tests give the queue one with a mock backend.
+    private let ai: AIService
+
+    init(ai: AIService = .shared) {
+        self.ai = ai
+    }
+
     // MARK: - State
 
     /// dedupKeys awaiting drain. FIFO, in-memory only; GRDB is the durability layer.
@@ -293,7 +300,7 @@ actor BackfillAIQueue {
 
     // MARK: - Per-item processing
 
-    private func processOne(dedupKey: String) async {
+    func processOne(dedupKey: String) async {
         let t0 = CFAbsoluteTimeGetCurrent()
         let retryCount = storage.retryCount(for: dedupKey)
         BackgroundSyncLogger.logBackfillAI("claim dedupKey=\(dedupKey) retry=\(retryCount)")
@@ -336,14 +343,7 @@ actor BackfillAIQueue {
 
         // Dispatch.
         do {
-            switch jobType {
-            case .actionRefine:
-                let snap = try row.decodeActionRefine()
-                await dispatchActionRefine(snap)
-            case .kbRefine:
-                let snap = try row.decodeKBRefine()
-                await dispatchKBRefine(snap)
-            }
+            try await dispatch(row, jobType: jobType)
         } catch {
             // Decode error is permanent — drop.
             BackgroundSyncLogger.logBackfillAI("drop dedupKey=\(dedupKey) reason=decode-error error=\(error)")
@@ -415,16 +415,36 @@ actor BackfillAIQueue {
 
     // MARK: - Dispatchers (call existing refinement functions unchanged)
 
-    private func dispatchActionRefine(_ s: ActionRefineSnapshot) async {
-        let currentActionMd = PromptStore.actionMarkdownSnapshot()
-        await AIService.shared.autoUpdateUserPromptOnTag(
+    /// Runs `row`'s job.
+    /// Throws when the row's payload does not decode (permanent: the caller drops the row).
+    func dispatch(_ row: PendingAIRefinement, jobType: BackfillAIJobType) async throws {
+        switch jobType {
+        case .actionRefine:
+            let snap = try row.decodeActionRefine()
+            await dispatchActionRefine(snap)
+        case .kbRefine:
+            let snap = try row.decodeKBRefine()
+            await dispatchKBRefine(snap)
+        }
+    }
+
+    func dispatchActionRefine(_ s: ActionRefineSnapshot) async {
+        // DS-AI step 1: the rules read in one brief hold of the prompt store. Skipped while their upgrade is
+        // unsaved (DS-UNSAVED-UPGRADE) or while busy: the refine is expendable. The queue only orders the AI
+        // calls and holds nothing of the store (DS-REFINE-QUEUE).
+        let read = await PromptStore.shared.readBeforeAI(.action, "action-rule refine")
+        guard case .read(let actionCapture) = read else {
+            BackgroundSyncLogger.logBackfillAI("skip actionRefine dedupKey=\(s.dedupKey) reason=\(read)")
+            return
+        }
+        await ai.autoUpdateUserPromptOnTag(
             subject: s.subject,
             from: s.from,
             summaryBlurb: s.summaryBlurb,
             summaryTodos: s.summaryTodos,
             originalAction: s.originalAction,
             userManualTag: s.userManualTag ?? "",
-            currentUserActionMd: currentActionMd
+            actionCapture: actionCapture
         )
     }
 

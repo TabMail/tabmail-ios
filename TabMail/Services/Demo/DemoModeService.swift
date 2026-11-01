@@ -12,7 +12,8 @@ import GRDB
 /// 2. POST /demo/start → mint a demo JWT, store in Keychain (`demo_session`).
 /// 3. Wipe any leftover demo rows defensively; if the leftover demo memory
 ///    turns can't be deleted, stay off and throw.
-/// 4. Set `DemoModeStore.isActive = true`.
+/// 4. Enter the demo as one operation on the prompt semaphore (DS-DEMO): flip
+///    `DemoModeStore.isActive`, create the prompt overlay and move the change counter.
 ///
 /// Note: seeding (pre-baked AI cache) and provider injection happen
 /// after the consent gates pass. RootView routes through gates first, then
@@ -23,7 +24,8 @@ import GRDB
 /// 1. Wipe demo session token.
 /// 2. Disconnect demo providers from AccountManager.
 /// 3. Wipe GRDB demo rows + FTS demo entries + memory.db demo entries.
-/// 4. Reset `DemoModeStore.isActive = false`. Counter persists.
+/// 4. Leave the demo as one operation on the prompt semaphore: discard the overlay, flip
+///    `DemoModeStore.isActive` off and move the change counter. The call counter persists.
 /// 5. Post `.demoModeDidExit` so RootView re-routes to login.
 @MainActor
 final class DemoModeService {
@@ -77,7 +79,6 @@ final class DemoModeService {
     /// stays off and this throws, as a failed mint does: a demo running over them
     /// would find the earlier demo's conversations in memory_search.
     func activate() async throws {
-        let store = DemoModeStore.shared
         do {
             try await Self.purgeOrphanedDemoData()
         } catch {
@@ -91,7 +92,21 @@ final class DemoModeService {
             return
         }
 
-        store.isActive = true
+        // One operation on the prompt semaphore (DS-DEMO): the mode flips, the prompt overlay is created and the
+        // change counter moves together, so nothing started before the switch saves after it.
+        do {
+            try await PromptStore.shared.enterDemo()
+        } catch {
+            DemoTokenManager.clearSession()
+            BackgroundSyncLogger.logDebug("[DemoMode] start(): the prompt store stayed busy: \(error)")
+            throw DemoError.startFailed("Demo not available right now.")
+        }
+        // An exit that came while the switch waited for its turn ends the demo it just started.
+        if startWithdrawn {
+            BackgroundSyncLogger.logDebug("[DemoMode] start(): withdrawn by exit during activation")
+            await exit()
+            return
+        }
 
         // Boundary hygiene runs the INSTANT demo activates (not in
         // completeSetup, which is seconds later behind consent gates + splash):
@@ -182,12 +197,9 @@ final class DemoModeService {
             AISubscriptionGate.shared.openGate()
         }
 
-        // Prompt overlay (ADR-IOS-038): swap KB / composition / action /
-        // templates to bundled defaults so demo tools (kb_add, reminder_add,
-        // template edits) operate on demo-scoped storage and the real prompts
-        // never surface in a demo. Chat-state teardown + Device Sync
-        // disconnect already happened at the top of start().
-        PromptStore.shared.enterDemoOverlay()
+        // The prompt overlay (ADR-IOS-038: KB / composition / action / templates at the bundled defaults, so
+        // demo tools operate on demo-scoped storage and the real prompts never surface) was created with
+        // the mode, in `activate()`.
 
         // Notify the search index / nav store so reactive UI picks up demo
         // folders + headers immediately. NavigationStore is a pull-model
@@ -257,13 +269,15 @@ final class DemoModeService {
         // chat pill (they'd resurrect wiped GRDB rows on screen).
         ChatPillState.shared.removeAllSessions()
 
-        // Restore the real prompts + delete the overlay keys. MUST run while
-        // isActive is still true (see PromptStore.exitDemoOverlay). The demo
-        // disabled-reminders map is deleted the same way.
-        PromptStore.shared.exitDemoOverlay()
-        UserDefaults.standard.removeObject(forKey: DisabledRemindersStore.demoStorageKeyV2)
-
-        store.isActive = false
+        // One operation on the prompt semaphore (DS-DEMO): restore the real prompts, delete the overlay keys
+        // and the demo's disabled-reminders map, flip the mode off and move the change counter. If the prompt
+        // store stays busy the demo stays on (its data is wiped again by the next exit).
+        do {
+            try await PromptStore.shared.leaveDemo()
+        } catch {
+            BackgroundSyncLogger.logDebug("[DemoMode] exit(): the prompt store stayed busy, the demo stays on: \(error)")
+            return
+        }
         store.enteredFromDebugMenu = false
         store.isTutorialPractice = false
         // Note: callsConsumed and demo gate flags persist.
@@ -327,7 +341,7 @@ final class DemoModeService {
         // Stale demo overlay keys from a force-quit mid-demo (harmless while
         // demo is inactive — all readers use the real keys — but clean up).
         PromptStore.removeDemoOverlayKeys()
-        UserDefaults.standard.removeObject(forKey: DisabledRemindersStore.demoStorageKeyV2)
+        DisabledRemindersStore.removeDemoMap()
         if let memoryError { throw memoryError }
     }
 

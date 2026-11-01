@@ -21,6 +21,9 @@ struct TemplateEditTool: AgentTool, Sendable {
     /// ADR-IOS-053: real entry point — delivers the confirmation card to the
     /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
+        // The call awaits (a confirmation, a lookup) before it writes, so it carries the change counter it started
+        // with (DS-DEMO): a demo switch, or any other change to the store, in between refuses its write.
+        let started = ChangeCounter.device.current
         // Resolve numeric ID to real template UUID
         let numericTemplateId = TemplateToolHelpers.intArg(arguments, "template_id")
         guard let templateId = await TemplateToolHelpers.resolveTemplateId(arguments, translator: ctx.translator) else {
@@ -88,12 +91,11 @@ struct TemplateEditTool: AgentTool, Sendable {
             if let n = newName { t.name = n }
             if let ins = newInstructions { t.instructions = ins }
             if let ex = newExampleReply { t.exampleReply = ex }
-            PromptStore.shared.updateTemplate(t)
-            return true
+            return PromptStore.shared.updateTemplate(t, since: started)
         }
 
         guard updated else {
-            return ToolJSON.string(from: ["error": "Template was deleted by another device during confirmation."])
+            return ToolJSON.string(from: ["error": "Could not save the change: the template was deleted, or the store changed during confirmation. Try again."])
         }
 
         // Update template name cache so pills show the new name

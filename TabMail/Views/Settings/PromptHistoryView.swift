@@ -38,7 +38,7 @@ struct PromptHistoryView: View {
                     entry: entry,
                     afterState: afterState(for: entry),
                     onRestore: {
-                        entries = PromptStore.shared.loadHistory().sorted(by: { $0.date > $1.date })
+                        Task { await loadEntries() }
                     }
                 )
                 .toolbar {
@@ -52,8 +52,19 @@ struct PromptHistoryView: View {
         }
         .task {
             guard !hasLoaded else { return }
-            entries = PromptStore.shared.loadHistory().sorted(by: { $0.date > $1.date })
+            await loadEntries()
             hasLoaded = true
+        }
+    }
+
+    /// The history, newest first, read through the prompt store; none when it refused.
+    private func loadEntries() async {
+        do {
+            entries = try await PromptStore.shared.withPromptStore("load prompt history") { try $0.loadHistory() }
+                .sorted(by: { $0.date > $1.date })
+        } catch {
+            BackgroundSyncLogger.logDebug("[PromptHistory] history not loaded: \(error)")
+            entries = []
         }
     }
 
@@ -226,9 +237,16 @@ private struct PromptHistoryDetailView: View {
         .navigationTitle("History Detail")
         .confirmationDialog("Restore to this state?", isPresented: $showRestoreConfirmation) {
             Button("Restore", role: .destructive) {
-                PromptStore.shared.restoreFromHistory(entry)
-                onRestore?()
-                dismiss()
+                let restoring = PromptStore.shared.gesture("restore prompt history") { hold in
+                    try hold.restoreFromHistory(entry)
+                    return .saved
+                }
+                Task {
+                    let outcome = await restoring.value
+                    BackgroundSyncLogger.logDebug("[PromptHistory] restore \(outcome)")
+                    onRestore?()
+                    dismiss()
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {

@@ -477,3 +477,57 @@ This reverses the 2026-10-21 "replay lives only in the debug menu" decision. Wel
 Less time on email", button "Take the tour".
 
 ---
+
+**Amendment 2026-10-31 — a demo switch is one operation on the prompt semaphore; a switch in flight drops the work in flight (owner):**
+Entering or leaving the demo is a single hold on the prompt store's semaphore (`PromptStore.enterDemo()` /
+`leaveDemo()`): inside it the mode flag flips, the overlay is created (entry) or discarded (exit), the
+demo's reminder map is deleted at exit, and the change counter moves. The reminder map's flip and counter
+move happen together under its leaf lock (`DisabledRemindersStore.switching`), so no transaction sees the
+new mode with the old counter. Busy at the semaphore is retried (`switchAttempts`); a switch that still
+cannot take the hold leaves the mode unchanged.
+
+Every writer that waits between starting and writing (AI calls, marketplace download, tool confirmations,
+reminder builds, the email-snooze fallback) carries the counter it started with, and its write is refused if
+the counter moved; a refused write saves nothing and reports "could not save". The disabled-reminders
+writers compare the counter inside their lock transaction. Inside one hold the live mode is stable, so reads
+and display follow the live mode.
+
+This replaces the earlier mechanism of a required `demo:` argument on every store API, captured-target
+checks, `admits(demo:)` guards and the source-scanning `DemoFlagReadSitesTests` allowlist: capturing a mode
+at call start across an `await` kept producing a late-read sibling in every review round. Unchanged: the
+`demo.`-prefixed overlay keys, and demo writes never touch bullet state, labels, seen or history. Tests pin
+the invariant for each multi-step writer: a switch in either direction mid-flight leaves both stores
+unchanged and reports failure, and an uninterrupted control saves.
+
+**Amendment 2026-10-31 (round 1 review) — brief operations carry the demo-switch count, not the change counter:**
+A brief operation that waits in line (a gesture, a KB or reminder tool, a sync receive) must not carry the
+change counter: ordinary commits move it, so an operation queued behind another real edit would be refused,
+which breaks "wait in line". The prompt semaphore counts demo switches (`ChangeCounter.switches`, moved only by
+`enterDemo`/`leaveDemo` inside their hold). `PromptStore.withPromptStore` / `edit` take the count when called,
+or `entered` from a caller that took it earlier (`gesture` before its task, a tool before its first await,
+`PromptStore.switchesSeen`), and compare it when the hold is granted; a switch in between refuses the call
+(`PromptRefusal.changed`, outcome `.dropped`, "could not save"). The rule lives in that one function, so no
+caller carries a check of its own. Multi-step writers keep the change-counter compare (AI staleness). Also
+fixed in the same round: the first-launch overdue suppression refuses an empty list across a switch and saves
+its done-mark in the suppression's own transaction; the public disabled-reminders readers read in the map
+transaction.
+
+**Amendment 2026-10-31 (round 2 review) — an operation starts at the tap; one snapshot pair; absolute waiter deadline:**
+(1) *Tap-time sampling.* The count (switch count for brief operations, change counter for multi-step ones) is
+taken in the tap, before the `Task` the tap makes, because a switch that does not suspend can finish before
+that task's first turn. Census of every view and view-model `Task {`, `.task`, `onChange`, `onSubmit` and
+alert-button closure that reaches the prompt store, a template API or the disabled-reminders store: gestures
+(`BulletListEditor`, `KnowledgeBaseView`, `ActionRulesView` reset, `CompositionPromptView`, `PromptHistoryView`
+restore, `RemindersSettingsView` delete, the tutorial sample rule) already take their count in `gesture`, before
+their task, and the tasks only await the result; the template edits and `DisabledRemindersStore.setEnabled`
+calls run synchronously in the tap. Two late samplers were found and fixed: the marketplace install
+(`installMarketplaceTemplate(id:since:download:)`, the tap passes `store.changeSeen`) and the action-rules
+compaction (`compactActionRulesNow(entered:)` through `readBeforeAI(entered:)`, `ActionCompactionMonitor.start`
+passes `PromptStore.switchesSeen`). The marketplace tap now calls `PromptStore.beginMarketplaceInstall(id:download:)`, which samples the counter synchronously before it creates the install task; behavioural tests drive both taps (no source-order fence). (2) *One pair.* The reminder build
+takes its change counter and the mode together with `DisabledRemindersStore.modeSnapshot()`, under the same lock
+`switching` writes them under; the earlier two adjacent loads (mutant m93) are deleted, so a snapshot never pairs
+the old mode with the new counter or the reverse. (3) *Absolute deadline.* Each queued waiter carries a
+`ContinuousClock` deadline and `grantNext` refuses an expired waiter instead of granting it, so a late timer
+cannot turn a waiter that ran out of time into a holder; and `hold` refuses a grant whose lease expired before its body starts (`PromptRefusal.changed`), so a body never runs under an already-expired lease. (4) The template toggle no longer returns early when the
+template already has the requested state: the call goes through the same guarded write as every other tool, so a
+switch refuses it too.

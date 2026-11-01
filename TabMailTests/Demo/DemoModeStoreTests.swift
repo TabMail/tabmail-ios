@@ -138,7 +138,7 @@ struct DemoModeStoreTests {
     // MARK: - Prompt overlay (ADR-IOS-038)
 
     @Test("PromptStore demo overlay: writes route to demo keys; real prompts untouched; exit restores")
-    func promptStoreDemoOverlayRoundtrip() {
+    func promptStoreDemoOverlayRoundtrip() async {
         let d = UserDefaults.standard
         let store = PromptStore.shared
         let realKBBefore = store.rawKB
@@ -153,9 +153,11 @@ struct DemoModeStoreTests {
         #expect(PromptStore.storageKey("x") == "demo.x")
 
         store.enterDemoOverlay()
-        store.rawKB = "- demo kb edit"
+        let outcome = await store.edit("demo kb edit") { try $0.editText(.kb) { $0 + "\n- demo kb edit\n" } }
+        #expect(outcome == .saved)
         // Snapshot (the chat KB injection path) sees the demo overlay…
-        #expect(PromptStore.kbTextSnapshot() == "- demo kb edit")
+        #expect(PromptStore.kbTextSnapshot().contains("- demo kb edit"))
+        #expect(store.rawKB.contains("- demo kb edit"))
         // …while the REAL key is untouched.
         #expect(d.string(forKey: "user_prompts:user_kb.md") == realKBBefore)
 

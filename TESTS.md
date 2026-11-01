@@ -95,3 +95,29 @@ partition-order and Rice-parameter guards, removed, fails it (a trap or a stream
 decode to the samples). The size tests hold digital silence to a few bytes a frame (the constant
 subframe) and full-scale audio to its PCM plus a frame's overhead (the verbatim fallback the upload's
 size bound rests on).
+
+## Device Sync — labelled bullets, shared with Thunderbird and Voice
+
+`DeviceSyncVectorsTests` runs the conformance vectors Thunderbird and TabMail Voice run too
+(`TabMailTests/Fixtures/DeviceSync/device-sync-vectors.json` and the bundled default catalog, both
+SHA-256 pinned, so a change to the shared files fails all three suites until each re-pins). Each
+scenario runs on simulated devices (`BulletDevices.swift`): every device runs the real `PromptBulletSync`,
+`BulletSync`, `Bullets` and `UserDefaultsBulletStore` on its own `UserDefaults` suite, connected through a
+relay the scenario delivers, reorders or drops. `DeviceSyncFuzzTests` runs seeded random devices, edits,
+resets, failed saves, restores and deliveries, and asserts at every delivery that no bullet a user did not
+delete is lost, at the end that the devices converge and stop sending, and that no message exceeds the
+relay's budget (8 seeds by default; `DEVICE_SYNC_FUZZ_SEEDS` sets more, 30 pass).
+
+`PromptSemaphoreTests` covers the prompt store's one semaphore: a hold is released when its body
+returns, throws or is cancelled; a hold past its lease loses it, hands the semaphore on and does not move
+the counter; a call made inside a hold, and from a child task of the holder, is refused as busy at once; a
+task created under the cleared mark waits instead; waiters take the semaphore in the order they asked, a
+request made as the holder releases queues behind the line, a cancelled waiter and one past its wait leave
+the line and are never granted. `PromptStoreBoundaryTests` pins the AI write (read, call holding nothing,
+write carrying the counter) being dropped after a local edit, a reset, a restore or a lapsed lease, with
+the stored state, the rendered text and the history unchanged; the counter moving only on a saved change;
+a hung model call blocking nothing; and the two gesture-order inversions (delete then add, add then
+delete) ending as the user's last gesture. `DeviceSyncReceiveTests` covers arrival order with the busy
+re-apply, the connection end dropping everything waiting, the bound (messages plus held parts) renewing
+the connection, and an older `prompt_state` never landing on a newer edit. `DeviceSyncSocketBoundaryTests`
+runs a loopback WebSocket server to show a message read after its connection was replaced is dropped.

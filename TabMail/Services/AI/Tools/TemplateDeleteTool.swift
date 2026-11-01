@@ -21,6 +21,9 @@ struct TemplateDeleteTool: AgentTool, Sendable {
     /// ADR-IOS-053: real entry point — delivers the confirmation card to the
     /// invoking session via `invocation.uiSink` (nil sink → declined fast-fail).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
+        // The call awaits (a confirmation, a lookup) before it writes, so it carries the change counter it started
+        // with (DS-DEMO): a demo switch, or any other change to the store, in between refuses its write.
+        let started = ChangeCounter.device.current
         guard let templateId = await TemplateToolHelpers.resolveTemplateId(arguments, translator: ctx.translator) else {
             return ToolJSON.string(from: ["error": "Template ID is required."])
         }
@@ -50,9 +53,10 @@ struct TemplateDeleteTool: AgentTool, Sendable {
 
         // Soft-delete template via PromptStore.deleteTemplate (CRDT tombstone for Device Sync)
         let templateName = template.name
-        await MainActor.run {
-            PromptStore.shared.deleteTemplate(id: templateId)
+        let saved = await MainActor.run {
+            PromptStore.shared.deleteTemplate(id: templateId, since: started)
         }
+        guard saved else { return ToolJSON.string(from: ["error": "Could not save the change; try again."]) }
 
         return ToolJSON.string(from: [
             "success": true,
