@@ -8,6 +8,7 @@ import SwiftUI
 import Synchronization
 import Testing
 import UIKit
+import Vision
 @testable import TabMail
 
 private final class PaymentHTTPState: @unchecked Sendable {
@@ -197,6 +198,7 @@ private final class PaymentViewFixture {
 @MainActor
 private final class PaymentViewHost {
     struct Frame {
+        let image: CGImage
         let pixels: [UInt8]
         let bluePixels: Int
         func difference(from other: Frame) -> Int {
@@ -253,7 +255,24 @@ private final class PaymentViewHost {
             let r = Int(pixels[index]), g = Int(pixels[index + 1]), b = Int(pixels[index + 2])
             if b > 150 && b > r + 90 && b > g + 45 { blue += 1 }
         }
-        return Frame(pixels: pixels, bluePixels: blue)
+        return Frame(image: imageCG, pixels: pixels, bluePixels: blue)
+    }
+
+    /// Recognize only a completed stable render, on device and without custom
+    /// words that could bias the observed payment terms toward the expectation.
+    func renderedText(from frame: Frame) throws -> String {
+        let request = VNRecognizeTextRequest()
+        request.revision = VNRecognizeTextRequestRevision3
+        request.recognitionLevel = .accurate
+        request.recognitionLanguages = ["en-US"]
+        request.usesLanguageCorrection = false
+        try VNImageRequestHandler(cgImage: frame.image, options: [:]).perform([request])
+        let recognized = try #require(request.results).compactMap { $0.topCandidates(1).first?.string }
+        return Self.normalizeLayout(recognized.joined(separator: " "))
+    }
+
+    static func normalizeLayout(_ text: String) -> String {
+        text.split(whereSeparator: \.isWhitespace).joined(separator: " ").lowercased()
     }
 
     func stableFrame() async throws -> Frame {
@@ -284,7 +303,8 @@ struct PaymentViewIntegrationTests {
 
     private func renderedFrame(account: String, dashboard: Bool = false,
                                period: TrialStoreKitFixture.Period = .week,
-                               includesFreeOffer: Bool = true) async throws -> PaymentViewHost.Frame {
+                               includesFreeOffer: Bool = true,
+                               inspect: ((PaymentViewHost, PaymentViewHost.Frame, Product, SubscriptionTrialOffer?) throws -> Void)? = nil) async throws -> PaymentViewHost.Frame {
         let fixture = try PaymentViewFixture(accountJSON: account, period: period, includesFreeOffer: includesFreeOffer)
         defer { fixture.close() }
         try await fixture.load()
@@ -301,6 +321,11 @@ struct PaymentViewIntegrationTests {
         let second = try await host.stableFrame()
         let sameInputDifference = first.difference(from: second)
         #expect(sameInputDifference == 0)
+        if let inspect {
+            let product = try fixture.catalog.product()
+            let offer = await fixture.catalog.manager.freeTrialOffer(for: product)
+            try inspect(host, second, product, offer)
+        }
         return second
     }
 
@@ -317,10 +342,20 @@ struct PaymentViewIntegrationTests {
         #expect(trialDifference > 100)
     }
 
-    @Test func actualParentPassesTheFreeOfferToItsCard() async throws {
+    @Test(arguments: [TrialStoreKitFixture.Period.week, .twoWeeks])
+    func actualParentPassesTheFreeOfferToItsCard(period: TrialStoreKitFixture.Period) async throws {
         let account = PaymentViewFixture.accountJSON()
-        let without = try await renderedFrame(account: account, includesFreeOffer: false)
-        let withOffer = try await renderedFrame(account: account)
+        let without = try await renderedFrame(account: account, period: period, includesFreeOffer: false)
+        let withOffer = try await renderedFrame(account: account, period: period) { host, frame, product, offer in
+            let offer = try #require(offer)
+            let subscription = try #require(product.subscription)
+            try #require(subscription.subscriptionPeriod.unit == .month)
+            try #require(subscription.subscriptionPeriod.value == 1)
+            let expectedTerms = PaymentViewHost.normalizeLayout(
+                "\(offer.durationDescription) free when you subscribe, then \(product.displayPrice)/month.")
+            let renderedTerms = try host.renderedText(from: frame)
+            #expect(renderedTerms.contains(expectedTerms))
+        }
         let offerDifference = without.difference(from: withOffer)
         #expect(offerDifference > 100)
     }
