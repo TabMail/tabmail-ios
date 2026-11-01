@@ -230,6 +230,38 @@ struct OnDeviceSpeechRecognizerTests {
         #expect(texts.all == ["again"])
     }
 
+    /// A recognizer built with its production permission reader (only the request, recognition and capture
+    /// are faked): where the system statuses are not both granted, an auto-start asks for nothing and
+    /// starts nothing, and a tap still dictates. (A host with both granted has no prompt to guard.)
+    @Test func theProductionReaderKeepsAnAutoStartFromPromptingWhereAPermissionIsUndecided() async {
+        guard !OnDeviceSpeechRecognizer.systemPermissionsGranted() else { return }
+        let capture = DeferredCapture()
+        let requests = Mutex(0)
+        let created = Mutex(0)
+        let recognizer = OnDeviceSpeechRecognizer(
+            capture: capture,
+            startRecognition: { _, handler in
+                created.withLock { $0 += 1 }
+                return FakeRecognition(handler: handler)
+            },
+            requestPermissions: {
+                requests.withLock { $0 += 1 }
+                return true
+            })
+        let texts = Texts()
+        recognizer.start(locale: Locale(identifier: "en_US"), auto: true) { texts.add($0) }
+        await settle()
+        #expect(requests.withLock { $0 } == 0)
+        #expect(created.withLock { $0 } == 0)
+        #expect(capture.starts == 0)
+        #expect(!recognizer.isStarting)
+
+        recognizer.start(locale: Locale(identifier: "en_US")) { texts.add($0) }
+        await settle()
+        #expect(requests.withLock { $0 } == 1)
+        #expect(capture.starts == 1)
+    }
+
     /// The recognizer's own reader is the system statuses through the same table (a host where both are
     /// granted and one where neither is decided read the same way).
     @Test func theDefaultReaderIsTheSystemStatusesThroughTheTable() {

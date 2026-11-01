@@ -107,6 +107,17 @@ struct PillDictationModeTests {
         let onDevice = try #require(view.range(of: "if dictationMode == .onDevice {"))
         let guardLine = try #require(view.range(of: "guard canUseAI, !speech.isRecording, !speech.isStarting else { return }"))
         #expect(gate.lowerBound < onDevice.lowerBound && onDevice.lowerBound < guardLine.lowerBound)
+        // `auto` only passes through to the recognizer: any other use inside `startDictation` (an early return
+        // on `!auto`, an `if auto`) would restore the blanket refusal of the pill's own start.
+        let startBody = try #require(view.range(of: "private func startDictation(auto: Bool = false) {"))
+        let startEnd = try #require(view.range(of: "private var canSend: Bool", range: startBody.upperBound..<view.endIndex))
+        let codeLines = view[startBody.upperBound..<startEnd.lowerBound].split(separator: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+        let usesOfAuto = codeLines.filter { line in
+            line.replacingOccurrences(of: "auto: auto", with: "").range(of: #"\bauto\b"#, options: .regularExpression) != nil
+        }
+        #expect(usesOfAuto.isEmpty, "startDictation may only pass `auto` to the recognizer: \(usesOfAuto)")
+        #expect(codeLines.contains { $0.contains("speech.start(locale: speechLocale, auto: auto)") })
         // The newest gesture wins: the mic button cancels a pending delayed auto-start before it acts.
         #expect(view.contains("autoStartTask?.cancel()\n                autoStartTask = nil\n                if speech.isRecording || speech.isStarting {"))
         #expect(view.components(separatedBy: "startDictation(auto: true)").count == 4)
