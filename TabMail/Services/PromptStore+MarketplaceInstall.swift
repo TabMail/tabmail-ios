@@ -14,11 +14,13 @@ extension PromptStore {
 
     /// Installs a marketplace template. The download awaits before the template is saved, so the install carries
     /// the change counter it started with (DS-DEMO): a demo switch in between refuses it and saves nothing.
+    /// The tap takes `started` (`changeSeen`) synchronously, before the task that calls this: the tap, not the
+    /// task's first turn, is where the install starts.
     func installMarketplaceTemplate(
         id: String,
+        since started: UUID,
         download: (String) async throws -> TemplateMarketplaceClient.DownloadedTemplate
     ) async throws -> MarketplaceInstall {
-        let started = changeSeen
         let downloaded = try await download(id)
         guard changeSeen == started else { return .notSaved }
 

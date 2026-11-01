@@ -155,8 +155,9 @@ extension AIService {
     /// Manually trigger a compact-only action-rules refinement.
     /// Sends `action_compact_only: true` so the backend runs compaction only,
     /// bypassing thresholds, and returns patch ops or an empty patch when nothing
-    /// is mergeable. Fire-and-return — returns a CompactResult describing what happened.
-    func compactActionRulesNow() async -> CompactResult {
+    /// is mergeable. Fire-and-return — returns a CompactResult describing what happened. The tap passes the
+    /// `entered` demo-switch count it took before it made the task that calls this (DS-DEMO).
+    func compactActionRulesNow(entered: Int? = nil) async -> CompactResult {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[AIService] compactActionRules: START disableLLM=\(disableLLMCalls)")
         }
@@ -172,7 +173,7 @@ extension AIService {
         // Current user_action.md, and the labels it shows, read in one brief hold of the prompt store
         //: the patch deletes only those whose text it removes (DS-CAPTURE).
         let actionCapture: PromptCapture
-        switch await PromptStore.shared.readBeforeAI(.action, "compact action rules") {
+        switch await PromptStore.shared.readBeforeAI(.action, "compact action rules", entered: entered) {
         case .read(let capture): actionCapture = capture
         case .refused(let outcome): return Self.compactResult(outcome, opsCount: 0)
         }

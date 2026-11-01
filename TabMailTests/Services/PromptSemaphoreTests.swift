@@ -246,6 +246,35 @@ struct PromptSemaphoreTests {
         #expect(order.entries == ["late"])
     }
 
+    /// Blocks the calling (main) thread, so no timer on it can run.
+    private static func blockTheMainActor(seconds: Double) { Thread.sleep(forTimeInterval: seconds) }
+
+    @Test("A waiter past its deadline is refused at the release even when its timer has not run yet; within its deadline it is granted",
+          arguments: [0.03, 5.0])
+    func expiredWaiterIsRefusedWhenItsTimerIsLate(wait: Double) async throws {
+        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 15, acquireWaitSeconds: wait))
+        let order = OrderLog()
+        var late: Task<Void, Error>?
+        try await semaphore.hold("holder") { _ in
+            // Under the cleared mark, so the task queues behind the hold instead of being refused as nested.
+            late = PromptSemaphore.$holding.withValue(nil) {
+                Task { @MainActor in try await semaphore.hold("late") { _ in order.entries.append("late") } }
+            }
+            try await Task.sleep(for: .milliseconds(10))
+            // The main actor is held past the short wait, so the waiter's timer cannot run before the release below.
+            Self.blockTheMainActor(seconds: 0.15)
+        }
+        let waiting = try #require(late)
+        if wait < 1 {
+            await #expect(throws: PromptRefusal.busy) { try await waiting.value }
+            #expect(order.entries.isEmpty, "a request past its time was handed the semaphore")
+        } else {
+            try await waiting.value
+            #expect(order.entries == ["late"], "control: a request within its time is granted")
+        }
+        #expect(await free(semaphore))
+    }
+
     @Test("A holder that never releases hands the semaphore on at its lease: the queue never blocks for good (I4)")
     func leaseHandsOver() async throws {
         let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 0.1, acquireWaitSeconds: 5))

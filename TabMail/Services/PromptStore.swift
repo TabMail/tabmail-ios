@@ -500,10 +500,11 @@ final class PromptStore {
     nonisolated static var switchesSeen: Int { ChangeCounter.device.switches }
 
     /// An AI writer's read (DS-AI step 1), in one brief hold: `field` now and the labels it shows, with
-    /// the change counter as read.
-    func readBeforeAI(_ field: BulletField, _ label: String) async -> PromptReadOutcome {
+    /// the change counter as read. A tap that starts the writer in a task passes the `entered` count it took
+    /// in the tap (as for `withPromptStore`).
+    func readBeforeAI(_ field: BulletField, _ label: String, entered: Int? = nil) async -> PromptReadOutcome {
         do {
-            return try await withPromptStore(label) { access in
+            return try await withPromptStore(label, entered: entered) { access in
                 guard let capture = try access.readForEdit(field) else { return .refused(.unsaved) }
                 return .read(capture)
             }

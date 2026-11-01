@@ -113,14 +113,13 @@ enum ReminderBuilder {
     /// surface for the user. The cache is invalidated on demo entry/exit via
     /// the `.remindersDidChange` posts in DemoModeService.
     ///
-    /// A build awaits between its start and its writes (DS-DEMO): it takes the change counter FIRST, then
-    /// the mode, and every write it makes (the migrated hash, first-launch suppression, GC) carries that
-    /// counter, so a demo switch in between refuses them.
+    /// A build awaits between its start and its writes (DS-DEMO): it takes the change counter and the mode as
+    /// one snapshot (`DisabledRemindersStore.modeSnapshot`), and every write it makes (the migrated hash,
+    /// first-launch suppression, GC) carries that counter, so a demo switch in between refuses them.
     private static func performBuild() async -> (reminders: [Reminder], started: UUID) {
         BackgroundSyncLogger.logDebug("[ReminderBuilder] Building complete reminder list...")
 
-        let started = ChangeCounter.device.current
-        let demoActive = DemoModeStore.isDemoActive
+        let (started, demoActive) = DisabledRemindersStore.modeSnapshot()
 
         // Collect reminders from both sources. kbTextSnapshot is demo-aware
         // (PromptStore demo overlay): in demo it returns the demo KB, so

@@ -96,6 +96,13 @@ enum DisabledRemindersStore {
         return ChangeCounter.device.current != started
     }
 
+    /// DS-DEMO: the change counter and the mode, as one pair. A demo switch writes both under this lock
+    /// (`switching`), so the pair is never the old mode with the new counter or the reverse. A multi-step
+    /// writer that needs both takes them here, once, before its first await, and never reads them separately.
+    static func modeSnapshot() -> (counter: UUID, demoActive: Bool) {
+        transaction { (ChangeCounter.device.current, DemoModeStore.isDemoActive) }
+    }
+
     /// DS-DEMO: the demo is entered or left. `flip` sets the mode and moves the change counter; both happen
     /// under the map lock, so no transaction sees the new mode with the old counter. Leaving also deletes
     /// the demo's map, after the flip.

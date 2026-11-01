@@ -105,6 +105,9 @@ final class PromptSemaphore {
     private struct Waiter {
         let token: UUID
         let label: String
+        /// When the wait ends, on the monotonic clock: a timer the MainActor runs late must not let an
+        /// expired request take the semaphore (DS-SEMAPHORE).
+        let deadline: ContinuousClock.Instant
         let resolve: (Bool) -> Void
     }
 
@@ -173,11 +176,12 @@ final class PromptSemaphore {
         await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
                 guard !Task.isCancelled else { return continuation.resume(returning: false) }
-                let deadline = Task { [weak self, wait = config.acquireWaitSeconds] in
+                let wait = config.acquireWaitSeconds
+                let deadline = Task { [weak self] in
                     try? await Task.sleep(for: .seconds(wait))
                     self?.drop(token)
                 }
-                queue.append(Waiter(token: token, label: label) { granted in
+                queue.append(Waiter(token: token, label: label, deadline: ContinuousClock.now + .seconds(wait)) { granted in
                     deadline.cancel()
                     continuation.resume(returning: granted)
                 })
@@ -193,12 +197,20 @@ final class PromptSemaphore {
         queue.remove(at: at).resolve(false)
     }
 
-    /// Hands the free semaphore to the oldest waiter.
+    /// Hands the free semaphore to the oldest waiter that has not run out of time.
     private func grantNext() {
-        guard holder == nil, !queue.isEmpty else { return }
-        let next = queue.removeFirst()
-        acquire(next.token, next.label)
-        next.resolve(true)
+        guard holder == nil else { return }
+        // A request past its deadline is refused, not granted, whether or not its timer has run yet.
+        while !queue.isEmpty {
+            let next = queue.removeFirst()
+            guard ContinuousClock.now < next.deadline else {
+                next.resolve(false)
+                continue
+            }
+            acquire(next.token, next.label)
+            next.resolve(true)
+            return
+        }
     }
 
     private func release(_ token: UUID) {

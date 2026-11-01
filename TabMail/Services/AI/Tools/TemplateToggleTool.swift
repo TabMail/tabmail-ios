@@ -30,16 +30,6 @@ struct TemplateToggleTool: AgentTool, Sendable {
             return ToolJSON.string(from: ["error": "Template not found."])
         }
 
-        if template.enabled == enabled {
-            return ToolJSON.string(from: [
-                "ok": true,
-                "result": "Template \"\(template.name)\" is already \(enabled ? "enabled" : "disabled").",
-                "template_id": templateId,
-                "template_name": template.name,
-                "enabled": enabled,
-            ] as [String: Any])
-        }
-
         let saved = await MainActor.run {
             var updated = template
             updated.enabled = enabled

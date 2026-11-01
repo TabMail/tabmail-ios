@@ -40,8 +40,10 @@ final class ActionCompactionMonitor {
         guard !isRunning else { return }
         isRunning = true
         statusMessage = nil
+        // The tap, not the task's first turn, is where the action starts (DS-DEMO).
+        let entered = PromptStore.switchesSeen
         Task {
-            let result = await AIService.shared.compactActionRulesNow()
+            let result = await AIService.shared.compactActionRulesNow(entered: entered)
             switch result {
             case .applied(let opsCount):
                 statusMessage = "Merged \(opsCount) rule\(opsCount == 1 ? "" : "s")"

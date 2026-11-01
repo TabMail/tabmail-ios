@@ -511,3 +511,23 @@ caller carries a check of its own. Multi-step writers keep the change-counter co
 fixed in the same round: the first-launch overdue suppression refuses an empty list across a switch and saves
 its done-mark in the suppression's own transaction; the public disabled-reminders readers read in the map
 transaction.
+
+**Amendment 2026-10-31 (round 2 review) — an operation starts at the tap; one snapshot pair; absolute waiter deadline:**
+(1) *Tap-time sampling.* The count (switch count for brief operations, change counter for multi-step ones) is
+taken in the tap, before the `Task` the tap makes, because a switch that does not suspend can finish before
+that task's first turn. Census of every view and view-model `Task {`, `.task`, `onChange`, `onSubmit` and
+alert-button closure that reaches the prompt store, a template API or the disabled-reminders store: gestures
+(`BulletListEditor`, `KnowledgeBaseView`, `ActionRulesView` reset, `CompositionPromptView`, `PromptHistoryView`
+restore, `RemindersSettingsView` delete, the tutorial sample rule) already take their count in `gesture`, before
+their task, and the tasks only await the result; the template edits and `DisabledRemindersStore.setEnabled`
+calls run synchronously in the tap. Two late samplers were found and fixed: the marketplace install
+(`installMarketplaceTemplate(id:since:download:)`, the tap passes `store.changeSeen`) and the action-rules
+compaction (`compactActionRulesNow(entered:)` through `readBeforeAI(entered:)`, `ActionCompactionMonitor.start`
+passes `PromptStore.switchesSeen`). A source fence test pins both taps' order. (2) *One pair.* The reminder build
+takes its change counter and the mode together with `DisabledRemindersStore.modeSnapshot()`, under the same lock
+`switching` writes them under; the earlier two adjacent loads (mutant m93) are deleted, so a snapshot never pairs
+the old mode with the new counter or the reverse. (3) *Absolute deadline.* Each queued waiter carries a
+`ContinuousClock` deadline and `grantNext` refuses an expired waiter instead of granting it, so a late timer
+cannot turn a waiter that ran out of time into a holder. (4) The template toggle no longer returns early when the
+template already has the requested state: the call goes through the same guarded write as every other tool, so a
+switch refuses it too.

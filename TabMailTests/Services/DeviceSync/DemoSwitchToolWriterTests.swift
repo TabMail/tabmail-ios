@@ -16,7 +16,7 @@ import Testing
 @Suite("Template writers across a demo switch", .serialized, .processGlobalState)
 struct DemoSwitchToolWriterTests {
     fileprivate enum Tool: String, CaseIterable, CustomStringConvertible {
-        case create, edit, delete, toggle, download
+        case create, edit, delete, toggle, toggleToCurrentState, download
         var description: String { rawValue }
 
         /// The tools with a confirmation card switch there; the others switch while they resolve the template id.
@@ -39,6 +39,10 @@ struct DemoSwitchToolWriterTests {
             case .toggle:
                 return try await TemplateToggleTool(context: context).execute(
                     arguments: ["template_id": .int(numericId), "enabled": .bool(false)], invocation: invocation)
+            case .toggleToCurrentState:
+                // The template is enabled in both stores, so this changes nothing: the switch still refuses it.
+                return try await TemplateToggleTool(context: context).execute(
+                    arguments: ["template_id": .int(numericId), "enabled": .bool(true)], invocation: invocation)
             case .download:
                 let body = Data(#"{"template":{"id":"switch-download","name":"Switch download","instructions":["Be brief"],"exampleReply":"Thanks","enabled":true}}"#.utf8)
                 return try await TemplateDownloadTool(context: context, fetch: { _ in .body(body) }).execute(
@@ -67,6 +71,10 @@ struct DemoSwitchToolWriterTests {
     }
 
     private func stored(_ key: String) -> Data? { UserDefaults.standard.data(forKey: key) }
+
+    private func decodedTemplates(_ key: String) -> [ReplyTemplate] {
+        stored(key).flatMap { try? JSONDecoder().decode([ReplyTemplate].self, from: $0) } ?? []
+    }
 
     @Test("A writer whose demo was entered or left during its call saves nothing in either store and reports it; an uninterrupted one saves",
           arguments: Tool.allCases, [true, false])
@@ -104,6 +112,21 @@ struct DemoSwitchToolWriterTests {
         #expect(result.contains("Could not save"), "\(tool): the tool reports that it could not save: \(result)")
         #expect(stored("user_templates") == realBefore, "\(tool): the real templates are unchanged")
         #expect(!store.templates.contains { $0.name == "Switch probe" || $0.name == "Switch renamed" || $0.name == "Switch download" }, "\(tool): nothing changed was saved in the mode now shown")
+        // Durable state, decoded from the keys themselves: the mode now live holds exactly the template it held
+        // before the call, and the other mode's key is untouched.
+        let probeNames: Set<String> = ["Switch probe", "Switch renamed", "Switch download"]
+        let liveKey = entering ? "demo.user_templates" : "user_templates"
+        let live = decodedTemplates(liveKey)
+        #expect(live.allSatisfy { !probeNames.contains($0.name) }, "\(tool): nothing the call made reached the stored \(liveKey)")
+        let liveShared = live.filter { $0.id == shared }
+        #expect(liveShared.count == 1, "\(tool): the stored \(liveKey) still holds the shared template once")
+        if let first = liveShared.first {
+            #expect(!first.deleted && first.enabled, "\(tool): the stored template is neither deleted nor toggled: \(first)")
+            #expect(entering || first.name == "Tool real", "\(tool): the stored real template is not renamed")
+        }
+        if !entering {
+            #expect(decodedTemplates("demo.user_templates").isEmpty, "\(tool): the demo's key is gone, not rewritten")
+        }
         let shownAfter = store.templates.first { $0.id == shared }
         if entering {
             // The demo's template is as the overlay seeded it, not the real one and not changed.
@@ -138,7 +161,7 @@ struct DemoSwitchToolWriterTests {
         let downloaded = TemplateMarketplaceClient.DownloadedTemplate(id: "install-new", name: "Install new", instructions: ["Be brief"], exampleReply: "Thanks", enabled: true)
         let realBefore = stored("user_templates")
 
-        let outcome = try await store.installMarketplaceTemplate(id: "install-new") { _ in
+        let outcome = try await store.installMarketplaceTemplate(id: "install-new", since: store.changeSeen) { _ in
             await DemoSwitchToolWriterTests.switchDemo(entering: entering)
             return downloaded
         }
@@ -149,7 +172,7 @@ struct DemoSwitchToolWriterTests {
         #expect(!store.templates.contains { $0.id == "install-new" }, "nothing was installed in the mode now shown")
 
         // Control: the same install with no switch installs into the mode now live.
-        let again = try await store.installMarketplaceTemplate(id: "install-new") { _ in downloaded }
+        let again = try await store.installMarketplaceTemplate(id: "install-new", since: store.changeSeen) { _ in downloaded }
         #expect(again == .installed("install-new"))
         #expect(store.templates.contains { $0.id == "install-new" })
         if DemoModeStore.isDemoActive { try await store.leaveDemo() }
