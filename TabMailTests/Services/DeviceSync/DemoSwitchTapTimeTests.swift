@@ -85,15 +85,18 @@ struct DemoSwitchTapTimeTests {
     func tapsSampleBeforeTheirTask() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        func order(_ path: String, sample: String, task: String) throws -> Bool {
+        /// The count is taken before the first `Task {` that follows `anchor`.
+        func sampledBeforeTheTask(_ path: String, anchor: String, sample: String) throws -> Bool {
             let source = try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
-            guard let sampled = source.range(of: sample), let tasked = source.range(of: task) else { return false }
+            guard let start = source.range(of: anchor) else { return false }
+            let rest = source[start.upperBound...]
+            guard let sampled = rest.range(of: sample), let tasked = rest.range(of: "Task {") else { return false }
             return sampled.lowerBound < tasked.lowerBound
         }
-        #expect(try order("TabMail/Views/Settings/MarketplaceTemplateDetailView.swift",
-                          sample: "let started = store.changeSeen", task: "Task { await installTemplate(since: started) }"))
-        #expect(try order("TabMail/Views/Settings/ActionRulesView.swift",
-                          sample: "let entered = PromptStore.switchesSeen", task: "compactActionRulesNow(entered: entered)"))
+        #expect(try sampledBeforeTheTask("TabMail/Views/Settings/MarketplaceTemplateDetailView.swift",
+                                         anchor: "Button {", sample: "let started = store.changeSeen"))
+        #expect(try sampledBeforeTheTask("TabMail/Views/Settings/ActionRulesView.swift",
+                                         anchor: "func start()", sample: "let entered = PromptStore.switchesSeen"))
     }
 
     // MARK: - Mode snapshot
