@@ -150,6 +150,39 @@ struct TrialFeedbackClientTests {
     }
 }
 
+private final class FeedbackChallengeSender: NSObject, URLAuthenticationChallengeSender {
+    func use(_ credential: URLCredential, for challenge: URLAuthenticationChallenge) { }
+    func continueWithoutCredential(for challenge: URLAuthenticationChallenge) { }
+    func cancel(_ challenge: URLAuthenticationChallenge) { }
+}
+
+@Suite("Feedback authentication boundary")
+struct TrialFeedbackAuthenticationTests {
+    @Test(arguments: [NSURLAuthenticationMethodHTTPBasic, NSURLAuthenticationMethodDefault, NSURLAuthenticationMethodServerTrust])
+    func sessionAndTaskChallengesNeverUseStoredCredentials(method: String) {
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let task = session.dataTask(with: TrialFeedbackConfig.endpoint)
+        let space = URLProtectionSpace(host: "example.test", port: 443, protocol: "https", realm: nil, authenticationMethod: method)
+        let challenge = URLAuthenticationChallenge(protectionSpace: space,
+            proposedCredential: URLCredential(user: "synthetic", password: "synthetic", persistence: .none),
+            previousFailureCount: 0, failureResponse: nil, error: nil, sender: FeedbackChallengeSender())
+        let delegate = TrialFeedbackSessionDelegate()
+        let results = Mutex<[(URLSession.AuthChallengeDisposition, Bool)]>([])
+        let capture: @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void = { disposition, credential in
+            results.withLock { $0.append((disposition, credential == nil)) }
+        }
+        delegate.urlSession(session, didReceive: challenge, completionHandler: capture)
+        delegate.urlSession(session, task: task, didReceive: challenge, completionHandler: capture)
+        let observed = results.withLock { $0 }
+        #expect(observed.count == 2)
+        for (disposition, noCredential) in observed {
+            #expect(noCredential)
+            #expect(disposition == (method == NSURLAuthenticationMethodServerTrust ? .performDefaultHandling : .cancelAuthenticationChallenge))
+        }
+    }
+}
+
 private actor FeedbackSubmitter: TrialFeedbackSubmitting {
     enum Failure: Error { case unavailable }
     let held: Bool
@@ -330,30 +363,37 @@ struct TrialFeedbackViewTests {
         #expect(prompt.isSuppressed)
     }
 
-    @Test(arguments: [false, true])
-    func theActualInboxRequiresCurrentExpiredAuthorityAndARealSession(demo: Bool) async throws {
+    @Test(arguments: ["ended", "demo", "no-session", "other-folder", "paid", "running"])
+    func theActualInboxRequiresCurrentExpiredAuthorityAndARealSession(scenario: String) async throws {
         PreviewMocks.hideAllTips()
         let gate = AISubscriptionGate.shared
         let oldActive = gate.isActive
         let oldDemo = DemoModeStore.shared.isActive
         gate.noteSignedOut()
-        DemoModeStore.shared.isActive = demo
+        DemoModeStore.shared.isActive = scenario == "demo"
         defer {
             gate.noteSignedOut()
             if oldActive { gate.openGate() } else { gate.closeGate() }
             DemoModeStore.shared.isActive = oldDemo
         }
-        let folder = Folder(name: "Inbox", path: "INBOX", role: .inbox, accountId: UUID().uuidString)
+        let otherFolder = scenario == "other-folder"
+        let folder = Folder(name: "Inbox", path: "INBOX", role: otherFolder ? .sent : .inbox, accountId: UUID().uuidString)
         let view = NavigationStack {
-            InboxView(title: "Mailbox", folders: [folder], selection: .unified(.inbox),
+            InboxView(title: "Mailbox", folders: [folder], selection: .unified(otherFolder ? .sent : .inbox),
                 selectedMessageId: .constant(nil), pushedMessageId: .constant(nil))
-        }.environment(NavigationStore()).environment(\.hasTabMailSession, true)
+        }.environment(NavigationStore()).environment(\.hasTabMailSession, scenario != "no-session")
         let host = try TrialFeedbackHost(view)
         defer { host.close() }
         #expect(!(try await host.text(topOnly: true)).contains("what's keeping"))
-        gate.apply(try WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: Date()))
+        if scenario == "running" {
+            gate.apply(try WhoamiFixture.runningSignupTrial(daysLeft: 3, reference: Date()))
+        } else if scenario == "paid" {
+            gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+        } else {
+            gate.apply(try WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: Date()))
+        }
         let ended = try await host.text(topOnly: true)
-        #expect(ended.contains("what's keeping") == !demo)
+        #expect(ended.contains("what's keeping") == (scenario == "ended"))
         gate.noteSignedOut()
         #expect(!(try await host.text(topOnly: true)).contains("what's keeping"))
     }
