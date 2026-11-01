@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Darwin
 import SwiftUI
 import UIKit
 import Vision
@@ -56,6 +57,7 @@ private final class FeedbackPacketProtocol: URLProtocol, @unchecked Sendable {
                 redirected.url = URL(string: "https://unrelated.example.test/feedback")!
                 redirected.httpBody = bytes
                 let response = HTTPURLResponse(url: request.url!, statusCode: 307, httpVersion: nil, headerFields: ["Location": redirected.url!.absoluteString])!
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
                 client?.urlProtocol(self, wasRedirectedTo: redirected, redirectResponse: response)
                 client?.urlProtocolDidFinishLoading(self)
             } else { finish(status: 204) }
@@ -78,6 +80,16 @@ struct TrialFeedbackClientTests {
         let noCredentials: Bool
         let noCache: Bool
         let noConnectivityWait: Bool
+    }
+
+    @Test func declaredReasonsKeepTheirMeaningOnTheWire() {
+        let expected: [(TrialFeedbackReason, String)] = [
+            (.priceValue, "price_value"), (.notEnoughUse, "not_enough_use"),
+            (.missingFeature, "missing_feature"), (.aiReliability, "ai_reliability"),
+            (.existingWorkflow, "existing_workflow"), (.other, "other_or_prefer_not_to_say")
+        ]
+        #expect(TrialFeedbackReason.allCases.count == expected.count)
+        for (reason, wire) in expected { #expect(reason.rawValue == wire) }
     }
 
     @Test(arguments: TrialFeedbackReason.allCases)
@@ -146,6 +158,10 @@ struct TrialFeedbackClientTests {
         try #require(FeedbackPacketProtocol.state.withLock { $0.packets.count } == 1)
         task.cancel()
         do { try await task.value; Issue.record("A cancelled request was accepted") } catch {}
+        for _ in 0..<200 {
+            if FeedbackPacketProtocol.state.withLock({ $0.stopped > 0 }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
         #expect(FeedbackPacketProtocol.state.withLock { $0.stopped } > 0)
     }
 }
@@ -280,6 +296,70 @@ struct TrialFeedbackFlowTests {
 
 
 @MainActor
+private func feedbackAccessibilityElement(in root: NSObject, identifier: String, trace: ((String) -> Void)? = nil) -> NSObject? {
+    var pending: [NSObject] = [root]
+    var seen = Set<ObjectIdentifier>()
+    while let object = pending.popLast(), seen.count < 2_048 {
+        guard seen.insert(ObjectIdentifier(object)).inserted else { continue }
+        let typed = (object as? UIAccessibilityIdentification)?.accessibilityIdentifier
+        let selector = NSSelectorFromString("accessibilityIdentifier")
+        let identifierValue = typed ?? (object.responds(to: selector)
+            ? object.perform(selector)?.takeUnretainedValue() as? String : nil)
+        trace?(String(reflecting: type(of: object)) + ":" + (identifierValue ?? "nil"))
+        if identifierValue == identifier { return object }
+        if let view = object as? UIView { pending.append(contentsOf: view.subviews) }
+        pending.append(contentsOf: (object.accessibilityElements ?? []).compactMap { $0 as? NSObject })
+        pending.append(contentsOf: (object.automationElements ?? []).compactMap { $0 as? NSObject })
+        let count = object.accessibilityElementCount()
+        if count > 0, count < 256 {
+            for index in 0..<count {
+                if let child = object.accessibilityElement(at: index) as? NSObject { pending.append(child) }
+            }
+        }
+    }
+    return nil
+}
+
+/// Simulator test bootstrap only. SwiftUI omits its accessibility nodes until
+/// automation is enabled. This is never linked into a shipping app target.
+/// The runtime entry points follow the AccessibilitySnapshot test-enabler
+/// pattern; the actual control is located/activated through public UIKit APIs.
+@MainActor
+private final class FeedbackAccessibilityAutomation {
+    private let handle: UnsafeMutableRawPointer
+    private let setter: @convention(c) (Int32) -> Void
+    private let original: Int32
+    private enum Failure: Error { case runtimeUnavailable }
+
+    init() throws {
+        #if targetEnvironment(simulator)
+        let root = ProcessInfo.processInfo.environment["IPHONE_SIMULATOR_ROOT"] ?? ""
+        guard let handle = dlopen(root + "/usr/lib/libAccessibility.dylib", RTLD_NOW | RTLD_LOCAL) else {
+            throw Failure.runtimeUnavailable
+        }
+        guard let read = dlsym(handle, "_AXSAutomationEnabled"),
+              let write = dlsym(handle, "_AXSSetAutomationEnabled") else {
+            dlclose(handle)
+            throw Failure.runtimeUnavailable
+        }
+        self.handle = handle
+        let getter = unsafeBitCast(read, to: (@convention(c) () -> Int32).self)
+        setter = unsafeBitCast(write, to: (@convention(c) (Int32) -> Void).self)
+        original = getter()
+        setter(1)
+        #expect(getter() != 0)
+        #else
+        throw Failure.runtimeUnavailable
+        #endif
+    }
+
+    func close() {
+        setter(original)
+        dlclose(handle)
+    }
+}
+
+@MainActor
 private final class TrialFeedbackHost {
     private let window: UIWindow
     private let controller: UIViewController
@@ -300,6 +380,32 @@ private final class TrialFeedbackHost {
         window.isHidden = true
         controller.view.removeFromSuperview()
         window.rootViewController = nil
+    }
+
+    func activate(_ identifier: String) async throws {
+        var scrolls: [UIScrollView] = []
+        var views: [UIView] = [controller.view]
+        while let view = views.popLast() {
+            views.append(contentsOf: view.subviews)
+            if let scroll = view as? UIScrollView, scroll.contentSize.height > scroll.bounds.height {
+                scrolls.append(scroll)
+            }
+        }
+        for step in 0..<24 {
+            controller.view.layoutIfNeeded()
+            if let element = feedbackAccessibilityElement(in: controller.view, identifier: identifier) {
+                _ = element.accessibilityActivate()
+                return
+            }
+            for scroll in scrolls {
+                let maximum = max(-scroll.adjustedContentInset.top,
+                    scroll.contentSize.height - scroll.bounds.height + scroll.adjustedContentInset.bottom)
+                let offset = min(maximum, -scroll.adjustedContentInset.top + CGFloat(step) * scroll.bounds.height / 2)
+                scroll.setContentOffset(CGPoint(x: 0, y: offset), animated: false)
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        Issue.record(Comment(rawValue: "Rendered feedback control missing: " + identifier))
     }
 
     func text(topOnly: Bool = false) async throws -> String {
@@ -364,27 +470,24 @@ struct TrialFeedbackViewTests {
     }
 
     @Test(.timeLimit(.minutes(1)))
-    func theMountedSubmitActionSendsExactlyTheChosenReasonOnce() async throws {
+    func theRenderedButtonsSendExactlyTheChosenReasonOnce() async throws {
         let name = "TrialFeedbackActions.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let prompt = TrialFeedbackPromptState(defaults: defaults)
         let client = FeedbackSubmitter()
         let flow = TrialFeedbackFlow(prompt: prompt, client: client)
-        var actions: TrialFeedbackForm.Actions?
-        let host = try TrialFeedbackHost(TrialFeedbackForm(flow: flow, actionsReady: { actions = $0 }))
+        let automation = try FeedbackAccessibilityAutomation()
+        defer { automation.close() }
+        let host = try TrialFeedbackHost(TrialFeedbackForm(flow: flow))
         defer { host.close() }
-        for _ in 0..<100 {
-            if actions != nil { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        let mounted = try #require(actions)
-        mounted.submit()
+        try await Task.sleep(for: .milliseconds(350))
+        #expect(flow.selectedReason == nil && !flow.canSubmit)
         #expect(await client.reasons.isEmpty)
-        mounted.select(.priceValue)
-        mounted.submit()
-        mounted.select(.other)
-        mounted.submit()
+        try await host.activate("trial-feedback-reason-price_value")
+        #expect(flow.selectedReason == .priceValue)
+        #expect(await client.reasons.isEmpty)
+        try await host.activate("trial-feedback-submit")
         for _ in 0..<100 {
             if flow.isComplete { break }
             try await Task.sleep(for: .milliseconds(10))
@@ -395,23 +498,21 @@ struct TrialFeedbackViewTests {
     }
 
     @Test(arguments: [false, true])
-    func mountedDismissalActionsSendNothingAndRespectTheLocalChoice(permanent: Bool) async throws {
+    func renderedDismissalButtonsSendNothingAndRespectTheLocalChoice(permanent: Bool) async throws {
         let name = "TrialFeedbackDismissal.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: name))
         defer { defaults.removePersistentDomain(forName: name) }
         let prompt = TrialFeedbackPromptState(defaults: defaults)
         let client = FeedbackSubmitter()
         let flow = TrialFeedbackFlow(prompt: prompt, client: client)
-        var actions: TrialFeedbackForm.Actions?
-        let host = try TrialFeedbackHost(TrialFeedbackForm(flow: flow, actionsReady: { actions = $0 }))
+        let automation = try FeedbackAccessibilityAutomation()
+        defer { automation.close() }
+        let host = try TrialFeedbackHost(TrialFeedbackForm(flow: flow))
         defer { host.close() }
-        for _ in 0..<100 {
-            if actions != nil { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        let mounted = try #require(actions)
-        mounted.select(.existingWorkflow)
-        if permanent { mounted.doNotAskAgain() } else { mounted.notNow() }
+        try await Task.sleep(for: .milliseconds(350))
+        try await host.activate("trial-feedback-reason-existing_workflow")
+        #expect(flow.selectedReason == .existingWorkflow)
+        try await host.activate(permanent ? "trial-feedback-decline" : "trial-feedback-not-now")
         #expect(await client.reasons.isEmpty)
         #expect(prompt.isSuppressed == permanent)
         #expect(prompt.deferredThisRun == !permanent)
@@ -426,23 +527,20 @@ struct TrialFeedbackViewTests {
         let prompt = TrialFeedbackPromptState(defaults: defaults)
         let client = FeedbackSubmitter(held: true)
         let flow = TrialFeedbackFlow(prompt: prompt, client: client)
-        var actions: TrialFeedbackForm.Actions?
-        let host = try TrialFeedbackHost(TrialFeedbackForm(flow: flow, actionsReady: { actions = $0 }))
+        let automation = try FeedbackAccessibilityAutomation()
+        defer { automation.close() }
+        let host = try TrialFeedbackHost(TrialFeedbackForm(flow: flow))
         defer { host.close() }
-        for _ in 0..<100 {
-            if actions != nil { break }
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        let mounted = try #require(actions)
-        mounted.select(.aiReliability)
-        mounted.submit()
+        try await Task.sleep(for: .milliseconds(350))
+        try await host.activate("trial-feedback-reason-ai_reliability")
+        #expect(flow.selectedReason == .aiReliability)
+        try await host.activate("trial-feedback-submit")
         for _ in 0..<100 {
             if await client.reasons.count == 1 { break }
             try await Task.sleep(for: .milliseconds(10))
         }
         let enteredReasons = await client.reasons
         try #require(flow.isSubmitting && enteredReasons.count == 1)
-        actions = nil
         host.close()
         try await Task.sleep(for: .milliseconds(50))
         await client.release()
@@ -481,7 +579,9 @@ struct TrialFeedbackViewTests {
         }.environment(NavigationStore()).environment(\.hasTabMailSession, scenario != "no-session")
         let host = try TrialFeedbackHost(view)
         defer { host.close() }
-        #expect(!(try await host.text(topOnly: true)).contains("what's keeping"))
+        let before = try await host.text(topOnly: true)
+        #expect(before.contains("mailbox"))
+        #expect(!before.contains("help improve tabmail"))
         if scenario == "running" {
             gate.apply(try WhoamiFixture.runningSignupTrial(daysLeft: 3, reference: Date()))
         } else if scenario == "paid" {
@@ -490,8 +590,11 @@ struct TrialFeedbackViewTests {
             gate.apply(try WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: Date()))
         }
         let ended = try await host.text(topOnly: true)
-        #expect(ended.contains("what's keeping") == (scenario == "ended"))
+        #expect(ended.contains("mailbox"))
+        #expect(ended.contains("help improve tabmail") == (scenario == "ended"), Comment(rawValue: "Rendered synthetic inbox: \(ended)"))
         gate.noteSignedOut()
-        #expect(!(try await host.text(topOnly: true)).contains("what's keeping"))
+        let after = try await host.text(topOnly: true)
+        #expect(after.contains("mailbox"))
+        #expect(!after.contains("help improve tabmail"))
     }
 }

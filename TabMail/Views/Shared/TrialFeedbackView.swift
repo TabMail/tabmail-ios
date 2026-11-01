@@ -61,16 +61,6 @@ struct TrialFeedbackForm: View {
     @State var flow: TrialFeedbackFlow
     @State private var submissionRequested = false
     @Environment(\.dismiss) private var dismiss
-    #if DEBUG
-    struct Actions {
-        let select: @MainActor (TrialFeedbackReason) -> Void
-        let submit: @MainActor () -> Void
-        let notNow: @MainActor () -> Void
-        let doNotAskAgain: @MainActor () -> Void
-    }
-    // Mirrors the existing mounted plan-picker action probe. No shipping hook.
-    var actionsReady: (@MainActor (Actions) -> Void)? = nil
-    #endif
 
     private func select(_ reason: TrialFeedbackReason) {
         guard !submissionRequested, !flow.isSubmitting else { return }
@@ -117,6 +107,7 @@ struct TrialFeedbackForm: View {
                             .buttonStyle(.plain)
                             .disabled(flow.isSubmitting || submissionRequested)
                             .accessibilityAddTraits(flow.selectedReason == reason ? .isSelected : [])
+                            .accessibilityIdentifier("trial-feedback-reason-\(reason.rawValue)")
                         }
                     }
                     Section {
@@ -138,6 +129,7 @@ struct TrialFeedbackForm: View {
                         .disabled(!flow.canSubmit || submissionRequested)
                         .accessibilityIdentifier("trial-feedback-submit")
                         Button("Don't ask again", action: decline)
+                            .accessibilityIdentifier("trial-feedback-decline")
                     }
                 }
             }
@@ -147,13 +139,9 @@ struct TrialFeedbackForm: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(flow.isComplete ? "Close" : "Not now", action: leave)
+                        .accessibilityIdentifier("trial-feedback-not-now")
                 }
             }
-        }
-        .onAppear {
-            #if DEBUG
-            actionsReady?(Actions(select: select, submit: requestSubmission, notNow: leave, doNotAskAgain: decline))
-            #endif
         }
         .task(id: submissionRequested) {
             guard submissionRequested else { return }
