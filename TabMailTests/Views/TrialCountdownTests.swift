@@ -3,6 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Darwin
+import Observation
 import SwiftUI
 import Synchronization
 import Testing
@@ -31,6 +33,7 @@ struct TrialCountdownModelTests {
         let expected = days == 0.1 ? "1 day left" : days == 1.5 ? "2 days left" : "14 days left"
         #expect(text.title.contains(expected))
         #expect(text.actionTitle == "Plans")
+        #expect(text.detail == "Ends \(notice.end.formatted(date: .abbreviated, time: .omitted))")
         #expect(notice.presentation(now: notice.end) == nil)
         #expect(notice.presentation(now: notice.end.addingTimeInterval(1)) == nil)
     }
@@ -42,6 +45,7 @@ struct TrialCountdownModelTests {
         let notice = try #require(TrialCountdownNotice.from(info, now: now))
         #expect(notice.kind == .subscription)
         #expect(notice.presentation(now: now)?.actionTitle == "Manage")
+        #expect(notice.presentation(now: now)?.title == "Free until \(notice.end.formatted(date: .abbreviated, time: .omitted))")
         #expect(notice.presentation(now: now)?.detail.contains("Payment begins") == true)
         #expect(info.trialState(now: now) == .noTrial)
     }
@@ -164,15 +168,23 @@ struct TrialCountdownGateTests {
         #expect(gate.lastAuthoritativeApplyAt == now)
     }
 
-    @Test func theBannerActionRequestsTheExistingPlansRoute() {
-        let delivered = Mutex(false)
-        let observer = NotificationCenter.default.addObserver(forName: .navigateToPlanPicker, object: nil, queue: nil) { _ in
-            delivered.withLock { $0 = true }
-        }
-        defer { NotificationCenter.default.removeObserver(observer) }
-        let notice = TrialCountdownNotice(kind: .signup, end: Date().addingTimeInterval(AccountPlanConfig.secondsPerDay), renewalCancelled: false)
-        TrialCountdownBanner(notice: notice).action()
-        #expect(delivered.withLock { $0 })
+    @Test func sameUserFallbackAndBackstopRetainAnAuthoritativeNotice() throws {
+        let scope = TrialCountdownGateScope()
+        defer { scope.close() }
+        let gate = AISubscriptionGate.shared
+        let now = Date()
+        gate.apply(try WhoamiFixture.runningSignupTrial(daysLeft: 3, reference: now), now: now)
+        let notice = try #require(gate.trialCountdownNotice)
+        let generation = gate.signInGeneration
+        let owner = "11111111-1111-4111-8111-111111111111"
+        gate.noteSignedIn(userId: owner, previousUserId: owner)
+        #expect(gate.trialCountdownNotice == notice)
+        #expect(gate.lastAuthoritativeApplyAt == now)
+        #expect(gate.signInGeneration == generation)
+        gate.noteSignedIn(userId: owner)
+        #expect(gate.trialCountdownNotice == notice)
+        #expect(gate.lastAuthoritativeApplyAt == now)
+        #expect(gate.signInGeneration == generation)
     }
 }
 
@@ -212,6 +224,23 @@ private final class TrialCountdownInboxHost {
         controller?.view.removeFromSuperview()
         window.rootViewController = nil
         controller = nil
+    }
+
+    func activateReminder() async throws {
+        let view = try #require(controller?.view)
+        for _ in 0..<100 {
+            if let element = countdownAccessibilityElement(in: view, identifier: "inbox-trial-countdown") {
+                _ = element.accessibilityActivate()
+                return
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        var trace: [String] = []
+        _ = countdownAccessibilityElement(in: view, identifier: "inbox-trial-countdown", trace: {
+            if trace.count < 60 { trace.append($0) }
+        })
+        Issue.record(Comment(rawValue: "Rendered reminder AX tree: " + trace.joined(separator: " | ")))
+
     }
 
     private func frame() throws -> CGImage {
@@ -301,6 +330,53 @@ struct TrialCountdownInboxTests {
     }
 
     @Test(.timeLimit(.minutes(1)))
+    func theRenderedInboxButtonRequestsPlansOnlyAfterActivation() async throws {
+        let automation = try CountdownAccessibilityAutomation()
+        defer { automation.close() }
+        let scope = TrialCountdownGateScope()
+        defer { scope.close() }
+        AISubscriptionGate.shared.apply(try WhoamiFixture.runningSignupTrial(daysLeft: 3, reference: Date()))
+        let count = Mutex(0)
+        let observer = NotificationCenter.default.addObserver(forName: .navigateToPlanPicker, object: nil, queue: nil) { _ in
+            count.withLock { $0 += 1 }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        let host = try TrialCountdownInboxHost()
+        defer { host.close() }
+        #expect((try await host.text()).contains("3 days left"))
+        #expect(count.withLock { $0 } == 0)
+        try await host.activateReminder()
+        for _ in 0..<100 {
+            if count.withLock({ $0 > 0 }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(count.withLock { $0 } == 1)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func theActualInboxReplacesAnOldScheduleWhenAuthorityExtendsTheDeadline() async throws {
+        let scope = TrialCountdownGateScope()
+        defer { scope.close() }
+        let gate = AISubscriptionGate.shared
+        let now = Date()
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true, planTier: "Trial", provider: "signup", isTrial: true,
+            trialEnd: now.addingTimeInterval(8)), now: now)
+        let host = try TrialCountdownInboxHost()
+        defer { host.close() }
+        #expect((try await host.text()).contains("1 day left"))
+        let applied = Date()
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true, planTier: "Basic", provider: "apple", isTrial: true,
+            trialEnd: applied.addingTimeInterval(16)), now: applied)
+        let notice = try #require(gate.trialCountdownNotice)
+        #expect((try await host.text()).contains("free until"))
+        try await Task.sleep(for: .seconds(max(0, notice.end.timeIntervalSinceNow) + 0.1))
+        let after = try await host.text()
+        #expect(!after.contains("free until"))
+        #expect(gate.isActive && !gate.trialHasEnded)
+        #expect(gate.lastAuthoritativeApplyAt == applied)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
     func theActualInboxWithdrawsTheCountdownAtItsDeadlineWithoutClosingAccess() async throws {
         let scope = TrialCountdownGateScope()
         defer { scope.close() }
@@ -323,5 +399,127 @@ struct TrialCountdownInboxTests {
         #expect(gate.isActive)
         #expect(!gate.trialHasEnded)
         #expect(gate.lastAuthoritativeApplyAt == now)
+    }
+}
+
+@MainActor
+func countdownAccessibilityElement(in root: NSObject, identifier: String, trace: ((String) -> Void)? = nil) -> NSObject? {
+    var pending: [NSObject] = [root]
+    var seen = Set<ObjectIdentifier>()
+    while let object = pending.popLast(), seen.count < 2_048 {
+        guard seen.insert(ObjectIdentifier(object)).inserted else { continue }
+        let typed = (object as? UIAccessibilityIdentification)?.accessibilityIdentifier
+        let selector = NSSelectorFromString("accessibilityIdentifier")
+        let identifierValue = typed ?? (object.responds(to: selector)
+            ? object.perform(selector)?.takeUnretainedValue() as? String : nil)
+        trace?(String(reflecting: type(of: object)) + ":" + (identifierValue ?? "nil"))
+        if identifierValue == identifier { return object }
+        if let view = object as? UIView { pending.append(contentsOf: view.subviews) }
+        pending.append(contentsOf: (object.accessibilityElements ?? []).compactMap { $0 as? NSObject })
+        pending.append(contentsOf: (object.automationElements ?? []).compactMap { $0 as? NSObject })
+        let count = object.accessibilityElementCount()
+        if count > 0, count < 256 {
+            for index in 0..<count {
+                if let child = object.accessibilityElement(at: index) as? NSObject { pending.append(child) }
+            }
+        }
+    }
+    return nil
+}
+
+@MainActor @Observable
+private final class CountdownPhase { var value: ScenePhase = .inactive }
+@MainActor
+private final class CountdownTaskStarts { var values: [Int] = [] }
+
+@MainActor
+private struct CountdownClockProbe: View {
+    let notice: TrialCountdownNotice
+    let phase: CountdownPhase
+    let starts: CountdownTaskStarts
+    var body: some View {
+        TrialCountdownBanner(notice: notice, clockTaskStarted: { starts.values.append($0) })
+            .environment(\.scenePhase, phase.value)
+    }
+}
+
+@Suite("Mounted countdown clock lifecycle", .serialized, .processGlobalState)
+@MainActor
+struct TrialCountdownClockTests {
+    @Test(.timeLimit(.minutes(1)))
+    func foregroundAndSignificantTimeChangesRestartTheMountedScheduleWithoutChangingAuthority() async throws {
+        let scope = TrialCountdownGateScope()
+        defer { scope.close() }
+        let gate = AISubscriptionGate.shared
+        let now = Date()
+        gate.apply(try WhoamiFixture.runningSignupTrial(daysLeft: 3, reference: now), now: now)
+        let notice = try #require(gate.trialCountdownNotice)
+        let phase = CountdownPhase()
+        let starts = CountdownTaskStarts()
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let controller = UIHostingController(rootView: CountdownClockProbe(notice: notice, phase: phase, starts: starts))
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; controller.view.removeFromSuperview(); window.rootViewController = nil }
+        func waitFor(_ count: Int) async throws {
+            for _ in 0..<100 {
+                if starts.values.count >= count { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            try #require(starts.values.count == count)
+        }
+        try await waitFor(1)
+        #expect(starts.values == [0])
+        phase.value = .active
+        try await waitFor(2)
+        #expect(starts.values == [0, 1])
+        NotificationCenter.default.post(name: UIApplication.significantTimeChangeNotification, object: nil)
+        try await waitFor(3)
+        #expect(starts.values == [0, 1, 2])
+        #expect(gate.trialCountdownNotice == notice)
+        #expect(gate.lastAuthoritativeApplyAt == now)
+        #expect(gate.isActive && !gate.trialHasEnded)
+    }
+}
+
+
+/// Simulator test bootstrap only. SwiftUI omits its accessibility nodes until
+/// automation is enabled. This is never linked into a shipping app target.
+/// The runtime entry points follow the AccessibilitySnapshot test-enabler
+/// pattern; the actual control is located/activated through public UIKit APIs.
+@MainActor
+private final class CountdownAccessibilityAutomation {
+    private let handle: UnsafeMutableRawPointer
+    private let setter: @convention(c) (Int32) -> Void
+    private let original: Int32
+    private enum Failure: Error { case runtimeUnavailable }
+
+    init() throws {
+        #if targetEnvironment(simulator)
+        let root = ProcessInfo.processInfo.environment["IPHONE_SIMULATOR_ROOT"] ?? ""
+        guard let handle = dlopen(root + "/usr/lib/libAccessibility.dylib", RTLD_NOW | RTLD_LOCAL) else {
+            throw Failure.runtimeUnavailable
+        }
+        guard let read = dlsym(handle, "_AXSAutomationEnabled"),
+              let write = dlsym(handle, "_AXSSetAutomationEnabled") else {
+            dlclose(handle)
+            throw Failure.runtimeUnavailable
+        }
+        self.handle = handle
+        let getter = unsafeBitCast(read, to: (@convention(c) () -> Int32).self)
+        setter = unsafeBitCast(write, to: (@convention(c) (Int32) -> Void).self)
+        original = getter()
+        setter(1)
+        #expect(getter() != 0)
+        #else
+        throw Failure.runtimeUnavailable
+        #endif
+    }
+
+    func close() {
+        setter(original)
+        dlclose(handle)
     }
 }

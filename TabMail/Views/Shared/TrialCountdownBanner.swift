@@ -52,6 +52,10 @@ struct TrialCountdownBanner: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var clockRevision = 0
     @State private var now = Date()
+    #if DEBUG
+    /// Read-only lifecycle probe for native tests; absent from Release builds.
+    var clockTaskStarted: (@MainActor (Int) -> Void)? = nil
+    #endif
 
     private struct ClockKey: Hashable {
         let end: Date
@@ -101,6 +105,9 @@ struct TrialCountdownBanner: View {
             }
         }
         .task(id: ClockKey(end: notice.end, revision: clockRevision)) {
+            #if DEBUG
+            clockTaskStarted?(clockRevision)
+            #endif
             // TimelineView may lower its cadence. A cancellable task wakes only
             // for actual label boundaries, including the authoritative end.
             var dates = TrialCountdownSchedule(end: notice.end).entries(from: Date(), mode: .normal)
