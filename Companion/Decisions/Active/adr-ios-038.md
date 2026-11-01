@@ -523,11 +523,11 @@ their task, and the tasks only await the result; the template edits and `Disable
 calls run synchronously in the tap. Two late samplers were found and fixed: the marketplace install
 (`installMarketplaceTemplate(id:since:download:)`, the tap passes `store.changeSeen`) and the action-rules
 compaction (`compactActionRulesNow(entered:)` through `readBeforeAI(entered:)`, `ActionCompactionMonitor.start`
-passes `PromptStore.switchesSeen`). A source fence test pins both taps' order. (2) *One pair.* The reminder build
+passes `PromptStore.switchesSeen`). The marketplace tap now calls `PromptStore.beginMarketplaceInstall(id:download:)`, which samples the counter synchronously before it creates the install task; behavioural tests drive both taps (no source-order fence). (2) *One pair.* The reminder build
 takes its change counter and the mode together with `DisabledRemindersStore.modeSnapshot()`, under the same lock
 `switching` writes them under; the earlier two adjacent loads (mutant m93) are deleted, so a snapshot never pairs
 the old mode with the new counter or the reverse. (3) *Absolute deadline.* Each queued waiter carries a
 `ContinuousClock` deadline and `grantNext` refuses an expired waiter instead of granting it, so a late timer
-cannot turn a waiter that ran out of time into a holder. (4) The template toggle no longer returns early when the
+cannot turn a waiter that ran out of time into a holder; and `hold` refuses a grant whose lease expired before its body starts (`PromptRefusal.changed`), so a body never runs under an already-expired lease. (4) The template toggle no longer returns early when the
 template already has the requested state: the call goes through the same guarded write as every other tool, so a
 switch refuses it too.
