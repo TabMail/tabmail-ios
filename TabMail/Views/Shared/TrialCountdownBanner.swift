@@ -35,7 +35,7 @@ struct TrialCountdownSchedule: TimelineSchedule {
             if date >= end {
                 nextDate = nil
             } else {
-                let daysAfterNextChange = max(0, ceil(end.timeIntervalSince(date) / AccountPlanConfig.secondsPerDay) - 1)
+                let daysAfterNextChange = Swift.max(0, ceil(end.timeIntervalSince(date) / AccountPlanConfig.secondsPerDay) - 1)
                 nextDate = end.addingTimeInterval(-daysAfterNextChange * AccountPlanConfig.secondsPerDay)
             }
             return date
