@@ -19,6 +19,33 @@ enum PlanPurchaseResult: Equatable {
 /// Dependencies are per operation, not global overrides or another authority.
 @MainActor
 enum PlanPurchaseFlow {
+    /// Production orchestration keeps signed delivery separate from the current
+    /// session's UI/gate completion. A finished purchase still belongs to its
+    /// captured token when the user changes accounts during Apple's sheet.
+    static func run(
+        identity: PlanPurchaseIdentity,
+        currentIdentity: () -> PlanPurchaseIdentity?,
+        fetchAccount: () async throws -> AccountInfo,
+        fetchOffer: () async -> SubscriptionTrialOffer?,
+        accountRefreshed: (AccountInfo) -> Void,
+        performPurchase: (String) async throws -> String?,
+        purchaseFinished: () -> Void,
+        deliverSignedPurchase: (String) -> Void,
+        currentAccountDidPurchase: () async -> Void
+    ) async throws -> PlanPurchaseResult {
+        let result = try await purchase(
+            identity: identity, currentIdentity: currentIdentity,
+            fetchAccount: fetchAccount, fetchOffer: fetchOffer,
+            accountRefreshed: accountRefreshed, performPurchase: performPurchase
+        )
+        purchaseFinished()
+        guard case .purchased(let jws) = result else { return result }
+        deliverSignedPurchase(jws)
+        guard currentIdentity() == identity else { return result }
+        await currentAccountDidPurchase()
+        return result
+    }
+
     static func purchase(
         identity: PlanPurchaseIdentity,
         currentIdentity: () -> PlanPurchaseIdentity?,

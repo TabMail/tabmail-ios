@@ -74,6 +74,23 @@ struct PlanPurchaseFlowTests {
         #expect(displays == (duringAccount ? 0 : 1))
     }
 
+    @Test(arguments: [true, false])
+    func sameAccountNewGenerationAfterEitherRefreshPreventsPurchase(duringAccount: Bool) async throws {
+        let account = try WhoamiFixture.runningSignupTrial(daysLeft: 1, reference: Date())
+        var current = identity
+        let signedInAgain = PlanPurchaseIdentity(userId: identity.userId, generation: identity.generation + 1)
+        var purchases = 0
+        var displays = 0
+        let result = try await PlanPurchaseFlow.purchase(identity: identity, currentIdentity: { current },
+            fetchAccount: { if duringAccount { current = signedInAgain }; return account },
+            fetchOffer: { current = signedInAgain; return .init(value: 1, unit: .week) },
+            accountRefreshed: { _ in displays += 1 },
+            performPurchase: { _ in purchases += 1; return "must-not-purchase" })
+        guard case .refused = result else { Issue.record("An older sign-in generation purchased"); return }
+        #expect(purchases == 0)
+        #expect(displays == (duringAccount ? 0 : 1))
+    }
+
     @Test func signOutDuringOfferRefreshPreventsPurchase() async throws {
         let account = try WhoamiFixture.runningSignupTrial(daysLeft: 1, reference: Date())
         var current: PlanPurchaseIdentity? = identity

@@ -54,7 +54,22 @@ struct TrialStoreKitTests {
         return (url, group, original)
     }
 
-    @Test func realProductMetadataAndAppleEligibilityControlTheFreeOffer() async throws {
+    private func waitForConsumedEligibility(_ subscription: Product.SubscriptionInfo) async throws -> Bool {
+        // Finishing a local transaction does not promise synchronous receipt /
+        // eligibility-cache propagation. Observe the real cached-product getter
+        // with a bounded wait before asserting the production reader's result.
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(5))
+        while await subscription.isEligibleForIntroOffer {
+            guard clock.now < deadline else { return false }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        return true
+    }
+
+    // Exercise launch and teardown twice in one process, each with a fresh group.
+    @Test(arguments: 0..<2)
+    func realProductMetadataAndAppleEligibilityControlTheFreeOffer(_: Int) async throws {
         let fixture = try configurationURL()
         defer { try? FileManager.default.removeItem(at: fixture.url) }
         let session = try SKTestSession(contentsOf: fixture.url)
@@ -100,6 +115,8 @@ struct TrialStoreKitTests {
         try #require(transaction.environment == .xcode)
         try #require(transaction.offer?.paymentMode == .freeTrial)
         await transaction.finish()
+        let consumed = try await waitForConsumedEligibility(subscription)
+        try #require(consumed)
         // PlanPicker passes its selected cached Product to this production
         // refresh caller. Its async eligibility must reflect the consumed trial
         // before any fresh Product lookup can affect the result.

@@ -180,3 +180,15 @@ schemes:
     test:
       targets:
         - TabMailScreenshots
+  # Unit tests opt into local StoreKit without changing app/screenshot launches.
+  TabMailTests:
+    build:
+      targets:
+        TabMail: all
+    run:
+      config: Debug
+      storeKitConfiguration: TabMail/Configuration.storekit
+    test:
+      config: Debug
+      targets:
+        - TabMailTests

@@ -334,7 +334,7 @@ struct PlanPickerView: View {
 
         do {
             let identity = PlanPurchaseIdentity(userId: session.userId, generation: signInGeneration)
-            let result = try await PlanPurchaseFlow.purchase(
+            let result = try await PlanPurchaseFlow.run(
                 identity: identity,
                 currentIdentity: {
                     TabMailAuthService.getSession().map {
@@ -344,12 +344,21 @@ struct PlanPickerView: View {
                 fetchAccount: { try await backend.fetchAccountInfo() },
                 fetchOffer: { await storeKit.freeTrialOffer(for: product) },
                 accountRefreshed: { accountInfo = $0 },
-                performPurchase: { try await storeKit.purchase(product, userId: $0) }
+                performPurchase: { try await storeKit.purchase(product, userId: $0) },
+                purchaseFinished: { isPurchasing = false },
+                deliverSignedPurchase: { Self.verifyPurchaseWithBackend(jws: $0) },
+                currentAccountDidPurchase: {
+                    // Open immediately from local StoreKit verification; the
+                    // following account read may race backend verification.
+                    AISubscriptionGate.shared.openGate()
+                    let purchased = try? await backend.fetchAccountInfo()
+                    accountInfo = purchased
+                    // Preserve the existing open-only reconciliation behavior.
+                    if let purchased { AISubscriptionGate.shared.refreshAfterLocalPurchase(purchased) }
+                }
             )
-            isPurchasing = false
-            let jws: String
             switch result {
-            case .purchased(let representation): jws = representation
+            case .purchased: break
             case .cancelled:
                 purchaseError = nil
                 return
@@ -357,23 +366,6 @@ struct PlanPickerView: View {
                 purchaseError = reason
                 return
             }
-            // Deliver the verified purchase for its signed appAccountToken even
-            // if this view's account changed while Apple's sheet was open.
-            Self.verifyPurchaseWithBackend(jws: jws)
-            guard AISubscriptionGate.shared.signInGeneration == signInGeneration,
-                  TabMailAuthService.getSession()?.userId == session.userId else { return }
-            // Open gate immediately from local StoreKit verification
-            AISubscriptionGate.shared.openGate()
-            // Refresh account info to update subscription display
-            let purchased = try? await backend.fetchAccountInfo()
-            accountInfo = purchased
-            // This body races the detached `verifyPurchaseWithBackend` write, so
-            // it may still be the pre-purchase state. Route it through the
-            // open-only seam: it can refresh the sidebar copy and reopen the gate
-            // when the backend already confirmed the subscription, but it must
-            // NEVER close the gate `openGate()` just opened from local StoreKit
-            // truth. A later authoritative whoami reconciles if this one raced.
-            if let purchased { AISubscriptionGate.shared.refreshAfterLocalPurchase(purchased) }
         } catch {
             BackgroundSyncLogger.logDebug("[PlanPicker] Purchase failed: \(error)")
             purchaseError = "Purchase failed. Please try again."
