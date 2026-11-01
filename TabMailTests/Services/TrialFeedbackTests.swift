@@ -440,7 +440,8 @@ struct TrialFeedbackViewTests {
             if await client.reasons.count == 1 { break }
             try await Task.sleep(for: .milliseconds(10))
         }
-        try #require(flow.isSubmitting && (await client.reasons.count) == 1)
+        let enteredReasons = await client.reasons
+        try #require(flow.isSubmitting && enteredReasons.count == 1)
         actions = nil
         host.close()
         try await Task.sleep(for: .milliseconds(50))
