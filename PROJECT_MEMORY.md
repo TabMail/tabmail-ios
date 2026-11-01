@@ -188,3 +188,5 @@ Authored after `v1.6.38`, so deliberately **not** rows in [`manifest.tsv`](Compa
 - **Subscription trial offers / 1+1 / no forfeiture:** actual per-product Apple free-offer eligibility/duration, signup-expiry purchase protection, purchased-trial display, and coordinated manual cutover: [subscription-trial-offers](Companion/Memory/Current/subscription-trial-offers.md).
 
 - **Inbox trial reminder / countdown / exact expiry:** authoritative in-memory notice, epoch clearing, real-inbox-only accent row and existing plans route: [inbox-trial-reminder](Companion/Memory/Current/inbox-trial-reminder.md).
+
+- **Optional trial feedback / categorical survey / account-unlinked:** explicit dedicated transport, local suppression and aggregate endpoint release requirements: [trial-feedback](Companion/Memory/Current/trial-feedback.md).

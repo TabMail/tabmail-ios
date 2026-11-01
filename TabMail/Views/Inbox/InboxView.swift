@@ -430,6 +430,12 @@ struct InboxView: View {
                     notice: AISubscriptionGate.shared.trialCountdownNotice
                 )
 
+                InboxTrialFeedback(
+                    isInbox: isInboxView,
+                    isDemo: DemoModeStore.shared.isActive,
+                    hasSession: hasTabMailSession
+                )
+
                 // Usage-throttle banner — surfaces when background AI
                 // processing is being throttled (monthly budget exhausted /
                 // BYOK on the shared queue). Subtle, non-dismissible; tapping
