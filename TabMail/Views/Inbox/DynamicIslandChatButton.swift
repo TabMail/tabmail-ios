@@ -796,6 +796,9 @@ struct DynamicIslandChat: View {
     private var expandedInputBar: some View {
         HStack(spacing: 10) {
             Button {
+                // The newest gesture wins: a delayed auto-start still waiting must not start after this tap.
+                autoStartTask?.cancel()
+                autoStartTask = nil
                 if speech.isRecording || speech.isStarting {
                     speech.stop()
                     return
@@ -1339,22 +1342,24 @@ struct DynamicIslandChat: View {
     }
 
     /// `auto`: started by the pill itself (it opened, the agent finished, Auto-Enable Dictation), not
-    /// by a tap on the mic. The on-device recognizer asks for permission, so it starts only from a tap.
+    /// by a tap on the mic. The on-device recognizer asks for permission on a tap only: an auto-start
+    /// runs when speech recognition and the microphone are both already granted, else it does nothing.
     private func startDictation(auto: Bool = false) {
         // Auto-start follows the mic button: while it is off, nothing starts.
         guard canDictate else { return }
+        // The same gate that shows the input bar (and so the mic and the waveform) in the body.
+        let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive
         isTextFieldFocused = false
         if dictationMode == .onDevice {
-            guard !auto, !speech.isRecording, !speech.isStarting else { return }
+            // Behind the sign-in or subscribe bar there is no mic or waveform: an auto-start records nothing there.
+            guard canUseAI, !speech.isRecording, !speech.isStarting else { return }
             speechBase = inputText
-            speech.start(locale: speechLocale) { transcript in
+            speech.start(locale: speechLocale, auto: auto) { transcript in
                 inputText = DictationController.appending(transcript, to: speechBase)
                 inputSelection = .init(insertionPoint: inputText.endIndex)
             }
             return
         }
-        // The same gate that shows the input bar (and so the mic and the waveform) in the body.
-        let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive
         dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in
             inputText = DictationController.appending(text, to: inputText)
             inputSelection = .init(insertionPoint: inputText.endIndex)

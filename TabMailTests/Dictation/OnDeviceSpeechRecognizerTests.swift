@@ -4,6 +4,7 @@
 
 import AVFoundation
 import Foundation
+import Speech
 import Synchronization
 import Testing
 @testable import TabMail
@@ -106,14 +107,23 @@ struct OnDeviceSpeechRecognizerTests {
     private final class Harness: @unchecked Sendable {
         let capture = DeferredCapture()
         let gate = PermissionGate()
+        /// What the recognizer's permission read sees; a request that is granted flips it, as the system does.
+        private let granted: Mutex<Bool>
+        private let requests = Mutex(0)
+        var permissionRequests: Int { requests.withLock { $0 } }
+        func setGranted(_ value: Bool) { granted.withLock { $0 = value } }
         private let created = Mutex<[FakeRecognition]>([])
         var recognizer: OnDeviceSpeechRecognizer!
 
         var recognitionCount: Int { created.withLock { $0.count } }
         func recognition(_ index: Int) -> FakeRecognition { created.withLock { $0[index] } }
 
-        init(permissionsGranted: Bool = true, languageAvailable: Bool = true, permissionsWaitForTheGate: Bool = false) {
+        init(
+            permissionsGranted: Bool = true, languageAvailable: Bool = true, permissionsWaitForTheGate: Bool = false,
+            alreadyGranted: Bool = true
+        ) {
             let gate = gate
+            granted = Mutex(alreadyGranted)
             recognizer = MainActor.assumeIsolated {
                 OnDeviceSpeechRecognizer(
                     capture: capture,
@@ -123,10 +133,13 @@ struct OnDeviceSpeechRecognizerTests {
                         self.created.withLock { $0.append(recognition) }
                         return recognition
                     },
-                    requestPermissions: {
+                    requestPermissions: { [unowned self] in
+                        self.requests.withLock { $0 += 1 }
                         if permissionsWaitForTheGate { await gate.wait() }
+                        if permissionsGranted { self.setGranted(true) }
                         return permissionsGranted
-                    })
+                    },
+                    permissionsGranted: { [unowned self] in self.granted.withLock { $0 } })
             }
         }
     }
@@ -136,9 +149,138 @@ struct OnDeviceSpeechRecognizerTests {
         try? await Task.sleep(for: .milliseconds(20))
     }
 
-    private func start(_ h: Harness, into texts: Texts) async {
-        h.recognizer.start(locale: Locale(identifier: "en_US")) { text in texts.add(text) }
+    private func start(_ h: Harness, into texts: Texts, auto: Bool = false) async {
+        h.recognizer.start(locale: Locale(identifier: "en_US"), auto: auto) { text in texts.add(text) }
         await settle()
+    }
+
+    /// The pill opened with Auto-Enable Dictation on and both permissions already granted: it starts as
+    /// a mic tap does.
+    @Test func anAutoStartRunsLikeATapWhenBothPermissionsAreGranted() async {
+        let h = Harness(alreadyGranted: true)
+        let texts = Texts()
+        await start(h, into: texts, auto: true)
+        #expect(h.recognizer.isStarting)
+        #expect(h.recognitionCount == 1)
+        #expect(h.capture.starts == 1)
+        guard h.recognitionCount == 1, h.capture.starts == 1 else { return }
+        h.capture.complete(0)
+        await settle()
+        #expect(h.recognizer.isRecording)
+        h.recognition(0).handler("hello", false)
+        await settle()
+        #expect(texts.all == ["hello"])
+    }
+
+    /// Speech recognition or the microphone still undetermined: an auto-start would raise a prompt
+    /// unasked, so it does nothing: no recognition, no capture, no permission request.
+    @Test func anAutoStartDoesNothingWhenAPermissionStillNeedsAPrompt() async {
+        let h = Harness(alreadyGranted: false)
+        let texts = Texts()
+        await start(h, into: texts, auto: true)
+        #expect(!h.recognizer.isStarting)
+        #expect(!h.recognizer.isRecording)
+        #expect(h.recognitionCount == 0)
+        #expect(h.capture.starts == 0)
+    }
+
+    /// The tap is where the prompt is asked: the same undetermined state starts from a tap.
+    @Test func aTapStillStartsWhenAPermissionIsUndetermined() async {
+        let h = Harness(alreadyGranted: false)
+        let texts = Texts()
+        await start(h, into: texts)
+        #expect(h.recognizer.isStarting)
+        #expect(h.capture.starts == 1)
+        guard h.capture.starts == 1 else { return }
+        h.capture.complete(0)
+        await settle()
+        #expect(h.recognizer.isRecording)
+    }
+
+    /// An auto-start that is refused asks for nothing: no permission request, so no prompt.
+    @Test func aRefusedAutoStartMakesNoPermissionRequest() async {
+        let h = Harness(alreadyGranted: false)
+        await start(h, into: Texts(), auto: true)
+        #expect(h.permissionRequests == 0)
+    }
+
+    /// The permissions are read at every start, not once: a first tap grants them, the user stops, and the
+    /// next auto-start runs without a request of its own.
+    @Test func anAutoStartReadsThePermissionsFreshAfterATapGrantedThem() async {
+        let h = Harness(permissionsGranted: true, alreadyGranted: false)
+        let texts = Texts()
+        await start(h, into: texts, auto: true)
+        #expect(h.capture.starts == 0)
+        await start(h, into: texts)
+        #expect(h.permissionRequests == 1)
+        #expect(h.capture.starts == 1)
+        guard h.capture.starts == 1, h.recognitionCount == 1 else { return }
+        h.capture.complete(0)
+        await settle()
+        #expect(h.recognizer.isRecording)
+        h.recognizer.stop()
+        await start(h, into: texts, auto: true)
+        #expect(h.capture.starts == 2)
+        guard h.capture.starts == 2, h.recognitionCount == 2 else { return }
+        h.capture.complete(1)
+        await settle()
+        #expect(h.recognizer.isRecording)
+        h.recognition(1).handler("again", false)
+        await settle()
+        #expect(texts.all == ["again"])
+    }
+
+    /// A recognizer built with its production permission reader (only the request, recognition and capture
+    /// are faked): where the system statuses are not both granted, an auto-start asks for nothing and
+    /// starts nothing, and a tap still dictates. (A host with both granted has no prompt to guard.)
+    @Test func theProductionReaderKeepsAnAutoStartFromPromptingWhereAPermissionIsUndecided() async {
+        guard !OnDeviceSpeechRecognizer.systemPermissionsGranted() else { return }
+        let capture = DeferredCapture()
+        let requests = Mutex(0)
+        let created = Mutex(0)
+        let recognizer = OnDeviceSpeechRecognizer(
+            capture: capture,
+            startRecognition: { _, handler in
+                created.withLock { $0 += 1 }
+                return FakeRecognition(handler: handler)
+            },
+            requestPermissions: {
+                requests.withLock { $0 += 1 }
+                return true
+            })
+        let texts = Texts()
+        recognizer.start(locale: Locale(identifier: "en_US"), auto: true) { texts.add($0) }
+        await settle()
+        #expect(requests.withLock { $0 } == 0)
+        #expect(created.withLock { $0 } == 0)
+        #expect(capture.starts == 0)
+        #expect(!recognizer.isStarting)
+
+        recognizer.start(locale: Locale(identifier: "en_US")) { texts.add($0) }
+        await settle()
+        #expect(requests.withLock { $0 } == 1)
+        #expect(capture.starts == 1)
+    }
+
+    /// The recognizer's own reader is the system statuses through the same table (a host where both are
+    /// granted and one where neither is decided read the same way).
+    @Test func theDefaultReaderIsTheSystemStatusesThroughTheTable() {
+        #expect(OnDeviceSpeechRecognizer.systemPermissionsGranted() == OnDeviceSpeechRecognizer.permissionsAlreadyGranted(
+            speech: SFSpeechRecognizer.authorizationStatus(), microphone: AVAudioApplication.shared.recordPermission))
+    }
+
+    /// Which system states need no prompt: only both authorized. Not determined needs one; denied or
+    /// restricted already turns the mic off (`OnDeviceReadiness`).
+    @Test func onlyBothPermissionsAuthorizedNeedNoPrompt() {
+        typealias Speech = SFSpeechRecognizerAuthorizationStatus
+        let speechStates: [Speech] = [.authorized, .notDetermined, .denied, .restricted]
+        let micStates: [AVAudioApplication.recordPermission] = [.granted, .undetermined, .denied]
+        for speech in speechStates {
+            for mic in micStates {
+                let expected = speech == .authorized && mic == .granted
+                #expect(OnDeviceSpeechRecognizer.permissionsAlreadyGranted(speech: speech, microphone: mic) == expected)
+            }
+        }
     }
 
     @Test func aStartRecordsOnceTheMicrophoneIsRunning() async {
