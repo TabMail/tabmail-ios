@@ -11,78 +11,14 @@ import Testing
 @MainActor
 @Suite("Real local StoreKit trial offers", .serialized, .processGlobalState)
 struct TrialStoreKitTests {
-    /// Local-only copy of the existing catalog; no scheme or live offer changes.
-    private func configurationURL() throws -> (url: URL, group: String, original: URL) {
-        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-            .deletingLastPathComponent().deletingLastPathComponent()
-        let original = root.appendingPathComponent("TabMail/Configuration.storekit")
-        let data = try Data(contentsOf: original)
-        var catalog = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        var groups = try #require(catalog["subscriptionGroups"] as? [[String: Any]])
-        #expect(groups.count == 1)
-        guard groups.count == 1 else { throw CocoaError(.fileReadCorruptFile) }
-        // Each run owns its eligibility history; do not depend on a previous
-        // session's transaction reset propagating to StoreKit's eligibility cache.
-        let group = UUID().uuidString
-        groups[0]["id"] = group
-        var products = try #require(groups[0]["subscriptions"] as? [[String: Any]])
-        for index in products.indices {
-            products[index]["subscriptionGroupID"] = group
-            let id = try #require(products[index]["productID"] as? String)
-            let mode: String?
-            switch id {
-            case "ai.tabmail.basic.monthly", "ai.tabmail.byok.monthly": mode = "free"
-            case "ai.tabmail.basic.yearly": mode = "payAsYouGo"
-            case "ai.tabmail.pro.monthly": mode = "payUpFront"
-            default: mode = nil
-            }
-            if let mode {
-                products[index]["introductoryOffer"] = [
-                    "internalID": "test-intro-\(id)", "numberOfPeriods": 1,
-                    "paymentMode": mode, "subscriptionPeriod": "P1W",
-                    "displayPrice": mode == "free" ? "0" : "1.00",
-                ]
-            } else {
-                products[index].removeValue(forKey: "introductoryOffer")
-            }
-        }
-        groups[0]["subscriptions"] = products
-        catalog["subscriptionGroups"] = groups
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("trial-offers-\(UUID().uuidString).storekit")
-        try JSONSerialization.data(withJSONObject: catalog).write(to: url)
-        return (url, group, original)
-    }
-
-    private func waitForConsumedEligibility(_ subscription: Product.SubscriptionInfo) async throws -> Bool {
-        // Finishing a local transaction does not promise synchronous receipt /
-        // eligibility-cache propagation. Observe the real cached-product getter
-        // with a bounded wait before asserting the production reader's result.
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(5))
-        while await subscription.isEligibleForIntroOffer {
-            guard clock.now < deadline else { return false }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-        return true
-    }
-
     // Exercise launch and teardown twice in one process, each with a fresh group.
     @Test(arguments: 0..<2)
     func realProductMetadataAndAppleEligibilityControlTheFreeOffer(_: Int) async throws {
-        let fixture = try configurationURL()
-        defer { try? FileManager.default.removeItem(at: fixture.url) }
-        let session = try SKTestSession(contentsOf: fixture.url)
-        session.clearTransactions()
-        session.disableDialogs = true
-        defer {
-            session.clearTransactions()
-            session.resetToDefaultState()
-            do { _ = try SKTestSession(contentsOf: fixture.original) }
-            catch { Issue.record("Could not restore the local StoreKit catalog: \(error)") }
-        }
-        let manager = StoreKitManager()
-        await manager.loadProducts()
+        let fixture = try TrialStoreKitFixture()
+        defer { fixture.close() }
+        try await fixture.load()
+        let session = fixture.session
+        let manager = fixture.manager
         #expect(manager.products.count == 6)
         let basic = try #require(manager.products.first { $0.id == "ai.tabmail.basic.monthly" })
         let paidGo = try #require(manager.products.first { $0.id == "ai.tabmail.basic.yearly" })
@@ -115,7 +51,7 @@ struct TrialStoreKitTests {
         try #require(transaction.environment == .xcode)
         try #require(transaction.offer?.paymentMode == .freeTrial)
         await transaction.finish()
-        let consumed = try await waitForConsumedEligibility(subscription)
+        let consumed = try await fixture.waitForConsumedEligibility(subscription)
         try #require(consumed)
         // PlanPicker passes its selected cached Product to this production
         // refresh caller. Its async eligibility must reflect the consumed trial
@@ -129,4 +65,27 @@ struct TrialStoreKitTests {
         await manager.loadProducts()
         #expect(manager.freeTrialOffers.isEmpty)
     }
+    @Test(arguments: TrialStoreKitFixture.Period.allCases)
+    func actualProductDurationControlsDisplayAndPreservation(period: TrialStoreKitFixture.Period) async throws {
+        let fixture = try TrialStoreKitFixture(period: period)
+        defer { fixture.close() }
+        try await fixture.load()
+        let product = try fixture.product()
+        let subscription = try #require(product.subscription)
+        let rawOffer = try #require(subscription.introductoryOffer)
+        try #require(rawOffer.paymentMode == .freeTrial)
+        try #require(rawOffer.period.unit == period.storeUnit)
+        try #require(rawOffer.period.value == period.value)
+        try #require(rawOffer.periodCount == 1)
+        try #require(await subscription.isEligibleForIntroOffer)
+        let decoded = try #require(await fixture.manager.freeTrialOffer(for: product))
+        #expect(decoded.unit == period.decodedUnit)
+        #expect(decoded.value == period.value)
+        #expect(decoded.durationDescription == period.displayedDuration)
+        let now = Date()
+        let account = try WhoamiFixture.runningSignupTrial(daysLeft: period.promisedDays, reference: now)
+        let restriction = SubscriptionTrialPurchasePolicy.restriction(account: account, offer: decoded, now: now)
+        #expect((restriction == nil) == period.preservesPromise)
+    }
+
 }

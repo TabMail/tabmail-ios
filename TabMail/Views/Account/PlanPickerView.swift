@@ -6,6 +6,11 @@ import SwiftUI
 import StoreKit
 
 struct PlanPickerView: View {
+    typealias PurchaseOverride = @MainActor (Product, String) async throws -> String?
+    typealias PurchaseAction = @MainActor (Product, PurchaseOverride?) async -> Void
+    typealias PurchaseState = (busy: Bool, error: String?, account: AccountInfo?)
+    typealias PurchaseStateReader = @MainActor () -> PurchaseState
+
     @Environment(StoreKitManager.self) private var storeKit
     @Environment(\.scenePhase) private var scenePhase
     @State private var billingInterval = "monthly"
@@ -14,7 +19,19 @@ struct PlanPickerView: View {
     @State private var purchaseError: String?
     @State private var accountInfo: AccountInfo?
 
-    private let backend = BackendClient()
+    private let backend: BackendClient
+    private let sessionStore: TabMailSessionStore
+    private let verificationSession: URLSession
+    private let purchaseActionReady: (@MainActor (@escaping PurchaseAction, @escaping PurchaseStateReader) -> Void)?
+
+    init(backend: BackendClient = BackendClient(), sessionStore: TabMailSessionStore = .shared,
+         verificationSession: URLSession = .shared,
+         onPurchaseActionReady: (@MainActor (@escaping PurchaseAction, @escaping PurchaseStateReader) -> Void)? = nil) {
+        self.backend = backend
+        self.sessionStore = sessionStore
+        self.verificationSession = verificationSession
+        self.purchaseActionReady = onPurchaseActionReady
+    }
 
     var body: some View {
         ScrollView {
@@ -191,13 +208,13 @@ struct PlanPickerView: View {
                             // entitlement provably belongs to someone else. Only the
                             // restore path is guarded — the purchase path stamps a
                             // fresh appAccountToken and can never mismatch.
-                            let currentUserId = TabMailAuthService.getSession()?.userId
+                            let currentUserId = TabMailAuthService.getSession(sessionStore: sessionStore)?.userId
                             let mayOpen = currentUserId
                                 .map { storeKit.shouldOpenGateForRestoredEntitlement(currentUserId: $0) } ?? true
                             if mayOpen {
                                 AISubscriptionGate.shared.openGate()
                                 if let jws = await storeKit.latestEntitlementJWS() {
-                                    Self.verifyPurchaseWithBackend(jws: jws)
+                                    Self.verifyPurchaseWithBackend(jws: jws, session: verificationSession)
                                 }
                                 let restored = try? await backend.fetchAccountInfo()
                                 accountInfo = restored
@@ -236,6 +253,13 @@ struct PlanPickerView: View {
         .background(Palette.previewPaneBg)
         .navigationTitle("Choose a Plan")
         .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            purchaseActionReady?({ product, operation in
+                await purchaseProduct(product, operation: operation)
+            }, {
+                (isPurchasing, purchaseError, accountInfo)
+            })
+        }
         .task {
             do {
                 accountInfo = try await backend.fetchAccountInfo()
@@ -321,11 +345,11 @@ struct PlanPickerView: View {
         return formatter.string(from: date)
     }
 
-    private func purchaseProduct(_ product: Product) async {
+    private func purchaseProduct(_ product: Product, operation: PurchaseOverride? = nil) async {
         isPurchasing = true
         purchaseError = nil
 
-        guard let session = TabMailAuthService.getSession() else {
+        guard let session = TabMailAuthService.getSession(sessionStore: sessionStore) else {
             purchaseError = "Please sign in first"
             isPurchasing = false
             return
@@ -337,16 +361,19 @@ struct PlanPickerView: View {
             let result = try await PlanPurchaseFlow.run(
                 identity: identity,
                 currentIdentity: {
-                    TabMailAuthService.getSession().map {
+                    TabMailAuthService.getSession(sessionStore: sessionStore).map {
                         PlanPurchaseIdentity(userId: $0.userId, generation: AISubscriptionGate.shared.signInGeneration)
                     }
                 },
                 fetchAccount: { try await backend.fetchAccountInfo() },
                 fetchOffer: { await storeKit.freeTrialOffer(for: product) },
                 accountRefreshed: { accountInfo = $0 },
-                performPurchase: { try await storeKit.purchase(product, userId: $0) },
+                performPurchase: { userId in
+                    if let operation { return try await operation(product, userId) }
+                    return try await storeKit.purchase(product, userId: userId)
+                },
                 purchaseFinished: { isPurchasing = false },
-                deliverSignedPurchase: { Self.verifyPurchaseWithBackend(jws: $0) },
+                deliverSignedPurchase: { Self.verifyPurchaseWithBackend(jws: $0, session: verificationSession) },
                 currentAccountDidPurchase: {
                     // Open immediately from local StoreKit verification; the
                     // following account read may race backend verification.
@@ -377,7 +404,7 @@ struct PlanPickerView: View {
     /// Detached to survive view re-renders. The backend verifies Apple's JWS signature
     /// and writes KV + Supabase — same as the webhook, but instant.
     /// Routes to dev webhook for sandbox transactions, prod for production.
-    private static func verifyPurchaseWithBackend(jws: String) {
+    private static func verifyPurchaseWithBackend(jws: String, session: URLSession) {
         Task.detached {
             // Route sandbox transactions to dev webhook, production to prod webhook.
             // This matches Apple's webhook routing (sandbox → apple-webhook-dev, prod → apple-webhook).
@@ -390,7 +417,7 @@ struct PlanPickerView: View {
             request.httpBody = try? JSONSerialization.data(withJSONObject: ["signedTransactionInfo": jws])
 
             do {
-                let (data, response) = try await URLSession.shared.data(for: request)
+                let (data, response) = try await session.data(for: request)
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if statusCode == 200 {
                     BackgroundSyncLogger.logDebug("[PlanPicker] Backend verified purchase successfully")

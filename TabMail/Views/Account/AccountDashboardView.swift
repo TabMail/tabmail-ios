@@ -23,7 +23,13 @@ struct AccountDashboardView: View {
     @Environment(StoreKitManager.self) private var storeKit
     @Environment(\.scenePhase) private var scenePhase
 
-    private let backend = BackendClient()
+    private let backend: BackendClient
+    private let sessionStore: TabMailSessionStore
+
+    init(backend: BackendClient = BackendClient(), sessionStore: TabMailSessionStore = .shared) {
+        self.backend = backend
+        self.sessionStore = sessionStore
+    }
 
     var body: some View {
         // `.task`/`.onAppear` MUST hang on a STABLE node, never directly on
@@ -97,10 +103,10 @@ struct AccountDashboardView: View {
             List {
                 // MARK: - Account Mismatch Warning
 
-                if let userId = TabMailAuthService.getSession()?.userId,
+                if let userId = TabMailAuthService.getSession(sessionStore: sessionStore)?.userId,
                    storeKit.hasAccountMismatch(currentUserId: userId) {
                     Section {
-                        AccountMismatchBanner(userEmail: TabMailAuthService.getSession()?.userEmail)
+                        AccountMismatchBanner(userEmail: TabMailAuthService.getSession(sessionStore: sessionStore)?.userEmail)
                             .listRowInsets(EdgeInsets())
                             .listRowBackground(Color.clear)
                     }
@@ -135,7 +141,7 @@ struct AccountDashboardView: View {
                     }
 
                     // Account email
-                    if let email = TabMailAuthService.getSession()?.userEmail {
+                    if let email = TabMailAuthService.getSession(sessionStore: sessionStore)?.userEmail {
                         LabeledContent {
                             Text(email)
                                 .foregroundStyle(Palette.textMuted)

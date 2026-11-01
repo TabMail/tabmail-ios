@@ -25,6 +25,8 @@ actor BackendClient {
     /// preventing stalled connections from holding semaphore slots for 5-16 minutes.
     /// The shared ephemeral session doesn't have this because it serves all HTTP traffic.
     private let llmSession: URLSession
+    private let accountReadSession: URLSession?
+    private let accountTokenCoordinator: TabMailTokenCoordinator
 
     /// Test seam: inject a mock `URLSession` (e.g. `FakeHTTP.makeSession()`) to drive
     /// the streaming/tool-loop path in unit tests. Production passes nil → the default
@@ -44,7 +46,10 @@ actor BackendClient {
     /// The injected session also serves the maintenance-class calls, so a manual compaction is testable.
     private let longOpSessionOverride: URLSession?
 
-    init(llmSession: URLSession? = nil) {
+    init(llmSession: URLSession? = nil, accountReadSession: URLSession? = nil,
+         accountTokenCoordinator: TabMailTokenCoordinator = .shared) {
+        self.accountReadSession = accountReadSession
+        self.accountTokenCoordinator = accountTokenCoordinator
         self.llmSession = llmSession ?? {
             let config = URLSessionConfiguration.ephemeral
             config.timeoutIntervalForResource = SyncConfig.llmResourceTimeoutSeconds
@@ -96,7 +101,7 @@ actor BackendClient {
     /// In demo mode, pulls the demo JWT from `DemoTokenManager` instead of
     /// the Supabase session — the demo flow never has a Supabase user, so
     /// the production coordinator returns `.noSession` and chat 401s.
-    private func currentAuthToken() async -> String? {
+    private func currentAuthToken(coordinator: TabMailTokenCoordinator = .shared) async -> String? {
         let (inDemo, inTutorial) = await MainActor.run {
             (DemoModeStore.shared.isActive, DemoModeStore.shared.isTutorialPractice)
         }
@@ -116,7 +121,7 @@ actor BackendClient {
                 return nil
             }
         }
-        switch await TabMailTokenCoordinator.shared.validToken() {
+        switch await coordinator.validToken() {
         case .success(let token):
             return token
         case .permanentFailure, .transientFailure, .noSession:
@@ -1571,7 +1576,7 @@ extension BackendClient {
 
 extension BackendClient {
     func fetchAccountInfo() async throws -> AccountInfo {
-        guard let token = await currentAuthToken() else {
+        guard let token = await currentAuthToken(coordinator: accountTokenCoordinator) else {
             throw BackendError.unauthorized
         }
 
@@ -1581,7 +1586,7 @@ extension BackendClient {
         request.setValue("ios", forHTTPHeaderField: "X-Client-Type")
         request.setValue(Self.clientVersion, forHTTPHeaderField: "X-Client-Version")
 
-        let (data, response) = try await sharedEphemeralSession.data(for: request)
+        let (data, response) = try await (accountReadSession ?? sharedEphemeralSession).data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               200..<300 ~= httpResponse.statusCode else {
             throw BackendError.requestFailed(
@@ -1597,7 +1602,7 @@ extension BackendClient {
     }
 
     func fetchUsageStats() async throws -> UsageStats {
-        guard let token = await currentAuthToken() else {
+        guard let token = await currentAuthToken(coordinator: accountTokenCoordinator) else {
             throw BackendError.unauthorized
         }
 
@@ -1607,7 +1612,7 @@ extension BackendClient {
         request.setValue("ios", forHTTPHeaderField: "X-Client-Type")
         request.setValue(Self.clientVersion, forHTTPHeaderField: "X-Client-Version")
 
-        let (data, response) = try await sharedEphemeralSession.data(for: request)
+        let (data, response) = try await (accountReadSession ?? sharedEphemeralSession).data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               200..<300 ~= httpResponse.statusCode else {
             throw BackendError.requestFailed(
