@@ -106,7 +106,7 @@ final class OnDeviceSpeechRecognizer {
         speech == .authorized && microphone == .granted
     }
 
-    nonisolated private static func systemPermissionsGranted() -> Bool {
+    nonisolated static func systemPermissionsGranted() -> Bool {
         permissionsAlreadyGranted(
             speech: SFSpeechRecognizer.authorizationStatus(), microphone: AVAudioApplication.shared.recordPermission)
     }

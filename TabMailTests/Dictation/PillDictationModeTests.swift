@@ -101,8 +101,14 @@ struct PillDictationModeTests {
         #expect(view.contains("if dictationMode == .onDevice {"))
         // The permissions are asked by a mic tap only: the pill hands `auto` to the recognizer, which then
         // starts only when both are already granted (`OnDeviceSpeechRecognizerTests`).
-        #expect(view.contains("guard !speech.isRecording, !speech.isStarting else { return }"))
         #expect(view.contains("speech.start(locale: speechLocale, auto: auto) {"))
+        // Behind the sign-in or subscribe bar there is no mic: the on-device branch passes the bar's gate first.
+        let gate = try #require(view.range(of: "let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive"))
+        let onDevice = try #require(view.range(of: "if dictationMode == .onDevice {"))
+        let guardLine = try #require(view.range(of: "guard canUseAI, !speech.isRecording, !speech.isStarting else { return }"))
+        #expect(gate.lowerBound < onDevice.lowerBound && onDevice.lowerBound < guardLine.lowerBound)
+        // The newest gesture wins: the mic button cancels a pending delayed auto-start before it acts.
+        #expect(view.contains("autoStartTask?.cancel()\n                autoStartTask = nil\n                if speech.isRecording || speech.isStarting {"))
         #expect(view.components(separatedBy: "startDictation(auto: true)").count == 4)
         // Going to the background releases the recognizer; a recording keeps the screen awake and blocks send.
         #expect(view.contains("if phase == .background { speech.stop() }"))
