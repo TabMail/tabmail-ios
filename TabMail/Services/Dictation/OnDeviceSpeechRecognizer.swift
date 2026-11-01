@@ -18,7 +18,8 @@ protocol SpeechRecognition: AnyObject, Sendable {
 /// `SFSpeechRecognizer`, on this iPhone only. Nothing is sent to TabMail's backend, and
 /// `requiresOnDeviceRecognition` keeps the audio from leaving the phone; where the language has no
 /// on-device model, `isAvailable(locale:)` is false and the mic stays off. The speech-recognition
-/// permission is asked at the first tap, never earlier.
+/// and microphone permissions are asked only by a tap on the mic; a start the pill makes itself
+/// (`auto`) runs only when both are already granted, so no prompt appears unasked.
 ///
 /// The microphone and the audio session belong to `AudioCapturing` (the backend dictation's own
 /// `MicrophoneCapture`): its serial queue orders a stop after the start it follows and releases the
@@ -38,6 +39,7 @@ final class OnDeviceSpeechRecognizer {
     private let capture: any AudioCapturing
     private let startRecognition: RecognitionStarter
     private let requestPermissions: @Sendable () async -> Bool
+    private let permissionsGranted: @Sendable () -> Bool
     private var recognition: (any SpeechRecognition)?
     /// Advances at every start and stop; main actor only.
     private var generation: UInt = 0
@@ -45,11 +47,13 @@ final class OnDeviceSpeechRecognizer {
     init(
         capture: any AudioCapturing = MicrophoneCapture(),
         startRecognition: @escaping RecognitionStarter = OnDeviceSpeechRecognizer.startSystemRecognition,
-        requestPermissions: @escaping @Sendable () async -> Bool = OnDeviceSpeechRecognizer.requestSystemPermissions
+        requestPermissions: @escaping @Sendable () async -> Bool = OnDeviceSpeechRecognizer.requestSystemPermissions,
+        permissionsGranted: @escaping @Sendable () -> Bool = OnDeviceSpeechRecognizer.systemPermissionsGranted
     ) {
         self.capture = capture
         self.startRecognition = startRecognition
         self.requestPermissions = requestPermissions
+        self.permissionsGranted = permissionsGranted
     }
 
     /// Whether this iPhone can recognise `locale` without the network.
@@ -94,6 +98,19 @@ final class OnDeviceSpeechRecognizer {
         return recognition
     }
 
+    /// Whether a start would need no permission prompt: speech recognition and the microphone are both
+    /// already authorized. Not determined needs a prompt; denied or restricted already turns the mic off.
+    nonisolated static func permissionsAlreadyGranted(
+        speech: SFSpeechRecognizerAuthorizationStatus, microphone: AVAudioApplication.recordPermission
+    ) -> Bool {
+        speech == .authorized && microphone == .granted
+    }
+
+    nonisolated private static func systemPermissionsGranted() -> Bool {
+        permissionsAlreadyGranted(
+            speech: SFSpeechRecognizer.authorizationStatus(), microphone: AVAudioApplication.shared.recordPermission)
+    }
+
     /// Asks for speech recognition and the microphone (each only when not yet decided).
     nonisolated private static func requestSystemPermissions() async -> Bool {
         let speech = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
@@ -107,11 +124,14 @@ final class OnDeviceSpeechRecognizer {
         return await AVAudioApplication.requestRecordPermission()
     }
 
-    func start(locale: Locale, onTranscript: @escaping @MainActor @Sendable (String) -> Void) {
+    /// `auto`: the pill started it (it opened, the agent finished), not a tap on the mic. It then starts
+    /// only when no permission prompt is needed, and does nothing otherwise.
+    func start(locale: Locale, auto: Bool = false, onTranscript: @escaping @MainActor @Sendable (String) -> Void) {
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[Speech] start() entry: isRecording=\(isRecording) isStarting=\(isStarting)")
+            BackgroundSyncLogger.logDebug("[Speech] start() entry: auto=\(auto) isRecording=\(isRecording) isStarting=\(isStarting)")
         }
         guard !isRecording, !isStarting else { return }
+        guard !auto || permissionsGranted() else { return }
 
         isStarting = true
         generation &+= 1

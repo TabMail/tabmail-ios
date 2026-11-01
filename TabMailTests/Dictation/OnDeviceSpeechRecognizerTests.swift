@@ -4,6 +4,7 @@
 
 import AVFoundation
 import Foundation
+import Speech
 import Synchronization
 import Testing
 @testable import TabMail
@@ -112,7 +113,10 @@ struct OnDeviceSpeechRecognizerTests {
         var recognitionCount: Int { created.withLock { $0.count } }
         func recognition(_ index: Int) -> FakeRecognition { created.withLock { $0[index] } }
 
-        init(permissionsGranted: Bool = true, languageAvailable: Bool = true, permissionsWaitForTheGate: Bool = false) {
+        init(
+            permissionsGranted: Bool = true, languageAvailable: Bool = true, permissionsWaitForTheGate: Bool = false,
+            alreadyGranted: Bool = true
+        ) {
             let gate = gate
             recognizer = MainActor.assumeIsolated {
                 OnDeviceSpeechRecognizer(
@@ -126,7 +130,8 @@ struct OnDeviceSpeechRecognizerTests {
                     requestPermissions: {
                         if permissionsWaitForTheGate { await gate.wait() }
                         return permissionsGranted
-                    })
+                    },
+                    permissionsGranted: { alreadyGranted })
             }
         }
     }
@@ -136,9 +141,62 @@ struct OnDeviceSpeechRecognizerTests {
         try? await Task.sleep(for: .milliseconds(20))
     }
 
-    private func start(_ h: Harness, into texts: Texts) async {
-        h.recognizer.start(locale: Locale(identifier: "en_US")) { text in texts.add(text) }
+    private func start(_ h: Harness, into texts: Texts, auto: Bool = false) async {
+        h.recognizer.start(locale: Locale(identifier: "en_US"), auto: auto) { text in texts.add(text) }
         await settle()
+    }
+
+    /// The pill opened with Auto-Enable Dictation on and both permissions already granted: it starts as
+    /// a mic tap does.
+    @Test func anAutoStartRunsLikeATapWhenBothPermissionsAreGranted() async {
+        let h = Harness(alreadyGranted: true)
+        let texts = Texts()
+        await start(h, into: texts, auto: true)
+        #expect(h.recognizer.isStarting)
+        #expect(h.recognitionCount == 1)
+        h.capture.complete(0)
+        await settle()
+        #expect(h.recognizer.isRecording)
+        h.recognition(0).handler("hello", false)
+        await settle()
+        #expect(texts.all == ["hello"])
+    }
+
+    /// Speech recognition or the microphone still undetermined: an auto-start would raise a prompt
+    /// unasked, so it does nothing: no recognition, no capture, no permission request.
+    @Test func anAutoStartDoesNothingWhenAPermissionStillNeedsAPrompt() async {
+        let h = Harness(alreadyGranted: false)
+        let texts = Texts()
+        await start(h, into: texts, auto: true)
+        #expect(!h.recognizer.isStarting)
+        #expect(!h.recognizer.isRecording)
+        #expect(h.recognitionCount == 0)
+        #expect(h.capture.starts == 0)
+    }
+
+    /// The tap is where the prompt is asked: the same undetermined state starts from a tap.
+    @Test func aTapStillStartsWhenAPermissionIsUndetermined() async {
+        let h = Harness(alreadyGranted: false)
+        let texts = Texts()
+        await start(h, into: texts)
+        #expect(h.recognizer.isStarting)
+        h.capture.complete(0)
+        await settle()
+        #expect(h.recognizer.isRecording)
+    }
+
+    /// Which system states need no prompt: only both authorized. Not determined needs one; denied or
+    /// restricted already turns the mic off (`OnDeviceReadiness`).
+    @Test func onlyBothPermissionsAuthorizedNeedNoPrompt() {
+        typealias Speech = SFSpeechRecognizerAuthorizationStatus
+        let speechStates: [Speech] = [.authorized, .notDetermined, .denied, .restricted]
+        let micStates: [AVAudioApplication.recordPermission] = [.granted, .undetermined, .denied]
+        for speech in speechStates {
+            for mic in micStates {
+                let expected = speech == .authorized && mic == .granted
+                #expect(OnDeviceSpeechRecognizer.permissionsAlreadyGranted(speech: speech, microphone: mic) == expected)
+            }
+        }
     }
 
     @Test func aStartRecordsOnceTheMicrophoneIsRunning() async {

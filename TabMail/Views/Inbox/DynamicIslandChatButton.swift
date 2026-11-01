@@ -1339,15 +1339,16 @@ struct DynamicIslandChat: View {
     }
 
     /// `auto`: started by the pill itself (it opened, the agent finished, Auto-Enable Dictation), not
-    /// by a tap on the mic. The on-device recognizer asks for permission, so it starts only from a tap.
+    /// by a tap on the mic. The on-device recognizer asks for permission on a tap only: an auto-start
+    /// runs when speech recognition and the microphone are both already granted, else it does nothing.
     private func startDictation(auto: Bool = false) {
         // Auto-start follows the mic button: while it is off, nothing starts.
         guard canDictate else { return }
         isTextFieldFocused = false
         if dictationMode == .onDevice {
-            guard !auto, !speech.isRecording, !speech.isStarting else { return }
+            guard !speech.isRecording, !speech.isStarting else { return }
             speechBase = inputText
-            speech.start(locale: speechLocale) { transcript in
+            speech.start(locale: speechLocale, auto: auto) { transcript in
                 inputText = DictationController.appending(transcript, to: speechBase)
                 inputSelection = .init(insertionPoint: inputText.endIndex)
             }
