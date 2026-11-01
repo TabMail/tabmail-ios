@@ -321,7 +321,7 @@ private final class TrialFeedbackHost {
         request.usesLanguageCorrection = false
         try VNImageRequestHandler(cgImage: cg, options: [:]).perform([request])
         return try #require(request.results).compactMap { $0.topCandidates(1).first?.string }
-            .joined(separator: " ").split(whereSeparator: \.isWhitespace).joined(separator: " ").lowercased()
+            .joined(separator: " ").split(whereSeparator: \.isWhitespace).joined(separator: " ").lowercased().replacingOccurrences(of: "’", with: "'")
     }
 }
 
