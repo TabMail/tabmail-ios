@@ -140,6 +140,17 @@ struct DemoSwitchToolWriterTests {
         await translator.setOnResolve(nil)
         let again = try await tool.run(translator, numericId: 1, sink: SwitchingSink(entering: nil))
         #expect(!again.contains("Could not save") && !again.contains("\"error\""), "\(tool): control saves: \(again)")
+        // ... and the effect is in the stored templates of the mode now live, decoded from the key itself.
+        let controlled = decodedTemplates(liveKey)
+        let target = controlled.first { $0.id == shared }
+        switch tool {
+        case .create: #expect(controlled.contains { $0.name == "Switch probe" && !$0.deleted }, "\(tool): control stored the new template")
+        case .download: #expect(controlled.contains { $0.name == "Switch download" && !$0.deleted }, "\(tool): control stored the downloaded template")
+        case .edit: #expect(target?.name == "Switch renamed", "\(tool): control stored the new name")
+        case .delete: #expect(target?.deleted == true, "\(tool): control stored the deletion")
+        case .toggle: #expect(target?.enabled == false, "\(tool): control stored the disabled state")
+        case .toggleToCurrentState: #expect(target?.enabled == true && target?.deleted == false, "\(tool): control left the template enabled")
+        }
         if DemoModeStore.isDemoActive { try await store.leaveDemo() }
     }
 
