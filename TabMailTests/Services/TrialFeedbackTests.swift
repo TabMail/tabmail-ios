@@ -363,6 +363,97 @@ struct TrialFeedbackViewTests {
         #expect(prompt.isSuppressed)
     }
 
+    @Test(.timeLimit(.minutes(1)))
+    func theMountedSubmitActionSendsExactlyTheChosenReasonOnce() async throws {
+        let name = "TrialFeedbackActions.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let prompt = TrialFeedbackPromptState(defaults: defaults)
+        let client = FeedbackSubmitter()
+        let flow = TrialFeedbackFlow(prompt: prompt, client: client)
+        var actions: TrialFeedbackForm.Actions?
+        let host = try TrialFeedbackHost(TrialFeedbackForm(flow: flow, actionsReady: { actions = $0 }))
+        defer { host.close() }
+        for _ in 0..<100 {
+            if actions != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let mounted = try #require(actions)
+        mounted.submit()
+        #expect(await client.reasons.isEmpty)
+        mounted.select(.priceValue)
+        mounted.submit()
+        mounted.select(.other)
+        mounted.submit()
+        for _ in 0..<100 {
+            if flow.isComplete { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(flow.isComplete && prompt.isSuppressed)
+        #expect(await client.reasons == [.priceValue])
+        #expect((try await host.text()).contains("thanks for your feedback"))
+    }
+
+    @Test(arguments: [false, true])
+    func mountedDismissalActionsSendNothingAndRespectTheLocalChoice(permanent: Bool) async throws {
+        let name = "TrialFeedbackDismissal.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let prompt = TrialFeedbackPromptState(defaults: defaults)
+        let client = FeedbackSubmitter()
+        let flow = TrialFeedbackFlow(prompt: prompt, client: client)
+        var actions: TrialFeedbackForm.Actions?
+        let host = try TrialFeedbackHost(TrialFeedbackForm(flow: flow, actionsReady: { actions = $0 }))
+        defer { host.close() }
+        for _ in 0..<100 {
+            if actions != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let mounted = try #require(actions)
+        mounted.select(.existingWorkflow)
+        if permanent { mounted.doNotAskAgain() } else { mounted.notNow() }
+        #expect(await client.reasons.isEmpty)
+        #expect(prompt.isSuppressed == permanent)
+        #expect(prompt.deferredThisRun == !permanent)
+        #expect(TrialFeedbackPromptState(defaults: defaults).isSuppressed == permanent)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func removingTheMountedFormCancelsItsPendingSubmission() async throws {
+        let name = "TrialFeedbackCancellation.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let prompt = TrialFeedbackPromptState(defaults: defaults)
+        let client = FeedbackSubmitter(held: true)
+        let flow = TrialFeedbackFlow(prompt: prompt, client: client)
+        var actions: TrialFeedbackForm.Actions?
+        let host = try TrialFeedbackHost(TrialFeedbackForm(flow: flow, actionsReady: { actions = $0 }))
+        defer { host.close() }
+        for _ in 0..<100 {
+            if actions != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let mounted = try #require(actions)
+        mounted.select(.aiReliability)
+        mounted.submit()
+        for _ in 0..<100 {
+            if await client.reasons.count == 1 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(flow.isSubmitting && (await client.reasons.count) == 1)
+        actions = nil
+        host.close()
+        try await Task.sleep(for: .milliseconds(50))
+        await client.release()
+        for _ in 0..<100 {
+            if !flow.isSubmitting { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(!flow.isComplete && !prompt.isSuppressed && !flow.isSubmitting)
+        #expect(flow.errorText == nil)
+        #expect(await client.reasons == [.aiReliability])
+    }
+
     @Test(arguments: ["ended", "demo", "no-session", "other-folder", "paid", "running"])
     func theActualInboxRequiresCurrentExpiredAuthorityAndARealSession(scenario: String) async throws {
         PreviewMocks.hideAllTips()
