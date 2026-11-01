@@ -460,10 +460,15 @@ struct TrialFeedbackViewTests {
         PreviewMocks.hideAllTips()
         let gate = AISubscriptionGate.shared
         let oldActive = gate.isActive
+        let oldEnded = gate.trialHasEnded
         let oldDemo = DemoModeStore.shared.isActive
         gate.noteSignedOut()
         DemoModeStore.shared.isActive = scenario == "demo"
         defer {
+            let restored = oldEnded
+                ? try? WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: Date())
+                : try? WhoamiFixture.accountInfo(hasSubscription: true)
+            if let restored { gate.apply(restored) }
             gate.noteSignedOut()
             if oldActive { gate.openGate() } else { gate.closeGate() }
             DemoModeStore.shared.isActive = oldDemo
