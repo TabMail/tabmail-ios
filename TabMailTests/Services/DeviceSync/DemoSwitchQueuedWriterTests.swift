@@ -172,6 +172,57 @@ struct DemoSwitchQueuedWriterTests {
         await PromptStoreTestCleanup.remove(tag: tag, from: store)
     }
 
+    // MARK: - A switch whose grant expired before it started
+
+    @Test("A switch whose lease ran out before its body started saves nothing in either mode; an unexpired one switches",
+          arguments: [true, false], [true, false])
+    func switchWhoseLeaseExpiredBeforeItsBodyIsRefused(expire: Bool, entering: Bool) async throws {
+        quiet()
+        PromptStore.removeDemoOverlayKeys()
+        let saved = store.semaphore.config
+        defer { store.semaphore.config = saved; DemoModeStore.shared._resetForTests(); PromptStore.removeDemoOverlayKeys() }
+        if !entering { try await store.enterDemo() }
+        let defaults = UserDefaults.standard
+        let before = ChangeCounter.device.current
+        let demoKB = "demo.user_prompts:user_kb.md"
+        let demoBefore = defaults.string(forKey: demoKB)
+        let realBefore = realStorage()
+        let (taken, took) = AsyncStream<Void>.makeStream()
+        let (released, release) = AsyncStream<Void>.makeStream()
+        let older = Task { @MainActor in
+            try await store.semaphore.hold("test holder") { _ in
+                took.yield(); took.finish()
+                for await _ in released { break }
+            }
+            // The release has just granted the queued switch. The main actor stays busy past its new lease.
+            if expire { Self.blockTheMainActor(seconds: 0.4) }
+        }
+        for await _ in taken { break }
+        store.semaphore.config = PromptSemaphore.Config(leaseSeconds: 0.15, acquireWaitSeconds: 3)
+        let switching = Task { @MainActor in
+            if entering { try await store.enterDemo() } else { try await store.leaveDemo() }
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(DemoModeStore.isDemoActive == !entering, "the switch is queued behind the holder")
+        release.yield(); release.finish()
+        try await older.value
+        let result = await switching.result
+        if expire {
+            if case .success = result { Issue.record("the expired switch reported success") }
+            #expect(DemoModeStore.isDemoActive == !entering, "an expired switch changed the mode")
+            #expect(ChangeCounter.device.current == before, "an expired switch moved the change counter")
+            #expect(defaults.string(forKey: demoKB) == demoBefore, "an expired switch changed the demo overlay")
+        } else {
+            try result.get()
+            #expect(DemoModeStore.isDemoActive == entering, "control: the live switch changed the mode")
+            #expect(ChangeCounter.device.current != before, "control: the live switch moved the counter")
+            #expect((defaults.object(forKey: demoKB) != nil) == entering, "control: the overlay follows the mode")
+        }
+        #expect(realStorage() == realBefore, "no real state changed")
+        store.semaphore.config = saved
+        if DemoModeStore.isDemoActive { try await store.leaveDemo() }
+    }
+
     // MARK: - First-launch suppression
 
     @Test("An obsolete first-launch build marks nothing done, whether its list is empty or not", arguments: [true, false])

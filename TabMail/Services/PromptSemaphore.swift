@@ -135,6 +135,12 @@ final class PromptSemaphore {
             acquire(token, label)
         }
         defer { release(token) }
+        // A grant is a lease that starts when it is handed over; the waiter resumes later (the main actor may be busy),
+        // and a hold whose lease ran out before its body starts has no authority (DS-LEASE): nothing is read or written.
+        guard holds(token) else {
+            BackgroundSyncLogger.logDebug("[PromptStore] \(label) refused: its lease ran out before it started")
+            throw PromptRefusal.changed
+        }
         return try await Self.$holding.withValue(token) { try await body(PromptHold(token: token, semaphore: self)) }
     }
 

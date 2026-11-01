@@ -53,9 +53,12 @@ struct MarketplaceTemplateDetailView: View {
                             .foregroundStyle(.green)
                     } else {
                         Button {
-                            // The install starts at the tap: the change counter is taken here, before the task.
-                            let started = store.changeSeen
-                            Task { await installTemplate(since: started) }
+                            guard !isInstalling else { return }
+                            isInstalling = true
+                            installError = nil
+                            // The install starts at the tap: the store takes the change counter here, before the task.
+                            let installing = store.beginMarketplaceInstall(id: template.id, download: { try await TemplateMarketplaceClient.shared.downloadTemplate(id: $0) })
+                            Task { await finishInstall(installing) }
                         } label: {
                             HStack {
                                 if isInstalling {
@@ -116,12 +119,9 @@ struct MarketplaceTemplateDetailView: View {
     }
 
     @MainActor
-    private func installTemplate(since started: UUID) async {
-        guard !isInstalling else { return }
-        isInstalling = true
-        installError = nil
+    private func finishInstall(_ installing: Task<PromptStore.MarketplaceInstall, Error>) async {
         do {
-            switch try await store.installMarketplaceTemplate(id: template.id, since: started, download: { try await TemplateMarketplaceClient.shared.downloadTemplate(id: $0) }) {
+            switch try await installing.value {
             case .installed(let id), .alreadyInstalled(let id):
                 didInstall = true
                 onInstall(id)

@@ -10,6 +10,7 @@ import Testing
 /// An operation starts at the user's tap, not at the first turn of the task the tap makes (DS-DEMO). The marketplace
 /// install and the action-rules compaction are the two taps whose task awaits a long step before it writes: each
 /// takes its count in the tap, before the task, and a demo switch between the tap and the task's start refuses it.
+/// The tests drive the production tap entry points (`beginMarketplaceInstall`, `ActionCompactionMonitor.start`).
 /// The reminder snapshot gives a build the change counter and the mode as one pair.
 @MainActor
 @Suite("Operations that start at a tap, and the mode snapshot", .serialized, .processGlobalState)
@@ -27,7 +28,7 @@ struct DemoSwitchTapTimeTests {
 
     // MARK: - Marketplace install
 
-    @Test("An install whose count was taken at the tap is refused when a switch ran before its task started; one taken after installs",
+    @Test("An install tapped before a switch that runs before its task starts is refused and saves nothing; one tapped after installs",
           arguments: [true, false])
     func installOvertakenBeforeItsTaskStartsIsRefused(entering: Bool) async throws {
         quiet()
@@ -42,61 +43,47 @@ struct DemoSwitchTapTimeTests {
         let downloaded = TemplateMarketplaceClient.DownloadedTemplate(id: "tap-new", name: "Tap new", instructions: ["Be brief"], exampleReply: "Thanks", enabled: true)
         let realBefore = stored("user_templates")
 
-        // The tap: the count is taken, the task is made, and a switch that does not suspend runs before the task's turn.
-        let tapped = store.changeSeen
-        let pending = Task { try await store.installMarketplaceTemplate(id: "tap-new", since: tapped, download: { _ in downloaded }) }
+        // The tap: the store takes the count, makes the task, and a switch that does not suspend runs before the task's turn.
+        let pending = store.beginMarketplaceInstall(id: "tap-new", download: { _ in downloaded })
         if entering { try await store.enterDemo() } else { try await store.leaveDemo() }
-        #expect(try await pending.value == .notSaved, "the install made before the switch is refused")
+        #expect(try await pending.value == .notSaved, "the install tapped before the switch is refused")
         #expect(stored("user_templates") == realBefore, "the real templates are unchanged")
         #expect(!store.templates.contains { $0.id == "tap-new" }, "nothing was installed in the mode now shown")
 
-        // Control: the same install, tapped after the switch, installs in the mode now live.
-        let again = try await store.installMarketplaceTemplate(id: "tap-new", since: store.changeSeen, download: { _ in downloaded })
+        // Control: the same tap, after the switch, installs in the mode now live.
+        let again = try await store.beginMarketplaceInstall(id: "tap-new", download: { _ in downloaded }).value
         #expect(again == .installed("tap-new"))
+        #expect(store.templates.contains { $0.id == "tap-new" && !$0.deleted })
         if DemoModeStore.isDemoActive { try await store.leaveDemo() }
     }
 
     // MARK: - Action rules compaction
 
-    @Test("A compaction whose count was taken at the tap is refused when a switch ran before its task started, and compacts nothing",
+    @Test("A compaction tapped before a switch that runs before its task starts is refused; one tapped after reaches its ordinary read",
           arguments: [true, false])
     func compactOvertakenBeforeItsTaskStartsIsRefused(entering: Bool) async throws {
         quiet()
+        // An offline fixture: even a monitor that reached its model call could not send a request.
+        DemoModeStore.shared.isTutorialPractice = true
         defer { DemoModeStore.shared._resetForTests(); PromptStore.removeDemoOverlayKeys() }
         if !entering { try await store.enterDemo() }
-
-        let entered = PromptStore.switchesSeen
-        let pending = Task { await AIService.shared.compactActionRulesNow(entered: entered) }
+        let monitor = ActionCompactionMonitor()
+        monitor.start()
         if entering { try await store.enterDemo() } else { try await store.leaveDemo() }
-        let result = await pending.value
-        guard case .skipped(let reason) = result else { Issue.record("the compaction made before the switch ran: \(result)"); return }
-        #expect(reason.contains("changed"), "it reports that the rules changed: \(reason)")
+        try await settle(monitor)
+        #expect(monitor.statusMessage?.contains("Rules changed") == true, "the stale tap was not refused: \(monitor.statusMessage ?? "nil")")
 
-        // Control: a count taken after the switch is accepted by the same read.
-        let control = await store.readBeforeAI(.action, "tap control", entered: PromptStore.switchesSeen)
-        guard case .read = control else { Issue.record("control: a count taken after the switch was refused"); return }
+        // Control: with no switch between the tap and the task, the same monitor passes the read of the rules.
+        monitor.start()
+        try await settle(monitor)
+        #expect(monitor.statusMessage != nil && monitor.statusMessage?.contains("Rules changed") == false, "control: \(monitor.statusMessage ?? "nil")")
         if DemoModeStore.isDemoActive { try await store.leaveDemo() }
     }
 
-    // MARK: - Source fence
-
-    /// The two taps take their count before they make their task. The fence reads the source at run time.
-    @Test("The marketplace install and the compaction button take their count before their task is made")
-    func tapsSampleBeforeTheirTask() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        /// The count is taken before the first `Task {` that follows `anchor`.
-        func sampledBeforeTheTask(_ path: String, anchor: String, sample: String) throws -> Bool {
-            let source = try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
-            guard let start = source.range(of: anchor) else { return false }
-            let rest = source[start.upperBound...]
-            guard let sampled = rest.range(of: sample), let tasked = rest.range(of: "Task {") else { return false }
-            return sampled.lowerBound < tasked.lowerBound
-        }
-        #expect(try sampledBeforeTheTask("TabMail/Views/Settings/MarketplaceTemplateDetailView.swift",
-                                         anchor: "Button {", sample: "let started = store.changeSeen"))
-        #expect(try sampledBeforeTheTask("TabMail/Views/Settings/ActionRulesView.swift",
-                                         anchor: "func start()", sample: "let entered = PromptStore.switchesSeen"))
+    private func settle(_ monitor: ActionCompactionMonitor) async throws {
+        let end = ContinuousClock.now + .seconds(5)
+        while monitor.isRunning, ContinuousClock.now < end { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(!monitor.isRunning, "the compaction finished")
     }
 
     // MARK: - Mode snapshot

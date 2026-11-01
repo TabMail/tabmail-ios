@@ -275,6 +275,39 @@ struct PromptSemaphoreTests {
         #expect(await free(semaphore))
     }
 
+    @Test("A grant whose lease ran out before its body started is refused and the body never runs; an unexpired grant runs (DS-LEASE)",
+          arguments: [true, false])
+    func grantExpiredBeforeItsBodyStartsIsRefused(expire: Bool) async throws {
+        let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 0.15, acquireWaitSeconds: 3))
+        let order = OrderLog()
+        let (taken, took) = AsyncStream<Void>.makeStream()
+        let (released, release) = AsyncStream<Void>.makeStream()
+        let older = Task { @MainActor in
+            try await semaphore.hold("older") { _ in
+                took.yield(); took.finish()
+                for await _ in released { break }
+            }
+            // The release has just granted the queued request. The main actor stays busy past its new lease.
+            if expire { Self.blockTheMainActor(seconds: 0.4) }
+        }
+        for await _ in taken { break }
+        let queued = PromptSemaphore.$holding.withValue(nil) {
+            Task { @MainActor in try await semaphore.hold("queued") { _ in order.entries.append("queued") } }
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        release.yield(); release.finish()
+        try await older.value
+        let result = await queued.result
+        if expire {
+            #expect(throws: PromptRefusal.changed) { try result.get() }
+            #expect(order.entries.isEmpty, "a hold whose lease ran out before it started ran its body")
+        } else {
+            try result.get()
+            #expect(order.entries == ["queued"], "control: an unexpired grant runs")
+        }
+        #expect(await free(semaphore))
+    }
+
     @Test("A holder that never releases hands the semaphore on at its lease: the queue never blocks for good (I4)")
     func leaseHandsOver() async throws {
         let semaphore = PromptSemaphore(config: PromptSemaphore.Config(leaseSeconds: 0.1, acquireWaitSeconds: 5))
