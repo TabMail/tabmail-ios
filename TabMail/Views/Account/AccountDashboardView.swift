@@ -110,15 +110,9 @@ struct AccountDashboardView: View {
 
                 Section {
                     // Status banners
-                    if let trialBanner = trialBannerCopy {
-                        StatusBanner(
-                            icon: trialBanner.icon,
-                            text: trialBanner.text,
-                            color: trialBanner.color
-                        )
+                    AccountTrialStatusBanner(accountInfo: accountInfo, context: .account)
                         .listRowInsets(EdgeInsets())
                         .listRowBackground(Color.clear)
-                    }
 
                     if let cancellation = accountInfo?.pendingCancellation, cancellation.cancelAt != nil {
                         StatusBanner(
@@ -511,31 +505,6 @@ struct AccountDashboardView: View {
         guard accountInfo?.hasSubscription == true else { return false }
         if case .active = accountInfo?.trialState() { return false }
         return true
-    }
-
-    /// Copy for the trial status banner, or `nil` when there is no trial to
-    /// describe.
-    ///
-    /// Deliberately NOT gated on `accountInfo?.trial` being non-nil: the ended
-    /// response can carry `"trial": null`, and reading the object first would
-    /// make the ended banner disappear on exactly the accounts that need it.
-    /// The `.noTrial` arm keeps today's plain "Trial active until <date>" for a
-    /// legacy Stripe/Apple card trial, which is a subscription rather than a
-    /// signup trial and must render exactly as it always has.
-    private var trialBannerCopy: (icon: String, text: String, color: Color)? {
-        switch accountInfo?.trialState() {
-        case .active(let daysRemaining):
-            let unit = daysRemaining == 1 ? "day" : "days"
-            return ("clock", "Free trial · \(daysRemaining) \(unit) left", .blue)
-        case .ended:
-            return ("clock.badge.exclamationmark",
-                    "Your free trial has ended — subscribe to continue",
-                    .orange)
-        default:
-            guard let trial = accountInfo?.trial, trial.isTrial else { return nil }
-            let suffix = trial.trialEnd.map { " until \(formatTimestamp($0))" } ?? ""
-            return ("clock", "Trial active" + suffix, .blue)
-        }
     }
 
     /// The account's zero-priority-budget plan, if it is on one. Internal tier

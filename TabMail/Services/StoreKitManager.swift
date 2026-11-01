@@ -48,6 +48,8 @@ final class StoreKitManager {
     var purchasedProductIDs: Set<String> = []
     var isAppleSubscriber = false
     var activePlan: String?
+    /// Only actual free offers for which this Apple ID is currently eligible.
+    var freeTrialOffers: [String: SubscriptionTrialOffer] = [:]
 
     /// The appAccountToken (TabMail user ID) embedded in the active subscription.
     /// If this doesn't match the currently logged-in user, the subscription belongs to a different account.
@@ -84,6 +86,7 @@ final class StoreKitManager {
 
     func loadProducts() async {
         productsLoadError = nil
+        freeTrialOffers = [:]
         BackgroundSyncLogger.logDebug("[StoreKit] Loading products for IDs: \(Self.productIDs)")
         do {
             let storeProducts = try await Product.products(for: Self.productIDs)
@@ -94,6 +97,11 @@ final class StoreKitManager {
                 let rhs = Self.tierRank(for: $1.id)
                 if lhs != rhs { return lhs < rhs }
                 return $0.price < $1.price
+            }
+            for product in products {
+                if let offer = await freeTrialOffer(for: product) {
+                    freeTrialOffers[product.id] = offer
+                }
             }
             if products.isEmpty {
                 BackgroundSyncLogger.logDebug("[StoreKit] Product.products returned empty — products may not be configured in App Store Connect")
@@ -109,6 +117,24 @@ final class StoreKitManager {
     }
 
     // MARK: - Purchase
+
+    /// Refresh eligibility at the purchase boundary as well as while loading cards.
+    func freeTrialOffer(for product: Product) async -> SubscriptionTrialOffer? {
+        guard Self.planName(for: product.id) != AccountPlanConfig.byokTierKey,
+              let subscription = product.subscription,
+              let offer = subscription.introductoryOffer,
+              offer.paymentMode == .freeTrial,
+              await subscription.isEligibleForIntroOffer else { return nil }
+        let unit: SubscriptionTrialOffer.Unit
+        switch offer.period.unit {
+        case .day: unit = .day
+        case .week: unit = .week
+        case .month: unit = .month
+        case .year: unit = .year
+        @unknown default: return nil
+        }
+        return SubscriptionTrialOffer(value: offer.period.value * offer.periodCount, unit: unit)
+    }
 
     /// Purchase a product. Returns the signed transaction JWS on success, nil on cancel/pending.
     func purchase(_ product: Product, userId: String) async throws -> String? {

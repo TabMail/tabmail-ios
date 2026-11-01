@@ -22,9 +22,7 @@ struct PlanPickerView: View {
                 // Free-trial state from the backend: this banner describes the
                 // server-granted trial the account already has (or had), so the
                 // page never implies the user still needs to start one.
-                if let trialBanner = trialBannerCopy {
-                    StatusBanner(icon: trialBanner.icon, text: trialBanner.text, color: trialBanner.color)
-                }
+                AccountTrialStatusBanner(accountInfo: accountInfo, context: .plans)
 
                 // Pending state banners from backend
                 if let cancellation = accountInfo?.pendingCancellation, cancellation.cancelAt != nil {
@@ -66,7 +64,11 @@ struct PlanPickerView: View {
                         // window where /whoami hasn't loaded (offline, fresh launch)
                         // so upgrade/downgrade labels stay rank-correct.
                         backendTier: accountInfo?.planTier ?? storeKit.activePlan,
-                        isPurchasing: isPurchasing
+                        isPurchasing: isPurchasing,
+                        trialOffer: storeKit.freeTrialOffers[product.id],
+                        purchaseRestriction: accountInfo == nil ? nil : SubscriptionTrialPurchasePolicy.restriction(
+                            account: accountInfo, offer: storeKit.freeTrialOffers[product.id]
+                        )
                     ) {
                         await purchaseProduct(product)
                     }
@@ -126,7 +128,7 @@ struct PlanPickerView: View {
                 // Apple-required subscription disclosure (Schedule 2, Section 3.8(b))
                 if !filteredProducts.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Payment will be charged to your Apple ID account at confirmation of purchase. Subscriptions automatically renew unless canceled at least 24 hours before the end of the current period. Your account will be charged for renewal within 24 hours prior to the end of the current period. You can manage and cancel your subscriptions by going to your Account Settings on the App Store after purchase. Any unused portion of a free trial period, if offered, will be forfeited when you purchase a subscription.")
+                        Text("If you are eligible for a free introductory offer, payment begins after that offer ends; otherwise payment is charged to your Apple ID account at confirmation of purchase. Apple's confirmation shows your applicable offer and price. Subscriptions automatically renew unless canceled at least 24 hours before the end of the current period. Your account will be charged for renewal within 24 hours prior to the end of the current period. You can manage and cancel your subscriptions in your App Store account settings. Changing an existing subscription may affect an unused Apple introductory offer.")
                             .font(.caption2)
                             .foregroundStyle(Palette.textMuted)
 
@@ -237,6 +239,7 @@ struct PlanPickerView: View {
         .task {
             do {
                 accountInfo = try await backend.fetchAccountInfo()
+                await storeKit.loadProducts()
             } catch {
                 BackgroundSyncLogger.logDebug("[PlanPicker] fetchAccountInfo failed: \(error)")
             }
@@ -246,6 +249,7 @@ struct PlanPickerView: View {
                 Task {
                     do {
                         accountInfo = try await backend.fetchAccountInfo()
+                        await storeKit.loadProducts()
                     } catch {
                         BackgroundSyncLogger.logDebug("[PlanPicker] Refresh on foreground failed: \(error)")
                     }
@@ -267,28 +271,6 @@ struct PlanPickerView: View {
     }
 
     // MARK: - Helpers
-
-    /// Banner describing the account's free trial, or `nil` when there is none
-    /// to describe.
-    ///
-    /// The active copy says the trial ends and deliberately makes no claim
-    /// about when billing starts — that is Apple's purchase sheet's story. The
-    /// forfeiture of the remaining server-trial days is true either way.
-    private var trialBannerCopy: (icon: String, text: String, color: Color)? {
-        switch accountInfo?.trialState() {
-        case .active(let daysRemaining):
-            let unit = daysRemaining == 1 ? "day" : "days"
-            return ("clock",
-                    "Free trial · \(daysRemaining) \(unit) left. Subscribing now ends the trial.",
-                    .blue)
-        case .ended:
-            return ("clock.badge.exclamationmark",
-                    "Your free trial has ended — subscribe to continue using AI features.",
-                    .orange)
-        default:
-            return nil
-        }
-    }
 
     /// Determine if this product is the user's current active plan.
     /// Uses backend tier for quick "is this the right tier?" check, then StoreKit for monthly/yearly distinction.
@@ -348,18 +330,40 @@ struct PlanPickerView: View {
             isPurchasing = false
             return
         }
+        let signInGeneration = AISubscriptionGate.shared.signInGeneration
 
         do {
-            let jwsRepresentation = try await storeKit.purchase(product, userId: session.userId)
+            let identity = PlanPurchaseIdentity(userId: session.userId, generation: signInGeneration)
+            let result = try await PlanPurchaseFlow.purchase(
+                identity: identity,
+                currentIdentity: {
+                    TabMailAuthService.getSession().map {
+                        PlanPurchaseIdentity(userId: $0.userId, generation: AISubscriptionGate.shared.signInGeneration)
+                    }
+                },
+                fetchAccount: { try await backend.fetchAccountInfo() },
+                fetchOffer: { await storeKit.freeTrialOffer(for: product) },
+                accountRefreshed: { accountInfo = $0 },
+                performPurchase: { try await storeKit.purchase(product, userId: $0) }
+            )
             isPurchasing = false
-            guard let jws = jwsRepresentation else {
+            let jws: String
+            switch result {
+            case .purchased(let representation): jws = representation
+            case .cancelled:
                 purchaseError = nil
                 return
+            case .refused(let reason):
+                purchaseError = reason
+                return
             }
+            // Deliver the verified purchase for its signed appAccountToken even
+            // if this view's account changed while Apple's sheet was open.
+            Self.verifyPurchaseWithBackend(jws: jws)
+            guard AISubscriptionGate.shared.signInGeneration == signInGeneration,
+                  TabMailAuthService.getSession()?.userId == session.userId else { return }
             // Open gate immediately from local StoreKit verification
             AISubscriptionGate.shared.openGate()
-            // Send JWS to backend to process immediately (don't wait for Apple webhook)
-            Self.verifyPurchaseWithBackend(jws: jws)
             // Refresh account info to update subscription display
             let purchased = try? await backend.fetchAccountInfo()
             accountInfo = purchased
@@ -445,6 +449,8 @@ private struct PlanCard: View {
     let hasAnyAppleSub: Bool  // User has any active subscription (Apple or backend)
     let backendTier: String?  // Current plan tier ("Pro"/"Basic"/"BYOK") — backend, or StoreKit while backend unloaded
     let isPurchasing: Bool
+    let trialOffer: SubscriptionTrialOffer?
+    let purchaseRestriction: String?
     let onPurchase: () async -> Void
 
     private var isPro: Bool { product.id.contains("pro") }
@@ -458,7 +464,10 @@ private struct PlanCard: View {
     private var planTier: String { StoreKitManager.displayPlanName(forTier: tierKey) }
 
     private var buttonLabel: String {
-        PlanCardCTA.buttonLabel(
+        if let trialOffer, !hasAnyAppleSub {
+            return "Start \(trialOffer.durationDescription) free"
+        }
+        return PlanCardCTA.buttonLabel(
             hasAnyAppleSub: hasAnyAppleSub,
             currentRank: StoreKitManager.tierRank(forTier: backendTier),
             cardRank: StoreKitManager.tierRank(for: product.id)
@@ -542,6 +551,12 @@ private struct PlanCard: View {
                 .font(.caption)
                 .foregroundStyle(Palette.textMuted)
 
+            if let trialOffer, !hasAnyAppleSub {
+                Text("\(trialOffer.durationDescription) free when you subscribe, then \(product.displayPrice)/\(isYearly ? "year" : "month"). Cancel before the offer ends to avoid payment.")
+                    .font(.caption)
+                    .foregroundStyle(Palette.textMuted)
+            }
+
             ForEach(features, id: \.self) { feature in
                 HStack(spacing: 8) {
                     Image(systemName: "checkmark.circle.fill")
@@ -571,7 +586,12 @@ private struct PlanCard: View {
                         .padding(.vertical, 10)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isPurchasing)
+                .disabled(isPurchasing || purchaseRestriction != nil)
+                if let purchaseRestriction {
+                    Text(purchaseRestriction)
+                        .font(.caption)
+                        .foregroundStyle(Palette.textMuted)
+                }
             }
         }
         .padding(16)
