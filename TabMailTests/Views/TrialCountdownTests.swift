@@ -226,7 +226,7 @@ private final class TrialCountdownInboxHost {
         }
         try #require(drawn)
         let cg = try #require(image.cgImage)
-        return try #require(cg.cropping(to: CGRect(x: 0, y: 0, width: cg.width, height: min(cg.height, 280))))
+        return try #require(cg.cropping(to: CGRect(x: 0, y: 0, width: cg.width, height: min(cg.height, 440))))
     }
 
     func text() async throws -> String {
