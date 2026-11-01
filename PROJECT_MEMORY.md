@@ -186,3 +186,5 @@ Authored after `v1.6.38`, so deliberately **not** rows in [`manifest.tsv`](Compa
 | Current | A system permission prompt in the unit-test host shows once per erased simulator (first full run fails, rerun passes; TCC.db `auth_reason 13` = cancelled prompt recorded as denied; Contacts from `ComposeView` onAppear `ContactSearchService.requestAccess`, `DraftOpenReloadTests`; inactive scene stops `.task`; `TestPermissionPrompts`, `simctl erase`) | [read in full](Companion/Memory/Current/139-a-system-permission-prompt-in-the-unit-test-host-shows-once-per-erased-simulator.md) |
 
 - **Subscription trial offers / 1+1 / no forfeiture:** actual per-product Apple free-offer eligibility/duration, signup-expiry purchase protection, purchased-trial display, and coordinated manual cutover: [subscription-trial-offers](Companion/Memory/Current/subscription-trial-offers.md).
+
+- **Inbox trial reminder / countdown / exact expiry:** authoritative in-memory notice, epoch clearing, real-inbox-only accent row and existing plans route: [inbox-trial-reminder](Companion/Memory/Current/inbox-trial-reminder.md).

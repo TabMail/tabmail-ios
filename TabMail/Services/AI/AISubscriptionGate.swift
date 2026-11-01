@@ -83,6 +83,10 @@ final class AISubscriptionGate: @unchecked Sendable {
     /// inherit the previous account's freshness.
     private(set) var lastAuthoritativeApplyAt: Date?
 
+    /// Current-process display data only. Hydrated gate defaults never supply
+    /// a countdown, and local purchase/402/403 responses cannot overwrite it.
+    private(set) var trialCountdownNotice: TrialCountdownNotice?
+
     /// Monotonic sign-in epoch for this process. Bumped by `noteSignedOut()`.
     /// A `/whoami` fetch belongs to the epoch in which it STARTED; a response
     /// that lands after the user signed out (and possibly after someone else
@@ -113,6 +117,7 @@ final class AISubscriptionGate: @unchecked Sendable {
             closeGate()
         }
         setTrialHasEnded(info.trialState(now: now) == .ended)
+        trialCountdownNotice = TrialCountdownNotice.from(info, now: now)
         lastAuthoritativeApplyAt = now
     }
 
@@ -126,6 +131,7 @@ final class AISubscriptionGate: @unchecked Sendable {
     @MainActor
     func noteSignedOut() {
         lastAuthoritativeApplyAt = nil
+        trialCountdownNotice = nil
         signInGeneration &+= 1
         // No identity owns the current epoch any more, so the next sign-in —
         // even by the same user — is a genuine identity change and must bump.
@@ -190,6 +196,7 @@ final class AISubscriptionGate: @unchecked Sendable {
         }
         lastSignedInUserId = userId
         lastAuthoritativeApplyAt = nil
+        trialCountdownNotice = nil
         signInGeneration &+= 1
     }
 

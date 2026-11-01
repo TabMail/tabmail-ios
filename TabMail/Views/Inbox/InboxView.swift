@@ -424,6 +424,12 @@ struct InboxView: View {
                     .foregroundStyle(Theme.errorFg)
                 }
 
+                InboxTrialCountdown(
+                    isInbox: isInboxView,
+                    isDemo: DemoModeStore.shared.isActive,
+                    notice: AISubscriptionGate.shared.trialCountdownNotice
+                )
+
                 // Usage-throttle banner — surfaces when background AI
                 // processing is being throttled (monthly budget exhausted /
                 // BYOK on the shared queue). Subtle, non-dismissible; tapping

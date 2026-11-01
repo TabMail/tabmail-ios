@@ -1,0 +1,9 @@
+# Inbox trial reminder
+
+The reminder uses a current-process `TrialCountdownNotice` derived only by `AISubscriptionGate.apply` from authoritative account data. It displays the stored signup promise or the existing purchased-subscription trial accessor, without assuming an offer duration. Paid/nontrial, missing and untrusted account data supply no notice. Sign-out and a new identity clear it; stale epochs cannot restore it. Bare AI gate changes and the open-only local-purchase refresh never overwrite it.
+
+The actual `InboxView` passes the notice to `InboxTrialCountdown` before the usage-throttle row. Demo mode and other folders hide it. `TrialCountdownBanner` uses the app's accent palette, supports wrapping text and routes its button to the existing plans destination; the subscription-trial label says Manage and respects cancelled renewal. There is no popup, network call, new persisted countdown, or access/billing decision.
+
+`TrialCountdownSchedule` lazily emits the rounded-day changes and exact deadline. At expiry the row disappears; foreground and significant clock changes rebuild the display schedule. Display expiry never changes entitlement or stamps an authoritative account refresh. Existing trial-ended UI still follows authoritative account state.
+
+Previews render the actual inbox. `TrialCountdownModelTests`, `TrialCountdownGateTests` and `TrialCountdownInboxTests` cover promised dates, boundaries, purchased/cancelled copy, epoch clearing, local-refresh nonauthority and actual inbox visibility. Native execution and the canonical review gate must be verified before treating the candidate as ready. This reminder is a separate held change, stacked on the payment branch; it does not activate offers or alter the 1+1 policy.
