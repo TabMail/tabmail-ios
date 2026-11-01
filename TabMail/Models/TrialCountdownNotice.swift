@@ -19,6 +19,7 @@ struct TrialCountdownNotice: Equatable, Sendable {
     }
 
     static func from(_ account: AccountInfo, now: Date = Date()) -> Self? {
+        guard account.planTier != AccountPlanConfig.byokTierKey else { return nil }
         if case .active = account.trialState(now: now), let end = account.trial?.trialEnd {
             return Self(kind: .signup, end: Date(timeIntervalSince1970: TimeInterval(end)), renewalCancelled: false)
         }

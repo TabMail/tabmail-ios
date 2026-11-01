@@ -49,13 +49,23 @@ struct TrialCountdownBanner: View {
         NotificationCenter.default.post(name: .navigateToPlanPicker, object: nil)
     }
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var clockRevision = 0
+    @State private var now = Date()
+
+    private struct ClockKey: Hashable {
+        let end: Date
+        let revision: Int
+    }
 
     var body: some View {
-        TimelineView(TrialCountdownSchedule(end: notice.end)) { context in
-            if let copy = notice.presentation(now: context.date) {
+        Group {
+            if let copy = notice.presentation(now: now) {
                 Button(action: action) {
-                    HStack(spacing: 8) {
+                    let layout = dynamicTypeSize.isAccessibilitySize
+                        ? AnyLayout(VStackLayout(alignment: .leading, spacing: 6))
+                        : AnyLayout(HStackLayout(spacing: 8))
+                    layout {
                         Image(systemName: "clock")
                             .foregroundStyle(Palette.accentColor)
                             .accessibilityHidden(true)
@@ -68,7 +78,8 @@ struct TrialCountdownBanner: View {
                                 .foregroundStyle(Palette.textMuted)
                         }
                         .fixedSize(horizontal: false, vertical: true)
-                        Spacer(minLength: 8)
+                        .layoutPriority(1)
+                        if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 8) }
                         Text(copy.actionTitle)
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(Palette.accentColor)
@@ -89,7 +100,20 @@ struct TrialCountdownBanner: View {
                 .accessibilityHint("Opens plans and subscription settings")
             }
         }
-        .id(clockRevision)
+        .task(id: ClockKey(end: notice.end, revision: clockRevision)) {
+            // TimelineView may lower its cadence. A cancellable task wakes only
+            // for actual label boundaries, including the authoritative end.
+            var dates = TrialCountdownSchedule(end: notice.end).entries(from: Date(), mode: .normal)
+            while let date = dates.next() {
+                let delay = date.timeIntervalSinceNow
+                if delay > 0 {
+                    do { try await Task.sleep(for: .seconds(delay)) }
+                    catch { return }
+                }
+                guard !Task.isCancelled else { return }
+                now = max(Date(), date)
+            }
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { clockRevision &+= 1 }
         }
