@@ -46,6 +46,15 @@ final class TrialFeedbackPromptState {
         defaults.set(true, forKey: Self.suppressionKey)
     }
     func submitted() { doNotAskAgain() }
+
+    #if DEBUG
+    /// Native tests restore the shared in-memory choice after exercising the
+    /// real inbox. The test scope restores its UserDefaults snapshot separately.
+    func restoreTestSnapshot(suppressed: Bool, deferred: Bool) {
+        isSuppressed = suppressed
+        deferredThisRun = deferred
+    }
+    #endif
 }
 
 protocol TrialFeedbackSubmitting: Sendable {

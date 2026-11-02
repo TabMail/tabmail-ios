@@ -4,6 +4,7 @@
 
 import Foundation
 import Darwin
+import ObjectiveC
 import SwiftUI
 import UIKit
 import Vision
@@ -14,7 +15,7 @@ import Testing
 /// The shared FakeHTTP adds a per-scenario header. This transport deliberately
 /// does not, so the actual privacy request can be inspected without a test ID.
 private final class FeedbackPacketProtocol: URLProtocol, @unchecked Sendable {
-    enum Mode: Sendable { case status(Int), failure, held, redirect }
+    enum Mode: Sendable { case status(Int), failure, held, redirect, trickling }
     struct Packet: Sendable {
         let url: URL?
         let method: String?
@@ -25,8 +26,10 @@ private final class FeedbackPacketProtocol: URLProtocol, @unchecked Sendable {
         var mode: Mode = .status(204)
         var packets: [Packet] = []
         var stopped = 0
+        var chunks = 0
     }
     static let state = Mutex(State())
+    private let streamTask = Mutex<Task<Void, Never>?>(nil)
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -51,6 +54,19 @@ private final class FeedbackPacketProtocol: URLProtocol, @unchecked Sendable {
         case .failure:
             client?.urlProtocol(self, didFailWithError: URLError(.notConnectedToInternet))
         case .held: break
+        case .trickling:
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Length": "1000000"])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            let task = Task { @Sendable [weak self] in
+                for _ in 0..<400 {
+                    do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+                    guard let self, !Task.isCancelled else { return }
+                    Self.state.withLock { $0.chunks += 1 }
+                    self.client?.urlProtocol(self, didLoad: Data([0x20]))
+                }
+            }
+            streamTask.withLock { $0 = task }
         case .redirect:
             if request.url?.host == TrialFeedbackConfig.endpoint.host {
                 var redirected = request
@@ -70,7 +86,158 @@ private final class FeedbackPacketProtocol: URLProtocol, @unchecked Sendable {
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocolDidFinishLoading(self)
     }
-    override func stopLoading() { Self.state.withLock { $0.stopped += 1 } }
+    override func stopLoading() {
+        streamTask.withLock { $0?.cancel(); $0 = nil }
+        Self.state.withLock { $0.stopped += 1 }
+    }
+}
+
+/// Scoped interception of the public NSURLSession factory. The production
+/// initializer, delegate and task still run; only the local protocol is installed.
+/// A preflight proves interception before any default feedback flow may submit.
+private final class FeedbackSessionScope: @unchecked Sendable {
+    private typealias Factory = @convention(c) (AnyObject, Selector, URLSessionConfiguration, AnyObject?, OperationQueue?) -> URLSession
+    private typealias FactoryBlock = @convention(block) (AnyObject, URLSessionConfiguration, AnyObject?, OperationQueue?) -> URLSession
+    private final class References: @unchecked Sendable {
+        private let lock = NSLock()
+        private weak var session: URLSession?
+        private weak var delegate: AnyObject?
+        init(session: URLSession, delegate: AnyObject?) { self.session = session; self.delegate = delegate }
+        var released: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return session == nil && delegate == nil
+        }
+        func cancel() {
+            lock.lock(); let current = session; lock.unlock()
+            current?.invalidateAndCancel()
+        }
+    }
+    private final class Probe: @unchecked Sendable {
+        let entries = Mutex<[References]>([])
+        func capture(_ session: URLSession, delegate: AnyObject?) {
+            entries.withLock { $0.append(References(session: session, delegate: delegate)) }
+        }
+    }
+    private struct RetainedBlock: @unchecked Sendable { let implementation: IMP }
+    // Retain the few test-scope blocks until process exit: an unrelated factory
+    // call already in flight may still hold the previous IMP after restoration.
+    private static let retainedBlocks = Mutex<[RetainedBlock]>([])
+    private let method: Method
+    private let original: IMP
+    private let replacement: IMP
+    private let probe: Probe
+    private let closed = Mutex(false)
+
+    init() throws {
+        let selector = NSSelectorFromString("sessionWithConfiguration:delegate:delegateQueue:")
+        let method = try #require(class_getClassMethod(URLSession.self, selector))
+        let original = method_getImplementation(method)
+        let factory = unsafeBitCast(original, to: Factory.self)
+        let probe = Probe()
+        let block: FactoryBlock = { object, config, delegate, queue in
+            if delegate is TrialFeedbackSessionDelegate {
+                config.protocolClasses = [FeedbackPacketProtocol.self]
+                let session = factory(object, selector, config, delegate, queue)
+                probe.capture(session, delegate: delegate)
+                return session
+            }
+            return factory(object, selector, config, delegate, queue)
+        }
+        self.method = method
+        self.original = original
+        self.replacement = imp_implementationWithBlock(block)
+        self.probe = probe
+        method_setImplementation(method, replacement)
+        do {
+            let session = URLSession(configuration: .ephemeral, delegate: TrialFeedbackSessionDelegate(), delegateQueue: nil)
+            defer { session.invalidateAndCancel() }
+            try #require(probe.entries.withLock { $0.count } == 1)
+            try #require(session.configuration.protocolClasses?.contains { $0 == FeedbackPacketProtocol.self } == true)
+            probe.entries.withLock { $0.removeAll() }
+        } catch { close(); throw error }
+    }
+
+    var createdCount: Int { probe.entries.withLock { $0.count } }
+    var allReleased: Bool { probe.entries.withLock { !$0.isEmpty && $0.allSatisfy(\.released) } }
+    func close() {
+        guard closed.withLock({ value in if value { return false }; value = true; return true }) else { return }
+        method_setImplementation(method, original)
+        for entry in probe.entries.withLock({ $0 }) { entry.cancel() }
+        Self.retainedBlocks.withLock { $0.append(RetainedBlock(implementation: replacement)) }
+    }
+    deinit { close() }
+}
+
+@Suite("Production feedback transport lifetime", .serialized, .processGlobalState)
+@MainActor
+struct TrialFeedbackNativeTransportTests {
+    @Test(arguments: [204, 503, -1])
+    func ownedSessionsAndDelegatesAreReleased(outcome: Int) async throws {
+        let scope = try FeedbackSessionScope()
+        defer { scope.close() }
+        FeedbackPacketProtocol.state.withLock { $0 = .init(mode: outcome == -1 ? .held : .status(outcome)) }
+        let client = TrialFeedbackClient()
+        let request = Task { try await client.submit(reason: .other) }
+        if outcome == -1 {
+            for _ in 0..<200 {
+                if FeedbackPacketProtocol.state.withLock({ !$0.packets.isEmpty }) { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            try #require(FeedbackPacketProtocol.state.withLock { $0.packets.count } == 1)
+            request.cancel()
+        }
+        do {
+            try await request.value
+            #expect(outcome == 204)
+        } catch { #expect(outcome != 204) }
+        #expect(scope.createdCount == 1)
+        for _ in 0..<300 {
+            if scope.allReleased { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(scope.allReleased)
+        #expect(FeedbackPacketProtocol.state.withLock { $0.packets.count } == 1)
+    }
+}
+
+
+@Suite("Feedback total transfer bound", .serialized, .processGlobalState)
+@MainActor
+struct TrialFeedbackTransferBoundTests {
+    @Test(.timeLimit(.minutes(1)))
+    func aTricklingResponseCannotExtendTheTotalTransferIndefinitely() async throws {
+        let scope = try FeedbackSessionScope()
+        defer { scope.close() }
+        FeedbackPacketProtocol.state.withLock { $0 = .init(mode: .trickling) }
+        let limit = Mutex<TimeInterval?>(nil)
+        let completion = Mutex<(done: Bool, code: Int?)>((false, nil))
+        let client = TrialFeedbackClient { config in limit.withLock { $0 = config.timeoutIntervalForResource } }
+        let began = Date()
+        let task = Task {
+            do { try await client.submit(reason: .other); completion.withLock { $0 = (true, nil) } }
+            catch { completion.withLock { $0 = (true, (error as? URLError)?.code.rawValue) } }
+        }
+        for _ in 0..<200 {
+            if limit.withLock({ $0 != nil }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let configuredLimit = try #require(limit.withLock { $0 })
+        if !(configuredLimit > 0 && configuredLimit <= 30) {
+            task.cancel(); await task.value
+            Issue.record("The total feedback transfer bound exceeds the interactive policy ceiling")
+            return
+        }
+        for _ in 0..<3500 {
+            if completion.withLock({ $0.done }) { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        if !completion.withLock({ $0.done }) { task.cancel() }
+        await task.value
+        #expect(completion.withLock { $0.code } == URLError.Code.timedOut.rawValue)
+        #expect(Date().timeIntervalSince(began) < 35)
+        #expect(FeedbackPacketProtocol.state.withLock { $0.chunks } > 2)
+        #expect(FeedbackPacketProtocol.state.withLock { $0.packets.count } == 1)
+    }
 }
 
 @Suite("Feedback request privacy", .serialized, .processGlobalState)
@@ -209,9 +376,18 @@ private actor FeedbackSubmitter: TrialFeedbackSubmitting {
     func submit(reason: TrialFeedbackReason) async throws {
         reasons.append(reason)
         if fails { throw Failure.unavailable }
-        if held { try await withCheckedThrowingContinuation { continuation = $0 } }
+        if held {
+            // Record an overlapping attempt, then reject it instead of losing
+            // the first continuation and hanging a deliberately broken run.
+            guard continuation == nil else { throw Failure.unavailable }
+            try await withCheckedThrowingContinuation { continuation = $0 }
+        }
     }
-    func release() { continuation?.resume(); continuation = nil }
+    func release(failing: Bool = false) {
+        if failing { continuation?.resume(throwing: Failure.unavailable) }
+        else { continuation?.resume() }
+        continuation = nil
+    }
 }
 
 @Suite("Optional feedback choices", .serialized, .processGlobalState)
@@ -296,7 +472,7 @@ struct TrialFeedbackFlowTests {
 
 
 @MainActor
-private func feedbackAccessibilityElement(in root: NSObject, identifier: String, trace: ((String) -> Void)? = nil) -> NSObject? {
+private func feedbackAccessibilityElement(in root: NSObject, identifier: String, labelContains: String? = nil, trace: ((String) -> Void)? = nil) -> NSObject? {
     var pending: [NSObject] = [root]
     var seen = Set<ObjectIdentifier>()
     while let object = pending.popLast(), seen.count < 2_048 {
@@ -306,7 +482,8 @@ private func feedbackAccessibilityElement(in root: NSObject, identifier: String,
         let identifierValue = typed ?? (object.responds(to: selector)
             ? object.perform(selector)?.takeUnretainedValue() as? String : nil)
         trace?(String(reflecting: type(of: object)) + ":" + (identifierValue ?? "nil"))
-        if identifierValue == identifier { return object }
+        if !identifier.isEmpty, identifierValue == identifier { return object }
+        if let labelContains, object.accessibilityLabel?.lowercased().contains(labelContains) == true { return object }
         if let view = object as? UIView { pending.append(contentsOf: view.subviews) }
         pending.append(contentsOf: (object.accessibilityElements ?? []).compactMap { $0 as? NSObject })
         pending.append(contentsOf: (object.automationElements ?? []).compactMap { $0 as? NSObject })
@@ -360,6 +537,56 @@ private final class FeedbackAccessibilityAutomation {
 }
 
 @MainActor
+private final class FeedbackSharedPromptScope {
+    let prompt = TrialFeedbackPromptState.shared
+    private let suppressed: Bool
+    private let deferred: Bool
+    private let stored: Any?
+    private let key = "trialFeedback.suppressed"
+    init() {
+        suppressed = prompt.isSuppressed
+        deferred = prompt.deferredThisRun
+        stored = UserDefaults.standard.object(forKey: key)
+        prompt.restoreTestSnapshot(suppressed: false, deferred: false)
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+    func close() {
+        if let stored { UserDefaults.standard.set(stored, forKey: key) }
+        else { UserDefaults.standard.removeObject(forKey: key) }
+        prompt.restoreTestSnapshot(suppressed: suppressed, deferred: deferred)
+    }
+}
+
+@MainActor
+private final class FeedbackInboxScope {
+    let promptScope = FeedbackSharedPromptScope()
+    private let active = AISubscriptionGate.shared.isActive
+    private let ended = AISubscriptionGate.shared.trialHasEnded
+    private let demo = DemoModeStore.shared.isActive
+    init() { AISubscriptionGate.shared.noteSignedOut(); DemoModeStore.shared.isActive = false }
+    func close() {
+        let gate = AISubscriptionGate.shared
+        let restored = ended
+            ? try? WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: Date())
+            : try? WhoamiFixture.accountInfo(hasSubscription: true)
+        if let restored { gate.apply(restored) }
+        gate.noteSignedOut()
+        if active { gate.openGate() } else { gate.closeGate() }
+        DemoModeStore.shared.isActive = demo
+        promptScope.close()
+    }
+}
+
+@MainActor
+private func feedbackInbox(hasSession: Bool = true, otherFolder: Bool = false) -> some View {
+    let folder = Folder(name: "Inbox", path: "INBOX", role: otherFolder ? .sent : .inbox, accountId: UUID().uuidString)
+    return NavigationStack {
+        InboxView(title: "Mailbox", folders: [folder], selection: .unified(otherFolder ? .sent : .inbox),
+            selectedMessageId: .constant(nil), pushedMessageId: .constant(nil))
+    }.environment(NavigationStore()).environment(\.hasTabMailSession, hasSession)
+}
+
+@MainActor
 private final class TrialFeedbackHost {
     private let window: UIWindow
     private let controller: UIViewController
@@ -382,9 +609,23 @@ private final class TrialFeedbackHost {
         window.rootViewController = nil
     }
 
-    func activate(_ identifier: String) async throws {
+    private var activeView: UIView {
+        var active = controller
+        while let presented = active.presentedViewController { active = presented }
+        return active.view
+    }
+
+    func waitForSheetDismissal() async throws {
+        for _ in 0..<100 {
+            if controller.presentedViewController == nil { return }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        Issue.record("The feedback sheet did not finish dismissal")
+    }
+
+    private func find(_ identifier: String, labelContains: String? = nil) async throws -> NSObject? {
         var scrolls: [UIScrollView] = []
-        var views: [UIView] = [controller.view]
+        var views: [UIView] = [activeView]
         while let view = views.popLast() {
             views.append(contentsOf: view.subviews)
             if let scroll = view as? UIScrollView, scroll.contentSize.height > scroll.bounds.height {
@@ -392,10 +633,9 @@ private final class TrialFeedbackHost {
             }
         }
         for step in 0..<24 {
-            controller.view.layoutIfNeeded()
-            if let element = feedbackAccessibilityElement(in: controller.view, identifier: identifier) {
-                _ = element.accessibilityActivate()
-                return
+            activeView.layoutIfNeeded()
+            if let element = feedbackAccessibilityElement(in: activeView, identifier: identifier, labelContains: labelContains) {
+                return element
             }
             for scroll in scrolls {
                 let maximum = max(-scroll.adjustedContentInset.top,
@@ -405,18 +645,32 @@ private final class TrialFeedbackHost {
             }
             try await Task.sleep(for: .milliseconds(100))
         }
-        Issue.record(Comment(rawValue: "Rendered feedback control missing: " + identifier))
+        return nil
+    }
+
+    func activate(_ identifier: String, expectedLabel: String? = nil) async throws {
+        let element = try #require(try await find(identifier), Comment(rawValue: "Rendered feedback control missing: " + identifier))
+        if let expectedLabel {
+            #expect(element.accessibilityLabel?.contains(expectedLabel) == true,
+                Comment(rawValue: "Visible feedback choice: " + (element.accessibilityLabel ?? "missing label")))
+        }
+        _ = element.accessibilityActivate()
+    }
+
+    func containsText(_ text: String) async throws -> Bool {
+        try await find("", labelContains: text) != nil
     }
 
     func text(topOnly: Bool = false) async throws -> String {
         // A short settling interval is followed by one local OCR pass. No
         // customer screenshot or UI contents leave the test process.
         try await Task.sleep(for: .milliseconds(350))
-        controller.view.layoutIfNeeded()
+        let view = activeView
+        view.layoutIfNeeded()
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
-        let rendered = UIGraphicsImageRenderer(bounds: controller.view.bounds, format: format).image { _ in
-            controller.view.drawHierarchy(in: controller.view.bounds, afterScreenUpdates: true)
+        let rendered = UIGraphicsImageRenderer(bounds: view.bounds, format: format).image { _ in
+            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
         }
         var cg = try #require(rendered.cgImage)
         if topOnly { cg = try #require(cg.cropping(to: CGRect(x: 0, y: 0, width: cg.width, height: min(cg.height, 440)))) }
@@ -553,48 +807,142 @@ struct TrialFeedbackViewTests {
         #expect(await client.reasons == [.aiReliability])
     }
 
-    @Test(arguments: ["ended", "demo", "no-session", "other-folder", "paid", "running"])
-    func theActualInboxRequiresCurrentExpiredAuthorityAndARealSession(scenario: String) async throws {
+    @Test(arguments: ["ended", "demo", "no-session", "other-folder", "paid", "running", "inactive-no-trial", "local-purchase", "suppressed", "deferred"])
+    func theActualInboxRequiresEachEligibilityCondition(scenario: String) async throws {
         PreviewMocks.hideAllTips()
+        let scope = FeedbackInboxScope()
+        defer { scope.close() }
         let gate = AISubscriptionGate.shared
-        let oldActive = gate.isActive
-        let oldEnded = gate.trialHasEnded
-        let oldDemo = DemoModeStore.shared.isActive
-        gate.noteSignedOut()
         DemoModeStore.shared.isActive = scenario == "demo"
-        defer {
-            let restored = oldEnded
-                ? try? WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: Date())
-                : try? WhoamiFixture.accountInfo(hasSubscription: true)
-            if let restored { gate.apply(restored) }
-            gate.noteSignedOut()
-            if oldActive { gate.openGate() } else { gate.closeGate() }
-            DemoModeStore.shared.isActive = oldDemo
-        }
-        let otherFolder = scenario == "other-folder"
-        let folder = Folder(name: "Inbox", path: "INBOX", role: otherFolder ? .sent : .inbox, accountId: UUID().uuidString)
-        let view = NavigationStack {
-            InboxView(title: "Mailbox", folders: [folder], selection: .unified(otherFolder ? .sent : .inbox),
-                selectedMessageId: .constant(nil), pushedMessageId: .constant(nil))
-        }.environment(NavigationStore()).environment(\.hasTabMailSession, scenario != "no-session")
-        let host = try TrialFeedbackHost(view)
+        let host = try TrialFeedbackHost(feedbackInbox(hasSession: scenario != "no-session", otherFolder: scenario == "other-folder"))
         defer { host.close() }
         let before = try await host.text(topOnly: true)
-        #expect(before.contains("mailbox"))
-        #expect(!before.contains("help improve tabmail"))
+        #expect(before.contains("mailbox") && !before.contains("help improve tabmail"))
         if scenario == "running" {
             gate.apply(try WhoamiFixture.runningSignupTrial(daysLeft: 3, reference: Date()))
         } else if scenario == "paid" {
             gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+        } else if scenario == "inactive-no-trial" {
+            gate.apply(try WhoamiFixture.signedInWithoutSubscription())
+            try #require(!gate.trialHasEnded && !gate.isActive && gate.lastAuthoritativeApplyAt != nil)
         } else {
             gate.apply(try WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: Date()))
         }
+        if ["local-purchase", "suppressed", "deferred"].contains(scenario) {
+            try #require((try await host.text(topOnly: true)).contains("help improve tabmail"))
+            switch scenario {
+            case "local-purchase":
+                gate.openGate()
+                try #require(gate.isActive && gate.trialHasEnded)
+            case "suppressed": scope.promptScope.prompt.doNotAskAgain()
+            default: scope.promptScope.prompt.notNow()
+            }
+        }
         let ended = try await host.text(topOnly: true)
         #expect(ended.contains("mailbox"))
-        #expect(ended.contains("help improve tabmail") == (scenario == "ended"), Comment(rawValue: "Rendered synthetic inbox: \(ended)"))
+        #expect(ended.contains("help improve tabmail") == (scenario == "ended"), Comment(rawValue: "Synthetic inbox [" + scenario + "]: " + ended))
         gate.noteSignedOut()
         let after = try await host.text(topOnly: true)
-        #expect(after.contains("mailbox"))
-        #expect(!after.contains("help improve tabmail"))
+        #expect(after.contains("mailbox") && !after.contains("help improve tabmail"))
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func theActualInboxUsesTheDefaultClientAndVisibleReasonsOnlyAfterSubmit() async throws {
+        PreviewMocks.hideAllTips()
+        let scope = FeedbackInboxScope()
+        defer { scope.close() }
+        let transport = try FeedbackSessionScope()
+        defer { transport.close() }
+        let automation = try FeedbackAccessibilityAutomation()
+        defer { automation.close() }
+        FeedbackPacketProtocol.state.withLock { $0 = .init(mode: .status(503)) }
+        AISubscriptionGate.shared.apply(try WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: Date()))
+        let host = try TrialFeedbackHost(feedbackInbox())
+        defer { host.close() }
+        var failure: (any Error)?
+        do {
+        try #require((try await host.text(topOnly: true)).contains("help improve tabmail"))
+        #expect(FeedbackPacketProtocol.state.withLock { $0.packets.isEmpty })
+        try await host.activate("inbox-trial-feedback")
+        try #require((try await host.text()).contains("main reason"))
+        #expect(FeedbackPacketProtocol.state.withLock { $0.packets.isEmpty })
+        let choices = [
+            ("price_value", "The price is higher than the value I get."),
+            ("not_enough_use", "I haven't used it enough to decide."),
+            ("missing_feature", "It's missing something I need."),
+            ("ai_reliability", "The AI results aren't reliable enough for me."),
+            ("existing_workflow", "I prefer my existing email workflow."),
+            ("other_or_prefer_not_to_say", "Another reason / prefer not to say.")
+        ]
+        for (index, choice) in choices.enumerated() {
+            try await host.activate("trial-feedback-reason-" + choice.0, expectedLabel: choice.1)
+            let preceding = index == 0 ? 0 : index + 1
+            #expect(FeedbackPacketProtocol.state.withLock { $0.packets.count } == preceding)
+            FeedbackPacketProtocol.state.withLock { $0.mode = .status(index == choices.count - 1 ? 204 : 503) }
+            try await host.activate("trial-feedback-submit")
+            for _ in 0..<200 {
+                if FeedbackPacketProtocol.state.withLock({ $0.packets.count > preceding }) { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let packets = FeedbackPacketProtocol.state.withLock { $0.packets }
+            try #require(packets.count == preceding + 1)
+            let body = try #require(JSONSerialization.jsonObject(with: packets[preceding].body) as? [String: String])
+            #expect(body == ["questionnaire_version": "trial-v1", "reason": choice.0])
+            #expect(packets[preceding].url == TrialFeedbackConfig.endpoint)
+            if index != choices.count - 1 {
+                #expect(try await host.containsText("couldn't confirm delivery"))
+                #expect(!scope.promptScope.prompt.isSuppressed)
+                if index == 0 {
+                    // Retry the retained choice without selecting again.
+                    try await host.activate("trial-feedback-submit")
+                    for _ in 0..<200 {
+                        if FeedbackPacketProtocol.state.withLock({ $0.packets.count == 2 }) { break }
+                        try await Task.sleep(for: .milliseconds(10))
+                    }
+                    let retryPackets = FeedbackPacketProtocol.state.withLock { $0.packets }
+                    try #require(retryPackets.count == 2)
+                    let retryBody = try #require(JSONSerialization.jsonObject(with: retryPackets[1].body) as? [String: String])
+                    #expect(retryBody == ["questionnaire_version": "trial-v1", "reason": choice.0])
+                    #expect(try await host.containsText("couldn't confirm delivery"))
+                }
+            }
+        }
+        for _ in 0..<200 {
+            if scope.promptScope.prompt.isSuppressed { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(scope.promptScope.prompt.isSuppressed)
+        try await host.waitForSheetDismissal()
+        #expect(!(try await host.text(topOnly: true)).contains("help improve tabmail"))
+        #expect(transport.createdCount == choices.count + 1)
+        #expect(FeedbackPacketProtocol.state.withLock { $0.packets.count } == choices.count + 1)
+        } catch { failure = error }
+        AISubscriptionGate.shared.noteSignedOut()
+        try await host.waitForSheetDismissal()
+        if let failure { throw failure }
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func cancelledThrowingSubmissionDoesNotPublishAnErrorOrPersistSuppression() async throws {
+        let name = "TrialFeedbackThrowingCancellation.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        let prompt = TrialFeedbackPromptState(defaults: defaults)
+        let client = FeedbackSubmitter(held: true)
+        let flow = TrialFeedbackFlow(prompt: prompt, client: client)
+        flow.selectedReason = .other
+        let task = Task { await flow.submit() }
+        for _ in 0..<100 {
+            if await client.reasons.count == 1 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(await client.reasons.count == 1)
+        task.cancel()
+        await client.release(failing: true)
+        await task.value
+        #expect(!flow.isSubmitting && !flow.isComplete && !prompt.isSuppressed)
+        #expect(flow.errorText == nil)
+        #expect(await client.reasons == [.other])
+        #expect(defaults.persistentDomain(forName: name) == nil || defaults.persistentDomain(forName: name)?.isEmpty == true)
     }
 }
