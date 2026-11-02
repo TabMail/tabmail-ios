@@ -6,6 +6,7 @@ import Foundation
 import Darwin
 import ObjectiveC
 import SwiftUI
+import Observation
 import UIKit
 import Vision
 import Synchronization
@@ -399,6 +400,30 @@ struct TrialFeedbackFlowTests {
         return (name, defaults, TrialFeedbackPromptState(defaults: defaults))
     }
 
+    @Test func automaticInvitationIsOfferedOnceAcrossLaunchesWithoutSavingAnAccountOrAnswer() throws {
+        let (name, defaults, prompt) = try fixture()
+        defer { defaults.removePersistentDomain(forName: name) }
+        #expect(prompt.claimAutomaticPresentation())
+        #expect(!prompt.claimAutomaticPresentation())
+        let nextLaunch = TrialFeedbackPromptState(defaults: defaults)
+        #expect(!nextLaunch.isSuppressed && !nextLaunch.deferredThisRun)
+        #expect(!nextLaunch.claimAutomaticPresentation())
+        let saved = try #require(defaults.persistentDomain(forName: name))
+        #expect(Set(saved.keys) == ["trialFeedback.automaticPresentationShown"])
+        #expect(saved["trialFeedback.automaticPresentationShown"] as? Bool == true)
+    }
+
+    @Test(arguments: [false, true])
+    func localDismissalPreventsAnAutomaticInvitation(suppress: Bool) throws {
+        let (name, defaults, prompt) = try fixture()
+        defer { defaults.removePersistentDomain(forName: name) }
+        if suppress { prompt.doNotAskAgain() } else { prompt.notNow() }
+        #expect(!prompt.claimAutomaticPresentation())
+        #expect(!prompt.automaticPresentationShown)
+        let nextLaunch = TrialFeedbackPromptState(defaults: defaults)
+        #expect(nextLaunch.claimAutomaticPresentation() == !suppress)
+    }
+
     @Test func noSelectionAndLocalDismissalsSendNothing() async throws {
         let (name, defaults, prompt) = try fixture()
         defer { defaults.removePersistentDomain(forName: name) }
@@ -542,28 +567,41 @@ private final class FeedbackSharedPromptScope {
     private let suppressed: Bool
     private let deferred: Bool
     private let stored: Any?
+    private let automaticShown: Bool
+    private let storedAutomatic: Any?
     private let key = "trialFeedback.suppressed"
-    init() {
+    private let automaticKey = "trialFeedback.automaticPresentationShown"
+    init(automaticWasShown: Bool = true) {
         suppressed = prompt.isSuppressed
         deferred = prompt.deferredThisRun
         stored = UserDefaults.standard.object(forKey: key)
-        prompt.restoreTestSnapshot(suppressed: false, deferred: false)
+        automaticShown = prompt.automaticPresentationShown
+        storedAutomatic = UserDefaults.standard.object(forKey: automaticKey)
+        // Manual-entry tests represent an installation already offered the popup.
+        prompt.restoreTestSnapshot(suppressed: false, deferred: false, automaticShown: automaticWasShown)
         UserDefaults.standard.removeObject(forKey: key)
+        UserDefaults.standard.removeObject(forKey: automaticKey)
     }
     func close() {
         if let stored { UserDefaults.standard.set(stored, forKey: key) }
         else { UserDefaults.standard.removeObject(forKey: key) }
-        prompt.restoreTestSnapshot(suppressed: suppressed, deferred: deferred)
+        if let storedAutomatic { UserDefaults.standard.set(storedAutomatic, forKey: automaticKey) }
+        else { UserDefaults.standard.removeObject(forKey: automaticKey) }
+        prompt.restoreTestSnapshot(suppressed: suppressed, deferred: deferred, automaticShown: automaticShown)
     }
 }
 
 @MainActor
 private final class FeedbackInboxScope {
-    let promptScope = FeedbackSharedPromptScope()
+    let promptScope: FeedbackSharedPromptScope
     private let active = AISubscriptionGate.shared.isActive
     private let ended = AISubscriptionGate.shared.trialHasEnded
     private let demo = DemoModeStore.shared.isActive
-    init() { AISubscriptionGate.shared.noteSignedOut(); DemoModeStore.shared.isActive = false }
+    init(automaticWasShown: Bool = true) {
+        promptScope = FeedbackSharedPromptScope(automaticWasShown: automaticWasShown)
+        AISubscriptionGate.shared.noteSignedOut()
+        DemoModeStore.shared.isActive = false
+    }
     func close() {
         let gate = AISubscriptionGate.shared
         let restored = ended
@@ -584,6 +622,16 @@ private func feedbackInbox(hasSession: Bool = true, otherFolder: Bool = false) -
         InboxView(title: "Mailbox", folders: [folder], selection: .unified(otherFolder ? .sent : .inbox),
             selectedMessageId: .constant(nil), pushedMessageId: .constant(nil))
     }.environment(NavigationStore()).environment(\.hasTabMailSession, hasSession)
+}
+
+@MainActor @Observable
+private final class FeedbackSceneState {
+    var phase = ScenePhase.inactive
+}
+
+private struct FeedbackForegroundInbox: View {
+    let state: FeedbackSceneState
+    var body: some View { feedbackInbox().environment(\.scenePhase, state.phase) }
 }
 
 @MainActor
@@ -689,6 +737,65 @@ private final class TrialFeedbackHost {
 @MainActor
 struct TrialFeedbackViewTests {
     @Test(arguments: [false, true])
+    func expiredInboxAutomaticallyOffersTheFormOnForegroundWithoutSendingAndDoesNotRepeat(knownBeforeMount: Bool) async throws {
+        PreviewMocks.hideAllTips()
+        let scope = FeedbackInboxScope(automaticWasShown: false)
+        defer { scope.close() }
+        let transport = try FeedbackSessionScope()
+        defer { transport.close() }
+        let automation = try FeedbackAccessibilityAutomation()
+        defer { automation.close() }
+        FeedbackPacketProtocol.state.withLock { $0 = .init(mode: .status(204)) }
+        let state = FeedbackSceneState()
+        let expired = try WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: Date())
+        if knownBeforeMount { AISubscriptionGate.shared.apply(expired) }
+        let host = try TrialFeedbackHost(FeedbackForegroundInbox(state: state))
+        defer { host.close() }
+        if !knownBeforeMount { AISubscriptionGate.shared.apply(expired) }
+        #expect(!(try await host.text()).contains("your trial has ended"))
+        #expect(!scope.promptScope.prompt.automaticPresentationShown)
+        state.phase = .active
+        let opened = try await host.text()
+        try #require(opened.contains("your trial has ended") && opened.contains("main reason"))
+        #expect(scope.promptScope.prompt.automaticPresentationShown)
+        #expect(FeedbackPacketProtocol.state.withLock { $0.packets.isEmpty })
+        try await host.activate("trial-feedback-not-now")
+        try await host.waitForSheetDismissal()
+        #expect(scope.promptScope.prompt.deferredThisRun)
+        // The stored once-only choice must hold independently of the run deferral.
+        scope.promptScope.prompt.restoreTestSnapshot(suppressed: false, deferred: false, automaticShown: true)
+        state.phase = .inactive
+        _ = try await host.text(topOnly: true)
+        state.phase = .active
+        #expect(!(try await host.text()).contains("your trial has ended"))
+        #expect(FeedbackPacketProtocol.state.withLock { $0.packets.isEmpty })
+    }
+
+    @Test(arguments: ["unknown", "demo", "no-session", "other-folder", "paid", "running", "inactive-no-trial", "local-purchase", "suppressed", "deferred"])
+    func automaticInvitationDoesNotConsumeItsOnceOnlyChoiceOutsideEligibility(scenario: String) async throws {
+        PreviewMocks.hideAllTips()
+        let scope = FeedbackInboxScope(automaticWasShown: false)
+        defer { scope.close() }
+        let gate = AISubscriptionGate.shared
+        switch scenario {
+        case "unknown": break
+        case "paid": gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true))
+        case "running": gate.apply(try WhoamiFixture.runningSignupTrial(daysLeft: 3, reference: Date()))
+        case "inactive-no-trial": gate.apply(try WhoamiFixture.signedInWithoutSubscription())
+        default: gate.apply(try WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: Date()))
+        }
+        if scenario == "demo" { DemoModeStore.shared.isActive = true }
+        if scenario == "local-purchase" { gate.openGate() }
+        if scenario == "suppressed" { scope.promptScope.prompt.doNotAskAgain() }
+        if scenario == "deferred" { scope.promptScope.prompt.notNow() }
+        let host = try TrialFeedbackHost(feedbackInbox(hasSession: scenario != "no-session", otherFolder: scenario == "other-folder")
+            .environment(\.scenePhase, .active))
+        defer { host.close() }
+        #expect(!(try await host.text()).contains("your trial has ended"))
+        #expect(!scope.promptScope.prompt.automaticPresentationShown)
+    }
+
+    @Test(arguments: [false, true])
     func openingTheFormIsOptionalAndDoesNotSubmit(dark: Bool) async throws {
         let name = "TrialFeedbackViews.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: name))
@@ -700,6 +807,7 @@ struct TrialFeedbackViewTests {
         defer { host.close() }
         let text = try await host.text()
         #expect(text.contains("help improve tabmail"))
+        #expect(text.contains("your trial has ended"))
         #expect(text.contains("not now"))
         #expect(text.contains("price is higher"))
         #expect(text.contains("haven't used it enough"))

@@ -8,6 +8,7 @@ struct InboxTrialFeedback: View {
     let isInbox: Bool
     let isDemo: Bool
     let hasSession: Bool
+    @Environment(\.scenePhase) private var scenePhase
     @State private var presented = false
     private let prompt = TrialFeedbackPromptState.shared
 
@@ -51,9 +52,19 @@ struct InboxTrialFeedback: View {
         }) {
             TrialFeedbackForm(flow: TrialFeedbackFlow(prompt: prompt))
         }
-        .onChange(of: eligible) { _, canInvite in
+        .onChange(of: eligible, initial: true) { _, canInvite in
             if !canInvite, !prompt.isSuppressed { presented = false }
+            presentAutomaticallyIfNeeded()
         }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { presentAutomaticallyIfNeeded() }
+        }
+    }
+
+    private func presentAutomaticallyIfNeeded() {
+        guard eligible, scenePhase == .active, !presented,
+              prompt.claimAutomaticPresentation() else { return }
+        presented = true
     }
 }
 
@@ -92,6 +103,10 @@ struct TrialFeedbackForm: View {
                         Button("Done") { dismiss() }
                     }
                 } else {
+                    Section {
+                        Text("Your trial has ended").font(.headline)
+                        Text("Help TabMail grow by sharing why you haven't subscribed.")
+                    }
                     Section("What's the main reason you haven't subscribed?") {
                         ForEach(TrialFeedbackReason.allCases) { reason in
                             Button {
@@ -111,8 +126,7 @@ struct TrialFeedbackForm: View {
                         }
                     }
                     Section {
-                        Text("Optional feedback to help improve TabMail. We send your selected reason without attaching your TabMail account, email or a device identifier. We keep answer totals.")
-                        Text("Cloudflare processes network information such as your IP address to deliver and protect this request.")
+                        Text("Feedback is optional. Technical information, including IP addresses, may be processed to deliver and protect your response.")
                         Link("Privacy Policy", destination: URL(string: "https://tabmail.ai/privacy")!)
                     }
                     .font(.footnote)

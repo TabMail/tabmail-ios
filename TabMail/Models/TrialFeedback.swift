@@ -26,18 +26,29 @@ enum TrialFeedbackReason: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-/// One device-level choice, with no account key, answer or submission ID stored.
+/// Device-local invitation state, with no account key, answer or submission ID stored.
 @MainActor @Observable
 final class TrialFeedbackPromptState {
     static let shared = TrialFeedbackPromptState()
     private static let suppressionKey = "trialFeedback.suppressed"
+    private static let automaticPresentationKey = "trialFeedback.automaticPresentationShown"
     private let defaults: UserDefaults
     private(set) var isSuppressed: Bool
     private(set) var deferredThisRun = false
+    private(set) var automaticPresentationShown: Bool
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         isSuppressed = defaults.bool(forKey: Self.suppressionKey)
+        automaticPresentationShown = defaults.bool(forKey: Self.automaticPresentationKey)
+    }
+
+    /// One local invitation across launches, shared by every mounted inbox.
+    func claimAutomaticPresentation() -> Bool {
+        guard !isSuppressed, !deferredThisRun, !automaticPresentationShown else { return false }
+        automaticPresentationShown = true
+        defaults.set(true, forKey: Self.automaticPresentationKey)
+        return true
     }
 
     func notNow() { deferredThisRun = true }
@@ -50,9 +61,10 @@ final class TrialFeedbackPromptState {
     #if DEBUG
     /// Native tests restore the shared in-memory choice after exercising the
     /// real inbox. The test scope restores its UserDefaults snapshot separately.
-    func restoreTestSnapshot(suppressed: Bool, deferred: Bool) {
+    func restoreTestSnapshot(suppressed: Bool, deferred: Bool, automaticShown: Bool = false) {
         isSuppressed = suppressed
         deferredThisRun = deferred
+        automaticPresentationShown = automaticShown
     }
     #endif
 }
