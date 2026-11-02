@@ -637,12 +637,12 @@ private struct FeedbackForegroundInbox: View {
 @MainActor
 private final class TrialFeedbackHost {
     private let window: UIWindow
-    private let controller: UIViewController
+    private let controller: UIHostingController<AnyView>
 
     init<V: View>(_ view: V, dark: Bool = false, largeText: Bool = false) throws {
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        controller = UIHostingController(rootView: view.environment(\.locale, Locale(identifier: "en_US"))
-            .dynamicTypeSize(largeText ? .accessibility3 : .large))
+        controller = UIHostingController(rootView: AnyView(view.environment(\.locale, Locale(identifier: "en_US"))
+            .dynamicTypeSize(largeText ? .accessibility3 : .large)))
         window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
         window.overrideUserInterfaceStyle = dark ? .dark : .light
@@ -652,13 +652,15 @@ private final class TrialFeedbackHost {
     }
 
     func close() {
+        controller.rootView = AnyView(EmptyView())
+        controller.view.layoutIfNeeded()
         window.isHidden = true
         controller.view.removeFromSuperview()
         window.rootViewController = nil
     }
 
     private var activeView: UIView {
-        var active = controller
+        var active: UIViewController = controller
         while let presented = active.presentedViewController { active = presented }
         return active.view
     }
@@ -1052,5 +1054,34 @@ struct TrialFeedbackViewTests {
         #expect(flow.errorText == nil)
         #expect(await client.reasons == [.other])
         #expect(defaults.persistentDomain(forName: name) == nil || defaults.persistentDomain(forName: name)?.isEmpty == true)
+    }
+}
+
+@Suite("Trial feedback active inbox opening", .serialized, .processGlobalState)
+@MainActor
+struct TrialFeedbackActiveOpeningTests {
+    @Test(arguments: [false, true])
+    func anActiveEligibleInboxOffersFeedbackWhetherAuthorityPrecedesOrFollowsMount(knownBeforeMount: Bool) async throws {
+        PreviewMocks.hideAllTips()
+        let scope = FeedbackInboxScope(automaticWasShown: false)
+        defer { scope.close() }
+        let transport = try FeedbackSessionScope()
+        defer { transport.close() }
+        FeedbackPacketProtocol.state.withLock { $0 = .init(mode: .status(204)) }
+        let expired = try WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: Date())
+        if knownBeforeMount { AISubscriptionGate.shared.apply(expired) }
+        let host = try TrialFeedbackHost(feedbackInbox().environment(\.scenePhase, .active))
+        defer { host.close() }
+        if !knownBeforeMount {
+            let before = try await host.text()
+            try #require(before.contains("mailbox") && !before.contains("your trial has ended"))
+            AISubscriptionGate.shared.apply(expired)
+        }
+        let visible = try await host.text()
+        #expect(visible.contains("your trial has ended") && visible.contains("main reason"),
+            Comment(rawValue: "An eligible active inbox must offer the form without another foreground transition; knownBeforeMount=\(knownBeforeMount)"))
+        #expect(FeedbackPacketProtocol.state.withLock { $0.packets.isEmpty })
+        AISubscriptionGate.shared.noteSignedOut()
+        try await host.waitForSheetDismissal()
     }
 }
