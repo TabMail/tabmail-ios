@@ -195,15 +195,24 @@ private final class TrialCountdownInboxHost {
     let window: UIWindow
     private var controller: UIViewController?
 
-    init(demo: Bool = false, otherFolder: Bool = false, dark: Bool = false, largeText: Bool = false) throws {
+    init(demo: Bool = false, otherFolder: Bool = false, dark: Bool = false, largeText: Bool = false, navigationParent: Bool = false) throws {
         PreviewMocks.hideAllTips()
         DemoModeStore.shared.isActive = demo
         let folder = Folder(name: "Inbox", path: "INBOX", role: otherFolder ? .sent : .inbox, accountId: UUID().uuidString)
-        let view = NavigationStack {
-            InboxView(title: "Mailbox", folders: [folder], selection: .unified(otherFolder ? .sent : .inbox),
-                      selectedMessageId: .constant(nil), pushedMessageId: .constant(nil))
+        let navigation = NavigationStore()
+        navigation.folders = [folder]
+        let content: AnyView
+        if navigationParent {
+            content = AnyView(MailNavigationView())
+        } else {
+            content = AnyView(NavigationStack {
+                InboxView(title: "Mailbox", folders: [folder], selection: .unified(otherFolder ? .sent : .inbox),
+                          selectedMessageId: .constant(nil), pushedMessageId: .constant(nil))
+            })
         }
-        .environment(NavigationStore())
+        let view = content
+        .environment(navigation)
+        .environment(StoreKitManager())
         .environment(\.hasTabMailSession, true)
         .environment(\.locale, Locale(identifier: "en_US"))
         .dynamicTypeSize(largeText ? .accessibility3 : .large)
@@ -521,5 +530,129 @@ private final class CountdownAccessibilityAutomation {
     func close() {
         setter(original)
         dlclose(handle)
+    }
+}
+
+@Suite("Trial countdown boundary behavior", .serialized, .processGlobalState)
+@MainActor
+struct TrialCountdownBoundaryTests {
+    @Test func noSubscriptionPurchaseRefreshRetainsThePriorAuthoritativeNotice() throws {
+        let scope = TrialCountdownGateScope()
+        defer { scope.close() }
+        let gate = AISubscriptionGate.shared
+        let now = Date()
+        gate.apply(try WhoamiFixture.runningSignupTrial(daysLeft: 3, reference: now), now: now)
+        let prior = try #require(gate.trialCountdownNotice)
+        gate.openGate()
+        let raced = try WhoamiFixture.signedInWithoutSubscription()
+        try #require(raced.hasSubscription == false)
+        gate.refreshAfterLocalPurchase(raced, now: now.addingTimeInterval(1))
+        #expect(gate.trialCountdownNotice == prior)
+        #expect(gate.lastAuthoritativeApplyAt == now)
+        #expect(gate.isActive && !gate.trialHasEnded)
+        gate.apply(try WhoamiFixture.accountInfo(hasSubscription: true), now: now)
+        #expect(gate.trialCountdownNotice == nil)
+    }
+
+    @Test(arguments: ["apple", "stripe"])
+    func purchasedTrialUsesTheExactAuthoritativeDeadline(provider: String) throws {
+        let now = Date()
+        let info = try WhoamiFixture.cardTrial(provider: provider, planTier: "Basic", daysLeft: 4, reference: now)
+        let rawEnd = try #require(info.trial?.trialEnd)
+        let promisedEnd = Date(timeIntervalSince1970: Double(rawEnd))
+        let notice = try #require(TrialCountdownNotice.from(info, now: now))
+        #expect(notice.end == promisedEnd)
+        #expect(notice.presentation(now: promisedEnd.addingTimeInterval(-1)) != nil)
+        #expect(notice.presentation(now: promisedEnd) == nil)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func foregroundAndClockChangesKeepAnUnexpiredReminderVisible() async throws {
+        let scope = TrialCountdownGateScope()
+        defer { scope.close() }
+        let gate = AISubscriptionGate.shared
+        let now = Date()
+        gate.apply(try WhoamiFixture.runningSignupTrial(daysLeft: 3, reference: now), now: now)
+        let notice = try #require(gate.trialCountdownNotice)
+        let phase = CountdownPhase()
+        let starts = CountdownTaskStarts()
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let controller = UIHostingController(rootView: CountdownClockProbe(notice: notice, phase: phase, starts: starts))
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true; controller.view.removeFromSuperview(); window.rootViewController = nil }
+        func waitFor(_ count: Int) async throws {
+            for _ in 0..<100 {
+                if starts.values.count >= count { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+            try #require(starts.values.count == count)
+        }
+        func renderedText() async throws -> String {
+            try await Task.sleep(for: .milliseconds(100))
+            let view = try #require(controller.view)
+            view.layoutIfNeeded()
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            format.opaque = true
+            var drawn = false
+            let image = UIGraphicsImageRenderer(bounds: view.bounds, format: format).image { _ in
+                drawn = view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+            }
+            try #require(drawn)
+            let request = VNRecognizeTextRequest()
+            request.revision = VNRecognizeTextRequestRevision3
+            request.recognitionLevel = .accurate
+            request.recognitionLanguages = ["en-US"]
+            request.usesLanguageCorrection = false
+            try VNImageRequestHandler(cgImage: try #require(image.cgImage), options: [:]).perform([request])
+            return try #require(request.results).compactMap { $0.topCandidates(1).first?.string }
+                .joined(separator: " ").lowercased()
+        }
+        try await waitFor(1)
+        try #require((try await renderedText()).contains("3 days left"))
+        phase.value = .active
+        try await waitFor(2)
+        #expect((try await renderedText()).contains("3 days left"))
+        NotificationCenter.default.post(name: UIApplication.significantTimeChangeNotification, object: nil)
+        try await waitFor(3)
+        #expect((try await renderedText()).contains("3 days left"))
+        #expect(gate.trialCountdownNotice == notice)
+        #expect(gate.lastAuthoritativeApplyAt == now)
+        #expect(gate.isActive && !gate.trialHasEnded)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func theRenderedReminderOpensTheRealPlansDestination() async throws {
+        try #require(!TabMailAuthService.hasSession())
+        let defaults = UserDefaults.standard
+        let pushKey = PushConfig.pushNotificationsEnabledKey
+        let previousPush = defaults.object(forKey: pushKey)
+        defaults.set(false, forKey: pushKey)
+        defer {
+            if let previousPush { defaults.set(previousPush, forKey: pushKey) }
+            else { defaults.removeObject(forKey: pushKey) }
+        }
+        try #require(!PendingPlanNavigationLatch.isSet())
+        let automation = try CountdownAccessibilityAutomation()
+        defer { automation.close() }
+        let scope = TrialCountdownGateScope()
+        defer { scope.close() }
+        AISubscriptionGate.shared.apply(try WhoamiFixture.runningSignupTrial(daysLeft: 3, reference: Date()))
+        let host = try TrialCountdownInboxHost(navigationParent: true)
+        defer { host.close() }
+        let before = try await host.text()
+        try #require(before.contains("3 days left"), Comment(rawValue: "Synthetic navigation before activation: " + before))
+        #expect(!before.contains("choose a plan"))
+        try await host.activateReminder()
+        var after = ""
+        for _ in 0..<20 {
+            after = try await host.text()
+            if after.contains("choose a plan") { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(after.contains("choose a plan"), Comment(rawValue: "Synthetic navigation destination: " + after))
     }
 }
