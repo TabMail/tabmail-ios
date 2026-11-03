@@ -29,7 +29,9 @@ struct InboxTrialReminder: View {
         .padding(.horizontal)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity)
-        .background(Color.blue.opacity(0.08))
+        // Tint the row only: by default a background bleeds into the safe
+        // area and would tint the navigation and status bars above it.
+        .background(Color.blue.opacity(0.08), ignoresSafeAreaEdges: [])
     }
 
     /// The row's text, or `nil` when the row must not show. Only a running
