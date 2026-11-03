@@ -22,6 +22,10 @@ enum AccountPlanConfig {
     /// `subscription_provider` value that marks the server-granted signup trial —
     /// as opposed to a purchase made through a payment provider.
     static let signupProviderKey = "signup"
+    /// Length of the free trial a new subscription starts with. Must match the
+    /// introductory offer configured in App Store Connect (and the Stripe trial);
+    /// the plan picker words its banner by comparing the days left against it.
+    static let subscriptionTrialDays = 7
 }
 
 /// The account's free-trial state as the CLIENT sees it.
