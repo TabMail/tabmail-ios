@@ -37,7 +37,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | ProviderWorkQueue Cancellation Semantics (2026-06-09) | [read in full](Companion/Memory/Current/012-providerworkqueue-cancellation-semantics-2026-06-09.md) |
 | FTS Tokenizer — NO tokenchars (ADR-024, 2026-06-09, lockstep with Rust crate) | [read in full](Companion/Memory/Current/013-fts-tokenizer-no-tokenchars-adr-024-2026-06-09-lockstep-with-rust-crate.md) |
 | SwiftUI preview convention | [read in full](Companion/Memory/Current/014-swiftui-preview-convention.md) |
-| Inbox usage-throttle banner (ADR-IOS-044) | [read in full](Companion/Memory/Current/015-inbox-usage-throttle-banner-adr-ios-044.md) |
+| Inbox usage-throttle banner (ADR-IOS-044); `UsageThrottleStore.trialState` + inbox trial reminder row (`InboxTrialReminder`, "Free trial · N days left", Plans) | [read in full](Companion/Memory/Current/015-inbox-usage-throttle-banner-adr-ios-044.md) |
 | Remote Search (SearchView) | [read in full](Companion/Memory/Current/016-remote-search-searchview.md) |
 | FTS↔GRDB id drift (folder baked into the key) — "indexed but unfindable" / wrong-subject class | [read in full](Companion/Memory/Current/017-fts-grdb-id-drift-folder-baked-into-the-key-indexed-but-unfindable-wrong.md) |
 | "Searchable but can't open / no snippet / not in its folder" — GRDB-side stuck headers (NOT FTS orphans), IMAP (under investigation 2026-06-22) | [read in full](Companion/Memory/Current/018-searchable-but-can-t-open-no-snippet-not-in-its-folder-grdb-side-stuck-h.md) |

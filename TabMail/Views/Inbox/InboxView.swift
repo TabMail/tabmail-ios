@@ -441,6 +441,15 @@ struct InboxView: View {
                     }
                 }
 
+                if let trialReminder = InboxTrialReminder.text(
+                    for: UsageThrottleStore.shared.trialState,
+                    isInbox: isInboxView,
+                    isSignedIn: hasTabMailSession,
+                    isDemo: DemoModeStore.shared.isActive
+                ) {
+                    InboxTrialReminder(text: trialReminder)
+                }
+
                 if isInboxView {
                     TipView(archiveOldEmailsTip)
                         .padding(.horizontal)
