@@ -22,7 +22,7 @@ struct PlanPickerView: View {
                 // Free-trial state from the backend: this banner describes the
                 // server-granted trial the account already has (or had), so the
                 // page never implies the user still needs to start one.
-                if let trialBanner = trialBannerCopy {
+                if let trialBanner = Self.trialBannerCopy(for: accountInfo?.trialState()) {
                     StatusBanner(icon: trialBanner.icon, text: trialBanner.text, color: trialBanner.color)
                 }
 
@@ -269,17 +269,12 @@ struct PlanPickerView: View {
     // MARK: - Helpers
 
     /// Banner describing the account's free trial, or `nil` when there is none
-    /// to describe.
+    /// to describe. A pure function of the trial state, so its copy can be
+    /// tested without building the view.
     ///
     /// The active copy says subscribing resets the free trial and makes no
     /// claim about durations, dates or when billing starts — that is Apple's
     /// purchase sheet's story, and the offer can change without a copy change.
-    private var trialBannerCopy: (icon: String, text: String, color: Color)? {
-        Self.trialBannerCopy(for: accountInfo?.trialState())
-    }
-
-    /// The banner for a trial state, as a pure function so its copy can be
-    /// tested without building the view.
     nonisolated static func trialBannerCopy(for trialState: TrialState?) -> (icon: String, text: String, color: Color)? {
         switch trialState {
         case .active(let daysRemaining):
