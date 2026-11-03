@@ -271,15 +271,21 @@ struct PlanPickerView: View {
     /// Banner describing the account's free trial, or `nil` when there is none
     /// to describe.
     ///
-    /// The active copy says the trial ends and deliberately makes no claim
-    /// about when billing starts — that is Apple's purchase sheet's story. The
-    /// forfeiture of the remaining server-trial days is true either way.
+    /// The active copy says subscribing resets the free trial and makes no
+    /// claim about durations, dates or when billing starts — that is Apple's
+    /// purchase sheet's story, and the offer can change without a copy change.
     private var trialBannerCopy: (icon: String, text: String, color: Color)? {
-        switch accountInfo?.trialState() {
+        Self.trialBannerCopy(for: accountInfo?.trialState())
+    }
+
+    /// The banner for a trial state, as a pure function so its copy can be
+    /// tested without building the view.
+    nonisolated static func trialBannerCopy(for trialState: TrialState?) -> (icon: String, text: String, color: Color)? {
+        switch trialState {
         case .active(let daysRemaining):
             let unit = daysRemaining == 1 ? "day" : "days"
             return ("clock",
-                    "Free trial · \(daysRemaining) \(unit) left. Subscribing now ends the trial.",
+                    "Free trial · \(daysRemaining) \(unit) left. Subscribing resets your free trial.",
                     .blue)
         case .ended:
             return ("clock.badge.exclamationmark",

@@ -1,3 +1,17 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note:** amended 2026-11-03, after this fragment was pinned. Where the text below
+> and the pinned body differ, this text wins.
+>
+> Point 4's closing sentence, "Zero NEVER has a trial (D8).", no longer holds. Zero now gets the
+> same App Store free-trial introductory offer as Basic and Pro (owner, 2026-11-03). Subscribing to
+> any plan, Zero included, ends the server-granted signup trial, and the subscription starts with
+> Apple's free trial. Apple decides eligibility itself (one introductory offer per subscription
+> group).
+>
+> No client logic changes with this. Since issue #55 (2026-08-19) the plan cards advertise no
+> introductory offer at all, and Apple's purchase sheet shows the trial, the price and the first
+> charge date. The plan picker's trial banner now reads "Subscribing resets your free trial."
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-040: Zero (BYOK) Plan in the IAP Plan Picker — Three-Tier, Display-Only Naming
 
