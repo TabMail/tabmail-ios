@@ -167,12 +167,12 @@ struct AccountDashboardView: View {
                     }
                     .listRowBackground(Palette.boxBg)
 
-                    // Renewal
+                    // Renewal, or when a card-free signup trial ends
                     LabeledContent {
                         Text(accountInfo?.billingPeriodEnd.map { formatTimestamp($0) } ?? "—")
                             .foregroundStyle(Palette.textMuted)
                     } label: {
-                        Label("Renewal", systemImage: "calendar")
+                        Label(Self.periodEndLabel(for: accountInfo?.trialState() ?? .noTrial), systemImage: "calendar")
                             .foregroundStyle(.primary)
                     }
                     .listRowBackground(Palette.boxBg)
@@ -535,6 +535,17 @@ struct AccountDashboardView: View {
             guard let trial = accountInfo?.trial, trial.isTrial else { return nil }
             let suffix = trial.trialEnd.map { " until \(formatTimestamp($0))" } ?? ""
             return ("clock", "Trial active" + suffix, .blue)
+        }
+    }
+
+    /// Label for the period-end date row. A card-free signup trial just ends,
+    /// with no charge and nothing renewing, so only a real subscription says
+    /// "Renewal".
+    nonisolated static func periodEndLabel(for trialState: TrialState) -> String {
+        switch trialState {
+        case .active: return "Trial ends"
+        case .ended: return "Trial ended"
+        case .noTrial: return "Renewal"
         }
     }
 
