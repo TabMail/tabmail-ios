@@ -47,6 +47,10 @@ final class UsageThrottleStore: @unchecked Sendable {
     private(set) var isThrottled: Bool = false
     /// Whether the user has at least one of their own provider API keys set.
     private(set) var hasOwnAPIKeys: Bool = false
+    /// Signup-trial state from the last `/whoami`; drives the inbox trial
+    /// reminder. In-memory like the rest of this store, so a cold launch shows
+    /// nothing until the first `/whoami` lands.
+    private(set) var trialState: TrialState = .noTrial
     /// True once `update(from:)` has run at least once this launch. The banner
     /// stays hidden until then to avoid a boot-time flash.
     private(set) var hasCheckedOnce: Bool = false
@@ -81,6 +85,7 @@ final class UsageThrottleStore: @unchecked Sendable {
     @MainActor
     func update(from info: AccountInfo) {
         planTier = info.planTier
+        trialState = info.trialState()
         isThrottled = (info.queueMode == "slow") || ((info.quotaPercentage ?? 0) >= 100)
         hasOwnAPIKeys = AIService.shared.byokBundle != nil
         hasCheckedOnce = true
