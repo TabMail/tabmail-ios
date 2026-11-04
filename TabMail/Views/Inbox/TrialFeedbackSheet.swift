@@ -59,6 +59,7 @@ struct TrialFeedbackSheet: View {
     /// setter only refuses leaves the refused text on screen while Send sends
     /// the older value.
     @State private var fieldText = ""
+    @AppStorage(TrialFeedback.sentKey) private var sent = false
     @Environment(\.dismiss) private var dismiss
 
     init(form: TrialFeedbackForm) {
@@ -95,6 +96,7 @@ struct TrialFeedbackSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button(TrialFeedback.sendLabel) {
                         form.send()
+                        sent = true
                         dismiss()
                     }
                     .disabled(!form.canSend)
@@ -122,18 +124,50 @@ struct TrialFeedbackSheet: View {
     }
 }
 
-/// Presents `TrialFeedbackSheet` over the inbox once per install (see
-/// `TrialFeedback.shouldPresent`). It is marked asked when the sheet
-/// appears, so Send, Not now, a swipe down, or the app closing while it is
-/// open all end it for good.
-struct TrialFeedbackPresenter: ViewModifier {
-    let isInbox: Bool
-    let isSomethingPresented: @MainActor () -> Bool
+/// Whether the trial-feedback sheet is up. One per app: the sheet is hosted
+/// once (`trialFeedbackSheetHost()` on `MailNavigationView`), and the inbox's
+/// one-time auto-open and both trial-ended banners' Feedback buttons all go
+/// through `open()`.
+@MainActor
+@Observable
+final class TrialFeedbackPresentation {
+    static let shared = TrialFeedbackPresentation()
+
+    var isPresented = false
+
+    func open() {
+        isPresented = true
+    }
+}
+
+/// Hosts `TrialFeedbackSheet`. It is marked asked when the sheet appears, so
+/// after Send, Not now, a swipe down, or the app closing while it is open it
+/// never opens by itself again (the banners can still open it).
+struct TrialFeedbackSheetHost: ViewModifier {
+    let presentation: TrialFeedbackPresentation
     let makeForm: @MainActor () -> TrialFeedbackForm
+
+    @AppStorage(TrialFeedback.askedKey) private var alreadyAsked = false
+
+    func body(content: Content) -> some View {
+        @Bindable var presentation = presentation
+        content
+            .sheet(isPresented: $presentation.isPresented) {
+                TrialFeedbackSheet(form: makeForm())
+                    .onAppear { alreadyAsked = true }
+            }
+    }
+}
+
+/// Opens the sheet by itself once per install, the first time the inbox
+/// appears while the question is due (see `TrialFeedback.shouldPresent`).
+struct TrialFeedbackAutoOpen: ViewModifier {
+    let isInbox: Bool
+    let presentation: TrialFeedbackPresentation
+    let isSomethingPresented: @MainActor () -> Bool
 
     @Environment(\.hasTabMailSession) private var hasTabMailSession
     @AppStorage(TrialFeedback.askedKey) private var alreadyAsked = false
-    @State private var isPresented = false
 
     /// Everything but "something else is presented", which is read only at
     /// the moment of presenting; a change here re-checks.
@@ -150,17 +184,13 @@ struct TrialFeedbackPresenter: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .onAppear(perform: presentIfDue)
-            .onChange(of: isDue) { presentIfDue() }
-            .sheet(isPresented: $isPresented) {
-                TrialFeedbackSheet(form: makeForm())
-                    .onAppear { alreadyAsked = true }
-            }
+            .onAppear(perform: openIfDue)
+            .onChange(of: isDue) { openIfDue() }
     }
 
-    private func presentIfDue() {
-        guard isDue, !isPresented, !isSomethingPresented() else { return }
-        isPresented = true
+    private func openIfDue() {
+        guard isDue, !presentation.isPresented, !isSomethingPresented() else { return }
+        presentation.open()
     }
 
     /// Whether the key window already presents something (a sheet or a
@@ -177,13 +207,21 @@ struct TrialFeedbackPresenter: ViewModifier {
 }
 
 extension View {
-    /// The one-time trial-feedback sheet, presented over this view when it is
-    /// the inbox and the question is due.
-    func trialFeedbackSheet(
-        isInbox: Bool,
-        isSomethingPresented: @escaping @MainActor () -> Bool = TrialFeedbackPresenter.keyWindowIsPresenting,
+    /// Hosts the trial-feedback sheet. Attach once, at the app's mail root.
+    func trialFeedbackSheetHost(
+        presentation: TrialFeedbackPresentation = .shared,
         makeForm: @escaping @MainActor () -> TrialFeedbackForm = { TrialFeedbackForm() }
     ) -> some View {
-        modifier(TrialFeedbackPresenter(isInbox: isInbox, isSomethingPresented: isSomethingPresented, makeForm: makeForm))
+        modifier(TrialFeedbackSheetHost(presentation: presentation, makeForm: makeForm))
+    }
+
+    /// Opens the trial-feedback sheet by itself once, when this view is the
+    /// inbox and the question is due.
+    func trialFeedbackAutoOpen(
+        isInbox: Bool,
+        presentation: TrialFeedbackPresentation = .shared,
+        isSomethingPresented: @escaping @MainActor () -> Bool = TrialFeedbackAutoOpen.keyWindowIsPresenting
+    ) -> some View {
+        modifier(TrialFeedbackAutoOpen(isInbox: isInbox, presentation: presentation, isSomethingPresented: isSomethingPresented))
     }
 }

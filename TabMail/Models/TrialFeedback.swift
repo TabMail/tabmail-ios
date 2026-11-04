@@ -26,9 +26,18 @@ enum TrialFeedback {
     /// the server checks (it refuses a longer one rather than cutting it).
     static let commentMaxCodePoints = 500
 
-    /// UserDefaults key: set once the sheet has appeared on this install.
-    /// Not user data, only "already asked".
+    /// The inbox row once the trial has ended (`InboxTrialReminder`).
+    static let bannerEndedText = "Free trial ended"
+    static let bannerFeedbackLabel = "Feedback"
+
+    /// UserDefaults key: set once the sheet has appeared on this install, so
+    /// it opens by itself only once. Not user data, only "already asked".
     static let askedKey = "trial_feedback_asked"
+
+    /// UserDefaults key: set once an answer was SENT on this install; hides
+    /// the row's Feedback button. Not now and closing the app leave it unset,
+    /// so the user can still answer from the row. Not user data.
+    static let sentKey = "trial_feedback_sent"
 
     /// The choices, in display order. Raw values are the server's reason keys.
     enum Reason: String, CaseIterable, Identifiable, Sendable {
@@ -66,6 +75,12 @@ enum TrialFeedback {
         somethingPresented: Bool
     ) -> Bool {
         isInbox && hasSession && !isDemo && trialState == .ended && !alreadyAsked && !somethingPresented
+    }
+
+    /// Whether a trial-ended banner (the inbox row and the folder list's
+    /// subscribe banner) offers Feedback: only until an answer was sent.
+    static func offersFeedback(sent: Bool) -> Bool {
+        !sent
     }
 
     /// Whether a comment is within the cap, counted as the server counts.

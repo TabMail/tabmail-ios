@@ -10,7 +10,9 @@ import UIKit
 @testable import TabMail
 
 /// The anonymous trial-feedback sheet (`TrialFeedback`, `TrialFeedbackForm`,
-/// `TrialFeedbackSheet`, `trialFeedbackSheet(isInbox:)`).
+/// `TrialFeedbackSheet`, `TrialFeedbackPresentation`, `trialFeedbackSheetHost()`,
+/// `trialFeedbackAutoOpen(isInbox:)`) and the trial-ended banners' Feedback
+/// buttons (`InboxTrialReminder`, the folder list's subscribe banner).
 ///
 /// INVARIANTS:
 /// - It is presented only over the inbox of a signed-in, non-demo user whose
@@ -22,6 +24,9 @@ import UIKit
 /// - The comment field never holds more than the server's cap (500 code
 ///   points), and what Send sends is what the field shows.
 /// - Nothing about the answer is written to the local log.
+/// - Once the trial ended (no subscription), the inbox row reads "Free trial
+///   ended" and both banners offer Feedback, which opens the same sheet, until
+///   an answer was SENT; Not now leaves it offered.
 @Suite("Trial feedback", .serialized, .processGlobalState)
 struct TrialFeedbackTests {
 
@@ -311,10 +316,12 @@ struct TrialFeedbackTests {
     private struct Presented {
         let window: UIWindow
         let host: UIViewController
+        let presentation: TrialFeedbackPresentation
         let defaults: UserDefaults
         let suiteName: String
     }
 
+    /// The inbox's auto-open and the app's one sheet host, as the app wires them.
     @MainActor
     private static func presentInbox(
         alreadyAsked: Bool = false,
@@ -325,16 +332,14 @@ struct TrialFeedbackTests {
         let suiteName = "TrialFeedbackTests-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         if alreadyAsked { defaults.set(true, forKey: TrialFeedback.askedKey) }
+        let presentation = TrialFeedbackPresentation()
         let root = Color.clear
-            .trialFeedbackSheet(
-                isInbox: isInbox,
-                isSomethingPresented: { somethingPresented },
-                makeForm: makeForm
-            )
+            .trialFeedbackAutoOpen(isInbox: isInbox, presentation: presentation, isSomethingPresented: { somethingPresented })
+            .trialFeedbackSheetHost(presentation: presentation, makeForm: makeForm)
             .environment(\.hasTabMailSession, true)
             .defaultAppStorage(defaults)
         let host = UIHostingController(rootView: root)
-        return Presented(window: try window(host), host: host, defaults: defaults, suiteName: suiteName)
+        return Presented(window: try window(host), host: host, presentation: presentation, defaults: defaults, suiteName: suiteName)
     }
 
     @MainActor
@@ -419,19 +424,32 @@ struct TrialFeedbackTests {
         await Self.close(presented)
     }
 
+    @Test("A banner's Feedback opens the sheet even after it opened by itself once")
+    @MainActor
+    func feedbackOpensTheSheetAfterAsked() async throws {
+        try Self.endTrial()
+        defer { Self.resetTrial() }
+        let presented = try Self.presentInbox(alreadyAsked: true)
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(presented.host.presentedViewController == nil)
+        presented.presentation.open() // what both banners' Feedback buttons call
+        try await Task.sleep(for: .milliseconds(800))
+        #expect(presented.host.presentedViewController != nil)
+        await Self.close(presented)
+    }
+
     @Test("The default presented check sees a sheet already up in the key window")
     @MainActor
     func keyWindowPresentedCheck() async throws {
         let root = UIViewController()
         let window = try Self.window(root)
         defer { window.isHidden = true; window.rootViewController = nil }
-        #expect(TrialFeedbackPresenter.keyWindowIsPresenting() == false)
+        #expect(TrialFeedbackAutoOpen.keyWindowIsPresenting() == false)
         root.present(UIViewController(), animated: false)
-        #expect(TrialFeedbackPresenter.keyWindowIsPresenting())
+        #expect(TrialFeedbackAutoOpen.keyWindowIsPresenting())
         root.dismiss(animated: false)
         try await Task.sleep(for: .milliseconds(200))
     }
-
 
     // MARK: - The sheet's own controls
 
@@ -451,7 +469,7 @@ struct TrialFeedbackTests {
         UIApplication.shared.sendAction(action, to: item.target, from: item, for: nil)
     }
 
-    @Test("Send is off until a choice is picked, then sends that choice once and closes the sheet")
+    @Test("Send is off until a choice is picked, then sends that choice once, closes the sheet and marks it sent")
     @MainActor
     func toolbarSend() async throws {
         try Self.endTrial()
@@ -470,15 +488,20 @@ struct TrialFeedbackTests {
         #expect(form.selected == .notUsedEnough)
         let enabled = try #require(Self.barItem("Send", in: sheet.view))
         #expect(enabled.isEnabled)
+        #expect(presented.defaults.bool(forKey: TrialFeedback.sentKey) == false)
         try Self.tap(enabled)
         try await Task.sleep(for: .milliseconds(800))
         #expect(delivered.withLock { $0 } == [.notUsedEnough])
         #expect(presented.host.presentedViewController == nil)
         #expect(presented.defaults.bool(forKey: TrialFeedback.askedKey))
+        // Sent hides the banners' Feedback button.
+        let sent = presented.defaults.bool(forKey: TrialFeedback.sentKey)
+        #expect(sent)
+        #expect(TrialFeedback.offersFeedback(sent: sent) == false)
         await Self.close(presented)
     }
 
-    @Test("Not now closes the sheet, sends nothing, and it is not asked again")
+    @Test("Not now closes the sheet, sends nothing, is not asked again, and leaves Feedback offered")
     @MainActor
     func toolbarNotNow() async throws {
         try Self.endTrial()
@@ -493,22 +516,131 @@ struct TrialFeedbackTests {
         #expect(presented.host.presentedViewController == nil)
         #expect(delivered.withLock { $0 } == 0)
         #expect(presented.defaults.bool(forKey: TrialFeedback.askedKey))
+        let sent = presented.defaults.bool(forKey: TrialFeedback.sentKey)
+        #expect(sent == false)
+        #expect(TrialFeedback.offersFeedback(sent: sent))
         await Self.close(presented)
     }
 
-    /// The inbox is too large to host here, so its one attachment is read from
-    /// source: `InboxView` attaches the presenter exactly once, gated on the
-    /// inbox (the presenter gates everything else, tested above).
-    @Test("The inbox attaches the sheet once, for the inbox view only")
-    func inboxAttachesTheSheet() throws {
-        let projectRoot = URL(fileURLWithPath: #filePath)
+    // MARK: - The trial-ended banners
+
+    @Test("Feedback is offered until an answer was sent")
+    func offersFeedbackUntilSent() {
+        #expect(TrialFeedback.bannerEndedText == "Free trial ended")
+        #expect(TrialFeedback.bannerFeedbackLabel == "Feedback")
+        #expect(TrialFeedback.offersFeedback(sent: false))
+        #expect(TrialFeedback.offersFeedback(sent: true) == false)
+    }
+
+    /// Each body is decoded by the real `/whoami` parser into the store the
+    /// inbox reads.
+    @Test("The inbox shows the running-trial row, the ended row, or nothing, per account state")
+    @MainActor
+    func inboxRowPerState() throws {
+        let now = Date()
+        let store = UsageThrottleStore.shared
+        defer { Self.resetTrial() }
+        func rows(isInbox: Bool = true, isSignedIn: Bool = true, isDemo: Bool = false) -> (String?, String?) {
+            (InboxTrialReminder.text(for: store.trialState, isInbox: isInbox, isSignedIn: isSignedIn, isDemo: isDemo),
+             InboxTrialReminder.endedText(for: store.trialState, isInbox: isInbox, isSignedIn: isSignedIn, isDemo: isDemo))
+        }
+
+        store.update(from: try WhoamiFixture.runningSignupTrial(daysLeft: 3, reference: now))
+        #expect(rows().0 == "Free trial · 3 days left")
+        #expect(rows().1 == nil)
+
+        store.update(from: try WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: now))
+        #expect(rows().0 == nil)
+        #expect(rows().1 == "Free trial ended")
+        #expect(rows(isInbox: false).1 == nil)
+        #expect(rows(isSignedIn: false).1 == nil)
+        #expect(rows(isDemo: true).1 == nil)
+
+        // Subscribing makes it disappear.
+        store.update(from: try WhoamiFixture.accountInfo(hasSubscription: true, planTier: AccountPlanConfig.basicTierKey, provider: "apple"))
+        #expect(rows().0 == nil)
+        #expect(rows().1 == nil)
+
+        // BYOK and no trial show nothing either.
+        store.update(from: try WhoamiFixture.accountInfo(hasSubscription: true, planTier: AccountPlanConfig.byokTierKey, provider: "stripe"))
+        #expect(rows().1 == nil)
+        store.update(from: try WhoamiFixture.signedInWithoutSubscription())
+        #expect(rows().1 == nil)
+    }
+
+    @Test("The ended-state matrix: only a signed-in, non-demo inbox with an ended trial gets the ended row")
+    func endedRowMatrix() {
+        let states: [TrialState] = [.noTrial, .active(daysRemaining: 1), .ended]
+        for state in states {
+            for isInbox in [true, false] {
+                for isSignedIn in [true, false] {
+                    for isDemo in [true, false] {
+                        let expected = state == .ended && isInbox && isSignedIn && !isDemo
+                        #expect(
+                            (InboxTrialReminder.endedText(for: state, isInbox: isInbox, isSignedIn: isSignedIn, isDemo: isDemo) != nil) == expected,
+                            "state=\(state) inbox=\(isInbox) signedIn=\(isSignedIn) demo=\(isDemo)"
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Wiring read from source
+
+    /// The project root, for reading view sources too large to host here.
+    private static var projectRoot: URL {
+        URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let text = try String(
-            contentsOf: projectRoot.appendingPathComponent("TabMail/Views/Inbox/InboxView.swift"),
-            encoding: .utf8)
-        #expect(text.components(separatedBy: ".trialFeedbackSheet(isInbox: isInboxView)").count - 1 == 1)
-        #expect(text.components(separatedBy: ".trialFeedbackSheet(").count - 1 == 1)
+    }
+
+    /// A source file with every run of whitespace made one space.
+    private static func source(_ path: String) throws -> String {
+        let text = try String(contentsOf: projectRoot.appendingPathComponent(path), encoding: .utf8)
+        return text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    private static func count(_ needle: String, in text: String) -> Int {
+        text.components(separatedBy: needle).count - 1
+    }
+
+    @Test("The app hosts the sheet exactly once, at the mail root")
+    func oneSheetHost() throws {
+        let root = Self.projectRoot.appendingPathComponent("TabMail")
+        let files = try #require(FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil))
+        var hosts: [String] = []
+        for case let url as URL in files where url.pathExtension == "swift" {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            let uses = Self.count(".trialFeedbackSheetHost(", in: text)
+            hosts += Array(repeating: url.lastPathComponent, count: uses)
+        }
+        #expect(hosts == ["MailNavigationView.swift"])
+    }
+
+    @Test("The inbox auto-opens it once and its ended row offers Feedback until sent")
+    func inboxWiring() throws {
+        let text = try Self.source("TabMail/Views/Inbox/InboxView.swift")
+        #expect(Self.count(".trialFeedbackAutoOpen(isInbox: isInboxView)", in: text) == 1)
+        #expect(Self.count(".trialFeedbackAutoOpen(", in: text) == 1)
+        #expect(Self.count("@AppStorage(TrialFeedback.sentKey) private var trialFeedbackSent = false", in: text) == 1)
+        #expect(Self.count("} else if let trialEnded = InboxTrialReminder.endedText( for: UsageThrottleStore.shared.trialState, isInbox: isInboxView, isSignedIn: hasTabMailSession, isDemo: DemoModeStore.shared.isActive ) { InboxTrialReminder( text: trialEnded, onFeedback: TrialFeedback.offersFeedback(sent: trialFeedbackSent) ? { TrialFeedbackPresentation.shared.open() } : nil ) }", in: text) == 1)
+        // The row draws Feedback, before Plans, exactly when given the action.
+        let row = try Self.source("TabMail/Views/Shared/InboxTrialReminder.swift")
+        #expect(Self.count("if let onFeedback { Button(TrialFeedback.bannerFeedbackLabel, action: onFeedback)", in: row) == 1)
+        let feedbackAt = try #require(row.range(of: "Button(TrialFeedback.bannerFeedbackLabel")).lowerBound
+        let plansAt = try #require(row.range(of: "Button(\"Plans\")")).lowerBound
+        #expect(feedbackAt < plansAt)
+    }
+
+    @Test("The folder list's subscribe banner offers Feedback only for an ended trial, until sent, apart from its Plans tap")
+    func sidebarWiring() throws {
+        let text = try Self.source("TabMail/Views/MailNavigationView.swift")
+        #expect(Self.count("private var showsTrialEndedCopy: Bool { hasTabMailSession && trialHasEnded }", in: text) == 1)
+        #expect(Self.count("@AppStorage(TrialFeedback.sentKey) private var trialFeedbackSent = false", in: text) == 1)
+        #expect(Self.count("if showsTrialEndedCopy, TrialFeedback.offersFeedback(sent: trialFeedbackSent) { Button(TrialFeedback.bannerFeedbackLabel) { TrialFeedbackPresentation.shared.open() }", in: text) == 1)
+        // Feedback is its own button, not inside the Plans button's label.
+        #expect(Self.count("Button(action: subscribeBannerTapped)", in: text) == 2)
     }
 }
