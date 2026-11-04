@@ -75,14 +75,15 @@ struct TrialFeedbackSheet: View {
                 } header: {
                     Text(TrialFeedback.question)
                         .textCase(nil)
+                } footer: {
+                    // Right under the choices, so it shows at the medium detent before Send.
+                    Text(TrialFeedback.footnote)
                 }
                 Section {
                     TextField(TrialFeedback.commentPlaceholder, text: $fieldText, axis: .vertical)
                         .onChange(of: fieldText) { previous, proposed in
                             if !form.edit(proposed) { fieldText = previous }
                         }
-                } footer: {
-                    Text(TrialFeedback.footnote)
                 }
             }
             .navigationTitle(TrialFeedback.navigationTitle)
