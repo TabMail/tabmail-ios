@@ -168,6 +168,12 @@ branch. Census both when adding a provider.
 > The suppression cohort the bullet protects no longer needs protecting: with no ASC offer,
 > there is nothing Apple could grant on top of a running signup trial. Everything else in this
 > file — the derivation, the gate seam, the banner rules — is untouched and current.
+>
+> ⚠️ **UPDATE 2026-11-03:** the first bullet's plan-picker quote *"Subscribing now ends the trial"* is
+> history too. Every subscription, Zero included, now starts with its own App Store free trial
+> (ADR-IOS-040 current note), so for a running signup trial the plan-picker banner always reads
+> "Free trial · N days left. Subscribing ends this trial and starts a new 7-day free trial."
+> (`PlanPickerView.trialBannerCopy(for:)`; the 7 is `AccountPlanConfig.subscriptionTrialDays`).
 
 - `StoreKitManager.checkTrialEligibility()` and `PlanCard.showsTrialBadge` stay. They gate on
   `product.subscription?.introductoryOffer != nil`, so removing the App Store Connect introductory
