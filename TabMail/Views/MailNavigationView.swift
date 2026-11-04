@@ -56,6 +56,8 @@ struct MailNavigationView: View {
     /// no banner, which means a signed-in user who reaches this banner either
     /// never had a trial or has just run out of one.
     @State private var trialHasEnded = AISubscriptionGate.shared.trialHasEnded
+    /// Hides the subscribe banner's Feedback button once an answer was sent.
+    @AppStorage(TrialFeedback.sentKey) private var trialFeedbackSent = false
     /// Emails whose server-side push consent is in `error`/`missing` state per
     /// the most recent foreground scan (or a consent-error notification tap).
     /// Populated by `.pushConsentErrorsDetected`. Empty → banner hidden.
@@ -171,6 +173,80 @@ struct MailNavigationView: View {
             : "Subscribe to unlock AI-powered features"
     }
 
+    /// The subscribe banner's icon.
+    private var subscribeBannerIcon: some View {
+        Image(systemName: "sparkles")
+            .font(.title3)
+            .foregroundStyle(Palette.accentColor)
+    }
+
+    /// The subscribe banner's title and subtitle.
+    private var subscribeBannerTexts: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(subscribeBannerTitle)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Palette.textColor)
+            Text(subscribeBannerSubtitle)
+                .font(.caption)
+                .foregroundStyle(Palette.textMuted)
+        }
+    }
+
+    /// The subscribe banner's content: icon, title and subtitle, chevron.
+    private var subscribeBannerLabel: some View {
+        HStack(spacing: 12) {
+            subscribeBannerIcon
+            subscribeBannerTexts
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Palette.textMuted)
+        }
+    }
+
+    /// The banner once the trial has ended (owner 2026-11-03): the text is not
+    /// a tap target and has no chevron; a filled See Plans button does what
+    /// the banner tap does, and a text button under it opens the feedback
+    /// sheet until an answer was sent. Two non-default-styled buttons in one
+    /// List row take only their own taps.
+    private var trialEndedBanner: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 12) {
+                subscribeBannerIcon
+                subscribeBannerTexts
+                Spacer()
+            }
+            Button(action: subscribeBannerTapped) {
+                Text("See Plans")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .buttonBorderShape(.capsule)
+            if TrialFeedback.offersFeedback(sent: trialFeedbackSent) {
+                Button(TrialFeedback.folderListFeedbackLabel) { TrialFeedbackPresentation.shared.open() }
+                    .font(.subheadline)
+                    .buttonStyle(.borderless)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// The subscribe banner's tap: Plans when signed in, else sign-in.
+    private func subscribeBannerTapped() {
+        if hasTabMailSession {
+            selection = .planPicker
+        } else {
+            // Signed out — entitlement unknowable here.
+            // Arm the latch; the entitlement-aware
+            // consumer (`consumePendingPlanNavigation`)
+            // decides after sign-in's authoritative
+            // /whoami lands.
+            PendingPlanNavigationLatch.set()
+            showSignInSheet = true
+        }
+    }
+
     /// Entitlement-aware consumption of the `pending_plan_navigation` latch.
     /// Invoked from the `.onChange(of: lastAuthoritativeApplyAt, initial:
     /// true)` observer in `body`, so it runs at mount and after every
@@ -229,37 +305,12 @@ struct MailNavigationView: View {
                     //   `hasCheckedSubscription` hides the banner until we know.
                     if !hasTabMailSession || (hasCheckedSubscription && !hasActiveSubscription) {
                         Section {
-                            Button {
-                                if hasTabMailSession {
-                                    selection = .planPicker
-                                } else {
-                                    // Signed out — entitlement unknowable here.
-                                    // Arm the latch; the entitlement-aware
-                                    // consumer (`consumePendingPlanNavigation`)
-                                    // decides after sign-in's authoritative
-                                    // /whoami lands.
-                                    PendingPlanNavigationLatch.set()
-                                    showSignInSheet = true
+                            if showsTrialEndedCopy {
+                                trialEndedBanner
+                            } else {
+                                Button(action: subscribeBannerTapped) {
+                                    subscribeBannerLabel.padding(.vertical, 4)
                                 }
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Image(systemName: "sparkles")
-                                        .font(.title3)
-                                        .foregroundStyle(Palette.accentColor)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(subscribeBannerTitle)
-                                            .font(.subheadline.weight(.semibold))
-                                            .foregroundStyle(Palette.textColor)
-                                        Text(subscribeBannerSubtitle)
-                                            .font(.caption)
-                                            .foregroundStyle(Palette.textMuted)
-                                    }
-                                    Spacer()
-                                    Image(systemName: "chevron.right")
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(Palette.textMuted)
-                                }
-                                .padding(.vertical, 4)
                             }
                         }
                     }
@@ -576,6 +627,7 @@ struct MailNavigationView: View {
                 showsTutorialReplay = false
             }, isReplay: true)
         }
+        .trialFeedbackSheetHost()
         .sheet(isPresented: $showSignInSheet) {
             TabMailLoginView {
                 showSignInSheet = false

@@ -6,7 +6,10 @@ import Foundation
 import Testing
 @testable import TabMail
 
-@Suite("Inbox trial reminder")
+/// `.processGlobalState`: `latestAccountDecides` writes the process-wide
+/// `UsageThrottleStore.shared`, which the trial-feedback suite also writes, so
+/// both suites take the shared lock and cannot interleave in one run.
+@Suite("Inbox trial reminder", .processGlobalState)
 struct InboxTrialReminderTests {
 
     private func text(_ state: TrialState, isInbox: Bool = true, isSignedIn: Bool = true, isDemo: Bool = false) -> String? {
@@ -73,8 +76,8 @@ struct InboxTrialReminderTests {
     func wiring() throws {
         #expect(try Self.count(in: "TabMail/Views/Inbox/InboxView.swift",
             "if let trialReminder = InboxTrialReminder.text( for: UsageThrottleStore.shared.trialState, isInbox: isInboxView, isSignedIn: hasTabMailSession, isDemo: DemoModeStore.shared.isActive ) { InboxTrialReminder(text: trialReminder) }") == 1)
-        #expect(try Self.count(in: "TabMail/Views/Inbox/InboxView.swift", "InboxTrialReminder") == 2,
-            "one call site in the inbox")
+        #expect(try Self.count(in: "TabMail/Views/Inbox/InboxView.swift", "InboxTrialReminder") == 4,
+            "two call sites in the inbox: the running-trial row and the trial-ended row")
         #expect(try Self.count(in: "TabMail/Views/Shared/InboxTrialReminder.swift",
             "Button(\"Plans\") { NotificationCenter.default.post(name: .navigateToPlanPicker, object: nil) }") == 1)
         #expect(try Self.count(in: "TabMail/Services/AI/UsageThrottleStore.swift",

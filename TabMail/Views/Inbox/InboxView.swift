@@ -215,6 +215,8 @@ struct InboxView: View {
     @Binding var pushedMessageId: String?
     @Environment(NavigationStore.self) private var navigationStore
     @Environment(\.hasTabMailSession) private var hasTabMailSession
+    /// Hides the trial-ended row's Feedback button once an answer was sent.
+    @AppStorage(TrialFeedback.sentKey) private var trialFeedbackSent = false
     // Read sync-status env at struct level so InboxView's body re-runs on any
     // change — needed so the `.toolbar { ... }` content closure re-invokes and
     // the UIKit navigation bar picks up the refreshed subtitle. Reading these
@@ -448,6 +450,17 @@ struct InboxView: View {
                     isDemo: DemoModeStore.shared.isActive
                 ) {
                     InboxTrialReminder(text: trialReminder)
+                } else if let trialEnded = InboxTrialReminder.endedText(
+                    for: UsageThrottleStore.shared.trialState,
+                    isInbox: isInboxView,
+                    isSignedIn: hasTabMailSession,
+                    isDemo: DemoModeStore.shared.isActive
+                ) {
+                    InboxTrialReminder(
+                        text: trialEnded,
+                        onFeedback: TrialFeedback.offersFeedback(sent: trialFeedbackSent)
+                            ? { TrialFeedbackPresentation.shared.open() } : nil
+                    )
                 }
 
                 if isInboxView {
@@ -863,6 +876,7 @@ struct InboxView: View {
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
         }
+        .trialFeedbackAutoOpen(isInbox: isInboxView)
         .onChange(of: navigationStore.folderKeySet) {
             // Re-resolve matching folders when folder list structure OR any folder role changes.
             // Key is a Set so ORDER churn from NavigationStore doesn't trigger spurious reloads

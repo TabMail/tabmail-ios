@@ -56,6 +56,13 @@ enum BackendConfig {
             : URL(string: "https://billing.tabmail.ai")!
     }
 
+    /// The forms worker's public, anonymous trial-feedback endpoint (`TrialFeedback`).
+    static var trialFeedbackURL: URL {
+        useDevServers
+            ? URL(string: "https://forms-dev.tabmail.ai/feedback/trial")!
+            : URL(string: "https://forms.tabmail.ai/feedback/trial")!
+    }
+
     static var appleWebhookBaseURL: URL {
         useDevServers
             ? URL(string: "https://apple-webhook-dev.tabmail.ai")!
