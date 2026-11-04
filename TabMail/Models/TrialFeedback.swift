@@ -29,6 +29,8 @@ enum TrialFeedback {
     /// The inbox row once the trial has ended (`InboxTrialReminder`).
     static let bannerEndedText = "Free trial ended"
     static let bannerFeedbackLabel = "Feedback"
+    /// SF Symbol on the banners' Feedback button.
+    static let bannerFeedbackSymbol = "bubble.left"
 
     /// UserDefaults key: set once the sheet has appeared on this install, so
     /// it opens by itself only once. Not user data, only "already asked".
@@ -112,7 +114,7 @@ enum TrialFeedback {
 
     /// Send one answer, once. No retry: a lost answer is acceptable. The
     /// debug log says only whether it went; never the answer itself.
-    static func send(_ reason: Reason, comment: String, session: URLSession = sharedEphemeralSession) async {
+    static func send(_ reason: Reason, comment: String, session: URLSession) async {
         do {
             let (_, response) = try await session.data(for: request(for: reason, comment: comment))
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0

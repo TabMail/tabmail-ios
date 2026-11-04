@@ -24,15 +24,16 @@ struct InboxTrialReminder: View {
                 .foregroundStyle(Palette.textColor)
             Spacer(minLength: 8)
             if let onFeedback {
-                Button(TrialFeedback.bannerFeedbackLabel, action: onFeedback)
-                    .font(.caption.weight(.semibold))
-                    .buttonStyle(.borderless)
+                TrialFeedbackButton(action: onFeedback)
             }
+            // Plans is the row's main action: a small filled capsule.
             Button("Plans") {
                 NotificationCenter.default.post(name: .navigateToPlanPicker, object: nil)
             }
             .font(.caption.weight(.semibold))
-            .buttonStyle(.borderless)
+            .buttonStyle(.borderedProminent)
+            .buttonBorderShape(.capsule)
+            .controlSize(.mini)
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
@@ -58,5 +59,23 @@ struct InboxTrialReminder: View {
     nonisolated static func endedText(for trialState: TrialState, isInbox: Bool, isSignedIn: Bool, isDemo: Bool) -> String? {
         guard isInbox, isSignedIn, !isDemo, trialState == .ended else { return nil }
         return TrialFeedback.bannerEndedText
+    }
+}
+
+/// The trial-ended banners' secondary action: a small gray bordered capsule
+/// that opens the feedback sheet. Shared by the inbox row and the folder list
+/// so both look the same, and set apart from the filled Plans capsule.
+struct TrialFeedbackButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Label(TrialFeedback.bannerFeedbackLabel, systemImage: TrialFeedback.bannerFeedbackSymbol)
+        }
+        .font(.caption.weight(.semibold))
+        .buttonStyle(.bordered)
+        .buttonBorderShape(.capsule)
+        .controlSize(.mini)
+        .tint(.gray)
     }
 }

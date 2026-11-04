@@ -16,12 +16,12 @@ final class TrialFeedbackForm {
 
     var canSend: Bool { selected != nil && !isSent }
 
-    private let deliver: @Sendable (TrialFeedback.Reason, String) async -> Void
+    /// The transport Send posts on: the app's shared ephemeral session (no
+    /// cookies, no stored credentials); tests pass a fake one.
+    let session: URLSession
 
-    init(deliver: @escaping @Sendable (TrialFeedback.Reason, String) async -> Void = { reason, comment in
-        await TrialFeedback.send(reason, comment: comment)
-    }) {
-        self.deliver = deliver
+    init(session: URLSession = sharedEphemeralSession) {
+        self.session = session
     }
 
     func select(_ reason: TrialFeedback.Reason) {
@@ -45,20 +45,37 @@ final class TrialFeedbackForm {
         guard let reason = selected, !isSent else { return nil }
         isSent = true
         let text = comment
-        let deliver = deliver
-        return Task { await deliver(reason, text) }
+        let session = session
+        return Task { await TrialFeedback.send(reason, comment: text, session: session) }
     }
 }
 
 /// The one-time trial-feedback sheet: the five choices with a checkmark on
 /// the picked one, an optional comment, "Not now" and "Send".
+/// The comment field's text, equal only when every Unicode scalar is: Swift's
+/// `String ==` holds canonically equivalent text equal (a precomposed "é" and
+/// "e" plus a combining accent), so such a replacement would never reach the
+/// cap check and the field would show what Send does not send.
+struct ExactText: Equatable {
+    var value: String
+
+    static func == (lhs: ExactText, rhs: ExactText) -> Bool {
+        lhs.value.unicodeScalars.elementsEqual(rhs.value.unicodeScalars)
+    }
+}
+
 struct TrialFeedbackSheet: View {
     @State private var form: TrialFeedbackForm
     /// What the field shows. A refused edit puts the previous text back here,
     /// a real change of this state, so the text view redraws: a binding whose
     /// setter only refuses leaves the refused text on screen while Send sends
     /// the older value.
-    @State private var fieldText = ""
+    @State private var field = ExactText(value: "")
+    /// Bumped to rebuild the text view after a refused edit that is canonically
+    /// equal to the kept text: TextField compares with `String ==`, so it never
+    /// pushes such a value back to the text view, which would keep showing the
+    /// refused text.
+    @State private var fieldRevision = 0
     @AppStorage(TrialFeedback.sentKey) private var sent = false
     @Environment(\.dismiss) private var dismiss
 
@@ -81,9 +98,12 @@ struct TrialFeedbackSheet: View {
                     Text(TrialFeedback.footnote)
                 }
                 Section {
-                    TextField(TrialFeedback.commentPlaceholder, text: $fieldText, axis: .vertical)
-                        .onChange(of: fieldText) { previous, proposed in
-                            if !form.edit(proposed) { fieldText = previous }
+                    TextField(TrialFeedback.commentPlaceholder, text: $field.value, axis: .vertical)
+                        .id(fieldRevision)
+                        .onChange(of: field) { previous, proposed in
+                            guard !form.edit(proposed.value) else { return }
+                            field = previous
+                            if previous.value == proposed.value { fieldRevision += 1 }
                         }
                 }
             }
@@ -168,6 +188,9 @@ struct TrialFeedbackAutoOpen: ViewModifier {
 
     @Environment(\.hasTabMailSession) private var hasTabMailSession
     @AppStorage(TrialFeedback.askedKey) private var alreadyAsked = false
+    /// Whether the inbox is on screen: a pushed message detail hides it
+    /// without changing which folder it shows.
+    @State private var isShowing = false
 
     /// Everything but "something else is presented", which is read only at
     /// the moment of presenting; a change here re-checks.
@@ -184,12 +207,18 @@ struct TrialFeedbackAutoOpen: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .onAppear(perform: openIfDue)
-            .onChange(of: isDue) { openIfDue() }
+            .onAppear {
+                isShowing = true
+                openIfDue(showing: true)
+            }
+            .onDisappear { isShowing = false }
+            .onChange(of: isDue) { openIfDue(showing: isShowing) }
     }
 
-    private func openIfDue() {
-        guard isDue, !presentation.isPresented, !isSomethingPresented() else { return }
+    /// A late /whoami that makes it due while the inbox is hidden waits for
+    /// the inbox's next appearance.
+    private func openIfDue(showing: Bool) {
+        guard showing, isDue, !presentation.isPresented, !isSomethingPresented() else { return }
         presentation.open()
     }
 

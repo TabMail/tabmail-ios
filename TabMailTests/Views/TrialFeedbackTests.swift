@@ -126,14 +126,14 @@ struct TrialFeedbackTests {
     @Test("The field takes 500 code points and refuses the 501st; a longer paste is refused whole, never cut")
     @MainActor
     func commentCap() {
-        let form = TrialFeedbackForm(deliver: { _, _ in })
+        let form = TrialFeedbackForm(session: Self.unusedSession)
         let atMax = String(repeating: "😀", count: 500) // one code point each, as the server counts
         #expect(form.edit(atMax))
         #expect(form.comment == atMax)
         #expect(form.edit(atMax + "a") == false)
         #expect(form.comment == atMax)
 
-        let fresh = TrialFeedbackForm(deliver: { _, _ in })
+        let fresh = TrialFeedbackForm(session: Self.unusedSession)
         fresh.edit("ab")
         #expect(fresh.edit(String(repeating: "a", count: 510)) == false)
         #expect(fresh.comment == "ab")
@@ -141,13 +141,45 @@ struct TrialFeedbackTests {
         // A grapheme of several code points counts each one (7 for this family emoji).
         let family = "👨‍👩‍👧‍👦"
         #expect(family.unicodeScalars.count == 7)
-        let near = TrialFeedbackForm(deliver: { _, _ in })
+        let near = TrialFeedbackForm(session: Self.unusedSession)
         let nearMax = String(repeating: "a", count: 494)
         near.edit(nearMax)
         #expect(near.edit(nearMax + family) == false)
         #expect(near.comment == nearMax)
         #expect(near.edit(String(repeating: "a", count: 493) + family))
         #expect(near.comment.unicodeScalars.count == 500)
+    }
+
+    /// For forms that never send: a fake session with no routes.
+    private static let unusedSession = FakeHTTP.Scenario().session
+
+    /// The answers a fake worker received, decoded.
+    private static func answers(_ fake: FakeHTTP.Scenario) throws -> [[String: Any]] {
+        try fake.recordedCalls().map { call in
+            let data = try #require(call.body)
+            return try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+    }
+
+    /// A fake worker that takes every answer.
+    private static func acceptingWorker() -> FakeHTTP.Scenario {
+        let fake = FakeHTTP.Scenario()
+        fake.register(path: "/feedback/trial", method: "POST", response: .status(204))
+        return fake
+    }
+
+    /// The sheet hosted in a window, with its one comment text view focused.
+    @MainActor
+    private static func hostSheet(_ form: TrialFeedbackForm) async throws -> (UIWindow, UITextView) {
+        let host = UIHostingController(rootView: TrialFeedbackSheet(form: form))
+        let window = try Self.window(host)
+        try await Task.sleep(for: .milliseconds(300))
+        host.view.layoutIfNeeded()
+        let inputs = Self.descendants(host.view).compactMap { $0 as? UITextView }
+        try #require(inputs.count == 1)
+        let input = try #require(inputs.first)
+        try #require(input.becomeFirstResponder())
+        return (window, input)
     }
 
     @MainActor
@@ -169,17 +201,11 @@ struct TrialFeedbackTests {
     @Test("The real comment field never shows more than 500 code points, and Send sends what it shows")
     @MainActor
     func visibleFieldStopsAtCap() async throws {
-        let delivered = Mutex<[String]>([])
-        let form = TrialFeedbackForm(deliver: { _, comment in delivered.withLock { $0.append(comment) } })
-        let host = UIHostingController(rootView: TrialFeedbackSheet(form: form))
-        let window = try Self.window(host)
+        let worker = Self.acceptingWorker()
+        defer { worker.close() }
+        let form = TrialFeedbackForm(session: worker.session)
+        let (window, input) = try await Self.hostSheet(form)
         defer { window.isHidden = true; window.rootViewController = nil }
-        try await Task.sleep(for: .milliseconds(300))
-        host.view.layoutIfNeeded()
-        let inputs = Self.descendants(host.view).compactMap { $0 as? UITextView }
-        try #require(inputs.count == 1)
-        let input = try #require(inputs.first)
-        try #require(input.becomeFirstResponder())
         let max = String(repeating: "a", count: 500)
         input.insertText(max)
         try await Task.sleep(for: .milliseconds(200))
@@ -192,16 +218,61 @@ struct TrialFeedbackTests {
 
         form.select(.somethingElse)
         await form.send()?.value
-        #expect(delivered.withLock { $0 } == [max])
+        let sent = try Self.answers(worker)
+        #expect(sent.count == 1)
+        guard sent.count == 1 else { return }
+        #expect(sent[0]["comment"] as? String == max)
+    }
+
+    @Test("Replacing the text with canonically equal text of more than 500 code points is refused whole, and Send sends the bytes shown")
+    @MainActor
+    func canonicallyEqualReplacementRefused() async throws {
+        let worker = Self.acceptingWorker()
+        defer { worker.close() }
+        let form = TrialFeedbackForm(session: worker.session)
+        let (window, input) = try await Self.hostSheet(form)
+        defer { window.isHidden = true; window.rootViewController = nil }
+        // 500 precomposed "é" (500 scalars), then the same text decomposed
+        // ("e" + combining acute, 1,000 scalars): Swift's == holds them equal.
+        let composed = String(repeating: "\u{e9}", count: 500)
+        let decomposed = String(repeating: "e\u{301}", count: 500)
+        try #require(composed == decomposed)
+        input.insertText(composed)
+        try await Task.sleep(for: .milliseconds(300))
+        try #require(input.text.unicodeScalars.elementsEqual(composed.unicodeScalars))
+        input.selectedRange = NSRange(location: 0, length: input.text.utf16.count)
+        input.insertText(decomposed)
+        try await Task.sleep(for: .milliseconds(400))
+        input.resignFirstResponder()
+        // The field may rebuild its text view: read whichever one shows now.
+        let view = try #require(window.rootViewController?.view)
+        view.layoutIfNeeded()
+        let shownViews = Self.descendants(view).compactMap { $0 as? UITextView }
+        try #require(shownViews.count == 1)
+        let shown = try #require(shownViews.first)
+        #expect(shown.text.unicodeScalars.count == 500)
+        #expect(shown.text.unicodeScalars.elementsEqual(composed.unicodeScalars))
+        #expect(form.comment.unicodeScalars.elementsEqual(composed.unicodeScalars))
+
+        form.select(.somethingElse)
+        await form.send()?.value
+        let calls = worker.recordedCalls()
+        #expect(calls.count == 1)
+        guard calls.count == 1 else { return }
+        let body = try #require(calls[0].body)
+        let sent = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let comment = try #require(sent["comment"] as? String)
+        #expect(comment.unicodeScalars.elementsEqual(shown.text.unicodeScalars))
     }
 
     // MARK: - The form
 
     @Test("Send is off until a choice is picked, sends once, and sends the answer as it was at Send")
     @MainActor
-    func formSendsOnce() async {
-        let delivered = Mutex<[(TrialFeedback.Reason, String)]>([])
-        let form = TrialFeedbackForm(deliver: { reason, comment in delivered.withLock { $0.append((reason, comment)) } })
+    func formSendsOnce() async throws {
+        let worker = Self.acceptingWorker()
+        defer { worker.close() }
+        let form = TrialFeedbackForm(session: worker.session)
         #expect(form.canSend == false)
         #expect(form.send() == nil)
         form.edit("Needed calendar sync")
@@ -215,11 +286,17 @@ struct TrialFeedbackTests {
         #expect(form.canSend == false)
         #expect(form.send() == nil)
         await task?.value
-        let sent = delivered.withLock { $0 }
+        let sent = try Self.answers(worker)
         #expect(sent.count == 1)
         guard sent.count == 1 else { return }
-        #expect(sent[0].0 == .missingFeature)
-        #expect(sent[0].1 == "Needed calendar sync")
+        #expect(sent[0]["reason"] as? String == "missing_feature")
+        #expect(sent[0]["comment"] as? String == "Needed calendar sync")
+    }
+
+    @Test("A form posts on the app's shared ephemeral session unless given another")
+    @MainActor
+    func formUsesTheSharedEphemeralSession() {
+        #expect(TrialFeedbackForm().session === sharedEphemeralSession)
     }
 
     // MARK: - Send
@@ -319,6 +396,9 @@ struct TrialFeedbackTests {
         let presentation: TrialFeedbackPresentation
         let defaults: UserDefaults
         let suiteName: String
+        /// The fake worker the sheet's form posts to, and that form.
+        let worker: FakeHTTP.Scenario
+        let form: TrialFeedbackForm
     }
 
     /// The inbox's auto-open and the app's one sheet host, as the app wires them.
@@ -326,20 +406,22 @@ struct TrialFeedbackTests {
     private static func presentInbox(
         alreadyAsked: Bool = false,
         isInbox: Bool = true,
-        somethingPresented: Bool = false,
-        makeForm: @escaping @MainActor () -> TrialFeedbackForm = { TrialFeedbackForm(deliver: { _, _ in }) }
+        hasSession: Bool = true,
+        somethingPresented: Bool = false
     ) throws -> Presented {
         let suiteName = "TrialFeedbackTests-\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         if alreadyAsked { defaults.set(true, forKey: TrialFeedback.askedKey) }
         let presentation = TrialFeedbackPresentation()
+        let worker = acceptingWorker()
+        let form = TrialFeedbackForm(session: worker.session)
         let root = Color.clear
             .trialFeedbackAutoOpen(isInbox: isInbox, presentation: presentation, isSomethingPresented: { somethingPresented })
-            .trialFeedbackSheetHost(presentation: presentation, makeForm: makeForm)
-            .environment(\.hasTabMailSession, true)
+            .trialFeedbackSheetHost(presentation: presentation, makeForm: { form })
+            .environment(\.hasTabMailSession, hasSession)
             .defaultAppStorage(defaults)
         let host = UIHostingController(rootView: root)
-        return Presented(window: try window(host), host: host, presentation: presentation, defaults: defaults, suiteName: suiteName)
+        return Presented(window: try window(host), host: host, presentation: presentation, defaults: defaults, suiteName: suiteName, worker: worker, form: form)
     }
 
     @MainActor
@@ -349,6 +431,7 @@ struct TrialFeedbackTests {
         presented.window.isHidden = true
         presented.window.rootViewController = nil
         presented.defaults.removePersistentDomain(forName: presented.suiteName)
+        presented.worker.close()
     }
 
     @MainActor
@@ -424,6 +507,122 @@ struct TrialFeedbackTests {
         await Self.close(presented)
     }
 
+    @MainActor @Observable
+    final class Navigation {
+        var path: [Int] = []
+        var inboxShowing = false
+    }
+
+    /// An inbox in a navigation stack that can push a message detail over it,
+    /// with the app's auto-open on the inbox and its one host at the root.
+    private struct InboxWithDetail: View {
+        @Bindable var navigation: Navigation
+        let presentation: TrialFeedbackPresentation
+        let form: TrialFeedbackForm
+        let defaults: UserDefaults
+
+        var body: some View {
+            NavigationStack(path: $navigation.path) {
+                Text("Synthetic inbox")
+                    .onAppear { navigation.inboxShowing = true }
+                    .onDisappear { navigation.inboxShowing = false }
+                    .trialFeedbackAutoOpen(isInbox: true, presentation: presentation, isSomethingPresented: { false })
+                    .navigationDestination(for: Int.self) { _ in Text("Synthetic message") }
+            }
+            .trialFeedbackSheetHost(presentation: presentation, makeForm: { form })
+            .environment(\.hasTabMailSession, true)
+            .defaultAppStorage(defaults)
+        }
+    }
+
+    @Test("A /whoami that ends the trial while a message covers the inbox waits for the inbox, and only then marks it asked")
+    @MainActor
+    func lateEligibilityWaitsForTheInbox() async throws {
+        Self.resetTrial()
+        defer { Self.resetTrial() }
+        let suiteName = "TrialFeedbackTests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let worker = Self.acceptingWorker()
+        defer { worker.close() }
+        let navigation = Navigation()
+        let host = UIHostingController(rootView: InboxWithDetail(
+            navigation: navigation, presentation: TrialFeedbackPresentation(),
+            form: TrialFeedbackForm(session: worker.session), defaults: defaults))
+        let window = try Self.window(host)
+        defer { window.isHidden = true; window.rootViewController = nil }
+        try await Task.sleep(for: .milliseconds(500))
+        try #require(navigation.inboxShowing)
+
+        navigation.path = [1]
+        try await Task.sleep(for: .milliseconds(700))
+        try #require(navigation.inboxShowing == false)
+        try Self.endTrial()
+        try await Task.sleep(for: .milliseconds(800))
+        #expect(host.presentedViewController == nil)
+        #expect(defaults.bool(forKey: TrialFeedback.askedKey) == false)
+
+        navigation.path = []
+        try await Task.sleep(for: .milliseconds(900))
+        #expect(host.presentedViewController != nil)
+        #expect(defaults.bool(forKey: TrialFeedback.askedKey))
+        host.dismiss(animated: false)
+        try await Task.sleep(for: .milliseconds(200))
+    }
+
+    @Test("Signed out or in demo mode, an ended trial presents nothing and leaves it unasked")
+    @MainActor
+    func notForSignedOutOrDemo() async throws {
+        try Self.endTrial()
+        defer { Self.resetTrial() }
+        let signedOut = try Self.presentInbox(hasSession: false)
+        try await Task.sleep(for: .milliseconds(800))
+        #expect(signedOut.host.presentedViewController == nil)
+        #expect(signedOut.defaults.bool(forKey: TrialFeedback.askedKey) == false)
+        await Self.close(signedOut)
+
+        let wasDemo = DemoModeStore.shared.isActive
+        DemoModeStore.shared.isActive = true
+        defer { DemoModeStore.shared.isActive = wasDemo }
+        let demo = try Self.presentInbox()
+        try await Task.sleep(for: .milliseconds(800))
+        #expect(demo.host.presentedViewController == nil)
+        #expect(demo.defaults.bool(forKey: TrialFeedback.askedKey) == false)
+        await Self.close(demo)
+    }
+
+    @Test("The real inbox opens the sheet once its trial has ended")
+    @MainActor
+    func inboxViewAutoOpens() async throws {
+        try Self.endTrial()
+        defer { Self.resetTrial() }
+        let suiteName = "TrialFeedbackTests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let presentation = TrialFeedbackPresentation.shared
+        presentation.isPresented = false
+        defer { presentation.isPresented = false }
+        let worker = Self.acceptingWorker()
+        defer { worker.close() }
+        let inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "trial-feedback-test")
+        let root = NavigationStack {
+            InboxView(title: "Inbox", folders: [inbox], selection: .unified(.inbox),
+                      selectedMessageId: .constant(nil), pushedMessageId: .constant(nil))
+        }
+        .trialFeedbackSheetHost(makeForm: { TrialFeedbackForm(session: worker.session) })
+        .environment(NavigationStore())
+        .environment(\.hasTabMailSession, true)
+        .defaultAppStorage(defaults)
+        let host = UIHostingController(rootView: root)
+        let window = try Self.window(host)
+        defer { window.isHidden = true; window.rootViewController = nil }
+        try await Task.sleep(for: .milliseconds(1200))
+        #expect(host.presentedViewController != nil)
+        #expect(defaults.bool(forKey: TrialFeedback.askedKey))
+        host.dismiss(animated: false)
+        try await Task.sleep(for: .milliseconds(200))
+    }
+
     @Test("A banner's Feedback opens the sheet even after it opened by itself once")
     @MainActor
     func feedbackOpensTheSheetAfterAsked() async throws {
@@ -474,9 +673,8 @@ struct TrialFeedbackTests {
     func toolbarSend() async throws {
         try Self.endTrial()
         defer { Self.resetTrial() }
-        let delivered = Mutex<[TrialFeedback.Reason]>([])
-        let form = TrialFeedbackForm(deliver: { reason, _ in delivered.withLock { $0.append(reason) } })
-        let presented = try Self.presentInbox(makeForm: { form })
+        let presented = try Self.presentInbox()
+        let form = presented.form
         try await Task.sleep(for: .milliseconds(800))
         let sheet = try #require(presented.host.presentedViewController)
         let send = try #require(Self.barItem("Send", in: sheet.view))
@@ -491,7 +689,9 @@ struct TrialFeedbackTests {
         #expect(presented.defaults.bool(forKey: TrialFeedback.sentKey) == false)
         try Self.tap(enabled)
         try await Task.sleep(for: .milliseconds(800))
-        #expect(delivered.withLock { $0 } == [.notUsedEnough])
+        let answers = try Self.answers(presented.worker)
+        #expect(answers.count == 1)
+        #expect(answers.first?["reason"] as? String == "not_used_enough")
         #expect(presented.host.presentedViewController == nil)
         #expect(presented.defaults.bool(forKey: TrialFeedback.askedKey))
         // Sent hides the banners' Feedback button.
@@ -506,15 +706,13 @@ struct TrialFeedbackTests {
     func toolbarNotNow() async throws {
         try Self.endTrial()
         defer { Self.resetTrial() }
-        let delivered = Mutex<Int>(0)
-        let form = TrialFeedbackForm(deliver: { _, _ in delivered.withLock { $0 += 1 } })
-        let presented = try Self.presentInbox(makeForm: { form })
+        let presented = try Self.presentInbox()
         try await Task.sleep(for: .milliseconds(800))
         let sheet = try #require(presented.host.presentedViewController)
         try Self.tap(try #require(Self.barItem("Not now", in: sheet.view)))
         try await Task.sleep(for: .milliseconds(800))
         #expect(presented.host.presentedViewController == nil)
-        #expect(delivered.withLock { $0 } == 0)
+        #expect(presented.worker.recordedCalls().isEmpty)
         #expect(presented.defaults.bool(forKey: TrialFeedback.askedKey))
         let sent = presented.defaults.bool(forKey: TrialFeedback.sentKey)
         #expect(sent == false)
@@ -628,10 +826,22 @@ struct TrialFeedbackTests {
         #expect(Self.count("} else if let trialEnded = InboxTrialReminder.endedText( for: UsageThrottleStore.shared.trialState, isInbox: isInboxView, isSignedIn: hasTabMailSession, isDemo: DemoModeStore.shared.isActive ) { InboxTrialReminder( text: trialEnded, onFeedback: TrialFeedback.offersFeedback(sent: trialFeedbackSent) ? { TrialFeedbackPresentation.shared.open() } : nil ) }", in: text) == 1)
         // The row draws Feedback, before Plans, exactly when given the action.
         let row = try Self.source("TabMail/Views/Shared/InboxTrialReminder.swift")
-        #expect(Self.count("if let onFeedback { Button(TrialFeedback.bannerFeedbackLabel, action: onFeedback)", in: row) == 1)
-        let feedbackAt = try #require(row.range(of: "Button(TrialFeedback.bannerFeedbackLabel")).lowerBound
+        #expect(Self.count("if let onFeedback { TrialFeedbackButton(action: onFeedback) }", in: row) == 1)
+        let feedbackAt = try #require(row.range(of: "TrialFeedbackButton(action: onFeedback)")).lowerBound
         let plansAt = try #require(row.range(of: "Button(\"Plans\")")).lowerBound
         #expect(feedbackAt < plansAt)
+    }
+
+    @Test("Plans is the filled main action and Feedback the gray secondary one, the same on both banners")
+    func bannerButtonStyles() throws {
+        let row = try Self.source("TabMail/Views/Shared/InboxTrialReminder.swift")
+        // Plans, on both the running-trial and the ended row.
+        #expect(Self.count("Button(\"Plans\") { NotificationCenter.default.post(name: .navigateToPlanPicker, object: nil) } .font(.caption.weight(.semibold)) .buttonStyle(.borderedProminent) .buttonBorderShape(.capsule) .controlSize(.mini)", in: row) == 1)
+        // One Feedback look, shared by the inbox row and the folder list.
+        #expect(Self.count("Button(action: action) { Label(TrialFeedback.bannerFeedbackLabel, systemImage: TrialFeedback.bannerFeedbackSymbol) } .font(.caption.weight(.semibold)) .buttonStyle(.bordered) .buttonBorderShape(.capsule) .controlSize(.mini) .tint(.gray)", in: row) == 1)
+        #expect(TrialFeedback.bannerFeedbackSymbol == "bubble.left")
+        let sidebar = try Self.source("TabMail/Views/MailNavigationView.swift")
+        #expect(Self.count("bannerFeedbackLabel", in: sidebar) == 0)
     }
 
     @Test("The folder list's subscribe banner offers Feedback only for an ended trial, until sent, apart from its Plans tap")
@@ -639,8 +849,19 @@ struct TrialFeedbackTests {
         let text = try Self.source("TabMail/Views/MailNavigationView.swift")
         #expect(Self.count("private var showsTrialEndedCopy: Bool { hasTabMailSession && trialHasEnded }", in: text) == 1)
         #expect(Self.count("@AppStorage(TrialFeedback.sentKey) private var trialFeedbackSent = false", in: text) == 1)
-        #expect(Self.count("if showsTrialEndedCopy, TrialFeedback.offersFeedback(sent: trialFeedbackSent) { Button(TrialFeedback.bannerFeedbackLabel) { TrialFeedbackPresentation.shared.open() }", in: text) == 1)
-        // Feedback is its own button, not inside the Plans button's label.
+        // Ended and not sent: the whole banner (chevron included) is the Plans
+        // button, and Feedback is a separate button on its own line under it.
+        #expect(Self.count("if showsTrialEndedCopy, TrialFeedback.offersFeedback(sent: trialFeedbackSent) {", in: text) == 1)
+        #expect(Self.count("VStack(alignment: .trailing, spacing: 8) { Button(action: subscribeBannerTapped) { subscribeBannerLabel.contentShape(Rectangle()) } .buttonStyle(.plain) TrialFeedbackButton { TrialFeedbackPresentation.shared.open() } }", in: text) == 1)
+        // Otherwise the banner is the single Plans/sign-in button it was.
+        #expect(Self.count("} else { Button(action: subscribeBannerTapped) { subscribeBannerLabel.padding(.vertical, 4) } }", in: text) == 1)
         #expect(Self.count("Button(action: subscribeBannerTapped)", in: text) == 2)
+        #expect(Self.count("TrialFeedbackButton", in: text) == 1)
+        // The chevron belongs to the banner's label, never beside Feedback.
+        let label = try #require(text.range(of: "private var subscribeBannerLabel: some View {"))
+        let labelEnd = try #require(text.range(of: "/// The subscribe banner's tap", range: label.upperBound..<text.endIndex))
+        let labelBody = text[label.upperBound..<labelEnd.lowerBound]
+        #expect(labelBody.contains("Image(systemName: \"chevron.right\")"))
+        #expect(!labelBody.contains("TrialFeedback"))
     }
 }

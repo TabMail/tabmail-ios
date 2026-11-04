@@ -173,6 +173,27 @@ struct MailNavigationView: View {
             : "Subscribe to unlock AI-powered features"
     }
 
+    /// The subscribe banner's content: icon, title and subtitle, chevron.
+    private var subscribeBannerLabel: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "sparkles")
+                .font(.title3)
+                .foregroundStyle(Palette.accentColor)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(subscribeBannerTitle)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(Palette.textColor)
+                Text(subscribeBannerSubtitle)
+                    .font(.caption)
+                    .foregroundStyle(Palette.textMuted)
+            }
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Palette.textMuted)
+        }
+    }
+
     /// The subscribe banner's tap: Plans when signed in, else sign-in.
     private func subscribeBannerTapped() {
         if hasTabMailSession {
@@ -246,45 +267,25 @@ struct MailNavigationView: View {
                     //   `hasCheckedSubscription` hides the banner until we know.
                     if !hasTabMailSession || (hasCheckedSubscription && !hasActiveSubscription) {
                         Section {
-                            // Two separate buttons in one row, so a Feedback
-                            // tap does not also open Plans: in a List row each
-                            // non-default-styled button takes only its own taps.
-                            HStack(spacing: 12) {
-                                Button(action: subscribeBannerTapped) {
-                                    HStack(spacing: 12) {
-                                        Image(systemName: "sparkles")
-                                            .font(.title3)
-                                            .foregroundStyle(Palette.accentColor)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(subscribeBannerTitle)
-                                                .font(.subheadline.weight(.semibold))
-                                                .foregroundStyle(Palette.textColor)
-                                            Text(subscribeBannerSubtitle)
-                                                .font(.caption)
-                                                .foregroundStyle(Palette.textMuted)
-                                        }
-                                        Spacer()
+                            if showsTrialEndedCopy, TrialFeedback.offersFeedback(sent: trialFeedbackSent) {
+                                // Feedback sits on its own line under the banner, so
+                                // the banner's right side (its chevron) reads as Plans
+                                // only. Two non-default-styled buttons in one List row
+                                // take only their own taps: a Feedback tap never opens
+                                // Plans.
+                                VStack(alignment: .trailing, spacing: 8) {
+                                    Button(action: subscribeBannerTapped) {
+                                        subscribeBannerLabel.contentShape(Rectangle())
                                     }
-                                    .contentShape(Rectangle())
+                                    .buttonStyle(.plain)
+                                    TrialFeedbackButton { TrialFeedbackPresentation.shared.open() }
                                 }
-                                .buttonStyle(.plain)
-                                if showsTrialEndedCopy, TrialFeedback.offersFeedback(sent: trialFeedbackSent) {
-                                    Button(TrialFeedback.bannerFeedbackLabel) {
-                                        TrialFeedbackPresentation.shared.open()
-                                    }
-                                    .font(.caption.weight(.semibold))
-                                    .buttonStyle(.borderless)
-                                }
+                                .padding(.vertical, 4)
+                            } else {
                                 Button(action: subscribeBannerTapped) {
-                                    Image(systemName: "chevron.right")
-                                        .font(.caption.weight(.semibold))
-                                        .foregroundStyle(Palette.textMuted)
-                                        .contentShape(Rectangle())
+                                    subscribeBannerLabel.padding(.vertical, 4)
                                 }
-                                .buttonStyle(.plain)
-                                .accessibilityHidden(true)
                             }
-                            .padding(.vertical, 4)
                         }
                     }
 
