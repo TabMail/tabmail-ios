@@ -546,8 +546,9 @@ struct TrialFeedbackTests {
         let worker = Self.acceptingWorker()
         defer { worker.close() }
         let navigation = Navigation()
+        let presentation = TrialFeedbackPresentation()
         let host = UIHostingController(rootView: InboxWithDetail(
-            navigation: navigation, presentation: TrialFeedbackPresentation(),
+            navigation: navigation, presentation: presentation,
             form: TrialFeedbackForm(session: worker.session), defaults: defaults))
         let window = try Self.window(host)
         defer { window.isHidden = true; window.rootViewController = nil }
@@ -559,10 +560,77 @@ struct TrialFeedbackTests {
         try #require(navigation.inboxShowing == false)
         try Self.endTrial()
         try await Task.sleep(for: .milliseconds(800))
+        #expect(presentation.isPresented == false)
         #expect(host.presentedViewController == nil)
         #expect(defaults.bool(forKey: TrialFeedback.askedKey) == false)
 
         navigation.path = []
+        try await Task.sleep(for: .milliseconds(900))
+        #expect(host.presentedViewController != nil)
+        #expect(defaults.bool(forKey: TrialFeedback.askedKey))
+        host.dismiss(animated: false)
+        try await Task.sleep(for: .milliseconds(200))
+    }
+
+    @MainActor @Observable
+    final class Tabs {
+        var selected = 0
+        var inboxShowing = false
+    }
+
+    /// An inbox in one tab of two: the other tab hides it while it stays live.
+    private struct InboxInTabs: View {
+        @Bindable var tabs: Tabs
+        let presentation: TrialFeedbackPresentation
+        let form: TrialFeedbackForm
+        let defaults: UserDefaults
+
+        var body: some View {
+            TabView(selection: $tabs.selected) {
+                Text("Synthetic inbox")
+                    .onAppear { tabs.inboxShowing = true }
+                    .onDisappear { tabs.inboxShowing = false }
+                    .trialFeedbackAutoOpen(isInbox: true, presentation: presentation, isSomethingPresented: { false })
+                    .tag(0)
+                Text("Synthetic other tab")
+                    .tag(1)
+            }
+            .trialFeedbackSheetHost(presentation: presentation, makeForm: { form })
+            .environment(\.hasTabMailSession, true)
+            .defaultAppStorage(defaults)
+        }
+    }
+
+    @Test("A /whoami that ends the trial while the inbox is hidden but live waits for the inbox, and only then marks it asked")
+    @MainActor
+    func lateEligibilityWaitsWhileHiddenButLive() async throws {
+        Self.resetTrial()
+        defer { Self.resetTrial() }
+        let suiteName = "TrialFeedbackTests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let worker = Self.acceptingWorker()
+        defer { worker.close() }
+        let tabs = Tabs()
+        let presentation = TrialFeedbackPresentation()
+        let host = UIHostingController(rootView: InboxInTabs(
+            tabs: tabs, presentation: presentation,
+            form: TrialFeedbackForm(session: worker.session), defaults: defaults))
+        let window = try Self.window(host)
+        defer { window.isHidden = true; window.rootViewController = nil }
+        try await Task.sleep(for: .milliseconds(500))
+        try #require(tabs.inboxShowing)
+
+        tabs.selected = 1
+        try await Task.sleep(for: .milliseconds(700))
+        try #require(tabs.inboxShowing == false)
+        try Self.endTrial()
+        try await Task.sleep(for: .milliseconds(800))
+        #expect(presentation.isPresented == false)
+        #expect(host.presentedViewController == nil)
+        #expect(defaults.bool(forKey: TrialFeedback.askedKey) == false)
+
+        tabs.selected = 0
         try await Task.sleep(for: .milliseconds(900))
         #expect(host.presentedViewController != nil)
         #expect(defaults.bool(forKey: TrialFeedback.askedKey))
