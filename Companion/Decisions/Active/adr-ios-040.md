@@ -10,10 +10,12 @@
 >
 > No client logic changes with this. Since issue #55 (2026-08-19) the plan cards advertise no
 > introductory offer at all, and Apple's purchase sheet shows the trial, the price and the first
-> charge date. The plan picker's trial banner now reads "Subscribing resets your free trial."
-> When the signup trial has more days left than the subscription's free trial
-> (`AccountPlanConfig.subscriptionTrialDays`, matching the App Store offer), it reads
-> "Subscribing ends this trial and starts a new 7-day free trial." instead (owner, 2026-11-03).
+> charge date. The plan picker's trial banner reads "Subscribing ends this trial and starts a new
+> 7-day free trial." for every running signup trial, whatever its days left; the 7 is
+> `AccountPlanConfig.subscriptionTrialDays`, matching the App Store offer (owner, 2026-11-03). A
+> shorter "Subscribing resets your free trial." line was dropped the same day: an older 14-day trial
+> with 7 or fewer days left read it as "back to 14 days", and the app cannot tell old trials from new
+> ones by days left. The owner wants the short line back once no 14-day trials remain.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-040: Zero (BYOK) Plan in the IAP Plan Picker — Three-Tier, Display-Only Naming

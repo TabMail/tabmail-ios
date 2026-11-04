@@ -272,21 +272,19 @@ struct PlanPickerView: View {
     /// to describe. A pure function of the trial state, so its copy can be
     /// tested without building the view.
     ///
-    /// The active copy says subscribing resets the free trial and makes no
-    /// claim about dates or when billing starts — that is Apple's purchase
-    /// sheet's story. Someone with more days left than a new subscription's
-    /// free trial (an older, longer signup trial) would lose the difference,
-    /// so their copy says plainly what subscribing gives instead.
+    /// The active copy says plainly what subscribing does: it ends this trial
+    /// and starts the subscription's own free trial. It makes no claim about
+    /// dates or when billing starts — that is Apple's purchase sheet's story.
+    /// The same line shows whatever the days left: the app cannot tell an
+    /// older, longer signup trial from a new one by its days left, and a
+    /// shorter "resets" line read as "back to the old trial length" there.
     nonisolated static func trialBannerCopy(for trialState: TrialState?) -> (icon: String, text: String, color: Color)? {
         switch trialState {
         case .active(let daysRemaining):
             let unit = daysRemaining == 1 ? "day" : "days"
             let trialDays = AccountPlanConfig.subscriptionTrialDays
-            let effect = daysRemaining > trialDays
-                ? "Subscribing ends this trial and starts a new \(trialDays)-day free trial."
-                : "Subscribing resets your free trial."
             return ("clock",
-                    "Free trial · \(daysRemaining) \(unit) left. \(effect)",
+                    "Free trial · \(daysRemaining) \(unit) left. Subscribing ends this trial and starts a new \(trialDays)-day free trial.",
                     .blue)
         case .ended:
             return ("clock.badge.exclamationmark",

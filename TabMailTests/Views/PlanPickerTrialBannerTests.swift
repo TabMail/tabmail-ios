@@ -10,33 +10,22 @@ import Testing
 @Suite("Plan picker trial banner")
 struct PlanPickerTrialBannerTests {
 
-    @Test("A running trial shows the days left and what subscribing does")
+    /// The same explicit line for every running trial, whatever its days
+    /// left: the app cannot tell an older, longer signup trial from a new one
+    /// by its days left.
+    @Test("A running trial shows the days left and that subscribing starts a new 7-day free trial")
     func activeTrialBanner() {
-        let several = PlanPickerView.trialBannerCopy(for: .active(daysRemaining: 5))
-        #expect(several?.icon == "clock")
-        #expect(several?.text == "Free trial · 5 days left. Subscribing resets your free trial.")
-        #expect(several?.color == .blue)
-
-        let lastDay = PlanPickerView.trialBannerCopy(for: .active(daysRemaining: 1))
-        #expect(lastDay?.text == "Free trial · 1 day left. Subscribing resets your free trial.")
-        #expect(lastDay?.color == .blue)
-    }
-
-    /// Someone still on an older, longer signup trial loses the days beyond
-    /// the subscription's own free trial when they subscribe, so for them the
-    /// banner says so instead of "resets".
-    @Test("More days left than the subscription's free trial says what subscribing gives instead")
-    func longerTrialBanner() {
-        for days in [10, 8] {
+        for days in [14, 10, 8, 7, 6, 5, 2] {
             let banner = PlanPickerView.trialBannerCopy(for: .active(daysRemaining: days))
             #expect(banner?.icon == "clock")
             #expect(banner?.text == "Free trial · \(days) days left. Subscribing ends this trial and starts a new 7-day free trial.")
             #expect(banner?.color == .blue)
         }
-        for days in [7, 6] {
-            let banner = PlanPickerView.trialBannerCopy(for: .active(daysRemaining: days))
-            #expect(banner?.text == "Free trial · \(days) days left. Subscribing resets your free trial.")
-        }
+
+        let lastDay = PlanPickerView.trialBannerCopy(for: .active(daysRemaining: 1))
+        #expect(lastDay?.icon == "clock")
+        #expect(lastDay?.text == "Free trial · 1 day left. Subscribing ends this trial and starts a new 7-day free trial.")
+        #expect(lastDay?.color == .blue)
     }
 
     @Test("An ended trial asks the user to subscribe")
@@ -63,7 +52,7 @@ struct PlanPickerTrialBannerTests {
         let banner = { (info: AccountInfo?) in PlanPickerView.trialBannerCopy(for: info?.trialState(now: now)) }
 
         let running = try WhoamiFixture.runningSignupTrial(daysLeft: 5, reference: now)
-        #expect(banner(running)?.text == "Free trial · 5 days left. Subscribing resets your free trial.")
+        #expect(banner(running)?.text == "Free trial · 5 days left. Subscribing ends this trial and starts a new 7-day free trial.")
 
         let longer = try WhoamiFixture.runningSignupTrial(daysLeft: 10, reference: now)
         #expect(banner(longer)?.text == "Free trial · 10 days left. Subscribing ends this trial and starts a new 7-day free trial.")
