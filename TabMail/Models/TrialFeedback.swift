@@ -8,8 +8,8 @@ import Foundation
 /// after a card-free signup trial ends without a subscription.
 ///
 /// The copy lives here and nowhere else. The answer is sent as exactly
-/// `{version, reason, comment?}`: no account, user, device, token or cookie,
-/// so the server cannot link it to anyone.
+/// `{version, reason, comment?}`: it carries no account, user, device, token
+/// or cookie.
 enum TrialFeedback {
     /// Question version. A reworded question gets a new number so the server
     /// counts its answers separately.

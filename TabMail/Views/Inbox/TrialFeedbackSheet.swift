@@ -109,6 +109,7 @@ struct TrialFeedbackSheet: View {
                         }
                 }
             }
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle(TrialFeedback.navigationTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -125,6 +126,8 @@ struct TrialFeedbackSheet: View {
                 }
             }
         }
+        // The sheet's own recognizer: the folder list, one of its presenters, installs none.
+        .dismissKeyboardOnTap()
         .presentationDetents([.medium, .large])
     }
 

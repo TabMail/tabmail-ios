@@ -25,6 +25,8 @@ us why. One optional question, answered anonymously, is the cheapest signal.
    on the picked one, with the footer "Anonymous. Not linked to your account." right under the
    choices (owner 2026-11-03: visible at the medium detent before Send; under the comment field it
    was clipped below the medium detent); an optional vertical comment field; toolbar "Not now" (cancellation) and "Send" (confirmation, disabled until a choice).
+   The sheet applies `.dismissKeyboardOnTap()` itself (and the Form dismisses the keyboard on
+   scroll), because the folder list, one of its presenters, installs no tap-to-dismiss recognizer.
 4. **What is sent.** Exactly `{version: 1, reason, comment?}` as `application/json` to
    `https://forms.tabmail.ai/feedback/trial` (dev servers: `forms-dev.tabmail.ai`), built from
    scratch and posted by `TrialFeedback.send` on the form's session, by default the shared ephemeral

@@ -326,6 +326,40 @@ struct TrialFeedbackTests {
         #expect(TrialFeedbackForm().session === sharedEphemeralSession)
     }
 
+    /// The app attaches the host with no arguments, so its default form is
+    /// what ships: the anonymous answer posts on the shared ephemeral session.
+    @Test("The app's sheet host builds its form on the shared ephemeral session")
+    @MainActor
+    func hostDefaultSession() throws {
+        let hosted = Color.clear.trialFeedbackSheetHost()
+        let host = try #require(Mirror(reflecting: hosted).descendant("modifier") as? TrialFeedbackSheetHost)
+        #expect(host.makeForm().session === sharedEphemeralSession)
+    }
+
+    /// The inbox builds its running-trial row with the text only, so the
+    /// default decides that row offers no Feedback.
+    @Test("The running-trial row, built as the inbox builds it, offers no Feedback")
+    @MainActor
+    func runningRowHasNoFeedback() {
+        #expect(InboxTrialReminder(text: "Free trial · 3 days left").onFeedback == nil)
+    }
+
+    /// Any presenter: the folder list installs no tap-to-dismiss recognizer of
+    /// its own, so the sheet must bring one.
+    @Test("The sheet dismisses the keyboard on a tap outside, whoever presents it")
+    @MainActor
+    func sheetDismissesKeyboardOnTap() async throws {
+        let worker = Self.acceptingWorker()
+        defer { worker.close() }
+        let (window, input) = try await Self.hostSheet(TrialFeedbackForm(session: worker.session))
+        defer { window.isHidden = true; window.rootViewController = nil }
+        #expect(input.isFirstResponder)
+        let dismissers = (window.gestureRecognizers ?? []).filter {
+            $0.delegate.map { String(describing: type(of: $0)).contains("KeyboardDismiss") } ?? false
+        }
+        #expect(dismissers.count == 1)
+    }
+
     // MARK: - Send
 
     @Test("Send makes exactly one POST with the answer, whatever the worker answers")
@@ -786,6 +820,23 @@ struct TrialFeedbackTests {
         try await Task.sleep(for: .milliseconds(200))
     }
 
+    /// The inbox attaches the auto-open without a presented check, so the
+    /// default is what keeps it off another presentation.
+    @Test("The inbox's auto-open checks the key window's presentation by default")
+    @MainActor
+    func autoOpenDefaultPresentedCheck() async throws {
+        let modified = Color.clear.trialFeedbackAutoOpen(isInbox: true)
+        let autoOpen = try #require(Mirror(reflecting: modified).descendant("modifier") as? TrialFeedbackAutoOpen)
+        let root = UIViewController()
+        let window = try Self.window(root)
+        defer { window.isHidden = true; window.rootViewController = nil }
+        #expect(autoOpen.isSomethingPresented() == false)
+        root.present(UIViewController(), animated: false)
+        #expect(autoOpen.isSomethingPresented())
+        root.dismiss(animated: false)
+        try await Task.sleep(for: .milliseconds(200))
+    }
+
     // MARK: - The sheet's own controls
 
     /// The toolbar item with this title in the presented sheet's navigation bar.
@@ -981,6 +1032,9 @@ struct TrialFeedbackTests {
             hosts += Array(repeating: url.lastPathComponent, count: uses)
         }
         #expect(hosts == ["MailNavigationView.swift"])
+        // With no arguments, so the defaults pinned by hostDefaultSession ship.
+        let mailRoot = try Self.source("TabMail/Views/MailNavigationView.swift")
+        #expect(Self.count(".trialFeedbackSheetHost()", in: mailRoot) == 1)
     }
 
     @Test("The inbox auto-opens it once and its ended row offers Feedback until sent")

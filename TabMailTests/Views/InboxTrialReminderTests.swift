@@ -6,7 +6,10 @@ import Foundation
 import Testing
 @testable import TabMail
 
-@Suite("Inbox trial reminder")
+/// `.processGlobalState`: `latestAccountDecides` writes the process-wide
+/// `UsageThrottleStore.shared`, which the trial-feedback suite also writes, so
+/// both suites take the shared lock and cannot interleave in one run.
+@Suite("Inbox trial reminder", .processGlobalState)
 struct InboxTrialReminderTests {
 
     private func text(_ state: TrialState, isInbox: Bool = true, isSignedIn: Bool = true, isDemo: Bool = false) -> String? {
