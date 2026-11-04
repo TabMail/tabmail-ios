@@ -112,6 +112,33 @@ struct TrialFeedbackTests {
         #expect(TrialFeedback.request(for: .tooExpensive, comment: "").url?.absoluteString == "https://forms-dev.tabmail.ai/feedback/trial")
     }
 
+    @Test("Send posts to the server set when it was pressed, even if the setting changes before the post")
+    @MainActor
+    func endpointCapturedAtSend() async throws {
+        let defaults = UserDefaults.standard
+        let unlockKey = "debug_mode_unlocked"
+        let previousUnlock = defaults.object(forKey: unlockKey)
+        let previousDev = BackendConfig.useDevServers
+        defer {
+            BackendConfig.useDevServers = previousDev
+            if let previousUnlock { defaults.set(previousUnlock, forKey: unlockKey) } else { defaults.removeObject(forKey: unlockKey) }
+        }
+        defaults.set(true, forKey: unlockKey)
+        BackendConfig.useDevServers = false
+        let worker = Self.acceptingWorker()
+        defer { worker.close() }
+        let form = TrialFeedbackForm(session: worker.session)
+        form.select(.missingFeature)
+        let task = form.send()
+        // The send runs later on this actor; the setting moves first.
+        BackendConfig.useDevServers = true
+        await task?.value
+        let calls = worker.recordedCalls()
+        #expect(calls.count == 1)
+        guard calls.count == 1 else { return }
+        #expect(calls[0].url == "https://forms.tabmail.ai/feedback/trial")
+    }
+
     @Test("A comment is sent exactly as typed; a blank one is left out")
     func commentAsTyped() throws {
         let typed = "  Needed calendar sync 😀 \"quoted\" \\ \n"
@@ -307,7 +334,7 @@ struct TrialFeedbackTests {
             let fake = FakeHTTP.Scenario()
             defer { fake.close() }
             fake.register(path: "/feedback/trial", method: "POST", response: .status(status))
-            await TrialFeedback.send(.tooExpensive, comment: "x", session: fake.session)
+            await TrialFeedback.send(TrialFeedback.request(for: .tooExpensive, comment: "x"), session: fake.session)
             let calls = fake.recordedCalls()
             #expect(calls.count == 1, "status=\(status)")
             guard calls.count == 1 else { continue }
@@ -324,7 +351,7 @@ struct TrialFeedbackTests {
             let fake = FakeHTTP.Scenario()
             defer { fake.close() }
             fake.register(path: "/feedback/trial", method: "POST", response: .transportError(error))
-            await TrialFeedback.send(.tooExpensive, comment: "x", session: fake.session)
+            await TrialFeedback.send(TrialFeedback.request(for: .tooExpensive, comment: "x"), session: fake.session)
             #expect(fake.recordedCalls().count == 1, "error=\(error.rawValue)")
         }
     }
@@ -339,7 +366,7 @@ struct TrialFeedbackTests {
             if let data = request.body { accepted.withLock { $0.append(data) } }
             return .transportError(.networkConnectionLost)
         }
-        await TrialFeedback.send(.missingFeature, comment: comment, session: fake.session)
+        await TrialFeedback.send(TrialFeedback.request(for: .missingFeature, comment: comment), session: fake.session)
         #expect(fake.recordedCalls().count == 1)
         let records = accepted.withLock { $0 }
         #expect(records.count == 1)
@@ -371,10 +398,19 @@ struct TrialFeedbackTests {
         let failing = FakeHTTP.Scenario()
         defer { failing.close() }
         failing.register(path: "/feedback/trial", method: "POST", response: .transportError(.timedOut))
-        BackgroundSyncLogger.logDebug("trial-feedback-log-control")
+        let console = try await Self.console {
+            print("trial-feedback-console-control")
+            BackgroundSyncLogger.logDebug("trial-feedback-log-control")
+            for reason in TrialFeedback.Reason.allCases {
+                await TrialFeedback.send(TrialFeedback.request(for: reason, comment: comment), session: ok.session)
+                await TrialFeedback.send(TrialFeedback.request(for: reason, comment: comment), session: failing.session)
+            }
+        }
+        #expect(console.contains("trial-feedback-console-control"))
+        #expect(!console.contains(comment))
         for reason in TrialFeedback.Reason.allCases {
-            await TrialFeedback.send(reason, comment: comment, session: ok.session)
-            await TrialFeedback.send(reason, comment: comment, session: failing.session)
+            #expect(!console.contains(reason.rawValue), "console reason=\(reason.rawValue)")
+            #expect(!console.contains(reason.label), "console label=\(reason.label)")
         }
         _ = AppLogStore.read() // flushes the pending writes to the file
         let persisted = try String(contentsOf: url, encoding: .utf8)
@@ -386,6 +422,29 @@ struct TrialFeedbackTests {
             #expect(!persisted.contains(reason.label), "label=\(reason.label)")
         }
         #expect(!persisted.contains(comment))
+    }
+
+    /// Runs `body` with the process's stdout and stderr going to a file, and
+    /// returns what they got, so a test can check what reached the console.
+    @MainActor
+    private static func console(_ body: () async -> Void) async throws -> String {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("trial-feedback-console-\(UUID().uuidString)")
+        try #require(FileManager.default.createFile(atPath: url.path, contents: nil))
+        defer { try? FileManager.default.removeItem(at: url) }
+        let handle = try FileHandle(forWritingTo: url)
+        fflush(nil)
+        let savedOut = dup(STDOUT_FILENO)
+        let savedErr = dup(STDERR_FILENO)
+        dup2(handle.fileDescriptor, STDOUT_FILENO)
+        dup2(handle.fileDescriptor, STDERR_FILENO)
+        await body()
+        fflush(nil)
+        dup2(savedOut, STDOUT_FILENO)
+        dup2(savedErr, STDERR_FILENO)
+        Darwin.close(savedOut)
+        Darwin.close(savedErr)
+        try handle.close()
+        return String(decoding: try Data(contentsOf: url), as: UTF8.self)
     }
 
     // MARK: - Presenting over the inbox
@@ -745,6 +804,33 @@ struct TrialFeedbackTests {
         UIApplication.shared.sendAction(action, to: item.target, from: item, for: nil)
     }
 
+    /// Picks a choice row of the presented sheet the way a tap does: through
+    /// the Form's collection view delegate, which selects the row and then
+    /// runs its primary action (a Button row's action runs on the second).
+    @MainActor
+    private static func pickChoice(_ reason: TrialFeedback.Reason, in root: UIView) async throws {
+        let item = try #require(TrialFeedback.Reason.allCases.firstIndex(of: reason))
+        let lists = descendants(root).compactMap { $0 as? UICollectionView }
+        try #require(lists.count == 1)
+        let list = try #require(lists.first)
+        try #require(list.numberOfItems(inSection: 0) == TrialFeedback.Reason.allCases.count)
+        let index = IndexPath(item: item, section: 0)
+        list.delegate?.collectionView?(list, didSelectItemAt: index)
+        list.delegate?.collectionView?(list, performPrimaryActionForItemAt: index)
+        try await Task.sleep(for: .milliseconds(300))
+    }
+
+    @Test("The sheet's footer sits under the choices and the picked choice shows a checkmark")
+    func sheetAppearance() throws {
+        let sheet = try Self.source("TabMail/Views/Inbox/TrialFeedbackSheet.swift")
+        #expect(Self.count("Section { ForEach(TrialFeedback.Reason.allCases) { reason in choice(reason) } } header: { Text(TrialFeedback.question) .textCase(nil) } footer: {", in: sheet) == 1)
+        #expect(Self.count("Text(TrialFeedback.footnote) } Section { TextField(", in: sheet) == 1)
+        #expect(Self.count(".presentationDetents([.medium, .large])", in: sheet) == 1)
+        #expect(Self.count("let isSelected = form.selected == reason return Button { form.select(reason) } label: {", in: sheet) == 1)
+        #expect(Self.count("if isSelected { Image(systemName: \"checkmark\")", in: sheet) == 1)
+        #expect(Self.count(".accessibilityAddTraits(isSelected ? .isSelected : [])", in: sheet) == 1)
+    }
+
     @Test("Send is off until a choice is picked, then sends that choice once, closes the sheet and marks it sent")
     @MainActor
     func toolbarSend() async throws {
@@ -754,12 +840,15 @@ struct TrialFeedbackTests {
         let form = presented.form
         try await Task.sleep(for: .milliseconds(800))
         let sheet = try #require(presented.host.presentedViewController)
+        let detents = try #require(sheet.sheetPresentationController?.detents)
+        #expect(Set(detents.map(\.identifier)) == [.medium, .large])
         let send = try #require(Self.barItem("Send", in: sheet.view))
         #expect(send.isEnabled == false)
-        // A hosted SwiftUI row exposes no control or list selection to drive,
-        // so the choice goes through the entry point the row calls.
-        form.select(.notUsedEnough)
-        try await Task.sleep(for: .milliseconds(300))
+        // The choices are the Form's first section; a row is picked through
+        // the list's own selection callback, the one a tap goes through.
+        try await Self.pickChoice(.preferOtherApp, in: sheet.view)
+        #expect(form.selected == .preferOtherApp)
+        try await Self.pickChoice(.notUsedEnough, in: sheet.view)
         #expect(form.selected == .notUsedEnough)
         let enabled = try #require(Self.barItem("Send", in: sheet.view))
         #expect(enabled.isEnabled)
@@ -941,6 +1030,13 @@ struct TrialFeedbackTests {
         #expect(!bannerBody.contains("subscribeBannerLabel"))
         #expect(Self.count("Button(action: subscribeBannerTapped)", in: text) == 2)
         #expect(Self.count("TrialFeedbackPresentation.shared.open()", in: text) == 1)
+        // Both buttons' action: Plans when signed in, else sign-in with the
+        // pending-Plans latch armed.
+        let tap = try #require(text.range(of: "private func subscribeBannerTapped() {"))
+        let tapEnd = try #require(text.range(of: "/// Entitlement-aware consumption", range: tap.upperBound..<text.endIndex))
+        let tapBody = String(text[tap.upperBound..<tapEnd.lowerBound])
+        #expect(tapBody.hasPrefix(" if hasTabMailSession { selection = .planPicker } else {"))
+        #expect(tapBody.hasSuffix(" PendingPlanNavigationLatch.set() showSignInSheet = true } } "))
         // The other states' label keeps the chevron and offers no feedback.
         let label = try #require(text.range(of: "private var subscribeBannerLabel: some View {"))
         let labelEnd = try #require(text.range(of: "/// The banner once the trial has ended", range: label.upperBound..<text.endIndex))

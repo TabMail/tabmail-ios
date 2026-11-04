@@ -114,11 +114,13 @@ enum TrialFeedback {
         return request
     }
 
-    /// Send one answer, once. No retry: a lost answer is acceptable. The
-    /// debug log says only whether it went; never the answer itself.
-    static func send(_ reason: Reason, comment: String, session: URLSession) async {
+    /// Send one answer, once, as the request built when Send was pressed
+    /// (its endpoint included, so a later change of the server setting does
+    /// not redirect it). No retry: a lost answer is acceptable. The debug log
+    /// says only whether it went; never the answer itself.
+    static func send(_ request: URLRequest, session: URLSession) async {
         do {
-            let (_, response) = try await session.data(for: request(for: reason, comment: comment))
+            let (_, response) = try await session.data(for: request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             BackgroundSyncLogger.logDebug("[TrialFeedback] sent: HTTP \(status)")
         } catch {

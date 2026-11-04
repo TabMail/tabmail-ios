@@ -15,7 +15,7 @@ us why. One optional question, answered anonymously, is the cheapest signal.
    shows (a late `/whoami`). It also needs the inbox ON SCREEN: it tracks the inbox's own
    appearance and disappearance, so a late `/whoami` while the inbox is hidden (a pushed message,
    another tab) waits for the inbox's next appearance instead of presenting over another screen and
-   marking it asked (Codex r2 C2). If something is already presented it waits for the next appearance;
+   marking it asked. If something is already presented it waits for the next appearance;
    it never stacks over another sheet.
 2. **Once per install.** The flag `trial_feedback_asked` (UserDefaults, not user data) is set when the
    sheet APPEARS, so Send, Not now, a swipe down, and the app being killed while it is open all end
@@ -29,8 +29,10 @@ us why. One optional question, answered anonymously, is the cheapest signal.
    `https://forms.tabmail.ai/feedback/trial` (dev servers: `forms-dev.tabmail.ai`), built from
    scratch and posted by `TrialFeedback.send` on the form's session, by default the shared ephemeral
    session (tests inject a fake one; there is no second delivery path): no Authorization or client headers, cookies off. A blank
-   comment is left out; any other is sent exactly as typed. Sent once, never retried; a lost answer
-   is acceptable.
+   comment is left out; any other is sent exactly as typed. The request, endpoint included, is built
+   when Send is pressed (`TrialFeedbackForm.send`), so a change of the dev-server setting while the
+   post waits does not send the answer to the other server (settings are read once, at operation
+   start). Sent once, never retried; a lost answer is acceptable.
 5. **Comment cap.** 500 Unicode code points, measured as the worker measures. `TrialFeedbackForm.edit`
    refuses an edit that would pass it whole (never cuts). The field is bound to the sheet's own
    `@State` text, and `onChange` puts the previous text back when the form refuses, a real change of
@@ -43,7 +45,7 @@ us why. One optional question, answered anonymously, is the cheapest signal.
    replacement by canonically equal text of more than 500 code points would skip the check. When
    such an edit is refused the text view is rebuilt (`.id`), because TextField never pushes a
    canonically equal value back to it; only in that case, so an ordinary refused keystroke keeps
-   the keyboard (Codex r2 C1).
+   the keyboard.
 6. **Logs.** Debug-gated status only (`[TrialFeedback] sent: HTTP n`, `send failed: <code>`); never
    the reason or the comment.
 7. **Trial-ended banners (owner 2026-11-03).** Two entry points to the same sheet, so a user who

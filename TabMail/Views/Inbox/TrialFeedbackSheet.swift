@@ -39,14 +39,16 @@ final class TrialFeedbackForm {
     }
 
     /// Send the answer once, in the background; a second call sends nothing.
+    /// The request, endpoint included, is built here, when Send is pressed:
+    /// a server-setting change while the send waits does not redirect it.
     /// The returned task lets a caller wait for the send.
     @discardableResult
     func send() -> Task<Void, Never>? {
         guard let reason = selected, !isSent else { return nil }
         isSent = true
-        let text = comment
+        let request = TrialFeedback.request(for: reason, comment: comment)
         let session = session
-        return Task { await TrialFeedback.send(reason, comment: text, session: session) }
+        return Task { await TrialFeedback.send(request, session: session) }
     }
 }
 
