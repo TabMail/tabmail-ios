@@ -100,7 +100,9 @@ until an answer is sent; no identity in the answer, no retry. Tests: `TrialFeedb
 demo inputs, the real `InboxView`, Feedback reopens it after the auto-open; real-control comment
 cap, including a canonically equal replacement; send once over every
 status, transport error, and a lost reply; log privacy; banner rows per trial state, Feedback hidden
-after Send but not after Not now; lexical wiring checks for the single sheet host, the inbox row and
+after Send but not after Not now; the sheet's own tap and scroll keyboard dismissal; the defaults the
+app relies on (the host's form session, the auto-open's presented check, no Feedback on the running-trial
+row, the argument-free host call); lexical wiring checks for the single sheet host, the inbox row and
 the folder-list ended banner's two buttons, because those views are too large to host). Real taps
 on See Plans, "Tell us why" and the banner text are checked in the simulator capture harness, not
 in the suite.

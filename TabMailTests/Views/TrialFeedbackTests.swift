@@ -345,8 +345,10 @@ struct TrialFeedbackTests {
     }
 
     /// Any presenter: the folder list installs no tap-to-dismiss recognizer of
-    /// its own, so the sheet must bring one.
-    @Test("The sheet dismisses the keyboard on a tap outside, whoever presents it")
+    /// its own, so the sheet must bring one. A unit test cannot deliver a real
+    /// tap, so the recognizer's own action is run and must end editing; a drag
+    /// on the sheet's list must dismiss the keyboard too.
+    @Test("The sheet brings its own tap and scroll keyboard dismissal, whoever presents it")
     @MainActor
     func sheetDismissesKeyboardOnTap() async throws {
         let worker = Self.acceptingWorker()
@@ -354,10 +356,20 @@ struct TrialFeedbackTests {
         let (window, input) = try await Self.hostSheet(TrialFeedbackForm(session: worker.session))
         defer { window.isHidden = true; window.rootViewController = nil }
         #expect(input.isFirstResponder)
-        let dismissers = (window.gestureRecognizers ?? []).filter {
-            $0.delegate.map { String(describing: type(of: $0)).contains("KeyboardDismiss") } ?? false
-        }
+
+        let lists = Self.descendants(window).compactMap { $0 as? UICollectionView }
+        try #require(lists.count == 1)
+        let list = try #require(lists.first)
+        #expect([UIScrollView.KeyboardDismissMode.interactive, .interactiveWithAccessory].contains(list.keyboardDismissMode))
+
+        let dismissers = (window.gestureRecognizers ?? []).compactMap { $0.delegate as? NSObject }
+            .filter { String(describing: type(of: $0)).contains("KeyboardDismiss") }
         #expect(dismissers.count == 1)
+        let dismisser = try #require(dismissers.first)
+        let handleTap = NSSelectorFromString("handleTap")
+        try #require(dismisser.responds(to: handleTap))
+        dismisser.perform(handleTap)
+        #expect(!input.isFirstResponder)
     }
 
     // MARK: - Send
