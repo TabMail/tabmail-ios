@@ -572,6 +572,18 @@ struct TrialFeedbackTests {
         try await Task.sleep(for: .milliseconds(200))
     }
 
+    /// Waits up to `seconds` for `condition`, so a setup step or a positive
+    /// check does not depend on how fast a loaded simulator lays out.
+    @MainActor
+    private static func eventually(within seconds: Double = 5, _ condition: () -> Bool) async -> Bool {
+        let end = Date().addingTimeInterval(seconds)
+        while !condition() {
+            if Date() >= end { return false }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        return true
+    }
+
     @MainActor @Observable
     final class Tabs {
         var selected = 0
@@ -618,12 +630,10 @@ struct TrialFeedbackTests {
             form: TrialFeedbackForm(session: worker.session), defaults: defaults))
         let window = try Self.window(host)
         defer { window.isHidden = true; window.rootViewController = nil }
-        try await Task.sleep(for: .milliseconds(500))
-        try #require(tabs.inboxShowing)
+        try #require(await Self.eventually { tabs.inboxShowing })
 
         tabs.selected = 1
-        try await Task.sleep(for: .milliseconds(700))
-        try #require(tabs.inboxShowing == false)
+        try #require(await Self.eventually { !tabs.inboxShowing })
         try Self.endTrial()
         try await Task.sleep(for: .milliseconds(800))
         #expect(presentation.isPresented == false)
@@ -631,8 +641,7 @@ struct TrialFeedbackTests {
         #expect(defaults.bool(forKey: TrialFeedback.askedKey) == false)
 
         tabs.selected = 0
-        try await Task.sleep(for: .milliseconds(900))
-        #expect(host.presentedViewController != nil)
+        #expect(await Self.eventually { host.presentedViewController != nil })
         #expect(defaults.bool(forKey: TrialFeedback.askedKey))
         host.dismiss(animated: false)
         try await Task.sleep(for: .milliseconds(200))
