@@ -2,7 +2,7 @@
 
 **Class:** testing
 **Severity:** high
-**First seen:** 2026 · **Recurrences:** 9 (**9, 2026-10-25: I rebased a PR branch onto a main that
+**First seen:** 2026 · **Recurrences:** 10 (**10, 2026-11-03: I created the worktree and ran `./Scripts/xcodegen.sh`, THEN wrote the new test file; the green run reported 14/14 (only the existing suite) and three red-proof mutants each "passed" with zero tests executed, because `-only-testing:` a suite that is not in the target selects nothing and exits 0. Caught by reading the counts: the mutants showed 0 total. Regenerate after the LAST new file, and treat a 0-total run as a failed run**; **9, 2026-10-25: I rebased a PR branch onto a main that
 had gained new source files (#315's `HTMLText`) and ran the targeted suites without re-running
 `./Scripts/xcodegen.sh`; the ignored `TabMail.xcodeproj` predated them and the build failed
 "cannot find 'HTMLText' in scope" — caught by the build this time, not by a count. A rebase or merge
