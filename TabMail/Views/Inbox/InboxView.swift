@@ -863,6 +863,7 @@ struct InboxView: View {
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
         }
+        .trialFeedbackSheet(isInbox: isInboxView)
         .onChange(of: navigationStore.folderKeySet) {
             // Re-resolve matching folders when folder list structure OR any folder role changes.
             // Key is a Set so ORDER churn from NavigationStore doesn't trigger spurious reloads
