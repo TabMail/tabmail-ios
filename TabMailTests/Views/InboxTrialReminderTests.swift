@@ -61,4 +61,35 @@ struct InboxTrialReminderTests {
         store.update(from: try WhoamiFixture.signedInWithoutSubscription())
         #expect(store.trialState == .noTrial)
     }
+
+    /// The inbox and the store cannot be driven from a unit test: `InboxView`
+    /// needs the whole mail environment, and the store is a singleton that
+    /// tests share. So this reads their source and pins the three places the
+    /// tests above do not reach: the inbox passes the real cached state and
+    /// its own inbox, session and demo signals, Plans opens Choose a Plan, and
+    /// the store starts with no trial, so nothing shows before the first
+    /// `/whoami`.
+    @Test("The inbox feeds the row its real inputs, Plans opens Choose a Plan, and the store starts with no trial")
+    func wiring() throws {
+        #expect(try Self.count(in: "TabMail/Views/Inbox/InboxView.swift",
+            "if let trialReminder = InboxTrialReminder.text( for: UsageThrottleStore.shared.trialState, isInbox: isInboxView, isSignedIn: hasTabMailSession, isDemo: DemoModeStore.shared.isActive ) { InboxTrialReminder(text: trialReminder) }") == 1)
+        #expect(try Self.count(in: "TabMail/Views/Inbox/InboxView.swift", "InboxTrialReminder") == 2,
+            "one call site in the inbox")
+        #expect(try Self.count(in: "TabMail/Views/Shared/InboxTrialReminder.swift",
+            "Button(\"Plans\") { NotificationCenter.default.post(name: .navigateToPlanPicker, object: nil) }") == 1)
+        #expect(try Self.count(in: "TabMail/Services/AI/UsageThrottleStore.swift",
+            "private(set) var trialState: TrialState = .noTrial") == 1)
+    }
+
+    /// Occurrences of `needle` in a source file, with every run of whitespace
+    /// made one space so line breaks and indentation do not matter.
+    private static func count(in path: String, _ needle: String) throws -> Int {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let text = try String(contentsOf: projectRoot.appendingPathComponent(path), encoding: .utf8)
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return text.components(separatedBy: needle).count - 1
+    }
 }
