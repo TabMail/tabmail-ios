@@ -12,7 +12,10 @@ us why. One optional question, answered anonymously, is the cheapest signal.
    `UsageThrottleStore.shared.trialState == .ended` (already means no subscription), not asked yet
    on this install, and nothing else presented. The auto-open check (`trialFeedbackAutoOpen(isInbox:)`
    on `InboxView`) runs on inbox appearance and again when eligibility turns true while the inbox
-   shows (a late `/whoami`). If something is already presented it waits for the next appearance;
+   shows (a late `/whoami`). It also needs the inbox ON SCREEN: it tracks the inbox's own
+   appearance and disappearance, so a late `/whoami` while the inbox is hidden (a pushed message,
+   another tab) waits for the inbox's next appearance instead of presenting over another screen and
+   marking it asked (Codex r2 C2). If something is already presented it waits for the next appearance;
    it never stacks over another sheet.
 2. **Once per install.** The flag `trial_feedback_asked` (UserDefaults, not user data) is set when the
    sheet APPEARS, so Send, Not now, a swipe down, and the app being killed while it is open all end
@@ -24,7 +27,8 @@ us why. One optional question, answered anonymously, is the cheapest signal.
    was clipped below the medium detent); an optional vertical comment field; toolbar "Not now" (cancellation) and "Send" (confirmation, disabled until a choice).
 4. **What is sent.** Exactly `{version: 1, reason, comment?}` as `application/json` to
    `https://forms.tabmail.ai/feedback/trial` (dev servers: `forms-dev.tabmail.ai`), built from
-   scratch on the shared ephemeral session: no Authorization or client headers, cookies off. A blank
+   scratch and posted by `TrialFeedback.send` on the form's session, by default the shared ephemeral
+   session (tests inject a fake one; there is no second delivery path): no Authorization or client headers, cookies off. A blank
    comment is left out; any other is sent exactly as typed. Sent once, never retried; a lost answer
    is acceptable.
 5. **Comment cap.** 500 Unicode code points, measured as the worker measures. `TrialFeedbackForm.edit`
@@ -34,6 +38,12 @@ us why. One optional question, answered anonymously, is the cheapest signal.
    on screen while Send sends the older value: a binding whose setter only refuses, and a setter
    that writes the proposed text then the previous one (SwiftUI can coalesce the two writes; it
    failed 1 run in 4 under load).
+   The field's text is compared scalar by scalar (`ExactText`), because Swift's `String ==` holds
+   canonically equal text equal (a precomposed "é" and "e" plus a combining accent), so a
+   replacement by canonically equal text of more than 500 code points would skip the check. When
+   such an edit is refused the text view is rebuilt (`.id`), because TextField never pushes a
+   canonically equal value back to it; only in that case, so an ordinary refused keystroke keeps
+   the keyboard (Codex r2 C1).
 6. **Logs.** Debug-gated status only (`[TrialFeedback] sent: HTTP n`, `send failed: <code>`); never
    the reason or the comment.
 7. **Trial-ended banners (owner 2026-11-03).** Two entry points to the same sheet, so a user who
@@ -47,6 +57,11 @@ us why. One optional question, answered anonymously, is the cheapest signal.
      Has Ended" banner gets a separate small **Feedback** button. The rest of the banner keeps its
      tap-to-Plans; the Feedback tap does not navigate (two borderless/plain buttons in one row).
      Never shown for "Start Your Free Trial" or signed out.
+   - **Styling (owner 2026-11-03).** Plans is a small filled capsule (the main action) on both the
+     running-trial and the ended inbox row; Feedback is a small gray bordered capsule with a
+     speech-bubble icon, one shared view (`TrialFeedbackButton`). In the folder list the banner stays
+     the single Plans/sign-in button (icon, title, subtitle, chevron) and Feedback sits on its own
+     line under it, aligned right, so the chevron side reads as Plans only.
 8. **Two flags, one sheet.** `trial_feedback_asked` only stops the one-time auto-open (decision 2,
    unchanged). `trial_feedback_sent` is set by Send and only hides the Feedback buttons
    (`TrialFeedback.offersFeedback(sent:)`); Not now, a swipe down or closing the app leave Feedback
@@ -67,7 +82,9 @@ us why. One optional question, answered anonymously, is the cheapest signal.
 **Consequences:** at most one automatic sheet per install, and a Feedback button on both banners
 until an answer is sent; no identity in the answer, no retry. Tests: `TrialFeedbackTests`
 (presentation matrix, hosted presenter: presents and marks asked, not over another sheet, late
-`/whoami`, Feedback reopens it after the auto-open; real-control comment cap; send once over every
+`/whoami`, a late `/whoami` while the inbox is hidden (pushed message, other tab), signed-out and
+demo inputs, the real `InboxView`, Feedback reopens it after the auto-open; real-control comment
+cap, including a canonically equal replacement; send once over every
 status, transport error, and a lost reply; log privacy; banner rows per trial state, Feedback hidden
 after Send but not after Not now; lexical wiring checks for the single sheet host, the inbox row and
 the folder-list button, because those views are too large to host).
