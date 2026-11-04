@@ -20,8 +20,8 @@ struct AccountDashboardPeriodEndLabelTests {
     }
 
     /// Bodies decoded by the real `/whoami` parser: only the signup trial
-    /// changes the label. A card trial and a BYOK plan are subscriptions that
-    /// renew.
+    /// changes the label. A card trial on any plan and a BYOK plan are
+    /// subscriptions that renew.
     @Test("Account info from the wire picks the right label")
     func labelFromAccountInfo() throws {
         let now = Date()
@@ -31,6 +31,9 @@ struct AccountDashboardPeriodEndLabelTests {
         #expect(label(try WhoamiFixture.expiredSignupTrial(endedDaysAgo: 1, reference: now)) == "Trial ended")
         #expect(label(try WhoamiFixture.cardTrial(provider: "apple", planTier: AccountPlanConfig.basicTierKey, daysLeft: 3, reference: now)) == "Renewal")
         #expect(label(try WhoamiFixture.cardTrial(provider: "stripe", planTier: AccountPlanConfig.basicTierKey, daysLeft: 3, reference: now)) == "Renewal")
+        #expect(label(try WhoamiFixture.cardTrial(provider: "stripe", planTier: AccountPlanConfig.proTierKey, daysLeft: 3, reference: now)) == "Renewal")
+        // Zero is the other zero-budget tier: its card trial renews too.
+        #expect(label(try WhoamiFixture.cardTrial(provider: "stripe", planTier: AccountPlanConfig.byokTierKey, daysLeft: 3, reference: now)) == "Renewal")
         #expect(label(try WhoamiFixture.accountInfo(hasSubscription: true, planTier: AccountPlanConfig.byokTierKey, provider: "stripe")) == "Renewal")
         #expect(label(try WhoamiFixture.signedInWithoutSubscription()) == "Renewal")
     }
