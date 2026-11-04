@@ -36,10 +36,12 @@ us why. One optional question, answered anonymously, is the cheapest signal.
 6. **Logs.** Debug-gated status only (`[TrialFeedback] sent: HTTP n`, `send failed: <code>`); never
    the reason or the comment.
 
-**Launch facts (owner action, not code):**
-- The App Store privacy label must declare it: **User Content > Other User Content, Not Linked to
-  You, purpose Analytics.** The optional-disclosure exemption does not apply because the form does
-  not carry the user's name. Do this before the release that ships the sheet.
+**Launch facts (not code):**
+- The App Store privacy label declares it: **User Content > Other User Content, Not Linked to You,
+  purpose Analytics.** The optional-disclosure exemption does not apply because the form does not
+  carry the user's name. The owner published this label on 2026-11-03 (nine data types in all; this
+  form is the Other User Content entry), so it is already in place before the release that ships
+  the sheet.
 - The forms worker's endpoint (migration plus its enable flag) goes live before the iOS build is
   released.
 
