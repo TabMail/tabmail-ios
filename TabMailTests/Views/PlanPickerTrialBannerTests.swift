@@ -53,9 +53,10 @@ struct PlanPickerTrialBannerTests {
         #expect(PlanPickerView.trialBannerCopy(for: nil) == nil)
     }
 
-    /// The view shows `trialBannerCopy(for: accountInfo?.trialState())`. These
-    /// run the same chain from `/whoami`-shaped bodies decoded by the real
-    /// parser, so a wire shape that stops reaching the banner fails here.
+    /// The view shows `trialBannerCopy(for: accountInfo?.trialState())` (pinned
+    /// by `viewShowsTheAccountsBanner`). These run the same chain from
+    /// `/whoami`-shaped bodies decoded by the real parser, so a wire shape that
+    /// stops reaching the banner fails here.
     @Test("Account info from the wire reaches the right banner")
     func bannerFromAccountInfo() throws {
         let now = Date()
@@ -78,5 +79,25 @@ struct PlanPickerTrialBannerTests {
 
         #expect(banner(try WhoamiFixture.signedInWithoutSubscription()) == nil)
         #expect(banner(nil) == nil)
+    }
+
+    /// A hosted `PlanPickerView` cannot be driven from a unit test: it fetches
+    /// its own account from the backend. So this reads the view's source and
+    /// pins the one place that turns the fetched account into the banner, the
+    /// last hop the tests above do not reach.
+    @Test("The plan picker shows the banner for the account it fetched")
+    func viewShowsTheAccountsBanner() throws {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let text = try String(
+            contentsOf: projectRoot.appendingPathComponent("TabMail/Views/Account/PlanPickerView.swift"),
+            encoding: .utf8)
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let count = { (needle: String) in text.components(separatedBy: needle).count - 1 }
+
+        #expect(count("trialBannerCopy(for: ") == 1, "one call site in the view")
+        #expect(count("if let trialBanner = Self.trialBannerCopy(for: accountInfo?.trialState()) { StatusBanner(icon: trialBanner.icon, text: trialBanner.text, color: trialBanner.color) }") == 1)
     }
 }
