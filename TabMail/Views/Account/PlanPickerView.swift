@@ -22,7 +22,7 @@ struct PlanPickerView: View {
                 // Free-trial state from the backend: this banner describes the
                 // server-granted trial the account already has (or had), so the
                 // page never implies the user still needs to start one.
-                if let trialBanner = trialBannerCopy {
+                if let trialBanner = Self.trialBannerCopy(for: accountInfo?.trialState()) {
                     StatusBanner(icon: trialBanner.icon, text: trialBanner.text, color: trialBanner.color)
                 }
 
@@ -269,17 +269,22 @@ struct PlanPickerView: View {
     // MARK: - Helpers
 
     /// Banner describing the account's free trial, or `nil` when there is none
-    /// to describe.
+    /// to describe. A pure function of the trial state, so its copy can be
+    /// tested without building the view.
     ///
-    /// The active copy says the trial ends and deliberately makes no claim
-    /// about when billing starts — that is Apple's purchase sheet's story. The
-    /// forfeiture of the remaining server-trial days is true either way.
-    private var trialBannerCopy: (icon: String, text: String, color: Color)? {
-        switch accountInfo?.trialState() {
+    /// The active copy says plainly what subscribing does: it ends this trial
+    /// and starts the subscription's own free trial. It makes no claim about
+    /// dates or when billing starts — that is Apple's purchase sheet's story.
+    /// The same line shows whatever the days left: the app cannot tell an
+    /// older, longer signup trial from a new one by its days left, and a
+    /// shorter "resets" line read as "back to the old trial length" there.
+    nonisolated static func trialBannerCopy(for trialState: TrialState?) -> (icon: String, text: String, color: Color)? {
+        switch trialState {
         case .active(let daysRemaining):
             let unit = daysRemaining == 1 ? "day" : "days"
+            let trialDays = AccountPlanConfig.subscriptionTrialDays
             return ("clock",
-                    "Free trial · \(daysRemaining) \(unit) left. Subscribing now ends the trial.",
+                    "Free trial · \(daysRemaining) \(unit) left. Subscribing ends this trial and starts a new \(trialDays)-day free trial.",
                     .blue)
         case .ended:
             return ("clock.badge.exclamationmark",

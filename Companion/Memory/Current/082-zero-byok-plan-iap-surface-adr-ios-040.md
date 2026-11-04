@@ -1,3 +1,13 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note:** amended 2026-11-03, after this fragment was pinned. Where the text below
+> and the pinned body differ, this text wins.
+>
+> The `checkTrialEligibility()` bullet below is history. `checkTrialEligibility()` and the PlanCard
+> trial badge were deleted with issue #55 (2026-08-19), and the plan cards advertise no introductory
+> offer at all. "Zero has none" no longer holds either: Zero now gets the same App Store free-trial
+> introductory offer as Basic and Pro (owner, 2026-11-03; ADR-IOS-040 current note). Its length is
+> `AccountPlanConfig.subscriptionTrialDays`, and Apple decides eligibility itself.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## Zero (BYOK) Plan — IAP Surface (ADR-IOS-040)
 

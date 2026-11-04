@@ -22,6 +22,10 @@ enum AccountPlanConfig {
     /// `subscription_provider` value that marks the server-granted signup trial —
     /// as opposed to a purchase made through a payment provider.
     static let signupProviderKey = "signup"
+    /// Length of the free trial a new subscription starts with. Must match the
+    /// introductory offer configured in App Store Connect (and the Stripe trial);
+    /// the plan picker's trial banner names it.
+    static let subscriptionTrialDays = 7
 }
 
 /// The account's free-trial state as the CLIENT sees it.
@@ -114,11 +118,12 @@ extension AccountInfo {
 /// The plan picker's purchase-button copy, as a pure function so the decision
 /// can be tested without building a `Product` or a SwiftUI view.
 ///
-/// The card never advertises a StoreKit introductory offer: the App Store
-/// Connect offers were removed when the server-granted signup trial launched
-/// (2026-08-19), and the client-side trial-badge machinery that read them was
-/// deleted with them (issue #55). The free trial a user sees today is the
-/// server-granted one, described by the whoami-driven banner — not by the card.
+/// The card never advertises a StoreKit introductory offer: the client-side
+/// trial-badge machinery that read them was deleted when the server-granted
+/// signup trial launched (2026-08-19, issue #55). Each subscription now starts
+/// with its own free trial again (`AccountPlanConfig.subscriptionTrialDays`);
+/// the plan picker's trial banner names it and Apple's purchase sheet shows
+/// its terms — not the card.
 enum PlanCardCTA {
     /// Purchase button text. Rank-driven upgrade/downgrade direction; ranks are
     /// passed in so this stays free of StoreKit.
