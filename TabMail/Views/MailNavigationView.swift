@@ -173,25 +173,63 @@ struct MailNavigationView: View {
             : "Subscribe to unlock AI-powered features"
     }
 
+    /// The subscribe banner's icon.
+    private var subscribeBannerIcon: some View {
+        Image(systemName: "sparkles")
+            .font(.title3)
+            .foregroundStyle(Palette.accentColor)
+    }
+
+    /// The subscribe banner's title and subtitle.
+    private var subscribeBannerTexts: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(subscribeBannerTitle)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Palette.textColor)
+            Text(subscribeBannerSubtitle)
+                .font(.caption)
+                .foregroundStyle(Palette.textMuted)
+        }
+    }
+
     /// The subscribe banner's content: icon, title and subtitle, chevron.
     private var subscribeBannerLabel: some View {
         HStack(spacing: 12) {
-            Image(systemName: "sparkles")
-                .font(.title3)
-                .foregroundStyle(Palette.accentColor)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(subscribeBannerTitle)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(Palette.textColor)
-                Text(subscribeBannerSubtitle)
-                    .font(.caption)
-                    .foregroundStyle(Palette.textMuted)
-            }
+            subscribeBannerIcon
+            subscribeBannerTexts
             Spacer()
             Image(systemName: "chevron.right")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(Palette.textMuted)
         }
+    }
+
+    /// The banner once the trial has ended (owner 2026-11-03): the text is not
+    /// a tap target and has no chevron; a filled See Plans button does what
+    /// the banner tap does, and a text button under it opens the feedback
+    /// sheet until an answer was sent. Two non-default-styled buttons in one
+    /// List row take only their own taps.
+    private var trialEndedBanner: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 12) {
+                subscribeBannerIcon
+                subscribeBannerTexts
+                Spacer()
+            }
+            Button(action: subscribeBannerTapped) {
+                Text("See Plans")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .buttonBorderShape(.capsule)
+            if TrialFeedback.offersFeedback(sent: trialFeedbackSent) {
+                Button(TrialFeedback.folderListFeedbackLabel) { TrialFeedbackPresentation.shared.open() }
+                    .font(.subheadline)
+                    .buttonStyle(.borderless)
+            }
+        }
+        .padding(.vertical, 4)
     }
 
     /// The subscribe banner's tap: Plans when signed in, else sign-in.
@@ -267,20 +305,8 @@ struct MailNavigationView: View {
                     //   `hasCheckedSubscription` hides the banner until we know.
                     if !hasTabMailSession || (hasCheckedSubscription && !hasActiveSubscription) {
                         Section {
-                            if showsTrialEndedCopy, TrialFeedback.offersFeedback(sent: trialFeedbackSent) {
-                                // Feedback sits on its own line under the banner, so
-                                // the banner's right side (its chevron) reads as Plans
-                                // only. Two non-default-styled buttons in one List row
-                                // take only their own taps: a Feedback tap never opens
-                                // Plans.
-                                VStack(alignment: .trailing, spacing: 8) {
-                                    Button(action: subscribeBannerTapped) {
-                                        subscribeBannerLabel.contentShape(Rectangle())
-                                    }
-                                    .buttonStyle(.plain)
-                                    TrialFeedbackButton { TrialFeedbackPresentation.shared.open() }
-                                }
-                                .padding(.vertical, 4)
+                            if showsTrialEndedCopy {
+                                trialEndedBanner
                             } else {
                                 Button(action: subscribeBannerTapped) {
                                     subscribeBannerLabel.padding(.vertical, 4)

@@ -25,7 +25,7 @@ import UIKit
 ///   points), and what Send sends is what the field shows.
 /// - Nothing about the answer is written to the local log.
 /// - Once the trial ended (no subscription), the inbox row reads "Free trial
-///   ended" and both banners offer Feedback, which opens the same sheet, until
+///   ended" and both banners offer feedback, which opens the same sheet, until
 ///   an answer was SENT; Not now leaves it offered.
 @Suite("Trial feedback", .serialized, .processGlobalState)
 struct TrialFeedbackTests {
@@ -903,42 +903,49 @@ struct TrialFeedbackTests {
         #expect(Self.count("} else if let trialEnded = InboxTrialReminder.endedText( for: UsageThrottleStore.shared.trialState, isInbox: isInboxView, isSignedIn: hasTabMailSession, isDemo: DemoModeStore.shared.isActive ) { InboxTrialReminder( text: trialEnded, onFeedback: TrialFeedback.offersFeedback(sent: trialFeedbackSent) ? { TrialFeedbackPresentation.shared.open() } : nil ) }", in: text) == 1)
         // The row draws Feedback, before Plans, exactly when given the action.
         let row = try Self.source("TabMail/Views/Shared/InboxTrialReminder.swift")
-        #expect(Self.count("if let onFeedback { TrialFeedbackButton(action: onFeedback) }", in: row) == 1)
-        let feedbackAt = try #require(row.range(of: "TrialFeedbackButton(action: onFeedback)")).lowerBound
+        #expect(Self.count("if let onFeedback { Button(action: onFeedback) {", in: row) == 1)
+        let feedbackAt = try #require(row.range(of: "if let onFeedback {")).lowerBound
         let plansAt = try #require(row.range(of: "Button(\"Plans\")")).lowerBound
         #expect(feedbackAt < plansAt)
     }
 
-    @Test("Plans is the filled main action and Feedback the gray secondary one, the same on both banners")
+    @Test("In the inbox row Plans is the filled main action and Feedback the gray secondary one")
     func bannerButtonStyles() throws {
         let row = try Self.source("TabMail/Views/Shared/InboxTrialReminder.swift")
         // Plans, on both the running-trial and the ended row.
         #expect(Self.count("Button(\"Plans\") { NotificationCenter.default.post(name: .navigateToPlanPicker, object: nil) } .font(.caption.weight(.semibold)) .buttonStyle(.borderedProminent) .buttonBorderShape(.capsule) .controlSize(.mini)", in: row) == 1)
-        // One Feedback look, shared by the inbox row and the folder list.
-        #expect(Self.count("Button(action: action) { Label(TrialFeedback.bannerFeedbackLabel, systemImage: TrialFeedback.bannerFeedbackSymbol) } .font(.caption.weight(.semibold)) .buttonStyle(.bordered) .buttonBorderShape(.capsule) .controlSize(.mini) .tint(.gray)", in: row) == 1)
+        #expect(Self.count("if let onFeedback { Button(action: onFeedback) { Label(TrialFeedback.bannerFeedbackLabel, systemImage: TrialFeedback.bannerFeedbackSymbol) } .font(.caption.weight(.semibold)) .buttonStyle(.bordered) .buttonBorderShape(.capsule) .controlSize(.mini) .tint(.gray) }", in: row) == 1)
         #expect(TrialFeedback.bannerFeedbackSymbol == "bubble.left")
+        // The folder list words its feedback button on its own.
+        #expect(TrialFeedback.folderListFeedbackLabel == "Not for you? Tell us why")
         let sidebar = try Self.source("TabMail/Views/MailNavigationView.swift")
         #expect(Self.count("bannerFeedbackLabel", in: sidebar) == 0)
     }
 
-    @Test("The folder list's subscribe banner offers Feedback only for an ended trial, until sent, apart from its Plans tap")
+    @Test("The folder list's ended banner is See Plans plus Tell us why until sent; every other state is the one Plans/sign-in button with its chevron")
     func sidebarWiring() throws {
         let text = try Self.source("TabMail/Views/MailNavigationView.swift")
         #expect(Self.count("private var showsTrialEndedCopy: Bool { hasTabMailSession && trialHasEnded }", in: text) == 1)
         #expect(Self.count("@AppStorage(TrialFeedback.sentKey) private var trialFeedbackSent = false", in: text) == 1)
-        // Ended and not sent: the whole banner (chevron included) is the Plans
-        // button, and Feedback is a separate button on its own line under it.
-        #expect(Self.count("if showsTrialEndedCopy, TrialFeedback.offersFeedback(sent: trialFeedbackSent) {", in: text) == 1)
-        #expect(Self.count("VStack(alignment: .trailing, spacing: 8) { Button(action: subscribeBannerTapped) { subscribeBannerLabel.contentShape(Rectangle()) } .buttonStyle(.plain) TrialFeedbackButton { TrialFeedbackPresentation.shared.open() } }", in: text) == 1)
-        // Otherwise the banner is the single Plans/sign-in button it was.
-        #expect(Self.count("} else { Button(action: subscribeBannerTapped) { subscribeBannerLabel.padding(.vertical, 4) } }", in: text) == 1)
+        // The ended state, sent or not, gets its own banner; every other state
+        // is the single button it was on main.
+        #expect(Self.count("if showsTrialEndedCopy { trialEndedBanner } else { Button(action: subscribeBannerTapped) { subscribeBannerLabel.padding(.vertical, 4) } }", in: text) == 1)
+        #expect(Self.count("trialEndedBanner", in: text) == 2)
+        // The ended banner: text with no chevron and no tap, a filled See
+        // Plans button, and the feedback text button only until sent.
+        let banner = try #require(text.range(of: "private var trialEndedBanner: some View {"))
+        let bannerEnd = try #require(text.range(of: "/// The subscribe banner's tap", range: banner.upperBound..<text.endIndex))
+        let bannerBody = String(text[banner.upperBound..<bannerEnd.lowerBound])
+        #expect(Self.count("VStack(spacing: 8) { HStack(spacing: 12) { subscribeBannerIcon subscribeBannerTexts Spacer() } Button(action: subscribeBannerTapped) { Text(\"See Plans\") .font(.subheadline.weight(.semibold)) .frame(maxWidth: .infinity) } .buttonStyle(.borderedProminent) .buttonBorderShape(.capsule) if TrialFeedback.offersFeedback(sent: trialFeedbackSent) { Button(TrialFeedback.folderListFeedbackLabel) { TrialFeedbackPresentation.shared.open() } .font(.subheadline) .buttonStyle(.borderless) } } .padding(.vertical, 4)", in: bannerBody) == 1)
+        #expect(!bannerBody.contains("chevron"))
+        #expect(!bannerBody.contains("subscribeBannerLabel"))
         #expect(Self.count("Button(action: subscribeBannerTapped)", in: text) == 2)
-        #expect(Self.count("TrialFeedbackButton", in: text) == 1)
-        // The chevron belongs to the banner's label, never beside Feedback.
+        #expect(Self.count("TrialFeedbackPresentation.shared.open()", in: text) == 1)
+        // The other states' label keeps the chevron and offers no feedback.
         let label = try #require(text.range(of: "private var subscribeBannerLabel: some View {"))
-        let labelEnd = try #require(text.range(of: "/// The subscribe banner's tap", range: label.upperBound..<text.endIndex))
+        let labelEnd = try #require(text.range(of: "/// The banner once the trial has ended", range: label.upperBound..<text.endIndex))
         let labelBody = text[label.upperBound..<labelEnd.lowerBound]
-        #expect(labelBody.contains("Image(systemName: \"chevron.right\")"))
+        #expect(Self.count("HStack(spacing: 12) { subscribeBannerIcon subscribeBannerTexts Spacer() Image(systemName: \"chevron.right\")", in: String(labelBody)) == 1)
         #expect(!labelBody.contains("TrialFeedback"))
     }
 }

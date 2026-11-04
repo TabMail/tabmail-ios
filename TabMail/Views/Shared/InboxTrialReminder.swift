@@ -23,8 +23,17 @@ struct InboxTrialReminder: View {
                 .font(.caption)
                 .foregroundStyle(Palette.textColor)
             Spacer(minLength: 8)
+            // Feedback, once the trial ended: a small gray bordered capsule,
+            // set apart from the filled Plans capsule.
             if let onFeedback {
-                TrialFeedbackButton(action: onFeedback)
+                Button(action: onFeedback) {
+                    Label(TrialFeedback.bannerFeedbackLabel, systemImage: TrialFeedback.bannerFeedbackSymbol)
+                }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.bordered)
+                .buttonBorderShape(.capsule)
+                .controlSize(.mini)
+                .tint(.gray)
             }
             // Plans is the row's main action: a small filled capsule.
             Button("Plans") {
@@ -59,23 +68,5 @@ struct InboxTrialReminder: View {
     nonisolated static func endedText(for trialState: TrialState, isInbox: Bool, isSignedIn: Bool, isDemo: Bool) -> String? {
         guard isInbox, isSignedIn, !isDemo, trialState == .ended else { return nil }
         return TrialFeedback.bannerEndedText
-    }
-}
-
-/// The trial-ended banners' secondary action: a small gray bordered capsule
-/// that opens the feedback sheet. Shared by the inbox row and the folder list
-/// so both look the same, and set apart from the filled Plans capsule.
-struct TrialFeedbackButton: View {
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Label(TrialFeedback.bannerFeedbackLabel, systemImage: TrialFeedback.bannerFeedbackSymbol)
-        }
-        .font(.caption.weight(.semibold))
-        .buttonStyle(.bordered)
-        .buttonBorderShape(.capsule)
-        .controlSize(.mini)
-        .tint(.gray)
     }
 }

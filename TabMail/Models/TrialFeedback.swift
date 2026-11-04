@@ -29,8 +29,10 @@ enum TrialFeedback {
     /// The inbox row once the trial has ended (`InboxTrialReminder`).
     static let bannerEndedText = "Free trial ended"
     static let bannerFeedbackLabel = "Feedback"
-    /// SF Symbol on the banners' Feedback button.
+    /// SF Symbol on the inbox row's Feedback button.
     static let bannerFeedbackSymbol = "bubble.left"
+    /// The folder-list banner's feedback text button, once the trial ended.
+    static let folderListFeedbackLabel = "Not for you? Tell us why"
 
     /// UserDefaults key: set once the sheet has appeared on this install, so
     /// it opens by itself only once. Not user data, only "already asked".
@@ -79,8 +81,8 @@ enum TrialFeedback {
         isInbox && hasSession && !isDemo && trialState == .ended && !alreadyAsked && !somethingPresented
     }
 
-    /// Whether a trial-ended banner (the inbox row and the folder list's
-    /// subscribe banner) offers Feedback: only until an answer was sent.
+    /// Whether a trial-ended banner (the inbox row's Feedback and the folder
+    /// list's "Tell us why") offers feedback: only until an answer was sent.
     static func offersFeedback(sent: Bool) -> Bool {
         !sent
     }

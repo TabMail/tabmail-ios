@@ -53,15 +53,25 @@ us why. One optional question, answered anonymously, is the cheapest signal.
      reminder (ADR-IOS-044 row from the stack base); BYOK and an unknown state show nothing, and it
      disappears once a subscription is active. The row reads "Free trial ended", then **Feedback**,
      then **Plans** (Choose a Plan).
-   - **Folder list.** In the trial-ended state only (`showsTrialEndedCopy`), the "Your Free Trial
-     Has Ended" banner gets a separate small **Feedback** button. The rest of the banner keeps its
-     tap-to-Plans; the Feedback tap does not navigate (two borderless/plain buttons in one row).
-     Never shown for "Start Your Free Trial" or signed out.
+   - **Folder list (layout C, owner 2026-11-03).** In the trial-ended state only
+     (`showsTrialEndedCopy`, `trialEndedBanner`), the "Your Free Trial Has Ended" banner keeps its
+     icon, title and subtitle, with no chevron, and the text is not a tap target. Under it a
+     full-width filled capsule **See Plans** does what the banner tap does (`subscribeBannerTapped`),
+     and under that a plain accent text button **"Not for you? Tell us why"**
+     (`TrialFeedback.folderListFeedbackLabel`) opens the sheet until an answer was sent; after that
+     only See Plans stays. The two are separate tap targets (non-default-styled buttons in one List
+     row take only their own taps): a feedback tap never opens Plans, a See Plans tap never opens the
+     sheet. Every other state ("Start Your Free Trial", signed out) is the single whole-row button
+     with a chevron, as on main. The wording "See Plans" and "Not for you? Tell us why" is awaiting
+     the owner's blessing.
    - **Styling (owner 2026-11-03).** Plans is a small filled capsule (the main action) on both the
-     running-trial and the ended inbox row; Feedback is a small gray bordered capsule with a
-     speech-bubble icon, one shared view (`TrialFeedbackButton`). In the folder list the banner stays
-     the single Plans/sign-in button (icon, title, subtitle, chevron) and Feedback sits on its own
-     line under it, aligned right, so the chevron side reads as Plans only.
+     running-trial and the ended inbox row; the inbox row's Feedback is a small gray bordered capsule
+     with a speech-bubble icon.
+   - History, superseded the same day: the folder list first carried a small Feedback button beside
+     the banner's text, then the same gray Feedback capsule as the inbox row (a shared
+     `TrialFeedbackButton`) on its own line under a whole-row Plans button. The owner disliked both
+     and chose layout C from five mockups; the shared view was inlined into the inbox row, its only
+     remaining user.
 8. **Two flags, one sheet.** `trial_feedback_asked` only stops the one-time auto-open (decision 2,
    unchanged). `trial_feedback_sent` is set by Send and only hides the Feedback buttons
    (`TrialFeedback.offersFeedback(sent:)`); Not now, a swipe down or closing the app leave Feedback
@@ -87,4 +97,6 @@ demo inputs, the real `InboxView`, Feedback reopens it after the auto-open; real
 cap, including a canonically equal replacement; send once over every
 status, transport error, and a lost reply; log privacy; banner rows per trial state, Feedback hidden
 after Send but not after Not now; lexical wiring checks for the single sheet host, the inbox row and
-the folder-list button, because those views are too large to host).
+the folder-list ended banner's two buttons, because those views are too large to host). Real taps
+on See Plans, "Tell us why" and the banner text are checked in the simulator capture harness, not
+in the suite.
