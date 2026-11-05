@@ -58,7 +58,9 @@ struct AISummaryResponseTests {
         #expect(result.reminderDate == nil)
         #expect(result.reminderTime == nil)
         #expect(result.reminderContent == nil)
-        // The backend sends the text message as a plain string with no "None" word.
+        // The backend sends the text message as a plain string with no "None" word, and a chat
+        // summary is done once its text message is stored: dropping a literal None would re-request
+        // the summary forever.
         #expect(result.textMessage == "NONE")
     }
 
@@ -66,6 +68,13 @@ struct AISummaryResponseTests {
     func blankAndMultiLineSummary() {
         #expect(parse(#"{"todos": [], "summary": " \n ", "reminder": null, "text_message": "T."}"#).blurb == nil)
         #expect(parse(#"{"todos": [], "summary": "One.\nTwo.", "reminder": null, "text_message": "T."}"#).blurb == "One. Two.")
+    }
+
+    @Test("A blank text message is nil")
+    func blankTextMessage() {
+        let result = parse(#"{"todos": [], "summary": "S.", "reminder": null, "text_message": "  \n "}"#)
+        #expect(result.blurb == "S.")
+        #expect(result.textMessage == nil)
     }
 
     @Test("A missing text message leaves the summary intact")

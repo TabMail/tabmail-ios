@@ -158,6 +158,10 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// eligible — fail-safe toward MORE reclaiming, never less.
     var actionTagSetAt: Date? = nil
 
+    /// The summary written locally, without a model call, for a message with nothing to summarize
+    /// (an empty body). It has no text message: there is no text to turn into one.
+    static let noContentSummary = "This message has no content."
+
     // AI-generated summary fields
     var summaryBlurb: String?
     var summaryTodos: String?

@@ -650,14 +650,14 @@ enum BodyFetchProcessor {
                                     bodyComplete = 1,
                                     bodyMetadataOversized = 0,
                                     emptyFetchCount = emptyFetchCount + 1,
-                                    summaryBlurb = 'This message has no content.',
+                                    summaryBlurb = ?,
                                     summaryTextMessage = NULL,
                                     actionTag = ?,
                                     tagSortOrder = ?,
                                     embeddingComplete = 1
                                 WHERE id = ?
                             """,
-                            arguments: [ActionTag.delete.rawValue, ActionTag.delete.sortOrder, item.headerId]
+                            arguments: [MessageHeader.noContentSummary, ActionTag.delete.rawValue, ActionTag.delete.sortOrder, item.headerId]
                         )
                     }
                 } catch {
@@ -709,7 +709,7 @@ enum BodyFetchProcessor {
             sql: """
                 UPDATE messageHeader
                 SET summaryBlurb = CASE
-                        WHEN bodyEmptyConfirmed = 1 AND summaryBlurb = 'This message has no content.'
+                        WHEN bodyEmptyConfirmed = 1 AND summaryBlurb = ?
                             THEN NULL
                         ELSE summaryBlurb
                     END,
@@ -728,6 +728,7 @@ enum BodyFetchProcessor {
                 WHERE id = ?
             """,
             arguments: [
+                MessageHeader.noContentSummary,
                 ActionTag.delete.rawValue,
                 ActionTag.delete.rawValue,
                 item.headerId,
@@ -838,6 +839,8 @@ enum BodyFetchProcessor {
                     windowExempt: aiWindowExempt)
             }
             if enableAI {
+                // A chat-view member that was waiting for its body (any folder) gets its summary.
+                await ActiveAIQueue.shared.chatBodyArrived(headerId: item.headerId)
                 await ActiveEmbeddingQueue.shared.enqueue(headerId: item.headerId)
             } else {
                 await BackfillEmbeddingQueue.shared.enqueue(headerId: item.headerId)
