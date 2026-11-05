@@ -2364,13 +2364,19 @@ struct ComposeView: View {
                 compositionPrompt: compositionPrompt
             )
             if let result, !result.body.isEmpty {
-                try? await dbPool.write { db in
-                    try db.execute(
-                        sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = ? WHERE id = ?",
-                        arguments: [result.body, result.textMessage, reply.id]
-                    )
-                }
-                BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId)")
+                // The row at `reply.id` can hold a different email by now (a UIDVALIDITY
+                // reset reuses the address), so the result is stored only while that row
+                // is still the email being replied to. The suggestion is shown either way:
+                // it answers the email on screen.
+                let outcome = (try? await dbPool.write { db -> AIWriteOutcome in
+                    guard let target = try AIWriteTarget.capture(message: reply, db: db) else { return .dropped }
+                    return try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
+                        msg.cachedReply = result.body
+                        msg.replyTextMessage = result.textMessage
+                        try msg.update(db)
+                    }
+                }) ?? .dropped
+                BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId), stored: \(outcome == .written)")
                 return result.body
             }
             BackgroundSyncLogger.logDebug("[Compose] Recompute returned nil/empty for \(reply.messageId)")
