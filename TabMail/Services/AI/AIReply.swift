@@ -198,7 +198,7 @@ extension AIService {
 
         // Device Sync probe: ask peer for cached reply before running LLM
         if let probeKey = rfc822MessageId {
-            if let probeResults = await DeviceSyncService.shared.probeAICache(keys: [probeKey]),
+            if let probeResults = await peerProbe([probeKey]),
                let cached = probeResults[probeKey],
                let peerReply = cached.reply, !peerReply.isEmpty {
                 BackgroundSyncLogger.logDebug("[AIService] Reply Device Sync HIT for \(messageId)")

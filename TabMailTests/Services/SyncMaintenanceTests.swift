@@ -627,6 +627,53 @@ struct AICachePurgeTests {
         #expect(try cache(f, "acc1:INBOX:empty") == nil)
     }
 
+    @Test("An old entry without a Message-ID is kept while its key's email is in any folder of that account")
+    func legacyEntryKeptByItsKey() throws {
+        let f = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
+        // Written by an older build without the Message-ID; the email moved to Archive since.
+        try insertHeader(f, uid: "7", folderPath: "Archive", rfc: "legacy@example.com")
+        try insertCache(f, key: "acc1:INBOX:legacy@example.com", rfc: nil, daysAgo: pastGrace)
+        // A folder path holding the delimiter still ends the key with the Message-ID.
+        try insertHeader(f, uid: "8", folderPath: "Archive", rfc: "nested@example.com")
+        try insertCache(f, key: "acc1:Work:Projects:nested@example.com", rfc: nil, daysAgo: pastGrace)
+        // The same Message-ID in another account does not keep this account's entry.
+        try f.pool.write { db in
+            var other = Account(emailAddress: "other@example.com", displayName: "Other", provider: .gmail)
+            other.id = "acc2"
+            try other.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc2").insert(db)
+            var header = MessageHeader(
+                messageId: "1", subject: "S", from: "sender@example.com", fromAddress: "sender@example.com",
+                to: "other@example.com", date: Date(), snippet: "", folderId: "acc2:INBOX",
+                accountId: "acc2", folderPath: "INBOX", isInInbox: true
+            )
+            header.rfc822MessageId = "elsewhere@example.com"
+            try header.insert(db)
+        }
+        try insertCache(f, key: "acc1:INBOX:elsewhere@example.com", rfc: nil, daysAgo: pastGrace)
+
+        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+
+        #expect(try cache(f, "acc1:INBOX:legacy@example.com")?.summaryTextMessage == "Text for acc1:INBOX:legacy@example.com")
+        #expect(try cache(f, "acc1:Work:Projects:nested@example.com") != nil)
+        #expect(try cache(f, "acc1:INBOX:elsewhere@example.com") == nil)
+    }
+
+    @Test("Storage maintenance runs the purge: an aged orphan goes, an entry whose email is here stays")
+    func maintenanceRunsThePurge() async throws {
+        let f = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
+        try insertHeader(f, uid: "3", folderPath: "Archive", rfc: "live@example.com")
+        try insertCache(f, key: "acc1:Archive:live@example.com", rfc: "live@example.com", daysAgo: pastGrace)
+        try insertCache(f, key: "acc1:INBOX:gone@example.com", rfc: "gone@example.com", daysAgo: pastGrace)
+
+        await SyncEngine.runWALMaintenance(dbPool: f.db, includePrune: false, undoProtectedBodyIds: [])
+
+        #expect(try cache(f, "acc1:INBOX:gone@example.com") == nil)
+        #expect(try cache(f, "acc1:Archive:live@example.com") != nil)
+    }
+
     @Test("More entries than one chunk: every kept entry kept, every orphan purged, the pass ends")
     func acrossChunks() throws {
         let f = try makeFixture()

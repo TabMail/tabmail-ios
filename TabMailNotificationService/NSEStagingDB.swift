@@ -27,10 +27,16 @@ enum NSEStagingDB {
         guard let url = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: SharedNSEData.appGroupIdentifier
         )?.appendingPathComponent(NSEConfig.stagingDBFileName) else { return nil }
+        return open(path: url.path)
+    }
 
+    /// Open the staging database at `path` and add the columns this build writes that an
+    /// older build's database lacks. `open()` passes the App Group file; internal so a test
+    /// can open a file of its own.
+    static func open(path: String) -> DatabaseQueue? {
         var config = Configuration()
         config.busyMode = .timeout(NSEConfig.stagingDBBusyTimeoutSeconds)
-        guard let queue = try? DatabaseQueue(path: url.path, configuration: config) else { return nil }
+        guard let queue = try? DatabaseQueue(path: path, configuration: config) else { return nil }
         ensureObservedUidValidityColumn(db: queue)
         ensureProviderDateColumn(db: queue)
         ensureSummaryTextMessageColumn(db: queue)

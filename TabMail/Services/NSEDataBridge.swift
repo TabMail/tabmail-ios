@@ -3646,15 +3646,13 @@ enum NSEDataBridge {
     /// staging delete failed must be a 0-row no-op, or it bumps `total_changes()` (a redundant
     /// reload) and, since REPLACE = delete+insert, NULLs columns it does not list (e.g. a peer's
     /// precomputed `cachedReply`). DO UPDATE touches only these columns, and only when the
-    /// content differs. The Message-ID lets the orphan purge match the entry to its email; an
-    /// entry an older build wrote without it gets it here (ADR-IOS-103).
+    /// content differs. The Message-ID lets the orphan purge match the entry to its email.
     static func upsertAICache(_ msg: StagedMessage, key: String, rfc822MessageId: String?, db: Database) throws {
         try db.execute(sql: """
             INSERT INTO messageAICache
                 (key, rfc822MessageId, summaryBlurb, summaryTodos, summaryTextMessage, actionTag, updatedAt)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
-                rfc822MessageId = COALESCE(messageAICache.rfc822MessageId, excluded.rfc822MessageId),
                 summaryBlurb = excluded.summaryBlurb,
                 summaryTodos = excluded.summaryTodos,
                 summaryTextMessage = excluded.summaryTextMessage,
@@ -3664,7 +3662,6 @@ enum NSEDataBridge {
                OR summaryTodos IS NOT excluded.summaryTodos
                OR summaryTextMessage IS NOT excluded.summaryTextMessage
                OR actionTag IS NOT excluded.actionTag
-               OR messageAICache.rfc822MessageId IS NULL
             """, arguments: [
                 key, rfc822MessageId, msg.summaryBlurb, msg.summaryTodos, msg.summaryTextMessage,
                 msg.actionTag, msg.processedAt
