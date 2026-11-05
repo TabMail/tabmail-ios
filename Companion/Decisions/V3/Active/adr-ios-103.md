@@ -56,7 +56,9 @@ same AI result, kept as long as the email itself is shown.
    `v96_repairAICacheMessageIds` (`AppDatabase.repairAICacheMessageIds`) has run on test devices, so it
    stays (frozen): it fills the Message-ID from the header in the folder the key names. The purge no
    longer depends on it. Review round 2 (2026-11-05) also removed a second purge trigger at the end of
-   the AI queue's drain.
+   the AI queue's drain. Review round 4 (2026-11-05): the purge reads the clock once (its `now`
+   argument), the base of its cutoff and the re-stamp of a kept entry, so a kept entry always leaves
+   the selection and the pass ends, even if the clock is set back while it runs.
 7. **Compose's recompute writes through the identity guard (review round 3, 2026-11-05).**
    `ComposeView.recomputedReply` stores its reply and text message with
    `AccountManager.aiGuardedHeaderWrite`, using an `AIWriteTarget` captured from the email compose is
@@ -72,9 +74,10 @@ parser does not read.
 
 **Tests:** `AISummaryParsingTests`, `AISummaryResponseTests`, `AIReplyParseTests`, `AIReplyTests`
 (parsers and `ReplyResult`); `AICachePurgeTests` (the orphan purge, driven for real, including
-`legacyEntryKeptByItsKey` and `maintenanceRunsThePurge`);
+`legacyEntryKeptByItsKey`, `maintenanceRunsThePurge` and `clockBehindEnds`);
 `ComposeSuggestionPersistTests.editClearsReplyTextMessage`; migration and merge tests in this PR;
-`AITextMessageCallerTests` (the queue's summary and reply jobs, the opened-email direct path in full and
+`AITextMessageCallerTests` (the queue's summary and reply jobs, a failed reply asked again and the next
+one stored (`queueReplyFailureRecovers`), the opened-email direct path in full and
 reply-only, a peer result through both, a whole queue job adopting a peer's action while keeping this
 device's summary and reply text messages (`queuePeerActionKeepsLocalPairs`), compose's recompute
 (`ComposeView.recomputedReply`) and its refusal to store on a replacement email at the same address
