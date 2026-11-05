@@ -692,13 +692,15 @@ struct AICachePurgeTests {
         #expect(keys.allSatisfy { $0.contains(":kept") })
     }
 
-    @Test("A pass whose clock is behind the wall clock keeps each entry once and ends")
-    func clockBehindEnds() throws {
+    /// The clock this pass reads is a month off the wall clock: behind it (the clock was set back
+    /// before the pass), or ahead of it (the clock is set back while the pass runs). Both entries
+    /// are past the grace by the pass's clock.
+    @Test("A pass whose clock is off the wall clock keeps each entry once and ends",
+          arguments: [-30, 30])
+    func clockOffWallClockEnds(daysOff: Int) throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
-        // The clock this pass reads is a month behind the wall clock (it was set back), and both
-        // entries are past the grace by that clock.
-        let now = try #require(Calendar.current.date(byAdding: .day, value: -30, to: Date()))
+        let now = try #require(Calendar.current.date(byAdding: .day, value: daysOff, to: Date()))
         let old = try #require(Calendar.current.date(byAdding: .day, value: -pastGrace, to: now))
         try insertHeader(f, uid: "1", folderPath: "Archive", rfc: "live@example.com")
         try f.pool.write { db in
