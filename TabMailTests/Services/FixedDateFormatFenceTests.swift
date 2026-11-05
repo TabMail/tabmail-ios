@@ -51,7 +51,7 @@ struct FixedDateFormatFenceTests {
         "TabMail/Views/Account/PlanPickerView.swift": 1,           // renewal date
         "TabMail/Views/Account/AccountDashboardView.swift": 2,     // billing dates
         "TabMail/Views/Message/MessageDetailView+Helpers.swift": 2, // message header time
-        "TabMail/Views/Agent/AgentChatSheet.swift": 3,             // event card times
+        "TabMail/Helpers/CalendarEventFormat.swift": 3,            // event card times (agent card, chat invite card)
         "TabMail/Views/Agent/MarkdownChatText.swift": 1,           // event card day
         "TabMail/Views/Settings/PromptHistoryView.swift": 1,       // prompt history stamp
     ]

@@ -78,6 +78,22 @@ struct MessageUserLabel: Codable, FetchableRecord, PersistableRecord, Sendable {
     static let userLabel = belongsTo(UserLabel.self, using: ForeignKey(["userLabelId"]))
 }
 
+extension UserLabel {
+    /// Every label of several messages, once each by id, sorted by name: what a collapsed thread
+    /// row and the chat header show for a thread.
+    static func union(_ lists: [[UserLabel]]) -> [UserLabel] {
+        var seenIds: Set<String> = []
+        var union: [UserLabel] = []
+        for labels in lists {
+            for label in labels where seenIds.insert(label.id).inserted {
+                union.append(label)
+            }
+        }
+        union.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        return union
+    }
+}
+
 // MARK: - MessageUserLabelWithUserLabel
 
 /// JOIN result struct for eager-loading labels with messages.

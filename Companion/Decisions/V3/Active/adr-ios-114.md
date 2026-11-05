@@ -152,6 +152,28 @@ same AI result, kept as long as the email itself is shown.
    and an in-flight twin keeps the offer (`ActiveAIQueue.chatOffersOnInFlightTwin`) until
    `jobCompleted` admits it.
 
+9. **The chat screen (amendment 2026-11-05, the third chat-view PR, 3a).** With the chat view on
+   (`ChatViewConfig.isActive` = reachable (release gate `isAvailableInBuild`, or the debug override
+   while debug is unlocked) AND the user's Settings toggle `chatViewEnabled` (default on, kept while
+   AI is off) AND AI on (not opted out, a plan or trial active)), every thread open goes through
+   `MessageOpenView`, which decides chat or today's email view ONCE per open (`opensInChat`, also off
+   in the demo's AI-off mode and during the tutorial): the inbox, push and notification opens
+   (`MessageDetailResolvedContent`), search results and the Reminders link.
+   `ChatThreadView` reuses `MessageDetailViewModel` (body, thread load, mark-read, archive, delete,
+   move); `ChatThread` is the pure model: drafts left out, one copy per `stableId` (the opened copy,
+   else one with a text message), oldest first by (date, id), own = from one of the account addresses
+   or in a Sent folder, reply people = the newest email's `buildReplyAllRecipients` minus the user,
+   a group when more than one other person; time stamps after `ChatViewLayout.timeStampGap`; the
+   Unread line above the first email unread at open (recorded before marking read). Each bubble opens
+   the email card (today's `MessageDetailView` in a sheet). `ChatThreadContext` reads the Drafts/Sent
+   folders, the label union (`UserLabel.union`, shared with `ThreadGroup.displayInfo`), top-level
+   attachment names and an addable invite (`ChatInvite`; the card stands for its calendar file).
+   The inbox row shows the text message when the chat view is on (`MessageSnapshot.preview`).
+   **Decided 2026-11-05:** in 3a today's pill stays and acts on the NEWEST email; "Sent" under
+   every own bubble; the 15-minute gap; tutorial and demo-AI-off keep today's view; the User
+   Interface Settings section moves to the top only when the chat view is reachable; a reminder open
+   highlights its email; triage rows keep the snippet; the agent's toast is not shown in the chat.
+
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
 parser does not read.
@@ -177,4 +199,5 @@ including to none (`sameSummaryNewTextMessage`), the merge's second stage creati
 stage could not and caching its result with the text message (`secondStageCachesTextMessage`), a merged
 cache entry kept through the orphan grace (`mergedCacheEntryGetsTheGrace`), and a push through `NotificationService.didReceive`
 staging the text message, via `NotificationService.stagingPathOverride`).
-Decision 8: `ChatSummaryQueueTests` (including a chat offer made while its ordinary twin is in flight, just after it ended, or when it runs again, and the foreground pass's walk, two-sided on the chat view); `ChatSummaryExecutionTests` (the own-email field, two-sided; the executor refusing an ordinary summary outside the Inbox, with an Inbox control).
+Decision 8: `ChatSummaryQueueTests` (including a chat offer made while its ordinary twin is in flight, just after it ended, or when it runs again, and the foreground pass's walk, two-sided on the chat view); `ChatSummaryExecutionTests` (the own-email field, two-sided; the executor refusing an ordinary summary outside the Inbox, with an Inbox control). Decision 9: `ChatThreadTests`,
+`ChatThreadContextTests`, `ChatSummaryQueueTests.releaseGate`/`activeMatrix`, `ThreadGroupTests.displayInfoUnionLabels`.
