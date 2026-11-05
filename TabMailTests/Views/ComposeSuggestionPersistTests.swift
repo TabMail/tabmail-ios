@@ -454,4 +454,24 @@ struct ComposeSuggestionPersistTests {
         let save = try #require(edit.range(of: "persistCachedReply(b)"))
         #expect(suggestion.lowerBound < gate.lowerBound && gate.lowerBound < save.lowerBound)
     }
+
+    @Test("A user edit clears the reply's text message, which described the AI's body")
+    func editClearsReplyTextMessage() async throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        var header = try TestDatabase.insertMessageHeader(db, messageId: "1")
+        header.cachedReply = "AI reply"
+        header.replyTextMessage = "AI text message"
+        header.summaryTextMessage = "Summary text message"
+        let seeded = header
+        try await db.write { try seeded.update($0) }
+
+        await ComposeView.writeCachedReplyToDB("my edit", replyTo: seeded, db: db)
+
+        let fetched = try await db.read { try MessageHeader.fetchOne($0, key: seeded.id) }
+        #expect(fetched?.cachedReply == "my edit")
+        #expect(fetched?.replyTextMessage == nil)
+        #expect(fetched?.summaryTextMessage == "Summary text message")
+    }
 }

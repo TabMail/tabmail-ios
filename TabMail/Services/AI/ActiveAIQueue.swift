@@ -817,10 +817,10 @@ actor ActiveAIQueue {
                 }
                 await ProactiveNotifyService.shared.onInboxUpdated()
 
-                // Lazy TTL touch + eviction: refresh AI cache TTL for inbox messages
-                // and purge expired entries. Runs once after all AI work completes.
+                // Purge AI cache entries whose email left the device. Runs once after
+                // all AI work completes.
                 Task.detached {
-                    SyncEngine.refreshAICacheTTLAndPurge(dbPool: AppDatabase.backgroundPool)
+                    SyncEngine.runPurgeOrphanedAICache(dbPool: AppDatabase.backgroundPool)
                 }
             }
         }
@@ -1112,6 +1112,8 @@ actor ActiveAIQueue {
                                 msg.reminderDate = ps.reminderDate?.isEmpty == true ? nil : ps.reminderDate
                                 msg.reminderTime = ps.reminderTime?.isEmpty == true ? nil : ps.reminderTime
                                 msg.reminderContent = ps.reminderContent?.isEmpty == true ? nil : ps.reminderContent
+                                // A peer (Thunderbird) summary has no text message.
+                                msg.summaryTextMessage = nil
                                 changed = true
                                 BackgroundSyncLogger.logAIProcessing("DeviceSync summary HIT for \(Self.logId(job.headerId))")
                             }
@@ -1125,6 +1127,7 @@ actor ActiveAIQueue {
                         }
                         if let pr = cached.reply, !pr.isEmpty, msg.cachedReply == nil {
                             msg.cachedReply = pr
+                            msg.replyTextMessage = nil
                             changed = true
                             BackgroundSyncLogger.logAIProcessing("DeviceSync reply HIT for \(Self.logId(job.headerId))")
                         }
@@ -1139,8 +1142,10 @@ actor ActiveAIQueue {
                             reminderDate: msg.reminderDate,
                             reminderTime: msg.reminderTime,
                             reminderContent: msg.reminderContent,
+                            summaryTextMessage: msg.summaryTextMessage,
                             actionTag: msg.actionTag,
                             cachedReply: msg.cachedReply,
+                            replyTextMessage: msg.replyTextMessage,
                             db: db
                         )
                     }
@@ -1361,6 +1366,7 @@ actor ActiveAIQueue {
                     msg.reminderDate = summary.reminderDate
                     msg.reminderTime = summary.reminderTime
                     msg.reminderContent = summary.reminderContent
+                    msg.summaryTextMessage = summary.textMessage
                     try msg.save(db)
 
                     try MessageAICache.writeThrough(
@@ -1372,6 +1378,7 @@ actor ActiveAIQueue {
                         reminderDate: summary.reminderDate,
                         reminderTime: summary.reminderTime,
                         reminderContent: summary.reminderContent,
+                        summaryTextMessage: summary.textMessage,
                         db: db
                     )
                 }
@@ -1453,7 +1460,8 @@ actor ActiveAIQueue {
                 todos: msg.summaryTodos,
                 reminderDate: msg.reminderDate,
                 reminderTime: msg.reminderTime,
-                reminderContent: msg.reminderContent
+                reminderContent: msg.reminderContent,
+                textMessage: msg.summaryTextMessage
             )
             let action = try await config.aiService.classifyAction(
                 subject: msg.subject,
@@ -1554,15 +1562,17 @@ actor ActiveAIQueue {
                 // T4.V7 site 4.
                 let outcome = (try? await dbPool.write { db in
                     try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
-                        msg.cachedReply = reply
+                        msg.cachedReply = reply.body
+                        msg.replyTextMessage = reply.textMessage
                         try msg.save(db)
-                        if !reply.isEmpty {
+                        if !reply.body.isEmpty {
                             try MessageAICache.writeThrough(
                                 accountId: account.id,
                                 folderPath: msg.folderPath,
                                 rfc822MessageId: msg.rfc822MessageId,
-                                cachedReply: reply,
+                                cachedReply: reply.body,
                                 replyGeneratedAt: Date(),
+                                replyTextMessage: reply.textMessage,
                                 db: db
                             )
                             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)

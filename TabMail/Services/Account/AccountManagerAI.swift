@@ -623,6 +623,7 @@ extension AccountManager {
                                 msg.reminderDate = summary.reminderDate
                                 msg.reminderTime = summary.reminderTime
                                 msg.reminderContent = summary.reminderContent
+                                msg.summaryTextMessage = summary.textMessage
 
                                 var cacheActionTag: ActionTag?
                                 if let action, !hasExistingAction {
@@ -638,6 +639,7 @@ extension AccountManager {
 
                                 if let peerReply, !peerReply.isEmpty, msg.cachedReply == nil {
                                     msg.cachedReply = peerReply
+                                    msg.replyTextMessage = nil
                                     if DebugModeManager.isLoggingEnabled() {
                                         print("[AI] Device Sync reply applied for direct path \(messageId)")
                                     }
@@ -654,8 +656,10 @@ extension AccountManager {
                                     reminderDate: summary.reminderDate,
                                     reminderTime: summary.reminderTime,
                                     reminderContent: summary.reminderContent,
+                                    summaryTextMessage: summary.textMessage,
                                     actionTag: cacheActionTag,
                                     cachedReply: msg.cachedReply,
+                                    replyTextMessage: msg.replyTextMessage,
                                     db: db
                                 )
                             }
@@ -695,7 +699,8 @@ extension AccountManager {
                             todos: message.summaryTodos,
                             reminderDate: message.reminderDate,
                             reminderTime: message.reminderTime,
-                            reminderContent: message.reminderContent
+                            reminderContent: message.reminderContent,
+                            textMessage: message.summaryTextMessage
                         )
                         let action = try await aiService.classifyAction(
                             subject: subject,
@@ -779,15 +784,17 @@ extension AccountManager {
                         // T4.V7 site 7.
                         let outcome = (try? await dbPool.write { db in
                             try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
-                                msg.cachedReply = reply
+                                msg.cachedReply = reply.body
+                                msg.replyTextMessage = reply.textMessage
                                 try msg.save(db)
-                                if !reply.isEmpty {
+                                if !reply.body.isEmpty {
                                     try MessageAICache.writeThrough(
                                         accountId: accountId,
                                         folderPath: msg.folderPath,
                                         rfc822MessageId: msg.rfc822MessageId,
-                                        cachedReply: reply,
+                                        cachedReply: reply.body,
                                         replyGeneratedAt: Date(),
+                                        replyTextMessage: reply.textMessage,
                                         db: db
                                     )
                                     if DebugModeManager.isLoggingEnabled() {
