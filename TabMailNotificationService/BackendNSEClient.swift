@@ -24,6 +24,9 @@ enum BackendNSEClient {
     /// `TabMailProtocolVersion` from this extension's Info.plist (TABMAIL_PROTOCOL_VERSION).
     static let protocolVersion = Bundle.main.infoDictionary?["TabMailProtocolVersion"] as? String
 
+    /// The completions transport; tests bind a fake (same seam as `NSETokenManager.transport`).
+    @TaskLocal static var transport: NSETokenManager.DataForRequest = { try await URLSession.shared.data(for: $0) }
+
     /// Single completions call (summary or chat)
     static func sendCompletions(
         promptAlias: String,
@@ -140,7 +143,7 @@ enum BackendNSEClient {
     /// 26.4s under the nominal 12s idle timeout, missing the 27s graceful-exit
     /// watchdog by 9ms; action calls were observed at 16.8s/17.4s/19s+.
     ///
-    /// Races `URLSession.shared.data(for:)` against `Task.sleep` for
+    /// Races `transport` (`URLSession.shared.data(for:)`) against `Task.sleep` for
     /// `timeout` seconds; first finisher wins, then `group.cancelAll()` —
     /// `data(for:)` is cancellation-aware and aborts the in-flight HTTP
     /// request, so the loser doesn't linger. `request.timeoutInterval` is
@@ -148,7 +151,7 @@ enum BackendNSEClient {
     private static func performRequestWithDeadline(_ request: URLRequest, timeout: TimeInterval) async -> Data? {
         let outcome = await withTaskGroup(of: CallOutcome.self) { group -> CallOutcome in
             group.addTask {
-                guard let (data, response) = try? await URLSession.shared.data(for: request),
+                guard let (data, response) = try? await transport(request),
                       let httpResponse = response as? HTTPURLResponse,
                       httpResponse.statusCode == 200 else { return .httpFailure }
                 return .success(data)

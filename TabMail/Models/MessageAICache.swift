@@ -143,6 +143,10 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
             .filter(Column("key") == key)
             .fetchOne(db) ?? MessageAICache(key: key, rfc822MessageId: rfc822MessageId)
 
+        // The orphan purge matches an entry to its email by this Message-ID; a row an older NSE
+        // wrote without it gets it on its next write (the key already names the same message).
+        if cache.rfc822MessageId == nil { cache.rfc822MessageId = rfc822MessageId }
+
         // Only overwrite non-nil values (preserves existing fields on partial updates)
         if let summaryBlurb {
             cache.summaryBlurb = summaryBlurb

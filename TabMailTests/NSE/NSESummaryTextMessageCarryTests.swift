@@ -43,7 +43,12 @@ struct NSESummaryTextMessageCarryTests {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let path = dir.appendingPathComponent("nse_staging.sqlite").path
         #expect(AppDatabase.createNSEStagingDB(atPath: path))
-        return (dir, try DatabaseQueue(path: path))
+        let queue = try DatabaseQueue(path: path)
+        // The columns `NSEStagingDB.open` adds before any write; the text message column is
+        // left to each test, which checks its upgrade.
+        NSEStagingDB.ensureObservedUidValidityColumn(db: queue)
+        NSEStagingDB.ensureProviderDateColumn(db: queue)
+        return (dir, queue)
     }
 
     @Test("A fresh staging schema has the column")

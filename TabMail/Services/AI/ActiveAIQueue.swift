@@ -211,6 +211,24 @@ actor ActiveAIQueue {
     /// seams in this file set (see `NSEDataBridge.resetStageMemoForTesting`).
     var dbPoolPriorityForTesting: WritePriority { dbPool.priority }
 
+    /// Test seam: run one job's executor with an injected AI service (production builds
+    /// the config from `AIService.shared` in `dispatch`), so a test observes what the real
+    /// job writes. Same visibility as `dbPoolPriorityForTesting`.
+    func executeJobForTesting(
+        _ job: AIJob, message: MessageHeader, plainText: String,
+        account: Account, target: AIWriteTarget, aiService: AIService
+    ) async -> Bool {
+        let config = DispatchConfig(aiService: aiService, kbText: "", actionPrompt: "", compositionPrompt: "")
+        switch job.jobType {
+        case .summary:
+            return await executeSummaryJob(job, message: message, plainText: plainText, account: account, target: target, config: config)
+        case .action:
+            return await executeActionJob(job, message: message, plainText: plainText, account: account, target: target, config: config)
+        case .reply:
+            return await executeReplyJob(job, message: message, plainText: plainText, account: account, target: target, config: config)
+        }
+    }
+
     /// Compact, MESSAGE-discriminating id for logs. A `headerId` is
     /// "accountId:folder:messageId"; the accountId is a 36-char UUID, so the old
     /// `headerId.prefix(30)` never reached the messageId — it printed the SAME string for

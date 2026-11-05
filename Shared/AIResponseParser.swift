@@ -45,7 +45,7 @@ enum AIResponseParser {
             reminderDate: reminderDate,
             reminderTime: reminderTime,
             reminderContent: reminderContent,
-            textMessage: (object["text_message"] as? String).flatMap(trimmed)
+            textMessage: (object["text_message"] as? String).flatMap(nonEmpty)
         )
     }
 
@@ -57,8 +57,8 @@ enum AIResponseParser {
     /// Parse the precache reply JSON: `{"subject": "..", "body": "..", "text_message": ".."}`. Nil when
     /// it is not that object or has no body; the caller treats that as no reply (retried later).
     static func parseReplyResponse(_ text: String) -> ReplyResult? {
-        guard let object = jsonObject(text), let body = (object["body"] as? String).flatMap(trimmed) else { return nil }
-        return ReplyResult(body: body, textMessage: (object["text_message"] as? String).flatMap(trimmed))
+        guard let object = jsonObject(text), let body = (object["body"] as? String).flatMap(nonEmpty) else { return nil }
+        return ReplyResult(body: body, textMessage: (object["text_message"] as? String).flatMap(nonEmpty))
     }
 
     /// The JSON object `text` holds, else nil.
@@ -72,6 +72,14 @@ enum AIResponseParser {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = text.lowercased()
         return text.isEmpty || lower == "none" || lower == "\"none\"" ? nil : text
+    }
+
+    /// Trimmed, nil only when empty. For the reply body and the text messages: the backend sends
+    /// them as plain strings with no "None" word for a missing value, so a reply that is the word
+    /// "None" is kept as written.
+    private static func nonEmpty(_ value: String) -> String? {
+        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 
     /// `trimmed`, with its newlines turned into spaces (the one-line stored fields).

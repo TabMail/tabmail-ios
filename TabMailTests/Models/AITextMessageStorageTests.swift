@@ -140,4 +140,66 @@ struct AITextMessageStorageTests {
         #expect(header.cachedReply == "Own reply")
         #expect(header.replyTextMessage == nil)
     }
+
+    // MARK: - Message-ID of an older build's entries (v96)
+
+    private static func migrated(upTo migration: String) throws -> DatabaseQueue {
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: config)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: migration)
+        return db
+    }
+
+    private static func legacyEntry(_ key: String, _ db: Database) throws {
+        try db.execute(sql: "INSERT INTO messageAICache (key, rfc822MessageId, summaryBlurb, updatedAt) VALUES (?, NULL, 'kept', ?)",
+                       arguments: [key, Date()])
+    }
+
+    @Test("v96 gives an older build's entry the Message-ID of the email its key names, and only that")
+    func v96RepairsLegacyIdentity() throws {
+        let db = try Self.migrated(upTo: "v95_addAITextMessages")
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+        try TestDatabase.insertMessageHeader(db, messageId: "1", rfc822MessageId: "live@example.com")
+        try db.write { db in
+            try Self.legacyEntry("acc1:INBOX:live@example.com", db)
+            // The same Message-ID filed under another folder's key: not this header's entry.
+            try Self.legacyEntry("acc1:Archive:live@example.com", db)
+            // No header: an orphan, left for the purge.
+            try Self.legacyEntry("acc1:INBOX:gone@example.com", db)
+            try db.execute(sql: "INSERT INTO messageAICache (key, rfc822MessageId, updatedAt) VALUES ('acc1:INBOX:other@example.com', 'other@example.com', ?)",
+                           arguments: [Date()])
+        }
+
+        try AppDatabase.runMigrations(on: db)
+
+        let ids = try db.read { db in
+            try Dictionary(uniqueKeysWithValues: Row.fetchAll(db, sql: "SELECT key, rfc822MessageId FROM messageAICache")
+                .map { ($0["key"] as String, $0["rfc822MessageId"] as String?) })
+        }
+        #expect(ids["acc1:INBOX:live@example.com"] == .some("live@example.com"))
+        #expect(ids["acc1:Archive:live@example.com"] == .some(nil))
+        #expect(ids["acc1:INBOX:gone@example.com"] == .some(nil))
+        #expect(ids["acc1:INBOX:other@example.com"] == .some("other@example.com"))
+        let applied = try db.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations") }
+        #expect(applied.contains("v96_repairAICacheMessageIds"))
+    }
+
+    @Test("A write-through onto an older build's entry gives it the Message-ID")
+    func writeThroughRepairsLegacyIdentity() throws {
+        let db = try TestDatabase.make()
+        try db.write { db in
+            try Self.legacyEntry("acc1:INBOX:old@example.com", db)
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "old@example.com",
+                                            cachedReply: "Sure.", replyGeneratedAt: Date(), replyTextMessage: "Sure", db: db)
+        }
+        let entry = try entry(db, "old@example.com")
+        #expect(entry?.rfc822MessageId == "old@example.com")
+        #expect(entry?.summaryBlurb == "kept")
+        #expect(entry?.replyTextMessage == "Sure")
+    }
 }
