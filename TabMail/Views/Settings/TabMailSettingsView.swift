@@ -47,7 +47,7 @@ struct TabMailSettingsView: View {
     @ViewBuilder
     private var userInterfaceSection: some View {
         Section("User Interface") {
-            if ChatViewConfig.isReachable { chatViewToggle }
+            chatViewToggle
 
             Toggle(isOn: $showAISummaries) {
                 Label {
@@ -154,8 +154,8 @@ struct TabMailSettingsView: View {
         ScrollViewReader { proxy in
         Form {
             Group {
-            // The chat view brings User Interface to the top (Q6).
-            if ChatViewConfig.isReachable { userInterfaceSection }
+            // User Interface sits at the top, where the chat view's switch is.
+            userInterfaceSection
 
             Section("Personalization") {
                 NavigationLink {
@@ -375,8 +375,6 @@ struct TabMailSettingsView: View {
                 }
 
             }
-
-            if !ChatViewConfig.isReachable { userInterfaceSection }
 
             // Privacy opt-out (matches TB's Settings → Privacy section)
             Section {

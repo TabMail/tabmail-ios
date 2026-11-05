@@ -275,25 +275,21 @@ struct ChatSummaryQueueTests {
         #expect(ids == [MessageIdentity.headerId(accountId: acc, folderPath: "Sent", messageId: "new-reply")])
     }
 
-    // MARK: - 6. Release gate
+    // MARK: - 6. The switch
 
     /// Everything `ChatViewConfig.isActive` reads, saved and put back so no suite sees residue:
-    /// the debug unlock, the override, the user toggle, the AI opt-out and the subscription gate.
+    /// the user toggle, the AI opt-out and the subscription gate.
     @MainActor
     private struct SavedChatViewState {
         let defaults = UserDefaults.standard
-        let unlocked = UserDefaults.standard.object(forKey: "debug_mode_unlocked")
-        let override = UserDefaults.standard.object(forKey: "debug_chat_view_enabled")
         let toggle = UserDefaults.standard.object(forKey: ChatViewConfig.enabledKey)
         let optOut = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
         let gateOpen = AISubscriptionGate.shared.isActive
         let lastKnownActive = UserDefaults.standard.object(forKey: "ai_subscription_last_known_active")
 
-        /// Debug unlocked, the override as given, the toggle unset (on), AI on.
+        /// The toggle as given, AI on.
         func setChatView(on: Bool) {
-            defaults.set(true, forKey: "debug_mode_unlocked")
-            ChatViewConfig.debugOverride = on
-            defaults.removeObject(forKey: ChatViewConfig.enabledKey)
+            defaults.set(on, forKey: ChatViewConfig.enabledKey)
             AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
             AISubscriptionGate.shared.openGate()
         }
@@ -301,30 +297,22 @@ struct ChatSummaryQueueTests {
         func restore() {
             if gateOpen { AISubscriptionGate.shared.openGate() } else { AISubscriptionGate.shared.closeGate() }
             defaults.set(lastKnownActive, forKey: "ai_subscription_last_known_active")
-            defaults.set(unlocked, forKey: "debug_mode_unlocked")
-            defaults.set(override, forKey: "debug_chat_view_enabled")
             defaults.set(toggle, forKey: ChatViewConfig.enabledKey)
             AIService.optOutStore.set(optOut, forKey: AIService.optOutAllAIKey)
         }
     }
 
     @MainActor
-    @Test("Release builds keep the chat view off; the override counts only while debug is unlocked; on needs the toggle and AI")
-    func releaseGate() {
+    @Test("The chat view is on by default; off needs the toggle off, an opt-out or no plan; AI going off keeps the choice")
+    func chatViewSwitch() {
         let saved = SavedChatViewState()
         defer { saved.restore() }
-        #expect(!ChatViewConfig.isAvailableInBuild, "the chat view must not reach users before it ships")
 
         saved.setChatView(on: true)
-        #expect(ChatViewConfig.isActive)
+        UserDefaults.standard.removeObject(forKey: ChatViewConfig.enabledKey)
+        #expect(ChatViewConfig.isActive, "a fresh install has it on")
 
-        UserDefaults.standard.set(false, forKey: "debug_mode_unlocked")
-        #expect(!ChatViewConfig.isReachable)
-        #expect(!ChatViewConfig.isActive, "a leftover override must not count once debug is locked")
-
-        UserDefaults.standard.set(true, forKey: "debug_mode_unlocked")
         UserDefaults.standard.set(false, forKey: ChatViewConfig.enabledKey)
-        #expect(ChatViewConfig.isReachable, "the Settings row stays while the user has it off")
         #expect(!ChatViewConfig.isActive, "the user turned it off")
 
         UserDefaults.standard.removeObject(forKey: ChatViewConfig.enabledKey)
@@ -339,18 +327,13 @@ struct ChatSummaryQueueTests {
 
         AISubscriptionGate.shared.openGate()
         #expect(ChatViewConfig.isActive, "AI back on: the user's choice applies again")
-        ChatViewConfig.debugOverride = false
-        #expect(!ChatViewConfig.isActive)
     }
 
-    @Test("The chat view is on only when reachable, chosen and with AI on")
+    @Test("The chat view is on only when chosen and with AI on")
     func activeMatrix() {
-        for reachable in [false, true] {
-            for chosen in [false, true] {
-                for aiOn in [false, true] {
-                    #expect(ChatViewConfig.isActive(reachable: reachable, enabledByUser: chosen, aiOn: aiOn)
-                            == (reachable && chosen && aiOn))
-                }
+        for chosen in [false, true] {
+            for aiOn in [false, true] {
+                #expect(ChatViewConfig.isActive(enabledByUser: chosen, aiOn: aiOn) == (chosen && aiOn))
             }
         }
         for optedOut in [false, true] {
