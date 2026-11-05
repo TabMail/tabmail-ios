@@ -499,12 +499,14 @@ extension AccountManager {
     /// Process a single message after its body is fetched (priority path for user-opened messages).
     /// Handles AI summary + action classification, matching TB's processMessage().
     /// `target` is the T4.V7 identity captured at the direct-path entry; every
-    /// header write below re-resolves through it.
+    /// header write below re-resolves through it. `aiService` is a test seam
+    /// (precedent: `AIService(backendClient:)`); production uses `shared`.
     func processMessage(
         _ message: MessageHeader,
         body: MessageBody,
         account: Account,
-        target: AIWriteTarget
+        target: AIWriteTarget,
+        aiService: AIService = .shared
     ) async {
         // `processOpenedMessage` captured this body, header and write target in
         // one database snapshot. Re-reading by `message.id` here opened a
@@ -575,7 +577,6 @@ extension AccountManager {
                 return
             }
 
-            let aiService = AIService.shared
             let needsSA = !hasSummary || !hasExistingAction
 
             // Launch SA and R in parallel — R does not depend on summary/action output.

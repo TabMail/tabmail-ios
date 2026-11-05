@@ -4278,6 +4278,32 @@ final class AppDatabase: Sendable {
                 t.add(column: "replyTextMessage", .text)
             }
         }
+
+        // AI results live as long as their email (ADR-IOS-103): the orphan purge keeps an AI
+        // cache entry while a header with its Message-ID is on the device. Older NSE builds
+        // wrote entries without that Message-ID, so the purge would delete them though their
+        // email is still here. Fill it from the header whose cache key the entry has (the key
+        // is `accountId:folderPath:rfc822MessageId`, the primary key, so each header is one
+        // indexed probe). Entries with no such header stay NULL and are orphans, as before.
+        // Convergence: a fresh install has no such rows; an upgraded DB ends with every entry
+        // whose email is on the device carrying its Message-ID. The write paths keep it so.
+        migrator.registerTimedMigration(
+            "v96_repairAICacheMessageIds", foreignKeyChecks: .immediate
+        ) { db in
+            try repairAICacheMessageIds(db)
+        }
+    }
+
+    /// Fill a missing `messageAICache.rfc822MessageId` from the header the entry's key names
+    /// (v96). Shared by the migration and its test.
+    static func repairAICacheMessageIds(_ db: Database) throws {
+        try db.execute(sql: """
+            UPDATE messageAICache SET rfc822MessageId = h.rfc822MessageId
+            FROM messageHeader AS h
+            WHERE messageAICache.rfc822MessageId IS NULL
+              AND h.rfc822MessageId IS NOT NULL AND h.rfc822MessageId != ''
+              AND messageAICache.key = h.accountId || ':' || h.folderPath || ':' || h.rfc822MessageId
+        """)
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

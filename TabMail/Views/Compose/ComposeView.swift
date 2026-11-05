@@ -2165,10 +2165,7 @@ struct ComposeView: View {
                 if let result, !result.body.isEmpty {
                     currentSuggestion = result.body
                     try? await dbPool.write { db in
-                        try db.execute(
-                            sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = ? WHERE id = ?",
-                            arguments: [result.body, result.textMessage, reply.id]
-                        )
+                        try Self.writeRecomputedReply(result, headerId: reply.id, db: db)
                     }
                     BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId)")
                 } else {
@@ -2361,6 +2358,15 @@ struct ComposeView: View {
                 )
             }
         }
+    }
+
+    /// Internal for testability — the write `recomputeReply` makes: the new reply and its
+    /// text message together.
+    nonisolated static func writeRecomputedReply(_ result: ReplyResult, headerId: String, db: Database) throws {
+        try db.execute(
+            sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = ? WHERE id = ?",
+            arguments: [result.body, result.textMessage, headerId]
+        )
     }
 
     // MARK: - From picker
