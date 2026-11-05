@@ -634,6 +634,10 @@ final class AppDatabase: Sendable {
                     // lands with the same `providerDate` sync would write and the
                     // `.date` stale window never sees an epoch-zero placeholder.
                     "providerDate REAL",
+                    // v8 (2026-11-05): the summary's text message, staged with the
+                    // summary (`NSEStagingDB.ensureSummaryTextMessageColumn` adds it
+                    // from the extension too, like `providerDate`).
+                    "summaryTextMessage TEXT",
                 ] {
                     do {
                         try db.execute(sql: "ALTER TABLE nse_processed_message ADD COLUMN \(col)")
@@ -4254,6 +4258,25 @@ final class AppDatabase: Sendable {
                 SET updatedAt = strftime('%Y-%m-%d %H:%M:%f', updatedAt, 'unixepoch')
                 WHERE typeof(updatedAt) IN ('integer', 'real')
                 """)
+        }
+
+        // Chat view: each AI summary and precomputed reply carries a short text-message
+        // version (`summaryTextMessage`, `replyTextMessage`) on the header and in the AI
+        // cache. NULLABLE and NO BACKFILL: a result computed before this version has no
+        // text message, and the chat view asks for one when it needs it.
+        // Convergence: a fresh install and an upgraded DB both end with the four
+        // columns, NULL on every pre-existing row.
+        migrator.registerTimedMigration(
+            "v95_addAITextMessages", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "summaryTextMessage", .text)
+                t.add(column: "replyTextMessage", .text)
+            }
+            try db.alter(table: "messageAICache") { t in
+                t.add(column: "summaryTextMessage", .text)
+                t.add(column: "replyTextMessage", .text)
+            }
         }
     }
 

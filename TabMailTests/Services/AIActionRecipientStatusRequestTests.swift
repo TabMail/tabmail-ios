@@ -66,7 +66,8 @@ struct AIActionRecipientStatusRequestTests {
             subject: "Quarterly planning", from: "Sender", fromAddress: "sender@company.com",
             bodyText: "Notes from the planning call.", htmlContent: nil,
             summary: SummaryResult(blurb: "Planning notes.", todos: nil,
-                                   reminderDate: nil, reminderTime: nil, reminderContent: nil),
+                                   reminderDate: nil, reminderTime: nil, reminderContent: nil,
+                                   textMessage: nil),
             userName: "Recipient", actionPrompt: "",
             recipientStatus: recipientStatus
         )

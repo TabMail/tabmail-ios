@@ -284,42 +284,13 @@ extension SyncEngine {
         }
     }
 
-    /// Lazy TTL touch + purge — runs after AI queue drains, not during sync.
-    /// Touches updatedAt on all inbox AI cache entries, then purges expired ones.
-    /// Runs on a background thread to avoid GRDB writer lock contention on MainActor.
-    nonisolated static func refreshAICacheTTLAndPurge(dbPool: PrioritizedDatabase) {
-        // Touch: refresh TTL for all inbox messages' AI cache entries
-        do {
-            let touchedCount = try dbPool.write { db in
-                // Get all inbox folder IDs
-                let inboxFolderIds = try Folder.filter(Column("role") == FolderRole.inbox.rawValue).fetchAll(db).map(\.id)
-                guard !inboxFolderIds.isEmpty else { return 0 }
-
-                // Build prefix patterns for LIKE queries
-                var totalTouched = 0
-                for folderId in inboxFolderIds {
-                    let prefix = "\(folderId):"
-                    let count = try MessageAICache
-                        .filter(Column("key").like("\(prefix)%"))
-                        .updateAll(db, Column("updatedAt").set(to: Date()))
-                    totalTouched += count
-                }
-                return totalTouched
-            }
-            if touchedCount > 0 {
-                BackgroundSyncLogger.logDebug("[AICache] TTL refresh: touched \(touchedCount) inbox AI cache entries")
-            }
-        } catch {
-            BackgroundSyncLogger.logDebug("[AICache] TTL refresh failed: \(error)")
-        }
-
-        // Purge expired entries
-        runPurgeExpiredAICache(dbPool: dbPool)
-    }
-
-    /// Nonisolated purge — runs entirely off the main thread.
-    nonisolated static func runPurgeExpiredAICache(dbPool: PrioritizedDatabase) {
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date()) ?? Date.distantPast
+    /// Purge AI cache entries whose email is no longer on the device. An entry untouched for
+    /// `SyncConfig.aiCacheOrphanGraceDays` is kept (and re-stamped, so it is not re-checked for
+    /// another grace period) while any header, in any folder, has its Message-ID; otherwise it
+    /// is deleted. A result therefore never expires while its email exists.
+    /// Nonisolated — runs entirely off the main thread.
+    nonisolated static func runPurgeOrphanedAICache(dbPool: PrioritizedDatabase) {
+        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheOrphanGraceDays, to: Date()) ?? Date.distantPast
         let chunkSize = SyncConfig.pruneChunkSize
 
         let count = (try? dbPool.read { db in
@@ -330,13 +301,15 @@ extension SyncEngine {
         let now = Date()
         var purged = 0
         var rescued = 0
-        var skipCount = 0
+        // Every entry a batch touches leaves the `updatedAt < cutoff` filter: a kept one is
+        // re-stamped to now, an orphan is deleted. So each batch reads from the start; an
+        // offset would skip entries still past the grace and leave orphans behind.
         while true {
             do {
                 let batchResult = try dbPool.write { db -> (purged: Int, rescued: Int, batchEmpty: Bool) in
                     let batch = try MessageAICache
                         .filter(Column("updatedAt") < cutoff)
-                        .limit(chunkSize, offset: skipCount)
+                        .limit(chunkSize)
                         .fetchAll(db)
                     guard !batch.isEmpty else { return (0, 0, true) }
 
@@ -348,7 +321,7 @@ extension SyncEngine {
                                 .filter(Column("rfc822MessageId") == msgId)
                                 .limit(5)
                                 .fetchAll(db)
-                            if headers.contains(where: { $0.isInInbox }) {
+                            if !headers.isEmpty {
                                 entry.updatedAt = now
                                 try entry.update(db)
                                 batchRescued += 1
@@ -363,14 +336,13 @@ extension SyncEngine {
                 if batchResult.batchEmpty { break }
                 purged += batchResult.purged
                 rescued += batchResult.rescued
-                skipCount += batchResult.rescued
             } catch {
                 BackgroundSyncLogger.logDebug("[AICache] Purge failed: \(error)")
                 break
             }
         }
         if purged > 0 || rescued > 0 {
-            BackgroundSyncLogger.logDebug("[AICache] Purged \(purged) expired entries, rescued \(rescued) still-in-inbox (TTL=\(SyncConfig.aiCacheTTLDays)d)")
+            BackgroundSyncLogger.logDebug("[AICache] Purged \(purged) orphaned entries, kept \(rescued) still on the device (grace=\(SyncConfig.aiCacheOrphanGraceDays)d)")
         }
     }
 

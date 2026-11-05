@@ -690,4 +690,79 @@ struct NSEGradualMergeTests {
         print("[measure] header-only mergeNSEStagingData surfaced the message in \(Int(ms))ms")
         #expect(ms < 1500)                         // …and fast (no AI wait, no contention)
     }
+
+    // MARK: - Summary text message (ADR-IOS-103)
+
+    private func stageTextMessage(_ q: DatabaseQueue, _ text: String?, messageId: String = "msg-1") throws {
+        try q.write { db in
+            try db.execute(sql: "UPDATE nse_processed_message SET summaryTextMessage = ? WHERE id = ?",
+                           arguments: [text, "acc1:\(messageId)"])
+        }
+    }
+
+    private func cacheRow(_ pool: DatabasePool, messageId: String = "msg-1") async throws -> MessageAICache? {
+        let key = "acc1:INBOX:rfc-\(messageId)@example.com"
+        return try await pool.read { try MessageAICache.fetchOne($0, key: key) }
+    }
+
+    @Test("Gradual merge carries the summary text message to the existing header and the AI cache")
+    func gradualCarriesSummaryTextMessage() async throws {
+        let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: ownedQueues, directory: dir)
+        }
+        let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
+
+        try stageHeaderRow(q)
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        let before = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
+        #expect(before?.summaryTextMessage == nil)
+
+        // Summary staged before the action vote: the existing header gets it, text message included.
+        try await q.write { db in
+            try db.execute(sql: "UPDATE nse_processed_message SET summaryBlurb = 'A short summary' WHERE id = 'acc1:msg-1'")
+        }
+        try stageTextMessage(q, "Hey, quick question about the budget.")
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        let mid = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
+        #expect(mid?.summaryBlurb == "A short summary")
+        #expect(mid?.summaryTextMessage == "Hey, quick question about the budget.")
+
+        // The terminal stage writes the cache with the text message and the Message-ID.
+        try stageAIRow(q, action: "reply")
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        let cache = try await cacheRow(pool)
+        #expect(cache?.summaryBlurb == "A short summary")
+        #expect(cache?.summaryTextMessage == "Hey, quick question about the budget.")
+        #expect(cache?.rfc822MessageId == "rfc-msg-1@example.com")
+        #expect(try stagingRowExists(q) == false)
+    }
+
+    @Test("A terminal row merged in one pass (new header) carries the text message to header and cache")
+    func terminalRowCarriesSummaryTextMessage() async throws {
+        let (dir, pool, previous) = try makeAppDatabase()
+        var ownedQueues: [DatabaseQueue] = []
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: ownedQueues, directory: dir)
+        }
+        let (path, q) = try makeStagingFile(in: dir)
+        ownedQueues.append(q)
+
+        try stageHeaderRow(q)
+        try stageBodyRow(q)
+        try stageAIRow(q, action: "archive")
+        try stageTextMessage(q, "FYI, the report is attached.")
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+
+        let h = try await pool.read { try MessageHeader.fetchOne($0, key: headerId()) }
+        #expect(h?.summaryTextMessage == "FYI, the report is attached.")
+        let cache = try await cacheRow(pool)
+        #expect(cache?.summaryTextMessage == "FYI, the report is attached.")
+        #expect(cache?.rfc822MessageId == "rfc-msg-1@example.com")
+        #expect(cache?.actionTag == .archive)
+    }
 }

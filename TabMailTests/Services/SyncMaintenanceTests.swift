@@ -480,292 +480,169 @@ struct BodyCacheEvictionTests {
 
 // MARK: - AI Cache Purge Tests
 
-@Suite("AI Cache Purge Algorithm")
+/// `SyncEngine.runPurgeOrphanedAICache`, driven for real: an AI result lives as long as its email
+/// is on the device (a header with its Message-ID in ANY folder), with no age limit; an entry whose
+/// email is gone is purged once it has been untouched for `SyncConfig.aiCacheOrphanGraceDays`.
+@Suite("AI Cache Orphan Purge")
 struct AICachePurgeTests {
 
-    private func makeExpiredCache(
-        _ db: DatabaseQueue,
-        key: String,
-        rfc822MessageId: String?,
-        daysAgo: Int
-    ) throws {
-        let expiredDate = Calendar.current.date(byAdding: .day, value: -daysAgo, to: Date())!
-        try db.write { dbConn in
-            var cache = MessageAICache(key: key, rfc822MessageId: rfc822MessageId)
-            cache.summaryBlurb = "Summary for \(key)"
-            cache.updatedAt = expiredDate
-            try cache.insert(dbConn)
-        }
+    private struct Fixture {
+        let pool: DatabasePool
+        let directory: URL
+        var db: PrioritizedDatabase { PrioritizedDatabase(pool: pool, priority: .background) }
     }
 
-    @Test("Expired AI cache entry with no inbox message is purged")
-    func expiredNonInboxPurged() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
-        let rfc = "<msg1@example.com>"
-        // Message is NOT in inbox
-        try TestDatabase.insertMessageHeader(
-            db, messageId: "1", folderId: "acc1:Sent", folderPath: "Sent",
-            isInInbox: false, rfc822MessageId: rfc
-        )
-        try makeExpiredCache(db, key: "acc1:Sent:\(rfc)", rfc822MessageId: rfc, daysAgo: SyncConfig.aiCacheTTLDays + 1)
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        var purged = 0
-        try db.write { dbConn in
-            let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
-            for var entry in batch {
-                if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                    let headers = try MessageHeader
-                        .filter(Column("rfc822MessageId") == msgId)
-                        .limit(5)
-                        .fetchAll(dbConn)
-                    if headers.contains(where: { $0.isInInbox }) {
-                        entry.updatedAt = Date()
-                        try entry.update(dbConn)
-                        continue
-                    }
-                }
-                try entry.delete(dbConn)
-                purged += 1
-            }
+    private func makeFixture() throws -> Fixture {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test_aicache_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: directory.appendingPathComponent("test.sqlite").path, configuration: config)
+        try AppDatabase.runMigrations(on: pool)
+        try pool.write { db in
+            var account = Account(emailAddress: "test@example.com", displayName: "Test", provider: .gmail)
+            account.id = "acc1"
+            try account.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1").insert(db)
+            try Folder(name: "Sent", path: "Sent", role: .sent, accountId: "acc1").insert(db)
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: "acc1").insert(db)
         }
-        #expect(purged == 1)
-        let remaining = try db.read { dbConn in try MessageAICache.fetchCount(dbConn) }
-        #expect(remaining == 0)
+        return Fixture(pool: pool, directory: directory)
     }
 
-    @Test("Expired AI cache entry rescued when rfc822MessageId still in inbox")
-    func expiredInboxRescued() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let rfc = "<msg1@example.com>"
-        try TestDatabase.insertMessageHeader(
-            db, messageId: "1", isInInbox: true, rfc822MessageId: rfc
-        )
-        try makeExpiredCache(db, key: "acc1:INBOX:\(rfc)", rfc822MessageId: rfc, daysAgo: SyncConfig.aiCacheTTLDays + 1)
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        let now = Date()
-        var purged = 0
-        var rescued = 0
-        try db.write { dbConn in
-            let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
-            for var entry in batch {
-                if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                    let headers = try MessageHeader
-                        .filter(Column("rfc822MessageId") == msgId)
-                        .limit(5)
-                        .fetchAll(dbConn)
-                    if headers.contains(where: { $0.isInInbox }) {
-                        entry.updatedAt = now
-                        try entry.update(dbConn)
-                        rescued += 1
-                        continue
-                    }
-                }
-                try entry.delete(dbConn)
-                purged += 1
-            }
-        }
-        #expect(purged == 0)
-        #expect(rescued == 1)
-
-        let cache = try db.read { dbConn in
-            try MessageAICache.fetchOne(dbConn, key: "acc1:INBOX:\(rfc)")
-        }
-        #expect(cache != nil)
-        #expect(cache!.updatedAt >= now.addingTimeInterval(-1))
-    }
-
-    @Test("AI cache entry with nil rfc822MessageId is always purged")
-    func nilRfc822AlwaysPurged() throws {
-        let db = try TestDatabase.make()
-        try makeExpiredCache(db, key: "acc1:INBOX:none", rfc822MessageId: nil, daysAgo: SyncConfig.aiCacheTTLDays + 1)
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        var purged = 0
-        try db.write { dbConn in
-            let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
-            for var entry in batch {
-                if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                    // Would check inbox, but rfc822MessageId is nil so we skip
-                    let headers = try MessageHeader
-                        .filter(Column("rfc822MessageId") == msgId)
-                        .limit(5)
-                        .fetchAll(dbConn)
-                    if headers.contains(where: { $0.isInInbox }) {
-                        entry.updatedAt = Date()
-                        try entry.update(dbConn)
-                        continue
-                    }
-                }
-                try entry.delete(dbConn)
-                purged += 1
-            }
-        }
-        #expect(purged == 1)
-    }
-
-    @Test("AI cache entry with empty rfc822MessageId is always purged")
-    func emptyRfc822AlwaysPurged() throws {
-        let db = try TestDatabase.make()
-        try makeExpiredCache(db, key: "acc1:INBOX:empty", rfc822MessageId: "", daysAgo: SyncConfig.aiCacheTTLDays + 1)
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        var purged = 0
-        try db.write { dbConn in
-            let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
-            for var entry in batch {
-                if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                    let headers = try MessageHeader
-                        .filter(Column("rfc822MessageId") == msgId)
-                        .limit(5)
-                        .fetchAll(dbConn)
-                    if headers.contains(where: { $0.isInInbox }) {
-                        entry.updatedAt = Date()
-                        try entry.update(dbConn)
-                        continue
-                    }
-                }
-                try entry.delete(dbConn)
-                purged += 1
-            }
-        }
-        #expect(purged == 1)
-    }
-
-    @Test("Recent AI cache entry is not purged")
-    func recentAICacheNotPurged() throws {
-        let db = try TestDatabase.make()
-        try db.write { dbConn in
-            var cache = MessageAICache(key: "acc1:INBOX:<fresh@example.com>", rfc822MessageId: "<fresh@example.com>")
-            cache.summaryBlurb = "Fresh"
-            cache.updatedAt = Date()
-            try cache.insert(dbConn)
-        }
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        let expiredCount = try db.read { dbConn in
-            try MessageAICache.filter(Column("updatedAt") < cutoff).fetchCount(dbConn)
-        }
-        #expect(expiredCount == 0)
-    }
-
-    @Test("Mixed purge and rescue in same batch")
-    func mixedPurgeAndRescue() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-
-        let rfcInbox = "<inbox@example.com>"
-        let rfcSent = "<sent@example.com>"
-
-        // One message in inbox, one not
-        try TestDatabase.insertMessageHeader(
-            db, messageId: "1", isInInbox: true, rfc822MessageId: rfcInbox
-        )
-        try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
-        try TestDatabase.insertMessageHeader(
-            db, messageId: "2", folderId: "acc1:Sent", folderPath: "Sent",
-            isInInbox: false, rfc822MessageId: rfcSent
-        )
-
-        try makeExpiredCache(db, key: "acc1:INBOX:\(rfcInbox)", rfc822MessageId: rfcInbox, daysAgo: SyncConfig.aiCacheTTLDays + 1)
-        try makeExpiredCache(db, key: "acc1:Sent:\(rfcSent)", rfc822MessageId: rfcSent, daysAgo: SyncConfig.aiCacheTTLDays + 1)
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        let now = Date()
-        var purged = 0
-        var rescued = 0
-
-        try db.write { dbConn in
-            let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
-            for var entry in batch {
-                if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                    let headers = try MessageHeader
-                        .filter(Column("rfc822MessageId") == msgId)
-                        .limit(5)
-                        .fetchAll(dbConn)
-                    if headers.contains(where: { $0.isInInbox }) {
-                        entry.updatedAt = now
-                        try entry.update(dbConn)
-                        rescued += 1
-                        continue
-                    }
-                }
-                try entry.delete(dbConn)
-                purged += 1
-            }
-        }
-
-        #expect(purged == 1)
-        #expect(rescued == 1)
-        let remaining = try db.read { dbConn in try MessageAICache.fetchCount(dbConn) }
-        #expect(remaining == 1)
-    }
-
-    @Test("Purge skips offset for rescued entries correctly")
-    func purgeSkipOffsetForRescued() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-
-        // Create 3 expired entries, all with inbox messages (all rescued)
-        for i in 0..<3 {
-            let rfc = "<msg\(i)@example.com>"
-            try TestDatabase.insertMessageHeader(
-                db, messageId: "\(i)", isInInbox: true, rfc822MessageId: rfc
+    private func insertHeader(_ f: Fixture, uid: String, folderPath: String, rfc: String) throws {
+        try f.pool.write { db in
+            var header = MessageHeader(
+                messageId: uid, subject: "S", from: "sender@example.com", fromAddress: "sender@example.com",
+                to: "recipient@example.com", date: Date(), snippet: "", folderId: "acc1:\(folderPath)",
+                accountId: "acc1", folderPath: folderPath, isInInbox: folderPath == "INBOX"
             )
-            try makeExpiredCache(db, key: "acc1:INBOX:\(rfc)", rfc822MessageId: rfc, daysAgo: SyncConfig.aiCacheTTLDays + 1)
+            header.rfc822MessageId = rfc
+            try header.insert(db)
+        }
+    }
+
+    private func insertCache(_ f: Fixture, key: String, rfc: String?, daysAgo: Int) throws {
+        try f.pool.write { db in
+            var cache = MessageAICache(key: key, rfc822MessageId: rfc)
+            cache.summaryBlurb = "Summary for \(key)"
+            cache.summaryTextMessage = "Text for \(key)"
+            cache.updatedAt = Calendar.current.date(byAdding: .day, value: -daysAgo, to: Date())!
+            try cache.insert(db)
+        }
+    }
+
+    private func cache(_ f: Fixture, _ key: String) throws -> MessageAICache? {
+        try f.pool.read { db in try MessageAICache.fetchOne(db, key: key) }
+    }
+
+    private var pastGrace: Int { SyncConfig.aiCacheOrphanGraceDays + 1 }
+
+    @Test("An entry past the grace whose email is gone is purged")
+    func orphanPastGracePurged() throws {
+        let f = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
+        try insertCache(f, key: "acc1:INBOX:gone@example.com", rfc: "gone@example.com", daysAgo: pastGrace)
+
+        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+
+        #expect(try cache(f, "acc1:INBOX:gone@example.com") == nil)
+    }
+
+    @Test("An old entry whose email is in Sent (not the inbox) is kept and re-stamped")
+    func oldEntryWithSentEmailKept() throws {
+        let f = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
+        try insertHeader(f, uid: "1", folderPath: "Sent", rfc: "sent@example.com")
+        try insertCache(f, key: "acc1:Sent:sent@example.com", rfc: "sent@example.com", daysAgo: pastGrace + 30)
+        let before = Date()
+
+        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+
+        let kept = try cache(f, "acc1:Sent:sent@example.com")
+        #expect(kept?.summaryBlurb == "Summary for acc1:Sent:sent@example.com")
+        #expect(kept?.summaryTextMessage == "Text for acc1:Sent:sent@example.com")
+        #expect((kept?.updatedAt ?? .distantPast) >= before.addingTimeInterval(-1))
+    }
+
+    @Test("An old entry whose email moved to Archive is kept under its old key")
+    func entryForMovedEmailKept() throws {
+        let f = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
+        try insertHeader(f, uid: "9", folderPath: "Archive", rfc: "moved@example.com")
+        try insertCache(f, key: "acc1:INBOX:moved@example.com", rfc: "moved@example.com", daysAgo: pastGrace)
+
+        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+
+        #expect(try cache(f, "acc1:INBOX:moved@example.com") != nil)
+    }
+
+    @Test("An old entry whose email is in the inbox is kept")
+    func oldEntryWithInboxEmailKept() throws {
+        let f = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
+        try insertHeader(f, uid: "2", folderPath: "INBOX", rfc: "inbox@example.com")
+        try insertCache(f, key: "acc1:INBOX:inbox@example.com", rfc: "inbox@example.com", daysAgo: pastGrace)
+
+        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+
+        #expect(try cache(f, "acc1:INBOX:inbox@example.com") != nil)
+    }
+
+    @Test("An orphan within the grace survives (a header that left may come back)")
+    func orphanWithinGraceKept() throws {
+        let f = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
+        try insertCache(f, key: "acc1:INBOX:resync@example.com", rfc: "resync@example.com",
+                        daysAgo: SyncConfig.aiCacheOrphanGraceDays - 1)
+
+        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+
+        #expect(try cache(f, "acc1:INBOX:resync@example.com") != nil)
+    }
+
+    @Test("A bracketed cache Message-ID matches its stored header")
+    func bracketedMessageIdMatches() throws {
+        let f = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
+        try insertHeader(f, uid: "3", folderPath: "INBOX", rfc: "bracket@example.com")
+        try insertCache(f, key: "acc1:INBOX:bracket@example.com", rfc: "<bracket@example.com>", daysAgo: pastGrace)
+
+        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+
+        #expect(try cache(f, "acc1:INBOX:bracket@example.com") != nil)
+    }
+
+    @Test("Entries past the grace with no or an empty Message-ID are purged")
+    func noMessageIdPurged() throws {
+        let f = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
+        try insertCache(f, key: "acc1:INBOX:none", rfc: nil, daysAgo: pastGrace)
+        try insertCache(f, key: "acc1:INBOX:empty", rfc: "", daysAgo: pastGrace)
+
+        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+
+        #expect(try cache(f, "acc1:INBOX:none") == nil)
+        #expect(try cache(f, "acc1:INBOX:empty") == nil)
+    }
+
+    @Test("More entries than one chunk: every kept entry kept, every orphan purged, the pass ends")
+    func acrossChunks() throws {
+        let f = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
+        let n = SyncConfig.pruneChunkSize + 7
+        for i in 0..<n {
+            try insertHeader(f, uid: "\(i)", folderPath: i.isMultiple(of: 2) ? "Sent" : "Archive", rfc: "kept\(i)@example.com")
+            try insertCache(f, key: "acc1:Sent:kept\(i)@example.com", rfc: "kept\(i)@example.com", daysAgo: pastGrace)
+            try insertCache(f, key: "acc1:Sent:orphan\(i)@example.com", rfc: "orphan\(i)@example.com", daysAgo: pastGrace)
         }
 
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        let now = Date()
-        let chunkSize = 2
-        var purged = 0
-        var rescued = 0
-        let skipCount = 0
+        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
 
-        while true {
-            let batchResult = try db.write { dbConn -> (purged: Int, rescued: Int, batchEmpty: Bool) in
-                let batch = try MessageAICache
-                    .filter(Column("updatedAt") < cutoff)
-                    .limit(chunkSize, offset: skipCount)
-                    .fetchAll(dbConn)
-                guard !batch.isEmpty else { return (0, 0, true) }
-
-                var batchPurged = 0
-                var batchRescued = 0
-                for var entry in batch {
-                    if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                        let headers = try MessageHeader
-                            .filter(Column("rfc822MessageId") == msgId)
-                            .limit(5)
-                            .fetchAll(dbConn)
-                        if headers.contains(where: { $0.isInInbox }) {
-                            entry.updatedAt = now
-                            try entry.update(dbConn)
-                            batchRescued += 1
-                            continue
-                        }
-                    }
-                    try entry.delete(dbConn)
-                    batchPurged += 1
-                }
-                return (batchPurged, batchRescued, false)
-            }
-            if batchResult.batchEmpty { break }
-            purged += batchResult.purged
-            rescued += batchResult.rescued
-            // NOTE: rescued entries had updatedAt bumped past cutoff, so they naturally
-            // drop out of the filter — no need to increment skipCount for them.
-        }
-
-        #expect(purged == 0)
-        #expect(rescued == 3)
+        let keys = try f.pool.read { db in try MessageAICache.fetchAll(db).map(\.key) }
+        #expect(keys.count == n)
+        #expect(keys.allSatisfy { $0.contains(":kept") })
     }
 }
 
@@ -1238,7 +1115,7 @@ struct SyncMaintenanceEdgeCaseTests {
             try cache.insert(dbConn)
         }
 
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
+        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheOrphanGraceDays, to: Date())!
         let count = try db.read { dbConn in
             try MessageAICache.filter(Column("updatedAt") < cutoff).fetchCount(dbConn)
         }

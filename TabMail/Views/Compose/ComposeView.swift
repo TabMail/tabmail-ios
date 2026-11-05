@@ -2162,12 +2162,12 @@ struct ComposeView: View {
                     kbText: PromptStore.shared.kbText(),
                     compositionPrompt: PromptStore.shared.compositionMarkdown()
                 )
-                if let result, !result.isEmpty {
-                    currentSuggestion = result
+                if let result, !result.body.isEmpty {
+                    currentSuggestion = result.body
                     try? await dbPool.write { db in
                         try db.execute(
-                            sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
-                            arguments: [result, reply.id]
+                            sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = ? WHERE id = ?",
+                            arguments: [result.body, result.textMessage, reply.id]
                         )
                     }
                     BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId)")
@@ -2336,7 +2336,8 @@ struct ComposeView: View {
         }
     }
 
-    /// Write the edited suggestion to `messageHeader.cachedReply` so reopens see it.
+    /// Write the edited suggestion to `messageHeader.cachedReply` so reopens see it. The reply's
+    /// text message described the AI's body, not the user's edit, so it is cleared.
     private func persistCachedReply(_ text: String) {
         guard let reply = replyTo else { return }
         Task { await Self.writeCachedReplyToDB(text, replyTo: reply, db: dbPool.pool) }
@@ -2355,7 +2356,7 @@ struct ComposeView: View {
             guard let target = try AIWriteTarget.capture(message: reply, db: db) else { return }
             _ = try AccountManager.aiGuardedHeaderWrite(db, target: target) { _, db in
                 try db.execute(
-                    sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
+                    sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = NULL WHERE id = ?",
                     arguments: [text, reply.id]
                 )
             }

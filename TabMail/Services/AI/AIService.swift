@@ -161,7 +161,8 @@ actor AIService {
                     todos: ps.todos?.isEmpty == true ? nil : ps.todos,
                     reminderDate: ps.reminderDate?.isEmpty == true ? nil : ps.reminderDate,
                     reminderTime: ps.reminderTime?.isEmpty == true ? nil : ps.reminderTime,
-                    reminderContent: ps.reminderContent?.isEmpty == true ? nil : ps.reminderContent
+                    reminderContent: ps.reminderContent?.isEmpty == true ? nil : ps.reminderContent,
+                    textMessage: nil // a peer (Thunderbird) summary has no text message
                 )
             }
             if let pa = cached.action {
@@ -202,7 +203,7 @@ actor AIService {
             } else {
                 BackgroundSyncLogger.logDebug("[AIService] No summary for \(messageId) — LLM disabled, no Device Sync result")
             }
-            summary = SummaryResult(blurb: nil, todos: nil, reminderDate: nil, reminderTime: nil, reminderContent: nil)
+            summary = .empty
         }
 
         // --- Action: use Device Sync result or run LLM (skip if IMAP tag exists) ---

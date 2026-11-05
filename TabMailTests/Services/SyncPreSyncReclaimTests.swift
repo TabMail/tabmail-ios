@@ -44,8 +44,12 @@ struct SyncPreSyncReclaimTests {
             header.reminderDate = preSync.reminderDate
             header.reminderTime = preSync.reminderTime
             header.reminderContent = preSync.reminderContent
+            header.summaryTextMessage = preSync.summaryTextMessage
         }
-        if header.cachedReply == nil { header.cachedReply = preSync.cachedReply }
+        if header.cachedReply == nil {
+            header.cachedReply = preSync.cachedReply
+            header.replyTextMessage = preSync.replyTextMessage
+        }
         header.notified = header.notified || preSync.notified
 
         var deferredBody: MessageBody?

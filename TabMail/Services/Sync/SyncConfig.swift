@@ -349,15 +349,14 @@ enum SyncConfig {
     static let bodyCacheTTLHours = 72
     /// Keep bodies for N most recent messages per non-inbox folder regardless of TTL.
     static let bodyCacheRecentPerFolder = 50
-    /// Reply cache TTL — precomputed replies older than this are regenerated (seconds).
-    /// Matches TB's SETTINGS.replyTTLSeconds in config.js.
-    static let replyTTLSeconds: TimeInterval = 604_800 // 1 week
     /// Age before an out-of-inbox action tag is reclaimed by sweepStaleActionTags.
     /// Matches TB's SETTINGS.actionTTLSeconds (1 week). Inbox tags are never swept.
     static let actionTagTTLSeconds: TimeInterval = 604_800
-    /// AI cache TTL — MessageAICache entries not refreshed within this period are purged.
-    /// Entries are touched during inbox sync; entries for messages that leave inbox expire.
-    static let aiCacheTTLDays = 7
+    /// An AI result lives as long as its email is on the device, with no size or age limit.
+    /// A MessageAICache entry whose email is no longer on the device (no header with its
+    /// Message-ID, in any folder) is purged once it has gone this long untouched, so a
+    /// header that leaves and comes back (stale detection, a UIDVALIDITY reset) is restored.
+    static let aiCacheOrphanGraceDays = 7
     /// Age after which a TERMINALLY-RETIRED calendar operation
     /// (`PendingStatus.failed`) is reclaimed by
     /// `SyncEngine.runReclaimRetiredCalendarOps`.

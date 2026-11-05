@@ -21,6 +21,9 @@ enum BackendNSEClient {
         init(_ raw: [String: Any]) { self.raw = raw }
     }
 
+    /// `TabMailProtocolVersion` from this extension's Info.plist (TABMAIL_PROTOCOL_VERSION).
+    static let protocolVersion = Bundle.main.infoDictionary?["TabMailProtocolVersion"] as? String
+
     /// Single completions call (summary or chat)
     static func sendCompletions(
         promptAlias: String,
@@ -37,6 +40,9 @@ enum BackendNSEClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
         request.setValue("ios", forHTTPHeaderField: "X-Client-Type")
+        // The same protocol version the app sends (project-level TABMAIL_PROTOCOL_VERSION):
+        // it selects the summary's response format, which `AIResponseParser` reads as JSON.
+        request.setValue(protocolVersion, forHTTPHeaderField: "X-Client-Version")
         request.timeoutInterval = timeout
 
         var systemMsg: [String: Any] = ["role": "system", "content": promptAlias]
