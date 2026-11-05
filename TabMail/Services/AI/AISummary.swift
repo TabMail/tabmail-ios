@@ -98,9 +98,10 @@ extension AIService {
             return .empty
         }
 
-        // Match TB: normalizeUnicode(json.assistant.trim()) before parsing
-        let text = Self.normalizeUnicode(rawText.trimmingCharacters(in: .whitespacesAndNewlines))
-        return parseSummaryResponse(text)
+        // Decoded as sent: the reply is JSON (protocol 2.0.0), so rewriting characters first, as
+        // the labelled text once was, can break it (curly quotes become bare ASCII quotes inside
+        // a JSON string). The NSE parses the same text the same way.
+        return parseSummaryResponse(rawText)
     }
 
     // MARK: - Response Parsing

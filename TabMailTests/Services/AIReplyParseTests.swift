@@ -33,17 +33,23 @@ struct AIReplyParseTests {
         #expect(result?.textMessage == "Hi.")
     }
 
-    @Test("No body, an empty body or a None body gives nil")
+    @Test("No body, an empty or blank body, or a non-string body gives nil")
     func noBody() {
         for text in [
             #"{"subject": "S", "text_message": "T"}"#,
             #"{"subject": "S", "body": "", "text_message": "T"}"#,
             #"{"subject": "S", "body": "   ", "text_message": "T"}"#,
-            #"{"subject": "S", "body": "None", "text_message": "T"}"#,
             #"{"subject": "S", "body": 7, "text_message": "T"}"#,
         ] {
             #expect(AIResponseParser.parseReplyResponse(text) == nil, "\(text)")
         }
+    }
+
+    @Test("A body or text message that is the word None is kept: the backend has no None word for them")
+    func noneIsData() {
+        let result = AIResponseParser.parseReplyResponse(#"{"subject": "S", "body": "None", "text_message": "None"}"#)
+        #expect(result?.body == "None")
+        #expect(result?.textMessage == "None")
     }
 
     @Test("A missing or empty text message keeps the body")

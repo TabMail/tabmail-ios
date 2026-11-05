@@ -41,6 +41,17 @@ same AI result, kept as long as the email itself is shown.
    job, restoring AI to a header that leaves and comes back (stale detection, a UIDVALIDITY reset).
    Awaiting owner blessing: the 7-day orphan grace. The extension's cache upserts now record the
    Message-ID, so the purge can match them to their email.
+6. **Decoding as sent, and older entries' identity (review round 1, 2026-11-05).** The summary JSON is
+   decoded exactly as received: rewriting characters first (`normalizeUnicode`, kept from the labelled
+   text) turned curly or fullwidth quotes inside a JSON string into bare ASCII quotes and broke the
+   object. A reply body is any non-blank string, "None" included: only the text message's "NONE"
+   placeholder of the summary is not a body rule. Entries an older extension wrote have no Message-ID,
+   so the purge would delete them though their email is here: the extension's one cache upsert
+   (`NSEDataBridge.upsertAICache`, used for an existing and a new header) fills a missing Message-ID on
+   conflict (`COALESCE`, and the row is rewritten even when its content is unchanged),
+   `MessageAICache.writeThrough` fills it on any later write, and `v96_repairAICacheMessageIds`
+   (`AppDatabase.repairAICacheMessageIds`) fills existing ones from the header whose key the entry has.
+   An entry with no such header stays without one and is an orphan, as before.
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (ADR-032) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
@@ -48,4 +59,12 @@ parser does not read.
 
 **Tests:** `AISummaryParsingTests`, `AISummaryResponseTests`, `AIReplyParseTests`, `AIReplyTests`
 (parsers and `ReplyResult`); `AICachePurgeTests` (the orphan purge, driven for real);
-`ComposeSuggestionPersistTests.editClearsReplyTextMessage`; migration and merge tests in this PR.
+`ComposeSuggestionPersistTests.editClearsReplyTextMessage`; migration and merge tests in this PR;
+`AITextMessageCallerTests` (the queue's summary and reply jobs, the opened-email direct path in full and
+reply-only, compose's
+recompute and the extension's request, each through its real producer and a fake backend);
+`AITextMessageStorageTests.v96RepairsLegacyIdentity` / `writeThroughRepairsLegacyIdentity`;
+`NSEGradualMergeTests.existingHeaderMergeRepairsLegacyCacheIdentity` /
+`newHeaderMergeRepairsLegacyCacheIdentity`; `RFC822IdentityMergeGuardTests.preSyncInboxReclaimCarriesTextMessages`.
+Not driven by a test: the line in the extension's `NotificationService` that hands the parsed text
+message to staging (the pipeline has no harness); its parser and its staging writes are tested.
