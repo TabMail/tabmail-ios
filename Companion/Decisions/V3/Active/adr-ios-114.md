@@ -74,7 +74,7 @@ parser does not read.
 
 **Tests:** `AISummaryParsingTests`, `AISummaryResponseTests`, `AIReplyParseTests`, `AIReplyTests`
 (parsers and `ReplyResult`); `AICachePurgeTests` (the orphan purge, driven for real, including
-`legacyEntryKeptByItsKey`, `maintenanceRunsThePurge` and `clockBehindEnds`);
+`legacyEntryKeptByItsKey`, `maintenanceRunsThePurge` and `clockOffWallClockEnds`, the clock behind and ahead of the wall clock);
 `ComposeSuggestionPersistTests.editClearsReplyTextMessage`; migration and merge tests in this PR;
 `AITextMessageCallerTests` (the queue's summary and reply jobs, a failed reply asked again and the next
 one stored (`queueReplyFailureRecovers`), the opened-email direct path in full and
@@ -87,5 +87,6 @@ upgraded) and `legacyEntriesSurviveUpgradeAndPurge` (including v96 filling the M
 probe then finds); `RFC822IdentityMergeGuardTests.preSyncInboxReclaimCarriesTextMessages`;
 `NSESummaryTextMessageCarryTests` (the staging writes, `NSEStagingDB.open(path:)` upgrading an older
 file, the extension bundle's protocol version, a later push whose only change is the text message,
-including to none (`sameSummaryNewTextMessage`), and a push through `NotificationService.didReceive`
+including to none (`sameSummaryNewTextMessage`), the merge's second stage creating a header the first
+stage could not and caching its result with the text message (`secondStageCachesTextMessage`), and a push through `NotificationService.didReceive`
 staging the text message, via `NotificationService.stagingPathOverride`).

@@ -168,9 +168,8 @@ struct NSESummaryTextMessageCarryTests {
         #expect(try Self.decode(queue, id: "acc1:peer-1").summaryTextMessage == nil)
     }
 
-    /// The whole extension path: a Gmail push through `NotificationService.didReceive`, a summary
-    /// answered with a text message, and the staged row the merge reads. Catches the extension
-    /// parsing the text message and then not passing it on.
+    /// The merge compares the staged result with the stored one; the text message is part of that
+    /// comparison, so a change to it alone, including to none, is stored on the header and the cache.
     @Test("A later push with the same summary but a different text message updates the header and the cache", .processGlobalState)
     func sameSummaryNewTextMessage() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -228,6 +227,62 @@ struct NSESummaryTextMessageCarryTests {
         }
     }
 
+    /// The merge's second stage creates a header the first stage could not, and caches its AI
+    /// result there as the first stage would have: the summary with its text message.
+    @Test("When the first stage cannot insert the header, the second stage creates it and caches the result with its text message", .processGlobalState)
+    func secondStageCachesTextMessage() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        var queues: [DatabaseQueue] = []
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: queues, directory: dir)
+        }
+        _ = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "acc1", path: "INBOX", role: .inbox, pool: pool)
+        let meta = Self.metadata("fallback")
+        let rfc = try #require(meta.rfc822MessageId)
+        let path = dir.appendingPathComponent("nse_staging.sqlite").path
+        #expect(AppDatabase.createNSEStagingDB(atPath: path))
+        let staging = try #require(NSEStagingDB.open(path: path))
+        queues.append(staging)
+        #expect(NSEStagingDB.persistProcessedMessage(
+            db: staging, accountId: "acc1", accountEmail: "acc1@example.com", provider: "gmail",
+            message: meta, summaryBlurb: "Budget review.", summaryTodos: nil, actionTag: "reply",
+            reminderDate: nil, reminderTime: nil, reminderContent: nil,
+            summaryTextMessage: "Can you review the budget?",
+            historyId: nil, aiCompleted: true, notified: false))
+        // The first insert of this header fails; the second succeeds.
+        let inserts = Mutex(0)
+        try await pool.write { db in
+            db.add(function: DatabaseFunction("refuseFirstInsert", argumentCount: 0, pure: false) { _ in
+                let n = inserts.withLock { value in value += 1; return value }
+                if n == 1 { throw NSError(domain: "NSESummaryTextMessageCarryTests", code: 1) }
+                return n
+            })
+            try db.execute(sql: """
+                CREATE TRIGGER refuseFirstInsert BEFORE INSERT ON messageHeader
+                WHEN NEW.messageId = '\(meta.messageId)' BEGIN SELECT refuseFirstInsert(); END;
+                """)
+        }
+
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+
+        #expect(inserts.withLock { $0 } == 2, "the first stage was refused and the second created the header")
+        let header = try #require(try await pool.read {
+            try MessageHeader.filter(Column("messageId") == meta.messageId).fetchOne($0)
+        })
+        #expect(header.summaryBlurb == "Budget review.")
+        #expect(header.summaryTextMessage == "Can you review the budget?")
+        let cache = try #require(try await pool.read { try MessageAICache.fetchOne($0, key: "acc1:INBOX:\(rfc)") })
+        #expect(cache.summaryBlurb == "Budget review.")
+        #expect(cache.summaryTextMessage == "Can you review the budget?")
+        #expect(cache.rfc822MessageId == rfc)
+        #expect(try await staging.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM nse_processed_message") } == 0)
+    }
+
+    /// The whole extension path: a Gmail push through `NotificationService.didReceive`, a summary
+    /// answered with a text message, and the staged row the merge reads. Catches the extension
+    /// parsing the text message and then not passing it on.
     @MainActor
     @Test("A push through the extension stages the summary's text message")
     func pushStagesTextMessage() async throws {
