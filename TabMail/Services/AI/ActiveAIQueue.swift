@@ -834,12 +834,6 @@ actor ActiveAIQueue {
                     didLLMWorkSinceDrain = false
                 }
                 await ProactiveNotifyService.shared.onInboxUpdated()
-
-                // Purge AI cache entries whose email left the device. Runs once after
-                // all AI work completes.
-                Task.detached {
-                    SyncEngine.runPurgeOrphanedAICache(dbPool: AppDatabase.backgroundPool)
-                }
             }
         }
     }

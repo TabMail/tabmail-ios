@@ -19,6 +19,8 @@ import Synchronization
 ///  3. A filtered reply (a no-reply sender) stores no reply and no text message, and asks nothing.
 ///  4. A recomputed reply in compose stores its text message; the extension sends the same
 ///     protocol version as the app and reads the summary JSON the same way.
+///  5. A result another device (Thunderbird) already has is stored as it is, with no text
+///     message, and asks the model nothing.
 ///
 /// `.processGlobalState`: the AI opt-out flag and `AppDatabase.shared` are process-wide.
 @Suite("AI text messages through their producers", .serialized, .processGlobalState)
@@ -28,11 +30,26 @@ struct AITextMessageCallerTests {
     static let summaryText = "Can you send the \u{201C}final\u{201D} budget? \u{FF02}Thanks\u{FF02}"
     static let replyBody = "None"
     static let replyText = "None from me, thanks"
+    static let peerBlurb = "Peer summary of the plans."
+    static let peerReply = "Peer reply to the plans."
 
     /// Answers `/completions/chat` by prompt: the summary JSON, an action, the reply JSON.
     final class Backend: Sendable {
         let http = FakeHTTP.Scenario()
-        var service: AIService { AIService(backendClient: BackendClient(llmSession: http.session)) }
+        var service: AIService { AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil }) }
+        /// The service when another device (Thunderbird) already has this email's AI.
+        var peerService: AIService { AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: Self.peer) }
+
+        /// Answers the Device Sync probe as Thunderbird would: a summary, an action and a reply,
+        /// and no text message for either.
+        static let peer: AIService.PeerProbe = { keys in
+            Dictionary(uniqueKeysWithValues: keys.map { key in
+                (key, AICacheResult(
+                    summary: AICacheSummary(blurb: AITextMessageCallerTests.peerBlurb, todos: nil, detailed: nil,
+                                            reminderDate: nil, reminderTime: nil, reminderContent: nil),
+                    action: "reply", reply: AITextMessageCallerTests.peerReply))
+            })
+        }
 
         init() {
             http.register(path: "/completions/chat", method: "POST") { request in
@@ -134,13 +151,13 @@ struct AITextMessageCallerTests {
         return try await body()
     }
 
-    private func runJob(_ type: ActiveAIQueue.AIJob.JobType, _ fixture: Fixture, _ backend: Backend) async -> Bool {
+    private func runJob(_ type: ActiveAIQueue.AIJob.JobType, _ fixture: Fixture, _ service: AIService) async -> Bool {
         let queue = ActiveAIQueue()
         await queue.setDispatchSuppressedForTesting(true)
         return await queue.executeJobForTesting(
             ActiveAIQueue.AIJob(headerId: fixture.header.id, accountId: "acc1", jobType: type),
             message: fixture.header, plainText: "Can you send the budget?", account: fixture.account,
-            target: fixture.target, aiService: backend.service)
+            target: fixture.target, aiService: service)
     }
 
     // MARK: - 1 and 2. The AI queue
@@ -152,7 +169,7 @@ struct AITextMessageCallerTests {
             let backend = Backend()
             defer { backend.close(); fixture.close() }
 
-            let retry = await runJob(.summary, fixture, backend)
+            let retry = await runJob(.summary, fixture, backend.service)
 
             #expect(!retry)
             #expect(backend.prompts == ["system_prompt_summary"])
@@ -173,7 +190,7 @@ struct AITextMessageCallerTests {
             let backend = Backend()
             defer { backend.close(); fixture.close() }
 
-            let retry = await runJob(.reply, fixture, backend)
+            let retry = await runJob(.reply, fixture, backend.service)
 
             #expect(!retry)
             #expect(backend.prompts == ["system_prompt_compose"])
@@ -193,7 +210,7 @@ struct AITextMessageCallerTests {
             let backend = Backend()
             defer { backend.close(); fixture.close() }
 
-            _ = await runJob(.reply, fixture, backend)
+            _ = await runJob(.reply, fixture, backend.service)
 
             #expect(backend.prompts.isEmpty)
             let row = try fixture.row()
@@ -262,20 +279,78 @@ struct AITextMessageCallerTests {
         }
     }
 
+    // MARK: - 5. A result from another device
+
+    @Test("Opening an email another device already summarized stores its results, with no text message and no model call")
+    func directPathPeerResult() async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture()
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+
+            await AccountManager.shared.processMessage(
+                fixture.header, body: try fixture.body, account: fixture.account,
+                target: fixture.target, aiService: backend.peerService)
+
+            // The direct path runs detached; wait for both writes, bounded.
+            let deadline = Date().addingTimeInterval(20)
+            var row = try fixture.row()
+            while (row?.summaryBlurb == nil || row?.cachedReply == nil), Date() < deadline {
+                try await Task.sleep(for: .milliseconds(50))
+                row = try fixture.row()
+            }
+            #expect(row?.summaryBlurb == Self.peerBlurb)
+            #expect(row?.summaryTextMessage == nil)
+            #expect(row?.cachedReply == Self.peerReply)
+            #expect(row?.replyTextMessage == nil)
+            let cache = try fixture.cache()
+            #expect(cache?.summaryBlurb == Self.peerBlurb)
+            #expect(cache?.summaryTextMessage == nil)
+            #expect(cache?.cachedReply == Self.peerReply)
+            #expect(cache?.replyTextMessage == nil)
+            #expect(backend.prompts.isEmpty)
+        }
+    }
+
+    @Test("The queue's reply job stores another device's reply with no text message and no model call")
+    func queueReplyPeerResult() async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(replyTextMessage: "stale")
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+
+            let retry = await runJob(.reply, fixture, backend.peerService)
+
+            #expect(!retry)
+            #expect(backend.prompts.isEmpty)
+            let row = try fixture.row()
+            #expect(row?.cachedReply == Self.peerReply)
+            #expect(row?.replyTextMessage == nil)
+            let cache = try fixture.cache()
+            #expect(cache?.cachedReply == Self.peerReply)
+            #expect(cache?.replyTextMessage == nil)
+        }
+    }
+
     // MARK: - 4. Compose and the extension
 
-    @Test("A recomputed reply in compose stores the reply and its text message")
-    func composeRecompute() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "1")
+    @Test("Recomputing a reply in compose stores the reply and its text message")
+    func composeRecompute() async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(replyTextMessage: "Earlier text")
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
 
-        try db.write { try ComposeView.writeRecomputedReply(ReplyResult(body: "New reply", textMessage: "New text"), headerId: header.id, db: $0) }
+            let suggestion = await ComposeView.recomputedReply(
+                for: fixture.header, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
 
-        let row = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        #expect(row?.cachedReply == "New reply")
-        #expect(row?.replyTextMessage == "New text")
+            #expect(suggestion == Self.replyBody)
+            #expect(backend.prompts == ["system_prompt_compose"])
+            let row = try fixture.row()
+            #expect(row?.cachedReply == Self.replyBody)
+            #expect(row?.replyTextMessage == Self.replyText)
+        }
     }
 
     @Test("The extension sends the app's protocol version and returns the summary the app would read")

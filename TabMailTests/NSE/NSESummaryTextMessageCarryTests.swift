@@ -5,6 +5,8 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
+import UserNotifications
 @testable import TabMail
 
 /// The summary's text message, end to end through the extension: the open-time column upgrade
@@ -123,6 +125,30 @@ struct NSESummaryTextMessageCarryTests {
         #expect(legacyHeader.summaryTextMessage == nil)
     }
 
+    @Test("Opening an older build's staging database adds the column this build writes")
+    func openUpgradesOlderDatabase() throws {
+        let (dir, queue) = try Self.makeStaging()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try queue.write { try $0.execute(sql: "ALTER TABLE nse_processed_message DROP COLUMN summaryTextMessage") }
+        #expect(!(try Self.columns(queue)).contains("summaryTextMessage"), "precondition: old schema")
+        try queue.close()
+
+        let opened = try #require(NSEStagingDB.open(path: dir.appendingPathComponent("nse_staging.sqlite").path))
+
+        let columns = try Self.columns(opened)
+        #expect(columns.contains("summaryTextMessage"))
+        #expect(columns.contains("observedUidValidity"))
+        #expect(columns.contains("providerDate"))
+    }
+
+    @Test("The extension and the app send the same protocol version, from their own bundles")
+    func extensionBundleProtocolVersion() throws {
+        let appex = try #require(Bundle.main.builtInPlugInsURL?.appendingPathComponent("TabMailNotificationService.appex"))
+        let extensionVersion = try #require(Bundle(url: appex)?.infoDictionary?["TabMailProtocolVersion"] as? String)
+        #expect(extensionVersion == "2.0.0")
+        #expect(extensionVersion == BackendClient.clientVersion)
+    }
+
     @Test("A terminal write without a text message stages nil (a peer hit or AI off)")
     func terminalWithoutTextMessage() throws {
         let (dir, queue) = try Self.makeStaging()
@@ -140,5 +166,90 @@ struct NSESummaryTextMessageCarryTests {
             historyId: "2", aiCompleted: true, notified: false)
         #expect(persisted)
         #expect(try Self.decode(queue, id: "acc1:peer-1").summaryTextMessage == nil)
+    }
+
+    /// The whole extension path: a Gmail push through `NotificationService.didReceive`, a summary
+    /// answered with a text message, and the staged row the merge reads. Catches the extension
+    /// parsing the text message and then not passing it on.
+    @MainActor
+    @Test("A push through the extension stages the summary's text message")
+    func pushStagesTextMessage() async throws {
+        let (dir, _) = try Self.makeStaging()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stagingPath = dir.appendingPathComponent("nse_staging.sqlite").path
+        let accountId = "nse-text-" + UUID().uuidString
+        let suiteName = "nse-text." + UUID().uuidString
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        let store = ProviderCredentialStore.shared
+        let h = CredentialTestHarness()
+        let http = FakeHTTP.Scenario()
+        defer {
+            http.close()
+            try? store.remove(accountId: accountId)
+            UserDefaults.standard.removePersistentDomain(forName: suiteName)
+        }
+        try store.install(accountId: accountId, tokens: .init(accessToken: "synthetic-access",
+            refreshToken: "synthetic-refresh", expiresAt: Date().addingTimeInterval(3600)))
+        try h.sessions.installNewSession(CredentialTestHarness.sessionData(access: "synthetic-backend", expired: false))
+        defaults.set("{\"user@example.com\":\"\(accountId)\"}", forKey: SharedNSEData.accountMapKey)
+        defaults.set(false, forKey: SharedNSEData.deviceSyncEnabledKey)
+
+        let body = Data("Lunch on Friday?".utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        let message = """
+        {"id": "synthetic-message", "threadId": "synthetic-thread",
+         "internalDate": "\(Int(Date().timeIntervalSince1970 * 1000))", "labelIds": ["INBOX", "UNREAD"],
+         "snippet": "Lunch on Friday?",
+         "payload": {"mimeType": "text/plain",
+           "headers": [{"name": "Subject", "value": "Lunch"}, {"name": "From", "value": "Sender <sender@example.com>"},
+                       {"name": "To", "value": "user@example.com"}, {"name": "Message-ID", "value": "<lunch@example.com>"}],
+           "body": {"size": 16, "data": "\(body)"}}}
+        """
+        http.register(path: "/messages/synthetic-message", response: .json(raw: message))
+
+        let prompts = Mutex<[String]>([])
+        let backend: NSETokenManager.DataForRequest = { request in
+            let sent = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
+            let alias = (sent?["messages"] as? [[String: Any]])?.first?["content"] as? String ?? ""
+            prompts.withLock { $0.append(alias) }
+            let assistant = alias == "system_prompt_summary"
+                ? #"{"todos": [], "summary": "Lunch on Friday.", "reminder": {"due_date": null, "due_time": null, "content": null}, "text_message": "Lunch Friday?"}"#
+                : #"{"action": "reply"}"#
+            return (try JSONSerialization.data(withJSONObject: ["assistant": assistant]),
+                    HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
+        let refresh: NSEAuthSource.Transport = { _ in throw URLError(.notConnectedToInternet) }
+
+        let delivered = CredentialTestLatch()
+        let service = NotificationService()
+        let content = UNMutableNotificationContent()
+        content.title = "New Email"
+        content.userInfo = ["provider": "gmail", "accountEmail": "user@example.com", "messageId": "synthetic-message"]
+        await SharedNSEData.$suiteOverride.withValue(.init(defaults: defaults)) {
+            await NSETokenManager.$storeOverride.withValue(h.sessions) {
+                await AuthedHTTP.$sessionOverride.withValue(http.session) {
+                    await NSEAuthSource.$transport.withValue(refresh) {
+                        await BackendNSEClient.$transport.withValue(backend) {
+                            await NotificationService.$stagingPathOverride.withValue(stagingPath) {
+                                await NotificationService.$visualCapability.withValue({ true }) {
+                                    service.didReceive(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { @Sendable _ in
+                                        Task { await delivered.signal() }
+                                    }
+                                    await delivered.wait()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        service.serviceExtensionTimeWillExpire()
+
+        #expect(prompts.withLock { $0 }.first == "system_prompt_summary")
+        let staged = try Self.decode(try DatabaseQueue(path: stagingPath), id: "\(accountId):synthetic-message")
+        #expect(staged.summaryBlurb == "Lunch on Friday.")
+        #expect(staged.actionTag == "reply")
+        #expect(staged.summaryTextMessage == "Lunch Friday?")
     }
 }

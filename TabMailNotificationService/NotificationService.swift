@@ -118,7 +118,10 @@ final class NotificationService: UNNotificationServiceExtension {
                 || settings.alertSetting == .enabled)
     }
 
-    private lazy var nseDB: DatabaseQueue? = NSEStagingDB.open()
+    /// The staging file a test opens in place of the App Group one (the test host has no
+    /// App Group container). Nil in the extension.
+    @TaskLocal static var stagingPathOverride: String?
+    private lazy var nseDB: DatabaseQueue? = Self.stagingPathOverride.map { NSEStagingDB.open(path: $0) } ?? NSEStagingDB.open()
     private let delivered = OneShotFlag()
     /// Instance-scoped holder for the AI lease heartbeat Task spawned inside
     /// `process(...)`. The exit handlers cancel it so the 1Hz SQLite drumbeat
