@@ -34,7 +34,6 @@ struct MessageRowView: View {
     /// observed, so the row repaints when either changes.
     private var chatViewActive: Bool {
         ChatViewConfig.isActive(
-            reachable: ChatViewConfig.isReachable,
             enabledByUser: chatViewEnabled,
             aiOn: !DemoModeStore.shared.hidesAIContent
                 && ChatViewConfig.isAIOn(optedOut: optOutAllAI, subscribed: AISubscriptionGate.shared.isActive))

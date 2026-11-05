@@ -6,40 +6,15 @@ import Foundation
 
 /// Whether the chat view, and the AI work only it needs, is on.
 ///
-/// The chat view lands on `main` in several changes, and `main` must stay releasable in between, so
-/// release builds keep it off (`isAvailableInBuild`) until the last of them turns it on. Until then
-/// it can be turned on from the debug menu for testing. While it is off nothing requests summaries
-/// for whole threads (they would spend model calls on a feature nobody sees).
-///
-/// Once reachable, the user switches it in TabMail Settings ("Enable Chat View", on by default).
-/// It needs AI: while AI is off (opted out, or no plan) it is off everywhere, and the user's
-/// choice is kept for when AI comes back.
+/// The user switches it in TabMail Settings ("Enable Chat View", on by default). It needs AI:
+/// while AI is off (opted out, or no plan) it is off everywhere, nothing requests summaries for
+/// whole threads, and the user's choice is kept for when AI comes back.
 ///
 /// Read `isActive` ONCE at the start of an operation and pass the value along; never re-read it
 /// mid-operation.
 enum ChatViewConfig {
-    /// The release gate: false until the chat view ships.
-    static let isAvailableInBuild = false
-
-    private static let debugOverrideKey = "debug_chat_view_enabled"
-
     /// The user's "Enable Chat View" setting. A missing key means on.
     static let enabledKey = "chatViewEnabled"
-
-    /// The debug menu's override. Only counts while debug mode is unlocked, like
-    /// `BackendConfig.useDevServers`.
-    static var debugOverride: Bool {
-        get {
-            guard UserDefaults.standard.bool(forKey: "debug_mode_unlocked") else { return false }
-            return UserDefaults.standard.bool(forKey: debugOverrideKey)
-        }
-        set {
-            UserDefaults.standard.set(newValue, forKey: debugOverrideKey)
-        }
-    }
-
-    /// Whether this build offers the chat view at all (and so shows its Settings row).
-    static var isReachable: Bool { isAvailableInBuild || debugOverride }
 
     /// The user's choice, kept while AI is off.
     static var isEnabledByUser: Bool {
@@ -57,11 +32,11 @@ enum ChatViewConfig {
     }
 
     static var isActive: Bool {
-        isActive(reachable: isReachable, enabledByUser: isEnabledByUser, aiOn: isAIOn)
+        isActive(enabledByUser: isEnabledByUser, aiOn: isAIOn)
     }
 
-    static func isActive(reachable: Bool, enabledByUser: Bool, aiOn: Bool) -> Bool {
-        reachable && enabledByUser && aiOn
+    static func isActive(enabledByUser: Bool, aiOn: Bool) -> Bool {
+        enabledByUser && aiOn
     }
 }
 
