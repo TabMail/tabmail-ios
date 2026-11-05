@@ -229,6 +229,13 @@ actor ActiveAIQueue {
         }
     }
 
+    /// Test seam: run one whole job as the drain does, from its own database read through the
+    /// Device Sync peer check to its executor, with an injected AI service.
+    func executeWholeJobForTesting(_ job: AIJob, aiService: AIService) async {
+        let config = DispatchConfig(aiService: aiService, kbText: "", actionPrompt: "", compositionPrompt: "")
+        _ = await executeJob(job, config: config)
+    }
+
     /// Compact, MESSAGE-discriminating id for logs. A `headerId` is
     /// "accountId:folder:messageId"; the accountId is a 36-char UUID, so the old
     /// `headerId.prefix(30)` never reached the messageId — it printed the SAME string for
@@ -1106,7 +1113,7 @@ actor ActiveAIQueue {
                 .replacingOccurrences(of: ">", with: "")
                 .trimmingCharacters(in: .whitespaces)
             if !probeKey.isEmpty,
-               let probeResults = await DeviceSyncService.shared.probeAICache(keys: [probeKey]),
+               let probeResults = await config.aiService.peerProbe([probeKey]),
                let cached = probeResults[probeKey] {
                 // Write peer data to GRDB — individual jobs will find fields filled and skip LLM.
                 // T4.V7 site 1: the field-wise "only if still empty" merge runs

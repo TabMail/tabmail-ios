@@ -233,6 +233,27 @@ struct AITextMessageStorageTests {
         }
 
         try AppDatabase.runMigrations(on: pool)
+
+        // The upgrade fills the Message-ID of the entry whose email is in the folder its key
+        // names. The moved email's entry and the gone email's entry stay without one.
+        let ids = try pool.read { db in
+            Dictionary(uniqueKeysWithValues: try MessageAICache.fetchAll(db).map { ($0.key, $0.rfc822MessageId) })
+        }
+        #expect(ids["acc1:INBOX:stayed@example.com"] == .some("stayed@example.com"))
+        #expect(ids["acc1:INBOX:moved@example.com"] == .some(nil))
+        #expect(ids["acc1:INBOX:gone@example.com"] == .some(nil))
+        // A Device Sync peer asks by Message-ID (`RootView`'s probe handler), which still
+        // answers once the header is gone. The deletion is rolled back for the purge below.
+        var probe: MessageAICache?
+        try pool.write { db in
+            try db.inSavepoint {
+                _ = try MessageHeader.deleteOne(db, key: MessageIdentity.headerId(accountId: "acc1", folderPath: "INBOX", messageId: "1"))
+                probe = try MessageAICache.filter(Column("rfc822MessageId") == "stayed@example.com").fetchOne(db)
+                return .rollback
+            }
+        }
+        #expect(probe?.summaryBlurb == "Old summary")
+
         SyncEngine.runPurgeOrphanedAICache(dbPool: PrioritizedDatabase(pool: pool, priority: .background))
 
         let keys = try pool.read { db in Set(try MessageAICache.fetchAll(db).map(\.key)) }

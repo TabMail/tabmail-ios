@@ -95,12 +95,13 @@ struct AITextMessageCallerTests {
 
         /// `summarized`: the email already has its summary and action, so opening it asks only
         /// for the reply.
-        init(fromAddress: String = "sender@example.com", replyTextMessage: String? = nil, summarized: Bool = false) throws {
+        init(fromAddress: String = "sender@example.com", replyTextMessage: String? = nil, summarized: Bool = false,
+             messageId: String = "1") throws {
             (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
             account = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: .imap, pool: pool)
             try FolderEpochTestFixture.insertFolder(accountId: "acc1", path: "INBOX", role: .inbox, pool: pool)
             var header = MessageHeader(
-                messageId: "1", subject: "Plans", from: "Sender", fromAddress: fromAddress,
+                messageId: messageId, subject: "Plans", from: "Sender", fromAddress: fromAddress,
                 to: "acc1@example.com", date: Date(), snippet: "snippet", folderId: "acc1:INBOX",
                 accountId: "acc1", folderPath: "INBOX", isInInbox: true)
             header.rfc822MessageId = Self.rfc
@@ -332,6 +333,54 @@ struct AITextMessageCallerTests {
         }
     }
 
+    @Test("A queue job that adopts another device's action keeps this device's summary and reply text messages")
+    func queuePeerActionKeepsLocalPairs() async throws {
+        try await withAIEnabled {
+            // A unique UID: the search index is shared by the whole test process.
+            let fixture = try Fixture(messageId: UUID().uuidString)
+            let backend = Backend()
+            let key = ContentKey(rawValue: fixture.header.id)
+            defer {
+                backend.close(); fixture.close()
+                Task { try? await SearchIndex.shared.removeMessages(contentKeys: [key]) }
+            }
+            // This device already made the summary and the reply; only the action is missing.
+            var local = fixture.header
+            local.summaryBlurb = Self.blurb
+            local.summaryTextMessage = Self.summaryText
+            local.cachedReply = Self.replyBody
+            local.replyTextMessage = Self.replyText
+            let seeded = local
+            try await fixture.pool.write { try seeded.update($0) }
+            // The job reads the email's text from the search index.
+            let h = fixture.header
+            try await SearchIndex.shared.removeMessages(contentKeys: [key])
+            _ = try await SearchIndex.shared.indexHeaders([FTSHeaderRecord(
+                contentKey: key, headerId: h.id, messageId: h.messageId, subject: h.subject,
+                from: "\(h.from) <\(h.fromAddress)>", to: h.to,
+                dateMs: Int64(h.date.timeIntervalSince1970 * 1000))])
+            try await SearchIndex.shared.updateBody(contentKey: key, body: "Can you send the budget?")
+
+            await ActiveAIQueue().executeWholeJobForTesting(
+                ActiveAIQueue.AIJob(headerId: h.id, accountId: "acc1", jobType: .action, windowExempt: true),
+                aiService: backend.peerService)
+
+            #expect(backend.prompts.isEmpty, "the peer's action is adopted without asking the model")
+            let row = try #require(try fixture.row())
+            #expect(row.actionTag == .reply)
+            #expect(row.summaryBlurb == Self.blurb)
+            #expect(row.summaryTextMessage == Self.summaryText)
+            #expect(row.cachedReply == Self.replyBody)
+            #expect(row.replyTextMessage == Self.replyText)
+            let cache = try #require(try fixture.cache())
+            #expect(cache.actionTag == .reply)
+            #expect(cache.summaryBlurb == Self.blurb)
+            #expect(cache.summaryTextMessage == Self.summaryText)
+            #expect(cache.cachedReply == Self.replyBody)
+            #expect(cache.replyTextMessage == Self.replyText)
+        }
+    }
+
     // MARK: - 4. Compose and the extension
 
     @Test("Recomputing a reply in compose stores the reply and its text message")
@@ -350,6 +399,40 @@ struct AITextMessageCallerTests {
             let row = try fixture.row()
             #expect(row?.cachedReply == Self.replyBody)
             #expect(row?.replyTextMessage == Self.replyText)
+        }
+    }
+
+    @Test("A recompute does not store its reply on a different email that took the same address")
+    func composeRecomputeReplacedEmail() async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture()
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+            // A UIDVALIDITY reset removed the email compose is replying to, and a different
+            // email was synced in at the same folder and UID.
+            let original = fixture.header
+            try await fixture.pool.write { db in
+                _ = try MessageHeader.deleteOne(db, key: original.id)
+                var successor = MessageHeader(
+                    messageId: original.messageId, subject: "Different email", from: "Other sender",
+                    fromAddress: "other@example.com", to: original.to, date: Date(), snippet: "Different email",
+                    folderId: original.folderId, accountId: original.accountId, folderPath: original.folderPath,
+                    isInInbox: true)
+                successor.rfc822MessageId = "different@example.com"
+                successor.cachedReply = "The other email's reply"
+                successor.replyTextMessage = "The other email's text"
+                try successor.insert(db)
+            }
+
+            let suggestion = await ComposeView.recomputedReply(
+                for: original, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+
+            #expect(suggestion == Self.replyBody, "compose still shows the reply to the email on screen")
+            let row = try #require(try fixture.row())
+            #expect(row.rfc822MessageId == "different@example.com")
+            #expect(row.cachedReply == "The other email's reply")
+            #expect(row.replyTextMessage == "The other email's text")
         }
     }
 
