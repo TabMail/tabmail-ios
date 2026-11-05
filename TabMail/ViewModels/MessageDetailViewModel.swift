@@ -2076,6 +2076,10 @@ final class MessageDetailViewModel {
 
     // MARK: - Thread Messages
 
+    /// True once a thread lookup has been applied (even one that found nothing): the chat view
+    /// waits for it before its first scroll to the Unread line or a highlighted email.
+    private(set) var hasLoadedThread = false
+
     /// Thread messages that are chronologically before the focused message (oldest first).
     private(set) var earlierMessages: [MessageHeader] = []
     /// Thread messages that are chronologically after the focused message (oldest first).
@@ -2418,6 +2422,7 @@ final class MessageDetailViewModel {
                 // afterwards and resurrect bubbles for deleted messages.
                 if results.isEmpty && self.threadMessages.isEmpty {
                     self.lastAppliedThreadGeneration = generation
+                    self.hasLoadedThread = true
                     return
                 }
                 // Freeze re-check at the MUTATION site: the detached thread
@@ -2475,11 +2480,13 @@ final class MessageDetailViewModel {
                 // over this confirmed-current set.
                 guard overlayed != self.threadMessages else {
                     self.lastAppliedThreadGeneration = generation
+                    self.hasLoadedThread = true
                     return
                 }
                 self.threadMessages = overlayed
                 self.recomputeThreadSplit()
                 self.lastAppliedThreadGeneration = generation
+                self.hasLoadedThread = true
             } catch {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[ThreadDebug] Failed to load thread messages: \(error)")

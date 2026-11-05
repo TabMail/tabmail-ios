@@ -18,6 +18,7 @@ struct MessageRowView: View {
     /// adds no information.
     var showsRecipientInsteadOfSender: Bool = false
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
+    @AppStorage(ChatViewConfig.enabledKey) private var chatViewEnabled = true
     @State private var tagTapTick = 0
     @State private var tagMenuOpenTick = 0
     /// Whether at least one AI source is enabled (LLM or Device Sync).
@@ -27,6 +28,16 @@ struct MessageRowView: View {
         let demoStore = DemoModeStore.shared
         if demoStore.hidesAIContent { return false }
         return (!optOutAllAI || DeviceSyncService.shared.isAutoEnabled) && AISubscriptionGate.shared.isActive
+    }
+
+    /// The chat view's switch, as the row can observe it: the Settings toggle and the opt-out are
+    /// observed, so the row repaints when either changes.
+    private var chatViewActive: Bool {
+        ChatViewConfig.isActive(
+            reachable: ChatViewConfig.isReachable,
+            enabledByUser: chatViewEnabled,
+            aiOn: !DemoModeStore.shared.hidesAIContent
+                && ChatViewConfig.isAIOn(optedOut: optOutAllAI, subscribed: AISubscriptionGate.shared.isActive))
     }
 
     /// Effective sender (or recipient) display:
@@ -135,7 +146,8 @@ struct MessageRowView: View {
                 HStack(alignment: .bottom) {
                     // Reserve 2 lines of height even when snippet is empty,
                     // so row height is consistent and scroll length stays stable.
-                    Text(message.snippet.isEmpty ? " \n " : message.snippet)
+                    let preview = message.preview(chatViewActive: chatViewActive)
+                    Text(preview.isEmpty ? " \n " : preview)
                         .font(.subheadline)
                         .fontWeight(.light)
                         .foregroundStyle(Theme.textSecondary)
