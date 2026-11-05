@@ -24,7 +24,7 @@ enum AgeAndTermsConsent {
     static let ineligibleBlockDays = 30
     /// Legal document version recorded with the agreement — the website's
     /// `public-config.js` `LEGAL_VERSION_ISO`.
-    static let legalVersion = "2026-09-29"
+    static let legalVersion = "2026-11-04"
 
     /// The app-wide "passed the age and terms screen" flag (RootView's
     /// `@AppStorage`). Reset on sign-out, restored per user on sign-in.
