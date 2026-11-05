@@ -245,6 +245,8 @@ struct DictationControllerTests {
         optedOut: @escaping @MainActor () -> Bool = { false },
         language: @escaping @MainActor () -> String? = { nil },
         smartDictation: Bool = true,
+        preferredLanguages: @escaping @MainActor () -> [String] = { ["en-US"] },
+        unknownWords: @escaping DictationController.UnknownWords = { _, _ in nil },
         microphoneAccess: @escaping @MainActor () async -> Bool = { true },
         transcript: @escaping @Sendable () async throws -> String = { "ask jordan about the road map" },
         /// The backend's `cleaned_text`: `""` when its cleanup failed, nil from a backend without it.
@@ -267,6 +269,8 @@ struct DictationControllerTests {
             isOptedOutOfAI: optedOut,
             dictationLanguage: language,
             smartDictation: { smartDictation },
+            preferredLanguages: preferredLanguages,
+            unknownWords: unknownWords,
             dictionary: dictionary,
             emailBody: emailBody,
             corrections: corrections,
@@ -361,6 +365,7 @@ struct DictationControllerTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
             smartDictation: { smart.withLock { $0 } },
+            unknownWords: { _, _ in nil },
             transcribe: { _, _, _, cleanup in
                 recorded.cleanups.withLock { $0.append(cleanup) }
                 return DictationTranscription(text: "ask jordan", cleanedText: "Ask Jordan.")
@@ -1165,6 +1170,7 @@ struct DictationControllerTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
             smartDictation: { true },
+            unknownWords: { _, _ in nil },
             transcribe: { flac, _, _, _ in
                 recorded.uploads.withLock { $0.append(flac) }
                 return DictationTranscription(text: "a long dictation", cleanedText: "A long dictation.")
@@ -1204,6 +1210,7 @@ struct DictationControllerTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
             smartDictation: { true },
+            unknownWords: { _, _ in nil },
             transcribe: { flac, _, _, _ in
                 recorded.uploads.withLock { $0.append(flac) }
                 return DictationTranscription(text: "a dictation with pauses", cleanedText: "A dictation with pauses.")
@@ -1491,6 +1498,70 @@ struct DictationControllerTests {
         #expect(recorded.cleanups.withLock { $0.first??["dictionary"] } == "Xyvora")
     }
 
+    /// The terms are the words the spelling dictionaries of the preferred languages, as they were when
+    /// the dictation started, do not know (ADR-IOS-101): a name opening a line is one, an everyday
+    /// capitalised word is not.
+    @Test func theTermsAreTheWordsThePreferredLanguagesDictionariesDoNotKnow() async throws {
+        let capture = FakeCapture()
+        let asked = Mutex<[(words: Set<String>, languages: [String])]>([])
+        let controller = controller(
+            capture: capture,
+            preferredLanguages: { ["fr-CA", "en-US"] },
+            unknownWords: { words, languages in
+                asked.withLock { $0.append((words, languages)) }
+                return words.subtracting(["monday", "report", "chat"])
+            },
+            emailBody: { _ in "Xyvora Brevalle sent the Report on Monday." }
+        )
+        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
+
+        await dictate(controller, capture: capture, context: context)
+
+        let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
+        #expect(vocabulary == ["Xyvora Brevalle"])
+        let questions = asked.withLock { $0 }
+        #expect(questions.count == 1)
+        guard questions.count == 1 else { return }
+        #expect(questions[0].languages == ["fr-CA", "en-US"])
+        #expect(questions[0].words == ["xyvora", "brevalle", "report", "monday", "chat"])
+    }
+
+    /// Dictionaries too slow to answer within `contextTermsWait` cost the dictation its terms, never
+    /// the dictation (the main-actor hop is inside the budget).
+    @Test func slowDictionariesCostTheTermsNotTheDictation() async throws {
+        let capture = FakeCapture()
+        let controller = controller(
+            capture: capture,
+            unknownWords: { words, _ in
+                try? await Task.sleep(for: .seconds(30))
+                return words
+            },
+            emailBody: { _ in "Xyvora Brevalle" }
+        )
+        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
+
+        await dictate(controller, capture: capture, context: context)
+
+        #expect(recorded.vocabularies.withLock { $0.first } == nil || recorded.vocabularies.withLock { $0.first } == [])
+        #expect(!recorded.uploads.withLock { $0 }.isEmpty)
+    }
+
+    /// No working dictionary: the earlier rule picks the terms, a name opening a sentence missed.
+    @Test func withoutAWorkingDictionaryTheEarlierRulePicksTheTerms() async throws {
+        let capture = FakeCapture()
+        let controller = controller(
+            capture: capture,
+            unknownWords: { _, _ in nil },
+            emailBody: { _ in "Xyvora met Brevalle Labs yesterday." }
+        )
+        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
+
+        await dictate(controller, capture: capture, context: context)
+
+        let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
+        #expect(vocabulary == ["Brevalle Labs"])
+    }
+
     /// An email of more terms than the backend takes: the dictionary whole, then the context's
     /// first terms filling the rest of the 200, all of them with no dictionary (owner, 2026-10-02).
     @Test(arguments: [0, 1, DictationConfig.dictionaryMaxEntries])
@@ -1725,6 +1796,7 @@ struct DictationOptOutFlagTests {
             capture: capture,
             requestMicrophoneAccess: { true },
             isOnline: { true },
+            unknownWords: { _, _ in nil },
             transcribe: { flac, _, _, cleanup in
                 recorded.uploads.withLock { $0.append(flac) }
                 recorded.cleanups.withLock { $0.append(cleanup) }
@@ -1900,6 +1972,10 @@ struct DictationOptOutFlagTests {
         #expect(controller.contains("emailBody: @escaping EmailBody = { await DictationController.storedEmailBody(headerId: $0) },"))
         #expect(controller.contains("corrections: DictationCorrectionWatch? = DictationCorrectionWatch { DictationDictionary.shared.learn($0) },"))
         #expect(controller.contains("useWords: @escaping @MainActor ([String]) -> Void = { DictationDictionary.shared.use($0) },"))
+        #expect(controller.contains("preferredLanguages: @escaping @MainActor () -> [String] = { Locale.preferredLanguages },"))
+        #expect(controller.contains("unknownWords: @escaping UnknownWords = { await SystemSpelling.unknownWords(among: $0, preferredLanguages: $1) },"))
+        // The languages are snapshotted when the dictation starts, in the same breath as the dictionary.
+        #expect(controller.contains("context: context, excluding: dictionary.words, preferredLanguages: preferredLanguages(),"))
     }
 
     /// Settings' Smart Dictation toggle writes the key the app's controller reads, on by default.
@@ -1998,6 +2074,7 @@ struct DictationWaveformTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
             smartDictation: { true },
+            unknownWords: { _, _ in nil },
             transcribe: { _, _, _, _ in try await Task.sleep(for: .seconds(60)); return DictationTranscription(text: "", cleanedText: nil) },
             warmUp: {},
             speechDetector: FakeSpeechDetector.hearing()
@@ -2040,6 +2117,7 @@ struct DictationWaveformTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
             smartDictation: { true },
+            unknownWords: { _, _ in nil },
             transcribe: { _, _, _, _ in throw DictationError(status: 502, code: "transcription_failed") },
             warmUp: {},
             transcriptionRetryDelays: [.seconds(60)],
@@ -2105,6 +2183,7 @@ struct DictationLanguageSettingTests {
                 isOnline: { true },
                 isOptedOutOfAI: { false },
                 smartDictation: { true },
+                unknownWords: { _, _ in nil },
                 transcribe: { _, language, _, _ in
                     languages.withLock { $0.append(language) }
                     return DictationTranscription(text: "annyeong", cleanedText: "Annyeong.")
@@ -2150,6 +2229,7 @@ struct DictationLanguageSettingTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
             smartDictation: { true },
+            unknownWords: { _, _ in nil },
             transcribe: DictationController.backendTranscription(BackendClient(llmSession: http.session)),
             warmUp: {},
             speechDetector: FakeSpeechDetector.hearing()
@@ -2208,6 +2288,7 @@ struct DictationLanguageSettingTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
+            unknownWords: { _, _ in nil },
             dictionary: { .init(words: [], learnsWords: false) },
             corrections: nil,
             useWords: { _ in },

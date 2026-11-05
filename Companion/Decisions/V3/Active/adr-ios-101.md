@@ -1,0 +1,19 @@
+## ADR-IOS-101: Dictation Context Terms Are the Words the System Spelling Dictionaries Do Not Know
+
+**Status:** Active (2026-11-05). Owner request via issue #383 (a name that opens a line, "Xyvora Brevalle  4:12 PM", lost its first word, so the speech model never got it); owner answers 2026-11-05: guard the dictionaries, all preferred languages, keep the 200 ms budget with the main-actor hop inside it, simulator is enough. Amends ADR-IOS-086 decision 2 (the rule that picks the terms) and follows TabMail Voice's change of the same rule (tabmail-voice #333, ADR-DESK-038).
+
+**Context:** the earlier rule took a capital inside a word, or at its start where no sentence starts, minus a fixed English everyday-word list. A name at a sentence or line start was missed, and English words were the only ones recognised.
+
+**Decision:**
+1. **The rule.** A word is a term when it has a capital (or is in a script without case), no digit, and its lowercase form is unknown to the spelling dictionaries of the user's preferred languages (`Locale.preferredLanguages`, snapshotted when the dictation starts). The sentence-start rule and the everyday-word list no longer apply. Tokens are split on whitespace and trimmed of punctuation, runs of terms joined, a run longer than a dictionary word counted word by word, addresses (`@`, `://`) excluded, frequency order and the backend's word limits: all as before. `DictationContextTerms.candidates(in:)` lists the lowercase words that could be terms; `DictationContextTerms.terms(in:excluding:max:rule:)` judges them under a `Rule`.
+2. **The dictionaries are `UITextChecker`** (`SystemSpelling.unknownWords`), asked word by word for each preferred language; a word is unknown only if every working dictionary flags it. No dictionary is shipped. It is main-actor isolated, so the whole batch of candidates goes over in ONE hop from the detached picking task (`DictationController.pickTerms`), inside the existing `contextTermsWait` = 0.2 s: a slower answer sends no terms, as before.
+3. **The guard.** `UITextChecker` calls every word of a language it cannot check correct (measured 2026-11-04 on the iOS 26.5 simulator: Korean, Japanese, Chinese, Thai, an unknown id, and many languages it lists in `availableLanguages`, such as Polish, Czech, Finnish, Greek). So each preferred language is probed once per dictation with a made-up word (`DictationConfig.spellingProbeWord`), and a language whose dictionary does not flag it is left out. `availableLanguages` is not consulted.
+4. **No working dictionary** among the preferred languages: the earlier rule, exactly (`Rule.legacy`): a capital inside a word, or at its start where no sentence starts, not an everyday word.
+
+**Consequences:**
+- Names that open a line or sentence are terms now. Weekdays, months and cities (lowercase unknown to English: "monday", "paris") are terms too; harmless (a phrase list only biases the model), but they take slots from the 200.
+- Names that are also dictionary words ("Mark", "Smith", "Apple", "Lee") are not terms; the earlier rule picked them mid-sentence. Same as TabMail Voice's Hunspell rule.
+- A Latin dictionary treats words of other scripts as known, so a Cyrillic or Greek name is a term only when a preferred language with a working dictionary for that script is set. Scripts without case and no working dictionary (Korean, Chinese, Japanese) yield no terms, as before.
+- The Latin-script names on a screen of a user whose preferred languages have no working dictionary (Korean only, say) are picked by the earlier rule.
+- The result depends on the device's dictionaries, which differ from the simulator's; checked in the owner's smoke test on a phone.
+- The picking logs (debug-gated) the candidate count, the rule used and the time it took, to measure the hop.

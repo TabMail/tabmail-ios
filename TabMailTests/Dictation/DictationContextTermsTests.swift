@@ -10,7 +10,7 @@ import Testing
 /// user's dictionary.
 struct DictationContextTermsTests {
     private func terms(_ text: String, excluding: [String] = [], max: Int = DictationConfig.vocabularyMaxTerms) -> [String] {
-        DictationContextTerms.terms(in: text, excluding: excluding, max: max)
+        DictationContextTerms.terms(in: text, excluding: excluding, max: max, rule: .legacy)
     }
 
     @Test func picksNamesAndTermsNotEverydayWords() {
@@ -73,5 +73,73 @@ struct DictationContextTermsTests {
     @Test func picksInAnyScript() {
         #expect(terms("회의는 내일 Brevalle 에서") == ["Brevalle"])
         #expect(terms("회의는 내일") == [])
+    }
+
+    // MARK: The dictionary rule (ADR-IOS-101)
+
+    /// The terms when the dictionaries know exactly `known` of the candidates (lowercase), as
+    /// `SystemSpelling` would answer.
+    private func dictionaryTerms(
+        _ text: String, known: Set<String> = [], excluding: [String] = [], max: Int = DictationConfig.vocabularyMaxTerms
+    ) -> [String] {
+        let unknown = DictationContextTerms.candidates(in: text).subtracting(known)
+        return DictationContextTerms.terms(in: text, excluding: excluding, max: max, rule: .dictionary(unknown: unknown))
+    }
+
+    /// The rule: a capital (or a script without case), no digit, and a lowercase form no dictionary
+    /// knows. A name opening a line or a sentence is a term like any other.
+    @Test func aNameAtTheStartOfALineOrSentenceIsATerm() {
+        #expect(dictionaryTerms("Xyvora Brevalle  4:12 PM", known: ["pm"]) == ["Xyvora Brevalle"])
+        #expect(dictionaryTerms("Tomorrow works. Xyvora agrees.", known: ["tomorrow", "works", "agrees"]) == ["Xyvora"])
+        #expect(dictionaryTerms("Done.\nBrevalle ships", known: ["done", "ships"]) == ["Brevalle"])
+    }
+
+    /// A capitalised word a dictionary knows is an everyday word, not a term; one it does not know is.
+    @Test func aCapitalisedWordTheDictionariesKnowIsNotATerm() {
+        let text = "ask Monday about the Report from Xyvora"
+        #expect(dictionaryTerms(text, known: ["report", "ask", "about", "the", "from"]) == ["Monday", "Xyvora"])
+        #expect(dictionaryTerms(text, known: ["monday", "report", "ask", "about", "the", "from"]) == ["Xyvora"])
+    }
+
+    /// A word with no capital is never a term, whatever the dictionaries say; a word with a digit
+    /// is never one either.
+    @Test func lowercaseWordsAndWordsWithDigitsAreNotTerms() {
+        #expect(dictionaryTerms("the brevalle report is late") == [])
+        #expect(dictionaryTerms("ask Xyvora2 and Q3 and Brevalle") == ["Brevalle"])
+        #expect(DictationContextTerms.candidates(in: "the brevalle report ask Xyvora2 Brevalle") == ["brevalle"])
+    }
+
+    /// A word in a script without case has no capital to ask for: the dictionaries decide.
+    @Test func aScriptWithoutCaseIsJudgedByTheDictionariesAlone() {
+        #expect(dictionaryTerms("회의는 내일 Brevalle 에서", known: ["회의는", "내일", "에서"]) == ["Brevalle"])
+        // Words the dictionaries do not know run together like any other terms.
+        #expect(dictionaryTerms("회의는 내일 Brevalle 에서") == ["회의는 내일 Brevalle 에서"])
+        #expect(DictationContextTerms.candidates(in: "회의는 Brevalle") == ["회의는", "brevalle"])
+        #expect(dictionaryTerms("회의는 내일", known: ["회의는", "내일"]) == [])
+        #expect(dictionaryTerms("회의는 내일") == ["회의는 내일"])
+    }
+
+    /// Runs, headings, frequency, the dictionary's own words, the cap and the backend's limits work as
+    /// they do under the earlier rule.
+    @Test func runsFrequencyAndLimitsAreAsBefore() {
+        #expect(dictionaryTerms("From: Kaelthorne Drake", known: ["from"]) == ["Kaelthorne Drake"])
+        #expect(dictionaryTerms("I met Kaelthorne, Drake and Xyvora.", known: ["i", "met", "and"]) == ["Kaelthorne", "Drake", "Xyvora"])
+        let text = "ask Brevalle and Xyvora. then Xyvora again, and XYVORA, and Kaelthorne"
+        let known: Set = ["ask", "and", "then", "again"]
+        #expect(dictionaryTerms(text, known: known) == ["Xyvora", "Brevalle", "Kaelthorne"])
+        #expect(dictionaryTerms(text, known: known, excluding: ["xyvora"]) == ["Brevalle", "Kaelthorne"])
+        #expect(dictionaryTerms(text, known: known, max: 1) == ["Xyvora"])
+        #expect(dictionaryTerms("ask Al and Xy<vora today", known: ["ask", "and", "today"]) == [])
+    }
+
+    @Test func addressesAreNotTermsUnderTheDictionaryRule() {
+        let text = "write to Xyvora <person@example.com> or https://Example.com/Brevalle or Person@Example.com"
+        #expect(dictionaryTerms(text, known: ["write", "to", "or"]) == ["Xyvora"])
+    }
+
+    /// No dictionary is asked about a word that cannot be a term.
+    @Test func candidatesAreTheLowercaseFormsOfWordsThatCouldBeTerms() {
+        #expect(DictationContextTerms.candidates(in: "Ask Xyvora, (Brevalle) and XYVORA about iOS 26 at 4:12") == ["ask", "xyvora", "brevalle", "ios"])
+        #expect(DictationContextTerms.candidates(in: "") == [])
     }
 }

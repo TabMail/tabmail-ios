@@ -56,6 +56,9 @@ final class DictationController {
     typealias WarmUp = @Sendable () async -> Void
     /// The plain-text body of an email (its `messageHeader.id`), for terms; nil without one.
     typealias EmailBody = @Sendable (String) async -> String?
+    /// Which of the words none of the languages' spelling dictionaries knows (`SystemSpelling`); nil
+    /// when none of the languages has a working dictionary.
+    typealias UnknownWords = @Sendable (_ words: Set<String>, _ preferredLanguages: [String]) async -> Set<String>?
     /// A speech detector for one dictation, given what to call when it hears speech and when it
     /// can't run.
     typealias MakeSpeechDetector = @MainActor (
@@ -69,6 +72,8 @@ final class DictationController {
     @ObservationIgnored private let isOptedOutOfAI: @MainActor () -> Bool
     @ObservationIgnored private let dictationLanguage: @MainActor () -> String?
     @ObservationIgnored private let smartDictation: @MainActor () -> Bool
+    @ObservationIgnored private let preferredLanguages: @MainActor () -> [String]
+    @ObservationIgnored private let unknownWords: UnknownWords
     @ObservationIgnored private let dictionary: @MainActor () -> DictationDictionary.Snapshot
     @ObservationIgnored private let emailBody: EmailBody
     @ObservationIgnored private let corrections: DictationCorrectionWatch?
@@ -120,6 +125,8 @@ final class DictationController {
         isOptedOutOfAI: @escaping @MainActor () -> Bool = { AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey) },
         dictationLanguage: @escaping @MainActor () -> String? = { DictationLanguage.current() },
         smartDictation: @escaping @MainActor () -> Bool = { SmartDictation.isOn() },
+        preferredLanguages: @escaping @MainActor () -> [String] = { Locale.preferredLanguages },
+        unknownWords: @escaping UnknownWords = { await SystemSpelling.unknownWords(among: $0, preferredLanguages: $1) },
         dictionary: @escaping @MainActor () -> DictationDictionary.Snapshot = { DictationDictionary.shared.snapshot },
         emailBody: @escaping EmailBody = { await DictationController.storedEmailBody(headerId: $0) },
         corrections: DictationCorrectionWatch? = DictationCorrectionWatch { DictationDictionary.shared.learn($0) },
@@ -142,6 +149,8 @@ final class DictationController {
         self.isOptedOutOfAI = isOptedOutOfAI
         self.dictationLanguage = dictationLanguage
         self.smartDictation = smartDictation
+        self.preferredLanguages = preferredLanguages
+        self.unknownWords = unknownWords
         self.dictionary = dictionary
         self.emailBody = emailBody
         self.corrections = corrections
@@ -225,7 +234,9 @@ final class DictationController {
         dictionaryTypedCount = dictionary.typedCount
         learnsWords = dictionary.learnsWords
         readInput = input
-        termsTask = Self.pickTerms(context: context, excluding: dictionary.words, emailBody: emailBody)
+        termsTask = Self.pickTerms(
+            context: context, excluding: dictionary.words, preferredLanguages: preferredLanguages(),
+            emailBody: emailBody, unknownWords: unknownWords)
         envelope = LevelEnvelope()
         level = 0
         hasHeardSpeech = false
@@ -267,12 +278,25 @@ final class DictationController {
 
     /// The terms of what the dictation is about (`DictationContextTerms`): from the context, and
     /// the email's body when there is one, read on this device; as many as the vocabulary has room
-    /// for beside the dictionary's words. Only the terms are sent.
-    private static func pickTerms(context: DictationContext, excluding: [String], emailBody: @escaping EmailBody) -> Task<[String], Never> {
+    /// for beside the dictionary's words. A term is a word unknown to the spelling dictionaries of
+    /// the preferred languages as they were when the dictation started (ADR-IOS-101), asked in one
+    /// hop to the main actor; with no working dictionary, by the earlier rule. Only the terms are
+    /// sent.
+    private static func pickTerms(
+        context: DictationContext, excluding: [String], preferredLanguages: [String],
+        emailBody: @escaping EmailBody, unknownWords: @escaping UnknownWords
+    ) -> Task<[String], Never> {
         Task.detached(priority: .userInitiated) {
+            let started = ContinuousClock.now
             let body = if let emailId = context.emailId { await emailBody(emailId) } else { String?.none }
             let text = [context.termsText, body].compactMap { $0 }.joined(separator: "\n")
-            return DictationContextTerms.terms(in: text, excluding: excluding, max: DictationConfig.vocabularyMaxTerms - excluding.count)
+            let candidates = DictationContextTerms.candidates(in: text)
+            let unknown = await unknownWords(candidates, preferredLanguages)
+            let rule: DictationContextTerms.Rule = unknown.map { .dictionary(unknown: $0) } ?? .legacy
+            let terms = DictationContextTerms.terms(
+                in: text, excluding: excluding, max: DictationConfig.vocabularyMaxTerms - excluding.count, rule: rule)
+            BackgroundSyncLogger.logDebug("[Dictation] terms: \(terms.count) from \(candidates.count) candidates, \(unknown == nil ? "legacy rule" : "dictionary rule") in \(started.duration(to: .now))")
+            return terms
         }
     }
 
