@@ -246,7 +246,8 @@ struct DictationLongDictationTests {
         polisher: Polisher = Polisher(),
         polishTimeout: Duration = .seconds(5),
         deadline: Duration = DictationConfig.transcriptionDeadline,
-        smartDictation: Bool = true
+        smartDictation: Bool = true,
+        unknownWords: @escaping DictationController.UnknownWords = { _, _ in nil }
     ) -> DictationController {
         DictationController(
             capture: capture,
@@ -255,6 +256,7 @@ struct DictationLongDictationTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
             smartDictation: { smartDictation },
+            unknownWords: unknownWords,
             dictionary: { .init(words: words, learnsWords: false, typedCount: typedCount) },
             emailBody: emailBody,
             corrections: nil,
@@ -464,6 +466,7 @@ struct DictationLongDictationTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
             smartDictation: { true },
+            unknownWords: { _, _ in nil },
             dictionary: { .init(words: [], learnsWords: false) },
             emailBody: { _ in nil },
             corrections: nil,
@@ -507,6 +510,7 @@ struct DictationLongDictationTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
             smartDictation: { true },
+            unknownWords: { _, _ in nil },
             dictionary: { .init(words: [], learnsWords: false) },
             emailBody: { _ in nil },
             corrections: nil,

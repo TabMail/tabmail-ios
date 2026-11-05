@@ -4,16 +4,37 @@
 
 import Foundation
 
-/// Names and terms in what the dictation is about (ADR-IOS-086): sent with a dictation beside the
-/// user's own dictionary, so the speech model spells them as they appear there. A dictionary built
-/// on the fly from the context, picked on this device; only the words picked are sent. TabMail
-/// Voice picks them from its screen read by the same rules (ADR-DESK-038).
+/// Names and terms in what the dictation is about (ADR-IOS-086, ADR-IOS-101): sent with a dictation
+/// beside the user's own dictionary, so the speech model spells them as they appear there. A
+/// dictionary built on the fly from the context, picked on this device; only the words picked are
+/// sent. TabMail Voice picks them from its screen read by the same rule (ADR-DESK-038).
 enum DictationContextTerms {
-    /// The terms in `text`: a word with a capital letter anywhere but at the start of a sentence (a
-    /// name, "TabMail", "OKR"), runs of such words kept together ("Jordan Lee"), not everyday words,
+    /// How a word is judged a term.
+    enum Rule: Equatable {
+        /// The system spelling dictionaries of the user's preferred languages (ADR-IOS-101): a word
+        /// with a capital (or in a script without case), no digit, whose lowercase form is in
+        /// `unknown`, the candidates none of those dictionaries knows (`SystemSpelling`).
+        case dictionary(unknown: Set<String>)
+        /// No preferred language has a working dictionary, so the earlier rule: a capital inside a
+        /// word, or at its start where no sentence starts, and not an everyday word.
+        case legacy
+    }
+
+    /// The lowercase forms of the words in `text` that the dictionary rule would call a term if the
+    /// dictionaries did not know them: what `SystemSpelling` is asked about.
+    static func candidates(in text: String) -> Set<String> {
+        var words: Set<String> = []
+        for token in text.split(whereSeparator: \.isWhitespace) {
+            let word = trimmed(token)
+            if isCandidate(word, raw: token) { words.insert(word.lowercased()) }
+        }
+        return words
+    }
+
+    /// The terms in `text`, as `rule` judges them: runs of such words kept together ("Jordan Lee"),
     /// no addresses. The most frequent first, then the earliest; none the same word as one in
     /// `excluding` or another; each a valid dictionary word; at most `max`.
-    static func terms(in text: String, excluding: [String], max: Int) -> [String] {
+    static func terms(in text: String, excluding: [String], max: Int, rule: Rule) -> [String] {
         var tallies: [String: (term: String, count: Int, first: Int)] = [:]
         func tally(_ term: String) {
             guard let word = DictationDictionary.word(term),
@@ -41,7 +62,7 @@ enum DictationContextTerms {
                 let word = trimmed(token)
                 // Punctuation before a word ends a run too ("Jordan (Brevalle Labs)").
                 if !token.hasPrefix(word) { endRun() }
-                if isTerm(word, raw: token, sentenceStart: sentenceStart) {
+                if isTerm(word, raw: token, sentenceStart: sentenceStart, rule: rule) {
                     run.append(word)
                 } else {
                     endRun()
@@ -61,9 +82,36 @@ enum DictationContextTerms {
             .map(\.term)
     }
 
-    /// Whether a word is a name or term: a capital inside it, or a capital at its start where no
-    /// sentence starts; not an everyday word; not an address.
-    private static func isTerm(_ word: String, raw: Substring, sentenceStart: Bool) -> Bool {
+    /// Whether a word is a name or term under `rule`.
+    private static func isTerm(_ word: String, raw: Substring, sentenceStart: Bool, rule: Rule) -> Bool {
+        switch rule {
+        case .dictionary(let unknown):
+            return isCandidate(word, raw: raw) && unknown.contains(word.lowercased())
+        case .legacy:
+            return isLegacyTerm(word, raw: raw, sentenceStart: sentenceStart)
+        }
+    }
+
+    /// Whether a word could be a term before the dictionaries are asked: not an address, no digit,
+    /// and a capital in it, or, in a script without case, a letter.
+    private static func isCandidate(_ word: String, raw: Substring) -> Bool {
+        guard !word.isEmpty, !raw.contains("@"), !raw.contains("://") else { return false }
+        var hasCapital = false, hasCasedLetter = false, hasLetter = false
+        for scalar in word.unicodeScalars {
+            switch scalar.properties.generalCategory {
+            case .decimalNumber: return false
+            case .uppercaseLetter, .titlecaseLetter: hasCapital = true; hasCasedLetter = true; hasLetter = true
+            case .lowercaseLetter: hasCasedLetter = true; hasLetter = true
+            case .otherLetter, .modifierLetter: hasLetter = true
+            default: break
+            }
+        }
+        return hasCapital || (hasLetter && !hasCasedLetter)
+    }
+
+    /// The earlier rule: a capital inside the word, or at its start where no sentence starts; not an
+    /// everyday word; not an address.
+    private static func isLegacyTerm(_ word: String, raw: Substring, sentenceStart: Bool) -> Bool {
         guard !word.isEmpty, !raw.contains("@"), !raw.contains("://") else { return false }
         let scalars = word.unicodeScalars
         let innerCapital = scalars.dropFirst().contains { $0.properties.generalCategory == .uppercaseLetter }

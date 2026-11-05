@@ -3,7 +3,7 @@
 **Class:** data-integrity
 **Severity:** high (wrong result shipped — one instance put the store's own metadata bytes into an
 outgoing email as an attachment)
-**First seen:** 2026-08 · **Recurrences:** 7 · **Status:** Active
+**First seen:** 2026-08 · **Recurrences:** 8 · **Status:** Active
 **Related:** `MIS-IOS-012` (a census whose SHAPE hid half its subjects — same root: the tool's
 notion of a unit was not the domain's), root `MIS-030` (scale is not shape) ·
 **Rule owner:** `../CLAUDE.md` § Data Integrity Rules
@@ -141,6 +141,12 @@ rg -n 'hasSuffix\(|hasPrefix\(|\.contains\("|split\(separator:|drop\(while:|drop
 # Companion check: the twins must stay byte-identical in the parts that make the decision.
 python3 <scratchpad>/check_twins.py
 ```
+
+**Recurrence 2026-11-05 (#383, `SystemSpelling`).** The `NSRange` handed to `UITextChecker` was built
+from `(word as NSString).length` (UTF-16) and the only real-dictionary test used ASCII, so a mutant
+using `word.count` survived: a decomposed "re\u{301}sume\u{301}" (6 characters, 8 units) is known
+with the full range and flagged with the truncated one. **Tell: a `String` to `NSRange` conversion
+whose tests are all ASCII.** Fixed with a decomposed-accent test against the real en-US dictionary.
 
 ---
 

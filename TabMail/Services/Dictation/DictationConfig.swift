@@ -196,6 +196,14 @@ enum DictationConfig {
     /// Longest a transcription waits for the context terms (seconds), which are picked while the
     /// user speaks; past it the transcription goes without them.
     static let contextTermsWait: TimeInterval = 0.2
+    /// A made-up Latin word every working spelling dictionary flags as misspelled
+    /// (`SystemSpelling`): a preferred language whose dictionary knows it has no working
+    /// dictionary (`UITextChecker` calls every word of a language it cannot check correct).
+    static let spellingProbeWord = "xyvoraq"
+    /// Words the spelling dictionaries are asked about before the main thread is given back: a
+    /// flagged word costs about 0.15 to 0.3 ms (measured on the simulator, 2026-11-05), so a slice holds
+    /// the main thread for about 4 to 8 ms.
+    static let spellingSliceWords = 25
     /// Each word is at most this many characters (UTF-16 code units, as the backend counts them)
     /// and this many space-separated words. As TabMail Voice's.
     static let dictionaryWordMaxChars = 50
