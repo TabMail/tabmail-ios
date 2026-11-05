@@ -76,7 +76,9 @@ enum AIResponseParser {
 
     /// Trimmed, nil only when empty. For the summary, the reply body and the text messages: the
     /// backend sends them as plain strings with no "None" word for a missing value (it accepts any
-    /// nonblank summary), so a summary or reply that is the word "None" is kept as written.
+    /// nonblank summary), so a summary or reply that is the word "None" is kept as written. A chat
+    /// summary is done once its text message is stored (`ActiveAIQueue.summaryDone`), so dropping a
+    /// literal "None" there would re-request that summary forever.
     private static func nonEmpty(_ value: String) -> String? {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? nil : text

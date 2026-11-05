@@ -89,12 +89,19 @@ actor ActiveAIQueue {
         /// (the queue repopulates from GRDB on launch), so no persistence
         /// migration.
         let windowExempt: Bool
+        /// A chat-view summary (D2: opening a thread; D3: the background walk through the threads of
+        /// recent inbox mail). Summary jobs only. Any folder, not just the Inbox (a thread holds Sent
+        /// and archived mail too), and done only when the summary has its text message
+        /// (`summaryDone`). Context, not identity, exactly like `windowExempt`: on dedupe the flags
+        /// only widen (`admitOrUpgrade`). Always created window-exempt.
+        let forChat: Bool
 
-        init(headerId: String, accountId: String, jobType: JobType, windowExempt: Bool = false) {
+        init(headerId: String, accountId: String, jobType: JobType, windowExempt: Bool = false, forChat: Bool = false) {
             self.headerId = headerId
             self.accountId = accountId
             self.jobType = jobType
             self.windowExempt = windowExempt
+            self.forChat = forChat
         }
 
         enum JobType: String, Hashable {
@@ -125,10 +132,30 @@ actor ActiveAIQueue {
         !inRecentWindow && !job.windowExempt
     }
 
+    /// Whether `message` already has the summary a job asks for: a non-empty summary, and for a chat
+    /// job (`forChat`) also its text message, unless the summary is the local no-content one, which
+    /// never has one (asking again would find no body text and retry forever). The ONE summary-done
+    /// check: every site that decides a summary job is finished (`executeJob`, its Device Sync and
+    /// NSE re-checks, `executeSummaryJob`'s cache hit, `readJobOutcome`) and the chat requests
+    /// (`enqueueChatSummaries`, `chatWalkCandidates`) ask this, so they cannot disagree and re-drive
+    /// a job forever.
+    nonisolated static func summaryDone(_ message: MessageHeader, forChat: Bool) -> Bool {
+        guard let blurb = message.summaryBlurb, !blurb.isEmpty else { return false }
+        return !forChat || message.summaryTextMessage != nil || blurb == MessageHeader.noContentSummary
+    }
+
+    /// The folder scope of every job, checked by `readJobOutcome` and `executeJob`: the Inbox, for
+    /// every origin; any folder for a chat summary (a thread holds Sent and archived mail too).
+    nonisolated static func inScope(_ message: MessageHeader, for job: AIJob) -> Bool {
+        message.isInInbox || job.forChat
+    }
+
     /// The action job chained after a summary job (both the LLM-completion and
     /// the cache-hit chain sites). Inherits the parent's `windowExempt` — an
     /// exempt summary's action must not be killed by the window the summary was
-    /// exempted from.
+    /// exempted from. It keeps its Inbox scope (`forChat` is never inherited): a chat summary of a
+    /// Sent or archived email chains an action job that retires at the executor's Inbox check
+    /// without a model call.
     nonisolated static func chainedActionJob(after job: AIJob) -> AIJob {
         AIJob(headerId: job.headerId, accountId: job.accountId,
               jobType: .action, windowExempt: job.windowExempt)
@@ -322,11 +349,19 @@ actor ActiveAIQueue {
     /// offer over a pending exempt job) returns `.rejected` and never downgrades.
     /// (Round-1 review fixed this for the S/R path; round-2 found the same class at
     /// the chain sites — ADR-IOS-078.)
+    /// The same holds for `forChat`: the stored job carries the union of both offers' flags.
     private enum AdmitResult { case added, upgraded, rejected }
     private func admitOrUpgrade(_ job: AIJob) -> AdmitResult {
         if storage.enqueue(job) { return .added }
-        if job.windowExempt, storage.replacePending(with: job) { return .upgraded }
-        return .rejected
+        guard let pending = storage.queue.first(where: { $0 == job }) else { return .rejected }
+        let merged = AIJob(
+            headerId: pending.headerId, accountId: pending.accountId, jobType: pending.jobType,
+            windowExempt: pending.windowExempt || job.windowExempt,
+            forChat: pending.forChat || job.forChat
+        )
+        guard merged.windowExempt != pending.windowExempt || merged.forChat != pending.forChat,
+              storage.replacePending(with: merged) else { return .rejected }
+        return .upgraded
     }
 
     /// Enqueue the action job chained after a summary (both the fresh-completion
@@ -358,6 +393,96 @@ actor ActiveAIQueue {
         scheduleDispatch()
     }
 
+    // MARK: - Chat view summaries (D2, D3)
+
+    /// Chat members asked for (`enqueueChatSummaries`) whose body was not downloaded yet, by header
+    /// id. `chatBodyArrived` hands each back once `BodyFetchProcessor.flushBatch` has written its
+    /// body. In memory only: a relaunch forgets them, and the next open or walk asks again. Entries
+    /// leave when their body lands; the set never holds more than the members opened this session.
+    private var chatAwaitingBody: [String: String] = [:]
+
+    /// D2: summaries for every email of an opened thread that lacks one with a text message, the
+    /// user's own included. A member with its body gets a chat summary job now; one without goes to
+    /// the body queue (`ActiveBodyQueue`; tests pass `requestBodies`) and gets its job when the body lands. The caller checks
+    /// `ChatViewConfig`.
+    func enqueueChatSummaries(
+        _ members: [MessageHeader],
+        requestBodies: (@Sendable ([MessageHeader]) async -> Void)? = nil
+    ) async {
+        let ids = members.map(\.id)
+        guard let fresh = try? await dbPool.read({ db in
+            try MessageHeader.filter(keys: ids).fetchAll(db)
+        }) else { return }
+        var ready: [(headerId: String, accountId: String)] = []
+        var needBody: [MessageHeader] = []
+        for member in fresh where !Self.summaryDone(member, forChat: true) {
+            if member.bodyComplete {
+                ready.append((member.id, member.accountId))
+            } else {
+                chatAwaitingBody[member.id] = member.accountId
+                needBody.append(member)
+            }
+        }
+        if !needBody.isEmpty {
+            if let requestBodies {
+                await requestBodies(needBody)
+            } else {
+                await ActiveBodyQueue.shared.enqueueBatch(needBody)
+            }
+        }
+        enqueueChatSummaryJobs(ready, origin: "open")
+    }
+
+    /// `BodyFetchProcessor.flushBatch`, for every body it wrote: a chat member waiting for its body
+    /// gets its summary job now.
+    func chatBodyArrived(headerId: String) {
+        guard let accountId = chatAwaitingBody.removeValue(forKey: headerId) else { return }
+        enqueueChatSummaryJobs([(headerId, accountId)], origin: "body")
+    }
+
+    /// Admit chat summary jobs (summary only, window-exempt, any folder).
+    private func enqueueChatSummaryJobs(_ items: [(headerId: String, accountId: String)], origin: String) {
+        var admitted = 0
+        for item in items {
+            let job = AIJob(headerId: item.headerId, accountId: item.accountId, jobType: .summary,
+                            windowExempt: true, forChat: true)
+            guard !unattributableJobs.contains(job) else { continue }
+            if admitOrUpgrade(job) != .rejected { admitted += 1 }
+        }
+        guard admitted > 0 else { return }
+        BackgroundSyncLogger.logAIProcessing("Enqueued \(admitted) chat summary job(s) (\(origin), total: \(storage.count))")
+        scheduleDispatch()
+    }
+
+    /// D3, the background walk: every email of the threads of the newest `SyncConfig.maxRecentEmails`
+    /// Inbox rows (those rows included, any folder, no depth limit beyond `ThreadDetection`'s own),
+    /// that has its body and no summary with a text message. A member whose body is not downloaded yet
+    /// is picked up by a later walk once backfill has fetched it. One thread lookup per Inbox row, so
+    /// it runs from `repopulateFromDatabase` (launch, foreground, AI re-enable), never on drain.
+    nonisolated static func chatWalkCandidates(
+        pool: DatabasePool
+    ) throws -> [(headerId: String, accountId: String)] {
+        let inbox = try pool.read { db in
+            try MessageHeader.fetchAll(db, sql: """
+                SELECT * FROM messageHeader
+                WHERE isInInbox = 1
+                ORDER BY date DESC, id DESC
+                LIMIT ?
+            """, arguments: [SyncConfig.maxRecentEmails])
+        }
+        var seen = Set<String>()
+        var members: [MessageHeader] = []
+        for row in inbox {
+            for member in [row] + (try ThreadDetection.findRelatedMessages(for: row, in: pool))
+            where seen.insert(member.id).inserted {
+                members.append(member)
+            }
+        }
+        return members
+            .filter { $0.bodyComplete && !Self.summaryDone($0, forChat: true) }
+            .map { ($0.id, $0.accountId) }
+    }
+
     /// Repopulate queue from GRDB on app launch / AI re-enable.
     /// Finds inbox messages that have body in FTS but are missing summary/action.
     /// Only the most recent `SyncConfig.maxRecentEmails` inbox messages are considered,
@@ -367,6 +492,9 @@ actor ActiveAIQueue {
     /// into the Inbox), which are window-EXEMPT since ADR-IOS-078. This bound is
     /// sync-origin only; it is not a global cap.
     func repopulateFromDatabase() async {
+        // Settings snapshot, first: the walk below runs only if the chat view was on when this
+        // pass began.
+        let chatViewActive = ChatViewConfig.isActive
         // Throttle: skip if cancelAllInFlight() fired < 2s ago.
         // Prevents the cancel→repopulate→dispatch cycle from creating duplicate job storms
         // when the user rapidly switches apps (foreground→background→foreground).
@@ -399,6 +527,14 @@ actor ActiveAIQueue {
             }
         } catch {
             activeAILog("[ActiveAI] Repopulate failed: \(error)")
+        }
+        guard chatViewActive else { return }
+        do {
+            let pool = AppDatabase.syncPool.pool
+            let chatItems = try await Task.detached { try Self.chatWalkCandidates(pool: pool) }.value
+            enqueueChatSummaryJobs(chatItems, origin: "walk")
+        } catch {
+            activeAILog("[ActiveAI] Chat walk failed: \(error)")
         }
     }
 
@@ -934,16 +1070,15 @@ actor ActiveAIQueue {
             return .scopeExited // row gone
         }
         let (message, inRecentWindow) = state
-        guard message.isInInbox else {
-            return .scopeExited // archived / moved out — unconditional, every origin
+        guard Self.inScope(message, for: job) else {
+            return .scopeExited // archived / moved out — every origin but a chat summary (any folder)
         }
         guard !Self.windowRetires(job: job, inRecentWindow: inRecentWindow) else {
             return .scopeExited // sync-origin job deliberately outside the bounded AI population
         }
         switch job.jobType {
         case .summary:
-            let has = (message.summaryBlurb?.isEmpty == false)
-            return has ? .verifiedComplete : .needsRetry
+            return Self.summaryDone(message, forChat: job.forChat) ? .verifiedComplete : .needsRetry
         case .action:
             return (message.actionTag != nil) ? .verifiedComplete : .needsRetry
         case .reply:
@@ -1039,7 +1174,7 @@ actor ActiveAIQueue {
         // Inbox membership is the unconditional scope for EVERY origin: before
         // the pathway regating this was implied by the window check (the window
         // is a subset of the Inbox); a window-exempt job must not lose it.
-        guard message.isInInbox else { return .ordinary(retry: false) }
+        guard Self.inScope(message, for: job) else { return .ordinary(retry: false) }
 
         // A SYNC-ORIGIN job may have aged out after it was admitted. Retire it
         // without a model call; `readJobOutcome` uses the same `windowRetires`
@@ -1054,7 +1189,7 @@ actor ActiveAIQueue {
         // Check if this specific job type is already done
         switch job.jobType {
         case .summary:
-            guard message.summaryBlurb == nil || message.summaryBlurb?.isEmpty == true else { return .ordinary(retry: false) }
+            guard !Self.summaryDone(message, forChat: job.forChat) else { return .ordinary(retry: false) }
         case .action:
             guard message.actionTag == nil else { return .ordinary(retry: false) }
         case .reply:
@@ -1177,7 +1312,7 @@ actor ActiveAIQueue {
                     // Re-check if this job is now done after peer data write
                     switch job.jobType {
                     case .summary:
-                        if updated.summaryBlurb != nil && !(updated.summaryBlurb?.isEmpty ?? true) {
+                        if Self.summaryDone(updated, forChat: job.forChat) {
                             NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
                             return .ordinary(retry: false)
                         }
@@ -1217,7 +1352,7 @@ actor ActiveAIQueue {
                 }) {
                     switch job.jobType {
                     case .summary:
-                        if updated.summaryBlurb != nil && !(updated.summaryBlurb?.isEmpty ?? true) {
+                        if Self.summaryDone(updated, forChat: job.forChat) {
                             BackgroundSyncLogger.logAIProcessing("NSE lease HIT (summary) for \(Self.logId(job.headerId))")
                             NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
                             return .ordinary(retry: false)
@@ -1342,7 +1477,7 @@ actor ActiveAIQueue {
         account: Account, target: AIWriteTarget, config: DispatchConfig
     ) async -> Bool {
         // Cache check: if summary already exists, skip LLM but still chain A.
-        if let existing = message.summaryBlurb, !existing.isEmpty {
+        if Self.summaryDone(message, forChat: job.forChat) {
             BackgroundSyncLogger.logAIProcessing("Summary cache HIT for \(Self.logId(job.headerId))")
             // Always chain A — even from cache hit
             chainActionJob(after: job)
