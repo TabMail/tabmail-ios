@@ -316,17 +316,11 @@ extension SyncEngine {
                     var batchPurged = 0
                     var batchRescued = 0
                     for var entry in batch {
-                        if let msgId = entry.rfc822MessageId.map({ EmailFilter.normalizeMessageId($0) }), !msgId.isEmpty {
-                            let headers = try MessageHeader
-                                .filter(Column("rfc822MessageId") == msgId)
-                                .limit(5)
-                                .fetchAll(db)
-                            if !headers.isEmpty {
-                                entry.updatedAt = now
-                                try entry.update(db)
-                                batchRescued += 1
-                                continue
-                            }
+                        if try aiCacheEntryHasEmail(entry, db: db) {
+                            entry.updatedAt = now
+                            try entry.update(db)
+                            batchRescued += 1
+                            continue
                         }
                         try entry.delete(db)
                         batchPurged += 1
@@ -344,6 +338,27 @@ extension SyncEngine {
         if purged > 0 || rescued > 0 {
             BackgroundSyncLogger.logDebug("[AICache] Purged \(purged) orphaned entries, kept \(rescued) still on the device (grace=\(SyncConfig.aiCacheOrphanGraceDays)d)")
         }
+    }
+
+    /// Whether the email an AI cache entry belongs to is still on the device, in any folder.
+    /// The entry names it by `rfc822MessageId`. An entry an older build wrote without one
+    /// still names it in its key (`MessageIdentity.aiCacheKey`: account, folder, Message-ID),
+    /// so a header of that account with the key's last part as its Message-ID is its email,
+    /// wherever it has moved since (ADR-IOS-103). A Message-ID containing a colon cannot be
+    /// read back from the key; that entry counts as an orphan, and its email's AI is asked
+    /// for again if it is ever needed.
+    nonisolated static func aiCacheEntryHasEmail(_ entry: MessageAICache, db: Database) throws -> Bool {
+        if let msgId = entry.rfc822MessageId.map({ EmailFilter.normalizeMessageId($0) }), !msgId.isEmpty {
+            return try !MessageHeader.filter(Column("rfc822MessageId") == msgId).isEmpty(db)
+        }
+        guard let colon = entry.key.lastIndex(of: ":") else { return false }
+        let keyMessageId = String(entry.key[entry.key.index(after: colon)...])
+        guard !keyMessageId.isEmpty else { return false }
+        return try Bool.fetchOne(db, sql: """
+            SELECT EXISTS(SELECT 1 FROM messageHeader
+                          WHERE rfc822MessageId = ?
+                            AND substr(?, 1, length(accountId) + 1) = accountId || ':')
+            """, arguments: [keyMessageId, entry.key]) ?? false
     }
 
     // MARK: - Retired calendar operation reclaim

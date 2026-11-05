@@ -8,11 +8,19 @@ actor AIService {
     static let shared = AIService()
     private let backendClient: BackendClient
 
-    /// Test seam (precedent: `BackendClient(llmSession:)`): inject a client built on a
-    /// `FakeHTTP` session to observe the exact request an AI call sends. Production
-    /// uses `shared`, built with the default client.
-    init(backendClient: BackendClient = BackendClient()) {
+    /// Asks the user's other devices (Device Sync) for this email's AI result.
+    typealias PeerProbe = @Sendable (_ keys: [String]) async -> [String: AICacheResult]?
+    let peerProbe: PeerProbe
+
+    /// Test seams (precedent: `BackendClient(llmSession:)`): inject a client built on a
+    /// `FakeHTTP` session to observe the exact request an AI call sends, and a peer probe
+    /// to answer as another device would. Production uses `shared`, built with the defaults.
+    init(
+        backendClient: BackendClient = BackendClient(),
+        peerProbe: @escaping PeerProbe = { await DeviceSyncService.shared.probeAICache(keys: $0) }
+    ) {
         self.backendClient = backendClient
+        self.peerProbe = peerProbe
     }
 
     /// UserDefaults key for the privacy opt-out toggle (Settings → AI Settings → Privacy).
@@ -150,7 +158,7 @@ actor AIService {
             DeviceSyncLogger.log("AI_PROBE START msgId=\(messageId.prefix(30)) key=\"\(probeKey)\" wsConnected=\(wsConnected)")
         }
         if let probeKey, !probeKey.isEmpty,
-           let probeResults = await DeviceSyncService.shared.probeAICache(keys: [probeKey]),
+           let probeResults = await peerProbe([probeKey]),
            let cached = probeResults[probeKey] {
             if let ps = cached.summary {
                 BackgroundSyncLogger.logDebug("[AIService] Device Sync summary HIT for \(messageId)")

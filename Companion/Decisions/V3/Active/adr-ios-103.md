@@ -35,8 +35,9 @@ same AI result, kept as long as the email itself is shown.
 5. **Lifetime (owner D1).** An AI result lives as long as its email is on the device, with no size or age
    limit. The time-based purge and its inbox-only touch (`refreshAICacheTTLAndPurge`,
    `SyncConfig.aiCacheTTLDays`, the unused `replyTTLSeconds`) are deleted.
-   `SyncEngine.runPurgeOrphanedAICache` deletes an entry only when no header in ANY folder has its
-   Message-ID and it has been untouched for `SyncConfig.aiCacheOrphanGraceDays` (7); a kept entry is
+   `SyncEngine.runPurgeOrphanedAICache`, run by storage maintenance (`SyncEngine.runWALMaintenance`:
+   the foreground poll and the background processing task), deletes an entry only when no header in ANY
+   folder has its Message-ID and it has been untouched for `SyncConfig.aiCacheOrphanGraceDays` (7); a kept entry is
    re-stamped so it is not re-checked for another grace period. The grace keeps the cache's original
    job, restoring AI to a header that leaves and comes back (stale detection, a UIDVALIDITY reset).
    Awaiting owner blessing: the 7-day orphan grace. The extension's cache upserts now record the
@@ -45,26 +46,31 @@ same AI result, kept as long as the email itself is shown.
    decoded exactly as received: rewriting characters first (`normalizeUnicode`, kept from the labelled
    text) turned curly or fullwidth quotes inside a JSON string into bare ASCII quotes and broke the
    object. A reply body is any non-blank string, "None" included: only the text message's "NONE"
-   placeholder of the summary is not a body rule. Entries an older extension wrote have no Message-ID,
-   so the purge would delete them though their email is here: the extension's one cache upsert
-   (`NSEDataBridge.upsertAICache`, used for an existing and a new header) fills a missing Message-ID on
-   conflict (`COALESCE`, and the row is rewritten even when its content is unchanged),
-   `MessageAICache.writeThrough` fills it on any later write, and `v96_repairAICacheMessageIds`
-   (`AppDatabase.repairAICacheMessageIds`) fills existing ones from the header whose key the entry has.
-   An entry with no such header stays without one and is an orphan, as before.
+   placeholder of the summary is not a body rule. Entries an older build wrote have no Message-ID; the
+   purge then reads it from the entry's key (`SyncEngine.aiCacheEntryHasEmail`: the text after the
+   key's last colon, kept only when a header of the key's own account has it, in any folder), so an
+   email that moved before the upgrade keeps its results. A Message-ID that itself contains a colon
+   reads wrong there and counts as an orphan, recoverable by asking again. Writers do not fill the
+   missing value: the extension's one cache upsert (`NSEDataBridge.upsertAICache`, for an existing and a
+   new header) records the Message-ID it has, as every new entry does.
+   `v96_repairAICacheMessageIds` (`AppDatabase.repairAICacheMessageIds`) has run on test devices, so it
+   stays (frozen): it fills the Message-ID from the header in the folder the key names. The purge no
+   longer depends on it. Review round 2 (2026-11-05) also removed a second purge trigger at the end of
+   the AI queue's drain.
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (ADR-032) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
 parser does not read.
 
 **Tests:** `AISummaryParsingTests`, `AISummaryResponseTests`, `AIReplyParseTests`, `AIReplyTests`
-(parsers and `ReplyResult`); `AICachePurgeTests` (the orphan purge, driven for real);
+(parsers and `ReplyResult`); `AICachePurgeTests` (the orphan purge, driven for real, including
+`legacyEntryKeptByItsKey` and `maintenanceRunsThePurge`);
 `ComposeSuggestionPersistTests.editClearsReplyTextMessage`; migration and merge tests in this PR;
 `AITextMessageCallerTests` (the queue's summary and reply jobs, the opened-email direct path in full and
-reply-only, compose's
-recompute and the extension's request, each through its real producer and a fake backend);
-`AITextMessageStorageTests.v96RepairsLegacyIdentity` / `writeThroughRepairsLegacyIdentity`;
-`NSEGradualMergeTests.existingHeaderMergeRepairsLegacyCacheIdentity` /
-`newHeaderMergeRepairsLegacyCacheIdentity`; `RFC822IdentityMergeGuardTests.preSyncInboxReclaimCarriesTextMessages`.
-Not driven by a test: the line in the extension's `NotificationService` that hands the parsed text
-message to staging (the pipeline has no harness); its parser and its staging writes are tested.
+reply-only, a peer result through both, compose's recompute (`ComposeView.recomputedReply`) and the
+extension's request, each through its real producer and a fake backend or peer);
+`AITextMessageStorageTests.upgradeKeepsResults` (a v94 database with results, upgraded) and
+`legacyEntriesSurviveUpgradeAndPurge`; `RFC822IdentityMergeGuardTests.preSyncInboxReclaimCarriesTextMessages`;
+`NSESummaryTextMessageCarryTests` (the staging writes, `NSEStagingDB.open(path:)` upgrading an older
+file, the extension bundle's protocol version, and a push through `NotificationService.didReceive`
+staging the text message, via `NotificationService.stagingPathOverride`).

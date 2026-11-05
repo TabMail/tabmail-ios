@@ -4286,7 +4286,10 @@ final class AppDatabase: Sendable {
         // is `accountId:folderPath:rfc822MessageId`, the primary key, so each header is one
         // indexed probe). Entries with no such header stay NULL and are orphans, as before.
         // Convergence: a fresh install has no such rows; an upgraded DB ends with every entry
-        // whose email is on the device carrying its Message-ID. The write paths keep it so.
+        // whose email is in the folder its key names carrying its Message-ID. Frozen: it has
+        // run. The purge itself now reads a missing Message-ID from the key
+        // (`SyncEngine.aiCacheEntryHasEmail`), which also covers an email that moved before
+        // the upgrade, so this repair is no longer what keeps those entries.
         migrator.registerTimedMigration(
             "v96_repairAICacheMessageIds", foreignKeyChecks: .immediate
         ) { db in

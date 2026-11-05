@@ -2136,43 +2136,13 @@ struct ComposeView: View {
         isRecomputing = true
 
         Task {
-            let body = try? await dbPool.read { db in try MessageBody.fetchOne(db, key: reply.id) }
-            let bodyText: String
-            if let html = body?.htmlContent, !html.isEmpty {
-                // Strip embedded .eml sections so the reply context is only the
-                // primary message body, not forwarded-as-attachment emails.
-                bodyText = EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html))
-            } else {
-                bodyText = reply.snippet
-            }
-
-            do {
-                let result = try await AIService.shared.processReply(
-                    messageId: reply.messageId,
-                    rfc822MessageId: reply.rfc822MessageId,
-                    accountEmail: account.emailAddress,
-                    subject: reply.subject,
-                    from: reply.from,
-                    fromAddress: reply.fromAddress,
-                    to: reply.to,
-                    date: reply.date,
-                    bodyText: bodyText,
-                    htmlContent: body?.htmlContent,
-                    userName: account.displayName,
-                    kbText: PromptStore.shared.kbText(),
-                    compositionPrompt: PromptStore.shared.compositionMarkdown()
-                )
-                if let result, !result.body.isEmpty {
-                    currentSuggestion = result.body
-                    try? await dbPool.write { db in
-                        try Self.writeRecomputedReply(result, headerId: reply.id, db: db)
-                    }
-                    BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId)")
-                } else {
-                    BackgroundSyncLogger.logDebug("[Compose] Recompute returned nil/empty for \(reply.messageId)")
-                }
-            } catch {
-                BackgroundSyncLogger.logDebug("[Compose] Recompute reply failed: \(error)")
+            if let body = await Self.recomputedReply(
+                for: reply, account: account,
+                kbText: PromptStore.shared.kbText(),
+                compositionPrompt: PromptStore.shared.compositionMarkdown(),
+                aiService: .shared, dbPool: dbPool
+            ) {
+                currentSuggestion = body
             }
             isRecomputing = false
         }
@@ -2360,13 +2330,54 @@ struct ComposeView: View {
         }
     }
 
-    /// Internal for testability — the write `recomputeReply` makes: the new reply and its
-    /// text message together.
-    nonisolated static func writeRecomputedReply(_ result: ReplyResult, headerId: String, db: Database) throws {
-        try db.execute(
-            sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = ? WHERE id = ?",
-            arguments: [result.body, result.textMessage, headerId]
-        )
+    /// What `recomputeReply` does, without the view: ask for a new reply to `reply` and store
+    /// it with its text message. Returns the reply for the suggestion, or nil when there is
+    /// none. Internal for testability.
+    nonisolated static func recomputedReply(
+        for reply: MessageHeader, account: Account, kbText: String, compositionPrompt: String,
+        aiService: AIService, dbPool: PrioritizedDatabase
+    ) async -> String? {
+        let body = try? await dbPool.read { db in try MessageBody.fetchOne(db, key: reply.id) }
+        let bodyText: String
+        if let html = body?.htmlContent, !html.isEmpty {
+            // Strip embedded .eml sections so the reply context is only the
+            // primary message body, not forwarded-as-attachment emails.
+            bodyText = EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html))
+        } else {
+            bodyText = reply.snippet
+        }
+
+        do {
+            let result = try await aiService.processReply(
+                messageId: reply.messageId,
+                rfc822MessageId: reply.rfc822MessageId,
+                accountEmail: account.emailAddress,
+                subject: reply.subject,
+                from: reply.from,
+                fromAddress: reply.fromAddress,
+                to: reply.to,
+                date: reply.date,
+                bodyText: bodyText,
+                htmlContent: body?.htmlContent,
+                userName: account.displayName,
+                kbText: kbText,
+                compositionPrompt: compositionPrompt
+            )
+            if let result, !result.body.isEmpty {
+                try? await dbPool.write { db in
+                    try db.execute(
+                        sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = ? WHERE id = ?",
+                        arguments: [result.body, result.textMessage, reply.id]
+                    )
+                }
+                BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId)")
+                return result.body
+            }
+            BackgroundSyncLogger.logDebug("[Compose] Recompute returned nil/empty for \(reply.messageId)")
+        } catch {
+            BackgroundSyncLogger.logDebug("[Compose] Recompute reply failed: \(error)")
+        }
+        return nil
     }
 
     // MARK: - From picker
