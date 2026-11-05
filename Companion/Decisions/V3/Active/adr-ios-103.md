@@ -1,7 +1,7 @@
 ## ADR-IOS-103: The Summary and the Precomputed Reply Arrive as JSON with a Text Message; AI Results Live as Long as Their Email
 
 **Status:** Active (2026-11-05). Owner decisions 2026-11-05 (chat view, iOS 2.0). Backend side:
-`tabmail-backend` ADR-032 (issue `tabmail-backend#153`). iOS issue #387. A deliberate exception to
+`tabmail-backend` ADR-032. iOS issue #387. A deliberate exception to
 ADR-IOS-008 (Thunderbird parity) for the AI cache lifetime and the response format, until a
 Thunderbird release moves to protocol 2.0.
 
@@ -58,7 +58,12 @@ same AI result, kept as long as the email itself is shown.
    longer depends on it. Review round 2 (2026-11-05) also removed a second purge trigger at the end of
    the AI queue's drain. Review round 4 (2026-11-05): the purge reads the clock once (its `now`
    argument), the base of its cutoff and the re-stamp of a kept entry, so a kept entry always leaves
-   the selection and the pass ends, even if the clock is set back while it runs.
+   the selection and the pass ends, even if the clock is set back while it runs. Later the same
+   day: the extension merge stamps a cache entry's `updatedAt` as a date
+   (`NSEDataBridge.upsertAICache`), like every other writer. A number sorted before every stored
+   date, so such an entry missed the grace. The two "no content" summary writers
+   (`AccountManager.processMessage`'s shortcut and `BodyFetchProcessor`'s confirmed-empty write)
+   clear the text message with the summary they replace.
 7. **Compose's recompute writes through the identity guard (review round 3, 2026-11-05).**
    `ComposeView.recomputedReply` stores its reply and text message with
    `AccountManager.aiGuardedHeaderWrite`, using an `AIWriteTarget` captured from the email compose is
@@ -77,16 +82,19 @@ parser does not read.
 `legacyEntryKeptByItsKey`, `maintenanceRunsThePurge` and `clockOffWallClockEnds`, the clock behind and ahead of the wall clock);
 `ComposeSuggestionPersistTests.editClearsReplyTextMessage`; migration and merge tests in this PR;
 `AITextMessageCallerTests` (the queue's summary and reply jobs, a failed reply asked again and the next
-one stored (`queueReplyFailureRecovers`), the opened-email direct path in full and
+one stored (`queueReplyFailureRecovers`), the "no content" summary clearing the text message
+(`noContentClearsTextMessage`, `confirmedEmptyClearsTextMessage`), the opened-email direct path in full and
 reply-only, a peer result through both, a whole queue job adopting a peer's action while keeping this
 device's summary and reply text messages (`queuePeerActionKeepsLocalPairs`), compose's recompute
 (`ComposeView.recomputedReply`) and its refusal to store on a replacement email at the same address
-(`composeRecomputeReplacedEmail`), and the extension's request, each through its real producer and a
+(`composeRecomputeReplacedEmail`), a filtered recompute and one from the snippet
+(`composeRecomputeFiltered`, `composeRecomputeFromSnippet`), and the extension's request, each through its real producer and a
 fake backend or peer); `AITextMessageStorageTests.upgradeKeepsResults` (a v94 database with results,
 upgraded) and `legacyEntriesSurviveUpgradeAndPurge` (including v96 filling the Message-ID that a peer's
 probe then finds); `RFC822IdentityMergeGuardTests.preSyncInboxReclaimCarriesTextMessages`;
 `NSESummaryTextMessageCarryTests` (the staging writes, `NSEStagingDB.open(path:)` upgrading an older
 file, the extension bundle's protocol version, a later push whose only change is the text message,
 including to none (`sameSummaryNewTextMessage`), the merge's second stage creating a header the first
-stage could not and caching its result with the text message (`secondStageCachesTextMessage`), and a push through `NotificationService.didReceive`
+stage could not and caching its result with the text message (`secondStageCachesTextMessage`), a merged
+cache entry kept through the orphan grace (`mergedCacheEntryGetsTheGrace`), and a push through `NotificationService.didReceive`
 staging the text message, via `NotificationService.stagingPathOverride`).

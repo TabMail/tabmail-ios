@@ -456,6 +456,8 @@ extension AccountManager {
             let outcome = (try? await dbPool.write { db in
                 try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
                     msg.summaryBlurb = "This message has no content."
+                    // A local summary has no text message; an earlier one goes with its summary.
+                    msg.summaryTextMessage = nil
                     msg.setActionTag(.delete)
                     try msg.save(db)
                 }

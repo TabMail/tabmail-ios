@@ -10,7 +10,7 @@
 4. **Drain loop with watchdog** — A periodic timer (watchdog) drains the queue in batches. Processing failures trigger a retry timer with backoff. The queue is persisted on app backgrounding.
 5. **Per-message semaphores** — Prevent concurrent AI generation for the same message. If a summary is already being generated for message X, other requestors wait for the result.
 6. **Global LLM concurrency limit** — A semaphore limits total concurrent backend API calls (prevent overload). Priority/user-initiated requests can bypass the semaphore.
-7. **Caching with TTL** — AI results (summary, action) are cached in database fields with generation timestamps. Expired results can be recomputed. Cache is checked before any LLM call.
+7. **Caching with TTL** — AI results (summary, action) are cached in database fields with generation timestamps. Expired results can be recomputed. Cache is checked before any LLM call. *Superseded on iOS by ADR-IOS-103 (2026-11-05): no TTL; a result lives as long as its email is on the device, a documented deviation from TB.*
 8. **First-compute-wins** — Before LLM action generation, check IMAP keywords / Gmail labels (per ADR-IOS-004). If found, adopt without LLM.
 9. **Three-call action voting** — Action classification makes N parallel calls and takes the mode (most common action), matching TB's voting mechanism.
 

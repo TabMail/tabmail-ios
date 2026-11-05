@@ -3664,7 +3664,9 @@ enum NSEDataBridge {
                OR actionTag IS NOT excluded.actionTag
             """, arguments: [
                 key, rfc822MessageId, msg.summaryBlurb, msg.summaryTodos, msg.summaryTextMessage,
-                msg.actionTag, msg.processedAt
+                // A Date, stored like every other `updatedAt` (a number would sort before
+                // every stored date and miss the orphan purge's grace).
+                msg.actionTag, Date(timeIntervalSince1970: msg.processedAt)
             ])
     }
 
