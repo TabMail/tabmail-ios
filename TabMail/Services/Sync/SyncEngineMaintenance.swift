@@ -289,8 +289,11 @@ extension SyncEngine {
     /// another grace period) while any header, in any folder, has its Message-ID; otherwise it
     /// is deleted. A result therefore never expires while its email exists.
     /// Nonisolated — runs entirely off the main thread.
-    nonisolated static func runPurgeOrphanedAICache(dbPool: PrioritizedDatabase) {
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheOrphanGraceDays, to: Date()) ?? Date.distantPast
+    ///
+    /// `now` is read once and is both the cutoff's base and the re-stamp, so a kept entry always
+    /// leaves the selection and the pass ends, even if the clock moves back during it.
+    nonisolated static func runPurgeOrphanedAICache(dbPool: PrioritizedDatabase, now: Date = Date()) {
+        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheOrphanGraceDays, to: now) ?? Date.distantPast
         let chunkSize = SyncConfig.pruneChunkSize
 
         let count = (try? dbPool.read { db in
@@ -298,7 +301,6 @@ extension SyncEngine {
         }) ?? 0
         guard count > 0 else { return }
 
-        let now = Date()
         var purged = 0
         var rescued = 0
         // Every entry a batch touches leaves the `updatedAt < cutoff` filter: a kept one is

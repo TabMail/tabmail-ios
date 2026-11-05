@@ -691,6 +691,45 @@ struct AICachePurgeTests {
         #expect(keys.count == n)
         #expect(keys.allSatisfy { $0.contains(":kept") })
     }
+
+    @Test("A pass whose clock is behind the wall clock keeps each entry once and ends")
+    func clockBehindEnds() throws {
+        let f = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
+        // The clock this pass reads is a month behind the wall clock (it was set back), and both
+        // entries are past the grace by that clock.
+        let now = try #require(Calendar.current.date(byAdding: .day, value: -30, to: Date()))
+        let old = try #require(Calendar.current.date(byAdding: .day, value: -pastGrace, to: now))
+        try insertHeader(f, uid: "1", folderPath: "Archive", rfc: "live@example.com")
+        try f.pool.write { db in
+            for rfc in ["live@example.com", "gone@example.com"] {
+                var cache = MessageAICache(key: "acc1:INBOX:\(rfc)", rfc822MessageId: rfc)
+                cache.summaryTextMessage = "Text for \(rfc)"
+                cache.updatedAt = old
+                try cache.insert(db)
+            }
+        }
+        // Safety bound: a second re-stamp throws, which ends the pass through its error path,
+        // so a pass that keeps selecting the same entry stops instead of hanging the test.
+        let restamps = Mutex(0)
+        try f.pool.write { db in
+            db.add(function: DatabaseFunction("countRestamp", argumentCount: 0, pure: false) { _ in
+                let n = restamps.withLock { value in value += 1; return value }
+                if n > 1 { throw NSError(domain: "AICachePurgeTests", code: 1) }
+                return n
+            })
+            try db.execute(sql: """
+                CREATE TRIGGER countRestamp BEFORE UPDATE OF updatedAt ON messageAICache
+                BEGIN SELECT countRestamp(); END;
+                """)
+        }
+
+        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, now: now)
+
+        #expect(restamps.withLock { $0 } == 1, "the kept entry is re-stamped once and leaves the selection")
+        #expect(try cache(f, "acc1:INBOX:live@example.com")?.summaryTextMessage == "Text for live@example.com")
+        #expect(try cache(f, "acc1:INBOX:gone@example.com") == nil)
+    }
 }
 
 // MARK: - Stale Tag Sweep Tests

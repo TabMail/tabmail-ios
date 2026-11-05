@@ -17,6 +17,7 @@ import Synchronization
 ///  2. A backend-valid reply survives decoding: curly and fullwidth quotes inside the JSON strings,
 ///     and a reply body that is the word "None".
 ///  3. A filtered reply (a no-reply sender) stores no reply and no text message, and asks nothing.
+///     A failed reply (empty, or not the reply JSON) is not filtered: the email is asked again.
 ///  4. A recomputed reply in compose stores its text message; the extension sends the same
 ///     protocol version as the app and reads the summary JSON the same way.
 ///  5. A result another device (Thunderbird) already has is stored as it is, with no text
@@ -218,6 +219,73 @@ struct AITextMessageCallerTests {
             #expect(row?.cachedReply == "")
             #expect(row?.replyTextMessage == nil)
             #expect(try fixture.cache()?.cachedReply == nil)
+        }
+    }
+
+    /// The backend sends an empty reply when its retries are exhausted. That is a failure, not a
+    /// filtered reply: the email stays without a reply and is picked up again, and the next answer
+    /// is stored with its text message.
+    @Test("A failed reply leaves the email to be asked again, and the next reply is stored",
+          arguments: ["", "not the reply JSON"])
+    func queueReplyFailureRecovers(firstAnswer: String) async throws {
+        try await withAIEnabled {
+            // A unique UID: the search index is shared by the whole test process.
+            let fixture = try Fixture(summarized: true, messageId: UUID().uuidString)
+            let http = FakeHTTP.Scenario()
+            let key = ContentKey(rawValue: fixture.header.id)
+            defer {
+                http.close(); fixture.close()
+                Task { try? await SearchIndex.shared.removeMessages(contentKeys: [key]) }
+            }
+            var local = fixture.header
+            local.headerComplete = true
+            local.bodyComplete = true
+            let seeded = local
+            try await fixture.pool.write { try seeded.update($0) }
+            // The job reads the email's text from the search index.
+            try await SearchIndex.shared.removeMessages(contentKeys: [key])
+            _ = try await SearchIndex.shared.indexHeaders([FTSHeaderRecord(
+                contentKey: key, headerId: seeded.id, messageId: seeded.messageId, subject: seeded.subject,
+                from: "\(seeded.from) <\(seeded.fromAddress)>", to: seeded.to,
+                dateMs: Int64(seeded.date.timeIntervalSince1970 * 1000))])
+            try await SearchIndex.shared.updateBody(contentKey: key, body: "Can you send the budget?")
+
+            let calls = Mutex(0)
+            http.register(path: "/completions/chat", method: "POST") { _ in
+                let n = calls.withLock { value in value += 1; return value }
+                let assistant = n == 1 ? firstAnswer
+                    : #"{"subject":"Re: Plans","body":"Recovered reply","text_message":"Recovered text"}"#
+                let final = (try? JSONSerialization.data(withJSONObject: ["assistant": assistant])) ?? Data()
+                let stream = "event: final\ndata: " + String(decoding: final, as: UTF8.self) + "\n\n"
+                return .bytes(Data(stream.utf8), contentType: "text/event-stream")
+            }
+            let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+            let queue = ActiveAIQueue()
+            await queue.setDispatchSuppressedForTesting(true)
+            let job = ActiveAIQueue.AIJob(headerId: seeded.id, accountId: "acc1", jobType: .reply, windowExempt: true)
+            func pending() throws -> Bool {
+                try fixture.pool.read { try ActiveAIQueue.repopulationCandidates(db: $0) }.contains { $0.headerId == seeded.id }
+            }
+
+            await queue.executeWholeJobForTesting(job, aiService: service)
+
+            #expect(calls.withLock { $0 } == 1)
+            let failed = try #require(try fixture.row())
+            #expect(failed.cachedReply == nil, "a failure is not a filtered reply")
+            #expect(failed.replyTextMessage == nil)
+            #expect(try fixture.cache() == nil)
+            #expect(try pending(), "the email is still to be asked for its reply")
+
+            await queue.executeWholeJobForTesting(job, aiService: service)
+
+            #expect(calls.withLock { $0 } == 2)
+            let row = try #require(try fixture.row())
+            #expect(row.cachedReply == "Recovered reply")
+            #expect(row.replyTextMessage == "Recovered text")
+            let cache = try #require(try fixture.cache())
+            #expect(cache.cachedReply == "Recovered reply")
+            #expect(cache.replyTextMessage == "Recovered text")
+            #expect(try !pending())
         }
     }
 
