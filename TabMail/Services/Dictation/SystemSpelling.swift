@@ -9,7 +9,7 @@ import UIKit
 ///
 /// `UITextChecker` is main-actor isolated, so the one batch of words goes over in one hop, worked
 /// through in slices of `DictationConfig.spellingSliceWords` with a yield between them (a flagged
-/// word costs about 0.3 ms, so 1,500 names would hold the main thread for half a second), and
+/// word costs about 0.15 to 0.3 ms, so 1,500 names would hold the main thread for a quarter to half a second), and
 /// dropped when the task is cancelled. It calls every word of a language it cannot check correct (Korean, Japanese, Chinese, and many languages
 /// it lists as available), so a language counts only if its dictionary flags a made-up word
 /// (`DictationConfig.spellingProbeWord`); the others are left out.

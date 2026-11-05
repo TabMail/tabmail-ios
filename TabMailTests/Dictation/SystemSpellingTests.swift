@@ -125,4 +125,11 @@ struct SystemSpellingTests {
         #expect(await SystemSpelling.unknownWords(among: ["xyvora"], preferredLanguages: ["ko-KR"]) == nil)
         #expect(await SystemSpelling.unknownWords(among: ["xyvora"], preferredLanguages: ["zz"]) == nil)
     }
+
+    /// The range handed to the checker is the word's UTF-16 length: a decomposed accent (a letter and a
+    /// combining mark) is two units but one character.
+    @Test func aDecomposedAccentedWordIsCheckedWhole() async {
+        let word = "re\u{301}sume\u{301}"
+        #expect(await SystemSpelling.unknownWords(among: [word], preferredLanguages: ["en-US"]) == [])
+    }
 }

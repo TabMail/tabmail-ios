@@ -3,7 +3,7 @@
 **Class:** testing / verification-gate integrity
 **Severity:** high (a green suite certified a path that was never executed; three separate instances
 found on one day, one of which had already survived a documented "fix")
-**First seen:** 2026-08-13 · **Recurrences:** 3 · **Status:** Active
+**First seen:** 2026-08-13 · **Recurrences:** 4 · **Status:** Active
 **Related:** `MIS-014` (a test that BLESSES the bug — asserts the wrong value) · `MIS-015`
 (mechanism-pinning instead of invariant) · `MIS-IOS-014` (a red-first proof that could not run red) ·
 `MIS-IOS-006` (a number reported but not measured) · **Rule owner:** `../CLAUDE.md` § Testing Rules
@@ -79,6 +79,14 @@ were fixed the same way, by asserting the step still HOLDS after the observation
 before the event, and by asserting the event's payload (the template's example equals the reply
 sent). **Tell, for this form: the test waits for a state an early, unprovoked transition also
 reaches, and asserts nothing between setup and event.**
+
+**Recurrence 2026-11-05 (#383, dictation context terms).** A test helper derived the dictionaries'
+"unknown" set from the candidates themselves, so no fixture ever put the lowercase form of an unknown
+word in the text, and `the brevalle report is late == []` passed with or without the capital check
+(unknown was empty). Found by a tier-1 mutant (drop the occurrence-level capital check): survived.
+**Tell: a helper that computes the test's input set from the code under test cannot reach the case
+the assertion's doc comment names.** Fixed with a test that hands the rule an unknown set containing
+the lowercase form directly.
 
 ## Why the usual defences did not catch it
 

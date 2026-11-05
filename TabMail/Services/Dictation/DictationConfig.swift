@@ -201,8 +201,8 @@ enum DictationConfig {
     /// dictionary (`UITextChecker` calls every word of a language it cannot check correct).
     static let spellingProbeWord = "xyvoraq"
     /// Words the spelling dictionaries are asked about before the main thread is given back: a
-    /// flagged word costs about 0.3 ms (measured on the simulator, 2026-11-05), so a slice holds the
-    /// main thread for about 8 ms.
+    /// flagged word costs about 0.15 to 0.3 ms (measured on the simulator, 2026-11-05), so a slice holds
+    /// the main thread for about 4 to 8 ms.
     static let spellingSliceWords = 25
     /// Each word is at most this many characters (UTF-16 code units, as the backend counts them)
     /// and this many space-separated words. As TabMail Voice's.

@@ -1546,6 +1546,62 @@ struct DictationControllerTests {
         #expect(!recorded.uploads.withLock { $0 }.isEmpty)
     }
 
+    /// Ending the dictation cancels the spelling batch still being asked of the dictionaries.
+    @Test func endingTheDictationCancelsTheSpellingBatch() async {
+        let capture = FakeCapture()
+        let started = Mutex(false)
+        let cancelled = Mutex(false)
+        let controller = controller(
+            capture: capture,
+            unknownWords: { words, _ in
+                started.withLock { $0 = true }
+                for _ in 0..<300 {
+                    if Task.isCancelled { cancelled.withLock { $0 = true }; break }
+                    try? await Task.sleep(for: .milliseconds(10))
+                }
+                return words
+            },
+            emailBody: { _ in "Xyvora Brevalle" }
+        )
+        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
+        controller.start(context: context, canUseAI: true) { _ in }
+        await waitUntil { started.withLock { $0 } }
+        controller.cancel()
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !cancelled.withLock({ $0 }), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(cancelled.withLock { $0 })
+    }
+
+    /// The languages asked about are the ones the dictation started with, however the setting changes
+    /// before the terms are picked.
+    @Test func theLanguagesAreTheOnesTheDictationStartedWith() async {
+        let capture = FakeCapture()
+        let languages = Mutex<[String]>(["fr-CA", "en-US"])
+        let release = Mutex(false)
+        let questions = Mutex<[[String]]>([])
+        let controller = controller(
+            capture: capture,
+            preferredLanguages: { languages.withLock { $0 } },
+            unknownWords: { words, askedLanguages in
+                questions.withLock { $0.append(askedLanguages) }
+                return words
+            },
+            emailBody: { _ in
+                while !release.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(5)) }
+                return "Xyvora Brevalle"
+            }
+        )
+        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
+        controller.start(context: context, canUseAI: true) { _ in }
+        languages.withLock { $0 = ["de-DE"] }
+        release.withLock { $0 = true }
+        await waitUntil { questions.withLock { !$0.isEmpty } }
+        controller.cancel()
+        #expect(questions.withLock { $0 } == [["fr-CA", "en-US"]])
+    }
+
     /// No working dictionary: the earlier rule picks the terms, a name opening a sentence missed.
     @Test func withoutAWorkingDictionaryTheEarlierRulePicksTheTerms() async throws {
         let capture = FakeCapture()

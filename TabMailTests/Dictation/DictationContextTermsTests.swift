@@ -109,6 +109,23 @@ struct DictationContextTermsTests {
         #expect(DictationContextTerms.candidates(in: "the brevalle report ask Xyvora2 Brevalle") == ["brevalle"])
     }
 
+    /// A word with no capital at an occurrence is never a term there, even when the dictionaries are
+    /// told it is unknown (its capitalised form elsewhere put it in the set).
+    @Test func anUnknownWordWithoutACapitalIsNeverATerm() {
+        let rule = DictationContextTerms.Rule.dictionary(unknown: ["xyvora", "brevalle"])
+        #expect(DictationContextTerms.terms(in: "ask Xyvora and brevalle later", excluding: [], max: 10, rule: rule) == ["Xyvora"])
+    }
+
+    /// A token with no letter (here three vulgar-fraction characters) is not asked of the dictionaries
+    /// and is never part of a term.
+    @Test func numeralsAreNotCandidates() {
+        let text = "Xyvora \u{00BE}\u{00BE}\u{00BE} Brevalle"
+        let candidates = DictationContextTerms.candidates(in: text)
+        #expect(candidates == ["xyvora", "brevalle"])
+        let unknown = candidates.union(["\u{00BE}\u{00BE}\u{00BE}"])
+        #expect(DictationContextTerms.terms(in: text, excluding: [], max: 10, rule: .dictionary(unknown: unknown)) == ["Xyvora", "Brevalle"])
+    }
+
     /// A word in a script without case has no capital to ask for: the dictionaries decide.
     @Test func aScriptWithoutCaseIsJudgedByTheDictionariesAlone() {
         #expect(dictionaryTerms("회의는 내일 Brevalle 에서", known: ["회의는", "내일", "에서"]) == ["Brevalle"])

@@ -13,7 +13,7 @@
 **Consequences:**
 - Names that open a line or sentence are terms now. Weekdays, months and cities (lowercase unknown to English: "monday", "paris") are terms too; harmless (a phrase list only biases the model), but they take slots from the 200.
 - Names that are also dictionary words ("Mark", "Smith", "Apple", "Lee") are not terms; the earlier rule picked them mid-sentence. Same as TabMail Voice's Hunspell rule.
-- A Latin dictionary treats words of other scripts as known, so a Cyrillic or Greek name is a term only when a preferred language with a working dictionary for that script is set. Scripts without case and no working dictionary (Korean, Chinese, Japanese) yield no terms, as before.
+- A Latin dictionary treats words of other scripts as known, so a Cyrillic or Greek name is a term only when no preferred language with a working Latin dictionary is set and one with a working dictionary for that script is (a bilingual English and Russian setup loses Cyrillic names, because a word is unknown only when every working dictionary flags it). Scripts without case and no working dictionary (Korean, Chinese, Japanese) yield no terms, as before.
 - The Latin-script names on a screen of a user whose preferred languages have no working dictionary (Korean only, say) are picked by the earlier rule.
 - The result depends on the device's dictionaries, which differ from the simulator's; checked in the owner's smoke test on a phone.
 - The picking logs (debug-gated) the candidate count, the rule used and the time it took, to measure the hop.
