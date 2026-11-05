@@ -31,6 +31,11 @@ settings:
     DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
     CODE_SIGN_IDENTITY: "Apple Development"
     CODE_SIGN_STYLE: Automatic
+    # The backend protocol (prompt/tool/response-format version) the app AND the
+    # Notification Service Extension send as X-Client-Version. Project-level so the
+    # two targets cannot drift: 2.0.0 is the first version that receives the summary
+    # and precache reply as JSON with their text messages.
+    TABMAIL_PROTOCOL_VERSION: "2.0.0"
 
 packages:
   SwiftMail:
@@ -85,7 +90,6 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         MARKETING_VERSION: "1.11.2"
         CURRENT_PROJECT_VERSION: 386
-        TABMAIL_PROTOCOL_VERSION: "1.10.2"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_STRICT_CONCURRENCY: complete
         SWIFT_OBJC_BRIDGING_HEADER: TabMail/TabMail-Bridging-Header.h

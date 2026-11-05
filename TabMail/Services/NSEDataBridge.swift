@@ -2278,18 +2278,21 @@ enum NSEDataBridge {
                                         try db.execute(sql: """
                                             UPDATE messageHeader SET
                                                 summaryBlurb = ?, summaryTodos = ?,
-                                                reminderDate = ?, reminderTime = ?, reminderContent = ?
+                                                reminderDate = ?, reminderTime = ?, reminderContent = ?,
+                                                summaryTextMessage = ?
                                             WHERE id = ? AND (
                                                 summaryBlurb IS NOT ? OR summaryTodos IS NOT ?
                                                 OR reminderDate IS NOT ? OR reminderTime IS NOT ?
-                                                OR reminderContent IS NOT ?
+                                                OR reminderContent IS NOT ? OR summaryTextMessage IS NOT ?
                                             )
                                             """, arguments: [
                                                 msg.summaryBlurb, msg.summaryTodos,
                                                 msg.reminderDate, msg.reminderTime, msg.reminderContent,
+                                                msg.summaryTextMessage,
                                                 headerId,
                                                 msg.summaryBlurb, msg.summaryTodos,
-                                                msg.reminderDate, msg.reminderTime, msg.reminderContent
+                                                msg.reminderDate, msg.reminderTime, msg.reminderContent,
+                                                msg.summaryTextMessage
                                             ])
                                     }
 
@@ -2366,7 +2369,25 @@ enum NSEDataBridge {
                                             // list (e.g. a peer's precomputed `cachedReply`).
                                             // DO UPDATE touches only these four columns, and only
                                             // when the content actually differs.
-                                            try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, db: db)
+                                            try db.execute(sql: """
+                                                INSERT INTO messageAICache
+                                                    (key, rfc822MessageId, summaryBlurb, summaryTodos, summaryTextMessage, actionTag, updatedAt)
+                                                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                                                ON CONFLICT(key) DO UPDATE SET
+                                                    summaryBlurb = excluded.summaryBlurb,
+                                                    summaryTodos = excluded.summaryTodos,
+                                                    summaryTextMessage = excluded.summaryTextMessage,
+                                                    actionTag = excluded.actionTag,
+                                                    updatedAt = excluded.updatedAt
+                                                WHERE summaryBlurb IS NOT excluded.summaryBlurb
+                                                   OR summaryTodos IS NOT excluded.summaryTodos
+                                                   OR summaryTextMessage IS NOT excluded.summaryTextMessage
+                                                   OR actionTag IS NOT excluded.actionTag
+                                                """, arguments: [
+                                                    // The Message-ID lets the orphan purge match the entry to its email.
+                                                    cacheKey, rfc, msg.summaryBlurb, msg.summaryTodos, msg.summaryTextMessage,
+                                                    msg.actionTag, msg.processedAt
+                                                ])
                                         }
                                     }
                                 } else {
@@ -2408,7 +2429,24 @@ enum NSEDataBridge {
                                         // Value-guarded UPSERT — same rationale as the existing-
                                         // header branch (no REPLACE-clobber of cachedReply, no
                                         // redundant count on a no-op re-write).
-                                        try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, db: db)
+                                        try db.execute(sql: """
+                                            INSERT INTO messageAICache
+                                                (key, rfc822MessageId, summaryBlurb, summaryTodos, summaryTextMessage, actionTag, updatedAt)
+                                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                            ON CONFLICT(key) DO UPDATE SET
+                                                summaryBlurb = excluded.summaryBlurb,
+                                                summaryTodos = excluded.summaryTodos,
+                                                summaryTextMessage = excluded.summaryTextMessage,
+                                                actionTag = excluded.actionTag,
+                                                updatedAt = excluded.updatedAt
+                                            WHERE summaryBlurb IS NOT excluded.summaryBlurb
+                                               OR summaryTodos IS NOT excluded.summaryTodos
+                                               OR summaryTextMessage IS NOT excluded.summaryTextMessage
+                                               OR actionTag IS NOT excluded.actionTag
+                                            """, arguments: [
+                                                cacheKey, msg.rfc822MessageId, msg.summaryBlurb, msg.summaryTodos, msg.summaryTextMessage,
+                                                msg.actionTag, msg.processedAt
+                                            ])
                                     }
                                 }
                                 return .commit
@@ -3644,6 +3682,10 @@ enum NSEDataBridge {
         /// both meaning "same as `date`". Same `var`-with-default contract as
         /// `observedUidValidity`.
         var providerDate: Double? = nil
+        /// The summary's text message (`MessageHeader.summaryTextMessage`), staged with the
+        /// summary; nil for rows staged before the column existed. Same `var`-with-default
+        /// contract as `observedUidValidity`.
+        var summaryTextMessage: String? = nil
     }
 
     /// Value-guarded UPSERT of the extension's AI result into `messageAICache` — the ONE
@@ -3808,6 +3850,7 @@ enum NSEDataBridge {
                 header.reminderDate = msg.reminderDate
                 header.reminderTime = msg.reminderTime
                 header.reminderContent = msg.reminderContent
+                header.summaryTextMessage = msg.summaryTextMessage
             }
             if let aiRaw = msg.actionTag, let aiTag = ActionTag(rawValue: aiRaw) {
                 header.actionTag = aiTag
@@ -4093,7 +4136,10 @@ extension NSEDataBridge.StagedMessage {
             icsText: row["icsText"],
             hasUnresolvedCIDs: (row["hasUnresolvedCIDs"] as Int? ?? 0) == 1,
             observedUidValidity: observedEpoch,
-            providerDate: providerDate
+            providerDate: providerDate,
+            // Missing on a staging table the extension has not opened since the update
+            // (`NSEStagingDB.ensureSummaryTextMessageColumn`): decodes nil, like `providerDate`.
+            summaryTextMessage: row["summaryTextMessage"] as String?
         )
     }
 

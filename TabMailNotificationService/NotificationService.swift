@@ -741,6 +741,7 @@ final class NotificationService: UNNotificationServiceExtension {
         let authToken = await NSETokenManager.validAccessToken()
         var summaryBlurb: String?, summaryTodos: String?, actionTag: String?
         var reminderDate: String?, reminderTime: String?, reminderContent: String?
+        var summaryTextMessage: String?
 
         // Gate 1 — Privacy opt-out. Flag lives in the App Group suite so this
         // process can see it. When set, NSE posts a plain (non-AI) banner and
@@ -892,6 +893,7 @@ final class NotificationService: UNNotificationServiceExtension {
                 summaryBlurb = parsed.blurb; summaryTodos = parsed.todos
                 reminderDate = parsed.reminderDate; reminderTime = parsed.reminderTime
                 reminderContent = parsed.reminderContent
+                summaryTextMessage = parsed.textMessage
                 // SHAPE, NOT CONTENT — see the step4 OK line above. The blurb
                 // is an AI summary OF THE USER'S EMAIL, and `NSELog.step`'s
                 // `privacy: .public` unified-log channel is persisted on
@@ -909,7 +911,8 @@ final class NotificationService: UNNotificationServiceExtension {
                         db: db, accountId: accountId, message: msg,
                         summaryBlurb: summaryBlurb, summaryTodos: summaryTodos,
                         reminderDate: reminderDate, reminderTime: reminderTime,
-                        reminderContent: reminderContent)
+                        reminderContent: reminderContent,
+                        summaryTextMessage: summaryTextMessage)
                 }
                 // Upgrade the partial to header+summary — actionTag stays nil,
                 // the vote hasn't returned yet. A watchdog/timeout firing from
@@ -1009,7 +1012,8 @@ final class NotificationService: UNNotificationServiceExtension {
                 message: msg, renderedBody: rendered,
                 summaryBlurb: summaryBlurb, summaryTodos: summaryTodos,
                 actionTag: actionTag, reminderDate: reminderDate, reminderTime: reminderTime,
-                reminderContent: reminderContent, historyId: info["historyId"],
+                reminderContent: reminderContent, summaryTextMessage: summaryTextMessage,
+                historyId: info["historyId"],
                 aiCompleted: aiDone, notified: active
             )
             NSELog.step(

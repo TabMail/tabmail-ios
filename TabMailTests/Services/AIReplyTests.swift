@@ -6,124 +6,28 @@ import Testing
 import Foundation
 @testable import TabMail
 
-// ⚠️ DISPLAY NAME DISAMBIGUATED (R18d-G3). Retired: "AIService.parseComposeResponse" — it collided
-// with `AIReplyParseTests` in `AIReplyParseTests.swift`. The run log prints DISPLAY names, so
-// `MIS-013`'s per-suite executed-vs-expected reconciliation could not tell the
-// two apart, and a suite that silently ran zero tests would have been covered
-// by its twin's line. `-only-testing:` was never affected: it selects by Swift
-// TYPE name, and the two types were always distinct.
-@Suite("AIService.parseComposeResponse — reply-composition cases")
+// Display name kept distinct from `AIReplyParseTests` (R18d-G3): the run log prints DISPLAY
+// names, so two suites sharing one could not be reconciled per suite (`MIS-013`).
+@Suite("ReplyResult — reply value and its filtered sentinel")
 struct AIReplyTests {
 
-    // MARK: - Body: Extraction
-
-    @Test("Extracts body after Body: marker")
-    func extractsBody() {
-        let input = "Subject: Re: Hello\nBody: Thanks for your email.\n\nBest regards"
-        let result = AIService.parseComposeResponse(input)
-        #expect(result == "Thanks for your email.\n\nBest regards")
+    @Test("filtered is an empty body with no text message")
+    func filteredSentinel() {
+        #expect(ReplyResult.filtered.body == "")
+        #expect(ReplyResult.filtered.textMessage == nil)
     }
 
-    @Test("Body extraction is case-insensitive")
-    func caseInsensitive() {
-        let input = "body: Hello there"
-        let result = AIService.parseComposeResponse(input)
-        #expect(result == "Hello there")
+    @Test("A peer reply carries no text message")
+    func peerReplyHasNoTextMessage() {
+        let peer = ReplyResult(body: "From Thunderbird", textMessage: nil)
+        #expect(peer != ReplyResult.filtered)
+        #expect(peer.textMessage == nil)
     }
 
-    @Test("Extracts multiline body content")
-    func multilineBody() {
-        let input = """
-        Subject: Test
-        Body: Line one.
-        Line two.
-        Line three.
-        """
-        let result = AIService.parseComposeResponse(input)
-        #expect(result.contains("Line one."))
-        #expect(result.contains("Line two."))
-        #expect(result.contains("Line three."))
-    }
-
-    // MARK: - Fallback Behavior
-
-    @Test("Returns raw text when no Body: marker found")
-    func fallbackRawText() {
-        let input = "Just some plain text response without markers"
-        let result = AIService.parseComposeResponse(input)
-        #expect(result == "Just some plain text response without markers")
-    }
-
-    @Test("Trims whitespace from result")
-    func trimsWhitespace() {
-        let input = "  \n  Body: Hello world  \n  "
-        let result = AIService.parseComposeResponse(input)
-        #expect(result == "Hello world")
-    }
-
-    // MARK: - Edge Cases
-
-    @Test("Empty body after marker returns fallback")
-    func emptyAfterMarker() {
-        // "Body:" with nothing after → empty body → falls back to... let's check
-        // Actually the regex captures everything after Body: including empty
-        // If body is empty after trim, the code checks `!body.isEmpty` and skips
-        // Then falls through to the fallback which returns the whole trimmed text
-        let input = "Subject: Test\nBody:"
-        let result = AIService.parseComposeResponse(input)
-        // The regex match captures "Body:" with empty content after
-        // `body` would be empty → skips → returns full trimmed text as fallback
-        #expect(result == "Subject: Test\nBody:")
-    }
-
-    @Test("Subject line before Body is excluded from result")
-    func subjectExcluded() {
-        let input = "Subject: Meeting Tomorrow\nBody: Please confirm your attendance."
-        let result = AIService.parseComposeResponse(input)
-        #expect(!result.contains("Meeting Tomorrow"))
-        #expect(result == "Please confirm your attendance.")
-    }
-
-    @Test("Handles Body: at start of text")
-    func bodyAtStart() {
-        let input = "Body: Direct body content here"
-        let result = AIService.parseComposeResponse(input)
-        #expect(result == "Direct body content here")
-    }
-
-    @Test("Handles empty input")
-    func emptyInput() {
-        let result = AIService.parseComposeResponse("")
-        #expect(result == "")
-    }
-
-    @Test("Handles whitespace-only input")
-    func whitespaceOnly() {
-        let result = AIService.parseComposeResponse("   \n  \n  ")
-        #expect(result == "")
-    }
-
-    @Test("Body with special characters")
-    func specialCharacters() {
-        let input = "Body: Hi! How's the Q&A going? <Thanks> & \"regards\""
-        let result = AIService.parseComposeResponse(input)
-        #expect(result.contains("Q&A"))
-        #expect(result.contains("<Thanks>"))
-    }
-
-    @Test("Multiple Body: markers uses first one")
-    func multipleBodyMarkers() {
-        let input = "Body: First body\nBody: Second body"
-        let result = AIService.parseComposeResponse(input)
-        // Regex captures from first Body: to end, which includes "Second body"
-        #expect(result.contains("First body"))
-    }
-
-    @Test("Response: before Body: is ignored in output")
-    func responseBeforeBody() {
-        let input = "Response: I updated your draft\nSubject: New Subject\nBody: The actual email content"
-        let result = AIService.parseComposeResponse(input)
-        #expect(result == "The actual email content")
-        #expect(!result.contains("I updated"))
+    @Test("Equality covers both fields")
+    func equality() {
+        #expect(ReplyResult(body: "B", textMessage: "T") == ReplyResult(body: "B", textMessage: "T"))
+        #expect(ReplyResult(body: "B", textMessage: "T") != ReplyResult(body: "B", textMessage: nil))
+        #expect(ReplyResult(body: "B", textMessage: "T") != ReplyResult(body: "C", textMessage: "T"))
     }
 }

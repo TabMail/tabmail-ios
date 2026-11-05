@@ -28,8 +28,7 @@ struct SyncConfigTests {
     @Test("TTL values are reasonable")
     func ttlValues() {
         #expect(SyncConfig.bodyCacheTTLHours >= 1)
-        #expect(SyncConfig.replyTTLSeconds > 0)
-        #expect(SyncConfig.aiCacheTTLDays >= 1)
+        #expect(SyncConfig.aiCacheOrphanGraceDays >= 1)
     }
 
     @Test("Timeout values are positive")

@@ -5,8 +5,11 @@
 import Foundation
 
 /// Shared AI response parsing between main app and NSE.
-/// Port of TB's `processSummaryResponse()` in llm.js.
 /// Single source of truth — both targets reference this file.
+///
+/// From protocol 2.0.0 the backend answers the summary and the precache reply as one JSON object
+/// (backend ADR-032), each with a short text message; it rebuilds the old labelled text only for
+/// clients below 2.0.0, so this app never receives it.
 enum AIResponseParser {
 
     struct SummaryResult {
@@ -15,78 +18,65 @@ enum AIResponseParser {
         let reminderDate: String?
         let reminderTime: String?
         let reminderContent: String?
+        let textMessage: String?
     }
 
-    /// Parse summary response from the backend.
-    /// Matches TB's `processSummaryResponse()` in llm.js.
+    /// Parse the summary JSON: `{"todos": [..], "summary": "..", "reminder": {"due_date", "due_time",
+    /// "content"}, "text_message": ".."}`, the reminder fields null for none. The stored shapes are
+    /// unchanged: todos as one bullet-joined line ("• a • b"), the blurb on one line, a reminder only
+    /// with content, its time only as HH:MM. A reply that is not that object gives an all-nil result,
+    /// which the callers treat as no summary (retried later).
     static func parseSummaryResponse(_ text: String) -> SummaryResult {
-        // 1. Pre-clean: strip markdown heading markers (## Todos: → Todos:)
-        // Matches TB: text.replace(/^#+\s*/gm, "")
-        let preCleaned = text.replacingOccurrences(
-            of: #"(?m)^#+\s*"#, with: "", options: .regularExpression
-        )
-
-        // 2. Regex-based section extraction (matches TB's regex approach)
-        let todosSection = extractSection(preCleaned, pattern: #"(?i)Todos:\s*([\s\S]*?)(?:Two-line summary:|$)"#)
-        let twoLineSection = extractSection(preCleaned, pattern: #"(?i)Two-line summary:\s*([\s\S]*?)(?:Reminder due date:|$)"#)
-        let reminderDueDateSection = extractSection(preCleaned, pattern: #"(?i)Reminder due date:\s*([\s\S]*?)(?:Reminder due time:|Reminder content:|$)"#)
-        let reminderDueTimeSection = extractSection(preCleaned, pattern: #"(?i)Reminder due time:\s*([\s\S]*?)(?:Reminder content:|$)"#)
-        let reminderContentSection = extractSection(preCleaned, pattern: #"(?i)Reminder content:\s*([\s\S]*)$"#)
-
-        // 3. Normalize todos into bullet-delimited format (matches TB exactly)
-        var todosClean = ""
-        if !todosSection.isEmpty {
-            let rawItems = todosSection.components(separatedBy: .newlines)
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
-            let cleanedItems = rawItems.map { line in
-                line.replacingOccurrences(
-                    of: #"^(\d+[\.)]|[-*•])\s*"#, with: "", options: .regularExpression
-                ).trimmingCharacters(in: .whitespaces)
-            }.filter { !$0.isEmpty }
-            if !cleanedItems.isEmpty {
-                todosClean = cleanedItems.map { "• \($0)" }.joined(separator: " ")
-            }
+        guard let object = jsonObject(text) else {
+            return SummaryResult(blurb: nil, todos: nil, reminderDate: nil, reminderTime: nil, reminderContent: nil, textMessage: nil)
         }
-        if todosClean.isEmpty {
-            todosClean = todosSection.replacingOccurrences(of: "\n", with: " ")
-                .trimmingCharacters(in: .whitespaces)
-        }
-
-        // 4. Blurb: newlines → spaces
-        let blurbClean = twoLineSection.replacingOccurrences(of: "\n", with: " ")
-            .trimmingCharacters(in: .whitespaces)
-
-        // 5. Reminder parsing
-        let dueDateClean = reminderDueDateSection.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
-        let dueTimeClean = reminderDueTimeSection.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
-        let contentClean = reminderContentSection.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
-
-        func isNoneOrEmpty(_ value: String) -> Bool {
-            let lower = value.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-            return lower == "none" || lower == "\"none\"" || lower.isEmpty
-        }
-
-        var reminderDate: String?
-        var reminderTime: String?
-        var reminderContent: String?
-
-        if !isNoneOrEmpty(contentClean) {
-            if !isNoneOrEmpty(dueDateClean) { reminderDate = dueDateClean }
-            if !isNoneOrEmpty(dueTimeClean),
-               dueTimeClean.range(of: #"^\d{2}:\d{2}$"#, options: .regularExpression) != nil {
-                reminderTime = dueTimeClean
-            }
-            reminderContent = contentClean
-        }
-
+        let todos = (object["todos"] as? [Any] ?? [])
+            .compactMap { ($0 as? String).flatMap(oneLine) }
+            .map { "• \($0)" }
+            .joined(separator: " ")
+        let reminder = object["reminder"] as? [String: Any] ?? [:]
+        let reminderContent = (reminder["content"] as? String).flatMap(oneLine)
+        let reminderDate = reminderContent == nil ? nil : (reminder["due_date"] as? String).flatMap(oneLine)
+        let reminderTime = reminderContent == nil ? nil : (reminder["due_time"] as? String).flatMap(oneLine)
+            .flatMap { $0.range(of: #"^\d{2}:\d{2}$"#, options: .regularExpression) != nil ? $0 : nil }
         return SummaryResult(
-            blurb: blurbClean.isEmpty ? nil : blurbClean,
-            todos: todosClean.isEmpty ? nil : todosClean,
+            blurb: (object["summary"] as? String).flatMap(oneLine),
+            todos: todos.isEmpty ? nil : todos,
             reminderDate: reminderDate,
             reminderTime: reminderTime,
-            reminderContent: reminderContent
+            reminderContent: reminderContent,
+            textMessage: (object["text_message"] as? String).flatMap(trimmed)
         )
+    }
+
+    struct ReplyResult {
+        let body: String
+        let textMessage: String?
+    }
+
+    /// Parse the precache reply JSON: `{"subject": "..", "body": "..", "text_message": ".."}`. Nil when
+    /// it is not that object or has no body; the caller treats that as no reply (retried later).
+    static func parseReplyResponse(_ text: String) -> ReplyResult? {
+        guard let object = jsonObject(text), let body = (object["body"] as? String).flatMap(trimmed) else { return nil }
+        return ReplyResult(body: body, textMessage: (object["text_message"] as? String).flatMap(trimmed))
+    }
+
+    /// The JSON object `text` holds, else nil.
+    private static func jsonObject(_ text: String) -> [String: Any]? {
+        guard let data = text.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    /// Trimmed, nil when empty or "None" (the model's word for no value).
+    private static func trimmed(_ value: String) -> String? {
+        let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = text.lowercased()
+        return text.isEmpty || lower == "none" || lower == "\"none\"" ? nil : text
+    }
+
+    /// `trimmed`, with its newlines turned into spaces (the one-line stored fields).
+    private static func oneLine(_ value: String) -> String? {
+        trimmed(value.replacingOccurrences(of: "\n", with: " "))
     }
 
     /// Parse action tag from backend response JSON.
@@ -100,16 +90,5 @@ enum AIResponseParser {
         let value = String(trimmed[range]).lowercased()
         guard ["delete", "archive", "reply", "none"].contains(value) else { return nil }
         return value
-    }
-
-    /// Extract first capture group from a regex pattern.
-    private static func extractSection(_ text: String, pattern: String) -> String {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
-              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-              match.numberOfRanges > 1,
-              let range = Range(match.range(at: 1), in: text) else {
-            return ""
-        }
-        return String(text[range]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

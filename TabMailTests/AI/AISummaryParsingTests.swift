@@ -16,132 +16,129 @@ struct SummaryResultTests {
             todos: "• Follow up • Send notes",
             reminderDate: "2024-03-20",
             reminderTime: "14:00",
-            reminderContent: "Follow up with team"
+            reminderContent: "Follow up with team",
+            textMessage: "Can you follow up with the team?"
         )
         #expect(result.blurb == "Meeting summary")
         #expect(result.todos?.contains("Follow up") == true)
         #expect(result.reminderDate == "2024-03-20")
         #expect(result.reminderTime == "14:00")
         #expect(result.reminderContent == "Follow up with team")
+        #expect(result.textMessage == "Can you follow up with the team?")
     }
 
-    @Test("SummaryResult with all nil")
-    func allNil() {
-        let result = SummaryResult(
-            blurb: nil, todos: nil,
-            reminderDate: nil, reminderTime: nil,
-            reminderContent: nil
-        )
+    @Test("SummaryResult.empty has every field nil")
+    func emptyIsAllNil() {
+        let result = SummaryResult.empty
         #expect(result.blurb == nil)
         #expect(result.todos == nil)
-        #expect(result.reminderDate == nil)
-    }
-}
-
-@Suite("AIService.parseSummaryResponse")
-struct AISummaryParsingTests {
-
-    // AIService is an actor — we need an instance. For unit-testing the parsing
-    // we create an isolated instance. parseSummaryResponse is a sync method on the actor.
-
-    @Test("Parses blurb from Two-line summary section")
-    func parsesBlurb() async {
-        let service = AIService.shared
-        let text = """
-        Todos: None
-        Two-line summary: Alice asks about the budget review.
-        Reminder due date: None
-        Reminder due time: None
-        Reminder content: None
-        """
-        let result = await service.parseSummaryResponse(text)
-        #expect(result.blurb?.contains("budget review") == true)
-    }
-
-    @Test("Parses todos with bullet normalization")
-    func parsesTodos() async {
-        let service = AIService.shared
-        let text = """
-        Todos:
-        1. Review the budget
-        2. Send feedback
-        Two-line summary: Budget discussion email.
-        Reminder due date: None
-        Reminder due time: None
-        Reminder content: None
-        """
-        let result = await service.parseSummaryResponse(text)
-        #expect(result.todos?.contains("•") == true)
-        #expect(result.todos?.contains("Review the budget") == true)
-        #expect(result.todos?.contains("Send feedback") == true)
-    }
-
-    @Test("Parses reminder fields")
-    func parsesReminder() async {
-        let service = AIService.shared
-        let text = """
-        Todos: None
-        Two-line summary: Meeting request.
-        Reminder due date: 2024-03-20
-        Reminder due time: 14:00
-        Reminder content: Follow up with Bob about the proposal.
-        """
-        let result = await service.parseSummaryResponse(text)
-        #expect(result.reminderDate == "2024-03-20")
-        #expect(result.reminderTime == "14:00")
-        #expect(result.reminderContent == "Follow up with Bob about the proposal.")
-    }
-
-    @Test("None values result in nil")
-    func noneValuesNil() async {
-        let service = AIService.shared
-        let text = """
-        Todos: None
-        Two-line summary: Simple email.
-        Reminder due date: None
-        Reminder due time: None
-        Reminder content: None
-        """
-        let result = await service.parseSummaryResponse(text)
         #expect(result.reminderDate == nil)
         #expect(result.reminderTime == nil)
         #expect(result.reminderContent == nil)
+        #expect(result.textMessage == nil)
     }
 
-    @Test("Empty response gives all nil")
-    func emptyResponse() async {
-        let service = AIService.shared
-        let result = await service.parseSummaryResponse("")
+    @Test("init(from:) carries the text message")
+    func fromSharedCarriesTextMessage() {
+        let shared = AIResponseParser.parseSummaryResponse(
+            #"{"todos": [], "summary": "S.", "reminder": null, "text_message": "Hi there."}"#
+        )
+        let result = SummaryResult(from: shared)
+        #expect(result.blurb == "S.")
+        #expect(result.textMessage == "Hi there.")
+    }
+}
+
+@Suite("AIService.parseSummaryResponse (JSON)")
+struct AISummaryParsingTests {
+
+    private func parse(_ text: String) async -> SummaryResult {
+        await AIService.shared.parseSummaryResponse(text)
+    }
+
+    @Test("Parses every field of a full summary object")
+    func parsesFullObject() async {
+        let result = await parse("""
+        {"todos": ["Review the budget", "Send feedback"],
+         "summary": "Alice asks about the budget review.",
+         "reminder": {"due_date": "2099-03-20", "due_time": "14:00", "content": "Reply to Alice about the budget."},
+         "text_message": "Hey, can you look at the budget and send me feedback by Friday?"}
+        """)
+        #expect(result.blurb == "Alice asks about the budget review.")
+        #expect(result.todos == "• Review the budget • Send feedback")
+        #expect(result.reminderDate == "2099-03-20")
+        #expect(result.reminderTime == "14:00")
+        #expect(result.reminderContent == "Reply to Alice about the budget.")
+        #expect(result.textMessage == "Hey, can you look at the budget and send me feedback by Friday?")
+    }
+
+    @Test("A null reminder gives no reminder fields")
+    func nullReminder() async {
+        let result = await parse(#"{"todos": [], "summary": "Simple email.", "reminder": null, "text_message": "Just saying hi."}"#)
+        #expect(result.blurb == "Simple email.")
+        #expect(result.todos == nil)
+        #expect(result.reminderDate == nil)
+        #expect(result.reminderTime == nil)
+        #expect(result.reminderContent == nil)
+        #expect(result.textMessage == "Just saying hi.")
+    }
+
+    @Test("Reminder date and time without content are dropped")
+    func reminderNeedsContent() async {
+        let result = await parse("""
+        {"todos": [], "summary": "S.", "reminder": {"due_date": "2099-03-20", "due_time": "09:00", "content": null}, "text_message": "T."}
+        """)
+        #expect(result.reminderContent == nil)
+        #expect(result.reminderDate == nil)
+        #expect(result.reminderTime == nil)
+    }
+
+    @Test("Reminder time must be HH:MM; content and date are kept")
+    func reminderTimeFormat() async {
+        let result = await parse("""
+        {"todos": [], "summary": "S.", "reminder": {"due_date": "2099-03-20", "due_time": "afternoon", "content": "Check something"}, "text_message": "T."}
+        """)
+        #expect(result.reminderTime == nil)
+        #expect(result.reminderDate == "2099-03-20")
+        #expect(result.reminderContent == "Check something")
+    }
+
+    @Test("A null reminder time with content keeps date and content")
+    func reminderNullTime() async {
+        let result = await parse("""
+        {"todos": [], "summary": "S.", "reminder": {"due_date": "2099-03-20", "due_time": null, "content": "Pay the invoice"}, "text_message": "T."}
+        """)
+        #expect(result.reminderTime == nil)
+        #expect(result.reminderDate == "2099-03-20")
+        #expect(result.reminderContent == "Pay the invoice")
+    }
+
+    @Test("Not JSON gives an all-nil result")
+    func notJSON() async {
+        let result = await parse("""
+        Todos: None
+        Two-line summary: Alice asks about the budget review.
+        Reminder due date: None
+        """)
         #expect(result.blurb == nil)
         #expect(result.todos == nil)
+        #expect(result.reminderContent == nil)
+        #expect(result.textMessage == nil)
     }
 
-    @Test("Markdown heading markers stripped")
-    func markdownHeadingsStripped() async {
-        let service = AIService.shared
-        let text = """
-        ## Todos: Review budget
-        ## Two-line summary: Quick summary of budget email.
-        Reminder due date: None
-        Reminder due time: None
-        Reminder content: None
-        """
-        let result = await service.parseSummaryResponse(text)
-        #expect(result.blurb?.contains("Quick summary") == true)
+    @Test("Empty and non-object JSON give an all-nil result")
+    func emptyAndNonObject() async {
+        for text in ["", "   ", "[]", #"["a"]"#, "null", "42", #""summary""#] {
+            let result = await parse(text)
+            #expect(result.blurb == nil, "\(text)")
+            #expect(result.textMessage == nil, "\(text)")
+        }
     }
 
-    @Test("Invalid reminder time format not stored")
-    func invalidReminderTime() async {
-        let service = AIService.shared
-        let text = """
-        Todos: None
-        Two-line summary: Test.
-        Reminder due date: 2024-03-20
-        Reminder due time: afternoon
-        Reminder content: Check something
-        """
-        let result = await service.parseSummaryResponse(text)
-        #expect(result.reminderTime == nil) // "afternoon" doesn't match HH:MM
-        #expect(result.reminderContent == "Check something") // content still stored
+    @Test("Surrounding whitespace around the object is accepted")
+    func surroundingWhitespace() async {
+        let result = await parse("\n  {\"todos\": [], \"summary\": \"S.\", \"reminder\": null, \"text_message\": \"T.\"}  \n")
+        #expect(result.blurb == "S.")
+        #expect(result.textMessage == "T.")
     }
 }

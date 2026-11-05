@@ -79,7 +79,7 @@ struct SyncEngineMaintenanceTests {
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
 
-        let expiredDate = Calendar.current.date(byAdding: .day, value: -(SyncConfig.aiCacheTTLDays + 1), to: Date())!
+        let expiredDate = Calendar.current.date(byAdding: .day, value: -(SyncConfig.aiCacheOrphanGraceDays + 1), to: Date())!
 
         try db.write { dbConn in
             var cache = MessageAICache(key: "acc1:INBOX:<msg1@example.com>", rfc822MessageId: "<msg1@example.com>")
@@ -88,7 +88,7 @@ struct SyncEngineMaintenanceTests {
             try cache.insert(dbConn)
         }
 
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
+        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheOrphanGraceDays, to: Date())!
         let expiredCount = try db.read { dbConn in
             try MessageAICache.filter(Column("updatedAt") < cutoff).fetchCount(dbConn)
         }
@@ -108,7 +108,7 @@ struct SyncEngineMaintenanceTests {
             try cache.insert(dbConn)
         }
 
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
+        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheOrphanGraceDays, to: Date())!
         let expiredCount = try db.read { dbConn in
             try MessageAICache.filter(Column("updatedAt") < cutoff).fetchCount(dbConn)
         }
@@ -126,7 +126,7 @@ struct SyncEngineMaintenanceTests {
             db, messageId: "1", isInInbox: true, rfc822MessageId: rfc822
         )
 
-        let expiredDate = Calendar.current.date(byAdding: .day, value: -(SyncConfig.aiCacheTTLDays + 1), to: Date())!
+        let expiredDate = Calendar.current.date(byAdding: .day, value: -(SyncConfig.aiCacheOrphanGraceDays + 1), to: Date())!
         try db.write { dbConn in
             var cache = MessageAICache(key: "acc1:INBOX:\(rfc822)", rfc822MessageId: rfc822)
             cache.summaryBlurb = "Summary"
@@ -134,10 +134,10 @@ struct SyncEngineMaintenanceTests {
             try cache.insert(dbConn)
         }
 
-        // Simulate the rescue logic from runPurgeExpiredAICache
+        // Simulate the rescue logic from runPurgeOrphanedAICache
         let now = Date()
         try db.write { dbConn in
-            let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
+            let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheOrphanGraceDays, to: Date())!
             let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
             for var entry in batch {
                 if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
