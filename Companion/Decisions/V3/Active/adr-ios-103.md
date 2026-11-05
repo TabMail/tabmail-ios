@@ -57,6 +57,14 @@ same AI result, kept as long as the email itself is shown.
    stays (frozen): it fills the Message-ID from the header in the folder the key names. The purge no
    longer depends on it. Review round 2 (2026-11-05) also removed a second purge trigger at the end of
    the AI queue's drain.
+7. **Compose's recompute writes through the identity guard (review round 3, 2026-11-05).**
+   `ComposeView.recomputedReply` stores its reply and text message with
+   `AccountManager.aiGuardedHeaderWrite`, using an `AIWriteTarget` captured from the email compose is
+   replying to. A UIDVALIDITY reset can put a different email at the same address while the model
+   answers; the write is then dropped, and the suggestion is still shown in compose. The queue's
+   pre-dispatch Device Sync check (`ActiveAIQueue.executeJob`) asks through `AIService.peerProbe`, the
+   seam the opened-email path already uses, so a whole queue job can be run against a fake peer
+   (`ActiveAIQueue.executeWholeJobForTesting`).
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (ADR-032) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
@@ -67,10 +75,14 @@ parser does not read.
 `legacyEntryKeptByItsKey` and `maintenanceRunsThePurge`);
 `ComposeSuggestionPersistTests.editClearsReplyTextMessage`; migration and merge tests in this PR;
 `AITextMessageCallerTests` (the queue's summary and reply jobs, the opened-email direct path in full and
-reply-only, a peer result through both, compose's recompute (`ComposeView.recomputedReply`) and the
-extension's request, each through its real producer and a fake backend or peer);
-`AITextMessageStorageTests.upgradeKeepsResults` (a v94 database with results, upgraded) and
-`legacyEntriesSurviveUpgradeAndPurge`; `RFC822IdentityMergeGuardTests.preSyncInboxReclaimCarriesTextMessages`;
+reply-only, a peer result through both, a whole queue job adopting a peer's action while keeping this
+device's summary and reply text messages (`queuePeerActionKeepsLocalPairs`), compose's recompute
+(`ComposeView.recomputedReply`) and its refusal to store on a replacement email at the same address
+(`composeRecomputeReplacedEmail`), and the extension's request, each through its real producer and a
+fake backend or peer); `AITextMessageStorageTests.upgradeKeepsResults` (a v94 database with results,
+upgraded) and `legacyEntriesSurviveUpgradeAndPurge` (including v96 filling the Message-ID that a peer's
+probe then finds); `RFC822IdentityMergeGuardTests.preSyncInboxReclaimCarriesTextMessages`;
 `NSESummaryTextMessageCarryTests` (the staging writes, `NSEStagingDB.open(path:)` upgrading an older
-file, the extension bundle's protocol version, and a push through `NotificationService.didReceive`
+file, the extension bundle's protocol version, a later push whose only change is the text message,
+including to none (`sameSummaryNewTextMessage`), and a push through `NotificationService.didReceive`
 staging the text message, via `NotificationService.stagingPathOverride`).

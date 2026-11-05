@@ -171,6 +171,63 @@ struct NSESummaryTextMessageCarryTests {
     /// The whole extension path: a Gmail push through `NotificationService.didReceive`, a summary
     /// answered with a text message, and the staged row the merge reads. Catches the extension
     /// parsing the text message and then not passing it on.
+    @Test("A later push with the same summary but a different text message updates the header and the cache", .processGlobalState)
+    func sameSummaryNewTextMessage() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        var queues: [DatabaseQueue] = []
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: queues, directory: dir)
+        }
+        _ = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "acc1", path: "INBOX", role: .inbox, pool: pool)
+        let meta = Self.metadata("budget")
+        var header = MessageHeader(
+            messageId: meta.messageId, subject: meta.subject, from: "Sender", fromAddress: "sender@example.com",
+            to: "acc1@example.com", date: Date(), snippet: "s", folderId: "acc1:INBOX", accountId: "acc1",
+            folderPath: "INBOX", isInInbox: true)
+        header.rfc822MessageId = meta.rfc822MessageId
+        header.summaryBlurb = "Budget review."
+        header.summaryTodos = "todo"
+        header.summaryTextMessage = "Earlier text"
+        header.actionTag = .reply
+        header.tagSortOrder = ActionTag.reply.sortOrder
+        let original = header
+        let rfc = try #require(meta.rfc822MessageId)
+        let cacheKey = "acc1:INBOX:\(rfc)"
+        try await pool.write { db in
+            try original.insert(db)
+            try MessageAICache.writeThrough(
+                accountId: "acc1", folderPath: "INBOX", rfc822MessageId: meta.rfc822MessageId,
+                summaryBlurb: "Budget review.", summaryTodos: "todo", summaryTextMessage: "Earlier text",
+                actionTag: .reply, db: db)
+        }
+        let path = dir.appendingPathComponent("nse_staging.sqlite").path
+        #expect(AppDatabase.createNSEStagingDB(atPath: path))
+        let staging = try #require(NSEStagingDB.open(path: path))
+        queues.append(staging)
+
+        // The same summary, todos and action each time; only the text message differs, and
+        // the second time there is none.
+        for text in ["Can you review the budget?", nil] as [String?] {
+            #expect(NSEStagingDB.persistProcessedMessage(
+                db: staging, accountId: "acc1", accountEmail: "acc1@example.com", provider: "gmail",
+                message: meta, summaryBlurb: "Budget review.", summaryTodos: "todo", actionTag: "reply",
+                reminderDate: nil, reminderTime: nil, reminderContent: nil, summaryTextMessage: text,
+                historyId: nil, aiCompleted: true, notified: false))
+            await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+
+            let after = try #require(try await pool.read { try MessageHeader.fetchOne($0, key: original.id) })
+            let cache = try #require(try await pool.read { try MessageAICache.fetchOne($0, key: cacheKey) })
+            #expect(after.summaryBlurb == "Budget review.")
+            #expect(after.summaryTextMessage == text)
+            #expect(cache.summaryBlurb == "Budget review.")
+            #expect(cache.summaryTextMessage == text)
+            let remaining = try await staging.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM nse_processed_message") }
+            #expect(remaining == 0)
+        }
+    }
+
     @MainActor
     @Test("A push through the extension stages the summary's text message")
     func pushStagesTextMessage() async throws {

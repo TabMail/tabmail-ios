@@ -24,16 +24,19 @@ import UserNotifications
 // `AIWriteTarget` is captured ONCE at job start and every downstream header write
 // re-resolves through it, dropping cleanly (no mutation, no success side effect)
 // when the captured identity no longer holds. Dropping is safe here in a way it
-// is NOT for user gestures: these nine sites — predicate, comments excluded so
+// is NOT for user gestures: these eleven sites — predicate, comments excluded so
 // this sentence cannot satisfy it:
 //   `rg -n --pcre2 '^(?!\s*(///|//)).*aiGuardedHeaderWrite\(db, target:'
-//    TabMail/ Shared/ TabMailNotificationService/` → **10**
-//   (`AccountManagerAI` ×5, `ActiveAIQueue` ×4, `ComposeView` ×1)
-// — nine of them write DERIVED AI METADATA, which is
+//    TabMail/ Shared/ TabMailNotificationService/` → **11**
+//   (`AccountManagerAI` ×5, `ActiveAIQueue` ×4, `ComposeView` ×2)
+// — ten of them write DERIVED AI METADATA, which is
 // recomputable — the queue's own GRDB arbiter (`ActiveAIQueue.readJobOutcome`)
-// sees the field still empty and re-drives the job. This leniency does NOT
+// sees the field still empty and re-drives the job. Compose's recompute
+// (`ComposeView.recomputedReply`) is a manual control, but what it stores is the
+// same derived reply: a dropped write leaves the replacement email's own reply in
+// place, and the suggestion is still shown in compose. This leniency does NOT
 // generalize to any user-intention path (see `Core Philosophy: Never Drop User
-// Intention`). The tenth, `ComposeView.writeCachedReplyToDB`, stores a user's
+// Intention`). The eleventh, `ComposeView.writeCachedReplyToDB`, stores a user's
 // edit of the suggestion, but only into the reopen-time cache; the edit itself
 // stays in the open compose, so a refused write costs that convenience only.
 
