@@ -80,6 +80,38 @@ enum ComposeDraftGuards {
             currentSuggestion: suggestion)
     }
 
+    /// What a tap on Send does (#384, ADR-IOS-100). The suggestion bubble and the
+    /// body editor are mutually exclusive, so a visible suggestion always sits
+    /// over an empty body; sending then means sending that suggestion.
+    enum SendTap: Equatable {
+        /// A prepared draft is still hydrating (#309); the tap does nothing.
+        case ignore
+        /// Empty body, nothing to accept: ask before sending an empty message.
+        case promptEmptyBody
+        /// Empty body with a visible suggestion: accept it, then send, no prompt.
+        case sendAcceptingSuggestion
+        /// Typed body: send it as is. A suggestion is never merged into typed text.
+        case sendAsTyped
+    }
+
+    /// The single decision behind the Send button. A suggestion that is only
+    /// whitespace does not count as one: Send must never ship an empty email
+    /// without the prompt.
+    static func sendTap(_ state: SuggestionState, isHydratingPreparedDraft: Bool) -> SendTap {
+        if isHydratingPreparedDraft { return .ignore }
+        if !isBlank(state.messageBody) { return .sendAsTyped }
+        if state.showingSuggestion,
+           let suggestion = state.currentSuggestion,
+           !isBlank(suggestion) {
+            return .sendAcceptingSuggestion
+        }
+        return .promptEmptyBody
+    }
+
+    private static func isBlank(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     enum AttachmentSnapshotProducer: CaseIterable, Sendable {
         case send
         case explicitSave
@@ -1783,20 +1815,10 @@ struct ComposeView: View {
                 onDiscard: { dismiss() }))
             .overlay { if isCheckingServerCopy { ServerCopyCheckCover() } }
             .alert("Empty Body", isPresented: $showEmptyBodyPrompt) {
-                if showingSuggestion, let currentSuggestion, !currentSuggestion.isEmpty {
-                    Button("Use Suggestion & Send") {
-                        acceptVisibleSuggestionIfOffered()
-                        Task { await send() }
-                    }
-                }
                 Button("Send Anyway") { Task { await send() } }
                 Button("Cancel", role: .cancel) { }
             } message: {
-                if showingSuggestion, let currentSuggestion, !currentSuggestion.isEmpty {
-                    Text("The message body is empty. You have an AI suggestion that hasn't been accepted.")
-                } else {
-                    Text("The message body is empty. Send anyway?")
-                }
+                Text("The message body is empty. Send anyway?")
             }
             .onAppear { performInitialAppear() }
             // ADR-IOS-030: Track ComposeView lifecycle so AgentToolRouter's FIFO queue
@@ -3377,14 +3399,27 @@ struct ComposeView: View {
     // MARK: - Send
 
     private func trySend() {
-        // #309: before the empty-body prompt, which would otherwise answer first.
-        guard !isHydratingPreparedDraft else { return }
-        let bodyEmpty = messageBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        if bodyEmpty {
-            showEmptyBodyPrompt = true
+        switch ComposeDraftGuards.sendTap(
+            .init(messageBody: messageBody,
+                  showingSuggestion: showingSuggestion,
+                  currentSuggestion: currentSuggestion),
+            // #309: before the empty-body prompt, which would otherwise answer first.
+            isHydratingPreparedDraft: isHydratingPreparedDraft
+        ) {
+        case .ignore:
             return
+        case .promptEmptyBody:
+            showEmptyBodyPrompt = true
+        case .sendAcceptingSuggestion:
+            // Same gate as the card's Use Suggestion: the guided tutorial
+            // unlocks it only after the scripted edit.
+            guard TutorialCoordinator.shared.admits(
+                .useSuggestion, accountId: replyTo?.accountId, messageId: replyTo?.messageId) else { return }
+            acceptVisibleSuggestionIfOffered()
+            Task { await send() }
+        case .sendAsTyped:
+            Task { await send() }
         }
-        Task { await send() }
     }
 
     private func send() async {

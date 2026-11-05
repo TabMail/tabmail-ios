@@ -138,6 +138,70 @@ struct ComposeSuggestionPersistTests {
         #expect(acceptedTwice == acceptedOnce)
     }
 
+    // MARK: - Send tap with an empty body (#384)
+
+    private func tap(
+        body: String,
+        showing: Bool,
+        suggestion: String?,
+        hydrating: Bool = false
+    ) -> ComposeDraftGuards.SendTap {
+        ComposeDraftGuards.sendTap(
+            .init(messageBody: body, showingSuggestion: showing, currentSuggestion: suggestion),
+            isHydratingPreparedDraft: hydrating)
+    }
+
+    @Test("Send with an empty body and a visible suggestion sends exactly the suggestion and never prompts")
+    func emptyBodyVisibleSuggestionSendsSuggestionWithoutPrompt() {
+        let offered = ComposeDraftGuards.SuggestionState(
+            messageBody: "  \n",
+            showingSuggestion: true,
+            currentSuggestion: "the visible AI suggestion")
+        let decision = ComposeDraftGuards.sendTap(offered, isHydratingPreparedDraft: false)
+        #expect(decision == .sendAcceptingSuggestion)
+
+        let sent = ComposeDraftGuards.acceptingVisibleSuggestion(offered)
+        #expect(sent.messageBody == "the visible AI suggestion")
+        #expect(sent.showingSuggestion == false)
+    }
+
+    @Test("Send with an empty body and no usable suggestion still prompts")
+    func emptyBodyWithoutUsableSuggestionPrompts() {
+        #expect(tap(body: "", showing: false, suggestion: nil) == .promptEmptyBody)
+        #expect(tap(body: "", showing: false, suggestion: "dismissed stale suggestion") == .promptEmptyBody)
+        #expect(tap(body: "", showing: true, suggestion: nil) == .promptEmptyBody)
+        #expect(tap(body: "", showing: true, suggestion: "") == .promptEmptyBody)
+        #expect(tap(body: " \n", showing: true, suggestion: "  \n") == .promptEmptyBody)
+    }
+
+    @Test("Send with a typed body sends the typed body only, never the suggestion")
+    func typedBodyIgnoresSuggestion() {
+        #expect(tap(body: "typed reply", showing: true, suggestion: "AI suggestion") == .sendAsTyped)
+        #expect(tap(body: "typed reply", showing: false, suggestion: "AI suggestion") == .sendAsTyped)
+        #expect(tap(body: "typed reply", showing: false, suggestion: nil) == .sendAsTyped)
+    }
+
+    @Test("Send while a prepared draft is hydrating is ignored whatever the body or suggestion")
+    func hydratingSendIsIgnored() {
+        #expect(tap(body: "", showing: true, suggestion: "AI suggestion", hydrating: true) == .ignore)
+        #expect(tap(body: "", showing: false, suggestion: nil, hydrating: true) == .ignore)
+        #expect(tap(body: "typed", showing: false, suggestion: nil, hydrating: true) == .ignore)
+    }
+
+    @Test("Production Send consults the decision, and the Empty Body alert no longer offers a suggestion button")
+    func productionSendWiring() throws {
+        let source = try composeSource()
+        let body = try functionBody(
+            "private func trySend() {",
+            before: "\n    }\n",
+            in: source)
+        #expect(body.contains("ComposeDraftGuards.sendTap("))
+        #expect(body.contains("acceptVisibleSuggestionIfOffered()"))
+
+        #expect(!source.contains("Use Suggestion & Send"))
+        #expect(!source.contains("You have an AI suggestion that hasn't been accepted"))
+    }
+
     @Test("Updates cachedReply on messageHeader for the given id")
     func updatesCachedReplyColumn() async throws {
         let db = try TestDatabase.make()
