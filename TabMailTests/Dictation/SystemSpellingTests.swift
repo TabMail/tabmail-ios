@@ -98,6 +98,24 @@ struct SystemSpellingTests {
         #expect(unknown == words.subtracting(["known"]))
     }
 
+    /// The batch gives the main actor back between slices: other main-actor work queued behind it
+    /// (the pill's animation) runs after at most one slice, not after the whole batch. Pins the effect
+    /// rather than the yield, and the answer stays whole.
+    @Test func otherMainActorWorkRunsBeforeALongBatchEnds() async {
+        let dictionaries = FakeDictionaries(["en-US": []])
+        let words = Set((0..<DictationConfig.spellingSliceWords * 4).map { "word\($0)" })
+        var lookupsWhenObserverRan: Int?
+        let observer = Task { @MainActor in lookupsWhenObserverRan = dictionaries.calls.count }
+
+        let unknown = await SystemSpelling.unknownWords(among: words, preferredLanguages: ["en-US"], isKnown: dictionaries.isKnown)
+        await observer.value
+
+        #expect(unknown == words)
+        #expect(dictionaries.calls.count == 1 + words.count)
+        let seen = lookupsWhenObserverRan ?? Int.max
+        #expect(seen <= 1 + DictationConfig.spellingSliceWords, "the observer ran after \(seen) of \(dictionaries.calls.count) lookups")
+    }
+
     /// The device's dictionaries, for English: a made-up word is flagged and an everyday word known
     /// (the one dictionary every simulator and device carries). Korean has no spell checker.
     @Test func theSystemsEnglishDictionaryFlagsMadeUpWordsAndKnowsEverydayOnes() async throws {

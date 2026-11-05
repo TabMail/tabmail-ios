@@ -119,6 +119,15 @@ struct DictationContextTermsTests {
         #expect(dictionaryTerms("회의는 내일") == ["회의는 내일"])
     }
 
+    /// A name that starts with a titlecase letter (a digraph such as U+01C5) has a capital like any
+    /// other; the same name in lowercase has none.
+    @Test func aTitlecaseLetterIsACapital() {
+        let titlecase = "\u{01C5}uro", lowercase = "\u{01C6}uro"
+        #expect(DictationContextTerms.candidates(in: "\(titlecase) and \(lowercase)") == [lowercase])
+        #expect(dictionaryTerms("\(titlecase) and \(lowercase)") == [titlecase])
+        #expect(dictionaryTerms("\(titlecase) and \(lowercase)", known: [lowercase]) == [])
+    }
+
     /// Runs, headings, frequency, the dictionary's own words, the cap and the backend's limits work as
     /// they do under the earlier rule.
     @Test func runsFrequencyAndLimitsAreAsBefore() {
