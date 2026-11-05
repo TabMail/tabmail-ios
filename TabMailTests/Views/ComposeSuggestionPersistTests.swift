@@ -198,6 +198,14 @@ struct ComposeSuggestionPersistTests {
         #expect(body.contains("ComposeDraftGuards.sendTap("))
         #expect(body.contains("acceptVisibleSuggestionIfOffered()"))
 
+        // Accept-and-send honours the guided tutorial's Use Suggestion lock, and
+        // adopts the suggestion synchronously before the send task is created.
+        let gate = try #require(body.range(of: ".useSuggestion, accountId: replyTo?.accountId"))
+        let accept = try #require(body.range(of: "acceptVisibleSuggestionIfOffered()"))
+        let send = try #require(body.range(of: "Task { await send() }"))
+        #expect(gate.lowerBound < accept.lowerBound && accept.lowerBound < send.lowerBound,
+                "tutorial gate, then adoption, then the send task")
+
         #expect(!source.contains("Use Suggestion & Send"))
         #expect(!source.contains("You have an AI suggestion that hasn't been accepted"))
     }
