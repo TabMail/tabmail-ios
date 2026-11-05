@@ -280,6 +280,45 @@ struct NSESummaryTextMessageCarryTests {
         #expect(try await staging.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM nse_processed_message") } == 0)
     }
 
+    /// A cache entry the merge writes is stamped like every other entry, so the orphan purge gives
+    /// it the full grace: it stays while its email is briefly gone (a header that leaves and
+    /// comes back).
+    @Test("A cache entry the merge writes is kept through the orphan grace", .processGlobalState)
+    func mergedCacheEntryGetsTheGrace() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        var queues: [DatabaseQueue] = []
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: queues, directory: dir)
+        }
+        _ = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "acc1", path: "INBOX", role: .inbox, pool: pool)
+        let meta = Self.metadata("grace")
+        let rfc = try #require(meta.rfc822MessageId)
+        let path = dir.appendingPathComponent("nse_staging.sqlite").path
+        #expect(AppDatabase.createNSEStagingDB(atPath: path))
+        let staging = try #require(NSEStagingDB.open(path: path))
+        queues.append(staging)
+        #expect(NSEStagingDB.persistProcessedMessage(
+            db: staging, accountId: "acc1", accountEmail: "acc1@example.com", provider: "gmail",
+            message: meta, summaryBlurb: "Budget review.", summaryTodos: nil, actionTag: "reply",
+            reminderDate: nil, reminderTime: nil, reminderContent: nil,
+            summaryTextMessage: "Can you review the budget?",
+            historyId: nil, aiCompleted: true, notified: false))
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+        let key = "acc1:INBOX:\(rfc)"
+        #expect(try await pool.read { try MessageAICache.fetchOne($0, key: key) } != nil)
+
+        // The email leaves the device for now; the entry is not past the grace.
+        try await pool.write { db in
+            _ = try MessageHeader.filter(Column("messageId") == meta.messageId).deleteAll(db)
+        }
+        SyncEngine.runPurgeOrphanedAICache(dbPool: PrioritizedDatabase(pool: pool, priority: .background))
+
+        let kept = try #require(try await pool.read { try MessageAICache.fetchOne($0, key: key) })
+        #expect(kept.summaryTextMessage == "Can you review the budget?")
+    }
+
     /// The whole extension path: a Gmail push through `NotificationService.didReceive`, a summary
     /// answered with a text message, and the staged row the merge reads. Catches the extension
     /// parsing the text message and then not passing it on.

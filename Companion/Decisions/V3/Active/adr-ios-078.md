@@ -218,6 +218,9 @@ within that directive's intent and are explicitly surfaced for owner veto.
   `runPurgeExpiredAICache` evict by inbox MEMBERSHIP (an expired cache entry is rescued whenever
   its `rfc822MessageId` still matches an `isInInbox == true` header), never by window. The
   owner's preferred behavior already held.
+  *Superseded by ADR-IOS-103 (2026-11-05):* the TTL sweep is deleted. `runPurgeOrphanedAICache`
+  keeps an entry while a header in any folder has its Message-ID, and purges it only after
+  `SyncConfig.aiCacheOrphanGraceDays` untouched with no such header.
 - **No durable exception state.** Exempt processing is direct and ephemeral — no marker columns,
   no triggers, no redrive. IOS-AI-004's retirement of PR #39's durable machinery stands.
 

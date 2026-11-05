@@ -651,6 +651,7 @@ enum BodyFetchProcessor {
                                     bodyMetadataOversized = 0,
                                     emptyFetchCount = emptyFetchCount + 1,
                                     summaryBlurb = 'This message has no content.',
+                                    summaryTextMessage = NULL,
                                     actionTag = ?,
                                     tagSortOrder = ?,
                                     embeddingComplete = 1
