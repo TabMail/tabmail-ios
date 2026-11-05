@@ -16,6 +16,7 @@ struct TabMailSettingsView: View {
     @AppStorage(SmartDictation.settingKey) private var smartDictation = SmartDictation.defaultValue
     @AppStorage(AccountManager.markReadOnArchiveDeleteKey) private var markReadOnArchiveDelete = true
     @AppStorage(SummaryBubbleView.showAISummariesKey) private var showAISummaries = true
+    @AppStorage(ChatViewConfig.enabledKey) private var chatViewEnabled = true
     @AppStorage(ProactiveNotifyService.enabledKey) private var proactiveEnabled = true
     @AppStorage(ProactiveNotifyService.windowDaysKey) private var windowDays = ProactiveNotifyService.defaultWindowDays
     @AppStorage(ProactiveNotifyService.advanceMinutesKey) private var advanceMinutes = ProactiveNotifyService.defaultAdvanceMinutes
@@ -43,10 +44,119 @@ struct TabMailSettingsView: View {
             .map { "Automatic (\(DictationLanguage.name(of: $0)))" } ?? "Automatic"
     }
 
+    @ViewBuilder
+    private var userInterfaceSection: some View {
+        Section("User Interface") {
+            if ChatViewConfig.isReachable { chatViewToggle }
+
+            Toggle(isOn: $showAISummaries) {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Show AI Summaries")
+                        Text("Display the AI summary above each email")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "wand.and.sparkles")
+                        .foregroundStyle(.primary)
+                }
+            }
+
+            Toggle(isOn: $autoDictation) {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Auto-Enable Dictation")
+                        Text("Start dictation when chat pill opens")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "mic")
+                        .foregroundStyle(.primary)
+                }
+            }
+
+            Picker(selection: $dictationLanguage) {
+                Text(automaticDictationLanguageLabel).tag(DictationLanguage.automatic)
+                ForEach(DictationLanguage.choices(), id: \.self) { code in
+                    Text(DictationLanguage.name(of: code)).tag(code)
+                }
+            } label: {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Dictation Language")
+                        Text("The language you speak when dictating")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "globe")
+                        .foregroundStyle(.primary)
+                }
+            }
+            .pickerStyle(.menu)
+            .onChange(of: dictationLanguage) {
+                DictationLanguageTip().invalidate(reason: .actionPerformed)
+            }
+
+            Toggle(isOn: $smartDictation) {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Smart Dictation")
+                        Text("AI cleans up your dictations, fixing typos and punctuation. Adds about a 1-second delay.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "sparkles")
+                        .foregroundStyle(.primary)
+                }
+            }
+
+            Toggle(isOn: $markReadOnArchiveDelete) {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Mark as Read on Archive & Delete")
+                        Text("Unread messages are marked read when archived or deleted")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "envelope.open")
+                        .foregroundStyle(.primary)
+                }
+            }
+        }
+    }
+
+    /// "Enable Chat View" (N8.2). Chat View needs AI: while AI is off the row is grayed out and
+    /// the stored choice is kept for when AI comes back (Q18).
+    private var chatViewToggle: some View {
+        let aiOn = ChatViewConfig.isAIOn(optedOut: optOutAllAI, subscribed: AISubscriptionGate.shared.isActive)
+        return Toggle(isOn: $chatViewEnabled) {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Enable Chat View")
+                    Text("Show threads as chats. Requires AI.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .foregroundStyle(.primary)
+            }
+        }
+        .disabled(!aiOn)
+    }
+
     var body: some View {
         ScrollViewReader { proxy in
         Form {
             Group {
+            // The chat view brings User Interface to the top (Q6).
+            if ChatViewConfig.isReachable { userInterfaceSection }
+
             Section("Personalization") {
                 NavigationLink {
                     CompositionPromptView()
@@ -266,86 +376,7 @@ struct TabMailSettingsView: View {
 
             }
 
-            Section("User Interface") {
-                Toggle(isOn: $showAISummaries) {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Show AI Summaries")
-                            Text("Display the AI summary above each email")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "wand.and.sparkles")
-                            .foregroundStyle(.primary)
-                    }
-                }
-
-                Toggle(isOn: $autoDictation) {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Auto-Enable Dictation")
-                            Text("Start dictation when chat pill opens")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "mic")
-                            .foregroundStyle(.primary)
-                    }
-                }
-
-                Picker(selection: $dictationLanguage) {
-                    Text(automaticDictationLanguageLabel).tag(DictationLanguage.automatic)
-                    ForEach(DictationLanguage.choices(), id: \.self) { code in
-                        Text(DictationLanguage.name(of: code)).tag(code)
-                    }
-                } label: {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Dictation Language")
-                            Text("The language you speak when dictating")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "globe")
-                            .foregroundStyle(.primary)
-                    }
-                }
-                .pickerStyle(.menu)
-                .onChange(of: dictationLanguage) {
-                    DictationLanguageTip().invalidate(reason: .actionPerformed)
-                }
-
-                Toggle(isOn: $smartDictation) {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Smart Dictation")
-                            Text("AI cleans up your dictations, fixing typos and punctuation. Adds about a 1-second delay.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "sparkles")
-                            .foregroundStyle(.primary)
-                    }
-                }
-
-                Toggle(isOn: $markReadOnArchiveDelete) {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Mark as Read on Archive & Delete")
-                            Text("Unread messages are marked read when archived or deleted")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                    } icon: {
-                        Image(systemName: "envelope.open")
-                            .foregroundStyle(.primary)
-                    }
-                }
-            }
+            if !ChatViewConfig.isReachable { userInterfaceSection }
 
             // Privacy opt-out (matches TB's Settings → Privacy section)
             Section {

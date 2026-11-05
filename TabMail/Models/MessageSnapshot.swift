@@ -43,6 +43,8 @@ struct MessageSnapshot: Identifiable, Hashable, Sendable {
     // arrives with actionTag == nil — see ADR-IOS-049 AI-field carry-over.
     var tagSortOrder: Int
     var summaryBlurb: String?
+    /// The summary's text message: the inbox preview while the chat view is on (N1.1).
+    var summaryTextMessage: String?
     var isInInbox: Bool
     var hasReplyReady: Bool
     var isReplyProcessed: Bool // cachedReply != nil (includes empty sentinel for filtered messages)
@@ -72,10 +74,18 @@ struct MessageSnapshot: Identifiable, Hashable, Sendable {
         self.actionTag = header.actionTag
         self.tagSortOrder = header.tagSortOrder
         self.summaryBlurb = header.summaryBlurb
+        self.summaryTextMessage = header.summaryTextMessage
         self.isInInbox = header.isInInbox
         self.hasReplyReady = header.cachedReply != nil && !header.cachedReply!.isEmpty
         self.isReplyProcessed = header.cachedReply != nil
         self.userLabels = userLabels
+    }
+
+    /// The row's two gray lines: the text message while the chat view is on and one exists, else
+    /// the snippet (N1.1: same look, only the content changes).
+    func preview(chatViewActive: Bool) -> String {
+        if chatViewActive, let text = summaryTextMessage, !text.isEmpty { return text }
+        return snippet
     }
 
     /// Stable identifier that survives IMAP MOVE (uses rfc822MessageId when available).

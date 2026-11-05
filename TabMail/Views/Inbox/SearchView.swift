@@ -95,9 +95,10 @@ struct SearchView: View {
                 }
             }
             .navigationDestination(for: OpenTarget.self) { target in
-                MessageDetailView(
+                MessageOpenView(
                     messageId: target.headerId,
-                    expectedRfc822MessageId: target.provenRfc822MessageId)
+                    expectedRfc822MessageId: target.provenRfc822MessageId,
+                    highlightsMessage: true)
             }
         }
         .background(Palette.previewPaneBg)

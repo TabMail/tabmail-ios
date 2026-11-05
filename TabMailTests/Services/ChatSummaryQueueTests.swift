@@ -20,7 +20,8 @@ import GRDB
 ///     without its body is sent to the body queue and gets its job when the body is written.
 ///  5. The walk covers the threads of the newest `SyncConfig.maxRecentEmails` Inbox rows and nothing
 ///     else, members with their body and without a done chat summary, never Trash.
-///  6. Release builds keep all of it off; the debug override counts only while debug is unlocked.
+///  6. Release builds keep all of it off; the debug override counts only while debug is unlocked;
+///     on also needs the user's toggle and AI on, and AI going off never rewrites the toggle.
 ///  7. Opening a thread with the chat view on asks once per open, with the opened message and its
 ///     thread; with it off, never.
 ///
@@ -276,25 +277,87 @@ struct ChatSummaryQueueTests {
 
     // MARK: - 6. Release gate
 
-    @Test("Release builds keep the chat view off; the debug override counts only while debug is unlocked")
-    func releaseGate() {
+    /// Everything `ChatViewConfig.isActive` reads, saved and put back so no suite sees residue:
+    /// the debug unlock, the override, the user toggle, the AI opt-out and the subscription gate.
+    @MainActor
+    private struct SavedChatViewState {
         let defaults = UserDefaults.standard
-        let previousUnlocked = defaults.object(forKey: "debug_mode_unlocked")
-        let previousOverride = defaults.object(forKey: "debug_chat_view_enabled")
-        defer {
-            defaults.set(previousUnlocked, forKey: "debug_mode_unlocked")
-            defaults.set(previousOverride, forKey: "debug_chat_view_enabled")
+        let unlocked = UserDefaults.standard.object(forKey: "debug_mode_unlocked")
+        let override = UserDefaults.standard.object(forKey: "debug_chat_view_enabled")
+        let toggle = UserDefaults.standard.object(forKey: ChatViewConfig.enabledKey)
+        let optOut = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
+        let gateOpen = AISubscriptionGate.shared.isActive
+        let lastKnownActive = UserDefaults.standard.object(forKey: "ai_subscription_last_known_active")
+
+        /// Debug unlocked, the override as given, the toggle unset (on), AI on.
+        func setChatView(on: Bool) {
+            defaults.set(true, forKey: "debug_mode_unlocked")
+            ChatViewConfig.debugOverride = on
+            defaults.removeObject(forKey: ChatViewConfig.enabledKey)
+            AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
+            AISubscriptionGate.shared.openGate()
         }
+
+        func restore() {
+            if gateOpen { AISubscriptionGate.shared.openGate() } else { AISubscriptionGate.shared.closeGate() }
+            defaults.set(lastKnownActive, forKey: "ai_subscription_last_known_active")
+            defaults.set(unlocked, forKey: "debug_mode_unlocked")
+            defaults.set(override, forKey: "debug_chat_view_enabled")
+            defaults.set(toggle, forKey: ChatViewConfig.enabledKey)
+            AIService.optOutStore.set(optOut, forKey: AIService.optOutAllAIKey)
+        }
+    }
+
+    @MainActor
+    @Test("Release builds keep the chat view off; the override counts only while debug is unlocked; on needs the toggle and AI")
+    func releaseGate() {
+        let saved = SavedChatViewState()
+        defer { saved.restore() }
         #expect(!ChatViewConfig.isAvailableInBuild, "the chat view must not reach users before it ships")
 
-        defaults.set(false, forKey: "debug_mode_unlocked")
-        ChatViewConfig.debugOverride = true
+        saved.setChatView(on: true)
+        #expect(ChatViewConfig.isActive)
+
+        UserDefaults.standard.set(false, forKey: "debug_mode_unlocked")
+        #expect(!ChatViewConfig.isReachable)
         #expect(!ChatViewConfig.isActive, "a leftover override must not count once debug is locked")
 
-        defaults.set(true, forKey: "debug_mode_unlocked")
-        #expect(ChatViewConfig.isActive)
+        UserDefaults.standard.set(true, forKey: "debug_mode_unlocked")
+        UserDefaults.standard.set(false, forKey: ChatViewConfig.enabledKey)
+        #expect(ChatViewConfig.isReachable, "the Settings row stays while the user has it off")
+        #expect(!ChatViewConfig.isActive, "the user turned it off")
+
+        UserDefaults.standard.removeObject(forKey: ChatViewConfig.enabledKey)
+        AIService.optOutStore.set(true, forKey: AIService.optOutAllAIKey)
+        #expect(!ChatViewConfig.isActive, "opted out of AI")
+
+        AIService.optOutStore.set(false, forKey: AIService.optOutAllAIKey)
+        AISubscriptionGate.shared.closeGate()
+        #expect(!ChatViewConfig.isActive, "no plan or trial")
+        #expect(UserDefaults.standard.object(forKey: ChatViewConfig.enabledKey) == nil,
+                "AI going off never rewrites the user's choice")
+
+        AISubscriptionGate.shared.openGate()
+        #expect(ChatViewConfig.isActive, "AI back on: the user's choice applies again")
         ChatViewConfig.debugOverride = false
         #expect(!ChatViewConfig.isActive)
+    }
+
+    @Test("The chat view is on only when reachable, chosen and with AI on")
+    func activeMatrix() {
+        for reachable in [false, true] {
+            for chosen in [false, true] {
+                for aiOn in [false, true] {
+                    #expect(ChatViewConfig.isActive(reachable: reachable, enabledByUser: chosen, aiOn: aiOn)
+                            == (reachable && chosen && aiOn))
+                }
+            }
+        }
+        for optedOut in [false, true] {
+            for subscribed in [false, true] {
+                #expect(ChatViewConfig.isAIOn(optedOut: optedOut, subscribed: subscribed) == (!optedOut && subscribed))
+            }
+        }
     }
 
     // MARK: - 7. Opening a thread in the detail view
@@ -319,19 +382,15 @@ struct ChatSummaryQueueTests {
     /// signal, and returns the chat requests the view model made.
     @MainActor
     private func openThread(chatViewOn: Bool) async throws -> (requests: [[String]], focused: String, parent: String) {
-        let defaults = UserDefaults.standard
-        let previousUnlocked = defaults.object(forKey: "debug_mode_unlocked")
-        let previousOverride = defaults.object(forKey: "debug_chat_view_enabled")
+        let saved = SavedChatViewState()
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer {
-            defaults.set(previousUnlocked, forKey: "debug_mode_unlocked")
-            defaults.set(previousOverride, forKey: "debug_chat_view_enabled")
+            saved.restore()
             AppDatabase.shared.withLock { $0 = previous }
             NSEDataBridge.latestStagedRows.withLock { $0 = [] }
             TestDatabaseTeardown.retire(pool: pool, directory: dir)
         }
-        defaults.set(true, forKey: "debug_mode_unlocked")
-        ChatViewConfig.debugOverride = chatViewOn
+        saved.setChatView(on: chatViewOn)
         _ = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: .gmail, pool: pool)
 
         let parent = stagedRow(messageId: "chat-parent")
@@ -346,6 +405,7 @@ struct ChatSummaryQueueTests {
         let requests = Requests()
         vm._requestChatSummariesOverride = { await requests.add($0) }
 
+        #expect(!vm.hasLoadedThread, "the chat waits for the thread before its first scroll")
         // First load: wait until it applied. Second load (a later merge): it must not ask again.
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
         for _ in 0..<150 where vm.threadMessages.isEmpty {
@@ -354,6 +414,7 @@ struct ChatSummaryQueueTests {
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
         try await Task.sleep(for: .milliseconds(300))
         #expect(vm.threadMessages.map(\.id) == [parent.headerId], "fixture: the thread load must find the parent")
+        #expect(vm.hasLoadedThread)
         return (await requests.calls, focused.headerId, parent.headerId)
     }
 

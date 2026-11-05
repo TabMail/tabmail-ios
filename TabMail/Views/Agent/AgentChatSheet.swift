@@ -527,40 +527,14 @@ struct ActionConfirmationCard: View {
     /// user can verify the zone before accepting (especially when the agent
     /// silently fell back to device local).
     private func eventTimezoneLabel(_ event: AgentToolRouter.ActionConfirmation.CalendarEventDetail) -> String {
-        let tz: TimeZone = if let tzId = event.timeZoneId, let resolved = TimeZone(identifier: tzId) {
-            resolved
-        } else {
-            .current
-        }
-        let abbr = tz.abbreviation() ?? tz.identifier
-        // If abbreviation == identifier (rare), don't duplicate.
-        if abbr == tz.identifier { return tz.identifier }
-        return "\(abbr) (\(tz.identifier))"
+        CalendarEventFormat.timeZoneLabel(CalendarEventFormat.timeZone(id: event.timeZoneId))
     }
 
     private func formatEventTime(_ event: AgentToolRouter.ActionConfirmation.CalendarEventDetail) -> String {
         // The dedicated 🌐 row beneath this label carries the timezone — keep
         // the time string itself clean so we don't render the zone twice.
-        let tz: TimeZone = if let tzId = event.timeZoneId, let resolved = TimeZone(identifier: tzId) {
-            resolved
-        } else {
-            .current
-        }
-
-        if event.isAllDay {
-            let fmt = DateFormatter()
-            fmt.dateStyle = .medium
-            fmt.timeStyle = .none
-            fmt.timeZone = tz
-            return "\(fmt.string(from: event.startDate)) (all day)"
-        }
-        let fmt = DateFormatter()
-        fmt.dateStyle = .medium
-        fmt.timeStyle = .short
-        fmt.timeZone = tz
-        let endFmt = DateFormatter()
-        endFmt.timeStyle = .short
-        endFmt.timeZone = tz
-        return "\(fmt.string(from: event.startDate)) – \(endFmt.string(from: event.endDate))"
+        CalendarEventFormat.time(
+            start: event.startDate, end: event.endDate, isAllDay: event.isAllDay,
+            timeZone: CalendarEventFormat.timeZone(id: event.timeZoneId))
     }
 }
