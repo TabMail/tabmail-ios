@@ -289,6 +289,67 @@ struct AITextMessageCallerTests {
         }
     }
 
+    // MARK: - The "no content" summary
+
+    /// The local "no content" summary replaces an earlier summary, and that summary's text
+    /// message goes with it.
+    @Test("Opening an email whose body is empty replaces the summary and clears its text message")
+    func noContentClearsTextMessage() async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture()
+            defer { fixture.close() }
+            var earlier = fixture.header
+            earlier.summaryBlurb = "An earlier summary."
+            earlier.summaryTextMessage = "Earlier text"
+            let seeded = earlier
+            try await fixture.pool.write { db in
+                try seeded.update(db)
+                try db.execute(sql: "UPDATE messageBody SET htmlContent = NULL WHERE id = ?", arguments: [seeded.id])
+            }
+
+            // The shortcut writes before any model call, so nothing is asked of a backend.
+            await AccountManager.shared.processOpenedMessage(seeded)
+
+            let row = try fixture.row()
+            #expect(row?.summaryBlurb == "This message has no content.")
+            #expect(row?.summaryTextMessage == nil)
+            #expect(row?.actionTag == .delete)
+        }
+    }
+
+    @Test("A body confirmed empty by the fetch replaces the summary and clears its text message")
+    func confirmedEmptyClearsTextMessage() async throws {
+        let fixture = try Fixture()
+        defer { fixture.close() }
+        let h = fixture.header
+        try await fixture.pool.write { db in
+            try db.execute(sql: """
+                UPDATE messageHeader SET summaryBlurb = 'An earlier summary.', summaryTextMessage = 'Earlier text',
+                    emptyFetchCount = 2 WHERE id = ?
+                """, arguments: [h.id])
+            try db.execute(sql: "DELETE FROM messageBody WHERE id = ?", arguments: [h.id])
+        }
+        let key = ContentKey(rawValue: h.id)
+
+        let (result, _) = await BodyFetchProcessor.process(
+            fetchResult: BodyFetchProcessor.FetchResult(
+                item: BodyFetchProcessor.Item(
+                    headerId: h.id, accountId: h.accountId, folderPath: h.folderPath,
+                    messageId: h.messageId, isInInbox: true),
+                renderedBody: MessageBody.create(contentKey: key, htmlBody: nil),
+                plainText: nil, hasAttachments: false, hasUnresolvedICS: false,
+                fetchedRfc822MessageId: Fixture.rfc),
+            enableAI: false)
+
+        guard case .confirmedEmpty = result else {
+            Issue.record("expected a confirmed-empty body, got \(result)")
+            return
+        }
+        let row = try #require(try fixture.row())
+        #expect(row.summaryBlurb == "This message has no content.")
+        #expect(row.summaryTextMessage == nil)
+    }
+
     // MARK: - 1. The opened-email direct path
 
     @Test("Opening an email stores its summary, reply and both text messages")
@@ -467,6 +528,54 @@ struct AITextMessageCallerTests {
             let row = try fixture.row()
             #expect(row?.cachedReply == Self.replyBody)
             #expect(row?.replyTextMessage == Self.replyText)
+        }
+    }
+
+    @Test("Recomputing for a sender that gets no reply suggests nothing and keeps the stored reply")
+    func composeRecomputeFiltered() async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(fromAddress: "noreply@example.com", replyTextMessage: "Earlier text")
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+            let id = fixture.header.id
+            try await fixture.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET cachedReply = 'Earlier reply' WHERE id = ?", arguments: [id])
+            }
+
+            let suggestion = await ComposeView.recomputedReply(
+                for: fixture.header, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+
+            #expect(suggestion == nil)
+            #expect(backend.prompts.isEmpty)
+            let row = try fixture.row()
+            #expect(row?.cachedReply == "Earlier reply")
+            #expect(row?.replyTextMessage == "Earlier text")
+        }
+    }
+
+    @Test("Recomputing for an email with no stored body asks with its snippet")
+    func composeRecomputeFromSnippet() async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture()
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+            let id = fixture.header.id
+            try await fixture.pool.write { db in
+                try db.execute(sql: "DELETE FROM messageBody WHERE id = ?", arguments: [id])
+            }
+
+            let suggestion = await ComposeView.recomputedReply(
+                for: fixture.header, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+
+            #expect(suggestion == Self.replyBody)
+            let messages = backend.http.recordedCalls().compactMap { call -> String? in
+                let json = call.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+                // The prompt's variables are fields of the message itself.
+                return (json["messages"] as? [[String: Any]])?.first?["message"] as? String
+            }
+            #expect(messages == [fixture.header.snippet])
         }
     }
 
