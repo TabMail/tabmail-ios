@@ -75,9 +75,8 @@ same AI result, kept as long as the email itself is shown.
    (`ActiveAIQueue.executeWholeJobForTesting`).
 8. **Chat summaries (owner D2, D3; amendment 2026-11-05, the second chat-view PR).** The chat view
    needs a summary with a text message for every email of a thread, from any folder, the user's own
-   included. Two requests ask for them, both behind `ChatViewConfig.isActive` (release builds keep it
-   off, `isAvailableInBuild = false`, until the chat view ships; the debug menu turns it on), read once
-   at the start of the operation:
+   included. Two requests ask for them, both behind `ChatViewConfig.isActive` (the user's toggle and AI
+   on, decision 9), read once at the start of the operation:
    - **D2, opening a thread** (`MessageDetailViewModel.loadThreadMessagesAsync`, once per open):
      `ActiveAIQueue.enqueueChatSummaries` with the opened message and every member
      `ThreadDetection.findRelatedMessages` returns. A member with its body gets a job now; one without
@@ -126,8 +125,7 @@ same AI result, kept as long as the email itself is shown.
    by the next walk or open.
 
 9. **The chat screen (amendment 2026-11-05, the third chat-view PR, 3a).** With the chat view on
-   (`ChatViewConfig.isActive` = reachable (release gate `isAvailableInBuild`, or the debug override
-   while debug is unlocked) AND the user's Settings toggle `chatViewEnabled` (default on, kept while
+   (`ChatViewConfig.isActive` = the user's Settings toggle `chatViewEnabled` (default on, kept while
    AI is off) AND AI on (not opted out, a plan or trial active)), every thread open goes through
    `MessageOpenView`, which decides chat or today's email view ONCE per open (`opensInChat`, also off
    in the demo's AI-off mode and during the tutorial): the inbox, push and notification opens
@@ -142,10 +140,17 @@ same AI result, kept as long as the email itself is shown.
    folders, the label union (`UserLabel.union`, shared with `ThreadGroup.displayInfo`), top-level
    attachment names and an addable invite (`ChatInvite`; the card stands for its calendar file).
    The inbox row shows the text message when the chat view is on (`MessageSnapshot.preview`).
-   **Awaiting owner blessing:** in 3a today's pill stays and acts on the NEWEST email; "Sent" under
-   every own bubble; the 15-minute gap; tutorial and demo-AI-off keep today's view; the User
-   Interface Settings section moves to the top only when the chat view is reachable; a reminder open
-   highlights its email; triage rows keep the snippet; the agent's toast is not shown in the chat.
+   **Blessed by the owner (2026-11-05):** in 3a today's pill stays and acts on the NEWEST email;
+   "Sent" under every own bubble; the 15-minute gap; tutorial and demo-AI-off keep today's view; a
+   reminder open highlights its email; triage rows keep the snippet, with no text message; the
+   agent's toast is not shown in the chat. The User Interface Settings section, which holds the
+   toggle, sits at the top of Settings.
+   **The hidden release switch is deleted (owner, 2026-11-05).** Until then release builds kept the
+   chat view off (`isAvailableInBuild = false`; a debug-menu override turned it on while debug was
+   unlocked; `isReachable` showed the toggle and moved User Interface to the top), so `main` stayed
+   releasable between the chat-view PRs. The owner ruled that the whole train is tested, merged and
+   released at once, so that reason is gone and the switch, the override and the two Settings
+   positions went with it.
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (ADR-032) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
@@ -173,4 +178,4 @@ stage could not and caching its result with the text message (`secondStageCaches
 cache entry kept through the orphan grace (`mergedCacheEntryGetsTheGrace`), and a push through `NotificationService.didReceive`
 staging the text message, via `NotificationService.stagingPathOverride`).
 Decision 8: `ChatSummaryQueueTests`; `ChatSummaryExecutionTests` (the own-email field, two-sided; a real body write releasing the waiting chat summary once; the executor refusing an ordinary summary outside the Inbox, with an Inbox control). Decision 9: `ChatThreadTests`,
-`ChatThreadContextTests`, `ChatSummaryQueueTests.releaseGate`/`activeMatrix`, `ThreadGroupTests.displayInfoUnionLabels`.
+`ChatThreadContextTests`, `ChatSummaryQueueTests.chatViewSwitch`/`activeMatrix`, `ThreadGroupTests.displayInfoUnionLabels`.
