@@ -16,14 +16,17 @@ import GRDB
 ///  2. A chat summary passes the folder scope in any folder; every other job keeps the Inbox scope.
 ///  3. `forChat` is context, not identity: a chat offer and an ordinary offer for the same message
 ///     are one job, and the flags only widen.
-///  4. Opening a thread asks for every member without a done chat summary, any folder; a member
-///     without its body is sent to the body queue and gets its job when the body is written.
+///  4. A chat's request covers every email it names without a done chat summary, any folder; one
+///     without its body is sent to the body queue and gets its job when the body is written. The
+///     work goes to the front of both queues in the order asked, so what is on screen comes first
+///     and the latest request beats earlier ones.
 ///  5. The walk covers the threads of the newest `SyncConfig.maxRecentEmails` Inbox rows and nothing
-///     else, members with their body and without a done chat summary, never Trash.
+///     else, at most each thread's newest `ChatViewConfig.summaryLead` emails, members with their
+///     body and without a done chat summary, never Trash.
 ///  6. Release builds keep all of it off; the debug override counts only while debug is unlocked;
 ///     on also needs the user's toggle and AI on, and AI going off never rewrites the toggle.
-///  7. Opening a thread with the chat view on asks once per open, with the opened message and its
-///     thread; with it off, never.
+///
+/// Which emails an open chat asks for is `ChatSummaryWindowTests` and `ChatThreadViewLifecycleTests`.
 ///
 /// Admission observation: see `WindowExemptAdmissionTests` (dispatch is suppressed so the queued
 /// jobs stay observable).
@@ -229,6 +232,62 @@ struct ChatSummaryQueueTests {
                 "the summary landed after the caller's snapshot; asking again would spend a model call for nothing")
     }
 
+    @Test("A request goes to the front of the queues in the order asked, and the latest request comes first")
+    func requestOrderComesFirst() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let acc = "acc-cs-7"
+        try makeAccount(acc, pool: pool)
+        let a = try insertHeader(accountId: acc, uid: "a", folderPath: "Archive", pool: pool)
+        let b = try insertHeader(accountId: acc, uid: "b", pool: pool)
+        let c = try insertHeader(accountId: acc, uid: "c", folderPath: "Sent", pool: pool)
+        let other = try insertHeader(accountId: acc, uid: "other", pool: pool)
+        let bodilessOne = try insertHeader(accountId: acc, uid: "nb1", bodyComplete: false, pool: pool)
+        let bodilessTwo = try insertHeader(accountId: acc, uid: "nb2", bodyComplete: false, pool: pool)
+
+        let queue = ActiveAIQueue()
+        await queue.setDispatchSuppressedForTesting(true)
+        // Work already waiting: another email, and an ordinary summary of b.
+        await queue.enqueue(headerId: other.id, accountId: acc)
+        await queue.enqueue(headerId: b.id, accountId: acc)
+        let requests = BodyRequests()
+
+        await queue.enqueueChatSummaries([c, bodilessTwo, b, bodilessOne, a], requestBodies: { await requests.add($0) })
+        var jobs = await queue.queuedJobsForTesting
+        #expect(jobs.prefix(3).map(\.headerId) == [c.id, b.id, a.id], "asked first, in the order asked, ahead of waiting work")
+        #expect(jobs.prefix(3).allSatisfy { $0.jobType == .summary && $0.forChat })
+        #expect(jobs.dropFirst(3).allSatisfy { $0.headerId == other.id || $0.headerId == b.id },
+                "the waiting work stays, behind")
+        #expect(await requests.ids == [bodilessTwo.id, bodilessOne.id], "bodies are asked for in the same order")
+
+        // A later request (the user scrolled) beats the earlier one.
+        await queue.enqueueChatSummaries([a], requestBodies: { _ in })
+        jobs = await queue.queuedJobsForTesting
+        #expect(jobs.prefix(3).map(\.headerId) == [a.id, c.id, b.id])
+
+        // A body that lands for an email asked for: its job comes first too.
+        await queue.chatBodyArrived(headerId: bodilessOne.id)
+        #expect(await queue.queuedJobsForTesting.first?.headerId == bodilessOne.id)
+    }
+
+    @Test("The body queue puts a chat's emails first, in the order asked")
+    func bodyQueueOrderComesFirst() async throws {
+        func header(_ uid: String) -> MessageHeader {
+            MessageHeader(
+                messageId: uid, subject: "s", from: "f", fromAddress: "f@example.com", to: "t@example.com",
+                date: Date(), snippet: "", folderId: "acc-cs-8|INBOX", accountId: "acc-cs-8", folderPath: "INBOX",
+                isInInbox: true)
+        }
+        let queue = ActiveBodyQueue()
+        let waiting = [header("w1"), header("w2")]
+        let asked = [header("c2"), header("w2"), header("c1")]
+        await queue.enqueueBatch(waiting)
+        await queue.enqueueBatch(asked, first: true)
+        #expect(await queue.queuedItemsForTesting.map(\.headerId) == [asked[0].id, asked[1].id, asked[2].id, waiting[0].id])
+        await queue.enqueueBatch([waiting[0]])
+        #expect(await queue.queuedItemsForTesting.last?.headerId == waiting[0].id, "an ordinary enqueue keeps its place")
+    }
+
     // MARK: - 5. The walk
 
     @Test("The walk covers the threads of recent Inbox mail, any folder but Trash, members with a body and no done chat summary")
@@ -275,12 +334,34 @@ struct ChatSummaryQueueTests {
         #expect(ids == [MessageIdentity.headerId(accountId: acc, folderPath: "Sent", messageId: "new-reply")])
     }
 
+    @Test("The walk takes at most each thread's newest summaryLead emails")
+    func walkTakesEachThreadsNewest() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let acc = "acc-cs-9"
+        try makeAccount(acc, pool: pool)
+        let now = Date()
+        let length = ChatViewConfig.summaryLead + 5
+        // A chain, oldest first; only the newest is in the Inbox.
+        var ids: [String] = []
+        for i in 0..<length {
+            let newest = i == length - 1
+            let h = try insertHeader(accountId: acc, uid: "w\(i)", folderPath: newest ? "INBOX" : "Archive",
+                                     date: now.addingTimeInterval(TimeInterval(i - length) * 60),
+                                     inReplyTo: i == 0 ? nil : Self.rfc("w\(i - 1)"), pool: pool)
+            ids.append(h.id)
+        }
+        let candidates = try ActiveAIQueue.chatWalkCandidates(pool: pool).map(\.headerId)
+        #expect(Set(candidates) == Set(ids.suffix(ChatViewConfig.summaryLead)),
+                "the newest emails, which an open chat shows first; the rest wait for the chat to ask")
+    }
+
     // MARK: - 6. The switch
 
     /// Everything `ChatViewConfig.isActive` reads, saved and put back so no suite sees residue:
     /// the user toggle, the AI opt-out and the subscription gate.
     @MainActor
-    private struct SavedChatViewState {
+    struct SavedChatViewState {
         let defaults = UserDefaults.standard
         let toggle = UserDefaults.standard.object(forKey: ChatViewConfig.enabledKey)
         let optOut = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
@@ -341,79 +422,5 @@ struct ChatSummaryQueueTests {
                 #expect(ChatViewConfig.isAIOn(optedOut: optedOut, subscribed: subscribed) == (!optedOut && subscribed))
             }
         }
-    }
-
-    // MARK: - 7. Opening a thread in the detail view
-
-    private func stagedRow(messageId: String, references: [String] = []) -> StagedInboxRow {
-        StagedInboxRow(
-            accountId: "acc1", folderPath: "INBOX", messageId: messageId,
-            rfc822MessageId: "<\(messageId)@example.com>", threadId: nil, inReplyTo: nil, references: references,
-            subject: "Staged \(messageId)", senderName: "Sender", senderAddress: "s@example.com",
-            to: "me@example.com", snippet: "snip", date: Date(),
-            isRead: false, isFlagged: false, hasAttachments: false, isReplied: false,
-            isForwarded: false, actionTag: nil, summaryBlurb: nil
-        )
-    }
-
-    private actor Requests {
-        var calls: [[String]] = []
-        func add(_ headers: [MessageHeader]) { calls.append(headers.map(\.id)) }
-    }
-
-    /// Opens a staged reply whose parent is durable, drives two thread loads through the merge-commit
-    /// signal, and returns the chat requests the view model made.
-    @MainActor
-    private func openThread(chatViewOn: Bool) async throws -> (requests: [[String]], focused: String, parent: String) {
-        let saved = SavedChatViewState()
-        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
-        defer {
-            saved.restore()
-            AppDatabase.shared.withLock { $0 = previous }
-            NSEDataBridge.latestStagedRows.withLock { $0 = [] }
-            TestDatabaseTeardown.retire(pool: pool, directory: dir)
-        }
-        saved.setChatView(on: chatViewOn)
-        _ = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: .gmail, pool: pool)
-
-        let parent = stagedRow(messageId: "chat-parent")
-        let focused = stagedRow(messageId: "chat-reply", references: [parent.rfc822MessageId!])
-        try await pool.write { db in try parent.toMessageHeader().insert(db) }
-        NSEDataBridge.latestStagedRows.withLock { $0 = [focused] }
-
-        let vm = MessageDetailViewModel(
-            messageId: focused.headerId, dbPool: pool, fetchBodyOverride: { _ in },
-            observeNotifications: true
-        )
-        let requests = Requests()
-        vm._requestChatSummariesOverride = { await requests.add($0) }
-
-        #expect(!vm.hasLoadedThread, "the chat waits for the thread before its first scroll")
-        // First load: wait until it applied. Second load (a later merge): it must not ask again.
-        NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
-        for _ in 0..<150 where vm.threadMessages.isEmpty {
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        NotificationCenter.default.post(name: .nseMergeDidCommit, object: MessageDetailStagedFallbackTests.testPostSentinel)
-        try await Task.sleep(for: .milliseconds(300))
-        #expect(vm.threadMessages.map(\.id) == [parent.headerId], "fixture: the thread load must find the parent")
-        #expect(vm.hasLoadedThread)
-        return (await requests.calls, focused.headerId, parent.headerId)
-    }
-
-    @MainActor
-    @Test("With the chat view on, opening a thread asks once, with the opened message and its thread")
-    func openAsksOnce() async throws {
-        let result = try await openThread(chatViewOn: true)
-        #expect(result.requests.count == 1, "one request per open; later thread reloads do not ask again")
-        guard result.requests.count == 1 else { return }
-        #expect(Set(result.requests[0]) == [result.focused, result.parent])
-    }
-
-    @MainActor
-    @Test("With the chat view off, opening a thread asks nothing")
-    func openAsksNothingWhenOff() async throws {
-        let result = try await openThread(chatViewOn: false)
-        #expect(result.requests.isEmpty)
     }
 }

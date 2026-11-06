@@ -94,6 +94,9 @@ same AI result, kept as long as the email itself is shown.
    bound that you load up to something like 10 emails from the current visible oldest message"):
    the open chat asks only for the emails on screen and those near them (decision 9,
    `ChatSummaryWindow`); until the chat screen exists the requests stay off in release builds.
+   **Amended 2026-11-06 (owner's safety bound):** D2 no longer asks for every member at open, and D3
+   takes at most each thread's newest `ChatViewConfig.summaryLead`; see decision 9, "The chat asks
+   for the emails in view".
    A chat request is an ordinary summary job (same model, queue, executor and write) with
    `AIJob.forChat`: it is window-exempt, any folder passes its scope checks (`readJobOutcome`,
    `executeJob`), and it is done only when the summary has its text message. `forChat` is context,
@@ -147,6 +150,36 @@ same AI result, kept as long as the email itself is shown.
    The chat shows the whole thread, all the way back (owner Q2): it comes from
    `ThreadDetection.findRelatedMessages`, shared with today's thread list, which has no length or
    depth limit (decision 8).
+   **The chat asks for the emails in view (owner, 2026-11-06, train gate).** Owner: "add a safety
+   bound that you load up to something like 10 emails from the current visible oldest message.
+   scrolling triggers everything "in view" to be prioritized once scrolling stops, and then again
+   20 in both directions". So the thread lookup stays whole, and the per-email work (body download
+   and summary) is bounded by what is on screen. `ChatThreadView.askForSummaries` reads the emails on
+   screen (`onScrollTargetVisibilityChange`) and asks `ActiveAIQueue.enqueueChatSummaries` for the
+   ids `ChatSummaryWindow.ids` gives: the emails on screen, newest first, then, until the user has
+   scrolled by hand, the `ChatViewConfig.summaryLead` (10) emails above the oldest on screen; once a
+   hand scroll (`ChatSummaryWindow.userMoved`: a drag or its fling) stops, `ChatViewConfig.
+   summarySpread` (20) on each side, nearest first. The chat's own scrolls (to the Unread line, a
+   searched email, the jump to the bottom) keep the open window. It asks once the emails on screen
+   have stayed the same for `ChatViewConfig.summaryAskSettle` (300 ms) with the scroll at rest (the
+   open, an email that joins at the bottom) and when a scroll stops; the wait keeps the layout jumps
+   while the chat moves to its opening place from asking for emails the user never sees. The first
+   scroll records the members' unread state itself (`noteMembers`) before choosing where to land:
+   SwiftUI runs the thread-loaded and members changes in either order, and the screen tests caught
+   the chat opening at the bottom with the Unread line missing. Each request's work
+   goes to the FRONT of both queues in that order (`QueueStorage.moveToFront`, `ActiveBodyQueue.
+   enqueueBatch(first:)`), so the screen comes first and the latest request beats earlier ones; a
+   body that lands for an email asked for gets its job at the front too. The open-time request in
+   `MessageDetailViewModel` (D2 as first built, every member at once) is deleted. The background walk
+   (D3) pre-summarizes each walked thread's newest `summaryLead` emails, which a chat opens at.
+   Overnight calls, awaiting the owner's blessing: the open asks for the screen plus 10 above and a
+   stopped hand scroll for 20 each way (the two numbers read as the open's bound and the scroll's);
+   the screen is asked newest first; the walk's 10 per thread; bodies are put first like summaries;
+   the 300 ms settle.
+   Tests: `ChatSummaryWindowTests`, `ChatSummaryQueueTests` (order, latest first, walk bound),
+   `QueueStorageTests` (`moveToFront`), and `ChatThreadViewLifecycleTests`, which opens the real
+   chat in a window: the first scroll (bottom, Unread line, searched email), every email marked read
+   in the database, and the request covering only the screen and the 10 above it.
    **Blessed by the owner (2026-11-05):** in 3a today's pill stays and acts on the NEWEST email;
    "Sent" under every own bubble; the 15-minute gap; tutorial and demo-AI-off keep today's view; a
    reminder open highlights its email; triage rows keep the snippet, with no text message; the

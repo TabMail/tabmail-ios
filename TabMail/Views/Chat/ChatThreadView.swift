@@ -57,6 +57,12 @@ struct ChatThreadView: View {
     @State private var unreadAtOpen: Set<String> = []
     @State private var seenIds: Set<String> = []
     @State private var didInitialScroll = false
+    /// The emails on screen, and whether the scroll is at rest; a scroll has stopped once since
+    /// the open (`askForSummaries`).
+    @State private var visibleIds: Set<String> = []
+    @State private var scrollIsIdle = true
+    @State private var hasScrolled = false
+    @State private var summaryAsk: Task<Void, Never>?
     @State private var highlightedId: String?
     @State private var showsJumpButton = false
     @State private var cardMessage: MessageHeader?
@@ -208,7 +214,18 @@ struct ChatThreadView: View {
                         }
                         Color.clear.frame(height: ChatViewLayout.pillClearance).id(Self.bottomId)
                     }
+                    .scrollTargetLayout()
                     .padding(.top, 8)
+                }
+                .onScrollTargetVisibilityChange(idType: String.self) { ids in
+                    visibleIds = Set(ids)
+                    if scrollIsIdle { askOnceSettled() }
+                }
+                .onScrollPhaseChange { _, phase in
+                    if ChatSummaryWindow.userMoved(phase) { hasScrolled = true }
+                    scrollIsIdle = phase == .idle
+                    guard phase == .idle else { summaryAsk?.cancel(); return }
+                    askOnceSettled()
                 }
                 .defaultScrollAnchor(.bottom)
                 .scrollDismissesKeyboard(.interactively)
@@ -310,11 +327,41 @@ struct ChatThreadView: View {
         }
     }
 
+    /// Asks for the summaries of the emails on screen and those near them, on screen first
+    /// (`ChatSummaryWindow`, owner 2026-11-06): until the user first scrolls by hand, the
+    /// `ChatViewConfig.summaryLead` emails above the oldest on screen; after it,
+    /// `ChatViewConfig.summarySpread` on each side. Runs whenever the emails on screen change while
+    /// the scroll is at rest, and when a scroll stops. The chat view setting is read once, here.
+    /// Asks once the screen has stayed the same for `ChatViewConfig.summaryAskSettle` with the
+    /// scroll at rest; each change starts the wait again.
+    private func askOnceSettled() {
+        summaryAsk?.cancel()
+        summaryAsk = Task { @MainActor in
+            try? await Task.sleep(for: ChatViewConfig.summaryAskSettle)
+            guard !Task.isCancelled, scrollIsIdle else { return }
+            askForSummaries()
+        }
+    }
+
+    private func askForSummaries() {
+        guard ChatViewConfig.isActive else { return }
+        let items = thread.items
+        let ids = ChatSummaryWindow.ids(order: items.map(\.id), visible: visibleIds, handScrolled: hasScrolled)
+        let byId = Dictionary(items.map { ($0.id, $0.header) }, uniquingKeysWith: { first, _ in first })
+        let headers = ids.compactMap { byId[$0] }
+        guard !headers.isEmpty else { return }
+        Task { await ActiveAIQueue.shared.enqueueChatSummaries(headers) }
+    }
+
     /// The first scroll, once the thread and its extras are in: to the opened email when it came
     /// from search or a notification (O2), else to the Unread line (O1), else the bottom (N2.10).
     private func scrollOnceLoaded() {
         guard !didInitialScroll, viewModel.hasLoadedThread, context.isLoaded else { return }
         didInitialScroll = true
+        // The thread's emails arrive with `hasLoadedThread`, and SwiftUI runs that change and the
+        // members change in either order: record their unread state first, or the Unread line can
+        // be missing and the chat opens at the bottom.
+        noteMembers()
         let thread = thread
         if highlightsOpenedMessage, let opened = viewModel.message,
            let item = thread.items.first(where: { $0.header.stableId == opened.stableId }) {
