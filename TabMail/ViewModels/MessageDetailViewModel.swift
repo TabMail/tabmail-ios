@@ -2033,6 +2033,36 @@ final class MessageDetailViewModel {
 
     /// Moves emails that share one folder as ONE action — see `archiveMessages(_:)`.
     @discardableResult
+    /// The emails a whole-chat Archive, Delete or Move acts on (S2.1, S3.1): every email the chat
+    /// shows, once each, wherever it is filed, except sent copies and drafts, which stay where they
+    /// are, and those already in a `skippedRole` folder or at `destinationPath`. The move is one
+    /// action with one undo entry; Undo puts each email back in its own folder.
+    private func chatMembers(_ members: [MessageHeader], destinationPath: String, skippedRole: FolderRole?) -> [MessageHeader] {
+        var seen = Set<String>()
+        return members.filter { member in
+            let role = lookupFolderRole(member.folderId)
+            return role != .sent && role != .drafts && (skippedRole == nil || role != skippedRole)
+                && member.folderPath != destinationPath && seen.insert(member.id).inserted
+        }
+    }
+
+    /// False when nothing moved, so the chat stays open.
+    func archiveChat(_ members: [MessageHeader]) -> Bool {
+        guard let first = members.first,
+              let archive = lookupFolder(accountId: first.accountId, role: .archive) else { return false }
+        return archiveMessages(chatMembers(members, destinationPath: archive.path, skippedRole: .archive))
+    }
+
+    func deleteChat(_ members: [MessageHeader]) -> Bool {
+        guard let first = members.first,
+              let trash = lookupFolder(accountId: first.accountId, role: .trash) else { return false }
+        return deleteMessages(chatMembers(members, destinationPath: trash.path, skippedRole: .trash))
+    }
+
+    func moveChat(_ members: [MessageHeader], toFolderPath path: String) -> Bool {
+        moveMessages(chatMembers(members, destinationPath: path, skippedRole: nil), toFolderPath: path)
+    }
+
     func moveMessages(_ msgs: [MessageHeader], toFolderPath: String) -> Bool {
         guard let first = msgs.first, lookupFolderRole(first.folderId) != .drafts else { return false }
         // Generic move: destination CAN be the inbox, which must re-enable
