@@ -21,7 +21,8 @@ enum PromptVariables {
         metadata: MessageMetadata,
         body: RenderedBody,
         account: AccountContext,
-        recipientStatus: String = ""
+        recipientStatus: String = "",
+        isSentByUser: Bool = false
     ) -> [String: Any] {
         let subject = metadata.subject.isEmpty ? "Not Available" : metadata.subject
         let fromSender = formatFromSender(metadata.from)
@@ -47,6 +48,11 @@ enum PromptVariables {
         // only on a non-empty "cc" value (TB parity: summaryGenerator.js).
         if !recipientStatus.isEmpty {
             vars["recipient_status"] = recipientStatus
+        }
+        // The user wrote this email (ADR-IOS-103): the backend writes its text message in the
+        // user's voice. Sent only as `true`; omitted otherwise, as Thunderbird never sends it.
+        if isSentByUser {
+            vars["is_sent_by_user"] = true
         }
         return vars
     }
