@@ -236,6 +236,23 @@ struct ChatThreadViewLifecycleTests {
         #expect(!opened.queued.contains(0), "the rest of the long thread waits")
     }
 
+    @Test("Screens that change faster than the settle wait ask once, for the last screen")
+    func quickChangesAskOnce() async throws {
+        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false) { scroll in
+            await ActiveAIQueue.shared.clearForTesting()
+            // Halfway, then the top, well inside `ChatViewConfig.summaryAskSettle`; no hand scroll.
+            scroll.setContentOffset(CGPoint(x: 0, y: (scroll.contentSize.height - scroll.bounds.height) / 2), animated: false)
+            scroll.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(30))
+            scroll.setContentOffset(CGPoint(x: 0, y: -scroll.adjustedContentInset.top), animated: false)
+            scroll.layoutIfNeeded()
+        }
+        #expect(!opened.queued.isEmpty, "the last screen is asked for")
+        #expect(Self.latestRun(opened.queued) == opened.queued && opened.queued.last == 0,
+                "one run: the top screen, newest first, down to the oldest email: \(opened.queued)")
+        #expect(opened.queued.allSatisfy { $0 < Self.length / 2 }, "nothing from the screen passed on the way: \(opened.queued)")
+    }
+
     @Test("From search: the chat opens at the opened email")
     func searchOpensAtTheEmail() async throws {
         let target = 5
