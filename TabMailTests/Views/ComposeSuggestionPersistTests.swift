@@ -217,7 +217,7 @@ struct ComposeSuggestionPersistTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db, messageId: "1")
 
-        await ComposeView.writeCachedReplyToDB("edited reply", headerId: header.id, db: db)
+        await ComposeView.writeCachedReplyToDB("edited reply", replyTo: header, db: db)
 
         let fetched = try await db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(fetched?.cachedReply == "edited reply")
@@ -230,7 +230,9 @@ struct ComposeSuggestionPersistTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db, messageId: "1")
 
-        await ComposeView.writeCachedReplyToDB("ghost", headerId: "nonexistent", db: db)
+        var ghost = header
+        ghost.id = "nonexistent"
+        await ComposeView.writeCachedReplyToDB("ghost", replyTo: ghost, db: db)
 
         let fetched = try await db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(fetched?.cachedReply == nil)
@@ -243,8 +245,8 @@ struct ComposeSuggestionPersistTests {
         try TestDatabase.insertFolder(db)
         let header = try TestDatabase.insertMessageHeader(db, messageId: "1")
 
-        await ComposeView.writeCachedReplyToDB("first", headerId: header.id, db: db)
-        await ComposeView.writeCachedReplyToDB("second", headerId: header.id, db: db)
+        await ComposeView.writeCachedReplyToDB("first", replyTo: header, db: db)
+        await ComposeView.writeCachedReplyToDB("second", replyTo: header, db: db)
 
         let fetched = try await db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(fetched?.cachedReply == "second")
@@ -263,12 +265,193 @@ struct ComposeSuggestionPersistTests {
             snippet: "Untouched snippet"
         )
 
-        await ComposeView.writeCachedReplyToDB("new reply", headerId: header.id, db: db)
+        await ComposeView.writeCachedReplyToDB("new reply", replyTo: header, db: db)
 
         let fetched = try await db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(fetched?.subject == "Untouched subject")
         #expect(fetched?.from == "alice@example.com")
         #expect(fetched?.snippet == "Untouched snippet")
         #expect(fetched?.cachedReply == "new reply")
+    }
+
+    // MARK: - The email compose opened for must still be the row written (#400)
+
+    /// IMAP and iCloud: the id is an address (`account:folder:uid`), so the same id can name a different
+    /// email after a UIDVALIDITY reset. The default test account is Gmail, whose address is the identity
+    /// and bypasses the epoch checks, so these run on both epoch-addressed providers.
+    private static let accountId = "acc1"
+    private static let folderPath = "INBOX"
+    private static let uid = "7"
+    private static let epochProviders: [AccountProvider] = [.imap, .icloud]
+    private static let earlier = "earlier suggestion"
+
+    private func epochFixture(_ provider: AccountProvider, folderEpoch: Int?) throws -> DatabaseQueue {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: Self.accountId, email: "user@example.com", provider: provider)
+        var folder = Folder(name: "INBOX", path: Self.folderPath, role: .inbox, accountId: Self.accountId)
+        folder.lastKnownUidValidity = folderEpoch
+        try db.write { try folder.insert($0) }
+        return db
+    }
+
+    /// An email at the shared address, already holding a cached suggestion.
+    private func header(rfc822: String?, epoch: Int?, uid: String = ComposeSuggestionPersistTests.uid) -> MessageHeader {
+        var header = MessageHeader(
+            messageId: uid,
+            subject: "Subject \(rfc822 ?? "none")",
+            from: "Sender <sender@example.com>",
+            fromAddress: "sender@example.com",
+            to: "user@example.com",
+            date: Date().addingTimeInterval(-3600),
+            snippet: "snippet",
+            folderId: MessageIdentity.folderId(accountId: Self.accountId, folderPath: Self.folderPath),
+            accountId: Self.accountId,
+            folderPath: Self.folderPath,
+            isInInbox: true
+        )
+        header.rfc822MessageId = rfc822
+        header.observedUidValidity = epoch
+        header.cachedReply = Self.earlier
+        return header
+    }
+
+    /// The row at `id` must exist (a refusal that deleted it must not read as "nothing written").
+    private func row(_ db: DatabaseQueue, _ id: String) throws -> MessageHeader {
+        try #require(try db.read { try MessageHeader.fetchOne($0, key: id) })
+    }
+
+    @Test("An edit lands on the email compose opened for", arguments: epochProviders)
+    func editLandsOnTheOpenedEmail(provider: AccountProvider) async throws {
+        let db = try epochFixture(provider, folderEpoch: 111)
+        let opened = header(rfc822: "<x@example.com>", epoch: 111)
+        let bystander = header(rfc822: "<z@example.com>", epoch: 111, uid: "8")
+        try await db.write { db in
+            try opened.insert(db)
+            try bystander.insert(db)
+        }
+
+        await ComposeView.writeCachedReplyToDB("my edit", replyTo: opened, db: db)
+
+        #expect(try row(db, opened.id).cachedReply == "my edit")
+        #expect(try row(db, bystander.id).cachedReply == Self.earlier, "the save touched another email")
+    }
+
+    @Test("An edit does not land on a different email seated at the same address", arguments: epochProviders)
+    func editDoesNotLandOnTheReplacement(provider: AccountProvider) async throws {
+        let db = try epochFixture(provider, folderEpoch: 111)
+        let opened = header(rfc822: "<x@example.com>", epoch: 111)
+        try await db.write { try opened.insert($0) }
+
+        // A reset purged the opened email and a resync seated another at the same folder and UID.
+        let replacement: MessageHeader = {
+            var other = header(rfc822: "<y@example.com>", epoch: nil)
+            other.cachedReply = "the replacement's own suggestion"
+            return other
+        }()
+        try await db.write { db in
+            _ = try MessageHeader.deleteOne(db, key: opened.id)
+            try replacement.insert(db)
+        }
+
+        // Non-vacuity: the unguarded statement this replaced lands on the replacement.
+        try await db.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?", arguments: ["control", opened.id])
+        }
+        #expect(try row(db, opened.id).cachedReply == "control", "the replacement must be present and writable")
+        try await db.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
+                           arguments: [replacement.cachedReply, opened.id])
+        }
+
+        await ComposeView.writeCachedReplyToDB("my edit", replyTo: opened, db: db)
+
+        // The replacement is still there, still itself, and still holds its own suggestion.
+        let after = try row(db, opened.id)
+        #expect(after.rfc822MessageId == "<y@example.com>")
+        #expect(after.subject == replacement.subject)
+        #expect(after.cachedReply == "the replacement's own suggestion", "the edit was stored on another email")
+    }
+
+    @Test("An edit does not land on a Message-ID-less replacement seated under the new numbering", arguments: epochProviders)
+    func editDoesNotLandOnAMessageIDLessReplacement(provider: AccountProvider) async throws {
+        // Neither email carries a Message-ID, so only the numbering can tell them apart. The reset moved
+        // the folder to 222 and the replacement was stamped with it; the opened email was seen under 111.
+        let db = try epochFixture(provider, folderEpoch: 222)
+        let opened = header(rfc822: nil, epoch: 111)
+        let replacement: MessageHeader = {
+            var other = header(rfc822: nil, epoch: 222)
+            other.cachedReply = "the replacement's own suggestion"
+            return other
+        }()
+        try await db.write { db in
+            try replacement.insert(db)
+        }
+
+        // Non-vacuity: the replacement is present at the opened email's address and writable.
+        #expect(opened.id == replacement.id)
+        try await db.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?", arguments: ["control", opened.id])
+        }
+        #expect(try row(db, opened.id).cachedReply == "control")
+        try await db.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
+                           arguments: [replacement.cachedReply, opened.id])
+        }
+
+        await ComposeView.writeCachedReplyToDB("my edit", replyTo: opened, db: db)
+
+        let after = try row(db, opened.id)
+        #expect(after.observedUidValidity == 222)
+        #expect(after.cachedReply == "the replacement's own suggestion", "the edit was stored on another email")
+    }
+
+    @Test("An email without a Message-ID takes the edit while its numbering is proven", arguments: epochProviders)
+    func editLandsWithoutMessageIDWhenNumberingIsProven(provider: AccountProvider) async throws {
+        let db = try epochFixture(provider, folderEpoch: 111)
+        let opened = header(rfc822: nil, epoch: 111)
+        try await db.write { try opened.insert($0) }
+
+        await ComposeView.writeCachedReplyToDB("my edit", replyTo: opened, db: db)
+
+        #expect(try row(db, opened.id).cachedReply == "my edit")
+    }
+
+    @Test("An email without a Message-ID refuses the edit once the numbering has moved", arguments: epochProviders)
+    func editRefusedWithoutMessageIDWhenNumberingMoved(provider: AccountProvider) async throws {
+        let db = try epochFixture(provider, folderEpoch: 222)
+        let opened = header(rfc822: nil, epoch: 111)
+        try await db.write { try opened.insert($0) }
+
+        await ComposeView.writeCachedReplyToDB("my edit", replyTo: opened, db: db)
+
+        #expect(try row(db, opened.id).cachedReply == Self.earlier)
+    }
+
+    @Test("An email without a Message-ID refuses the edit when its numbering was never observed", arguments: epochProviders)
+    func editRefusedWithoutMessageIDWhenNumberingUnknown(provider: AccountProvider) async throws {
+        let db = try epochFixture(provider, folderEpoch: nil)
+        let opened = header(rfc822: nil, epoch: nil)
+        try await db.write { try opened.insert($0) }
+
+        await ComposeView.writeCachedReplyToDB("my edit", replyTo: opened, db: db)
+
+        #expect(try row(db, opened.id).cachedReply == Self.earlier)
+    }
+
+    /// The edit reaches the writer: an inline edit of the visible suggestion in reply mode (not forward,
+    /// not a new message) saves through `writeCachedReplyToDB` with the message compose opened for.
+    @Test("An inline edit of the visible reply suggestion is saved with the message compose opened for")
+    func inlineEditReachesTheWriterWithTheOpenedMessage() throws {
+        let source = try composeSource()
+        let persist = try functionBody(
+            "private func persistCachedReply(", before: "static func writeCachedReplyToDB(", in: source)
+        #expect(persist.contains("guard let reply = replyTo else { return }"))
+        #expect(persist.contains("writeCachedReplyToDB(text, replyTo: reply, db: dbPool.pool)"))
+
+        let edit = try functionBody("private func applyInlineEdit(", before: "private func persistCachedReply(", in: source)
+        let suggestion = try #require(edit.range(of: "if showingSuggestion {"))
+        let gate = try #require(edit.range(of: "if replyTo != nil && !isForward {"))
+        let save = try #require(edit.range(of: "persistCachedReply(b)"))
+        #expect(suggestion.lowerBound < gate.lowerBound && gate.lowerBound < save.lowerBound)
     }
 }

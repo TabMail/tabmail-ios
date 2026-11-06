@@ -2339,16 +2339,26 @@ struct ComposeView: View {
     /// Write the edited suggestion to `messageHeader.cachedReply` so reopens see it.
     private func persistCachedReply(_ text: String) {
         guard let reply = replyTo else { return }
-        Task { await Self.writeCachedReplyToDB(text, headerId: reply.id, db: dbPool.pool) }
+        Task { await Self.writeCachedReplyToDB(text, replyTo: reply, db: dbPool.pool) }
     }
 
     /// Internal for testability — exact SQL used by `persistCachedReply`.
-    static func writeCachedReplyToDB(_ text: String, headerId: String, db: any DatabaseWriter) async {
+    ///
+    /// `reply` is the email compose opened for. Its id is an address, not an identity: a UIDVALIDITY
+    /// reset can purge the email while compose is open and a resync can seat a different one at the
+    /// same address. The edit is stored only while the row at that address is still the email compose
+    /// opened for (`AIWriteTarget` captured from `reply`, one transaction); on any doubt nothing is
+    /// written. The edit stays in the open compose, and the cache is a convenience for reopening, so
+    /// a refused write costs that convenience, while the alternative stores it on another email.
+    static func writeCachedReplyToDB(_ text: String, replyTo reply: MessageHeader, db: any DatabaseWriter) async {
         try? await db.write { db in
-            try db.execute(
-                sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
-                arguments: [text, headerId]
-            )
+            guard let target = try AIWriteTarget.capture(message: reply, db: db) else { return }
+            _ = try AccountManager.aiGuardedHeaderWrite(db, target: target) { _, db in
+                try db.execute(
+                    sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
+                    arguments: [text, reply.id]
+                )
+            }
         }
     }
 

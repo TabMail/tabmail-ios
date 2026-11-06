@@ -27,13 +27,15 @@ import UserNotifications
 // is NOT for user gestures: these nine sites — predicate, comments excluded so
 // this sentence cannot satisfy it:
 //   `rg -n --pcre2 '^(?!\s*(///|//)).*aiGuardedHeaderWrite\(db, target:'
-//    TabMail/ Shared/ TabMailNotificationService/` → **9**
-//   (`AccountManagerAI` ×5, `ActiveAIQueue` ×4)
-// — write DERIVED AI METADATA, which is
+//    TabMail/ Shared/ TabMailNotificationService/` → **10**
+//   (`AccountManagerAI` ×5, `ActiveAIQueue` ×4, `ComposeView` ×1)
+// — nine of them write DERIVED AI METADATA, which is
 // recomputable — the queue's own GRDB arbiter (`ActiveAIQueue.readJobOutcome`)
 // sees the field still empty and re-drives the job. This leniency does NOT
 // generalize to any user-intention path (see `Core Philosophy: Never Drop User
-// Intention`).
+// Intention`). The tenth, `ComposeView.writeCachedReplyToDB`, stores a user's
+// edit of the suggestion, but only into the reopen-time cache; the edit itself
+// stays in the open compose, so a refused write costs that convenience only.
 
 /// Outcome of a guarded AI header write. `Sendable` because it is produced inside
 /// an async `dbPool.write` and returned across the await boundary.
