@@ -10,7 +10,8 @@ import Testing
 ///
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. Every email of the thread shows once, oldest first; drafts never show (Q22).
-///  2. One email in two folders shows once: the opened copy, else one with a text message.
+///  2. One email in two folders shows once: the opened copy, else one with a text message. Headers
+///     without a Message-ID are copies only when a provider id names the message in one account.
 ///  3. An email is the user's own when it is from one of their addresses or sits in a Sent folder.
 ///  4. The next reply goes to the newest email's Reply All people, never the user; more than one
 ///     other person makes a group.
@@ -96,6 +97,42 @@ struct ChatThreadTests {
         #expect(Self.thread([bare, summarized]).items.map(\.id) == [summarized.id])
         #expect(Self.thread([summarized, bare]).items.map(\.id) == [summarized.id])
         #expect(Self.thread([bare, other]).items.map(\.id) == [bare.id])
+    }
+
+    @Test("Without a Message-ID, the same UID in two folders or two accounts is two emails; a provider id names one email in its account")
+    func noMessageIdIsNotACopy() {
+        func bare(_ uid: String, minutesAgo: Double, folder: String = "INBOX", account: String = "acc1") -> MessageHeader {
+            MessageHeader(
+                messageId: uid, subject: "Plans", from: "Alex Doe", fromAddress: "alex@example.com",
+                to: Self.me, date: Self.now.addingTimeInterval(-minutesAgo * 60), snippet: "snippet \(uid)",
+                folderId: "\(account):\(folder)", accountId: account, folderPath: folder,
+                isInInbox: folder == "INBOX")
+        }
+        let parent = bare("1", minutesAgo: 60, folder: "Archive")
+        let opened = bare("1", minutesAgo: 30)
+        let newest = bare("1", minutesAgo: 5, account: "acc2")
+        let chat = Self.thread([parent, opened, newest], preferred: opened.id)
+        #expect(chat.items.map(\.id) == [parent.id, opened.id, newest.id], "three emails show, though their UIDs coincide")
+        #expect(chat.newest?.id == newest.id, "the newest email is the newest, not the opened one")
+        #expect(Set([parent, opened, newest].map(ChatThread.copyKey)).count == 3)
+        // An empty Message-ID is no Message-ID.
+        var emptyA = bare("2", minutesAgo: 20), emptyB = bare("2", minutesAgo: 20, folder: "Archive")
+        emptyA.rfc822MessageId = ""
+        emptyB.rfc822MessageId = ""
+        #expect(Self.thread([emptyA, emptyB]).items.count == 2)
+
+        // A provider id names the message itself: two folders of one account hold one email,
+        // the same id in another account is another email.
+        let gmailInbox = bare("18c2f0a1b2", minutesAgo: 10)
+        let gmailLabel = bare("18c2f0a1b2", minutesAgo: 10, folder: "Work")
+        let otherAccount = bare("18c2f0a1b2", minutesAgo: 10, account: "acc2")
+        #expect(Self.thread([gmailInbox, gmailLabel], preferred: gmailLabel.id).items.map(\.id) == [gmailLabel.id])
+        #expect(Self.thread([gmailInbox, otherAccount]).items.count == 2)
+        // A Message-ID still makes copies, whatever the UIDs.
+        let rfcA = Self.header("7", minutesAgo: 3, rfc822: "<one@example.com>")
+        let rfcB = Self.header("8", minutesAgo: 3, folder: "Archive", rfc822: "<one@example.com>")
+        #expect(ChatThread.copyKey(rfcA) == ChatThread.copyKey(rfcB))
+        #expect(Self.thread([rfcA, rfcB]).items.count == 1)
     }
 
     // MARK: - 3. Own emails
@@ -225,5 +262,14 @@ struct ChatThreadTests {
         #expect(ChatThread.headerTitle(people) == "Ann, Bo +2")
         #expect(ChatThread.headerTitle(people, nameCount: 3) == "Ann, Bo, Cy +1")
         #expect(ChatThread.headerTitle([]) == "")
+    }
+
+    @Test("The chat view finds an email by its copy key, never by the bare-UID stableId")
+    func chatViewUsesCopyKey() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let text = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Chat/ChatThreadView.swift"), encoding: .utf8)
+        #expect(!text.contains("stableId"), "two emails with one UID and no Message-ID would be taken for one")
+        #expect(text.contains("ChatThread.copyKey($0.header) == ChatThread.copyKey(opened)"), "the opened email is found by its copy key")
     }
 }
