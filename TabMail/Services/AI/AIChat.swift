@@ -23,15 +23,12 @@ extension AIService {
     ///   - userText: The user's message
     ///   - history: Current session turns for multi-turn context (not expired/archived history)
     ///   - onSSEEvent: Optional callback for server-side tool progress (UI activity bubbles)
-    ///   - logsUserText: whether a failure's persistent log line quotes `userText`. False for the
-    ///     chat view's reply field, whose text is often the AI Reply, written from the email.
     /// - Returns: A ChatResponse with assistant text and optional thinking, or nil if empty/error
     func sendChatMessage(
         userText: String,
         history: [ChatTurn],
         onSSEEvent: BackendClient.SSEEventHandler? = nil,
-        invocation: ToolInvocation = .noninteractive,
-        logsUserText: Bool = true
+        invocation: ToolInvocation = .noninteractive
     ) async throws -> ChatResponse? {
         // Per-user-turn pagination cache reset — matches TB resetPaginationSessions()
         // (memory_search.js:11-16). Each user message starts a fresh turn; within that
@@ -123,7 +120,7 @@ extension AIService {
 
         if let error = response.error {
             BackgroundSyncLogger.logDebug("[AIService] sendChatMessage error: \(error)")
-            BackgroundSyncLogger.logChatError("Server error: \(error)", userMessage: logsUserText ? userText : nil)
+            BackgroundSyncLogger.logChatError("Server error: \(error)", userMessage: userText)
             // Refund only when error string indicates transient failure (5xx, demo throttle).
             if inDemo {
                 let dummy = NSError(domain: "AIChat", code: 0, userInfo: [NSLocalizedDescriptionKey: error])
@@ -137,7 +134,7 @@ extension AIService {
 
         guard let text = response.assistant, !text.isEmpty else {
             BackgroundSyncLogger.logDebug("[AIService] sendChatMessage: empty response")
-            BackgroundSyncLogger.logChatError("Empty assistant response from server", userMessage: logsUserText ? userText : nil)
+            BackgroundSyncLogger.logChatError("Empty assistant response from server", userMessage: userText)
             return nil
         }
 
@@ -145,7 +142,7 @@ extension AIService {
         let cleaned = Self.normalizeUnicode(text.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !cleaned.isEmpty else {
             BackgroundSyncLogger.logDebug("[AIService] sendChatMessage: empty response after normalization")
-            BackgroundSyncLogger.logChatError("Response empty after normalizeUnicode+trim (raw len=\(text.count))", userMessage: logsUserText ? userText : nil)
+            BackgroundSyncLogger.logChatError("Response empty after normalizeUnicode+trim (raw len=\(text.count))", userMessage: userText)
             return nil
         }
         BackgroundSyncLogger.logDebug("[AIChatDebug] sendChatMessage raw response (\(cleaned.count) chars):")
