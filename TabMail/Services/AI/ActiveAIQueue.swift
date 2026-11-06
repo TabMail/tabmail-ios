@@ -1488,6 +1488,7 @@ actor ActiveAIQueue {
         BackgroundSyncLogger.logAIProcessing("Summary START \(Self.logId(job.headerId))")
 
         let recipientStatus = await recipientStatusForJob(message, account: account)
+        let isSentByUser = await sentByUser(message)
 
         do {
             let summary = try await config.aiService.generateSummary(
@@ -1499,7 +1500,8 @@ actor ActiveAIQueue {
                 htmlContent: nil,
                 userName: account.displayName,
                 kbText: config.kbText,
-                recipientStatus: recipientStatus
+                recipientStatus: recipientStatus,
+                isSentByUser: isSentByUser
             )
 
             guard let blurb = summary.blurb, !blurb.isEmpty else {
@@ -1575,6 +1577,23 @@ actor ActiveAIQueue {
             toField: message.to, ccField: message.cc, fromField: message.fromAddress,
             claimEmails: [account.emailAddress], suppressEmails: allAccountEmails
         )
+    }
+
+    /// The user wrote this email, as the chat decides it (`ChatThread`): it is from one of the
+    /// user's addresses, or it sits in a Sent folder. A chat summarizes the user's own emails too,
+    /// and their text message is then in the user's voice.
+    private func sentByUser(_ message: MessageHeader) async -> Bool {
+        let found = try? await dbPool.read { db in
+            let addresses = try Account.fetchAll(db).map { $0.emailAddress.lowercased() }
+            let role = try Folder.fetchOne(db, key: message.folderId)?.role
+            return (addresses, role)
+        }
+        guard let (addresses, role) = found else { return false }
+        return Self.isSentByUser(fromAddress: message.fromAddress, accountAddresses: Set(addresses), folderRole: role)
+    }
+
+    nonisolated static func isSentByUser(fromAddress: String, accountAddresses: Set<String>, folderRole: FolderRole?) -> Bool {
+        accountAddresses.contains(fromAddress.lowercased()) || folderRole == .sent
     }
 
     // MARK: - Action Job
