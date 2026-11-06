@@ -1,4 +1,4 @@
-<!-- Copied unchanged from TabMail Voice (apps/desktop/native/shared/dictionary in the tabmail-voice repository), where `generate.py` and `requirements.txt` build `words.txt` and `languages.json`. The same files are used by both apps. -->
+<!-- Copied from TabMail Voice (apps/desktop/native/shared/dictionary in the tabmail-voice repository), with this note added at the top. Only words.txt, languages.json and this README are vendored here; the generator (`generate.py`, `requirements.txt`), its tests and `cases.json` stay in the Voice repository, and the shared cases are kept in the app's test fixtures. The same words.txt and languages.json are used by both apps. -->
 
 # Word list for screen terms
 

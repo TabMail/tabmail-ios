@@ -30,6 +30,16 @@ struct WordListTests {
         }
     }
 
+    /// Forms the shared cases do not reach: an all-capitals Turkish word folds with Turkish's dotted
+    /// and dotless i, an Arabic presentation form is judged as the letters it stands for (compatibility
+    /// normalisation), and a word with a character of no script is not looked up as the rest of it.
+    @Test func turkishCapitalsCompatibilityFormsAndUnassignedCharacters() throws {
+        let list = try list()
+        #expect(list.seen("ACIYOR") == .tenths(45))
+        #expect(list.seen("\u{FEFB}") == list.seen("\u{0644}\u{0627}"))
+        #expect(list.seen("today\u{0378}") == .tenths(0))
+    }
+
     /// A tiny list in a folder, to test the lookup mechanics without the real one's size.
     private func folder(words: [String], languages: String? = nil) throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("wordlist-\(UUID().uuidString)")
