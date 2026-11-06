@@ -34,12 +34,6 @@ final class MessageDetailViewModel {
     /// `.task` and `.onAppear` both call `loadBody()` — the first caller wins.
     @ObservationIgnored private var loadBodyCalled = false
 
-    /// D2: the chat-view summaries for this thread were requested (once per open; later thread
-    /// reloads after merges do not ask again).
-    @ObservationIgnored private var chatSummariesRequested = false
-    /// Test seam, like `_fetchBodyOverride`: receives the D2 request instead of `ActiveAIQueue`.
-    @ObservationIgnored var _requestChatSummariesOverride: (@Sendable ([MessageHeader]) async -> Void)?
-
     /// Guards against concurrent/duplicate `markReadOnOpenIfNeeded()` calls.
     /// Independent of `loadBodyCalled` — mark-read must succeed even when
     /// body load is cancelled mid-DB-read.
@@ -2335,8 +2329,6 @@ final class MessageDetailViewModel {
     /// Fire-and-forget async thread detection — does not block message rendering.
     private func loadThreadMessagesAsync() {
         guard let msg = message else { return }
-        // Settings snapshot for this load: whether it asks for the thread's chat summaries.
-        let requestChatSummaries = !chatSummariesRequested && ChatViewConfig.isActive
         threadLoadGeneration += 1
         let generation = threadLoadGeneration
         if DebugModeManager.isLoggingEnabled() {
@@ -2386,20 +2378,6 @@ final class MessageDetailViewModel {
                 let results = try await Task.detached {
                     try ThreadDetection.findRelatedMessages(for: msg, in: pool.pool)
                 }.value
-                // D2: opening a thread asks for the summary of every email in it that has none
-                // with a text message, from any folder, the user's own emails included.
-                if requestChatSummaries, !self.chatSummariesRequested {
-                    self.chatSummariesRequested = true
-                    let members = [msg] + results
-                    let override = self._requestChatSummariesOverride
-                    Task {
-                        if let override {
-                            await override(members)
-                        } else {
-                            await ActiveAIQueue.shared.enqueueChatSummaries(members)
-                        }
-                    }
-                }
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[ThreadDebug] Found \(results.count) related messages for \(msg.id.prefix(40))")
                     for r in results {

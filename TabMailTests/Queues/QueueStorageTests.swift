@@ -298,4 +298,44 @@ struct QueueStorageTests {
         #expect(added == true)
         #expect(storage.count == 1)
     }
+
+    // MARK: - Move to front
+
+    /// An item whose identity ignores its context, like `ActiveAIQueue.AIJob.windowExempt`.
+    private struct Tagged: Hashable {
+        let id: String
+        let tag: String
+        static func == (lhs: Tagged, rhs: Tagged) -> Bool { lhs.id == rhs.id }
+        func hash(into hasher: inout Hasher) { hasher.combine(id) }
+    }
+
+    @Test("moveToFront puts pending items first in the given order and keeps the rest in theirs")
+    func moveToFrontOrders() {
+        var storage = QueueStorage<String>()
+        storage.enqueueBatch(["a", "b", "c", "d", "e"])
+        storage.moveToFront(["d", "unknown", "b", "d"])
+        #expect(storage.queue == ["d", "b", "a", "c", "e"])
+        #expect(storage.enqueued == ["a", "b", "c", "d", "e"], "membership unchanged")
+    }
+
+    @Test("moveToFront leaves in-flight items where they are")
+    func moveToFrontSkipsInFlight() {
+        var storage = QueueStorage<String>()
+        storage.enqueueBatch(["a", "b", "c"])
+        let taken = storage.collectCandidates(maxJobs: 1)
+        #expect(taken == ["a"])
+        // Dispatch moved "a" to the back and marked it in flight.
+        storage.moveToFront(["a", "c"])
+        #expect(storage.queue == ["c", "b", "a"])
+    }
+
+    @Test("moveToFront keeps the queue's own value of an equal item")
+    func moveToFrontKeepsStoredValue() {
+        var storage = QueueStorage<Tagged>()
+        storage.enqueue(Tagged(id: "a", tag: "stored"))
+        storage.enqueue(Tagged(id: "b", tag: "stored"))
+        storage.moveToFront([Tagged(id: "b", tag: "offer")])
+        #expect(storage.queue.map(\.id) == ["b", "a"])
+        #expect(storage.queue.allSatisfy { $0.tag == "stored" })
+    }
 }
