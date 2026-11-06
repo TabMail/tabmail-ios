@@ -19,7 +19,8 @@ import GRDB
 ///  4. A chat's request covers every email it names without a done chat summary, any folder; one
 ///     without its body is sent to the body queue and gets its job when the body is written. The
 ///     work goes to the front of both queues in the order asked, so what is on screen comes first
-///     and the latest request beats earlier ones.
+///     and the latest request beats earlier ones; an earlier request that resumes later (from the
+///     database read or the body hop) adds its work behind, never ahead of the latest.
 ///  5. The walk covers the threads of the newest `SyncConfig.maxRecentEmails` Inbox rows and nothing
 ///     else, at most each thread's newest `ChatViewConfig.summaryLead` emails, members with their
 ///     body and without a done chat summary, never Trash.
@@ -73,6 +74,14 @@ struct ChatSummaryQueueTests {
     private actor BodyRequests {
         var ids: [String] = []
         func add(_ headers: [MessageHeader]) { ids.append(contentsOf: headers.map(\.id)) }
+    }
+
+    /// Holds a request in its body hop until opened.
+    private actor BodyHop {
+        private var held: CheckedContinuation<Void, Never>?
+        var isHolding: Bool { held != nil }
+        func hold() async { await withCheckedContinuation { held = $0 } }
+        func open() { held?.resume(); held = nil }
     }
 
     private func header(blurb: String?, textMessage: String?, isInInbox: Bool = true) -> MessageHeader {
@@ -265,9 +274,49 @@ struct ChatSummaryQueueTests {
         jobs = await queue.queuedJobsForTesting
         #expect(jobs.prefix(3).map(\.headerId) == [a.id, c.id, b.id])
 
-        // A body that lands for an email asked for: its job comes first too.
+        // A body that lands for an email only the earlier request asked for joins behind.
         await queue.chatBodyArrived(headerId: bodilessOne.id)
-        #expect(await queue.queuedJobsForTesting.first?.headerId == bodilessOne.id)
+        jobs = await queue.queuedJobsForTesting
+        #expect(jobs.first?.headerId == a.id, "the latest request stays first: \(jobs.map(\.headerId))")
+        #expect(jobs.contains { $0.headerId == bodilessOne.id && $0.forChat })
+
+        // One the latest request asked for comes first.
+        await queue.enqueueChatSummaries([bodilessTwo], requestBodies: { _ in })
+        await queue.chatBodyArrived(headerId: bodilessTwo.id)
+        #expect(await queue.queuedJobsForTesting.first?.headerId == bodilessTwo.id)
+    }
+
+    @Test("An earlier request that resumes after a later one never puts its emails ahead of the later screen")
+    func earlierRequestNeverOvertakes() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let acc = "acc-cs-9"
+        try makeAccount(acc, pool: pool)
+        let a = try insertHeader(accountId: acc, uid: "a", pool: pool)
+        let b = try insertHeader(accountId: acc, uid: "b", pool: pool)
+        let bodiless = try insertHeader(accountId: acc, uid: "nb", bodyComplete: false, pool: pool)
+
+        let queue = ActiveAIQueue()
+        await queue.setDispatchSuppressedForTesting(true)
+        let hop = BodyHop()
+        let earlier = Task { await queue.enqueueChatSummaries([a, bodiless], requestBodies: { _ in await hop.hold() }) }
+        for _ in 0..<200 {
+            if await hop.isHolding { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(await hop.isHolding, "the earlier request waits in its body hop")
+
+        await queue.enqueueChatSummaries([b], requestBodies: { _ in })
+        await hop.open()
+        await earlier.value
+        var jobs = await queue.queuedJobsForTesting.map(\.headerId)
+        #expect(jobs.first == b.id, "the later screen stays first: \(jobs)")
+        #expect(jobs.contains(a.id), "the earlier request's email still waits")
+
+        await queue.chatBodyArrived(headerId: bodiless.id)
+        jobs = await queue.queuedJobsForTesting.map(\.headerId)
+        #expect(jobs.first == b.id, "its body landing does not overtake either: \(jobs)")
+        #expect(jobs.contains(bodiless.id))
     }
 
     @Test("The body queue puts a chat's emails first, in the order asked")

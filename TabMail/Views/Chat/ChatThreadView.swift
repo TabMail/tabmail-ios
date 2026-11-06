@@ -181,7 +181,7 @@ struct ChatThreadView: View {
         .sheet(item: $cardMessage) { msg in
             // N3: today's detail of that email, from the bottom; swipe down to return.
             NavigationStack {
-                MessageDetailView(messageId: msg.id)
+                MessageDetailView(messageId: msg.id, expectedRfc822MessageId: msg.rfc822MessageId)
             }
             .presentationDragIndicator(.visible)
         }
