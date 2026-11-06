@@ -177,7 +177,7 @@ struct ChatThreadView: View {
             sentReplies.settle(thread.items)
         }
         // A new newest email has its own people: the next reply is a Reply All to them.
-        .onChange(of: thread.newest?.stableId) { _, _ in replyTarget = .replyAll }
+        .onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 // R1.2: Forward the newest email, in today's forward compose.
