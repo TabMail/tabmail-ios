@@ -627,7 +627,7 @@ struct DynamicIslandChat: View {
                     }
                 }
 
-                if autoDictation && replyField == nil {
+                if Self.autoListens(autoDictation: autoDictation, inChat: replyField != nil) {
                     // Start dictation after the animation fully settles.
                     // (Never in the chat view: there the mic listens only when tapped, Q16.)
                     // Task is stored so collapse cancels it (prevents a double start).
@@ -718,7 +718,7 @@ struct DynamicIslandChat: View {
                 }
                 return
             }
-            guard autoDictation, replyField == nil, isExpanded, !isTextFieldFocused else {
+            guard Self.autoListens(autoDictation: autoDictation, inChat: replyField != nil), isExpanded, !isTextFieldFocused else {
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[DynamicIslandChat] dictation-auto-restart: skip — replyField=\(replyField != nil) autoDictation=\(autoDictation) isExpanded=\(isExpanded) isTextFieldFocused=\(isTextFieldFocused)")
                 }
@@ -1452,6 +1452,13 @@ struct DynamicIslandChat: View {
     /// `auto`: started by the pill itself (it opened, the agent finished, Auto-Enable Dictation), not
     /// by a tap on the mic. The on-device recognizer asks for permission on a tap only: an auto-start
     /// runs when speech recognition and the microphone are both already granted, else it does nothing.
+    /// Whether dictation starts by itself, on open and after the agent's turn: only with the
+    /// auto-dictation preference on, and never in the chat view's reply field, where the mic
+    /// listens only when tapped (Q16). The ONE decision both automatic starts ask.
+    static func autoListens(autoDictation: Bool, inChat: Bool) -> Bool {
+        autoDictation && !inChat
+    }
+
     private func startDictation(auto: Bool = false) {
         // Auto-start follows the mic button: while it is off, nothing starts.
         guard canDictate else { return }

@@ -165,6 +165,44 @@ struct ChatReplyFieldTests {
         #expect(replies.entries(accountId: "acc2", messageIds: ["<1@example.com>"]).isEmpty)
     }
 
+    @Test("Only a sent compose card keeps the reply's words and empties the field; a cancelled or failed one changes nothing",
+          arguments: ["sent", "cancelled", "failed"])
+    func composeEndedKeepsOnlySent(outcomeName: String) {
+        let outcome: ComposeOutcome = switch outcomeName {
+        case "sent": .sent
+        case "cancelled": .cancelled
+        default: .failed("The account could not send")
+        }
+        let sent = outcomeName == "sent"
+        let replies = ChatSentReplies()
+        var parent = Self.header("1")
+        parent.rfc822MessageId = "<1@example.com>"
+        #expect(replies.composeEnded(outcome, replyTo: parent, words: "Tuesday works") == sent,
+                "the field empties only after a send")
+        #expect(replies.entries.map(\.text) == (sent ? ["Tuesday works"] : []), "the Sent bubble keeps the words only after a send")
+        #expect(replies.entries.map(\.repliedTo) == (sent ? ["<1@example.com>"] : []))
+        // A sent card without the field's words (an agent compose) or without a parent still empties the field.
+        #expect(replies.composeEnded(outcome, replyTo: parent, words: nil) == sent)
+        #expect(replies.composeEnded(outcome, replyTo: nil, words: "Hello") == sent)
+        #expect(replies.entries.count == (sent ? 1 : 0), "no words, no Sent bubble")
+    }
+
+    @Test("Dictation starts by itself only with the preference on and never in the chat's reply field",
+          arguments: [false, true], [false, true])
+    func autoListens(autoDictation: Bool, inChat: Bool) {
+        #expect(DynamicIslandChat.autoListens(autoDictation: autoDictation, inChat: inChat) == (autoDictation && !inChat))
+    }
+
+    @Test("Both automatic dictation starts ask the one rule, and nothing else starts dictation by itself")
+    func autoListenWiring() throws {
+        let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        #expect(Self.count("Self.autoListens(autoDictation: autoDictation, inChat: replyField != nil)", in: text) == 2,
+                "the open and the after-the-agent's-turn starts")
+        #expect(Self.count("startDictation(auto: true)", in: text) == 3, "those two and the prompt's Enable; no other automatic start")
+        #expect(Self.count("} else if !dictationPromptShown && !TutorialCoordinator.shared.isRunning && replyField == nil {", in: text) == 1,
+                "the prompt whose Enable starts dictation never shows in the chat")
+    }
+
     @Test("A sent reply goes once its email has a text message, or after its lifetime")
     func sentReplySettles() {
         let replies = ChatSentReplies()
@@ -234,9 +272,15 @@ struct ChatReplyFieldTests {
         #expect(Self.count("onAgentOutcome: { outcome in composeEnded(outcome, replyTo: msg, words: words) }", in: text) == 1)
         #expect(Self.count("composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil, words: words)", in: text) == 1)
         #expect(Self.count("onAgentOutcome: onOutcome)", in: text) == 3, "every agent compose")
+        // Every compose card hands its own outcome on: four callbacks, none naming an outcome itself.
+        #expect(Self.count("onAgentOutcome:", in: text) == 4)
+        #expect(Self.count("composeEnded(.", in: text) == 0 && Self.count("{ _ in composeEnded", in: text) == 0)
+        #expect(Self.count("onAgentOutcome: { outcome in composeEnded(outcome, replyTo: msg, words: words) })", in: text) == 1,
+                "the field's own compose hands on its outcome")
+        #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil, words: words)", in: text) == 1,
+                "an agent compose hands on its outcome")
         let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?, words: String?) {", in: text)
-        #expect(Self.count("guard case .sent = outcome else { return }", in: ended) == 1)
-        #expect(Self.count("sentReplies.add(accountId: replyTo.accountId, repliedTo: repliedTo, text: words)", in: ended) == 1)
+        #expect(Self.count("if sentReplies.composeEnded(outcome, replyTo: replyTo, words: words) { fieldClearCount += 1 }", in: ended) == 1)
         #expect(Self.count("sentReplies.settle(thread.items)", in: text) == 1)
         #expect(Self.count("ChatSentReplyBubble(text: entry.text)", in: text) == 1)
     }

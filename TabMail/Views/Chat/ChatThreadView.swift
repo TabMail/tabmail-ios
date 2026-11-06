@@ -452,11 +452,7 @@ struct ChatThreadView: View {
     /// A compose card from the chat closed. Sent: the field empties and, for a reply, the chat
     /// shows the words until the sent email's own text message arrives (N6.3, N7).
     private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?, words: String?) {
-        guard case .sent = outcome else { return }
-        if let replyTo, let repliedTo = replyTo.rfc822MessageId, let words {
-            sentReplies.add(accountId: replyTo.accountId, repliedTo: repliedTo, text: words)
-        }
-        fieldClearCount += 1
+        if sentReplies.composeEnded(outcome, replyTo: replyTo, words: words) { fieldClearCount += 1 }
     }
 
     /// This chat's sent replies still waiting for their email's text message.

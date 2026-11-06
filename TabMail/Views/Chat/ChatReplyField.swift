@@ -99,6 +99,18 @@ final class ChatSentReplies {
         entries.append(Entry(accountId: accountId, repliedTo: repliedTo, text: text, sentAt: sentAt))
     }
 
+    /// A compose card opened from the chat ended. Only a sent one counts: a sent reply keeps the
+    /// user's words as its Sent bubble until its email's text message arrives, and the caller empties
+    /// the field. A cancelled or failed card changes nothing. Returns whether it was sent.
+    @discardableResult
+    func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?, words: String?) -> Bool {
+        guard case .sent = outcome else { return false }
+        if let replyTo, let repliedTo = replyTo.rfc822MessageId, let words {
+            add(accountId: replyTo.accountId, repliedTo: repliedTo, text: words)
+        }
+        return true
+    }
+
     /// The entries for a chat whose emails have these Message-IDs.
     func entries(accountId: String, messageIds: Set<String>) -> [Entry] {
         entries.filter { $0.accountId == accountId && messageIds.contains($0.repliedTo) }
