@@ -33,4 +33,12 @@ if [ -z "$team" ]; then
 fi
 
 export DEVELOPMENT_TEAM="$team"
-exec xcodegen generate "$@"
+xcodegen generate "$@"
+
+# Pin every package to the versions in the tracked Package.resolved. The generated project is not
+# tracked (and is rewritten by the line above), so the pins live at the repository root and are
+# copied to where Xcode and xcodebuild read them; every clone and every release then resolves the
+# same versions. To move a package, change the root file (see ADR-IOS-102), never the copy.
+pins="TabMail.xcodeproj/project.xcworkspace/xcshareddata/swiftpm"
+mkdir -p "$pins"
+cp Package.resolved "$pins/Package.resolved"

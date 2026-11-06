@@ -18,7 +18,8 @@ build/
 .swiftpm/
 Packages/
 Package.pins
-Package.resolved
+# NOTE: /Package.resolved is deliberately NOT ignored. It pins every package version and
+# Scripts/xcodegen.sh copies it into the generated project (ADR-IOS-102).
 Pods/
 .DS_Store
 *.swp
