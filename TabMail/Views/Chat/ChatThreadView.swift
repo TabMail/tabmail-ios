@@ -341,8 +341,8 @@ struct ChatThreadView: View {
 
     /// Asks for the summaries of the emails on screen and those near them, on screen first
     /// (`ChatSummaryWindow`, owner 2026-11-06): until the user first scrolls by hand, the
-    /// `ChatViewConfig.summaryLead` emails above the oldest on screen; after it,
-    /// `ChatViewConfig.summarySpread` on each side. Runs whenever the emails on screen change while
+    /// `ChatViewConfig.summaryWindow` emails above the oldest on screen; after it,
+    /// `ChatViewConfig.summaryWindow` on each side. Runs whenever the emails on screen change while
     /// the scroll is at rest, and when a scroll stops. The chat view setting is read once, here.
     /// Asks once the screen has stayed the same for `ChatViewConfig.summaryAskSettle` with the
     /// scroll at rest; each change starts the wait again.

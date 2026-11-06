@@ -23,16 +23,16 @@ enum ChatSummaryWindow {
         return ids
     }
 
-    /// The chat's window: the screen and `ChatViewConfig.summaryLead` above it until the user has
-    /// scrolled by hand, then `ChatViewConfig.summarySpread` on each side.
+    /// The chat's window: the screen and `ChatViewConfig.summaryWindow` above it until the user
+    /// has scrolled by hand, then `ChatViewConfig.summaryWindow` on each side.
     static func ids(order: [String], visible: Set<String>, handScrolled: Bool) -> [String] {
         ids(order: order, visible: visible,
-            older: handScrolled ? ChatViewConfig.summarySpread : ChatViewConfig.summaryLead,
-            newer: handScrolled ? ChatViewConfig.summarySpread : 0)
+            older: ChatViewConfig.summaryWindow,
+            newer: handScrolled ? ChatViewConfig.summaryWindow : 0)
     }
 
     /// Whether the user moved the chat by hand: a finger drag or the fling after it. Only then does
-    /// a stop ask `ChatViewConfig.summarySpread` both ways; the chat's own scroll to its opening
+    /// a stop ask `ChatViewConfig.summaryWindow` both ways; the chat's own scroll to its opening
     /// place (the Unread line, a searched email) and the jump to the bottom keep the open window.
     static func userMoved(_ phase: ScrollPhase) -> Bool {
         phase == .interacting || phase == .decelerating

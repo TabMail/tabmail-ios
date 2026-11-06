@@ -17,16 +17,16 @@ struct ChatSummaryWindowTests {
     private let order = (0..<50).map { "e\($0)" }
     private func ids(_ range: ClosedRange<Int>) -> [String] { range.map { "e\($0)" } }
 
-    @Test("At open: the emails on screen, newest first, then summaryLead older ones, nearest first")
+    @Test("At open: the emails on screen, newest first, then summaryWindow older ones, nearest first")
     func openWindow() {
         let visible = Set(ids(45...49))
-        let got = ChatSummaryWindow.ids(order: order, visible: visible, older: ChatViewConfig.summaryLead, newer: 0)
-        #expect(got == Array(ids(45...49).reversed()) + Array(ids((45 - ChatViewConfig.summaryLead)...44).reversed()))
+        let got = ChatSummaryWindow.ids(order: order, visible: visible, older: ChatViewConfig.summaryWindow, newer: 0)
+        #expect(got == Array(ids(45...49).reversed()) + Array(ids((45 - ChatViewConfig.summaryWindow)...44).reversed()))
     }
 
-    @Test("After a scroll: the emails on screen, then summarySpread on each side, nearest first, older first")
+    @Test("After a scroll: the emails on screen, then summaryWindow on each side, nearest first, older first")
     func scrollWindow() {
-        let spread = ChatViewConfig.summarySpread
+        let spread = ChatViewConfig.summaryWindow
         let visible = Set(ids(24...26))
         let got = ChatSummaryWindow.ids(order: order, visible: visible, older: spread, newer: spread)
         var expected = Array(ids(24...26).reversed())
@@ -53,14 +53,14 @@ struct ChatSummaryWindowTests {
         #expect(ChatSummaryWindow.ids(order: order, visible: ["chat-bottom", "e49"], older: 1, newer: 0) == ["e49", "e48"])
     }
 
-    @Test("The chat's window: summaryLead above the screen at open, summarySpread each way once the user has scrolled by hand")
+    @Test("The chat's window: summaryWindow above the screen at open, and each way once the user has scrolled by hand")
     func chatWindow() {
         let visible = Set(ids(24...26))
         #expect(ChatSummaryWindow.ids(order: order, visible: visible, handScrolled: false)
-                == ChatSummaryWindow.ids(order: order, visible: visible, older: ChatViewConfig.summaryLead, newer: 0))
+                == ChatSummaryWindow.ids(order: order, visible: visible, older: ChatViewConfig.summaryWindow, newer: 0))
         #expect(ChatSummaryWindow.ids(order: order, visible: visible, handScrolled: true)
                 == ChatSummaryWindow.ids(order: order, visible: visible,
-                                         older: ChatViewConfig.summarySpread, newer: ChatViewConfig.summarySpread))
+                                         older: ChatViewConfig.summaryWindow, newer: ChatViewConfig.summaryWindow))
     }
 
     @Test("Only a hand scroll widens the window: a drag or its fling, never the chat's own scroll or a resting list")
@@ -72,9 +72,8 @@ struct ChatSummaryWindowTests {
         #expect(!ChatSummaryWindow.userMoved(.idle))
     }
 
-    @Test("The numbers are the owner's")
-    func ownerNumbers() {
-        #expect(ChatViewConfig.summaryLead == 10)
-        #expect(ChatViewConfig.summarySpread == 20)
+    @Test("The window is the owner's one number: 10 above the screen at open, 10 each way after a hand scroll")
+    func ownerNumber() {
+        #expect(ChatViewConfig.summaryWindow == 10)
     }
 }

@@ -22,7 +22,7 @@ import GRDB
 ///     and the latest request beats earlier ones; an earlier request that resumes later (from the
 ///     database read or the body hop) adds its work behind, never ahead of the latest.
 ///  5. The walk covers the threads of the newest `SyncConfig.maxRecentEmails` Inbox rows and nothing
-///     else, at most each thread's newest `ChatViewConfig.summaryLead` emails, members with their
+///     else, at most each thread's newest `ChatViewConfig.summaryWindow` emails, members with their
 ///     body and without a done chat summary, never Trash.
 ///  6. Release builds keep all of it off; the debug override counts only while debug is unlocked;
 ///     on also needs the user's toggle and AI on, and AI going off never rewrites the toggle.
@@ -383,14 +383,14 @@ struct ChatSummaryQueueTests {
         #expect(ids == [MessageIdentity.headerId(accountId: acc, folderPath: "Sent", messageId: "new-reply")])
     }
 
-    @Test("The walk takes at most each thread's newest summaryLead emails")
+    @Test("The walk takes at most each thread's newest summaryWindow emails")
     func walkTakesEachThreadsNewest() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let acc = "acc-cs-9"
         try makeAccount(acc, pool: pool)
         let now = Date()
-        let length = ChatViewConfig.summaryLead + 5
+        let length = ChatViewConfig.summaryWindow + 5
         // A chain, oldest first; only the newest is in the Inbox.
         var ids: [String] = []
         for i in 0..<length {
@@ -401,7 +401,7 @@ struct ChatSummaryQueueTests {
             ids.append(h.id)
         }
         let candidates = try ActiveAIQueue.chatWalkCandidates(pool: pool).map(\.headerId)
-        #expect(Set(candidates) == Set(ids.suffix(ChatViewConfig.summaryLead)),
+        #expect(Set(candidates) == Set(ids.suffix(ChatViewConfig.summaryWindow)),
                 "the newest emails, which an open chat shows first; the rest wait for the chat to ask")
     }
 
