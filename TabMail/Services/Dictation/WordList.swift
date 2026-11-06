@@ -13,8 +13,8 @@ enum WordSeen: Equatable, Sendable {
     case tenths(Int)
 }
 
-/// The word list the screen terms are judged by (ADR-IOS-101): 42 languages' lists from wordfreq's
-/// data merged into one, each word with the most often any of them sees it, in `Vendor/wordlist`
+/// The word list the screen terms are judged by (ADR-IOS-101): 41 languages' lists from FrequencyWords'
+/// counts merged into one, each word with the most often any of them sees it, in `Vendor/wordlist`
 /// (the same files TabMail Voice ships). A word on screen is looked up in each form the lists
 /// written in its script store their words in, and gets the most any of them sees it.
 ///
@@ -27,7 +27,7 @@ final class WordList: Sendable {
     static let bundled: WordList? = Bundle.main.url(forResource: "wordlist", withExtension: nil).flatMap { WordList(folder: $0) }
 
     /// How a word is put in the form a list has its words in (`languages.json`): wordfreq's
-    /// `preprocess_text` for the list's language.
+    /// `preprocess_text` for the list's language (the code the list was generated with).
     private struct Form: Hashable {
         /// NFKC rather than NFC.
         var compatibility: Bool
@@ -70,9 +70,10 @@ final class WordList: Sendable {
         "Latn": "a", "Taml": "\u{0BA4}",
     ]
 
-    /// The characters that join the parts of a word ("что-то", "don't"); a word none of the lists has is
-    /// as often seen as its least seen part when every part is in one list.
-    private static let joiners: Set<Unicode.Scalar> = ["-", "'", "\u{2019}", "\u{02BC}"]
+    /// The characters that join the parts of a word ("что-то", "don't", Catalan's "col·legi" with its
+    /// middle dot, Persian's zero-width non-joiner); a word none of the lists has is as often seen as
+    /// its least seen part when every part is in one list.
+    private static let joiners: Set<Unicode.Scalar> = ["-", "'", "\u{2019}", "\u{02BC}", "\u{00B7}", "\u{200C}", "\u{200D}"]
 
     /// The list in `folder` (`languages.json`, `words.txt`); nil when either can't be read.
     init?(folder: URL) {

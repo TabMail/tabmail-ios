@@ -70,11 +70,16 @@ struct WordListTests {
     /// A word joined by hyphens or apostrophes is as often seen as its least seen part, when every
     /// part is listed.
     @Test func aJoinedWordIsAsOftenSeenAsItsLeastSeenPart() throws {
-        let url = try folder(words: ["don\t62\n", "known\t51\n", "t\t30\n", "well\t54\n"])
+        let url = try folder(words: ["col\t45\n", "don\t62\n", "known\t51\n", "legi\t42\n", "t\t30\n", "well\t54\n"])
         defer { try? FileManager.default.removeItem(at: url) }
         let list = try #require(WordList(folder: url))
         #expect(list.seen("well-known") == .tenths(51))
         #expect(list.seen("Well\u{2019}Known") == .tenths(51))
+        // Catalan's middle dot and the zero-width (non-)joiner join parts too.
+        #expect(list.seen("col\u{00B7}legi") == .tenths(42))
+        #expect(list.seen("col\u{200C}legi") == .tenths(42))
+        #expect(list.seen("col\u{200D}legi") == .tenths(42))
+        #expect(list.seen("col\u{00B7}xyvora") == .tenths(0))
         #expect(list.seen("don't") == .tenths(30))
         #expect(list.seen("don\u{2019}t") == .tenths(30))
         #expect(list.seen("well-xyvora") == .tenths(0))

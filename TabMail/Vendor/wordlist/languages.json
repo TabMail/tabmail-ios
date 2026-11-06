@@ -3615,20 +3615,6 @@
     ]
    ]
   },
-  "ja": {
-   "dotless_i": false,
-   "letters": null,
-   "marks": false,
-   "normal": "NFKC",
-   "under": null,
-   "writings": [
-    [
-     "Hani",
-     "Hira",
-     "Kana"
-    ]
-   ]
-  },
   "ko": {
    "dotless_i": false,
    "letters": null,

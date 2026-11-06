@@ -67,11 +67,17 @@ struct DictationContextTermsTests {
         #expect(DictationContextTerms.candidates(in: "Xyvora\(space)Brevalle") == ["Xyvora", "Brevalle"])
     }
 
+    /// The app's cutoff is the one the shared cases were written for (Voice's `cases.json`).
+    @Test func theCutoffIsTheSharedOne() throws {
+        #expect(try WordListCases.load().cutoff == DictationConfig.screenTermCommonZipf)
+    }
+
     /// A term is a word the list sees below the cutoff; at it, the word is ordinary.
     @Test func aWordBelowTheCutoffIsATerm() {
-        let answers: [String: WordSeen] = ["Xyvora": .tenths(39), "Brevalle": .tenths(40), "Quill": .tenths(0), "Kaelthorne": .tenths(75)]
+        let cutoff = DictationConfig.screenTermCommonZipf
+        let answers: [String: WordSeen] = ["Xyvora": .tenths(cutoff - 1), "Brevalle": .tenths(cutoff), "Quill": .tenths(0), "Kaelthorne": .tenths(75)]
         #expect(terms("Xyvora Brevalle Quill Kaelthorne", answers) == ["Quill", "Xyvora"])
-        #expect(terms("Xyvora Brevalle Quill Kaelthorne", answers, cutoff: 41) == ["Quill", "Xyvora", "Brevalle"])
+        #expect(terms("Xyvora Brevalle Quill Kaelthorne", answers, cutoff: cutoff + 1) == ["Quill", "Xyvora", "Brevalle"])
         #expect(terms("Xyvora Brevalle", answers, cutoff: 0) == [])
     }
 
@@ -95,7 +101,7 @@ struct DictationContextTermsTests {
 
     /// Each word stands alone: a name's words are judged one by one, not joined.
     @Test func eachWordStandsAlone() {
-        #expect(terms("From: Kaelthorne Drake", ["From": .tenths(66), "Kaelthorne": .tenths(0), "Drake": .tenths(40)]) == ["Kaelthorne"])
+        #expect(terms("From: Kaelthorne Drake", ["From": .tenths(66), "Kaelthorne": .tenths(0), "Drake": .tenths(DictationConfig.screenTermCommonZipf)]) == ["Kaelthorne"])
         #expect(terms("Xyvora Brevalle Labs") == ["Xyvora", "Brevalle", "Labs"])
     }
 
@@ -103,7 +109,8 @@ struct DictationContextTermsTests {
     /// most often on screen, then the earliest; the same word in another case is one term, spelled
     /// as first seen.
     @Test func theRarestComeFirstThenTheMostOftenThenTheEarliest() {
-        let answers: [String: WordSeen] = ["Nairobi": .tenths(35), "Priya": .tenths(36), "Tolkien": .tenths(34), "Zorbel": .noList]
+        let cutoff = DictationConfig.screenTermCommonZipf
+        let answers: [String: WordSeen] = ["Nairobi": .tenths(cutoff - 5), "Priya": .tenths(cutoff - 4), "Tolkien": .tenths(cutoff - 6), "Zorbel": .noList]
         #expect(terms("Nairobi met Priya. Brevalle, Xyvora and Xyvora met Nairobi and Tolkien Zorbel", answers.merging(["met": .tenths(70), "and": .tenths(74)]) { $1 })
             == ["Xyvora", "Brevalle", "Zorbel", "Tolkien", "Nairobi", "Priya"])
         #expect(terms("xyvora Xyvora XYVORA Brevalle") == ["xyvora", "Brevalle"])

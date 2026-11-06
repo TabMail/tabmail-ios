@@ -1,5 +1,5 @@
 {
-  "comment": "The screen terms' test against the word list in words.txt (ADR-DESK-038, amended 2026-11-05). Every implementation runs these. `frequencies`: words, and how often the word list sees each, in Zipf tenths (the most any list written in its script sees it in that list's form; 0: none has it; null: no list is written in its script); a case naming a `list` holds a word of that list. `terms`: a screen's text, the answer for each word the rule asks about (checked against the word list too), and the terms picked, in order, with `cutoff` (Zipf tenths) as the line between rare and common. A term case's `zipf` names exactly the words the rule asks about (its candidates).",
+  "comment": "The screen terms' test against the word list in words.txt (ADR-DESK-038, amended 2026-11-05 and 2026-11-06). Every implementation runs these. `frequencies`: words, and how often the word list sees each, in Zipf tenths (the most any list written in its script sees it in that list's form; 0: none has it; null: no list is written in its script); a case naming a `list` holds a word of that list. `terms`: a screen's text, the answer for each word the rule asks about (checked against the word list too), and the terms picked, in order, with `cutoff` (Zipf tenths) as the line between rare and common. A term case's `zipf` names exactly the words the rule asks about (its candidates).",
   "frequencies": [
     {
       "name": "names, made-up words and everyday words in English",
@@ -16,12 +16,12 @@
       "zipf": [
         0,
         0,
-        56,
         57,
-        46,
+        49,
+        35,
         0,
-        40,
-        32
+        42,
+        33
       ]
     },
     {
@@ -36,9 +36,9 @@
       "zipf": [
         53,
         53,
-        53,
-        53,
-        48
+        51,
+        51,
+        38
       ]
     },
     {
@@ -52,9 +52,9 @@
         "co-xyvora"
       ],
       "zipf": [
-        62,
-        62,
         66,
+        66,
+        64,
         0,
         null,
         0
@@ -65,16 +65,16 @@
       "words": [
         "Москва",
         "Ксыворна",
-        "Київ",
+        "дякую",
         "회의",
         "흐뷀롭",
         "Schule",
         "aujourd'hui"
       ],
       "zipf": [
-        54,
+        43,
         0,
-        55,
+        59,
         43,
         0,
         53,
@@ -90,10 +90,10 @@
         "Љубав"
       ],
       "zipf": [
-        58,
-        51,
-        55,
-        52
+        60,
+        63,
+        33,
+        53
       ]
     },
     {
@@ -110,16 +110,18 @@
       ]
     },
     {
-      "name": "Han characters are judged by the lists written in Han (Chinese's in their simplified form, as wordfreq has them: 会議 as 会议), kana by Japanese's",
+      "name": "Han characters are judged by Chinese's list, in its simplified form (会議 as 会议); kana, which no list is written in, gets no answer",
       "words": [
         "会議",
         "ラーメン",
-        "東京"
+        "東京",
+        "ﾃｽﾄ"
       ],
       "zipf": [
-        56,
         47,
-        55
+        null,
+        44,
+        null
       ]
     },
     {
@@ -129,8 +131,8 @@
         "ΛΌΓΟΣ"
       ],
       "zipf": [
-        51,
-        51
+        52,
+        52
       ]
     },
     {
@@ -141,9 +143,9 @@
         "İstanbul"
       ],
       "zipf": [
-        59,
-        43,
-        59
+        39,
+        0,
+        39
       ]
     },
     {
@@ -173,14 +175,14 @@
         "أيضا"
       ],
       "zipf": [
-        62
+        61
       ]
     },
     {
       "name": "an everyday word of the bg list, which no other list sees as often",
       "list": "bg",
       "words": [
-        "българия"
+        "защото"
       ],
       "zipf": [
         62
@@ -193,7 +195,7 @@
         "আপনার"
       ],
       "zipf": [
-        62
+        64
       ]
     },
     {
@@ -203,7 +205,7 @@
         "això"
       ],
       "zipf": [
-        62
+        68
       ]
     },
     {
@@ -223,7 +225,7 @@
         "lidt"
       ],
       "zipf": [
-        62
+        61
       ]
     },
     {
@@ -233,7 +235,7 @@
         "diese"
       ],
       "zipf": [
-        62
+        61
       ]
     },
     {
@@ -243,7 +245,7 @@
         "γιατί"
       ],
       "zipf": [
-        62
+        65
       ]
     },
     {
@@ -253,7 +255,7 @@
         "don't"
       ],
       "zipf": [
-        62
+        66
       ]
     },
     {
@@ -263,7 +265,7 @@
         "también"
       ],
       "zipf": [
-        62
+        61
       ]
     },
     {
@@ -273,7 +275,7 @@
         "دارد"
       ],
       "zipf": [
-        62
+        50
       ]
     },
     {
@@ -293,7 +295,7 @@
         "araw"
       ],
       "zipf": [
-        62
+        61
       ]
     },
     {
@@ -303,7 +305,7 @@
         "aussi"
       ],
       "zipf": [
-        62
+        61
       ]
     },
     {
@@ -313,7 +315,7 @@
         "אותו"
       ],
       "zipf": [
-        62
+        65
       ]
     },
     {
@@ -323,7 +325,7 @@
         "अपनी"
       ],
       "zipf": [
-        62
+        63
       ]
     },
     {
@@ -343,7 +345,7 @@
         "ingin"
       ],
       "zipf": [
-        62
+        66
       ]
     },
     {
@@ -353,7 +355,7 @@
         "einnig"
       ],
       "zipf": [
-        62
+        47
       ]
     },
     {
@@ -363,17 +365,7 @@
         "anni"
       ],
       "zipf": [
-        62
-      ]
-    },
-    {
-      "name": "an everyday word of the ja list, which no other list sees as often",
-      "list": "ja",
-      "words": [
-        "その"
-      ],
-      "zipf": [
-        62
+        60
       ]
     },
     {
@@ -393,7 +385,7 @@
         "arba"
       ],
       "zipf": [
-        62
+        58
       ]
     },
     {
@@ -403,7 +395,7 @@
         "būtu"
       ],
       "zipf": [
-        62
+        63
       ]
     },
     {
@@ -413,7 +405,7 @@
         "каде"
       ],
       "zipf": [
-        62
+        64
       ]
     },
     {
@@ -423,7 +415,7 @@
         "beliau"
       ],
       "zipf": [
-        62
+        57
       ]
     },
     {
@@ -433,7 +425,7 @@
         "gjøre"
       ],
       "zipf": [
-        62
+        63
       ]
     },
     {
@@ -443,7 +435,7 @@
         "gaan"
       ],
       "zipf": [
-        62
+        64
       ]
     },
     {
@@ -463,7 +455,7 @@
         "ainda"
       ],
       "zipf": [
-        62
+        61
       ]
     },
     {
@@ -473,7 +465,7 @@
         "despre"
       ],
       "zipf": [
-        62
+        63
       ]
     },
     {
@@ -483,7 +475,7 @@
         "будет"
       ],
       "zipf": [
-        62
+        63
       ]
     },
     {
@@ -493,7 +485,7 @@
         "može"
       ],
       "zipf": [
-        62
+        61
       ]
     },
     {
@@ -513,7 +505,7 @@
         "bodo"
       ],
       "zipf": [
-        62
+        61
       ]
     },
     {
@@ -523,7 +515,7 @@
         "andra"
       ],
       "zipf": [
-        62
+        59
       ]
     },
     {
@@ -533,7 +525,7 @@
         "அரசு"
       ],
       "zipf": [
-        62
+        48
       ]
     },
     {
@@ -553,7 +545,7 @@
         "дуже"
       ],
       "zipf": [
-        62
+        61
       ]
     },
     {
@@ -563,7 +555,7 @@
         "اپنی"
       ],
       "zipf": [
-        62
+        61
       ]
     },
     {
@@ -573,7 +565,7 @@
         "biết"
       ],
       "zipf": [
-        62
+        68
       ]
     },
     {
@@ -583,7 +575,7 @@
         "问题"
       ],
       "zipf": [
-        62
+        59
       ]
     },
     {
@@ -594,8 +586,8 @@
         "l'avionezz"
       ],
       "zipf": [
-        49,
-        49,
+        50,
+        50,
         0
       ]
     },
@@ -621,12 +613,12 @@
         "說明"
       ],
       "zipf": [
-        51,
         48,
-        38,
-        56,
-        47,
-        53
+        40,
+        37,
+        39,
+        45,
+        47
       ]
     },
     {
@@ -638,10 +630,10 @@
         "شكـــرا"
       ],
       "zipf": [
-        53,
-        58,
         62,
-        53
+        63,
+        61,
+        62
       ]
     },
     {
@@ -651,21 +643,34 @@
         "שלום"
       ],
       "zipf": [
-        56,
-        56
+        59,
+        59
       ]
     },
     {
-      "name": "Persian words spelled with the zero-width non-joiner",
+      "name": "Persian words spelled with the zero-width non-joiner, which the list has only in parts, are seen as their least seen part",
       "words": [
         "می‌شود",
         "نمی‌دانم",
         "آن‌ها"
       ],
       "zipf": [
-        58,
-        39,
-        53
+        50,
+        45,
+        55
+      ]
+    },
+    {
+      "name": "Catalan words spelled with the middle dot, which the list has only in parts, are seen as their least seen part",
+      "words": [
+        "col·legi",
+        "Pel·lícula",
+        "il·lusió"
+      ],
+      "zipf": [
+        42,
+        48,
+        41
       ]
     },
     {
@@ -677,10 +682,10 @@
         "și"
       ],
       "zipf": [
-        75,
-        75,
-        53,
-        75
+        71,
+        71,
+        48,
+        71
       ]
     },
     {
@@ -690,19 +695,8 @@
         "şehir"
       ],
       "zipf": [
-        53,
-        53
-      ]
-    },
-    {
-      "name": "Japanese half-width katakana are its full-width ones",
-      "words": [
-        "ﾃｽﾄ",
-        "テスト"
-      ],
-      "zipf": [
-        49,
-        49
+        50,
+        50
       ]
     },
     {
@@ -714,10 +708,10 @@
         "office"
       ],
       "zipf": [
+        53,
         54,
-        56,
-        58,
-        54
+        59,
+        53
       ]
     },
     {
@@ -728,9 +722,9 @@
         "ΜΑΪ́ΟΥ"
       ],
       "zipf": [
-        49,
-        49,
-        49
+        37,
+        37,
+        37
       ]
     }
   ],
@@ -739,17 +733,17 @@
       "name": "made-up names and jargon are terms; everyday words, capitalized or not, and well-known names are not",
       "text": "Today Xyvora asked about kubectl in Paris, then today at the Schule.",
       "zipf": {
-        "Today": 56,
+        "Today": 57,
         "Xyvora": 0,
-        "asked": 53,
-        "about": 64,
+        "asked": 54,
+        "about": 65,
         "kubectl": 0,
-        "in": 75,
-        "Paris": 57,
-        "then": 61,
-        "today": 56,
-        "at": 74,
-        "the": 77,
+        "in": 71,
+        "Paris": 49,
+        "then": 62,
+        "today": 57,
+        "at": 72,
+        "the": 75,
         "Schule": 53
       },
       "terms": [
@@ -761,10 +755,10 @@
       "name": "each word stands alone: a name's word the list sees often is not sent",
       "text": "From: Kaelthorne Drake\nThanks, Kaelthorne!",
       "zipf": {
-        "From": 66,
+        "From": 64,
         "Kaelthorne": 0,
-        "Drake": 40,
-        "Thanks": 54
+        "Drake": 42,
+        "Thanks": 57
       },
       "terms": [
         "Kaelthorne"
@@ -772,22 +766,22 @@
     },
     {
       "name": "rarer words come first, then the most often on screen, then the earliest",
-      "text": "Nairobi met Priya. Brevalle, Xyvora and Xyvora met Nairobi and Tolkien.",
+      "text": "Nairobi met Priya. Brevalle, Xyvora and Xyvora met Nairobi, Quillon and Tolkien.",
       "zipf": {
         "Nairobi": 35,
-        "met": 70,
-        "Priya": 36,
+        "met": 68,
+        "Priya": 44,
         "Brevalle": 0,
         "Xyvora": 0,
-        "and": 74,
-        "Tolkien": 34
+        "and": 72,
+        "Quillon": 0,
+        "Tolkien": 33
       },
       "terms": [
         "Xyvora",
         "Brevalle",
-        "Tolkien",
-        "Nairobi",
-        "Priya"
+        "Quillon",
+        "Tolkien"
       ]
     },
     {
@@ -824,8 +818,8 @@
       "name": "words with digits, addresses and short words are not asked about or not sent",
       "text": "Xyvora4 2026 xyvora@example.com https://brevalle.example.com Xy Qu Brevalle",
       "zipf": {
-        "Xy": 36,
-        "Qu": 68,
+        "Xy": 31,
+        "Qu": 45,
         "Brevalle": 0
       },
       "terms": [
@@ -836,11 +830,11 @@
       "name": "a word joined by a hyphen or an apostrophe is ordinary when its parts are",
       "text": "Don't co-xyvora что-то Xyvora-Brevalle well-known",
       "zipf": {
-        "Don't": 62,
+        "Don't": 66,
         "co-xyvora": 0,
-        "что-то": 66,
+        "что-то": 64,
         "Xyvora-Brevalle": 0,
-        "well-known": 54
+        "well-known": 51
       },
       "terms": [
         "co-xyvora",
@@ -865,14 +859,14 @@
       "name": "everyday words in other scripts and forms are not terms",
       "text": "Већ Хвала Μαΐου ΜΑΪ́ΟΥ İstanbul 電腦 شكراً Straße Xyvora",
       "zipf": {
-        "Већ": 58,
-        "Хвала": 51,
-        "Μαΐου": 49,
-        "ΜΑΪ́ΟΥ": 49,
-        "İstanbul": 59,
-        "電腦": 51,
-        "شكراً": 53,
-        "Straße": 53,
+        "Већ": 60,
+        "Хвала": 63,
+        "Μαΐου": 37,
+        "ΜΑΪ́ΟΥ": 37,
+        "İstanbul": 39,
+        "電腦": 48,
+        "شكراً": 62,
+        "Straße": 51,
         "Xyvora": 0
       },
       "terms": [
@@ -892,5 +886,5 @@
       ]
     }
   ],
-  "cutoff": 40
+  "cutoff": 35
 }
