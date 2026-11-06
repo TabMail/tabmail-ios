@@ -17,6 +17,11 @@ import Testing
 ///  2. A real body write releases the chat summary that waited for it, on the shared queue, once.
 ///  3. The executor refuses an ordinary summary outside the Inbox (no model call, nothing written)
 ///     even when its admission was window-exempt; the same setup in the Inbox calls and writes.
+///  4. A chat summary is finished only with its text message, at every site that decides it
+///     (`ActiveAIQueue.jobDone`): the executor runs it in any folder, on an old summary without a
+///     text message, and after another device's summary (which has none), and `readJobOutcome`
+///     retries it until the text message is stored; an ordinary summary job stops at each of those.
+///  5. Chat members waiting for a body are forgotten when the queue is cancelled.
 @Suite("Chat summary execution", .serialized, .processGlobalState)
 struct ChatSummaryExecutionTests {
 
@@ -211,5 +216,157 @@ struct ChatSummaryExecutionTests {
             #expect(try await pool.read { try MessageHeader.fetchOne($0, key: inbox.id)?.summaryTextMessage } == "An actual summary text.",
                     "and writes the result")
         }
+    }
+
+    // MARK: - 4. A chat summary is finished only with its text message
+
+    @Test("One done check: a chat summary needs its text message; an ordinary one, action and reply do not",
+          arguments: [ActiveAIQueue.AIJob.JobType.summary, .action, .reply])
+    func jobDoneTable(type: ActiveAIQueue.AIJob.JobType) {
+        let bare = Self.header("done-table", accountId: "table", folder: "INBOX")
+        var legacy = bare
+        legacy.summaryBlurb = "An old summary."
+        legacy.actionTag = .reply
+        legacy.cachedReply = "A reply."
+        var complete = legacy
+        complete.summaryTextMessage = "A text message."
+        var noContent = bare
+        noContent.summaryBlurb = MessageHeader.noContentSummary
+        func done(_ message: MessageHeader, chat: Bool) -> Bool {
+            ActiveAIQueue.jobDone(message, for: .init(headerId: message.id, accountId: "table", jobType: type, forChat: chat))
+        }
+        for chat in [false, true] {
+            #expect(!done(bare, chat: chat), "\(type) chat=\(chat): nothing stored is never done")
+            #expect(done(complete, chat: chat), "\(type) chat=\(chat): everything stored is done")
+        }
+        // The only row the two kinds of job disagree on: a summary without its text message.
+        #expect(done(legacy, chat: false))
+        #expect(done(legacy, chat: true) == (type != .summary), "\(type): only a chat summary still needs the text message")
+        if type == .summary {
+            #expect(done(noContent, chat: true), "the no-content summary never gets a text message")
+        }
+    }
+
+    @Test("A chat summary runs outside the Inbox, on an old summary and after another device's summary, until its text message is stored; an ordinary summary job stops")
+    func chatSummaryRunsUntilItsTextMessage() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        _ = try FolderEpochTestFixture.makeAccount(id: "chat", provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "chat", path: "Sent", role: .sent, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "chat", path: "INBOX", role: .inbox, pool: pool)
+        let sent = Self.header("chat-sent", accountId: "chat", folder: "Sent")
+        var legacy = Self.header("chat-legacy", accountId: "chat", folder: "INBOX")
+        legacy.summaryBlurb = "An old summary."
+        var complete = Self.header("chat-complete", accountId: "chat", folder: "INBOX")
+        complete.summaryBlurb = "A summary."
+        complete.summaryTextMessage = "Its text message."
+        let peerChat = Self.header("chat-peer", accountId: "chat", folder: "INBOX")
+        let peerOrdinary = Self.header("chat-peer-ordinary", accountId: "chat", folder: "INBOX")
+        let rows = [sent, legacy, complete, peerChat, peerOrdinary]
+        try await pool.write { db in for row in rows { try row.insert(db) } }
+        for row in rows { try await Self.index(row, body: "Let us meet on Tuesday.") }
+        let keys = rows.map { ContentKey(rawValue: $0.id) }
+        do {
+            try await runsUntilTextMessage(sent: sent, legacy: legacy, complete: complete,
+                                           peerChat: peerChat, peerOrdinary: peerOrdinary, pool: pool)
+        } catch {
+            try? await SearchIndex.shared.removeMessages(contentKeys: keys)
+            throw error
+        }
+        try? await SearchIndex.shared.removeMessages(contentKeys: keys)
+    }
+
+    private func runsUntilTextMessage(
+        sent: MessageHeader, legacy: MessageHeader, complete: MessageHeader,
+        peerChat: MessageHeader, peerOrdinary: MessageHeader, pool: DatabasePool
+    ) async throws {
+        let http = Self.summaryBackend(textMessage: "See you Tuesday.")
+        defer { http.close() }
+        func row(_ header: MessageHeader) async throws -> MessageHeader? {
+            try await pool.read { try MessageHeader.fetchOne($0, key: header.id) }
+        }
+        func job(_ header: MessageHeader, chat: Bool) -> ActiveAIQueue.AIJob {
+            .init(headerId: header.id, accountId: header.accountId, jobType: .summary, windowExempt: true, forChat: chat)
+        }
+        // Another device (Thunderbird) has a summary of the two peer emails, without a text message.
+        let peerKeys: Set<String> = [peerChat.rfc822MessageId!, peerOrdinary.rfc822MessageId!]
+            .map { $0.replacingOccurrences(of: "<", with: "").replacingOccurrences(of: ">", with: "") }
+            .reduce(into: []) { $0.insert($1) }
+        let peer: AIService.PeerProbe = { keys in
+            Dictionary(uniqueKeysWithValues: keys.filter { peerKeys.contains($0) }.map { key in
+                (key, AICacheResult(
+                    summary: AICacheSummary(blurb: "A peer summary.", todos: nil, detailed: nil,
+                                            reminderDate: nil, reminderTime: nil, reminderContent: nil),
+                    action: nil, reply: nil))
+            })
+        }
+
+        try await Self.withAIOn {
+            let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: peer)
+            let queue = ActiveAIQueue()
+            await queue.setDispatchSuppressedForTesting(true)
+
+            // An old summary without a text message: finished for an ordinary job, not for a chat job.
+            #expect(await queue.jobVerifiedCompleteForTesting(job(legacy, chat: false)))
+            #expect(!(await queue.jobVerifiedCompleteForTesting(job(legacy, chat: true))), "retried until its text message")
+            await queue.executeWholeJobForTesting(job(legacy, chat: false), aiService: service)
+            #expect(http.recordedCalls().isEmpty, "an ordinary job takes the old summary")
+            await queue.executeWholeJobForTesting(job(legacy, chat: true), aiService: service)
+            #expect(http.recordedCalls().count == 1, "a chat job asks for the text message")
+            let legacy1 = try await row(legacy)?.summaryTextMessage
+
+            #expect(legacy1 == "See you Tuesday.")
+            #expect(await queue.jobVerifiedCompleteForTesting(job(legacy, chat: true)), "and is finished once it is stored")
+
+            // A summary with its text message: no call for either job.
+            await queue.executeWholeJobForTesting(job(complete, chat: true), aiService: service)
+            #expect(http.recordedCalls().count == 1, "nothing to ask for")
+            #expect(await queue.jobVerifiedCompleteForTesting(job(complete, chat: true)))
+
+            // Outside the Inbox: a chat job runs and writes.
+            await queue.executeWholeJobForTesting(job(sent, chat: true), aiService: service)
+            #expect(http.recordedCalls().count == 2, "a chat summary of a Sent email calls the model")
+            let sent2 = try await row(sent)?.summaryTextMessage
+
+            #expect(sent2 == "See you Tuesday.")
+            #expect(await queue.jobVerifiedCompleteForTesting(job(sent, chat: true)), "in any folder")
+
+            // Another device's summary: an ordinary job takes it; a chat job still asks for its text message.
+            await queue.executeWholeJobForTesting(job(peerOrdinary, chat: false), aiService: service)
+            #expect(http.recordedCalls().count == 2, "an ordinary job takes the peer summary")
+            let peerOrdinary3 = try await row(peerOrdinary)?.summaryBlurb
+
+            #expect(peerOrdinary3 == "A peer summary.", "the peer summary was really written")
+            await queue.executeWholeJobForTesting(job(peerChat, chat: true), aiService: service)
+            #expect(http.recordedCalls().count == 3, "a chat job asks for the text message the peer summary lacks")
+            let peerChat4 = try await row(peerChat)?.summaryTextMessage
+
+            #expect(peerChat4 == "See you Tuesday.")
+        }
+    }
+
+    // MARK: - 5. Waiting chat members are forgotten on cancel
+
+    @Test("A chat member waiting for its body is released by the body, unless the queue was cancelled first",
+          arguments: [false, true])
+    func cancelForgetsWaitingMembers(cancelFirst: Bool) async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        _ = try FolderEpochTestFixture.makeAccount(id: "wait", provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "wait", path: "INBOX", role: .inbox, pool: pool)
+        let header = Self.header("wait-body", accountId: "wait", folder: "INBOX", bodyComplete: false)
+        try await pool.write { try header.insert($0) }
+        let queue = ActiveAIQueue()
+        await queue.setDispatchSuppressedForTesting(true)
+        let asked = Mutex<[String]>([])
+        await queue.enqueueChatSummaries([header], requestBodies: { rows in asked.withLock { $0.append(contentsOf: rows.map(\.id)) } })
+        #expect(asked.withLock { $0 } == [header.id], "the member waits for its body")
+        #expect(await queue.queuedJobsForTesting.isEmpty)
+
+        if cancelFirst { await queue.cancelAllInFlight() }
+        await queue.chatBodyArrived(headerId: header.id)
+        let released = await queue.queuedJobsForTesting.filter { $0.headerId == header.id }
+        #expect(released.count == (cancelFirst ? 0 : 1),
+                cancelFirst ? "a cancel forgets the waiting member" : "without a cancel the body releases it")
     }
 }
