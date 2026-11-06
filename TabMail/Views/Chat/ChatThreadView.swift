@@ -223,6 +223,8 @@ struct ChatThreadView: View {
                 }
                 .onScrollPhaseChange { _, phase in
                     if ChatSummaryWindow.userMoved(phase) { hasScrolled = true }
+                    // Any scroll (a hand, the jump button, an animated scroll) ends the landing.
+                    if phase != .idle { scrollTarget = nil }
                     scrollIsIdle = phase == .idle
                     guard phase == .idle else { summaryAsk?.cancel(); return }
                     askOnceSettled()
@@ -237,7 +239,15 @@ struct ChatThreadView: View {
                 .onChange(of: scrollTarget) { _, target in
                     guard let target else { return }
                     proxy.scrollTo(target.id, anchor: target.anchor)
-                    scrollTarget = nil
+                }
+                // A one-shot scroll can be dropped or undone while the rows are still laid out
+                // (the bottom anchor keeps its place as they measure), so the landing is issued
+                // again on every size change until a scroll begins.
+                .onScrollGeometryChange(for: [CGFloat].self) { geo in
+                    [geo.containerSize.height, geo.contentSize.height]
+                } action: { _, _ in
+                    guard let target = scrollTarget else { return }
+                    proxy.scrollTo(target.id, anchor: target.anchor)
                 }
                 .overlay(alignment: .bottomTrailing) {
                     if showsJumpButton {
@@ -310,6 +320,8 @@ struct ChatThreadView: View {
         let anchor: UnitPoint
     }
 
+    /// Where the open lands (`scrollOnceLoaded`). Held until the first scroll of any kind, so a
+    /// layout that settles after the first scroll cannot move the chat off it.
     @State private var scrollTarget: ScrollTarget?
 
     /// Records each email the first time it shows, then marks it read (Q21). Its unread state at
