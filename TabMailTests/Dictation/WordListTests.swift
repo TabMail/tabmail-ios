@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -125,5 +126,32 @@ struct WordListTests {
         }
         let terms = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationContextTerms.swift"), encoding: .utf8)
         #expect(!terms.contains("@MainActor"))
+    }
+
+    /// A long batch looked up from a detached task leaves the main actor free: it keeps running
+    /// (its pauses stay short) and the lookup still answers for every word. A lookup moved onto the
+    /// main actor would hold it for the whole batch.
+    @Test func aLongBatchLeavesTheMainActorResponsive() async throws {
+        let list = try #require(await Task.detached { WordList.bundled }.value)
+        let words = (0..<20_000).map { "unlisted\(String(UnicodeScalar(UInt8(97 + $0 % 26))))\(String(UnicodeScalar(UInt8(97 + $0 / 26 % 26))))\(String(UnicodeScalar(UInt8(97 + $0 / 676 % 26))))" }
+        let done = Mutex(false)
+        let pulse = Task { @MainActor in
+            var longestPause: Duration = .zero
+            var pulses = 0
+            while !done.withLock({ $0 }) {
+                let started = ContinuousClock.now
+                try? await Task.sleep(for: .milliseconds(1))
+                longestPause = max(longestPause, started.duration(to: .now))
+                pulses += 1
+            }
+            return (longestPause, pulses)
+        }
+        await Task.yield()
+        let answers = await Task.detached { await list.seen(words) }.value
+        done.withLock { $0 = true }
+        let (longestPause, pulses) = await pulse.value
+        #expect(answers.count == Set(words).count)
+        #expect(pulses > 2)
+        #expect(longestPause < .milliseconds(400), "the main actor paused for \(longestPause)")
     }
 }

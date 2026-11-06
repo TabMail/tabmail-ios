@@ -1592,6 +1592,20 @@ struct DictationControllerTests {
         #expect(await task.value == [])
     }
 
+    /// There is no cap on the candidates: a rare name after hundreds of ordinary words is still a
+    /// term (owner 2026-11-05).
+    @Test func aRareWordAfterHundredsOfOrdinaryWordsIsStillPicked() async {
+        let letters = Array("abcdefghijklmnopqrstuvwxyz")
+        let ordinary = (0..<600).map { "common" + String(letters[$0 / letters.count]) + String(letters[$0 % letters.count]) }
+        let text = (ordinary + ["Xyvora"]).joined(separator: " ")
+        let task = DictationController.pickTerms(
+            context: DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1"),
+            excluding: [],
+            emailBody: { _ in text },
+            wordFrequencies: rareWords { $0 == "Xyvora" })
+        #expect(await task.value == ["Xyvora"])
+    }
+
     /// A list that answers for none of the words (its files missing) leaves the dictation with no
     /// terms, not with a guess.
     @Test func withoutAnAnswerFromTheWordListThereAreNoTerms() async throws {
