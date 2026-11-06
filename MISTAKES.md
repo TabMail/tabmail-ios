@@ -22,6 +22,7 @@ flips, or give a test seam a default that differs from production's initial valu
 · **call a key/id wrong from a remembered keying fact before reading the function that mints it, or write `ContentKey(rawValue: header.id)` → MIS-IOS-025.**
 · **write a `finish`/`cancel` that "releases" an object by nilling a property while a `Task`/`await` elsewhere still calls it → MIS-IOS-026.**
 · **write a `getBoundingClientRect()` length back into a style as px (margin/width/height), or call a region "untransformed" from `transform` alone → MIS-IOS-027.**
+· **pick a PR's focused suites → MIS-IOS-030.**
 
 ## Data integrity — the irreversible ones
 
@@ -59,6 +60,7 @@ flips, or give a test seam a default that differs from production's initial valu
 - **MIS-IOS-005** — ran bare `xcodegen generate`; literal `${DEVELOPMENT_TEAM}` → NSE never launches → smart push silently dies while background push still works. (×2)
 - **MIS-IOS-006** — recorded a baseline from a stale `.xctest`; a new file is not in the target until `./Scripts/xcodegen.sh` runs, and a peer build holding `build.db` makes `test-without-building` measure the PREVIOUS bundle. **Verify new tests by NAME; gate on `TEST BUILD SUCCEEDED`; one simulator per concurrent test job; a 0-total `-only-testing:` run is a failure, not a pass.** (×10)
 - **MIS-IOS-014** — wrote a red-first proof that **could not run red**: a fixture SIZED in situ went NEGATIVE once the inverted code bisected to 0, and `String(repeating:count:)` **TRAPS**, burying 101 real failures. **`Fatal error`, or >1 `Test run with` line, = not evidence.** (×1)
+- **MIS-IOS-030** — chose a PR's focused suites by subject and missed `PillDictationModeTests`, which reads `DynamicIslandChatButton.swift`'s source with literal indentation; found three PRs later. Before choosing focused suites, `rg -l '<changed file>' TabMailTests` for every edited file; write source checks whitespace-collapsed ([detail](Companion/Mistakes/Active/MIS-IOS-030-picked-focused-suites-by-subject-and-missed-a-test-that-reads-the-changed-file.md)).
 
 ## Companion tree — the proof that stopped running
 

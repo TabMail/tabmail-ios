@@ -692,6 +692,13 @@ struct MailNavigationView: View {
                     }
             }
         }
+        .sheet(isPresented: Binding(
+            get: { TutorialCoordinator.shared.highlightsChatViewSwitch },
+            set: { _ in })) {
+            // Guided tutorial, chat view: the Chat View switch as a short last step (T4). The step
+            // closes it (Finish or Skip tutorial), never a swipe.
+            TutorialChatViewSwitchSheet()
+        }
         .sheet(item: $templateSheetItem) { item in
             NavigationStack {
                 TemplateDetailView(templateId: item.id)
@@ -1268,7 +1275,8 @@ private struct MessageDetailContainer: View {
 private struct MessageDetailResolvedContent: View {
     let messageId: String
     let opensWithSkeletonDwell: Bool
-    /// Opened from a notification: the chat scrolls to it and highlights it (O2).
+    /// Opened from a notification or an email reference: the chat scrolls to it and highlights
+    /// it (O2, TQ3).
     var highlightsMessage = false
 
     var body: some View {
@@ -1301,7 +1309,9 @@ private struct PushedMessageDestination: View {
     let messageId: String
 
     var body: some View {
-        MessageDetailResolvedContent(messageId: messageId, opensWithSkeletonDwell: true)
+        // An email reference opens the chat at that email, which glows briefly (TQ3, as from
+        // search); today's detail ignores it.
+        MessageDetailResolvedContent(messageId: messageId, opensWithSkeletonDwell: true, highlightsMessage: true)
     }
 }
 
