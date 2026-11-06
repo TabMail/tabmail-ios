@@ -54,6 +54,7 @@ targets:
           - "Vendor/sqlite-vec/*.c"
           - "Vendor/sqlite-vec/LICENSE-*"
           - "Vendor/pdfjs"
+          - "Vendor/wordlist"
       - path: Shared
       - path: TabMail/Vendor/sqlite-vec
         includes:
@@ -65,6 +66,10 @@ targets:
         buildPhase: resources
       # pdf.js for attachment_read_pdf (ADR-IOS-088), kept as a folder so cmaps/ stays a directory.
       - path: TabMail/Vendor/pdfjs
+        type: folder
+        buildPhase: resources
+      # The word list the screen terms are judged by (ADR-IOS-101), read in place.
+      - path: TabMail/Vendor/wordlist
         type: folder
         buildPhase: resources
     settings:
@@ -85,6 +90,8 @@ targets:
       - package: SwiftSoup
       - package: GRDB
       - target: TabMailNotificationService
+      # ICU's Unicode script and case folding, for the word list's lookup forms (`WordList`).
+      - sdk: libicucore.tbd
 
   TabMailNotificationService:
     type: app-extension

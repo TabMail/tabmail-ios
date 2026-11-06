@@ -4,129 +4,103 @@
 
 import Foundation
 
-/// Names and terms in what the dictation is about (ADR-IOS-086, ADR-IOS-101): sent with a dictation
-/// beside the user's own dictionary, so the speech model spells them as they appear there. A
-/// dictionary built on the fly from the context, picked on this device; only the words picked are
-/// sent. TabMail Voice picks them from its screen read by the same rule (ADR-DESK-038).
+/// Names and terms in what the dictation is about (ADR-IOS-086): sent with a dictation beside the
+/// user's own dictionary, so the speech model spells them as they appear there. A dictionary built
+/// on the fly from the context, picked on this device; only the words picked are sent. TabMail
+/// Voice picks them by the same rule (ADR-DESK-038, `contextTerms.ts`).
 enum DictationContextTerms {
-    /// How a word is judged a term.
-    enum Rule: Equatable {
-        /// The system spelling dictionaries of the user's preferred languages (ADR-IOS-101): a word
-        /// with a capital (or in a script without case), no digit, whose lowercase form is in
-        /// `unknown`, the candidates none of those dictionaries knows (`SystemSpelling`).
-        case dictionary(unknown: Set<String>)
-        /// No preferred language has a working dictionary, so the earlier rule: a capital inside a
-        /// word, or at its start where no sentence starts, and not an everyday word.
-        case legacy
-    }
-
-    /// The lowercase forms of the words in `text` that the dictionary rule would call a term if the
-    /// dictionaries did not know them: what `SystemSpelling` is asked about.
-    static func candidates(in text: String) -> Set<String> {
-        var words: Set<String> = []
-        for token in text.split(whereSeparator: \.isWhitespace) {
+    /// The words in `text` that `terms` asks `WordList` about, each once as written: every word,
+    /// split on whitespace with the punctuation around it trimmed, that has a letter, no digit, is no
+    /// part of an address, and is no longer than a dictionary word (a longer one is never a term, so
+    /// it isn't asked about).
+    static func candidates(in text: String) -> [String] {
+        var seen: Set<String> = []
+        var candidates: [String] = []
+        for token in tokens(of: text) {
             let word = trimmed(token)
-            if isCandidate(word, raw: token) { words.insert(word.lowercased()) }
+            if isCandidate(word, raw: token), seen.insert(word).inserted { candidates.append(word) }
         }
-        return words
+        return candidates
     }
 
-    /// The terms in `text`, as `rule` judges them: runs of such words kept together ("Jordan Lee"),
-    /// no addresses. The most frequent first, then the earliest; none the same word as one in
-    /// `excluding` or another; each a valid dictionary word; at most `max`.
-    static func terms(in text: String, excluding: [String], max: Int, rule: Rule) -> [String] {
-        var tallies: [String: (term: String, count: Int, first: Int)] = [:]
-        func tally(_ term: String) {
-            guard let word = DictationDictionary.word(term),
-                  word.unicodeScalars.count >= DictationConfig.correctionMinWordLength else { return }
-            let key = word.lowercased()
+    /// The terms in `text`: the candidates the word list sees less often than `cutoff` (Zipf in
+    /// tenths), or, in a script no list is written in, with a capital letter. Each word stands alone.
+    /// The rarest first (a word no list has, or in a script without a list, counts as 0), then the
+    /// most often on screen, then the earliest; none the same word as one in `excluding` or another,
+    /// the case aside; each a valid dictionary word; at most `max`. A word `frequencies` has no
+    /// answer for is no term.
+    static func terms(
+        in text: String, frequencies: [String: WordSeen], excluding: [String], max: Int,
+        cutoff: Int = DictationConfig.screenTermCommonZipf
+    ) -> [String] {
+        var tallies: [String: (term: String, zipf: Int, count: Int, first: Int)] = [:]
+        for token in tokens(of: text) {
+            let word = trimmed(token)
+            guard isCandidate(word, raw: token), let seen = frequencies[word] else { continue }
+            let zipf: Int
+            switch seen {
+            case .noList:
+                guard hasCapital(word) else { continue }
+                zipf = 0
+            case .tenths(let tenths):
+                guard tenths < cutoff else { continue }
+                zipf = tenths
+            }
+            guard let term = DictationDictionary.word(word),
+                  term.unicodeScalars.count >= DictationConfig.correctionMinWordLength else { continue }
+            let key = term.lowercased()
             if let existing = tallies[key] {
                 tallies[key]?.count = existing.count + 1
             } else {
-                tallies[key] = (word, 1, tallies.count)
+                tallies[key] = (term, zipf, 1, tallies.count)
             }
-        }
-        for line in text.split(whereSeparator: \.isNewline) {
-            var run: [String] = []
-            func endRun() {
-                // A longer run is a title or a heading, not a name: its words count one by one.
-                if run.count <= DictationConfig.dictionaryWordMaxWords {
-                    if !run.isEmpty { tally(run.joined(separator: " ")) }
-                } else {
-                    run.forEach(tally)
-                }
-                run = []
-            }
-            var sentenceStart = true
-            for token in line.split(whereSeparator: \.isWhitespace) {
-                let word = trimmed(token)
-                // Punctuation before a word ends a run too ("Jordan (Brevalle Labs)").
-                if !token.hasPrefix(word) { endRun() }
-                if isTerm(word, raw: token, sentenceStart: sentenceStart, rule: rule) {
-                    run.append(word)
-                } else {
-                    endRun()
-                }
-                // Punctuation after a word ends a run ("Jordan, Lee"); a full stop also ends the
-                // sentence.
-                if word.isEmpty || !token.hasSuffix(word) { endRun() }
-                sentenceStart = word.isEmpty ? sentenceStart : endsSentence(token)
-            }
-            endRun()
         }
         let excluded = Set(excluding.map { $0.lowercased() })
         return tallies.values
             .filter { !excluded.contains($0.term.lowercased()) }
-            .sorted { $0.count != $1.count ? $0.count > $1.count : $0.first < $1.first }
+            .sorted { $0.zipf != $1.zipf ? $0.zipf < $1.zipf : $0.count != $1.count ? $0.count > $1.count : $0.first < $1.first }
             .prefix(max)
             .map(\.term)
     }
 
-    /// Whether a word is a name or term under `rule`.
-    private static func isTerm(_ word: String, raw: Substring, sentenceStart: Bool, rule: Rule) -> Bool {
-        switch rule {
-        case .dictionary(let unknown):
-            return isCandidate(word, raw: raw) && unknown.contains(word.lowercased())
-        case .legacy:
-            return isLegacyTerm(word, raw: raw, sentenceStart: sentenceStart)
-        }
+    /// The text split on whitespace (as JavaScript's `\s` and the next-line character split it).
+    private static func tokens(of text: String) -> [String] {
+        text.unicodeScalars.split(whereSeparator: isSpace).map { String(String.UnicodeScalarView($0)) }
     }
 
-    /// Whether a word could be a term before the dictionaries are asked: not an address, no digit,
-    /// and a capital in it, or, in a script without case, a letter.
-    private static func isCandidate(_ word: String, raw: Substring) -> Bool {
-        guard !word.isEmpty, !raw.contains("@"), !raw.contains("://") else { return false }
-        var hasCapital = false, hasCasedLetter = false, hasLetter = false
+    private static func isSpace(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.properties.isWhitespace || scalar.value == 0xFEFF
+    }
+
+    /// Whether a word is asked about: a letter in it, no digit, not part of an address (`raw` is the
+    /// token it came from), not longer than a dictionary word.
+    private static func isCandidate(_ word: String, raw: String) -> Bool {
+        guard word.utf16.count <= DictationConfig.dictionaryWordMaxChars, !isAddress(raw) else { return false }
+        var hasLetter = false
         for scalar in word.unicodeScalars {
             switch scalar.properties.generalCategory {
-            case .decimalNumber: return false
-            case .uppercaseLetter, .titlecaseLetter: hasCapital = true; hasCasedLetter = true; hasLetter = true
-            case .lowercaseLetter: hasCasedLetter = true; hasLetter = true
-            case .otherLetter, .modifierLetter: hasLetter = true
+            case .decimalNumber, .letterNumber, .otherNumber: return false
+            case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter: hasLetter = true
             default: break
             }
         }
-        return hasCapital || (hasLetter && !hasCasedLetter)
+        return hasLetter
     }
 
-    /// The earlier rule: a capital inside the word, or at its start where no sentence starts; not an
-    /// everyday word; not an address.
-    private static func isLegacyTerm(_ word: String, raw: Substring, sentenceStart: Bool) -> Bool {
-        guard !word.isEmpty, !raw.contains("@"), !raw.contains("://") else { return false }
-        let scalars = word.unicodeScalars
-        let innerCapital = scalars.dropFirst().contains { $0.properties.generalCategory == .uppercaseLetter }
-        if innerCapital { return true }
-        guard !sentenceStart, let first = scalars.first, first.properties.generalCategory == .uppercaseLetter else { return false }
-        return !DictationConfig.correctionCommonWords.contains(word.lowercased())
+    /// Whether a token holds "@" or "://", compared scalar by scalar.
+    private static func isAddress(_ token: String) -> Bool {
+        let scalars = Array(token.unicodeScalars)
+        if scalars.contains("@") { return true }
+        return scalars.indices.dropLast(2).contains { scalars[$0] == ":" && scalars[$0 + 1] == "/" && scalars[$0 + 2] == "/" }
     }
 
-    /// Whether the punctuation after a word ends its sentence (`Lee.` or `Lee?"`).
-    private static func endsSentence(_ token: Substring) -> Bool {
-        token.unicodeScalars.reversed().prefix { !isWordScalar($0) }.contains { ".!?".unicodeScalars.contains($0) }
+    /// Whether a word has an uppercase or titlecase letter.
+    private static func hasCapital(_ word: String) -> Bool {
+        word.unicodeScalars.contains { $0.properties.generalCategory == .uppercaseLetter || $0.properties.generalCategory == .titlecaseLetter }
     }
 
     /// The token without the punctuation around it.
-    static func trimmed(_ token: Substring) -> String {
+    static func trimmed(_ token: String) -> String {
         let scalars = Array(token.unicodeScalars)
         guard let first = scalars.firstIndex(where: isWordScalar),
               let last = scalars.lastIndex(where: isWordScalar) else { return "" }

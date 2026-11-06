@@ -57,6 +57,27 @@ project's MPL-2.0 license.
 
 ---
 
+## Bundled data
+
+### Word list for dictation screen terms
+
+- **Files:** `TabMail/Vendor/wordlist/words.txt` and `languages.json`, bundled as a folder resource; the
+  sources, the changes made and the notices are in `TabMail/Vendor/wordlist/README.md`
+- **Sources:** FrequencyWords (Hermit Dave; word counts of OpenSubtitles 2018, CC BY-SA 4.0;
+  https://github.com/hermitdave/FrequencyWords); OpenSubtitles 2018 through OPUS (P. Lison and
+  J. Tiedemann, LREC 2016; https://www.opensubtitles.org); wordfreq (Robyn Speer; Apache License 2.0 code
+  whose word normalization and letter tables are used, CC BY-SA 4.0 data; https://github.com/rspeer/wordfreq);
+  OpenCC (Apache License 2.0; Traditional to Simplified Chinese through wordfreq's table;
+  https://github.com/BYVoid/OpenCC); Unicode CLDR (Unicode License v3; Copyright (c) 1991-2025 Unicode, Inc.;
+  https://cldr.unicode.org)
+- **License of the files:** CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/), as the sources
+  are. The files adapt the sources: filtered, converted to Zipf tenths, merged and sorted. They are
+  licensed to you under CC BY-SA 4.0 independent of any App Store terms. The same files are in the public
+  repositories of TabMail for iOS and TabMail Voice.
+- **Usage:** Decides which words on screen are rare enough to give the speech model as vocabulary
+
+---
+
 ## Bundled model & tokenizer
 
 ### all-MiniLM-L6-v2 (Sentence Transformer model)

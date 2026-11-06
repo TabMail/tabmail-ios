@@ -47,8 +47,12 @@ struct DictationContextTests {
             input: "cc Quill"
         )
 
-        #expect(DictationContextTerms.terms(in: context.termsText, excluding: [], max: DictationConfig.vocabularyMaxTerms, rule: .legacy)
-            .sorted() == ["Brevalle", "Kaelthorne Drake", "Quill", "Xyvora"])
+        let everyday: Set<String> = ["Planning", "with", "From", "ask", "and", "so", "on"]
+        let frequencies = Dictionary(uniqueKeysWithValues: DictationContextTerms.candidates(in: context.termsText).map {
+            ($0, everyday.contains($0) ? WordSeen.tenths(60) : .tenths(0))
+        })
+        #expect(DictationContextTerms.terms(in: context.termsText, frequencies: frequencies, excluding: [], max: DictationConfig.vocabularyMaxTerms)
+            .sorted() == ["Brevalle", "Drake", "Kaelthorne", "Quill", "Xyvora"])
         #expect(!context.screenText.contains("Brevalle"))
     }
 
