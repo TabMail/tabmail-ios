@@ -15,10 +15,10 @@ import UIKit
 ///  1. The first scroll lands where the open asks: the bottom when every email is read, the Unread
 ///     line when some are not, the opened email when it came from search or a notification.
 ///  2. Every email of the thread is marked read in the database once the chat shows it (Q21).
-///  3. The chat asks summaries only for the emails on screen and the `ChatViewConfig.summaryLead`
+///  3. The chat asks summaries only for the emails on screen and the `ChatViewConfig.summaryWindow`
 ///     older than the oldest of them, on screen first: the rest of a long thread waits. When a
 ///     scroll stops, the emails then on screen go to the front. Only a hand scroll widens the
-///     window to `summarySpread` both ways (`ChatSummaryWindow.userMoved`, unit-tested: a test
+///     window to `summaryWindow` both ways (`ChatSummaryWindow.userMoved`, unit-tested: a test
 ///     cannot drag a finger), so the chat's own scrolls keep the open window. A layout change
 ///     with no scroll at all (the screen shrinks) asks again for the emails then on screen.
 ///
@@ -154,14 +154,14 @@ struct ChatThreadViewLifecycleTests {
         return opened
     }
 
-    @Test("All read: the chat opens at the bottom and asks for the screen and summaryLead older emails, newest first")
+    @Test("All read: the chat opens at the bottom and asks for the screen and summaryWindow older emails, newest first")
     func allReadOpensAtTheBottom() async throws {
         let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false)
         #expect(abs(opened.belowScreen) < 2, "at the bottom, got \(opened.belowScreen) below the screen")
         #expect(opened.queued.first == Self.length - 1, "the newest email is on screen and asked for first: \(opened.queued)")
         let asked = opened.queued.count
-        #expect(asked > ChatViewConfig.summaryLead && asked < Self.length,
-                "the screen and summaryLead more, never the whole thread: \(opened.queued)")
+        #expect(asked > ChatViewConfig.summaryWindow && asked < Self.length,
+                "the screen and summaryWindow more, never the whole thread: \(opened.queued)")
         #expect(opened.queued == Array((Self.length - asked..<Self.length).reversed()),
                 "one run of the newest emails, newest first: \(opened.queued)")
         #expect(!opened.queued.contains(0), "the oldest email waits for a scroll")
@@ -178,7 +178,7 @@ struct ChatThreadViewLifecycleTests {
         return run
     }
 
-    @Test("Some unread: the chat opens at the Unread line, marks every email read, and asks for the screen and exactly summaryLead above it")
+    @Test("Some unread: the chat opens at the Unread line, marks every email read, and asks for the screen and exactly summaryWindow above it")
     func unreadOpensAtTheUnreadLine() async throws {
         let firstUnread = 20
         let opened = try await open(unreadFrom: firstUnread, openedIndex: Self.length - 1, highlights: false, landsAway: true)
@@ -190,8 +190,8 @@ struct ChatThreadViewLifecycleTests {
         #expect(newestOnScreen >= firstUnread && newestOnScreen < Self.length - 1,
                 "the first unread email is at the top of the screen, the newest is below it: \(opened.queued)")
         // The Unread line sits at the top of the screen, so the email above it may show a little.
-        #expect((firstUnread - 1 - ChatViewConfig.summaryLead)...(firstUnread - ChatViewConfig.summaryLead) ~= oldestAsked,
-                "the screen, then exactly summaryLead emails above it: \(opened.queued)")
+        #expect((firstUnread - 1 - ChatViewConfig.summaryWindow)...(firstUnread - ChatViewConfig.summaryWindow) ~= oldestAsked,
+                "the screen, then exactly summaryWindow emails above it: \(opened.queued)")
         #expect(opened.queued.allSatisfy { $0 >= oldestAsked },
                 "the chat's own scroll to the Unread line is not a hand scroll: nothing further is asked: \(opened.queued)")
     }
@@ -204,7 +204,7 @@ struct ChatThreadViewLifecycleTests {
         #expect(opened.belowScreen > 2, "scrolled away from the bottom")
         let run = Self.latestRun(opened.queued)
         let newestOnScreen = try #require(run.first)
-        #expect(newestOnScreen < Self.length - 1 - ChatViewConfig.summaryLead,
+        #expect(newestOnScreen < Self.length - 1 - ChatViewConfig.summaryWindow,
                 "the front of the queue is the new screen, not the bottom: \(opened.queued)")
         #expect(run.last == 0, "then the emails above it, to the top of the thread: \(opened.queued)")
         // A programmatic scroll is not a hand scroll, so nothing below the screen comes next: the
@@ -232,7 +232,7 @@ struct ChatThreadViewLifecycleTests {
         #expect(!opened.queued.isEmpty, "the chat asks again after the layout change")
         #expect(Self.latestRun(opened.queued) == opened.queued,
                 "one run of the emails then on screen and above them, newest first: \(opened.queued)")
-        #expect(opened.queued.count > ChatViewConfig.summaryLead, "the screen and summaryLead more")
+        #expect(opened.queued.count > ChatViewConfig.summaryWindow, "the screen and summaryWindow more")
         #expect(!opened.queued.contains(0), "the rest of the long thread waits")
     }
 
@@ -244,6 +244,6 @@ struct ChatThreadViewLifecycleTests {
         let newestOnScreen = try #require(opened.queued.first)
         #expect(newestOnScreen >= target && newestOnScreen < Self.length - 1, "\(opened.queued)")
         #expect(opened.queued.contains(target))
-        #expect(opened.queued.contains(0), "the emails above it, within summaryLead")
+        #expect(opened.queued.contains(0), "the emails above it, within summaryWindow")
     }
 }

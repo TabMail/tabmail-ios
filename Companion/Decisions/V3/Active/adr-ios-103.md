@@ -94,7 +94,7 @@ same AI result, kept as long as the email itself is shown.
    the open chat asks only for the emails on screen and those near them (decision 9,
    `ChatSummaryWindow`); until the chat screen exists the requests stay off in release builds.
    **Amended 2026-11-06 (owner's safety bound):** D2 no longer asks for every member at open, and D3
-   takes at most each thread's newest `ChatViewConfig.summaryLead`; see decision 9, "The chat asks
+   takes at most each thread's newest `ChatViewConfig.summaryWindow`; see decision 9, "The chat asks
    for the emails in view".
    A chat request is an ordinary summary job (same model, queue, executor and write) with
    `AIJob.forChat`: it is window-exempt, any folder passes its scope checks (`readJobOutcome`,
@@ -156,9 +156,9 @@ same AI result, kept as long as the email itself is shown.
    and summary) is bounded by what is on screen. `ChatThreadView.askForSummaries` reads the emails on
    screen (`onScrollTargetVisibilityChange`) and asks `ActiveAIQueue.enqueueChatSummaries` for the
    ids `ChatSummaryWindow.ids` gives: the emails on screen, newest first, then, until the user has
-   scrolled by hand, the `ChatViewConfig.summaryLead` (10) emails above the oldest on screen; once a
-   hand scroll (`ChatSummaryWindow.userMoved`: a drag or its fling) stops, `ChatViewConfig.
-   summarySpread` (20) on each side, nearest first. The chat's own scrolls (to the Unread line, a
+   scrolled by hand, the `ChatViewConfig.summaryWindow` (10) emails above the oldest on screen; once
+   a hand scroll (`ChatSummaryWindow.userMoved`: a drag or its fling) stops, `ChatViewConfig.
+   summaryWindow` on each side, nearest first. The chat's own scrolls (to the Unread line, a
    searched email, the jump to the bottom) keep the open window. It asks once the emails on screen
    have stayed the same for `ChatViewConfig.summaryAskSettle` (300 ms) with the scroll at rest (the
    open, an email that joins at the bottom) and when a scroll stops; the wait keeps the layout jumps
@@ -170,11 +170,15 @@ same AI result, kept as long as the email itself is shown.
    enqueueBatch(first:)`), so the screen comes first and the latest request beats earlier ones; a
    body that lands for an email asked for gets its job at the front too. The open-time request in
    `MessageDetailViewModel` (D2 as first built, every member at once) is deleted. The background walk
-   (D3) pre-summarizes each walked thread's newest `summaryLead` emails, which a chat opens at.
+   (D3) pre-summarizes each walked thread's newest `summaryWindow` emails, which a chat opens at.
    Overnight calls, awaiting the owner's blessing: the open asks for the screen plus 10 above and a
    stopped hand scroll for 20 each way (the two numbers read as the open's bound and the scroll's);
    the screen is asked newest first; the walk's 10 per thread; bodies are put first like summaries;
    the 300 ms settle.
+   **Owner ruling 2026-11-06 on those calls:** the 20 was arbitrary; one number, 10, everywhere: 10
+   above the oldest email on screen at open, 10 each way once a hand scroll stops, and the walk's 10
+   newest per thread, all from the single `ChatViewConfig.summaryWindow` so it is easy to change
+   (it replaced `summaryLead` and `summarySpread`).
    Tests: `ChatSummaryWindowTests`, `ChatSummaryQueueTests` (order, latest first, walk bound),
    `QueueStorageTests` (`moveToFront`), and `ChatThreadViewLifecycleTests`, which opens the real
    chat in a window: the first scroll (bottom, Unread line, searched email), every email marked read

@@ -494,7 +494,7 @@ actor ActiveAIQueue {
         scheduleDispatch()
     }
 
-    /// D3, the background walk: the newest `ChatViewConfig.summaryLead` emails of each thread of the
+    /// D3, the background walk: the newest `ChatViewConfig.summaryWindow` emails of each thread of the
     /// newest `SyncConfig.maxRecentEmails` Inbox rows (any folder), each that has its body and no
     /// summary with a text message. A chat opens at its newest emails, so those are ready; the open
     /// chat asks for the rest as they come near the screen (`ChatSummaryWindow`). A member whose body is not downloaded yet
@@ -516,7 +516,7 @@ actor ActiveAIQueue {
         for row in inbox {
             let thread = ([row] + (try ThreadDetection.findRelatedMessages(for: row, in: pool)))
                 .sorted { ($0.date, $0.id) > ($1.date, $1.id) }
-            for member in thread.prefix(ChatViewConfig.summaryLead) where seen.insert(member.id).inserted {
+            for member in thread.prefix(ChatViewConfig.summaryWindow) where seen.insert(member.id).inserted {
                 members.append(member)
             }
         }

@@ -39,11 +39,11 @@ enum ChatViewConfig {
         enabledByUser && aiOn
     }
 
-    /// An open chat asks for the summaries of the emails on screen and this many older than the
-    /// oldest of them, and no others (owner 2026-11-06: a safety bound on a thread's AI work).
-    static let summaryLead = 10
-    /// Once a scroll stops: the emails on screen first, then this many on each side.
-    static let summarySpread = 20
+    /// The bound on a thread's AI work, one number (owner 2026-11-06): an open chat asks for the
+    /// summaries of the emails on screen and this many older than the oldest of them; once a hand
+    /// scroll stops, the emails on screen and this many on each side; the background walk takes
+    /// each thread's newest this many.
+    static let summaryWindow = 10
     /// The emails on screen are asked for once they have stayed the same this long, so the brief
     /// layout jumps while the chat moves to its opening place ask for nothing.
     static let summaryAskSettle: Duration = .milliseconds(300)
