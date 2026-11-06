@@ -417,19 +417,27 @@ actor ActiveAIQueue {
     /// leave when their body lands, and all of them on `cancelAllInFlight` (resume recovery, a
     /// background task's end), so a body that never lands is not kept past the next recovery. The set
     /// never holds more than the members asked for this session.
-    private var chatAwaitingBody: [String: String] = [:]
+    /// `request`: the newest request that asked for the member (`chatRequestNumber`).
+    private var chatAwaitingBody: [String: (accountId: String, request: Int)] = [:]
+
+    /// The number of the latest chat request. Only the latest moves work to the front: a request
+    /// that suspends (the database read, the body hop) must never put an older screen ahead of a
+    /// newer one. An older request's work still joins the queues, behind.
+    private var chatRequestNumber = 0
 
     /// D2: summaries for the emails an open chat shows and those near them (`ChatSummaryWindow`),
     /// each that lacks one with a text message, the user's own included. `members` comes in the
     /// order the chat wants them, and the work goes to the FRONT of the queues in that order, so
     /// what is on screen comes first and the latest request beats earlier ones. A member with its
     /// body gets a chat summary job now; one without goes to the body queue (`ActiveBodyQueue`;
-    /// tests pass `requestBodies`) and gets its job, also at the front, when the body lands. The
-    /// caller checks `ChatViewConfig`.
+    /// tests pass `requestBodies`) and gets its job when the body lands, at the front while no newer
+    /// request has asked for other emails. The caller checks `ChatViewConfig`.
     func enqueueChatSummaries(
         _ members: [MessageHeader],
         requestBodies: (@Sendable ([MessageHeader]) async -> Void)? = nil
     ) async {
+        chatRequestNumber += 1
+        let request = chatRequestNumber
         let ids = members.map(\.id)
         guard let rows = try? await dbPool.read({ db in
             try MessageHeader.filter(keys: ids).fetchAll(db)
@@ -442,7 +450,8 @@ actor ActiveAIQueue {
             if member.bodyComplete {
                 ready.append((member.id, member.accountId))
             } else {
-                chatAwaitingBody[member.id] = member.accountId
+                let newest = max(request, chatAwaitingBody[member.id]?.request ?? 0)
+                chatAwaitingBody[member.id] = (member.accountId, newest)
                 needBody.append(member)
             }
         }
@@ -450,17 +459,19 @@ actor ActiveAIQueue {
             if let requestBodies {
                 await requestBodies(needBody)
             } else {
-                await ActiveBodyQueue.shared.enqueueBatch(needBody, first: true)
+                await ActiveBodyQueue.shared.enqueueBatch(needBody, first: request == chatRequestNumber)
             }
         }
-        enqueueChatSummaryJobs(ready, origin: "open", first: true)
+        // After both suspensions (the read, the body hop): a newer request owns the front.
+        enqueueChatSummaryJobs(ready, origin: "open", first: request == chatRequestNumber)
     }
 
     /// `BodyFetchProcessor.flushBatch`, for every body it wrote: a chat member waiting for its body
-    /// gets its summary job now.
+    /// gets its summary job now, at the front if the latest request asked for it.
     func chatBodyArrived(headerId: String) {
-        guard let accountId = chatAwaitingBody.removeValue(forKey: headerId) else { return }
-        enqueueChatSummaryJobs([(headerId, accountId)], origin: "body", first: true)
+        guard let waiting = chatAwaitingBody.removeValue(forKey: headerId) else { return }
+        enqueueChatSummaryJobs([(headerId, waiting.accountId)], origin: "body",
+                               first: waiting.request == chatRequestNumber)
     }
 
     /// Admit chat summary jobs (summary only, window-exempt, any folder). `first`: they go to the
