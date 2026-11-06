@@ -34,6 +34,19 @@ struct ChatReplyField: Equatable {
             == readyText.trimmingCharacters(in: .whitespacesAndNewlines) ? .readyReply : .agent
     }
 
+    /// Dictation in the collapsed field over the untouched ready AI Reply replaces it rather than
+    /// adding to it (N4.3). Edited words, no ready reply, or the open chat sheet keep the text.
+    static func dictationReplaces(input: String, readyText: String?, expanded: Bool) -> Bool {
+        guard !expanded, let readyText else { return false }
+        return input == readyText
+    }
+
+    /// The field's text once dictation brings `words`: they replace it when `replacing`, else they
+    /// are added to what is there.
+    static func dictated(_ words: String, onto input: String, replacing: Bool) -> String {
+        DictationController.appending(words, to: replacing ? "" : input)
+    }
+
     /// The ready AI Reply of the thread's newest email, as the field shows it: its text message,
     /// while the full reply is stored. Nothing for the user's own email or a no-reply sender.
     static func readyText(newest: MessageHeader, isOwn: Bool) -> String? {

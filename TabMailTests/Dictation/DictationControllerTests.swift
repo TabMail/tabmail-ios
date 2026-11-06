@@ -1999,7 +1999,7 @@ struct DictationOptOutFlagTests {
         let start = String(try slice(source, from: "private func startDictation(auto: Bool = false)", to: "private var canSend: Bool"))
         let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { [replacesReadyReply] text in", to: "scrollPosition.scrollTo(edge: .bottom)")
         // The words land in the input (replacing the ready AI Reply, N4.3), then are sent.
-        let appended = try #require(onText.range(of: "inputText = replacesReadyReply ? text : DictationController.appending(text, to: inputText)"))
+        let appended = try #require(onText.range(of: "inputText = ChatReplyField.dictated(text, onto: inputText, replacing: replacesReadyReply)"))
         let sent = try #require(onText.range(of: "if sendWhenDictated { sendWhenDictated = false if canSend { sendMessage() }"))
         #expect(appended.upperBound <= sent.lowerBound)
 

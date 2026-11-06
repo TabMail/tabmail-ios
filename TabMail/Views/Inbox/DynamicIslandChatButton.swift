@@ -1458,7 +1458,8 @@ struct DynamicIslandChat: View {
         // The same gate that shows the input bar (and so the mic and the waveform) in the body.
         let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive
         // Said over the ready AI Reply, the words replace it rather than add to it (N4.3).
-        let replacesReadyReply = holdsReadyReply && !isExpanded
+        let replacesReadyReply = ChatReplyField.dictationReplaces(
+            input: inputText, readyText: replyField?.readyText, expanded: isExpanded)
         isTextFieldFocused = false
         if dictationMode == .onDevice {
             // Behind the sign-in or subscribe bar there is no mic or waveform: an auto-start records nothing there.
@@ -1471,7 +1472,7 @@ struct DynamicIslandChat: View {
             return
         }
         dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { [replacesReadyReply] text in
-            inputText = replacesReadyReply ? text : DictationController.appending(text, to: inputText)
+            inputText = ChatReplyField.dictated(text, onto: inputText, replacing: replacesReadyReply)
             inputSelection = .init(insertionPoint: inputText.endIndex)
             Task { await DictationLanguageTip.dictationCompleted.donate() }
             if sendWhenDictated {
