@@ -59,8 +59,10 @@ enum ChatSwipe {
     enum Settle: Equatable { case closed, open, full }
 
     /// `offset` and `velocity` are signed along the drag; `sign` is the opening direction (-1 left).
+    /// Only a finished drag acts: one the system cancelled or failed closes, whatever its offset.
     static func settle(offset: CGFloat, velocity: CGFloat, sign: CGFloat, revealWidth: CGFloat,
-                       width: CGFloat, allowsFull: Bool) -> Settle {
+                       width: CGFloat, allowsFull: Bool, finished: Bool) -> Settle {
+        guard finished else { return .closed }
         let distance = offset * sign
         let flick = velocity * sign
         if allowsFull, width > 0, distance > width * ChatViewLayout.swipeFullFraction { return .full }
@@ -140,10 +142,10 @@ struct ChatSwipeReveal: ViewModifier {
                                  width: width, allowsFull: allowsFullSwipe)
     }
 
-    private func ended(_ velocity: CGFloat) {
+    private func ended(_ velocity: CGFloat, finished: Bool) {
         dragBase = nil
         switch ChatSwipe.settle(offset: offset, velocity: velocity, sign: sign, revealWidth: revealWidth,
-                                width: width, allowsFull: allowsFullSwipe) {
+                                width: width, allowsFull: allowsFullSwipe, finished: finished) {
         case .full:
             close()
             edgeButton?.action()
@@ -188,7 +190,19 @@ struct ChatSwipeReveal: ViewModifier {
 struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     let shouldBegin: (CGFloat) -> Bool
     let changed: (CGFloat) -> Void
-    let ended: (CGFloat) -> Void
+    /// The drag's last velocity, and whether the user finished it (false when the system cancelled
+    /// or failed it).
+    let ended: (CGFloat, Bool) -> Void
+
+    /// Whether a recognizer state ends the drag as finished (true) or interrupted (false); nil
+    /// while it is still moving.
+    static func finished(_ state: UIGestureRecognizer.State) -> Bool? {
+        switch state {
+        case .ended: true
+        case .cancelled, .failed: false
+        default: nil
+        }
+    }
 
     func makeCoordinator(converter: CoordinateSpaceConverter) -> Coordinator {
         Coordinator(shouldBegin: shouldBegin)
@@ -205,13 +219,10 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
-        switch recognizer.state {
-        case .began, .changed:
+        if let finished = Self.finished(recognizer.state) {
+            ended(recognizer.velocity(in: recognizer.view).x, finished)
+        } else if recognizer.state == .began || recognizer.state == .changed {
             changed(recognizer.translation(in: recognizer.view).x)
-        case .ended, .cancelled, .failed:
-            ended(recognizer.velocity(in: recognizer.view).x)
-        default:
-            break
         }
     }
 

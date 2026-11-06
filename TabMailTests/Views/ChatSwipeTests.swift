@@ -4,6 +4,7 @@
 
 import Foundation
 import Testing
+import UIKit
 @testable import TabMail
 
 /// ADR-IOS-103: the chat's swipes (S1.2 to S4).
@@ -17,7 +18,8 @@ import Testing
 ///  4. In the inbox, Read on a collapsed chat reads the whole chat when the chat view is on; every
 ///     other case is today's single-email toggle (S1.2).
 ///  5. A let-go swipe opens, closes, or (where allowed) runs the edge button, and a drag never
-///     goes past closed or fully open.
+///     goes past closed or fully open. A drag the system cancels or fails closes and runs
+///     nothing, however far it went.
 ///  6. The views wire each of these: hosted SwiftUI views cannot be driven from a unit test, so the
 ///     wiring is read from the source.
 @Suite("Chat swipes")
@@ -137,9 +139,9 @@ struct ChatSwipeTests {
     private static let width: CGFloat = 400
 
     private static func settle(_ offset: CGFloat, velocity: CGFloat = 0, sign: CGFloat = -1,
-                               allowsFull: Bool = true) -> ChatSwipe.Settle {
+                               allowsFull: Bool = true, finished: Bool = true) -> ChatSwipe.Settle {
         ChatSwipe.settle(offset: offset, velocity: velocity, sign: sign, revealWidth: reveal,
-                         width: width, allowsFull: allowsFull)
+                         width: width, allowsFull: allowsFull, finished: finished)
     }
 
     @Test("A let-go swipe opens past half its buttons, closes short of that, and runs the edge button past the full-swipe line")
@@ -162,6 +164,23 @@ struct ChatSwipeTests {
         #expect(Self.settle(-Self.reveal, velocity: flick) == .closed)
         #expect(Self.settle(-1, velocity: -(flick - 2)) == .closed)
         #expect(Self.settle(0, velocity: -flick) == .closed, "no distance, nothing to open")
+    }
+
+    @Test("A drag the system cancels or fails closes and runs nothing, however far it went")
+    func interruptedDragRunsNothing() {
+        let full = Self.width * ChatViewLayout.swipeFullFraction
+        let flick = ChatViewLayout.swipeFlickVelocity + 1
+        #expect(Self.settle(-(full + 1)) == .full, "control: the same drag, finished, runs the edge button")
+        #expect(Self.settle(-(full + 1), finished: false) == .closed)
+        #expect(Self.settle(-Self.reveal, finished: false) == .closed, "nor does it stay open")
+        #expect(Self.settle(-1, velocity: -flick, finished: false) == .closed)
+
+        #expect(ChatHorizontalPan.finished(.ended) == true)
+        #expect(ChatHorizontalPan.finished(.cancelled) == false)
+        #expect(ChatHorizontalPan.finished(.failed) == false)
+        for moving in [UIGestureRecognizer.State.possible, .began, .changed] {
+            #expect(ChatHorizontalPan.finished(moving) == nil, "still moving")
+        }
     }
 
     @Test("A drag stays between closed and fully open")
@@ -188,6 +207,14 @@ struct ChatSwipeTests {
         let start = try #require(text.range(of: signature))
         let end = try #require(text[start.upperBound...].range(of: " private "))
         return String(text[start.upperBound..<end.lowerBound])
+    }
+
+    @Test("The reveal settles with whether the recognizer finished the drag")
+    func interruptedDragWiring() throws {
+        let text = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
+        let ended = try Self.body(of: "private func ended(_ velocity: CGFloat, finished: Bool) {", in: text)
+        #expect(ended.contains("allowsFull: allowsFullSwipe, finished: finished)"))
+        #expect(text.contains("if let finished = Self.finished(recognizer.state) { ended(recognizer.velocity(in: recognizer.view).x, finished) }"))
     }
 
     @Test("The chat slides left for Delete then Archive, with a full swipe, acting on the whole chat")

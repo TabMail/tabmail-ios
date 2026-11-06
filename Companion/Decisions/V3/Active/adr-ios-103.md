@@ -270,6 +270,9 @@ same AI result, kept as long as the email itself is shown.
    (S3.1). The Unread line then marks the emails unread (S4.1, `ChatSwipe.unreadIds`). One reveal
    is open at a time (`ChatSwipeReveal`, `openId`); the pan starts only on a horizontal motion
    toward its buttons (`ChatHorizontalPan`), so vertical scrolling stays the scroll view's.
+   Only a drag the user finished acts: one the system cancels or fails (a call, a system
+   gesture) closes the reveal and runs nothing, however far it went (`ChatHorizontalPan.finished`,
+   `ChatSwipe.settle(finished:)`; train gate, 2026-11-05).
    VoiceOver reaches every button as a named action. Archive, Delete and Move act on every email in
    the opened email's folder (`ChatSwipe.chatMembers`), as a collapsed inbox thread does, and close
    the chat as closing the email does today (Q29). They are ONE action each: the detail view model's
@@ -318,7 +321,7 @@ a failed request's log with and without its text, and the send wiring),
 `someoneNewIsNotOnly`, `userIsOnePerson`; `ChatReplyFieldTests` (`changedRecipientsRoute`,
 `agentMessageOnlyTo`, `replyTarget`, `replyToChoice`, `accessibilityOnlyTo`, `recipientsWiring`).
 Decision 12: `ChatSwipeTests` (the read swipes' targets, the Unread line after them, the whole-chat
-members, the inbox's Read, letting go and the drag limits, and the swipe wiring read from the
+members, the inbox's Read, letting go, an interrupted drag running nothing, and the drag limits, and the swipe wiring read from the
 source); `MessageDetailThreadActionTests` (a chat's Archive, Delete and Move as one undo entry and
 one queued move, one undo restoring every email, the no-ops, `setRead`); the single-email detail
 actions stay pinned by `MessageDetailViewModelMoveTests`, `MessageDetailMarkReadOnArchiveDeleteTests`,
