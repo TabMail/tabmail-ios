@@ -109,13 +109,23 @@ struct ChatThread: Equatable {
         self.isGroup = others.count > 1
     }
 
-    /// One header per email: copies of one message in two folders share a `stableId`. Keeps the
+    /// What makes two headers copies of one email (`copyKey`): its RFC Message-ID; without one, a
+    /// provider id that names the message itself (Gmail, Exchange), in its account; else the row.
+    /// An IMAP UID only numbers a message inside one folder, so two headers with the same UID and no
+    /// Message-ID are two emails, never copies (`MessageHeader.stableId` falls back to the bare UID).
+    static func copyKey(_ header: MessageHeader) -> String {
+        if let rfc822 = header.rfc822MessageId, !rfc822.isEmpty { return "rfc:\(rfc822)" }
+        if UInt32(header.messageId) == nil { return "id:\(header.accountId):\(header.messageId)" }
+        return "row:\(header.id)"
+    }
+
+    /// One header per email: copies of one message in two folders share a `copyKey`. Keeps the
     /// opened copy, else one with a text message, else the first.
     static func oneCopyEach(_ headers: [MessageHeader], preferredId: String?) -> [MessageHeader] {
         var order: [String] = []
         var chosen: [String: MessageHeader] = [:]
         for header in headers {
-            let key = header.stableId
+            let key = Self.copyKey(header)
             guard let current = chosen[key] else {
                 order.append(key)
                 chosen[key] = header
