@@ -380,7 +380,7 @@ struct ChatThreadView: View {
         noteMembers()
         let thread = thread
         if highlightsOpenedMessage, let opened = viewModel.message,
-           let item = thread.items.first(where: { $0.header.stableId == opened.stableId }) {
+           let item = thread.items.first(where: { ChatThread.copyKey($0.header) == ChatThread.copyKey(opened) }) {
             scrollTarget = ScrollTarget(id: item.id, anchor: .center)
             highlightedId = item.id
             Task {
