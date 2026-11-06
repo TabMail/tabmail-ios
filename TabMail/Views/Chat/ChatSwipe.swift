@@ -201,8 +201,14 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer {
+        Self.makePan(delegate: context.coordinator)
+    }
+
+    /// The swipe's pan, asking `delegate` before it starts so a vertical drag stays the scroll
+    /// view's (`Coordinator.gestureRecognizerShouldBegin`).
+    static func makePan(delegate: Coordinator) -> UIPanGestureRecognizer {
         let pan = UIPanGestureRecognizer()
-        pan.delegate = context.coordinator
+        pan.delegate = delegate
         return pan
     }
 

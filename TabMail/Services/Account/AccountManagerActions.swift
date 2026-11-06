@@ -805,8 +805,14 @@ extension AccountManager {
     /// `countCurrentlyUnread`, and `optimisticMoveToFolder` re-reads `isRead`
     /// from the DB (never a caller snapshot) for its own source/dest delta, so
     /// it sees zero unread moving and adjusts nothing.
-    func markReadBeforeRoleMove(_ messages: [MessageHeader]) async {
-        guard Self.markReadOnArchiveDeleteEnabled else { return }
+    ///
+    /// `enabled` is the CALLER's snapshot of `markReadOnArchiveDeleteEnabled`,
+    /// taken when the user's action started. This queued closure may run long
+    /// after the gesture, and a setting changed in between applies to the next
+    /// action, never to one already under way (snapshot settings at operation
+    /// start). So this function never reads the setting itself.
+    func markReadBeforeRoleMove(_ messages: [MessageHeader], enabled: Bool) async {
+        guard enabled else { return }
         let unread = messages.filter { !$0.isRead }
         guard !unread.isEmpty else { return }
         await markRead(unread)
@@ -821,12 +827,12 @@ extension AccountManager {
     /// longer resolve are dropped by `resolveHeadersForAction`'s documented
     /// contract, exactly as they are for the move.
     ///
-    /// The setting is checked BEFORE the resolve so an OFF toggle costs no
-    /// extra read — pre-feature parity, byte for byte.
-    func markReadBeforeRoleMove(ids: [String]) async {
-        guard Self.markReadOnArchiveDeleteEnabled else { return }
+    /// The caller's snapshot is checked BEFORE the resolve so an OFF toggle
+    /// costs no extra read — pre-feature parity, byte for byte.
+    func markReadBeforeRoleMove(ids: [String], enabled: Bool) async {
+        guard enabled else { return }
         let fresh = await resolveHeadersForAction(ids: ids)
-        await markReadBeforeRoleMove(fresh)
+        await markReadBeforeRoleMove(fresh, enabled: true)
     }
 
     func markRead(_ messages: [MessageHeader]) async {
@@ -1715,6 +1721,9 @@ extension AccountManager {
         expectedIdentities: [String: ExpectedMessageIdentity]
     ) async -> RoleMoveAdmission {
         guard !ids.isEmpty else { return .empty }
+        // The setting as it stands when the action starts; the queued closure
+        // below uses this snapshot, never a later read.
+        let marksRead = Self.markReadOnArchiveDeleteEnabled
         var outcome = RoleMoveAdmission()
         guard role == .archive || role == .trash else {
             BackgroundSyncLogger.logInbox("[AccountManager] performCoordinatedRoleMove — unsupported role \(role.rawValue), no-op")
@@ -1897,7 +1906,7 @@ extension AccountManager {
                 // immediately before the move inside this one closure; see
                 // `markReadBeforeRoleMove` for why that ordering is the C3
                 // guard and not a stylistic choice.
-                await self.markReadBeforeRoleMove(freshMovable)
+                await self.markReadBeforeRoleMove(freshMovable, enabled: marksRead)
 
                 switch role {
                 case .archive:

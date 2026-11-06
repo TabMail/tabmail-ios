@@ -1530,4 +1530,35 @@ struct MarkReadOnArchiveDeleteSettingTests {
         defaults.set(true, forKey: key)
         #expect(AccountManager.markReadOnArchiveDeleteEnabled == true, "a persisted true is honoured on the next read")
     }
+
+    /// The read-before-move runs in a queued closure, often well after the user's action. Every
+    /// action reads the setting once as it starts and hands that value on, so a change in between
+    /// applies to the next action. Runtime tests cover the chat, inbox and coordinated actions;
+    /// this pins every caller, including Settings' archive-old-mail.
+    @Test("Every read-before-move is handed the setting as its action started, never a later read")
+    func everyCallerHandsOnItsSnapshot() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        func source(_ path: String) throws -> String {
+            try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        }
+        let files = ["TabMail/Services/Account/AccountManagerActions.swift", "TabMail/ViewModels/InboxViewModel.swift",
+                     "TabMail/ViewModels/MessageDetailViewModel.swift", "TabMail/Views/Settings/SettingsView.swift"]
+        var calls = 0
+        for file in files {
+            let text = try source(file)
+            for call in text.components(separatedBy: "markReadBeforeRoleMove(").dropFirst() {
+                guard let close = call.firstIndex(of: ")") else { continue }
+                let arguments = String(call[..<close])
+                guard !arguments.contains(": Bool") else { continue }  // the two declarations
+                calls += 1
+                #expect(!arguments.contains("markReadOnArchiveDeleteEnabled"), "\(file): \(arguments)")
+            }
+        }
+        #expect(calls == 8, "the helper's own pass-through, the coordinated move, four inbox actions, the chat and Settings")
+        let settings = try source("TabMail/Views/Settings/SettingsView.swift")
+        #expect(settings.contains("private func archiveOldMessages() async { // The mark-as-read setting as it stands when the action starts. let marksRead = AccountManager.markReadOnArchiveDeleteEnabled"))
+        #expect(settings.contains("markReadBeforeRoleMove(ids: messages.map(\\.id), enabled: marksRead)"))
+    }
 }
