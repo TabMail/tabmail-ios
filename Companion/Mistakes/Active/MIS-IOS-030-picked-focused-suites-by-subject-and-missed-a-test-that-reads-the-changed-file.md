@@ -1,6 +1,6 @@
 # MIS-IOS-030 — picked a PR's focused suites by subject, and missed a test that reads the changed file's source
 
-**Recurrences:** 1
+**Recurrences:** 2
 **Status:** Active
 **First recorded:** 2026-11-05
 
@@ -20,10 +20,23 @@ from the chat feature and did not include the dictation suite, so the failure wa
 when a later PR added that suite to its run, and the fix had to go back into the earlier PR and
 restack every PR after it.
 
+## Recurrence 2 (2026-11-05, the chat view train gate)
+
+The file search was done, and it found `DictationControllerTests.swift`, but the run named the
+file's main suite, `DictationControllerTests`. `xcodebuild -only-testing:` addresses a Swift Testing
+suite by its TYPE name, not by its file, and the same file also declares `ChatPillDictationWiringTests`.
+That suite never ran, so three of its source checks were stale on the candidate and the reviewer
+found them. A first census script then missed a suite with no `@Suite` attribute
+(`PillDictationModeTests`, a bare `struct` holding `@Test`s).
+
+The tell this time: *"the file is in the list, so its tests ran."* A file is not a suite.
+
 ## The rule
 
 Before choosing a PR's focused suites, run `rg -l '<changed file name>' TabMailTests` for every
-production file the PR edits, and add every suite that names one. Many iOS tests read source text at
+production file the PR edits, and add every suite that names one. Then list every suite TYPE each matched file
+declares (every type after a `@Suite`, and every top-level `struct`/`class` holding `@Test`s), and
+pass each one to `-only-testing:`; naming one suite of a file runs only that suite. Many iOS tests read source text at
 run time (`String(contentsOf:)` on a `TabMail/…` path); they break on a move that changes no behaviour.
 Write such a check with whitespace collapsed (`split(whereSeparator: \.isWhitespace).joined(separator: " ")`),
 as `ChatReplyFieldTests` and `ChatSwipeTests` do, so a move does not break it.
