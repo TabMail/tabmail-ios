@@ -170,10 +170,9 @@ same AI result, kept as long as the email itself is shown.
    A bubble with no text message yet reads "Summarizing"; an email with nothing to summarize is
    done without one (`MessageHeader.noContentSummary`, which `summaryDone` counts as done), so its
    bubble shows that line instead (`ChatThread.Item.textMessage`), never a spinner that cannot end.
-   **Decided 2026-11-05 (review):** the thread comes from
-   `ThreadDetection.findRelatedMessages`, shared with today's thread list, which bounds its work at
-   `SyncConfig.threadQueryLimit` (100) emails and five expansion rounds and keeps the newest; a
-   longer thread shows its newest 100 (decided 2026-11-05: "Typical email threads are not that long").
+   The chat shows the whole thread, all the way back (decided 2026-11-06): it comes from
+   `ThreadDetection.findRelatedMessages`, shared with today's thread list, which has no length or
+   depth limit (decision 8).
    **Decided 2026-11-05:** in 3a today's pill stays and acts on the NEWEST email;
    "Sent" under every own bubble; the 15-minute gap; tutorial and demo-AI-off keep today's view; a
    reminder open highlights its email; triage rows keep the snippet, with no text message; the
