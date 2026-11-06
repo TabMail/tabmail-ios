@@ -67,4 +67,12 @@ enum ChatViewLayout {
     /// The jump-to-bottom button shows once the bottom is this far below the screen.
     static let jumpButtonThreshold: CGFloat = 240
     static let jumpButtonSize: CGFloat = 40
+    /// A sent reply's email is matched to the field's words when it is dated no earlier than this
+    /// before the Send (the Date header is written on this iPhone, at the Send).
+    static let sentReplyDateSlack: TimeInterval = 2 * 60
+    /// The field's words stand in for a sent reply's text message at most this long.
+    static let sentReplyLifetime: TimeInterval = 24 * 60 * 60
+    /// The reply field's words pulse to this opacity while TabMail writes (N5.1), as compose does.
+    static let fieldPulseOpacity: Double = 0.35
+    static let fieldPulseDuration: Double = 0.8
 }

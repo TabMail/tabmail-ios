@@ -24,8 +24,8 @@ import GRDB
 ///  5. The walk covers the threads of the newest `SyncConfig.maxRecentEmails` Inbox rows and nothing
 ///     else, at most each thread's newest `ChatViewConfig.summaryWindow` emails, members with their
 ///     body and without a done chat summary, never Trash.
-///  6. Release builds keep all of it off; the debug override counts only while debug is unlocked;
-///     on also needs the user's toggle and AI on, and AI going off never rewrites the toggle.
+///  6. The chat view is on by default; it needs the user's toggle and AI on, and AI going off
+///     never rewrites the toggle.
 ///
 /// Which emails an open chat asks for is `ChatSummaryWindowTests` and `ChatThreadViewLifecycleTests`.
 ///
