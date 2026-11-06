@@ -242,7 +242,7 @@ struct ChatThreadView: View {
                 }
                 // A one-shot scroll can be dropped or undone while the rows are still laid out
                 // (the bottom anchor keeps its place as they measure), so the landing is issued
-                // again on every size change until a scroll begins.
+                // again on every size change until it has settled or a scroll begins.
                 .onScrollGeometryChange(for: [CGFloat].self) { geo in
                     [geo.containerSize.height, geo.contentSize.height]
                 } action: { _, _ in
@@ -320,8 +320,11 @@ struct ChatThreadView: View {
         let anchor: UnitPoint
     }
 
-    /// Where the open lands (`scrollOnceLoaded`). Held until the first scroll of any kind, so a
-    /// layout that settles after the first scroll cannot move the chat off it.
+    /// Where the open lands (`scrollOnceLoaded`). Held while the rows lay out, so their late
+    /// measuring cannot move the chat off it, and released once the screen has settled with
+    /// emails on it (`askOnceSettled`) or a scroll of any kind begins. Held any longer, it would
+    /// scroll again on every later size change (a smaller screen, the keyboard) and the chat would
+    /// stop seeing which emails are on screen.
     @State private var scrollTarget: ScrollTarget?
 
     /// Records each email the first time it shows, then marks it read (Q21). Its unread state at
@@ -351,6 +354,7 @@ struct ChatThreadView: View {
         summaryAsk = Task { @MainActor in
             try? await Task.sleep(for: ChatViewConfig.summaryAskSettle)
             guard !Task.isCancelled, scrollIsIdle else { return }
+            if !visibleIds.isEmpty { scrollTarget = nil }
             askForSummaries()
         }
     }
