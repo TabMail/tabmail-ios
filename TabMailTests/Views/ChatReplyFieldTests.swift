@@ -528,7 +528,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil, words: words)", in: text) == 1,
                 "an agent compose hands on its outcome")
         let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?, words: String?) {", in: text)
-        #expect(Self.count("if sentReplies.composeEnded(outcome, replyTo: replyTo, words: words) { fieldClearCount += 1 }", in: ended) == 1)
+        #expect(Self.count("guard sentReplies.composeEnded(outcome, replyTo: replyTo, words: words) else { return }", in: ended) == 1)
+        #expect(Self.count("fieldClearCount += 1", in: ended) == 1, "only after a send")
         #expect(Self.count("sentReplies.settle(thread.items)", in: text) == 1)
         #expect(Self.count("ChatSentReplyBubble(text: entry.text)", in: text) == 1)
     }
@@ -571,7 +572,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count("ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) { showsReplyTo = true }", in: chat) == 1)
         #expect(Self.count("Button { forwardMessage = thread.newest }", in: chat) == 1)
         #expect(Self.count(".fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }", in: chat) == 1)
-        #expect(Self.count(".onChange(of: thread.newest?.stableId) { _, _ in replyTarget = .replyAll }", in: chat) == 1)
+        #expect(Self.count(".onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }", in: chat) == 1,
+                "a new newest email resets the choice, even one whose UID matches the last")
 
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(Self.count("ChatReplyField.route(text: text, readyText: field.readyText, recipientsChanged: field.onlyTo != nil)", in: island) == 1)

@@ -267,6 +267,23 @@ struct ChatThreadTests {
         #expect(ChatThread.headerTitle([]) == "")
     }
 
+    @Test("A newer email with the same UID and no Message-ID changes the newest email's key, so the reply choice resets")
+    func newestKeyChangesWithCoincidingUIDs() {
+        func bare(_ uid: String, minutesAgo: Double, account: String) -> MessageHeader {
+            MessageHeader(
+                messageId: uid, subject: "Plans", from: "Alex Doe", fromAddress: "alex@example.com",
+                to: Self.me, date: Self.now.addingTimeInterval(-minutesAgo * 60), snippet: "snippet",
+                folderId: "\(account):INBOX", accountId: account, folderPath: "INBOX", isInInbox: true)
+        }
+        let first = bare("1", minutesAgo: 30, account: "acc1")
+        let newer = bare("1", minutesAgo: 5, account: "acc2")
+        let before = Self.thread([first]).newest.map(ChatThread.copyKey)
+        let after = Self.thread([first, newer]).newest.map(ChatThread.copyKey)
+        #expect(before != nil && after != nil)
+        #expect(before != after, "the reply choice resets when a new email becomes the newest")
+        #expect(first.stableId == newer.stableId, "the bare-UID stableId would not have changed")
+    }
+
     @Test("The chat view finds an email by its copy key, never by the bare-UID stableId")
     func chatViewUsesCopyKey() throws {
         let root = URL(fileURLWithPath: #filePath)
