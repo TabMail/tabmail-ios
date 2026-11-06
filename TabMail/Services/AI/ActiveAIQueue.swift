@@ -135,13 +135,23 @@ actor ActiveAIQueue {
     /// Whether `message` already has the summary a job asks for: a non-empty summary, and for a chat
     /// job (`forChat`) also its text message, unless the summary is the local no-content one, which
     /// never has one (asking again would find no body text and retry forever). The ONE summary-done
-    /// check: every site that decides a summary job is finished (`executeJob`, its Device Sync and
-    /// NSE re-checks, `executeSummaryJob`'s cache hit, `readJobOutcome`) and the chat requests
-    /// (`enqueueChatSummaries`, `chatWalkCandidates`) ask this, so they cannot disagree and re-drive
-    /// a job forever.
+    /// check: the job sites ask it through `jobDone`, and the chat requests (`enqueueChatSummaries`,
+    /// `chatWalkCandidates`) ask it directly, so they cannot disagree and re-drive a job forever.
     nonisolated static func summaryDone(_ message: MessageHeader, forChat: Bool) -> Bool {
         guard let blurb = message.summaryBlurb, !blurb.isEmpty else { return false }
         return !forChat || message.summaryTextMessage != nil || blurb == MessageHeader.noContentSummary
+    }
+
+    /// Whether `message` already has what `job` asks for. The ONE job-done check: the executor's
+    /// first check, its Device Sync and NSE re-checks, `executeSummaryJob`'s cache hit and
+    /// `readJobOutcome` all ask this, so a chat job (`forChat`) is never finished by one site and
+    /// re-driven by another.
+    nonisolated static func jobDone(_ message: MessageHeader, for job: AIJob) -> Bool {
+        switch job.jobType {
+        case .summary: return summaryDone(message, forChat: job.forChat)
+        case .action: return message.actionTag != nil
+        case .reply: return message.cachedReply != nil
+        }
     }
 
     /// The folder scope of every job, checked by `readJobOutcome` and `executeJob`: the Inbox, for
@@ -261,6 +271,12 @@ actor ActiveAIQueue {
     func executeWholeJobForTesting(_ job: AIJob, aiService: AIService) async {
         let config = DispatchConfig(aiService: aiService, kbText: "", actionPrompt: "", compositionPrompt: "")
         _ = await executeJob(job, config: config)
+    }
+
+    /// Test seam: whether `readJobOutcome` finds `job` finished (`verifiedComplete`) after a run.
+    func jobVerifiedCompleteForTesting(_ job: AIJob) async -> Bool {
+        if case .verifiedComplete = await readJobOutcome(job) { return true }
+        return false
     }
 
     /// Compact, MESSAGE-discriminating id for logs. A `headerId` is
@@ -398,7 +414,8 @@ actor ActiveAIQueue {
     /// Chat members asked for (`enqueueChatSummaries`) whose body was not downloaded yet, by header
     /// id. `chatBodyArrived` hands each back once `BodyFetchProcessor.flushBatch` has written its
     /// body. In memory only: a relaunch forgets them, and the next open or walk asks again. Entries
-    /// leave when their body lands; the set never holds more than the members opened this session.
+    /// leave when their body lands, and all of them on `cancelAllInFlight` (resume recovery, a
+    /// background task's end), so a body that never lands is not kept past the next recovery.
     private var chatAwaitingBody: [String: String] = [:]
 
     /// D2: summaries for every email of an opened thread that lacks one with a text message, the
@@ -638,6 +655,8 @@ actor ActiveAIQueue {
         }
         inFlightTasks.removeAll()
         storage.cancelAllInFlight()
+        // Chat members waiting for a body are forgotten too: the next open or walk asks again.
+        chatAwaitingBody.removeAll()
         backoff.removeAll()
         backoffRetryCount.removeAll()
         rearmUnattributableJobs()
@@ -1076,14 +1095,7 @@ actor ActiveAIQueue {
         guard !Self.windowRetires(job: job, inRecentWindow: inRecentWindow) else {
             return .scopeExited // sync-origin job deliberately outside the bounded AI population
         }
-        switch job.jobType {
-        case .summary:
-            return Self.summaryDone(message, forChat: job.forChat) ? .verifiedComplete : .needsRetry
-        case .action:
-            return (message.actionTag != nil) ? .verifiedComplete : .needsRetry
-        case .reply:
-            return (message.cachedReply != nil) ? .verifiedComplete : .needsRetry
-        }
+        return Self.jobDone(message, for: job) ? .verifiedComplete : .needsRetry
     }
 
     /// Drain-time self-repopulate: re-run the work-remaining query and enqueue any
@@ -1187,14 +1199,7 @@ actor ActiveAIQueue {
         }
 
         // Check if this specific job type is already done
-        switch job.jobType {
-        case .summary:
-            guard !Self.summaryDone(message, forChat: job.forChat) else { return .ordinary(retry: false) }
-        case .action:
-            guard message.actionTag == nil else { return .ordinary(retry: false) }
-        case .reply:
-            guard message.cachedReply == nil else { return .ordinary(retry: false) }
-        }
+        guard !Self.jobDone(message, for: job) else { return .ordinary(retry: false) }
 
         // `IOS-AI-002` / `IOS-AI-003`. The job genuinely still needs its field, and
         // the guarded write-back that would deliver it CANNOT be admitted from this
@@ -1310,16 +1315,11 @@ actor ActiveAIQueue {
                     try MessageHeader.fetchOne(db, key: job.headerId)
                 }) {
                     // Re-check if this job is now done after peer data write
-                    switch job.jobType {
-                    case .summary:
-                        if Self.summaryDone(updated, forChat: job.forChat) {
+                    if Self.jobDone(updated, for: job) {
+                        if job.jobType == .summary {
                             NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
-                            return .ordinary(retry: false)
                         }
-                    case .action:
-                        if updated.actionTag != nil { return .ordinary(retry: false) }
-                    case .reply:
-                        if updated.cachedReply != nil { return .ordinary(retry: false) }
+                        return .ordinary(retry: false)
                     }
                 }
             }
@@ -1350,21 +1350,14 @@ actor ActiveAIQueue {
                 if let updated = try? await dbPool.read({ db in
                     try MessageHeader.fetchOne(db, key: job.headerId)
                 }) {
-                    switch job.jobType {
-                    case .summary:
-                        if Self.summaryDone(updated, forChat: job.forChat) {
-                            BackgroundSyncLogger.logAIProcessing("NSE lease HIT (summary) for \(Self.logId(job.headerId))")
+                    // The NSE never makes a reply, so a reply job is done here only if it
+                    // already was, and otherwise falls through to claim+run.
+                    if Self.jobDone(updated, for: job) {
+                        BackgroundSyncLogger.logAIProcessing("NSE lease HIT (\(job.jobType.rawValue)) for \(Self.logId(job.headerId))")
+                        if job.jobType == .summary {
                             NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)
-                            return .ordinary(retry: false)
                         }
-                    case .action:
-                        if updated.actionTag != nil {
-                            BackgroundSyncLogger.logAIProcessing("NSE lease HIT (action) for \(Self.logId(job.headerId))")
-                            return .ordinary(retry: false)
-                        }
-                    case .reply:
-                        // NSE doesn't generate replies; fall through to claim+run.
-                        break
+                        return .ordinary(retry: false)
                     }
                 }
             }
@@ -1477,7 +1470,7 @@ actor ActiveAIQueue {
         account: Account, target: AIWriteTarget, config: DispatchConfig
     ) async -> Bool {
         // Cache check: if summary already exists, skip LLM but still chain A.
-        if Self.summaryDone(message, forChat: job.forChat) {
+        if Self.jobDone(message, for: job) {
             BackgroundSyncLogger.logAIProcessing("Summary cache HIT for \(Self.logId(job.headerId))")
             // Always chain A — even from cache hit
             chainActionJob(after: job)
