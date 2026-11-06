@@ -117,4 +117,21 @@ struct ComposeRecipientWiringTests {
         #expect(Self.count("capBcc", in: text) == 3)
         #expect(text.contains("composeRecipients: { recipients.stored },"))
     }
+
+    /// The recompute control's action, which `AITextMessageCallerTests` cannot reach: it asks
+    /// through the shared service. The tests there drive `ComposeView.recomputedReply` itself
+    /// (the stored reply and text message, a filtered sender, the snippet, a replaced email).
+    @Test("The recompute control asks for a new reply and shows it, keeping the old one when none comes")
+    func recomputeControlRunsTheRecompute() throws {
+        let text = try Self.source()
+        #expect(Self.count("Button { recomputeReply() }", in: text) == 1, "the control runs the action")
+        let start = try #require(text.range(of: "private func recomputeReply() {"))
+        let end = try #require(text[start.upperBound...].range(of: "// MARK: - "))
+        let action = String(text[start.upperBound..<end.lowerBound])
+        #expect(Self.count("if let body = await Self.recomputedReply( for: reply, account: account, kbText: PromptStore.shared.kbText(), compositionPrompt: PromptStore.shared.compositionMarkdown(), aiService: .shared, dbPool: dbPool ) { currentSuggestion = body }", in: action) == 1,
+                "the new reply replaces the suggestion; no reply keeps it")
+        #expect(Self.count("currentSuggestion", in: action) == 1, "nothing else changes the suggestion")
+        #expect(Self.count("isRecomputing = true", in: action) == 1)
+        #expect(Self.count("isRecomputing = false", in: action) == 1)
+    }
 }
