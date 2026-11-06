@@ -247,7 +247,7 @@ struct DictationLongDictationTests {
         polishTimeout: Duration = .seconds(5),
         deadline: Duration = DictationConfig.transcriptionDeadline,
         smartDictation: Bool = true,
-        unknownWords: @escaping DictationController.UnknownWords = { _, _ in nil }
+        wordFrequencies: @escaping DictationController.ScreenWordFrequencies = { _ in [:] }
     ) -> DictationController {
         DictationController(
             capture: capture,
@@ -256,7 +256,7 @@ struct DictationLongDictationTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
             smartDictation: { smartDictation },
-            unknownWords: unknownWords,
+            wordFrequencies: wordFrequencies,
             dictionary: { .init(words: words, learnsWords: false, typedCount: typedCount) },
             emailBody: emailBody,
             corrections: nil,
@@ -466,7 +466,7 @@ struct DictationLongDictationTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
             smartDictation: { true },
-            unknownWords: { _, _ in nil },
+            wordFrequencies: { _ in [:] },
             dictionary: { .init(words: [], learnsWords: false) },
             emailBody: { _ in nil },
             corrections: nil,
@@ -510,7 +510,7 @@ struct DictationLongDictationTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
             smartDictation: { true },
-            unknownWords: { _, _ in nil },
+            wordFrequencies: { _ in [:] },
             dictionary: { .init(words: [], learnsWords: false) },
             emailBody: { _ in nil },
             corrections: nil,
@@ -560,7 +560,7 @@ struct DictationLongDictationTests {
     @Test func everyChunkGoesWithTheContextsTerms() async {
         let capture = SpeakingCapture()
         let backend = ChunkBackend()
-        let controller = controller(capture, backend, emailBody: { _ in "We met the team at Brevalle Labs yesterday." })
+        let controller = controller(capture, backend, emailBody: { _ in "We met the team at Brevalle Labs yesterday." }, wordFrequencies: rareWords { $0 == "Brevalle" || $0 == "Labs" })
         let pasted = pasted
         controller.start(context: DictationContext(windowTitle: "Chat", screenText: "Me: hi\n» ‸", emailId: "email-1"), canUseAI: true) { text in pasted.texts.withLock { $0.append(text) } }
         await waitUntil { capture.starts == 1 }
@@ -570,7 +570,7 @@ struct DictationLongDictationTests {
         await waitUntil { controller.phase == .idle }
 
         #expect(backend.vocabularies.count == 2)
-        #expect(backend.vocabularies.allSatisfy { $0.contains("Brevalle Labs") })
+        #expect(backend.vocabularies.allSatisfy { $0.contains("Brevalle") && $0.contains("Labs") })
     }
 
     /// Every chunk goes with the same ordered vocabulary a single recording does, for a dictionary of
@@ -589,7 +589,8 @@ struct DictationLongDictationTests {
         let backend = ChunkBackend()
         let controller = controller(
             capture, backend, words: words, typedCount: 100,
-            emailBody: { _ in "ask " + terms.joined(separator: " and ") + " today" }, smartDictation: smartDictation)
+            emailBody: { _ in "ask " + terms.joined(separator: " and ") + " today" }, smartDictation: smartDictation,
+            wordFrequencies: rareWords { $0.hasPrefix("Xyv") })
         let pasted = pasted
         controller.start(context: DictationContext(windowTitle: "Chat", screenText: "Me: hi\n» ‸", emailId: "email-1"), canUseAI: true) { text in pasted.texts.withLock { $0.append(text) } }
         await waitUntil { capture.starts == 1 }

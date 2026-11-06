@@ -55,7 +55,7 @@ enum DictationCorrections {
 
     /// The text's words, without the punctuation around them.
     private static func words(_ text: String) -> [String] {
-        text.split(whereSeparator: \.isWhitespace).map(DictationContextTerms.trimmed).filter { !$0.isEmpty }
+        text.split(whereSeparator: \.isWhitespace).map { DictationContextTerms.trimmed(String($0)) }.filter { !$0.isEmpty }
     }
 
     private struct ChangedRun {

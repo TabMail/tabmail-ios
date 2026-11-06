@@ -1,0 +1,896 @@
+{
+  "comment": "The screen terms' test against the word list in words.txt (ADR-DESK-038, amended 2026-11-05). Every implementation runs these. `frequencies`: words, and how often the word list sees each, in Zipf tenths (the most any list written in its script sees it in that list's form; 0: none has it; null: no list is written in its script); a case naming a `list` holds a word of that list. `terms`: a screen's text, the answer for each word the rule asks about (checked against the word list too), and the terms picked, in order, with `cutoff` (Zipf tenths) as the line between rare and common. A term case's `zipf` names exactly the words the rule asks about (its candidates).",
+  "frequencies": [
+    {
+      "name": "names, made-up words and everyday words in English",
+      "words": [
+        "Xyvora",
+        "Brevalle",
+        "Today",
+        "Paris",
+        "Microsoft",
+        "Kaelthorne",
+        "Drake",
+        "Thaddeus"
+      ],
+      "zipf": [
+        0,
+        0,
+        56,
+        57,
+        46,
+        0,
+        40,
+        32
+      ]
+    },
+    {
+      "name": "a German noun is seen as written and in lowercase, ß and ss alike",
+      "words": [
+        "Schule",
+        "schule",
+        "Straße",
+        "STRASSE",
+        "Müller"
+      ],
+      "zipf": [
+        53,
+        53,
+        53,
+        53,
+        48
+      ]
+    },
+    {
+      "name": "a word joined by a hyphen or an apostrophe is seen as its least seen part",
+      "words": [
+        "don't",
+        "Don’t",
+        "что-то",
+        "Xyvora-Brevalle",
+        "-",
+        "co-xyvora"
+      ],
+      "zipf": [
+        62,
+        62,
+        66,
+        0,
+        null,
+        0
+      ]
+    },
+    {
+      "name": "a word is seen as often as the list that sees it most: Cyrillic and Hangul, Latin in another language's list",
+      "words": [
+        "Москва",
+        "Ксыворна",
+        "Київ",
+        "회의",
+        "흐뷀롭",
+        "Schule",
+        "aujourd'hui"
+      ],
+      "zipf": [
+        54,
+        0,
+        55,
+        43,
+        0,
+        53,
+        56
+      ]
+    },
+    {
+      "name": "Serbian in Cyrillic is looked up in the Latin form wordfreq lists it in, among the Cyrillic lists' forms",
+      "words": [
+        "Већ",
+        "Хвала",
+        "Београд",
+        "Љубав"
+      ],
+      "zipf": [
+        58,
+        51,
+        55,
+        52
+      ]
+    },
+    {
+      "name": "Korean words as written, particles and all",
+      "words": [
+        "회의",
+        "사람이",
+        "흐뷀롭"
+      ],
+      "zipf": [
+        43,
+        59,
+        0
+      ]
+    },
+    {
+      "name": "Han characters are judged by the lists written in Han (Chinese's in their simplified form, as wordfreq has them: 会議 as 会议), kana by Japanese's",
+      "words": [
+        "会議",
+        "ラーメン",
+        "東京"
+      ],
+      "zipf": [
+        56,
+        47,
+        55
+      ]
+    },
+    {
+      "name": "Greek's final sigma",
+      "words": [
+        "Λόγος",
+        "ΛΌΓΟΣ"
+      ],
+      "zipf": [
+        51,
+        51
+      ]
+    },
+    {
+      "name": "Turkish's dotted and dotless i, the dotted capital composed or not",
+      "words": [
+        "İstanbul",
+        "Isparta",
+        "İstanbul"
+      ],
+      "zipf": [
+        59,
+        43,
+        59
+      ]
+    },
+    {
+      "name": "a word in a script no list is written in, or in two scripts, gets no answer",
+      "words": [
+        "สวัสดี",
+        "Tabмail",
+        "Ⴀბ",
+        "'"
+      ],
+      "zipf": [
+        null,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "name": "no words",
+      "words": [],
+      "zipf": []
+    },
+    {
+      "name": "an everyday word of the ar list, which no other list sees as often",
+      "list": "ar",
+      "words": [
+        "أيضا"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the bg list, which no other list sees as often",
+      "list": "bg",
+      "words": [
+        "българия"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the bn list, which no other list sees as often",
+      "list": "bn",
+      "words": [
+        "আপনার"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the ca list, which no other list sees as often",
+      "list": "ca",
+      "words": [
+        "això"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the cs list, which no other list sees as often",
+      "list": "cs",
+      "words": [
+        "byla"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the da list, which no other list sees as often",
+      "list": "da",
+      "words": [
+        "lidt"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the de list, which no other list sees as often",
+      "list": "de",
+      "words": [
+        "diese"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the el list, which no other list sees as often",
+      "list": "el",
+      "words": [
+        "γιατί"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the en list, which no other list sees as often",
+      "list": "en",
+      "words": [
+        "don't"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the es list, which no other list sees as often",
+      "list": "es",
+      "words": [
+        "también"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the fa list, which no other list sees as often",
+      "list": "fa",
+      "words": [
+        "دارد"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the fi list, which no other list sees as often",
+      "list": "fi",
+      "words": [
+        "hyvin"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the fil list, which no other list sees as often",
+      "list": "fil",
+      "words": [
+        "araw"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the fr list, which no other list sees as often",
+      "list": "fr",
+      "words": [
+        "aussi"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the he list, which no other list sees as often",
+      "list": "he",
+      "words": [
+        "אותו"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the hi list, which no other list sees as often",
+      "list": "hi",
+      "words": [
+        "अपनी"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the hu list, which no other list sees as often",
+      "list": "hu",
+      "words": [
+        "majd"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the id list, which no other list sees as often",
+      "list": "id",
+      "words": [
+        "ingin"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the is list, which no other list sees as often",
+      "list": "is",
+      "words": [
+        "einnig"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the it list, which no other list sees as often",
+      "list": "it",
+      "words": [
+        "anni"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the ja list, which no other list sees as often",
+      "list": "ja",
+      "words": [
+        "その"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the ko list, which no other list sees as often",
+      "list": "ko",
+      "words": [
+        "아니에요"
+      ],
+      "zipf": [
+        59
+      ]
+    },
+    {
+      "name": "an everyday word of the lt list, which no other list sees as often",
+      "list": "lt",
+      "words": [
+        "arba"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the lv list, which no other list sees as often",
+      "list": "lv",
+      "words": [
+        "būtu"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the mk list, which no other list sees as often",
+      "list": "mk",
+      "words": [
+        "каде"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the ms list, which no other list sees as often",
+      "list": "ms",
+      "words": [
+        "beliau"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the nb list, which no other list sees as often",
+      "list": "nb",
+      "words": [
+        "gjøre"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the nl list, which no other list sees as often",
+      "list": "nl",
+      "words": [
+        "gaan"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the pl list, which no other list sees as often",
+      "list": "pl",
+      "words": [
+        "było"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the pt list, which no other list sees as often",
+      "list": "pt",
+      "words": [
+        "ainda"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the ro list, which no other list sees as often",
+      "list": "ro",
+      "words": [
+        "despre"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the ru list, which no other list sees as often",
+      "list": "ru",
+      "words": [
+        "будет"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the sh list, which no other list sees as often",
+      "list": "sh",
+      "words": [
+        "može"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the sk list, which no other list sees as often",
+      "list": "sk",
+      "words": [
+        "bolo"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the sl list, which no other list sees as often",
+      "list": "sl",
+      "words": [
+        "bodo"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the sv list, which no other list sees as often",
+      "list": "sv",
+      "words": [
+        "andra"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the ta list, which no other list sees as often",
+      "list": "ta",
+      "words": [
+        "அரசு"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the tr list, which no other list sees as often",
+      "list": "tr",
+      "words": [
+        "güzel"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the uk list, which no other list sees as often",
+      "list": "uk",
+      "words": [
+        "дуже"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the ur list, which no other list sees as often",
+      "list": "ur",
+      "words": [
+        "اپنی"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the vi list, which no other list sees as often",
+      "list": "vi",
+      "words": [
+        "biết"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "an everyday word of the zh list, which no other list sees as often",
+      "list": "zh",
+      "words": [
+        "问题"
+      ],
+      "zipf": [
+        62
+      ]
+    },
+    {
+      "name": "a word joined by an apostrophe that the list has only in parts is seen as its least seen part, either apostrophe; an unknown part makes it unseen",
+      "words": [
+        "L'Avion",
+        "L’Avion",
+        "l'avionezz"
+      ],
+      "zipf": [
+        49,
+        49,
+        0
+      ]
+    },
+    {
+      "name": "a word mixing Latin and Cyrillic letters is judged by no list, Serbian's written in both",
+      "words": [
+        "Tabмail",
+        "Xyvora"
+      ],
+      "zipf": [
+        null,
+        0
+      ]
+    },
+    {
+      "name": "Traditional Chinese is judged in its simplified form",
+      "words": [
+        "電腦",
+        "計算機",
+        "電子郵件",
+        "台灣",
+        "檔案",
+        "說明"
+      ],
+      "zipf": [
+        51,
+        48,
+        38,
+        56,
+        47,
+        53
+      ]
+    },
+    {
+      "name": "Arabic's vowel marks and tatweel are left out",
+      "words": [
+        "شكراً",
+        "جداً",
+        "أيضاً",
+        "شكـــرا"
+      ],
+      "zipf": [
+        53,
+        58,
+        62,
+        53
+      ]
+    },
+    {
+      "name": "Hebrew's vowel points are left out",
+      "words": [
+        "שָׁלוֹם",
+        "שלום"
+      ],
+      "zipf": [
+        56,
+        56
+      ]
+    },
+    {
+      "name": "Persian words spelled with the zero-width non-joiner",
+      "words": [
+        "می‌شود",
+        "نمی‌دانم",
+        "آن‌ها"
+      ],
+      "zipf": [
+        58,
+        39,
+        53
+      ]
+    },
+    {
+      "name": "Romanian s and t with a cedilla are its letters with a comma below",
+      "words": [
+        "şi",
+        "Şi",
+        "ţară",
+        "și"
+      ],
+      "zipf": [
+        75,
+        75,
+        53,
+        75
+      ]
+    },
+    {
+      "name": "Turkish s with a comma below is its letter with a cedilla",
+      "words": [
+        "Șehir",
+        "şehir"
+      ],
+      "zipf": [
+        53,
+        53
+      ]
+    },
+    {
+      "name": "Japanese half-width katakana are its full-width ones",
+      "words": [
+        "ﾃｽﾄ",
+        "テスト"
+      ],
+      "zipf": [
+        49,
+        49
+      ]
+    },
+    {
+      "name": "a word is case-folded as wordfreq does, so PDF text's ligatures are plain letters",
+      "words": [
+        "ofﬁce",
+        "Diﬀerent",
+        "ﬁnd",
+        "office"
+      ],
+      "zipf": [
+        54,
+        56,
+        58,
+        54
+      ]
+    },
+    {
+      "name": "a Greek word composed again after case folding, however its accented iota is written",
+      "words": [
+        "μαΐου",
+        "Μαΐου",
+        "ΜΑΪ́ΟΥ"
+      ],
+      "zipf": [
+        49,
+        49,
+        49
+      ]
+    }
+  ],
+  "terms": [
+    {
+      "name": "made-up names and jargon are terms; everyday words, capitalized or not, and well-known names are not",
+      "text": "Today Xyvora asked about kubectl in Paris, then today at the Schule.",
+      "zipf": {
+        "Today": 56,
+        "Xyvora": 0,
+        "asked": 53,
+        "about": 64,
+        "kubectl": 0,
+        "in": 75,
+        "Paris": 57,
+        "then": 61,
+        "today": 56,
+        "at": 74,
+        "the": 77,
+        "Schule": 53
+      },
+      "terms": [
+        "Xyvora",
+        "kubectl"
+      ]
+    },
+    {
+      "name": "each word stands alone: a name's word the list sees often is not sent",
+      "text": "From: Kaelthorne Drake\nThanks, Kaelthorne!",
+      "zipf": {
+        "From": 66,
+        "Kaelthorne": 0,
+        "Drake": 40,
+        "Thanks": 54
+      },
+      "terms": [
+        "Kaelthorne"
+      ]
+    },
+    {
+      "name": "rarer words come first, then the most often on screen, then the earliest",
+      "text": "Nairobi met Priya. Brevalle, Xyvora and Xyvora met Nairobi and Tolkien.",
+      "zipf": {
+        "Nairobi": 35,
+        "met": 70,
+        "Priya": 36,
+        "Brevalle": 0,
+        "Xyvora": 0,
+        "and": 74,
+        "Tolkien": 34
+      },
+      "terms": [
+        "Xyvora",
+        "Brevalle",
+        "Tolkien",
+        "Nairobi",
+        "Priya"
+      ]
+    },
+    {
+      "name": "a word in a script no list is written in is a term only with a capital letter",
+      "text": "Արամ արամ Ծովինար սարգիս สวัสดี Xyvora",
+      "zipf": {
+        "Արամ": null,
+        "արամ": null,
+        "Ծովինար": null,
+        "սարգիս": null,
+        "สวัสดี": null,
+        "Xyvora": 0
+      },
+      "terms": [
+        "Արամ",
+        "Ծովինար",
+        "Xyvora"
+      ]
+    },
+    {
+      "name": "a word in a script without case is a term when the list doesn't see it often",
+      "text": "회의 흐뷀롭 Xyvora",
+      "zipf": {
+        "회의": 43,
+        "흐뷀롭": 0,
+        "Xyvora": 0
+      },
+      "terms": [
+        "흐뷀롭",
+        "Xyvora"
+      ]
+    },
+    {
+      "name": "words with digits, addresses and short words are not asked about or not sent",
+      "text": "Xyvora4 2026 xyvora@example.com https://brevalle.example.com Xy Qu Brevalle",
+      "zipf": {
+        "Xy": 36,
+        "Qu": 68,
+        "Brevalle": 0
+      },
+      "terms": [
+        "Brevalle"
+      ]
+    },
+    {
+      "name": "a word joined by a hyphen or an apostrophe is ordinary when its parts are",
+      "text": "Don't co-xyvora что-то Xyvora-Brevalle well-known",
+      "zipf": {
+        "Don't": 62,
+        "co-xyvora": 0,
+        "что-то": 66,
+        "Xyvora-Brevalle": 0,
+        "well-known": 54
+      },
+      "terms": [
+        "co-xyvora",
+        "Xyvora-Brevalle"
+      ]
+    },
+    {
+      "name": "a word is the same term whatever its case, spelled as first seen",
+      "text": "xyvora Xyvora XYVORA Brevalle",
+      "zipf": {
+        "xyvora": 0,
+        "Xyvora": 0,
+        "XYVORA": 0,
+        "Brevalle": 0
+      },
+      "terms": [
+        "xyvora",
+        "Brevalle"
+      ]
+    },
+    {
+      "name": "everyday words in other scripts and forms are not terms",
+      "text": "Већ Хвала Μαΐου ΜΑΪ́ΟΥ İstanbul 電腦 شكراً Straße Xyvora",
+      "zipf": {
+        "Већ": 58,
+        "Хвала": 51,
+        "Μαΐου": 49,
+        "ΜΑΪ́ΟΥ": 49,
+        "İstanbul": 59,
+        "電腦": 51,
+        "شكراً": 53,
+        "Straße": 53,
+        "Xyvora": 0
+      },
+      "terms": [
+        "Xyvora"
+      ]
+    },
+    {
+      "name": "a word longer than a dictionary word (50 characters) is not asked about: it can never be a term",
+      "text": "Xyvora Xyvorabrevallekaelthornequillonvexmarathandrielsoph Xyvorabrevallekaelthornequillonvexmarathandrielsop",
+      "zipf": {
+        "Xyvora": 0,
+        "Xyvorabrevallekaelthornequillonvexmarathandrielsop": 0
+      },
+      "terms": [
+        "Xyvora",
+        "Xyvorabrevallekaelthornequillonvexmarathandrielsop"
+      ]
+    }
+  ],
+  "cutoff": 40
+}

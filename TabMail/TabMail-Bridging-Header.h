@@ -10,6 +10,10 @@
 #ifndef TabMail_Bridging_Header_h
 #define TabMail_Bridging_Header_h
 
+// ICU (libicucore): a character's script and full case folding, which Swift's standard library lacks.
+#include <unicode/uchar.h>
+#include <unicode/ustring.h>
+
 // sqlite-vec: register vec0 virtual table module on a specific connection (for GRDB prepareDatabase)
 int tabmail_register_sqlite_vec_on_db(void *db);
 

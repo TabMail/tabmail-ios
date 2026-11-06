@@ -325,7 +325,9 @@ struct DictationDictionaryTests {
     ])
     func whatIsTakenTheBackendCountsTheSame(raw: String) {
         let dictionary = DictationDictionary(defaults: defaults)
-        let picked = DictationContextTerms.terms(in: "met \(raw) today", excluding: [], max: DictationConfig.vocabularyMaxTerms, rule: .legacy)
+        let text = "met \(raw) today"
+        let frequencies = Dictionary(uniqueKeysWithValues: DictationContextTerms.candidates(in: text).map { ($0, WordSeen.tenths(0)) })
+        let picked = DictationContextTerms.terms(in: text, frequencies: frequencies, excluding: [], max: DictationConfig.vocabularyMaxTerms)
         for word in [DictationDictionary.word(raw)].compactMap({ $0 }) + picked {
             let counted = Self.backendWords(word)
             #expect(!counted.isEmpty && counted.count <= DictationConfig.dictionaryWordMaxWords, "\(word.unicodeScalars.map { String($0.value, radix: 16) })")

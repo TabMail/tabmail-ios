@@ -245,8 +245,7 @@ struct DictationControllerTests {
         optedOut: @escaping @MainActor () -> Bool = { false },
         language: @escaping @MainActor () -> String? = { nil },
         smartDictation: Bool = true,
-        preferredLanguages: @escaping @MainActor () -> [String] = { ["en-US"] },
-        unknownWords: @escaping DictationController.UnknownWords = { _, _ in nil },
+        wordFrequencies: @escaping DictationController.ScreenWordFrequencies = { _ in [:] },
         microphoneAccess: @escaping @MainActor () async -> Bool = { true },
         transcript: @escaping @Sendable () async throws -> String = { "ask jordan about the road map" },
         /// The backend's `cleaned_text`: `""` when its cleanup failed, nil from a backend without it.
@@ -269,8 +268,7 @@ struct DictationControllerTests {
             isOptedOutOfAI: optedOut,
             dictationLanguage: language,
             smartDictation: { smartDictation },
-            preferredLanguages: preferredLanguages,
-            unknownWords: unknownWords,
+            wordFrequencies: wordFrequencies,
             dictionary: dictionary,
             emailBody: emailBody,
             corrections: corrections,
@@ -365,7 +363,7 @@ struct DictationControllerTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
             smartDictation: { smart.withLock { $0 } },
-            unknownWords: { _, _ in nil },
+            wordFrequencies: { _ in [:] },
             transcribe: { _, _, _, cleanup in
                 recorded.cleanups.withLock { $0.append(cleanup) }
                 return DictationTranscription(text: "ask jordan", cleanedText: "Ask Jordan.")
@@ -1170,7 +1168,7 @@ struct DictationControllerTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
             smartDictation: { true },
-            unknownWords: { _, _ in nil },
+            wordFrequencies: { _ in [:] },
             transcribe: { flac, _, _, _ in
                 recorded.uploads.withLock { $0.append(flac) }
                 return DictationTranscription(text: "a long dictation", cleanedText: "A long dictation.")
@@ -1210,7 +1208,7 @@ struct DictationControllerTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
             smartDictation: { true },
-            unknownWords: { _, _ in nil },
+            wordFrequencies: { _ in [:] },
             transcribe: { flac, _, _, _ in
                 recorded.uploads.withLock { $0.append(flac) }
                 return DictationTranscription(text: "a dictation with pauses", cleanedText: "A dictation with pauses.")
@@ -1479,6 +1477,7 @@ struct DictationControllerTests {
         let bodies = Mutex<[String]>([])
         let controller = controller(
             capture: capture,
+            wordFrequencies: rareWords { ["Xyvora", "Kaelthorne", "Drake", "Brevalle", "Labs"].contains($0) },
             dictionary: { .init(words: ["Xyvora"], learnsWords: false) },
             emailBody: { id in
                 bodies.withLock { $0.append(id) }
@@ -1492,24 +1491,25 @@ struct DictationControllerTests {
         #expect(bodies.withLock { $0 } == ["email-1"])
         let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
         #expect(vocabulary.first == "Xyvora")
-        // A dictionary word in the context is sent once.
-        #expect(vocabulary.count == 3)
-        #expect(Set(vocabulary) == ["Xyvora", "Kaelthorne Drake", "Brevalle Labs"])
+        // A dictionary word in the context is sent once; each word of a name stands alone.
+        #expect(vocabulary.count == 5)
+        #expect(Set(vocabulary) == ["Xyvora", "Kaelthorne", "Drake", "Brevalle", "Labs"])
         #expect(recorded.cleanups.withLock { $0.first??["dictionary"] } == "Xyvora")
     }
 
-    /// The terms are the words the spelling dictionaries of the preferred languages, as they were when
-    /// the dictation started, do not know (ADR-IOS-101): a name opening a line is one, an everyday
-    /// capitalised word is not.
-    @Test func theTermsAreTheWordsThePreferredLanguagesDictionariesDoNotKnow() async throws {
+    /// The terms are the words the word list sees less often than the cutoff (ADR-IOS-101): a name
+    /// opening a line is one, an everyday capitalised word is not. The list is asked once, for every
+    /// candidate as written.
+    @Test func theTermsAreTheWordsTheWordListSeesLessOftenThanTheCutoff() async throws {
         let capture = FakeCapture()
-        let asked = Mutex<[(words: Set<String>, languages: [String])]>([])
+        let asked = Mutex<[[String]]>([])
         let controller = controller(
             capture: capture,
-            preferredLanguages: { ["fr-CA", "en-US"] },
-            unknownWords: { words, languages in
-                asked.withLock { $0.append((words, languages)) }
-                return words.subtracting(["monday", "report", "chat"])
+            wordFrequencies: { words in
+                asked.withLock { $0.append(words) }
+                return Dictionary(uniqueKeysWithValues: words.map { word in
+                    (word, word == "Xyvora" || word == "Brevalle" ? WordSeen.tenths(0) : .tenths(60))
+                })
             },
             emailBody: { _ in "Xyvora Brevalle sent the Report on Monday." }
         )
@@ -1518,23 +1518,22 @@ struct DictationControllerTests {
         await dictate(controller, capture: capture, context: context)
 
         let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
-        #expect(vocabulary == ["Xyvora Brevalle"])
+        #expect(vocabulary == ["Xyvora", "Brevalle"])
         let questions = asked.withLock { $0 }
         #expect(questions.count == 1)
         guard questions.count == 1 else { return }
-        #expect(questions[0].languages == ["fr-CA", "en-US"])
-        #expect(questions[0].words == ["xyvora", "brevalle", "report", "monday", "chat"])
+        #expect(Set(questions[0]) == ["Chat", "Xyvora", "Brevalle", "sent", "the", "Report", "on", "Monday"])
     }
 
-    /// Dictionaries too slow to answer within `contextTermsWait` cost the dictation its terms, never
-    /// the dictation (the main-actor hop is inside the budget).
-    @Test func slowDictionariesCostTheTermsNotTheDictation() async throws {
+    /// A word list too slow to answer within `contextTermsWait` costs the dictation its terms, never
+    /// the dictation.
+    @Test func aSlowWordListCostsTheTermsNotTheDictation() async throws {
         let capture = FakeCapture()
         let controller = controller(
             capture: capture,
-            unknownWords: { words, _ in
+            wordFrequencies: { words in
                 try? await Task.sleep(for: .seconds(30))
-                return words
+                return Dictionary(uniqueKeysWithValues: words.map { ($0, WordSeen.tenths(0)) })
             },
             emailBody: { _ in "Xyvora Brevalle" }
         )
@@ -1546,20 +1545,21 @@ struct DictationControllerTests {
         #expect(!recorded.uploads.withLock { $0 }.isEmpty)
     }
 
-    /// Ending the dictation cancels the spelling batch still being asked of the dictionaries.
-    @Test func endingTheDictationCancelsTheSpellingBatch() async {
+    /// Ending the dictation cancels the lookup still going on, and the terms it would have picked
+    /// are none: a word it didn't answer for is never a term.
+    @Test func endingTheDictationCancelsTheLookup() async {
         let capture = FakeCapture()
         let started = Mutex(false)
         let cancelled = Mutex(false)
         let controller = controller(
             capture: capture,
-            unknownWords: { words, _ in
+            wordFrequencies: { _ in
                 started.withLock { $0 = true }
                 for _ in 0..<300 {
                     if Task.isCancelled { cancelled.withLock { $0 = true }; break }
                     try? await Task.sleep(for: .milliseconds(10))
                 }
-                return words
+                return [:]
             },
             emailBody: { _ in "Xyvora Brevalle" }
         )
@@ -1574,48 +1574,39 @@ struct DictationControllerTests {
         #expect(cancelled.withLock { $0 })
     }
 
-    /// The languages asked about are the ones the dictation started with, however the setting changes
-    /// before the terms are picked.
-    @Test func theLanguagesAreTheOnesTheDictationStartedWith() async {
-        let capture = FakeCapture()
-        let languages = Mutex<[String]>(["fr-CA", "en-US"])
-        let release = Mutex(false)
-        let questions = Mutex<[[String]]>([])
-        let controller = controller(
-            capture: capture,
-            preferredLanguages: { languages.withLock { $0 } },
-            unknownWords: { words, askedLanguages in
-                questions.withLock { $0.append(askedLanguages) }
-                return words
-            },
-            emailBody: { _ in
-                while !release.withLock({ $0 }) { try? await Task.sleep(for: .milliseconds(5)) }
-                return "Xyvora Brevalle"
-            }
-        )
-        let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
-        controller.start(context: context, canUseAI: true) { _ in }
-        languages.withLock { $0 = ["de-DE"] }
-        release.withLock { $0 = true }
-        await waitUntil { questions.withLock { !$0.isEmpty } }
-        controller.cancel()
-        #expect(questions.withLock { $0 } == [["fr-CA", "en-US"]])
+    /// A lookup cancelled part-way still hands back the words it answered for; those make no terms,
+    /// since an upload already waiting on the task would otherwise send a part of them.
+    @Test func aCancelledPickingGivesNoTermsEvenFromAnAnsweredLookup() async {
+        let started = Mutex(false)
+        let task = DictationController.pickTerms(
+            context: DictationContext.chatPill(title: "Chat", header: ["From: Kaelthorne Drake"], messages: [], input: "", emailId: nil),
+            excluding: [],
+            emailBody: { _ in nil },
+            wordFrequencies: { words in
+                started.withLock { $0 = true }
+                while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(5)) }
+                return Dictionary(uniqueKeysWithValues: words.map { ($0, WordSeen.tenths(0)) })
+            })
+        await waitUntil { started.withLock { $0 } }
+        task.cancel()
+        #expect(await task.value == [])
     }
 
-    /// No working dictionary: the earlier rule picks the terms, a name opening a sentence missed.
-    @Test func withoutAWorkingDictionaryTheEarlierRulePicksTheTerms() async throws {
+    /// A list that answers for none of the words (its files missing) leaves the dictation with no
+    /// terms, not with a guess.
+    @Test func withoutAnAnswerFromTheWordListThereAreNoTerms() async throws {
         let capture = FakeCapture()
         let controller = controller(
             capture: capture,
-            unknownWords: { _, _ in nil },
+            wordFrequencies: { _ in [:] },
             emailBody: { _ in "Xyvora met Brevalle Labs yesterday." }
         )
         let context = DictationContext.chatPill(title: "Chat", header: [], messages: [], input: "", emailId: "email-1")
 
         await dictate(controller, capture: capture, context: context)
 
-        let vocabulary = try #require(recorded.vocabularies.withLock { $0.first })
-        #expect(vocabulary == ["Brevalle Labs"])
+        #expect(recorded.vocabularies.withLock { $0.first } == nil || recorded.vocabularies.withLock { $0.first } == [])
+        #expect(!recorded.uploads.withLock { $0 }.isEmpty)
     }
 
     /// An email of more terms than the backend takes: the dictionary whole, then the context's
@@ -1631,6 +1622,7 @@ struct DictationControllerTests {
         let terms = (0..<DictationConfig.vocabularyMaxTerms + 1).map { name("Xyv", $0) }
         let controller = controller(
             capture: capture,
+            wordFrequencies: rareWords { $0.hasPrefix("Xyv") },
             dictionary: { .init(words: words, learnsWords: false) },
             emailBody: { _ in "ask " + terms.joined(separator: " and ") + " today" }
         )
@@ -1661,6 +1653,7 @@ struct DictationControllerTests {
         let terms = (0..<80).map { name("Xyv", $0) }
         let controller = controller(
             capture: capture,
+            wordFrequencies: rareWords { $0.hasPrefix("Xyv") },
             dictionary: { .init(words: words, learnsWords: false, typedCount: 100) },
             emailBody: { _ in "ask " + terms.joined(separator: " and ") + " today" }
         )
@@ -1688,6 +1681,7 @@ struct DictationControllerTests {
         let controller = controller(
             capture: capture,
             smartDictation: false,
+            wordFrequencies: rareWords { $0.hasPrefix("Xyv") },
             dictionary: { .init(words: words, learnsWords: false, typedCount: 100) },
             emailBody: { _ in "ask " + terms.joined(separator: " and ") + " today" }
         )
@@ -1852,7 +1846,7 @@ struct DictationOptOutFlagTests {
             capture: capture,
             requestMicrophoneAccess: { true },
             isOnline: { true },
-            unknownWords: { _, _ in nil },
+            wordFrequencies: { _ in [:] },
             transcribe: { flac, _, _, cleanup in
                 recorded.uploads.withLock { $0.append(flac) }
                 recorded.cleanups.withLock { $0.append(cleanup) }
@@ -2028,10 +2022,7 @@ struct DictationOptOutFlagTests {
         #expect(controller.contains("emailBody: @escaping EmailBody = { await DictationController.storedEmailBody(headerId: $0) },"))
         #expect(controller.contains("corrections: DictationCorrectionWatch? = DictationCorrectionWatch { DictationDictionary.shared.learn($0) },"))
         #expect(controller.contains("useWords: @escaping @MainActor ([String]) -> Void = { DictationDictionary.shared.use($0) },"))
-        #expect(controller.contains("preferredLanguages: @escaping @MainActor () -> [String] = { Locale.preferredLanguages },"))
-        #expect(controller.contains("unknownWords: @escaping UnknownWords = { await SystemSpelling.unknownWords(among: $0, preferredLanguages: $1) },"))
-        // The languages are snapshotted when the dictation starts, in the same breath as the dictionary.
-        #expect(controller.contains("context: context, excluding: dictionary.words, preferredLanguages: preferredLanguages(),"))
+        #expect(controller.contains("wordFrequencies: @escaping ScreenWordFrequencies = { await WordList.bundled?.seen($0) ?? [:] },"))
     }
 
     /// Settings' Smart Dictation toggle writes the key the app's controller reads, on by default.
@@ -2130,7 +2121,7 @@ struct DictationWaveformTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
             smartDictation: { true },
-            unknownWords: { _, _ in nil },
+            wordFrequencies: { _ in [:] },
             transcribe: { _, _, _, _ in try await Task.sleep(for: .seconds(60)); return DictationTranscription(text: "", cleanedText: nil) },
             warmUp: {},
             speechDetector: FakeSpeechDetector.hearing()
@@ -2173,7 +2164,7 @@ struct DictationWaveformTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
             smartDictation: { true },
-            unknownWords: { _, _ in nil },
+            wordFrequencies: { _ in [:] },
             transcribe: { _, _, _, _ in throw DictationError(status: 502, code: "transcription_failed") },
             warmUp: {},
             transcriptionRetryDelays: [.seconds(60)],
@@ -2239,7 +2230,7 @@ struct DictationLanguageSettingTests {
                 isOnline: { true },
                 isOptedOutOfAI: { false },
                 smartDictation: { true },
-                unknownWords: { _, _ in nil },
+                wordFrequencies: { _ in [:] },
                 transcribe: { _, language, _, _ in
                     languages.withLock { $0.append(language) }
                     return DictationTranscription(text: "annyeong", cleanedText: "Annyeong.")
@@ -2285,7 +2276,7 @@ struct DictationLanguageSettingTests {
             isOptedOutOfAI: { false },
             dictationLanguage: { language },
             smartDictation: { true },
-            unknownWords: { _, _ in nil },
+            wordFrequencies: { _ in [:] },
             transcribe: DictationController.backendTranscription(BackendClient(llmSession: http.session)),
             warmUp: {},
             speechDetector: FakeSpeechDetector.hearing()
@@ -2344,7 +2335,7 @@ struct DictationLanguageSettingTests {
             isOnline: { true },
             isOptedOutOfAI: { false },
             dictationLanguage: { nil },
-            unknownWords: { _, _ in nil },
+            wordFrequencies: { _ in [:] },
             dictionary: { .init(words: [], learnsWords: false) },
             corrections: nil,
             useWords: { _ in },
@@ -2455,4 +2446,10 @@ struct DictationEmailBodyTests {
         #expect(await DictationController.storedEmailBody(headerId: header.id) == "Meet Xyvora at Brevalle Labs.")
         #expect(await DictationController.storedEmailBody(headerId: "\(accountId):INBOX:999") == nil)
     }
+}
+
+/// A word list for the controller's tests: the words `isRare` names are seen never, every other
+/// word often (as the word list sees an everyday one).
+func rareWords(_ isRare: @escaping @Sendable (String) -> Bool) -> DictationController.ScreenWordFrequencies {
+    { words in Dictionary(uniqueKeysWithValues: words.map { ($0, isRare($0) ? WordSeen.tenths(0) : .tenths(60)) }) }
 }
