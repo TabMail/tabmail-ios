@@ -1,6 +1,6 @@
 # MIS-IOS-030 — picked a PR's focused suites by subject, and missed a test that reads the changed file's source
 
-**Recurrences:** 3
+**Recurrences:** 4
 **Status:** Active
 **First recorded:** 2026-11-05
 
@@ -43,12 +43,23 @@ suites were then run and passed.
 The tell this time: *"the suite is named after its file."* Read the declared types; a run that
 reports fewer suites than the list named is a miss, not a pass.
 
+## Recurrence 4 (2026-11-06, the chat view train gate)
+
+A coverage fix added a source check to the reply-field PR, third from the bottom of a six-PR stack,
+and its focused run passed there. The check looked for `clearCount: fieldClearCount)`, closing
+parenthesis included; the next PR adds an `onlyTo:` argument after it, so the check failed from that
+PR on and was found only by the train-tip gate, after the stack had been rebased onto it.
+
+The tell this time: *"the new test passes in the PR I added it to."* In a stack, a test added to an
+earlier PR also has to pass at the tip, and a source check should match the smallest token that
+carries its meaning.
+
 ## The rule
 
 Before choosing a PR's focused suites, run `rg -l '<changed file name>' TabMailTests` for every
 production file the PR edits, and add every suite that names one. Then list every suite TYPE each matched file
 declares (every type after a `@Suite`, and every top-level `struct`/`class` holding `@Test`s), and
-pass each one to `-only-testing:`; naming one suite of a file runs only that suite, and a name no type carries runs nothing, silently. Check that the reported suite count equals the list's. Many iOS tests read source text at
+pass each one to `-only-testing:`; naming one suite of a file runs only that suite, and a name no type carries runs nothing, silently. Check that the reported suite count equals the list's. A test added to an earlier PR of a stack is also run at the stack's tip before the round closes. Many iOS tests read source text at
 run time (`String(contentsOf:)` on a `TabMail/…` path); they break on a move that changes no behaviour.
 Write such a check with whitespace collapsed (`split(whereSeparator: \.isWhitespace).joined(separator: " ")`),
 as `ChatReplyFieldTests` and `ChatSwipeTests` do, so a move does not break it.
