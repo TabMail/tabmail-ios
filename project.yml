@@ -55,6 +55,7 @@ targets:
           - "Vendor/sqlite-vec/LICENSE-*"
           - "Vendor/pdfjs"
           - "Vendor/wordlist"
+          - "Vendor/licenses"
       - path: Shared
       - path: TabMail/Vendor/sqlite-vec
         includes:
@@ -63,6 +64,10 @@ targets:
       - path: TabMail/Resources
         excludes:
           - "Info.plist"
+        buildPhase: resources
+      # The license texts the Acknowledgments screen shows (copied as published), kept as a folder.
+      - path: TabMail/Vendor/licenses
+        type: folder
         buildPhase: resources
       # pdf.js for attachment_read_pdf (ADR-IOS-088), kept as a folder so cmaps/ stays a directory.
       - path: TabMail/Vendor/pdfjs
