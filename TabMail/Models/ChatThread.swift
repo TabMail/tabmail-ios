@@ -36,10 +36,12 @@ struct ChatThread: Equatable {
         /// Written by the user: a blue bubble on the right.
         let isOwn: Bool
         let sender: Person
-        /// The bubble's text message; nil while it is being summarized (N2b).
+        /// The bubble's text message; nil while it is being summarized (N2b). An email with
+        /// nothing to summarize is done without one (`MessageHeader.noContentSummary`): its bubble
+        /// says so, never "Summarizing".
         var textMessage: String? {
-            guard let text = header.summaryTextMessage, !text.isEmpty else { return nil }
-            return text
+            if let text = header.summaryTextMessage, !text.isEmpty { return text }
+            return header.summaryBlurb == MessageHeader.noContentSummary ? MessageHeader.noContentSummary : nil
         }
         /// A time stamp goes above this bubble.
         let showsTimeStamp: Bool
