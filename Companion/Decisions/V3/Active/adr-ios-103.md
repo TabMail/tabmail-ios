@@ -86,6 +86,15 @@ same AI result, kept as long as the email itself is shown.
      (`chatBodyArrived`).
    - **D3, the background walk** (`chatWalkCandidates`, run at the end of `repopulateFromDatabase`):
      the threads of the newest `SyncConfig.maxRecentEmails` Inbox rows, every member with its body.
+   **A thread is the whole thread (amendment 2026-11-06, train gate):** `findRelatedMessages`
+   returns every email connected to the opened one, with no length or depth limit, because the chat
+   shows the whole thread, all the way back (owner Q2, "Typical email threads are not that long").
+   Its old cap (`SyncConfig.threadQueryLimit`, 100 emails, plus five expansion rounds) dated from the
+   first release with no recorded reason and is deleted. The expansion still ends: each round adds
+   only emails not seen yet. The bound is on the AI work instead (owner 2026-11-06: "add a safety
+   bound that you load up to something like 10 emails from the current visible oldest message"):
+   the open chat asks only for the emails on screen and those near them (decision 9,
+   `ChatSummaryWindow`); until the chat screen exists the requests stay off in release builds.
    A chat request is an ordinary summary job (same model, queue, executor and write) with
    `AIJob.forChat`: it is window-exempt, any folder passes its scope checks (`readJobOutcome`,
    `executeJob`), and it is done only when the summary has its text message. `forChat` is context,
