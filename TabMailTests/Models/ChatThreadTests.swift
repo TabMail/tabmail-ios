@@ -180,14 +180,20 @@ struct ChatThreadTests {
 
     // MARK: - Bubble text, avatars, header
 
-    @Test("A bubble's text message is the summary's, and an empty one counts as still summarizing")
+    @Test("A bubble's text message is the summary's, an empty one counts as still summarizing, and an email with nothing to summarize says so")
     func textMessage() {
+        var summarizedNoText = Self.header("4", minutesAgo: 0.5)
+        summarizedNoText.summaryBlurb = "A summary without its text message yet."
+        var noContent = Self.header("5", minutesAgo: 0.2)
+        noContent.summaryBlurb = MessageHeader.noContentSummary
         let chat = Self.thread([
             Self.header("1", minutesAgo: 3, text: "See you then"),
             Self.header("2", minutesAgo: 2, text: ""),
             Self.header("3", minutesAgo: 1),
+            summarizedNoText,
+            noContent,
         ])
-        #expect(chat.items.map(\.textMessage) == ["See you then", nil, nil])
+        #expect(chat.items.map(\.textMessage) == ["See you then", nil, nil, nil, MessageHeader.noContentSummary])
     }
 
     @Test("Initials come from the first two words of the name, else the address")

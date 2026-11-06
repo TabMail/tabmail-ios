@@ -18,6 +18,7 @@ import Testing
 ///     tutorial. A draft opens in the draft editor from every open path, never as a chat.
 ///     A tap outside the keyboard dismisses it in the chat.
 ///  4. The inbox row shows the text message only with the chat view on; else the snippet.
+///  5. An email the body writer confirms empty is done: its bubble says so, never "Summarizing".
 @Suite("Chat thread context", .serialized)
 struct ChatThreadContextTests {
 
@@ -119,6 +120,50 @@ struct ChatThreadContextTests {
         #expect(context.isLoaded)
         #expect(context.extras.isEmpty)
         #expect(context.accounts.isEmpty)
+    }
+
+    @Test("An email the body writer confirms empty is done, and its bubble says it has no content, not Summarizing")
+    func confirmedEmptyEmailIsDone() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        _ = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "acc1", path: "INBOX", role: .inbox, pool: pool)
+        var original = Self.header("empty")
+        original.rfc822MessageId = "<empty@example.com>"
+        original.headerComplete = true
+        // One more empty fetch confirms the body empty.
+        original.emptyFetchCount = 2
+        let stored = original
+        try await pool.write { try stored.insert($0) }
+        let items = { (header: MessageHeader) in
+            ChatThread(members: [header], replyAddresses: { [$0.fromAddress] }, ownAddresses: [],
+                       draftFolderIds: [], sentFolderIds: [], unreadAtOpen: [], preferredId: nil).items
+        }
+        let before = items(original)
+        #expect(before.count == 1)
+        guard before.count == 1 else { return }
+        #expect(before[0].textMessage == nil, "before the body: still summarizing")
+
+        let (result, _) = await BodyFetchProcessor.process(fetchResult: .init(
+            item: .init(headerId: original.id, accountId: original.accountId, folderPath: original.folderPath,
+                        messageId: original.messageId, isInInbox: true),
+            renderedBody: MessageBody.create(contentKey: ContentKey(rawValue: original.id), htmlBody: nil),
+            plainText: nil, hasAttachments: false, hasUnresolvedICS: false,
+            fetchedRfc822MessageId: original.rfc822MessageId), enableAI: false)
+        guard case .confirmedEmpty = result else {
+            Issue.record("the real empty-body writer did not confirm the body empty: \(result)")
+            return
+        }
+        let finished = try #require(try await pool.read { try MessageHeader.fetchOne($0, key: stored.id) })
+        #expect(finished.summaryBlurb == MessageHeader.noContentSummary)
+        #expect(ActiveAIQueue.summaryDone(finished, forChat: true), "the queue counts it done")
+        let after = items(finished)
+        #expect(after.count == 1)
+        guard after.count == 1 else { return }
+        #expect(after[0].textMessage == MessageHeader.noContentSummary, "so the bubble never waits for a text message")
     }
 
     @Test("An invite card needs a request the user can add, with a start time")
