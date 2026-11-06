@@ -218,6 +218,15 @@ same AI result, kept as long as the email itself is shown.
    `AIService.sendChatMessage(logsUserText:)` for the request's own failure lines): the field's text
    is often the AI Reply, written from the email, and the chat error log is kept with debug logging
    off. Text typed in the chat is logged as before.
+   **Superseded (train gate round 2, 2026-11-06):** a resend or rewind replayed the field's words
+   without that flag and logged them. The gate moved to the one writer instead:
+   `BackgroundSyncLogger.logChatError` always keeps the error line and adds the user's words only
+   while debug logging is on, for every caller (typed chat text included), and the flag and
+   `loggedText` are deleted. Tests: `ChatReplyFieldRuntimeTests.chatRequestFailureLog` (every
+   request failure branch, debug off and on) and `BackgroundSyncLoggerTests.chatErrorRoundTrip`.
+   Overnight call, awaiting the owner's blessing: typed chat text no longer reaches the production
+   chat error log either (debug logging keeps it), following the rule that diagnostic logging is
+   debug-gated.
    **The Sent bubble before its email arrives (N7):** a reply sent from the chat (the ready AI Reply,
    or an agent compose asked for in the field) is kept in memory (`ChatSentReplies`, keyed by the
    account and the replied-to Message-ID) and shown as the user's words: on the sent email's own

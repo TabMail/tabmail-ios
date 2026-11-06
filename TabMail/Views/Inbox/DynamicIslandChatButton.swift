@@ -2325,12 +2325,6 @@ struct DynamicIslandChat: View {
         return await ChatIdTranslator.shared.toNumericId(message.id)
     }
 
-    /// What a failed send's persistent log line may quote: the text typed in the chat, but never
-    /// the reply field's, which is often the AI Reply, written from the email.
-    static func loggedText(_ text: String, fromReplyField: Bool) -> String? {
-        fromReplyField ? nil : text
-    }
-
     /// `script`: a guided-tutorial prompt, answered by `TutorialChatScript`
     /// on the device instead of the AI.
     private func sendAgentChat(_ text: String, script: TutorialCoordinator.ChatPrompt? = nil, fromReplyField: Bool = false) {
@@ -2439,7 +2433,6 @@ struct DynamicIslandChat: View {
         // Captured with the session id: a demo turn is written only while its demo runs.
         let admission = DemoModeStore.shared.chatAdmission
         let capturedSessionKey = sessionKey
-        let loggedText = Self.loggedText(text, fromReplyField: fromReplyField)
 
         activeChatTask = Task {
             let chatStore = ChatStore.shared
@@ -2535,14 +2528,13 @@ struct DynamicIslandChat: View {
                         userText: enrichedText,
                         history: history,
                         onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
-                        invocation: invocation,
-                        logsUserText: loggedText != nil
+                        invocation: invocation
                     )
                 }
 
                 let replyText = response?.text ?? "I couldn't generate a response. Please try again."
                 if response == nil {
-                    BackgroundSyncLogger.logChatError("Empty/nil response from LLM", userMessage: loggedText)
+                    BackgroundSyncLogger.logChatError("Empty/nil response from LLM", userMessage: text)
                 } else if script == nil {
                     confirmSubscriptionActive()
                 }
@@ -2637,11 +2629,11 @@ struct DynamicIslandChat: View {
                     // with the saved checkpoint — completed tool calls + prior thinking
                     // are preserved in its conversation_state. No hard error bubble, and
                     // no `lastFailedMessage` (that's the separate fork/resend pathway).
-                    BackgroundSyncLogger.logChatError("Connection lost (resumable): \(error.localizedDescription)", userMessage: loggedText)
+                    BackgroundSyncLogger.logChatError("Connection lost (resumable): \(error.localizedDescription)", userMessage: text)
                     pendingResumeRequest = resumable.resumeRequest
                 } else {
                     // Connection/server error — enable retry
-                    BackgroundSyncLogger.logChatError("Chat error: \(error.localizedDescription)", userMessage: loggedText)
+                    BackgroundSyncLogger.logChatError("Chat error: \(error.localizedDescription)", userMessage: text)
                     lastFailedMessage = text
                     chatMessages.append(ChatMessage(
                         role: .agent,
