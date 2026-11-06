@@ -96,6 +96,22 @@ struct ChatReplyFieldTests {
 
     // MARK: - 3. The agent's message
 
+    @Test("Dictation over the untouched AI Reply in the field replaces it; edited words, no reply, or the open sheet keep the text")
+    func dictationReplacesOnlyTheUntouchedReply() {
+        let ready = "Sounds good, see you Friday"
+        func field(after words: String, input: String, readyText: String?, expanded: Bool) -> String {
+            ChatReplyField.dictated(words, onto: input, replacing: ChatReplyField.dictationReplaces(
+                input: input, readyText: readyText, expanded: expanded))
+        }
+        #expect(field(after: "Can we do Monday", input: ready, readyText: ready, expanded: false) == "Can we do Monday")
+        #expect(field(after: "or Monday", input: ready + " maybe", readyText: ready, expanded: false)
+                == ready + " maybe or Monday", "edited words stay")
+        #expect(field(after: "what is this about", input: ready, readyText: ready, expanded: true)
+                == ready + " what is this about", "the open chat sheet adds to it")
+        #expect(field(after: "hello", input: "", readyText: nil, expanded: false) == "hello")
+        #expect(field(after: "there", input: "hi", readyText: nil, expanded: false) == "hi there")
+    }
+
     @Test("Words for the agent name the email and say where they came from")
     func agentMessage() {
         let reply = ChatReplyField.agentMessage(emailNumericId: 42, text: "say yes", isNoReply: false)
@@ -198,6 +214,10 @@ struct ChatReplyFieldTests {
     @Test("The field's Send opens compose for the unchanged AI Reply, else sends the words to the agent")
     func fieldSendWiring() throws {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        // Both dictation paths take the field's decision (on-device and cloud).
+        #expect(Self.count("let replacesReadyReply = ChatReplyField.dictationReplaces( input: inputText, readyText: replyField?.readyText, expanded: isExpanded)", in: text) == 1)
+        #expect(Self.count("speechBase = replacesReadyReply ? \"\" : inputText", in: text) == 1)
+        #expect(Self.count("inputText = ChatReplyField.dictated(text, onto: inputText, replacing: replacesReadyReply)", in: text) == 1)
         let send = try Self.body(of: "private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {", in: text)
         #expect(Self.count("if ChatReplyField.route(text: text, readyText: field.readyText) == .readyReply { onSendReadyReply?() return }", in: send) == 1)
         #expect(Self.count("onFieldSend?(text)", in: send) == 1)
