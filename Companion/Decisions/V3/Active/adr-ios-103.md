@@ -91,6 +91,12 @@ same AI result, kept as long as the email itself is shown.
    `executeJob`), and it is done only when the summary has its text message. `forChat` is context,
    not identity, like `windowExempt`; on dedupe the flags only widen (`admitOrUpgrade`). The chained
    action job does not inherit it, so it keeps the Inbox scope.
+   **The user's own email** (amendment 2026-11-05, train gate): a summary of an email the user
+   wrote, as the chat decides it (from one of the user's addresses, or in a Sent folder;
+   `ActiveAIQueue.isSentByUser`), sends `is_sent_by_user: true` (`PromptVariables.summaryVariables`),
+   so the backend writes its text message in the user's voice (ADR-032); any other email's request
+   omits the field, as Thunderbird's always do. Every queue summary job carries it; the new-mail
+   pipeline (`AIService.process`) is Inbox mail and keeps Thunderbird's request.
    **The no-forever-retry rule:** "done" is ONE predicate, `ActiveAIQueue.summaryDone`, used by every
    completion check and by both requests. A chat job whose done-condition could never become true
    would retry forever (the backoff has no cap on attempts), so: the parser keeps any non-empty text
@@ -129,4 +135,4 @@ including to none (`sameSummaryNewTextMessage`), the merge's second stage creati
 stage could not and caching its result with the text message (`secondStageCachesTextMessage`), a merged
 cache entry kept through the orphan grace (`mergedCacheEntryGetsTheGrace`), and a push through `NotificationService.didReceive`
 staging the text message, via `NotificationService.stagingPathOverride`).
-Decision 8: `ChatSummaryQueueTests`.
+Decision 8: `ChatSummaryQueueTests`; `ChatSummaryExecutionTests` (the own-email field, two-sided; a real body write releasing the waiting chat summary once; the executor refusing an ordinary summary outside the Inbox, with an Inbox control).
