@@ -284,6 +284,70 @@ struct MessageDetailThreadActionTests {
         #expect(try await folders(pool, ids) == before)
     }
 
+    enum TwoAccountAction: String, CaseIterable, Sendable {
+        case archive, delete, move, moveWithNoSuchFolder
+    }
+
+    /// The other account files its Archive and Trash under other names, so a move that sent both
+    /// emails to the opened account's folder names would leave the other email where it was.
+    private static let otherArchivePath = "Other Archive"
+    private static let otherTrashPath = "Other Trash"
+
+    @Test("A chat with emails in two accounts moves each to its own account's folder; one Undo puts both back",
+          arguments: TwoAccountAction.allCases)
+    @MainActor
+    func chatInTwoAccountsMovesEachInItsAccount(action: TwoAccountAction) async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+        try await pool.writeWithoutTransaction { db in
+            var acc = Account(emailAddress: "other@example.com", displayName: "Other", provider: .gmail)
+            acc.id = "acc2"
+            try acc.insert(db)
+            try Folder(name: "INBOX", path: Self.inboxPath, role: .inbox, accountId: "acc2").insert(db)
+            try Folder(name: "Archive", path: Self.otherArchivePath, role: .archive, accountId: "acc2").insert(db)
+            try Folder(name: "Trash", path: Self.otherTrashPath, role: .trash, accountId: "acc2").insert(db)
+            if action == .move {
+                try Folder(name: "Projects", path: Self.projectsPath, role: .custom, accountId: "acc2").insert(db)
+            }
+        }
+        let opened = try insertHeader(pool, messageId: "two-acc-own")
+        var other = MessageHeader(
+            messageId: "two-acc-other", subject: "Test", from: "sender@example.com", fromAddress: "sender@example.com",
+            to: "other@example.com", date: Date(), snippet: "body", folderId: "acc2:\(Self.inboxPath)",
+            accountId: "acc2", folderPath: Self.inboxPath, isInInbox: true)
+        other.headerComplete = true
+        let seeded = other
+        try await pool.writeWithoutTransaction { try seeded.insert($0) }
+        let ids = [opened.id, other.id]
+        let before = try await folders(pool, ids)
+        let vm = openChat(pool, focused: opened, others: [other])
+
+        var after = before
+        switch action {
+        case .archive:
+            #expect(vm.archiveChat([opened, other]))
+            after = [opened.id: Self.archivePath, other.id: Self.otherArchivePath]
+        case .delete:
+            #expect(vm.deleteChat([opened, other]))
+            after = [opened.id: Self.trashPath, other.id: Self.otherTrashPath]
+        case .move:
+            #expect(vm.moveChat([opened, other], toFolderPath: Self.projectsPath))
+            after = [opened.id: Self.projectsPath, other.id: Self.projectsPath]
+        case .moveWithNoSuchFolder:
+            #expect(vm.moveChat([opened, other], toFolderPath: Self.projectsPath))
+            after[opened.id] = Self.projectsPath
+        }
+        #expect(UndoService.shared.undoStack.count == 1)
+        try await settle(pool, after)
+        #expect(try await folders(pool, ids) == after, "each email went to its own account's folder")
+
+        await UndoService.shared.undo()
+        try await settle(pool, before)
+        #expect(try await folders(pool, ids) == before, "one Undo puts every email back")
+    }
+
     @Test("A chat of only sent copies and drafts, or already all in Trash, records nothing")
     @MainActor
     func chatWithNothingToMove() async throws {
