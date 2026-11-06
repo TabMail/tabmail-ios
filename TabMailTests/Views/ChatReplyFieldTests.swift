@@ -18,12 +18,15 @@ import Testing
 ///  4. While the agent writes a reply the line above the field says so (N5.1).
 ///  5. A reply sent from the chat shows its words on the user's bubble until that email's own text
 ///     message arrives, and only on the email that is that reply (N7).
-///  6. The view wires each of these: hosted SwiftUI views cannot be driven from a unit test, so the
-///     wiring is read from the source.
-///  7. A ready AI Reply fills the field only while the field is the app's, and only over an empty
+///  6. With recipients changed (Reply to), Send has the agent write the reply again for the people
+///     chosen, and its message names them; everyone ticked is Reply All (R1, R2.4, Q33).
+///  7. VoiceOver reads who an email went to when it was not everyone (Q25).
+///  8. A ready AI Reply fills the field only while the field is the app's, and only over an empty
 ///     field or the AI Reply the app put there: never over words typed or said, in the field or in
 ///     the open sheet, and never while a dictation is bringing words. One that arrives while the
 ///     sheet is open or a dictation runs fills the untouched field once that ends.
+///  9. The view wires each of these: hosted SwiftUI views cannot be driven from a unit test, so the
+///     wiring is read from the source.
 @Suite("Chat reply field")
 @MainActor
 struct ChatReplyFieldTests {
@@ -232,7 +235,107 @@ struct ChatReplyFieldTests {
         #expect(replies.entries.map(\.text) == ["New"], "adding prunes old entries")
     }
 
-    // MARK: - 7. Whose words are in the field
+    // MARK: - 6. Changed recipients
+
+    private static let david = ChatThread.Person(address: "david@example.com", name: "David Kim")
+    private static let sarah = ChatThread.Person(address: "sarah@example.com", name: "Sarah Chen")
+    private static let sam = ChatThread.Person(address: "sam@example.com", name: "Sam Lee")
+
+    @Test("With recipients changed, the unchanged AI Reply goes to the agent to be written again")
+    func changedRecipientsRoute() {
+        #expect(ChatReplyField.route(text: "Tuesday works", readyText: "Tuesday works", recipientsChanged: true) == .agent)
+        #expect(ChatReplyField.route(text: "Tuesday works", readyText: "Tuesday works", recipientsChanged: false) == .readyReply)
+    }
+
+    @Test("The agent's message names the people a reply goes only to")
+    func agentMessageOnlyTo() {
+        let message = ChatReplyField.agentMessage(
+            emailNumericId: 3, text: "say yes", isNoReply: false, onlyTo: [Self.david, Self.sam])
+        #expect(message == "Regarding [Email](3) (typed in its reply field; if what I want is unclear, I am replying to it; a reply goes only to David Kim <david@example.com>, Sam Lee <sam@example.com>): say yes")
+        #expect(ChatReplyField.agentMessage(emailNumericId: 3, text: "x", isNoReply: false, onlyTo: [])
+                == ChatReplyField.agentMessage(emailNumericId: 3, text: "x", isNoReply: false))
+    }
+
+    @Test("Everyone on the newest email ticked, nobody added, is Reply All; anything else is only them")
+    func replyTarget() {
+        let people = [Self.sarah, Self.david]
+        #expect(ChatReplyTarget.chosen([Self.david, Self.sarah], replyPeople: people) == .replyAll, "order does not matter")
+        #expect(ChatReplyTarget.chosen([Self.david], replyPeople: people).only == [Self.david])
+        #expect(ChatReplyTarget.chosen(people + [Self.sam], replyPeople: people).only == people + [Self.sam],
+                "someone added")
+        let chips = ChatReplyTarget.chips([Self.david, Self.sarah, Self.sam, Self.david])
+        #expect(chips.names == ["David Kim", "Sarah Chen"] && chips.more == 2)
+        #expect(ChatReplyTarget.chips([Self.david]).more == 0)
+    }
+
+    @Test("Reply to starts from the current choice, ticks and unticks, and adds people")
+    func replyToChoice() {
+        let people = [Self.sarah, Self.david]
+        var choice = ChatReplyToChoice(replyPeople: people, target: .replyAll)
+        #expect(choice.people == people && choice.ticked == ["sarah@example.com", "david@example.com"])
+        #expect(choice.target(replyPeople: people) == .replyAll)
+
+        choice.toggle(Self.sarah)
+        #expect(!choice.isTicked(Self.sarah) && choice.target(replyPeople: people).only == [Self.david])
+        choice.toggle(Self.david)
+        #expect(!choice.canFinish, "nobody to reply to")
+        choice.toggle(Self.sarah)
+        #expect(choice.canFinish)
+
+        let own: Set<String> = ["me@example.com"]
+        let addedSam = choice.add("Sam Lee <Sam@Example.com>", ownAddresses: own)
+        #expect(addedSam)
+        #expect(choice.people.last == Self.sam, "a typed address, lowercased, with its name")
+        let addedPat = choice.add("pat@example.com", name: "Pat Doe", ownAddresses: own)
+        #expect(addedPat)
+        #expect(choice.people.last?.name == "Pat Doe", "a contact pick keeps the contact's name")
+        let addedMe = choice.add("me@example.com", ownAddresses: own)
+        #expect(!addedMe, "never the user")
+        let addedText = choice.add("not an address", ownAddresses: own)
+        #expect(!addedText)
+        #expect(choice.people.count == 4)
+
+        choice.toggle(Self.sam)
+        let reAdded = choice.add("sam@example.com", ownAddresses: own)
+        #expect(reAdded, "adding someone listed ticks them")
+        #expect(choice.people.count == 4 && choice.isTicked(Self.sam))
+        #expect(choice.target(replyPeople: people).only?.map(\.address)
+                == ["sarah@example.com", "sam@example.com", "pat@example.com"])
+
+        let reopened = ChatReplyToChoice(replyPeople: people, target: ChatReplyTarget(only: [Self.david, Self.sam]))
+        #expect(reopened.people == people + [Self.sam], "the added person is listed again")
+        #expect(reopened.ticked == ["david@example.com", "sam@example.com"])
+    }
+
+    // MARK: - 7. VoiceOver
+
+    @Test("VoiceOver reads who an email went to when it was not everyone")
+    func accessibilityOnlyTo() throws {
+        func item(from: String, to: String, minutesAgo: Double) -> MessageHeader {
+            var header = Self.header(String(Int(minutesAgo)), fromAddress: from, minutesAgo: minutesAgo)
+            header.from = from == "me@example.com" ? "Me" : "Priya Vasanth"
+            header.to = to
+            return header
+        }
+        let all = item(from: "sarah@example.com", to: "me@example.com, Priya Vasanth <priya@example.com>", minutesAgo: 30)
+        var allHeader = all
+        allHeader.from = "Sarah Chen"
+        let toMe = item(from: "priya@example.com", to: "me@example.com", minutesAgo: 20)
+        let mine = item(from: "me@example.com", to: "Priya Vasanth <priya@example.com>", minutesAgo: 10)
+        let chat = ChatThread(
+            members: [allHeader, toMe, mine], replyAddresses: { [$0.fromAddress] },
+            ownAddresses: ["me@example.com"], draftFolderIds: [], sentFolderIds: [], unreadAtOpen: [], preferredId: nil)
+        guard chat.items.count == 3 else { Issue.record("three bubbles"); return }
+        #expect(ChatBubbleView.accessibilityText(item: chat.items[0], words: "Hi all") == "Sarah Chen said: Hi all")
+        #expect(ChatBubbleView.accessibilityText(item: chat.items[1], words: "Between us")
+                == "Priya Vasanth replied only to you, said: Between us")
+        #expect(ChatBubbleView.accessibilityText(item: chat.items[2], words: "Will do")
+                == "You replied only to Priya Vasanth, saying: Will do")
+        let only = try #require(chat.items[1].repliedOnlyTo)
+        #expect(ChatBubbleView.listNames(only) == ["You"])
+    }
+
+    // MARK: - 8. Whose words are in the field
 
     /// Offers `ready` with the field collapsed, nothing sent and no dictation, unless told otherwise.
     private static func offer(
@@ -347,7 +450,7 @@ struct ChatReplyFieldTests {
         #expect(Self.offer(&fill, nil, input: "A reply to the new email") == "", "a reply taken back empties the app's fill")
     }
 
-    // MARK: - 6. Wiring
+    // MARK: - 9. Wiring
 
     private static func source(_ path: String) throws -> String {
         let projectRoot = URL(fileURLWithPath: #filePath)
@@ -402,11 +505,11 @@ struct ChatReplyFieldTests {
         #expect(Self.count("speechBase = replacesReadyReply ? \"\" : inputText", in: text) == 1)
         #expect(Self.count("inputText = ChatReplyField.dictated(text, onto: inputText, replacing: replacesReadyReply)", in: text) == 1)
         let send = try Self.body(of: "private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {", in: text)
-        #expect(Self.count("if ChatReplyField.route(text: text, readyText: field.readyText) == .readyReply { onSendReadyReply?() return }", in: send) == 1)
+        #expect(Self.count("if ChatReplyField.route(text: text, readyText: field.readyText, recipientsChanged: field.onlyTo != nil) == .readyReply { onSendReadyReply?() return }", in: send) == 1)
         #expect(Self.count("onFieldSend?(text)", in: send) == 1)
         #expect(Self.count("sendAgentChat(text, fromReplyField: true)", in: send) == 1)
         #expect(Self.count("sendFromReplyField(", in: text) == 2, "Send reaches it")
-        #expect(Self.count("enrichedText = ChatReplyField.agentMessage( emailNumericId: numericId, text: text, isNoReply: replyField?.isNoReply ?? false)", in: text) == 1)
+        #expect(Self.count("enrichedText = ChatReplyField.agentMessage( emailNumericId: numericId, text: text, isNoReply: replyField?.isNoReply ?? false, onlyTo: replyField?.onlyTo)", in: text) == 1)
         #expect(Self.count("enqueueStatus(isReplyField ? ChatReplyField.statusLine(label) : label)", in: text) == 1)
     }
 
@@ -428,5 +531,24 @@ struct ChatReplyFieldTests {
         #expect(Self.count("if sentReplies.composeEnded(outcome, replyTo: replyTo, words: words) { fieldClearCount += 1 }", in: ended) == 1)
         #expect(Self.count("sentReplies.settle(thread.items)", in: text) == 1)
         #expect(Self.count("ChatSentReplyBubble(text: entry.text)", in: text) == 1)
+    }
+
+    @Test("Reply to, Forward and the chosen people reach the field and the compose card")
+    func recipientsWiring() throws {
+        let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        #expect(Self.count("onlyTo: replyTarget.only)", in: chat) == 1, "the field knows the people chosen")
+        #expect(Self.count("let only = fieldComposeOpened ? replyTarget.only?.map(\\.address) : nil let to = only ?? req.to let cc = only == nil ? req.cc : []", in: chat) == 1,
+                "a reply asked for in the field goes to the people chosen")
+        #expect(Self.count("prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,", in: chat) == 1)
+        #expect(Self.count("if replyTo != nil { replyTarget = .replyAll }", in: chat) == 1, "a sent reply clears it")
+        #expect(Self.count("ownAddresses: context.ownAddresses) { replyTarget = $0 }", in: chat) == 1, "Done sets it")
+        #expect(Self.count("ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) { showsReplyTo = true }", in: chat) == 1)
+        #expect(Self.count("Button { forwardMessage = thread.newest }", in: chat) == 1)
+        #expect(Self.count(".fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }", in: chat) == 1)
+        #expect(Self.count(".onChange(of: thread.newest?.stableId) { _, _ in replyTarget = .replyAll }", in: chat) == 1)
+
+        let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        #expect(Self.count("ChatReplyField.route(text: text, readyText: field.readyText, recipientsChanged: field.onlyTo != nil)", in: island) == 1)
+        #expect(Self.count("onlyTo: replyField?.onlyTo)", in: island) == 1)
     }
 }
