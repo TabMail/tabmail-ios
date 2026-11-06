@@ -19,7 +19,8 @@ import UIKit
 ///     older than the oldest of them, on screen first: the rest of a long thread waits. When a
 ///     scroll stops, the emails then on screen go to the front. Only a hand scroll widens the
 ///     window to `summarySpread` both ways (`ChatSummaryWindow.userMoved`, unit-tested: a test
-///     cannot drag a finger), so the chat's own scrolls keep the open window.
+///     cannot drag a finger), so the chat's own scrolls keep the open window. A layout change
+///     with no scroll at all (the screen shrinks) asks again for the emails then on screen.
 ///
 /// What is on screen is read back from the summary queue, whose front is the latest request:
 /// the newest email on screen, then the rest of the screen, then the older ones.
@@ -96,7 +97,7 @@ struct ChatThreadViewLifecycleTests {
     /// the wait first lets that scroll happen; the chat starts at the bottom until its thread loads.
     private func open(
         unreadFrom: Int?, openedIndex: Int, highlights: Bool, landsAway: Bool = false,
-        then action: ((UIScrollView) -> Void)? = nil
+        then action: (@MainActor (UIScrollView) async throws -> Void)? = nil
     ) async throws -> Opened {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -136,7 +137,7 @@ struct ChatThreadViewLifecycleTests {
         let scroll = chatScroll()
         if let action {
             let view = try #require(scroll)
-            action(view)
+            try await action(view)
             try await Task.sleep(for: .milliseconds(600))
             front = try await Self.settledFront(queue)
         }
@@ -209,6 +210,30 @@ struct ChatThreadViewLifecycleTests {
         // A programmatic scroll is not a hand scroll, so nothing below the screen comes next: the
         // queue goes on with the open's request, the newest email first.
         #expect(opened.queued.dropFirst(run.count).first == Self.length - 1, "\(opened.queued)")
+    }
+
+    @Test("A layout change with no scroll asks for the emails then on screen")
+    func idleLayoutChangeAsks() async throws {
+        var heights: (before: CGFloat, after: CGFloat) = (0, 0)
+        let opened = try await open(unreadFrom: nil, openedIndex: Self.length - 1, highlights: false) { scroll in
+            #expect(!(await ActiveAIQueue.shared.queuedJobsForTesting).isEmpty, "control: the open asked")
+            await ActiveAIQueue.shared.clearForTesting()
+            let window = try #require(scroll.window)
+            heights.before = scroll.bounds.height
+            window.frame.size.height = 480
+            window.layoutIfNeeded()
+            try await Task.sleep(for: .milliseconds(400))
+            heights.after = scroll.bounds.height
+            #expect(!scroll.isDragging && !scroll.isDecelerating, "no scroll happened")
+        }
+        #expect(heights.after < heights.before - 100, "control: the screen itself shrank")
+        // The scroll view keeps its offset as the screen shrinks, so which emails stay on screen
+        // depends on the layout; what is pinned is that the chat asks again, for one screen.
+        #expect(!opened.queued.isEmpty, "the chat asks again after the layout change")
+        #expect(Self.latestRun(opened.queued) == opened.queued,
+                "one run of the emails then on screen and above them, newest first: \(opened.queued)")
+        #expect(opened.queued.count > ChatViewConfig.summaryLead, "the screen and summaryLead more")
+        #expect(!opened.queued.contains(0), "the rest of the long thread waits")
     }
 
     @Test("From search: the chat opens at the opened email")
