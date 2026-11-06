@@ -13,7 +13,10 @@ import UIKit
 ///
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. The ready AI Reply is in the mounted field; when the newest email changes, the untouched
-///     field holds the new email's ready reply.
+///     field holds the new email's ready reply. A completion (a sent compose card, an agent answer
+///     from the field) empties the field, and the ready reply does not come back; a late AI Reply
+///     never replaces words the user typed. The two completions are private to `ChatThreadView`,
+///     so which ones empty the field is read from the source (`clearWiring`).
 ///  2. A send names the pill's email as the send starts: after the newest email changes, the next
 ///     request names the new email, never the number found for the earlier one.
 ///  3. A failed chat request's persistent log keeps the error and never the user's words while
@@ -41,6 +44,8 @@ struct ChatReplyFieldRuntimeTests {
 
     @Observable final class Host {
         var message: MessageHeader
+        /// `ChatThreadView.fieldClearCount`: a send or an answer from the field bumps it.
+        var clearCount = 0
         init(_ message: MessageHeader) { self.message = message }
     }
 
@@ -51,7 +56,7 @@ struct ChatReplyFieldRuntimeTests {
                 message: host.message, isExpanded: .constant(false), isWorking: .constant(false),
                 replyField: ChatReplyField(
                     readyText: ChatReplyField.readyText(newest: host.message, isOwn: false),
-                    isNoReply: false, clearCount: 0))
+                    isNoReply: false, clearCount: host.clearCount))
         }
     }
 
@@ -93,6 +98,72 @@ struct ChatReplyFieldRuntimeTests {
         let after = Self.fieldTexts(controller.view)
         #expect(after.contains("A ready reply to the newer email"), "got \(after)")
         #expect(!after.contains("A ready reply to the first email"))
+    }
+
+    /// Mounts the pill on `message` and hands the host and controller to `body`.
+    private func withMountedField(
+        _ message: MessageHeader,
+        _ body: @MainActor (Host, UIHostingController<HostView>) async throws -> Void
+    ) async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        ChatPillState.shared.removeAllSessions()
+        let host = Host(message)
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let controller = UIHostingController(rootView: HostView(host: host))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            ChatPillState.shared.removeAllSessions()
+        }
+        try await Self.settle()
+        try await body(host, controller)
+    }
+
+    /// Types `words` into the mounted field the way UIKit reports an edit.
+    private static func type(_ words: String, in view: UIView) -> Bool {
+        if let text = view as? UITextView, text.isEditable {
+            text.text = words
+            text.delegate?.textViewDidChange?(text)
+            return true
+        }
+        if let text = view as? UITextField {
+            text.text = words
+            text.sendActions(for: .editingChanged)
+            return true
+        }
+        return view.subviews.contains { type(words, in: $0) }
+    }
+
+    @Test("A send or an answer from the field empties it, and the ready AI Reply does not come back")
+    func completionEmptiesTheField() async throws {
+        try await withMountedField(Self.header("field-C", ready: "A ready reply")) { host, controller in
+            #expect(Self.fieldTexts(controller.view).contains("A ready reply"), "control: the field starts filled")
+            host.clearCount += 1
+            try await Self.settle()
+            let texts = Self.fieldTexts(controller.view)
+            #expect(!texts.isEmpty)
+            #expect(texts.allSatisfy { $0.isEmpty }, "the field is empty after the completion: \(texts)")
+        }
+    }
+
+    @Test("A late AI Reply never replaces words the user typed in the field")
+    func lateReplyKeepsTheUsersWords() async throws {
+        try await withMountedField(Self.header("field-D", ready: "A ready reply")) { host, controller in
+            let words = "My own words"
+            #expect(Self.type(words, in: controller.view), "the mounted pill has a native editable field")
+            try await Self.settle()
+            #expect(Self.fieldTexts(controller.view).contains(words), "control: the edit reached the field")
+            host.message.replyTextMessage = "A late AI Reply"
+            try await Self.settle()
+            let texts = Self.fieldTexts(controller.view)
+            #expect(texts.contains(words), "the user's words stay: \(texts)")
+            #expect(!texts.contains("A late AI Reply"))
+        }
     }
 
     // MARK: - 2. A send names the email it is about
@@ -189,5 +260,24 @@ struct ChatReplyFieldRuntimeTests {
         let start = try #require(text.range(of: "private func sendAgentChat("))
         let send = String(text[start.upperBound...])
         #expect(send.contains("var contextNumericId = await Self.contextNumber(sendingAbout: message, known: contextEmailNumericId)"))
+    }
+
+    /// The text from `start` to the next `private func`.
+    private static func function(_ start: String, in text: String) throws -> String {
+        let begin = try #require(text.range(of: start))
+        let rest = text[begin.upperBound...]
+        return String(rest[..<(rest.range(of: "private func ")?.lowerBound ?? rest.endIndex)])
+    }
+
+    @Test("A sent compose card and an agent answer from the field each empty the field; a cancelled card does not")
+    func clearWiring() throws {
+        let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        #expect(text.components(separatedBy: "clearCount: fieldClearCount").count == 2, "the field gets the count once")
+        #expect(text.components(separatedBy: "fieldClearCount += 1").count == 3, "only the two completions")
+        let answered = try Self.function("private func agentAnswered() {", in: text)
+        #expect(answered.contains("guard !fieldComposeOpened else { return } fieldClearCount += 1"))
+        let ended = try Self.function("private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?, words: String?) {", in: text)
+        #expect(ended.hasPrefix(" guard case .sent = outcome else { return }"))
+        #expect(ended.contains("fieldClearCount += 1"))
     }
 }
