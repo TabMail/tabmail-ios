@@ -455,7 +455,7 @@ actor ActiveAIQueue {
     }
 
     /// D3, the background walk: every email of the threads of the newest `SyncConfig.maxRecentEmails`
-    /// Inbox rows (those rows included, any folder, no depth limit beyond `ThreadDetection`'s own),
+    /// Inbox rows (those rows included, any folder, the whole thread as `ThreadDetection` returns it),
     /// that has its body and no summary with a text message. A member whose body is not downloaded yet
     /// is picked up by a later walk once backfill has fetched it. One thread lookup per Inbox row, so
     /// it runs from `repopulateFromDatabase` (launch, foreground, AI re-enable), never on drain.

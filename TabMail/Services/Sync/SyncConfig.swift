@@ -378,8 +378,6 @@ enum SyncConfig {
     /// TTL for compose chat session turns. Compose sessions are never resumable;
     /// turns are kept for MemorySearchTool until this TTL, then deleted.
     static let composeChatSessionTTLDays = 30
-    /// Thread query: max messages returned per thread query.
-    static let threadQueryLimit = 100
     /// Max inline images (CID) to resolve per message — alias onto the shared
     /// canonical constant so main-app callers (providers, IMAP, Graph) and
     /// NSE use the same value without a second source of truth.

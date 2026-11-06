@@ -265,6 +265,53 @@ struct ThreadDetectionTests {
         #expect(ids.contains("f@test.com"))
     }
 
+    @Test("A long reply chain comes back whole, however many emails and rounds deep (the chat shows all of it)")
+    func longChainComesBackWhole() throws {
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
+        try insertAccount(pool)
+        try insertFolder(pool)
+
+        // 120 emails, each replying to the one before: more than 100, and opened from the middle,
+        // 60 rounds from either end.
+        let now = Date()
+        let count = 120
+        var opened: MessageHeader?
+        for index in 0..<count {
+            let header = try insertHeader(
+                pool, messageId: "\(index)", rfc822MessageId: "<m\(index)@example.com>",
+                inReplyTo: index == 0 ? nil : "<m\(index - 1)@example.com>",
+                date: now.addingTimeInterval(Double(index - count) * 60))
+            if index == count / 2 { opened = header }
+        }
+        let related = try ThreadDetection.findRelatedMessages(for: try #require(opened), in: pool)
+
+        #expect(related.count == count - 1)
+        #expect(Set(related.map(\.messageId)) == Set((0..<count).map(String.init)).subtracting(["\(count / 2)"]))
+        #expect(related.map(\.date) == related.map(\.date).sorted(by: >), "newest first")
+    }
+
+    @Test("Every reply to one email comes back, however many")
+    func manyRepliesComeBack() throws {
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
+        try insertAccount(pool)
+        try insertFolder(pool)
+
+        let now = Date()
+        let root = try insertHeader(pool, messageId: "root", rfc822MessageId: "<root@example.com>",
+                                    date: now.addingTimeInterval(-86_400))
+        let replies = 130
+        for index in 0..<replies {
+            _ = try insertHeader(pool, messageId: "r\(index)", rfc822MessageId: "<r\(index)@example.com>",
+                                 inReplyTo: "<root@example.com>", date: now.addingTimeInterval(Double(-index)))
+        }
+        let related = try ThreadDetection.findRelatedMessages(for: root, in: pool)
+
+        #expect(related.count == replies)
+        #expect(Set(related.map(\.messageId)) == Set((0..<replies).map { "r\($0)" }))
+    }
+
     @Test("Forward chain from first message finds all replies")
     func forwardChainFromFirst() throws {
         let (pool, directory) = try makePool()

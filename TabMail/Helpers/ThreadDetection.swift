@@ -11,7 +11,8 @@ import GRDB
 enum ThreadDetection {
 
     /// Find related messages by collecting from ALL thread signals in parallel,
-    /// then deduplicating and sorting. No priority/fallback — pure union.
+    /// then deduplicating and sorting. No priority/fallback — pure union. Returns the whole
+    /// thread, with no length or depth limit.
     ///
     /// For a given message, any other message connected to it through one of the
     /// following is treated as related (direction-agnostic):
@@ -98,7 +99,6 @@ enum ThreadDetection {
                             && !seenIds.contains(Column("id"))
                             && !excludedFolderIds.contains(Column("folderId")))
                     .order(Column("date").desc)
-                    .limit(SyncConfig.threadQueryLimit)
                     .fetchAll(db)
 
                 // (2) + (4) Reverse + lateral via inReplyTo: messages whose inReplyTo is in L.
@@ -109,7 +109,6 @@ enum ThreadDetection {
                             && !seenIds.contains(Column("id"))
                             && !excludedFolderIds.contains(Column("folderId")))
                     .order(Column("date").desc)
-                    .limit(SyncConfig.threadQueryLimit)
                     .fetchAll(db)
 
                 // (3) + (5) Reverse + lateral via References: messages whose References
@@ -122,7 +121,6 @@ enum ThreadDetection {
                     .filter(!seenIds.contains(Column("id"))
                             && !excludedFolderIds.contains(Column("folderId")))
                     .order(Column("date").desc)
-                    .limit(SyncConfig.threadQueryLimit)
                     .fetchAll(db)
 
                 return forward + inReplyToMatches + refMatches
@@ -138,10 +136,9 @@ enum ThreadDetection {
         // BFS: for each newly found message, expand their references too. This
         // rescues transitive connections — e.g., messages B and C both cite a
         // common ancestor A that does exist in the DB; B finds A directly, then
-        // expanding A finds C. Bounded by depth and result count.
-        var depth = 0
-        while !newlyFound.isEmpty, depth < 5, collected.count < SyncConfig.threadQueryLimit {
-            depth += 1
+        // expanding A finds C. It runs until the thread is complete: each round adds only emails
+        // not seen yet, so it ends after at most one round per email of the thread.
+        while !newlyFound.isEmpty {
             var nextRound: [MessageHeader] = []
             for found in newlyFound {
                 let expanded = try findConnected(rfc822MessageId: found.rfc822MessageId,
@@ -161,9 +158,10 @@ enum ThreadDetection {
 
         if collected.isEmpty { return [] }
 
-        // Deduplicate cross-folder copies, sort by date, cap to limit.
+        // Deduplicate cross-folder copies, sort by date. The whole thread, however long: the chat
+        // shows every email of it, all the way back (ADR-IOS-103).
         let deduped = excludeCopies(collected, of: msg)
-        return Array(deduped.sorted { $0.date > $1.date }.prefix(SyncConfig.threadQueryLimit))
+        return deduped.sorted { $0.date > $1.date }
     }
 
     /// Filter out copies of the same email that exist in different folders.
@@ -191,7 +189,6 @@ enum ThreadDetection {
                         && Column("id") != msg.id
                         && !excludedFolderIds.contains(Column("folderId")))
                 .order(Column("date").desc)
-                .limit(SyncConfig.threadQueryLimit)
                 .fetchAll(db)
         }
     }
