@@ -547,7 +547,7 @@ struct ChatThreadView: View {
     @ViewBuilder
     private func composeView(for req: AgentToolRouter.ComposeRequest) -> some View {
         // A reply asked for in the field shows the field's words as its Sent bubble (N7).
-        let words = req.mode == .reply && fieldComposeOpened ? fieldWords : nil
+        let words = ChatAgentCompose.sentWords(mode: req.mode, fromField: fieldComposeOpened, fieldWords: fieldWords)
         let onOutcome: @MainActor (ComposeOutcome) -> Void = { outcome in
             req.onOutcome(outcome)
             composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil, words: words)
@@ -560,9 +560,8 @@ struct ChatThreadView: View {
                 onAgentOutcome: onOutcome)
         case .reply:
             // R1: a reply asked for in the field goes to the people chosen in Reply to.
-            let only = fieldComposeOpened ? replyTarget.only?.map(\.address) : nil
-            let to = only ?? req.to
-            let cc = only == nil ? req.cc : []
+            let (to, cc) = ChatAgentCompose.replyRecipients(
+                fromField: fieldComposeOpened, target: replyTarget, to: req.to, cc: req.cc)
             ComposeView(
                 replyTo: req.replyTo, suggestedBody: req.body,
                 prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,

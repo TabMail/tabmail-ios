@@ -160,6 +160,25 @@ struct ChatReplyTarget: Equatable {
     }
 }
 
+/// A compose card the agent opens in the chat. `fromField`: it was asked for in the collapsed reply
+/// field, not in the open chat sheet.
+enum ChatAgentCompose {
+    /// The words the chat shows as the Sent bubble once the card sends (N7): only a reply asked for
+    /// in the field shows the field's words.
+    static func sentWords(mode: AgentToolRouter.ComposeRequest.Mode, fromField: Bool, fieldWords: String?) -> String? {
+        mode == .reply && fromField ? fieldWords : nil
+    }
+
+    /// Who a reply goes to (R1): asked for in the field with people chosen in Reply to, only them;
+    /// otherwise the agent's own recipients.
+    static func replyRecipients(
+        fromField: Bool, target: ChatReplyTarget, to: [String], cc: [String]
+    ) -> (to: [String], cc: [String]) {
+        guard fromField, let only = target.only else { return (to, cc) }
+        return (only.map(\.address), [])
+    }
+}
+
 /// Replies sent from the chat whose email has no text message yet (N7). The bubble shows what the
 /// user said, or the ready AI Reply's text message, until the email's own text message arrives.
 /// In memory only: after a relaunch the sent email shows "Summarizing" until its summary lands.
