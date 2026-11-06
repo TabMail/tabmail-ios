@@ -112,14 +112,8 @@ struct ChatSwipeTests {
 
     // MARK: - 3. Whole-chat actions
 
-    @Test("Whole-chat actions take every email in the opened email's folder, once each")
-    func chatMembers() {
-        let a = Self.header("1", minutesAgo: 30, isRead: true)
-        let sent = Self.header("2", fromAddress: Self.me, minutesAgo: 20, isRead: true, folder: "Sent")
-        let b = Self.header("3", minutesAgo: 10, isRead: true)
-        #expect(Self.uids(ChatSwipe.chatMembers([b, a, sent, b], folderId: "acc1:INBOX")) == ["3", "1"])
-        #expect(ChatSwipe.chatMembers([a], folderId: "acc1:Archive").isEmpty)
-    }
+    // The emails a whole-chat action takes are pinned by their effect in
+    // `MessageDetailThreadActionTests` (several folders, one Undo).
 
     // MARK: - 4. The inbox row
 
@@ -228,14 +222,12 @@ struct ChatSwipeTests {
         #expect(buttons.contains("{ deleteChat() }"))
         #expect(buttons.contains("{ archiveChat() }"))
         #expect(try Self.body(of: "private func archiveChat() {", in: text)
-            .contains("if viewModel.archiveMessages(chatMembers) { dismissChat(destinationFolderId: nil) }"))
+            .contains("if viewModel.archiveChat(members) { dismissChat(destinationFolderId: nil) }"))
         #expect(try Self.body(of: "private func deleteChat() {", in: text)
-            .contains("if viewModel.deleteMessages(chatMembers) { dismissChat(destinationFolderId: nil) }"))
+            .contains("if viewModel.deleteChat(members) { dismissChat(destinationFolderId: nil) }"))
         let move = try Self.body(of: "private func moveChat(toFolderPath path: String) {", in: text)
-        #expect(move.contains("if viewModel.moveMessages(chatMembers, toFolderPath: path) {"))
+        #expect(move.contains("if viewModel.moveChat(members, toFolderPath: path) {"))
         #expect(move.contains("dismissChat(destinationFolderId: MessageIdentity.folderId(accountId: opened.accountId, folderPath: path))"))
-        #expect(try Self.body(of: "private var chatMembers: [MessageHeader] {", in: text)
-            .contains("ChatSwipe.chatMembers(members, folderId: opened.folderId)"))
         let dismissal = try Self.body(of: "private func dismissChat(destinationFolderId: String?) {", in: text)
         #expect(dismissal.contains("name: .messageDismissedFromDetail, object: viewModel.messageId"))
         #expect(dismissal.contains("dismiss()"))

@@ -154,11 +154,22 @@ struct UndoableAction {
         self.timestamp = timestamp
         switch type {
         case .move(_, let destinationPath):
-            self.commands = [UndoAccountCommand(
-                accountId: accountId,
-                forwardDestinationPath: destinationPath,
-                members: messages.map(UndoMember.init(header:))
-            )]
+            // One command per source folder and epoch: `AccountManager.undoMove` moves a command's
+            // members back to ONE source, so a move from several folders (a whole chat) undoes as
+            // one entry whose commands each restore their own folder.
+            var commands: [UndoAccountCommand] = []
+            var commandIndex: [String: Int] = [:]
+            for member in messages.map(UndoMember.init(header:)) {
+                let key = "\(member.sourceFolderId)|\(member.sourceObservedUidValidity.map(String.init) ?? "-")"
+                if let index = commandIndex[key] {
+                    commands[index].members.append(member)
+                } else {
+                    commandIndex[key] = commands.count
+                    commands.append(UndoAccountCommand(
+                        accountId: accountId, forwardDestinationPath: destinationPath, members: [member]))
+                }
+            }
+            self.commands = commands
         }
     }
 

@@ -493,22 +493,17 @@ struct ChatThreadView: View {
         unreadAtOpen = ChatSwipe.unreadIds(after: action, targets: targets, items: thread.items)
     }
 
-    private var chatMembers: [MessageHeader] {
-        guard let opened = viewModel.message else { return [] }
-        return ChatSwipe.chatMembers(members, folderId: opened.folderId)
-    }
-
     private func archiveChat() {
-        if viewModel.archiveMessages(chatMembers) { dismissChat(destinationFolderId: nil) }
+        if viewModel.archiveChat(members) { dismissChat(destinationFolderId: nil) }
     }
 
     private func deleteChat() {
-        if viewModel.deleteMessages(chatMembers) { dismissChat(destinationFolderId: nil) }
+        if viewModel.deleteChat(members) { dismissChat(destinationFolderId: nil) }
     }
 
     private func moveChat(toFolderPath path: String) {
         guard let opened = viewModel.message else { return }
-        if viewModel.moveMessages(chatMembers, toFolderPath: path) {
+        if viewModel.moveChat(members, toFolderPath: path) {
             // A chosen folder can be one the list behind renders (Archive to Inbox).
             dismissChat(destinationFolderId: MessageIdentity.folderId(accountId: opened.accountId, folderPath: path))
         }

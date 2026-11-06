@@ -40,14 +40,6 @@ enum ChatSwipe {
         return Set(items.filter { changed.contains($0.id) ? !action.isRead : !$0.header.isRead }.map(\.id))
     }
 
-    /// The emails a whole-chat action (Archive, Delete, Move) acts on: every email in the opened
-    /// email's folder, as a collapsed inbox thread does (S1.1, S2.1). Emails elsewhere (sent
-    /// replies, older archived ones) stay where they are.
-    static func chatMembers(_ members: [MessageHeader], folderId: String) -> [MessageHeader] {
-        var seen = Set<String>()
-        return members.filter { $0.folderId == folderId && seen.insert($0.id).inserted }
-    }
-
     /// S1.2: Read on a collapsed chat in the inbox reads the whole chat, as opening it does.
     /// Nil means today's single-email toggle (Unread, a single email, or the chat view off).
     static func inboxReadIds(rowIsRead: Bool, memberIds: [String], collapsedThread: Bool, chatActive: Bool) -> [String]? {

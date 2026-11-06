@@ -273,9 +273,15 @@ same AI result, kept as long as the email itself is shown.
    Only a drag the user finished acts: one the system cancels or fails (a call, a system
    gesture) closes the reveal and runs nothing, however far it went (`ChatHorizontalPan.finished`,
    `ChatSwipe.settle(finished:)`; train gate, 2026-11-05).
-   VoiceOver reaches every button as a named action. Archive, Delete and Move act on every email in
-   the opened email's folder (`ChatSwipe.chatMembers`), as a collapsed inbox thread does, and close
-   the chat as closing the email does today (Q29). They are ONE action each: the detail view model's
+   VoiceOver reaches every button as a named action. Archive, Delete and Move act on every email the
+   chat shows, wherever it is filed ("always the whole thread", 2026-11-04), except the user's sent
+   copies and drafts, which stay in their folders, and emails already at the destination
+   (`MessageDetailViewModel.archiveChat` / `deleteChat` / `moveChat`), and close the chat as closing
+   the email does today (Q29). **Amended in train gate round 2 (2026-11-06):** they first took only
+   the opened email's folder, which left the chat's archived and filed emails behind. One Undo puts
+   each email back in its own folder: `UndoableAction` keeps one command per source folder and epoch,
+   because `AccountManager.undoMove` moves a command back to one source; this also fixes Undo of an
+   inbox thread whose emails sat in different folders. They are ONE action each: the detail view model's
    `archiveMessages` / `deleteMessages` / `moveMessages` push one undo entry and queue one move for
    every email (`recordMove`, one `enqueueMove` closure with the read op before the move); the
    single-email `archiveMessage` / `deleteMessage` / `moveMessage` are now the one-email case of
@@ -284,7 +290,9 @@ same AI result, kept as long as the email itself is shown.
    S1.2); Unread stays on the newest email.
    **Product choices made in PR 5, awaiting owner blessing:** Unread from here skips the user's own
    emails; a bubble has no full swipe; the swipe buttons are labelled "Delete" (as the mock) where
-   the inbox row says "Trash".
+   the inbox row says "Trash". Overnight call (train gate round 2, 2026-11-06): a whole-chat action
+   leaves the user's sent copies and drafts where they are (a draft must stay in Drafts to stay
+   editable; on Gmail a sent copy is the same email as its other labels).
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (ADR-032) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
