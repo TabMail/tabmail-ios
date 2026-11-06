@@ -2318,6 +2318,19 @@ struct DynamicIslandChat: View {
         lastStatusChangeTime = .distantPast
     }
 
+    /// The [Email](N) number a send names: the pill's email as the send starts, else the number
+    /// already known (a resumed session's email). Never a number found for another email.
+    static func contextNumber(sendingAbout message: MessageHeader?, known: Int?) async -> Int? {
+        guard let message else { return known }
+        return await ChatIdTranslator.shared.toNumericId(message.id)
+    }
+
+    /// What a failed send's persistent log line may quote: the text typed in the chat, but never
+    /// the reply field's, which is often the AI Reply, written from the email.
+    static func loggedText(_ text: String, fromReplyField: Bool) -> String? {
+        fromReplyField ? nil : text
+    }
+
     /// `script`: a guided-tutorial prompt, answered by `TutorialChatScript`
     /// on the device instead of the AI.
     private func sendAgentChat(_ text: String, script: TutorialCoordinator.ChatPrompt? = nil, fromReplyField: Bool = false) {
@@ -2426,6 +2439,7 @@ struct DynamicIslandChat: View {
         // Captured with the session id: a demo turn is written only while its demo runs.
         let admission = DemoModeStore.shared.chatAdmission
         let capturedSessionKey = sessionKey
+        let loggedText = Self.loggedText(text, fromReplyField: fromReplyField)
 
         activeChatTask = Task {
             let chatStore = ChatStore.shared
@@ -2437,9 +2451,14 @@ struct DynamicIslandChat: View {
             //    sessionEmailContexts has the snapshot, register from it (avoids race
             //    with fire-and-forget Task that was previously used)
             // 3. Inbox session — neither applies, enrichedText = raw text
-            if let msg = message, contextEmailNumericId == nil {
-                contextEmailNumericId = await ChatIdTranslator.shared.toNumericId(msg.id)
-            } else if contextEmailNumericId == nil, let sid = sid,
+            // The email this send is about is the pill's email as the send starts: the chat view's
+            // newest email changes while its pill stays mounted, so a number found for an earlier
+            // email is never reused, and the send reads its own copy, which a late registration
+            // from an earlier open cannot overwrite.
+            var contextNumericId = await Self.contextNumber(sendingAbout: message, known: contextEmailNumericId)
+            if message != nil {
+                contextEmailNumericId = contextNumericId
+            } else if contextNumericId == nil, let sid = sid,
                       let emailCtx = sessionEmailContexts[sid] {
                 // Resuming past msg-detail session from inbox. The messageHeaderId may be stale
                 // (IMAP MOVE changes PKs). Resolve to current PK before registering.
@@ -2454,17 +2473,18 @@ struct DynamicIslandChat: View {
                             from: emailCtx.messageHeaderId, to: resolvedId
                         )
                     }
-                    contextEmailNumericId = await ChatIdTranslator.shared.toNumericId(resolvedId)
+                    contextNumericId = await ChatIdTranslator.shared.toNumericId(resolvedId)
+                    contextEmailNumericId = contextNumericId
                     BackgroundSyncLogger.logDebug("[DynamicIslandChat] Restored email context for resumed session: \(emailCtx.subject)")
                 }
             }
 
             // Build enrichedText INSIDE Task block (after awaiting registration)
             let enrichedText: String
-            if let numericId = contextEmailNumericId, fromReplyField {
+            if let numericId = contextNumericId, fromReplyField {
                 enrichedText = ChatReplyField.agentMessage(
                     emailNumericId: numericId, text: text, isNoReply: replyField?.isNoReply ?? false)
-            } else if let numericId = contextEmailNumericId {
+            } else if let numericId = contextNumericId {
                 enrichedText = "Regarding [Email](\(numericId)): \(text)"
             } else {
                 enrichedText = text
@@ -2515,13 +2535,14 @@ struct DynamicIslandChat: View {
                         userText: enrichedText,
                         history: history,
                         onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
-                        invocation: invocation
+                        invocation: invocation,
+                        logsUserText: loggedText != nil
                     )
                 }
 
                 let replyText = response?.text ?? "I couldn't generate a response. Please try again."
                 if response == nil {
-                    BackgroundSyncLogger.logChatError("Empty/nil response from LLM", userMessage: text)
+                    BackgroundSyncLogger.logChatError("Empty/nil response from LLM", userMessage: loggedText)
                 } else if script == nil {
                     confirmSubscriptionActive()
                 }
@@ -2616,11 +2637,11 @@ struct DynamicIslandChat: View {
                     // with the saved checkpoint — completed tool calls + prior thinking
                     // are preserved in its conversation_state. No hard error bubble, and
                     // no `lastFailedMessage` (that's the separate fork/resend pathway).
-                    BackgroundSyncLogger.logChatError("Connection lost (resumable): \(error.localizedDescription)", userMessage: text)
+                    BackgroundSyncLogger.logChatError("Connection lost (resumable): \(error.localizedDescription)", userMessage: loggedText)
                     pendingResumeRequest = resumable.resumeRequest
                 } else {
                     // Connection/server error — enable retry
-                    BackgroundSyncLogger.logChatError("Chat error: \(error.localizedDescription)", userMessage: text)
+                    BackgroundSyncLogger.logChatError("Chat error: \(error.localizedDescription)", userMessage: loggedText)
                     lastFailedMessage = text
                     chatMessages.append(ChatMessage(
                         role: .agent,

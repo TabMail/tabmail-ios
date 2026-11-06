@@ -1896,6 +1896,12 @@ struct DictationOptOutFlagTests {
         return try String(contentsOf: projectRoot.appendingPathComponent(Self.pillPath), encoding: .utf8)
     }
 
+    /// The pill's source with every run of whitespace collapsed to one space, so a check reads
+    /// what the code says, not how far it is indented.
+    private func flatPillSource() throws -> String {
+        try pillSource().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
     /// The source between `start` and the next occurrence of `end` after it.
     private func slice(_ source: String, from start: String, to end: String) throws -> Substring {
         let startRange = try #require(source.range(of: start))
@@ -1951,18 +1957,20 @@ struct DictationOptOutFlagTests {
     /// While dictating, the input field stays in place with its text dimmed behind the waveform,
     /// can't be edited, and a tap on it stops listening; otherwise nothing covers it.
     @Test func theWaveformDimsTheInputInPlace() throws {
-        let source = try pillSource()
-        let field = String(try slice(source, from: "TextField(PillDictationMode.placeholder(", to: "if isWorking {"))
+        let source = try flatPillSource()
+        // The one input field, used by the pill's input bar and the chat's reply field.
+        let field = String(try slice(source, from: "private func inputField(placeholder: String) -> some View {", to: "private var trailingButton: some View"))
         // The field dims and ignores touches beneath the overlay, which stays full strength and
         // tappable: both modifiers come before it.
-        let beneath = try slice(field, from: "TextField(PillDictationMode.placeholder(", to: ".overlay {")
+        let beneath = try slice(field, from: "TextField(placeholder, text: $inputText, selection: $inputSelection, axis: .vertical)", to: ".overlay {")
         #expect(beneath.contains(".opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)"))
         #expect(beneath.contains(".allowsHitTesting(!dictation.isActive)"))
         #expect(beneath.contains(".accessibilityHidden(dictation.isActive)"))
         let overlay = try slice(field, from: ".overlay {", to: ".onTapGesture { dictation.finish() }")
-        #expect(overlay.contains("if dictation.isActive {\n                        DictationPillView(controller: dictation)"))
+        #expect(overlay.contains("if dictation.isActive { DictationPillView(controller: dictation)"))
         #expect(source.components(separatedBy: "DictationPillView(").count == 2)
         #expect(source.components(separatedBy: "TextField(").count == 2)
+        #expect(source.contains("inputField(placeholder: PillDictationMode.placeholder(isCompose: isComposeMode, offNote: dictationOffNote))"))
         #expect(DictationConfig.dimmedInputOpacity > 0 && DictationConfig.dimmedInputOpacity < 0.5)
     }
 
@@ -1971,10 +1979,10 @@ struct DictationOptOutFlagTests {
     /// While the words are transcribed, the button is a spinner. A pending retry doesn't take
     /// the slot while dictating.
     @Test func sendFinishesTheDictationThenSendsItsText() throws {
-        let source = try pillSource()
+        let source = try flatPillSource()
         let send = try slice(source, from: "// Normal send button", to: ".disabled(!canTapSend)")
         #expect(send.contains("if dictation.phase == .listening {"))
-        #expect(send.contains("sendWhenDictated = true\n                        dictation.finish()\n                    } else {\n                        sendMessage()"))
+        #expect(send.contains("sendWhenDictated = true dictation.finish() } else { sendMessage()"))
         #expect(send.contains(".foregroundStyle(canTapSend ? Theme.accent : .secondary.opacity(0.3))"))
         let canTapSend = try slice(source, from: "private var canTapSend: Bool {", to: "private func sendMessage()")
         #expect(canTapSend.contains("canSend || (dictation.phase == .listening && hasTabMailSession && !isWorking && composeReadyToSend)"))
@@ -1982,16 +1990,17 @@ struct DictationOptOutFlagTests {
         #expect(composeReady.contains("!isComposeMode || (composeMutationAllowed && composeAttachmentSnapshotReady)"))
         // While dictating, the slot is send even after a failed turn: retry doesn't take it over.
         #expect(source.contains("} else if !isWorking && !dictation.isActive && (pendingResumeRequest != nil || lastFailedMessage != nil)"))
-        #expect(!source.contains("Image(systemName: \"stop.circle.fill\")\n                        .font(.title2)\n                        .foregroundStyle(Theme.accent)"))
+        #expect(!source.contains("Image(systemName: \"stop.circle.fill\") .font(.title2) .foregroundStyle(Theme.accent)"))
 
         let transcribing = try slice(source, from: "} else if dictation.phase == .transcribing {", to: "} else if !isWorking && !dictation.isActive && (pendingResumeRequest != nil")
         #expect(transcribing.contains("DictationSpinner(isRetrying: dictation.isRetrying)"))
         #expect(!transcribing.contains("Button"))
 
         let start = String(try slice(source, from: "private func startDictation(auto: Bool = false)", to: "private var canSend: Bool"))
-        let onText = try slice(start, from: "{ text in", to: "scrollPosition.scrollTo(edge: .bottom)")
-        let appended = try #require(onText.range(of: "inputText = DictationController.appending(text, to: inputText)"))
-        let sent = try #require(onText.range(of: "if sendWhenDictated {\n                sendWhenDictated = false\n                if canSend { sendMessage() }"))
+        let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { [replacesReadyReply] text in", to: "scrollPosition.scrollTo(edge: .bottom)")
+        // The words land in the input (replacing the ready AI Reply, N4.3), then are sent.
+        let appended = try #require(onText.range(of: "inputText = replacesReadyReply ? text : DictationController.appending(text, to: inputText)"))
+        let sent = try #require(onText.range(of: "if sendWhenDictated { sendWhenDictated = false if canSend { sendMessage() }"))
         #expect(appended.upperBound <= sent.lowerBound)
 
         let ended = try slice(source, from: ".onChange(of: dictation.isActive) {", to: ".onChange(of: isTextFieldFocused)")
@@ -2113,7 +2122,7 @@ struct DictationOptOutFlagTests {
         let beforeStart = try slice(source, from: "private func startDictation(auto: Bool = false)", to: "dictation.start(context:")
         #expect(!beforeStart.contains("donate()"))
         let start = String(try slice(source, from: "private func startDictation(auto: Bool = false)", to: "private var canSend: Bool"))
-        let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in", to: "scrollPosition.scrollTo(edge: .bottom)")
+        let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { [replacesReadyReply] text in", to: "scrollPosition.scrollTo(edge: .bottom)")
         #expect(onText.contains("DictationLanguageTip.dictationCompleted.donate()"))
         // Nothing after the callback's last statement donates either.
         let pieces = start.components(separatedBy: "scrollPosition.scrollTo(edge: .bottom)")

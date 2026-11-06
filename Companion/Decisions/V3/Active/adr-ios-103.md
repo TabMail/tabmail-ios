@@ -212,6 +212,13 @@ same AI result, kept as long as the email itself is shown.
    sheet and empties the field, except after a compose the request opened (the compose was the
    answer). Dictation in the field replaces an unchanged AI Reply rather than appending to it, and
    the field never starts dictation by itself.
+   **Each send names the email it is about, and the field's words stay out of logs (train gate,
+   2026-11-05):** a send looks up the pill's current email as it starts
+   (`DynamicIslandChat.contextNumber`), never the number found for an earlier newest email. A failed
+   send from the field logs without its text (`DynamicIslandChat.loggedText`, and
+   `AIService.sendChatMessage(logsUserText:)` for the request's own failure lines): the field's text
+   is often the AI Reply, written from the email, and the chat error log is kept with debug logging
+   off. Text typed in the chat is logged as before.
    **The Sent bubble before its email arrives (N7):** a reply sent from the chat (the ready AI Reply,
    or an agent compose asked for in the field) is kept in memory (`ChatSentReplies`, keyed by the
    account and the replied-to Message-ID) and shown as the user's words: on the sent email's own
@@ -253,4 +260,6 @@ Decision 8: `ChatSummaryQueueTests`; `ChatSummaryExecutionTests` (the own-email 
 `ChatThreadContextTests`, `ChatSummaryQueueTests.chatViewSwitch`/`activeMatrix`, `ThreadGroupTests.displayInfoUnionLabels`.
 Decision 10: `ChatReplyFieldTests` (the ready text, Send's route, the agent's message, the status
 line, sent-reply matching and settling, and the field and chat wiring read from the source),
+`ChatReplyFieldRuntimeTests` (the ready AI Reply in the mounted field, the send's email lookup,
+a failed request's log with and without its text, and the send wiring),
 `ChatSummaryQueueTests.openAsksForAnEmailThatJoins`.
