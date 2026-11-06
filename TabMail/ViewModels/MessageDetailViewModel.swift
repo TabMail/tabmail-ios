@@ -1817,8 +1817,9 @@ final class MessageDetailViewModel {
     /// primary `message` when it is the one being acted on, and the matching
     /// thread card, which `updateThreadMessageFolder` deliberately KEEPS
     /// VISIBLE after an archive/delete (it only relabels its location).
+    /// Called only when the action's own snapshot of the setting is on.
     private func markReadOnArchiveDeleteInMemory(_ msg: MessageHeader) {
-        guard AccountManager.markReadOnArchiveDeleteEnabled, !msg.isRead else { return }
+        guard !msg.isRead else { return }
         if msg.id == message?.id { message?.isRead = true }
         if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
             threadMessages[idx].isRead = true
@@ -1922,9 +1923,9 @@ final class MessageDetailViewModel {
                     isRead: marksRead ? true : nil,
                     folderId: group.toFolderId,
                     actionTag: (msg.isInInbox && !group.destIsInbox) ? .some(nil) : nil))
-                if roleMove { markReadOnArchiveDeleteInMemory(msg) }
+                if marksRead { markReadOnArchiveDeleteInMemory(msg) }
             }
-            enqueueMove(group.msgs, to: group.toPath, markReadFirst: roleMove)
+            enqueueMove(group.msgs, to: group.toPath, markReadFirst: marksRead)
             for msg in group.msgs {
                 updateThreadMessageFolder(msg, newFolderPath: group.toPath, newFolderId: group.toFolderId,
                                           isInInbox: group.destIsInbox)
@@ -1973,9 +1974,10 @@ final class MessageDetailViewModel {
     /// round-9 defect, which shipped in three hand-kept copies; one helper
     /// keeps the protocol in lockstep).
     /// `markReadFirst` has NO DEFAULT on purpose: it selects the
-    /// mark-as-read-on-archive/delete composition, which is ON for the two
-    /// role-move callers (archive, delete) and OFF for the user-chosen-folder
-    /// move. A default would let a future caller silently pick one without the
+    /// mark-as-read-on-archive/delete composition. It is the action's own
+    /// snapshot, taken in `recordMove` as the action starts: on for archive and
+    /// delete while the setting was on then, always off for a move to a chosen
+    /// folder. A default would let a future caller silently pick one without the
     /// call site saying so — the same seam the `expectedIdentities` parameter
     /// on `performCoordinatedRoleMove` had to give up.
     private func enqueueMove(_ msgs: [MessageHeader], to folderPath: String, markReadFirst: Bool) {
@@ -1985,7 +1987,7 @@ final class MessageDetailViewModel {
             // Read intent BEFORE the move, in this one closure — a move
             // changes the address the read op would have to name. See
             // `AccountManager.markReadBeforeRoleMove`.
-            if markReadFirst { await manager.markReadBeforeRoleMove(ids: ids) }
+            await manager.markReadBeforeRoleMove(ids: ids, enabled: markReadFirst)
             await manager.move(msgs, to: folderPath)
             for id in ids {
                 manager.releaseOverlayEntry(id: id)

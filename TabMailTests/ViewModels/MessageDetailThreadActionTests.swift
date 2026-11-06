@@ -152,6 +152,44 @@ struct MessageDetailThreadActionTests {
         #expect(restored.allSatisfy { $0.folderPath == Self.inboxPath }, "one undo restores the whole chat")
     }
 
+    @Test("A chat's Archive or Delete uses the mark-as-read setting as it was when the action started, even if it changes before the queued work runs",
+          arguments: [true, false], [true, false])
+    @MainActor
+    func markReadSettingIsTheOneAtTheStart(archive: Bool, onAtStart: Bool) async throws {
+        let (pool, dir, previous) = try makeEnv()
+        defer { teardown(previous: previous, pool: pool, dir: dir) }
+        clearOverlay()
+        UndoService.shared.dismissAll()
+        UserDefaults.standard.set(onAtStart, forKey: AccountManager.markReadOnArchiveDeleteKey)
+
+        // Two source folders, so the action queues one move per folder.
+        let a = try insertHeader(pool, messageId: "snap-a")
+        let b = try insertHeader(pool, messageId: "snap-b", folderPath: Self.projectsPath)
+        let ids = [a.id, b.id]
+        let vm = openChat(pool, focused: b, others: [a])
+
+        // Hold the write queue so the action's queued work runs only after the setting changes.
+        let (gateStream, gate) = AsyncStream<Void>.makeStream()
+        defer { gate.finish() }
+        await AccountManager.shared.enqueueWrite {
+            var iterator = gateStream.makeAsyncIterator()
+            _ = await iterator.next()
+        }
+        #expect(archive ? vm.archiveChat([b, a]) : vm.deleteChat([b, a]))
+        #expect(vm.threadMessages.first?.isRead == onAtStart, "the card shows the setting as it was at the start")
+        UserDefaults.standard.set(!onAtStart, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        gate.finish()
+
+        let destination = archive ? Self.archivePath : Self.trashPath
+        try await settle(pool, ids: ids, in: destination)
+        let done = try await rows(pool, ids)
+        #expect(done.count == 2)
+        #expect(done.allSatisfy { $0.folderPath == destination && $0.isRead == onAtStart },
+                "every email's read state follows the setting as it was when the action started")
+        let reads = try await opsInDrainOrder(pool).filter { $0.type == .markRead }
+        #expect(reads.isEmpty == !onAtStart)
+    }
+
     @Test("Deleting a chat moves every email to Trash as one undo entry and one queued move")
     @MainActor
     func deleteChatIsOneAction() async throws {

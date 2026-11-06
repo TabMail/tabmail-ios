@@ -264,4 +264,20 @@ struct ChatSwipeTests {
                 "a vertical drag stays the scroll view's")
         #expect(text.contains("if now != id, offset != 0 { withAnimation(Self.spring) { offset = 0 } }"))
     }
+
+    // SwiftUI keeps a representable's recognizer outside the hosted view tree, so the pan is checked
+    // where it is built, and the source shows the representable builds it that way.
+    @Test("The swipe's pan asks its coordinator before it starts, so a vertical drag stays the scroll view's")
+    func panAsksItsCoordinator() throws {
+        var asked: [CGFloat] = []
+        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { asked.append($0); return true })
+        let pan = ChatHorizontalPan.makePan(delegate: coordinator)
+        #expect(pan.delegate === coordinator)
+        #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == false,
+                "a drag with no sideways speed does not start the swipe")
+        #expect(asked.isEmpty, "a drag that is not sideways never reaches the chat's own check")
+
+        let text = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
+        #expect(text.contains("func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer { Self.makePan(delegate: context.coordinator) }"))
+    }
 }
