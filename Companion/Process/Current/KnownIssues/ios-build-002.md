@@ -9,6 +9,8 @@
 
 ✅ **CLOSED AS A DECISION (reconfirmed 2026-08-09 for released `v1.7.5`)** — the **SwiftMail dependency is not pinned reproducibly**: `project.yml` pins it by `branch: main`, and `Package.resolved` — the file that would pin the exact revision — is gitignored. **PRE-EXISTING, not introduced by the v3 range**, and **accepted** because the fork is the owner's own repository
 
+> **SUPERSEDED 2026-11-06 (owner ruling): packages are now pinned.** A tracked root `Package.resolved` is copied into the generated project by `Scripts/xcodegen.sh`; decision [ADR-IOS-102](../../../Decisions/V3/Active/adr-ios-102.md). The text below is the history of the accepted hazard, kept for search.
+
 ## Subsystem and search terms
 
 Build reproducibility; SPM; `project.yml` `packages:`; `branch: main`; `Package.resolved`; `.gitignore:6` `TabMail.xcodeproj/`; XcodeGen; `github.com/TabMail/SwiftMail.git`; supply chain; dependency pinning; `Scripts/xcodegen.sh`
