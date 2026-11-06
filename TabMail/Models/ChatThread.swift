@@ -43,10 +43,31 @@ struct ChatThread: Equatable {
             if let text = header.summaryTextMessage, !text.isEmpty { return text }
             return header.summaryBlurb == MessageHeader.noContentSummary ? MessageHeader.noContentSummary : nil
         }
+        /// The email did not go to everyone in the chat: who it went to (R3). Nil for an email to
+        /// everyone.
+        let repliedOnlyTo: OnlyTo?
         /// A time stamp goes above this bubble.
         let showsTimeStamp: Bool
         /// The "Unread" line goes above this bubble (O1).
         let showsUnreadLine: Bool
+    }
+
+    /// The people an email went to when it did not go to everyone in the chat (R3).
+    struct OnlyTo: Equatable {
+        /// The user was one of them.
+        let includesYou: Bool
+        /// Everyone else it went to, in its To then Cc order.
+        let people: [Person]
+
+        /// "you" first, then the names.
+        var names: [String] { (includesYou ? ["you"] : []) + people.map(\.name) }
+
+        /// The gray label: up to `nameCount` names, then "+N" (R3.4).
+        func label(nameCount: Int = ChatViewLayout.headerNameCount) -> String {
+            let shown = names.prefix(nameCount).joined(separator: ", ")
+            let rest = names.count - min(names.count, nameCount)
+            return rest > 0 ? "\(shown) +\(rest)" : shown
+        }
     }
 
     let items: [Item]
@@ -80,6 +101,8 @@ struct ChatThread: Equatable {
             members.filter { !draftFolderIds.contains($0.folderId) }, preferredId: preferredId)
             .sorted { ($0.date, $0.id) < ($1.date, $1.id) }
         let names = Self.names(in: kept)
+        /// Everyone on the emails so far (R3).
+        var chatPeople = Set<String>()
 
         var items: [Item] = []
         var unreadLineShown = false
@@ -93,8 +116,10 @@ struct ChatThread: Equatable {
                 header: header,
                 isOwn: isOwn,
                 sender: Person(address: address, name: Self.name(for: address, header: header, names: names)),
+                repliedOnlyTo: Self.onlyTo(header, chatPeople: chatPeople, ownAddresses: ownAddresses, names: names),
                 showsTimeStamp: previous.map { header.date.timeIntervalSince($0) >= timeStampGap } ?? true,
                 showsUnreadLine: showsUnread))
+            chatPeople.formUnion(Self.audience(of: header, ownAddresses: ownAddresses))
         }
         self.items = items
 
@@ -108,6 +133,41 @@ struct ChatThread: Equatable {
         for item in items where !item.isOwn { others.insert(item.sender.address) }
         self.isGroup = others.count > 1
     }
+
+    /// Stands for the user in an audience, whichever of their addresses an email used.
+    private static let you = "\u{0}you"
+
+    /// Everyone on an email: its sender and its To and Cc, lowercased, the user as one person.
+    static func audience(of header: MessageHeader, ownAddresses: Set<String>) -> Set<String> {
+        var people = Set(recipients(of: header).map(\.address))
+        people.insert(header.fromAddress.lowercased())
+        return Set(people.map { ownAddresses.contains($0) ? you : $0 })
+    }
+
+    /// An email's To then Cc recipients, lowercased, each once.
+    private static func recipients(of header: MessageHeader) -> [(address: String, name: String?)] {
+        var seen = Set<String>()
+        return [header.to, header.cc].flatMap { RecipientEntry($0).recipients }
+            .map { (address: $0.address.lowercased(), name: $0.name) }
+            .filter { seen.insert($0.address).inserted }
+    }
+
+    /// Who an email went to, when it left out someone already in the chat: on an earlier email
+    /// (R3.2, R3.3). Someone new on an email joins the chat's people, so adding a person alone is
+    /// not "only", and an email is never "only" for people who joined after it.
+    private static func onlyTo(
+        _ header: MessageHeader, chatPeople: Set<String>, ownAddresses: Set<String>, names: [String: String]
+    ) -> OnlyTo? {
+        guard !chatPeople.subtracting(audience(of: header, ownAddresses: ownAddresses)).isEmpty else { return nil }
+        let sender = header.fromAddress.lowercased()
+        let others = recipients(of: header).filter { $0.address != sender }
+        let includesYou = others.contains { ownAddresses.contains($0.address) }
+        let people = others.filter { !ownAddresses.contains($0.address) }
+            .map { Person(address: $0.address, name: names[$0.address] ?? Self.fallbackName($0.address)) }
+        guard includesYou || !people.isEmpty else { return nil }
+        return OnlyTo(includesYou: includesYou, people: people)
+    }
+
 
     /// What makes two headers copies of one email (`copyKey`): its RFC Message-ID; without one, a
     /// provider id that names the message itself (Gmail, Exchange), in its account; else the row.

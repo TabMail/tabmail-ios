@@ -18,6 +18,8 @@ struct ChatReplyField: Equatable {
     /// Changes when the field must empty: the reply went out (N7), or the agent answered in the
     /// sheet (A3).
     let clearCount: Int
+    /// The reply goes only to these people (R2); nil for Reply All.
+    var onlyTo: [ChatThread.Person]? = nil
 
     var placeholder: String { isNoReply ? "Ask anything" : "Reply or ask anything" }
 
@@ -29,8 +31,10 @@ struct ChatReplyField: Equatable {
         case agent
     }
 
-    static func route(text: String, readyText: String?) -> Route {
-        guard let readyText else { return .agent }
+    /// With recipients changed the ready AI Reply was written for everyone, so Send has the agent
+    /// write it again for the people chosen (R2.4, Q33).
+    static func route(text: String, readyText: String?, recipientsChanged: Bool = false) -> Route {
+        guard let readyText, !recipientsChanged else { return .agent }
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
             == readyText.trimmingCharacters(in: .whitespacesAndNewlines) ? .readyReply : .agent
     }
@@ -48,10 +52,17 @@ struct ChatReplyField: Equatable {
     /// newest email (`Regarding [Email](N): …`), with a nudge that the words came from this
     /// email's reply field, so an unclear request is a reply to it (section 3c). For a no-reply
     /// sender the nudge says it takes no replies (E1.2).
-    static func agentMessage(emailNumericId: Int, text: String, isNoReply: Bool) -> String {
-        let nudge = isNoReply
+    /// With recipients chosen (R2) the nudge names them: a reply goes only to them.
+    static func agentMessage(
+        emailNumericId: Int, text: String, isNoReply: Bool, onlyTo: [ChatThread.Person]? = nil
+    ) -> String {
+        var nudge = isNoReply
             ? "typed in its reply field; the sender is a no-reply address, so do not write a reply to it"
             : "typed in its reply field; if what I want is unclear, I am replying to it"
+        if let onlyTo, !onlyTo.isEmpty {
+            let people = onlyTo.map { "\($0.name) <\($0.address)>" }.joined(separator: ", ")
+            nudge += "; a reply goes only to \(people)"
+        }
         return "Regarding [Email](\(emailNumericId)) (\(nudge)): \(text)"
     }
 
@@ -169,6 +180,24 @@ struct ChatFieldFill {
     private var clears: Bool {
         guard let atSend else { return true }
         return words == atSend || words.isEmpty
+    }
+}
+
+/// Who the chat's next reply goes to (R1, R2): Reply All, or only the people chosen in Reply to.
+struct ChatReplyTarget: Equatable {
+    /// Nil: Reply All, the newest email's people (R1.3).
+    let only: [ChatThread.Person]?
+
+    static let replyAll = ChatReplyTarget(only: nil)
+
+    /// Done in Reply to: everyone on the newest email ticked and nobody added is Reply All.
+    static func chosen(_ ticked: [ChatThread.Person], replyPeople: [ChatThread.Person]) -> ChatReplyTarget {
+        Set(ticked.map(\.address)) == Set(replyPeople.map(\.address)) ? .replyAll : ChatReplyTarget(only: ticked)
+    }
+
+    /// The "Replying only to" chips: up to `nameCount` names, then how many more (R2.3).
+    static func chips(_ people: [ChatThread.Person], nameCount: Int = ChatViewLayout.headerNameCount) -> (names: [String], more: Int) {
+        (people.prefix(nameCount).map(\.name), max(0, people.count - nameCount))
     }
 }
 
