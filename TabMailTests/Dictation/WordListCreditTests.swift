@@ -19,7 +19,8 @@ struct WordListCreditTests {
     }
 
     @Test func theAcknowledgmentsScreenCreditsEverySourceOfTheList() throws {
-        let screen = try read("TabMail/Views/Settings/AcknowledgmentsView.swift")
+        // The credits are the screen's catalogue, the list's own license statement is on the screen.
+        let screen = try read("TabMail/Views/Settings/AcknowledgmentEntries.swift") + read("TabMail/Views/Settings/AcknowledgmentsView.swift")
         for credit in ["FrequencyWords", "Hermit Dave", "OpenSubtitles 2018", "Lison", "wordfreq", "OpenCC", "Unicode CLDR", "CC BY-SA 4.0", "Vendor/wordlist/README.md"] {
             #expect(screen.contains(credit), "\(credit)")
         }

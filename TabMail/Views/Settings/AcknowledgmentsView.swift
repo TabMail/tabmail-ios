@@ -7,32 +7,6 @@ import SwiftUI
 struct AcknowledgmentsView: View {
     @Environment(\.dismiss) private var dismiss
 
-    private static let libraries: [(name: String, license: String, url: String, note: String?)] = [
-        // Apple — networking & utilities
-        ("SwiftNIO", "Apache License 2.0", "https://github.com/apple/swift-nio", nil),
-        ("SwiftNIO SSL", "Apache License 2.0", "https://github.com/apple/swift-nio-ssl", nil),
-        ("SwiftNIO IMAP", "Apache License 2.0", "https://github.com/apple/swift-nio-imap", nil),
-        ("Swift Collections", "Apache License 2.0", "https://github.com/apple/swift-collections", nil),
-        ("Swift Log", "Apache License 2.0", "https://github.com/apple/swift-log", nil),
-        // Database & email
-        ("GRDB.swift", "MIT License", "https://github.com/groue/GRDB.swift", nil),
-        ("SwiftMail", "BSD 2-Clause License", "https://github.com/Cocoanetics/SwiftMail", nil),
-        // Parsing & text
-        ("SwiftSoup", "MIT License", "https://github.com/scinfu/SwiftSoup", nil),
-        ("ZIPFoundation", "MIT License", "https://github.com/weichsel/ZIPFoundation", nil),
-        ("PDF.js", "Apache License 2.0", "https://github.com/mozilla/pdf.js", nil),
-        // The screen-term word list (ADR-IOS-101); the full credits are in its README.
-        ("FrequencyWords", "CC BY-SA 4.0", "https://github.com/hermitdave/FrequencyWords",
-         "Hermit Dave's word counts of OpenSubtitles 2018, adapted into the word list screen terms are judged by, itself CC BY-SA 4.0"),
-        ("OpenSubtitles 2018", "The subtitles FrequencyWords counted", "https://www.opensubtitles.org",
-         "Through OPUS: P. Lison and J. Tiedemann, LREC 2016"),
-        ("wordfreq", "Apache License 2.0 (code), CC BY-SA 4.0 (data)", "https://github.com/rspeer/wordfreq",
-         "Its word normalization and letter tables"),
-        ("OpenCC", "Apache License 2.0", "https://github.com/BYVoid/OpenCC",
-         "Traditional to Simplified Chinese, through wordfreq's table"),
-        ("Unicode CLDR", "Unicode License v3", "https://cldr.unicode.org", "The letters each language is written in"),
-    ]
-
     private static let wordListLicense = "The word list (words.txt and languages.json) adapts the sources above and is licensed to you under CC BY-SA 4.0, independent of any App Store terms. Sources, changes and notices: TabMail/Vendor/wordlist/README.md"
     private static let wordListLicenseURL = "https://github.com/TabMail/tabmail-ios/blob/main/TabMail/Vendor/wordlist/README.md"
 
@@ -40,27 +14,24 @@ struct AcknowledgmentsView: View {
         NavigationStack {
             List {
                 Section {
-                    Text("TabMail is built with the help of these open source libraries. We're grateful to their authors and contributors.")
+                    Text("TabMail is built with the help of these open source libraries and models. We're grateful to their authors and contributors. Tap one for its license.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
                 .listRowBackground(Color.clear)
 
                 Section {
-                    ForEach(Self.libraries, id: \.name) { lib in
-                        Link(destination: URL(string: lib.url)!) {
+                    ForEach(AcknowledgmentEntry.all) { entry in
+                        NavigationLink {
+                            AcknowledgmentDetailView(entry: entry)
+                        } label: {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(lib.name)
+                                Text(entry.name)
                                     .font(.body)
                                     .fontWeight(.medium)
-                                Text(lib.license)
+                                Text(entry.license)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
-                                if let note = lib.note {
-                                    Text(note)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
                             }
                             .padding(.vertical, 2)
                         }
@@ -82,5 +53,49 @@ struct AcknowledgmentsView: View {
                 }
             }
         }
+    }
+}
+
+/// One credit: the copyright, any line the author asks for, and the license text(s) as published.
+struct AcknowledgmentDetailView: View {
+    let entry: AcknowledgmentEntry
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text(entry.copyright)
+                    .font(.subheadline)
+                if let note = entry.note {
+                    Text(note)
+                        .font(.subheadline)
+                }
+                if let url = URL(string: entry.url) {
+                    Link(entry.url, destination: url)
+                        .font(.footnote)
+                }
+                ForEach(entry.texts, id: \.path) { text in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(text.title)
+                            .font(.headline)
+                        Text(AcknowledgmentText.load(text.path))
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+            .padding()
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .navigationTitle(entry.name)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+enum AcknowledgmentText {
+    /// The license file at `path` under the app bundle's resources; empty when it isn't there.
+    static func load(_ path: String) -> String {
+        guard let root = Bundle.main.resourceURL,
+              let text = try? String(contentsOf: root.appendingPathComponent(path), encoding: .utf8) else { return "" }
+        return text
     }
 }
