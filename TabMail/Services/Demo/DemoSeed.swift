@@ -171,6 +171,16 @@ enum DemoSeed {
         var reminderDaysAhead: Int? = nil
         var reminderTime: String? = nil        // "HH:MM" 24-hour, optional
         var reminderContent: String? = nil
+        /// The chat view's bubble (`summaryTextMessage`) and AI Reply (`replyTextMessage`).
+        var textMessage: String? = nil
+        var replyTextMessage: String? = nil
+        var cc: String = ""
+        /// Messages of one thread share a key (`computedThreadId`); nil stands alone.
+        var thread: String? = nil
+        /// The seeded message this one replies to (`demo-msg-<n>`).
+        var inReplyTo: String? = nil
+        /// Moves the date this many hours back, to order a thread's emails on one day.
+        var hoursEarlier: Int = 0
     }
 
     private static let seededMessages: [SeededMessage] = [
@@ -189,7 +199,9 @@ enum DemoSeed {
             daysAgo: 1,
             reminderDaysAhead: 3,
             reminderTime: "17:00",
-            reminderContent: "Send Q1 actuals + Q2 projections to Maya"
+            reminderContent: "Send Q1 actuals + Q2 projections to Maya",
+            textMessage: "Can you send me your team's Q1 actuals and Q2 projections by Friday? Headcount, tooling and contractors.",
+            replyTextMessage: "Sure, I'll send them by Thursday."
         ),
         SeededMessage(
             path: "INBOX",
@@ -202,7 +214,11 @@ enum DemoSeed {
             action: .reply,
             summaryBlurb: "Jordan found two flight options for the weekend — a 5pm or 6:30pm departure, both ~$240. Cabin early check-in confirmed.",
             cachedReply: "Let's do the earlier flight — earlier arrival means we can grab dinner downtown. I'll book my half tonight.",
-            daysAgo: 2
+            daysAgo: 2,
+            textMessage: "Found two flights for the weekend: 5pm or 6:30pm, both about $240. Which one?",
+            replyTextMessage: "Let's take the 5pm, I'll book my half tonight.",
+            thread: "trip",
+            inReplyTo: "demo-msg-16"
         ),
         SeededMessage(
             path: "INBOX",
@@ -215,7 +231,8 @@ enum DemoSeed {
             action: .archive,
             summaryBlurb: "Receipt — $19.99 monthly subscription charged successfully. No action needed.",
             cachedReply: nil,
-            daysAgo: 3
+            daysAgo: 3,
+            textMessage: "Your $19.99 monthly payment went through."
         ),
         SeededMessage(
             path: "INBOX",
@@ -228,7 +245,9 @@ enum DemoSeed {
             action: .reply,
             summaryBlurb: "Sarah opened PR #1247 to refactor InboxViewModel actor isolation — ready for your review.",
             cachedReply: "Reviewed — looks great, just left two minor comments on the dispatch order. LGTM after those.",
-            daysAgo: 1
+            daysAgo: 1,
+            textMessage: "PR #1247, the actor isolation refactor, is ready for your review.",
+            replyTextMessage: "Reviewed, two small comments. LGTM after those."
         ),
         SeededMessage(
             path: "INBOX",
@@ -241,7 +260,8 @@ enum DemoSeed {
             action: .archive,
             summaryBlurb: "Daily DailyTech digest — a model launch, a startup funding round, autonomous agents.",
             cachedReply: nil,
-            daysAgo: 1
+            daysAgo: 1,
+            textMessage: "Big model launch today, and a coding-tool startup just raised a round."
         ),
         SeededMessage(
             path: "INBOX",
@@ -257,7 +277,9 @@ enum DemoSeed {
             daysAgo: 0,
             reminderDaysAhead: 0,
             reminderTime: "20:00",
-            reminderContent: "Call Mom (20 min)"
+            reminderContent: "Call Mom (20 min)",
+            textMessage: "Dad's surgery went well! Call me when you have 20 minutes?",
+            replyTextMessage: "So glad! I'll call you tonight around 8."
         ),
         SeededMessage(
             path: "INBOX",
@@ -270,7 +292,8 @@ enum DemoSeed {
             action: .delete,
             summaryBlurb: "OTP code — 847291. Expires in 10 minutes.",
             cachedReply: nil,
-            daysAgo: 0
+            daysAgo: 0,
+            textMessage: "Your code is 847291. It expires in 10 minutes."
         ),
         SeededMessage(
             path: "INBOX",
@@ -278,15 +301,20 @@ enum DemoSeed {
             fromName: "Priya Vasanth",
             fromAddress: "priya@workmail.example",
             to: demoEmail,
-            body: "<p>Final agenda for the offsite next month attached. Please RSVP by Wednesday.</p><p>Hotel block expires Friday.</p>",
+            body: "<p>Hi all,</p><p>The final agenda for the offsite next month is attached. Please RSVP by Wednesday. Alex, could you say a few words on day one?</p><p>The hotel block expires Friday.</p><p>Priya</p>",
             isRead: false, isFlagged: false,
             action: .reply,
-            summaryBlurb: "Priya needs offsite RSVP by Wednesday; hotel block expires Friday. Agenda attached.",
-            cachedReply: "Confirming attendance. I'll book the hotel today before the block expires.",
+            summaryBlurb: "Priya needs your offsite RSVP by Wednesday and asks you to say a few words on day one. Hotel block expires Friday.",
+            cachedReply: "Hi Priya,\n\nThanks for the agenda. I'm in for the offsite, and I'm happy to say a few words on day one.\n\nBest,\nAlex",
             daysAgo: 4,
             reminderDaysAhead: 2,
             reminderTime: nil,
-            reminderContent: "RSVP for offsite + book hotel"
+            reminderContent: "RSVP for offsite + book hotel",
+            textMessage: "Agenda's attached. Can you RSVP by Wednesday and say a few words on day one?",
+            replyTextMessage: "Thanks Priya, I'm in, and happy to say a few words on day one.",
+            cc: samLeeAddress,
+            thread: "offsite",
+            inReplyTo: "demo-msg-14"
         ),
 
         // Sent
@@ -301,7 +329,8 @@ enum DemoSeed {
             action: nil,
             summaryBlurb: "Sent — Q4 retro action items: on-call rotation, hybrid search ship, kill deprecated endpoint.",
             cachedReply: nil,
-            daysAgo: 5
+            daysAgo: 5,
+            textMessage: "Notes from the retro: on-call rotation, ship hybrid search, retire the old metrics endpoint."
         ),
         SeededMessage(
             path: "SENT",
@@ -314,7 +343,8 @@ enum DemoSeed {
             action: nil,
             summaryBlurb: "Sent — revised proposal with feedback incorporated; offered call this week.",
             cachedReply: nil,
-            daysAgo: 7
+            daysAgo: 7,
+            textMessage: "Here's the revised proposal with your team's feedback. Free for a call this week."
         ),
 
         // Drafts
@@ -344,7 +374,8 @@ enum DemoSeed {
             action: nil,
             summaryBlurb: "HR confirmed all onboarding paperwork is on file.",
             cachedReply: nil,
-            daysAgo: 30
+            daysAgo: 30,
+            textMessage: "All your paperwork is on file. Welcome aboard!"
         ),
 
         // Newsletters
@@ -359,17 +390,75 @@ enum DemoSeed {
             action: nil,
             summaryBlurb: "The Weekly Byte — vertical AI agents as the new SaaS unit of distribution.",
             cachedReply: nil,
-            daysAgo: 2
+            daysAgo: 2,
+            textMessage: "This week: vertical AI agents are the new unit of SaaS distribution."
+        ),
+
+        // The earlier emails of two inbox threads, so their chats hold a conversation (the
+        // tutorial opens both). Appended: a message's id is its position.
+        // demo-msg-14: Sam starts the offsite thread Priya answers (demo-msg-8).
+        SeededMessage(
+            path: "INBOX",
+            subject: "Engineering offsite — agenda + logistics",
+            fromName: "Sam Lee",
+            fromAddress: samLeeAddress,
+            to: demoEmail,
+            body: "<p>I'll book a hotel block for everyone once the dates are final.</p><p>Sam</p>",
+            isRead: true, isFlagged: false,
+            action: ActionTag.none,
+            summaryBlurb: "Sam will book a hotel block for the offsite once the dates are final.",
+            cachedReply: nil,
+            daysAgo: 6,
+            textMessage: "I'll book a hotel block for everyone once the dates are final.",
+            cc: "priya@workmail.example",
+            thread: "offsite"
+        ),
+        // demo-msg-15 and 16: Jordan asks about the trip and Alex answers; Jordan's flight
+        // options (demo-msg-2) reply to that.
+        SeededMessage(
+            path: "ARCHIVE",
+            subject: "Weekend trip",
+            fromName: "Jordan Park",
+            fromAddress: "jordan@personal.example",
+            to: demoEmail,
+            body: "<p>Want to fly out Saturday? I'll look at flights tonight.</p>",
+            isRead: true, isFlagged: false,
+            action: nil,
+            summaryBlurb: "Jordan wants to fly out Saturday and will look at flights tonight.",
+            cachedReply: nil,
+            daysAgo: 3,
+            textMessage: "Want to fly out Saturday? I'll look at flights tonight.",
+            thread: "trip",
+            hoursEarlier: 2
+        ),
+        SeededMessage(
+            path: "SENT",
+            subject: "Re: Weekend trip",
+            fromName: demoDisplayName,
+            fromAddress: demoEmail,
+            to: "jordan@personal.example",
+            body: "<p>Yes, find something after work.</p>",
+            isRead: true, isFlagged: false,
+            action: nil,
+            summaryBlurb: "Sent — yes to Saturday, on a flight after work.",
+            cachedReply: nil,
+            daysAgo: 3,
+            textMessage: "Yes, find something after work.",
+            thread: "trip",
+            inReplyTo: "demo-msg-15"
         ),
     ]
+
+    private static let samLeeAddress = "sam.lee@workmail.example"
 
     private static func seedMessages(_ db: Database, folders: [String: Folder]) throws {
         let now = Date()
         for (idx, m) in seededMessages.enumerated() {
             guard let folder = folders[m.path] else { continue }
-            let date = Calendar.current.date(byAdding: .day, value: -m.daysAgo, to: now) ?? now
+            let day = Calendar.current.date(byAdding: .day, value: -m.daysAgo, to: now) ?? now
+            let date = day.addingTimeInterval(-TimeInterval(m.hoursEarlier) * 3600)
             let messageId = "demo-msg-\(idx + 1)"
-            let rfc822 = "<demo-msg-\(idx + 1)@demomail.example>"
+            let rfc822 = rfc822Id(messageId)
 
             var header = MessageHeader(
                 messageId: messageId,
@@ -385,11 +474,16 @@ enum DemoSeed {
                 isInInbox: folder.role == .inbox
             )
             header.rfc822MessageId = rfc822
+            header.cc = m.cc
+            header.inReplyTo = m.inReplyTo.map(rfc822Id)
+            header.computedThreadId = m.thread.map { "demo-thread-\($0)" } ?? ""
             header.isRead = m.isRead
             header.isFlagged = m.isFlagged
             header.actionTag = m.action
             header.tagSortOrder = m.action?.sortOrder ?? 99
             header.summaryBlurb = m.summaryBlurb
+            header.summaryTextMessage = m.textMessage
+            header.replyTextMessage = m.replyTextMessage
             // Empty-string sentinel = "reply pipeline ran, no reply needed"
             // (MessageSnapshot.swift:32). Without this, a tagged demo message
             // (e.g. .archive / .delete) with no precomputed reply has
@@ -427,6 +521,8 @@ enum DemoSeed {
                ) {
                 var cache = MessageAICache(key: cacheKey, rfc822MessageId: rfc822)
                 cache.summaryBlurb = m.summaryBlurb
+                cache.summaryTextMessage = m.textMessage
+                cache.replyTextMessage = m.replyTextMessage
                 cache.actionTag = m.action
                 cache.cachedReply = m.cachedReply
                 cache.replyGeneratedAt = m.cachedReply != nil ? date : nil
@@ -434,6 +530,10 @@ enum DemoSeed {
                 try cache.insert(db)
             }
         }
+    }
+
+    private static func rfc822Id(_ messageId: String) -> String {
+        "<\(messageId)@demomail.example>"
     }
 
     private static func stripHTML(_ s: String) -> String {

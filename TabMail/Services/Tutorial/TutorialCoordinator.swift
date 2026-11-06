@@ -36,6 +36,8 @@ final class TutorialCoordinator {
         case askAnythingDone
         /// Back in Chat: what else to ask, and "What can you do?".
         case moreToAsk
+        /// In the chat view, a short last step: the Chat View switch in TabMail Settings (TQ1).
+        case chatViewSwitch
         /// The closing recap; its button ends the tutorial.
         case finished
     }
@@ -44,13 +46,41 @@ final class TutorialCoordinator {
     /// the matching `TutorialChatScript` answer.
     enum ChatPrompt: String, CaseIterable {
         case makeTemplate = "Make my most recent reply a template"
+        /// The chat view's request, in Priya's chat field (Q32: the field is also the agent).
+        case saveReplyAsTemplate = "Save my reply as a template."
         case flights = "What flight times did Jordan suggest?"
         case whatCanYouDo = "What can you do?"
+
+        /// The line above the chat's field while the script works (T2.5).
+        var workingStatus: String? {
+            self == .saveReplyAsTemplate ? "Saving template" : nil
+        }
+    }
+
+    /// The tutorial's next move in the chat view's reply field, in Priya's chat (part 2).
+    enum FieldMove: Equatable {
+        /// Send the AI Reply waiting in the field: the compose card opens (T2.2).
+        case sendReadyReply
+        /// Send the filled-in request to TabMail (T2.4).
+        case ask(ChatPrompt)
     }
 
     private(set) var lesson: TutorialLesson?
     private(set) var step: Step?
     var isRunning: Bool { lesson != nil }
+
+    /// This run teaches in the chat view: Chat View was on when it started (snapshot, so the
+    /// T4 switch or any later change applies to the next run). Off, it is today's tutorial.
+    private(set) var teachesChat = false
+
+    /// Whether a run starting now teaches in the chat view: the user's Chat View setting with AI
+    /// on, since the tutorial opens the AI gate itself and only an AI opt-out keeps it off.
+    static var chatViewOnForTutorial: Bool {
+        ChatViewConfig.isActive(
+            enabledByUser: ChatViewConfig.isEnabledByUser,
+            aiOn: ChatViewConfig.isAIOn(
+                optedOut: AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey), subscribed: true))
+    }
 
     /// The flight question was sent: the chat card moves on to "Check the original".
     private(set) var flightsAsked = false
@@ -115,6 +145,7 @@ final class TutorialCoordinator {
         self.lesson = lesson
         step = .starting
         startedSignedIn = hasTabMailSession
+        teachesChat = Self.chatViewOnForTutorial
         // Before the demo is active: no backend call can slip in between.
         demoStore.isTutorialPractice = true
         do {
@@ -159,6 +190,7 @@ final class TutorialCoordinator {
         templateObservationGeneration += 1
         lesson = nil
         step = nil
+        teachesChat = false
         isEnding = false
         flightsAsked = false
         whatCanYouDoAsked = false
@@ -192,9 +224,15 @@ final class TutorialCoordinator {
         step = .moreToAsk
     }
 
-    /// "Finish" in Chat: the closing recap.
+    /// "Finish" in Chat: the Chat View switch in the chat view (T4), else the closing recap.
     func showRecap() {
         guard step == .moreToAsk else { return }
+        step = teachesChat ? .chatViewSwitch : .finished
+    }
+
+    /// "Finish" on the Chat View switch: the closing recap.
+    func finishChatViewSwitch() {
+        guard step == .chatViewSwitch else { return }
         step = .finished
     }
 
@@ -234,7 +272,7 @@ final class TutorialCoordinator {
 
     // MARK: - Events
 
-    /// A message detail opened (part 3's source email).
+    /// A message detail, or in the chat view a chat at that email, opened (part 3's source email).
     func messageOpened(accountId: String, messageId: String) {
         guard step == .askFlights,
               accountId == DemoSeed.demoAccountId,
@@ -244,17 +282,46 @@ final class TutorialCoordinator {
 
     /// The inbox chat's filled-in input now, if this step has one.
     var chatPrompt: ChatPrompt? {
-        Self.chatPrompt(for: step, flightsAsked: flightsAsked, whatCanYouDoAsked: whatCanYouDoAsked)
+        Self.chatPrompt(
+            for: step, flightsAsked: flightsAsked, whatCanYouDoAsked: whatCanYouDoAsked, teachesChat: teachesChat)
     }
 
+    /// In the chat view the template is asked for in Priya's chat field, not the inbox chat.
     nonisolated static func chatPrompt(
-        for step: Step?, flightsAsked: Bool, whatCanYouDoAsked: Bool = false
+        for step: Step?, flightsAsked: Bool, whatCanYouDoAsked: Bool = false, teachesChat: Bool = false
     ) -> ChatPrompt? {
         switch step {
-        case .makeTemplate: return .makeTemplate
+        case .makeTemplate: return teachesChat ? nil : .makeTemplate
         case .askFlights where !flightsAsked: return .flights
         case .moreToAsk where !whatCanYouDoAsked: return .whatCanYouDo
         default: return nil
+        }
+    }
+
+    /// The reply field's move now in a chat that holds Priya's practice email, if any.
+    func fieldMove(inPracticeChat: Bool) -> FieldMove? {
+        Self.fieldMove(for: step, inPracticeChat: inPracticeChat, teachesChat: teachesChat)
+    }
+
+    nonisolated static func fieldMove(for step: Step?, inPracticeChat: Bool, teachesChat: Bool) -> FieldMove? {
+        guard teachesChat, inPracticeChat else { return nil }
+        switch step {
+        case .replyToPriya: return .sendReadyReply
+        case .makeTemplate: return .ask(.saveReplyAsTemplate)
+        default: return nil
+        }
+    }
+
+    /// Whether a chat shows the step's coach card: part 2's steps in Priya's chat, part 3's
+    /// answer in Jordan's. Any other chat shows none, so no card points at a control elsewhere.
+    nonisolated static func chatShowsCard(
+        step: Step?, teachesChat: Bool, holdsPracticeEmail: Bool, holdsSourceEmail: Bool
+    ) -> Bool {
+        guard teachesChat else { return false }
+        switch step {
+        case .replyToPriya, .makeTemplate, .reuseReplyDone: return holdsPracticeEmail
+        case .askAnythingDone: return holdsSourceEmail
+        default: return false
         }
     }
 
@@ -270,6 +337,9 @@ final class TutorialCoordinator {
         step == .reuseReplyDone || (step == .moreToAsk && whatCanYouDoAsked)
     }
 
+    /// The chat view's switch is the next thing to see (T4).
+    var highlightsChatViewSwitch: Bool { step == .chatViewSwitch }
+
     /// The template proposal's Create is the next tap in part 2.
     var highlightsTemplateCreate: Bool { step == .makeTemplate }
 
@@ -279,17 +349,26 @@ final class TutorialCoordinator {
     /// new run, before the wait is over): the edit belongs to that run alone.
     func runPracticeReplyEdit(apply: (String) -> Void) async {
         let admission = DemoModeStore.shared.chatAdmission
+        let edited = TutorialChatScript.editedReply(teachesChat: teachesChat)
         try? await Task.sleep(for: TutorialChatScript.editDuration)
         guard DemoModeStore.admits(admission) else { return }
-        apply(TutorialChatScript.declinedReply)
+        apply(edited)
         practiceReplyEdited()
     }
 
-    /// What the practice reply's draft chat holds before its edit ran.
+    /// What the practice reply's draft chat holds before its edit ran. In the chat view the
+    /// sent reply's bubble shows the AI Reply ("I'm in"), so the edit keeps its meaning.
     static let editPrompt = "Say I can’t make it"
+    static let chatViewEditPrompt = "Make it shorter"
+
+    static func editPrompt(teachesChat: Bool) -> String {
+        teachesChat ? chatViewEditPrompt : editPrompt
+    }
 
     /// The practice reply's draft chat input now, if this step has one.
-    var composeEditPrompt: String? { step == .replyToPriya && !replyEdited ? Self.editPrompt : nil }
+    var composeEditPrompt: String? {
+        step == .replyToPriya && !replyEdited ? Self.editPrompt(teachesChat: teachesChat) : nil
+    }
 
     /// The draft chat's scripted edit rewrote the practice reply.
     func practiceReplyEdited() {

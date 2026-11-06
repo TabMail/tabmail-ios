@@ -310,7 +310,8 @@ struct DynamicIslandChat: View {
                         .overlay {
                             // Guided tutorial: the open chat covers the card, whose
                             // button is the next tap.
-                            if isInboxChat && TutorialCoordinator.shared.highlightsChatClose {
+                            // In the chat view, the chat's own sheet (part 2's template).
+                            if (isInboxChat || replyField != nil) && TutorialCoordinator.shared.highlightsChatClose {
                                 TutorialPulseRing(shape: Circle(), lineWidth: 2, outset: 3)
                             }
                         }
@@ -994,7 +995,47 @@ struct DynamicIslandChat: View {
     /// The chat view's reply field (`ChatReplyField`): [mic] [field] [Send] on the newest email.
     /// The field's top line says AI Reply while it holds the ready reply (Q15); while the agent
     /// works, the line above says what it is doing and the words pulse (N5, A2).
+    /// In the tutorial the field is filled in and read-only, as the inbox chat's input is.
+    @ViewBuilder
     private func replyFieldBar(_ field: ChatReplyField) -> some View {
+        if TutorialCoordinator.shared.isRunning && !(isWorking && fieldSentText != nil) {
+            TutorialChatInputBar(
+                prompt: Self.tutorialFieldText(field),
+                isWorking: isWorking,
+                label: field.tutorialMove == .sendReadyReply ? "AI Reply" : nil,
+                send: { sendTutorialField(field) })
+            .accessibilityIdentifier("chatReplyField")
+        } else {
+            liveReplyFieldBar(field)
+        }
+    }
+
+    /// The tutorial's filled-in words in the chat's field: the ready AI Reply, or the request.
+    static func tutorialFieldText(_ field: ChatReplyField) -> String? {
+        switch field.tutorialMove {
+        case .sendReadyReply: return field.readyText
+        case .ask(let prompt): return prompt.rawValue
+        case nil: return nil
+        }
+    }
+
+    /// Send in the tutorial's field: the AI Reply goes to its compose card; the request goes to
+    /// the script, pulsing in the field as a real request does (T2.5).
+    private func sendTutorialField(_ field: ChatReplyField) {
+        switch field.tutorialMove {
+        case .sendReadyReply:
+            onSendReadyReply?()
+        case .ask(let prompt):
+            fieldSentText = prompt.rawValue
+            onFieldSend?(prompt.rawValue)
+            TutorialCoordinator.shared.chatPromptSent(prompt)
+            sendAgentChat(prompt.rawValue, script: prompt, fromReplyField: true)
+        case nil:
+            break
+        }
+    }
+
+    private func liveReplyFieldBar(_ field: ChatReplyField) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             if isWorking, fieldSentText != nil {
                 Text(workingStatus.isEmpty ? "Thinking..." : workingStatus)
@@ -2444,6 +2485,8 @@ struct DynamicIslandChat: View {
         isWorking = true
         ActiveAgentTracker.shared.setWorking(sessionKey)
         resetStatusQueue()
+        // A scripted tutorial request names its own work (it runs no tools that would).
+        if let status = script?.workingStatus { enqueueStatus(status) }
         lastFailedMessage = nil
         pendingResumeRequest = nil  // a fresh send abandons any interrupted turn
         lastChatActivity = Date()

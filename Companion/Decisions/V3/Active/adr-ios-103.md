@@ -345,6 +345,36 @@ same AI result, kept as long as the email itself is shown.
    leaves the user's sent copies and drafts where they are (a draft must stay in Drafts to stay
    editable; on Gmail a sent copy is the same email as its other labels).
 
+13. **The tutorial in the chat view (amendment 2026-11-05, the seventh chat-view PR, PR 6).** A
+   tutorial run teaches the view it starts in: with Chat View on and AI not opted out
+   (`TutorialCoordinator.chatViewOnForTutorial`), `start` snapshots `teachesChat = true` and the run
+   keeps it whatever the setting does meanwhile; with Chat View off or AI opted out the run is today's,
+   unchanged. `ChatViewConfig.opensInChat` follows the run (`tutorialRunning ? tutorialTeachesChat :
+   …`), so a chat-view run's emails open as chats and today's run keeps today's view. Part 2 opens
+   Priya's email as a chat with everyone on the thread (the demo seeds Sam Lee's earlier email in the
+   same thread, and Jordan's trip thread with the user's own Sent reply; every seeded email has its
+   text message, every seeded AI Reply its reply text message). The reply field holds the AI Reply,
+   prefilled and read-only (`TutorialChatInputBar` with the "AI Reply" label, `FieldMove.sendReadyReply`);
+   Send opens today's compose, whose draft-chat edit is "Make it shorter", so the Sent bubble stays a
+   yes (`TutorialChatScript.shorterReply`). After it is sent, the same field asks "Save my reply as a
+   template." (`FieldMove.ask(.saveReplyAsTemplate)`, "Saving template" for a moment), which shows the
+   real Create card for "Event RSVP: yes"; the inbox chat offers no template prompt in this run. Part 3
+   asks the flights question in the inbox chat as today; the email reference opens Jordan's chat at his
+   email, where the step's card says so (`chatShowsCard`). A last step (`Step.chatViewSwitch`, after
+   the recap's Finish) shows TabMail Settings' Chat View switch, ringed, in a sheet
+   (`TutorialChatViewSwitchSheet`, `ChatViewToggleRow`, shared with Settings); flipping it switches for
+   real, and only the card's Finish closes it. The welcome and recap screens name the chat view's reply
+   and the switch. Inside the chat, Forward, Reply to, Move, the read swipes, Archive and Delete ask the
+   tutorial first (`admits(.other)`), as every mail action does in the tutorial. Outside the tutorial:
+   the inbox's Reply tag opens the email's chat when the chat view is on (`executeTaggedAction`
+   `.reply`), and an email opened from a chat's email reference highlights its referenced text as a
+   message opened from the agent does (`PushedMessageDestination`, `highlightsMessage: true`).
+   **Product choices made in PR 6 (owner 2026-11-05: the listed choices are blessed):** today's
+   tutorial still runs with Chat View off or AI opted out; the switch step is a sheet holding only the
+   switch; the edit is "Make it shorter"; the template is "Event RSVP: yes"; compose keeps its Use
+   Suggestion step; no attachment chip is seeded for the agenda; the Reply tag opens the chat in
+   general, not only in the tutorial.
+
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (ADR-032) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
 parser does not read.
@@ -385,3 +415,11 @@ source); `MessageDetailThreadActionTests` (a chat's Archive, Delete and Move as 
 one queued move, one undo restoring every email, the no-ops, `setRead`); the single-email detail
 actions stay pinned by `MessageDetailViewModelMoveTests`, `MessageDetailMarkReadOnArchiveDeleteTests`,
 `SameFolderNoOpTests` and `MessageDetailStagedFallbackTests`, green before and after the refactor.
+Decision 13: `TutorialChatViewContentTests` (each step's card where it happens, compose's order, the
+progress lines and titles, Send only on screens that have it, the field's moves, the inbox chat's
+prompts and working status, where a chat shows the card, the edit staying a yes);
+`TutorialChatViewSeedTests` (the request shows the Create card without reaching the model, the seeded
+chats and inbox groups, every seeded email's text message); `TutorialChatViewRunTests` (a chat-view run
+from Part 2 to the switch with the setting flipped mid-run, and today's run with Chat View off or AI
+opted out); `ChatThreadContextTests.opensInChat`; the tutorial locks in the chat read from the source
+by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`.

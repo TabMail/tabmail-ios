@@ -13,6 +13,8 @@ struct TutorialChatInputBar: View {
     /// The filled-in text, or nil when this step has nothing to send here.
     let prompt: String?
     let isWorking: Bool
+    /// A small line over the words: "AI Reply" in the chat view's field (Q15).
+    var label: String? = nil
     let send: () -> Void
 
     /// The prompt whose tooltip was closed (by sending it or tapping it), so
@@ -45,11 +47,19 @@ struct TutorialChatInputBar: View {
                 .frame(width: 28, height: 28)
                 .accessibilityHidden(true)
 
-            Text(prompt ?? "Chat follows the tutorial steps")
-                .foregroundStyle(prompt == nil ? Theme.textSecondary : Theme.textPrimary)
-                .lineLimit(1...6)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .accessibilityIdentifier("tutorial-chat-input")
+            VStack(alignment: .leading, spacing: 2) {
+                if let label, prompt != nil {
+                    Text(label)
+                        .font(.caption2)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.secondary)
+                }
+                Text(prompt ?? "Chat follows the tutorial steps")
+                    .foregroundStyle(prompt == nil ? Theme.textSecondary : Theme.textPrimary)
+                    .lineLimit(1...6)
+                    .accessibilityIdentifier("tutorial-chat-input")
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             Button {
                 guard prompt != nil else { return }

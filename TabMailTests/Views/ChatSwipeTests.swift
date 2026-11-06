@@ -303,7 +303,16 @@ struct ChatSwipeTests {
         #expect(buttons.contains("let action = ChatSwipe.ReadAction(for: item.header)"))
         #expect(buttons.contains("setRead(action, at: item, thread: thread)"))
         #expect(buttons.contains("title: \"Move\""))
-        #expect(buttons.contains("{ showsMove = true }"))
+        #expect(buttons.contains("{ guard TutorialCoordinator.shared.admits(.other) else { return } showsMove = true }"))
+        // The tutorial's mail actions are off (owner 2026-10-21): every chat action asks it first.
+        for signature in [
+            "private func setRead(_ action: ChatSwipe.ReadAction, at item: ChatThread.Item, thread: ChatThread) {",
+            "private func archiveChat() {",
+            "private func deleteChat() {",
+        ] {
+            let body = try Self.body(of: signature, in: text)
+            #expect(body.hasPrefix(" guard TutorialCoordinator.shared.admits(.other) else { return }"), "\(signature) asks the tutorial first")
+        }
         let read = try Self.body(of: "private func setRead(_ action: ChatSwipe.ReadAction, at item: ChatThread.Item, thread: ChatThread) {", in: text)
         #expect(read.contains("let targets = ChatSwipe.readTargets(action, at: item.id, in: thread.items)"))
         #expect(read.contains("viewModel.setRead(targets, isRead: action.isRead)"))

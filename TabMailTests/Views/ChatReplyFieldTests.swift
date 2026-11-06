@@ -565,7 +565,7 @@ struct ChatReplyFieldTests {
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(Self.count("onlyTo: replyTarget.only)", in: chat) == 1, "the field knows the people chosen")
+        #expect(Self.count("onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
         #expect(Self.count("let (to, cc, bcc) = ChatAgentCompose.replyRecipients( fromField: fieldComposeOpened, target: replyTarget, request: req)", in: chat) == 1,
                 "a reply asked for in the field goes to the people chosen")
         #expect(Self.count("prefillBcc: bcc.isEmpty ? nil : bcc, onAgentOutcome: onOutcome)", in: chat) == 1,
@@ -579,8 +579,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count("prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,", in: chat) == 1)
         #expect(Self.count("if replyTo != nil { replyTarget = .replyAll }", in: chat) == 1, "a sent reply clears it")
         #expect(Self.count("ownAddresses: context.ownAddresses) { replyTarget = $0 }", in: chat) == 1, "Done sets it")
-        #expect(Self.count("ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) { showsReplyTo = true }", in: chat) == 1)
-        #expect(Self.count("Button { forwardMessage = thread.newest }", in: chat) == 1)
+        #expect(Self.count("ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) { guard TutorialCoordinator.shared.admits(.other) else { return } showsReplyTo = true }", in: chat) == 1)
+        #expect(Self.count("Button { guard TutorialCoordinator.shared.admits(.other) else { return } forwardMessage = thread.newest }", in: chat) == 1)
         #expect(Self.count(".fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }", in: chat) == 1)
         #expect(Self.count(".onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }", in: chat) == 1,
                 "a new newest email resets the choice, even one whose UID matches the last")
