@@ -1424,18 +1424,19 @@ extension AICacheUpdatedAtEncodingMigrationTests {
         AppDatabase.registerAllMigrations(on: &migrator)
         try migrator.migrate(db, upTo: "v94_addDraftServerCopyNamesParent")
         let stamp = Int64(Date().timeIntervalSince1970)
+        // Written as SQL with only the columns the table has at v94: the model also carries
+        // columns that later migrations add, so inserting it here would name missing columns.
         try db.write { conn in
-            var cache = MessageAICache(key: "acc:INBOX:message@example.com", rfc822MessageId: "message@example.com")
-            cache.summaryBlurb = "kept summary"
-            cache.summaryTodos = "kept todos"
-            cache.actionTag = .reply
-            cache.cachedReply = "kept reply"
-            cache.replyGeneratedAt = Date(timeIntervalSince1970: Double(stamp))
-            cache.reminderDate = "2099-01-01"
-            cache.reminderTime = "09:00"
-            cache.reminderContent = "kept reminder"
-            try cache.insert(conn)
-            try conn.execute(sql: "UPDATE messageAICache SET updatedAt = ?", arguments: [stamp])
+            try conn.execute(sql: """
+                INSERT INTO messageAICache
+                    (key, rfc822MessageId, summaryBlurb, summaryTodos, actionTag, cachedReply,
+                     replyGeneratedAt, reminderDate, reminderTime, reminderContent, updatedAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, arguments: [
+                    "acc:INBOX:message@example.com", "message@example.com", "kept summary", "kept todos",
+                    ActionTag.reply.rawValue, "kept reply", Date(timeIntervalSince1970: Double(stamp)),
+                    "2099-01-01", "09:00", "kept reminder", stamp,
+                ])
         }
         func otherColumns(_ conn: Database) throws -> [Row] {
             try Row.fetchAll(conn, sql: """

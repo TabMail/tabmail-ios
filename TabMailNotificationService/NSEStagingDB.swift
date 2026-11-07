@@ -27,12 +27,19 @@ enum NSEStagingDB {
         guard let url = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: SharedNSEData.appGroupIdentifier
         )?.appendingPathComponent(NSEConfig.stagingDBFileName) else { return nil }
+        return open(path: url.path)
+    }
 
+    /// Open the staging database at `path` and add the columns this build writes that an
+    /// older build's database lacks. `open()` passes the App Group file; internal so a test
+    /// can open a file of its own.
+    static func open(path: String) -> DatabaseQueue? {
         var config = Configuration()
         config.busyMode = .timeout(NSEConfig.stagingDBBusyTimeoutSeconds)
-        guard let queue = try? DatabaseQueue(path: url.path, configuration: config) else { return nil }
+        guard let queue = try? DatabaseQueue(path: path, configuration: config) else { return nil }
         ensureObservedUidValidityColumn(db: queue)
         ensureProviderDateColumn(db: queue)
+        ensureSummaryTextMessageColumn(db: queue)
         return queue
     }
 
@@ -111,6 +118,27 @@ enum NSEStagingDB {
             }
         } catch {
             NSELog.error("ensureProviderDateColumn failed: \(error)")
+        }
+    }
+
+    /// Add `nse_processed_message.summaryTextMessage` (the summary's text message,
+    /// `MessageHeader.summaryTextMessage`) when the column is missing. Same shape and
+    /// reasoning as `ensureObservedUidValidityColumn`.
+    static func ensureSummaryTextMessageColumn(db: DatabaseQueue) {
+        do {
+            try db.write { db in
+                guard try db.tableExists("nse_processed_message") else { return }
+                let columns = Set(
+                    try Row.fetchAll(db, sql: "PRAGMA table_info(nse_processed_message)")
+                        .map { $0["name"] as String }
+                )
+                guard !columns.contains("summaryTextMessage") else { return }
+                try db.execute(
+                    sql: "ALTER TABLE nse_processed_message ADD COLUMN summaryTextMessage TEXT"
+                )
+            }
+        } catch {
+            NSELog.error("ensureSummaryTextMessageColumn failed: \(error)")
         }
     }
 
@@ -225,6 +253,7 @@ enum NSEStagingDB {
         renderedBody: RenderedBody? = nil,
         summaryBlurb: String?, summaryTodos: String?, actionTag: String?,
         reminderDate: String?, reminderTime: String?, reminderContent: String?,
+        summaryTextMessage: String? = nil,
         historyId: String?, aiCompleted: Bool, notified: Bool
     ) -> Bool {
         let id = "\(accountId):\(message.messageId)"
@@ -261,7 +290,7 @@ enum NSEStagingDB {
                      summaryBlurb, summaryTodos, actionTag, reminderDate, reminderTime, reminderContent,
                      processedAt, historyId, aiCompleted, notified,
                      htmlContent, textContent, attachmentsJSON, icsText, hasUnresolvedCIDs,
-                     observedUidValidity, providerDate, populated)
+                     observedUidValidity, providerDate, summaryTextMessage, populated)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?,
@@ -269,7 +298,7 @@ enum NSEStagingDB {
                             ?, ?, ?, ?, ?, ?,
                             ?, ?, ?, ?,
                             ?, ?, ?, ?, ?,
-                            ?, ?, 1)
+                            ?, ?, ?, 1)
                     """, arguments: [
                         // `folderPath` stores the provider-canonical folder path
                         // (Gmail: "INBOX"; Graph: parentFolderId; IMAP: "INBOX").
@@ -304,7 +333,8 @@ enum NSEStagingDB {
                         // server reported none) — see
                         // `NSEMessageMetadata.observedUidValidity`.
                         message.observedUidValidity,
-                        message.providerDate?.timeIntervalSince1970
+                        message.providerDate?.timeIntervalSince1970,
+                        summaryTextMessage
                     ])
             }
             if refused {
@@ -613,7 +643,8 @@ enum NSEStagingDB {
         db: DatabaseQueue,
         accountId: String, message: NSEMessageMetadata,
         summaryBlurb: String?, summaryTodos: String?,
-        reminderDate: String?, reminderTime: String?, reminderContent: String?
+        reminderDate: String?, reminderTime: String?, reminderContent: String?,
+        summaryTextMessage: String? = nil
     ) {
         let id = "\(accountId):\(message.messageId)"
         do {
@@ -626,11 +657,13 @@ enum NSEStagingDB {
                 try db.execute(sql: """
                     UPDATE nse_processed_message SET
                         summaryBlurb = ?, summaryTodos = ?,
-                        reminderDate = ?, reminderTime = ?, reminderContent = ?
+                        reminderDate = ?, reminderTime = ?, reminderContent = ?,
+                        summaryTextMessage = ?
                     WHERE id = ?
                     """, arguments: [
                         summaryBlurb, summaryTodos,
-                        reminderDate, reminderTime, reminderContent, id
+                        reminderDate, reminderTime, reminderContent,
+                        summaryTextMessage, id
                     ])
             }
             if refused {

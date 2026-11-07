@@ -786,12 +786,19 @@ extension SyncEngine {
                 survivor.actionTag = tag
                 survivor.tagSortOrder = row.tagSortOrder
             }
-            if survivor.summaryBlurb == nil { survivor.summaryBlurb = row.summaryBlurb }
+            if survivor.summaryBlurb == nil {
+                survivor.summaryBlurb = row.summaryBlurb
+                // The text message travels with the summary it belongs to.
+                survivor.summaryTextMessage = row.summaryTextMessage
+            }
             if survivor.summaryTodos == nil { survivor.summaryTodos = row.summaryTodos }
             if survivor.reminderDate == nil { survivor.reminderDate = row.reminderDate }
             if survivor.reminderTime == nil { survivor.reminderTime = row.reminderTime }
             if survivor.reminderContent == nil { survivor.reminderContent = row.reminderContent }
-            if survivor.cachedReply == nil { survivor.cachedReply = row.cachedReply }
+            if survivor.cachedReply == nil {
+                survivor.cachedReply = row.cachedReply
+                survivor.replyTextMessage = row.replyTextMessage
+            }
             survivor.isReplied = survivor.isReplied || row.isReplied
             survivor.isForwarded = survivor.isForwarded || row.isForwarded
             survivor.isRead = survivor.isRead || row.isRead
@@ -2031,8 +2038,12 @@ extension SyncEngine {
                         header.reminderDate = preSync.reminderDate
                         header.reminderTime = preSync.reminderTime
                         header.reminderContent = preSync.reminderContent
+                        header.summaryTextMessage = preSync.summaryTextMessage
                     }
-                    if header.cachedReply == nil { header.cachedReply = preSync.cachedReply }
+                    if header.cachedReply == nil {
+                        header.cachedReply = preSync.cachedReply
+                        header.replyTextMessage = preSync.replyTextMessage
+                    }
                     header.notified = header.notified || preSync.notified
                     // Migrate MessageBody (FK to old id) before delete.
                     var deferredBody: MessageBody?

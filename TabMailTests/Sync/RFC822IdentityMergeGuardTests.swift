@@ -694,4 +694,48 @@ struct RFC822IdentityMergeGuardTests {
         // Failing closed may defer the incoming occupant until sync vacates the
         // ambiguous address; it must never cannibalise the moved-in row.
     }
+
+    private func insertDriftedInboxRow(_ pool: DatabasePool, messageId: String, rfc822: String) throws -> String {
+        var header = MessageHeader(
+            messageId: messageId, subject: "Original subject", from: "Sender", fromAddress: "sender@example.com",
+            to: "user@example.com", date: Date(timeIntervalSince1970: 1_750_000_000), snippet: "snippet",
+            folderId: "acc1:INBOX-DRIFT", accountId: "acc1", folderPath: "INBOX-DRIFT", isInInbox: true)
+        header.rfc822MessageId = rfc822
+        header.headerComplete = true
+        let toInsert = header
+        try pool.writeWithoutTransaction { db in try toInsert.insert(db) }
+        return header.id
+    }
+
+    private func setAIWork(_ pool: DatabasePool, id: String) throws {
+        try pool.writeWithoutTransaction { db in
+            try db.execute(sql: """
+                UPDATE messageHeader SET summaryBlurb = 'Budget review.', summaryTextMessage = 'Can you review the budget?',
+                    cachedReply = 'Sure, I will.', replyTextMessage = 'Will do' WHERE id = ?
+                """, arguments: [id])
+        }
+    }
+
+    /// ADR-IOS-103: the reclaimed row's AI work moves to the synced row with each text message
+    /// beside the result it belongs to, through the real sync.
+    @Test("The pre-sync inbox reclaim carries each text message with its summary and reply")
+    func preSyncInboxReclaimCarriesTextMessages() async throws {
+        let (pool, dir, previous) = try makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try seedAccountAndFolders(pool)
+        // The same message, written to the inbox under another folder path (an earlier writer's
+        // drift, e.g. the extension's provider folder id).
+        let oldId = try insertDriftedInboxRow(pool, messageId: "600", rfc822: "same@example.com")
+        try setAIWork(pool, id: oldId)
+
+        let provider = await mock([headerInfo(messageId: "600", rfc822: "same@example.com")])
+        _ = try await sync(pool, folderId: "acc1:INBOX", provider: provider)
+
+        #expect(try header(pool, id: oldId) == nil, "the reclaimed row is gone")
+        let synced = try #require(try header(pool, id: "acc1:INBOX:600"))
+        #expect(synced.summaryBlurb == "Budget review.")
+        #expect(synced.summaryTextMessage == "Can you review the budget?")
+        #expect(synced.cachedReply == "Sure, I will.")
+        #expect(synced.replyTextMessage == "Will do")
+    }
 }

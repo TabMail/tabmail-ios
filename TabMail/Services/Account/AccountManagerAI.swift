@@ -24,16 +24,19 @@ import UserNotifications
 // `AIWriteTarget` is captured ONCE at job start and every downstream header write
 // re-resolves through it, dropping cleanly (no mutation, no success side effect)
 // when the captured identity no longer holds. Dropping is safe here in a way it
-// is NOT for user gestures: these nine sites — predicate, comments excluded so
+// is NOT for user gestures: these eleven sites — predicate, comments excluded so
 // this sentence cannot satisfy it:
 //   `rg -n --pcre2 '^(?!\s*(///|//)).*aiGuardedHeaderWrite\(db, target:'
-//    TabMail/ Shared/ TabMailNotificationService/` → **10**
-//   (`AccountManagerAI` ×5, `ActiveAIQueue` ×4, `ComposeView` ×1)
-// — nine of them write DERIVED AI METADATA, which is
+//    TabMail/ Shared/ TabMailNotificationService/` → **11**
+//   (`AccountManagerAI` ×5, `ActiveAIQueue` ×4, `ComposeView` ×2)
+// — ten of them write DERIVED AI METADATA, which is
 // recomputable — the queue's own GRDB arbiter (`ActiveAIQueue.readJobOutcome`)
-// sees the field still empty and re-drives the job. This leniency does NOT
+// sees the field still empty and re-drives the job. Compose's recompute
+// (`ComposeView.recomputedReply`) is a manual control, but what it stores is the
+// same derived reply: a dropped write leaves the replacement email's own reply in
+// place, and the suggestion is still shown in compose. This leniency does NOT
 // generalize to any user-intention path (see `Core Philosophy: Never Drop User
-// Intention`). The tenth, `ComposeView.writeCachedReplyToDB`, stores a user's
+// Intention`). The eleventh, `ComposeView.writeCachedReplyToDB`, stores a user's
 // edit of the suggestion, but only into the reopen-time cache; the edit itself
 // stays in the open compose, so a refused write costs that convenience only.
 
@@ -453,6 +456,8 @@ extension AccountManager {
             let outcome = (try? await dbPool.write { db in
                 try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
                     msg.summaryBlurb = "This message has no content."
+                    // A local summary has no text message; an earlier one goes with its summary.
+                    msg.summaryTextMessage = nil
                     msg.setActionTag(.delete)
                     try msg.save(db)
                 }
@@ -499,12 +504,14 @@ extension AccountManager {
     /// Process a single message after its body is fetched (priority path for user-opened messages).
     /// Handles AI summary + action classification, matching TB's processMessage().
     /// `target` is the T4.V7 identity captured at the direct-path entry; every
-    /// header write below re-resolves through it.
+    /// header write below re-resolves through it. `aiService` is a test seam
+    /// (precedent: `AIService(backendClient:)`); production uses `shared`.
     func processMessage(
         _ message: MessageHeader,
         body: MessageBody,
         account: Account,
-        target: AIWriteTarget
+        target: AIWriteTarget,
+        aiService: AIService = .shared
     ) async {
         // `processOpenedMessage` captured this body, header and write target in
         // one database snapshot. Re-reading by `message.id` here opened a
@@ -575,7 +582,6 @@ extension AccountManager {
                 return
             }
 
-            let aiService = AIService.shared
             let needsSA = !hasSummary || !hasExistingAction
 
             // Launch SA and R in parallel — R does not depend on summary/action output.
@@ -623,6 +629,7 @@ extension AccountManager {
                                 msg.reminderDate = summary.reminderDate
                                 msg.reminderTime = summary.reminderTime
                                 msg.reminderContent = summary.reminderContent
+                                msg.summaryTextMessage = summary.textMessage
 
                                 var cacheActionTag: ActionTag?
                                 if let action, !hasExistingAction {
@@ -638,6 +645,7 @@ extension AccountManager {
 
                                 if let peerReply, !peerReply.isEmpty, msg.cachedReply == nil {
                                     msg.cachedReply = peerReply
+                                    msg.replyTextMessage = nil
                                     if DebugModeManager.isLoggingEnabled() {
                                         print("[AI] Device Sync reply applied for direct path \(messageId)")
                                     }
@@ -654,8 +662,10 @@ extension AccountManager {
                                     reminderDate: summary.reminderDate,
                                     reminderTime: summary.reminderTime,
                                     reminderContent: summary.reminderContent,
+                                    summaryTextMessage: summary.textMessage,
                                     actionTag: cacheActionTag,
                                     cachedReply: msg.cachedReply,
+                                    replyTextMessage: msg.replyTextMessage,
                                     db: db
                                 )
                             }
@@ -695,7 +705,8 @@ extension AccountManager {
                             todos: message.summaryTodos,
                             reminderDate: message.reminderDate,
                             reminderTime: message.reminderTime,
-                            reminderContent: message.reminderContent
+                            reminderContent: message.reminderContent,
+                            textMessage: message.summaryTextMessage
                         )
                         let action = try await aiService.classifyAction(
                             subject: subject,
@@ -779,15 +790,17 @@ extension AccountManager {
                         // T4.V7 site 7.
                         let outcome = (try? await dbPool.write { db in
                             try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
-                                msg.cachedReply = reply
+                                msg.cachedReply = reply.body
+                                msg.replyTextMessage = reply.textMessage
                                 try msg.save(db)
-                                if !reply.isEmpty {
+                                if !reply.body.isEmpty {
                                     try MessageAICache.writeThrough(
                                         accountId: accountId,
                                         folderPath: msg.folderPath,
                                         rfc822MessageId: msg.rfc822MessageId,
-                                        cachedReply: reply,
+                                        cachedReply: reply.body,
                                         replyGeneratedAt: Date(),
+                                        replyTextMessage: reply.textMessage,
                                         db: db
                                     )
                                     if DebugModeManager.isLoggingEnabled() {

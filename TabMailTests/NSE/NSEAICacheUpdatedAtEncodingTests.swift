@@ -9,15 +9,15 @@ import Synchronization
 @testable import TabMail
 
 /// #395 — an AI cache entry the notification extension staged and the main app merged
-/// must age like every other entry: the TTL purge (`updatedAt < cutoff`) may only
-/// remove it once it is actually older than the TTL.
+/// must age like every other entry: the orphan purge (`updatedAt < cutoff` for an entry no
+/// header has) may only remove it once it is actually older than the orphan grace.
 ///
 /// The merge used to bind `updatedAt` as the staged `processedAt` NUMBER while every
 /// other writer stores GRDB's `Date` TEXT. SQLite orders every number below every
 /// text value, so the purge counted a fresh extension-written entry as expired at once.
 ///
 /// Drives the REAL `NSEDataBridge.mergeNSEStagingData` (through the staging-path test
-/// seam) and the REAL `SyncEngine.runPurgeExpiredAICache`, so it pins the property
+/// seam) and the REAL `SyncEngine.runPurgeOrphanedAICache`, so it pins the property
 /// (a fresh entry survives, an old one does not), not the column's storage class.
 @Suite("NSE-written AI cache entries age like any other (#395)", .serialized, .processGlobalState)
 @MainActor
@@ -120,7 +120,7 @@ struct NSEAICacheUpdatedAtEncodingTests {
     }
 
     private func purge(_ pool: DatabasePool) {
-        SyncEngine.runPurgeExpiredAICache(dbPool: PrioritizedDatabase(pool: pool))
+        SyncEngine.runPurgeOrphanedAICache(dbPool: PrioritizedDatabase(pool: pool))
     }
 
     private func entryExists(_ pool: DatabasePool) async throws -> Bool {
@@ -158,23 +158,23 @@ struct NSEAICacheUpdatedAtEncodingTests {
         return try await entryExists(pool)
     }
 
-    @Test("A fresh extension-written entry survives the TTL purge when its header is missing",
+    @Test("A fresh extension-written entry survives the orphan purge when its header is missing",
           arguments: Branch.allCases)
     func freshEntrySurvives(branch: Branch) async throws {
         let survived = try await entrySurvivesPurge(
             branch: branch, processedAt: Date().timeIntervalSince1970
         )
-        #expect(survived, "\(branch): a just-written entry was purged inside the TTL")
+        #expect(survived, "\(branch): a just-written entry was purged inside the orphan grace")
     }
 
-    @Test("An extension-written entry older than the TTL is still purged (the purge can say no)",
+    @Test("An extension-written orphan older than the grace is still purged (the purge can say no)",
           arguments: Branch.allCases)
     func expiredEntryIsPurged(branch: Branch) async throws {
-        let expired = Date().addingTimeInterval(-Double(SyncConfig.aiCacheTTLDays + 1) * 86_400)
+        let expired = Date().addingTimeInterval(-Double(SyncConfig.aiCacheOrphanGraceDays + 1) * 86_400)
         let survived = try await entrySurvivesPurge(
             branch: branch, processedAt: expired.timeIntervalSince1970
         )
-        #expect(!survived, "\(branch): an entry older than the TTL was kept")
+        #expect(!survived, "\(branch): an orphan older than the grace was kept")
     }
 }
 
@@ -222,7 +222,7 @@ extension NSEAICacheUpdatedAtEncodingTests {
         }
         let failure = FailFirstHeaderCommit()
         try await pool.write { $0.add(transactionObserver: failure, extent: .databaseLifetime) }
-        let age = fresh ? 0 : -Double(SyncConfig.aiCacheTTLDays + 1) * 86_400
+        let age = fresh ? 0 : -Double(SyncConfig.aiCacheOrphanGraceDays + 1) * 86_400
         let processedAt = Date().timeIntervalSince1970 + age
         try stageRow(q, processedAt: processedAt, aiCompleted: true)
         await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
@@ -250,7 +250,7 @@ extension NSEAICacheUpdatedAtEncodingTests {
             TestDatabaseTeardown.retire(pools: [pool], queues: [q], directory: dir)
         }
         let key = cacheKey
-        let oldDate = Date().addingTimeInterval(-Double(SyncConfig.aiCacheTTLDays + 1) * 86_400)
+        let oldDate = Date().addingTimeInterval(-Double(SyncConfig.aiCacheOrphanGraceDays + 1) * 86_400)
         // The entry as the main app left it, differing from the staged result in one field only
         // (or holding nothing but a reply).
         let replyOnly = changedField == "replyOnlyCache"

@@ -634,6 +634,10 @@ final class AppDatabase: Sendable {
                     // lands with the same `providerDate` sync would write and the
                     // `.date` stale window never sees an epoch-zero placeholder.
                     "providerDate REAL",
+                    // v8 (2026-11-05): the summary's text message, staged with the
+                    // summary (`NSEStagingDB.ensureSummaryTextMessageColumn` adds it
+                    // from the extension too, like `providerDate`).
+                    "summaryTextMessage TEXT",
                 ] {
                     do {
                         try db.execute(sql: "ALTER TABLE nse_processed_message ADD COLUMN \(col)")
@@ -4255,6 +4259,58 @@ final class AppDatabase: Sendable {
                 WHERE typeof(updatedAt) IN ('integer', 'real')
                 """)
         }
+
+        // Chat view: each AI summary and precomputed reply carries a short text-message
+        // version (`summaryTextMessage`, `replyTextMessage`) on the header and in the AI
+        // cache. NULLABLE and NO BACKFILL: a result computed before this version has no
+        // text message, and the chat view asks for one when it needs it.
+        // Convergence: a fresh install and an upgraded DB both end with the four
+        // columns, NULL on every pre-existing row. Its name shares the v95 number with
+        // `v95_convertNumericAICacheUpdatedAt` above, which landed first: this one and the
+        // next had already run on test devices, and GRDB records a migration by its name,
+        // so renaming them would run them again there and fail on the existing columns.
+        // Names only need to be unique; the next migration is v97.
+        migrator.registerTimedMigration(
+            "v95_addAITextMessages", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "summaryTextMessage", .text)
+                t.add(column: "replyTextMessage", .text)
+            }
+            try db.alter(table: "messageAICache") { t in
+                t.add(column: "summaryTextMessage", .text)
+                t.add(column: "replyTextMessage", .text)
+            }
+        }
+
+        // AI results live as long as their email (ADR-IOS-103): the orphan purge keeps an AI
+        // cache entry while a header with its Message-ID is on the device. Older NSE builds
+        // wrote entries without that Message-ID, so the purge would delete them though their
+        // email is still here. Fill it from the header whose cache key the entry has (the key
+        // is `accountId:folderPath:rfc822MessageId`, the primary key, so each header is one
+        // indexed probe). Entries with no such header stay NULL and are orphans, as before.
+        // Convergence: a fresh install has no such rows; an upgraded DB ends with every entry
+        // whose email is in the folder its key names carrying its Message-ID. Frozen: it has
+        // run. The purge itself now reads a missing Message-ID from the key
+        // (`SyncEngine.aiCacheEntryHasEmail`), which also covers an email that moved before
+        // the upgrade, so this repair is no longer what keeps those entries.
+        migrator.registerTimedMigration(
+            "v96_repairAICacheMessageIds", foreignKeyChecks: .immediate
+        ) { db in
+            try repairAICacheMessageIds(db)
+        }
+    }
+
+    /// Fill a missing `messageAICache.rfc822MessageId` from the header the entry's key names
+    /// (v96). Shared by the migration and its test.
+    static func repairAICacheMessageIds(_ db: Database) throws {
+        try db.execute(sql: """
+            UPDATE messageAICache SET rfc822MessageId = h.rfc822MessageId
+            FROM messageHeader AS h
+            WHERE messageAICache.rfc822MessageId IS NULL
+              AND h.rfc822MessageId IS NOT NULL AND h.rfc822MessageId != ''
+              AND messageAICache.key = h.accountId || ':' || h.folderPath || ':' || h.rfc822MessageId
+        """)
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static
