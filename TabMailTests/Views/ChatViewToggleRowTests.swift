@@ -12,15 +12,20 @@ import UIKit
 ///
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. With AI on, the switch can be used and flipping it stores the user's choice.
-///  2. With AI off (opted out), the switch is grayed out and the stored choice is kept as it was,
-///     so it comes back when AI does (Q18).
+///  2. With AI off, opted out or with no active plan, the switch is grayed out and the stored
+///     choice is kept as it was, so it comes back when AI does (Q18).
 @Suite("Chat View switch", .serialized, .processGlobalState)
 @MainActor
 struct ChatViewToggleRowTests {
 
+    /// AI on; AI off because the user opted out; AI off because there is no active plan (the
+    /// subscription gate is closed while the user still consents).
+    enum AIState: CaseIterable, Sendable { case on, optedOut, noPlan }
+
     @Test("The switch works while AI is on and stores the choice; with AI off it is grayed out and the choice is kept",
-          arguments: [true, false])
-    func switchFollowsAI(aiOn: Bool) async throws {
+          arguments: AIState.allCases)
+    func switchFollowsAI(state: AIState) async throws {
+        let aiOn = state == .on
         let defaults = UserDefaults.standard
         let savedChoice = defaults.object(forKey: ChatViewConfig.enabledKey)
         let savedOptOut = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
@@ -31,14 +36,16 @@ struct ChatViewToggleRowTests {
             AIService.optOutStore.set(savedOptOut, forKey: AIService.optOutAllAIKey)
             if gateWasOpen { gate.openGate() } else { gate.closeGate() }
         }
-        gate.openGate()
-        AIService.writeOptOutFlag(!aiOn)
-        defaults.set(false, forKey: ChatViewConfig.enabledKey)
+        if state == .noPlan { gate.closeGate() } else { gate.openGate() }
+        AIService.writeOptOutFlag(state == .optedOut)
+        // With AI off the stored choice is on, so the test sees it shown and kept.
+        defaults.set(!aiOn, forKey: ChatViewConfig.enabledKey)
+        #expect(gate.isActive == (state != .noPlan), "control: the plan state is set")
 
         let window = try Self.host(Form { ChatViewToggleRow() })
         defer { window.isHidden = true }
         let control = try #require(await Self.waitForSwitch(in: window), "the row renders a switch")
-        #expect(!control.isOn, "it shows the stored choice")
+        #expect(control.isOn == !aiOn, "it shows the stored choice")
         if aiOn {
             #expect(control.isEnabled, "AI on: the switch can be used")
             control.setOn(true, animated: false)
@@ -48,7 +55,7 @@ struct ChatViewToggleRowTests {
         } else {
             #expect(!control.isEnabled, "AI off: the switch is grayed out")
             try await Task.sleep(for: .milliseconds(100))
-            #expect(defaults.object(forKey: ChatViewConfig.enabledKey) as? Bool == false,
+            #expect(defaults.object(forKey: ChatViewConfig.enabledKey) as? Bool == true,
                     "AI off leaves the stored choice as it was")
         }
     }
