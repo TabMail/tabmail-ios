@@ -50,15 +50,22 @@ struct AISummaryResponseTests {
         #expect(result.textMessage == "First line.\nSecond line.")
     }
 
-    @Test("None, quoted None and blank values are nil, except the text message, kept as written")
+    @Test("None, quoted None and blank reminder values are nil; the summary and text message are kept as written")
     func noneValues() {
         let result = parse(#"{"todos": [], "summary": "None", "reminder": {"due_date": "none", "due_time": "\"None\"", "content": "  "}, "text_message": "NONE"}"#)
-        #expect(result.blurb == nil)
+        // The backend accepts any nonblank summary and sends it as is: "None" is a summary.
+        #expect(result.blurb == "None")
         #expect(result.reminderDate == nil)
         #expect(result.reminderTime == nil)
         #expect(result.reminderContent == nil)
         // The backend sends the text message as a plain string with no "None" word.
         #expect(result.textMessage == "NONE")
+    }
+
+    @Test("A blank summary is no summary; a multi-line one is stored on one line")
+    func blankAndMultiLineSummary() {
+        #expect(parse(#"{"todos": [], "summary": " \n ", "reminder": null, "text_message": "T."}"#).blurb == nil)
+        #expect(parse(#"{"todos": [], "summary": "One.\nTwo.", "reminder": null, "text_message": "T."}"#).blurb == "One. Two.")
     }
 
     @Test("A missing text message leaves the summary intact")
