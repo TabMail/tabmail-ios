@@ -1364,3 +1364,54 @@ struct DraftServerCopyNamesParentMigrationTests {
         #expect(drafts[0].serverCopyNamesParent == nil)
     }
 }
+
+// MARK: - v95 — messageAICache.updatedAt stored as GRDB Date text (#395)
+
+/// `v95_convertNumericAICacheUpdatedAt` rewrites the numeric `updatedAt` values the
+/// notification extension used to write into GRDB's `Date` text, so the TTL purge's
+/// `updatedAt < cutoff` orders them with every other row. Rows already stored as text
+/// must come through untouched.
+@Suite("Migration v95 — messageAICache.updatedAt encoding")
+struct AICacheUpdatedAtEncodingMigrationTests {
+    @Test("Numeric updatedAt values become the same instant as Date text; text rows are untouched")
+    func numericValuesBecomeDateText() throws {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: "v94_addDraftServerCopyNamesParent")
+
+        // Seconds since 1970 as the extension wrote them: one REAL with a fraction, one INTEGER.
+        let realSeconds = 1_800_000_000.123
+        let integerSeconds = 1_800_000_500.0
+        let textRow = "2026-11-06 10:20:30.456"
+        try db.write { conn in
+            for (key, value) in [("real", realSeconds.databaseValue),
+                                 ("integer", Int64(integerSeconds).databaseValue),
+                                 ("text", textRow.databaseValue)] {
+                try conn.execute(
+                    sql: "INSERT INTO messageAICache (key, updatedAt) VALUES (?, ?)",
+                    arguments: [key, value]
+                )
+            }
+        }
+
+        try migrator.migrate(db, upTo: "v95_convertNumericAICacheUpdatedAt")
+
+        let types = try db.read {
+            try Row.fetchAll($0, sql: "SELECT key, typeof(updatedAt) AS t FROM messageAICache")
+        }
+        #expect(Set(types.map { $0["t"] as String }) == ["text"])
+        let rows = try db.read { try MessageAICache.fetchAll($0) }
+        let byKey = Dictionary(uniqueKeysWithValues: rows.map { ($0.key, $0.updatedAt) })
+        #expect(byKey.count == 3)
+        // Same instant to the millisecond GRDB's text format keeps.
+        #expect(abs((byKey["real"]?.timeIntervalSince1970 ?? 0) - realSeconds) < 0.001)
+        #expect(byKey["integer"]?.timeIntervalSince1970 == integerSeconds)
+        let stored = try db.read {
+            try String.fetchOne($0, sql: "SELECT updatedAt FROM messageAICache WHERE key = 'text'")
+        }
+        #expect(stored == textRow)
+    }
+}

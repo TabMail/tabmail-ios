@@ -4238,6 +4238,23 @@ final class AppDatabase: Sendable {
                 t.add(column: "serverCopyNamesParent", .boolean)
             }
         }
+
+        // #395: the notification extension's merge used to bind `messageAICache.updatedAt`
+        // as a number (seconds since 1970) while every other writer stores GRDB's `Date`
+        // text. In SQLite every number sorts below every text value, so the TTL purge's
+        // `updatedAt < cutoff` always counted those entries as expired. The writers now
+        // bind a `Date`; this converts the rows already written. Only numeric values are
+        // touched, so a text row (and a re-run) is left as it is. Convergence: a fresh
+        // install has no numeric rows and an upgraded DB ends with none.
+        migrator.registerTimedMigration(
+            "v95_convertNumericAICacheUpdatedAt", foreignKeyChecks: .immediate
+        ) { db in
+            try db.execute(sql: """
+                UPDATE messageAICache
+                SET updatedAt = strftime('%Y-%m-%d %H:%M:%f', updatedAt, 'unixepoch')
+                WHERE typeof(updatedAt) IN ('integer', 'real')
+                """)
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static
