@@ -16,7 +16,7 @@ struct AITextMessageStorageTests {
         try db.read { db in Set(try db.columns(in: table).map(\.name)) }
     }
 
-    @Test("v95 adds both text-message columns to messageHeader and messageAICache")
+    @Test("v105 adds both text-message columns to messageHeader and messageAICache")
     func migrationAddsColumns() throws {
         let db = try TestDatabase.make()
         for table in ["messageHeader", "messageAICache"] {
@@ -25,7 +25,10 @@ struct AITextMessageStorageTests {
             #expect(cols.contains("replyTextMessage"), "\(table)")
         }
         let applied = try db.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations") }
-        #expect(applied.contains("v95_addAITextMessages"))
+        #expect(applied.contains("v105_addAITextMessages"))
+        // The chat view's migrations are numbered after main's newest and run in that order.
+        let order = ["v103_addFolderChangeCursor", "v105_addAITextMessages", "v106_repairAICacheMessageIds"]
+        #expect(applied.filter { order.contains($0) } == order)
     }
 
     @Test("The header round-trips both text messages")
@@ -215,7 +218,7 @@ struct AITextMessageStorageTests {
 
     @Test("An older build's entries without a Message-ID survive the upgrade and the purge while their email is here")
     func legacyEntriesSurviveUpgradeAndPurge() throws {
-        let (pool, dir) = try Self.migrated(upTo: "v95_addAITextMessages")
+        let (pool, dir) = try Self.migrated(upTo: "v105_addAITextMessages")
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
         let aged = SyncConfig.aiCacheOrphanGraceDays + 1
         try pool.write { db in
@@ -259,6 +262,65 @@ struct AITextMessageStorageTests {
         let keys = try pool.read { db in Set(try MessageAICache.fetchAll(db).map(\.key)) }
         #expect(keys == ["acc1:INBOX:stayed@example.com", "acc1:INBOX:moved@example.com"])
         let applied = try pool.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations") }
-        #expect(applied.contains("v96_repairAICacheMessageIds"))
+        #expect(applied.contains("v106_repairAICacheMessageIds"))
+    }
+
+    /// Storage maintenance runs `ANALYZE` once per schema change, so a device upgrading to
+    /// v106 can hold planner statistics for a cache with many entries that have no Message-ID.
+    /// `sqlite_stat1` keeps one average per index column, so those statistics call
+    /// `rfc822MessageId IS NULL` a near-unique lookup. The repair must still scan the headers once
+    /// and look each one up in the cache by key; with the cache as the outer loop it scans every
+    /// header once per such entry, minutes on a large mailbox before any screen appears.
+    @Test("v106 scans the headers once and looks each up in the cache by key, with planner statistics for many entries without a Message-ID")
+    func repairPlanWithStatistics() throws {
+        let (pool, dir) = try Self.migrated(upTo: "v105_addAITextMessages")
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        let headers = 2000, entries = 600, withoutId = 150, gone = 5
+        try pool.write { db in
+            var account = Account(emailAddress: "acc1@example.com", displayName: "A", provider: .imap)
+            account.id = "acc1"
+            try account.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1").insert(db)
+            for i in 1...headers {
+                try Self.header("\(i)", folder: "INBOX", rfc: "m\(i)@example.com").insert(db)
+            }
+            // The first `withoutId` entries were written by an older extension, without the
+            // Message-ID; the rest carry it.
+            for i in 1...entries {
+                try Self.cacheEntry("acc1:INBOX:m\(i)@example.com", rfc: i <= withoutId ? nil : "m\(i)@example.com", daysAgo: 0).insert(db)
+            }
+            // Entries without a Message-ID whose email is not on the device.
+            for i in 1...gone {
+                try Self.cacheEntry("acc1:INBOX:gone\(i)@example.com", rfc: nil, daysAgo: 0).insert(db)
+            }
+        }
+        // Planned on the writer, the connection the migration runs on, right after its ANALYZE
+        // loaded the new statistics.
+        let (stat, details) = try pool.write { db in
+            try db.execute(sql: "ANALYZE")
+            return (try String.fetchOne(db, sql: "SELECT stat FROM sqlite_stat1 WHERE idx = 'messageAICache_rfc822MessageId'"),
+                    try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + AppDatabase.repairAICacheMessageIdsSQL).map { $0["detail"] as String })
+        }
+        // The statistics the scenario needs are in place.
+        #expect(stat != nil)
+        // messageHeader is the outer loop, scanned once; the cache is searched by its key and
+        // never through its Message-ID index.
+        #expect(details.first?.hasPrefix("SCAN h") == true, "\(details)")
+        #expect(details.contains { $0.hasPrefix("SEARCH messageAICache") && $0.contains("(key=?)") }, "\(details)")
+        #expect(!details.contains { $0.contains("messageAICache_rfc822MessageId") }, "\(details)")
+
+        try AppDatabase.runMigrations(on: pool)
+
+        // The same rows are filled: every entry whose email is where its key says gets that
+        // email's Message-ID, the rest are unchanged.
+        let ids = try pool.read { db in
+            Dictionary(uniqueKeysWithValues: try MessageAICache.fetchAll(db).map { ($0.key, $0.rfc822MessageId) })
+        }
+        var expected: [String: String?] = [:]
+        for i in 1...entries { expected["acc1:INBOX:m\(i)@example.com"] = .some("m\(i)@example.com") }
+        for i in 1...gone { expected["acc1:INBOX:gone\(i)@example.com"] = .some(nil) }
+        #expect(ids == expected)
+        let applied = try pool.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations") }
+        #expect(applied.contains("v106_repairAICacheMessageIds"))
     }
 }

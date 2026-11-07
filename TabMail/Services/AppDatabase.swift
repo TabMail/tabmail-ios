@@ -4458,13 +4458,10 @@ final class AppDatabase: Sendable {
         // cache. NULLABLE and NO BACKFILL: a result computed before this version has no
         // text message, and the chat view asks for one when it needs it.
         // Convergence: a fresh install and an upgraded DB both end with the four
-        // columns, NULL on every pre-existing row. Its name shares the v95 number with
-        // `v95_convertNumericAICacheUpdatedAt` above, which landed first: this one and the
-        // next had already run on test devices, and GRDB records a migration by its name,
-        // so renaming them would run them again there and fail on the existing columns.
-        // Names only need to be unique; the next migration is v97.
+        // columns, NULL on every pre-existing row. Numbered after main's newest,
+        // v103_addFolderChangeCursor, whose numbers stay; the next migration is v107.
         migrator.registerTimedMigration(
-            "v95_addAITextMessages", foreignKeyChecks: .immediate
+            "v105_addAITextMessages", foreignKeyChecks: .immediate
         ) { db in
             try db.alter(table: "messageHeader") { t in
                 t.add(column: "summaryTextMessage", .text)
@@ -4480,31 +4477,47 @@ final class AppDatabase: Sendable {
         // cache entry while a header with its Message-ID is on the device. Older NSE builds
         // wrote entries without that Message-ID, so the purge would delete them though their
         // email is still here. Fill it from the header whose cache key the entry has (the key
-        // is `accountId:folderPath:rfc822MessageId`, the primary key, so each header is one
-        // indexed probe). Entries with no such header stay NULL and are orphans, as before.
+        // is `accountId:folderPath:rfc822MessageId`, the primary key). messageHeader drives the
+        // join and each header is one indexed probe of the cache by key; the statement's `+`
+        // keeps the planner from turning that around (`repairAICacheMessageIdsSQL`). Entries
+        // with no such header stay NULL and are orphans, as before.
         // Convergence: a fresh install has no such rows; an upgraded DB ends with every entry
-        // whose email is in the folder its key names carrying its Message-ID. Frozen: it has
-        // run. The purge itself now reads a missing Message-ID from the key
+        // whose email is in the folder its key names carrying its Message-ID. The purge
+        // itself reads a missing Message-ID from the key
         // (`SyncEngine.aiCacheEntryHasEmail`), which also covers an email that moved before
         // the upgrade, so this repair is no longer what keeps those entries.
         migrator.registerTimedMigration(
-            "v96_repairAICacheMessageIds", foreignKeyChecks: .immediate
+            "v106_repairAICacheMessageIds", foreignKeyChecks: .immediate
         ) { db in
             try repairAICacheMessageIds(db)
         }
     }
 
     /// Fill a missing `messageAICache.rfc822MessageId` from the header the entry's key names
-    /// (v96). Shared by the migration and its test.
+    /// (v106). Shared by the migration and its test.
     static func repairAICacheMessageIds(_ db: Database) throws {
-        try db.execute(sql: """
-            UPDATE messageAICache SET rfc822MessageId = h.rfc822MessageId
-            FROM messageHeader AS h
-            WHERE messageAICache.rfc822MessageId IS NULL
-              AND h.rfc822MessageId IS NOT NULL AND h.rfc822MessageId != ''
-              AND messageAICache.key = h.accountId || ':' || h.folderPath || ':' || h.rfc822MessageId
-        """)
+        try db.execute(sql: repairAICacheMessageIdsSQL)
     }
+
+    /// v106's one statement, shared by `repairAICacheMessageIds` and its query-plan test.
+    ///
+    /// The join term on the key is an expression over the header's columns, so no index serves
+    /// it from the header's side: the plan must scan messageHeader once and, for each header,
+    /// look the cache entry up by its key. The unary `+` on `rfc822MessageId IS NULL` keeps the
+    /// cache's `messageAICache_rfc822MessageId` index out of the plan (SQLite "The SQLite Query
+    /// Optimizer Overview", "Disqualifying WHERE clause terms using unary-+"). Without it, once
+    /// `ANALYZE` has run (`SyncEngine.runRefreshPlannerStatisticsIfStale`), `sqlite_stat1` keeps one
+    /// average per column and reports that index as about one row per value, the large NULL group
+    /// averaged away, so the planner makes the cache the outer loop and scans every header once
+    /// per entry without a Message-ID. The `+` changes no row and no value: it also drops type
+    /// affinity, which an `IS NULL` test does not use.
+    static let repairAICacheMessageIdsSQL = """
+        UPDATE messageAICache SET rfc822MessageId = h.rfc822MessageId
+        FROM messageHeader AS h
+        WHERE +messageAICache.rfc822MessageId IS NULL
+          AND h.rfc822MessageId IS NOT NULL AND h.rfc822MessageId != ''
+          AND messageAICache.key = h.accountId || ':' || h.folderPath || ':' || h.rfc822MessageId
+        """
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static
     /// so the v79 migration and its tests share ONE algorithm.
