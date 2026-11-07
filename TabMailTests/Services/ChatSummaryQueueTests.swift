@@ -395,7 +395,7 @@ struct ChatSummaryQueueTests {
     /// Everything `ChatViewConfig.isActive` reads, saved and put back so no suite sees residue:
     /// the user toggle, the AI opt-out and the subscription gate.
     @MainActor
-    private struct SavedChatViewState {
+    struct SavedChatViewState {
         let defaults = UserDefaults.standard
         let toggle = UserDefaults.standard.object(forKey: ChatViewConfig.enabledKey)
         let optOut = AIService.optOutStore.object(forKey: AIService.optOutAllAIKey)
