@@ -74,6 +74,45 @@ struct ChatReplyField: Equatable {
     }
 }
 
+/// Whose words are in the reply field (N2.7, N4.3): the ready AI Reply fills the field only while
+/// it is the app's, and only over an empty field or the AI Reply the app itself put there, so a
+/// late reply never lands on words the user typed or said, in the field or in the open chat sheet.
+/// Every event that can hand the field to the user, or back, is decided here, in one place.
+struct ChatFieldFill: Equatable {
+    /// The user has the field: they changed it while collapsed, or a send or an answer emptied it.
+    private(set) var isUsers = false
+    /// The AI Reply the app last put in the field: only it, or nothing, may be replaced.
+    private(set) var filled: String?
+
+    /// The field's words once the ready AI Reply `ready` is offered, or nil to leave them as they
+    /// are: while the field is the app's, collapsed, with nothing sent and no dictation running,
+    /// over an empty field or the AI Reply the app put there. Offered again when the sheet closes
+    /// and when a dictation ends, so a reply that arrived meanwhile is not lost.
+    mutating func offer(_ ready: String?, input: String, expanded: Bool, sent: Bool, dictating: Bool) -> String? {
+        guard !isUsers, !expanded, !sent, !dictating, input.isEmpty || input == filled else { return nil }
+        filled = ready
+        return ready ?? ""
+    }
+
+    /// The field's words changed. Collapsed, words other than the AI Reply the app put there are
+    /// the user's; words left in the sheet are kept by `offer`, which never replaces them.
+    mutating func edited(_ input: String, expanded: Bool) {
+        guard !expanded, input != (filled ?? "") else { return }
+        isUsers = true
+    }
+
+    /// A new newest email: an empty field is the app's again, and its ready AI Reply fills it.
+    mutating func newEmail(input: String) {
+        guard input.isEmpty else { return }
+        isUsers = false
+    }
+
+    /// The reply went out, or the agent answered in the sheet: the field empties and stays empty.
+    mutating func cleared() {
+        isUsers = true
+    }
+}
+
 /// Replies sent from the chat whose email has no text message yet (N7). The bubble shows what the
 /// user said, or the ready AI Reply's text message, until the email's own text message arrives.
 /// In memory only: after a relaunch the sent email shows "Summarizing" until its summary lands.

@@ -15,7 +15,8 @@ import UIKit
 ///  1. The ready AI Reply is in the mounted field; when the newest email changes, the untouched
 ///     field holds the new email's ready reply. A completion (a sent compose card, an agent answer
 ///     from the field) empties the field, and the ready reply does not come back; a late AI Reply
-///     never replaces words the user typed. The two completions are private to `ChatThreadView`,
+///     never replaces words the user typed. One that arrives while the chat sheet is open fills the
+///     untouched field when the sheet closes; words typed in the sheet stay. The two completions are private to `ChatThreadView`,
 ///     so which ones empty the field is read from the source (`clearWiring`).
 ///  2. A send names the pill's email as the send starts: after the newest email changes, the next
 ///     request names the new email, never the number found for the earlier one.
@@ -46,6 +47,10 @@ struct ChatReplyFieldRuntimeTests {
         var message: MessageHeader
         /// `ChatThreadView.fieldClearCount`: a send or an answer from the field bumps it.
         var clearCount = 0
+        /// The chat sheet is open.
+        var expanded = false
+        /// Signed in: the open sheet shows its input bar, not the sign-in bar.
+        var signedIn = false
         init(_ message: MessageHeader) { self.message = message }
     }
 
@@ -53,10 +58,11 @@ struct ChatReplyFieldRuntimeTests {
         @Bindable var host: Host
         var body: some View {
             DynamicIslandChat(
-                message: host.message, isExpanded: .constant(false), isWorking: .constant(false),
+                message: host.message, isExpanded: $host.expanded, isWorking: .constant(false),
                 replyField: ChatReplyField(
                     readyText: ChatReplyField.readyText(newest: host.message, isOwn: false),
                     isNoReply: false, clearCount: host.clearCount))
+            .environment(\.hasTabMailSession, host.signedIn)
         }
     }
 
@@ -164,6 +170,40 @@ struct ChatReplyFieldRuntimeTests {
             #expect(texts.contains(words), "the user's words stay: \(texts)")
             #expect(!texts.contains("A late AI Reply"))
         }
+    }
+
+    /// The field's words after a reply arrives while the sheet is open and the sheet closes;
+    /// `typed`: words the user typed in the sheet first.
+    private func afterTheSheet(typed: String?, uid: String) async throws -> [String] {
+        var words: [String] = []
+        try await withMountedField(Self.header(uid)) { host, controller in
+            #expect(Self.fieldTexts(controller.view).contains(""), "control: the field starts empty")
+            host.signedIn = true
+            host.expanded = true
+            try await Task.sleep(for: .milliseconds(600))
+            if let typed {
+                #expect(Self.type(typed, in: controller.view), "the open sheet has a native editable field")
+                try await Self.settle()
+                #expect(Self.fieldTexts(controller.view).contains(typed), "control: the edit reached the field")
+            }
+            host.message.cachedReply = "Full reply"
+            host.message.replyTextMessage = "Yes, Tuesday works for me."
+            try await Self.settle()
+            #expect(!Self.fieldTexts(controller.view).contains("Yes, Tuesday works for me."), "never into the open sheet")
+            host.expanded = false
+            try await Task.sleep(for: .milliseconds(600))
+            words = Self.fieldTexts(controller.view)
+        }
+        return words
+    }
+
+    @Test("A reply that arrives while the sheet is open fills the untouched field when it closes; words typed there stay")
+    func readyReplyFollowsTheSheet() async throws {
+        let untouched = try await afterTheSheet(typed: nil, uid: "field-sheet-A")
+        #expect(untouched.contains("Yes, Tuesday works for me."), "filled once the sheet closed: \(untouched)")
+        let typed = try await afterTheSheet(typed: "My own question", uid: "field-sheet-B")
+        #expect(typed.contains("My own question"), "the user's words stay: \(typed)")
+        #expect(!typed.contains("Yes, Tuesday works for me."))
     }
 
     // MARK: - 2. A send names the email it is about
