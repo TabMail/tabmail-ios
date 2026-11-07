@@ -342,4 +342,37 @@ struct ChatSwipeTests {
         let text = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
         #expect(text.contains("func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer { Self.makePan(delegate: context.coordinator) }"))
     }
+
+    /// A pan whose speed the test sets, as UIKit reports it to the delegate before the pan starts.
+    private final class MovingPan: UIPanGestureRecognizer {
+        var speed = CGPoint.zero
+        override func velocity(in view: UIView?) -> CGPoint { speed }
+    }
+
+    @Test("A sideways drag starts the swipe when the chat's check allows its direction; an upright drag never asks")
+    func panAdmitsSidewaysMotion() {
+        var asked: [CGFloat] = []
+        // The chat's own check: here, only a drag toward the leading edge opens buttons.
+        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { asked.append($0); return $0 < 0 })
+        let pan = MovingPan()
+        pan.delegate = coordinator
+
+        pan.speed = CGPoint(x: -120, y: 4)
+        #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == true, "a sideways drag in an allowed direction starts")
+        #expect(asked == [-120], "the chat's check is asked with the drag's sideways speed")
+
+        asked.removeAll()
+        pan.speed = CGPoint(x: 120, y: 4)
+        #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == false, "the chat's check refuses this direction")
+        #expect(asked == [120])
+
+        asked.removeAll()
+        pan.speed = CGPoint(x: -4, y: 120)
+        #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == false, "an upright drag stays the scroll view's")
+        #expect(asked.isEmpty, "an upright drag never reaches the chat's check")
+
+        pan.speed = CGPoint(x: -40, y: 40)
+        #expect(pan.delegate?.gestureRecognizerShouldBegin?(pan) == false, "a drag no more sideways than upright does not start")
+        #expect(asked.isEmpty)
+    }
 }
