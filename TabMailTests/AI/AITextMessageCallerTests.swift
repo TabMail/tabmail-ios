@@ -52,13 +52,14 @@ struct AITextMessageCallerTests {
             })
         }
 
-        init() {
+        /// `summary`: the summary the backend answers with.
+        init(summary: String = AITextMessageCallerTests.blurb) {
             http.register(path: "/completions/chat", method: "POST") { request in
                 let prompt = Self.prompt(request.body)
                 let object: [String: Any]
                 switch prompt {
                 case "system_prompt_summary":
-                    object = ["summary": AITextMessageCallerTests.blurb, "todos": [],
+                    object = ["summary": summary, "todos": [],
                               "reminder": ["due_date": NSNull(), "due_time": NSNull(), "content": NSNull()],
                               "text_message": AITextMessageCallerTests.summaryText]
                 case "system_prompt_action":
@@ -182,6 +183,31 @@ struct AITextMessageCallerTests {
             #expect(cache?.summaryBlurb == Self.blurb)
             #expect(cache?.summaryTextMessage == Self.summaryText)
             #expect(cache?.rfc822MessageId == Fixture.rfc)
+        }
+    }
+
+    @Test("A summary that reads \"None\" is stored, and the email is not asked again")
+    func queueSummaryNone() async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture()
+            let backend = Backend(summary: "None")
+            defer { backend.close(); fixture.close() }
+
+            let retry = await runJob(.summary, fixture, backend.service)
+
+            #expect(!retry)
+            let row = try #require(try fixture.row())
+            #expect(row.summaryBlurb == "None", "the backend sends any nonblank summary as a summary")
+            #expect(row.summaryTextMessage == Self.summaryText)
+            #expect(try fixture.cache()?.summaryBlurb == "None")
+            // The stored row is a finished summary: the job runs again without asking the backend.
+            let queue = ActiveAIQueue()
+            await queue.setDispatchSuppressedForTesting(true)
+            _ = await queue.executeJobForTesting(
+                ActiveAIQueue.AIJob(headerId: row.id, accountId: "acc1", jobType: .summary),
+                message: row, plainText: "Can you send the budget?", account: fixture.account,
+                target: fixture.target, aiService: backend.service)
+            #expect(backend.prompts.filter { $0 == "system_prompt_summary" }.count == 1)
         }
     }
 
