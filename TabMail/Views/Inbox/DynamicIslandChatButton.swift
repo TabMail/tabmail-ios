@@ -688,8 +688,10 @@ struct DynamicIslandChat: View {
             if !dictating { fillReadyReply() }
         }
         .onChange(of: replyField?.clearCount) { _, _ in
-            inputText = ""
             fieldSentText = nil
+            // Words written after the send this completes are newer, and stay (`ChatFieldFill.clears`).
+            guard fieldFill.clears(inputText) else { return }
+            inputText = ""
             fieldFill.cleared()
         }
         .onChange(of: inputText) { _, text in
@@ -698,7 +700,7 @@ struct DynamicIslandChat: View {
         }
         .onChange(of: chatMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
-            inputText = ""
+            if fieldFill.clears(inputText) { inputText = "" }
             fieldSentText = nil
             withAnimation(expandSpring) { isExpanded = true }
         }
@@ -1574,6 +1576,8 @@ struct DynamicIslandChat: View {
             sendFromReplyField(text, replyField)
             return
         }
+        // From the open sheet the input empties as it goes; a newer draft is what is typed next.
+        if replyField != nil { fieldFill.sent(input: "") }
         let composeAdmissionAcquired: Bool
         if isComposeMode {
             guard acquireComposeEditAdmission() else { return }
@@ -1617,6 +1621,7 @@ struct DynamicIslandChat: View {
     /// answers in the sheet; a closed compose card leaves the words (N6.3).
     private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {
         isTextFieldFocused = false
+        fieldFill.sent(input: inputText)
         if ChatReplyField.route(text: text, readyText: field.readyText) == .readyReply {
             onSendReadyReply?()
             return

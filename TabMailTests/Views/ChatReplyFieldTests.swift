@@ -262,6 +262,32 @@ struct ChatReplyFieldTests {
         #expect(Self.offer(&cleared, "A newer reply", input: "") == nil)
     }
 
+    @Test("A completion empties only the words that were sent, nothing, or the app's AI Reply; newer words stay")
+    func completionClearsOnlyTheSentWords() {
+        // Nothing sent yet (a reply sent from a bubble's compose card): the field empties.
+        let fresh = ChatFieldFill()
+        #expect(fresh.clears("Anything"))
+
+        // Sent from the collapsed field, then a newer draft typed in the open sheet.
+        var fill = ChatFieldFill()
+        _ = Self.offer(&fill, "A ready reply", input: "")
+        fill.sent(input: "First request")
+        #expect(fill.clears("First request"), "the words sent")
+        #expect(fill.clears(""))
+        #expect(fill.clears("A ready reply"), "the app's own AI Reply")
+        #expect(!fill.clears("My newer draft"), "words written after the send are newer")
+        // Once emptied, the next completion has no send to protect.
+        fill.cleared()
+        #expect(fill.atSend == nil)
+        #expect(fill.clears("Anything"))
+
+        // Sent from the open sheet, which empties as it sends: whatever is typed next is newer.
+        var sheet = ChatFieldFill()
+        sheet.sent(input: "")
+        #expect(sheet.clears(""))
+        #expect(!sheet.clears("Typed after the send"))
+    }
+
     @Test("While a dictation runs no AI Reply fills the field; after it, the dictated words stay")
     func dictationOwnsTheField() {
         // Started on an empty field, a reply arrives while the words are transcribed.
@@ -352,7 +378,13 @@ struct ChatReplyFieldTests {
         #expect(Self.count("fieldFill.newEmail(input: inputText) fillReadyReply()", in: text) == 1)
         #expect(Self.count(".onChange(of: isExpanded) { _, expanded in if !expanded { fillReadyReply() } }", in: text) == 1)
         #expect(Self.count(".onChange(of: isDictating) { _, dictating in if !dictating { fillReadyReply() } }", in: text) == 1)
-        #expect(Self.count("fieldSentText = nil fieldFill.cleared()", in: text) == 1)
+        // A completion empties the field only while it holds what was sent (`ChatFieldFill.clears`),
+        // for an answer or a sent reply and for a confirmation card; both sends record it.
+        #expect(Self.count("fieldSentText = nil // Words written after the send this completes are newer, and stay (`ChatFieldFill.clears`). guard fieldFill.clears(inputText) else { return } inputText = \"\" fieldFill.cleared()", in: text) == 1)
+        #expect(Self.count("if fieldFill.clears(inputText) { inputText = \"\" }", in: text) == 1)
+        #expect(Self.count("fieldFill.cleared()", in: text) == 1)
+        #expect(Self.count("if replyField != nil { fieldFill.sent(input: \"\") }", in: text) == 1)
+        #expect(Self.count("isTextFieldFocused = false fieldFill.sent(input: inputText) if ChatReplyField.route", in: text) == 1)
         #expect(Self.count("guard replyField != nil else { return } fieldFill.edited(text, expanded: isExpanded)", in: text) == 1)
         #expect(Self.count("fillReadyReply()", in: text) == 5, "the four triggers and the definition")
         #expect(Self.count("inputText = words", in: text) == 1, "the field is filled in one place")
@@ -363,7 +395,8 @@ struct ChatReplyFieldTests {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         // Collapsed, the reply field's Send takes the field's route; the open sheet keeps the chat's.
         let message = try Self.body(of: "private func sendMessage() {", in: text)
-        #expect(Self.count("if let replyField, !isExpanded { sendFromReplyField(text, replyField) return }", in: message) == 1)
+        // Send refuses only an empty input, and the collapsed field then takes its own route.
+        #expect(message.hasPrefix(" let text = inputText.trimmingCharacters(in: .whitespaces) guard !text.isEmpty else { return } if let replyField, !isExpanded { sendFromReplyField(text, replyField) return }"))
         // Both dictation paths take the field's decision (on-device and cloud).
         #expect(Self.count("let replacesReadyReply = ChatReplyField.dictationReplaces( input: inputText, readyText: replyField?.readyText, expanded: isExpanded)", in: text) == 1)
         #expect(Self.count("speechBase = replacesReadyReply ? \"\" : inputText", in: text) == 1)

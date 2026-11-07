@@ -83,6 +83,10 @@ struct ChatFieldFill: Equatable {
     private(set) var isUsers = false
     /// The AI Reply the app last put in the field: only it, or nothing, may be replaced.
     private(set) var filled: String?
+    /// The field's words when the user last sent, from the field or from the open sheet; nil once
+    /// a completion emptied it. An answer or a sent reply completes that send, so it empties only
+    /// those words: words the user typed after it, in the open sheet, are newer and stay.
+    private(set) var atSend: String?
 
     /// The field's words once the ready AI Reply `ready` is offered, or nil to leave them as they
     /// are: while the field is the app's, collapsed, with nothing sent and no dictation running,
@@ -107,9 +111,23 @@ struct ChatFieldFill: Equatable {
         isUsers = false
     }
 
+    /// The user sent with `input` in the field.
+    mutating func sent(input: String) {
+        atSend = input
+    }
+
+    /// Whether the completion of the last send (the agent answered, or the reply went out) may
+    /// empty the field holding `input`: it still holds the words sent, nothing, or the AI Reply the
+    /// app put there. Anything else the user wrote after the send.
+    func clears(_ input: String) -> Bool {
+        guard let atSend else { return true }
+        return input == atSend || input.isEmpty || input == filled
+    }
+
     /// The reply went out, or the agent answered in the sheet: the field empties and stays empty.
     mutating func cleared() {
         isUsers = true
+        atSend = nil
     }
 }
 
