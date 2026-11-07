@@ -80,7 +80,7 @@ struct AIActionRecipientStatusRequestTests {
             subject: "Quarterly planning", from: "Sender", fromAddress: "sender@company.com",
             date: Date(), bodyText: "Notes from the planning call.", htmlContent: nil,
             hasExistingAction: false, userName: "Recipient", kbText: "", actionPrompt: "",
-            recipientStatus: recipientStatus
+            recipientStatus: recipientStatus, isSentByUser: false
         )
     }
 
