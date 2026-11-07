@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import GRDB
 import Observation
 
 /// The chat's reply field (N2.6 to N7, A1 to A4, E1, E1b): the pill on the newest email becomes
@@ -126,41 +127,65 @@ struct ChatFieldFill: Equatable {
     }
 }
 
-/// Replies sent from the chat whose email has not reached the chat yet (N7). A Sent bubble shows
-/// what the user said, or the ready AI Reply's text message, until an own reply to that email
-/// arrives; the arrived email then shows like any other, "Summarizing" until its own text message.
-/// The words never go on an email: a reply sent elsewhere to the same email can arrive first, and
-/// nothing here proves which email is which send. In memory only.
+/// Replies sent from the chat whose email is not in the chat yet (N7). Each follows its own queued
+/// email through the outbox row the send wrote (owner 2026-11-07): its bubble shows from the queue
+/// write, Undo window included, says "Sending" until the provider takes the email and "Sent" after,
+/// and shows the email's summary as soon as it is made at Send ("Summarizing" until then). Undo or a
+/// discard deletes the unsent row, and the bubble goes with it. The bubble ends when the email
+/// itself, by its own Message-ID, is in the chat. In memory only.
 @MainActor @Observable
 final class ChatSentReplies {
     static let shared = ChatSentReplies()
 
     struct Entry: Identifiable, Equatable {
-        let id = UUID()
+        /// The queued email's outbox row.
+        let outboxId: String
         let accountId: String
         /// The Message-ID of the email the reply answers (the reply's In-Reply-To).
         let repliedTo: String
-        let text: String
         let sentAt: Date
+
+        var id: String { outboxId }
     }
 
-    private(set) var entries: [Entry] = []
+    /// Where a sent reply's email is, from its outbox row and the AI cache.
+    struct Progress: Equatable, Sendable {
+        enum Status: Equatable, Sendable {
+            case sending, sent, notSent
+        }
 
-    func add(accountId: String, repliedTo: String, text: String, sentAt: Date = Date()) {
-        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
-        prune(now: sentAt)
-        entries.append(Entry(accountId: accountId, repliedTo: repliedTo, text: text, sentAt: sentAt))
+        let status: Status
+        /// The email's own Message-ID, without brackets.
+        let messageId: String?
+        /// The email's summary as a text message, once made.
+        let textMessage: String?
+
+        /// The line under the bubble, as under every email of the user's.
+        var caption: String {
+            switch status {
+            case .sending: "Sending"
+            case .sent: "Sent"
+            case .notSent: "Not sent"
+            }
+        }
     }
 
-    /// A compose card opened from the chat ended. Only a sent one counts: a sent reply keeps the
-    /// user's words as its Sent bubble until its email arrives in the chat, and the caller empties
-    /// the field. A cancelled or failed card changes nothing. Returns whether it was sent.
+    private(set) var entries: [Entry] = [] {
+        didSet { if entries.map(\.id) != oldValue.map(\.id) { observe() } }
+    }
+    /// The last progress read for each entry.
+    private(set) var progress: [String: Progress] = [:]
+    private var observation: Task<Void, Never>?
+
+    /// A compose card opened from the chat ended. Only a sent one counts: a sent reply shows as its
+    /// queued email's bubble until that email is in the chat, and the caller empties the field. A
+    /// cancelled or failed card changes nothing. Returns whether it was sent.
     @discardableResult
-    func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?, words: String?) -> Bool {
-        guard case .sent = outcome else { return false }
-        if let replyTo, let repliedTo = replyTo.rfc822MessageId, let words {
-            add(accountId: replyTo.accountId, repliedTo: repliedTo, text: words)
+    func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?, now: Date = Date()) -> Bool {
+        guard case .sent(let outboxId) = outcome else { return false }
+        if let replyTo, let repliedTo = replyTo.rfc822MessageId {
+            prune(now: now)
+            entries.append(Entry(outboxId: outboxId, accountId: replyTo.accountId, repliedTo: repliedTo, sentAt: now))
         }
         return true
     }
@@ -170,22 +195,16 @@ final class ChatSentReplies {
         entries.filter { $0.accountId == accountId && messageIds.contains($0.repliedTo) }
     }
 
-    /// The entry an own email may have arrived for: a reply to `repliedTo`, dated from about when
-    /// it was sent. It only ends the entry's Sent bubble; it is no proof the email is that send.
-    static func entry(for header: MessageHeader, in entries: [Entry]) -> Entry? {
-        guard let inReplyTo = header.inReplyTo else { return nil }
-        return entries.first { entry in
-            let earliest = entry.sentAt.addingTimeInterval(-ChatViewLayout.sentReplyDateSlack)
-            return entry.accountId == header.accountId && entry.repliedTo == inReplyTo && header.date >= earliest
-        }
+    /// Whether the email of `entry` is among `items`, by its own Message-ID.
+    func isInChat(_ entry: Entry, items: [ChatThread.Item]) -> Bool {
+        guard let messageId = progress[entry.id]?.messageId else { return false }
+        return items.contains { $0.header.rfc822MessageId.map(EmailFilter.normalizeMessageId) == messageId }
     }
 
-    /// Drops the entries an own email has arrived for, and old ones.
+    /// Drops the entries whose email is in the chat, and old ones.
     func settle(_ items: [ChatThread.Item], now: Date = Date()) {
-        let done = Set(items.compactMap { item in
-            item.isOwn ? Self.entry(for: item.header, in: entries)?.id : nil
-        })
-        if !done.isEmpty { entries.removeAll { done.contains($0.id) } }
+        let arrived = Set(entries.filter { isInChat($0, items: items) }.map(\.id))
+        if !arrived.isEmpty { entries.removeAll { arrived.contains($0.id) } }
         prune(now: now)
     }
 
@@ -193,7 +212,60 @@ final class ChatSentReplies {
         entries.removeAll { now.timeIntervalSince($0.sentAt) > ChatViewLayout.sentReplyLifetime }
     }
 
+    /// The progress of each of `outboxIds` whose row is still there.
+    nonisolated static func progress(of outboxIds: [String], db: Database) throws -> [String: Progress] {
+        var found: [String: Progress] = [:]
+        for row in try OutboxMessage.filter(keys: outboxIds).fetchAll(db) {
+            let messageId = row.sentMessageId.map(EmailFilter.normalizeMessageId)
+            let sentPath = try Folder
+                .filter(Column("accountId") == row.accountId && Column("role") == FolderRole.sent.rawValue)
+                .fetchOne(db)?.path
+            let key = sentPath.flatMap {
+                MessageAICache.cacheKey(accountId: row.accountId, folderPath: $0, rfc822MessageId: messageId)
+            }
+            let text = try key.flatMap { try MessageAICache.fetchOne(db, key: $0) }?.summaryTextMessage
+            let status: Progress.Status = row.sentAt != nil ? .sent : row.outboxStatus == .failed ? .notSent : .sending
+            found[row.id] = Progress(status: status, messageId: messageId, textMessage: text?.isEmpty == false ? text : nil)
+        }
+        return found
+    }
+
+    /// Follows the entries' outbox rows and AI cache entries while there are any.
+    private func observe() {
+        observation?.cancel()
+        let ids = entries.map(\.id)
+        guard !ids.isEmpty else {
+            observation = nil
+            return
+        }
+        observation = Task { [weak self] in
+            let tracking = ValueObservation.tracking { db in try Self.progress(of: ids, db: db) }.removeDuplicates()
+            do {
+                for try await found in tracking.values(in: AppDatabase.rawPool) {
+                    guard let self, !Task.isCancelled else { return }
+                    self.apply(found)
+                }
+            } catch {
+                BackgroundSyncLogger.logDebug("[Chat] sent reply observation ended: \(error)")
+            }
+        }
+    }
+
+    /// A row that is gone before its email went out was undone or discarded: its bubble goes. A
+    /// sent email's row goes once it is filed in Sent; its bubble stays, "Sent", until the email is
+    /// in the chat.
+    private func apply(_ found: [String: Progress]) {
+        let undone = Set(entries.map(\.id).filter { found[$0] == nil && progress[$0]?.status != .sent })
+        for (id, value) in found { progress[id] = value }
+        for id in undone { progress[id] = nil }
+        if !undone.isEmpty { entries.removeAll { undone.contains($0.id) } }
+        progress = progress.filter { id, _ in entries.contains { $0.id == id } }
+    }
+
     #if DEBUG
-    func removeAllForTesting() { entries = [] }
+    func removeAllForTesting() {
+        entries = []
+        progress = [:]
+    }
     #endif
 }

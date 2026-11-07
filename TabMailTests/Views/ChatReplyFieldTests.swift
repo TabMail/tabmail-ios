@@ -16,8 +16,8 @@ import Testing
 ///  3. Words for the agent name the newest email and say they came from its reply field; for a
 ///     no-reply sender they say not to write a reply (section 3c, E1.2).
 ///  4. While the agent writes a reply the line above the field says so (N5.1).
-///  5. A reply sent from the chat shows its words on the user's bubble until that email's own text
-///     message arrives, and only on the email that is that reply (N7).
+///  5. A reply sent from the chat shows as a Sending bubble following its queued email, and only a
+///     sent card makes one (N7; the bubble itself: `ChatSendingBubbleTests`).
 ///  6. The view wires each of these: hosted SwiftUI views cannot be driven from a unit test, so the
 ///     wiring is read from the source.
 ///  7. A ready AI Reply shows in the field only while the field holds no words of the user's
@@ -138,41 +138,11 @@ struct ChatReplyFieldTests {
 
     // MARK: - 5. Sent replies
 
-    @Test("An own email answering the same email from about then, in the same account, ends a sent reply's bubble")
-    func sentReplyMatching() {
-        let replies = ChatSentReplies()
-        replies.add(accountId: "acc1", repliedTo: "<1@example.com>", text: "  Tuesday works \n", sentAt: Self.now)
-        replies.add(accountId: "acc1", repliedTo: "<1@example.com>", text: "   ", sentAt: Self.now)
-        #expect(replies.entries.map(\.text) == ["Tuesday works"], "trimmed; empty words are not kept")
-
-        let entries = replies.entries
-        let sent = Self.header("2", inReplyTo: "<1@example.com>")
-        #expect(ChatSentReplies.entry(for: sent, in: entries)?.text == "Tuesday works")
-
-        let slackMinutes = ChatViewLayout.sentReplyDateSlack / 60
-        let early = Self.header("3", minutesAgo: slackMinutes - 0.1, inReplyTo: "<1@example.com>")
-        #expect(ChatSentReplies.entry(for: early, in: entries) != nil, "a clock a little behind")
-        let older = Self.header("4", minutesAgo: slackMinutes + 1, inReplyTo: "<1@example.com>")
-        #expect(ChatSentReplies.entry(for: older, in: entries) == nil, "an earlier reply to the same email")
-
-        let other = Self.header("5", inReplyTo: "<9@example.com>")
-        #expect(ChatSentReplies.entry(for: other, in: entries) == nil, "a reply to another email")
-        let noParent = Self.header("6")
-        #expect(ChatSentReplies.entry(for: noParent, in: entries) == nil)
-        var otherAccount = sent
-        otherAccount.accountId = "acc2"
-        #expect(ChatSentReplies.entry(for: otherAccount, in: entries) == nil, "another account")
-
-        #expect(replies.entries(accountId: "acc1", messageIds: ["<1@example.com>"]).count == 1)
-        #expect(replies.entries(accountId: "acc1", messageIds: ["<9@example.com>"]).isEmpty, "another chat")
-        #expect(replies.entries(accountId: "acc2", messageIds: ["<1@example.com>"]).isEmpty)
-    }
-
-    @Test("Only a sent compose card keeps the reply's words and empties the field; a cancelled or failed one changes nothing",
+    @Test("Only a sent compose card makes a Sending bubble, for a reply, following its queued email; a cancelled or failed one changes nothing",
           arguments: ["sent", "cancelled", "failed"])
     func composeEndedKeepsOnlySent(outcomeName: String) {
         let outcome: ComposeOutcome = switch outcomeName {
-        case "sent": .sent
+        case "sent": .sent(outboxId: "outbox-1")
         case "cancelled": .cancelled
         default: .failed("The account could not send")
         }
@@ -180,14 +150,15 @@ struct ChatReplyFieldTests {
         let replies = ChatSentReplies()
         var parent = Self.header("1")
         parent.rfc822MessageId = "<1@example.com>"
-        #expect(replies.composeEnded(outcome, replyTo: parent, words: "Tuesday works") == sent,
-                "the field empties only after a send")
-        #expect(replies.entries.map(\.text) == (sent ? ["Tuesday works"] : []), "the Sent bubble keeps the words only after a send")
+        #expect(replies.composeEnded(outcome, replyTo: parent) == sent, "the field empties only after a send")
+        #expect(replies.entries.map(\.outboxId) == (sent ? ["outbox-1"] : []), "the bubble follows the queued email")
         #expect(replies.entries.map(\.repliedTo) == (sent ? ["<1@example.com>"] : []))
-        // A sent card without the field's words (an agent compose) or without a parent still empties the field.
-        #expect(replies.composeEnded(outcome, replyTo: parent, words: nil) == sent)
-        #expect(replies.composeEnded(outcome, replyTo: nil, words: "Hello") == sent)
-        #expect(replies.entries.count == (sent ? 1 : 0), "no words, no Sent bubble")
+        // A sent card without a parent (a new email or a forward) still empties the field.
+        #expect(replies.composeEnded(outcome, replyTo: nil) == sent)
+        #expect(replies.entries.count == (sent ? 1 : 0), "no parent, no bubble")
+        #expect(replies.entries(accountId: parent.accountId, messageIds: ["<1@example.com>"]).count == (sent ? 1 : 0))
+        #expect(replies.entries(accountId: parent.accountId, messageIds: ["<9@example.com>"]).isEmpty, "another chat")
+        #expect(replies.entries(accountId: "acc2", messageIds: ["<1@example.com>"]).isEmpty, "another account")
     }
 
     @Test("Dictation starts by itself only with the preference on and never in the chat's reply field",
@@ -206,30 +177,19 @@ struct ChatReplyFieldTests {
                 "the prompt whose Enable starts dictation never shows in the chat")
     }
 
-    @Test("A sent reply goes once an own email answering it arrives, summarized or not, or after its lifetime")
-    func sentReplySettles() {
+    @Test("A sent reply's bubble goes after its lifetime, and adding one prunes old ones")
+    func sentReplyLifetime() {
         let replies = ChatSentReplies()
-        replies.add(accountId: "acc1", repliedTo: "<1@example.com>", text: "Tuesday works", sentAt: Self.now)
-        replies.add(accountId: "acc1", repliedTo: "<8@example.com>", text: "Sure", sentAt: Self.now)
-
-        let someoneElse = Self.item(Self.header("2", inReplyTo: "<1@example.com>"))
-        replies.settle([someoneElse], now: Self.now)
-        #expect(replies.entries.count == 2, "someone else's reply to the same email is not the user's")
-
-        let ownSummarizing = Self.item(Self.header("3", fromAddress: "me@example.com", inReplyTo: "<1@example.com>"))
-        #expect(ownSummarizing.isOwn && ownSummarizing.textMessage == nil, "control: own, not summarized yet")
-        replies.settle([ownSummarizing], now: Self.now)
-        #expect(replies.entries.map(\.repliedTo) == ["<8@example.com>"], "only the arrived email's entry goes")
-
+        var parent = Self.header("1")
+        parent.rfc822MessageId = "<1@example.com>"
+        replies.composeEnded(.sent(outboxId: "outbox-old"), replyTo: parent, now: Self.now)
         replies.settle([], now: Self.now.addingTimeInterval(ChatViewLayout.sentReplyLifetime))
         #expect(replies.entries.count == 1, "kept through its lifetime")
-        replies.settle([], now: Self.now.addingTimeInterval(ChatViewLayout.sentReplyLifetime + 1))
+        replies.composeEnded(.sent(outboxId: "outbox-new"), replyTo: parent,
+                             now: Self.now.addingTimeInterval(ChatViewLayout.sentReplyLifetime + 1))
+        #expect(replies.entries.map(\.outboxId) == ["outbox-new"], "adding prunes old entries")
+        replies.settle([], now: Self.now.addingTimeInterval(2 * ChatViewLayout.sentReplyLifetime + 2))
         #expect(replies.entries.isEmpty, "gone after it")
-
-        replies.add(accountId: "acc1", repliedTo: "<1@example.com>", text: "Old", sentAt: Self.now)
-        replies.add(accountId: "acc1", repliedTo: "<1@example.com>", text: "New",
-                    sentAt: Self.now.addingTimeInterval(ChatViewLayout.sentReplyLifetime + 1))
-        #expect(replies.entries.map(\.text) == ["New"], "adding prunes old entries")
     }
 
     // MARK: - 7. Whose words are in the field
@@ -391,23 +351,23 @@ struct ChatReplyFieldTests {
         #expect(Self.count("enqueueStatus(isReplyField ? ChatReplyField.statusLine(label) : label)", in: text) == 1)
     }
 
-    @Test("The chat opens compose for the AI Reply and keeps a sent reply's words")
+    @Test("The chat opens compose for the AI Reply and shows a sent reply's Sending bubble")
     func chatWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(Self.count("onSendReadyReply: { readyReplyMessage = newest }", in: text) == 1)
-        #expect(Self.count("onAgentOutcome: { outcome in composeEnded(outcome, replyTo: msg, words: words) }", in: text) == 1)
-        #expect(Self.count("composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil, words: words)", in: text) == 1)
+        #expect(Self.count("onAgentOutcome: { outcome in composeEnded(outcome, replyTo: msg) }", in: text) == 1)
+        #expect(Self.count("composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)", in: text) == 1)
         #expect(Self.count("onAgentOutcome: onOutcome)", in: text) == 3, "every agent compose")
         // Every compose card hands its own outcome on: four callbacks, none naming an outcome itself.
         #expect(Self.count("onAgentOutcome:", in: text) == 4)
         #expect(Self.count("composeEnded(.", in: text) == 0 && Self.count("{ _ in composeEnded", in: text) == 0)
-        #expect(Self.count("onAgentOutcome: { outcome in composeEnded(outcome, replyTo: msg, words: words) })", in: text) == 1,
+        #expect(Self.count("onAgentOutcome: { outcome in composeEnded(outcome, replyTo: msg) })", in: text) == 1,
                 "the field's own compose hands on its outcome")
-        #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil, words: words)", in: text) == 1,
+        #expect(Self.count("req.onOutcome(outcome) composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)", in: text) == 1,
                 "an agent compose hands on its outcome")
-        let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?, words: String?) {", in: text)
-        #expect(Self.count("if sentReplies.composeEnded(outcome, replyTo: replyTo, words: words) { fieldClearCount += 1 }", in: ended) == 1)
+        let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
+        #expect(Self.count("if sentReplies.composeEnded(outcome, replyTo: replyTo) { fieldClearCount += 1 }", in: ended) == 1)
         #expect(Self.count("sentReplies.settle(thread.items)", in: text) == 1)
-        #expect(Self.count("ChatSentReplyBubble(text: entry.text)", in: text) == 1)
+        #expect(Self.count("ChatSentReplyBubble(progress: sentReplies.progress[entry.id])", in: text) == 1)
     }
 }

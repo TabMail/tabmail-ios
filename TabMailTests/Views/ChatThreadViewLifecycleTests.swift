@@ -27,9 +27,7 @@ import UIKit
 ///     a six-line ready AI Reply raises the thread's bottom by as much as it raises the field.
 ///  5. A context load that a newer member change cancelled never shows: the chat keeps the newer
 ///     load's accounts and attachment chips when the older read finally returns.
-///  6. An email shows only its own words: a reply sent from the chat shows its words as a Sent
-///     bubble until an own reply to that email arrives, and the arrived email never shows them,
-///     because nothing proves it is that send (a reply sent elsewhere can arrive first).
+///  6. (The Sending bubble of a reply sent from the chat: `ChatSendingBubbleTests`.)
 ///  7. No AI Reply is offered on the user's turn (owner 2026-11-07): from the moment a reply is
 ///     sent from the chat, the field holds no suggestion, whether or not the sent email has
 ///     arrived (offline it may not for long), until an email from someone else arrives; that
@@ -471,81 +469,6 @@ struct ChatThreadViewLifecycleTests {
         await queue.setDispatchSuppressedForTesting(false)
     }
 
-    @Test("An arrived own reply shows only its own words, never a sent reply's: those stay on their Sent bubble until it goes")
-    func arrivedReplyShowsOnlyItsOwnWords() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
-        try await HostedAccessibility.withAutomation { try await arrivedReplyShowsOnlyItsOwnWordsBody() }
-    }
-
-    private func arrivedReplyShowsOnlyItsOwnWordsBody() async throws {
-        let saved = ChatSummaryQueueTests.SavedChatViewState()
-        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
-        let queue = ActiveAIQueue.shared
-        await queue.setDispatchSuppressedForTesting(true)
-        await queue.clearForTesting()
-        let replies = ChatSentReplies.shared
-        replies.removeAllForTesting()
-        defer {
-            replies.removeAllForTesting()
-            saved.restore()
-            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
-        }
-        saved.setChatView(on: true)
-        let account = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
-        try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
-        let now = Date()
-        func header(_ id: String, subject: String, from: String, minutesAgo: Double, inReplyTo: String?) -> MessageHeader {
-            var header = MessageHeader(
-                messageId: id, subject: subject, from: from, fromAddress: from, to: "someone@example.com",
-                date: now.addingTimeInterval(-minutesAgo * 60), snippet: "Note \(id)",
-                folderId: MessageIdentity.folderId(accountId: Self.account, folderPath: "INBOX"),
-                accountId: Self.account, folderPath: "INBOX", isInInbox: true)
-            header.rfc822MessageId = "<\(id)@example.com>"
-            header.inReplyTo = inReplyTo
-            header.headerComplete = true
-            header.bodyComplete = true
-            header.isRead = true
-            return header
-        }
-        let parent = header("words-parent", subject: "Lunch plans", from: "sender@example.com", minutesAgo: 10, inReplyTo: nil)
-        // An own reply to the parent, not summarized yet: a reply sent elsewhere, or this phone's.
-        let arrived = header("words-arrived", subject: "Re: Lunch plans", from: account.emailAddress,
-                             minutesAgo: 5, inReplyTo: "<words-parent@example.com>")
-        // Someone else answers the parent just now: not the user's email.
-        let others = header("words-other", subject: "Re: Lunch plans", from: "friend@example.com",
-                            minutesAgo: 0, inReplyTo: "<words-parent@example.com>")
-        try await pool.write { db in try parent.insert(db); try arrived.insert(db); try others.insert(db) }
-        // Two replies sent from the chat to the parent: one from about when the arrived email is
-        // dated, one sent after it, whose email has not arrived.
-        replies.add(accountId: Self.account, repliedTo: "<words-parent@example.com>", text: "Tuesday works for me",
-                    sentAt: arrived.date)
-        replies.add(accountId: Self.account, repliedTo: "<words-parent@example.com>", text: "And Thursday too",
-                    sentAt: now)
-
-        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
-        let window = UIWindow(windowScene: scene)
-        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: parent.id) })
-        window.rootViewController = controller
-        window.makeKeyAndVisible()
-        defer {
-            window.isHidden = true
-            window.rootViewController = nil
-        }
-        func labels() -> [String] { HostedAccessibility.labels(in: controller.view) }
-        func shows(_ words: String) -> Bool { labels().contains { $0.contains(words) } }
-        for _ in 0..<100 where !(shows("You said: Re: Lunch plans") && shows("And Thursday too")) {
-            try await Task.sleep(for: .milliseconds(100))
-        }
-        #expect(shows("And Thursday too"),
-                "a sent reply whose email has not arrived shows its words, whoever else answered: \(labels().prefix(20))")
-        #expect(shows("You said: Re: Lunch plans, summarizing"),
-                "the arrived own reply shows as itself, summarizing: \(labels().prefix(20))")
-        #expect(!shows("Tuesday works for me"), "no email shows a sent reply's words: \(labels().prefix(20))")
-        await queue.clearForTesting()
-        await queue.setDispatchSuppressedForTesting(false)
-    }
-
     @Test("After a reply is sent from the chat, no AI Reply shows until someone else's email arrives, whether or not the sent email has")
     func sentReplyTakesTheTurn() async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
@@ -585,7 +508,16 @@ struct ChatThreadViewLifecycleTests {
         }
         let ready = "Yes, Tuesday works for me."
         let parent = header("turn-parent", from: "sender@example.com", secondsAgo: 600, inReplyTo: nil, ready: ready)
-        try await pool.write { db in try parent.insert(db) }
+        let accountId = Self.account
+        try await pool.write { db in
+            try parent.insert(db)
+            var draft = Draft(
+                id: "turn-draft", accountId: accountId, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Re: Lunch plans", body: ready, replyToId: nil, isForward: false, editHistoryJSON: nil,
+                createdAt: Date().timeIntervalSince1970, updatedAt: Date().timeIntervalSince1970)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
 
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
@@ -606,8 +538,14 @@ struct ChatThreadViewLifecycleTests {
         try await waitFor { fieldTexts().contains(ready) }
         #expect(fieldTexts().contains(ready), "control: the field offers the AI Reply on the sender's turn: \(fieldTexts())")
 
-        // The reply is sent from the chat, as a sent compose card records it.
-        #expect(replies.composeEnded(.sent, replyTo: parent, words: ready), "control: the send counts")
+        // The reply is sent from the chat: queued as the compose card queues it, and reported sent.
+        let queued = try await AccountManager.persistQueuedSend(
+            draft: DraftMessage(to: ["sender@example.com"], subject: "Re: Lunch plans", body: ready,
+                                inReplyTo: parent.rfc822MessageId),
+            accountId: Self.account, replyToHeaderId: parent.id, isForward: false, serverDraftId: nil,
+            draftId: "turn-draft", instanceEpoch: "E1")
+        let sentId = try #require(try await pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId)?.sentMessageId })
+        #expect(replies.composeEnded(.sent(outboxId: queued.outboxId), replyTo: parent), "control: the send counts")
         try await waitFor { !fieldTexts().contains(ready) }
         // Offline, the sent email does not arrive: the field stays without a suggestion.
         try await Task.sleep(for: .milliseconds(1500))
@@ -616,8 +554,10 @@ struct ChatThreadViewLifecycleTests {
 
         // Online, the sent email arrives, announced as a mail merge announces new mail: still the
         // user's turn.
-        let own = header("turn-own", from: account.emailAddress, secondsAgo: 0, inReplyTo: "<turn-parent@example.com>", ready: nil)
-        try await pool.write { db in try own.insert(db) }
+        var own = header("turn-own", from: account.emailAddress, secondsAgo: 0, inReplyTo: "<turn-parent@example.com>", ready: nil)
+        own.rfc822MessageId = EmailFilter.normalizeMessageId(sentId)
+        let ownCopy = own
+        try await pool.write { db in try ownCopy.insert(db) }
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
         try await waitFor { replies.entries.isEmpty }
         #expect(replies.entries.isEmpty, "control: the sent email reached the chat and ended its Sent bubble")
@@ -626,7 +566,7 @@ struct ChatThreadViewLifecycleTests {
 
         // Someone else answers: their email's own AI Reply shows.
         let later = "Friday is better for me."
-        let other = header("turn-other", from: "friend@example.com", secondsAgo: -5, inReplyTo: "<turn-own@example.com>", ready: later)
+        let other = header("turn-other", from: "friend@example.com", secondsAgo: -5, inReplyTo: own.rfc822MessageId, ready: later)
         try await pool.write { db in try other.insert(db) }
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
         try await waitFor { fieldTexts().contains(later) }

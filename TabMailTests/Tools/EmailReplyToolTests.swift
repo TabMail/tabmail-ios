@@ -75,7 +75,7 @@ struct EmailReplyToolTests {
             return
         }
 
-        req.onOutcome(.sent)
+        req.onOutcome(.sent(outboxId: "outbox-1"))
         let result = try await task.value
         #expect(result.contains("sent successfully"))
     }
@@ -188,7 +188,7 @@ struct EmailReplyToolTests {
             Issue.record("Helper did not populate pendingCompose")
             task.cancel(); _ = try? await task.value; return
         }
-        req.onOutcome(.sent)
+        req.onOutcome(.sent(outboxId: "outbox-1"))
         _ = try await task.value
 
         // Cache should now mark (acc1, header.stableId, .reply) as recent.
@@ -215,7 +215,7 @@ struct EmailReplyToolTests {
             Issue.record("Helper did not populate pendingCompose")
             firstTask.cancel(); _ = try? await firstTask.value; return
         }
-        req.onOutcome(.sent)
+        req.onOutcome(.sent(outboxId: "outbox-1"))
         _ = try await firstTask.value
 
         // Clear pendingCompose as the view normally would on teardown.

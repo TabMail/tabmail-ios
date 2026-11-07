@@ -128,25 +128,41 @@ struct ChatBubbleView: View {
     }
 }
 
-/// A reply just sent from the chat whose email is not in the thread yet (N7): the user's words in
-/// a blue bubble marked Sent. Its email's own bubble replaces it once the email arrives.
+/// A reply just sent from the chat whose email is not in the chat yet (N7): a blue bubble from the
+/// queue write on, with the email's summary once it is made ("Summarizing" until then), and under
+/// it "Sending", then "Sent", as under every email of the user's. Its email's own bubble replaces it
+/// once the email is in the chat.
 struct ChatSentReplyBubble: View {
-    let text: String
+    let progress: ChatSentReplies.Progress?
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 4) {
-            Text(text)
-                .font(.body)
-                .foregroundStyle(Color.white)
-                .multilineTextAlignment(.leading)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .background(
-                    RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
-                        .fill(Theme.accent)
-                )
-                .accessibilityLabel("You said: \(text)")
-            Text("Sent")
+            Group {
+                // Each branch says what it shows, so VoiceOver reads what is on screen.
+                if let text = progress?.textMessage {
+                    Text(text)
+                        .font(.body)
+                        .foregroundStyle(Color.white)
+                        .multilineTextAlignment(.leading)
+                        .accessibilityLabel("You said: \(text)")
+                } else {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.mini).tint(Color.white)
+                        Text("Summarizing")
+                            .font(.caption)
+                            .foregroundStyle(Color.white.opacity(0.8))
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("You said: summarizing")
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                    .fill(Theme.accent)
+            )
+            Text(progress?.caption ?? "Sending")
                 .font(.caption2)
                 .foregroundStyle(Theme.textSecondary)
         }

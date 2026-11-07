@@ -240,7 +240,28 @@ same AI result, kept as long as the email itself is shown.
    Overnight call, awaiting the owner's blessing: typed chat text no longer reaches the production
    chat error log either (debug logging keeps it), following the rule that diagnostic logging is
    debug-gated.
-   **The Sent bubble before its email arrives (N7):** a reply sent from the chat (the ready AI Reply,
+   **The Sending bubble follows its queued email (owner 2026-11-07, blessed):** a reply sent from
+   the chat (the ready AI Reply, or an agent compose) reports its queued email's outbox row
+   (`ComposeOutcome.sent(outboxId:)`), and `ChatSentReplies` follows that row and the email's AI
+   cache entry with one GRDB observation. The bubble shows from the queue write, Undo window
+   included: "Summarizing" until the email's summary is made, then that summary, even while still
+   sending; under it the grey caption every own email has, "Sending", then "Sent" once the provider
+   took it (`sentAt`). Undo or a discard deletes the unsent row and the bubble with it; a filed row
+   (sent, then appended to Sent) keeps the bubble, "Sent", until the email itself, by its own
+   Message-ID, is in the chat (`isInChat`, `settle`), or after `sentReplyLifetime`. The summary is
+   made at Send (`SentEmailSummary`, chat view on and AI allowed only): the outbox row gets its
+   Message-ID at the queue write (`persistQueuedSend`; the claim keeps it and the send uses it),
+   the summary is written to the AI cache under the Sent folder and that Message-ID, and the
+   optimistic Sent copy (`insertOptimisticSentHeader`) and every synced copy restore it, so the
+   email's own bubble shows the same summary with no second bubble. A copy that arrived before the
+   summary returned takes it when it does. Owner's reason: the words typed in the chat are not
+   guaranteed to be the summary, so a real summary of the final email is the simpler, correct
+   source. Outlook does not keep our Message-ID, so its server copy is summarized as it arrives;
+   offline the bubble stays "Sending". Decided overnight, awaiting blessing: a send that failed for
+   good reads "Not sent". The words are kept nowhere; nothing new is persisted (ADR-004).
+   Tests: `ChatSendingBubbleTests`.
+   **Superseded by the above (2026-11-07), kept for history:**
+   *The Sent bubble before its email arrives (N7):* a reply sent from the chat (the ready AI Reply,
    or an agent compose asked for in the field) is kept in memory (`ChatSentReplies`, keyed by the
    account and the replied-to Message-ID) and shown as the user's words in a pending Sent bubble at
    the bottom until an own email answering that Message-ID, dated no earlier than the send minus

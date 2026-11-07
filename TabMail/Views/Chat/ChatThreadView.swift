@@ -80,8 +80,6 @@ struct ChatThreadView: View {
     /// The ready AI Reply's compose card (N2.6): the email it answers.
     @State private var readyReplyMessage: MessageHeader?
     @State private var agentCompose: AgentToolRouter.ComposeRequest?
-    /// The words last sent from the field to the agent; the Sent bubble shows them (N7).
-    @State private var fieldWords: String?
     /// A compose card opened for the field's last request, so the agent's closing words open
     /// no sheet (N5, N6).
     @State private var fieldComposeOpened = false
@@ -207,12 +205,11 @@ struct ChatThreadView: View {
         .fullScreenCover(item: $readyReplyMessage) { msg in
             // N6: today's reply compose, Reply All, with the AI Reply in its suggestion box.
             let recipients = buildReplyAllRecipients(for: msg, allAccounts: context.accounts)
-            let words = ChatReplyField.readyText(newest: msg, isOwn: false)
             ComposeView(
                 replyTo: msg,
                 prefillTo: recipients.to.isEmpty ? nil : recipients.to,
                 prefillCc: recipients.cc.isEmpty ? nil : recipients.cc,
-                onAgentOutcome: { outcome in composeEnded(outcome, replyTo: msg, words: words) })
+                onAgentOutcome: { outcome in composeEnded(outcome, replyTo: msg) })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
     }
@@ -228,7 +225,7 @@ struct ChatThreadView: View {
                         }
                         // Sent replies whose email has not reached this iPhone yet (N7).
                         ForEach(unmatchedReplies(thread)) { entry in
-                            ChatSentReplyBubble(text: entry.text)
+                            ChatSentReplyBubble(progress: sentReplies.progress[entry.id])
                         }
                         Color.clear.frame(height: pillHeight + ChatViewLayout.pillGap).id(Self.bottomId)
                     }
@@ -442,10 +439,7 @@ struct ChatThreadView: View {
                     isNoReply: isNoReply,
                     clearCount: fieldClearCount),
                 onSendReadyReply: { readyReplyMessage = newest },
-                onFieldSend: { words in
-                    fieldWords = words
-                    fieldComposeOpened = false
-                })
+                onFieldSend: { _ in fieldComposeOpened = false })
         }
         .padding(.horizontal, chatExpanded ? 0 : 12)
         .padding(.bottom, chatExpanded ? 8 : 34)
@@ -462,12 +456,12 @@ struct ChatThreadView: View {
     }
 
     /// A compose card from the chat closed. Sent: the field empties and, for a reply, the chat
-    /// shows the words until the sent email arrives in the chat (N6.3, N7).
-    private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?, words: String?) {
-        if sentReplies.composeEnded(outcome, replyTo: replyTo, words: words) { fieldClearCount += 1 }
+    /// shows the queued email's Sending bubble until the email is in the chat (N6.3, N7).
+    private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {
+        if sentReplies.composeEnded(outcome, replyTo: replyTo) { fieldClearCount += 1 }
     }
 
-    /// This chat's sent replies, until an own reply to their email arrives.
+    /// This chat's sent replies.
     private func pendingReplies(_ thread: ChatThread) -> [ChatSentReplies.Entry] {
         guard let accountId = thread.newest?.accountId else { return [] }
         return sentReplies.entries(
@@ -476,18 +470,14 @@ struct ChatThreadView: View {
 
     /// Sent replies whose email is not in the chat yet.
     private func unmatchedReplies(_ thread: ChatThread) -> [ChatSentReplies.Entry] {
-        let own = thread.items.filter(\.isOwn)
-        let matched = Set(own.compactMap { ChatSentReplies.entry(for: $0.header, in: pendingReplies(thread))?.id })
-        return pendingReplies(thread).filter { !matched.contains($0.id) }
+        pendingReplies(thread).filter { !sentReplies.isInChat($0, items: thread.items) }
     }
 
     @ViewBuilder
     private func composeView(for req: AgentToolRouter.ComposeRequest) -> some View {
-        // A reply asked for in the field shows the field's words as its Sent bubble (N7).
-        let words = req.mode == .reply && fieldComposeOpened ? fieldWords : nil
         let onOutcome: @MainActor (ComposeOutcome) -> Void = { outcome in
             req.onOutcome(outcome)
-            composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil, words: words)
+            composeEnded(outcome, replyTo: req.mode == .reply ? req.replyTo : nil)
         }
         switch req.mode {
         case .compose:

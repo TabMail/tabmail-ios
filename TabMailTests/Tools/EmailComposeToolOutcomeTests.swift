@@ -81,7 +81,7 @@ struct EmailComposeToolOutcomeTests {
         #expect(req.to == ["a@b.com"])
         #expect(req.subject == "Hello")
 
-        req.onOutcome(.sent)
+        req.onOutcome(.sent(outboxId: "outbox-1"))
         let result = try await task.value
         #expect(result.contains("sent successfully"))
     }

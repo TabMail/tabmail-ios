@@ -447,7 +447,7 @@ struct ChatReplyFieldRuntimeTests {
         #expect(text.components(separatedBy: "fieldClearCount += 1").count == 3, "only the two completions")
         let answered = try Self.function("private func agentAnswered() {", in: text)
         #expect(answered.contains("guard !fieldComposeOpened else { return } fieldClearCount += 1"))
-        let ended = try Self.function("private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?, words: String?) {", in: text)
-        #expect(ended.contains("if sentReplies.composeEnded(outcome, replyTo: replyTo, words: words) { fieldClearCount += 1 }"))
+        let ended = try Self.function("private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
+        #expect(ended.contains("if sentReplies.composeEnded(outcome, replyTo: replyTo) { fieldClearCount += 1 }"))
     }
 }
