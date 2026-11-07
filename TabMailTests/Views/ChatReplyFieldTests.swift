@@ -505,12 +505,31 @@ struct ChatReplyFieldTests {
                 "a failed send's Retry and Delete act on its own entry")
     }
 
+    @Test("A compose card asked for in the field goes to the people chosen; one from the sheet keeps the agent's")
+    func agentComposeFromTheField() {
+        let chosen = ChatReplyTarget(only: [Self.david, Self.sam])
+        let agentTo = ["sarah@example.com"], agentCc = ["team@example.com"]
+
+        let fromField = ChatAgentCompose.replyRecipients(fromField: true, target: chosen, to: agentTo, cc: agentCc)
+        #expect(fromField.to == [Self.david.address, Self.sam.address] && fromField.cc.isEmpty)
+        let fromSheet = ChatAgentCompose.replyRecipients(fromField: false, target: chosen, to: agentTo, cc: agentCc)
+        #expect(fromSheet.to == agentTo && fromSheet.cc == agentCc, "the sheet's request keeps the agent's recipients")
+        let replyAll = ChatAgentCompose.replyRecipients(fromField: true, target: .replyAll, to: agentTo, cc: agentCc)
+        #expect(replyAll.to == agentTo && replyAll.cc == agentCc, "Reply All keeps the agent's recipients")
+    }
+
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(Self.count("onlyTo: replyTarget.only)", in: chat) == 1, "the field knows the people chosen")
-        #expect(Self.count("let only = fieldComposeOpened ? replyTarget.only?.map(\\.address) : nil let to = only ?? req.to let cc = only == nil ? req.cc : []", in: chat) == 1,
+        #expect(Self.count("let (to, cc) = ChatAgentCompose.replyRecipients( fromField: fieldComposeOpened, target: replyTarget, to: req.to, cc: req.cc)", in: chat) == 1,
                 "a reply asked for in the field goes to the people chosen")
+        // Where a card came from: the field while the sheet is closed; a field send starts afresh;
+        // after a card from the field the agent's closing words open nothing.
+        #expect(Self.count("fieldComposeOpened = !chatExpanded agentCompose = AgentToolRouter.shared.pendingCompose", in: chat) == 1)
+        #expect(Self.count("onFieldSend: { _ in fieldComposeOpened = false })", in: chat) == 1)
+        #expect(Self.count("private func agentAnswered() { guard !fieldComposeOpened else { return }", in: chat) == 1)
+        #expect(Self.count("fieldComposeOpened = true", in: chat) == 0)
         #expect(Self.count("prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,", in: chat) == 1)
         #expect(Self.count("if replyTo != nil { replyTarget = .replyAll }", in: chat) == 1, "a sent reply clears it")
         #expect(Self.count("ownAddresses: context.ownAddresses) { replyTarget = $0 }", in: chat) == 1, "Done sets it")

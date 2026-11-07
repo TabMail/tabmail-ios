@@ -560,9 +560,8 @@ struct ChatThreadView: View {
                 onAgentOutcome: onOutcome)
         case .reply:
             // R1: a reply asked for in the field goes to the people chosen in Reply to.
-            let only = fieldComposeOpened ? replyTarget.only?.map(\.address) : nil
-            let to = only ?? req.to
-            let cc = only == nil ? req.cc : []
+            let (to, cc) = ChatAgentCompose.replyRecipients(
+                fromField: fieldComposeOpened, target: replyTarget, to: req.to, cc: req.cc)
             ComposeView(
                 replyTo: req.replyTo, suggestedBody: req.body,
                 prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,

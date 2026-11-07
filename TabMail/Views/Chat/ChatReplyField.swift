@@ -201,6 +201,19 @@ struct ChatReplyTarget: Equatable {
     }
 }
 
+/// A compose card the agent opens in the chat. `fromField`: it was asked for in the collapsed reply
+/// field, not in the open chat sheet.
+enum ChatAgentCompose {
+    /// Who a reply goes to (R1): asked for in the field with people chosen in Reply to, only them;
+    /// otherwise the agent's own recipients.
+    static func replyRecipients(
+        fromField: Bool, target: ChatReplyTarget, to: [String], cc: [String]
+    ) -> (to: [String], cc: [String]) {
+        guard fromField, let only = target.only else { return (to, cc) }
+        return (only.map(\.address), [])
+    }
+}
+
 /// Replies sent from the chat whose email is not in the chat yet (N7). Each follows its own queued
 /// email through the outbox row the send wrote (owner 2026-11-07): its bubble shows from the queue
 /// write, Undo window included, says "Sending" until the provider takes the email and "Sent" after,
