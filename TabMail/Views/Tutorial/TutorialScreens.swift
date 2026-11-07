@@ -15,6 +15,8 @@ struct TutorialWelcomeView: View {
     var isReplay = false
 
     @State private var isStarting = false
+    /// The run this screen starts teaches in the chat view (T0.1).
+    private var teachesChat: Bool { TutorialCoordinator.chatViewOnForTutorial }
 
     var body: some View {
         TutorialPage {
@@ -43,7 +45,11 @@ struct TutorialWelcomeView: View {
 
             VStack(alignment: .leading, spacing: 14) {
                 TutorialBenefit(symbol: "hand.tap", title: "Tap away your emails, your way", detail: "Tap tags to act, or hold to teach.")
-                TutorialBenefit(symbol: "arrowshape.turn.up.left", title: "Reply in seconds, and reuse them", detail: "Pre-written replies. Turn any reply into a smart template.")
+                if teachesChat {
+                    TutorialBenefit(symbol: "bubble.left.and.bubble.right", title: "Reply like a message", detail: "Every email reads like a text. Your reply is ready.")
+                } else {
+                    TutorialBenefit(symbol: "arrowshape.turn.up.left", title: "Reply in seconds, and reuse them", detail: "Pre-written replies. Turn any reply into a smart template.")
+                }
                 TutorialBenefit(symbol: "magnifyingglass", title: "Ask anything", detail: "Find past emails and calendar events, schedule meetings, and more.")
             }
             .padding(.vertical, 8)
@@ -79,6 +85,8 @@ struct TutorialWelcomeView: View {
 /// then sign-in (new user) or the restored inbox opens.
 struct TutorialFinishView: View {
     let signedIn: Bool
+    /// The run taught in the chat view: the recap names its reply and its switch (T5.1).
+    var teachesChat = false
     @State private var isEnding = false
 
     var body: some View {
@@ -92,14 +100,21 @@ struct TutorialFinishView: View {
                 .fontWeight(.bold)
                 .foregroundStyle(Theme.textPrimary)
 
-            Text("Three things to try in your own inbox:")
+            Text(teachesChat ? "Four things to try in your own inbox:" : "Three things to try in your own inbox:")
                 .font(.subheadline)
                 .foregroundStyle(Theme.textSecondary)
 
             VStack(alignment: .leading, spacing: 12) {
                 Label("Tap a tag to act. Hold it to change.", systemImage: "checkmark")
-                Label("Turn a good reply into a template.", systemImage: "checkmark")
+                if teachesChat {
+                    Label("Send the AI Reply, or say anything: a reply or a request.", systemImage: "checkmark")
+                } else {
+                    Label("Turn a good reply into a template.", systemImage: "checkmark")
+                }
                 Label("Ask TabMail anything.", systemImage: "checkmark")
+                if teachesChat {
+                    Label("Turn Chat View on or off in TabMail Settings.", systemImage: "checkmark")
+                }
             }
             .font(.subheadline)
             .fontWeight(.medium)

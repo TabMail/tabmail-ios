@@ -153,7 +153,7 @@ struct RootView: View {
                         }
                     }
             } else if tutorial.step == .finished {
-                TutorialFinishView(signedIn: tutorial.startedSignedIn)
+                TutorialFinishView(signedIn: tutorial.startedSignedIn, teachesChat: tutorial.teachesChat)
             } else {
                 MailNavigationView()
             }

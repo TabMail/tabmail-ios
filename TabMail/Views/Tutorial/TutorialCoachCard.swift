@@ -20,7 +20,8 @@ struct TutorialCoachView: View {
             step: step, lesson: lesson, host: host,
             flightsAsked: tutorial.flightsAsked,
             replyEdited: tutorial.replyEdited,
-            isSending: PendingSendService.shared.current != nil) {
+            isSending: PendingSendService.shared.current != nil,
+            teachesChat: tutorial.teachesChat) {
             TutorialCoachCard(
                 content: content,
                 onAction: { action in
@@ -39,6 +40,7 @@ struct TutorialCoachView: View {
         case .seeRule: tutorial.showActionRule()
         case .showMoreToAsk: tutorial.showMoreToAsk()
         case .showRecap: tutorial.showRecap()
+        case .finishChatViewSwitch: tutorial.finishChatViewSwitch()
         case .seeTemplate:
             guard let templateId = tutorial.savedTemplateId else { return }
             NotificationCenter.default.post(
