@@ -105,6 +105,13 @@ same AI result, kept as long as the email itself is shown.
    so the backend writes its text message in the user's voice (ADR-032); any other email's request
    omits the field, as Thunderbird's always do. Every queue summary job carries it; the new-mail
    pipeline (`AIService.process`) is Inbox mail and keeps Thunderbird's request.
+   *Amended 2026-11-07 (train review round 8):* the last sentence was wrong. Inbox mail can be the
+   user's own (a copy to themselves, or mail from another of their accounts), and the chat reuses
+   whichever writer's text message is stored first. So the rule is one function,
+   `PromptVariables.isSentByUser` (it replaced `ActiveAIQueue.isSentByUser`), and every summary
+   writer calls it: the queue, opening an email (`AccountManager.processMessage` through
+   `AIService.process`), and the notification extension (with the mirrored account addresses,
+   `NSEState.getAllAccountEmails`; a pushed email is never in a Sent folder).
    **The no-forever-retry rule:** "done" is ONE predicate, `ActiveAIQueue.summaryDone`, used by every
    completion check and by both requests. A chat job whose done-condition could never become true
    would retry forever (the backoff has no cap on attempts), so: the parser keeps any non-empty text

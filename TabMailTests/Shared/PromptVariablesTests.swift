@@ -47,6 +47,25 @@ struct PromptVariablesTests {
 
     // MARK: - Summary variable shape
 
+    @Test("The user wrote an email from one of their addresses, any case, or one in a Sent folder")
+    func sentByUserRule() {
+        let mine = ["me@example.com", "Work@Example.com"]
+        #expect(PromptVariables.isSentByUser(fromAddress: "ME@example.com", userAddresses: mine, inSentFolder: false))
+        #expect(PromptVariables.isSentByUser(fromAddress: "work@example.com", userAddresses: mine, inSentFolder: false))
+        #expect(PromptVariables.isSentByUser(fromAddress: "sender@example.com", userAddresses: mine, inSentFolder: true))
+        #expect(!PromptVariables.isSentByUser(fromAddress: "sender@example.com", userAddresses: mine, inSentFolder: false))
+        #expect(!PromptVariables.isSentByUser(fromAddress: "me@example.co", userAddresses: mine, inSentFolder: false))
+        #expect(!PromptVariables.isSentByUser(fromAddress: "sender@example.com", userAddresses: [], inSentFolder: false))
+    }
+
+    @Test("Summary sends is_sent_by_user only as true")
+    func summarySentByUserFlag() {
+        let own = PromptVariables.summaryVariables(metadata: fixtureMetadata(), body: fixtureBody(), account: account, isSentByUser: true)
+        let other = PromptVariables.summaryVariables(metadata: fixtureMetadata(), body: fixtureBody(), account: account)
+        #expect(own["is_sent_by_user"] as? Bool == true)
+        #expect(other["is_sent_by_user"] == nil)
+    }
+
     @Test("Summary has every expected key")
     func summaryKeys() {
         let vars = PromptVariables.summaryVariables(

@@ -57,6 +57,15 @@ enum PromptVariables {
         return vars
     }
 
+    /// The user wrote this email (ADR-IOS-103): it is from one of the user's registered addresses, or
+    /// it sits in a Sent folder. The one rule for every summary writer (the queue, opening an email,
+    /// the notification extension): the chat shows such an email as the user's own, and reuses
+    /// whichever writer's text message is stored first, so each must ask for the user's voice.
+    static func isSentByUser(fromAddress: String, userAddresses: [String], inSentFolder: Bool) -> Bool {
+        let from = fromAddress.lowercased()
+        return inSentFolder || userAddresses.contains { $0.lowercased() == from }
+    }
+
     /// Recipient-status classification for the summary and action requests — parity with the
     /// TB addon's `senderFilter.classifyRecipientStatus`. Returns "cc" ONLY on
     /// positive evidence: one of `claimEmails` (the RECEIVING account's
