@@ -186,6 +186,64 @@ struct ChatSwipeTests {
         #expect(ChatSwipe.clamp(40, sign: 1, revealWidth: Self.reveal, width: Self.width, allowsFull: false) == 40)
     }
 
+    /// A pan whose event the test sets: UIKit's own recognizer type, as the swipe receives it.
+    private final class DeliveredPan: UIPanGestureRecognizer {
+        var event: UIGestureRecognizer.State = .possible
+        var travel: CGFloat = 0
+        var speed: CGFloat = 0
+        override var state: UIGestureRecognizer.State {
+            get { event }
+            set { event = newValue }
+        }
+        override func translation(in view: UIView?) -> CGPoint { CGPoint(x: travel, y: 7) }
+        override func velocity(in view: UIView?) -> CGPoint { CGPoint(x: speed, y: 9) }
+    }
+
+    @Test("A pan's events move the reveal by the drag's travel since it began, and its let-go settles it")
+    func deliveredPanMovesTheReveal() {
+        let pan = DeliveredPan()
+        var drag = ChatSwipeDrag()
+        var settled: [ChatSwipe.Settle] = []
+        func send(_ state: UIGestureRecognizer.State, travel: CGFloat = 0, speed: CGFloat = 0) {
+            pan.event = state
+            pan.travel = travel
+            pan.speed = speed
+            ChatHorizontalPan.deliver(pan, changed: {
+                drag.moved($0, sign: -1, revealWidth: Self.reveal, width: Self.width, allowsFull: true)
+            }, ended: {
+                settled.append(drag.letGo(velocity: $0, finished: $1, sign: -1, revealWidth: Self.reveal,
+                                          width: Self.width, allowsFull: true))
+            })
+        }
+
+        send(.possible, travel: -50)
+        #expect(drag.offset == 0 && settled.isEmpty, "not a drag yet")
+        send(.began, travel: -10)
+        #expect(drag.offset == -10)
+        send(.changed, travel: -Self.reveal * 0.75)
+        #expect(drag.offset == -Self.reveal * 0.75, "the travel since the drag began, not added up")
+        send(.ended, speed: 0)
+        #expect(settled == [.open], "past half the buttons, let go: open")
+
+        drag.offset = -Self.reveal  // the reveal springs open
+        send(.began, travel: 5)
+        #expect(drag.offset == -Self.reveal + 5, "the next drag starts where the reveal sits")
+        send(.changed, travel: Self.reveal * 2)
+        #expect(drag.offset == 0, "dragged shut, never past closed")
+        send(.changed, travel: -Self.width)
+        #expect(drag.offset == -Self.width, "back past the full-swipe line")
+        send(.cancelled, speed: -(ChatViewLayout.swipeFlickVelocity + 1))
+        #expect(settled.last == .closed, "the system cancelled it: closed, however far it went")
+
+        drag.offset = 0
+        send(.began, travel: -1)
+        send(.changed, travel: -Self.width)
+        #expect(drag.offset == -Self.width)
+        send(.ended, speed: -10)
+        #expect(settled.last == .full, "past the full-swipe line: the edge button runs")
+        #expect(settled.count == 3, "one settle per let-go")
+    }
+
     // MARK: - 6. Wiring
 
     private static func source(_ path: String) throws -> String {
@@ -207,8 +265,12 @@ struct ChatSwipeTests {
     func interruptedDragWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
         let ended = try Self.body(of: "private func ended(_ velocity: CGFloat, finished: Bool) {", in: text)
-        #expect(ended.contains("allowsFull: allowsFullSwipe, finished: finished)"))
-        #expect(text.contains("if let finished = Self.finished(recognizer.state) { ended(recognizer.velocity(in: recognizer.view).x, finished) }"))
+        #expect(ended.contains("switch drag.letGo(velocity: velocity, finished: finished, sign: sign, revealWidth: revealWidth, width: width, allowsFull: allowsFullSwipe) {"))
+        let changed = try Self.body(of: "private func changed(_ translation: CGFloat) {", in: text)
+        #expect(changed.contains("drag.moved(translation, sign: sign, revealWidth: revealWidth, width: width, allowsFull: allowsFullSwipe)"))
+        #expect(text.contains("changed: changed, ended: ended))"), "the reveal hands the pan its drag")
+        #expect(text.contains("func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) { Self.deliver(recognizer, changed: changed, ended: ended) }"),
+                "every recognizer event goes through `deliver`")
     }
 
     @Test("The chat slides left for Delete then Archive, with a full swipe, acting on the whole chat")
@@ -262,7 +324,7 @@ struct ChatSwipeTests {
         #expect(text.contains("shouldBegin: { velocityX in openId == id || (openId == nil && velocityX * sign > 0) }"))
         #expect(text.contains("return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x)"),
                 "a vertical drag stays the scroll view's")
-        #expect(text.contains("if now != id, offset != 0 { withAnimation(Self.spring) { offset = 0 } }"))
+        #expect(text.contains("if now != id, drag.offset != 0 { withAnimation(Self.spring) { drag.offset = 0 } }"))
     }
 
     // SwiftUI keeps a representable's recognizer outside the hosted view tree, so the pan is checked

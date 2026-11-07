@@ -71,6 +71,30 @@ enum ChatSwipe {
     }
 }
 
+/// One reveal's drag: where its content sits, and where it sat when the current drag began.
+struct ChatSwipeDrag: Equatable {
+    var offset: CGFloat = 0
+    private(set) var start: CGFloat?
+
+    /// The drag has travelled `translation` since it began; arguments as `ChatSwipe.clamp`.
+    mutating func moved(_ translation: CGFloat, sign: CGFloat, revealWidth: CGFloat, width: CGFloat,
+                        allowsFull: Bool) {
+        let from = start ?? offset
+        start = from
+        offset = ChatSwipe.clamp(from + translation, sign: sign, revealWidth: revealWidth, width: width,
+                                 allowsFull: allowsFull)
+    }
+
+    /// The drag let go: where it goes (`ChatSwipe.settle`). The next drag starts from wherever the
+    /// content then sits.
+    mutating func letGo(velocity: CGFloat, finished: Bool, sign: CGFloat, revealWidth: CGFloat,
+                        width: CGFloat, allowsFull: Bool) -> ChatSwipe.Settle {
+        start = nil
+        return ChatSwipe.settle(offset: offset, velocity: velocity, sign: sign, revealWidth: revealWidth,
+                                width: width, allowsFull: allowsFull, finished: finished)
+    }
+}
+
 /// One revealed swipe button, as today's iOS 26 list swipes: a round tinted button, label below.
 struct ChatSwipeButton: Identifiable {
     let title: String
@@ -90,8 +114,7 @@ struct ChatSwipeReveal: ViewModifier {
     let allowsFullSwipe: Bool
     @Binding var openId: String?
 
-    @State private var offset: CGFloat = 0
-    @State private var dragBase: CGFloat?
+    @State private var drag = ChatSwipeDrag()
     @State private var width: CGFloat = 0
 
     private var sign: CGFloat { edge == .trailing ? -1 : 1 }
@@ -101,15 +124,15 @@ struct ChatSwipeReveal: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .offset(x: offset)
+            .offset(x: drag.offset)
             .overlay(alignment: edge == .trailing ? .trailing : .leading) {
-                if offset != 0 {
+                if drag.offset != 0 {
                     HStack(spacing: 0) {
                         ForEach(buttons) { button in
                             buttonView(button)
                         }
                     }
-                    .frame(width: abs(offset), alignment: edge == .trailing ? .leading : .trailing)
+                    .frame(width: abs(drag.offset), alignment: edge == .trailing ? .leading : .trailing)
                     .clipped()
                 }
             }
@@ -118,7 +141,7 @@ struct ChatSwipeReveal: ViewModifier {
                 shouldBegin: { velocityX in openId == id || (openId == nil && velocityX * sign > 0) },
                 changed: changed, ended: ended))
             .onChange(of: openId) { _, now in
-                if now != id, offset != 0 { withAnimation(Self.spring) { offset = 0 } }
+                if now != id, drag.offset != 0 { withAnimation(Self.spring) { drag.offset = 0 } }
             }
             .accessibilityActions {
                 ForEach(buttons) { button in
@@ -128,22 +151,18 @@ struct ChatSwipeReveal: ViewModifier {
     }
 
     private func changed(_ translation: CGFloat) {
-        let base = dragBase ?? offset
-        dragBase = base
-        offset = ChatSwipe.clamp(base + translation, sign: sign, revealWidth: revealWidth,
-                                 width: width, allowsFull: allowsFullSwipe)
+        drag.moved(translation, sign: sign, revealWidth: revealWidth, width: width, allowsFull: allowsFullSwipe)
     }
 
     private func ended(_ velocity: CGFloat, finished: Bool) {
-        dragBase = nil
-        switch ChatSwipe.settle(offset: offset, velocity: velocity, sign: sign, revealWidth: revealWidth,
-                                width: width, allowsFull: allowsFullSwipe, finished: finished) {
+        switch drag.letGo(velocity: velocity, finished: finished, sign: sign, revealWidth: revealWidth,
+                          width: width, allowsFull: allowsFullSwipe) {
         case .full:
             close()
             edgeButton?.action()
         case .open:
             openId = id
-            withAnimation(Self.spring) { offset = sign * revealWidth }
+            withAnimation(Self.spring) { drag.offset = sign * revealWidth }
         case .closed:
             close()
         }
@@ -151,7 +170,7 @@ struct ChatSwipeReveal: ViewModifier {
 
     private func close() {
         if openId == id { openId = nil }
-        withAnimation(Self.spring) { offset = 0 }
+        withAnimation(Self.spring) { drag.offset = 0 }
     }
 
     private func buttonView(_ button: ChatSwipeButton) -> some View {
@@ -217,7 +236,14 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     func handleUIGestureRecognizerAction(_ recognizer: UIPanGestureRecognizer, context: Context) {
-        if let finished = Self.finished(recognizer.state) {
+        Self.deliver(recognizer, changed: changed, ended: ended)
+    }
+
+    /// Hands a pan's event on: its horizontal travel while it moves; its velocity, and whether the
+    /// user finished it, once it ends.
+    static func deliver(_ recognizer: UIPanGestureRecognizer, changed: (CGFloat) -> Void,
+                        ended: (CGFloat, Bool) -> Void) {
+        if let finished = finished(recognizer.state) {
             ended(recognizer.velocity(in: recognizer.view).x, finished)
         } else if recognizer.state == .began || recognizer.state == .changed {
             changed(recognizer.translation(in: recognizer.view).x)
