@@ -21,6 +21,8 @@ import UIKit
 ///     window to `summaryWindow` both ways (`ChatSummaryWindow.userMoved`, unit-tested: a test
 ///     cannot drag a finger), so the chat's own scrolls keep the open window. A layout change
 ///     with no scroll at all (the screen shrinks) asks again for the emails then on screen.
+///  4. At the bottom, the newest bubble stays above the reply field however tall the field grows:
+///     a six-line ready AI Reply raises the thread's bottom by as much as it raises the field.
 ///
 /// What is on screen is read back from the summary queue, whose front is the latest request:
 /// the newest email on screen, then the rest of the screen, then the older ones.
@@ -34,7 +36,7 @@ struct ChatThreadViewLifecycleTests {
 
     /// A 40-email chain, e0 (oldest) to e39 (newest), all in the Inbox with their bodies and no
     /// summaries. `unreadFrom`: emails from this index on are unread.
-    private static func insertThread(unreadFrom: Int?, pool: DatabasePool) throws -> [MessageHeader] {
+    private static func insertThread(unreadFrom: Int?, newestReady: String? = nil, pool: DatabasePool) throws -> [MessageHeader] {
         _ = try FolderEpochTestFixture.makeAccount(id: account, provider: .gmail, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: account, path: "INBOX", role: .inbox, pool: pool)
         let now = Date()
@@ -51,6 +53,10 @@ struct ChatThreadViewLifecycleTests {
             header.headerComplete = true
             header.bodyComplete = true
             header.isRead = unreadFrom.map { index < $0 } ?? true
+            if index == length - 1, let newestReady {
+                header.cachedReply = "Hello,\n\n\(newestReady)\n\nThanks."
+                header.replyTextMessage = newestReady
+            }
             let row = header
             try pool.write { db in
                 try row.insert(db)
@@ -262,5 +268,86 @@ struct ChatThreadViewLifecycleTests {
         #expect(newestOnScreen >= target && newestOnScreen < Self.length - 1, "\(opened.queued)")
         #expect(opened.queued.contains(target))
         #expect(opened.queued.contains(0), "the emails above it, within summaryWindow")
+    }
+
+    // MARK: - 4. The field never covers the newest bubble
+
+    private struct Bottom: Equatable {
+        /// The chat's scrollable height: the bubbles, then the room kept under the last one.
+        let contentHeight: CGFloat
+        /// The top of the reply field's text, on screen.
+        let fieldTop: CGFloat
+        let belowScreen: CGFloat
+    }
+
+    private static func textViews(_ view: UIView) -> [UITextView] {
+        ((view as? UITextView).map { [$0] } ?? []) + view.subviews.flatMap { textViews($0) }
+    }
+
+    /// Opens the all-read thread, signed in, with `ready` as the newest email's AI Reply, and reads
+    /// the bottom once the scroll and the field have not moved for a while.
+    private func bottom(ready: String) async throws -> Bottom {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let queue = ActiveAIQueue.shared
+        await queue.setDispatchSuppressedForTesting(true)
+        await queue.clearForTesting()
+        defer {
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        saved.setChatView(on: true)
+        ChatPillState.shared.removeAllSessions()
+        let headers = try Self.insertThread(unreadFrom: nil, newestReady: ready, pool: pool)
+        let newest = try #require(headers.last)
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let controller = UIHostingController(rootView: NavigationStack {
+            ChatThreadView(messageId: newest.id)
+        }.environment(\.hasTabMailSession, true))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            ChatPillState.shared.removeAllSessions()
+        }
+
+        var last: Bottom?
+        var stableFor = 0
+        for _ in 0..<120 where stableFor < 6 {
+            try await Task.sleep(for: .milliseconds(100))
+            guard let scroll = Self.scrollViews(controller.view).max(by: { $0.contentSize.height < $1.contentSize.height }),
+                  let field = Self.textViews(controller.view).first(where: { $0.text == ready }) else {
+                stableFor = 0
+                continue
+            }
+            let now = Bottom(contentHeight: scroll.contentSize.height,
+                             fieldTop: field.convert(field.bounds, to: nil).minY,
+                             belowScreen: Self.below(scroll))
+            stableFor = now == last ? stableFor + 1 : 0
+            last = now
+        }
+        await queue.clearForTesting()
+        await queue.setDispatchSuppressedForTesting(false)
+        try #require(stableFor >= 6, "the chat and its field settle, got \(String(describing: last))")
+        return try #require(last)
+    }
+
+    @Test("At the bottom, a six-line ready AI Reply raises the thread's bottom as much as it raises the field")
+    func newestBubbleClearsATallField() async throws {
+        let short = try await bottom(ready: "Sounds good.")
+        let long = try await bottom(ready: "Thanks for sending the detailed schedule, I can attend the planning session on Tuesday afternoon and will bring the updated budget numbers, the contractor estimates and the notes from our last discussion. I will also check the two open questions with the team beforehand and send the revised agenda by Monday so everyone has time to review it.")
+        #expect(abs(short.belowScreen) < 2 && abs(long.belowScreen) < 2,
+                "both open at the bottom: \(short.belowScreen), \(long.belowScreen)")
+        // The bubbles are the same in both chats, so the extra scrollable height is the extra room
+        // under the last bubble; at the bottom it lifts the last bubble by that much.
+        let fieldRise = short.fieldTop - long.fieldTop
+        let threadRise = long.contentHeight - short.contentHeight
+        #expect(fieldRise > 40, "control: the long reply grows the field, by \(fieldRise)")
+        #expect(threadRise >= fieldRise - 1,
+                "the newest bubble rises with the field: the field rose \(fieldRise), the thread \(threadRise)")
     }
 }

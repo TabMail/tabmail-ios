@@ -11,6 +11,8 @@ struct ChatBubbleView: View {
     let isGroup: Bool
     let extras: ChatMemberExtras?
     let isHighlighted: Bool
+    /// The user's sent reply, shown until the email's own text message arrives (N7).
+    var standInText: String? = nil
     let onOpen: () -> Void
 
     var body: some View {
@@ -52,10 +54,12 @@ struct ChatBubbleView: View {
 
     private var showsSender: Bool { isGroup && !item.isOwn }
 
+    private var shownText: String? { item.textMessage ?? standInText }
+
     private var bubble: some View {
         Button(action: onOpen) {
             VStack(alignment: .leading, spacing: 6) {
-                if let text = item.textMessage {
+                if let text = shownText {
                     Text(text)
                         .font(.body)
                         .foregroundStyle(item.isOwn ? Color.white : Theme.textPrimary)
@@ -104,7 +108,7 @@ struct ChatBubbleView: View {
 
     /// Q25: what is on screen, in order.
     private var accessibilityText: String {
-        let words = item.textMessage ?? "\(item.header.subject), summarizing"
+        let words = shownText ?? "\(item.header.subject), summarizing"
         return item.isOwn ? "You said: \(words)" : "\(item.sender.name) said: \(words)"
     }
 
@@ -123,6 +127,36 @@ struct ChatBubbleView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Attachment \(name)")
+    }
+}
+
+/// A reply just sent from the chat whose email is not in the thread yet (N7): the user's words in
+/// a blue bubble marked Sent. Its email's own bubble replaces it once the email arrives.
+struct ChatSentReplyBubble: View {
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            Text(text)
+                .font(.body)
+                .foregroundStyle(Color.white)
+                .multilineTextAlignment(.leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(
+                    RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                        .fill(Theme.accent)
+                )
+                .accessibilityLabel("You said: \(text)")
+            Text("Sent")
+                .font(.caption2)
+                .foregroundStyle(Theme.textSecondary)
+        }
+        .containerRelativeFrame(.horizontal, alignment: .trailing) { width, _ in
+            width * ChatViewLayout.bubbleMaxWidthFraction
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.horizontal)
     }
 }
 

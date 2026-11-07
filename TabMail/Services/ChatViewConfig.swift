@@ -62,9 +62,20 @@ enum ChatViewLayout {
     static let bubbleCornerRadius: CGFloat = 18
     static let bubbleMaxWidthFraction: CGFloat = 0.78
     static let bubbleSpacing: CGFloat = 6
-    /// Room under the last bubble so it sits above the pill, never under it (N2.10).
-    static let pillClearance: CGFloat = 104
+    /// The one-line pill's height, used until the pill is measured: the thread keeps the measured
+    /// collapsed height under its last bubble, so it sits above the pill, never under it (N2.10).
+    static let pillStartHeight: CGFloat = 98
+    /// Room between the last bubble and the pill's top, beyond the bubble spacing.
+    static let pillGap: CGFloat = 6
     /// The jump-to-bottom button shows once the bottom is this far below the screen.
     static let jumpButtonThreshold: CGFloat = 240
     static let jumpButtonSize: CGFloat = 40
+    /// A sent reply's email is matched to the field's words when it is dated no earlier than this
+    /// before the Send (the Date header is written on this iPhone, at the Send).
+    static let sentReplyDateSlack: TimeInterval = 2 * 60
+    /// The field's words stand in for a sent reply's text message at most this long.
+    static let sentReplyLifetime: TimeInterval = 24 * 60 * 60
+    /// The reply field's words pulse to this opacity while TabMail writes (N5.1), as compose does.
+    static let fieldPulseOpacity: Double = 0.35
+    static let fieldPulseDuration: Double = 0.8
 }

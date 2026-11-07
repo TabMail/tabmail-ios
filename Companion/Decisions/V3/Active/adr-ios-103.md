@@ -134,8 +134,8 @@ same AI result, kept as long as the email itself is shown.
    `MessageOpenView`, which decides chat or today's email view ONCE per open (`opensInChat`, also off
    in the demo's AI-off mode and during the tutorial): the inbox, push and notification opens
    (`MessageDetailResolvedContent`), search results and the Reminders link.
-   `ChatThreadView` reuses `MessageDetailViewModel` (body, thread load, mark-read, archive, delete,
-   move); `ChatThread` is the pure model: drafts left out, one copy per `stableId` (the opened copy,
+   `ChatThreadView` reuses `MessageDetailViewModel` (body, thread load, mark-read; in 3a also
+   archive, delete and move from today's pill menus, which 3b drops, decision 10); `ChatThread` is the pure model: drafts left out, one copy per `stableId` (the opened copy,
    else one with a text message), oldest first by (date, id), own = from one of the account addresses
    or in a Sent folder, reply people = the newest email's `buildReplyAllRecipients` minus the user,
    a group when more than one other person; time stamps after `ChatViewLayout.timeStampGap`; the
@@ -196,6 +196,50 @@ same AI result, kept as long as the email itself is shown.
    released at once, so that reason is gone and the switch, the override and the two Settings
    positions went with it.
 
+10. **The reply field (amendment 2026-11-05, the fourth chat-view PR, 3b).** In the chat, today's
+   pill on the newest email is shown as a reply field, [mic] [field] [Send]: `DynamicIslandChat`
+   with a `ChatReplyField`, so it is the same agent session (`msg:{accountId}:{stableId}`) and the
+   same sheet. The field holds the ready AI Reply's text message (`ChatReplyField.readyText`: someone
+   else's email, a full `cachedReply` and a `replyTextMessage`, not a no-reply sender), with an
+   "AI Reply" caption while unchanged. Send with it unchanged (`ChatReplyField.route`, trimmed
+   compare) opens today's Reply All compose with the full AI Reply in its suggestion box and calls no
+   agent. Any other words, typed or said, go to the agent as today's Chat pill message on the newest
+   email with a short nudge (`ChatReplyField.agentMessage`): they came from that email's reply field,
+   so an unclear request is a reply to it; for a no-reply sender (`EmailFilter.isNoReply`, with the
+   "Replies won't be read" line) the nudge says not to write a reply. While the agent works the
+   words pulse in the field and the line above shows the agent's own step labels, writing a reply as
+   "Writing your email" (`ChatReplyField.statusLine`). An answer or a confirmation card opens the
+   sheet and empties the field, except after a compose the request opened (the compose was the
+   answer). Dictation in the field replaces an unchanged AI Reply rather than appending to it, and
+   the field never starts dictation by itself.
+   **Each send names the email it is about, and the field's words stay out of logs (train gate,
+   2026-11-05):** a send looks up the pill's current email as it starts
+   (`DynamicIslandChat.contextNumber`), never the number found for an earlier newest email. A failed
+   send from the field logs without its text (`DynamicIslandChat.loggedText`, and
+   `AIService.sendChatMessage(logsUserText:)` for the request's own failure lines): the field's text
+   is often the AI Reply, written from the email, and the chat error log is kept with debug logging
+   off. Text typed in the chat is logged as before.
+   **Superseded (train gate round 2, 2026-11-06):** a resend or rewind replayed the field's words
+   without that flag and logged them. The gate moved to the one writer instead:
+   `BackgroundSyncLogger.logChatError` always keeps the error line and adds the user's words only
+   while debug logging is on, for every caller (typed chat text included), and the flag and
+   `loggedText` are deleted. Tests: `ChatReplyFieldRuntimeTests.chatRequestFailureLog` (every
+   request failure branch, debug off and on) and `BackgroundSyncLoggerTests.chatErrorRoundTrip`.
+   Overnight call, awaiting the owner's blessing: typed chat text no longer reaches the production
+   chat error log either (debug logging keeps it), following the rule that diagnostic logging is
+   debug-gated.
+   **The Sent bubble before its email arrives (N7):** a reply sent from the chat (the ready AI Reply,
+   or an agent compose asked for in the field) is kept in memory (`ChatSentReplies`, keyed by the
+   account and the replied-to Message-ID) and shown as the user's words: on the sent email's own
+   bubble while it has no text message (matched by `inReplyTo` and a date no earlier than the send
+   minus `ChatViewLayout.sentReplyDateSlack`), else as a pending bubble at the bottom. An entry goes
+   when its email's text message arrives (`settle`) or after `sentReplyLifetime`. After a relaunch
+   the sent email shows "Summarizing" until its summary lands; nothing is persisted (ADR-004).
+   **Product choices made in 3b, awaiting owner blessing:** the chat-view pill drops today's Reply
+   and Archive menus (swipes come with PR 5, Forward and recipients with PR 4); the field-to-sheet
+   change has no morph animation yet; the sheet is not sized to its content; a request that only
+   acts (archive, label) opens the sheet with the agent's answer.
+
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (ADR-032) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
 parser does not read.
@@ -223,3 +267,8 @@ cache entry kept through the orphan grace (`mergedCacheEntryGetsTheGrace`), and 
 staging the text message, via `NotificationService.stagingPathOverride`).
 Decision 8: `ChatSummaryQueueTests`; `ChatSummaryExecutionTests` (the own-email field, two-sided; a real body write releasing the waiting chat summary once; the executor refusing an ordinary summary outside the Inbox, with an Inbox control). Decision 9: `ChatThreadTests`,
 `ChatThreadContextTests`, `ChatSummaryQueueTests.chatViewSwitch`/`activeMatrix`, `ThreadGroupTests.displayInfoUnionLabels`.
+Decision 10: `ChatReplyFieldTests` (the ready text, Send's route, the agent's message, the status
+line, sent-reply matching and settling, and the field and chat wiring read from the source),
+`ChatReplyFieldRuntimeTests` (the ready AI Reply in the mounted field, the send's email lookup,
+a failed request's log with and without its text, and the send wiring),
+`ChatSummaryQueueTests.openAsksForAnEmailThatJoins`.
