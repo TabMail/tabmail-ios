@@ -24,7 +24,8 @@ import UIKit
 ///     debug logging is off, in every failure branch: the words can be the reply field's AI Reply,
 ///     written from the email, and a resend or rewind replays them. The gate is in
 ///     `BackgroundSyncLogger.logChatError`, so it covers every caller.
-///  4. The pill wires 2 into every send: hosted views cannot be sent from a unit test, so that
+///  4. The pill wires 2 into every send: hosted views cannot be sent from a unit test (activating the
+///     Send button through in-process accessibility did not run it, tried 2026-11-07), so that
 ///     wiring is read from the source.
 @Suite("Chat reply field at run time", .serialized, .processGlobalState)
 @MainActor
