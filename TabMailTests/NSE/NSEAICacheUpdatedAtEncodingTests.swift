@@ -33,10 +33,9 @@ struct NSEAICacheUpdatedAtEncodingTests {
         )!
     }
 
-    /// How the extension staged the row before the merge. Both reach the cache write in
-    /// the merge's AI phase (the header is created by the header phase first, so the
-    /// merge's "header not in main DB" branch is not reachable through this seam; it
-    /// calls the same `upsertAICacheFromStaging`).
+    /// How the extension staged the row before the merge. Both reach the cache write of the
+    /// merge's existing-header branch (the header phase creates the header first); the
+    /// new-header fallback branch has its own tests below.
     enum Branch: String, CaseIterable, CustomStringConvertible {
         /// Header-only stage merged first, the AI result merged on a later wake.
         case headerThenResult
