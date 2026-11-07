@@ -204,7 +204,7 @@ private struct ReminderRow: View {
                 if reminder.source == "message", let subject = reminder.subject, !subject.isEmpty,
                    let messageId = reminder.messageId, !messageId.isEmpty {
                     NavigationLink {
-                        MessageDetailView(messageId: messageId)
+                        MessageOpenView(messageId: messageId, highlightsMessage: true)
                     } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "envelope")

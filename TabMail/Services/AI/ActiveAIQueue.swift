@@ -415,28 +415,43 @@ actor ActiveAIQueue {
     /// id. `chatBodyArrived` hands each back once `BodyFetchProcessor.flushBatch` has written its
     /// body. In memory only: a relaunch forgets them, and the next open or walk asks again. Entries
     /// leave when their body lands, and all of them on `cancelAllInFlight` (resume recovery, a
-    /// background task's end), so a body that never lands is not kept past the next recovery.
-    private var chatAwaitingBody: [String: String] = [:]
+    /// background task's end), so a body that never lands is not kept past the next recovery. The set
+    /// never holds more than the members asked for this session.
+    /// `request`: the newest request that asked for the member (`chatRequestNumber`).
+    private var chatAwaitingBody: [String: (accountId: String, request: Int)] = [:]
 
-    /// D2: summaries for every email of an opened thread that lacks one with a text message, the
-    /// user's own included. A member with its body gets a chat summary job now; one without goes to
-    /// the body queue (`ActiveBodyQueue`; tests pass `requestBodies`) and gets its job when the body lands. The caller checks
-    /// `ChatViewConfig`.
+    /// The number of the latest chat request. Only the latest moves work to the front: a request
+    /// that suspends (the database read, the body hop) must never put an older screen ahead of a
+    /// newer one. An older request's work still joins the queues, behind.
+    private var chatRequestNumber = 0
+
+    /// D2: summaries for the emails an open chat shows and those near them (`ChatSummaryWindow`),
+    /// each that lacks one with a text message, the user's own included. `members` comes in the
+    /// order the chat wants them, and the work goes to the FRONT of the queues in that order, so
+    /// what is on screen comes first and the latest request beats earlier ones. A member with its
+    /// body gets a chat summary job now; one without goes to the body queue (`ActiveBodyQueue`;
+    /// tests pass `requestBodies`) and gets its job when the body lands, at the front while no newer
+    /// request has asked for other emails. The caller checks `ChatViewConfig`.
     func enqueueChatSummaries(
         _ members: [MessageHeader],
         requestBodies: (@Sendable ([MessageHeader]) async -> Void)? = nil
     ) async {
+        chatRequestNumber += 1
+        let request = chatRequestNumber
         let ids = members.map(\.id)
-        guard let fresh = try? await dbPool.read({ db in
+        guard let rows = try? await dbPool.read({ db in
             try MessageHeader.filter(keys: ids).fetchAll(db)
         }) else { return }
+        let position = Dictionary(ids.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        let fresh = rows.sorted { (position[$0.id] ?? 0) < (position[$1.id] ?? 0) }
         var ready: [(headerId: String, accountId: String)] = []
         var needBody: [MessageHeader] = []
         for member in fresh where !Self.summaryDone(member, forChat: true) {
             if member.bodyComplete {
                 ready.append((member.id, member.accountId))
             } else {
-                chatAwaitingBody[member.id] = member.accountId
+                let newest = max(request, chatAwaitingBody[member.id]?.request ?? 0)
+                chatAwaitingBody[member.id] = (member.accountId, newest)
                 needBody.append(member)
             }
         }
@@ -444,36 +459,45 @@ actor ActiveAIQueue {
             if let requestBodies {
                 await requestBodies(needBody)
             } else {
-                await ActiveBodyQueue.shared.enqueueBatch(needBody)
+                await ActiveBodyQueue.shared.enqueueBatch(needBody, first: request == chatRequestNumber)
             }
         }
-        enqueueChatSummaryJobs(ready, origin: "open")
+        // After both suspensions (the read, the body hop): a newer request owns the front.
+        enqueueChatSummaryJobs(ready, origin: "open", first: request == chatRequestNumber)
     }
 
     /// `BodyFetchProcessor.flushBatch`, for every body it wrote: a chat member waiting for its body
-    /// gets its summary job now.
+    /// gets its summary job now, at the front if the latest request asked for it.
     func chatBodyArrived(headerId: String) {
-        guard let accountId = chatAwaitingBody.removeValue(forKey: headerId) else { return }
-        enqueueChatSummaryJobs([(headerId, accountId)], origin: "body")
+        guard let waiting = chatAwaitingBody.removeValue(forKey: headerId) else { return }
+        enqueueChatSummaryJobs([(headerId, waiting.accountId)], origin: "body",
+                               first: waiting.request == chatRequestNumber)
     }
 
-    /// Admit chat summary jobs (summary only, window-exempt, any folder).
-    private func enqueueChatSummaryJobs(_ items: [(headerId: String, accountId: String)], origin: String) {
+    /// Admit chat summary jobs (summary only, window-exempt, any folder). `first`: they go to the
+    /// front of the queue in the given order, pending ones already queued included.
+    private func enqueueChatSummaryJobs(
+        _ items: [(headerId: String, accountId: String)], origin: String, first: Bool = false
+    ) {
         var admitted = 0
+        var jobs: [AIJob] = []
         for item in items {
             let job = AIJob(headerId: item.headerId, accountId: item.accountId, jobType: .summary,
                             windowExempt: true, forChat: true)
             guard !unattributableJobs.contains(job) else { continue }
+            jobs.append(job)
             if admitOrUpgrade(job) != .rejected { admitted += 1 }
         }
-        guard admitted > 0 else { return }
+        if first { storage.moveToFront(jobs) }
+        guard admitted > 0 || (first && !jobs.isEmpty) else { return }
         BackgroundSyncLogger.logAIProcessing("Enqueued \(admitted) chat summary job(s) (\(origin), total: \(storage.count))")
         scheduleDispatch()
     }
 
-    /// D3, the background walk: every email of the threads of the newest `SyncConfig.maxRecentEmails`
-    /// Inbox rows (those rows included, any folder, the whole thread as `ThreadDetection` returns it),
-    /// that has its body and no summary with a text message. A member whose body is not downloaded yet
+    /// D3, the background walk: the newest `ChatViewConfig.summaryWindow` emails of each thread of the
+    /// newest `SyncConfig.maxRecentEmails` Inbox rows (any folder), each that has its body and no
+    /// summary with a text message. A chat opens at its newest emails, so those are ready; the open
+    /// chat asks for the rest as they come near the screen (`ChatSummaryWindow`). A member whose body is not downloaded yet
     /// is picked up by a later walk once backfill has fetched it. One thread lookup per Inbox row, so
     /// it runs from `repopulateFromDatabase` (launch, foreground, AI re-enable), never on drain.
     nonisolated static func chatWalkCandidates(
@@ -490,8 +514,9 @@ actor ActiveAIQueue {
         var seen = Set<String>()
         var members: [MessageHeader] = []
         for row in inbox {
-            for member in [row] + (try ThreadDetection.findRelatedMessages(for: row, in: pool))
-            where seen.insert(member.id).inserted {
+            let thread = ([row] + (try ThreadDetection.findRelatedMessages(for: row, in: pool)))
+                .sorted { ($0.date, $0.id) > ($1.date, $1.id) }
+            for member in thread.prefix(ChatViewConfig.summaryWindow) where seen.insert(member.id).inserted {
                 members.append(member)
             }
         }

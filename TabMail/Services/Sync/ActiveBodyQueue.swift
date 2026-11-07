@@ -463,8 +463,11 @@ actor ActiveBodyQueue {
         scheduleDispatch()
     }
 
-    func enqueueBatch(_ headers: [MessageHeader]) {
+    /// `first`: the items go to the front of the queue in the given order, those already pending
+    /// included (an open chat's emails on screen, `ActiveAIQueue.enqueueChatSummaries`).
+    func enqueueBatch(_ headers: [MessageHeader], first: Bool = false) {
         var added = 0
+        var items: [Item] = []
         for header in headers {
             let item = Item(
                 headerId: header.id, accountId: header.accountId,
@@ -472,9 +475,11 @@ actor ActiveBodyQueue {
                 isInInbox: header.isInInbox
             )
             retryExhaustedThisDrain.remove(item.headerId)
+            items.append(item)
             if admit(item) { added += 1 }
         }
-        guard added > 0 else { return }
+        if first { storage.moveToFront(items) }
+        guard added > 0 || (first && !items.isEmpty) else { return }
         BackgroundSyncLogger.logDebug("[ActiveBody] Enqueued \(added) items (total: \(storage.count))")
         scheduleDispatch()
     }

@@ -7,7 +7,6 @@ import UserNotifications
 
 struct DebugMenuView: View {
     @State private var useDevServers = BackendConfig.useDevServers
-    @State private var chatViewOn = ChatViewConfig.debugOverride
     @State private var pushTestResult: String?
     @State private var reminderTestStatus: String?
     @State private var showTouchRings = TouchVisualizer.shared.isEnabled
@@ -88,16 +87,6 @@ struct DebugMenuView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("Device Sync reconnects automatically. Other services (API, billing) take effect on next app launch.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section("Chat View") {
-                Toggle("Chat View (in development)", isOn: $chatViewOn)
-                    .onChange(of: chatViewOn) { _, newValue in
-                        ChatViewConfig.debugOverride = newValue
-                    }
-                Text("Requests summaries with text messages for every email of a thread you open, and for the threads of recent inbox mail.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

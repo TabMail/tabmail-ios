@@ -39,17 +39,7 @@ struct ThreadGroup: Identifiable, Equatable {
         let inboxMembers = members.filter({ $0.isInInbox })
         let allTagged = inboxMembers.allSatisfy { $0.actionTag != nil }
         let anyStillProcessing = inboxMembers.contains { $0.actionTag != nil && !$0.isReplyProcessed }
-        // Union of user labels across all thread members, deduped by ID
-        var seenIds: Set<String> = []
-        var union: [UserLabel] = []
-        for member in members {
-            for label in member.userLabels {
-                if seenIds.insert(label.id).inserted {
-                    union.append(label)
-                }
-            }
-        }
-        union.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        let union = UserLabel.union(members.map(\.userLabels))
         return ThreadDisplayInfo(
             senderList: allSenders.joined(separator: ", "),
             memberCount: memberCount,
