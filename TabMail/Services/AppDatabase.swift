@@ -4265,7 +4265,11 @@ final class AppDatabase: Sendable {
         // cache. NULLABLE and NO BACKFILL: a result computed before this version has no
         // text message, and the chat view asks for one when it needs it.
         // Convergence: a fresh install and an upgraded DB both end with the four
-        // columns, NULL on every pre-existing row.
+        // columns, NULL on every pre-existing row. Its name shares the v95 number with
+        // `v95_convertNumericAICacheUpdatedAt` above, which landed first: this one and the
+        // next had already run on test devices, and GRDB records a migration by its name,
+        // so renaming them would run them again there and fail on the existing columns.
+        // Names only need to be unique; the next migration is v97.
         migrator.registerTimedMigration(
             "v95_addAITextMessages", foreignKeyChecks: .immediate
         ) { db in

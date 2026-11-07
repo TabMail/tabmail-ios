@@ -21,7 +21,9 @@ same AI result, kept as long as the email itself is shown.
    that is not the object is no result (nil blurb / nil reply), retried like a failed call. The stored
    shapes are unchanged (todos `• a • b`, one-line blurb, HH:MM reminder time, reminder only with content).
 3. **Storage.** `MessageHeader` and `MessageAICache` gain `summaryTextMessage` and `replyTextMessage`
-   (`v95_addAITextMessages`, nullable, no backfill). Each text message belongs to its result: every
+   (`v95_addAITextMessages`, nullable, no backfill; it shares the v95 number with main's
+   `v95_convertNumericAICacheUpdatedAt`, because both it and v96 had already run on test devices
+   and GRDB records a migration by its name, so they keep their names and the next is v97). Each text message belongs to its result: every
    writer that sets a summary or a reply sets its text message with it (nil included), the survivor
    merge and the pre-sync restore carry it with its result, and `MessageAICache.writeThrough` replaces
    the text message whenever it replaces the result. The extension stages `summaryTextMessage` in
@@ -51,7 +53,7 @@ same AI result, kept as long as the email itself is shown.
    key's last colon, kept only when a header of the key's own account has it, in any folder), so an
    email that moved before the upgrade keeps its results. A Message-ID that itself contains a colon
    reads wrong there and counts as an orphan, recoverable by asking again. Writers do not fill the
-   missing value: the extension's one cache upsert (`NSEDataBridge.upsertAICache`, for an existing and a
+   missing value: the extension's one cache upsert (`NSEDataBridge.upsertAICacheFromStaging`, for an existing and a
    new header) records the Message-ID it has, as every new entry does.
    `v96_repairAICacheMessageIds` (`AppDatabase.repairAICacheMessageIds`) has run on test devices, so it
    stays (frozen): it fills the Message-ID from the header in the folder the key names. The purge no
@@ -60,7 +62,7 @@ same AI result, kept as long as the email itself is shown.
    argument), the base of its cutoff and the re-stamp of a kept entry, so a kept entry always leaves
    the selection and the pass ends, even if the clock is set back while it runs. Later the same
    day: the extension merge stamps a cache entry's `updatedAt` as a date
-   (`NSEDataBridge.upsertAICache`), like every other writer. A number sorted before every stored
+   (`NSEDataBridge.upsertAICacheFromStaging`), like every other writer. A number sorted before every stored
    date, so such an entry missed the grace. The two "no content" summary writers
    (`AccountManager.processMessage`'s shortcut and `BodyFetchProcessor`'s confirmed-empty write)
    clear the text message with the summary they replace.

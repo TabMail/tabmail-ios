@@ -2360,7 +2360,7 @@ enum NSEDataBridge {
                                             folderPath: existingFolderPath,
                                             rfc822MessageId: rfc
                                         ) {
-                                            try Self.upsertAICache(msg, key: cacheKey, rfc822MessageId: rfc, db: db)
+                                            try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, rfc822MessageId: rfc, db: db)
                                         }
                                     }
                                 } else {
@@ -2399,7 +2399,7 @@ enum NSEDataBridge {
                                         folderPath: msg.folderPath,
                                         rfc822MessageId: msg.rfc822MessageId
                                        ) {
-                                        try Self.upsertAICache(msg, key: cacheKey, rfc822MessageId: msg.rfc822MessageId, db: db)
+                                        try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, rfc822MessageId: msg.rfc822MessageId, db: db)
                                     }
                                 }
                                 return .commit
@@ -3641,13 +3641,28 @@ enum NSEDataBridge {
         var summaryTextMessage: String? = nil
     }
 
-    /// The terminal merge's AI cache write, for an existing or a newly created header. A
-    /// value-guarded UPSERT (not INSERT OR REPLACE): a re-merge of a terminal row whose prior
-    /// staging delete failed must be a 0-row no-op, or it bumps `total_changes()` (a redundant
-    /// reload) and, since REPLACE = delete+insert, NULLs columns it does not list (e.g. a peer's
-    /// precomputed `cachedReply`). DO UPDATE touches only these columns, and only when the
-    /// content differs. The Message-ID lets the orphan purge match the entry to its email.
-    static func upsertAICache(_ msg: StagedMessage, key: String, rfc822MessageId: String?, db: Database) throws {
+    /// Value-guarded UPSERT of the extension's AI result into `messageAICache` — the ONE
+    /// place the merge writes that table, so both merge branches (an existing or a newly
+    /// created header) share one encoding.
+    ///
+    /// UPSERT, not INSERT OR REPLACE: re-writing the SAME cached summary/action on a
+    /// re-merge of a terminal row whose prior staging delete failed must be a 0-row
+    /// no-op — otherwise it bumps total_changes() (redundant reload) AND, since
+    /// REPLACE = delete+insert, NULLs columns it doesn't list (e.g. a peer's
+    /// precomputed `cachedReply`). DO UPDATE touches only the AI columns, and only
+    /// when the content actually differs. The Message-ID lets the orphan purge match the
+    /// entry to its email.
+    ///
+    /// `updatedAt` is bound as a `Date` (GRDB text), like every other writer of this
+    /// column. The staged `processedAt` is a number, and SQLite orders every number
+    /// below every text value, so binding it raw made the TTL purge's
+    /// `updatedAt < cutoff` count a fresh entry as expired (#395).
+    static func upsertAICacheFromStaging(
+        _ msg: StagedMessage,
+        cacheKey: String,
+        rfc822MessageId: String?,
+        db: GRDB.Database
+    ) throws {
         try db.execute(sql: """
             INSERT INTO messageAICache
                 (key, rfc822MessageId, summaryBlurb, summaryTodos, summaryTextMessage, actionTag, updatedAt)
@@ -3663,9 +3678,7 @@ enum NSEDataBridge {
                OR summaryTextMessage IS NOT excluded.summaryTextMessage
                OR actionTag IS NOT excluded.actionTag
             """, arguments: [
-                key, rfc822MessageId, msg.summaryBlurb, msg.summaryTodos, msg.summaryTextMessage,
-                // A Date, stored like every other `updatedAt` (a number would sort before
-                // every stored date and miss the orphan purge's grace).
+                cacheKey, rfc822MessageId, msg.summaryBlurb, msg.summaryTodos, msg.summaryTextMessage,
                 msg.actionTag, Date(timeIntervalSince1970: msg.processedAt)
             ])
     }
