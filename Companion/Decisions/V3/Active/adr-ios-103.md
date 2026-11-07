@@ -211,6 +211,19 @@ same AI result, kept as long as the email itself is shown.
    sheet and empties the field, except after a compose the request opened (the compose was the
    answer). Dictation in the field replaces an unchanged AI Reply rather than appending to it, and
    the field never starts dictation by itself.
+   **The AI Reply shows only while the field holds no words of the user's, and never on the user's
+   turn (owner 2026-11-07):** `ChatFieldFill.offer`. An empty field, or the AI Reply the app itself
+   put there, takes the ready reply whenever it arrives, collapsed or in the open sheet; typed or
+   dictated words are never replaced. Three things hold it back, and nothing else (no sheet or
+   timing condition): (a) the user spoke last and is still waiting, a dictation bringing their
+   words or the agent answering them; (b) the user emptied the field by hand, which keeps it empty
+   for that newest email (`emptiedByHand`; only the user's own edits count, and a newer email
+   shows its own reply); (c) it is the user's turn: the newest email is theirs, or a reply they
+   sent from the chat shows as a Sent bubble below it (`ChatThreadView.pill`), from the moment of
+   Send, online or offline, until someone else's email arrives. Words sent to the agent are not a
+   turn: once it has answered, the email still awaits a reply, so the reply shows again. The field
+   is offered the reply when the reply changes, when a dictation ends, when the agent has answered
+   and whenever the field empties.
    **Each send names the email it is about, and the field's words stay out of logs (train gate,
    2026-11-05):** a send looks up the pill's current email as it starts
    (`DynamicIslandChat.contextNumber`), never the number found for an earlier newest email. A failed

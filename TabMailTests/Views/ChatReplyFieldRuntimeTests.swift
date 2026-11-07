@@ -12,12 +12,14 @@ import UIKit
 /// ADR-IOS-103: the chat's reply field, run for real.
 ///
 /// THE SYSTEM PROPERTIES pinned here:
-///  1. The ready AI Reply is in the mounted field; when the newest email changes, the untouched
-///     field holds the new email's ready reply. A completion (a sent compose card, an agent answer
-///     from the field) empties the field, and the ready reply does not come back; a late AI Reply
-///     never replaces words the user typed. One that arrives while the chat sheet is open fills the
-///     untouched field when the sheet closes; words typed in the sheet stay. The two completions are private to `ChatThreadView`,
-///     so which ones empty the field is read from the source (`clearWiring`).
+///  1. The ready AI Reply shows in the mounted field whenever the field holds no words of the
+///     user's (owner 2026-11-07): when the newest email changes, the untouched field holds the new
+///     email's ready reply; a field a completion emptied (a sent compose card, an agent answer
+///     from the field) shows it again; one that arrives while the chat sheet is open fills the
+///     empty field there at once. Words the user typed, in the field or the sheet, are never
+///     replaced, and a field the user emptied by hand stays empty for that email (the next newest
+///     email shows its own reply). The two completions are private to `ChatThreadView`, so which ones empty
+///     the field is read from the source (`clearWiring`).
 ///  2. A send names the pill's email as the send starts: after the newest email changes, the next
 ///     request names the new email, never the number found for the earlier one.
 ///  3. A failed chat request's persistent log keeps the error and never the user's words while
@@ -53,6 +55,8 @@ struct ChatReplyFieldRuntimeTests {
         var clearCount = 0
         /// The chat sheet is open.
         var expanded = false
+        /// The agent is answering the user's words.
+        var working = false
         /// Signed in: the open sheet shows its input bar, not the sign-in bar.
         var signedIn = false
         /// Sends of the unchanged ready AI Reply (`onSendReadyReply`): the compose card opens.
@@ -66,7 +70,7 @@ struct ChatReplyFieldRuntimeTests {
         @Bindable var host: Host
         var body: some View {
             DynamicIslandChat(
-                message: host.message, isExpanded: $host.expanded, isWorking: .constant(false),
+                message: host.message, isExpanded: $host.expanded, isWorking: $host.working,
                 replyField: ChatReplyField(
                     readyText: ChatReplyField.readyText(newest: host.message, isOwn: false),
                     isNoReply: false, clearCount: host.clearCount),
@@ -216,22 +220,47 @@ struct ChatReplyFieldRuntimeTests {
                 let texts = Self.fieldTexts(controller.view)
                 if typesNewer {
                     #expect(texts.contains("My newer draft"), "the newer draft stays: \(texts)")
+                    #expect(!texts.contains("A ready reply"))
                 } else {
-                    #expect(!texts.isEmpty && texts.allSatisfy { $0.isEmpty }, "the sent words are gone: \(texts)")
+                    #expect(texts.contains("A ready reply"), "the emptied field shows the ready reply: \(texts)")
                 }
             }
         }
     }
 
-    @Test("A send or an answer from the field empties it, and the ready AI Reply does not come back")
+    @Test("A send or an answer from the field empties it, and the ready AI Reply then shows there")
     func completionEmptiesTheField() async throws {
         try await withMountedField(Self.header("field-C", ready: "A ready reply")) { host, controller in
             #expect(Self.fieldTexts(controller.view).contains("A ready reply"), "control: the field starts filled")
+            #expect(Self.type("My question", in: controller.view), "the mounted pill has a native editable field")
+            try await Self.settle()
+            #expect(Self.fieldTexts(controller.view).contains("My question"), "control: the edit reached the field")
             host.clearCount += 1
             try await Self.settle()
             let texts = Self.fieldTexts(controller.view)
-            #expect(!texts.isEmpty)
-            #expect(texts.allSatisfy { $0.isEmpty }, "the field is empty after the completion: \(texts)")
+            #expect(!texts.contains("My question"), "the completion emptied the field: \(texts)")
+            #expect(texts.contains("A ready reply"), "the empty field shows the ready reply: \(texts)")
+        }
+    }
+
+    @Test("A field emptied by hand stays empty for that email; the next newest email shows its own reply")
+    func handEmptiedFieldStaysEmpty() async throws {
+        try await withMountedField(Self.header("field-E", ready: "A ready reply")) { host, controller in
+            #expect(Self.type("A ready", in: controller.view), "the mounted pill has a native editable field")
+            try await Self.settle()
+            #expect(Self.fieldTexts(controller.view).contains("A ready"), "control: words cut back by hand stay")
+            #expect(Self.type("", in: controller.view))
+            try await Self.settle()
+            var texts = Self.fieldTexts(controller.view)
+            #expect(!texts.isEmpty && texts.allSatisfy { $0.isEmpty }, "the emptied field stays empty: \(texts)")
+            host.message.replyTextMessage = "A newer AI Reply"
+            try await Self.settle()
+            texts = Self.fieldTexts(controller.view)
+            #expect(texts.allSatisfy { $0.isEmpty }, "even for a newer AI Reply to that email: \(texts)")
+            host.message = Self.header("field-E2", ready: "A reply to the next email")
+            try await Self.settle()
+            texts = Self.fieldTexts(controller.view)
+            #expect(texts.contains("A reply to the next email"), "the next newest email shows its own: \(texts)")
         }
     }
 
@@ -250,9 +279,10 @@ struct ChatReplyFieldRuntimeTests {
         }
     }
 
-    /// The field's words after a reply arrives while the sheet is open and the sheet closes;
+    /// The field's words once a reply arrives while the sheet is open, then once the sheet closes;
     /// `typed`: words the user typed in the sheet first.
-    private func afterTheSheet(typed: String?, uid: String) async throws -> [String] {
+    private func afterTheSheet(typed: String?, uid: String) async throws -> (open: [String], closed: [String]) {
+        var open: [String] = []
         var words: [String] = []
         try await withMountedField(Self.header(uid)) { host, controller in
             #expect(Self.fieldTexts(controller.view).contains(""), "control: the field starts empty")
@@ -267,21 +297,44 @@ struct ChatReplyFieldRuntimeTests {
             host.message.cachedReply = "Full reply"
             host.message.replyTextMessage = "Yes, Tuesday works for me."
             try await Self.settle()
-            #expect(!Self.fieldTexts(controller.view).contains("Yes, Tuesday works for me."), "never into the open sheet")
+            open = Self.fieldTexts(controller.view)
             host.expanded = false
             try await Task.sleep(for: .milliseconds(600))
             words = Self.fieldTexts(controller.view)
         }
-        return words
+        return (open, words)
     }
 
-    @Test("A reply that arrives while the sheet is open fills the untouched field when it closes; words typed there stay")
+    @Test("While the agent answers the user's words no AI Reply fills the field; once it has answered, the reply shows")
+    func noReplyWhileTheAgentAnswers() async throws {
+        try await withMountedField(Self.header("field-F")) { host, controller in
+            host.signedIn = true
+            host.expanded = true
+            try await Task.sleep(for: .milliseconds(600))
+            #expect(Self.fieldTexts(controller.view).contains(""), "control: the open sheet's field is empty")
+            // The user's question went out from the sheet, which empties as it sends.
+            host.working = true
+            host.message.cachedReply = "Full reply"
+            host.message.replyTextMessage = "Yes, Tuesday works for me."
+            try await Self.settle()
+            #expect(!Self.fieldTexts(controller.view).contains("Yes, Tuesday works for me."), "the user spoke last")
+            host.working = false
+            try await Self.settle()
+            #expect(Self.fieldTexts(controller.view).contains("Yes, Tuesday works for me."),
+                    "the agent answered: \(Self.fieldTexts(controller.view))")
+        }
+    }
+
+    @Test("A reply that arrives while the sheet is open fills the empty field there at once; words typed there stay")
     func readyReplyFollowsTheSheet() async throws {
         let untouched = try await afterTheSheet(typed: nil, uid: "field-sheet-A")
-        #expect(untouched.contains("Yes, Tuesday works for me."), "filled once the sheet closed: \(untouched)")
+        #expect(untouched.open.contains("Yes, Tuesday works for me."), "filled in the open sheet: \(untouched.open)")
+        #expect(untouched.closed.contains("Yes, Tuesday works for me."), "and still after it closed: \(untouched.closed)")
         let typed = try await afterTheSheet(typed: "My own question", uid: "field-sheet-B")
-        #expect(typed.contains("My own question"), "the user's words stay: \(typed)")
-        #expect(!typed.contains("Yes, Tuesday works for me."))
+        #expect(typed.open.contains("My own question"), "the user's words stay: \(typed.open)")
+        #expect(!typed.open.contains("Yes, Tuesday works for me."))
+        #expect(typed.closed.contains("My own question"), "after the sheet closed too: \(typed.closed)")
+        #expect(!typed.closed.contains("Yes, Tuesday works for me."))
     }
 
     // MARK: - 2. A send names the email it is about

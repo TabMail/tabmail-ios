@@ -30,6 +30,10 @@ import UIKit
 ///  6. An email shows only its own words: a reply sent from the chat shows its words as a Sent
 ///     bubble until an own reply to that email arrives, and the arrived email never shows them,
 ///     because nothing proves it is that send (a reply sent elsewhere can arrive first).
+///  7. No AI Reply is offered on the user's turn (owner 2026-11-07): from the moment a reply is
+///     sent from the chat, the field holds no suggestion, whether or not the sent email has
+///     arrived (offline it may not for long), until an email from someone else arrives; that
+///     email's own AI Reply then shows.
 ///
 /// What is on screen is read back from the summary queue, whose front is the latest request:
 /// the newest email on screen, then the rest of the screen, then the older ones.
@@ -538,6 +542,95 @@ struct ChatThreadViewLifecycleTests {
         #expect(shows("You said: Re: Lunch plans, summarizing"),
                 "the arrived own reply shows as itself, summarizing: \(labels().prefix(20))")
         #expect(!shows("Tuesday works for me"), "no email shows a sent reply's words: \(labels().prefix(20))")
+        await queue.clearForTesting()
+        await queue.setDispatchSuppressedForTesting(false)
+    }
+
+    @Test("After a reply is sent from the chat, no AI Reply shows until someone else's email arrives, whether or not the sent email has")
+    func sentReplyTakesTheTurn() async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let queue = ActiveAIQueue.shared
+        await queue.setDispatchSuppressedForTesting(true)
+        await queue.clearForTesting()
+        let replies = ChatSentReplies.shared
+        replies.removeAllForTesting()
+        ChatPillState.shared.removeAllSessions()
+        defer {
+            replies.removeAllForTesting()
+            ChatPillState.shared.removeAllSessions()
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        saved.setChatView(on: true)
+        let account = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
+        let now = Date()
+        func header(_ id: String, from: String, secondsAgo: Double, inReplyTo: String?, ready: String?) -> MessageHeader {
+            var header = MessageHeader(
+                messageId: id, subject: "Lunch plans", from: from, fromAddress: from, to: "someone@example.com",
+                date: now.addingTimeInterval(-secondsAgo), snippet: "Note \(id)",
+                folderId: MessageIdentity.folderId(accountId: Self.account, folderPath: "INBOX"),
+                accountId: Self.account, folderPath: "INBOX", isInInbox: true)
+            header.rfc822MessageId = "<\(id)@example.com>"
+            header.inReplyTo = inReplyTo
+            header.headerComplete = true
+            header.bodyComplete = true
+            header.isRead = true
+            if let ready {
+                header.cachedReply = "Hello,\n\n\(ready)\n\nThanks."
+                header.replyTextMessage = ready
+            }
+            return header
+        }
+        let ready = "Yes, Tuesday works for me."
+        let parent = header("turn-parent", from: "sender@example.com", secondsAgo: 600, inReplyTo: nil, ready: ready)
+        try await pool.write { db in try parent.insert(db) }
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let controller = UIHostingController(rootView: NavigationStack {
+            ChatThreadView(messageId: parent.id)
+        }.environment(\.hasTabMailSession, true))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func fieldTexts() -> [String] { Self.textViews(controller.view).map(\.text) }
+        func waitFor(_ done: () -> Bool) async throws {
+            for _ in 0..<60 where !done() { try await Task.sleep(for: .milliseconds(100)) }
+        }
+        try await waitFor { fieldTexts().contains(ready) }
+        #expect(fieldTexts().contains(ready), "control: the field offers the AI Reply on the sender's turn: \(fieldTexts())")
+
+        // The reply is sent from the chat, as a sent compose card records it.
+        #expect(replies.composeEnded(.sent, replyTo: parent, words: ready), "control: the send counts")
+        try await waitFor { !fieldTexts().contains(ready) }
+        // Offline, the sent email does not arrive: the field stays without a suggestion.
+        try await Task.sleep(for: .milliseconds(1500))
+        #expect(!fieldTexts().isEmpty, "control: the field is on screen")
+        #expect(!fieldTexts().contains(ready), "no suggestion while the sent email has not arrived: \(fieldTexts())")
+
+        // Online, the sent email arrives, announced as a mail merge announces new mail: still the
+        // user's turn.
+        let own = header("turn-own", from: account.emailAddress, secondsAgo: 0, inReplyTo: "<turn-parent@example.com>", ready: nil)
+        try await pool.write { db in try own.insert(db) }
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
+        try await waitFor { replies.entries.isEmpty }
+        #expect(replies.entries.isEmpty, "control: the sent email reached the chat and ended its Sent bubble")
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(!fieldTexts().contains(ready), "no suggestion once the sent email is in the chat: \(fieldTexts())")
+
+        // Someone else answers: their email's own AI Reply shows.
+        let later = "Friday is better for me."
+        let other = header("turn-other", from: "friend@example.com", secondsAgo: -5, inReplyTo: "<turn-own@example.com>", ready: later)
+        try await pool.write { db in try other.insert(db) }
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
+        try await waitFor { fieldTexts().contains(later) }
+        #expect(fieldTexts().contains(later), "a new email from someone else is their turn: \(fieldTexts())")
         await queue.clearForTesting()
         await queue.setDispatchSuppressedForTesting(false)
     }

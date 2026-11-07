@@ -419,6 +419,9 @@ struct ChatThreadView: View {
 
     private func pill(on newest: MessageHeader) -> some View {
         let isOwn = thread.items.last?.isOwn ?? false
+        // The user's turn: their email is the newest, or a reply they sent from the chat shows
+        // below it until that email arrives (N7). No AI Reply is offered on the user's turn.
+        let usersTurn = isOwn || !unmatchedReplies(thread).isEmpty
         let isNoReply = !isOwn && EmailFilter.isNoReply(newest.fromAddress)
         return VStack(spacing: 8) {
             if isNoReply && !chatExpanded {
@@ -435,7 +438,7 @@ struct ChatThreadView: View {
                 isWorking: $chatWorking,
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
-                    readyText: ChatReplyField.readyText(newest: newest, isOwn: isOwn),
+                    readyText: ChatReplyField.readyText(newest: newest, isOwn: usersTurn),
                     isNoReply: isNoReply,
                     clearCount: fieldClearCount),
                 onSendReadyReply: { readyReplyMessage = newest },
