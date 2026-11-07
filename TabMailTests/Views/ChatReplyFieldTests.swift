@@ -537,7 +537,7 @@ struct ChatReplyFieldTests {
     @Test("A compose card asked for in the field carries the field's words and goes to the people chosen; one from the sheet keeps the agent's")
     func agentComposeFromTheField() {
         let chosen = ChatReplyTarget(only: [Self.david, Self.sam])
-        let agentTo = ["sarah@example.com"], agentCc = ["team@example.com"]
+        let agentTo = ["sarah@example.com"], agentCc = ["team@example.com"], agentBcc = ["boss@example.com"]
 
         #expect(ChatAgentCompose.sentWords(mode: .reply, fromField: true, fieldWords: "Friday works") == "Friday works")
         #expect(ChatAgentCompose.sentWords(mode: .reply, fromField: false, fieldWords: "Friday works") == nil,
@@ -545,20 +545,65 @@ struct ChatReplyFieldTests {
         #expect(ChatAgentCompose.sentWords(mode: .forward, fromField: true, fieldWords: "Friday works") == nil)
         #expect(ChatAgentCompose.sentWords(mode: .compose, fromField: true, fieldWords: "Friday works") == nil)
 
-        let fromField = ChatAgentCompose.replyRecipients(fromField: true, target: chosen, to: agentTo, cc: agentCc)
-        #expect(fromField.to == [Self.david.address, Self.sam.address] && fromField.cc.isEmpty)
-        let fromSheet = ChatAgentCompose.replyRecipients(fromField: false, target: chosen, to: agentTo, cc: agentCc)
-        #expect(fromSheet.to == agentTo && fromSheet.cc == agentCc, "the sheet's request keeps the agent's recipients")
-        let replyAll = ChatAgentCompose.replyRecipients(fromField: true, target: .replyAll, to: agentTo, cc: agentCc)
-        #expect(replyAll.to == agentTo && replyAll.cc == agentCc, "Reply All keeps the agent's recipients")
+        let req = AgentToolRouter.ComposeRequest(
+            mode: .reply, replyTo: nil, to: agentTo, cc: agentCc, bcc: agentBcc, subject: nil, body: nil)
+        let fromField = ChatAgentCompose.replyRecipients(fromField: true, target: chosen, request: req)
+        #expect(fromField.to == [Self.david.address, Self.sam.address] && fromField.cc.isEmpty && fromField.bcc.isEmpty,
+                "only the people chosen: no Cc, no Bcc")
+        let fromSheet = ChatAgentCompose.replyRecipients(fromField: false, target: chosen, request: req)
+        #expect(fromSheet.to == agentTo && fromSheet.cc == agentCc && fromSheet.bcc == agentBcc,
+                "the sheet's request keeps the agent's recipients")
+        let replyAll = ChatAgentCompose.replyRecipients(fromField: true, target: .replyAll, request: req)
+        #expect(replyAll.to == agentTo && replyAll.cc == agentCc && replyAll.bcc == agentBcc,
+                "Reply All keeps the agent's recipients")
+    }
+
+    @Test("A reply the agent writes from the field reaches only the people chosen, even when it adds Cc and Bcc")
+    func agentReplyEnvelopeFromTheField() async throws {
+        let db = try TestDatabase.make()
+        let translator = MockChatIdTranslator()
+        let router = AgentToolRouter()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "r1", subject: "Plans", to: "test@example.com, team@example.com")
+        await translator.seed(header.id, as: 1)
+        let tool = EmailReplyTool(context: ToolContext(db: db, translator: translator, router: router))
+        let task = Task { @MainActor () -> String in
+            try await tool.execute(arguments: [
+                "unique_id": .int(1), "body": .string("Friday works"),
+                "add_cc": .array([.string("extra@example.com")]),
+                "add_bcc": .array([.string("hidden@example.com")]),
+            ])
+        }
+        defer { task.cancel() }
+        var pending: AgentToolRouter.ComposeRequest?
+        let deadline = Date().addingTimeInterval(5)
+        while pending == nil, Date() < deadline {
+            pending = router.pendingCompose
+            await Task.yield()
+        }
+        let req = try #require(pending, "the tool opens a reply")
+        #expect(req.mode == .reply && req.bcc == ["hidden@example.com"] && req.cc.contains("extra@example.com"))
+
+        let chosen = ChatReplyTarget(only: [Self.david])
+        let fromField = ChatAgentCompose.replyRecipients(fromField: true, target: chosen, request: req)
+        #expect(fromField.to == [Self.david.address] && fromField.cc.isEmpty && fromField.bcc.isEmpty,
+                "Replying only to David: nobody else, seen or hidden")
+        let fromSheet = ChatAgentCompose.replyRecipients(fromField: false, target: chosen, request: req)
+        #expect(fromSheet.to == req.to && fromSheet.cc == req.cc && fromSheet.bcc == req.bcc,
+                "the open chat keeps everyone the agent chose")
+        req.onOutcome(.cancelled)
+        _ = try await task.value
     }
 
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(Self.count("onlyTo: replyTarget.only)", in: chat) == 1, "the field knows the people chosen")
-        #expect(Self.count("let (to, cc) = ChatAgentCompose.replyRecipients( fromField: fieldComposeOpened, target: replyTarget, to: req.to, cc: req.cc)", in: chat) == 1,
+        #expect(Self.count("let (to, cc, bcc) = ChatAgentCompose.replyRecipients( fromField: fieldComposeOpened, target: replyTarget, request: req)", in: chat) == 1,
                 "a reply asked for in the field goes to the people chosen")
+        #expect(Self.count("prefillBcc: bcc.isEmpty ? nil : bcc, onAgentOutcome: onOutcome)", in: chat) == 1,
+                "its Bcc is the chosen envelope's, not the agent's")
         #expect(Self.count("let words = ChatAgentCompose.sentWords(mode: req.mode, fromField: fieldComposeOpened, fieldWords: fieldWords)", in: chat) == 1)
         // Where a card came from: the field while the sheet is closed; a field send starts afresh;
         // after a card from the field the agent's closing words open nothing.
