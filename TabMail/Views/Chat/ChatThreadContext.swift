@@ -53,7 +53,15 @@ struct ChatThreadContext {
                 context.sentFolderIds = Set(folders.filter { $0.role == .sent }.map(\.id))
                 let labelsById = try UserLabelStore.loadLabels(for: ids, in: db)
                 context.labels = UserLabel.union(ids.map { labelsById[$0] ?? [] })
-                for body in try MessageBody.fetchAll(db, keys: ids) {
+                // Every member's attachment list and calendar file, never its HTML: the thread is
+                // uncapped, so the stored bodies are not read here (the bubbles show text messages).
+                let rows = try Row.fetchAll(db, MessageBody
+                    .select(Column("id"), Column("attachmentsJSON"), Column("icsText"))
+                    .filter(keys: ids))
+                for row in rows {
+                    var body = MessageBody(contentKey: ContentKey(rawValue: row["id"]), htmlContent: nil)
+                    body.attachmentsJSON = row["attachmentsJSON"]
+                    body.icsText = row["icsText"]
                     let invite = body.icsText.flatMap(ChatInvite.from(icsText:))
                     let names = body.attachments
                         .filter { $0.parentEmlSection == nil }
