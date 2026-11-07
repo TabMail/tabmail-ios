@@ -455,7 +455,7 @@ extension AccountManager {
             // success side effect fires.
             let outcome = (try? await dbPool.write { db in
                 try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
-                    msg.summaryBlurb = "This message has no content."
+                    msg.summaryBlurb = MessageHeader.noContentSummary
                     // A local summary has no text message; an earlier one goes with its summary.
                     msg.summaryTextMessage = nil
                     msg.setActionTag(.delete)
@@ -544,13 +544,17 @@ extension AccountManager {
         // "cc" needs positive evidence: the RECEIVING account's address in the
         // Cc header (claim set). All registered accounts feed the suppress set
         // only — a cross-account To/From hit prevents a claim, never makes one.
-        let allAccountEmails = (try? await dbPool.read { db in
-            try Account.fetchAll(db).map(\.emailAddress)
-        }) ?? []
+        let (allAccountEmails, folderRole) = (try? await dbPool.read { db in
+            (try Account.fetchAll(db).map(\.emailAddress), try Folder.fetchOne(db, key: message.folderId)?.role)
+        }) ?? ([], nil)
         let recipientStatus = PromptVariables.classifyRecipientStatus(
             toField: toRecipients, ccField: message.cc, fromField: message.fromAddress,
             claimEmails: [account.emailAddress], suppressEmails: allAccountEmails
         )
+        // The user's own email (a copy to themselves, or from another of their accounts) is asked
+        // for in the user's voice, as the queue asks (`PromptVariables.isSentByUser`).
+        let isSentByUser = PromptVariables.isSentByUser(
+            fromAddress: message.fromAddress, userAddresses: allAccountEmails, inSentFolder: folderRole == .sent)
         let kbText = PromptStore.kbTextSnapshot()
         let actionPrompt = PromptStore.actionMarkdownSnapshot()
         let compositionPrompt = await MainActor.run { PromptStore.shared.compositionMarkdown() }
@@ -607,7 +611,8 @@ extension AccountManager {
                             userName: userName,
                             kbText: kbText,
                             actionPrompt: actionPrompt,
-                            recipientStatus: recipientStatus
+                            recipientStatus: recipientStatus,
+                            isSentByUser: isSentByUser
                         ) else {
                             return // in-flight dedup (AIService level)
                         }

@@ -21,7 +21,8 @@ enum PromptVariables {
         metadata: MessageMetadata,
         body: RenderedBody,
         account: AccountContext,
-        recipientStatus: String = ""
+        recipientStatus: String = "",
+        isSentByUser: Bool = false
     ) -> [String: Any] {
         let subject = metadata.subject.isEmpty ? "Not Available" : metadata.subject
         let fromSender = formatFromSender(metadata.from)
@@ -48,7 +49,21 @@ enum PromptVariables {
         if !recipientStatus.isEmpty {
             vars["recipient_status"] = recipientStatus
         }
+        // The user wrote this email (ADR-IOS-103): the backend writes its text message in the
+        // user's voice. Sent only as `true`; omitted otherwise, as Thunderbird never sends it.
+        if isSentByUser {
+            vars["is_sent_by_user"] = true
+        }
         return vars
+    }
+
+    /// The user wrote this email (ADR-IOS-103): it is from one of the user's registered addresses, or
+    /// it sits in a Sent folder. The one rule for every summary writer (the queue, opening an email,
+    /// the notification extension): the chat shows such an email as the user's own, and reuses
+    /// whichever writer's text message is stored first, so each must ask for the user's voice.
+    static func isSentByUser(fromAddress: String, userAddresses: [String], inSentFolder: Bool) -> Bool {
+        let from = fromAddress.lowercased()
+        return inSentFolder || userAddresses.contains { $0.lowercased() == from }
     }
 
     /// Recipient-status classification for the summary and action requests — parity with the

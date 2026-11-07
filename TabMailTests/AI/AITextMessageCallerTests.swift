@@ -31,6 +31,8 @@ struct AITextMessageCallerTests {
     static let summaryText = "Can you send the \u{201C}final\u{201D} budget? \u{FF02}Thanks\u{FF02}"
     static let replyBody = "None"
     static let replyText = "None from me, thanks"
+    /// The text message the backend writes when asked for the user's voice (`is_sent_by_user`).
+    static let ownSummaryText = "Can you send me the \u{201C}final\u{201D} budget?"
     static let peerBlurb = "Peer summary of the plans."
     static let peerReply = "Peer reply to the plans."
 
@@ -61,7 +63,8 @@ struct AITextMessageCallerTests {
                 case "system_prompt_summary":
                     object = ["summary": summary, "todos": [],
                               "reminder": ["due_date": NSNull(), "due_time": NSNull(), "content": NSNull()],
-                              "text_message": AITextMessageCallerTests.summaryText]
+                              "text_message": Self.ownFlag(request.body)
+                                  ? AITextMessageCallerTests.ownSummaryText : AITextMessageCallerTests.summaryText]
                 case "system_prompt_action":
                     object = ["action": "reply"]
                 default:
@@ -80,7 +83,18 @@ struct AITextMessageCallerTests {
             return (json["messages"] as? [[String: Any]])?.first?["content"] as? String
         }
 
+        /// The request says the user wrote the email.
+        static func ownFlag(_ body: Data?) -> Bool {
+            let json = body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+            return (json["messages"] as? [[String: Any]])?.first?["is_sent_by_user"] as? Bool == true
+        }
+
         var prompts: [String] { http.recordedCalls().compactMap { Self.prompt($0.body) } }
+
+        /// For each summary request, whether it said the user wrote the email.
+        var summaryOwnFlags: [Bool] {
+            http.recordedCalls().filter { Self.prompt($0.body) == "system_prompt_summary" }.map { Self.ownFlag($0.body) }
+        }
 
         func close() { http.close() }
     }
@@ -404,6 +418,49 @@ struct AITextMessageCallerTests {
             #expect(cache?.summaryTextMessage == Self.summaryText)
             #expect(cache?.replyTextMessage == Self.replyText)
             #expect(Set(backend.prompts) == ["system_prompt_summary", "system_prompt_action", "system_prompt_compose"])
+        }
+    }
+
+    @Test("Opening the user's own email asks for its summary in the user's voice, as the queue does",
+          arguments: [("acc1@example.com", true), ("ACC2@example.com", true), ("sender@example.com", false)])
+    func directPathOwnEmail(fromAddress: String, own: Bool) async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(fromAddress: fromAddress)
+            // A second registered account: an email from it is the user's own too.
+            _ = try FolderEpochTestFixture.makeAccount(id: "acc2", provider: .imap, pool: fixture.pool)
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+
+            await AccountManager.shared.processMessage(
+                fixture.header, body: try fixture.body, account: fixture.account,
+                target: fixture.target, aiService: backend.service)
+
+            let deadline = Date().addingTimeInterval(20)
+            var row = try fixture.row()
+            while row?.summaryTextMessage == nil, Date() < deadline {
+                try await Task.sleep(for: .milliseconds(50))
+                row = try fixture.row()
+            }
+            #expect(backend.summaryOwnFlags == [own])
+            let expected = own ? Self.ownSummaryText : Self.summaryText
+            #expect(row?.summaryTextMessage == expected)
+            #expect(try fixture.cache()?.summaryTextMessage == expected)
+        }
+    }
+
+    @Test("The queue's summary job asks for the user's voice for their own email, and only then",
+          arguments: [("acc1@example.com", true), ("ACC2@example.com", true), ("sender@example.com", false)])
+    func queueSummaryOwnEmail(fromAddress: String, own: Bool) async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(fromAddress: fromAddress)
+            _ = try FolderEpochTestFixture.makeAccount(id: "acc2", provider: .imap, pool: fixture.pool)
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+
+            _ = await runJob(.summary, fixture, backend.service)
+
+            #expect(backend.summaryOwnFlags == [own])
+            #expect(try fixture.row()?.summaryTextMessage == (own ? Self.ownSummaryText : Self.summaryText))
         }
     }
 

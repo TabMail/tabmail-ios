@@ -74,6 +74,57 @@ same AI result, kept as long as the email itself is shown.
    pre-dispatch Device Sync check (`ActiveAIQueue.executeJob`) asks through `AIService.peerProbe`, the
    seam the opened-email path already uses, so a whole queue job can be run against a fake peer
    (`ActiveAIQueue.executeWholeJobForTesting`).
+8. **Chat summaries (owner D2, D3; amendment 2026-11-05, the second chat-view PR).** The chat view
+   needs a summary with a text message for every email of a thread, from any folder, the user's own
+   included. Two requests ask for them, both behind `ChatViewConfig.isActive` (release builds keep it
+   off, `isAvailableInBuild = false`, until the chat view ships; the debug menu turns it on), read once
+   at the start of the operation:
+   - **D2, opening a thread** (`MessageDetailViewModel.loadThreadMessagesAsync`, once per open):
+     `ActiveAIQueue.enqueueChatSummaries` with the opened message and every member
+     `ThreadDetection.findRelatedMessages` returns. A member with its body gets a job now; one without
+     goes to `ActiveBodyQueue` and gets its job when `BodyFetchProcessor.flushBatch` writes the body
+     (`chatBodyArrived`).
+   - **D3, the background walk** (`chatWalkCandidates`, run at the end of `repopulateFromDatabase`):
+     the threads of the newest `SyncConfig.maxRecentEmails` Inbox rows, every member with its body.
+   **A thread is the whole thread (amendment 2026-11-06, train gate):** `findRelatedMessages`
+   returns every email connected to the opened one, with no length or depth limit, because the chat
+   shows the whole thread, all the way back (owner Q2, "Typical email threads are not that long").
+   Its old cap (`SyncConfig.threadQueryLimit`, 100 emails, plus five expansion rounds) dated from the
+   first release with no recorded reason and is deleted. The expansion still ends: each round adds
+   only emails not seen yet. The bound is on the AI work instead (owner 2026-11-06: "add a safety
+   bound that you load up to something like 10 emails from the current visible oldest message"):
+   the open chat asks only for the emails on screen and those near them (decision 9,
+   `ChatSummaryWindow`); until the chat screen exists the requests stay off in release builds.
+   A chat request is an ordinary summary job (same model, queue, executor and write) with
+   `AIJob.forChat`: it is window-exempt, any folder passes its scope checks (`readJobOutcome`,
+   `executeJob`), and it is done only when the summary has its text message. `forChat` is context,
+   not identity, like `windowExempt`; on dedupe the flags only widen (`admitOrUpgrade`). The chained
+   action job does not inherit it, so it keeps the Inbox scope.
+   **The user's own email** (amendment 2026-11-05, train gate): a summary of an email the user
+   wrote, as the chat decides it (from one of the user's addresses, or in a Sent folder;
+   `ActiveAIQueue.isSentByUser`), sends `is_sent_by_user: true` (`PromptVariables.summaryVariables`),
+   so the backend writes its text message in the user's voice (ADR-032); any other email's request
+   omits the field, as Thunderbird's always do. Every queue summary job carries it; the new-mail
+   pipeline (`AIService.process`) is Inbox mail and keeps Thunderbird's request.
+   *Amended 2026-11-07 (train review round 8):* the last sentence was wrong. Inbox mail can be the
+   user's own (a copy to themselves, or mail from another of their accounts), and the chat reuses
+   whichever writer's text message is stored first. So the rule is one function,
+   `PromptVariables.isSentByUser` (it replaced `ActiveAIQueue.isSentByUser`), and every summary
+   writer calls it: the queue, opening an email (`AccountManager.processMessage` through
+   `AIService.process`), and the notification extension (with the mirrored account addresses,
+   `NSEState.getAllAccountEmails`; a pushed email is never in a Sent folder).
+   **The no-forever-retry rule:** "done" is ONE predicate, `ActiveAIQueue.summaryDone`, used by every
+   completion check and by both requests. A chat job whose done-condition could never become true
+   would retry forever (the backoff has no cap on attempts), so: the parser keeps any non-empty text
+   message, a literal "None" included (`AIResponseParser.nonEmpty`; the 2.0 backend never sends an
+   empty one, `readStructuredSummary`), and the local no-content summary
+   (`MessageHeader.noContentSummary`), which has no text message, counts as done.
+   **TB parity:** a further exception to ADR-IOS-008: Thunderbird summarizes Inbox mail only.
+   **Recoverable edges, awaiting owner blessing:** members awaiting their body are held in memory
+   only (a relaunch forgets them; the next open or walk asks again); a member whose body arrives
+   through the background backfill (not the AI-enabled body queue) is picked up by the next walk or
+   open, not at once; a chat offer rejected by `recentlyCompleted` or an in-flight twin is asked again
+   by the next walk or open.
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (ADR-032) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
@@ -100,3 +151,4 @@ including to none (`sameSummaryNewTextMessage`), the merge's second stage creati
 stage could not and caching its result with the text message (`secondStageCachesTextMessage`), a merged
 cache entry kept through the orphan grace (`mergedCacheEntryGetsTheGrace`), and a push through `NotificationService.didReceive`
 staging the text message, via `NotificationService.stagingPathOverride`).
+Decision 8: `ChatSummaryQueueTests`; `ChatSummaryExecutionTests` (the own-email field, two-sided; a real body write releasing the waiting chat summary once; the executor refusing an ordinary summary outside the Inbox, with an Inbox control).
