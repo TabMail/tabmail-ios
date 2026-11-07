@@ -1962,7 +1962,7 @@ struct DictationOptOutFlagTests {
         let field = String(try slice(source, from: "private func inputField(placeholder: String) -> some View {", to: "private var trailingButton: some View"))
         // The field dims and ignores touches beneath the overlay, which stays full strength and
         // tappable: both modifiers come before it.
-        let beneath = try slice(field, from: "TextField(placeholder, text: $inputText, selection: $inputSelection, axis: .vertical)", to: ".overlay {")
+        let beneath = try slice(field, from: "TextField(placeholder, text: typedText, selection: $inputSelection, axis: .vertical)", to: ".overlay {")
         #expect(beneath.contains(".opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)"))
         #expect(beneath.contains(".allowsHitTesting(!dictation.isActive)"))
         #expect(beneath.contains(".accessibilityHidden(dictation.isActive)"))
