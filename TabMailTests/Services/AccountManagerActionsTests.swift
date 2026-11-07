@@ -1556,7 +1556,7 @@ struct MarkReadOnArchiveDeleteSettingTests {
                 #expect(!arguments.contains("markReadOnArchiveDeleteEnabled"), "\(file): \(arguments)")
             }
         }
-        #expect(calls == 8, "the helper's own pass-through, the coordinated move, four inbox actions, the chat and Settings")
+        #expect(calls == 7, "the helper's own pass-through, the coordinated move, the inbox archive and delete, the inbox thread step they share with move, the chat and Settings")
         let settings = try source("TabMail/Views/Settings/SettingsView.swift")
         #expect(settings.contains("private func archiveOldMessages() async { // The mark-as-read setting as it stands when the action starts. let marksRead = AccountManager.markReadOnArchiveDeleteEnabled"))
         #expect(settings.contains("markReadBeforeRoleMove(ids: messages.map(\\.id), enabled: marksRead)"))
