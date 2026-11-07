@@ -24,9 +24,12 @@ import UIKit
 ///     debug logging is off, in every failure branch: the words can be the reply field's AI Reply,
 ///     written from the email, and a resend or rewind replays them. The gate is in
 ///     `BackgroundSyncLogger.logChatError`, so it covers every caller.
-///  4. The pill wires 2 into every send: hosted views cannot be sent from a unit test (activating the
-///     Send button through in-process accessibility did not run it, tried 2026-11-07), so that
-///     wiring is read from the source.
+///  4. The pill wires 2 into every send. The field's Send is pressed for real, through
+///     accessibility (`HostedAccessibility`), for the AI Reply route: it opens the compose card and
+///     asks the agent nothing. The agent route sends to the live backend client, which has no test
+///     seam, so a press there would reach the backend: its routing is `ChatReplyField.route`,
+///     unit-tested, and its wiring is read from the source.
+///  5. A completion empties only what was sent: a draft typed in the sheet after the send stays.
 @Suite("Chat reply field at run time", .serialized, .processGlobalState)
 @MainActor
 struct ChatReplyFieldRuntimeTests {
@@ -52,6 +55,10 @@ struct ChatReplyFieldRuntimeTests {
         var expanded = false
         /// Signed in: the open sheet shows its input bar, not the sign-in bar.
         var signedIn = false
+        /// Sends of the unchanged ready AI Reply (`onSendReadyReply`): the compose card opens.
+        var readySends = 0
+        /// Words the field sent to the agent (`onFieldSend`).
+        var fieldSends: [String] = []
         init(_ message: MessageHeader) { self.message = message }
     }
 
@@ -62,7 +69,9 @@ struct ChatReplyFieldRuntimeTests {
                 message: host.message, isExpanded: $host.expanded, isWorking: .constant(false),
                 replyField: ChatReplyField(
                     readyText: ChatReplyField.readyText(newest: host.message, isOwn: false),
-                    isNoReply: false, clearCount: host.clearCount))
+                    isNoReply: false, clearCount: host.clearCount),
+                onSendReadyReply: { host.readySends += 1 },
+                onFieldSend: { host.fieldSends.append($0) })
             .environment(\.hasTabMailSession, host.signedIn)
         }
     }
@@ -114,6 +123,10 @@ struct ChatReplyFieldRuntimeTests {
     ) async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        // The open sheet's input bar needs a plan: set it here, never from an earlier suite.
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        saved.setChatView(on: true)
+        defer { saved.restore() }
         ChatPillState.shared.removeAllSessions()
         let host = Host(message)
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
@@ -144,6 +157,70 @@ struct ChatReplyFieldRuntimeTests {
             return true
         }
         return view.subviews.contains { type(words, in: $0) }
+    }
+
+    @Test("The field's Send opens compose for the unchanged AI Reply and keeps it there; an empty field sends nothing")
+    func sendOpensComposeForTheReadyReply() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")
+        try await HostedAccessibility.withAutomation { try await sendOpensComposeForTheReadyReplyBody() }
+    }
+
+    private func sendOpensComposeForTheReadyReplyBody() async throws {
+        try await withMountedField(Self.header("field-send-A", ready: "A ready reply")) { host, controller in
+            host.signedIn = true
+            try await Self.settle()
+            #expect(Self.fieldTexts(controller.view).contains("A ready reply"), "control: the field starts filled")
+            #expect(HostedAccessibility.activate("chatSend", in: controller.view),
+                    "the mounted field has a Send that takes a tap: \(HostedAccessibility.identifiers(in: controller.view))")
+            try await Self.settle()
+            #expect(host.readySends == 1, "Send with the unchanged AI Reply opens the compose card")
+            #expect(host.fieldSends.isEmpty, "and asks the agent nothing")
+            #expect(Self.fieldTexts(controller.view).contains("A ready reply"), "a closed card leaves the words")
+        }
+        try await withMountedField(Self.header("field-send-B")) { host, controller in
+            host.signedIn = true
+            try await Self.settle()
+            #expect(Self.fieldTexts(controller.view).allSatisfy { $0.isEmpty }, "control: the field starts empty")
+            _ = HostedAccessibility.activate("chatSend", in: controller.view)
+            try await Self.settle()
+            #expect(host.readySends == 0 && host.fieldSends.isEmpty, "an empty field sends nothing")
+        }
+    }
+
+    @Test("A sent reply empties the field it was sent from, but not a newer draft typed in the sheet after the send")
+    func completionKeepsANewerDraft() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted Send")
+        try await HostedAccessibility.withAutomation { try await completionKeepsANewerDraftBody() }
+    }
+
+    private func completionKeepsANewerDraftBody() async throws {
+        for typesNewer in [false, true] {
+            try await withMountedField(Self.header("field-order-\(typesNewer)", ready: "A ready reply")) { host, controller in
+                host.signedIn = true
+                try await Self.settle()
+                #expect(HostedAccessibility.activate("chatSend", in: controller.view), "control: the field's Send ran")
+                try await Self.settle()
+                #expect(host.readySends == 1, "control: the compose card opened")
+                if typesNewer {
+                    host.expanded = true
+                    try await Task.sleep(for: .milliseconds(600))
+                    #expect(Self.type("My newer draft", in: controller.view), "the open sheet has a native editable field")
+                    try await Self.settle()
+                    host.expanded = false
+                    try await Task.sleep(for: .milliseconds(600))
+                    #expect(Self.fieldTexts(controller.view).contains("My newer draft"), "control: the draft is in the field")
+                }
+                // The compose card was sent: `ChatThreadView.composeEnded` bumps the count.
+                host.clearCount += 1
+                try await Self.settle()
+                let texts = Self.fieldTexts(controller.view)
+                if typesNewer {
+                    #expect(texts.contains("My newer draft"), "the newer draft stays: \(texts)")
+                } else {
+                    #expect(!texts.isEmpty && texts.allSatisfy { $0.isEmpty }, "the sent words are gone: \(texts)")
+                }
+            }
+        }
     }
 
     @Test("A send or an answer from the field empties it, and the ready AI Reply does not come back")

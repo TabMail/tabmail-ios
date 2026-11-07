@@ -1033,7 +1033,6 @@ struct DynamicIslandChat: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .accessibilityIdentifier("chatReplyField")
     }
 
     private var signInBar: some View {
