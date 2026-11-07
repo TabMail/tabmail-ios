@@ -1,6 +1,6 @@
 # MIS-IOS-030 — picked a PR's focused suites by subject, and missed a test that reads the changed file's source
 
-**Recurrences:** 4
+**Recurrences:** 5
 **Status:** Active
 **First recorded:** 2026-11-05
 
@@ -53,6 +53,16 @@ PR on and was found only by the train-tip gate, after the stack had been rebased
 The tell this time: *"the new test passes in the PR I added it to."* In a stack, a test added to an
 earlier PR also has to pass at the tip, and a source check should match the smallest token that
 carries its meaning.
+
+## Recurrence 5 (2026-11-07, the chat view train, round 11)
+
+A round-11 change to the reply field's PR edited `DynamicIslandChatButton.swift` (the field now binds
+`typedText`), and its focused run named the reply-field and sending-bubble suites but not
+`ChatPillDictationWiringTests`, which reads that file's source for the waveform's `TextField(...)`
+line. The anchor went stale and only the train-tip gate found it.
+
+The tell this time: *"the suites about the feature I changed."* The rule below already said to `rg -l`
+every edited file; it was skipped because the edit looked like the feature's own.
 
 ## The rule
 
