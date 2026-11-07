@@ -40,7 +40,7 @@ enum AIResponseParser {
         let reminderTime = reminderContent == nil ? nil : (reminder["due_time"] as? String).flatMap(oneLine)
             .flatMap { $0.range(of: #"^\d{2}:\d{2}$"#, options: .regularExpression) != nil ? $0 : nil }
         return SummaryResult(
-            blurb: (object["summary"] as? String).flatMap(oneLine),
+            blurb: (object["summary"] as? String).flatMap { nonEmpty($0.replacingOccurrences(of: "\n", with: " ")) },
             todos: todos.isEmpty ? nil : todos,
             reminderDate: reminderDate,
             reminderTime: reminderTime,
@@ -74,15 +74,15 @@ enum AIResponseParser {
         return text.isEmpty || lower == "none" || lower == "\"none\"" ? nil : text
     }
 
-    /// Trimmed, nil only when empty. For the reply body and the text messages: the backend sends
-    /// them as plain strings with no "None" word for a missing value, so a reply that is the word
-    /// "None" is kept as written.
+    /// Trimmed, nil only when empty. For the summary, the reply body and the text messages: the
+    /// backend sends them as plain strings with no "None" word for a missing value (it accepts any
+    /// nonblank summary), so a summary or reply that is the word "None" is kept as written.
     private static func nonEmpty(_ value: String) -> String? {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? nil : text
     }
 
-    /// `trimmed`, with its newlines turned into spaces (the one-line stored fields).
+    /// `trimmed`, with its newlines turned into spaces (the one-line todo and reminder fields).
     private static func oneLine(_ value: String) -> String? {
         trimmed(value.replacingOccurrences(of: "\n", with: " "))
     }
