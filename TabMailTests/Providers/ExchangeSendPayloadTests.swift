@@ -96,4 +96,13 @@ struct ExchangeSendPayloadTests {
         let payload = makeProvider().buildGraphSendPayload(draft: draft)
         #expect(payload["subject"] as? String == subject)
     }
+
+    @Test("A Graph error body is summarized as code and message")
+    func graphErrorSummary() {
+        let body = Data(#"{"error":{"code":"SomeCode","message":"Some message."}}"#.utf8)
+        #expect(ExchangeProvider.graphErrorSummary(body) == "SomeCode: Some message.")
+        #expect(ExchangeProvider.graphErrorSummary(Data(#"{"error":{"code":"SomeCode"}}"#.utf8)) == "SomeCode")
+        #expect(ExchangeProvider.graphErrorSummary(Data("not json".utf8)) == nil)
+        #expect(ExchangeProvider.graphErrorSummary(nil) == nil)
+    }
 }

@@ -27,12 +27,21 @@ struct AuthedHTTP: Sendable {
     /// Optional URLSession override — used by tests to inject a URLProtocol-backed
     /// session. Production call sites omit this and get the shared ephemeral session.
     let session: URLSession?
+    /// Called once with a request's final failure (after any 401 refresh and
+    /// rate-limit retries) before the error is thrown: the method, the status and
+    /// the provider's error body. Lets a provider log the error it names; it is
+    /// never handed the request body or the token.
+    let onFailure: (@Sendable (_ method: String, _ statusCode: Int, _ errorBody: Data?) -> Void)?
 
-    init(auth: any AuthSource, retry: HTTPRetryPolicy, logLabel: String? = nil, session: URLSession? = nil) {
+    init(
+        auth: any AuthSource, retry: HTTPRetryPolicy, logLabel: String? = nil, session: URLSession? = nil,
+        onFailure: (@Sendable (_ method: String, _ statusCode: Int, _ errorBody: Data?) -> Void)? = nil
+    ) {
         self.auth = auth
         self.retry = retry
         self.logLabel = logLabel
         self.session = session ?? Self.sessionOverride
+        self.onFailure = onFailure
     }
 
     func get(_ url: String, extraHeaders: [String: String] = [:]) async throws -> Data {
@@ -137,6 +146,7 @@ struct AuthedHTTP: Sendable {
         if let data = result.data {
             return data
         }
+        onFailure?(method, result.statusCode, result.errorBody)
         if result.statusCode == 400, let errorBody = result.errorBody {
             throw HTTPError.networkErrorWithBody(statusCode: 400, body: errorBody)
         }
@@ -167,6 +177,7 @@ struct AuthedHTTP: Sendable {
         if let data = result.data {
             return data
         }
+        onFailure?(method, result.statusCode, result.errorBody)
         throw HTTPError.networkError(statusCode: result.statusCode)
     }
 

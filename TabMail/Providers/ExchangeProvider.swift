@@ -1520,10 +1520,30 @@ actor ExchangeProvider: EmailProvider {
         if let cached = authedHTTPCached { return cached }
         let built = AuthedHTTP(
             auth: AccountAuthSource(accountId: userEmail, accessToken: accessToken),
-            retry: .graph, logLabel: "Exchange", session: testSession
+            retry: .graph, logLabel: "Exchange", session: testSession,
+            onFailure: Self.logGraphFailure
         )
         authedHTTPCached = built
         return built
+    }
+
+    /// Debug log of a failed Graph request, naming Graph's error code and message
+    /// (a `400` otherwise reaches the log as a bare status). Never the request
+    /// body or the token. A no-op unless debug logging is on.
+    static func logGraphFailure(method: String, statusCode: Int, errorBody: Data?) {
+        BackgroundSyncLogger.logDebug(
+            "[Exchange] Graph \(method) failed: HTTP \(statusCode) \(graphErrorSummary(errorBody) ?? "(no Graph error)")")
+    }
+
+    /// `code: message` from a Graph error body (`{"error": {"code", "message"}}`),
+    /// or nil when the body isn't one.
+    static func graphErrorSummary(_ body: Data?) -> String? {
+        guard let body,
+              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let error = json["error"] as? [String: Any],
+              let code = error["code"] as? String else { return nil }
+        guard let message = error["message"] as? String, !message.isEmpty else { return code }
+        return "\(code): \(message)"
     }
 
     /// ⚑ THE `default` ARM TRAPS; IT MUST NEVER DOWNGRADE TO `GET`. Until R15-FIX-3
