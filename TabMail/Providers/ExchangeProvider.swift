@@ -1735,6 +1735,11 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Sending Helpers
 
+    /// PidTagInReplyToId, the property Exchange writes a sent message's In-Reply-To from.
+    static let graphInReplyToProperty = "String 0x1042"
+    /// PidTagInternetReferences, the property Exchange writes a sent message's References from.
+    static let graphReferencesProperty = "String 0x1039"
+
     nonisolated func buildGraphSendPayload(draft: DraftMessage) -> [String: Any] {
         var message: [String: Any] = [:]
 
@@ -1759,17 +1764,20 @@ actor ExchangeProvider: EmailProvider {
             ["emailAddress": ["address": email]]
         }
 
-        // Threading headers (RFC 2822 requires angle brackets around message IDs)
-        var customHeaders: [[String: String]] = []
+        // Threading (RFC 2822 requires angle brackets around message IDs). Graph's
+        // `internetMessageHeaders` takes only custom `x-` headers, so In-Reply-To and
+        // References go as the MAPI properties Exchange writes those headers from. Graph
+        // takes them when a message is created, in a draft's PATCH and in sendMail's message.
+        var threading: [[String: String]] = []
         if let inReplyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
-            customHeaders.append(["name": "In-Reply-To", "value": inReplyTo])
+            threading.append(["id": Self.graphInReplyToProperty, "value": inReplyTo])
         }
         let references = IMAPProvider.threadingMessageIDs(draft.references)
         if !references.isEmpty {
-            customHeaders.append(["name": "References", "value": references.joined(separator: " ")])
+            threading.append(["id": Self.graphReferencesProperty, "value": references.joined(separator: " ")])
         }
-        if !customHeaders.isEmpty {
-            message["internetMessageHeaders"] = customHeaders
+        if !threading.isEmpty {
+            message["singleValueExtendedProperties"] = threading
         }
 
         // Attachments
