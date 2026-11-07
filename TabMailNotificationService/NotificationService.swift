@@ -830,9 +830,13 @@ final class NotificationService: UNNotificationServiceExtension {
                 toField: msg.to, ccField: msg.cc, fromField: msg.senderEmail,
                 claimEmails: [accountEmail], suppressEmails: NSEState.getAllAccountEmails()
             )
+            // A pushed email is in the inbox; from one of the user's addresses it is their own (a
+            // copy to themselves, or from another of their accounts), asked for in their voice.
             let summaryVars = PromptVariables.summaryVariables(
                 metadata: sharedMetadata, body: sharedBody, account: account,
-                recipientStatus: recipientStatus
+                recipientStatus: recipientStatus,
+                isSentByUser: PromptVariables.isSentByUser(
+                    fromAddress: msg.senderEmail, userAddresses: NSEState.getAllAccountEmails(), inSentFolder: false)
             )
 
             // Budget each LLM call from the run's REMAINING time (against the

@@ -1577,16 +1577,12 @@ actor ActiveAIQueue {
     /// and their text message is then in the user's voice.
     private func sentByUser(_ message: MessageHeader) async -> Bool {
         let found = try? await dbPool.read { db in
-            let addresses = try Account.fetchAll(db).map { $0.emailAddress.lowercased() }
+            let addresses = try Account.fetchAll(db).map(\.emailAddress)
             let role = try Folder.fetchOne(db, key: message.folderId)?.role
             return (addresses, role)
         }
         guard let (addresses, role) = found else { return false }
-        return Self.isSentByUser(fromAddress: message.fromAddress, accountAddresses: Set(addresses), folderRole: role)
-    }
-
-    nonisolated static func isSentByUser(fromAddress: String, accountAddresses: Set<String>, folderRole: FolderRole?) -> Bool {
-        accountAddresses.contains(fromAddress.lowercased()) || folderRole == .sent
+        return PromptVariables.isSentByUser(fromAddress: message.fromAddress, userAddresses: addresses, inSentFolder: role == .sent)
     }
 
     // MARK: - Action Job

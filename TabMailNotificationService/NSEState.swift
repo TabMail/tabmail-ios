@@ -20,8 +20,9 @@ enum NSEState {
     }
 
     /// All registered account email addresses (keys of the email→accountId map
-    /// the main app mirrors). Used only for the recipient-status SUPPRESS set —
-    /// returns [] when the mirror is missing (suppression just narrows).
+    /// the main app mirrors). Used for the recipient-status SUPPRESS set and to tell
+    /// the user's own email (`PromptVariables.isSentByUser`) — returns [] when the
+    /// mirror is missing (suppression just narrows; the email reads as incoming).
     static func getAllAccountEmails() -> [String] {
         guard let json = suite.string(forKey: SharedNSEData.accountMapKey),
               let data = json.data(using: .utf8),
