@@ -1622,7 +1622,7 @@ struct DynamicIslandChat: View {
     private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {
         isTextFieldFocused = false
         fieldFill.sent(input: inputText)
-        if ChatReplyField.route(text: text, readyText: field.readyText) == .readyReply {
+        if ChatReplyField.route(text: text, readyText: field.readyText, recipientsChanged: field.onlyTo != nil) == .readyReply {
             onSendReadyReply?()
             return
         }
@@ -2503,7 +2503,8 @@ struct DynamicIslandChat: View {
             let enrichedText: String
             if let numericId = contextNumericId, fromReplyField {
                 enrichedText = ChatReplyField.agentMessage(
-                    emailNumericId: numericId, text: text, isNoReply: replyField?.isNoReply ?? false)
+                    emailNumericId: numericId, text: text, isNoReply: replyField?.isNoReply ?? false,
+                    onlyTo: replyField?.onlyTo)
             } else if let numericId = contextNumericId {
                 enrichedText = "Regarding [Email](\(numericId)): \(text)"
             } else {

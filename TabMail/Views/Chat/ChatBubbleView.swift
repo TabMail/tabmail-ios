@@ -15,18 +15,16 @@ struct ChatBubbleView: View {
     var standInText: String? = nil
     let onOpen: () -> Void
 
+    @State private var showsOnlyList = false
+
     var body: some View {
         VStack(alignment: item.isOwn ? .trailing : .leading, spacing: 4) {
             HStack(alignment: .bottom, spacing: 8) {
                 if item.isOwn { Spacer(minLength: 0) }
                 if showsSender { ChatAvatar(person: item.sender, size: ChatViewLayout.avatarSize) }
                 VStack(alignment: item.isOwn ? .trailing : .leading, spacing: 4) {
-                    if showsSender {
-                        Text(item.sender.name)
-                            .font(.caption)
-                            .fontWeight(.medium)
-                            .foregroundStyle(ChatAvatar.color(for: item.sender))
-                            .lineLimit(1)
+                    if showsSender || item.repliedOnlyTo != nil {
+                        nameLine
                     }
                     bubble
                     if let names = extras?.attachmentNames, !names.isEmpty {
@@ -53,6 +51,39 @@ struct ChatBubbleView: View {
     }
 
     private var showsSender: Bool { isGroup && !item.isOwn }
+
+    /// The sender's name (group chats), or "You" on the user's own email, with a gray
+    /// "(replied only to …)" when the email did not go to everyone (R3.2, R3.3). One line; tap the
+    /// label for the full list (R3.4).
+    private var nameLine: some View {
+        HStack(spacing: 4) {
+            Text(item.isOwn ? "You" : item.sender.name)
+                .font(.caption)
+                .fontWeight(.medium)
+                .foregroundStyle(item.isOwn ? Theme.textSecondary : ChatAvatar.color(for: item.sender))
+                .fixedSize()
+            if let only = item.repliedOnlyTo {
+                Button { showsOnlyList = true } label: {
+                    Text("(replied only to \(only.label()))")
+                        .font(.caption)
+                        .foregroundStyle(Theme.textSecondary)
+                }
+                .buttonStyle(.plain)
+                .popover(isPresented: $showsOnlyList) {
+                    ChatPeopleList(
+                        title: "\(item.isOwn ? "You" : item.sender.name) replied only to",
+                        names: Self.listNames(only))
+                }
+            }
+        }
+        .lineLimit(1)
+        .accessibilityHidden(true)
+    }
+
+    /// The full list: "You" for the user.
+    static func listNames(_ only: ChatThread.OnlyTo) -> [String] {
+        (only.includesYou ? ["You"] : []) + only.people.map(\.name)
+    }
 
     private var shownText: String? { item.textMessage ?? standInText }
 
@@ -108,8 +139,16 @@ struct ChatBubbleView: View {
 
     /// Q25: what is on screen, in order.
     private var accessibilityText: String {
-        let words = shownText ?? "\(item.header.subject), summarizing"
-        return item.isOwn ? "You said: \(words)" : "\(item.sender.name) said: \(words)"
+        Self.accessibilityText(item: item, words: shownText ?? "\(item.header.subject), summarizing")
+    }
+
+    /// "Priya Vasanth replied only to you, said: …"; "You replied only to Priya Vasanth, saying: …";
+    /// "Sarah Chen said: …" for an email to everyone (Q25).
+    static func accessibilityText(item: ChatThread.Item, words: String) -> String {
+        let who = item.isOwn ? "You" : item.sender.name
+        guard let only = item.repliedOnlyTo else { return "\(who) said: \(words)" }
+        let names = only.names.joined(separator: ", ")
+        return "\(who) replied only to \(names), \(item.isOwn ? "saying" : "said"): \(words)"
     }
 
     private func attachmentChip(_ name: String) -> some View {
