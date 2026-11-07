@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -104,6 +105,47 @@ struct ChatThreadContextTests {
         #expect(context.extras[files.id]?.attachmentNames == ["cancel.ics"])
         #expect(context.extras[files.id]?.invite == nil)
         #expect(context.extras[plain.id] == nil, "no body yet, nothing extra")
+    }
+
+    @Test("The context reads every email's attachments and invite, never its stored HTML")
+    func loadNeverReadsTheHTML() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let statements = Mutex<[String]>([])
+        var config = Configuration()
+        config.prepareDatabase { db in
+            db.trace { event in statements.withLock { $0.append("\(event)") } }
+        }
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path, configuration: config)
+        _ = try AppDatabase(dbPool: pool)
+        _ = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "acc1", path: "INBOX", role: .inbox, pool: pool)
+        // A long thread: the uncapped lookup hands every member to the load.
+        let members = (1...30).map { Self.header(String($0)) }
+        try await pool.write { db in
+            for header in members {
+                try header.insert(db)
+                var body = MessageBody(contentKey: ContentKey(rawValue: header.id),
+                                       htmlContent: String(repeating: "<p>long body</p>", count: 500))
+                body.attachmentsJSON = try Self.attachmentsJSON([
+                    AttachmentInfo(filename: "notes-\(header.messageId).pdf", contentType: "application/pdf", section: "2", size: 10, encoding: nil),
+                ])
+                if header.messageId == "1" { body.icsText = Self.ics() }
+                try body.insert(db)
+            }
+        }
+        statements.withLock { $0.removeAll() }
+
+        let context = await ChatThreadContext.load(members: members, pool: PrioritizedDatabase(pool: pool))
+
+        #expect(context.extras.count == members.count, "every member, not a window")
+        #expect(context.extras[members[29].id]?.attachmentNames == ["notes-30.pdf"])
+        #expect(context.extras[members[0].id]?.invite?.parsed.title == "Planning")
+        let bodyReads = statements.withLock { $0 }.filter { $0.contains("\"messageBody\"") }
+        #expect(!bodyReads.isEmpty, "the load reads the body table")
+        #expect(bodyReads.allSatisfy { !$0.contains("htmlContent") && !$0.contains("*") },
+                "only the attachment list and calendar file: \(bodyReads)")
     }
 
     @Test("A read failure still finishes loading, with nothing extra")
