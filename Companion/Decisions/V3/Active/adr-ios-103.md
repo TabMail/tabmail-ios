@@ -248,7 +248,14 @@ same AI result, kept as long as the email itself is shown.
    sending; under it the grey caption every own email has, "Sending", then "Sent" once the provider
    took it (`sentAt`). Undo or a discard deletes the unsent row and the bubble with it; a filed row
    (sent, then appended to Sent) keeps the bubble, "Sent", until the email itself, by its own
-   Message-ID, is in the chat (`isInChat`, `settle`), or after `sentReplyLifetime`. The summary is
+   Message-ID, is in the chat (`isInChat`, `settle`), or until no email of its account carries that
+   Message-ID any more, or after `sentReplyLifetime`. Review round 11 (2026-11-07): Outlook files
+   its own copy under a Message-ID of its own and the Sent sync then drops our optimistic copy, so
+   with no chat on screen at that moment the bubble stayed under its own email for up to a day and
+   held the user's turn; `ChatSentReplies` now follows a filed row's Message-ID and ends the bubble
+   when no email carries it. Ending it at filing instead was tried and rejected: the chat reloads
+   its emails only after the Sent sync commits, so the bubble would vanish a moment before the
+   email shows. The summary is
    made at Send (`SentEmailSummary`, chat view on and AI allowed only): the outbox row gets its
    Message-ID at the queue write (`persistQueuedSend`; the claim keeps it and the send uses it),
    the summary is written to the AI cache under the Sent folder and that Message-ID, and the
@@ -264,7 +271,9 @@ same AI result, kept as long as the email itself is shown.
    no new state: Retry queues that row again and the bubble follows it back to "Sending", and Delete
    removes the row and the bubble with it. VoiceOver reaches both as the mark's named actions. The
    words are kept nowhere; nothing new is persisted (ADR-004).
-   Tests: `ChatSendingBubbleTests` (`failedSendRetryAndDelete` drives the hosted chat's own actions).
+   Tests: `ChatSendingBubbleTests` (`failedSendRetryAndDelete` drives the hosted chat's own actions;
+   `bubbleEndsWhateverIdTheProviderFilesUnder` sends through a provider that files its own
+   Message-ID and one that keeps ours; `summaryAtSendGate` turns each input of the gate off).
    **Superseded by the above (2026-11-07), kept for history:**
    *The Sent bubble before its email arrives (N7):* a reply sent from the chat (the ready AI Reply,
    or an agent compose asked for in the field) is kept in memory (`ChatSentReplies`, keyed by the

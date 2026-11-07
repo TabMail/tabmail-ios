@@ -21,10 +21,14 @@ import UIKit
 ///     same summary with no second bubble.
 ///  4. The bubble follows its own outbox row: "Sent" once the provider took the email, kept after
 ///     the row is filed until the email is in the chat; Undo of an unsent row removes it; a failed
-///     send says "Not sent". Another reply of the user's to the same email never ends it.
+///     send says "Not sent". Another reply of the user's to the same email never ends it. A filed
+///     row whose Message-ID no email carries any more ends it: with a provider that files its own
+///     copy under a Message-ID of its own (Outlook) the bubble ends, with no chat on screen, and is
+///     not the user's turn.
 ///  5. The wiring: a sent compose card reports its queued email's outbox row, and a queued (not
-///     deduplicated) send summarizes at once only with the chat view on and AI allowed. Read from
-///     the source: the compose card and the queue write cannot be driven from a unit test.
+///     deduplicated) send summarizes at once only with the chat view on and AI allowed. The gate
+///     is driven through each of its real inputs; the compose card cannot be driven from a unit
+///     test, so its trigger is read from the source.
 ///  6. A send that failed for good shows the red mark beside its bubble (owner 2026-11-07); the
 ///     mark's Retry puts the same outbox row back in the queue and the bubble back to "Sending",
 ///     and its Delete removes the row and the bubble. Driven through the hosted chat's own actions.
@@ -242,6 +246,15 @@ struct ChatSendingBubbleTests {
         try await pool.write { db in try db.execute(sql: "UPDATE outboxMessage SET sentAt = ? WHERE id = ?", arguments: [Date(), row.id]) }
         try await waitFor { replies.progress[row.id]?.caption == "Sent" }
         #expect(replies.progress[row.id]?.caption == "Sent", "Sent once the provider took it")
+
+        // Filed as the send files it: its Sent copy, under its own Message-ID, is written first.
+        let copy: MessageHeader = {
+            var header = Self.header("sent-\(row.id)", folder: "Sent", from: fixture.account.emailAddress,
+                                     inReplyTo: fixture.parent.rfc822MessageId)
+            header.rfc822MessageId = EmailFilter.normalizeMessageId(messageId)
+            return header
+        }()
+        try await pool.write { db in try copy.insert(db) }
         _ = try await pool.write { db in try OutboxMessage.deleteOne(db, key: row.id) }
         try await Task.sleep(for: .milliseconds(500))
         #expect(replies.entries.map(\.id) == [row.id], "a filed row keeps its bubble until the email is in the chat")
@@ -251,10 +264,30 @@ struct ChatSendingBubbleTests {
                                   inReplyTo: fixture.parent.rfc822MessageId)
         replies.settle([Self.ownItem(another)])
         #expect(replies.entries.map(\.id) == [row.id], "another email of the user's never ends it")
-        var copy = another
-        copy.rfc822MessageId = EmailFilter.normalizeMessageId(messageId)
         replies.settle([Self.ownItem(copy)])
         #expect(replies.entries.isEmpty, "its own email ends it")
+
+        // The provider filed its own copy under a Message-ID of its own, and the Sent sync replaced
+        // ours: no email carries ours any more, so the bubble ends with no chat on screen.
+        let replaced = try await Self.queueReply(fixture, draftId: "draft-replaced", holdsForUndo: true)
+        replies.composeEnded(.sent(outboxId: replaced.id), replyTo: fixture.parent)
+        try await waitFor { replies.progress[replaced.id] != nil }
+        try await pool.write { db in try db.execute(sql: "UPDATE outboxMessage SET sentAt = ? WHERE id = ?", arguments: [Date(), replaced.id]) }
+        try await waitFor { replies.progress[replaced.id]?.caption == "Sent" }
+        let oursId = EmailFilter.normalizeMessageId(try #require(replaced.sentMessageId))
+        let ours: MessageHeader = {
+            var header = Self.header("sent-\(replaced.id)", folder: "Sent", from: fixture.account.emailAddress,
+                                     inReplyTo: fixture.parent.rfc822MessageId)
+            header.rfc822MessageId = oursId
+            return header
+        }()
+        try await pool.write { db in try ours.insert(db) }
+        _ = try await pool.write { db in try OutboxMessage.deleteOne(db, key: replaced.id) }
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(replies.entries.map(\.id) == [replaced.id], "control: filed with its copy there, the bubble is kept")
+        _ = try await pool.write { db in try MessageHeader.deleteOne(db, key: ours.id) }
+        try await waitFor { replies.entries.isEmpty }
+        #expect(replies.entries.isEmpty, "no email carries its Message-ID any more: its bubble ends")
 
         // Undo of an unsent row removes its bubble.
         let undone = try await Self.queueReply(fixture, draftId: "draft-undo", holdsForUndo: true)
@@ -341,6 +374,114 @@ struct ChatSendingBubbleTests {
                 "no second bubble and no flash back: \(labels().prefix(20))")
         await queue.clearForTesting()
         await queue.setDispatchSuppressedForTesting(false)
+    }
+
+    /// A provider that files the sent email in Sent under a Message-ID of its own, as Outlook's
+    /// sendMail does, and one that keeps ours. No chat is on screen while the email goes out. Once
+    /// the email is in Sent, the chat holds it, so no bubble may be left for it and it may not be
+    /// the user's turn.
+    @Test("A reply's bubble ends once its email is in Sent, also when the provider files it under a Message-ID of its own",
+          arguments: [true, false])
+    func bubbleEndsWhateverIdTheProviderFilesUnder(providerAssigned: Bool) async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let replies = ChatSentReplies()
+        defer {
+            replies.removeAllForTesting()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        let fixture = try await Self.makeFixture(pool)
+        func waitFor(_ done: () -> Bool) async throws {
+            for _ in 0..<100 where !done() { try await Task.sleep(for: .milliseconds(100)) }
+        }
+        let row = try await Self.queueReply(fixture, draftId: "draft-provider-id", holdsForUndo: false)
+        let ours = EmailFilter.normalizeMessageId(try #require(row.sentMessageId))
+        #expect(replies.composeEnded(.sent(outboxId: row.id), replyTo: fixture.parent))
+        try await waitFor { replies.progress[row.id] != nil }
+        #expect(replies.progress[row.id]?.caption == "Sending", "control: the bubble follows the queued email")
+
+        #expect(await AccountManager.shared.atomicClaimForTesting(row), "control: the row is claimed")
+        let claimed = try #require(try await AppDatabase.dbPool.read { try OutboxMessage.fetchOne($0, key: row.id) })
+        let provider = MockEmailProvider()
+        var serverCopy = Self.header("server-\(row.id)", folder: "Sent", from: fixture.account.emailAddress,
+                                     inReplyTo: fixture.parent.rfc822MessageId)
+        serverCopy.rfc822MessageId = providerAssigned ? "provider-assigned-\(row.id)@example.com" : ours
+        serverCopy.subject = row.subject
+        serverCopy.date = Date()
+        await provider.setFetchMessagesResult([Self.serverInfo(serverCopy)])
+        let sentFolder = try #require(try await pool.read { db in
+            try Folder.filter(Column("accountId") == Self.account && Column("role") == FolderRole.sent.rawValue).fetchOne(db)
+        })
+        try await TestProviderRegistry.withRegisteredProvider(accountId: Self.account, provider: provider) {
+            await AccountManager.shared.sendClaimedOutboxMessageForTesting(claimed, messageId: try! #require(claimed.sentMessageId))
+            // The post-send Sent folder sync, run here so the test does not race the send's own.
+            try await SyncEngine().syncFolderMessages(folder: sentFolder, provider: provider)
+        }
+        let sent = try await Self.sentHeaders(pool)
+        let copy = try #require(sent.first { $0.rfc822MessageId == serverCopy.rfc822MessageId },
+                                "control: the provider's copy is in Sent: \(sent.map(\.rfc822MessageId))")
+        #expect(sent.contains { $0.rfc822MessageId == ours } == !providerAssigned,
+                "control: an email in Sent carries our Message-ID only when the provider kept it: \(sent.map(\.rfc822MessageId))")
+        #expect(try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) } == nil, "control: the row was filed")
+
+        if providerAssigned {
+            // No email carries ours any more: the bubble ends with no chat on screen.
+            try await waitFor { replies.entries.isEmpty }
+            #expect(replies.entries.isEmpty, "the provider's copy is the email, so its bubble ended: \(replies.entries.map(\.id)) \(replies.progress)")
+        }
+        // As the chat view computes it once it holds the email (pendingReplies, then
+        // unmatchedReplies): any left would be shown under the email and taken as the user's turn.
+        let chatIds = Set([fixture.parent.rfc822MessageId, copy.rfc822MessageId].compactMap { $0 })
+        let unmatched = replies.entries(accountId: Self.account, messageIds: chatIds)
+            .filter { !replies.isInChat($0, items: [Self.ownItem(copy)]) }
+        #expect(unmatched.isEmpty, "no Sent bubble and not the user's turn: \(unmatched.map(\.id))")
+        replies.settle([Self.ownItem(copy)])
+        #expect(replies.entries.isEmpty, "a chat showing the email ends its bubble")
+    }
+
+    // MARK: - 5. The gate of the summary at Send
+
+    enum GateInput: String, CaseIterable, Sendable {
+        case none, chatViewOff, optedOut, noPlan, signedOut, noConsent
+    }
+
+    /// Every input on, the summary at Send may run; any one off, it may not. Each input is set
+    /// through its real store.
+    @Test("The summary at Send runs only with the chat view on, AI on, a plan, a session and consent", arguments: GateInput.allCases)
+    func summaryAtSendGate(off: GateInput) throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let standard = UserDefaults.standard
+        let consentBefore = standard.object(forKey: AgeAndTermsConsent.completedKey)
+        let previousSession = TabMailSessionStore.shared.loadActiveSession()?.data
+        let previousDemo = DemoModeStore.shared.isActive
+        defer {
+            _ = TabMailAuthService.completeSession(mode: .deactivate, notify: false)
+            if let previousSession { _ = try? TabMailSessionStore.shared.installNewSession(previousSession) }
+            DemoModeStore.shared.isActive = previousDemo
+            if let consentBefore { standard.set(consentBefore, forKey: AgeAndTermsConsent.completedKey) } else {
+                standard.removeObject(forKey: AgeAndTermsConsent.completedKey)
+            }
+            saved.restore()
+        }
+        saved.setChatView(on: true)
+        DemoModeStore.shared.isActive = false
+        standard.set(true, forKey: AgeAndTermsConsent.completedKey)
+        let sessionData = try JSONSerialization.data(withJSONObject: [
+            "access_token": "synthetic-worker-token", "refresh_token": "synthetic-refresh-token",
+            "expires_at": Int(Date().addingTimeInterval(86400).timeIntervalSince1970),
+            "user": ["id": "11111111-1111-4111-8111-111111111111", "email": "user@example.com"],
+        ])
+        _ = try TabMailSessionStore.shared.installNewSession(sessionData)
+        #expect(!TutorialCoordinator.shared.isRunning, "control: no tutorial running")
+
+        switch off {
+        case .none: break
+        case .chatViewOff: standard.set(false, forKey: ChatViewConfig.enabledKey)
+        case .optedOut: AIService.optOutStore.set(true, forKey: AIService.optOutAllAIKey)
+        case .noPlan: AISubscriptionGate.shared.closeGate()
+        case .signedOut: _ = TabMailAuthService.completeSession(mode: .deactivate, notify: false)
+        case .noConsent: standard.set(false, forKey: AgeAndTermsConsent.completedKey)
+        }
+        #expect(SentEmailSummary.mayRun() == (off == .none), "with \(off.rawValue) off")
     }
 
     // MARK: - 6. A send that failed for good
@@ -446,11 +587,6 @@ struct ChatSendingBubbleTests {
             + "let outboxId = result.outboxId Task { guard await SentEmailSummary.mayRun() else { return } "
             + "await SentEmailSummary.summarize(outboxId: outboxId) } }", in: outbox) == 1)
         #expect(Self.count("SentEmailSummary.summarize(", in: outbox) == 1, "nothing else summarizes at Send")
-
-        let summary = try Self.source("TabMail/Services/AI/SentEmailSummary.swift")
-        #expect(Self.count("ChatViewConfig.opensInChat && TabMailAuthService.hasSession() "
-            + "&& UserDefaults.standard.bool(forKey: AgeAndTermsConsent.completedKey) "
-            + "&& !AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey) "
-            + "&& AISubscriptionGate.shared.isActive", in: summary) == 1)
+        // The gate itself is driven through its real inputs in `summaryAtSendGate`.
     }
 }

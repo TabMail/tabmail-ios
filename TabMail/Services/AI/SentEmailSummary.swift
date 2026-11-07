@@ -13,16 +13,16 @@ import GRDB
 ///
 /// Thunderbird summarizes a sent email when it processes its Sent copy; this only moves the trigger
 /// earlier (ADR-IOS-008, recorded divergence). Nothing new is stored: it is the AI cache entry the
-/// Sent copy would have written.
+/// Sent copy would have written. An entry no Sent copy takes (the send was undone, or Outlook filed
+/// its own copy under a Message-ID of its own) is purged with the other orphaned AI cache entries.
 enum SentEmailSummary {
     /// Whether a send summarizes its email now: the chat view is on and AI may run. Read once, at
     /// the queue write.
     @MainActor static func mayRun() -> Bool {
+        // The chat view is on only with AI on: not opted out, and a plan (`ChatViewConfig.isActive`).
         ChatViewConfig.opensInChat
             && TabMailAuthService.hasSession()
             && UserDefaults.standard.bool(forKey: AgeAndTermsConsent.completedKey)
-            && !AIService.optOutStore.bool(forKey: AIService.optOutAllAIKey)
-            && AISubscriptionGate.shared.isActive
     }
 
     /// What the summary call needs, read from the queued outbox row.
