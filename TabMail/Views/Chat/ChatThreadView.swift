@@ -310,8 +310,6 @@ struct ChatThreadView: View {
             isGroup: thread.isGroup,
             extras: context.extras[item.id],
             isHighlighted: highlightedId == item.id,
-            standInText: item.isOwn && item.textMessage == nil
-                ? ChatSentReplies.entry(for: item.header, in: pendingReplies(thread))?.text : nil,
             onOpen: { cardMessage = item.header })
         .id(item.id)
     }
@@ -461,12 +459,12 @@ struct ChatThreadView: View {
     }
 
     /// A compose card from the chat closed. Sent: the field empties and, for a reply, the chat
-    /// shows the words until the sent email's own text message arrives (N6.3, N7).
+    /// shows the words until the sent email arrives in the chat (N6.3, N7).
     private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?, words: String?) {
         if sentReplies.composeEnded(outcome, replyTo: replyTo, words: words) { fieldClearCount += 1 }
     }
 
-    /// This chat's sent replies still waiting for their email's text message.
+    /// This chat's sent replies, until an own reply to their email arrives.
     private func pendingReplies(_ thread: ChatThread) -> [ChatSentReplies.Entry] {
         guard let accountId = thread.newest?.accountId else { return [] }
         return sentReplies.entries(
@@ -475,7 +473,8 @@ struct ChatThreadView: View {
 
     /// Sent replies whose email is not in the chat yet.
     private func unmatchedReplies(_ thread: ChatThread) -> [ChatSentReplies.Entry] {
-        let matched = Set(thread.items.compactMap { ChatSentReplies.entry(for: $0.header, in: pendingReplies(thread))?.id })
+        let own = thread.items.filter(\.isOwn)
+        let matched = Set(own.compactMap { ChatSentReplies.entry(for: $0.header, in: pendingReplies(thread))?.id })
         return pendingReplies(thread).filter { !matched.contains($0.id) }
     }
 

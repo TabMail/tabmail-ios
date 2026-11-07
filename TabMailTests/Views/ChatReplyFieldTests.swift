@@ -139,7 +139,7 @@ struct ChatReplyFieldTests {
 
     // MARK: - 5. Sent replies
 
-    @Test("A sent reply belongs to the email that answers it, sent from about then, in the same account")
+    @Test("An own email answering the same email from about then, in the same account, ends a sent reply's bubble")
     func sentReplyMatching() {
         let replies = ChatSentReplies()
         replies.add(accountId: "acc1", repliedTo: "<1@example.com>", text: "  Tuesday works \n", sentAt: Self.now)
@@ -207,19 +207,20 @@ struct ChatReplyFieldTests {
                 "the prompt whose Enable starts dictation never shows in the chat")
     }
 
-    @Test("A sent reply goes once its email has a text message, or after its lifetime")
+    @Test("A sent reply goes once an own email answering it arrives, summarized or not, or after its lifetime")
     func sentReplySettles() {
         let replies = ChatSentReplies()
         replies.add(accountId: "acc1", repliedTo: "<1@example.com>", text: "Tuesday works", sentAt: Self.now)
         replies.add(accountId: "acc1", repliedTo: "<8@example.com>", text: "Sure", sentAt: Self.now)
 
-        let summarizing = Self.item(Self.header("2", inReplyTo: "<1@example.com>"))
-        replies.settle([summarizing], now: Self.now)
-        #expect(replies.entries.count == 2, "still being summarized")
+        let someoneElse = Self.item(Self.header("2", inReplyTo: "<1@example.com>"))
+        replies.settle([someoneElse], now: Self.now)
+        #expect(replies.entries.count == 2, "someone else's reply to the same email is not the user's")
 
-        let summarized = Self.item(Self.header("2", inReplyTo: "<1@example.com>", text: "Tuesday works for me"))
-        replies.settle([summarized], now: Self.now)
-        #expect(replies.entries.map(\.repliedTo) == ["<8@example.com>"], "only the summarized email's entry goes")
+        let ownSummarizing = Self.item(Self.header("3", fromAddress: "me@example.com", inReplyTo: "<1@example.com>"))
+        #expect(ownSummarizing.isOwn && ownSummarizing.textMessage == nil, "control: own, not summarized yet")
+        replies.settle([ownSummarizing], now: Self.now)
+        #expect(replies.entries.map(\.repliedTo) == ["<8@example.com>"], "only the arrived email's entry goes")
 
         replies.settle([], now: Self.now.addingTimeInterval(ChatViewLayout.sentReplyLifetime))
         #expect(replies.entries.count == 1, "kept through its lifetime")

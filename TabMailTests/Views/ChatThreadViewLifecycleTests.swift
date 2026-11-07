@@ -27,6 +27,9 @@ import UIKit
 ///     a six-line ready AI Reply raises the thread's bottom by as much as it raises the field.
 ///  5. A context load that a newer member change cancelled never shows: the chat keeps the newer
 ///     load's accounts and attachment chips when the older read finally returns.
+///  6. An email shows only its own words: a reply sent from the chat shows its words as a Sent
+///     bubble until an own reply to that email arrives, and the arrived email never shows them,
+///     because nothing proves it is that send (a reply sent elsewhere can arrive first).
 ///
 /// What is on screen is read back from the summary queue, whose front is the latest request:
 /// the newest email on screen, then the rest of the screen, then the older ones.
@@ -460,6 +463,81 @@ struct ChatThreadViewLifecycleTests {
         try await Task.sleep(for: .seconds(1))
         #expect(!hold.state.withLock { $0.timedOut }, "control: the held read was released, not timed out")
         #expect(showsChip(), "the cancelled older load did not replace the newer one")
+        await queue.clearForTesting()
+        await queue.setDispatchSuppressedForTesting(false)
+    }
+
+    @Test("An arrived own reply shows only its own words, never a sent reply's: those stay on their Sent bubble until it goes")
+    func arrivedReplyShowsOnlyItsOwnWords() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation { try await arrivedReplyShowsOnlyItsOwnWordsBody() }
+    }
+
+    private func arrivedReplyShowsOnlyItsOwnWordsBody() async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let queue = ActiveAIQueue.shared
+        await queue.setDispatchSuppressedForTesting(true)
+        await queue.clearForTesting()
+        let replies = ChatSentReplies.shared
+        replies.removeAllForTesting()
+        defer {
+            replies.removeAllForTesting()
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        saved.setChatView(on: true)
+        let account = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
+        let now = Date()
+        func header(_ id: String, subject: String, from: String, minutesAgo: Double, inReplyTo: String?) -> MessageHeader {
+            var header = MessageHeader(
+                messageId: id, subject: subject, from: from, fromAddress: from, to: "someone@example.com",
+                date: now.addingTimeInterval(-minutesAgo * 60), snippet: "Note \(id)",
+                folderId: MessageIdentity.folderId(accountId: Self.account, folderPath: "INBOX"),
+                accountId: Self.account, folderPath: "INBOX", isInInbox: true)
+            header.rfc822MessageId = "<\(id)@example.com>"
+            header.inReplyTo = inReplyTo
+            header.headerComplete = true
+            header.bodyComplete = true
+            header.isRead = true
+            return header
+        }
+        let parent = header("words-parent", subject: "Lunch plans", from: "sender@example.com", minutesAgo: 10, inReplyTo: nil)
+        // An own reply to the parent, not summarized yet: a reply sent elsewhere, or this phone's.
+        let arrived = header("words-arrived", subject: "Re: Lunch plans", from: account.emailAddress,
+                             minutesAgo: 5, inReplyTo: "<words-parent@example.com>")
+        // Someone else answers the parent just now: not the user's email.
+        let others = header("words-other", subject: "Re: Lunch plans", from: "friend@example.com",
+                            minutesAgo: 0, inReplyTo: "<words-parent@example.com>")
+        try await pool.write { db in try parent.insert(db); try arrived.insert(db); try others.insert(db) }
+        // Two replies sent from the chat to the parent: one from about when the arrived email is
+        // dated, one sent after it, whose email has not arrived.
+        replies.add(accountId: Self.account, repliedTo: "<words-parent@example.com>", text: "Tuesday works for me",
+                    sentAt: arrived.date)
+        replies.add(accountId: Self.account, repliedTo: "<words-parent@example.com>", text: "And Thursday too",
+                    sentAt: now)
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: parent.id) })
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func labels() -> [String] { HostedAccessibility.labels(in: controller.view) }
+        func shows(_ words: String) -> Bool { labels().contains { $0.contains(words) } }
+        for _ in 0..<100 where !(shows("You said: Re: Lunch plans") && shows("And Thursday too")) {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(shows("And Thursday too"),
+                "a sent reply whose email has not arrived shows its words, whoever else answered: \(labels().prefix(20))")
+        #expect(shows("You said: Re: Lunch plans, summarizing"),
+                "the arrived own reply shows as itself, summarizing: \(labels().prefix(20))")
+        #expect(!shows("Tuesday works for me"), "no email shows a sent reply's words: \(labels().prefix(20))")
         await queue.clearForTesting()
         await queue.setDispatchSuppressedForTesting(false)
     }

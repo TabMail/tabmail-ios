@@ -11,8 +11,6 @@ struct ChatBubbleView: View {
     let isGroup: Bool
     let extras: ChatMemberExtras?
     let isHighlighted: Bool
-    /// The user's sent reply, shown until the email's own text message arrives (N7).
-    var standInText: String? = nil
     let onOpen: () -> Void
 
     var body: some View {
@@ -54,7 +52,7 @@ struct ChatBubbleView: View {
 
     private var showsSender: Bool { isGroup && !item.isOwn }
 
-    private var shownText: String? { item.textMessage ?? standInText }
+    private var shownText: String? { item.textMessage }
 
     private var bubble: some View {
         Button(action: onOpen) {

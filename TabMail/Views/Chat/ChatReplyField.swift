@@ -131,9 +131,11 @@ struct ChatFieldFill: Equatable {
     }
 }
 
-/// Replies sent from the chat whose email has no text message yet (N7). The bubble shows what the
-/// user said, or the ready AI Reply's text message, until the email's own text message arrives.
-/// In memory only: after a relaunch the sent email shows "Summarizing" until its summary lands.
+/// Replies sent from the chat whose email has not reached the chat yet (N7). A Sent bubble shows
+/// what the user said, or the ready AI Reply's text message, until an own reply to that email
+/// arrives; the arrived email then shows like any other, "Summarizing" until its own text message.
+/// The words never go on an email: a reply sent elsewhere to the same email can arrive first, and
+/// nothing here proves which email is which send. In memory only.
 @MainActor @Observable
 final class ChatSentReplies {
     static let shared = ChatSentReplies()
@@ -157,7 +159,7 @@ final class ChatSentReplies {
     }
 
     /// A compose card opened from the chat ended. Only a sent one counts: a sent reply keeps the
-    /// user's words as its Sent bubble until its email's text message arrives, and the caller empties
+    /// user's words as its Sent bubble until its email arrives in the chat, and the caller empties
     /// the field. A cancelled or failed card changes nothing. Returns whether it was sent.
     @discardableResult
     func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?, words: String?) -> Bool {
@@ -173,8 +175,8 @@ final class ChatSentReplies {
         entries.filter { $0.accountId == accountId && messageIds.contains($0.repliedTo) }
     }
 
-    /// The entry that is this email's: the user's reply to `repliedTo`, dated from about when it
-    /// was sent.
+    /// The entry an own email may have arrived for: a reply to `repliedTo`, dated from about when
+    /// it was sent. It only ends the entry's Sent bubble; it is no proof the email is that send.
     static func entry(for header: MessageHeader, in entries: [Entry]) -> Entry? {
         guard let inReplyTo = header.inReplyTo else { return nil }
         return entries.first { entry in
@@ -183,10 +185,10 @@ final class ChatSentReplies {
         }
     }
 
-    /// Drops the entries whose email now has its own text message, and old ones.
+    /// Drops the entries an own email has arrived for, and old ones.
     func settle(_ items: [ChatThread.Item], now: Date = Date()) {
         let done = Set(items.compactMap { item in
-            item.textMessage != nil ? Self.entry(for: item.header, in: entries)?.id : nil
+            item.isOwn ? Self.entry(for: item.header, in: entries)?.id : nil
         })
         if !done.isEmpty { entries.removeAll { done.contains($0.id) } }
         prune(now: now)

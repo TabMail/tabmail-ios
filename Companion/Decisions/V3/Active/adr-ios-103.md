@@ -229,11 +229,15 @@ same AI result, kept as long as the email itself is shown.
    debug-gated.
    **The Sent bubble before its email arrives (N7):** a reply sent from the chat (the ready AI Reply,
    or an agent compose asked for in the field) is kept in memory (`ChatSentReplies`, keyed by the
-   account and the replied-to Message-ID) and shown as the user's words: on the sent email's own
-   bubble while it has no text message (matched by `inReplyTo` and a date no earlier than the send
-   minus `ChatViewLayout.sentReplyDateSlack`), else as a pending bubble at the bottom. An entry goes
-   when its email's text message arrives (`settle`) or after `sentReplyLifetime`. After a relaunch
-   the sent email shows "Summarizing" until its summary lands; nothing is persisted (ADR-004).
+   account and the replied-to Message-ID) and shown as the user's words in a pending Sent bubble at
+   the bottom until an own email answering that Message-ID, dated no earlier than the send minus
+   `ChatViewLayout.sentReplyDateSlack`, is in the chat (`settle`), or after `sentReplyLifetime`.
+   The words never go on an email: an email shows only its own text message, "Summarizing" until
+   then. Review round 10 (2026-11-07): the date match had put a chat reply's words on a different
+   reply sent elsewhere to the same email; nothing proves which email is which send, so the match
+   now only ends the pending bubble. Awaiting the owner's blessing: the arrived email reads
+   "Summarizing" for the few seconds until its summary, instead of the user's words. Nothing is
+   persisted (ADR-004).
    **Product choices made in 3b, awaiting owner blessing:** the chat-view pill drops today's Reply
    and Archive menus (swipes come with PR 5, Forward and recipients with PR 4); the field-to-sheet
    change has no morph animation yet; the sheet is not sized to its content; a request that only
