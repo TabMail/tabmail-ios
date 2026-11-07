@@ -1415,3 +1415,40 @@ struct AICacheUpdatedAtEncodingMigrationTests {
         #expect(stored == textRow)
     }
 }
+
+extension AICacheUpdatedAtEncodingMigrationTests {
+    @Test("The conversion changes only updatedAt: summary, reply and reminder data survive")
+    func conversionKeepsAllOtherColumns() throws {
+        let db = try DatabaseQueue()
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: "v94_addDraftServerCopyNamesParent")
+        let stamp = Int64(Date().timeIntervalSince1970)
+        try db.write { conn in
+            var cache = MessageAICache(key: "acc:INBOX:message@example.com", rfc822MessageId: "message@example.com")
+            cache.summaryBlurb = "kept summary"
+            cache.summaryTodos = "kept todos"
+            cache.actionTag = .reply
+            cache.cachedReply = "kept reply"
+            cache.replyGeneratedAt = Date(timeIntervalSince1970: Double(stamp))
+            cache.reminderDate = "2099-01-01"
+            cache.reminderTime = "09:00"
+            cache.reminderContent = "kept reminder"
+            try cache.insert(conn)
+            try conn.execute(sql: "UPDATE messageAICache SET updatedAt = ?", arguments: [stamp])
+        }
+        func otherColumns(_ conn: Database) throws -> [Row] {
+            try Row.fetchAll(conn, sql: """
+                SELECT key, rfc822MessageId, summaryBlurb, summaryTodos, actionTag, cachedReply,
+                       replyGeneratedAt, reminderDate, reminderTime, reminderContent
+                FROM messageAICache ORDER BY key
+                """)
+        }
+        let before = try db.read(otherColumns)
+        try migrator.migrate(db)
+        let after = try db.read(otherColumns)
+        #expect(before.count == 1)
+        #expect(after == before)
+    }
+}
+

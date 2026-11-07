@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 /// #395 — an AI cache entry the notification extension staged and the main app merged
@@ -175,5 +176,160 @@ struct NSEAICacheUpdatedAtEncodingTests {
             branch: branch, processedAt: expired.timeIntervalSince1970
         )
         #expect(!survived, "\(branch): an entry older than the TTL was kept")
+    }
+}
+
+/// Rejects the first commit that inserts a message header, as a transient failure of the
+/// merge's header phase would, so the merge takes its full per-message fallback.
+private final class FailFirstHeaderCommit: TransactionObserver, @unchecked Sendable {
+    private let state = Mutex((pending: false, rejected: 0))
+    var rejected: Int { state.withLock { $0.rejected } }
+    func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+        eventKind.tableName == "messageHeader"
+    }
+    func databaseDidChange(with event: DatabaseEvent) {
+        if case .insert = event.kind { state.withLock { $0.pending = true } }
+    }
+    func databaseWillCommit() throws {
+        let refuse = state.withLock { value -> Bool in
+            guard value.pending, value.rejected == 0 else { return false }
+            value.rejected = 1
+            return true
+        }
+        if refuse { throw NSError(domain: "PhaseOneTransientFailure", code: 1) }
+    }
+    func databaseDidCommit(_ db: Database) { state.withLock { $0.pending = false } }
+    func databaseDidRollback(_ db: Database) { state.withLock { $0.pending = false } }
+}
+
+/// The merge's other cache-write leg (header phase failed, the full fallback creates the
+/// header), and the update-in-place semantics of an entry that already exists.
+extension NSEAICacheUpdatedAtEncodingTests {
+
+    private func openScenario() throws -> (dir: URL, pool: DatabasePool, previous: AppDatabase?, q: DatabaseQueue, path: String) {
+        let (dir, pool, previous) = try makeAppDatabase()
+        let path = dir.appendingPathComponent("nse_staging.sqlite").path
+        AppDatabase.createNSEStagingDB(atPath: path)
+        return (dir, pool, previous, try DatabaseQueue(path: path), path)
+    }
+
+    @Test("A header-phase failure still caches the AI result with its own age and cleans staging",
+          arguments: [true, false])
+    func fallbackLegCachesWithSourceAge(fresh: Bool) async throws {
+        let (dir, pool, previous, q, path) = try openScenario()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: [q], directory: dir)
+        }
+        let failure = FailFirstHeaderCommit()
+        try await pool.write { $0.add(transactionObserver: failure, extent: .databaseLifetime) }
+        let age = fresh ? 0 : -Double(SyncConfig.aiCacheTTLDays + 1) * 86_400
+        let processedAt = Date().timeIntervalSince1970 + age
+        try stageRow(q, processedAt: processedAt, aiCompleted: true)
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+
+        #expect(failure.rejected == 1, "the header phase was not made to fail, so this is not the fallback leg")
+        let key = cacheKey
+        let cached = try await pool.read { try MessageAICache.fetchOne($0, key: key) }
+        #expect(cached?.summaryBlurb == "A short summary")
+        #expect(cached?.actionTag == .reply)
+        #expect(abs((cached?.updatedAt.timeIntervalSince1970 ?? 0) - processedAt) < 0.002)
+        #expect(try await pool.read { try MessageHeader.fetchOne($0) } != nil)
+        #expect(try await q.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM nse_processed_message") } == 0)
+
+        try await pool.write { try $0.execute(sql: "DELETE FROM messageHeader") }
+        purge(pool)
+        #expect(try await entryExists(pool) == fresh)
+    }
+
+    @Test("A staged result updates exactly the AI fields that changed and keeps every peer field",
+          arguments: ["summaryBlurb", "summaryTodos", "actionTag", "replyOnlyCache", "blurbNull", "todosNull", "actionNull"])
+    func existingEntryUpdatesAIFieldsOnly(changedField: String) async throws {
+        let (dir, pool, previous, q, path) = try openScenario()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: [q], directory: dir)
+        }
+        let key = cacheKey
+        let oldDate = Date().addingTimeInterval(-Double(SyncConfig.aiCacheTTLDays + 1) * 86_400)
+        // The entry as the main app left it, differing from the staged result in one field only
+        // (or holding nothing but a reply).
+        let replyOnly = changedField == "replyOnlyCache"
+        let incomingTodosNil = changedField == "blurbNull" || changedField == "todosNull"
+        let keepsReminder = !replyOnly && changedField != "blurbNull"
+        try await pool.write { db in
+            var prior = MessageAICache(key: key, rfc822MessageId: Self.rfc822)
+            prior.summaryBlurb = (replyOnly || changedField == "blurbNull") ? nil
+                : (changedField == "summaryBlurb" ? "An older summary" : "A short summary")
+            prior.summaryTodos = (replyOnly || changedField == "blurbNull") ? nil
+                : ((changedField == "summaryTodos" || changedField == "todosNull") ? "an older todo" : "todo one")
+            prior.actionTag = (replyOnly || changedField == "actionNull") ? nil
+                : (changedField == "actionTag" ? .archive : .reply)
+            prior.cachedReply = "preserved peer reply"
+            prior.replyGeneratedAt = oldDate
+            prior.reminderDate = keepsReminder ? "2099-01-01" : nil
+            prior.reminderTime = keepsReminder ? "09:00" : nil
+            prior.reminderContent = keepsReminder ? "preserved reminder" : nil
+            prior.updatedAt = oldDate
+            try prior.insert(db)
+        }
+        let processedAt = Date().timeIntervalSince1970
+        try stageRow(q, processedAt: processedAt, aiCompleted: true)
+        if incomingTodosNil {
+            try await q.write { try $0.execute(sql: "UPDATE nse_processed_message SET summaryTodos = NULL") }
+        }
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+
+        let after = try await pool.read { try MessageAICache.fetchOne($0, key: key) }
+        #expect(after?.summaryBlurb == "A short summary")
+        #expect(after?.summaryTodos == (incomingTodosNil ? nil : "todo one"))
+        #expect(after?.actionTag == .reply)
+        #expect(abs((after?.updatedAt.timeIntervalSince1970 ?? 0) - processedAt) < 0.002)
+        #expect(after?.cachedReply == "preserved peer reply")
+        #expect(abs((after?.replyGeneratedAt?.timeIntervalSince1970 ?? 0) - oldDate.timeIntervalSince1970) < 0.002)
+        #expect(after?.reminderDate == (keepsReminder ? "2099-01-01" : nil))
+        #expect(after?.reminderTime == (keepsReminder ? "09:00" : nil))
+        #expect(after?.reminderContent == (keepsReminder ? "preserved reminder" : nil))
+        #expect(after?.rfc822MessageId == Self.rfc822)
+    }
+
+    @Test("A staged summary without its terminal action leaves a known cached action alone",
+          arguments: [false, true])
+    func incompleteStageKeepsKnownAction(headerPhaseFails: Bool) async throws {
+        let (dir, pool, previous, q, path) = try openScenario()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: [q], directory: dir)
+        }
+        let key = cacheKey
+        try await pool.write { db in
+            try MessageAICache.writeThrough(
+                accountId: Self.accountId, folderPath: "INBOX", rfc822MessageId: Self.rfc822,
+                summaryBlurb: "Prior complete summary", summaryTodos: "prior todo",
+                actionTag: .archive, cachedReply: "preserved peer reply", db: db)
+        }
+        let failure = FailFirstHeaderCommit()
+        if headerPhaseFails {
+            try await pool.write { $0.add(transactionObserver: failure, extent: .databaseLifetime) }
+        }
+        try stageRow(q, processedAt: Date().timeIntervalSince1970, aiCompleted: false)
+        // The summary is staged before the terminal action vote.
+        try await q.write { db in
+            try db.execute(sql: """
+                UPDATE nse_processed_message SET summaryBlurb = 'A partial summary',
+                    summaryTodos = 'todo one', aiCompleted = 0
+                """)
+        }
+        await NSEDataBridge.mergeNSEStagingData(stagingPathOverride: path)
+
+        #expect(failure.rejected == (headerPhaseFails ? 1 : 0))
+        let cached = try await pool.read { try MessageAICache.fetchOne($0, key: key) }
+        #expect(cached?.actionTag == .archive)
+        #expect(cached?.summaryBlurb == "Prior complete summary")
+        #expect(cached?.cachedReply == "preserved peer reply")
+        // The staged row is still pending, so the terminal result can land later.
+        #expect(try await q.read {
+            try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM nse_processed_message WHERE aiCompleted = 0")
+        } == 1)
     }
 }
