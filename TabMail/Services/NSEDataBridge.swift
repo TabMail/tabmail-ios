@@ -2366,22 +2366,7 @@ enum NSEDataBridge {
                                             // list (e.g. a peer's precomputed `cachedReply`).
                                             // DO UPDATE touches only these four columns, and only
                                             // when the content actually differs.
-                                            try db.execute(sql: """
-                                                INSERT INTO messageAICache
-                                                    (key, summaryBlurb, summaryTodos, actionTag, updatedAt)
-                                                    VALUES (?, ?, ?, ?, ?)
-                                                ON CONFLICT(key) DO UPDATE SET
-                                                    summaryBlurb = excluded.summaryBlurb,
-                                                    summaryTodos = excluded.summaryTodos,
-                                                    actionTag = excluded.actionTag,
-                                                    updatedAt = excluded.updatedAt
-                                                WHERE summaryBlurb IS NOT excluded.summaryBlurb
-                                                   OR summaryTodos IS NOT excluded.summaryTodos
-                                                   OR actionTag IS NOT excluded.actionTag
-                                                """, arguments: [
-                                                    cacheKey, msg.summaryBlurb, msg.summaryTodos,
-                                                    msg.actionTag, msg.processedAt
-                                                ])
+                                            try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, db: db)
                                         }
                                     }
                                 } else {
@@ -2423,22 +2408,7 @@ enum NSEDataBridge {
                                         // Value-guarded UPSERT — same rationale as the existing-
                                         // header branch (no REPLACE-clobber of cachedReply, no
                                         // redundant count on a no-op re-write).
-                                        try db.execute(sql: """
-                                            INSERT INTO messageAICache
-                                                (key, summaryBlurb, summaryTodos, actionTag, updatedAt)
-                                                VALUES (?, ?, ?, ?, ?)
-                                            ON CONFLICT(key) DO UPDATE SET
-                                                summaryBlurb = excluded.summaryBlurb,
-                                                summaryTodos = excluded.summaryTodos,
-                                                actionTag = excluded.actionTag,
-                                                updatedAt = excluded.updatedAt
-                                            WHERE summaryBlurb IS NOT excluded.summaryBlurb
-                                               OR summaryTodos IS NOT excluded.summaryTodos
-                                               OR actionTag IS NOT excluded.actionTag
-                                            """, arguments: [
-                                                cacheKey, msg.summaryBlurb, msg.summaryTodos,
-                                                msg.actionTag, msg.processedAt
-                                            ])
+                                        try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, db: db)
                                     }
                                 }
                                 return .commit
@@ -3674,6 +3644,43 @@ enum NSEDataBridge {
         /// both meaning "same as `date`". Same `var`-with-default contract as
         /// `observedUidValidity`.
         var providerDate: Double? = nil
+    }
+
+    /// Value-guarded UPSERT of the extension's AI result into `messageAICache` — the ONE
+    /// place the merge writes that table, so both merge branches share one encoding.
+    ///
+    /// UPSERT, not INSERT OR REPLACE: re-writing the SAME cached summary/action on a
+    /// re-merge of a terminal row whose prior staging delete failed must be a 0-row
+    /// no-op — otherwise it bumps total_changes() (redundant reload) AND, since
+    /// REPLACE = delete+insert, NULLs columns it doesn't list (e.g. a peer's
+    /// precomputed `cachedReply`). DO UPDATE touches only these four columns, and
+    /// only when the content actually differs.
+    ///
+    /// `updatedAt` is bound as a `Date` (GRDB text), like every other writer of this
+    /// column. The staged `processedAt` is a number, and SQLite orders every number
+    /// below every text value, so binding it raw made the TTL purge's
+    /// `updatedAt < cutoff` count a fresh entry as expired (#395).
+    static func upsertAICacheFromStaging(
+        _ msg: StagedMessage,
+        cacheKey: String,
+        db: GRDB.Database
+    ) throws {
+        try db.execute(sql: """
+            INSERT INTO messageAICache
+                (key, summaryBlurb, summaryTodos, actionTag, updatedAt)
+                VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                summaryBlurb = excluded.summaryBlurb,
+                summaryTodos = excluded.summaryTodos,
+                actionTag = excluded.actionTag,
+                updatedAt = excluded.updatedAt
+            WHERE summaryBlurb IS NOT excluded.summaryBlurb
+               OR summaryTodos IS NOT excluded.summaryTodos
+               OR actionTag IS NOT excluded.actionTag
+            """, arguments: [
+                cacheKey, msg.summaryBlurb, msg.summaryTodos,
+                msg.actionTag, Date(timeIntervalSince1970: msg.processedAt)
+            ])
     }
 
     /// Body of the "insert new MessageHeader from NSE staging" branch of
