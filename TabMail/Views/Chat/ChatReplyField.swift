@@ -204,13 +204,13 @@ struct ChatReplyTarget: Equatable {
 /// A compose card the agent opens in the chat. `fromField`: it was asked for in the collapsed reply
 /// field, not in the open chat sheet.
 enum ChatAgentCompose {
-    /// Who a reply goes to (R1): asked for in the field with people chosen in Reply to, only them;
-    /// otherwise the agent's own recipients.
+    /// Who a reply goes to (R1): asked for in the field with people chosen in Reply to, only them,
+    /// with no Cc or Bcc; otherwise the agent's own recipients.
     static func replyRecipients(
-        fromField: Bool, target: ChatReplyTarget, to: [String], cc: [String]
-    ) -> (to: [String], cc: [String]) {
-        guard fromField, let only = target.only else { return (to, cc) }
-        return (only.map(\.address), [])
+        fromField: Bool, target: ChatReplyTarget, request req: AgentToolRouter.ComposeRequest
+    ) -> (to: [String], cc: [String], bcc: [String]) {
+        guard fromField, let only = target.only else { return (req.to, req.cc, req.bcc) }
+        return (only.map(\.address), [], [])
     }
 }
 
