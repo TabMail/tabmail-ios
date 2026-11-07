@@ -20,6 +20,10 @@ import Testing
 ///     message arrives, and only on the email that is that reply (N7).
 ///  6. The view wires each of these: hosted SwiftUI views cannot be driven from a unit test, so the
 ///     wiring is read from the source.
+///  7. A ready AI Reply fills the field only while the field is the app's, and only over an empty
+///     field or the AI Reply the app put there: never over words typed or said, in the field or in
+///     the open sheet, and never while a dictation is bringing words. One that arrives while the
+///     sheet is open or a dictation runs fills the untouched field once that ends.
 @Suite("Chat reply field")
 @MainActor
 struct ChatReplyFieldTests {
@@ -228,6 +232,95 @@ struct ChatReplyFieldTests {
         #expect(replies.entries.map(\.text) == ["New"], "adding prunes old entries")
     }
 
+    // MARK: - 7. Whose words are in the field
+
+    /// Offers `ready` with the field collapsed, nothing sent and no dictation, unless told otherwise.
+    private static func offer(
+        _ fill: inout ChatFieldFill, _ ready: String?, input: String,
+        expanded: Bool = false, sent: Bool = false, dictating: Bool = false
+    ) -> String? {
+        fill.offer(ready, input: input, expanded: expanded, sent: sent, dictating: dictating)
+    }
+
+    @Test("A newer AI Reply replaces the one the app put in the field, never words typed over it")
+    func readyReplyReplacesOnlyItsOwn() {
+        var fill = ChatFieldFill()
+        #expect(Self.offer(&fill, "First reply", input: "") == "First reply")
+        fill.edited("First reply", expanded: false)
+        #expect(!fill.isUsers, "the app's own fill is not the user's edit")
+        #expect(Self.offer(&fill, "Newer reply", input: "First reply") == "Newer reply")
+        fill.edited("Newer reply", expanded: false)
+
+        fill.edited("Newer reply, and more", expanded: false)
+        #expect(fill.isUsers)
+        #expect(Self.offer(&fill, "Latest reply", input: "Newer reply, and more") == nil)
+
+        // Emptied by hand, the field stays empty: the user took it.
+        var cleared = ChatFieldFill()
+        _ = Self.offer(&cleared, "A reply", input: "")
+        cleared.edited("", expanded: false)
+        #expect(Self.offer(&cleared, "A newer reply", input: "") == nil)
+    }
+
+    @Test("While a dictation runs no AI Reply fills the field; after it, the dictated words stay")
+    func dictationOwnsTheField() {
+        // Started on an empty field, a reply arrives while the words are transcribed.
+        var fill = ChatFieldFill()
+        _ = Self.offer(&fill, nil, input: "")
+        #expect(Self.offer(&fill, "Yes, Tuesday works.", input: "", dictating: true) == nil)
+        // The words land, then the dictation ends, in either order of the two changes.
+        #expect(Self.offer(&fill, "Yes, Tuesday works.", input: "My dictated request") == nil,
+                "the end of the dictation never replaces the words it brought")
+        fill.edited("My dictated request", expanded: false)
+        #expect(fill.isUsers)
+
+        // Nothing was said: the reply that arrived meanwhile fills the untouched field at the end.
+        var silent = ChatFieldFill()
+        #expect(Self.offer(&silent, "Yes, Tuesday works.", input: "", dictating: true) == nil)
+        #expect(Self.offer(&silent, "Yes, Tuesday works.", input: "") == "Yes, Tuesday works.")
+
+        // A new newest email while the field is empty and a dictation runs: still nothing fills it.
+        var newer = ChatFieldFill()
+        newer.newEmail(input: "")
+        #expect(Self.offer(&newer, "A reply to the newer email", input: "", dictating: true) == nil)
+    }
+
+    @Test("A reply that arrives while the sheet is open fills the untouched field when it closes; words left in the sheet stay")
+    func sheetKeepsItsWordsAndFillsOnClose() {
+        var fill = ChatFieldFill()
+        _ = Self.offer(&fill, nil, input: "")
+        #expect(Self.offer(&fill, "Yes, Tuesday works.", input: "", expanded: true) == nil, "never into the open sheet")
+        #expect(Self.offer(&fill, "Yes, Tuesday works.", input: "") == "Yes, Tuesday works.", "filled on close")
+
+        var asked = ChatFieldFill()
+        _ = Self.offer(&asked, nil, input: "")
+        asked.edited("My own question", expanded: true)
+        #expect(Self.offer(&asked, "Yes, Tuesday works.", input: "My own question") == nil, "on close")
+        #expect(Self.offer(&asked, "A later reply", input: "My own question") == nil, "and later")
+
+        // The sheet opened over the app's reply, a newer one came meanwhile: it replaces the older.
+        var older = ChatFieldFill()
+        _ = Self.offer(&older, "Older reply", input: "")
+        #expect(Self.offer(&older, "Newer reply", input: "Older reply", expanded: true) == nil)
+        #expect(Self.offer(&older, "Newer reply", input: "Older reply") == "Newer reply")
+    }
+
+    @Test("Words sent wait in the field; a send or an answer empties it for good; a new newest email frees an empty field")
+    func sendAndNewEmail() {
+        var fill = ChatFieldFill()
+        #expect(Self.offer(&fill, "A reply", input: "", sent: true) == nil, "never while the words are with the agent")
+        fill.cleared()
+        #expect(Self.offer(&fill, "A reply", input: "") == nil, "the emptied field stays empty")
+
+        fill.newEmail(input: "Words for the old email")
+        #expect(Self.offer(&fill, "A reply to the new email", input: "Words for the old email") == nil,
+                "words still in the field stay the user's")
+        fill.newEmail(input: "")
+        #expect(!fill.isUsers)
+        #expect(Self.offer(&fill, "A reply to the new email", input: "") == "A reply to the new email")
+        #expect(Self.offer(&fill, nil, input: "A reply to the new email") == "", "a reply taken back empties the app's fill")
+    }
+
     // MARK: - 6. Wiring
 
     private static func source(_ path: String) throws -> String {
@@ -249,9 +342,28 @@ struct ChatReplyFieldTests {
         return String(text[start.upperBound..<end.lowerBound])
     }
 
+    @Test("Every change that can fill the field asks ChatFieldFill, with the dictation and the sheet")
+    func fieldFillWiring() throws {
+        let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        let fill = try Self.body(of: "private func fillReadyReply() {", in: text)
+        #expect(Self.count("guard let replyField, let words = fieldFill.offer( replyField.readyText, input: inputText, expanded: isExpanded, sent: fieldSentText != nil, dictating: isDictating) else { return } inputText = words", in: fill) == 1)
+        #expect(Self.count("dictation.isActive || speech.isRecording || speech.isStarting", in: text) == 1)
+        #expect(Self.count(".onChange(of: replyField?.readyText, initial: true) { _, _ in fillReadyReply() }", in: text) == 1)
+        #expect(Self.count("fieldFill.newEmail(input: inputText) fillReadyReply()", in: text) == 1)
+        #expect(Self.count(".onChange(of: isExpanded) { _, expanded in if !expanded { fillReadyReply() } }", in: text) == 1)
+        #expect(Self.count(".onChange(of: isDictating) { _, dictating in if !dictating { fillReadyReply() } }", in: text) == 1)
+        #expect(Self.count("fieldSentText = nil fieldFill.cleared()", in: text) == 1)
+        #expect(Self.count("guard replyField != nil else { return } fieldFill.edited(text, expanded: isExpanded)", in: text) == 1)
+        #expect(Self.count("fillReadyReply()", in: text) == 5, "the four triggers and the definition")
+        #expect(Self.count("inputText = words", in: text) == 1, "the field is filled in one place")
+    }
+
     @Test("The field's Send opens compose for the unchanged AI Reply, else sends the words to the agent")
     func fieldSendWiring() throws {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        // Collapsed, the reply field's Send takes the field's route; the open sheet keeps the chat's.
+        let message = try Self.body(of: "private func sendMessage() {", in: text)
+        #expect(Self.count("if let replyField, !isExpanded { sendFromReplyField(text, replyField) return }", in: message) == 1)
         // Both dictation paths take the field's decision (on-device and cloud).
         #expect(Self.count("let replacesReadyReply = ChatReplyField.dictationReplaces( input: inputText, readyText: replyField?.readyText, expanded: isExpanded)", in: text) == 1)
         #expect(Self.count("speechBase = replacesReadyReply ? \"\" : inputText", in: text) == 1)

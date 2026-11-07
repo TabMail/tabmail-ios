@@ -56,8 +56,8 @@ struct DynamicIslandChat: View {
     @State private var inputText = ""
     /// Reply field: the words sent to the agent, shown pulsing while it works (N5, A2).
     @State private var fieldSentText: String?
-    /// Reply field: the user changed the field, so a ready AI Reply no longer fills it.
-    @State private var fieldTouched = false
+    /// Reply field: whose words are in it, so a ready AI Reply fills only the app's (`ChatFieldFill`).
+    @State private var fieldFill = ChatFieldFill()
     @State private var fieldPulse = false
     @State private var inputSelection: TextSelection?
     @State private var dictation = DictationController()
@@ -672,22 +672,29 @@ struct DynamicIslandChat: View {
                 speech.stop()
             }
         }
-        // Reply field (chat view): the ready AI Reply fills the untouched field; a clear empties it;
-        // a confirmation card while collapsed opens the sheet, which takes the request (A3).
+        // Reply field (chat view): the ready AI Reply fills the field while it is the app's, and is
+        // offered again when the sheet closes and when a dictation ends; a clear empties it; a
+        // confirmation card while collapsed opens the sheet, which takes the request (A3).
         .onChange(of: replyField?.readyText, initial: true) { _, _ in fillReadyReply() }
         .onChange(of: message?.id) { _, _ in
-            guard replyField != nil, inputText.isEmpty else { return }
-            fieldTouched = false
+            guard replyField != nil else { return }
+            fieldFill.newEmail(input: inputText)
             fillReadyReply()
+        }
+        .onChange(of: isExpanded) { _, expanded in
+            if !expanded { fillReadyReply() }
+        }
+        .onChange(of: isDictating) { _, dictating in
+            if !dictating { fillReadyReply() }
         }
         .onChange(of: replyField?.clearCount) { _, _ in
             inputText = ""
             fieldSentText = nil
-            fieldTouched = true
+            fieldFill.cleared()
         }
         .onChange(of: inputText) { _, text in
-            guard let replyField, !isExpanded, text != (replyField.readyText ?? "") else { return }
-            fieldTouched = true
+            guard replyField != nil else { return }
+            fieldFill.edited(text, expanded: isExpanded)
         }
         .onChange(of: chatMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
@@ -1623,10 +1630,17 @@ struct DynamicIslandChat: View {
         }
     }
 
-    /// The ready AI Reply fills the field while the user has not changed it.
+    /// The ready AI Reply fills the field while it is the app's (`ChatFieldFill.offer`).
     private func fillReadyReply() {
-        guard let replyField, !fieldTouched, fieldSentText == nil, !isExpanded else { return }
-        inputText = replyField.readyText ?? ""
+        guard let replyField, let words = fieldFill.offer(
+            replyField.readyText, input: inputText, expanded: isExpanded,
+            sent: fieldSentText != nil, dictating: isDictating) else { return }
+        inputText = words
+    }
+
+    /// A dictation is recording, transcribing, or starting: its words are coming to the field.
+    private var isDictating: Bool {
+        dictation.isActive || speech.isRecording || speech.isStarting
     }
 
     /// The field holds the ready AI Reply, unchanged (its top line says AI Reply, Q15).

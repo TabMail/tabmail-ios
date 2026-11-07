@@ -71,6 +71,10 @@ struct ChatThreadView: View {
 
     // The reply field: today's Chat pill on the newest email.
     @State private var chatExpanded = false
+    /// The collapsed pill's height, notices and chips included: the room the thread keeps under its
+    /// last bubble and the jump button (N2.10). The field grows to six lines, so it is measured;
+    /// the open sheet keeps the last collapsed height, so the thread does not move under it.
+    @State private var pillHeight = ChatViewLayout.pillStartHeight
     @State private var chatInputFocused = false
     @State private var chatWorking = false
     /// The ready AI Reply's compose card (N2.6): the email it answers.
@@ -226,7 +230,7 @@ struct ChatThreadView: View {
                         ForEach(unmatchedReplies(thread)) { entry in
                             ChatSentReplyBubble(text: entry.text)
                         }
-                        Color.clear.frame(height: ChatViewLayout.pillClearance).id(Self.bottomId)
+                        Color.clear.frame(height: pillHeight + ChatViewLayout.pillGap).id(Self.bottomId)
                     }
                     .scrollTargetLayout()
                     .padding(.top, 8)
@@ -282,6 +286,9 @@ struct ChatThreadView: View {
 
             if let newest = thread.newest {
                 pill(on: newest)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                        if !chatExpanded { pillHeight = height }
+                    }
             }
         }
     }
@@ -324,7 +331,7 @@ struct ChatThreadView: View {
         }
         .buttonStyle(.plain)
         .padding(.trailing)
-        .padding(.bottom, ChatViewLayout.pillClearance)
+        .padding(.bottom, pillHeight + ChatViewLayout.pillGap)
         .transition(.opacity)
         .accessibilityLabel("Jump to the newest email")
     }

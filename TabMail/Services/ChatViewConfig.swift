@@ -62,8 +62,11 @@ enum ChatViewLayout {
     static let bubbleCornerRadius: CGFloat = 18
     static let bubbleMaxWidthFraction: CGFloat = 0.78
     static let bubbleSpacing: CGFloat = 6
-    /// Room under the last bubble so it sits above the pill, never under it (N2.10).
-    static let pillClearance: CGFloat = 104
+    /// The one-line pill's height, used until the pill is measured: the thread keeps the measured
+    /// collapsed height under its last bubble, so it sits above the pill, never under it (N2.10).
+    static let pillStartHeight: CGFloat = 98
+    /// Room between the last bubble and the pill's top, beyond the bubble spacing.
+    static let pillGap: CGFloat = 6
     /// The jump-to-bottom button shows once the bottom is this far below the screen.
     static let jumpButtonThreshold: CGFloat = 240
     static let jumpButtonSize: CGFloat = 40
