@@ -131,11 +131,46 @@ struct ChatBubbleView: View {
 /// A reply just sent from the chat whose email is not in the chat yet (N7): a blue bubble from the
 /// queue write on, with the email's summary once it is made ("Summarizing" until then), and under
 /// it "Sending", then "Sent", as under every email of the user's. Its email's own bubble replaces it
-/// once the email is in the chat.
+/// once the email is in the chat. A send that failed for good reads "Not sent", with the red mark
+/// beside the bubble as in Messages; touch and hold offers Retry and Delete, which are the Outbox's
+/// own Retry and Discard for the same queued email (owner 2026-11-07).
 struct ChatSentReplyBubble: View {
     let progress: ChatSentReplies.Progress?
+    let retry: () -> Void
+    let delete: () -> Void
+
+    private var notSent: Bool { progress?.status == .notSent }
 
     var body: some View {
+        HStack(alignment: .center, spacing: 6) {
+            bubble
+            if notSent {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(Theme.destructive)
+                    .accessibilityLabel("Not sent")
+                    .accessibilityIdentifier(Self.notSentMarkId)
+                    .accessibilityAction(named: "Retry", retry)
+                    .accessibilityAction(named: "Delete", delete)
+            }
+        }
+        .contextMenu { if notSent { failedSendMenu } }
+        .containerRelativeFrame(.horizontal, alignment: .trailing) { width, _ in
+            width * ChatViewLayout.bubbleMaxWidthFraction
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.horizontal)
+    }
+
+    static let notSentMarkId = "chat.sentReply.notSent"
+
+    @ViewBuilder
+    private var failedSendMenu: some View {
+        Button(action: retry) { Label("Retry", systemImage: "arrow.clockwise") }
+        Button(role: .destructive, action: delete) { Label("Delete", systemImage: "trash") }
+    }
+
+    private var bubble: some View {
         VStack(alignment: .trailing, spacing: 4) {
             Group {
                 // Each branch says what it shows, so VoiceOver reads what is on screen.
@@ -166,11 +201,6 @@ struct ChatSentReplyBubble: View {
                 .font(.caption2)
                 .foregroundStyle(Theme.textSecondary)
         }
-        .containerRelativeFrame(.horizontal, alignment: .trailing) { width, _ in
-            width * ChatViewLayout.bubbleMaxWidthFraction
-        }
-        .frame(maxWidth: .infinity, alignment: .trailing)
-        .padding(.horizontal)
     }
 }
 

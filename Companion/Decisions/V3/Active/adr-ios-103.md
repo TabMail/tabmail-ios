@@ -257,9 +257,14 @@ same AI result, kept as long as the email itself is shown.
    summary returned takes it when it does. Owner's reason: the words typed in the chat are not
    guaranteed to be the summary, so a real summary of the final email is the simpler, correct
    source. Outlook does not keep our Message-ID, so its server copy is summarized as it arrives;
-   offline the bubble stays "Sending". Decided overnight, awaiting blessing: a send that failed for
-   good reads "Not sent". The words are kept nowhere; nothing new is persisted (ADR-004).
-   Tests: `ChatSendingBubbleTests`.
+   offline the bubble stays "Sending". **A send that failed for good (owner 2026-11-07):** it reads
+   "Not sent", with a red exclamation mark beside the bubble as in Messages; touch and hold offers
+   Retry and Delete (`ChatSentReplies.retry` / `delete`), which are the Outbox's own Retry and Discard
+   (`AccountManager.retryOutboxMessage`, `discardOutboxMessageConfirmed`) for the same outbox row, so
+   no new state: Retry queues that row again and the bubble follows it back to "Sending", and Delete
+   removes the row and the bubble with it. VoiceOver reaches both as the mark's named actions. The
+   words are kept nowhere; nothing new is persisted (ADR-004).
+   Tests: `ChatSendingBubbleTests` (`failedSendRetryAndDelete` drives the hosted chat's own actions).
    **Superseded by the above (2026-11-07), kept for history:**
    *The Sent bubble before its email arrives (N7):* a reply sent from the chat (the ready AI Reply,
    or an agent compose asked for in the field) is kept in memory (`ChatSentReplies`, keyed by the

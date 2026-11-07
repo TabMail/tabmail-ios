@@ -368,6 +368,8 @@ struct ChatReplyFieldTests {
         let ended = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
         #expect(Self.count("if sentReplies.composeEnded(outcome, replyTo: replyTo) { fieldClearCount += 1 }", in: ended) == 1)
         #expect(Self.count("sentReplies.settle(thread.items)", in: text) == 1)
-        #expect(Self.count("ChatSentReplyBubble(progress: sentReplies.progress[entry.id])", in: text) == 1)
+        #expect(Self.count("ChatSentReplyBubble( progress: sentReplies.progress[entry.id], "
+            + "retry: { sentReplies.retry(entry) }, delete: { sentReplies.delete(entry) } )", in: text) == 1,
+                "a failed send's Retry and Delete act on its own entry")
     }
 }

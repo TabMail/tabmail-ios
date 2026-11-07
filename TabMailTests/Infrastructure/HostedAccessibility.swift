@@ -88,4 +88,16 @@ enum HostedAccessibility {
         else { return false }
         return element.accessibilityActivate()
     }
+
+    /// Performs the named action of the element `identifier` under `view`, as VoiceOver's actions
+    /// rotor does. Returns whether the element and its action were found and the action ran.
+    static func perform(_ action: String, on identifier: String, in view: UIView) -> Bool {
+        guard let element = elements(under: view).first(where: { Self.identifier(of: $0) == identifier }),
+              let custom = element.accessibilityCustomActions?.first(where: { $0.name == action })
+        else { return false }
+        if let handler = custom.actionHandler { return handler(custom) }
+        guard let target = custom.target as? NSObject, target.responds(to: custom.selector) else { return false }
+        _ = target.perform(custom.selector, with: custom)
+        return true
+    }
 }

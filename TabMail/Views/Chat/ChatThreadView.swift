@@ -225,7 +225,11 @@ struct ChatThreadView: View {
                         }
                         // Sent replies whose email has not reached this iPhone yet (N7).
                         ForEach(unmatchedReplies(thread)) { entry in
-                            ChatSentReplyBubble(progress: sentReplies.progress[entry.id])
+                            ChatSentReplyBubble(
+                                progress: sentReplies.progress[entry.id],
+                                retry: { sentReplies.retry(entry) },
+                                delete: { sentReplies.delete(entry) }
+                            )
                         }
                         Color.clear.frame(height: pillHeight + ChatViewLayout.pillGap).id(Self.bottomId)
                     }

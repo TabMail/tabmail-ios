@@ -25,6 +25,9 @@ import UIKit
 ///  5. The wiring: a sent compose card reports its queued email's outbox row, and a queued (not
 ///     deduplicated) send summarizes at once only with the chat view on and AI allowed. Read from
 ///     the source: the compose card and the queue write cannot be driven from a unit test.
+///  6. A send that failed for good shows the red mark beside its bubble (owner 2026-11-07); the
+///     mark's Retry puts the same outbox row back in the queue and the bubble back to "Sending",
+///     and its Delete removes the row and the bubble. Driven through the hosted chat's own actions.
 @Suite("Sending bubble", .serialized, .processGlobalState)
 @MainActor
 struct ChatSendingBubbleTests {
@@ -97,11 +100,28 @@ struct ChatSendingBubbleTests {
         return try #require(try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId) })
     }
 
-    /// Claims and sends the row through the real send path with a mock provider.
-    private static func send(_ row: OutboxMessage) async throws -> MockEmailProvider {
+    /// The server's listing of `header`, as a Sent folder sync reads it.
+    private static func serverInfo(_ header: MessageHeader) -> MessageHeaderInfo {
+        MessageHeaderInfo(
+            messageId: header.messageId, rfc822MessageId: header.rfc822MessageId,
+            inReplyTo: header.inReplyTo, references: [], threadId: nil,
+            subject: header.subject, from: header.from, fromAddress: header.fromAddress, to: header.to, cc: "", bcc: "",
+            replyTo: nil, date: header.date, snippet: header.snippet, isRead: true,
+            isFlagged: false, hasAttachments: false, isReplied: false, isForwarded: false, actionTag: nil)
+    }
+
+    /// Claims and sends the row through the real send path with a mock provider. The provider's
+    /// Sent folder then lists the sent email under its own server id, plus `alsoListed`, as a
+    /// server does after the append: the send's own Sent folder sync runs on its own schedule and
+    /// replaces the optimistic copy with that one, so the tests hold whichever copy is there.
+    private static func send(_ row: OutboxMessage, alsoListed: [MessageHeader] = []) async throws -> MockEmailProvider {
         #expect(await AccountManager.shared.atomicClaimForTesting(row), "control: the row is claimed")
         let claimed = try #require(try await AppDatabase.dbPool.read { try OutboxMessage.fetchOne($0, key: row.id) })
         let provider = MockEmailProvider()
+        var serverCopy = Self.header("server-\(row.id)", folder: "Sent", from: "me@example.com", inReplyTo: row.inReplyTo.map(EmailFilter.normalizeMessageId))
+        serverCopy.rfc822MessageId = claimed.sentMessageId.map(EmailFilter.normalizeMessageId)
+        serverCopy.subject = row.subject
+        await provider.setFetchMessagesResult([Self.serverInfo(serverCopy)] + alsoListed.map(Self.serverInfo))
         await TestProviderRegistry.withRegisteredProvider(accountId: Self.account, provider: provider) {
             await AccountManager.shared.sendClaimedOutboxMessageForTesting(claimed, messageId: try! #require(claimed.sentMessageId))
         }
@@ -140,7 +160,7 @@ struct ChatSendingBubbleTests {
         let first = try #require((object["messages"] as? [[String: Any]])?.first)
         #expect(first["is_sent_by_user"] as? Bool == true, "summarized as the user's own email")
 
-        let provider = try await Self.send(row)
+        let provider = try await Self.send(row, alsoListed: [other])
         #expect(await provider.sentDrafts.first?.messageId == messageId, "the send uses the Message-ID of the queue write")
         let sent = try await Self.sentHeaders(pool)
         let copy = try #require(sent.first { $0.rfc822MessageId == EmailFilter.normalizeMessageId(messageId) },
@@ -178,7 +198,9 @@ struct ChatSendingBubbleTests {
         #expect(try await Self.sentHeaders(pool).map(\.summaryBlurb) == [nil], "control: the copy arrived unsummarized")
         answer.signal()
         await summarizing.value
-        #expect(try await Self.sentHeaders(pool).map(\.summaryTextMessage) == ["I said Tuesday works."])
+        let final = try await Self.sentHeaders(pool)
+        #expect(final.map(\.summaryTextMessage) == ["I said Tuesday works."],
+                "Sent copies: \(final.map { "\($0.id) \($0.rfc822MessageId ?? "-") \($0.summaryBlurb ?? "-")" })")
     }
 
     /// Waits on `semaphore` off the main actor, up to ten seconds.
@@ -311,13 +333,90 @@ struct ChatSendingBubbleTests {
         _ = try await Self.send(row)
         NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
         try await waitFor { replies.entries.isEmpty }
-        #expect(replies.entries.isEmpty, "control: the email reached the chat")
+        let sentNow = try await Self.sentHeaders(pool).map { "\($0.id) \($0.rfc822MessageId ?? "-")" }
+        #expect(replies.entries.isEmpty, "control: the email reached the chat; progress \(replies.progress), Sent copies \(sentNow)")
         try await waitFor { count("Sending") == 0 }
         #expect(count(text) == 1, "the email shows the same summary, once: \(labels().prefix(20))")
         #expect(count("Sending") == 0 && count("Summarizing") == 0 && count("You said: summarizing") == 0,
                 "no second bubble and no flash back: \(labels().prefix(20))")
         await queue.clearForTesting()
         await queue.setDispatchSuppressedForTesting(false)
+    }
+
+    // MARK: - 6. A send that failed for good
+
+    @Test("A send that failed for good shows the red mark; its Retry queues the same email again and its Delete removes it and the bubble")
+    func failedSendRetryAndDelete() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation { try await failedSendRetryAndDeleteBody() }
+    }
+
+    private func failedSendRetryAndDeleteBody() async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let replies = ChatSentReplies.shared
+        replies.removeAllForTesting()
+        defer {
+            replies.removeAllForTesting()
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        saved.setChatView(on: true)
+        let fixture = try await Self.makeFixture(pool)
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: fixture.parent.id) })
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        let mark = ChatSentReplyBubble.notSentMarkId
+        func hasMark() -> Bool { HostedAccessibility.identifiers(in: controller.view).contains(mark) }
+        func count(_ words: String) -> Int { HostedAccessibility.labels(in: controller.view).filter { $0.contains(words) }.count }
+        func waitFor(_ done: () -> Bool) async throws {
+            for _ in 0..<80 where !done() { try await Task.sleep(for: .milliseconds(100)) }
+        }
+        func rows() async throws -> [OutboxMessage] { try await pool.read { try OutboxMessage.fetchAll($0) } }
+        // The send fails for good. The hold keeps the drain off the row while the test reads it.
+        func fail(_ id: String) async throws {
+            try await pool.write { db in
+                try db.execute(
+                    sql: "UPDATE outboxMessage SET status = ?, retryCount = 3, errorMessage = 'Refused', holdUntil = ? WHERE id = ?",
+                    arguments: [OutboxStatus.failed.rawValue, Date().addingTimeInterval(3600), id])
+            }
+        }
+        try await waitFor { count("Lunch plans") > 0 }
+
+        let row = try await Self.queueReply(fixture, draftId: "draft-failed-chat", holdsForUndo: true)
+        replies.composeEnded(.sent(outboxId: row.id), replyTo: fixture.parent)
+        try await waitFor { count("Sending") == 1 }
+        #expect(count("Sending") == 1 && !hasMark(), "control: a send in progress has no mark")
+
+        try await fail(row.id)
+        try await waitFor { hasMark() }
+        #expect(hasMark() && count("Not sent") >= 1, "a send that failed for good shows the red mark and Not sent")
+
+        #expect(HostedAccessibility.perform("Retry", on: mark, in: controller.view), "the mark offers Retry")
+        let retried = try await rows()
+        #expect(retried.map(\.id) == [row.id], "Retry queues the same email, no second one")
+        #expect(retried.first?.outboxStatus == .queued && retried.first?.retryCount == 0 && retried.first?.sentAt == nil,
+                "the same row is queued again with fresh retries")
+        try await waitFor { !hasMark() && count("Sending") == 1 }
+        #expect(!hasMark() && count("Sending") == 1, "the bubble follows it back to Sending")
+
+        try await fail(row.id)
+        try await waitFor { hasMark() }
+        #expect(hasMark(), "control: failed again")
+        #expect(HostedAccessibility.perform("Delete", on: mark, in: controller.view), "the mark offers Delete")
+        #expect(try await rows().isEmpty, "Delete removes the queued email")
+        try await waitFor { replies.entries.isEmpty }
+        #expect(replies.entries.isEmpty, "and its bubble")
+        try await waitFor { !hasMark() && count("Not sent") == 0 }
+        #expect(!hasMark() && count("Not sent") == 0 && count("You said: summarizing") == 0, "nothing of it is left on screen")
     }
 
     // MARK: - 5. Wiring

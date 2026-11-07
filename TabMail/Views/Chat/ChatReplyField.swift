@@ -201,6 +201,21 @@ final class ChatSentReplies {
         return items.contains { $0.header.rfc822MessageId.map(EmailFilter.normalizeMessageId) == messageId }
     }
 
+    /// Retry on a "Not sent" bubble: the Outbox's own Retry for the same queued email, which puts a
+    /// failed, unsent row back in the queue. The bubble follows the row back to "Sending". Returns
+    /// whether the row was queued again.
+    @discardableResult
+    func retry(_ entry: Entry) -> Bool {
+        AccountManager.shared.retryOutboxMessage(entry.outboxId)
+    }
+
+    /// Delete on a "Not sent" bubble: the Outbox's own Discard for the same queued email. The row
+    /// goes unsent, so the bubble goes with it. Returns whether the row was deleted.
+    @discardableResult
+    func delete(_ entry: Entry) -> Bool {
+        AccountManager.shared.discardOutboxMessageConfirmed(entry.outboxId)
+    }
+
     /// Drops the entries whose email is in the chat, and old ones.
     func settle(_ items: [ChatThread.Item], now: Date = Date()) {
         let arrived = Set(entries.filter { isInChat($0, items: items) }.map(\.id))
