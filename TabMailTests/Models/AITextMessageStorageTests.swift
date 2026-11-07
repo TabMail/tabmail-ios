@@ -16,7 +16,7 @@ struct AITextMessageStorageTests {
         try db.read { db in Set(try db.columns(in: table).map(\.name)) }
     }
 
-    @Test("v95 adds both text-message columns to messageHeader and messageAICache")
+    @Test("v96 adds both text-message columns to messageHeader and messageAICache")
     func migrationAddsColumns() throws {
         let db = try TestDatabase.make()
         for table in ["messageHeader", "messageAICache"] {
@@ -25,7 +25,10 @@ struct AITextMessageStorageTests {
             #expect(cols.contains("replyTextMessage"), "\(table)")
         }
         let applied = try db.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations") }
-        #expect(applied.contains("v95_addAITextMessages"))
+        #expect(applied.contains("v96_addAITextMessages"))
+        // The chat view's migrations are numbered after main's v95 and run in that order.
+        let order = ["v95_convertNumericAICacheUpdatedAt", "v96_addAITextMessages", "v97_repairAICacheMessageIds"]
+        #expect(applied.filter { order.contains($0) } == order)
     }
 
     @Test("The header round-trips both text messages")
@@ -215,7 +218,7 @@ struct AITextMessageStorageTests {
 
     @Test("An older build's entries without a Message-ID survive the upgrade and the purge while their email is here")
     func legacyEntriesSurviveUpgradeAndPurge() throws {
-        let (pool, dir) = try Self.migrated(upTo: "v95_addAITextMessages")
+        let (pool, dir) = try Self.migrated(upTo: "v96_addAITextMessages")
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
         let aged = SyncConfig.aiCacheOrphanGraceDays + 1
         try pool.write { db in
@@ -259,6 +262,6 @@ struct AITextMessageStorageTests {
         let keys = try pool.read { db in Set(try MessageAICache.fetchAll(db).map(\.key)) }
         #expect(keys == ["acc1:INBOX:stayed@example.com", "acc1:INBOX:moved@example.com"])
         let applied = try pool.read { try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations") }
-        #expect(applied.contains("v96_repairAICacheMessageIds"))
+        #expect(applied.contains("v97_repairAICacheMessageIds"))
     }
 }

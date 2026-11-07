@@ -21,9 +21,9 @@ same AI result, kept as long as the email itself is shown.
    that is not the object is no result (nil blurb / nil reply), retried like a failed call. The stored
    shapes are unchanged (todos `• a • b`, one-line blurb, HH:MM reminder time, reminder only with content).
 3. **Storage.** `MessageHeader` and `MessageAICache` gain `summaryTextMessage` and `replyTextMessage`
-   (`v95_addAITextMessages`, nullable, no backfill; it shares the v95 number with main's
-   `v95_convertNumericAICacheUpdatedAt`, because both it and v96 had already run on test devices
-   and GRDB records a migration by its name, so they keep their names and the next is v97). Each text message belongs to its result: every
+   (`v96_addAITextMessages`, nullable, no backfill; numbered after main's
+   `v95_convertNumericAICacheUpdatedAt`, which keeps its number; owner 2026-11-07: main has priority, and
+   these migrations have run on no device). The next migration is v98. Each text message belongs to its result: every
    writer that sets a summary or a reply sets its text message with it (nil included), the survivor
    merge and the pre-sync restore carry it with its result, and `MessageAICache.writeThrough` replaces
    the text message whenever it replaces the result. The extension stages `summaryTextMessage` in
@@ -55,8 +55,7 @@ same AI result, kept as long as the email itself is shown.
    reads wrong there and counts as an orphan, recoverable by asking again. Writers do not fill the
    missing value: the extension's one cache upsert (`NSEDataBridge.upsertAICacheFromStaging`, for an existing and a
    new header) records the Message-ID it has, as every new entry does.
-   `v96_repairAICacheMessageIds` (`AppDatabase.repairAICacheMessageIds`) has run on test devices, so it
-   stays (frozen): it fills the Message-ID from the header in the folder the key names. The purge no
+   `v97_repairAICacheMessageIds` (`AppDatabase.repairAICacheMessageIds`) stays: it fills the Message-ID from the header in the folder the key names. The purge no
    longer depends on it. Review round 2 (2026-11-05) also removed a second purge trigger at the end of
    the AI queue's drain. Review round 4 (2026-11-05): the purge reads the clock once (its `now`
    argument), the base of its cutoff and the re-stamp of a kept entry, so a kept entry always leaves
@@ -92,7 +91,7 @@ device's summary and reply text messages (`queuePeerActionKeepsLocalPairs`), com
 (`composeRecomputeReplacedEmail`), a filtered recompute and one from the snippet
 (`composeRecomputeFiltered`, `composeRecomputeFromSnippet`), and the extension's request, each through its real producer and a
 fake backend or peer); `AITextMessageStorageTests.upgradeKeepsResults` (a v94 database with results,
-upgraded) and `legacyEntriesSurviveUpgradeAndPurge` (including v96 filling the Message-ID that a peer's
+upgraded) and `legacyEntriesSurviveUpgradeAndPurge` (including v97 filling the Message-ID that a peer's
 probe then finds); `RFC822IdentityMergeGuardTests.preSyncInboxReclaimCarriesTextMessages`;
 `NSESummaryTextMessageCarryTests` (the staging writes, `NSEStagingDB.open(path:)` upgrading an older
 file, the extension bundle's protocol version, a later push whose only change is the text message,

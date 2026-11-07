@@ -4265,13 +4265,10 @@ final class AppDatabase: Sendable {
         // cache. NULLABLE and NO BACKFILL: a result computed before this version has no
         // text message, and the chat view asks for one when it needs it.
         // Convergence: a fresh install and an upgraded DB both end with the four
-        // columns, NULL on every pre-existing row. Its name shares the v95 number with
-        // `v95_convertNumericAICacheUpdatedAt` above, which landed first: this one and the
-        // next had already run on test devices, and GRDB records a migration by its name,
-        // so renaming them would run them again there and fail on the existing columns.
-        // Names only need to be unique; the next migration is v97.
+        // columns, NULL on every pre-existing row. Numbered after main's v95, which keeps
+        // its number; the next migration is v98.
         migrator.registerTimedMigration(
-            "v95_addAITextMessages", foreignKeyChecks: .immediate
+            "v96_addAITextMessages", foreignKeyChecks: .immediate
         ) { db in
             try db.alter(table: "messageHeader") { t in
                 t.add(column: "summaryTextMessage", .text)
@@ -4290,19 +4287,19 @@ final class AppDatabase: Sendable {
         // is `accountId:folderPath:rfc822MessageId`, the primary key, so each header is one
         // indexed probe). Entries with no such header stay NULL and are orphans, as before.
         // Convergence: a fresh install has no such rows; an upgraded DB ends with every entry
-        // whose email is in the folder its key names carrying its Message-ID. Frozen: it has
-        // run. The purge itself now reads a missing Message-ID from the key
+        // whose email is in the folder its key names carrying its Message-ID. The purge
+        // itself reads a missing Message-ID from the key
         // (`SyncEngine.aiCacheEntryHasEmail`), which also covers an email that moved before
         // the upgrade, so this repair is no longer what keeps those entries.
         migrator.registerTimedMigration(
-            "v96_repairAICacheMessageIds", foreignKeyChecks: .immediate
+            "v97_repairAICacheMessageIds", foreignKeyChecks: .immediate
         ) { db in
             try repairAICacheMessageIds(db)
         }
     }
 
     /// Fill a missing `messageAICache.rfc822MessageId` from the header the entry's key names
-    /// (v96). Shared by the migration and its test.
+    /// (v97). Shared by the migration and its test.
     static func repairAICacheMessageIds(_ db: Database) throws {
         try db.execute(sql: """
             UPDATE messageAICache SET rfc822MessageId = h.rfc822MessageId
