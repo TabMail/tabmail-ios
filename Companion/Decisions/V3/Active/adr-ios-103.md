@@ -262,6 +262,38 @@ same AI result, kept as long as the email itself is shown.
    joined after it; a new newest email resets the choice to Reply All; with recipients chosen the
    agent's own recipient changes are replaced by the chosen people on the compose card.
 
+12. **Swipes in the chat (amendment 2026-11-05, the sixth chat-view PR, PR 5).** Swiping left
+   anywhere between the header and the field slides the whole chat to reveal Delete, then Archive at
+   the edge, so a full swipe archives (S2.1); swiping right on a bubble reveals "Unread from here"
+   (this email and every newer one become unread, never the user's own) or, on an unread bubble,
+   "Read up to here" (this email and every older one become read), and Move for the whole chat
+   (S3.1). The Unread line then marks the emails unread (S4.1, `ChatSwipe.unreadIds`). One reveal
+   is open at a time (`ChatSwipeReveal`, `openId`); the pan starts only on a horizontal motion
+   toward its buttons (`ChatHorizontalPan`), so vertical scrolling stays the scroll view's.
+   Only a drag the user finished acts: one the system cancels or fails (a call, a system
+   gesture) closes the reveal and runs nothing, however far it went (`ChatHorizontalPan.finished`,
+   `ChatSwipe.settle(finished:)`; train gate, 2026-11-05).
+   VoiceOver reaches every button as a named action. Archive, Delete and Move act on every email the
+   chat shows, wherever it is filed ("always the whole thread", 2026-11-04), except the user's sent
+   copies and drafts, which stay in their folders, and emails already at the destination
+   (`MessageDetailViewModel.archiveChat` / `deleteChat` / `moveChat`), and close the chat as closing
+   the email does today (Q29). **Amended in train gate round 2 (2026-11-06):** they first took only
+   the opened email's folder, which left the chat's archived and filed emails behind. One Undo puts
+   each email back in its own folder: `UndoableAction` keeps one command per source folder and epoch,
+   because `AccountManager.undoMove` moves a command back to one source; this also fixes Undo of an
+   inbox thread whose emails sat in different folders. They are ONE action each: the detail view model's
+   `archiveMessages` / `deleteMessages` / `moveMessages` push one undo entry and queue one move for
+   every email (`recordMove`, one `enqueueMove` closure with the read op before the move); the
+   single-email `archiveMessage` / `deleteMessage` / `moveMessage` are now the one-email case of
+   these. `setRead` sets each email's read state through today's gesture intent. In the inbox, Read
+   on a collapsed chat reads every email in it when the chat view is on (`ChatSwipe.inboxReadIds`,
+   S1.2); Unread stays on the newest email.
+   **Product choices made in PR 5, awaiting owner blessing:** Unread from here skips the user's own
+   emails; a bubble has no full swipe; the swipe buttons are labelled "Delete" (as the mock) where
+   the inbox row says "Trash". Overnight call (train gate round 2, 2026-11-06): a whole-chat action
+   leaves the user's sent copies and drafts where they are (a draft must stay in Drafts to stay
+   editable; on Gmail a sent copy is the same email as its other labels).
+
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (ADR-032) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
 parser does not read.
@@ -296,3 +328,9 @@ a failed request's log with and without its text, and the send wiring),
 `ChatSummaryQueueTests.openAsksForAnEmailThatJoins`. Decision 11: `ChatThreadTests.repliedOnlyTo`,
 `someoneNewIsNotOnly`, `userIsOnePerson`; `ChatReplyFieldTests` (`changedRecipientsRoute`,
 `agentMessageOnlyTo`, `replyTarget`, `replyToChoice`, `accessibilityOnlyTo`, `recipientsWiring`).
+Decision 12: `ChatSwipeTests` (the read swipes' targets, the Unread line after them, the whole-chat
+members, the inbox's Read, letting go, an interrupted drag running nothing, and the drag limits, and the swipe wiring read from the
+source); `MessageDetailThreadActionTests` (a chat's Archive, Delete and Move as one undo entry and
+one queued move, one undo restoring every email, the no-ops, `setRead`); the single-email detail
+actions stay pinned by `MessageDetailViewModelMoveTests`, `MessageDetailMarkReadOnArchiveDeleteTests`,
+`SameFolderNoOpTests` and `MessageDetailStagedFallbackTests`, green before and after the refactor.
