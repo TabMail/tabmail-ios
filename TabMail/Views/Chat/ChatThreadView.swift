@@ -151,7 +151,11 @@ struct ChatThreadView: View {
         }
         .task(id: memberKey) {
             guard !members.isEmpty else { return }
-            context = await ChatThreadContext.load(members: members, pool: AppDatabase.dbPool)
+            let loaded = await ChatThreadContext.load(members: members, pool: AppDatabase.dbPool)
+            // A member change cancels this load and starts the next. A cancelled read comes back
+            // empty, maybe after the next load has shown its context: never show it.
+            guard !Task.isCancelled else { return }
+            context = loaded
             scrollOnceLoaded()
         }
         .onChange(of: memberKey) { _, _ in noteMembers() }
