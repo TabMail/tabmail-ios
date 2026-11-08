@@ -111,7 +111,7 @@ struct ExchangeNewDraftAttachmentTests {
         defer { http.close() }
         let mailbox = Mailbox()
         mailbox.install(http)
-        let limit = GraphAttachmentLimits.uploadSessionMinimum
+        let limit = ExchangeDraftConfig.singlePostAttachmentLimitBytes
         let files: [DraftAttachment]
         switch shape {
         case "empty": files = []
@@ -199,7 +199,7 @@ struct ExchangeNewDraftAttachmentTests {
         }
         mailbox.install(http)
         let large = DraftAttachment(filename: "large.bin", mimeType: "application/octet-stream",
-                                    data: Data(count: stage == "small" ? 1 : GraphAttachmentLimits.uploadSessionMinimum + 1))
+                                    data: Data(count: stage == "small" ? 1 : ExchangeDraftConfig.singlePostAttachmentLimitBytes + 1))
         let files = stage == "session"
             ? [DraftAttachment(filename: "first.txt", mimeType: "text/plain", data: Data([1])), large]
             : [large]
