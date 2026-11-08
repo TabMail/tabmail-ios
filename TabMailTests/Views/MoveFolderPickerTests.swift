@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import GRDB
 @testable import TabMail
 
 @Suite("MoveFolderPicker.partition")
@@ -112,5 +113,32 @@ struct MoveFolderPickerTests {
         let order: [FolderRole] = [.inbox, .archive, .sent, .drafts, .trash, .spam, .custom]
         let mapped = order.map { MoveFolderPicker.folderOrder($0) }
         #expect(mapped == [0, 1, 2, 3, 4, 5, 6])
+    }
+
+    /// The picker reads each account's own provider from the database: a Gmail
+    /// account's picker hides Sent and Drafts (Gmail keeps those labels itself,
+    /// and a move into them is refused), while another account with folders at
+    /// the same paths keeps them.
+    @Test("The picker hides Sent and Drafts for a Gmail account read from the database, and only for it")
+    func loadReadsTheAccountsProvider() throws {
+        let db = try TestDatabase.make()
+        let paths = ["INBOX", "SENT", "DRAFT", "TRASH", "Label_7"]
+        let roles: [FolderRole] = [.inbox, .sent, .drafts, .trash, .custom]
+        for (accountId, provider) in [("picker-gmail", AccountProvider.gmail), ("picker-imap", AccountProvider.imap)] {
+            try TestDatabase.insertAccount(db, id: accountId, email: "\(accountId)@example.com", provider: provider)
+            try db.write { database in
+                for (path, role) in zip(paths, roles) {
+                    try Folder(name: path, path: path, role: role, accountId: accountId).insert(database)
+                }
+            }
+        }
+
+        let gmail = try db.read { try MoveFolderPicker.load(accountId: "picker-gmail", currentFolderPath: "INBOX", db: $0) }
+        let imap = try db.read { try MoveFolderPicker.load(accountId: "picker-imap", currentFolderPath: "INBOX", db: $0) }
+
+        let gmailPaths = Set((gmail.favorites + gmail.others).map(\.path))
+        let imapPaths = Set((imap.favorites + imap.others).map(\.path))
+        #expect(gmailPaths == ["TRASH", "Label_7"], "Gmail picker offered \(gmailPaths.sorted())")
+        #expect(imapPaths == ["SENT", "DRAFT", "TRASH", "Label_7"], "IMAP picker offered \(imapPaths.sorted())")
     }
 }

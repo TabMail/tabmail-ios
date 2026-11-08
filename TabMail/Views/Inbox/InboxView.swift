@@ -2135,12 +2135,19 @@ struct MoveFolderPicker: View {
     @Environment(\.dismiss) private var dismiss
 
     private var partitioned: (favorites: [Folder], others: [Folder]) {
-        let loaded = (try? AppDatabase.dbPool.read { db in
-            (try Folder.filter(Column("accountId") == accountId).order(Column("name")).fetchAll(db),
-             try Account.fetchOne(db, key: accountId)?.provider)
-        })
-        return Self.partition(
-            folders: loaded?.0 ?? [], currentFolderPath: currentFolderPath, provider: loaded?.1)
+        (try? AppDatabase.dbPool.read { db in
+            try Self.load(accountId: accountId, currentFolderPath: currentFolderPath, db: db)
+        }) ?? (favorites: [], others: [])
+    }
+
+    /// The picker's folders for one account, read from the database: the
+    /// account's folders and its provider, partitioned by `partition`.
+    nonisolated static func load(
+        accountId: String, currentFolderPath: String, db: Database
+    ) throws -> (favorites: [Folder], others: [Folder]) {
+        let folders = try Folder.filter(Column("accountId") == accountId).order(Column("name")).fetchAll(db)
+        let provider = try Account.fetchOne(db, key: accountId)?.provider
+        return partition(folders: folders, currentFolderPath: currentFolderPath, provider: provider)
     }
 
     private var favoriteFolders: [Folder] { partitioned.favorites }
