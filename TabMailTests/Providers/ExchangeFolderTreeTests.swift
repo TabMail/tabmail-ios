@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import GRDB
 import Synchronization
 import Testing
 @testable import TabMail
@@ -23,9 +24,12 @@ import Testing
 /// - a mail search folder under the root comes back in the same listing, marked
 ///   `"@odata.type": "#microsoft.graph.mailSearchFolder"`. It is a saved query
 ///   over messages that live in real folders, not a place mail can be filed;
-/// - a hidden folder (`isHidden`) is listed only when the request asks for it
-///   with `includeHiddenFolders=true` (List mailFolders), and the nextLink
-///   carries the request's options to the following pages.
+/// - a hidden folder (`isHidden`), at the root or below it, is listed only when
+///   that listing's request asks for it with `includeHiddenFolders=true` (List
+///   mailFolders, List childFolders);
+/// - a folder carries only the properties the request's `$select` names (Use
+///   query parameters), and the nextLink carries the request's options to the
+///   following pages.
 @Suite("ExchangeProvider — whole folder tree")
 struct ExchangeFolderTreeTests {
     private struct Node {
@@ -47,10 +51,12 @@ struct ExchangeFolderTreeTests {
     }
 
     /// Six folders under the root (three pages), one of them hidden, an Inbox
-    /// with three children (two pages), and a branch four levels deep.
+    /// with three children (two pages), a branch four levels deep, and a hidden
+    /// folder below a visible one.
     private static let rootChildren: [Node] = [
         Node("f-inbox", "Inbox", [
             Node("f-clients", "Clients", [
+                Node("f-clients-private", "Private", hidden: true),
                 Node("f-acme", "Acme", [
                     Node("f-acme-contracts", "Contracts"),
                 ]),
@@ -79,30 +85,41 @@ struct ExchangeFolderTreeTests {
     private static let pageSize = 2
     private static let graphBase = "https://graph.microsoft.com/v1.0/me"
 
-    private static func folderJSON(_ node: Node) -> String {
-        let type = node.isSearchFolder
-            ? "\"@odata.type\": \"#microsoft.graph.mailSearchFolder\", "
-            : ""
+    /// A folder as Graph returns it: its `id` and type annotation always, and
+    /// each other property only when `selected` names it.
+    private static func folderJSON(_ node: Node, selected: Set<String>) -> String {
         let count = counts(node.id)
-        return """
-        {\(type)"id": "\(node.id)", "displayName": "\(node.name)", \
-        "unreadItemCount": \(count.unread), "totalItemCount": \(count.total), "childFolderCount": \(node.children.count)}
-        """
+        var fields = ["\"id\": \"\(node.id)\""]
+        if node.isSearchFolder { fields.insert("\"@odata.type\": \"#microsoft.graph.mailSearchFolder\"", at: 0) }
+        let properties: [(String, String)] = [
+            ("displayName", "\"\(node.name)\""),
+            ("unreadItemCount", "\(count.unread)"),
+            ("totalItemCount", "\(count.total)"),
+            ("childFolderCount", "\(node.children.count)"),
+        ]
+        for (name, value) in properties where selected.contains(name) {
+            fields.append("\"\(name)\": \(value)")
+        }
+        return "{" + fields.joined(separator: ", ") + "}"
     }
 
     /// One page of `children`, starting at the `$skiptoken` the request carries.
-    /// Hidden folders are in the listing only when the request asks for them.
+    /// Hidden folders are in the listing only when the request asks for them,
+    /// and the next page's link keeps every option of the request.
     private static func page(of allChildren: [Node], listingPath: String, url: URL) -> String {
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         let start = items.first { $0.name == "$skiptoken" }.flatMap { Int($0.value ?? "") } ?? 0
         let withHidden = items.contains { $0.name == "includeHiddenFolders" && $0.value == "true" }
+        let selected = Set((items.first { $0.name == "$select" }?.value ?? "").split(separator: ",").map(String.init))
         let children = allChildren.filter { withHidden || !$0.isHidden }
         let end = min(start + pageSize, children.count)
-        let values = children[start..<end].map(folderJSON).joined(separator: ", ")
-        let carried = withHidden ? "&includeHiddenFolders=true" : ""
-        let next = end < children.count
-            ? ", \"@odata.nextLink\": \"\(graphBase)\(listingPath)?$skiptoken=\(end)\(carried)\""
-            : ""
+        let values = children[start..<end].map { folderJSON($0, selected: selected) }.joined(separator: ", ")
+        var next = ""
+        if end < children.count {
+            var link = URLComponents(string: graphBase + listingPath)!
+            link.queryItems = items.filter { $0.name != "$skiptoken" } + [URLQueryItem(name: "$skiptoken", value: "\(end)")]
+            next = ", \"@odata.nextLink\": \"\(link.url!.absoluteString)\""
+        }
         return "{\"value\": [\(values)]\(next)}"
     }
 
@@ -158,8 +175,138 @@ struct ExchangeFolderTreeTests {
             #expect(byId[node.id]?.totalCount == Self.counts(node.id).total, "\(node.id) total")
         }
         #expect(listedIds.contains("f-hidden"), "a hidden folder is a real folder mail can be filed in")
+        #expect(listedIds.contains("f-clients-private"), "so is a hidden folder below a visible one")
         #expect(byId["f-inbox"]?.role == .inbox)
         #expect(byId["f-sent"]?.role == .sent)
         #expect(byId["f-acme-contracts"]?.role == .custom)
+    }
+}
+
+/// `fetchFolders` feeds `SyncEngine.fullSync`, which stores the list it returns as
+/// the account's whole folder table. So a listing that cannot finish must fail as a
+/// whole, through the real sync path, and leave the stored folders, headers and
+/// queued actions as they were; a later sync lists the tree again.
+@Suite("ExchangeProvider — folder tree failures", .serialized, .processGlobalState)
+struct ExchangeFolderTreeFailureTests {
+    private static let root = "/v1.0/me/mailFolders"
+    private static let graph = "https://graph.microsoft.com/v1.0/me/mailFolders"
+    /// Stops a server that would otherwise answer forever, so a walker with no
+    /// end of its own fails the test instead of hanging it.
+    private static let fuse = 32
+
+    private static func folder(_ id: String, children: Int = 0) -> String {
+        "{\"id\":\"\(id)\",\"displayName\":\"\(id)\",\"unreadItemCount\":2,\"totalItemCount\":7,\"childFolderCount\":\(children)}"
+    }
+
+    private static func page(_ entries: [String], next: String? = nil) -> FakeHTTP.CannedResponse {
+        let tail = next.map { ",\"@odata.nextLink\":\"\($0)\"" } ?? ""
+        return .json(raw: "{\"value\":[\(entries.joined(separator: ","))]\(tail)}")
+    }
+
+    private static func provider(_ http: FakeHTTP.Scenario) -> ExchangeProvider {
+        ExchangeProvider(userEmail: "folder-tree@example.com", accessToken: { _ in "fake-graph-token" }, session: http.session)
+    }
+
+    /// An account with a stored folder `kept`, two headers in it and a queued move.
+    private static func seed(_ id: String, pool: DatabasePool) async throws -> Account {
+        let account = try FolderEpochTestFixture.makeAccount(id: id, provider: .outlook, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: account.id, path: "kept", role: .custom, pool: pool, totalCount: 2)
+        try FolderEpochTestFixture.insertHeaders(accountId: account.id, path: "kept", uids: [1, 2], pool: pool)
+        try await pool.write { db in
+            var op = PendingOperation(type: .move, messageIds: ["1"], accountId: account.id, folderPath: "kept", destinationPath: "destination")
+            try op.insert(db)
+        }
+        return account
+    }
+
+    private static func expectSeedUnchanged(_ pool: DatabasePool) async throws {
+        let state = try await pool.read { db in
+            (try Folder.fetchAll(db), try MessageHeader.fetchAll(db), try PendingOperation.fetchAll(db))
+        }
+        #expect(state.0.map(\.path) == ["kept"], "the stored folders stay as they were")
+        #expect(Set(state.1.map(\.messageId)) == ["1", "2"])
+        #expect(state.1.allSatisfy { $0.folderPath == "kept" })
+        #expect(state.2.count == 1 && state.2.first?.folderPath == "kept")
+    }
+
+    @Test("A page that fails after earlier pages, at the root or inside a folder, fails the whole sync and changes nothing stored",
+          arguments: [false, true])
+    func aFailedPageChangesNothing(insideAFolder: Bool) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let account = try await Self.seed("folder-tree-failure", pool: pool)
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: Self.root) { request in
+            guard request.url.path == Self.root else { return .status(404) }
+            if request.url.query?.contains("failed") == true { return .status(503) }
+            return Self.page([Self.folder("new-parent", children: 1)], next: insideAFolder ? nil : Self.graph + "?$skiptoken=failed")
+        }
+        http.register(path: Self.root + "/new-parent/childFolders") { request in
+            if request.url.query?.contains("failed") == true { return .status(503) }
+            return Self.page([Self.folder("new-leaf")], next: insideAFolder ? Self.graph + "/new-parent/childFolders?$skiptoken=failed" : nil)
+        }
+        do {
+            try await SyncEngine().fullSync(account: account, provider: Self.provider(http))
+            Issue.record("a listing with a failed page must not be stored as the whole folder list")
+        } catch ProviderError.networkError { }
+        let calls = http.recordedCalls().map(\.url)
+        #expect(calls.contains { $0.contains("failed") }, "the failing page was reached")
+        if insideAFolder { #expect(calls.contains { $0.contains("new-parent/childFolders") }) }
+        try await Self.expectSeedUnchanged(pool)
+    }
+
+    @Test("A next-page link already followed, or a folder listed again below itself, ends the sync with an error, not a loop",
+          arguments: [false, true])
+    func aCycleEndsTheListing(folderInsideItself: Bool) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let account = try await Self.seed("folder-tree-cycle", pool: pool)
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let requests = Mutex(0)
+        let fuseHit = Mutex(false)
+        // Counts the requests the cycle repeats; past the fuse the server fails them.
+        let repeated: @Sendable () -> Bool = {
+            let n = requests.withLock { $0 += 1; return $0 }
+            guard n >= Self.fuse else { return false }
+            fuseHit.withLock { $0 = true }
+            return true
+        }
+        if folderInsideItself {
+            http.register(path: Self.root) { request in
+                request.url.path == Self.root ? Self.page([Self.folder("self-parent", children: 1)]) : .status(404)
+            }
+            http.register(path: Self.root + "/self-parent/childFolders") { _ in
+                repeated() ? .status(503) : Self.page([Self.folder("self-parent", children: 1)])
+            }
+        } else {
+            let link = Self.graph + "?$skiptoken=repeat"
+            http.register(path: Self.root) { request in
+                guard request.url.path == Self.root else { return .status(404) }
+                if request.url.query?.contains("repeat") == true, repeated() { return .status(503) }
+                return Self.page(request.url.query?.contains("repeat") == true ? [] : [Self.folder("first")], next: link)
+            }
+        }
+        let provider = Self.provider(http)
+        let queue = ProviderWorkQueue(provider: provider, maxConcurrency: 1)
+        let engine = SyncEngine()
+        await engine.register(accountId: account.id, provider: provider, workQueue: queue)
+        do {
+            _ = try await engine.sync(account: account)
+            Issue.record("a listing with a cycle must not be stored as the whole folder list")
+        } catch {
+            #expect(error is ExchangeProvider.GraphFolderTreeCycle, "\(error)")
+        }
+        #expect(requests.withLock { $0 } > 0, "the cycle was reached")
+        #expect(!fuseHit.withLock { $0 }, "the cycle was requested \(requests.withLock { $0 }) times and ended only at the server's fuse")
+        #expect(await queue.activeOperations == 0)
+        try await Self.expectSeedUnchanged(pool)
     }
 }

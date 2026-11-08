@@ -104,9 +104,11 @@ actor ExchangeProvider: EmailProvider {
 
         // `/mailFolders` lists only the root's children; every child is traversed
         // separately and every listing is read to its last `@odata.nextLink`.
+        var seen = FolderTreeWalk()
         let folders = try await listFolderTree(
             firstPage: "/mailFolders?\(selectFolderFields)&\(topParam(100))&includeHiddenFolders=true",
-            knownFolderIds: knownFolderIds)
+            knownFolderIds: knownFolderIds,
+            seen: &seen)
 
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] fetchFolders returning \(folders.count) folders: \(folders.map { "\($0.name)(\($0.role))" })") }
         return folders
@@ -118,13 +120,23 @@ actor ExchangeProvider: EmailProvider {
     /// separately", and a listing longer than its page carries `@odata.nextLink`
     /// until the last page. A mail search folder (`#microsoft.graph.mailSearchFolder`)
     /// is a saved query over messages filed in real folders, so it and anything
-    /// under it are left out: listing it would show those messages twice.
-    private func listFolderTree(firstPage: String, knownFolderIds: [String: FolderRole]) async throws -> [FolderInfo] {
+    /// under it are left out: listing it would show those messages twice. Hidden
+    /// folders are real folders, so every listing asks for them
+    /// (`includeHiddenFolders=true`, on child listings too).
+    ///
+    /// A folder listed twice, or a next-page link already followed, means the
+    /// server's answer has a cycle: the whole listing throws
+    /// `GraphFolderTreeCycle` rather than loop, and the stored folders stay as
+    /// they were until a later sync lists the tree again.
+    private func listFolderTree(
+        firstPage: String, knownFolderIds: [String: FolderRole], seen: inout FolderTreeWalk
+    ) async throws -> [FolderInfo] {
         var folders: [FolderInfo] = []
         var data = try await request(path: firstPage)
         while true {
             let response = try JSONDecoder().decode(GraphFolderListResponse.self, from: data)
             for folder in response.value where folder.odataType != Self.mailSearchFolderType {
+                guard seen.folderIds.insert(folder.id).inserted else { throw GraphFolderTreeCycle() }
                 let role = knownFolderIds[folder.id]
                 if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] folder: \(folder.displayName) role=\(String(describing: role)) id=\(folder.id)") }
                 folders.append(FolderInfo(
@@ -137,14 +149,26 @@ actor ExchangeProvider: EmailProvider {
                 if (folder.childFolderCount ?? 0) > 0 {
                     let encodedId = try Self.encodedGraphPathSegment(folder.id, context: "Graph parent folder id")
                     folders += try await listFolderTree(
-                        firstPage: "/mailFolders/\(encodedId)/childFolders?\(selectFolderFields)&\(topParam(50))",
-                        knownFolderIds: knownFolderIds)
+                        firstPage: "/mailFolders/\(encodedId)/childFolders?\(selectFolderFields)&\(topParam(50))&includeHiddenFolders=true",
+                        knownFolderIds: knownFolderIds,
+                        seen: &seen)
                 }
             }
             guard let next = response.nextLink else { return folders }
+            guard seen.nextLinks.insert(next).inserted else { throw GraphFolderTreeCycle() }
             data = try await requestAbsolute(url: next)
         }
     }
+
+    /// What one folder-tree listing has already read: every folder and every
+    /// next-page link, across all depths.
+    private struct FolderTreeWalk {
+        var folderIds: Set<String> = []
+        var nextLinks: Set<String> = []
+    }
+
+    /// The server listed a folder twice or sent a next-page link already followed.
+    struct GraphFolderTreeCycle: Error {}
 
     private static let mailSearchFolderType = "#microsoft.graph.mailSearchFolder"
 
