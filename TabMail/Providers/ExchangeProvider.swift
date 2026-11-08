@@ -990,10 +990,31 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Sending
 
+    /// A message without files goes in one `sendMail`. Graph accepts a file inline
+    /// there only under 3 MB and wants an upload session for 3-150 MB, choosing
+    /// per file (Graph: "Attach large files to Outlook messages"), so a message
+    /// with files is created as a draft, given each file the way a draft save adds
+    /// it, then sent (`POST /messages/{id}/send`) (#422). Any failure removes that
+    /// draft before rethrowing, so an Outbox retry never leaves a copy behind per
+    /// attempt. If the send itself was accepted and only its answer was lost, the
+    /// message has left: the delete finds nothing (a moved item gets a new id) or
+    /// moves the leftover to Deleted Items, and the retry may send it again, as a
+    /// lost `sendMail` answer would (a duplicate, never a drop).
     func send(draft: DraftMessage) async throws {
-        let message = buildGraphSendPayload(draft: draft)
-        let jsonData = try JSONSerialization.data(withJSONObject: ["message": message])
-        let _ = try await request(path: "/sendMail", method: "POST", body: jsonData)
+        guard !draft.attachments.isEmpty else {
+            let message = buildGraphSendPayload(draft: draft)
+            let jsonData = try JSONSerialization.data(withJSONObject: ["message": message])
+            let _ = try await request(path: "/sendMail", method: "POST", body: jsonData)
+            return
+        }
+        let graphId = try await createDraftWithAttachments(draft)
+        do {
+            let encodedId = try Self.encodedGraphPathSegment(graphId, context: "Graph draft message id")
+            _ = try await request(path: "/messages/\(encodedId)/send", method: "POST")
+        } catch {
+            try? await deleteDraft(identity: .outlook(graphId: graphId))
+            throw error
+        }
     }
 
     /// Exchange/Graph API auto-saves sent messages to Sent Items — no explicit append needed.
@@ -1037,30 +1058,38 @@ actor ExchangeProvider: EmailProvider {
             try await replaceDraftAttachments(graphId: graphId, with: draft.attachments)
             return .created(.outlook(graphId: graphId))
         } else {
-            // Create the message first, then add each file through the same
-            // size-aware path as an update (#237). Sending them in this POST
-            // would reject a large file before an upload session can be made.
-            let jsonData = try JSONSerialization.data(withJSONObject: message)
-            let response = try await request(path: "/mailFolders/drafts/messages", method: "POST", body: jsonData)
-            guard let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
-                  let msgId = dict["id"] as? String else {
-                throw NSError(domain: "ExchangeProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "No message ID in draft response"])
-            }
-            do {
-                if !draft.attachments.isEmpty {
-                    try await replaceDraftAttachments(graphId: msgId, with: draft.attachments)
-                }
-            } catch {
-                // The local draft still owns every byte and the throw keeps its
-                // Save queued. Remove only this attempt's incomplete server copy
-                // so the retry normally creates one complete draft. If cleanup
-                // also fails, sync can surface that copy for ordinary deletion;
-                // preserve the original error for the queue's retry classifier.
-                try? await deleteDraft(identity: .outlook(graphId: msgId))
-                throw error
-            }
-            return .created(.outlook(graphId: msgId))
+            return .created(.outlook(graphId: try await createDraftWithAttachments(draft)))
         }
+    }
+
+    /// Create a new draft holding `draft` and every one of its files; returns its
+    /// Graph id. Used by a first draft save and by a send with files (#422).
+    private func createDraftWithAttachments(_ draft: DraftMessage) async throws -> String {
+        // Create the message first, then add each file through the same
+        // size-aware path as an update (#237). Sending them in this POST
+        // would reject a large file before an upload session can be made.
+        var messageDraft = draft
+        messageDraft.attachments = []
+        let jsonData = try JSONSerialization.data(withJSONObject: buildGraphSendPayload(draft: messageDraft))
+        let response = try await request(path: "/mailFolders/drafts/messages", method: "POST", body: jsonData)
+        guard let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
+              let msgId = dict["id"] as? String else {
+            throw NSError(domain: "ExchangeProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "No message ID in draft response"])
+        }
+        do {
+            if !draft.attachments.isEmpty {
+                try await replaceDraftAttachments(graphId: msgId, with: draft.attachments)
+            }
+        } catch {
+            // The local draft (or Outbox row) still owns every byte and the
+            // throw keeps it queued. Remove only this attempt's incomplete server
+            // copy so the retry normally creates one complete draft. If cleanup
+            // also fails, sync can surface that copy for ordinary deletion;
+            // preserve the original error for the queue's retry classifier.
+            try? await deleteDraft(identity: .outlook(graphId: msgId))
+            throw error
+        }
+        return msgId
     }
 
     /// #217: the draft's current copy, or nil on 404 (deleted elsewhere).
