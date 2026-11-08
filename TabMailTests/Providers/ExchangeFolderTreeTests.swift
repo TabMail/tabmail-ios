@@ -194,11 +194,12 @@ struct ExchangeFolderTreeTests {
 }
 
 /// `fetchFolders` feeds `SyncEngine.fullSync`, which stores the list it returns as
-/// the account's whole folder table. So a listing that cannot finish must fail as a
+/// the account's whole folder table. So a listing that finishes reaches the stored
+/// folders and the move picker, and a listing that cannot finish must fail as a
 /// whole, through the real sync path, and leave the stored folders, headers and
 /// queued actions as they were; a later sync lists the tree again.
-@Suite("ExchangeProvider — folder tree failures", .serialized, .processGlobalState)
-struct ExchangeFolderTreeFailureTests {
+@Suite("ExchangeProvider — folder tree through the full sync", .serialized, .processGlobalState)
+struct ExchangeFolderTreeSyncTests {
     private static let root = "/v1.0/me/mailFolders"
     private static let graph = "https://graph.microsoft.com/v1.0/me/mailFolders"
     /// Stops a server that would otherwise answer forever, so a walker with no
@@ -207,6 +208,10 @@ struct ExchangeFolderTreeFailureTests {
 
     private static func folder(_ id: String, children: Int = 0) -> String {
         "{\"id\":\"\(id)\",\"displayName\":\"\(id)\",\"unreadItemCount\":2,\"totalItemCount\":7,\"childFolderCount\":\(children)}"
+    }
+
+    private static func searchFolder(_ id: String) -> String {
+        "{\"@odata.type\":\"#microsoft.graph.mailSearchFolder\",\"id\":\"\(id)\",\"displayName\":\"\(id)\",\"unreadItemCount\":0,\"totalItemCount\":3,\"childFolderCount\":0}"
     }
 
     private static func page(_ entries: [String], next: String? = nil) -> FakeHTTP.CannedResponse {
@@ -247,6 +252,67 @@ struct ExchangeFolderTreeFailureTests {
         case firstFolderPage
         /// The second page of a folder's subfolders.
         case laterFolderPage
+    }
+
+    @Test("A complete listing reaches the stored folders and the move picker: a new subfolder is added, a known folder keeps its id, counts and backfill state, a stored search folder goes, and the mail and queued action stay")
+    func aCompleteListingIsStored() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let account = try FolderEpochTestFixture.makeAccount(id: "folder-tree-success", provider: .outlook, pool: pool)
+        // `kept` is a known folder with mail and a finished backfill; `old-search` was stored as
+        // a folder before search folders were left out, and a queued move names its mail.
+        for (path, uid) in [("kept", 1), ("old-search", 2)] {
+            try FolderEpochTestFixture.insertFolder(accountId: account.id, path: path, role: .custom, pool: pool)
+            try FolderEpochTestFixture.insertHeaders(accountId: account.id, path: path, uids: [uid], pool: pool)
+        }
+        try await pool.write { db in
+            var kept = try #require(try Folder.fetchOne(db, key: account.id + ":kept"))
+            kept.backfillComplete = true
+            kept.backfillPageToken = "backfill-cursor"
+            try kept.update(db)
+            var op = PendingOperation(type: .move, messageIds: ["2"], accountId: account.id, folderPath: "old-search", destinationPath: "kept")
+            try op.insert(db)
+        }
+        let wellKnown = ["inbox", "sentitems", "drafts", "deleteditems", "junkemail", "archive"]
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: Self.root) { request in
+            let path = request.url.path
+            if path == Self.root {
+                let system = wellKnown.map { "{\"id\":\"sys-\($0)\",\"displayName\":\"\($0)\",\"unreadItemCount\":0,\"totalItemCount\":0,\"childFolderCount\":0}" }
+                return Self.page(system + [Self.folder("kept", children: 1), Self.searchFolder("old-search")])
+            }
+            if let name = wellKnown.first(where: { path == Self.root + "/" + $0 }) {
+                return .json(raw: "{\"id\":\"sys-\(name)\",\"displayName\":\"\(name)\"}")
+            }
+            if wellKnown.contains(where: { path == Self.root + "/sys-" + $0 + "/messages" }) { return Self.page([]) }
+            return .status(404)
+        }
+        http.register(path: Self.root + "/kept/childFolders", response: Self.page([Self.folder("new-child")]))
+
+        try await SyncEngine().fullSync(account: account, provider: Self.provider(http))
+
+        let state = try await pool.read { db in
+            (try Folder.fetchAll(db), try MessageHeader.fetchAll(db), try PendingOperation.fetchAll(db))
+        }
+        let folders = state.0
+        #expect(Set(folders.map(\.path)) == Set(wellKnown.map { "sys-" + $0 } + ["kept", "new-child"]),
+                "the new subfolder is stored and the search folder is not: \(folders.map(\.path))")
+        let kept = try #require(folders.first { $0.path == "kept" })
+        #expect(kept.id == account.id + ":kept", "a known folder keeps its id")
+        #expect(kept.totalCount == 7, "and takes the listing's count")
+        #expect(kept.backfillComplete && kept.backfillPageToken == "backfill-cursor", "and keeps its backfill state")
+        #expect(Set(state.1.map(\.messageId)) == ["1", "2"], "no stored mail is removed")
+        #expect(state.2.count == 1 && state.2.first?.folderPath == "old-search" && state.2.first?.messageIds == ["2"]
+                && state.2.first?.destinationPath == "kept", "the queued move stays as it was")
+        let picker = MoveFolderPicker.partition(folders: folders, currentFolderPath: "kept")
+        let offered = Set((picker.favorites + picker.others).map(\.path))
+        #expect(offered.contains("new-child"), "the new subfolder can be picked as a move target")
+        #expect(offered.isDisjoint(with: ["kept", "old-search"]))
+        #expect(http.recordedCalls().allSatisfy { $0.method == "GET" }, "listing writes nothing to the server")
     }
 
     @Test("A page that fails, at the root or inside a folder, first or after earlier pages, fails the whole sync and changes nothing stored",
