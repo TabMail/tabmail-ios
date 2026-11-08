@@ -198,8 +198,10 @@ struct ExchangeNewDraftAttachmentTests {
             return .json(raw: "{}", statusCode: 201)
         }
         mailbox.install(http)
+        // Past the single-POST threshold and longer than one range, so "range" has a second range to fail.
+        let largeBytes = max(ExchangeDraftConfig.singlePostAttachmentLimitBytes, ExchangeDraftConfig.uploadChunkBytes) + 1
         let large = DraftAttachment(filename: "large.bin", mimeType: "application/octet-stream",
-                                    data: Data(count: stage == "small" ? 1 : ExchangeDraftConfig.singlePostAttachmentLimitBytes + 1))
+                                    data: Data(count: stage == "small" ? 1 : largeBytes))
         let files = stage == "session"
             ? [DraftAttachment(filename: "first.txt", mimeType: "text/plain", data: Data([1])), large]
             : [large]
