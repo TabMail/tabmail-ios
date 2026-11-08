@@ -62,13 +62,8 @@ enum SentEmailSummary {
     /// Summarizes the queued email `outboxId` and writes the result to the AI cache under its Sent
     /// folder and Message-ID. A Sent copy already there without a summary takes it at once.
     static func summarize(outboxId: String, aiService: AIService = .shared) async {
-        let pool = AppDatabase.dbPool
-        do {
-            guard let source = try await pool.read({ db in try Self.source(outboxId: outboxId, db: db) }) else {
-                BackgroundSyncLogger.logAIProcessing("Sent summary SKIPPED for \(outboxId): no row, Message-ID or Sent folder")
-                return
-            }
-            let summary = try await aiService.generateSummary(
+        await write(outboxId: outboxId) { source in
+            try await aiService.generateSummary(
                 subject: source.subject,
                 from: source.senderName,
                 fromAddress: source.senderEmail,
@@ -81,6 +76,34 @@ enum SentEmailSummary {
                     toField: source.to, ccField: source.cc, fromField: source.senderEmail,
                     claimEmails: [source.senderEmail], suppressEmails: source.userAddresses),
                 isSentByUser: true)
+        }
+    }
+
+    /// The demo account's own sends, which make no AI call (the guided tutorial is scripted, owner
+    /// 2026-10-21, and has no TabMail session): the summary is the email's own words, without the
+    /// quoted email, written exactly as `summarize` writes, so its Sending bubble and Sent copy
+    /// carry a text message like every other email's.
+    static func summarizeLocally(outboxId: String) async {
+        await write(outboxId: outboxId) { source in
+            let words = EmailFilter.splitMessageAndQuotes(source.plainText).message
+            return SummaryResult(
+                blurb: words, todos: nil, reminderDate: nil, reminderTime: nil, reminderContent: nil,
+                textMessage: words)
+        }
+    }
+
+    /// Reads the queued email `outboxId`, makes its summary with `produce`, and writes it to the AI
+    /// cache under its Sent folder and Message-ID.
+    private static func write(
+        outboxId: String, produce: (Source) async throws -> SummaryResult
+    ) async {
+        let pool = AppDatabase.dbPool
+        do {
+            guard let source = try await pool.read({ db in try Self.source(outboxId: outboxId, db: db) }) else {
+                BackgroundSyncLogger.logAIProcessing("Sent summary SKIPPED for \(outboxId): no row, Message-ID or Sent folder")
+                return
+            }
+            let summary = try await produce(source)
             guard let blurb = summary.blurb, !blurb.isEmpty else {
                 BackgroundSyncLogger.logAIProcessing("Sent summary EMPTY for \(outboxId)")
                 return

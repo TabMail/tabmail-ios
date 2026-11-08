@@ -154,8 +154,14 @@ extension AccountManager {
         if !result.deduped {
             Task { await AppDatabase.checkpointForDurability() }
             // The chat view summarizes the email now, for its Sending bubble and its Sent copy.
+            // The demo account's sends (the tutorial's practice reply) are summarized on the device.
             let outboxId = result.outboxId
+            let isDemo = account.id == DemoSeed.demoAccountId
             Task {
+                if isDemo {
+                    await SentEmailSummary.summarizeLocally(outboxId: outboxId)
+                    return
+                }
                 guard await SentEmailSummary.mayRun() else { return }
                 await SentEmailSummary.summarize(outboxId: outboxId, aiService: summaryService)
             }

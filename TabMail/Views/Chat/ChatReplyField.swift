@@ -20,6 +20,8 @@ struct ChatReplyField: Equatable {
     let clearCount: Int
     /// The reply goes only to these people (R2); nil for Reply All.
     var onlyTo: [ChatThread.Person]? = nil
+    /// In the tutorial, what the read-only field holds and sends (part 2); nil holds nothing.
+    var tutorialMove: TutorialCoordinator.FieldMove? = nil
 
     var placeholder: String { isNoReply ? "Ask anything" : "Reply or ask anything" }
 

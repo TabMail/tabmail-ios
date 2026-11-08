@@ -16,7 +16,6 @@ struct TabMailSettingsView: View {
     @AppStorage(SmartDictation.settingKey) private var smartDictation = SmartDictation.defaultValue
     @AppStorage(AccountManager.markReadOnArchiveDeleteKey) private var markReadOnArchiveDelete = true
     @AppStorage(SummaryBubbleView.showAISummariesKey) private var showAISummaries = true
-    @AppStorage(ChatViewConfig.enabledKey) private var chatViewEnabled = true
     @AppStorage(ProactiveNotifyService.enabledKey) private var proactiveEnabled = true
     @AppStorage(ProactiveNotifyService.windowDaysKey) private var windowDays = ProactiveNotifyService.defaultWindowDays
     @AppStorage(ProactiveNotifyService.advanceMinutesKey) private var advanceMinutes = ProactiveNotifyService.defaultAdvanceMinutes
@@ -47,7 +46,7 @@ struct TabMailSettingsView: View {
     @ViewBuilder
     private var userInterfaceSection: some View {
         Section("User Interface") {
-            chatViewToggle
+            ChatViewToggleRow()
 
             Toggle(isOn: $showAISummaries) {
                 Label {
@@ -128,26 +127,6 @@ struct TabMailSettingsView: View {
                 }
             }
         }
-    }
-
-    /// "Enable Chat View" (N8.2). Chat View needs AI: while AI is off the row is grayed out and
-    /// the stored choice is kept for when AI comes back (Q18).
-    private var chatViewToggle: some View {
-        let aiOn = ChatViewConfig.isAIOn(optedOut: optOutAllAI, subscribed: AISubscriptionGate.shared.isActive)
-        return Toggle(isOn: $chatViewEnabled) {
-            Label {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Enable Chat View")
-                    Text("Show threads as chats. Requires AI.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            } icon: {
-                Image(systemName: "bubble.left.and.bubble.right")
-                    .foregroundStyle(.primary)
-            }
-        }
-        .disabled(!aiOn)
     }
 
     var body: some View {
@@ -660,3 +639,28 @@ struct TabMailSettingsView: View {
     }
 }
 
+/// "Enable Chat View" (N8.2), in TabMail Settings and the tutorial's last step (T4). Chat View
+/// needs AI: while AI is off the row is grayed out and the stored choice is kept for when AI
+/// comes back (Q18).
+struct ChatViewToggleRow: View {
+    @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
+    @AppStorage(ChatViewConfig.enabledKey) private var chatViewEnabled = true
+
+    var body: some View {
+        let aiOn = ChatViewConfig.isAIOn(optedOut: optOutAllAI, subscribed: AISubscriptionGate.shared.isActive)
+        Toggle(isOn: $chatViewEnabled) {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Enable Chat View")
+                    Text("Show threads as chats. Requires AI.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } icon: {
+                Image(systemName: "bubble.left.and.bubble.right")
+                    .foregroundStyle(.primary)
+            }
+        }
+        .disabled(!aiOn)
+    }
+}

@@ -1675,6 +1675,12 @@ struct InboxView: View {
         TutorialCoordinator.shared.discovered(.tagTap)
         switch tag {
         case .reply:
+            // TQ2: in the chat view the Reply tag opens the chat, its AI Reply ready in the
+            // field; the chat marks emails read as they show (Q21).
+            if ChatViewConfig.opensInChat {
+                selectedMessageId = snapshot.id
+                break
+            }
             // Mark as read — user is actively dismissing (matches TB behavior).
             // Thread reply: set-read on every member so unread siblings don't linger.
             if let group, group.isThread {

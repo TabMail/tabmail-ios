@@ -19,7 +19,9 @@ struct TutorialMessageHost: ViewModifier {
     func body(content: Content) -> some View {
         content
             .safeAreaInset(edge: .top) {
-                if TutorialCoordinator.shared.isRunning && isTutorialSource {
+                // In the chat view the chat at Jordan's email shows the card, and this detail
+                // opens from a bubble inside it.
+                if TutorialCoordinator.shared.isRunning && !TutorialCoordinator.shared.teachesChat && isTutorialSource {
                     TutorialCoachView(host: .message, onAction: { action in
                         // "Next" continues in the inbox's chat.
                         if action == .showMoreToAsk { dismiss() }
@@ -79,6 +81,31 @@ struct TutorialInboxScroll: ViewModifier {
                 BackgroundSyncLogger.logDebug("[TutScroll] relayout container=\(Int(new.containerHeight)) content=\(Int(new.contentHeight)): rescroll")
                 proxy.scrollTo(id, anchor: .center)
             }
+    }
+}
+
+/// The chat view's last step (T4): TabMail Settings' Chat View switch, ringed, under the step's
+/// card. Flipping it switches for real, so both views can be tried (T4.1). Only the card's Finish
+/// (or Skip tutorial) closes it; the rest of Settings is not offered while the tutorial runs.
+struct TutorialChatViewSwitchSheet: View {
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("User Interface") {
+                    ChatViewToggleRow()
+                        .overlay {
+                            TutorialPulseRing(shape: RoundedRectangle(cornerRadius: 10), lineWidth: 2, outset: 4)
+                        }
+                }
+            }
+            .safeAreaInset(edge: .top) {
+                TutorialCoachView(host: .chatViewSwitch)
+                    .padding(.vertical, 8)
+            }
+            .navigationTitle("TabMail Settings")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .interactiveDismissDisabled()
     }
 }
 

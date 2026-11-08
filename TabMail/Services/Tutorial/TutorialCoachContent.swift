@@ -16,8 +16,12 @@ enum TutorialCoachHost: Equatable {
     case compose(showingSuggestion: Bool)
     /// The source email of part 3.
     case message
+    /// A chat in the chat view: Priya's in part 2, Jordan's in part 3.
+    case chat
     /// Action Classification, opened by "See rule" on the part 1 result.
     case actionRules
+    /// The Chat View switch, the chat view's last step (T4).
+    case chatViewSwitch
 }
 
 /// The text and buttons of one coach card (owner V5 mockup copy). Pure, so
@@ -30,6 +34,7 @@ struct TutorialCoachContent: Equatable {
         case seeTemplate
         case showMoreToAsk
         case showRecap
+        case finishChatViewSwitch
     }
 
     struct Button: Equatable {
@@ -57,20 +62,27 @@ struct TutorialCoachContent: Equatable {
     /// The card `host` shows for `step`, or nil when this host has none.
     /// `isSending`: a send is waiting out its undo window (`PendingSendService`).
     /// `replyEdited`: the practice reply's scripted edit ran.
+    /// `teachesChat`: the run teaches in the chat view (tutorial mock v3).
     static func make(
         step: TutorialCoordinator.Step,
         lesson: TutorialLesson,
         host: TutorialCoachHost,
         flightsAsked: Bool,
         replyEdited: Bool = false,
-        isSending: Bool = false
+        isSending: Bool = false,
+        teachesChat: Bool = false
     ) -> TutorialCoachContent? {
         func card(_ title: String, _ message: String, done: Bool = false) -> TutorialCoachContent {
-            let line = "\(lesson.rawValue) of \(TutorialLesson.allCases.count) · \(lesson.title)"
+            let line = "\(lesson.rawValue) of \(TutorialLesson.allCases.count) · \(lesson.title(teachesChat: teachesChat))"
             return TutorialCoachContent(progressLine: done ? line + " · done" : line, title: title, message: message)
         }
         // Skip tutorial, always at the top right, is the way to stop (owner 2026-10-25).
         let next = Button(label: "Next", action: .nextLesson, isPrimary: true)
+
+        if teachesChat, let chatCard = chatViewCard(
+            step: step, host: host, card: card, next: next, replyEdited: replyEdited, isSending: isSending) {
+            return chatCard
+        }
 
         switch (step, host) {
         // Part 1
@@ -140,6 +152,62 @@ struct TutorialCoachContent: Equatable {
             c.buttons = [Button(label: "Finish", action: .showRecap, isPrimary: true)]
             return c
 
+        default:
+            return nil
+        }
+    }
+
+    /// The chat view's own cards (tutorial mock v3, T2 to T4); nil where the run shows today's.
+    private static func chatViewCard(
+        step: TutorialCoordinator.Step,
+        host: TutorialCoachHost,
+        card: (String, String, Bool) -> TutorialCoachContent,
+        next: Button,
+        replyEdited: Bool,
+        isSending: Bool
+    ) -> TutorialCoachContent? {
+        switch (step, host) {
+        // Part 2, in Priya's chat.
+        case (.replyToPriya, .chat) where isSending:
+            var c = card("Sending your practice reply.", "It stays in the demo. Nobody receives an email.", false)
+            c.showsProgress = true
+            return c
+        case (.replyToPriya, .inbox) where !isSending:
+            return card("Open Priya’s email.", "It opens as a chat with everyone on the thread.", false)
+        case (.replyToPriya, .chat):
+            return card(
+                "Your reply is ready.",
+                "Each email reads like a message, and TabMail already wrote your answer to Priya. "
+                    + "Tap Send to see the full email.", false)
+        case (.replyToPriya, .compose(showingSuggestion: true)) where !replyEdited:
+            return card("TabMail wrote the email.", "Say what to change: tap Edit at the top, then Send.", false)
+        case (.makeTemplate, .chat):
+            return card(
+                "Sent. Now reuse it.",
+                "Nobody received it. The same field takes requests too: "
+                    + "tap Send to ask TabMail to keep this reply as a template.", false)
+        case (.makeTemplate, .inbox):
+            return card("Sent. Now reuse it.", "Nobody received it. Open Priya’s email to ask TabMail for a template.", false)
+        case (.reuseReplyDone, .chat), (.reuseReplyDone, .inbox):
+            var c = card("Template saved.", "Next time an invite comes in, your reply starts from this.", true)
+            c.buttons = [Button(label: "See template", action: .seeTemplate), next]
+            return c
+
+        // Part 3, in Jordan's chat.
+        case (.askAnythingDone, .chat):
+            var c = card(
+                "There’s your answer.",
+                "You went from a question to Jordan’s email. Tap the message for the full email.", true)
+            c.buttons = [Button(label: "Next", action: .showMoreToAsk, isPrimary: true)]
+            return c
+
+        // T4, after the three parts.
+        case (.chatViewSwitch, .chatViewSwitch):
+            return TutorialCoachContent(
+                progressLine: "Last step",
+                title: "Two ways to read.",
+                message: "Prefer the classic email view? Turn off Chat View here. You can turn it back on any time.",
+                buttons: [Button(label: "Finish", action: .finishChatViewSwitch, isPrimary: true)])
         default:
             return nil
         }
