@@ -164,6 +164,22 @@ struct ThreadGroupTests {
         #expect(info?.memberCount == 2)
     }
 
+    @Test("ThreadDisplayInfo unionLabels: every member's labels, once each, by name")
+    func displayInfoUnionLabels() {
+        let work = UserLabel(accountId: "acc1", providerLabelId: "work", name: "work", isSystem: false)
+        let alpha = UserLabel(accountId: "acc1", providerLabelId: "alpha", name: "Alpha", isSystem: false)
+        let zed = UserLabel(accountId: "acc1", providerLabelId: "zed", name: "Zed", isSystem: false)
+        var first = makeSnapshot()
+        first.userLabels = [zed, work]
+        var second = makeSnapshot()
+        second.userLabels = [work, alpha]
+        let group = ThreadGroup(
+            id: "t1", representative: first, memberCount: 2, allSenders: ["Alice", "Bob"],
+            threadTag: nil, hasUnread: false, members: [first, second])
+        #expect(group.displayInfo?.unionLabels.map(\.name) == ["Alpha", "work", "Zed"])
+        #expect(UserLabel.union([[zed, work], [work, alpha]]).map(\.name) == ["Alpha", "work", "Zed"])
+    }
+
     // Helper to create a minimal MessageSnapshot via MessageHeader
     private func makeSnapshot(actionTag: ActionTag? = nil, isInInbox: Bool = true) -> MessageSnapshot {
         var header = MessageHeader(

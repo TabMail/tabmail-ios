@@ -90,6 +90,24 @@ struct QueueStorage<Item: Hashable> {
         return true
     }
 
+    /// Move pending `items` to the front of the queue, in the given order: `items[0]` is next.
+    /// In-flight items and items not in the queue stay where they are. The queue keeps its own
+    /// values (an equal item can carry other context, like `ActiveAIQueue.AIJob.windowExempt`), and
+    /// membership, retry counts and completion markers are keyed by identity, so the move changes
+    /// only the order.
+    mutating func moveToFront(_ items: [Item]) {
+        var stored: [Item: Item] = [:]
+        for item in queue where !inFlight.contains(item) { stored[item] = item }
+        var front: [Item] = []
+        for item in items {
+            guard let value = stored.removeValue(forKey: item) else { continue }
+            front.append(value)
+        }
+        guard !front.isEmpty else { return }
+        let moved = Set(front)
+        queue = front + queue.filter { !moved.contains($0) }
+    }
+
     /// Sweep `recentlyCompleted` entries older than the TTL.
     /// Called lazily from `enqueue` — cheap when the dict is small.
     private mutating func sweepExpiredRecentlyCompleted() {

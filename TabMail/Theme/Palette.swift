@@ -34,6 +34,15 @@ enum Palette {
     static let textColor = Color(light: Color(hex: 0x15141A), dark: Color(hex: 0xFBFBFE))
     static let accentColor = Color(light: Color(hex: 0x0060DF), dark: Color(hex: 0x0A84FF))
 
+    // MARK: - Chat view
+    /// Incoming bubble gray (mock Q26; the app had no equivalent).
+    static let chatIncomingBubble = Color(light: Color(hex: 0xE9E9EB), dark: Color(hex: 0x26262A))
+    /// Sender colors for avatars and names in group chats (N2.11), picked per address.
+    static let chatPersonColors: [Color] = [
+        Color(hex: 0x0A84FF), Color(hex: 0x30B0C7), Color(hex: 0x34C759), Color(hex: 0xFF9500),
+        Color(hex: 0xFF2D55), Color(hex: 0xAF52DE), Color(hex: 0x5856D6), Color(hex: 0xA2845E),
+    ]
+
     // MARK: - Separator
     static let separator = Color(light: Color.black.opacity(0.15), dark: Color.white.opacity(0.15))
 
