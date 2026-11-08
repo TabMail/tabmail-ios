@@ -132,10 +132,11 @@ struct ChatFieldFill: Equatable {
 /// write, Undo window included, says "Sending" until the provider takes the email and "Sent" after,
 /// and shows the email's summary as soon as it is made at Send ("Summarizing" until then). Undo or a
 /// discard deletes the unsent row, and the bubble goes with it. The bubble ends when the email
-/// itself, by its own Message-ID, is in the chat. A filed row whose Message-ID no email of its
-/// account carries any more ends it too: the provider filed its own copy under a Message-ID of its
-/// own (Outlook keeps none of ours) and the Sent sync replaced ours, so that copy is the email, and
-/// it ends with no chat on screen. In memory only.
+/// itself, by its own Message-ID, is in the chat. A filed row whose Message-ID no email carries any
+/// more ends it too: the provider filed its own copy under a Message-ID of its own (Outlook keeps
+/// none of ours) and the Sent sync replaced ours, so that copy is the email, and it ends with no chat
+/// on screen. The email is looked for by its Message-ID alone, in every account: the reply may go
+/// out from another account than the email it answers (compose's From). In memory only.
 @MainActor @Observable
 final class ChatSentReplies {
     static let shared = ChatSentReplies()
@@ -183,17 +184,16 @@ final class ChatSentReplies {
     private var watched: [Watch] = []
 
     /// What the observation follows for an entry: its outbox row, and once its Message-ID is
-    /// known, whether an email of its account still carries it.
+    /// known, whether an email still carries it.
     struct Watch: Equatable, Sendable {
         let outboxId: String
-        let accountId: String
         let messageId: String?
     }
 
     /// One read of the entries' rows and emails.
     struct Observed: Equatable, Sendable {
         var progress: [String: Progress] = [:]
-        /// Entries whose row is gone and whose Message-ID no email of their account carries.
+        /// Entries whose row is gone and whose Message-ID no email carries.
         var withoutEmail: Set<String> = []
     }
 
@@ -271,7 +271,7 @@ final class ChatSentReplies {
         for watch in watches where observed.progress[watch.outboxId] == nil {
             guard let messageId = watch.messageId else { continue }
             let carried = try MessageHeader
-                .filter(Column("accountId") == watch.accountId && Column("rfc822MessageId") == messageId)
+                .filter(Column("rfc822MessageId") == messageId)
                 .fetchCount(db) > 0
             if !carried { observed.withoutEmail.insert(watch.outboxId) }
         }
@@ -282,7 +282,7 @@ final class ChatSentReplies {
     /// while there are any.
     private func observe() {
         observation?.cancel()
-        let watches = entries.map { Watch(outboxId: $0.id, accountId: $0.accountId, messageId: progress[$0.id]?.messageId) }
+        let watches = entries.map { Watch(outboxId: $0.id, messageId: progress[$0.id]?.messageId) }
         watched = watches
         guard !watches.isEmpty else {
             observation = nil
@@ -303,7 +303,7 @@ final class ChatSentReplies {
 
     /// A row that is gone before its email went out was undone or discarded: its bubble goes. A
     /// sent email's row goes once it is filed in Sent; its bubble stays, "Sent", until the email is
-    /// in the chat, or until no email of its account carries its Message-ID (the provider's own
+    /// in the chat, or until no email carries its Message-ID (the provider's own
     /// copy replaced ours). A Message-ID learned here is followed from then on.
     private func apply(_ observed: Observed) {
         let found = observed.progress
@@ -312,7 +312,7 @@ final class ChatSentReplies {
         for (id, value) in found { progress[id] = value }
         if !gone.isEmpty { entries.removeAll { gone.contains($0.id) } }
         progress = progress.filter { id, _ in entries.contains { $0.id == id } }
-        let watches = entries.map { Watch(outboxId: $0.id, accountId: $0.accountId, messageId: progress[$0.id]?.messageId) }
+        let watches = entries.map { Watch(outboxId: $0.id, messageId: progress[$0.id]?.messageId) }
         if watches != watched { observe() }
     }
 

@@ -102,6 +102,9 @@ extension AccountManager {
     /// during the now-suspended dismiss window — NO second row is created; the
     /// existing id is returned. (This is the persistence-layer guarantee; the UI
     /// `isSending` guard in ComposeView is the first line of defense.)
+    ///
+    /// `summaryService` makes the Send-time summary (`SentEmailSummary`): production uses
+    /// `AIService.shared`; tests pass one built on a `FakeHTTP` session (AIService's own seam).
     @discardableResult
     nonisolated func queueSend(
         draft: DraftMessage,
@@ -114,7 +117,8 @@ extension AccountManager {
         serverDraftGmailMessageId: String? = nil,
         draftId: String,
         instanceEpoch: String,
-        holdsForUndo: Bool = true
+        holdsForUndo: Bool = true,
+        summaryService: AIService = .shared
     ) async throws -> (outboxId: String, holdUntil: Date?) {
         let result = try await Self.persistQueuedSend(
             draft: draft,
@@ -153,7 +157,7 @@ extension AccountManager {
             let outboxId = result.outboxId
             Task {
                 guard await SentEmailSummary.mayRun() else { return }
-                await SentEmailSummary.summarize(outboxId: outboxId)
+                await SentEmailSummary.summarize(outboxId: outboxId, aiService: summaryService)
             }
         }
         Task { await self.drainOutbox() }

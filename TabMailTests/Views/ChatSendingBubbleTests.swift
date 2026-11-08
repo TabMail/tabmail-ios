@@ -24,11 +24,12 @@ import UIKit
 ///     send says "Not sent". Another reply of the user's to the same email never ends it. A filed
 ///     row whose Message-ID no email carries any more ends it: with a provider that files its own
 ///     copy under a Message-ID of its own (Outlook) the bubble ends, with no chat on screen, and is
-///     not the user's turn.
+///     not the user's turn. A reply sent from another account than the email it answers (compose's
+///     From) is found in that account: its bubble stays until the chat shows it.
 ///  5. The wiring: a sent compose card reports its queued email's outbox row, and a queued (not
-///     deduplicated) send summarizes at once only with the chat view on and AI allowed. The gate
-///     is driven through each of its real inputs; the compose card cannot be driven from a unit
-///     test, so its trigger is read from the source.
+///     deduplicated) send summarizes at once, through the real `queueSend`, only with the chat view
+///     on and AI allowed. The gate is driven through each of its real inputs; the compose card
+///     cannot be driven from a unit test, so its trigger is read from the source.
 ///  6. A send that failed for good shows the red mark beside its bubble (owner 2026-11-07); the
 ///     mark's Retry puts the same outbox row back in the queue and the bubble back to "Sending",
 ///     and its Delete removes the row and the bubble. Driven through the hosted chat's own actions.
@@ -438,6 +439,78 @@ struct ChatSendingBubbleTests {
         #expect(replies.entries.isEmpty, "a chat showing the email ends its bubble")
     }
 
+    @Test("A reply sent from another account than the email it answers keeps its bubble until its email is in the chat")
+    func bubbleFollowsAReplyFromAnotherAccount() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let replies = ChatSentReplies()
+        defer {
+            replies.removeAllForTesting()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        let fixture = try await Self.makeFixture(pool)
+        // Compose's From picker chose the user's other account.
+        let from = "acc-sending-from"
+        _ = try FolderEpochTestFixture.makeAccount(id: from, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: from, path: "Sent", role: .sent, pool: pool)
+        func queue(_ draftId: String) async throws -> OutboxMessage {
+            try await pool.write { db in
+                var draft = Draft(
+                    id: draftId, accountId: from, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                    subject: "Re: Lunch plans", body: "Tuesday works", replyToId: nil, isForward: false,
+                    editHistoryJSON: nil, createdAt: Date().timeIntervalSince1970, updatedAt: Date().timeIntervalSince1970)
+                draft.instanceEpoch = "E1"
+                try draft.insert(db)
+            }
+            let queued = try await AccountManager.persistQueuedSend(
+                draft: DraftMessage(to: ["sender@example.com"], subject: "Re: Lunch plans", body: "Tuesday works for me.",
+                                    inReplyTo: fixture.parent.rfc822MessageId),
+                accountId: from, replyToHeaderId: fixture.parent.id, isForward: false, serverDraftId: nil,
+                draftId: draftId, instanceEpoch: "E1", holdsForUndo: false)
+            return try #require(try await pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId) })
+        }
+        let row = try await queue("draft-other-account")
+        // A witness filed at the same moment, whose Message-ID no email carries: its bubble ending
+        // shows the observation has read the filing.
+        let witness = try await queue("draft-other-account-witness")
+        #expect(replies.composeEnded(.sent(outboxId: row.id), replyTo: fixture.parent))
+        #expect(replies.composeEnded(.sent(outboxId: witness.id), replyTo: fixture.parent))
+        for _ in 0..<100 where replies.progress[row.id] == nil || replies.progress[witness.id] == nil {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(replies.progress[row.id]?.caption == "Sending", "control: the bubble follows the queued email")
+
+        // The provider took both ("Sent"), then filing deletes their rows, and the reply's Sent copy
+        // is in the sending account's Sent.
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE outboxMessage SET sentAt = ? WHERE id IN (?, ?)", arguments: [Date(), row.id, witness.id])
+        }
+        for _ in 0..<100 where replies.progress[row.id]?.caption != "Sent" || replies.progress[witness.id]?.caption != "Sent" {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(replies.progress[row.id]?.caption == "Sent" && replies.progress[witness.id]?.caption == "Sent",
+                "control: both were sent")
+        var copy = MessageHeader(
+            messageId: "sent-\(row.id)", subject: "Re: Lunch plans", from: "\(from)@example.com",
+            fromAddress: "\(from)@example.com", to: "sender@example.com", date: Date(), snippet: "Tuesday",
+            folderId: MessageIdentity.folderId(accountId: from, folderPath: "Sent"),
+            accountId: from, folderPath: "Sent", isInInbox: false)
+        copy.rfc822MessageId = EmailFilter.normalizeMessageId(try #require(row.sentMessageId))
+        copy.inReplyTo = fixture.parent.rfc822MessageId
+        let sentCopy = copy
+        try await pool.write { db in
+            try sentCopy.insert(db)
+            _ = try OutboxMessage.deleteAll(db, keys: [row.id, witness.id])
+        }
+        for _ in 0..<100 where replies.entries.contains(where: { $0.id == witness.id }) {
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(!replies.entries.contains { $0.id == witness.id }, "control: the observation read the filing")
+        #expect(replies.entries.map(\.id) == [row.id],
+                "its email exists, in the account it was sent from, so the bubble stays until the chat shows it")
+        replies.settle([Self.ownItem(sentCopy)])
+        #expect(replies.entries.isEmpty, "a chat showing the email ends its bubble")
+    }
+
     // MARK: - 5. The gate of the summary at Send
 
     enum GateInput: String, CaseIterable, Sendable {
@@ -448,12 +521,20 @@ struct ChatSendingBubbleTests {
     /// through its real store.
     @Test("The summary at Send runs only with the chat view on, AI on, a plan, a session and consent", arguments: GateInput.allCases)
     func summaryAtSendGate(off: GateInput) throws {
+        let restore = try Self.openGate(except: off)
+        defer { restore() }
+        #expect(SentEmailSummary.mayRun() == (off == .none), "with \(off.rawValue) off")
+    }
+
+    /// Sets every input of the summary gate on through its real store, except `off`, and returns
+    /// what restores them.
+    private static func openGate(except off: GateInput) throws -> () -> Void {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
         let standard = UserDefaults.standard
         let consentBefore = standard.object(forKey: AgeAndTermsConsent.completedKey)
         let previousSession = TabMailSessionStore.shared.loadActiveSession()?.data
         let previousDemo = DemoModeStore.shared.isActive
-        defer {
+        let restore = {
             _ = TabMailAuthService.completeSession(mode: .deactivate, notify: false)
             if let previousSession { _ = try? TabMailSessionStore.shared.installNewSession(previousSession) }
             DemoModeStore.shared.isActive = previousDemo
@@ -481,7 +562,56 @@ struct ChatSendingBubbleTests {
         case .signedOut: _ = TabMailAuthService.completeSession(mode: .deactivate, notify: false)
         case .noConsent: standard.set(false, forKey: AgeAndTermsConsent.completedKey)
         }
-        #expect(SentEmailSummary.mayRun() == (off == .none), "with \(off.rawValue) off")
+        return restore
+    }
+
+    /// The real producer: `queueSend` summarizes a new queued email with the gate open, under its
+    /// Sent folder and Message-ID; a deduplicated second Send makes no second summary, and with the
+    /// gate closed there is none at all.
+    @Test("A queued send summarizes its email once, and only with the gate open", arguments: [true, false])
+    func queueSendSummarizes(gateOpen: Bool) async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let restore = try Self.openGate(except: gateOpen ? .none : .chatViewOff)
+        defer { restore() }
+        let fixture = try await Self.makeFixture(pool)
+        let http = Self.summaryBackend(textMessage: "I said Tuesday works.")
+        defer { http.close() }
+        let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+        try await pool.write { db in
+            var draft = Draft(
+                id: "draft-queue", accountId: Self.account, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Re: Lunch plans", body: "Tuesday works", replyToId: nil, isForward: false,
+                editHistoryJSON: nil, createdAt: Date().timeIntervalSince1970, updatedAt: Date().timeIntervalSince1970)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+        func send() async throws -> String {
+            try await AccountManager.shared.queueSend(
+                draft: DraftMessage(to: ["sender@example.com"], subject: "Re: Lunch plans", body: "Tuesday works for me.",
+                                    inReplyTo: fixture.parent.rfc822MessageId),
+                from: fixture.account, replyToHeaderId: fixture.parent.id, draftId: "draft-queue", instanceEpoch: "E1",
+                summaryService: service).outboxId
+        }
+        let outboxId = try await send()
+        #expect(try await send() == outboxId, "control: the second Send is deduplicated")
+        let row = try #require(try await pool.read { try OutboxMessage.fetchOne($0, key: outboxId) })
+        let sentMessageId = try #require(row.sentMessageId)
+        let key = try #require(MessageAICache.cacheKey(
+            accountId: Self.account, folderPath: "Sent",
+            rfc822MessageId: EmailFilter.normalizeMessageId(sentMessageId)))
+        func cached() async throws -> MessageAICache? {
+            try await pool.read { try MessageAICache.filter(Column("key") == key).fetchOne($0) }
+        }
+        if gateOpen {
+            for _ in 0..<100 where try await cached() == nil { try await Task.sleep(for: .milliseconds(100)) }
+            #expect(try await cached()?.summaryTextMessage == "I said Tuesday works.",
+                    "the queued email's summary, under its Sent folder and Message-ID")
+        }
+        // Long enough for a second summary, or a gated one, to have been asked.
+        try await Task.sleep(for: .seconds(2))
+        #expect(http.recordedCalls().count == (gateOpen ? 1 : 0), "one summary per queued email, none when gated")
+        if !gateOpen { #expect(try await cached() == nil, "nothing written when gated") }
     }
 
     // MARK: - 6. A send that failed for good
@@ -575,18 +705,13 @@ struct ChatSendingBubbleTests {
         text.components(separatedBy: needle).count - 1
     }
 
-    @Test("A sent compose card reports its outbox row, and only a new queued send summarizes, only with the chat view on and AI allowed")
+    @Test("A sent compose card reports its outbox row")
     func summaryAtSendWiring() throws {
         let compose = try Self.source("TabMail/Views/Compose/ComposeView.swift")
         #expect(Self.count("onAgentOutcome?(.sent(outboxId: queued.outboxId))", in: compose) == 1)
         #expect(Self.count("onAgentOutcome?(.sent", in: compose) == 1, "no other sent report")
 
-        let outbox = try Self.source("TabMail/Services/Account/AccountManagerOutbox.swift")
-        #expect(Self.count("if !result.deduped { Task { await AppDatabase.checkpointForDurability() } "
-            + "// The chat view summarizes the email now, for its Sending bubble and its Sent copy. "
-            + "let outboxId = result.outboxId Task { guard await SentEmailSummary.mayRun() else { return } "
-            + "await SentEmailSummary.summarize(outboxId: outboxId) } }", in: outbox) == 1)
-        #expect(Self.count("SentEmailSummary.summarize(", in: outbox) == 1, "nothing else summarizes at Send")
-        // The gate itself is driven through its real inputs in `summaryAtSendGate`.
+        // queueSend's summary is driven for real in `queueSendSummarizes`, and its gate through its
+        // real inputs in `summaryAtSendGate`.
     }
 }
