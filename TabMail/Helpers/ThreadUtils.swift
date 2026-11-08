@@ -277,7 +277,7 @@ enum ThreadUtils {
         return "subj:\(accountId):\(normalized.lowercased())"
     }
 
-    // MARK: - Outgoing Threading Headers (send path)
+    // MARK: - Outgoing Threading Headers (send and draft upload)
 
     /// The threading fields a reply/forward must carry so the provider files it
     /// into the source conversation. See the outgoing-thread fix (ADR-IOS-043) and ADR-IOS-043.
@@ -285,7 +285,8 @@ enum ThreadUtils {
     /// - `inReplyTo` / `references` are bare (normalized) RFC 2822 message IDs;
     ///   each provider adds the `<…>` brackets at the wire boundary.
     /// - `threadId` is Gmail's native conversation id (used only by the Gmail
-    ///   REST send); `nil` for non-Gmail providers and for new compositions.
+    ///   REST send and the Gmail reply-draft upload); `nil` for non-Gmail
+    ///   providers and for new compositions.
     struct OutgoingThreadHeaders: Sendable, Equatable {
         var inReplyTo: String?
         var references: [String]
@@ -302,7 +303,8 @@ enum ThreadUtils {
     /// empty `To`, `Fwd:` subject, quoted block — live in ComposeView, not here).
     /// A `nil` `replyTo` (a true new composition) yields `.none`.
     ///
-    /// Adapter over the scalar core below; ComposeView passes the resolved header.
+    /// Adapter over the scalar core below; ComposeView and
+    /// `DraftStore.uploadThreadHeaders` pass the resolved header.
     static func outgoingThreadHeaders(
         replyTo: MessageHeader?,
         sendAccountId: String,

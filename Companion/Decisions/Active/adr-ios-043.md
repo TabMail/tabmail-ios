@@ -25,4 +25,6 @@ Forward semantics were verified against Gmail (web research, 2026-06-23): Gmail 
 - Local receive-side grouping (`ThreadUtils.assignComputedThreadId`) is untouched; this ADR governs **outgoing** headers only.
 - Regression: `OutgoingThreadHeadersTests` (builder), `GmailSendBodyTests` (threadId in/out of send body), `ExchangeSendPayloadTests` (References emission), `DatabaseOutboxTests` (v60 column + round-trip), plus existing `IMAPProviderBuildEmailTests` (References). See the outgoing-thread fix (ADR-IOS-043).
 
+**Amendment (2026-11-07, #431): item 6 no longer holds.** `ComposeView.send` is no longer the only caller of `ThreadUtils.outgoingThreadHeaders`. `DraftStore.uploadThreadHeaders` calls it for every Gmail reply-draft upload (`drafts.create` and `drafts.update`): since #278 for the References/In-Reply-To pair, and since #431 also for `threadId`, under the same conditions Send applies (same account as the parent, matching subject). A forward draft and every non-Gmail draft upload write no thread headers. Item 6's text above is kept as the original record. Regression: `GmailReplyDraftThreadTests`.
+
 ---

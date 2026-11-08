@@ -130,4 +130,6 @@ Gmail files a message or draft in a conversation only when the request's `messag
 `DraftStore.pushDraftToServer` against a real `GmailProvider` on `FakeHTTP` and reads both
 `drafts.create` and `drafts.update` off the wire: each carries the `threadId` that
 `ThreadUtils.outgoingThreadHeaders` gives Send for the same reply (the parent's id for a matching
-subject, none for a changed one) beside the headers that name the parent.
+subject, none for a changed one) beside the headers that name the parent. A reply draft saved in a
+different Gmail account than its parent sends no `threadId` on either request, as Send from that
+account would not, and still names the parent in its headers.

@@ -75,6 +75,54 @@ struct GmailReplyDraftThreadTests {
         return (message, headerLines)
     }
 
+    /// Saves a reply draft to `parent` in `draftAccountId`, pushes it (drafts.create),
+    /// edits it and pushes again (drafts.update), and returns the two upload requests.
+    private static func createThenUpdate(
+        pool: DatabasePool, parent: MessageHeader, draftAccountId: String,
+        draftUserEmail: String, subject: String
+    ) async throws -> [(method: String, url: String, body: Data?)] {
+        let draftId = "reply:\(draftAccountId):parent-431@example.com"
+        try await pool.write { db in
+            var draft = Draft(
+                id: draftId, accountId: draftAccountId, toJSON: #"["sender@example.com"]"#, ccJSON: "[]", bccJSON: "[]",
+                subject: subject, body: "first body", replyToId: parent.id, isForward: false,
+                editHistoryJSON: nil, createdAt: 1, updatedAt: 2, serverDraftId: nil,
+                serverPushStatus: nil, rfc822MessageId: nil, attachmentsDirName: nil)
+            draft.instanceEpoch = "tabmail-E1"
+            draft.replyToProviderMessageId = parent.messageId
+            try DraftStore.applySave(draft, db: db)
+        }
+
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/drafts", method: "POST", response: .json(raw: #"{"id":"r431","message":{"id":"m-1"}}"#))
+        http.register(path: "/drafts/r431", method: "PUT", response: .json(raw: #"{"id":"r431","message":{"id":"m-2"}}"#))
+        let provider = GmailProvider(userEmail: draftUserEmail, accessToken: { _ in "token" }, session: http.session)
+
+        let created = try await DraftStore.shared.pushDraftToServer(
+            draftId: draftId, expectedInstanceEpoch: "tabmail-E1", provider: provider,
+            runtimeKind: .gmail, draftsFolderPath: "DRAFT")
+        try #require(created == .completed, "precondition: the first upload created the Gmail draft")
+
+        // An edit, then the second upload replaces the same Gmail draft.
+        let pushed = try #require(try await pool.read { try Draft.fetchOne($0, key: draftId) })
+        #expect(pushed.serverDraftId == "r431", "precondition: the row names the created draft")
+        try await pool.write { db in
+            var edited = pushed
+            edited.body = "second body"
+            edited.updatedAt = 3
+            try DraftStore.applySave(edited, db: db)
+        }
+        let updated = try await DraftStore.shared.pushDraftToServer(
+            draftId: draftId, expectedInstanceEpoch: try #require(pushed.instanceEpoch), provider: provider,
+            runtimeKind: .gmail, draftsFolderPath: "DRAFT")
+        try #require(updated == .completed, "precondition: the second upload updated the Gmail draft")
+
+        return http.recordedCalls().filter {
+            ($0.method == "POST" && $0.url.hasSuffix("/drafts")) || ($0.method == "PUT" && $0.url.hasSuffix("/drafts/r431"))
+        }
+    }
+
     @Test("A Gmail reply draft's create and update carry the thread id exactly when Send would",
           arguments: ["Re: Quarterly plan", "A different topic"])
     func replyDraftUploadCarriesSendsThreadBinding(subject: String) async throws {
@@ -88,51 +136,47 @@ struct GmailReplyDraftThreadTests {
                 #expect(sendBinding.threadId == nil, "fixture: Send starts a new thread for a changed subject")
             }
 
-            let draftId = "reply:\(Self.accountId):parent-431@example.com"
-            try await pool.write { db in
-                var draft = Draft(
-                    id: draftId, accountId: Self.accountId, toJSON: #"["sender@example.com"]"#, ccJSON: "[]", bccJSON: "[]",
-                    subject: subject, body: "first body", replyToId: parent.id, isForward: false,
-                    editHistoryJSON: nil, createdAt: 1, updatedAt: 2, serverDraftId: nil,
-                    serverPushStatus: nil, rfc822MessageId: nil, attachmentsDirName: nil)
-                draft.instanceEpoch = "tabmail-E1"
-                draft.replyToProviderMessageId = parent.messageId
-                try DraftStore.applySave(draft, db: db)
-            }
-
-            let http = FakeHTTP.Scenario()
-            defer { http.close() }
-            http.register(path: "/drafts", method: "POST", response: .json(raw: #"{"id":"r431","message":{"id":"m-1"}}"#))
-            http.register(path: "/drafts/r431", method: "PUT", response: .json(raw: #"{"id":"r431","message":{"id":"m-2"}}"#))
-            let provider = GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
-
-            let created = try await DraftStore.shared.pushDraftToServer(
-                draftId: draftId, expectedInstanceEpoch: "tabmail-E1", provider: provider,
-                runtimeKind: .gmail, draftsFolderPath: "DRAFT")
-            try #require(created == .completed, "precondition: the first upload created the Gmail draft")
-
-            // An edit, then the second upload replaces the same Gmail draft.
-            let pushed = try #require(try await pool.read { try Draft.fetchOne($0, key: draftId) })
-            #expect(pushed.serverDraftId == "r431", "precondition: the row names the created draft")
-            try await pool.write { db in
-                var edited = pushed
-                edited.body = "second body"
-                edited.updatedAt = 3
-                try DraftStore.applySave(edited, db: db)
-            }
-            let updated = try await DraftStore.shared.pushDraftToServer(
-                draftId: draftId, expectedInstanceEpoch: try #require(pushed.instanceEpoch), provider: provider,
-                runtimeKind: .gmail, draftsFolderPath: "DRAFT")
-            try #require(updated == .completed, "precondition: the second upload updated the Gmail draft")
-
-            let uploads = http.recordedCalls().filter {
-                ($0.method == "POST" && $0.url.hasSuffix("/drafts")) || ($0.method == "PUT" && $0.url.hasSuffix("/drafts/r431"))
-            }
+            let uploads = try await Self.createThenUpdate(
+                pool: pool, parent: parent, draftAccountId: Self.accountId,
+                draftUserEmail: "owner@example.com", subject: subject)
             #expect(uploads.map(\.method) == ["POST", "PUT"], "expected drafts.create then drafts.update")
             for call in uploads {
                 let (message, headerLines) = try Self.uploadedMessage(call.body)
                 #expect(message["threadId"] as? String == sendBinding.threadId,
                         "\(call.method) sent threadId \(String(describing: message["threadId"])), Send would send \(String(describing: sendBinding.threadId))")
+                #expect(headerLines.contains("In-Reply-To: <parent-431@example.com>"), "\(call.method) does not name the parent")
+                #expect(headerLines.contains("References: <parent-431@example.com>"), "\(call.method) does not name the parent")
+            }
+        }
+    }
+
+    /// Send binds a reply to the parent's conversation only from the parent's own
+    /// account (a Gmail thread id is per mailbox), so a reply draft saved in another
+    /// Gmail account must name no thread, on create and on update alike.
+    @Test("A reply draft saved in another Gmail account than its parent names no thread")
+    func crossAccountReplyDraftNamesNoThread() async throws {
+        try await withInstalledPool { pool in
+            let parent = try await pool.write { try Self.insertParent($0) }
+            let otherAccountId = "acc-431-other"
+            try await pool.write { db in
+                var other = Account(emailAddress: "other@example.com", displayName: "Other", provider: .gmail)
+                other.id = otherAccountId
+                try other.insert(db)
+                try Folder(name: "Drafts", path: "DRAFT", role: .drafts, accountId: otherAccountId).insert(db)
+            }
+            let subject = "Re: \(Self.parentSubject)"
+            let sendBinding = ThreadUtils.outgoingThreadHeaders(
+                replyTo: parent, sendAccountId: otherAccountId, sendSubject: subject, providerKind: .gmail)
+            #expect(sendBinding.threadId == nil, "fixture: Send from the other account binds no thread")
+
+            let uploads = try await Self.createThenUpdate(
+                pool: pool, parent: parent, draftAccountId: otherAccountId,
+                draftUserEmail: "other@example.com", subject: subject)
+            #expect(uploads.map(\.method) == ["POST", "PUT"], "expected drafts.create then drafts.update")
+            for call in uploads {
+                let (message, headerLines) = try Self.uploadedMessage(call.body)
+                #expect(!message.keys.contains("threadId"),
+                        "\(call.method) sent threadId \(String(describing: message["threadId"])) from another account")
                 #expect(headerLines.contains("In-Reply-To: <parent-431@example.com>"), "\(call.method) does not name the parent")
                 #expect(headerLines.contains("References: <parent-431@example.com>"), "\(call.method) does not name the parent")
             }

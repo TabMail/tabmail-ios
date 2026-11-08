@@ -29,3 +29,12 @@ controls. `GmailThreadHeaderFoldingTests` pins long safe histories and parents.
 
 This restores the app-side boundary parked from the Bcc train, adapting it to the
 Gmail folding now on main; it does not change the SwiftMail pin or incoming parsing.
+
+## Amendment (2026-11-07, #431): two callers, not one
+
+The first bullet's "`ComposeView.send` is the ONE callsite" is stale. `DraftStore.uploadThreadHeaders`
+also calls `ThreadUtils.outgoingThreadHeaders`, for Gmail reply-draft uploads only (create and update):
+the References/In-Reply-To pair since #278, and `threadId` since #431, under Send's own conditions (the
+parent's account, a matching subject). Forwards and non-Gmail drafts write none. A reply draft saved in a
+different Gmail account than its parent names no thread, exactly as Send from that account would.
+Pinned by `GmailReplyDraftThreadTests`. See ADR-IOS-043's amendment.

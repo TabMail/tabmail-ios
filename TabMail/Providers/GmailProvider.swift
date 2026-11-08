@@ -697,10 +697,12 @@ actor GmailProvider: EmailProvider {
 
     /// Build the `users.messages.send` request body, which is also the `message`
     /// resource `saveDraft` uploads. Includes `threadId` when the draft carries
-    /// one (reply/forward), so Gmail files the message into the existing
-    /// conversation instead of starting a new thread. Gmail also requires
-    /// the raw message to carry RFC-compliant References/In-Reply-To and a matching
-    /// Subject — all set by the centralized ComposeView callsite. See ADR-IOS-043.
+    /// one, so Gmail files the message into the existing conversation instead of
+    /// starting a new thread. Gmail also requires the raw message to carry
+    /// RFC-compliant References/In-Reply-To and a matching Subject. Send
+    /// (`ComposeView.send`) and the reply-draft upload
+    /// (`DraftStore.uploadThreadHeaders`) both set these through
+    /// `ThreadUtils.outgoingThreadHeaders`. See ADR-IOS-043.
     /// Extracted from `send()` so the threadId wiring is unit-testable.
     /// `nonisolated` (pure — derives only from `draft`) so it returns the
     /// non-Sendable `[String: Any]` without crossing the actor boundary.
