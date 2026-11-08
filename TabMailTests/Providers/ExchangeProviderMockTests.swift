@@ -881,6 +881,8 @@ struct ExchangeProviderSelectionWiringTests {
               "AT&T C# a+b 100% done",
               "say \"hello\" to back\\slash",
               "x=1;y=2 ?query #tag /path",
+              // An address, and every reserved character RFC 3986 names.
+              "sender@example.com :/?#[]@!$&'()*+,;=",
               "plain",
           ])
     func searchTextReachesGraphIntact(typed: String) async throws {
