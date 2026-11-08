@@ -432,7 +432,9 @@ actor DraftStore {
     /// The threading headers a draft upload writes. A Gmail reply names its parent
     /// as Send will (`ThreadUtils.outgoingThreadHeaders` on the parent
     /// `Draft.resolveReplyToHeader` finds), so a reload can tell TabMail's own copy
-    /// from a standalone message another app put in its place (#278). A forward, and
+    /// from a standalone message another app put in its place (#278), and carries
+    /// the parent's `threadId` under Send's conditions (same account, matching
+    /// subject), so Gmail files the draft in its conversation (#431). A forward, and
     /// every other provider, writes none, as before.
     static func uploadThreadHeaders(
         for draft: Draft,
@@ -836,7 +838,8 @@ actor DraftStore {
             isHTML: false,
             inReplyTo: threadHeaders.inReplyTo,
             references: threadHeaders.references,
-            attachments: attachments)
+            attachments: attachments,
+            threadId: threadHeaders.threadId)
         payload.messageId = freshRfc
         let copyNamesParent = MessageIdentity.comparableRfc822Identity(threadHeaders.inReplyTo) != nil
 
