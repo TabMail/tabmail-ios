@@ -410,10 +410,39 @@ struct TutorialChatViewRunTests {
                 try draft.insert(db)
             }
             let account = try #require(try await pool.read { try Account.fetchOne($0, key: DemoSeed.demoAccountId) })
-            _ = try await AccountManager.shared.queueSend(
-                draft: DraftMessage(to: ["priya@company.com"], subject: "Re: Engineering offsite", body: reply),
-                from: account, draftId: draftId, instanceEpoch: "E1", holdsForUndo: false)
+            let priya = try #require(try await pool.read { db in
+                try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                    && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+            })
+            // Linked to Priya's email, as compose links a reply.
+            let queued = try await AccountManager.shared.queueSend(
+                draft: DraftMessage(to: ["priya@company.com"], subject: "Re: Engineering offsite", body: reply,
+                                    inReplyTo: priya.rfc822MessageId),
+                from: account, replyToHeaderId: priya.id, draftId: draftId, instanceEpoch: "E1", holdsForUndo: false)
             try await waitFor(.makeTemplate)
+
+            // Its Sent copy joins Priya's chat as the user's own bubble, with its own words: the
+            // tutorial makes no AI call, so nothing else would ever write its text message.
+            var sentCopy: MessageHeader?
+            for _ in 0..<80 {
+                sentCopy = try await pool.read { db in
+                    try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                        && Column("messageId") == "sent-\(queued.outboxId)").fetchOne(db)
+                }
+                if sentCopy?.summaryTextMessage != nil { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            let sent = try #require(sentCopy, "the demo provider files the Sent copy")
+            #expect(sent.summaryTextMessage == reply)
+            let related = try ThreadDetection.findRelatedMessages(for: priya, in: pool)
+            #expect(related.contains { $0.id == sent.id }, "the sent reply is in Priya's chat")
+            let chat = ChatThread(
+                members: [priya] + related, replyAddresses: { [$0.fromAddress] },
+                ownAddresses: [DemoSeed.demoEmail.lowercased()], draftFolderIds: [],
+                sentFolderIds: [sent.folderId], unreadAtOpen: [], preferredId: priya.id)
+            let bubble = try #require(chat.items.first { $0.id == sent.id })
+            #expect(bubble.isOwn)
+            #expect(bubble.textMessage == reply, "its own words, never Summarizing")
 
             // T2.4 to T2.6: the request in the same field, then Create.
             #expect(coordinator.fieldMove(inPracticeChat: true) == .ask(.saveReplyAsTemplate))

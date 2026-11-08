@@ -532,8 +532,11 @@ enum DemoSeed {
         }
     }
 
+    /// A seeded email's Message-ID as every email's is stored: without its angle brackets
+    /// (`EmailFilter.normalizeMessageId`), so a reply the tutorial sends, whose In-Reply-To the
+    /// Sent-copy writer stores the same way, is found in its email's chat.
     private static func rfc822Id(_ messageId: String) -> String {
-        "<\(messageId)@demomail.example>"
+        "\(messageId)@demomail.example"
     }
 
     private static func stripHTML(_ s: String) -> String {
