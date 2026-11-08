@@ -1,12 +1,15 @@
 # IOS-DRAFT-026
 
-- Register classification: `open`
+- Register classification: `accepted`
 - New post-freeze record (2026-11-07) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
 
-🔓 **OPEN (2026-11-07, #422), proposed for acceptance.** Registered with the change that sends an
+📋 **ACCEPTED LIMITATION (2026-11-08, owner, #422).** The owner accepted it as a limitation and kept
+the draft route for every send with files.
+
+*Preserved, superseded:* 🔓 **OPEN (2026-11-07, #422), proposed for acceptance.** Registered with the change that sends an
 Outlook message with files through a draft (ADR-IOS-091, #422 section). Recoverable by one ordinary
 gesture, so THE MANTRA's answer is to register it rather than build a mechanism; it becomes
 `accepted` only once accepted as a limitation.
@@ -40,4 +43,4 @@ finding the leftover in Drafts by Message-ID could delete the user's own draft o
 
 Outbox; Outlook; Graph; send with attachments; draft route; `/messages/{id}/send`; stray draft;
 leftover draft; cleanup failure; `createDraftWithAttachments`; `ExchangeProvider.send`; upload
-session; ADR-IOS-091; #422; IOS-DRAFT-015
+session; ADR-IOS-091; #422; IOS-DRAFT-015; owner-accepted

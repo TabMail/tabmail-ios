@@ -699,7 +699,7 @@ only its answer was lost, the delete finds nothing (a moved item gets a new id, 
 send again: a duplicate, never a drop (Outbox Reliability Rule 4). Nothing is deleted after an
 accepted send: Graph's 202 is an asynchronous submission, and a delete then could withdraw it.
 
-Residual, registered as `IOS-DRAFT-026` (open, pending acceptance): a refused cleanup, a lost create
+Residual, registered as `IOS-DRAFT-026` (accepted limitation, owner, 2026-11-08): a refused cleanup, a lost create
 answer or an app kill between create and send leaves that attempt's draft in Drafts, one per
 affected attempt, recoverable by one ordinary delete. Unlike the draft-save residual
 (`IOS-DRAFT-015`), a later successful attempt does not replace it, and it is a copy of a message
