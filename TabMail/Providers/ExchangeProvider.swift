@@ -102,49 +102,51 @@ actor ExchangeProvider: EmailProvider {
             }
         }
 
-        // Now list all folders and assign roles by matching IDs
-        let data = try await request(path: "/mailFolders?\(selectFolderFields)&\(topParam(100))&includeHiddenFolders=true")
-        let response = try JSONDecoder().decode(GraphFolderListResponse.self, from: data)
-
-        var folders: [FolderInfo] = []
-
-        for folder in response.value {
-            let role = knownFolderIds[folder.id]
-            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] folder: \(folder.displayName) role=\(String(describing: role)) id=\(folder.id)") }
-
-            folders.append(FolderInfo(
-                name: folder.displayName,
-                path: folder.id,
-                role: role ?? .custom,
-                unreadCount: folder.unreadItemCount ?? 0,
-                totalCount: folder.totalItemCount ?? 0
-            ))
-
-            // Also fetch child folders
-            if (folder.childFolderCount ?? 0) > 0 {
-                let childFolders = try await fetchChildFolders(parentId: folder.id, knownFolderIds: knownFolderIds)
-                folders.append(contentsOf: childFolders)
-            }
-        }
+        // `/mailFolders` lists only the root's children; every child is traversed
+        // separately and every listing is read to its last `@odata.nextLink`.
+        let folders = try await listFolderTree(
+            firstPage: "/mailFolders?\(selectFolderFields)&\(topParam(100))&includeHiddenFolders=true",
+            knownFolderIds: knownFolderIds)
 
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] fetchFolders returning \(folders.count) folders: \(folders.map { "\($0.name)(\($0.role))" })") }
         return folders
     }
 
-    private func fetchChildFolders(parentId: String, knownFolderIds: [String: FolderRole]) async throws -> [FolderInfo] {
-        let encodedParentId = try Self.encodedGraphPathSegment(parentId, context: "Graph parent folder id")
-        let data = try await request(path: "/mailFolders/\(encodedParentId)/childFolders?\(selectFolderFields)&\(topParam(50))")
-        let response = try JSONDecoder().decode(GraphFolderListResponse.self, from: data)
-        return response.value.map { folder in
-            FolderInfo(
-                name: folder.displayName,
-                path: folder.id,
-                role: knownFolderIds[folder.id] ?? .custom,
-                unreadCount: folder.unreadItemCount ?? 0,
-                totalCount: folder.totalItemCount ?? 0
-            )
+    /// Every folder under one listing, at every depth, in listing order with each
+    /// folder followed by its subtree. Graph's List mailFolders: "to return all
+    /// mail folders in a mailbox, each child folder must be traversed
+    /// separately", and a listing longer than its page carries `@odata.nextLink`
+    /// until the last page. A mail search folder (`#microsoft.graph.mailSearchFolder`)
+    /// is a saved query over messages filed in real folders, so it and anything
+    /// under it are left out: listing it would show those messages twice.
+    private func listFolderTree(firstPage: String, knownFolderIds: [String: FolderRole]) async throws -> [FolderInfo] {
+        var folders: [FolderInfo] = []
+        var data = try await request(path: firstPage)
+        while true {
+            let response = try JSONDecoder().decode(GraphFolderListResponse.self, from: data)
+            for folder in response.value where folder.odataType != Self.mailSearchFolderType {
+                let role = knownFolderIds[folder.id]
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] folder: \(folder.displayName) role=\(String(describing: role)) id=\(folder.id)") }
+                folders.append(FolderInfo(
+                    name: folder.displayName,
+                    path: folder.id,
+                    role: role ?? .custom,
+                    unreadCount: folder.unreadItemCount ?? 0,
+                    totalCount: folder.totalItemCount ?? 0
+                ))
+                if (folder.childFolderCount ?? 0) > 0 {
+                    let encodedId = try Self.encodedGraphPathSegment(folder.id, context: "Graph parent folder id")
+                    folders += try await listFolderTree(
+                        firstPage: "/mailFolders/\(encodedId)/childFolders?\(selectFolderFields)&\(topParam(50))",
+                        knownFolderIds: knownFolderIds)
+                }
+            }
+            guard let next = response.nextLink else { return folders }
+            data = try await requestAbsolute(url: next)
         }
     }
+
+    private static let mailSearchFolderType = "#microsoft.graph.mailSearchFolder"
 
     // MARK: - Messages
 
@@ -1864,6 +1866,12 @@ struct ExchangeMessageDetail: Sendable {
 
 private struct GraphFolderListResponse: Decodable {
     let value: [GraphFolder]
+    let nextLink: String?
+
+    enum CodingKeys: String, CodingKey {
+        case value
+        case nextLink = "@odata.nextLink"
+    }
 }
 
 private struct GraphFolder: Decodable {
@@ -1872,6 +1880,13 @@ private struct GraphFolder: Decodable {
     let unreadItemCount: Int?
     let totalItemCount: Int?
     let childFolderCount: Int?
+    /// Present for a derived type only, such as `#microsoft.graph.mailSearchFolder`.
+    let odataType: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, displayName, unreadItemCount, totalItemCount, childFolderCount
+        case odataType = "@odata.type"
+    }
 }
 
 private struct GraphMessageListResponse: Decodable {
