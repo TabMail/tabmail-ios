@@ -187,6 +187,37 @@ struct AuthedHTTPNetworkTests {
         #expect(log.calls.isEmpty)
     }
 
+    @Test("A 401 the refresh recovers from never reaches onFailure")
+    func recoveredUnauthorizedSkipsOnFailure() async throws {
+        let recorder = Recorder(responses: [(401, Data()), (200, Data("{}".utf8))])
+        let session = Self.makeSession(recorder: recorder)
+        let auth = TokenSource(initial: "old", nextRefresh: "new")
+        let log = FailureLog()
+        let http = AuthedHTTP(auth: auth, retry: .graph, logLabel: nil, session: session, onFailure: { log.record($0, $1, $2) })
+
+        _ = try await http.get("https://example.test/v1/me")
+        #expect(auth.refreshCount == 1)
+        #expect(log.calls.isEmpty, "an expired token that refreshed is not a failure")
+    }
+
+    @Test("After a 401 refresh, onFailure gets the retried request's failure, not the 401")
+    func failureAfterRefreshReachesOnFailure() async {
+        let errorBody = Data(#"{"error":{"code":"SomeCode","message":"Some message"}}"#.utf8)
+        let recorder = Recorder(responses: [(401, Data("unauth".utf8)), (400, errorBody)])
+        let session = Self.makeSession(recorder: recorder)
+        let auth = TokenSource(initial: "old", nextRefresh: "new")
+        let log = FailureLog()
+        let http = AuthedHTTP(auth: auth, retry: .graph, logLabel: nil, session: session, onFailure: { log.record($0, $1, $2) })
+
+        await #expect(throws: HTTPError.self) { _ = try await http.post("https://example.test/v1/me/sendMail", body: Data("{}".utf8)) }
+        let calls = log.calls
+        #expect(calls.count == 1)
+        guard calls.count == 1 else { return }
+        #expect(calls[0].method == "POST")
+        #expect(calls[0].status == 400)
+        #expect(calls[0].body == errorBody)
+    }
+
     @Test("Every request carries the X-Client-Timezone header")
     func timezoneHeader() async throws {
         let recorder = Recorder(responses: [(200, Data("{}".utf8))])

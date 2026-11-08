@@ -27,10 +27,12 @@ struct AuthedHTTP: Sendable {
     /// Optional URLSession override — used by tests to inject a URLProtocol-backed
     /// session. Production call sites omit this and get the shared ephemeral session.
     let session: URLSession?
-    /// Called once with a request's final failure (after any 401 refresh and
-    /// rate-limit retries) before the error is thrown: the method, the status and
-    /// the provider's error body. Lets a provider log the error it names; it is
-    /// never handed the request body or the token.
+    /// Called once with the final HTTP-status failure of `get`/`post`/`patch`/
+    /// `put`/`delete` (after any 401 refresh and rate-limit retries), before the
+    /// error is thrown: the method, the status and the provider's error body. Lets
+    /// a provider log the error it names; it is never handed the request body or
+    /// the token. Not called for a transport error, a cancellation, a failed
+    /// refresh, `requestAllowing404` or `requestPreservingBadRequestBody`.
     let onFailure: (@Sendable (_ method: String, _ statusCode: Int, _ errorBody: Data?) -> Void)?
 
     init(
@@ -146,7 +148,6 @@ struct AuthedHTTP: Sendable {
         if let data = result.data {
             return data
         }
-        onFailure?(method, result.statusCode, result.errorBody)
         if result.statusCode == 400, let errorBody = result.errorBody {
             throw HTTPError.networkErrorWithBody(statusCode: 400, body: errorBody)
         }

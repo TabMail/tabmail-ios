@@ -1,3 +1,6 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Outlook threading goes as extended properties (#419, 2026-11-07).** Graph's `internetMessageHeaders` takes only custom `x-` headers, set at create; it refuses `In-Reply-To` and `References`. The "Exchange already emits In-Reply-To/References — NO code change" line below was wrong from v1.6.0. `ExchangeProvider.buildGraphSendPayload` now writes them as `singleValueExtendedProperties` `String 0x1042` (PidTagInReplyToId) and `String 0x1039` (PidTagInternetReferences), named by `ExchangeProvider.graphInReplyToProperty` / `graphReferencesProperty`; Exchange writes the headers from them on send (confirmed by a live reply, 2026-11-07). Only `sendMail` carries threading: Outlook drafts upload without it (`DraftStore.uploadThreadHeaders`). Never put a standard header back in `internetMessageHeaders`: `ExchangeSendPayloadTests` fails on any name not starting with `x-`. Reading a received Outlook message's In-Reply-To/References still needs a separate `internetMessageHeaders` `$select` (GraphParse leaves them nil). Decision: ADR-IOS-043 amendment (#419).
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Outgoing Threading — reply/forward stay in-thread on every provider (ADR-IOS-043, 2026-06-23)
 - **Single source of truth: `ThreadUtils.outgoingThreadHeaders(...)`** builds the outgoing `inReplyTo` + full normalized/deduped `References` chain (`parent.references ++ parent.rfc822MessageId`) + Gmail `threadId`. Pure scalar core + a `MessageHeader` adapter; `ComposeView.send` is the ONE callsite (covers manual AND agent `email_reply`/`email_forward`, which open the same ComposeView).
@@ -26,7 +29,3 @@ controls. `GmailThreadHeaderFoldingTests` pins long safe histories and parents.
 
 This restores the app-side boundary parked from the Bcc train, adapting it to the
 Gmail folding now on main; it does not change the SwiftMail pin or incoming parsing.
-
-## Outlook threading goes as extended properties (#419, 2026-11-07)
-
-Graph's `internetMessageHeaders` takes only custom `x-` headers, set at create; it refuses `In-Reply-To` and `References`. The "Exchange already emits In-Reply-To/References — NO code change" line above was wrong from v1.6.0. `ExchangeProvider.buildGraphSendPayload` now writes them as `singleValueExtendedProperties` `String 0x1042` (PidTagInReplyToId) and `String 0x1039` (PidTagInternetReferences), named by `ExchangeProvider.graphInReplyToProperty` / `graphReferencesProperty`; Exchange writes the headers from them on send. Covers sendMail, draft create and draft PATCH (one payload). Never put a standard header back in `internetMessageHeaders`: `ExchangeSendPayloadTests` fails on any name not starting with `x-`. Reading a received Outlook message's In-Reply-To/References still needs a separate `internetMessageHeaders` `$select` (GraphParse leaves them nil). Decision: ADR-IOS-043 amendment (#419).

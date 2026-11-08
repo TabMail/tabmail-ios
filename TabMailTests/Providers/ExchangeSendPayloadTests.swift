@@ -6,8 +6,9 @@ import Testing
 import Foundation
 @testable import TabMail
 
-/// Covers the Microsoft Graph payload's threading, used by `sendMail` and by
-/// draft create and update. Recipients thread on the RFC-2822 In-Reply-To /
+/// Covers the Microsoft Graph payload's threading. The builder serves `sendMail`
+/// and draft create and update, but only `sendMail` carries threading today
+/// (Outlook drafts upload without it). Recipients thread on the RFC-2822 In-Reply-To /
 /// References headers (no thread-id field on `sendMail`), so a populated
 /// `references` chain is what keeps replies/forwards in-thread. Graph's
 /// `internetMessageHeaders` takes only custom `x-` headers, so the two travel as
@@ -33,8 +34,8 @@ struct ExchangeSendPayloadTests {
     }
 
     /// Graph refuses a standard header in `internetMessageHeaders`; only names
-    /// starting with `x-` are accepted there, so a reply, forward or reply draft
-    /// carrying one would be refused.
+    /// starting with `x-` are accepted there, so a reply or forward carrying one
+    /// would be refused.
     @Test("Every internetMessageHeaders name is a custom x- header")
     func internetMessageHeadersAreCustomOnly() {
         let drafts = [
@@ -102,6 +103,7 @@ struct ExchangeSendPayloadTests {
         let body = Data(#"{"error":{"code":"SomeCode","message":"Some message."}}"#.utf8)
         #expect(ExchangeProvider.graphErrorSummary(body) == "SomeCode: Some message.")
         #expect(ExchangeProvider.graphErrorSummary(Data(#"{"error":{"code":"SomeCode"}}"#.utf8)) == "SomeCode")
+        #expect(ExchangeProvider.graphErrorSummary(Data(#"{"error":{"code":"SomeCode","message":""}}"#.utf8)) == "SomeCode")
         #expect(ExchangeProvider.graphErrorSummary(Data("not json".utf8)) == nil)
         #expect(ExchangeProvider.graphErrorSummary(nil) == nil)
     }

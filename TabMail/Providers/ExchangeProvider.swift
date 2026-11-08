@@ -1529,7 +1529,9 @@ actor ExchangeProvider: EmailProvider {
 
     /// Debug log of a failed Graph request, naming Graph's error code and message
     /// (a `400` otherwise reaches the log as a bare status). Never the request
-    /// body or the token. A no-op unless debug logging is on.
+    /// body or the token, though Graph's own message can quote a request value
+    /// (an address, a search term); it reaches only the debug channel. A no-op
+    /// unless debug logging is on.
     static func logGraphFailure(method: String, statusCode: Int, errorBody: Data?) {
         BackgroundSyncLogger.logDebug(
             "[Exchange] Graph \(method) failed: HTTP \(statusCode) \(graphErrorSummary(errorBody) ?? "(no Graph error)")")
@@ -1786,8 +1788,9 @@ actor ExchangeProvider: EmailProvider {
 
         // Threading (RFC 2822 requires angle brackets around message IDs). Graph's
         // `internetMessageHeaders` takes only custom `x-` headers, so In-Reply-To and
-        // References go as the MAPI properties Exchange writes those headers from. Graph
-        // takes them when a message is created, in a draft's PATCH and in sendMail's message.
+        // References go as the MAPI properties Exchange writes those headers from
+        // (confirmed by a live reply). Only `sendMail` carries threading today:
+        // Outlook drafts upload without it (`DraftStore.uploadThreadHeaders`).
         var threading: [[String: String]] = []
         if let inReplyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
             threading.append(["id": Self.graphInReplyToProperty, "value": inReplyTo])
