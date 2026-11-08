@@ -174,3 +174,11 @@ carry: the record budget on its own (records that name nothing to fetch), and th
 budget for every record kind that makes the delta fetch a message, on one page and across pages,
 each at exactly the budget (applied) and one past it (no GET, cursor cleared); a message named by two records on different pages counts once. A page without
 `history`, Gmail's answer to a quiet poll, is an empty delta that moves the cursor.
+
+## Gmail search text on the wire
+
+`GmailProviderMockTests.searchTextReachesGmailIntact` decodes the recorded
+search request the way Gmail reads a query string (`&` separates parameters,
+`=` splits name from value, `+` is a space) and asserts that the user's text,
+including `&`, `+`, `=`, `%`, `#` and non-ASCII characters and a `from:` address
+with a `+` tag, comes back as exactly one `q`, with no stray parameter.

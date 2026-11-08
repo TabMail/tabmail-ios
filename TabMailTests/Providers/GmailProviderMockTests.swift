@@ -460,6 +460,65 @@ struct GmailProviderMockTests {
         #expect(url.contains("-in:inbox") || url.contains("-in%3Ainbox"), "Missing exclusion query: \(url)")
     }
 
+    /// Gmail reads the query string form-style: `&` separates parameters, `=`
+    /// separates a name from its value, and `+` is a space. Whatever the user
+    /// typed must come back out of that decoding unchanged, as the one `q`.
+    @Test("search text reaches Gmail exactly as typed, as one q parameter",
+          arguments: [
+              ("R&D a+b", nil as String?),
+              ("C++ x=y", nil),
+              ("100% #1 ? / ; : , @ $ ! ' ( ) *", nil),
+              ("caf\u{e9} \u{1F4E7}", nil),
+              ("invoice", "user+tag@example.com"),
+          ])
+    func searchTextReachesGmailIntact(query: String, from: String?) async throws {
+        FakeHTTP.reset()
+        defer { FakeHTTP.reset() }
+
+        FakeHTTP.register(
+            path: "/messages?q=",
+            method: "GET",
+            response: .json(raw: #"{"messages": []}"#)
+        )
+
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: FakeHTTP.makeSession()
+        )
+
+        _ = try await provider.search(
+            query: query, folder: "Label_7",
+            after: nil, before: nil, from: from, to: nil
+        )
+
+        let calls = FakeHTTP.recordedCalls()
+        #expect(calls.count == 1)
+        guard calls.count == 1, let url = URL(string: calls[0].url),
+              let rawQuery = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedQuery else {
+            Issue.record("no search request recorded")
+            return
+        }
+        var parameters: [String: [String]] = [:]
+        for pair in rawQuery.split(separator: "&", omittingEmptySubsequences: false) {
+            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            func formDecoded(_ raw: Substring) -> String? {
+                raw.replacingOccurrences(of: "+", with: " ").removingPercentEncoding
+            }
+            guard let name = formDecoded(parts[0]) else {
+                Issue.record("undecodable parameter name in \(rawQuery)")
+                return
+            }
+            let value = parts.count == 2 ? formDecoded(parts[1]) : ""
+            parameters[name, default: []].append(value ?? "<undecodable>")
+        }
+        let expected = from.map { "\(query) from:\($0)" } ?? query
+        #expect(parameters["q"] == [expected], "Gmail would read \(parameters) from \(rawQuery)")
+        #expect(Set(parameters.keys) == ["q", "maxResults", "labelIds"], "stray parameters in \(rawQuery)")
+        #expect(parameters["labelIds"] == ["Label_7"])
+        #expect(parameters["maxResults"] == ["20"])
+    }
+
     @Test("search fetches and parses headers for returned refs (parallel path)")
     func searchFetchesHeaders() async throws {
         FakeHTTP.reset()

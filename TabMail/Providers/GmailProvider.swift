@@ -500,10 +500,15 @@ actor GmailProvider: EmailProvider {
         if folder == GmailProvider.archivePath {
             q += " " + GmailProvider.allMailExclusionQuery
         }
-        let encoded = q.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? q
+        // `q` carries the user's search text, so it is encoded as one query
+        // component: `&`, `=` and `+` would otherwise split the parameter or
+        // read as a space.
+        var queryItems: [(name: String, value: String)] = [("q", q), ("maxResults", "20")]
         // Scope to folder using labelIds parameter (works for both system and custom labels)
-        let labelParam = (folder.isEmpty || folder == GmailProvider.archivePath) ? "" : "&labelIds=\(folder)"
-        let data = try await request(path: "/messages?q=\(encoded)&maxResults=20\(labelParam)")
+        if !folder.isEmpty && folder != GmailProvider.archivePath {
+            queryItems.append(("labelIds", folder))
+        }
+        let data = try await request(path: try Self.strictEncodedPath("/messages", queryItems: queryItems))
         let listResponse = try JSONDecoder().decode(GmailMessageListResponse.self, from: data)
 
         guard let messageRefs = listResponse.messages else { return [] }
@@ -1106,7 +1111,7 @@ actor GmailProvider: EmailProvider {
         for item in queryItems {
             guard let name = item.name.addingPercentEncoding(withAllowedCharacters: unreserved),
                   let value = item.value.addingPercentEncoding(withAllowedCharacters: unreserved) else {
-                throw ProviderError.invalidURL("Gmail draft resource lookup")
+                throw ProviderError.invalidURL("Gmail request query")
             }
             encodedItems.append(URLQueryItem(name: name, value: value))
         }
@@ -1114,7 +1119,7 @@ actor GmailProvider: EmailProvider {
         components.path = path
         components.percentEncodedQueryItems = encodedItems
         guard let result = components.string else {
-            throw ProviderError.invalidURL("Gmail draft resource lookup")
+            throw ProviderError.invalidURL("Gmail request query")
         }
         return result
     }
