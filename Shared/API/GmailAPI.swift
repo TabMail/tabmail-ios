@@ -44,29 +44,99 @@ enum GmailAPI {
     /// `metadataQuery`.
     static let fullQuery = "?format=full"
 
+    /// Records per `users.history.list` page: Gmail's documented maximum (the
+    /// default is 100), to keep the number of round trips low.
+    static let historyPageSize = 500
+
+    /// Most `users.history.list` pages read in one call. With
+    /// `historyMaxChanges` in force this binds only when Gmail returns many
+    /// sparse pages. History longer than this is answered like an expired
+    /// history id (nil, so the caller runs a full sync): the cursor must never
+    /// move past pages that were not read, and a cap that threw instead would
+    /// fail the same way on every retry.
+    static let historyMaxPages = 40
+
+    /// Most history records, and most distinct changed messages, one delta
+    /// takes on. The app's delta fetches each changed message with one
+    /// sequential GET and saves those messages and the new cursor only after
+    /// the GETs, all under the per-account sync deadline, so a delta bigger
+    /// than the deadline can carry times out before its cursor moves and fails
+    /// the same way on every poll. One record can name many
+    /// messages (a conversation-wide archive or label change names each
+    /// message in it), so the messages are counted, not only the records.
+    /// The value is Gmail's default page size, the delta the app took on before
+    /// it read further pages. A larger delta is answered like an expired
+    /// history id (nil): the caller clears its cursor and the full sync runs
+    /// instead. Reading stops at the page that crosses either bound.
+    static let historyMaxChanges = 100
+
     /// `users.history.list` — incremental changes since `startHistoryId`.
     /// `historyTypes` filters which events are returned (Gmail default = all four).
     /// `labelId` restricts to a single label (e.g. "INBOX"); pass nil for mailbox-wide.
     ///
+    /// Follows `nextPageToken` until Gmail sends none ("If you receive no
+    /// `nextPageToken` in the response, there are no updates to retrieve"), so
+    /// the delta holds every record after `startHistoryId`. Its cursor is the
+    /// FIRST page's `historyId`: a record newer than that is read again next
+    /// time rather than skipped.
+    ///
     /// Returns nil when Gmail responds 404 — the historyId has expired, callers
-    /// must fall back to a full sync. Any other error throws.
+    /// must fall back to a full sync — and when the history holds more than
+    /// `historyMaxChanges` records or names more than `historyMaxChanges`
+    /// messages to fetch, or runs past `historyMaxPages` pages. Any
+    /// other error throws.
     static func historyList(
         http: AuthedHTTP,
         startHistoryId: String,
         historyTypes: [String] = ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"],
         labelId: String? = nil
     ) async throws -> HistoryDelta? {
-        var q: [String] = ["startHistoryId=\(startHistoryId)"]
+        var q: [String] = ["startHistoryId=\(startHistoryId)", "maxResults=\(historyPageSize)"]
         for t in historyTypes { q.append("historyTypes=\(t)") }
         if let labelId { q.append("labelId=\(labelId)") }
-        let url = "\(baseURL)/history?" + q.joined(separator: "&")
-        let res = try await http.requestAllowing404(url: url)
-        if res.statusCode == 404 { return nil }
-        guard let data = res.data,
-              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw HTTPError.networkError(statusCode: res.statusCode)
+        var records: [[String: Any]] = []
+        var changedMessageIds = Set<String>()
+        var cursor: String?
+        var pageToken: String?
+        for _ in 0..<historyMaxPages {
+            var pageQuery = q
+            if let pageToken {
+                guard let encoded = queryValue(pageToken) else {
+                    throw HTTPError.invalidURL("history.list pageToken")
+                }
+                pageQuery.append("pageToken=\(encoded)")
+            }
+            let url = "\(baseURL)/history?" + pageQuery.joined(separator: "&")
+            let res = try await http.requestAllowing404(url: url)
+            if res.statusCode == 404 { return nil }
+            guard let data = res.data,
+                  let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw HTTPError.networkError(statusCode: res.statusCode)
+            }
+            let pageRecords = json["history"] as? [[String: Any]] ?? []
+            records.append(contentsOf: pageRecords)
+            // The messages the delta fetches: added or relabelled ones.
+            let page = GmailParse.parseHistory(["history": pageRecords])
+            changedMessageIds.formUnion(page.added.map(\.providerMessageId))
+            changedMessageIds.formUnion(page.labelsAdded.map(\.providerMessageId))
+            changedMessageIds.formUnion(page.labelsRemoved.map(\.providerMessageId))
+            if records.count > historyMaxChanges || changedMessageIds.count > historyMaxChanges { return nil }
+            if cursor == nil { cursor = json["historyId"] as? String ?? "" }
+            guard let next = json["nextPageToken"] as? String, !next.isEmpty else {
+                return GmailParse.parseHistory(["historyId": cursor ?? "", "history": records])
+            }
+            pageToken = next
         }
-        return GmailParse.parseHistory(json)
+        return nil
+    }
+
+    /// Percent-encodes an opaque value (a page token) for a query string,
+    /// leaving only RFC 3986 unreserved characters bare. Nil when the value
+    /// cannot be encoded; it is never sent raw.
+    private static func queryValue(_ value: String) -> String? {
+        let unreserved = CharacterSet(
+            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        return value.addingPercentEncoding(withAllowedCharacters: unreserved)
     }
 
     /// `users.messages.get` with `format=metadata` — headers only, no body.

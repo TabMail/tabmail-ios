@@ -1,3 +1,6 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note (2026-11-08, tabmail-ios #429): `fetchHistory` also returns nil for a history too long for one delta.** Besides the 404 expiry below, `GmailAPI.historyList` returns nil when the history holds more than `GmailAPI.historyMaxChanges` records or changed messages, or runs past `GmailAPI.historyMaxPages` pages; the caller handles both the same way (clear the cursor, full sync when next due). Detail: memory topic 041.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-009: Two-Tier Delta + Full Sync
 

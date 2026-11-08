@@ -135,3 +135,20 @@ different Gmail account than its parent sends no `threadId` on either request, a
 account would not, and still names the parent in its headers. Both cases run with and without a
 stored attachment, so the multipart upload is held to the same binding and keeps the body and the
 attachment bytes.
+
+## Gmail history pages and the delta work bound
+
+`GmailHistoryPaginationTests` drives production `SyncEngine.performDeltaSync` end to end against a
+real `GmailProvider` on `FakeHTTP`. The property: the Gmail delta applies every history record after
+the stored cursor before the cursor moves, and never moves it past a page it did not read. Covered:
+every page applied with the first page's `historyId` as the cursor and the page token percent-encoded
+on the wire; each of three page requests carrying the original query, a `maxResults` Gmail accepts and
+only the current page token; a deletion on a later page applied (the deleted row removed, a bystander
+kept, a message added then deleted never fetched or kept); a later page that fails (error status,
+transport failure, cancellation, or a 200 whose body is not a history page) applies nothing and keeps
+the cursor; a later-page 404 and a history past the page limit clear the cursor for the full sync. The
+work bound, which stops a delta from committing to more message GETs than the sync deadline can
+carry: the record budget on its own (records that name nothing to fetch), and the distinct-message
+budget for every record kind that makes the delta fetch a message, on one page and across pages,
+each at exactly the budget (applied) and one past it (no GET, cursor cleared); a message named by two records on different pages counts once. A page without
+`history`, Gmail's answer to a quiet poll, is an empty delta that moves the cursor.

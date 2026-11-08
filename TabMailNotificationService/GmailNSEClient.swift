@@ -58,7 +58,7 @@ enum GmailNSEClient {
             return .empty
         }
         guard let delta else {
-            NSELog.step("NSE history.list: 404 — historyId expired; main app will recover via full sync")
+            NSELog.step("NSE history.list: historyId expired or history too long; main app will recover via full sync")
             return .empty
         }
 
