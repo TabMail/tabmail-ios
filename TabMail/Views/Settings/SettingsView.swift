@@ -734,6 +734,8 @@ struct SettingsView: View {
     }
 
     private func archiveOldMessages() async {
+        // The mark-as-read setting as it stands when the action starts.
+        let marksRead = AccountManager.markReadOnArchiveDeleteEnabled
         let archiveCutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.archiveAgeDays, to: Date()) ?? Date()
         let inboxFolderIds = Set(navigationStore.folders.filter { $0.role == .inbox }.map(\.id))
         guard !inboxFolderIds.isEmpty else { return }
@@ -776,7 +778,7 @@ struct SettingsView: View {
             // default ON). Strictly before the move and in the same awaited
             // sequence: a move changes the address the read op would have to
             // name. See `AccountManager.markReadBeforeRoleMove`.
-            await AccountManager.shared.markReadBeforeRoleMove(ids: messages.map(\.id))
+            await AccountManager.shared.markReadBeforeRoleMove(ids: messages.map(\.id), enabled: marksRead)
             await AccountManager.shared.move(messages, to: archivePath)
             totalArchived += messages.count
         }

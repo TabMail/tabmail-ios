@@ -1984,6 +1984,9 @@ final class InboxViewModel {
     /// defect class `archiveThread`'s skipped-ids contract guards against).
     @discardableResult
     func archive(_ messageId: String) -> Bool {
+        // The mark-as-read setting as it stands when the action starts (snapshot
+        // settings at operation start): the overlay and the queued closure both use it.
+        let marksRead = AccountManager.markReadOnArchiveDeleteEnabled
         guard let stored = lookupMessage(messageId) else { return false }
         let message = overlayAdjustedForAction(stored)
         let actionId = message.id
@@ -2015,7 +2018,7 @@ final class InboxViewModel {
         // `nil` when the setting is off ⇒ `registerMutation` skips the field
         // entirely (pre-feature parity).
         manager.registerMutation(id: actionId, mutation: .init(
-            isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
+            isRead: marksRead ? true : nil,
             folderId: destFolderId,
             folderPath: archivePath,
             isInInbox: false,
@@ -2030,7 +2033,7 @@ final class InboxViewModel {
             // Read intent BEFORE the move, in this one closure — a move
             // changes the address the read op would have to name. See
             // `AccountManager.markReadBeforeRoleMove`.
-            await manager.markReadBeforeRoleMove(ids: [actionId])
+            await manager.markReadBeforeRoleMove(ids: [actionId], enabled: marksRead)
             await manager.move([message], to: archivePath)
             manager.releaseOverlayEntry(id: actionId)
         }
@@ -2044,6 +2047,9 @@ final class InboxViewModel {
     /// those rows vanish forever with no undo entry.
     @discardableResult
     func archiveThread(_ messageIds: [String]) -> [String] {
+        // The mark-as-read setting as it stands when the action starts (snapshot
+        // settings at operation start): the overlay and the queued closure both use it.
+        let marksRead = AccountManager.markReadOnArchiveDeleteEnabled
         let resolved = messageIds.compactMap { requestedId in
             lookupMessage(requestedId).map {
                 (requestedId: requestedId, message: overlayAdjustedForAction($0))
@@ -2078,7 +2084,7 @@ final class InboxViewModel {
         for msg in messages {
             manager.retainOverlayEntry(id: msg.id)
             manager.registerMutation(id: msg.id, mutation: .init(
-                isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
+                isRead: marksRead ? true : nil,
                 folderId: destFolderId,
                 folderPath: archivePath,
                 isInInbox: false,
@@ -2093,7 +2099,7 @@ final class InboxViewModel {
         manager.enqueueWriteFromSynchronousContext { [manager] in
             // Read intent BEFORE the move — see `archive(_:)`. Only the
             // members that are actually unread at execution time get it.
-            await manager.markReadBeforeRoleMove(ids: compositeIds)
+            await manager.markReadBeforeRoleMove(ids: compositeIds, enabled: marksRead)
             await manager.move(messages, to: archivePath)
             for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }
@@ -2110,6 +2116,9 @@ final class InboxViewModel {
     /// draft-specific path's own success.
     @discardableResult
     func delete(_ messageId: String) async -> Bool {
+        // The mark-as-read setting as it stands when the action starts (snapshot
+        // settings at operation start): the overlay and the queued closure both use it.
+        let marksRead = AccountManager.markReadOnArchiveDeleteEnabled
         guard let stored = lookupMessage(messageId) else {
             logRoleActionLocation(
                 action: "delete", phase: "admission", stored: nil, effective: nil,
@@ -2167,7 +2176,7 @@ final class InboxViewModel {
         // `message.isInInbox` alone determines "leaving the inbox" (F6).
         // `isRead` rides the same coalesced entry — see `archive(_:)`.
         manager.registerMutation(id: actionId, mutation: .init(
-            isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
+            isRead: marksRead ? true : nil,
             folderId: destFolderId,
             folderPath: trashPath,
             isInInbox: false,
@@ -2188,7 +2197,7 @@ final class InboxViewModel {
                     + "destination=\(trashPath) "
                     + manager.roleActionOverlayDiagnostic(id: actionId))
             // Read intent BEFORE the move — see `archive(_:)`.
-            await manager.markReadBeforeRoleMove(ids: [actionId])
+            await manager.markReadBeforeRoleMove(ids: [actionId], enabled: marksRead)
             let admission = await manager.move([message], to: trashPath)
             BackgroundSyncLogger.logInbox(
                 "[RoleActionTrace] vm action=delete phase=queuedClosure.admission "
@@ -2211,6 +2220,9 @@ final class InboxViewModel {
     /// `archiveThread`'s doc comment for the un-hide contract this satisfies.
     @discardableResult
     func deleteThread(_ messageIds: [String]) async -> [String] {
+        // The mark-as-read setting as it stands when the action starts (snapshot
+        // settings at operation start): the overlay and the queued closure both use it.
+        let marksRead = AccountManager.markReadOnArchiveDeleteEnabled
         let resolved = messageIds.compactMap { requestedId in
             lookupMessage(requestedId).map {
                 (requestedId: requestedId, message: overlayAdjustedForAction($0))
@@ -2254,7 +2266,7 @@ final class InboxViewModel {
         for msg in messages {
             manager.retainOverlayEntry(id: msg.id)
             manager.registerMutation(id: msg.id, mutation: .init(
-                isRead: AccountManager.markReadOnArchiveDeleteEnabled ? true : nil,
+                isRead: marksRead ? true : nil,
                 folderId: destFolderId,
                 folderPath: trashPath,
                 isInInbox: false,
@@ -2268,7 +2280,7 @@ final class InboxViewModel {
         ))
         manager.enqueueWriteFromSynchronousContext { [manager] in
             // Read intent BEFORE the move — see `archive(_:)`.
-            await manager.markReadBeforeRoleMove(ids: compositeIds)
+            await manager.markReadBeforeRoleMove(ids: compositeIds, enabled: marksRead)
             await manager.move(messages, to: trashPath)
             for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }
