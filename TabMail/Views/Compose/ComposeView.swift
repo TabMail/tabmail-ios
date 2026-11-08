@@ -2136,46 +2136,13 @@ struct ComposeView: View {
         isRecomputing = true
 
         Task {
-            let body = try? await dbPool.read { db in try MessageBody.fetchOne(db, key: reply.id) }
-            let bodyText: String
-            if let html = body?.htmlContent, !html.isEmpty {
-                // Strip embedded .eml sections so the reply context is only the
-                // primary message body, not forwarded-as-attachment emails.
-                bodyText = EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html))
-            } else {
-                bodyText = reply.snippet
-            }
-
-            do {
-                let result = try await AIService.shared.processReply(
-                    messageId: reply.messageId,
-                    rfc822MessageId: reply.rfc822MessageId,
-                    accountEmail: account.emailAddress,
-                    subject: reply.subject,
-                    from: reply.from,
-                    fromAddress: reply.fromAddress,
-                    to: reply.to,
-                    date: reply.date,
-                    bodyText: bodyText,
-                    htmlContent: body?.htmlContent,
-                    userName: account.displayName,
-                    kbText: PromptStore.shared.kbText(),
-                    compositionPrompt: PromptStore.shared.compositionMarkdown()
-                )
-                if let result, !result.isEmpty {
-                    currentSuggestion = result
-                    try? await dbPool.write { db in
-                        try db.execute(
-                            sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
-                            arguments: [result, reply.id]
-                        )
-                    }
-                    BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId)")
-                } else {
-                    BackgroundSyncLogger.logDebug("[Compose] Recompute returned nil/empty for \(reply.messageId)")
-                }
-            } catch {
-                BackgroundSyncLogger.logDebug("[Compose] Recompute reply failed: \(error)")
+            if let body = await Self.recomputedReply(
+                for: reply, account: account,
+                kbText: PromptStore.shared.kbText(),
+                compositionPrompt: PromptStore.shared.compositionMarkdown(),
+                aiService: .shared, dbPool: dbPool
+            ) {
+                currentSuggestion = body
             }
             isRecomputing = false
         }
@@ -2336,7 +2303,8 @@ struct ComposeView: View {
         }
     }
 
-    /// Write the edited suggestion to `messageHeader.cachedReply` so reopens see it.
+    /// Write the edited suggestion to `messageHeader.cachedReply` so reopens see it. The reply's
+    /// text message described the AI's body, not the user's edit, so it is cleared.
     private func persistCachedReply(_ text: String) {
         guard let reply = replyTo else { return }
         Task { await Self.writeCachedReplyToDB(text, replyTo: reply, db: dbPool.pool) }
@@ -2355,11 +2323,67 @@ struct ComposeView: View {
             guard let target = try AIWriteTarget.capture(message: reply, db: db) else { return }
             _ = try AccountManager.aiGuardedHeaderWrite(db, target: target) { _, db in
                 try db.execute(
-                    sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
+                    sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = NULL WHERE id = ?",
                     arguments: [text, reply.id]
                 )
             }
         }
+    }
+
+    /// What `recomputeReply` does, without the view: ask for a new reply to `reply` and store
+    /// it with its text message. Returns the reply for the suggestion, or nil when there is
+    /// none. Internal for testability.
+    nonisolated static func recomputedReply(
+        for reply: MessageHeader, account: Account, kbText: String, compositionPrompt: String,
+        aiService: AIService, dbPool: PrioritizedDatabase
+    ) async -> String? {
+        let body = try? await dbPool.read { db in try MessageBody.fetchOne(db, key: reply.id) }
+        let bodyText: String
+        if let html = body?.htmlContent, !html.isEmpty {
+            // Strip embedded .eml sections so the reply context is only the
+            // primary message body, not forwarded-as-attachment emails.
+            bodyText = EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html))
+        } else {
+            bodyText = reply.snippet
+        }
+
+        do {
+            let result = try await aiService.processReply(
+                messageId: reply.messageId,
+                rfc822MessageId: reply.rfc822MessageId,
+                accountEmail: account.emailAddress,
+                subject: reply.subject,
+                from: reply.from,
+                fromAddress: reply.fromAddress,
+                to: reply.to,
+                date: reply.date,
+                bodyText: bodyText,
+                htmlContent: body?.htmlContent,
+                userName: account.displayName,
+                kbText: kbText,
+                compositionPrompt: compositionPrompt
+            )
+            if let result, !result.body.isEmpty {
+                // The row at `reply.id` can hold a different email by now (a UIDVALIDITY
+                // reset reuses the address), so the result is stored only while that row
+                // is still the email being replied to. The suggestion is shown either way:
+                // it answers the email on screen.
+                let outcome = (try? await dbPool.write { db -> AIWriteOutcome in
+                    guard let target = try AIWriteTarget.capture(message: reply, db: db) else { return .dropped }
+                    return try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
+                        msg.cachedReply = result.body
+                        msg.replyTextMessage = result.textMessage
+                        try msg.update(db)
+                    }
+                }) ?? .dropped
+                BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId), stored: \(outcome == .written)")
+                return result.body
+            }
+            BackgroundSyncLogger.logDebug("[Compose] Recompute returned nil/empty for \(reply.messageId)")
+        } catch {
+            BackgroundSyncLogger.logDebug("[Compose] Recompute reply failed: \(error)")
+        }
+        return nil
     }
 
     // MARK: - From picker

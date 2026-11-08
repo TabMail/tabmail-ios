@@ -103,14 +103,9 @@ struct SyncConfigConstantsTests {
         #expect(SyncConfig.bodyCacheRecentPerFolder == 50)
     }
 
-    @Test("replyTTLSeconds is 604800 (1 week)")
-    func replyTTLSecondsValue() {
-        #expect(SyncConfig.replyTTLSeconds == 604_800)
-    }
-
-    @Test("aiCacheTTLDays is 7")
-    func aiCacheTTLDaysValue() {
-        #expect(SyncConfig.aiCacheTTLDays == 7)
+    @Test("aiCacheOrphanGraceDays is 7")
+    func aiCacheOrphanGraceDaysValue() {
+        #expect(SyncConfig.aiCacheOrphanGraceDays == 7)
     }
 
     @Test("threadQueryLimit is 100")
@@ -230,11 +225,6 @@ struct SyncConfigConstantsTests {
     func poolCeilingReasonable() {
         #expect(SyncConfig.imapMaxConnectionCeiling >= 10)
         #expect(SyncConfig.imapMaxConnectionCeiling <= 50)
-    }
-
-    @Test("replyTTLSeconds equals exactly 7 days")
-    func replyTTLIsOneWeek() {
-        #expect(SyncConfig.replyTTLSeconds == 7 * 24 * 60 * 60)
     }
 
     @Test("ftsWriteBatchSize == ftsBodyYieldInterval")

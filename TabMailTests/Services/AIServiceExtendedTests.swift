@@ -123,140 +123,6 @@ struct ParseActionResponseDeepTests {
     }
 }
 
-@Suite("AIService.parseSummaryResponse Extended")
-struct ParseSummaryResponseDeepTests {
-
-    @Test("Todos with 'None' string is treated as a todo item")
-    func todosNone() async {
-        let service = AIService.shared
-        let text = """
-        Todos: None
-        Two-line summary: Just a quick note.
-        Reminder due date: None
-        Reminder due time: None
-        Reminder content: None
-        """
-        let result = await service.parseSummaryResponse(text)
-        // "None" is treated as a todo item value, not as nil
-        #expect(result.todos != nil)
-    }
-
-    @Test("Reminder with valid date but no time still stores date")
-    func reminderDateNoTime() async {
-        let service = AIService.shared
-        let text = """
-        Todos: None
-        Two-line summary: Test.
-        Reminder due date: 2024-12-25
-        Reminder due time: None
-        Reminder content: Christmas follow up
-        """
-        let result = await service.parseSummaryResponse(text)
-        #expect(result.reminderDate == "2024-12-25")
-        #expect(result.reminderTime == nil)
-        #expect(result.reminderContent == "Christmas follow up")
-    }
-
-    @Test("Reminder time with seconds not stored (must be HH:MM only)")
-    func reminderTimeWithSeconds() async {
-        let service = AIService.shared
-        let text = """
-        Todos: None
-        Two-line summary: Test.
-        Reminder due date: 2024-03-20
-        Reminder due time: 14:30:00
-        Reminder content: Check something
-        """
-        let result = await service.parseSummaryResponse(text)
-        #expect(result.reminderTime == nil) // "14:30:00" doesn't match ^\d{2}:\d{2}$
-    }
-
-    @Test("Multiple todos with dash prefix normalize correctly")
-    func multipleTodosDash() async {
-        let service = AIService.shared
-        let text = """
-        Todos:
-        - Send the report
-        - Update the spreadsheet
-        - Schedule meeting
-        Two-line summary: Action items from team sync.
-        Reminder due date: None
-        Reminder due time: None
-        Reminder content: None
-        """
-        let result = await service.parseSummaryResponse(text)
-        #expect(result.todos?.contains("• Send the report") == true)
-        #expect(result.todos?.contains("• Update the spreadsheet") == true)
-        #expect(result.todos?.contains("• Schedule meeting") == true)
-        // Space-joined: "• item1 • item2 • item3"
-        let bulletCount = result.todos?.components(separatedBy: "•").count ?? 0
-        #expect(bulletCount == 4) // 3 bullets + 1 empty before first
-    }
-
-    @Test("All sections empty returns all nils")
-    func allSectionsEmpty() async {
-        let service = AIService.shared
-        let text = """
-        Todos:
-        Two-line summary:
-        Reminder due date:
-        Reminder due time:
-        Reminder content:
-        """
-        let result = await service.parseSummaryResponse(text)
-        #expect(result.blurb == nil)
-        #expect(result.todos == nil)
-        #expect(result.reminderDate == nil)
-        #expect(result.reminderTime == nil)
-        #expect(result.reminderContent == nil)
-    }
-
-    @Test("Blurb with newlines collapses to single line")
-    func blurbNewlinesCollapse() async {
-        let service = AIService.shared
-        let text = """
-        Todos: None
-        Two-line summary: This is line one.
-        This is line two which continues the summary.
-        Reminder due date: None
-        Reminder due time: None
-        Reminder content: None
-        """
-        let result = await service.parseSummaryResponse(text)
-        #expect(result.blurb?.contains("\n") == false)
-        #expect(result.blurb?.contains("line one") == true)
-        #expect(result.blurb?.contains("line two") == true)
-    }
-
-    @Test("Reminder midnight time (00:00) is stored")
-    func midnightReminderTime() async {
-        let service = AIService.shared
-        let text = """
-        Todos: None
-        Two-line summary: Test.
-        Reminder due date: 2024-01-01
-        Reminder due time: 00:00
-        Reminder content: New Year reminder
-        """
-        let result = await service.parseSummaryResponse(text)
-        #expect(result.reminderTime == "00:00")
-    }
-
-    @Test("Reminder time 23:59 is stored")
-    func endOfDayReminderTime() async {
-        let service = AIService.shared
-        let text = """
-        Todos: None
-        Two-line summary: Test.
-        Reminder due date: 2024-12-31
-        Reminder due time: 23:59
-        Reminder content: End of year deadline
-        """
-        let result = await service.parseSummaryResponse(text)
-        #expect(result.reminderTime == "23:59")
-    }
-}
-
 @Suite("AIService.formatTimestampForAgent Extended")
 struct FormatTimestampForAgentDeepTests {
 
@@ -329,7 +195,8 @@ struct SummaryResultExtendedTests {
             todos: nil,
             reminderDate: nil,
             reminderTime: nil,
-            reminderContent: nil
+            reminderContent: nil,
+            textMessage: nil
         )
         #expect(result.blurb == "A simple summary")
         #expect(result.todos == nil)
@@ -343,7 +210,8 @@ struct SummaryResultExtendedTests {
             todos: nil,
             reminderDate: "2024-06-01",
             reminderTime: "10:00",
-            reminderContent: "Follow up"
+            reminderContent: "Follow up",
+            textMessage: nil
         )
         #expect(result.blurb == nil)
         #expect(result.todos == nil)
@@ -359,7 +227,8 @@ struct SummaryResultExtendedTests {
             todos: nil,
             reminderDate: nil,
             reminderTime: nil,
-            reminderContent: nil
+            reminderContent: nil,
+            textMessage: nil
         )
         // Verify it can cross actor boundaries
         let task = Task { result.blurb }

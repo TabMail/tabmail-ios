@@ -97,8 +97,7 @@ struct SyncConfigBoundaryTests {
 
     @Test("TTL values are positive")
     func ttlValuesPositive() {
-        #expect(SyncConfig.replyTTLSeconds > 0)
-        #expect(SyncConfig.aiCacheTTLDays > 0)
+        #expect(SyncConfig.aiCacheOrphanGraceDays > 0)
     }
 }
 

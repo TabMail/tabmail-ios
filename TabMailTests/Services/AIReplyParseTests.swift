@@ -6,96 +6,67 @@ import Testing
 import Foundation
 @testable import TabMail
 
-@Suite("AIService.parseComposeResponse")
+@Suite("AIResponseParser.parseReplyResponse")
 struct AIReplyParseTests {
 
-    @Test("Extracts body after 'Body:' marker")
-    func extractsBodyAfterMarker() {
-        let input = "Subject: Hello\nBody: Thanks for your email."
-        let result = AIService.parseComposeResponse(input)
-        #expect(result == "Thanks for your email.")
+    @Test("Extracts the body and the text message")
+    func bodyAndTextMessage() {
+        let result = AIResponseParser.parseReplyResponse(
+            #"{"subject": "Re: Budget", "body": "Thanks for your email.", "text_message": "Thanks, got it."}"#
+        )
+        #expect(result?.body == "Thanks for your email.")
+        #expect(result?.textMessage == "Thanks, got it.")
     }
 
-    @Test("Handles multiline body after marker")
+    @Test("A multiline body keeps its line breaks")
     func multilineBody() {
-        let input = """
-        Subject: Re: Meeting
-        Body: Hi there,
-
-        I'll be available at 3pm.
-
-        Best regards,
-        Alice
-        """
-        let result = AIService.parseComposeResponse(input)
-        #expect(result.contains("Hi there,"))
-        #expect(result.contains("Best regards,"))
-        #expect(result.contains("Alice"))
+        let result = AIResponseParser.parseReplyResponse(
+            #"{"subject": "Re: Meeting", "body": "Hi there,\n\nI'll be available at 3pm.\n\nBest regards,\nAlice", "text_message": "3pm works."}"#
+        )
+        #expect(result?.body == "Hi there,\n\nI'll be available at 3pm.\n\nBest regards,\nAlice")
     }
 
-    @Test("Case-insensitive Body: marker")
-    func caseInsensitive() {
-        let result1 = AIService.parseComposeResponse("BODY: Upper case")
-        #expect(result1 == "Upper case")
-
-        let result2 = AIService.parseComposeResponse("body: Lower case")
-        #expect(result2 == "Lower case")
+    @Test("Body and text message are trimmed")
+    func trims() {
+        let result = AIResponseParser.parseReplyResponse(#"  {"subject": "S", "body": "  Hello world  \n", "text_message": "  Hi.  "}  "#)
+        #expect(result?.body == "Hello world")
+        #expect(result?.textMessage == "Hi.")
     }
 
-    @Test("Returns raw text when no Body: marker found")
-    func fallbackRawText() {
-        let input = "Just a plain response without markers."
-        let result = AIService.parseComposeResponse(input)
-        #expect(result == "Just a plain response without markers.")
+    @Test("No body, an empty or blank body, or a non-string body gives nil")
+    func noBody() {
+        for text in [
+            #"{"subject": "S", "text_message": "T"}"#,
+            #"{"subject": "S", "body": "", "text_message": "T"}"#,
+            #"{"subject": "S", "body": "   ", "text_message": "T"}"#,
+            #"{"subject": "S", "body": 7, "text_message": "T"}"#,
+        ] {
+            #expect(AIResponseParser.parseReplyResponse(text) == nil, "\(text)")
+        }
     }
 
-    @Test("Empty Body: marker falls back to raw text")
-    func emptyBodyMarkerFallback() {
-        // Body: with nothing after it — empty body, so fallback to full text
-        let input = "Subject: Test\nBody:"
-        let result = AIService.parseComposeResponse(input)
-        // Body is empty after trimming, so returns full text
-        #expect(result.contains("Subject: Test"))
+    @Test("A body or text message that is the word None is kept: the backend has no None word for them")
+    func noneIsData() {
+        let result = AIResponseParser.parseReplyResponse(#"{"subject": "S", "body": "None", "text_message": "None"}"#)
+        #expect(result?.body == "None")
+        #expect(result?.textMessage == "None")
     }
 
-    @Test("Strips leading/trailing whitespace")
-    func stripsWhitespace() {
-        let input = "   \n  Body:   Hello world   \n  "
-        let result = AIService.parseComposeResponse(input)
-        #expect(result == "Hello world")
+    @Test("A missing or empty text message keeps the body")
+    func missingTextMessage() {
+        let missing = AIResponseParser.parseReplyResponse(#"{"subject": "S", "body": "B"}"#)
+        #expect(missing?.body == "B")
+        #expect(missing?.textMessage == nil)
+        let empty = AIResponseParser.parseReplyResponse(#"{"subject": "S", "body": "B", "text_message": ""}"#)
+        #expect(empty?.body == "B")
+        #expect(empty?.textMessage == nil)
     }
 
-    @Test("Empty input returns empty string")
-    func emptyInput() {
-        let result = AIService.parseComposeResponse("")
-        #expect(result == "")
-    }
-
-    @Test("Body: on first line")
-    func bodyOnFirstLine() {
-        let result = AIService.parseComposeResponse("Body: Direct reply text here.")
-        #expect(result == "Direct reply text here.")
-    }
-
-    @Test("Ignores Body: in the middle of a line")
-    func bodyMidLine() {
-        let input = "The Body: field should not match here"
-        let result = AIService.parseComposeResponse(input)
-        // "Body:" must be at start of line; this should fall back
-        #expect(result == "The Body: field should not match here")
-    }
-
-    @Test("Subject and Response lines before Body are excluded")
-    func subjectBeforeBody() {
-        let input = """
-        Response: I've drafted a reply.
-        Subject: Re: Quarterly Review
-        Body: Thank you for the update. I'll review the numbers.
-        """
-        let result = AIService.parseComposeResponse(input)
-        #expect(result == "Thank you for the update. I'll review the numbers.")
-        #expect(!result.contains("Response:"))
-        #expect(!result.contains("Subject:"))
+    @Test("Labelled text, empty input and non-object JSON give nil")
+    func notTheObject() {
+        for text in ["Subject: Hello\nBody: Thanks for your email.", "", "Just a plain reply.", "[]", "null", #""body""#] {
+            #expect(AIResponseParser.parseReplyResponse(text) == nil, "\(text)")
+        }
     }
 }
 

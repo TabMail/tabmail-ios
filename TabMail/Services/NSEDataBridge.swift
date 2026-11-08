@@ -2278,18 +2278,21 @@ enum NSEDataBridge {
                                         try db.execute(sql: """
                                             UPDATE messageHeader SET
                                                 summaryBlurb = ?, summaryTodos = ?,
-                                                reminderDate = ?, reminderTime = ?, reminderContent = ?
+                                                reminderDate = ?, reminderTime = ?, reminderContent = ?,
+                                                summaryTextMessage = ?
                                             WHERE id = ? AND (
                                                 summaryBlurb IS NOT ? OR summaryTodos IS NOT ?
                                                 OR reminderDate IS NOT ? OR reminderTime IS NOT ?
-                                                OR reminderContent IS NOT ?
+                                                OR reminderContent IS NOT ? OR summaryTextMessage IS NOT ?
                                             )
                                             """, arguments: [
                                                 msg.summaryBlurb, msg.summaryTodos,
                                                 msg.reminderDate, msg.reminderTime, msg.reminderContent,
+                                                msg.summaryTextMessage,
                                                 headerId,
                                                 msg.summaryBlurb, msg.summaryTodos,
-                                                msg.reminderDate, msg.reminderTime, msg.reminderContent
+                                                msg.reminderDate, msg.reminderTime, msg.reminderContent,
+                                                msg.summaryTextMessage
                                             ])
                                     }
 
@@ -2357,16 +2360,7 @@ enum NSEDataBridge {
                                             folderPath: existingFolderPath,
                                             rfc822MessageId: rfc
                                         ) {
-                                            // Value-guarded UPSERT (not INSERT OR REPLACE):
-                                            // re-writing the SAME cached summary/action on a
-                                            // re-merge of a terminal row whose prior staging
-                                            // delete failed must be a 0-row no-op — otherwise it
-                                            // bumps total_changes() (redundant reload) AND, since
-                                            // REPLACE = delete+insert, NULLs columns it doesn't
-                                            // list (e.g. a peer's precomputed `cachedReply`).
-                                            // DO UPDATE touches only these four columns, and only
-                                            // when the content actually differs.
-                                            try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, db: db)
+                                            try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, rfc822MessageId: rfc, db: db)
                                         }
                                     }
                                 } else {
@@ -2405,10 +2399,7 @@ enum NSEDataBridge {
                                         folderPath: msg.folderPath,
                                         rfc822MessageId: msg.rfc822MessageId
                                        ) {
-                                        // Value-guarded UPSERT — same rationale as the existing-
-                                        // header branch (no REPLACE-clobber of cachedReply, no
-                                        // redundant count on a no-op re-write).
-                                        try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, db: db)
+                                        try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, rfc822MessageId: msg.rfc822MessageId, db: db)
                                     }
                                 }
                                 return .commit
@@ -3644,17 +3635,23 @@ enum NSEDataBridge {
         /// both meaning "same as `date`". Same `var`-with-default contract as
         /// `observedUidValidity`.
         var providerDate: Double? = nil
+        /// The summary's text message (`MessageHeader.summaryTextMessage`), staged with the
+        /// summary; nil for rows staged before the column existed. Same `var`-with-default
+        /// contract as `observedUidValidity`.
+        var summaryTextMessage: String? = nil
     }
 
     /// Value-guarded UPSERT of the extension's AI result into `messageAICache` — the ONE
-    /// place the merge writes that table, so both merge branches share one encoding.
+    /// place the merge writes that table, so both merge branches (an existing or a newly
+    /// created header) share one encoding.
     ///
     /// UPSERT, not INSERT OR REPLACE: re-writing the SAME cached summary/action on a
     /// re-merge of a terminal row whose prior staging delete failed must be a 0-row
     /// no-op — otherwise it bumps total_changes() (redundant reload) AND, since
     /// REPLACE = delete+insert, NULLs columns it doesn't list (e.g. a peer's
-    /// precomputed `cachedReply`). DO UPDATE touches only these four columns, and
-    /// only when the content actually differs.
+    /// precomputed `cachedReply`). DO UPDATE touches only the AI columns, and only
+    /// when the content actually differs. The Message-ID lets the orphan purge match the
+    /// entry to its email.
     ///
     /// `updatedAt` is bound as a `Date` (GRDB text), like every other writer of this
     /// column. The staged `processedAt` is a number, and SQLite orders every number
@@ -3663,22 +3660,25 @@ enum NSEDataBridge {
     static func upsertAICacheFromStaging(
         _ msg: StagedMessage,
         cacheKey: String,
+        rfc822MessageId: String?,
         db: GRDB.Database
     ) throws {
         try db.execute(sql: """
             INSERT INTO messageAICache
-                (key, summaryBlurb, summaryTodos, actionTag, updatedAt)
-                VALUES (?, ?, ?, ?, ?)
+                (key, rfc822MessageId, summaryBlurb, summaryTodos, summaryTextMessage, actionTag, updatedAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
                 summaryBlurb = excluded.summaryBlurb,
                 summaryTodos = excluded.summaryTodos,
+                summaryTextMessage = excluded.summaryTextMessage,
                 actionTag = excluded.actionTag,
                 updatedAt = excluded.updatedAt
             WHERE summaryBlurb IS NOT excluded.summaryBlurb
                OR summaryTodos IS NOT excluded.summaryTodos
+               OR summaryTextMessage IS NOT excluded.summaryTextMessage
                OR actionTag IS NOT excluded.actionTag
             """, arguments: [
-                cacheKey, msg.summaryBlurb, msg.summaryTodos,
+                cacheKey, rfc822MessageId, msg.summaryBlurb, msg.summaryTodos, msg.summaryTextMessage,
                 msg.actionTag, Date(timeIntervalSince1970: msg.processedAt)
             ])
     }
@@ -3808,6 +3808,7 @@ enum NSEDataBridge {
                 header.reminderDate = msg.reminderDate
                 header.reminderTime = msg.reminderTime
                 header.reminderContent = msg.reminderContent
+                header.summaryTextMessage = msg.summaryTextMessage
             }
             if let aiRaw = msg.actionTag, let aiTag = ActionTag(rawValue: aiRaw) {
                 header.actionTag = aiTag
@@ -4093,7 +4094,10 @@ extension NSEDataBridge.StagedMessage {
             icsText: row["icsText"],
             hasUnresolvedCIDs: (row["hasUnresolvedCIDs"] as Int? ?? 0) == 1,
             observedUidValidity: observedEpoch,
-            providerDate: providerDate
+            providerDate: providerDate,
+            // Missing on a staging table the extension has not opened since the update
+            // (`NSEStagingDB.ensureSummaryTextMessageColumn`): decodes nil, like `providerDate`.
+            summaryTextMessage: row["summaryTextMessage"] as String?
         )
     }
 

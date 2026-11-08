@@ -211,6 +211,31 @@ actor ActiveAIQueue {
     /// seams in this file set (see `NSEDataBridge.resetStageMemoForTesting`).
     var dbPoolPriorityForTesting: WritePriority { dbPool.priority }
 
+    /// Test seam: run one job's executor with an injected AI service (production builds
+    /// the config from `AIService.shared` in `dispatch`), so a test observes what the real
+    /// job writes. Same visibility as `dbPoolPriorityForTesting`.
+    func executeJobForTesting(
+        _ job: AIJob, message: MessageHeader, plainText: String,
+        account: Account, target: AIWriteTarget, aiService: AIService
+    ) async -> Bool {
+        let config = DispatchConfig(aiService: aiService, kbText: "", actionPrompt: "", compositionPrompt: "")
+        switch job.jobType {
+        case .summary:
+            return await executeSummaryJob(job, message: message, plainText: plainText, account: account, target: target, config: config)
+        case .action:
+            return await executeActionJob(job, message: message, plainText: plainText, account: account, target: target, config: config)
+        case .reply:
+            return await executeReplyJob(job, message: message, plainText: plainText, account: account, target: target, config: config)
+        }
+    }
+
+    /// Test seam: run one whole job as the drain does, from its own database read through the
+    /// Device Sync peer check to its executor, with an injected AI service.
+    func executeWholeJobForTesting(_ job: AIJob, aiService: AIService) async {
+        let config = DispatchConfig(aiService: aiService, kbText: "", actionPrompt: "", compositionPrompt: "")
+        _ = await executeJob(job, config: config)
+    }
+
     /// Compact, MESSAGE-discriminating id for logs. A `headerId` is
     /// "accountId:folder:messageId"; the accountId is a 36-char UUID, so the old
     /// `headerId.prefix(30)` never reached the messageId — it printed the SAME string for
@@ -816,12 +841,6 @@ actor ActiveAIQueue {
                     didLLMWorkSinceDrain = false
                 }
                 await ProactiveNotifyService.shared.onInboxUpdated()
-
-                // Lazy TTL touch + eviction: refresh AI cache TTL for inbox messages
-                // and purge expired entries. Runs once after all AI work completes.
-                Task.detached {
-                    SyncEngine.refreshAICacheTTLAndPurge(dbPool: AppDatabase.backgroundPool)
-                }
             }
         }
     }
@@ -1094,7 +1113,7 @@ actor ActiveAIQueue {
                 .replacingOccurrences(of: ">", with: "")
                 .trimmingCharacters(in: .whitespaces)
             if !probeKey.isEmpty,
-               let probeResults = await DeviceSyncService.shared.probeAICache(keys: [probeKey]),
+               let probeResults = await config.aiService.peerProbe([probeKey]),
                let cached = probeResults[probeKey] {
                 // Write peer data to GRDB — individual jobs will find fields filled and skip LLM.
                 // T4.V7 site 1: the field-wise "only if still empty" merge runs
@@ -1112,6 +1131,8 @@ actor ActiveAIQueue {
                                 msg.reminderDate = ps.reminderDate?.isEmpty == true ? nil : ps.reminderDate
                                 msg.reminderTime = ps.reminderTime?.isEmpty == true ? nil : ps.reminderTime
                                 msg.reminderContent = ps.reminderContent?.isEmpty == true ? nil : ps.reminderContent
+                                // A peer (Thunderbird) summary has no text message.
+                                msg.summaryTextMessage = nil
                                 changed = true
                                 BackgroundSyncLogger.logAIProcessing("DeviceSync summary HIT for \(Self.logId(job.headerId))")
                             }
@@ -1125,6 +1146,7 @@ actor ActiveAIQueue {
                         }
                         if let pr = cached.reply, !pr.isEmpty, msg.cachedReply == nil {
                             msg.cachedReply = pr
+                            msg.replyTextMessage = nil
                             changed = true
                             BackgroundSyncLogger.logAIProcessing("DeviceSync reply HIT for \(Self.logId(job.headerId))")
                         }
@@ -1139,8 +1161,10 @@ actor ActiveAIQueue {
                             reminderDate: msg.reminderDate,
                             reminderTime: msg.reminderTime,
                             reminderContent: msg.reminderContent,
+                            summaryTextMessage: msg.summaryTextMessage,
                             actionTag: msg.actionTag,
                             cachedReply: msg.cachedReply,
+                            replyTextMessage: msg.replyTextMessage,
                             db: db
                         )
                     }
@@ -1361,6 +1385,7 @@ actor ActiveAIQueue {
                     msg.reminderDate = summary.reminderDate
                     msg.reminderTime = summary.reminderTime
                     msg.reminderContent = summary.reminderContent
+                    msg.summaryTextMessage = summary.textMessage
                     try msg.save(db)
 
                     try MessageAICache.writeThrough(
@@ -1372,6 +1397,7 @@ actor ActiveAIQueue {
                         reminderDate: summary.reminderDate,
                         reminderTime: summary.reminderTime,
                         reminderContent: summary.reminderContent,
+                        summaryTextMessage: summary.textMessage,
                         db: db
                     )
                 }
@@ -1453,7 +1479,8 @@ actor ActiveAIQueue {
                 todos: msg.summaryTodos,
                 reminderDate: msg.reminderDate,
                 reminderTime: msg.reminderTime,
-                reminderContent: msg.reminderContent
+                reminderContent: msg.reminderContent,
+                textMessage: msg.summaryTextMessage
             )
             let action = try await config.aiService.classifyAction(
                 subject: msg.subject,
@@ -1554,15 +1581,17 @@ actor ActiveAIQueue {
                 // T4.V7 site 4.
                 let outcome = (try? await dbPool.write { db in
                     try AccountManager.aiGuardedHeaderWrite(db, target: target) { msg, db in
-                        msg.cachedReply = reply
+                        msg.cachedReply = reply.body
+                        msg.replyTextMessage = reply.textMessage
                         try msg.save(db)
-                        if !reply.isEmpty {
+                        if !reply.body.isEmpty {
                             try MessageAICache.writeThrough(
                                 accountId: account.id,
                                 folderPath: msg.folderPath,
                                 rfc822MessageId: msg.rfc822MessageId,
-                                cachedReply: reply,
+                                cachedReply: reply.body,
                                 replyGeneratedAt: Date(),
+                                replyTextMessage: reply.textMessage,
                                 db: db
                             )
                             let elapsed = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
