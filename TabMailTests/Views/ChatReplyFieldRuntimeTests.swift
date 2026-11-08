@@ -18,7 +18,7 @@ import UIKit
 ///     from the field) shows it again; one that arrives while the chat sheet is open fills the
 ///     empty field there at once. Words the user typed, in the field or the sheet, are never
 ///     replaced, and a field the user emptied by hand stays empty for that email (the next newest
-///     email shows its own reply). The two completions are private to `ChatThreadView`, so which ones empty
+///     email shows its own reply, also one with the same text). The two completions are private to `ChatThreadView`, so which ones empty
 ///     the field is read from the source (`clearWiring`).
 ///  2. A send names the pill's email as the send starts: after the newest email changes, the next
 ///     request names the new email, never the number found for the earlier one.
@@ -257,10 +257,11 @@ struct ChatReplyFieldRuntimeTests {
             try await Self.settle()
             texts = Self.fieldTexts(controller.view)
             #expect(texts.allSatisfy { $0.isEmpty }, "even for a newer AI Reply to that email: \(texts)")
-            host.message = Self.header("field-E2", ready: "A reply to the next email")
+            // The next newest email shows its own, also when its AI Reply has the same text.
+            host.message = Self.header("field-E2", ready: "A newer AI Reply")
             try await Self.settle()
             texts = Self.fieldTexts(controller.view)
-            #expect(texts.contains("A reply to the next email"), "the next newest email shows its own: \(texts)")
+            #expect(texts.contains("A newer AI Reply"), "the next newest email shows its own: \(texts)")
         }
     }
 

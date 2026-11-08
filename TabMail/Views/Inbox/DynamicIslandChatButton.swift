@@ -56,7 +56,8 @@ struct DynamicIslandChat: View {
     @State private var inputText = ""
     /// Reply field: the words sent to the agent, shown pulsing while it works (N5, A2).
     @State private var fieldSentText: String?
-    /// Reply field: whose words are in it, so a ready AI Reply never replaces the user's (`ChatFieldFill`).
+    /// Reply field: what it shows besides the user's words (`ChatFieldFill`). `inputText` holds only
+    /// the user's own words; the ready AI Reply is shown, never written into it.
     @State private var fieldFill = ChatFieldFill()
     @State private var fieldPulse = false
     @State private var inputSelection: TextSelection?
@@ -672,23 +673,15 @@ struct DynamicIslandChat: View {
                 speech.stop()
             }
         }
-        // Reply field (chat view): the ready AI Reply fills the field while it holds no words of
-        // the user's, and is offered again when a dictation ends, when the agent has answered, and
-        // whenever the field empties; a clear empties it; a confirmation card while collapsed
-        // opens the sheet, which takes the request (A3).
-        .onChange(of: replyField?.readyText, initial: true) { _, _ in fillReadyReply() }
-        .onChange(of: isDictating) { _, dictating in
-            if !dictating { fillReadyReply() }
-        }
+        // Reply field (chat view): it shows the ready AI Reply while it holds no words of the
+        // user's (`fieldText`); a clear empties the words that were sent; a confirmation card while
+        // collapsed opens the sheet, which takes the request (A3).
         .onChange(of: replyField?.clearCount) { _, _ in
             fieldSentText = nil
             // Words written after the send this completes are newer, and stay (`ChatFieldFill.clears`).
             guard fieldFill.clears(inputText) else { return }
             inputText = ""
             fieldFill.cleared()
-        }
-        .onChange(of: inputText) { _, text in
-            if text.isEmpty { fillReadyReply() }
         }
         .onChange(of: chatMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
@@ -708,7 +701,6 @@ struct DynamicIslandChat: View {
         .onChange(of: isWorking) { wasWorking, nowWorking in
             if wasWorking && !nowWorking {
                 fieldSentText = nil
-                fillReadyReply()
             }
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[DynamicIslandChat] dictation-auto-restart onChange(isWorking) fired: wasWorking=\(wasWorking) nowWorking=\(nowWorking)")
@@ -895,15 +887,13 @@ struct DynamicIslandChat: View {
         .popoverTip(DictationLanguageTip(), arrowEdge: .bottom)
     }
 
-    /// The input text as the user edits it: emptying the reply field by hand keeps the AI Reply
-    /// out of it for that email (`ChatFieldFill.emptiedByHand`). The app's own changes to the text
-    /// do not pass through here.
+    /// The input as the user sees and edits it: it shows `fieldText`, and what the user types
+    /// becomes their words; emptying the reply field by hand keeps the AI Reply out of it for that
+    /// email (`ChatFieldFill.edited`). The app's own changes to the words do not pass through here.
     private var typedText: Binding<String> {
-        Binding(get: { inputText }, set: { typed in
-            if replyField != nil, typed.isEmpty, !inputText.isEmpty {
-                fieldFill.emptiedByHand(on: message?.id)
-            }
-            inputText = typed
+        Binding(get: { fieldText }, set: { typed in
+            inputText = replyField == nil
+                ? typed : fieldFill.edited(from: fieldText, to: typed, email: fieldEmail)
         })
     }
 
@@ -957,9 +947,9 @@ struct DynamicIslandChat: View {
             DictationSpinner(isRetrying: dictation.isRetrying)
                 .frame(width: 44, height: 44)
                 .accessibilityLabel("Transcribing")
-        } else if !isWorking && !dictation.isActive && (pendingResumeRequest != nil || lastFailedMessage != nil) && isOnLiveSession && inputText.trimmingCharacters(in: .whitespaces).isEmpty {
+        } else if !isWorking && !dictation.isActive && (pendingResumeRequest != nil || lastFailedMessage != nil) && isOnLiveSession && fieldText.trimmingCharacters(in: .whitespaces).isEmpty {
             // Retry button. Reverts to the send button as soon as the user types
-            // (the `inputText.isEmpty` gate above). Routes to the right path:
+            // (the `fieldText.isEmpty` gate above). Routes to the right path:
             // a connection-lost RESUMES from saved state; a plain failure re-sends.
             Button {
                 if pendingResumeRequest != nil {
@@ -1479,22 +1469,21 @@ struct DynamicIslandChat: View {
         guard canDictate else { return }
         // The same gate that shows the input bar (and so the mic and the waveform) in the body.
         let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive
-        // Said over the ready AI Reply, the words replace it rather than add to it (N4.3).
-        let replacesReadyReply = ChatReplyField.dictationReplaces(
-            input: inputText, readyText: replyField?.readyText)
+        // Said over the ready AI Reply, the words replace it (N4.3): it is shown, not the user's
+        // words, so the words they say are the first.
         isTextFieldFocused = false
         if dictationMode == .onDevice {
             // Behind the sign-in or subscribe bar there is no mic or waveform: an auto-start records nothing there.
             guard canUseAI, !speech.isRecording, !speech.isStarting else { return }
-            speechBase = replacesReadyReply ? "" : inputText
+            speechBase = inputText
             speech.start(locale: speechLocale, auto: auto) { transcript in
                 inputText = DictationController.appending(transcript, to: speechBase)
                 inputSelection = .init(insertionPoint: inputText.endIndex)
             }
             return
         }
-        dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { [replacesReadyReply] text in
-            inputText = ChatReplyField.dictated(text, onto: inputText, replacing: replacesReadyReply)
+        dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in
+            inputText = DictationController.appending(text, to: inputText)
             inputSelection = .init(insertionPoint: inputText.endIndex)
             Task { await DictationLanguageTip.dictationCompleted.donate() }
             if sendWhenDictated {
@@ -1512,7 +1501,7 @@ struct DynamicIslandChat: View {
 
     private var canSend: Bool {
         hasTabMailSession
-            && !inputText.trimmingCharacters(in: .whitespaces).isEmpty
+            && !fieldText.trimmingCharacters(in: .whitespaces).isEmpty
             && !isWorking
             && !dictation.isActive
             && !speech.isRecording
@@ -1576,14 +1565,14 @@ struct DynamicIslandChat: View {
     }
 
     private func sendMessage() {
-        let text = inputText.trimmingCharacters(in: .whitespaces)
+        let text = fieldText.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { return }
         if let replyField, !isExpanded {
             sendFromReplyField(text, replyField)
             return
         }
         // From the open sheet the input empties as it goes; a newer draft is what is typed next.
-        if replyField != nil { fieldFill.sent(input: "") }
+        if replyField != nil { fieldFill.sent(words: "") }
         let composeAdmissionAcquired: Bool
         if isComposeMode {
             guard acquireComposeEditAdmission() else { return }
@@ -1627,7 +1616,7 @@ struct DynamicIslandChat: View {
     /// answers in the sheet; a closed compose card leaves the words (N6.3).
     private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {
         isTextFieldFocused = false
-        fieldFill.sent(input: inputText)
+        fieldFill.sent(words: inputText)
         if ChatReplyField.route(text: text, readyText: field.readyText) == .readyReply {
             onSendReadyReply?()
             return
@@ -1641,11 +1630,15 @@ struct DynamicIslandChat: View {
         }
     }
 
-    /// The ready AI Reply fills the field while it holds no words of the user's (`ChatFieldFill.offer`).
-    private func fillReadyReply() {
-        guard let replyField, let words = fieldFill.offer(
-            replyField.readyText, input: inputText, busy: isDictating || isWorking, email: message?.id) else { return }
-        inputText = words
+    /// What the input shows: the user's words, or the ready AI Reply while there are none
+    /// (`ChatFieldFill.shown`).
+    private var fieldText: String {
+        fieldFill.shown(words: inputText, ready: replyField?.readyText, busy: isDictating || isWorking, email: fieldEmail)
+    }
+
+    /// The newest email, as the field's per-email state names it: copies of one email are one.
+    private var fieldEmail: String? {
+        message.map(ChatThread.copyKey)
     }
 
     /// A dictation is recording, transcribing, or starting: its words are coming to the field.
@@ -1653,10 +1646,9 @@ struct DynamicIslandChat: View {
         dictation.isActive || speech.isRecording || speech.isStarting
     }
 
-    /// The field holds the ready AI Reply, unchanged (its top line says AI Reply, Q15).
+    /// The field shows the ready AI Reply, untouched (its top line says AI Reply, Q15).
     private var holdsReadyReply: Bool {
-        guard let ready = replyField?.readyText else { return false }
-        return inputText == ready
+        inputText.isEmpty && !fieldText.isEmpty
     }
 
     // MARK: - Compose inline edit

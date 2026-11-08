@@ -21,9 +21,11 @@ import Testing
 ///  6. The view wires each of these: hosted SwiftUI views cannot be driven from a unit test, so the
 ///     wiring is read from the source.
 ///  7. A ready AI Reply shows in the field only while the field holds no words of the user's
-///     (owner 2026-11-07): an empty field, or the AI Reply the app put there, takes it whenever it
-///     arrives, collapsed or in the open sheet; words typed or said are never replaced, and no
-///     reply lands while a dictation is bringing words.
+///     (owner 2026-11-07), collapsed or in the open sheet: what the field shows is a function of
+///     the user's words (`ChatFieldFill.shown`), so words typed or said are never replaced, said
+///     words replace a shown reply, no reply shows while a dictation is bringing words, a field
+///     emptied by hand stays empty for that email only, and a completion empties only the words
+///     that were sent.
 @Suite("Chat reply field")
 @MainActor
 struct ChatReplyFieldTests {
@@ -99,21 +101,6 @@ struct ChatReplyFieldTests {
     }
 
     // MARK: - 3. The agent's message
-
-    @Test("Dictation over the untouched AI Reply replaces it; edited words or no reply keep the text")
-    func dictationReplacesOnlyTheUntouchedReply() {
-        let ready = "Sounds good, see you Friday"
-        func field(after words: String, input: String, readyText: String?) -> String {
-            ChatReplyField.dictated(words, onto: input, replacing: ChatReplyField.dictationReplaces(
-                input: input, readyText: readyText))
-        }
-        #expect(field(after: "Can we do Monday", input: ready, readyText: ready) == "Can we do Monday",
-                "the AI Reply is not the user's words, in the field or the open sheet")
-        #expect(field(after: "or Monday", input: ready + " maybe", readyText: ready)
-                == ready + " maybe or Monday", "edited words stay")
-        #expect(field(after: "hello", input: "", readyText: nil) == "hello")
-        #expect(field(after: "there", input: "hi", readyText: nil) == "hi there")
-    }
 
     @Test("Words for the agent name the email and say where they came from")
     func agentMessage() {
@@ -192,97 +179,88 @@ struct ChatReplyFieldTests {
         #expect(replies.entries.isEmpty, "gone after it")
     }
 
-    // MARK: - 7. Whose words are in the field
+    // MARK: - 7. What the field shows
 
-    /// Offers `ready` of the newest email `email` while the user has not spoken last, unless told otherwise.
-    private static func offer(
-        _ fill: inout ChatFieldFill, _ ready: String?, input: String, busy: Bool = false, email: String? = "email-1"
-    ) -> String? {
-        fill.offer(ready, input: input, busy: busy, email: email)
+    @Test("With no words of the user's the field shows the ready reply; their words always win")
+    func shownIsTheUsersWordsOrTheReadyReply() {
+        let fill = ChatFieldFill()
+        #expect(fill.shown(words: "", ready: "A reply", busy: false, email: "e1") == "A reply")
+        #expect(fill.shown(words: "", ready: nil, busy: false, email: "e1") == "", "no ready reply, nothing")
+        #expect(fill.shown(words: "My words", ready: "A reply", busy: false, email: "e1") == "My words")
+        #expect(fill.shown(words: "My words", ready: "A reply", busy: true, email: "e1") == "My words")
+        // A ready reply that changes is shown as it is now: nothing was ever written.
+        #expect(fill.shown(words: "", ready: "A newer reply", busy: false, email: "e1") == "A newer reply")
     }
 
-    @Test("An empty field or the app's own AI Reply takes the ready reply; words typed over it stay")
-    func readyReplyReplacesOnlyItsOwn() {
+    @Test("While the user spoke last, a dictation running or the agent answering, no reply shows; said words replace a shown one")
+    func busyHidesTheReply() {
+        let fill = ChatFieldFill()
+        #expect(fill.shown(words: "", ready: "Yes, Tuesday works.", busy: true, email: "e1") == "")
+        // The said words are the user's words: whichever order the words and the end of the
+        // dictation come in, the field shows them.
+        let said = DictationController.appending("Can we do Monday", to: "")
+        #expect(fill.shown(words: said, ready: "Yes, Tuesday works.", busy: true, email: "e1") == said)
+        #expect(fill.shown(words: said, ready: "Yes, Tuesday works.", busy: false, email: "e1") == said)
+        // Nothing was said: the reply shows once the dictation ends.
+        #expect(fill.shown(words: "", ready: "Yes, Tuesday works.", busy: false, email: "e1") == "Yes, Tuesday works.")
+    }
+
+    @Test("Edited, the shown reply becomes the user's words; emptied by hand, the field stays empty for that email only")
+    func editsAreTheUsers() {
         var fill = ChatFieldFill()
-        #expect(Self.offer(&fill, "First reply", input: "") == "First reply")
-        #expect(Self.offer(&fill, "Newer reply", input: "First reply") == "Newer reply", "the app's own is replaced")
-        #expect(Self.offer(&fill, "Latest reply", input: "Newer reply, and more") == nil, "typed words stay")
-        #expect(Self.offer(&fill, "Latest reply", input: "Newer") == nil, "words cut back by hand stay")
-        #expect(fill.filled == "Newer reply", "a refused offer changes nothing")
+        let shown = fill.shown(words: "", ready: "A reply", busy: false, email: "e1")
+        #expect(fill.edited(from: shown, to: "A reply, and more", email: "e1") == "A reply, and more",
+                "an edit of the shown reply is the user's")
+        #expect(fill.emptiedOn == nil, "an edit that leaves words is not an emptying")
 
-        // Emptied by the app (a send or an answer), the field holds no words of the user's: the reply shows again.
-        #expect(Self.offer(&fill, "Latest reply", input: "") == "Latest reply")
-        // A reply taken back empties the app's fill, and nothing else.
-        #expect(Self.offer(&fill, nil, input: "Latest reply") == "")
-        #expect(Self.offer(&fill, nil, input: "My own words") == nil)
+        #expect(fill.edited(from: shown, to: "", email: "e1") == "")
+        #expect(fill.emptiedOn == "e1")
+        #expect(fill.shown(words: "", ready: "A reply", busy: false, email: "e1") == "", "it stays empty")
+        #expect(fill.shown(words: "", ready: "A newer reply to it", busy: false, email: "e1") == "",
+                "even for a newer AI Reply to that email")
+        #expect(fill.shown(words: "My words", ready: "A reply", busy: false, email: "e1") == "My words")
+        // A new email is a new turn, also when its AI Reply has the same text as the old one's.
+        #expect(fill.shown(words: "", ready: "A reply", busy: false, email: "e2") == "A reply")
+
+        // Emptying a field that showed nothing is not an emptying by hand.
+        var blank = ChatFieldFill()
+        #expect(blank.edited(from: "", to: "", email: "e1") == "")
+        #expect(blank.emptiedOn == nil)
     }
 
-    @Test("A completion empties only the words that were sent, nothing, or the app's AI Reply; newer words stay")
+    @Test("A completion empties only the words that were sent, or none; newer words stay")
     func completionClearsOnlyTheSentWords() {
-        // Nothing sent yet (a reply sent from a bubble's compose card): the field empties.
+        // Nothing sent yet (a reply sent from a bubble's compose card): the words empty.
         let fresh = ChatFieldFill()
         #expect(fresh.clears("Anything"))
 
         // Sent from the collapsed field, then a newer draft typed in the open sheet.
         var fill = ChatFieldFill()
-        _ = Self.offer(&fill, "A ready reply", input: "")
-        fill.sent(input: "First request")
+        fill.sent(words: "First request")
         #expect(fill.clears("First request"), "the words sent")
         #expect(fill.clears(""))
-        #expect(fill.clears("A ready reply"), "the app's own AI Reply")
         #expect(!fill.clears("My newer draft"), "words written after the send are newer")
-        // Once emptied, the next completion has no send to protect.
+        // Once completed, the next completion has no send to protect.
         fill.cleared()
         #expect(fill.atSend == nil)
         #expect(fill.clears("Anything"))
 
-        // Sent from the open sheet, which empties as it sends: whatever is typed next is newer.
-        var sheet = ChatFieldFill()
-        sheet.sent(input: "")
-        #expect(sheet.clears(""))
-        #expect(!sheet.clears("Typed after the send"))
+        // The untouched AI Reply sent from the field: no words were the user's, so any typed since stay.
+        var ready = ChatFieldFill()
+        ready.sent(words: "")
+        #expect(ready.clears(""))
+        #expect(!ready.clears("Typed after the send"))
     }
 
-    @Test("Emptied by hand, the field stays empty for that email; a newer email shows its own reply")
-    func emptiedByHandStaysEmpty() {
+    @Test("A send or an answer empties the words, and the ready reply then shows again")
+    func sendThenShowAgain() {
         var fill = ChatFieldFill()
-        #expect(Self.offer(&fill, "A reply", input: "") == "A reply")
-        fill.emptiedByHand(on: "email-1")
-        #expect(fill.filled == nil, "the emptied field holds nothing of the app's")
-        #expect(Self.offer(&fill, "A reply", input: "") == "", "it stays empty")
-        #expect(Self.offer(&fill, "A newer reply to it", input: "") == "", "even for a newer AI Reply to that email")
-        #expect(Self.offer(&fill, "My words", input: "My words") == nil, "and the user's words stay")
-        #expect(Self.offer(&fill, "A reply to the newer email", input: "", email: "email-2") == "A reply to the newer email",
-                "a new email is a new turn")
-    }
-
-    @Test("While the user spoke last, a dictation running or the agent answering, no AI Reply fills the field")
-    func dictationOwnsTheField() {
-        // Started on an empty field, a reply arrives while the words are transcribed.
-        var fill = ChatFieldFill()
-        _ = Self.offer(&fill, nil, input: "")
-        #expect(Self.offer(&fill, "Yes, Tuesday works.", input: "", busy: true) == nil)
-        // The words land, then the dictation ends, in either order of the two changes.
-        #expect(Self.offer(&fill, "Yes, Tuesday works.", input: "My dictated request") == nil,
-                "the end of the dictation never replaces the words it brought")
-        #expect(Self.offer(&fill, "A later reply", input: "My dictated request") == nil, "nor does a later reply")
-
-        // Nothing was said: the reply that arrived meanwhile fills the empty field at the end.
-        var silent = ChatFieldFill()
-        #expect(Self.offer(&silent, "Yes, Tuesday works.", input: "", busy: true) == nil)
-        #expect(Self.offer(&silent, "Yes, Tuesday works.", input: "") == "Yes, Tuesday works.")
-    }
-
-    @Test("A send or an answer empties the field, and the ready reply then shows again")
-    func sendThenRefill() {
-        var fill = ChatFieldFill()
-        _ = Self.offer(&fill, "A reply", input: "")
-        fill.sent(input: "My question")
-        #expect(Self.offer(&fill, "A reply", input: "My question") == nil, "never while the words wait in the field")
+        fill.sent(words: "My question")
+        #expect(fill.shown(words: "My question", ready: "A reply", busy: false, email: "e1") == "My question",
+                "never while the words wait in the field")
         #expect(fill.clears("My question"))
         fill.cleared()
-        #expect(fill.atSend == nil)
-        #expect(Self.offer(&fill, "A reply", input: "") == "A reply", "the emptied field shows the ready reply")
+        #expect(fill.shown(words: "", ready: "A reply", busy: false, email: "e1") == "A reply")
     }
 
     // MARK: - 6. Wiring
@@ -306,29 +284,24 @@ struct ChatReplyFieldTests {
         return String(text[start.upperBound..<end.lowerBound])
     }
 
-    @Test("Every change that can fill the field asks ChatFieldFill, with the dictation")
-    func fieldFillWiring() throws {
+    @Test("The input shows ChatFieldFill's text, the user's edits are their words, and nothing writes the reply in")
+    func fieldShownWiring() throws {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
-        let fill = try Self.body(of: "private func fillReadyReply() {", in: text)
-        #expect(Self.count("guard let replyField, let words = fieldFill.offer( replyField.readyText, input: inputText, busy: isDictating || isWorking, email: message?.id) else { return } inputText = words", in: fill) == 1)
-        // Only the user's own edits mark the field emptied by hand.
         #expect(Self.count("TextField(placeholder, text: typedText,", in: text) == 1)
-        #expect(Self.count("if replyField != nil, typed.isEmpty, !inputText.isEmpty { fieldFill.emptiedByHand(on: message?.id) }", in: text) == 1)
-        #expect(Self.count("fieldFill.emptiedByHand(", in: text) == 1)
-        #expect(Self.count("if wasWorking && !nowWorking { fieldSentText = nil fillReadyReply() }", in: text) == 1)
+        #expect(Self.count("Binding(get: { fieldText }, set: { typed in inputText = replyField == nil ? typed : fieldFill.edited(from: fieldText, to: typed, email: fieldEmail) })", in: text) == 1)
+        #expect(Self.count("fieldFill.shown(words: inputText, ready: replyField?.readyText, busy: isDictating || isWorking, email: fieldEmail)", in: text) == 1)
+        #expect(Self.count("message.map(ChatThread.copyKey)", in: text) == 1)
         #expect(Self.count("dictation.isActive || speech.isRecording || speech.isStarting", in: text) == 1)
-        #expect(Self.count(".onChange(of: replyField?.readyText, initial: true) { _, _ in fillReadyReply() }", in: text) == 1)
-        #expect(Self.count(".onChange(of: inputText) { _, text in if text.isEmpty { fillReadyReply() } }", in: text) == 1)
-        #expect(Self.count(".onChange(of: isDictating) { _, dictating in if !dictating { fillReadyReply() } }", in: text) == 1)
-        // A completion empties the field only while it holds what was sent (`ChatFieldFill.clears`),
+        // Dictation appends to the user's words, in both paths.
+        #expect(Self.count("speechBase = inputText", in: text) == 1)
+        #expect(Self.count("inputText = DictationController.appending(text, to: inputText)", in: text) == 1)
+        // A completion empties the words only while they are what was sent (`ChatFieldFill.clears`),
         // for an answer or a sent reply and for a confirmation card; both sends record it.
         #expect(Self.count("fieldSentText = nil // Words written after the send this completes are newer, and stay (`ChatFieldFill.clears`). guard fieldFill.clears(inputText) else { return } inputText = \"\" fieldFill.cleared()", in: text) == 1)
         #expect(Self.count("if fieldFill.clears(inputText) { inputText = \"\" }", in: text) == 1)
         #expect(Self.count("fieldFill.cleared()", in: text) == 1)
-        #expect(Self.count("if replyField != nil { fieldFill.sent(input: \"\") }", in: text) == 1)
-        #expect(Self.count("isTextFieldFocused = false fieldFill.sent(input: inputText) if ChatReplyField.route", in: text) == 1)
-        #expect(Self.count("fillReadyReply()", in: text) == 5, "the four triggers and the definition")
-        #expect(Self.count("inputText = words", in: text) == 1, "the field is filled in one place")
+        #expect(Self.count("if replyField != nil { fieldFill.sent(words: \"\") }", in: text) == 1)
+        #expect(Self.count("isTextFieldFocused = false fieldFill.sent(words: inputText) if ChatReplyField.route", in: text) == 1)
     }
 
     @Test("The field's Send opens compose for the unchanged AI Reply, else sends the words to the agent")
@@ -337,11 +310,7 @@ struct ChatReplyFieldTests {
         // Collapsed, the reply field's Send takes the field's route; the open sheet keeps the chat's.
         let message = try Self.body(of: "private func sendMessage() {", in: text)
         // Send refuses only an empty input, and the collapsed field then takes its own route.
-        #expect(message.hasPrefix(" let text = inputText.trimmingCharacters(in: .whitespaces) guard !text.isEmpty else { return } if let replyField, !isExpanded { sendFromReplyField(text, replyField) return }"))
-        // Both dictation paths take the field's decision (on-device and cloud).
-        #expect(Self.count("let replacesReadyReply = ChatReplyField.dictationReplaces( input: inputText, readyText: replyField?.readyText)", in: text) == 1)
-        #expect(Self.count("speechBase = replacesReadyReply ? \"\" : inputText", in: text) == 1)
-        #expect(Self.count("inputText = ChatReplyField.dictated(text, onto: inputText, replacing: replacesReadyReply)", in: text) == 1)
+        #expect(message.hasPrefix(" let text = fieldText.trimmingCharacters(in: .whitespaces) guard !text.isEmpty else { return } if let replyField, !isExpanded { sendFromReplyField(text, replyField) return }"))
         let send = try Self.body(of: "private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {", in: text)
         #expect(Self.count("if ChatReplyField.route(text: text, readyText: field.readyText) == .readyReply { onSendReadyReply?() return }", in: send) == 1)
         #expect(Self.count("onFieldSend?(text)", in: send) == 1)

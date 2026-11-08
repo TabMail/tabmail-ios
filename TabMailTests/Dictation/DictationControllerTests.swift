@@ -1997,9 +1997,9 @@ struct DictationOptOutFlagTests {
         #expect(!transcribing.contains("Button"))
 
         let start = String(try slice(source, from: "private func startDictation(auto: Bool = false)", to: "private var canSend: Bool"))
-        let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { [replacesReadyReply] text in", to: "scrollPosition.scrollTo(edge: .bottom)")
-        // The words land in the input (replacing the ready AI Reply, N4.3), then are sent.
-        let appended = try #require(onText.range(of: "inputText = ChatReplyField.dictated(text, onto: inputText, replacing: replacesReadyReply)"))
+        let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in", to: "scrollPosition.scrollTo(edge: .bottom)")
+        // The words land in the input (the user's words, so over a shown AI Reply they replace it, N4.3), then are sent.
+        let appended = try #require(onText.range(of: "inputText = DictationController.appending(text, to: inputText)"))
         let sent = try #require(onText.range(of: "if sendWhenDictated { sendWhenDictated = false if canSend { sendMessage() }"))
         #expect(appended.upperBound <= sent.lowerBound)
 
@@ -2122,7 +2122,7 @@ struct DictationOptOutFlagTests {
         let beforeStart = try slice(source, from: "private func startDictation(auto: Bool = false)", to: "dictation.start(context:")
         #expect(!beforeStart.contains("donate()"))
         let start = String(try slice(source, from: "private func startDictation(auto: Bool = false)", to: "private var canSend: Bool"))
-        let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { [replacesReadyReply] text in", to: "scrollPosition.scrollTo(edge: .bottom)")
+        let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in", to: "scrollPosition.scrollTo(edge: .bottom)")
         #expect(onText.contains("DictationLanguageTip.dictationCompleted.donate()"))
         // Nothing after the callback's last statement donates either.
         let pieces = start.components(separatedBy: "scrollPosition.scrollTo(edge: .bottom)")

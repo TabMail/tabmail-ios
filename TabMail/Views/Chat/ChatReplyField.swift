@@ -35,19 +35,6 @@ struct ChatReplyField: Equatable {
             == readyText.trimmingCharacters(in: .whitespacesAndNewlines) ? .readyReply : .agent
     }
 
-    /// Dictation over the untouched ready AI Reply replaces it rather than adding to it (N4.3):
-    /// the AI Reply is not the user's words. Edited words or no ready reply keep the text.
-    static func dictationReplaces(input: String, readyText: String?) -> Bool {
-        guard let readyText else { return false }
-        return input == readyText
-    }
-
-    /// The field's text once dictation brings `words`: they replace it when `replacing`, else they
-    /// are added to what is there.
-    static func dictated(_ words: String, onto input: String, replacing: Bool) -> String {
-        DictationController.appending(words, to: replacing ? "" : input)
-    }
-
     /// The ready AI Reply of the thread's newest email, as the field shows it: its text message,
     /// while the full reply is stored. Nothing for the user's own email or a no-reply sender.
     static func readyText(newest: MessageHeader, isOwn: Bool) -> String? {
@@ -75,53 +62,52 @@ struct ChatReplyField: Equatable {
     }
 }
 
-/// Whose words are in the reply field (N2.7, N4.3). One rule (owner 2026-11-07): the ready AI
-/// Reply shows in the field only while the field holds no words of the user's, typed or said,
-/// whenever the reply arrives: an empty field, or the AI Reply the app itself put there, takes it.
-/// Once the user empties the field by hand it stays empty for that email. The field and the open
-/// chat sheet share the words, so the rule is the same in both.
+/// What the reply field shows (N2.7, N4.3). One rule (owner 2026-11-07): the ready AI Reply shows
+/// in the field while it holds no words of the user's, typed or said; once the user empties the
+/// field by hand it stays empty for that email; a completed send empties only the words that were
+/// sent. The field and the open chat sheet share the words, so the rule is the same in both.
+///
+/// The shown text is a function of the user's own words and the state at render (`shown`): nothing
+/// ever writes the AI Reply into the field, so no late reply, dictation or completion can land on
+/// the wrong text, and a new email is simply a new input.
 struct ChatFieldFill: Equatable {
-    /// The AI Reply the app last put in the field: only it, or nothing, may be replaced.
-    private(set) var filled: String?
-    /// The email the user emptied the field on by hand: no AI Reply fills it while that email is
-    /// the newest. A newer email is a new turn and shows its own.
+    /// The email (`ChatThread.copyKey`) the user emptied the field on by hand: no AI Reply shows
+    /// while it is the newest. A newer email is a new turn and shows its own.
     private(set) var emptiedOn: String?
-    /// The field's words when the user last sent, from the field or from the open sheet; nil once
-    /// a completion emptied it. An answer or a sent reply completes that send, so it empties only
-    /// those words: words the user typed after it, in the open sheet, are newer and stay.
+    /// The user's words when they last sent, from the field or from the open sheet; nil once that
+    /// send completed. An answer or a sent reply completes it, so it empties only those words:
+    /// words the user wrote after it are newer and stay.
     private(set) var atSend: String?
 
-    /// The field's words once the ready AI Reply `ready` of the newest email `email` is offered,
-    /// or nil to leave them as they are: over an empty field or the AI Reply the app put there,
-    /// unless the user emptied the field on that email. Not while the user spoke last (`busy`): a
-    /// dictation is bringing their words, which a reply would join, or the agent is still answering
-    /// them. Offered again when that ends and whenever the field empties.
-    mutating func offer(_ ready: String?, input: String, busy: Bool, email: String?) -> String? {
-        guard !busy, input.isEmpty || input == filled else { return nil }
-        filled = email == emptiedOn ? nil : ready
-        return filled ?? ""
+    /// What the field shows: the user's `words`, or with none the newest email's ready AI Reply
+    /// `ready`, unless the user emptied the field on that email or spoke last (`busy`: a dictation
+    /// is bringing their words, or the agent is still answering them).
+    func shown(words: String, ready: String?, busy: Bool, email: String?) -> String {
+        guard words.isEmpty, !busy, let ready, emptiedOn == nil || email != emptiedOn else { return words }
+        return ready
     }
 
-    /// The user emptied the field by hand while `email` was the newest.
-    mutating func emptiedByHand(on email: String?) {
-        emptiedOn = email
-        filled = nil
+    /// The user edited the field from `shown` to `typed`, which are now their words. Emptying it
+    /// while it showed something keeps the AI Reply out of it for `email`.
+    mutating func edited(from shown: String, to typed: String, email: String?) -> String {
+        if typed.isEmpty, !shown.isEmpty { emptiedOn = email }
+        return typed
     }
 
-    /// The user sent with `input` in the field.
-    mutating func sent(input: String) {
-        atSend = input
+    /// The user sent with `words` theirs in the field.
+    mutating func sent(words: String) {
+        atSend = words
     }
 
     /// Whether the completion of the last send (the agent answered, or the reply went out) may
-    /// empty the field holding `input`: it still holds the words sent, nothing, or the AI Reply the
-    /// app put there. Anything else the user wrote after the send.
-    func clears(_ input: String) -> Bool {
+    /// empty the user's `words`: they are still the words sent, or none. Anything else the user
+    /// wrote after the send.
+    func clears(_ words: String) -> Bool {
         guard let atSend else { return true }
-        return input == atSend || input.isEmpty || input == filled
+        return words == atSend || words.isEmpty
     }
 
-    /// The reply went out, or the agent answered in the sheet: the field emptied.
+    /// The reply went out, or the agent answered in the sheet: the send completed.
     mutating func cleared() {
         atSend = nil
     }
