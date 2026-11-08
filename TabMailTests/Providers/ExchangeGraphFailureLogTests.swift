@@ -19,7 +19,10 @@ struct ExchangeGraphFailureLogTests {
     private static let body = "Distinct body text 9d2e"
     private static let recipient = "distinct-recipient-5b1@example.com"
 
-    private func refusedReply(loggingEnabled: Bool) async -> (error: (any Error)?, log: String, debug: String, otherChannels: [AppLogChannel: String]) {
+    private static let graphError = FakeHTTP.CannedResponse.json(
+        raw: #"{"error":{"code":"SomeCode","message":"Some message"}}"#, statusCode: 400)
+
+    private func refusedReply(loggingEnabled: Bool, response: FakeHTTP.CannedResponse = graphError) async -> (error: (any Error)?, log: String, debug: String, otherChannels: [AppLogChannel: String]) {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("graphfailurelog_\(UUID().uuidString).log")
         AppLogStore.fileURLOverride.withLock { $0 = url }
@@ -31,8 +34,7 @@ struct ExchangeGraphFailureLogTests {
         }
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        http.register(path: "/sendMail", method: "POST", response: .json(
-            raw: #"{"error":{"code":"SomeCode","message":"Some message"}}"#, statusCode: 400))
+        http.register(path: "/sendMail", method: "POST", response: response)
         let provider = ExchangeProvider(userEmail: "owner@example.com", accessToken: { _ in Self.token }, session: http.session)
         let draft = DraftMessage(to: [Self.recipient], subject: Self.subject, body: Self.body,
                                  inReplyTo: "parent@example.com", references: ["parent@example.com"])
@@ -47,13 +49,13 @@ struct ExchangeGraphFailureLogTests {
         return (thrown, AppLogStore.read(), AppLogStore.read(channel: .debug), others)
     }
 
-    private static func expectRefusal(_ error: (any Error)?) {
+    private static func expectRefusal(_ error: (any Error)?, status expected: Int = 400) {
         guard let failure = error as? ProviderError, case .networkError(let underlying) = failure,
               let httpFailure = underlying as? HTTPError, case .networkError(let status) = httpFailure else {
-            Issue.record("the refusal must reach the caller as networkError(400), got \(String(describing: error))")
+            Issue.record("the refusal must reach the caller as networkError(\(expected)), got \(String(describing: error))")
             return
         }
-        #expect(status == 400)
+        #expect(status == expected)
     }
 
     @Test("With debug logging on, the debug channel names Graph's error and no channel holds the request")
@@ -78,5 +80,16 @@ struct ExchangeGraphFailureLogTests {
 
         Self.expectRefusal(result.error)
         #expect(!result.log.contains("SomeCode"))
+    }
+
+    @Test("With debug logging on, a refusal without a usable Graph error still reaches the caller unchanged")
+    func refusalWithoutGraphError() async {
+        let result = await refusedReply(loggingEnabled: true, response: .status(503))
+
+        Self.expectRefusal(result.error, status: 503)
+        #expect(result.debug.contains("HTTP 503"))
+        for secret in [Self.token, Self.subject, Self.body, Self.recipient] {
+            #expect(!result.log.contains(secret), "the log must not hold \(secret)")
+        }
     }
 }
