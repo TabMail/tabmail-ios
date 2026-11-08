@@ -1856,8 +1856,8 @@ struct InboxView: View {
         let allIds = group.members.map(\.id)
         viewModel.beginInteraction()
         // Same guard as `performSingleMove`. Asked once for the representative because
-        // `moveThread` itself derives ONE `destFolderId` from the first resolved
-        // member's account — the members of a thread move share a destination folder.
+        // the members of a thread move share a destination path (in each one's own
+        // account; `moveThread` reports back an account's members that stay put).
         if !viewModel.moveDestinationIsDisplayed(
             group.representative.id, toFolderPath: destinationPath) {
             withAnimation(.easeIn(duration: 0.25)) {
