@@ -203,7 +203,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/TabMail/SwiftMail.git",
       "state" : {
-        "revision" : "b14f52a63b7b5d0dbe57367b79fd06793b1aa6aa"
+        "revision" : "4da38768ceac62bd5f38250bebe50985608da1a3"
       }
     },
     {
