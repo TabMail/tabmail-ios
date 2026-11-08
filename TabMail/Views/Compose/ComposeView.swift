@@ -3785,7 +3785,7 @@ struct ComposeView: View {
         // `.onDisappear` will fire
         // `.cancelled` after dismiss, but
         // `ComposeOutcomeState.tryResolve` makes that a no-op.
-        onAgentOutcome?(.sent)
+        onAgentOutcome?(.sent(outboxId: queued.outboxId))
 
         dismiss()
     }

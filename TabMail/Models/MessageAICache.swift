@@ -117,6 +117,14 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
     /// `summaryTextMessage` to the one passed, nil included, and a new reply (`cachedReply` given)
     /// sets `replyTextMessage` likewise, so a result without one never keeps an older result's.
     /// No-op if rfc822MessageId is nil (skip cache for messages without Message-ID).
+    ///
+    /// No-op too when the account no longer exists. Removing an account deletes its entries
+    /// (`AccountManager.removeAccountRowsTxn`), and a producer that read the email before the
+    /// removal (a summary at Send, an AI job, a sync pass) may finish after it: its entry would
+    /// bring a removed account's email content back, and nothing would ever delete it. The check
+    /// is inside this write, so the removal either came first (no entry) or comes after (deletes
+    /// it). Every row-creating writer of this table checks the same: this one, and the
+    /// extension's merge in its SQL (`NSEDataBridge.upsertAICacheFromStaging`).
     static func writeThrough(
         accountId: String,
         folderPath: String,
@@ -138,6 +146,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
             folderPath: folderPath,
             rfc822MessageId: rfc822MessageId
         ) else { return }
+        guard try Account.exists(db, key: accountId) else { return }
 
         var cache = try MessageAICache
             .filter(Column("key") == key)

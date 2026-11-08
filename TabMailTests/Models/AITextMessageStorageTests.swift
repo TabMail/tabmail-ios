@@ -52,6 +52,7 @@ struct AITextMessageStorageTests {
     @Test("writeThrough stores the text message with its summary and replaces it with the next summary")
     func summaryTextMessageFollowsSummary() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "s@example.com",
                                             summaryBlurb: "First", summaryTextMessage: "First text", db: $0)
@@ -79,6 +80,7 @@ struct AITextMessageStorageTests {
     @Test("writeThrough stores the text message with its reply and replaces it with the next reply")
     func replyTextMessageFollowsReply() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "r@example.com",
                                             cachedReply: "Body one", replyTextMessage: "Text one", db: $0)
@@ -103,6 +105,7 @@ struct AITextMessageStorageTests {
     @Test("restoreIfCached restores each text message with its result")
     func restoreCarriesTextMessages() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "x@example.com",
                                             summaryBlurb: "Summary", summaryTextMessage: "Summary text",
@@ -124,6 +127,7 @@ struct AITextMessageStorageTests {
     @Test("restoreIfCached does not graft a cached text message onto the header's own result")
     func restoreKeepsHeaderResult() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
         try db.write {
             try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "y@example.com",
                                             summaryBlurb: "Cached", summaryTextMessage: "Cached text",

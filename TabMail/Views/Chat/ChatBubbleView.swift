@@ -52,10 +52,12 @@ struct ChatBubbleView: View {
 
     private var showsSender: Bool { isGroup && !item.isOwn }
 
+    private var shownText: String? { item.textMessage }
+
     private var bubble: some View {
         Button(action: onOpen) {
             VStack(alignment: .leading, spacing: 6) {
-                if let text = item.textMessage {
+                if let text = shownText {
                     Text(text)
                         .font(.body)
                         .foregroundStyle(item.isOwn ? Color.white : Theme.textPrimary)
@@ -104,7 +106,7 @@ struct ChatBubbleView: View {
 
     /// Q25: what is on screen, in order.
     private var accessibilityText: String {
-        let words = item.textMessage ?? "\(item.header.subject), summarizing"
+        let words = shownText ?? "\(item.header.subject), summarizing"
         return item.isOwn ? "You said: \(words)" : "\(item.sender.name) said: \(words)"
     }
 
@@ -123,6 +125,82 @@ struct ChatBubbleView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Attachment \(name)")
+    }
+}
+
+/// A reply just sent from the chat whose email is not in the chat yet (N7): a blue bubble from the
+/// queue write on, with the email's summary once it is made ("Summarizing" until then), and under
+/// it "Sending", then "Sent", as under every email of the user's. Its email's own bubble replaces it
+/// once the email is in the chat. A send that failed for good reads "Not sent", with the red mark
+/// beside the bubble as in Messages; touch and hold offers Retry and Delete, which are the Outbox's
+/// own Retry and Discard for the same queued email (owner 2026-11-07).
+struct ChatSentReplyBubble: View {
+    let progress: ChatSentReplies.Progress?
+    let retry: () -> Void
+    let delete: () -> Void
+
+    private var notSent: Bool { progress?.status == .notSent }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 6) {
+            bubble
+            if notSent {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(Theme.destructive)
+                    .accessibilityLabel("Not sent")
+                    .accessibilityIdentifier(Self.notSentMarkId)
+                    .accessibilityAction(named: "Retry", retry)
+                    .accessibilityAction(named: "Delete", delete)
+            }
+        }
+        .contextMenu { if notSent { failedSendMenu } }
+        .containerRelativeFrame(.horizontal, alignment: .trailing) { width, _ in
+            width * ChatViewLayout.bubbleMaxWidthFraction
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.horizontal)
+    }
+
+    static let notSentMarkId = "chat.sentReply.notSent"
+
+    @ViewBuilder
+    private var failedSendMenu: some View {
+        Button(action: retry) { Label("Retry", systemImage: "arrow.clockwise") }
+        Button(role: .destructive, action: delete) { Label("Delete", systemImage: "trash") }
+    }
+
+    private var bubble: some View {
+        VStack(alignment: .trailing, spacing: 4) {
+            Group {
+                // Each branch says what it shows, so VoiceOver reads what is on screen.
+                if let text = progress?.textMessage {
+                    Text(text)
+                        .font(.body)
+                        .foregroundStyle(Color.white)
+                        .multilineTextAlignment(.leading)
+                        .accessibilityLabel("You said: \(text)")
+                } else {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.mini).tint(Color.white)
+                        Text("Summarizing")
+                            .font(.caption)
+                            .foregroundStyle(Color.white.opacity(0.8))
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("You said: summarizing")
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                    .fill(Theme.accent)
+            )
+            Text(progress?.caption ?? "Sending")
+                .font(.caption2)
+                .foregroundStyle(Theme.textSecondary)
+        }
     }
 }
 

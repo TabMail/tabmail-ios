@@ -102,6 +102,9 @@ extension AccountManager {
     /// during the now-suspended dismiss window — NO second row is created; the
     /// existing id is returned. (This is the persistence-layer guarantee; the UI
     /// `isSending` guard in ComposeView is the first line of defense.)
+    ///
+    /// `summaryService` makes the Send-time summary (`SentEmailSummary`): production uses
+    /// `AIService.shared`; tests pass one built on a `FakeHTTP` session (AIService's own seam).
     @discardableResult
     nonisolated func queueSend(
         draft: DraftMessage,
@@ -114,7 +117,8 @@ extension AccountManager {
         serverDraftGmailMessageId: String? = nil,
         draftId: String,
         instanceEpoch: String,
-        holdsForUndo: Bool = true
+        holdsForUndo: Bool = true,
+        summaryService: AIService = .shared
     ) async throws -> (outboxId: String, holdUntil: Date?) {
         let result = try await Self.persistQueuedSend(
             draft: draft,
@@ -149,6 +153,12 @@ extension AccountManager {
         // is the outbox's cardinal sin. Skip on dedup (no new row was written).
         if !result.deduped {
             Task { await AppDatabase.checkpointForDurability() }
+            // The chat view summarizes the email now, for its Sending bubble and its Sent copy.
+            let outboxId = result.outboxId
+            Task {
+                guard await SentEmailSummary.mayRun() else { return }
+                await SentEmailSummary.summarize(outboxId: outboxId, aiService: summaryService)
+            }
         }
         Task { await self.drainOutbox() }
         return (result.outboxId, result.holdUntil)
@@ -289,7 +299,12 @@ extension AccountManager {
                     // drain has long since stopped honouring.
                     return (existing.id, true, nil, existing.holdUntil)
                 }
-                try outboxToInsert.insert(db)
+                // The email's own Message-ID from the queue write, so a summary made at Send is
+                // keyed to it (`SentEmailSummary`); the claim keeps it, and the send uses it.
+                var inserted = outboxToInsert
+                let senderEmail = try Account.fetchOne(db, key: accountId)?.emailAddress
+                inserted.sentMessageId = AccountManager.generateMessageId(senderEmail: senderEmail ?? "user@tabmail.local")
+                try inserted.insert(db)
                 // Optimistic isReplied/isForwarded — matches markRead/archive pattern.
                 // Server state overwrites on next sync (~90s). No rollback needed.
                 guard let originalId = replyToHeaderId else {
@@ -885,6 +900,9 @@ extension AccountManager {
                 header.isRead = true
                 header.inReplyTo = msg.inReplyTo.map { EmailFilter.normalizeMessageId($0) }
                 header.referencesJSON = MessageHeader.encodeReferences(msg.references)
+                // The summary made at Send, under this email's own Message-ID.
+                try MessageAICache.restoreIfCached(
+                    into: &header, accountId: msg.accountId, folderPath: sentFolder.path, db: db)
                 // Thread grouping so the sent message appears in the conversation
                 try ThreadUtils.assignComputedThreadId(to: &header, nativeThreadId: nil, db: db)
                 try header.insert(db)

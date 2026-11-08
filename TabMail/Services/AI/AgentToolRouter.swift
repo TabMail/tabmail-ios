@@ -11,7 +11,8 @@ import SwiftUI
 /// LLM sees what actually happened (send / cancel / setup failure), instead
 /// of the old fire-and-forget "Opening…" placeholder.
 enum ComposeOutcome: Sendable {
-    case sent
+    /// The email was queued: `outboxId` is its outbox row, which the chat's Sending bubble follows.
+    case sent(outboxId: String)
     case cancelled
     case failed(String)
 }

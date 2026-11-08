@@ -3657,6 +3657,10 @@ enum NSEDataBridge {
     /// column. The staged `processedAt` is a number, and SQLite orders every number
     /// below every text value, so binding it raw made the TTL purge's
     /// `updatedAt < cutoff` count a fresh entry as expired (#395).
+    ///
+    /// Writes only while the staged email's account exists, checked in the same statement: an
+    /// account removed before this merge gets no entry back. The main app's writer has the same
+    /// check (`MessageAICache.writeThrough`), whose comment says why.
     static func upsertAICacheFromStaging(
         _ msg: StagedMessage,
         cacheKey: String,
@@ -3666,7 +3670,8 @@ enum NSEDataBridge {
         try db.execute(sql: """
             INSERT INTO messageAICache
                 (key, rfc822MessageId, summaryBlurb, summaryTodos, summaryTextMessage, actionTag, updatedAt)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                SELECT ?, ?, ?, ?, ?, ?, ?
+                WHERE EXISTS (SELECT 1 FROM account WHERE id = ?)
             ON CONFLICT(key) DO UPDATE SET
                 summaryBlurb = excluded.summaryBlurb,
                 summaryTodos = excluded.summaryTodos,
@@ -3679,7 +3684,7 @@ enum NSEDataBridge {
                OR actionTag IS NOT excluded.actionTag
             """, arguments: [
                 cacheKey, rfc822MessageId, msg.summaryBlurb, msg.summaryTodos, msg.summaryTextMessage,
-                msg.actionTag, Date(timeIntervalSince1970: msg.processedAt)
+                msg.actionTag, Date(timeIntervalSince1970: msg.processedAt), msg.accountId
             ])
     }
 

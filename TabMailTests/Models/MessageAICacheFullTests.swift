@@ -15,6 +15,7 @@ struct MessageAICacheFullTests {
     @Test("writeThrough creates new entry with summary fields")
     func writeThroughCreatesNewWithSummary() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(
@@ -39,6 +40,7 @@ struct MessageAICacheFullTests {
     @Test("writeThrough creates new entry with action tag")
     func writeThroughCreatesNewWithAction() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(
@@ -59,6 +61,7 @@ struct MessageAICacheFullTests {
     @Test("writeThrough creates new entry with reply fields")
     func writeThroughCreatesNewWithReply() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
         let now = Date()
 
         try db.write {
@@ -82,6 +85,7 @@ struct MessageAICacheFullTests {
     @Test("writeThrough creates new entry with reminder fields")
     func writeThroughCreatesNewWithReminder() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(
@@ -108,6 +112,7 @@ struct MessageAICacheFullTests {
     @Test("writeThrough preserves summary when updating action only")
     func writeThroughPreservesSummaryOnActionUpdate() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(
@@ -141,6 +146,7 @@ struct MessageAICacheFullTests {
     @Test("writeThrough preserves action when updating reply only")
     func writeThroughPreservesActionOnReplyUpdate() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(
@@ -172,6 +178,7 @@ struct MessageAICacheFullTests {
     @Test("writeThrough overwrites specific field when provided")
     func writeThroughOverwritesProvidedField() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(
@@ -204,6 +211,7 @@ struct MessageAICacheFullTests {
     @Test("writeThrough with nil rfc822MessageId does not insert")
     func writeThroughNilMessageIdNoOp() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(
@@ -223,6 +231,7 @@ struct MessageAICacheFullTests {
     @Test("writeThrough with empty rfc822MessageId does not insert")
     func writeThroughEmptyMessageIdNoOp() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(
@@ -622,6 +631,7 @@ struct MessageAICacheFullTests {
     @Test("writeThrough updates updatedAt on each call")
     func writeThroughUpdatesTimestamp() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(

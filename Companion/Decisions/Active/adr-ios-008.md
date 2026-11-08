@@ -11,6 +11,7 @@
 5. **Per-message semaphores** — Prevent concurrent AI generation for the same message. If a summary is already being generated for message X, other requestors wait for the result.
 6. **Global LLM concurrency limit** — A semaphore limits total concurrent backend API calls (prevent overload). Priority/user-initiated requests can bypass the semaphore.
 7. **Caching with TTL** — AI results (summary, action) are cached in database fields with generation timestamps. Expired results can be recomputed. Cache is checked before any LLM call. *Superseded on iOS by ADR-IOS-103 (2026-11-05): no TTL; a result lives as long as its email is on the device, a documented deviation from TB.*
+   *Trigger-only divergence (owner 2026-11-07, ADR-IOS-103):* with the chat view on, iOS summarizes an email the user sends from the moment it is queued (`SentEmailSummary`), not when its Sent copy is processed as TB does. It is the same summary call on the same final email (`isSentByUser`), written to the same AI cache key (Sent folder plus the email's own Message-ID), which the Sent copy then restores; only the moment it runs differs, so the chat's Sending bubble can show it while the email goes out.
 8. **First-compute-wins** — Before LLM action generation, check IMAP keywords / Gmail labels (per ADR-IOS-004). If found, adopt without LLM.
 9. **Three-call action voting** — Action classification makes N parallel calls and takes the mode (most common action), matching TB's voting mechanism.
 

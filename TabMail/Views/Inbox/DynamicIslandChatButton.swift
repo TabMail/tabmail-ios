@@ -45,14 +45,26 @@ struct DynamicIslandChat: View {
     @Binding var isWorking: Bool
     var onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?) -> Void)?
     var onAgentReply: ((String) -> Void)?
+    /// The chat view's reply field (`ChatReplyField`): collapsed, this pill is [mic] [field] [Send]
+    /// on the thread's newest email instead of the Chat capsule.
+    let replyField: ChatReplyField?
+    /// Send with the ready AI Reply unchanged: the parent opens the compose card (N2.6).
+    var onSendReadyReply: (() -> Void)?
+    /// The user's own words went from the field to the agent (N4.4).
+    var onFieldSend: ((String) -> Void)?
     @Environment(\.hasTabMailSession) private var hasTabMailSession
-    @State private var inputText = ""
+    /// Reply field: the words sent to the agent, shown pulsing while it works (N5, A2).
+    @State private var fieldSentText: String?
+    /// The input's words and the reply field's state. `ChatFieldFill.apply` is the only way the words
+    /// change; the ready AI Reply is shown, never written into them (`ChatFieldFill`).
+    @State private var fieldFill = ChatFieldFill()
+    /// The user's own words in the input (`ChatFieldFill.words`), read-only here.
+    private var inputText: String { fieldFill.words }
+    @State private var fieldPulse = false
     @State private var inputSelection: TextSelection?
     @State private var dictation = DictationController()
     /// Dictation for a user opted out of AI: Apple's recognition on this iPhone only (`PillDictationMode`).
     @State private var speech = OnDeviceSpeechRecognizer()
-    /// The input text the on-device transcript is appended to, captured when it starts.
-    @State private var speechBase = ""
     /// The speech and microphone permissions, read again when the app becomes active (the user may
     /// have changed them in Settings, or answered the system prompt) and when a start begins or ends.
     @State private var speechPermission = SFSpeechRecognizer.authorizationStatus()
@@ -228,7 +240,10 @@ struct DynamicIslandChat: View {
         isInputFocused: Binding<Bool> = .constant(false),
         isWorking: Binding<Bool> = .constant(false),
         onDraftUpdate: ((String?, String?, RecipientDelta?, RecipientDelta?, RecipientDelta?) -> Void)? = nil,
-        onAgentReply: ((String) -> Void)? = nil
+        onAgentReply: ((String) -> Void)? = nil,
+        replyField: ChatReplyField? = nil,
+        onSendReadyReply: (() -> Void)? = nil,
+        onFieldSend: ((String) -> Void)? = nil
     ) {
         self.message = message
         self.draftSubject = draftSubject
@@ -250,6 +265,9 @@ struct DynamicIslandChat: View {
         self._isWorking = isWorking
         self.onDraftUpdate = onDraftUpdate
         self.onAgentReply = onAgentReply
+        self.replyField = replyField
+        self.onSendReadyReply = onSendReadyReply
+        self.onFieldSend = onFieldSend
     }
 
     /// Max expanded height as fraction of screen height.
@@ -370,6 +388,8 @@ struct DynamicIslandChat: View {
                     expandedInputBar
                         .layoutPriority(1)
                 }
+            } else if let replyField {
+                replyFieldBar(replyField)
             } else {
                 collapsedPill
             }
@@ -607,15 +627,16 @@ struct DynamicIslandChat: View {
                     }
                 }
 
-                if autoDictation {
+                if Self.autoListens(autoDictation: autoDictation, inChat: replyField != nil) {
                     // Start dictation after the animation fully settles.
+                    // (Never in the chat view: there the mic listens only when tapped, Q16.)
                     // Task is stored so collapse cancels it (prevents a double start).
                     autoStartTask = Task {
                         try? await Task.sleep(for: .milliseconds(800))
                         guard !Task.isCancelled, isExpanded, !isTextFieldFocused else { return }
                         startDictation(auto: true)
                     }
-                } else if !dictationPromptShown && !TutorialCoordinator.shared.isRunning {
+                } else if !dictationPromptShown && !TutorialCoordinator.shared.isRunning && replyField == nil {
                     dictationPromptShown = true
                     showDictationPrompt = true
                 }
@@ -651,7 +672,33 @@ struct DynamicIslandChat: View {
                 speech.stop()
             }
         }
+        // Reply field (chat view): it shows the ready AI Reply while it holds no words of the
+        // user's (`fieldText`); a clear empties the words that were sent; a confirmation card while
+        // collapsed opens the sheet, which takes the request (A3).
+        .onChange(of: replyField?.clearCount) { _, _ in
+            fieldSentText = nil
+            // Words written after the send this completes are newer, and stay (`ChatFieldFill`).
+            fieldFill.apply(.completed)
+        }
+        .onChange(of: chatMessages.last?.actionConfirmation != nil) { _, hasCard in
+            guard hasCard, replyField != nil, !isExpanded else { return }
+            fieldFill.apply(.confirmationCard)
+            fieldSentText = nil
+            withAnimation(expandSpring) { isExpanded = true }
+        }
+        .onChange(of: isWorking && fieldSentText != nil) { _, pulsing in
+            if pulsing {
+                withAnimation(.easeInOut(duration: ChatViewLayout.fieldPulseDuration).repeatForever(autoreverses: true)) {
+                    fieldPulse = true
+                }
+            } else {
+                withAnimation(.easeInOut(duration: 0.3)) { fieldPulse = false }
+            }
+        }
         .onChange(of: isWorking) { wasWorking, nowWorking in
+            if wasWorking && !nowWorking {
+                fieldSentText = nil
+            }
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[DynamicIslandChat] dictation-auto-restart onChange(isWorking) fired: wasWorking=\(wasWorking) nowWorking=\(nowWorking)")
             }
@@ -664,9 +711,9 @@ struct DynamicIslandChat: View {
                 }
                 return
             }
-            guard autoDictation, isExpanded, !isTextFieldFocused else {
+            guard Self.autoListens(autoDictation: autoDictation, inChat: replyField != nil), isExpanded, !isTextFieldFocused else {
                 if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[DynamicIslandChat] dictation-auto-restart: skip — autoDictation=\(autoDictation) isExpanded=\(isExpanded) isTextFieldFocused=\(isTextFieldFocused)")
+                    BackgroundSyncLogger.logDebug("[DynamicIslandChat] dictation-auto-restart: skip — replyField=\(replyField != nil) autoDictation=\(autoDictation) isExpanded=\(isExpanded) isTextFieldFocused=\(isTextFieldFocused)")
                 }
                 return
             }
@@ -795,128 +842,190 @@ struct DynamicIslandChat: View {
 
     private var expandedInputBar: some View {
         HStack(spacing: 10) {
-            Button {
-                // The newest gesture wins: a delayed auto-start still waiting must not start after this tap.
-                autoStartTask?.cancel()
-                autoStartTask = nil
-                if speech.isRecording || speech.isStarting {
-                    speech.stop()
-                    return
-                }
-                switch dictation.phase {
-                case .listening: dictation.finish()
-                case .idle: startDictation()
-                case .transcribing: break
-                }
-            } label: {
-                Image(systemName: micSymbol)
-                    .contentTransition(.symbolEffect(.replace))
-                    .font(.title3)
-                    .foregroundStyle(dictation.phase == .listening || speech.isRecording ? .red : Theme.accent)
-                    .frame(width: 28, height: 28)
-            }
-            // Dictation is transcribed on the AI backend (off without a connection), or on this iPhone
-            // when opted out of AI (off if the language has no on-device model).
-            .disabled(isWorking || dictation.phase == .transcribing
-                || (!dictation.isActive && !speech.isRecording && !speech.isStarting && !canDictate))
-            .accessibilityLabel(dictation.phase == .listening || speech.isRecording ? "Stop dictation" : "Dictate")
-            .popoverTip(DictationLanguageTip(), arrowEdge: .bottom)
+            micButton
 
-            // Dictating: the field's text dims behind the waveform. Tap it to stop listening; the
-            // text is appended when it comes back.
-            TextField(PillDictationMode.placeholder(isCompose: isComposeMode, offNote: dictationOffNote), text: $inputText, selection: $inputSelection, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...6)
-                .focused($isTextFieldFocused)
-                .frame(minHeight: dictation.isActive ? DictationConfig.meterMaxBarHeight : nil)
-                .opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)
-                .allowsHitTesting(!dictation.isActive)
-                // VoiceOver reads the waveform instead of the dimmed field.
-                .accessibilityHidden(dictation.isActive)
-                .overlay {
-                    if dictation.isActive {
-                        DictationPillView(controller: dictation)
-                            .contentShape(Rectangle())
-                            .onTapGesture { dictation.finish() }
-                    }
-                }
+            inputField(placeholder: PillDictationMode.placeholder(isCompose: isComposeMode, offNote: dictationOffNote))
 
-            if isWorking {
-                // Stop button — handle stop entirely here (not in Task catch)
-                // because URLSession throws URLError.cancelled, not CancellationError
-                Button {
-                    activeChatTask?.cancel()
-                    activeChatTask = nil
-                    isWorking = false
-                    ActiveAgentTracker.shared.clearWorking(sessionKey)
-                    resetStatusQueue()
-                    chatMessages.append(ChatMessage(
-                        role: .agent,
-                        content: "Stopped.",
-                        timestamp: Date()
-                    ))
-                } label: {
-                    Image(systemName: "stop.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(.red.opacity(0.8))
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
-                }
-            } else if dictation.phase == .transcribing {
-                DictationSpinner(isRetrying: dictation.isRetrying)
-                    .frame(width: 44, height: 44)
-                    .accessibilityLabel("Transcribing")
-            } else if !isWorking && !dictation.isActive && (pendingResumeRequest != nil || lastFailedMessage != nil) && isOnLiveSession && inputText.trimmingCharacters(in: .whitespaces).isEmpty {
-                // Retry button. Reverts to the send button as soon as the user types
-                // (the `inputText.isEmpty` gate above). Routes to the right path:
-                // a connection-lost RESUMES from saved state; a plain failure re-sends.
-                Button {
-                    if pendingResumeRequest != nil {
-                        // Connection-lost: resume the interrupted turn (no re-execution
-                        // of completed tools). Same action as the inline affordance.
-                        resumeAgentChat()
-                    } else if let msg = lastFailedMessage {
-                        lastFailedMessage = nil
-                        // Remove error bubble + user bubble, then re-send (matches TB retry)
-                        if chatMessages.count >= 2 {
-                            chatMessages.removeLast(2)
-                        } else {
-                            chatMessages.removeLast()
-                        }
-                        sendAgentChat(msg)
-                    }
-                } label: {
-                    Image(systemName: "arrow.clockwise.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(Theme.accent)
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
-                }
-            } else {
-                // Normal send button
-                Button {
-                    if dictation.phase == .listening {
-                        // Send finishes the dictation first; its text, if any, is sent when it lands.
-                        sendWhenDictated = true
-                        dictation.finish()
-                    } else {
-                        sendMessage()
-                    }
-                } label: {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.title2)
-                        .foregroundStyle(canTapSend ? Theme.accent : .secondary.opacity(0.3))
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
-                }
-                .disabled(!canTapSend)
-                .accessibilityIdentifier("chatSend")
-            }
+            trailingButton
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .animation(nil, value: isTextFieldFocused)
         .animation(nil, value: isWorking)
+    }
+
+    /// The mic: dictation into the input (backend, or on this iPhone when opted out of AI).
+    private var micButton: some View {
+        Button {
+            // The newest gesture wins: a delayed auto-start still waiting must not start after this tap.
+            autoStartTask?.cancel()
+            autoStartTask = nil
+            if speech.isRecording || speech.isStarting {
+                speech.stop()
+                return
+            }
+            switch dictation.phase {
+            case .listening: dictation.finish()
+            case .idle: startDictation()
+            case .transcribing: break
+            }
+        } label: {
+            Image(systemName: micSymbol)
+                .contentTransition(.symbolEffect(.replace))
+                .font(.title3)
+                .foregroundStyle(dictation.phase == .listening || speech.isRecording ? .red : Theme.accent)
+                .frame(width: 28, height: 28)
+        }
+        // Dictation is transcribed on the AI backend (off without a connection), or on this iPhone
+        // when opted out of AI (off if the language has no on-device model).
+        .disabled(isWorking || dictation.phase == .transcribing
+            || (!dictation.isActive && !speech.isRecording && !speech.isStarting && !canDictate))
+        .accessibilityLabel(dictation.phase == .listening || speech.isRecording ? "Stop dictation" : "Dictate")
+        .popoverTip(DictationLanguageTip(), arrowEdge: .bottom)
+    }
+
+    /// The input as the user sees and edits it: it shows `fieldText`, and what the user types
+    /// becomes their words; emptying the reply field by hand keeps the AI Reply out of it for that
+    /// email (`ChatFieldFill.edited`). The app's own changes to the words do not pass through here.
+    private var typedText: Binding<String> {
+        Binding(get: { fieldText }, set: { typed in
+            fieldFill.apply(.typed(typed, shown: fieldText, email: fieldEmail, replyField: replyField != nil))
+        })
+    }
+
+    /// The input field, with the dictation waveform over it while listening.
+    private func inputField(placeholder: String) -> some View {
+        // Dictating: the field's text dims behind the waveform. Tap it to stop listening; the
+        // text is appended when it comes back.
+        TextField(placeholder, text: typedText, selection: $inputSelection, axis: .vertical)
+            .textFieldStyle(.plain)
+            .lineLimit(1...6)
+            .focused($isTextFieldFocused)
+            .frame(minHeight: dictation.isActive ? DictationConfig.meterMaxBarHeight : nil)
+            .opacity(dictation.isActive ? DictationConfig.dimmedInputOpacity : 1)
+            .allowsHitTesting(!dictation.isActive)
+            // VoiceOver reads the waveform instead of the dimmed field.
+            .accessibilityHidden(dictation.isActive)
+            .overlay {
+                if dictation.isActive {
+                    DictationPillView(controller: dictation)
+                        .contentShape(Rectangle())
+                        .onTapGesture { dictation.finish() }
+                }
+            }
+    }
+
+    /// Send, or Stop while the agent works, Retry after a failure, the spinner while transcribing.
+    @ViewBuilder
+    private var trailingButton: some View {
+        if isWorking {
+            // Stop button — handle stop entirely here (not in Task catch)
+            // because URLSession throws URLError.cancelled, not CancellationError
+            Button {
+                activeChatTask?.cancel()
+                activeChatTask = nil
+                isWorking = false
+                ActiveAgentTracker.shared.clearWorking(sessionKey)
+                resetStatusQueue()
+                chatMessages.append(ChatMessage(
+                    role: .agent,
+                    content: "Stopped.",
+                    timestamp: Date()
+                ))
+            } label: {
+                Image(systemName: "stop.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.red.opacity(0.8))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+        } else if dictation.phase == .transcribing {
+            DictationSpinner(isRetrying: dictation.isRetrying)
+                .frame(width: 44, height: 44)
+                .accessibilityLabel("Transcribing")
+        } else if !isWorking && !dictation.isActive && (pendingResumeRequest != nil || lastFailedMessage != nil) && isOnLiveSession && fieldText.trimmingCharacters(in: .whitespaces).isEmpty {
+            // Retry button. Reverts to the send button as soon as the user types
+            // (the `fieldText.isEmpty` gate above). Routes to the right path:
+            // a connection-lost RESUMES from saved state; a plain failure re-sends.
+            Button {
+                if pendingResumeRequest != nil {
+                    // Connection-lost: resume the interrupted turn (no re-execution
+                    // of completed tools). Same action as the inline affordance.
+                    resumeAgentChat()
+                } else if let msg = lastFailedMessage {
+                    lastFailedMessage = nil
+                    // Remove error bubble + user bubble, then re-send (matches TB retry)
+                    if chatMessages.count >= 2 {
+                        chatMessages.removeLast(2)
+                    } else {
+                        chatMessages.removeLast()
+                    }
+                    sendAgentChat(msg, fromReplyField: replyField != nil && !isExpanded)
+                }
+            } label: {
+                Image(systemName: "arrow.clockwise.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(Theme.accent)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+        } else {
+            // Normal send button
+            Button {
+                if dictation.phase == .listening {
+                    // Send finishes the dictation first; its text, if any, is sent when it lands.
+                    sendWhenDictated = true
+                    dictation.finish()
+                } else {
+                    sendMessage()
+                }
+            } label: {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(canTapSend ? Theme.accent : .secondary.opacity(0.3))
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .disabled(!canTapSend)
+            .accessibilityIdentifier("chatSend")
+        }
+    }
+
+    /// The chat view's reply field (`ChatReplyField`): [mic] [field] [Send] on the newest email.
+    /// The field's top line says AI Reply while it holds the ready reply (Q15); while the agent
+    /// works, the line above says what it is doing and the words pulse (N5, A2).
+    private func replyFieldBar(_ field: ChatReplyField) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if isWorking, fieldSentText != nil {
+                Text(workingStatus.isEmpty ? "Thinking..." : workingStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .transition(.opacity)
+            }
+            HStack(spacing: 10) {
+                micButton
+                VStack(alignment: .leading, spacing: 2) {
+                    if holdsReadyReply {
+                        Text("AI Reply")
+                            .font(.caption2)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(.secondary)
+                    }
+                    if isWorking, let sent = fieldSentText {
+                        Text(sent)
+                            .lineLimit(1...6)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .opacity(fieldPulse ? ChatViewLayout.fieldPulseOpacity : 1)
+                    } else {
+                        inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply or ask")
+                    }
+                }
+                trailingButton
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
     }
 
     private var signInBar: some View {
@@ -1344,24 +1453,33 @@ struct DynamicIslandChat: View {
     /// `auto`: started by the pill itself (it opened, the agent finished, Auto-Enable Dictation), not
     /// by a tap on the mic. The on-device recognizer asks for permission on a tap only: an auto-start
     /// runs when speech recognition and the microphone are both already granted, else it does nothing.
+    /// Whether dictation starts by itself, on open and after the agent's turn: only with the
+    /// auto-dictation preference on, and never in the chat view's reply field, where the mic
+    /// listens only when tapped (Q16). The ONE decision both automatic starts ask.
+    static func autoListens(autoDictation: Bool, inChat: Bool) -> Bool {
+        autoDictation && !inChat
+    }
+
     private func startDictation(auto: Bool = false) {
         // Auto-start follows the mic button: while it is off, nothing starts.
         guard canDictate else { return }
         // The same gate that shows the input bar (and so the mic and the waveform) in the body.
         let canUseAI = hasTabMailSession && AISubscriptionGate.shared.isActive
+        // Said over the ready AI Reply, the words replace it (N4.3): it is shown, not the user's
+        // words, so the words they say are the first.
         isTextFieldFocused = false
         if dictationMode == .onDevice {
             // Behind the sign-in or subscribe bar there is no mic or waveform: an auto-start records nothing there.
             guard canUseAI, !speech.isRecording, !speech.isStarting else { return }
-            speechBase = inputText
+            fieldFill.apply(.startHearing)
             speech.start(locale: speechLocale, auto: auto) { transcript in
-                inputText = DictationController.appending(transcript, to: speechBase)
+                fieldFill.apply(.heard(transcript))
                 inputSelection = .init(insertionPoint: inputText.endIndex)
             }
             return
         }
         dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in
-            inputText = DictationController.appending(text, to: inputText)
+            fieldFill.apply(.said(text))
             inputSelection = .init(insertionPoint: inputText.endIndex)
             Task { await DictationLanguageTip.dictationCompleted.donate() }
             if sendWhenDictated {
@@ -1379,7 +1497,7 @@ struct DynamicIslandChat: View {
 
     private var canSend: Bool {
         hasTabMailSession
-            && !inputText.trimmingCharacters(in: .whitespaces).isEmpty
+            && !fieldText.trimmingCharacters(in: .whitespaces).isEmpty
             && !isWorking
             && !dictation.isActive
             && !speech.isRecording
@@ -1443,8 +1561,12 @@ struct DynamicIslandChat: View {
     }
 
     private func sendMessage() {
-        let text = inputText.trimmingCharacters(in: .whitespaces)
+        let text = fieldText.trimmingCharacters(in: .whitespaces)
         guard !text.isEmpty else { return }
+        if let replyField, !isExpanded {
+            sendFromReplyField(text, replyField)
+            return
+        }
         let composeAdmissionAcquired: Bool
         if isComposeMode {
             guard acquireComposeEditAdmission() else { return }
@@ -1461,7 +1583,8 @@ struct DynamicIslandChat: View {
         isTextFieldFocused = false
         // The input as sent is the last word on a correction of a dictation in it (ADR-IOS-086).
         dictation.inputSent(inputText)
-        inputText = ""
+        // From the open sheet the input empties as it goes; a newer draft is what is typed next.
+        fieldFill.apply(.sentFromSheet)
         inputSelection = .init(insertionPoint: "".startIndex)
 
         Task { @MainActor in
@@ -1480,6 +1603,47 @@ struct DynamicIslandChat: View {
                 sendAgentChat(text)
             }
         }
+    }
+
+    /// Send in the chat's reply field: the ready AI Reply unchanged goes straight to the compose
+    /// card; anything else goes to the agent on the newest email and stays in the field, pulsing,
+    /// while it works (N4.4, N5, A2). The field empties when the reply goes out or the agent
+    /// answers in the sheet; a closed compose card leaves the words (N6.3).
+    private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {
+        isTextFieldFocused = false
+        fieldFill.apply(.sentFromField)
+        if ChatReplyField.route(text: text, readyText: field.readyText) == .readyReply {
+            onSendReadyReply?()
+            return
+        }
+        dictation.inputSent(inputText)
+        fieldSentText = text
+        onFieldSend?(text)
+        Task { @MainActor in
+            MessageChatCollapseTip.hasStartedMessageChat = true
+            sendAgentChat(text, fromReplyField: true)
+        }
+    }
+
+    /// What the input shows: the user's words, or the ready AI Reply while there are none
+    /// (`ChatFieldFill.shown`).
+    private var fieldText: String {
+        fieldFill.shown(ready: replyField?.readyText, busy: isDictating || isWorking, email: fieldEmail)
+    }
+
+    /// The newest email, as the field's per-email state names it: copies of one email are one.
+    private var fieldEmail: String? {
+        message.map(ChatThread.copyKey)
+    }
+
+    /// A dictation is recording, transcribing, or starting: its words are coming to the field.
+    private var isDictating: Bool {
+        dictation.isActive || speech.isRecording || speech.isStarting
+    }
+
+    /// The field shows the ready AI Reply, untouched (its top line says AI Reply, Q15).
+    private var holdsReadyReply: Bool {
+        inputText.isEmpty && !fieldText.isEmpty
     }
 
     // MARK: - Compose inline edit
@@ -2105,6 +2269,7 @@ struct DynamicIslandChat: View {
     private func makeCompletionsSSEHandler(
         idleLabel: String
     ) -> BackendClient.SSEEventHandler {
+        let isReplyField = replyField != nil
         return { @Sendable event in
             Task { @MainActor in
                 switch event {
@@ -2114,7 +2279,7 @@ struct DynamicIslandChat: View {
                     isThrottled = false
                 default:
                     if let label = Self.statusLabel(for: event, idleLabel: idleLabel) {
-                        enqueueStatus(label)
+                        enqueueStatus(isReplyField ? ChatReplyField.statusLine(label) : label)
                     }
                 }
             }
@@ -2172,9 +2337,16 @@ struct DynamicIslandChat: View {
         lastStatusChangeTime = .distantPast
     }
 
+    /// The [Email](N) number a send names: the pill's email as the send starts, else the number
+    /// already known (a resumed session's email). Never a number found for another email.
+    static func contextNumber(sendingAbout message: MessageHeader?, known: Int?) async -> Int? {
+        guard let message else { return known }
+        return await ChatIdTranslator.shared.toNumericId(message.id)
+    }
+
     /// `script`: a guided-tutorial prompt, answered by `TutorialChatScript`
     /// on the device instead of the AI.
-    private func sendAgentChat(_ text: String, script: TutorialCoordinator.ChatPrompt? = nil) {
+    private func sendAgentChat(_ text: String, script: TutorialCoordinator.ChatPrompt? = nil, fromReplyField: Bool = false) {
         // If on the "new session" page in multi-session mode, start a fresh session
         if hasSessionHistory, activeSessionIndex < loadedSessions.count,
            loadedSessions[activeSessionIndex].id == "__new__" {
@@ -2291,9 +2463,14 @@ struct DynamicIslandChat: View {
             //    sessionEmailContexts has the snapshot, register from it (avoids race
             //    with fire-and-forget Task that was previously used)
             // 3. Inbox session — neither applies, enrichedText = raw text
-            if let msg = message, contextEmailNumericId == nil {
-                contextEmailNumericId = await ChatIdTranslator.shared.toNumericId(msg.id)
-            } else if contextEmailNumericId == nil, let sid = sid,
+            // The email this send is about is the pill's email as the send starts: the chat view's
+            // newest email changes while its pill stays mounted, so a number found for an earlier
+            // email is never reused, and the send reads its own copy, which a late registration
+            // from an earlier open cannot overwrite.
+            var contextNumericId = await Self.contextNumber(sendingAbout: message, known: contextEmailNumericId)
+            if message != nil {
+                contextEmailNumericId = contextNumericId
+            } else if contextNumericId == nil, let sid = sid,
                       let emailCtx = sessionEmailContexts[sid] {
                 // Resuming past msg-detail session from inbox. The messageHeaderId may be stale
                 // (IMAP MOVE changes PKs). Resolve to current PK before registering.
@@ -2308,14 +2485,18 @@ struct DynamicIslandChat: View {
                             from: emailCtx.messageHeaderId, to: resolvedId
                         )
                     }
-                    contextEmailNumericId = await ChatIdTranslator.shared.toNumericId(resolvedId)
+                    contextNumericId = await ChatIdTranslator.shared.toNumericId(resolvedId)
+                    contextEmailNumericId = contextNumericId
                     BackgroundSyncLogger.logDebug("[DynamicIslandChat] Restored email context for resumed session: \(emailCtx.subject)")
                 }
             }
 
             // Build enrichedText INSIDE Task block (after awaiting registration)
             let enrichedText: String
-            if let numericId = contextEmailNumericId {
+            if let numericId = contextNumericId, fromReplyField {
+                enrichedText = ChatReplyField.agentMessage(
+                    emailNumericId: numericId, text: text, isNoReply: replyField?.isNoReply ?? false)
+            } else if let numericId = contextNumericId {
                 enrichedText = "Regarding [Email](\(numericId)): \(text)"
             } else {
                 enrichedText = text
@@ -2788,7 +2969,7 @@ struct DynamicIslandChat: View {
             }
         }
 
-        inputText = text
+        fieldFill.apply(.put(text))
         isTextFieldFocused = true
     }
 

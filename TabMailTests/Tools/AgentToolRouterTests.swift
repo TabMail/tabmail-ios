@@ -643,7 +643,7 @@ struct AgentToolRouterBlockingComposeTests {
 
         // Simulate ComposeView.send() firing .sent followed by .onDisappear
         // firing .cancelled. Only the first should register.
-        req.onOutcome(.sent)
+        req.onOutcome(.sent(outboxId: "outbox-1"))
         req.onOutcome(.cancelled)
 
         let outcome = await task.value
@@ -892,7 +892,7 @@ struct ComposeOutcomeDescribeTests {
 
     @Test("sent → 'Email sent successfully.'")
     func sentDescription() {
-        #expect(ComposeOutcome.sent.describeForLLM == "Email sent successfully.")
+        #expect(ComposeOutcome.sent(outboxId: "outbox-1").describeForLLM == "Email sent successfully.")
     }
 
     @Test("cancelled → 'User closed the compose window without sending.'")
