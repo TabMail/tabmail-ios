@@ -678,7 +678,7 @@ extension EmailProvider {
 /// `AccountManager.isConfirmedGoneError` — does NOT match
 /// `ProviderError.messageNotFound` because Gmail/Exchange overload it for
 /// parse failures (see `fetchMessagesBatch` doc above).
-private func isHttpGoneStatus(_ error: Error) -> Bool {
+func isHttpGoneStatus(_ error: Error) -> Bool {
     guard case ProviderError.networkError(let underlying) = error else { return false }
     if case HTTPError.networkError(let statusCode) = underlying {
         return statusCode == 404 || statusCode == 410

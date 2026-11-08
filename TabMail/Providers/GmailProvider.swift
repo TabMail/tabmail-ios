@@ -281,9 +281,20 @@ actor GmailProvider: EmailProvider {
         let page = try await withThrowingTaskGroup(of: (id: String, header: MessageHeaderInfo?).self) { group in
             for ref in messageRefs {
                 group.addTask {
-                    let msgData = try await self.request(path: "/messages/\(ref.id)\(GmailAPI.metadataQuery)")
-                    let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
-                    return (ref.id, await self.parseGmailMessage(msg))
+                    do {
+                        let msgData = try await self.request(path: "/messages/\(ref.id)\(GmailAPI.metadataQuery)")
+                        let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
+                        return (ref.id, await self.parseGmailMessage(msg))
+                    } catch where Self.isUnreadableAnswerForOneMessage(error) {
+                        // The server answered for this one message and the answer
+                        // is unusable. The message stays NAMED (unmaterialised), so
+                        // its row is kept, and the rest of the folder still syncs:
+                        // one message that keeps failing must not stop the full
+                        // sync, because the full sync is what bounds a delta that
+                        // cannot fetch a changed message (`fetchMessageDetails`).
+                        if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] fetchMessages: \(ref.id) unreadable (\(error)) — kept as unmaterialised") }
+                        return (ref.id, nil)
+                    }
                 }
             }
             var result: [MessageHeaderInfo] = []
@@ -1505,24 +1516,56 @@ actor GmailProvider: EmailProvider {
     }
 
     /// Fetch message details including label IDs for delta sync folder assignment.
+    ///
+    /// Skips a message only when Gmail answers that it is gone (404/410): it
+    /// was deleted between the history listing and this fetch, which is normal,
+    /// and skipping it lets the cursor move instead of asking for the same gone
+    /// message forever. Any other failure (a 5xx, a 4xx such as a 429 past the
+    /// retry budget, a dropped connection, cancellation, an unreadable body, a
+    /// record `parseGmailMessage` refuses) throws, so the delta fails without
+    /// moving its cursor and a later pass asks again. A failure that never
+    /// clears is bounded by the full sync:
+    /// it completes past one message it cannot read (see
+    /// `fetchMessagesWithObservedEpoch`) and then moves the cursor forward. A
+    /// change in the failed batch that no full-sync window covers is not
+    /// recovered once that happens.
     func fetchMessageDetails(ids: [String]) async throws -> [GmailMessageDetail] {
         var results: [GmailMessageDetail] = []
         for id in ids {
+            let msgData: Data
             do {
-                let msgData = try await request(path: "/messages/\(id)\(GmailAPI.metadataQuery)")
-                let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
-                if let header = parseGmailMessage(msg) {
-                    results.append(GmailMessageDetail(header: header, labelIds: msg.labelIds ?? []))
-                }
-            } catch {
-                // Message deleted between history listing and detail fetch — skip.
-                // Normal for Gmail: history reports the messageId but the message
-                // is gone by fetch time. Skipping lets historyId advance instead
-                // of looping forever on the same 404.
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] fetchMessageDetails: skipping \(id) — \(error)") }
+                msgData = try await request(path: "/messages/\(id)\(GmailAPI.metadataQuery)")
+            } catch where isHttpGoneStatus(error) {
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] fetchMessageDetails: skipping \(id) — gone (\(error))") }
+                continue
             }
+            let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
+            // A record the parser refuses (no usable date) is a failed fetch,
+            // not a gone message: it says nothing about deletion and is often
+            // transient, so it fails the delta like an unreadable body would.
+            guard let header = parseGmailMessage(msg) else {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: [], debugDescription: "Gmail message \(id) has no usable header"))
+            }
+            results.append(GmailMessageDetail(header: header, labelIds: msg.labelIds ?? []))
         }
         return results
+    }
+
+    /// True when the server answered for ONE message and that answer cannot be
+    /// used: an HTTP error status for the message, or a body that does not
+    /// decode. A status reaching here comes after `AuthedHTTP`'s own retries
+    /// and token refresh, so it is taken as the server's answer for that
+    /// message, even one that may be about the server (5xx, 429); counting it
+    /// unmaterialised only keeps the row. 401 is the exception: after the
+    /// refresh it means the credentials are bad, and the folder must fail.
+    /// A dropped connection, cancellation or any other error is not an answer
+    /// and returns false.
+    nonisolated static func isUnreadableAnswerForOneMessage(_ error: Error) -> Bool {
+        if error is DecodingError { return true }
+        guard case ProviderError.networkError(let underlying) = error,
+              case HTTPError.networkError(let statusCode) = underlying else { return false }
+        return statusCode != 401
     }
 
     /// Get the current historyId for this account (needed to initialize the incremental sync cursor)
