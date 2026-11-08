@@ -60,10 +60,14 @@ struct GmailReplyDraftThreadTests {
         return parent
     }
 
-    /// The `message` resource of one recorded draft request, and its raw header lines.
+    /// Bytes of the file an attached reply carries (binary, so a lossy MIME path shows).
+    private nonisolated static let attachmentBytes = Data([0, 1, 2, 127, 128, 255])
+
+    /// The `message` resource of one recorded draft request, its raw header lines,
+    /// and the whole raw message.
     private nonisolated static func uploadedMessage(
         _ requestBody: Data?
-    ) throws -> (message: [String: Any], headerLines: [String]) {
+    ) throws -> (message: [String: Any], headerLines: [String], raw: String) {
         let body = try #require(requestBody)
         let json = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
         let message = try #require(json["message"] as? [String: Any])
@@ -72,22 +76,31 @@ struct GmailReplyDraftThreadTests {
         base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
         let raw = String(decoding: try #require(Data(base64Encoded: base64)), as: UTF8.self)
         let headerLines = raw.components(separatedBy: "\r\n\r\n").first?.components(separatedBy: "\r\n") ?? []
-        return (message, headerLines)
+        return (message, headerLines, raw)
     }
 
-    /// Saves a reply draft to `parent` in `draftAccountId`, pushes it (drafts.create),
-    /// edits it and pushes again (drafts.update), and returns the two upload requests.
+    /// Saves a reply draft to `parent` in `draftAccountId` (with a stored file when
+    /// `withAttachment`), pushes it (drafts.create), edits it and pushes again
+    /// (drafts.update), and returns the two upload requests. Each upload must carry
+    /// the authored body, and the whole file when there is one.
     private static func createThenUpdate(
         pool: DatabasePool, parent: MessageHeader, draftAccountId: String,
-        draftUserEmail: String, subject: String
+        draftUserEmail: String, subject: String, withAttachment: Bool
     ) async throws -> [(method: String, url: String, body: Data?)] {
         let draftId = "reply:\(draftAccountId):parent-431@example.com"
+        let attachmentsDirName: String? = withAttachment ? DraftAttachmentStorage.newStagingDirName() : nil
+        if let attachmentsDirName {
+            try DraftAttachmentStorage.saveAttachments(
+                [DraftAttachment(filename: "plan.bin", mimeType: "application/octet-stream", data: attachmentBytes)],
+                dirName: attachmentsDirName)
+        }
+        defer { if let attachmentsDirName { DraftAttachmentStorage.deleteAttachments(dirName: attachmentsDirName) } }
         try await pool.write { db in
             var draft = Draft(
                 id: draftId, accountId: draftAccountId, toJSON: #"["sender@example.com"]"#, ccJSON: "[]", bccJSON: "[]",
                 subject: subject, body: "first body", replyToId: parent.id, isForward: false,
                 editHistoryJSON: nil, createdAt: 1, updatedAt: 2, serverDraftId: nil,
-                serverPushStatus: nil, rfc822MessageId: nil, attachmentsDirName: nil)
+                serverPushStatus: nil, rfc822MessageId: nil, attachmentsDirName: attachmentsDirName)
             draft.instanceEpoch = "tabmail-E1"
             draft.replyToProviderMessageId = parent.messageId
             try DraftStore.applySave(draft, db: db)
@@ -118,14 +131,22 @@ struct GmailReplyDraftThreadTests {
             runtimeKind: .gmail, draftsFolderPath: "DRAFT")
         try #require(updated == .completed, "precondition: the second upload updated the Gmail draft")
 
-        return http.recordedCalls().filter {
+        let uploads = http.recordedCalls().filter {
             ($0.method == "POST" && $0.url.hasSuffix("/drafts")) || ($0.method == "PUT" && $0.url.hasSuffix("/drafts/r431"))
         }
+        for (call, body) in zip(uploads, ["first body", "second body"]) {
+            let raw = try uploadedMessage(call.body).raw
+            #expect(raw.contains(body) || raw.contains(Data(body.utf8).base64EncodedString()),
+                    "\(call.method) does not carry the authored body")
+            #expect(raw.contains(attachmentBytes.base64EncodedString()) == withAttachment,
+                    "\(call.method) attachment presence differs from the draft (withAttachment: \(withAttachment))")
+        }
+        return uploads
     }
 
     @Test("A Gmail reply draft's create and update carry the thread id exactly when Send would",
-          arguments: ["Re: Quarterly plan", "A different topic"])
-    func replyDraftUploadCarriesSendsThreadBinding(subject: String) async throws {
+          arguments: ["Re: Quarterly plan", "A different topic"], [false, true])
+    func replyDraftUploadCarriesSendsThreadBinding(subject: String, withAttachment: Bool) async throws {
         try await withInstalledPool { pool in
             let parent = try await pool.write { try Self.insertParent($0) }
             let sendBinding = ThreadUtils.outgoingThreadHeaders(
@@ -138,10 +159,10 @@ struct GmailReplyDraftThreadTests {
 
             let uploads = try await Self.createThenUpdate(
                 pool: pool, parent: parent, draftAccountId: Self.accountId,
-                draftUserEmail: "owner@example.com", subject: subject)
+                draftUserEmail: "owner@example.com", subject: subject, withAttachment: withAttachment)
             #expect(uploads.map(\.method) == ["POST", "PUT"], "expected drafts.create then drafts.update")
             for call in uploads {
-                let (message, headerLines) = try Self.uploadedMessage(call.body)
+                let (message, headerLines, _) = try Self.uploadedMessage(call.body)
                 #expect(message["threadId"] as? String == sendBinding.threadId,
                         "\(call.method) sent threadId \(String(describing: message["threadId"])), Send would send \(String(describing: sendBinding.threadId))")
                 #expect(headerLines.contains("In-Reply-To: <parent-431@example.com>"), "\(call.method) does not name the parent")
@@ -153,8 +174,9 @@ struct GmailReplyDraftThreadTests {
     /// Send binds a reply to the parent's conversation only from the parent's own
     /// account (a Gmail thread id is per mailbox), so a reply draft saved in another
     /// Gmail account must name no thread, on create and on update alike.
-    @Test("A reply draft saved in another Gmail account than its parent names no thread")
-    func crossAccountReplyDraftNamesNoThread() async throws {
+    @Test("A reply draft saved in another Gmail account than its parent names no thread",
+          arguments: [false, true])
+    func crossAccountReplyDraftNamesNoThread(withAttachment: Bool) async throws {
         try await withInstalledPool { pool in
             let parent = try await pool.write { try Self.insertParent($0) }
             let otherAccountId = "acc-431-other"
@@ -171,10 +193,10 @@ struct GmailReplyDraftThreadTests {
 
             let uploads = try await Self.createThenUpdate(
                 pool: pool, parent: parent, draftAccountId: otherAccountId,
-                draftUserEmail: "other@example.com", subject: subject)
+                draftUserEmail: "other@example.com", subject: subject, withAttachment: withAttachment)
             #expect(uploads.map(\.method) == ["POST", "PUT"], "expected drafts.create then drafts.update")
             for call in uploads {
-                let (message, headerLines) = try Self.uploadedMessage(call.body)
+                let (message, headerLines, _) = try Self.uploadedMessage(call.body)
                 #expect(!message.keys.contains("threadId"),
                         "\(call.method) sent threadId \(String(describing: message["threadId"])) from another account")
                 #expect(headerLines.contains("In-Reply-To: <parent-431@example.com>"), "\(call.method) does not name the parent")

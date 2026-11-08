@@ -132,4 +132,6 @@ Gmail files a message or draft in a conversation only when the request's `messag
 `ThreadUtils.outgoingThreadHeaders` gives Send for the same reply (the parent's id for a matching
 subject, none for a changed one) beside the headers that name the parent. A reply draft saved in a
 different Gmail account than its parent sends no `threadId` on either request, as Send from that
-account would not, and still names the parent in its headers.
+account would not, and still names the parent in its headers. Both cases run with and without a
+stored attachment, so the multipart upload is held to the same binding and keeps the body and the
+attachment bytes.

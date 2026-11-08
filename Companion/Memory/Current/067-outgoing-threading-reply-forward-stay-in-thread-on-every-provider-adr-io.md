@@ -1,5 +1,6 @@
 <!-- COMPANION-CURRENT-NOTE-BEGIN -->
 > **Outlook threading goes as extended properties (#419, 2026-11-07).** Graph's `internetMessageHeaders` takes only custom `x-` headers, set at create; it refuses `In-Reply-To` and `References`. The "Exchange already emits In-Reply-To/References — NO code change" line below was wrong from v1.6.0. `ExchangeProvider.buildGraphSendPayload` now writes them as `singleValueExtendedProperties` `String 0x1042` (PidTagInReplyToId) and `String 0x1039` (PidTagInternetReferences), named by `ExchangeProvider.graphInReplyToProperty` / `graphReferencesProperty`; Exchange writes the headers from them on send (confirmed by a live reply, 2026-11-07). Only `sendMail` carries threading: Outlook drafts upload without it (`DraftStore.uploadThreadHeaders`). Never put a standard header back in `internetMessageHeaders`: `ExchangeSendPayloadTests` fails on any name not starting with `x-`. Reading a received Outlook message's In-Reply-To/References still needs a separate `internetMessageHeaders` `$select` (GraphParse leaves them nil). Decision: ADR-IOS-043 amendment (#419).
+> **Current routing note (2026-11-07, #431): a second caller of the threading builder; Gmail reply drafts carry `threadId`.** The first bullet's "`ComposeView.send` is the ONE callsite" is stale. `DraftStore.uploadThreadHeaders` also calls `ThreadUtils.outgoingThreadHeaders`, for Gmail reply-draft uploads only (create and update): the References/In-Reply-To pair since #278, and `threadId` since #431, under Send's own conditions (the parent's account, a matching subject). A Gmail reply-draft upload (`drafts.create`/`drafts.update`) posts the same `GmailProvider.buildSendBody` resource Send uses, and `DraftStore`'s push path copies `threadId` from `DraftStore.uploadThreadHeaders`; before #431, drafts sat outside their conversation. Forwards and non-Gmail drafts write no thread headers. A reply draft saved in a different Gmail account than its parent names no thread, exactly as Send from that account would. Pinned by `GmailReplyDraftThreadTests`. See ADR-IOS-043's routing note.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Outgoing Threading — reply/forward stay in-thread on every provider (ADR-IOS-043, 2026-06-23)
@@ -8,7 +9,7 @@
 - **The bug this fixed:** `ComposeView.send` set only `inReplyTo` and never built `references` (empty `References` on every send), AND Gmail's REST `send` omitted `threadId`. Gmail's `users.messages.send` does NOT thread by headers alone — it needs `threadId` + RFC `References`/`In-Reply-To` + matching `Subject`. Result: Gmail web filed every iOS reply as a NEW conversation. (TB is unaffected — it sends Gmail via SMTP, header-threaded. Functional parity, not implementation parity.)
 - **Gmail `threadId` is guarded twice** (in the builder): parent account == sending account, AND `normalizeSubject(sendSubject) == normalizeSubject(parentSubject)`. A failed guard → `nil` → a fresh thread (correct for cross-account / changed-subject). Preconditions, not a fallback (ADR-003).
 - **Plumbing:** `threadId` added to `DraftMessage` + persisted on `OutboxMessage` (**v60** migration, so a post-relaunch drain re-sends with the same binding). `Draft` GRDB record UNCHANGED — derived from the resolved `replyTo` at send, like `inReplyTo` always was.
-- **Provider responsibilities:** Gmail send includes `threadId` (`GmailProvider.buildSendBody`, extracted for tests). A Gmail reply-draft upload (`drafts.create`/`drafts.update`) posts the same `buildSendBody` resource, and `DraftStore`'s push path copies `threadId` from `DraftStore.uploadThreadHeaders` (#431, `GmailReplyDraftThreadTests`); before, drafts sat outside their conversation. Exchange (`internetMessageHeaders`) + IMAP/SMTP (`buildEmail`) already emit In-Reply-To/References — NO code change, they just receive a populated chain now. `ExchangeProvider.buildGraphSendPayload` is `nonisolated` (pure, so unit tests can call it synchronously without crossing the actor boundary — `[String:Any]` is non-Sendable).
+- **Provider responsibilities:** Gmail send includes `threadId` (`GmailProvider.buildSendBody`, extracted for tests). Exchange (`internetMessageHeaders`) + IMAP/SMTP (`buildEmail`) already emit In-Reply-To/References — NO code change, they just receive a populated chain now. `ExchangeProvider.buildGraphSendPayload` is `nonisolated` (pure, so unit tests can call it synchronously without crossing the actor boundary — `[String:Any]` is non-Sendable).
 - Tests: `OutgoingThreadHeadersTests`, `GmailSendBodyTests`, `ExchangeSendPayloadTests`, `DatabaseOutboxTests` (v60 + round-trip), existing `IMAPProviderBuildEmailTests`. Plan: the outgoing-thread fix (ADR-IOS-043).
 
 ## Outgoing threading IDs containing line breaks (#221)
@@ -29,12 +30,3 @@ controls. `GmailThreadHeaderFoldingTests` pins long safe histories and parents.
 
 This restores the app-side boundary parked from the Bcc train, adapting it to the
 Gmail folding now on main; it does not change the SwiftMail pin or incoming parsing.
-
-## Amendment (2026-11-07, #431): two callers, not one
-
-The first bullet's "`ComposeView.send` is the ONE callsite" is stale. `DraftStore.uploadThreadHeaders`
-also calls `ThreadUtils.outgoingThreadHeaders`, for Gmail reply-draft uploads only (create and update):
-the References/In-Reply-To pair since #278, and `threadId` since #431, under Send's own conditions (the
-parent's account, a matching subject). Forwards and non-Gmail drafts write none. A reply draft saved in a
-different Gmail account than its parent names no thread, exactly as Send from that account would.
-Pinned by `GmailReplyDraftThreadTests`. See ADR-IOS-043's amendment.
