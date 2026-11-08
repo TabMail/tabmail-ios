@@ -695,11 +695,14 @@ actor GmailProvider: EmailProvider {
         let _ = try await request(path: "/messages/send", method: "POST", body: jsonData)
     }
 
-    /// Build the `users.messages.send` request body. Includes `threadId` when the
-    /// draft carries one (reply/forward), so Gmail files the message into the
-    /// existing conversation instead of starting a new thread. Gmail also requires
-    /// the raw message to carry RFC-compliant References/In-Reply-To and a matching
-    /// Subject — all set by the centralized ComposeView callsite. See ADR-IOS-043.
+    /// Build the `users.messages.send` request body, which is also the `message`
+    /// resource `saveDraft` uploads. Includes `threadId` when the draft carries
+    /// one, so Gmail files the message into the existing conversation instead of
+    /// starting a new thread. Gmail also requires the raw message to carry
+    /// RFC-compliant References/In-Reply-To and a matching Subject. Send
+    /// (`ComposeView.send`) and the reply-draft upload
+    /// (`DraftStore.uploadThreadHeaders`) both set these through
+    /// `ThreadUtils.outgoingThreadHeaders`. See ADR-IOS-043.
     /// Extracted from `send()` so the threadId wiring is unit-testable.
     /// `nonisolated` (pure — derives only from `draft`) so it returns the
     /// non-Sendable `[String: Any]` without crossing the actor boundary.
@@ -748,8 +751,11 @@ actor GmailProvider: EmailProvider {
             throw ProviderError.actionIdentityResolutionFailed(
                 "GmailProvider received a non-Gmail prior draft identity")
         }
-        let base64 = buildUrlSafeBase64(draft: draft)
-        let messagePayload: [String: Any] = ["raw": base64]
+        // The draft's `message` resource is the same one Send posts: the raw
+        // message, plus `threadId` when the draft carries one, so Gmail files a
+        // reply draft in its conversation (threads guide: the threadId, RFC 2822
+        // References/In-Reply-To and a matching Subject; #431).
+        let messagePayload = buildSendBody(draft: draft)
 
         // Log exactly what we're sending — base64 body length + first chars of
         // plain body + recipients. Helps diagnose "remote shows stale" reports:
@@ -757,7 +763,7 @@ actor GmailProvider: EmailProvider {
         // content is correct and any server-side staleness is on Gmail's side.
         if DebugModeManager.isLoggingEnabled() {
             let bodyPreview = String(draft.body.prefix(120))
-            BackgroundSyncLogger.logDebug("[Gmail] saveDraft REQUEST: existingId=\(existingDraftId ?? "nil") subject=\(String(draft.subject.prefix(60))) to=\(draft.to) bodyLen=\(draft.body.count) bodyPrefix=\(bodyPreview) rawB64Len=\(base64.count)")
+            BackgroundSyncLogger.logDebug("[Gmail] saveDraft REQUEST: existingId=\(existingDraftId ?? "nil") subject=\(String(draft.subject.prefix(60))) to=\(draft.to) bodyLen=\(draft.body.count) bodyPrefix=\(bodyPreview) rawB64Len=\((messagePayload["raw"] as? String)?.count ?? 0) threadId=\(draft.threadId ?? "nil")")
         }
 
         if let existingId = existingDraftId {

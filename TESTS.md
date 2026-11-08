@@ -121,3 +121,17 @@ delete) ending as the user's last gesture. `DeviceSyncReceiveTests` covers arriv
 re-apply, the connection end dropping everything waiting, the bound (messages plus held parts) renewing
 the connection, and an older `prompt_state` never landing on a newer edit. `DeviceSyncSocketBoundaryTests`
 runs a loopback WebSocket server to show a message read after its connection was replaced is dropped.
+
+## Gmail thread binding — Send and draft uploads
+
+Gmail files a message or draft in a conversation only when the request's `message` resource names the
+`threadId`, the raw message's In-Reply-To/References name the parent, and the Subject matches.
+`GmailSendBodyTests` covers the Send body. `GmailReplyDraftThreadTests` drives production
+`DraftStore.pushDraftToServer` against a real `GmailProvider` on `FakeHTTP` and reads both
+`drafts.create` and `drafts.update` off the wire: each carries the `threadId` that
+`ThreadUtils.outgoingThreadHeaders` gives Send for the same reply (the parent's id for a matching
+subject, none for a changed one) beside the headers that name the parent. A reply draft saved in a
+different Gmail account than its parent sends no `threadId` on either request, as Send from that
+account would not, and still names the parent in its headers. Both cases run with and without a
+stored attachment, so the multipart upload is held to the same binding and keeps the body and the
+attachment bytes.

@@ -29,8 +29,9 @@ struct DraftMessage: Sendable {
     /// generating a new one — ensures SMTP send and IMAP Sent append share the same ID.
     var messageId: String?
     /// Gmail native conversation id of the source message, for reply/forward.
-    /// Only the Gmail REST send consumes it (to file the message into the existing
-    /// thread); IMAP/Exchange thread purely via the In-Reply-To/References headers.
+    /// Only Gmail REST consumes it, on send and on a draft upload (to file the
+    /// message into the existing thread); IMAP/Exchange thread purely via the
+    /// In-Reply-To/References headers.
     /// `nil` for new compositions and non-Gmail providers. See ADR-IOS-043.
     var threadId: String?
 
