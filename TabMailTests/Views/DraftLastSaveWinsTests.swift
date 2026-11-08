@@ -690,7 +690,8 @@ struct DraftCopyReadTests {
         http.register(path: "/messages/g1/attachments/createUploadSession", method: "POST", response: .json(raw: """
             {"uploadUrl":"https://outlook.office.com/api/v2.0/Users('u')/Messages('g1')/AttachmentSessions('s1')?authtoken=t"}
             """))
-        let total = ExchangeDraftConfig.singlePostAttachmentLimitBytes + 1
+        // Past the single-POST threshold and longer than one range, whatever either is.
+        let total = max(ExchangeDraftConfig.singlePostAttachmentLimitBytes, ExchangeDraftConfig.uploadChunkBytes) + 1
         let bytes = Data((0..<total).map { UInt8(truncatingIfNeeded: $0) })
         let puts = RequestLog()
         http.register(path: "AttachmentSessions", method: "PUT") { request in
@@ -799,7 +800,8 @@ struct DraftCopyReadTests {
             let isLast = puts.requests.withLock { $0.append(request); return $0.count } > 1
             return .json(raw: "{}", statusCode: isLast ? lastStatus : firstStatus)
         }
-        let bytes = Data(count: ExchangeDraftConfig.singlePostAttachmentLimitBytes + 1)
+        // Past the single-POST threshold and longer than one range, whatever either is.
+        let bytes = Data(count: max(ExchangeDraftConfig.singlePostAttachmentLimitBytes, ExchangeDraftConfig.uploadChunkBytes) + 1)
 
         do {
             _ = try await provider.saveDraft(

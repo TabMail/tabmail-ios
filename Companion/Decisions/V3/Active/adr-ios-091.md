@@ -713,3 +713,34 @@ Pinned by `ExchangeAttachmentSendTests`: every file, the threading, no draft lef
 accepted send, a lost connection reaching the Outbox as the same transient error whether the cleanup
 succeeds or is refused, and a lost send answer giving at worst a duplicate. Its fake refuses an
 inline file of 3,000,000 bytes or more.
+
+### The single-POST threshold's unit (#433, 2026-11-08)
+
+`ExchangeDraftConfig.singlePostAttachmentLimitBytes` stays `3 * 1024 * 1024`. A file added to a
+message has two documented "3 MB" edges: a single POST takes an attachment "under 3 MB"
+(message-post-attachments), and `createUploadSession` refuses a file "smaller than 3 MB" with
+`ErrorAttachmentSizeShouldNotBeLessThanMinimumSize` (outlook-large-attachments). Neither page gives
+the byte count. #433 asked whether files of 3,000,000 to 3,145,727 bytes fail, which would happen if
+both edges were the binary 3,145,728 (the session would refuse them) or both the decimal 3,000,000
+(the single POST would). Moving the threshold to 3,000,000 would only have moved that window from one
+route to the other.
+
+Measured on a test Outlook.com mailbox on 2026-11-08: a single POST of exactly 3,100,000 bytes and a
+`createUploadSession` for 3,100,000 bytes were both accepted (HTTP 201). The suspected gap is not
+reproduced, so the threshold stays. The two edges are read differently: the single POST refuses
+from the binary 3,145,728 (Practical365 gives the 150 MB maximum as 157,286,400 bytes, which suggests
+binary megabytes for these limits; not measured above 3,100,000, so this refusal may be stricter than
+Graph), and the session refuses below the decimal 3,000,000, the only reading both the documented
+error and the measured 3,100,000 allow (not measured below 3,000,000).
+
+Test side: `GraphAttachmentLimits` (TabMailTests/Infrastructure) states those two edges from the
+documentation and the live check, never from `ExchangeDraftConfig`. The fakes in
+`ExchangeNewDraftAttachmentTests` and `ExchangeAttachmentSendTests` refuse at both;
+`DraftOpenReloadTests`, whose files are all small, models only the single-POST edge. Before this
+change the `ExchangeNewDraftAttachmentTests` and `DraftOpenReloadTests` refusals sat at the app's own
+constant, so they agreed with it by construction, and `ExchangeAttachmentSendTests` refused at its own
+3,000,000 on both routes and kept every file size out of the window. `everySizeAtTheEdgeIsAccepted`, and the send test's `edge` shape, push one file
+per size on either side of both readings through the first save and the send. A threshold below
+3,000,000 or above 3,145,728 routes one of those sizes to a route that refuses it and fails the
+suite. `ExchangeAttachmentSendTests` keeps its stricter assumption for an inline `sendMail` or draft
+create: 413 at 3,000,000 bytes, the behaviour #422 reported.

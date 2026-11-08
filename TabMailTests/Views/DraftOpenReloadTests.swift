@@ -532,7 +532,7 @@ struct DraftOpenReloadTests {
                   let bytes = (json["contentBytes"] as? String).flatMap({ Data(base64Encoded: $0) }) else {
                 return .status(400)
             }
-            guard bytes.count < ExchangeDraftConfig.singlePostAttachmentLimitBytes else { return .status(413) }
+            guard bytes.count < GraphAttachmentLimits.singlePostMaxExclusive else { return .status(413) }
             let id = "att-\(UUID().uuidString)"
             model.attachments.withLock {
                 $0.append(.init(
