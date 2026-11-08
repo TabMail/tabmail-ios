@@ -472,10 +472,10 @@ struct GmailProviderMockTests {
               ("invoice", "user+tag@example.com"),
           ])
     func searchTextReachesGmailIntact(query: String, from: String?) async throws {
-        FakeHTTP.reset()
-        defer { FakeHTTP.reset() }
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
 
-        FakeHTTP.register(
+        http.register(
             path: "/messages?q=",
             method: "GET",
             response: .json(raw: #"{"messages": []}"#)
@@ -484,7 +484,7 @@ struct GmailProviderMockTests {
         let provider = GmailProvider(
             userEmail: "test@example.com",
             accessToken: { _ in "fake-access-token" },
-            session: FakeHTTP.makeSession()
+            session: http.session
         )
 
         _ = try await provider.search(
@@ -492,7 +492,7 @@ struct GmailProviderMockTests {
             after: nil, before: nil, from: from, to: nil
         )
 
-        let calls = FakeHTTP.recordedCalls()
+        let calls = http.recordedCalls()
         #expect(calls.count == 1)
         guard calls.count == 1, let url = URL(string: calls[0].url),
               let rawQuery = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedQuery else {

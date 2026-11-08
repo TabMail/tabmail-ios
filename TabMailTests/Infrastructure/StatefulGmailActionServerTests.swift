@@ -767,8 +767,7 @@ struct StatefulGmailActionServerTests {
     /// `resolveActionMessageId` sent `q` + `maxResults=2` +
     /// `includeSpamTrash=true` (+ `labelIds=<folder>` when the folder is NOT the
     /// archive path); v3's `search` sends `q` + `maxResults=20` (+
-    /// `labelIds=<folder>` when the folder is neither empty nor the archive path —
-    /// the guard is `(folder.isEmpty || folder == GmailProvider.archivePath) ? "" : …`,
+    /// `labelIds=<folder>` when the folder is neither empty nor the archive path,
     /// so an empty folder suppresses it too). Note this is the OPPOSITE polarity to
     /// the `allMailExclusionQuery` clause above, which is appended ON the archive
     /// path — see the correction there. What the fixture's hook keys on — and all it keys on — is
