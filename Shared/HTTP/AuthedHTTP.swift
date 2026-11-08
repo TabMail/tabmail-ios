@@ -104,7 +104,8 @@ struct AuthedHTTP: Sendable {
     /// wrapper *"and the Gmail label-lookup site"* — and the second of those has no
     /// call sites either. At HEAD there is exactly ONE caller of this function,
     /// `GmailProvider.requestPreservingBadRequestBody` (its private wrapper), and
-    /// that wrapper in turn has exactly ONE caller, `GmailProvider.modifyMessage`.
+    /// that wrapper in turn has exactly TWO callers, `GmailProvider.modifyMessage`
+    /// and `GmailProvider.trashOrUntrashMessage` (#420).
     /// No Gmail label-lookup path reaches here: the `/labels` catalog calls go
     /// through the ordinary `request(...)`. Nothing else calls it;
     /// `ExchangeProvider.patchMessage` and `ExchangeProvider.moveMessage` both

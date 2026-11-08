@@ -92,3 +92,5 @@ Timeout-path pinned by `AccountManagerQueueDemotionTests.timeoutDemotesChainAndU
 **Implementation and audit record:** the intention-queue audit (ADR-IOS-060) (force-added in the Round 53 recovery checkpoint). Hybrid identity: the hybrid-identity amendment (ADR-IOS-060).
 
 ---
+
+**Invalid-label amendment (2026-11-07, tabmail-ios #420).** The amendments above that call Gmail's invalid-label `400` an authoritative no-op are superseded: Gmail answers "Invalid label" for a move naming a label it keeps itself (SENT, DRAFT), so the refusal proves the move was NOT done, and retiring it dropped the user's delete. It is now a counted failure under the bounded ordinary-action exit; only the structured invalid-id `400` stays authoritative, and Gmail's per-member requests (`modifyMessage`, `trashOrUntrashMessage`) settle that shape per member inside the per-member boundary. Moves between Trash and SENT/DRAFT use `messages.trash`/`untrash`, and no move names SENT or DRAFT.

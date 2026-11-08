@@ -414,9 +414,12 @@ final class AccountOperationExecutor {
 
 
     /// Returns true only when the provider's own response STRUCTURALLY PROVES the
-    /// operation can never succeed — e.g. Gmail rejecting a label modification on
-    /// a system label like `DRAFT`. Such a `400` is a provider-authoritative
-    /// no-op (exit 2) and retires the durable row.
+    /// operation can never succeed — Gmail's structured invalid-id `400` (#420:
+    /// an "Invalid label" refusal is NOT this; it proves nothing is done). Such a
+    /// `400` is a provider-authoritative no-op (exit 2) and retires the durable
+    /// row. Both Gmail requests that preserve the `400` body (`modifyMessage`,
+    /// `trashOrUntrashMessage`) settle that shape per member themselves, so it
+    /// reaches here only from a future caller that does not.
     ///
     /// 🚨 A BARE STATUS CODE IS NOT A CLASSIFICATION. The predecessor returned
     /// `true` for `HTTPError.networkError(400)`, for

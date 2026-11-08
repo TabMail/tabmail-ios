@@ -71,10 +71,15 @@ The SAME scenario histories as Layer 1, driven through the REAL pipeline instead
 Gmail keeps the `SENT` and `DRAFT` labels itself and refuses any
 `messages.modify` that adds or removes them with 400 "Invalid label".
 `TabMailTests/Infrastructure/StatefulGmailActionServer.swift` refuses them the
-same way, and serves `/messages/{id}/trash` and `/untrash`.
-`TabMailTests/Services/GmailMaintainedLabelMoveTests.swift` asserts the
-properties over every source and destination pair: no request ever names a
-maintained label; delete from Sent or Drafts and its Undo land on the server;
+same way, refuses a new label on a draft's message, and serves
+`/messages/{id}/trash` and `/untrash`.
+`TabMailTests/Services/GmailMaintainedLabelMoveTests.swift` asserts, over every
+source and destination pair, that the move reaches Gmail's end state (the kept
+label stays, Trash is entered and left with trash/untrash, a draft's message
+takes no new label) and that no request ever names a maintained label. It also
+asserts that delete from Sent or Drafts and its Undo land on the server through
+trash/untrash; that every real member of a delete from Sent and of its Undo
+lands when the first member is an invalid or missing id;
 the agent's draft delete lands; a move the server refuses stays queued rather
 than counted as done; a user move into Sent or Drafts is refused on Gmail and
 queued on IMAP. `MoveFolderPickerTests.gmailOmitsTheLabelsGmailKeeps` covers the

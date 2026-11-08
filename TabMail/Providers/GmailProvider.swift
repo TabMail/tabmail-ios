@@ -608,7 +608,7 @@ actor GmailProvider: EmailProvider {
             guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
             absent.append(id)
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[Gmail] modifyMessage \(id): the server reports THIS message gone — the member is dispositioned and the operation narrows to the members still owed")
+                BackgroundSyncLogger.logDebug("[Gmail] message \(id): the server reports THIS message gone — the member is dispositioned and the operation narrows to the members still owed")
             }
         }
         // Silence is "every member, mutated": the only outcome the `Void`-returning
@@ -1597,8 +1597,9 @@ actor GmailProvider: EmailProvider {
     /// `resolveActionMessageId`'s / `resolveTokenMember`'s list and metadata
     /// calls. Both of those methods are RFC-search machinery that v3 does not
     /// have (D4: durable ops key on Gmail's native `message.id`, so nothing
-    /// resolves an identity by search), leaving `modifyMessage`'s POST as the
-    /// only body-classifying call site on this tree. A `GET` arm here would be
+    /// resolves an identity by search), leaving `modifyMessage`'s and
+    /// `trashOrUntrashMessage`'s POSTs as the only body-classifying call sites
+    /// on this tree. A `GET` arm here would be
     /// unreachable code, and its absence cannot silently mis-route anything:
     /// the `default` arm below traps at the callsite rather than quietly
     /// downgrading to the bodyless path.
@@ -1850,11 +1851,24 @@ actor GmailProvider: EmailProvider {
     }
 
     /// `messages.trash` or `messages.untrash` for one message, with the same
-    /// error shapes as `modifyMessage`, so the per-member boundary and the
-    /// queue classify its failures alike.
+    /// error handling as `modifyMessage`: Gmail's structured invalid-id `400`
+    /// proves this exact id can never resolve, so it settles THIS member as a
+    /// stale no-op here, inside the per-member boundary. Thrown instead, it
+    /// would reach the queue's whole-operation classifier and retire every
+    /// other member of the operation unattempted.
     private func trashOrUntrashMessage(id: String, verb: String) async throws {
-        _ = try await requestPreservingBadRequestBody(
-            path: "/messages/\(id)/\(verb)", method: "POST", body: nil)
+        do {
+            _ = try await requestPreservingBadRequestBody(
+                path: "/messages/\(id)/\(verb)", method: "POST", body: nil)
+        } catch {
+            guard !isGmailInvalidIdError(error) else {
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[Gmail] \(verb) \(id): invalid-id 400 confirmed stale — treating as no-op")
+                }
+                return
+            }
+            throw error
+        }
     }
 
     // MARK: - Parsing
