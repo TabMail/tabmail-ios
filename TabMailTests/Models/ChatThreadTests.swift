@@ -17,6 +17,9 @@ import Testing
 ///     other person makes a group.
 ///  5. A time stamp goes above the first bubble and after every gap of at least the threshold.
 ///  6. The Unread line goes above the first email that was unread at open, once.
+///  7. An email that left out someone already in the chat (on an earlier email) carries who it went
+///     to ("replied only to"), the user as "you" whichever address they used; an email to everyone,
+///     or to everyone and someone new, carries nothing, and nobody who joined later counts (R3).
 @Suite("Chat thread")
 struct ChatThreadTests {
     private static let me = "me@example.com"
@@ -264,6 +267,23 @@ struct ChatThreadTests {
         #expect(ChatThread.headerTitle([]) == "")
     }
 
+    @Test("A newer email with the same UID and no Message-ID changes the newest email's key, so the reply choice resets")
+    func newestKeyChangesWithCoincidingUIDs() {
+        func bare(_ uid: String, minutesAgo: Double, account: String) -> MessageHeader {
+            MessageHeader(
+                messageId: uid, subject: "Plans", from: "Alex Doe", fromAddress: "alex@example.com",
+                to: Self.me, date: Self.now.addingTimeInterval(-minutesAgo * 60), snippet: "snippet",
+                folderId: "\(account):INBOX", accountId: account, folderPath: "INBOX", isInInbox: true)
+        }
+        let first = bare("1", minutesAgo: 30, account: "acc1")
+        let newer = bare("1", minutesAgo: 5, account: "acc2")
+        let before = Self.thread([first]).newest.map(ChatThread.copyKey)
+        let after = Self.thread([first, newer]).newest.map(ChatThread.copyKey)
+        #expect(before != nil && after != nil)
+        #expect(before != after, "the reply choice resets when a new email becomes the newest")
+        #expect(first.stableId == newer.stableId, "the bare-UID stableId would not have changed")
+    }
+
     @Test("The chat view finds an email by its copy key, never by the bare-UID stableId")
     func chatViewUsesCopyKey() throws {
         let root = URL(fileURLWithPath: #filePath)
@@ -271,5 +291,73 @@ struct ChatThreadTests {
         let text = try String(contentsOf: root.appendingPathComponent("TabMail/Views/Chat/ChatThreadView.swift"), encoding: .utf8)
         #expect(!text.contains("stableId"), "two emails with one UID and no Message-ID would be taken for one")
         #expect(text.contains("ChatThread.copyKey($0.header) == ChatThread.copyKey(opened)"), "the opened email is found by its copy key")
+    }
+
+    // MARK: - 7. Replied only to
+
+    private static let sarah = "Sarah Chen <sarah@example.com>"
+    private static let david = "David Kim <david@example.com>"
+    private static let priya = "Priya Vasanth <priya@example.com>"
+    private static let sam = "Sam Lee <sam@example.com>"
+
+    @Test("An email that left someone out carries who it went to; one to everyone carries nothing")
+    func repliedOnlyTo() throws {
+        let all = Self.header("1", from: "Sarah Chen", fromAddress: "sarah@example.com",
+                              to: "me@example.com, \(Self.david)", cc: "\(Self.priya), \(Self.sam)", minutesAgo: 50)
+        let toMe = Self.header("2", from: "Priya Vasanth", fromAddress: "priya@example.com",
+                               to: "me@example.com", minutesAgo: 40)
+        let mine = Self.header("3", from: "Me", fromAddress: Self.me, to: Self.priya, minutesAgo: 30)
+        let three = Self.header("4", from: "Sam Lee", fromAddress: "sam@example.com",
+                                to: "me@example.com, \(Self.david)", cc: Self.priya, minutesAgo: 20)
+        let allAgain = Self.header("5", from: "Sarah Chen", fromAddress: "sarah@example.com",
+                                   to: "me@example.com, \(Self.david), \(Self.priya)", cc: Self.sam, minutesAgo: 10)
+
+        let chat = Self.thread([all, toMe, mine, three, allAgain])
+        guard chat.items.count == 5 else { Issue.record("five bubbles"); return }
+
+        #expect(chat.items[0].repliedOnlyTo == nil, "to everyone")
+        #expect(chat.items[4].repliedOnlyTo == nil, "to everyone, To and Cc in another order")
+
+        let onlyMe = try #require(chat.items[1].repliedOnlyTo)
+        #expect(onlyMe.includesYou && onlyMe.people.isEmpty)
+        #expect(onlyMe.label() == "you")
+
+        let ownOnly = try #require(chat.items[2].repliedOnlyTo)
+        #expect(!ownOnly.includesYou, "the user sent it")
+        #expect(ownOnly.people.map(\.name) == ["Priya Vasanth"])
+
+        let some = try #require(chat.items[3].repliedOnlyTo)
+        #expect(some.names == ["you", "David Kim", "Priya Vasanth"])
+        #expect(some.label() == "you, David Kim +1", "one line: two names, then +N")
+        #expect(some.label(nameCount: 3) == "you, David Kim, Priya Vasanth")
+    }
+
+    @Test("Someone new on an email joins the chat; it is not \"only\"")
+    func someoneNewIsNotOnly() {
+        let first = Self.header("1", from: "Sarah Chen", fromAddress: "sarah@example.com",
+                                to: "me@example.com", cc: Self.david, minutesAgo: 20)
+        let adds = Self.header("2", from: "David Kim", fromAddress: "david@example.com",
+                               to: "me@example.com, \(Self.sarah)", cc: Self.priya, minutesAgo: 10)
+        let chat = Self.thread([first, adds])
+        #expect(chat.items.map(\.repliedOnlyTo) == [nil, nil] as [ChatThread.OnlyTo?],
+                "the first email had everyone then in the chat; the second added Priya")
+        // Priya is in the chat now, so an email without her is "only".
+        let later = Self.header("3", from: "Sarah Chen", fromAddress: "sarah@example.com",
+                                to: "me@example.com, \(Self.david)", minutesAgo: 5)
+        let longer = Self.thread([first, adds, later])
+        #expect(longer.items[2].repliedOnlyTo?.people.map(\.name) == ["David Kim"])
+    }
+
+    @Test("The user is one person, whichever of their addresses an email used")
+    func userIsOnePerson() {
+        let toWork = Self.header("1", from: "Sarah Chen", fromAddress: "sarah@example.com",
+                                 to: "work@example.com", minutesAgo: 20)
+        let toHome = Self.header("2", from: "Sarah Chen", fromAddress: "sarah@example.com",
+                                 to: "Me <me@example.com>", minutesAgo: 10)
+        let chat = ChatThread(
+            members: [toWork, toHome], replyAddresses: { [$0.fromAddress] },
+            ownAddresses: [Self.me, "work@example.com"], draftFolderIds: [], sentFolderIds: [],
+            unreadAtOpen: [], preferredId: nil)
+        #expect(chat.items.map(\.repliedOnlyTo) == [nil, nil] as [ChatThread.OnlyTo?])
     }
 }

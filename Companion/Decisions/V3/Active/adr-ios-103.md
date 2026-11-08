@@ -291,6 +291,28 @@ same AI result, kept as long as the email itself is shown.
    change has no morph animation yet; the sheet is not sized to its content; a request that only
    acts (archive, label) opens the sheet with the agent's answer.
 
+11. **Who gets the reply, and Forward (amendment 2026-11-05, the fifth chat-view PR, PR 4).** The
+   reply is a Reply All to the newest email's people by default (`ChatReplyTarget.replyAll`).
+   Tapping the header's names opens "Reply to" (`ChatReplyToSheet`): the newest email's people, all
+   ticked; untick someone or add someone (today's contact search, or a typed address; never the
+   user). Done with everyone ticked and nobody added stays Reply All (`ChatReplyTarget.chosen`);
+   anything else replies only to the ticked people, shown as a gray "Replying only to" line of chips
+   above the field (two names, then "+N"; tap for everyone). Nothing forks: the header stays the
+   whole group. The chosen people become the compose card's To (Cc empty) for a reply asked for in
+   the field. With recipients changed, Send on the unchanged AI Reply goes to the agent, so the
+   email is written again for the people chosen (`route(recipientsChanged:)`, Q33), and the agent's
+   message names them (`agentMessage(onlyTo:)`). A sent reply, or a new newest email, returns to
+   Reply All. Forward is the chat's top-right button: today's forward compose for the newest email.
+   **Replied only to (R3):** an email that left out someone already in the chat (on an earlier
+   email) carries who it went to (`ChatThread.Item.repliedOnlyTo`, `OnlyTo`): a gray
+   "(replied only to you, David Kim +1)" after the sender's name, or "You (replied only to …)" above
+   the user's own bubble; tap for the full list (`ChatPeopleList`). The user is one person whichever
+   address an email used. VoiceOver reads it (`ChatBubbleView.accessibilityText`, Q25).
+   **Product choices made in PR 4, awaiting owner blessing:** an email that only adds someone new is
+   not "only" (the new person joins the chat's people), and an email is never "only" for someone who
+   joined after it; a new newest email resets the choice to Reply All; with recipients chosen the
+   agent's own recipient changes are replaced by the chosen people on the compose card.
+
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (ADR-032) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
 parser does not read.
@@ -322,4 +344,6 @@ Decision 10: `ChatReplyFieldTests` (the ready text, Send's route, the agent's me
 line, sent-reply matching and settling, and the field and chat wiring read from the source),
 `ChatReplyFieldRuntimeTests` (the ready AI Reply in the mounted field, the send's email lookup,
 a failed request's log with and without its text, and the send wiring),
-`ChatSummaryQueueTests.openAsksForAnEmailThatJoins`.
+`ChatSummaryQueueTests.openAsksForAnEmailThatJoins`. Decision 11: `ChatThreadTests.repliedOnlyTo`,
+`someoneNewIsNotOnly`, `userIsOnePerson`; `ChatReplyFieldTests` (`changedRecipientsRoute`,
+`agentMessageOnlyTo`, `replyTarget`, `replyToChoice`, `accessibilityOnlyTo`, `recipientsWiring`).

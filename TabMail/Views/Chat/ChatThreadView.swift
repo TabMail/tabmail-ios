@@ -85,6 +85,11 @@ struct ChatThreadView: View {
     @State private var fieldComposeOpened = false
     /// Bumps to empty the field.
     @State private var fieldClearCount = 0
+    /// Who the next reply goes to (R1, R2); Reply All until changed in Reply to.
+    @State private var replyTarget = ChatReplyTarget.replyAll
+    @State private var showsReplyTo = false
+    @State private var showsOnlyList = false
+    @State private var forwardMessage: MessageHeader?
     private let sentReplies = ChatSentReplies.shared
 
     private static let bottomId = "chat-bottom"
@@ -126,6 +131,7 @@ struct ChatThreadView: View {
 
     private var isAnyPresentation: Bool {
         cardMessage != nil || readyReplyMessage != nil || agentCompose != nil
+            || forwardMessage != nil || showsReplyTo
     }
 
     // MARK: - Body
@@ -170,6 +176,18 @@ struct ChatThreadView: View {
             noteMembers()
             sentReplies.settle(thread.items)
         }
+        // A new newest email has its own people: the next reply is a Reply All to them.
+        .onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                // R1.2: Forward the newest email, in today's forward compose.
+                Button { forwardMessage = thread.newest } label: {
+                    Image(systemName: "arrowshape.turn.up.right")
+                }
+                .disabled(thread.newest == nil)
+                .accessibilityLabel("Forward")
+            }
+        }
         .onChange(of: viewModel.hasLoadedThread) { _, _ in scrollOnceLoaded() }
         .onAppear {
             viewModel.isViewVisible = true
@@ -212,6 +230,12 @@ struct ChatThreadView: View {
                 onAgentOutcome: { outcome in composeEnded(outcome, replyTo: msg) })
         }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
+        .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }
+        .sheet(isPresented: $showsReplyTo) {
+            ChatReplyToSheet(
+                replyPeople: thread.replyPeople, target: replyTarget,
+                ownAddresses: context.ownAddresses) { replyTarget = $0 }
+        }
     }
 
     @ViewBuilder
@@ -274,7 +298,11 @@ struct ChatThreadView: View {
                     }
                 }
             }
-            .safeAreaInset(edge: .top, spacing: 0) { ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) {
+                    showsReplyTo = true
+                }
+            }
             .overlay {
                 if chatExpanded {
                     Color.black.opacity(0.3)
@@ -425,6 +453,9 @@ struct ChatThreadView: View {
         let usersTurn = isOwn || !unmatchedReplies(thread).isEmpty
         let isNoReply = !isOwn && EmailFilter.isNoReply(newest.fromAddress)
         return VStack(spacing: 8) {
+            if let only = replyTarget.only, !chatExpanded {
+                replyingOnlyTo(only)
+            }
             if isNoReply && !chatExpanded {
                 // E1.1: the field stays usable (the agent declines to reply, E1.2).
                 Text("This is a no-reply email. Replies won't be read.")
@@ -441,13 +472,48 @@ struct ChatThreadView: View {
                 replyField: ChatReplyField(
                     readyText: ChatReplyField.readyText(newest: newest, isOwn: usersTurn),
                     isNoReply: isNoReply,
-                    clearCount: fieldClearCount),
+                    clearCount: fieldClearCount,
+                    onlyTo: replyTarget.only),
                 onSendReadyReply: { readyReplyMessage = newest },
                 onFieldSend: { _ in fieldComposeOpened = false })
         }
         .padding(.horizontal, chatExpanded ? 0 : 12)
         .padding(.bottom, chatExpanded ? 8 : 34)
         .animation(Self.pillSpring, value: chatExpanded)
+    }
+
+    /// R2.3: the gray line above the field when the reply is not a Reply All; tap for everyone.
+    private func replyingOnlyTo(_ people: [ChatThread.Person]) -> some View {
+        let chips = ChatReplyTarget.chips(people)
+        return Button { showsOnlyList = true } label: {
+            HStack(spacing: 6) {
+                Text("Replying only to")
+                    .font(.caption)
+                    .foregroundStyle(Theme.textSecondary)
+                    .fixedSize()
+                ForEach(Array(chips.names.enumerated()), id: \.offset) { _, name in
+                    chip(name)
+                }
+                if chips.more > 0 { chip("+\(chips.more)") }
+            }
+            .lineLimit(1)
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Replying only to \(people.map(\.name).joined(separator: ", "))")
+        .popover(isPresented: $showsOnlyList) {
+            ChatPeopleList(title: "Replying only to", names: people.map(\.name))
+        }
+    }
+
+    private func chip(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(Theme.textPrimary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(Palette.boxBg))
+            .overlay(Capsule().stroke(Palette.separator, lineWidth: 0.5))
     }
 
     /// The agent finished a request from the field with something to say: the sheet rises with
@@ -462,7 +528,10 @@ struct ChatThreadView: View {
     /// A compose card from the chat closed. Sent: the field empties and, for a reply, the chat
     /// shows the queued email's Sending bubble until the email is in the chat (N6.3, N7).
     private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {
-        if sentReplies.composeEnded(outcome, replyTo: replyTo) { fieldClearCount += 1 }
+        guard sentReplies.composeEnded(outcome, replyTo: replyTo) else { return }
+        // R2.4: a reply sent clears "Replying only to"; the next one is a Reply All again.
+        if replyTo != nil { replyTarget = .replyAll }
+        fieldClearCount += 1
     }
 
     /// This chat's sent replies.
@@ -490,10 +559,13 @@ struct ChatThreadView: View {
                 prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, prefillSubject: req.subject,
                 onAgentOutcome: onOutcome)
         case .reply:
+            // R1: a reply asked for in the field goes to the people chosen in Reply to.
+            let (to, cc, bcc) = ChatAgentCompose.replyRecipients(
+                fromField: fieldComposeOpened, target: replyTarget, request: req)
             ComposeView(
                 replyTo: req.replyTo, suggestedBody: req.body,
-                prefillTo: req.to.isEmpty ? nil : req.to, prefillCc: req.cc.isEmpty ? nil : req.cc,
-                prefillBcc: req.bcc.isEmpty ? nil : req.bcc, onAgentOutcome: onOutcome)
+                prefillTo: to.isEmpty ? nil : to, prefillCc: cc.isEmpty ? nil : cc,
+                prefillBcc: bcc.isEmpty ? nil : bcc, onAgentOutcome: onOutcome)
         case .forward:
             ComposeView(
                 replyTo: req.replyTo, suggestedBody: req.body, isForward: true,
@@ -507,6 +579,8 @@ struct ChatHeaderView: View {
     let thread: ChatThread
     let subject: String
     let labels: [UserLabel]
+    /// Tapping the names changes who gets the reply (R1.1).
+    var onTapNames: (() -> Void)? = nil
 
     var body: some View {
         VStack(spacing: 4) {
@@ -517,11 +591,21 @@ struct ChatHeaderView: View {
                 }
             }
             if !thread.replyPeople.isEmpty {
-                Text(ChatThread.headerTitle(thread.replyPeople))
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(Theme.textPrimary)
-                    .lineLimit(1)
+                Button { onTapNames?() } label: {
+                    HStack(spacing: 2) {
+                        Text(ChatThread.headerTitle(thread.replyPeople))
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(Theme.textPrimary)
+                            .lineLimit(1)
+                        Image(systemName: "chevron.right")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(Theme.textSecondary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(onTapNames == nil)
+                .accessibilityHint("Changes who gets your reply")
             }
             Text(subject)
                 .font(.caption)
@@ -541,6 +625,6 @@ struct ChatHeaderView: View {
         .padding(.bottom, 8)
         .frame(maxWidth: .infinity)
         .background(.bar)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
 }
