@@ -1,3 +1,6 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note (ADR-IOS-114):** since protocol 2.0.0 the summary and the precache reply arrive as JSON, each with a `text_message`, parsed by `AIResponseParser` (shared with the extension); the section-based summary parser described below is gone. `MessageHeader` also carries `summaryTextMessage` (and `replyTextMessage` with `cachedReply`).
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ### AI Summary & Action Pipeline
 
@@ -7,9 +10,8 @@
 - **Action flow**: system message with `content: "system_prompt_action"` + variables → 3 parallel calls → mode (most common action wins)
 - **Variable encoding**: `CompletionsMessage` uses dynamic coding keys to flatten vars into top-level JSON keys alongside role/content
 - **Response parsing**: summary uses section-based text parsing (Todos/Two-line summary/Reminder); action uses JSON parsing (`{"action": "...", "justification": "..."}`)
-  - **Since protocol 2.0.0 (ADR-IOS-114):** the summary and the precache reply arrive as JSON, each with a `text_message`, parsed by `AIResponseParser` (shared with the extension). The section-based summary parser is gone.
 - **Cross-instance dedup now via Device Sync probe** (ADR-IOS-036, supersedes ADR-IOS-004 "First Compute Wins"): `DeviceSyncService.probeAICache` queries connected peers before running the action LLM; hit = adopt, miss = compute.
 - `AccountManager.processAIForAccount()`: gathers `AIMessageSnapshot`s on main actor, dispatches to AIService, updates `MessageHeader.actionTag` + `MessageAICache` locally. No provider-side tag write.
 - `EmailFilter.isNoReply()` / `.hasUnsubscribeLink()` — lightweight heuristics for LLM prompt context. `hasUnsubscribe` is NOT used in reply skip (too aggressive for mailing lists) — only `isNoReply` drives `skipCachedReply`.
-- `MessageHeader` summary fields: `summaryBlurb`, `summaryTodos`, `reminderDate`, `reminderTime`, `reminderContent`; since ADR-IOS-114 also `summaryTextMessage` (and `replyTextMessage` with `cachedReply`)
+- `MessageHeader` summary fields: `summaryBlurb`, `summaryTodos`, `reminderDate`, `reminderTime`, `reminderContent`
 - Provider `setActionTag` methods exist as no-op stubs (signature kept so legacy PendingOperation(.setTag) drain flushes cleanly). ADR-IOS-036.
