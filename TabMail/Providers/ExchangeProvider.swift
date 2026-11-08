@@ -2106,10 +2106,17 @@ private struct GraphRemoved: Decodable {
 }
 
 /// #217: Outlook draft attachment upload (Graph "Attach large files to Outlook
-/// messages"). Graph says "under 3 MB" for a single POST and an upload session for
-/// 3-150 MB without defining the unit; a binary megabyte is assumed. A file the
-/// service refuses on either path only fails its add, which is retried and never
-/// deletes anything.
+/// messages"). A file added to a message has two documented edges, both "3 MB":
+/// a single POST takes an attachment "under 3 MB" (message-post-attachments), and
+/// `createUploadSession` refuses a file "smaller than 3 MB" with
+/// `ErrorAttachmentSizeShouldNotBeLessThanMinimumSize`, for 3-150 MB. Neither page
+/// gives the byte count. The threshold must sit at the session's minimum, or files
+/// between the two readings fail on one route or the other (#433). It is a binary
+/// megabyte because: the upload session's edge is the hard one (a documented
+/// error code), while the single POST is reported to accept larger files; and
+/// these attachment limits are quoted in binary megabytes (150 MB as 157,286,400
+/// bytes). Not yet measured on the wire. A file the service refuses on either path
+/// only fails its add, which is retried and never deletes anything.
 enum ExchangeDraftConfig {
     static let singlePostAttachmentLimitBytes = 3 * 1024 * 1024
     /// Each PUT's byte range; Graph asks for under 4 MB per request.

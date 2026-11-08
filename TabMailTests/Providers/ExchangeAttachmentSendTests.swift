@@ -13,15 +13,14 @@ import Testing
 /// a send must never be dropped. Graph limits a file added inline to under 3 MB and
 /// asks for an upload session for 3-150 MB ("Attach large files to Outlook messages").
 /// The fake mailbox records only the remote effects: what was sent and which drafts
-/// remain. Two of its refusals are assumptions stricter than any Graph page, so they
-/// can only cause a false red: `sendMail` answers 413 for an inline file of 3,000,000
-/// bytes or more (the behaviour #422 reported; the sendMail page states no limit), and
-/// `createUploadSession` answers 400 for a smaller file (Graph says to use a session
-/// for 3-150 MB but documents no refusal). The file sizes stay clear of the window
-/// between 3,000,000 bytes and the app's binary-megabyte constant (#433).
+/// remain. Adding a file to the draft refuses at Graph's own two edges
+/// (`GraphAttachmentLimits`), never at the app's constant (#433). One refusal is an
+/// assumption stricter than any Graph page, so it can only cause a false red:
+/// `sendMail` and the draft create answer 413 for an inline file of 3,000,000 bytes
+/// or more (the behaviour #422 reported; the sendMail page states no limit).
 @Suite("Outlook sends with attachments (#422)")
 struct ExchangeAttachmentSendTests {
-    /// Graph's documented "under 3 MB", read strictly.
+    /// The inline refusal #422 reported for `sendMail`, read strictly as 3,000,000 bytes.
     private static let documentedInlineLimit = 3_000_000
 
     private func draft(_ files: [DraftAttachment], html: Bool = false) -> DraftMessage {
@@ -69,12 +68,14 @@ struct ExchangeAttachmentSendTests {
 
         init(idPrefix: String = "g") { self.idPrefix = idPrefix }
 
-        private static func inlineFiles(_ json: [String: Any]) -> [String: Data]? {
+        private static func inlineFiles(
+            _ json: [String: Any], under limit: Int = ExchangeAttachmentSendTests.documentedInlineLimit
+        ) -> [String: Data]? {
             var files: [String: Data] = [:]
             for file in json["attachments"] as? [[String: Any]] ?? [] {
                 guard let name = file["name"] as? String, let raw = file["contentBytes"] as? String,
                       let bytes = Data(base64Encoded: raw),
-                      bytes.count < ExchangeAttachmentSendTests.documentedInlineLimit else { return nil }
+                      bytes.count < limit else { return nil }
                 files[name] = bytes
             }
             return files
@@ -141,12 +142,13 @@ struct ExchangeAttachmentSendTests {
                     if path.hasSuffix("/createUploadSession") {
                         guard let item = Self.json(request)?["AttachmentItem"] as? [String: Any],
                               let name = item["name"] as? String, let size = item["size"] as? Int,
-                              size >= ExchangeAttachmentSendTests.documentedInlineLimit else { return .status(400) }
+                              size >= GraphAttachmentLimits.uploadSessionMinimum else { return .status(400) }
                         state.uploads[id] = (name, size, Data())
                         return .json(raw: "{\"uploadUrl\":\"https://outlook.office.com/AttachmentSessions/\(id)?authtoken=synthetic-token\"}")
                     }
                     guard let json = Self.json(request), let name = json["name"] as? String,
-                          let files = Self.inlineFiles(["attachments": [json]]), let bytes = files[name] else {
+                          let files = Self.inlineFiles(["attachments": [json]], under: GraphAttachmentLimits.singlePostMaxExclusive),
+                          let bytes = files[name] else {
                         return .status(413)
                     }
                     state.drafts[id]?.files[name] = bytes
@@ -194,7 +196,7 @@ struct ExchangeAttachmentSendTests {
     }
 
     @Test("One message goes out carrying every file, and no draft is left behind",
-          arguments: ["small", "combined", "large", "mixed", "html"])
+          arguments: ["small", "combined", "large", "mixed", "html", "edge"])
     func sendCarriesEveryFile(shape: String) async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -207,6 +209,8 @@ struct ExchangeAttachmentSendTests {
         case "combined": [Self.file("one.bin", bytes: 1_600_000), Self.file("two.bin", bytes: 1_600_000)]
         case "large": [large]
         case "html": [small, large]
+        // One file per size on either reading of Graph's 3 MB (#433).
+        case "edge": GraphAttachmentLimits.edgeSizes.map { Self.file("edge-\($0).bin", bytes: $0) }
         default: [small, large, Self.file("other.pdf", bytes: 7_000_000)]
         }
         // An HTML reply or forward with files must go out as HTML, not as markup in text.

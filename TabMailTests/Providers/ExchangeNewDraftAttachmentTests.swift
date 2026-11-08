@@ -25,6 +25,8 @@ struct ExchangeNewDraftAttachmentTests {
     /// Model only the remote effects the invariant observes, independently of
     /// which upload path the provider selects. Inline creation is refused when
     /// the combined files exceed Graph's request limit, as on the issue's wire.
+    /// A single POST and an upload session each refuse at Graph's own edge
+    /// (`GraphAttachmentLimits`), never at the app's constant (#433).
     private final class Mailbox: Sendable {
         struct State {
             var creations = 0
@@ -44,7 +46,7 @@ struct ExchangeNewDraftAttachmentTests {
                 let inline = json["attachments"] as? [[String: Any]] ?? []
                 let count = inline.compactMap { $0["contentBytes"] as? String }
                     .compactMap { Data(base64Encoded: $0) }.reduce(0) { $0 + $1.count }
-                guard count < ExchangeDraftConfig.singlePostAttachmentLimitBytes else { return .status(413) }
+                guard count < GraphAttachmentLimits.singlePostMaxExclusive else { return .status(413) }
                 return self.state.withLock { state in
                     state.creations += 1
                     let id = "g\(state.creations)"
@@ -64,12 +66,17 @@ struct ExchangeNewDraftAttachmentTests {
                     return .status(400)
                 }
                 if request.url.absoluteString.contains("createUploadSession") {
+                    guard let size = (json["AttachmentItem"] as? [String: Any])?["size"] as? Int,
+                          size >= GraphAttachmentLimits.uploadSessionMinimum else {
+                        return .json(raw: #"{"error":{"code":"ErrorAttachmentSizeShouldNotBeLessThanMinimumSize"}}"#,
+                                     statusCode: 400)
+                    }
                     self.state.withLock { $0.uploaded = Data() }
                     return .json(raw: #"{"uploadUrl":"https://outlook.office.com/AttachmentSessions/session?authtoken=synthetic-token"}"#)
                 }
                 guard let name = json["name"] as? String, let raw = json["contentBytes"] as? String,
                       let bytes = Data(base64Encoded: raw),
-                      bytes.count < ExchangeDraftConfig.singlePostAttachmentLimitBytes else { return .status(413) }
+                      bytes.count < GraphAttachmentLimits.singlePostMaxExclusive else { return .status(413) }
                 self.state.withLock { $0.files[name] = bytes }
                 return .json(raw: #"{"id":"file"}"#, statusCode: 201)
             }
@@ -104,7 +111,7 @@ struct ExchangeNewDraftAttachmentTests {
         defer { http.close() }
         let mailbox = Mailbox()
         mailbox.install(http)
-        let limit = ExchangeDraftConfig.singlePostAttachmentLimitBytes
+        let limit = GraphAttachmentLimits.uploadSessionMinimum
         let files: [DraftAttachment]
         switch shape {
         case "empty": files = []
@@ -138,6 +145,23 @@ struct ExchangeNewDraftAttachmentTests {
         #expect(puts.isEmpty == !(shape == "boundary" || shape == "large"))
         #expect(mailbox.state.withLock { $0.uploadAuthorizations.count } == puts.count)
         #expect(mailbox.state.withLock { $0.uploadAuthorizations.allSatisfy { $0 == nil } })
+    }
+
+    @Test("A file of any size on either reading of Graph's 3 MB reaches a route Graph accepts (#433)",
+          arguments: GraphAttachmentLimits.edgeSizes)
+    func everySizeAtTheEdgeIsAccepted(bytes: Int) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let mailbox = Mailbox()
+        mailbox.install(http)
+        let file = DraftAttachment(filename: "large.bin", mimeType: "application/octet-stream",
+                                   data: Data((0..<bytes).map { UInt8(truncatingIfNeeded: $0) }))
+
+        let result = try await provider(http).saveDraft(draft([file]), existingIdentity: nil, draftsFolderPath: "Drafts")
+
+        #expect(result == .created(.outlook(graphId: "g1")))
+        #expect(mailbox.state.withLock { $0.files } == ["large.bin": file.data])
+        #expect(!http.recordedCalls().contains { $0.method == "DELETE" })
     }
 
     @Test("A failed first attachment upload throws, removes only its incomplete draft, and a retry succeeds",
@@ -175,7 +199,7 @@ struct ExchangeNewDraftAttachmentTests {
         }
         mailbox.install(http)
         let large = DraftAttachment(filename: "large.bin", mimeType: "application/octet-stream",
-                                    data: Data(count: stage == "small" ? 1 : ExchangeDraftConfig.singlePostAttachmentLimitBytes + 1))
+                                    data: Data(count: stage == "small" ? 1 : GraphAttachmentLimits.uploadSessionMinimum + 1))
         let files = stage == "session"
             ? [DraftAttachment(filename: "first.txt", mimeType: "text/plain", data: Data([1])), large]
             : [large]
