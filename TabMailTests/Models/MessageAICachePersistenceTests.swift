@@ -151,6 +151,7 @@ struct MessageAICachePersistenceTests {
     @Test("writeThrough creates new entry when none exists")
     func writeThroughNew() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(
@@ -175,6 +176,7 @@ struct MessageAICachePersistenceTests {
     @Test("writeThrough updates existing entry preserving unset fields")
     func writeThroughPreserves() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         // First write: summary + action
         try db.write {
@@ -210,6 +212,7 @@ struct MessageAICachePersistenceTests {
     @Test("writeThrough overwrites fields when provided")
     func writeThroughOverwrites() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(
@@ -240,6 +243,7 @@ struct MessageAICachePersistenceTests {
     @Test("writeThrough is no-op when rfc822MessageId is nil")
     func writeThroughNilMessageId() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(
@@ -258,6 +262,7 @@ struct MessageAICachePersistenceTests {
     @Test("writeThrough is no-op when rfc822MessageId is empty")
     func writeThroughEmptyMessageId() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
 
         try db.write {
             try MessageAICache.writeThrough(
@@ -276,6 +281,7 @@ struct MessageAICachePersistenceTests {
     @Test("writeThrough sets all summary fields")
     func writeThroughAllSummaryFields() throws {
         let db = try TestDatabase.make()
+        _ = try TestDatabase.insertAccount(db) // writeThrough writes only for an account that exists
         let now = Date()
 
         try db.write {
