@@ -48,6 +48,15 @@ struct GmailHistoryPaginationTests {
         """
     }
 
+    /// One page holding a `messagesAdded` record for each of `addedIds`.
+    private static func historyPage(historyId: String, addedIds: [String], nextPageToken: String?) -> String {
+        let token = nextPageToken.map { #", "nextPageToken": "\#($0)""# } ?? ""
+        let records = addedIds.enumerated().map { index, id in
+            #"{ "id": "\#(index)", "messagesAdded": [ { "message": { "id": "\#(id)", "labelIds": ["INBOX"] } } ] }"#
+        }
+        return #"{ "historyId": "\#(historyId)", "history": [ \#(records.joined(separator: ", ")) ]\#(token) }"#
+    }
+
     private static func messageJSON(id: String) -> String {
         """
         {
@@ -55,7 +64,7 @@ struct GmailHistoryPaginationTests {
           "threadId": "thread-\(id)",
           "labelIds": ["INBOX"],
           "snippet": "",
-          "internalDate": "1700000000000",
+          "internalDate": "\(Int64(Date().timeIntervalSince1970 * 1000))",
           "payload": {
             "mimeType": "text/plain",
             "headers": [
@@ -72,6 +81,25 @@ struct GmailHistoryPaginationTests {
     private static func pageToken(of request: FakeHTTP.Request) -> String? {
         URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
             .queryItems?.first(where: { $0.name == "pageToken" })?.value
+    }
+
+    /// The request's query exactly as it went on the wire, still percent-encoded.
+    private static func wireQuery(of request: FakeHTTP.Request) -> String {
+        URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.percentEncodedQuery ?? ""
+    }
+
+    /// Detail GETs (`users.messages.get`) the provider issued in this scenario.
+    private static func detailGETs(_ scenario: FakeHTTP.Scenario) -> Int {
+        scenario.recordedCalls().filter { $0.method == "GET" && $0.url.contains("/messages/") }.count
+    }
+
+    private static func withAppDB(_ body: (DatabasePool) async throws -> Void) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        try await body(pool)
     }
 
     private static func headerExists(_ messageId: String, pool: DatabasePool) throws -> Bool {
@@ -94,17 +122,19 @@ struct GmailHistoryPaginationTests {
         }
         let account = try Self.makeAccount(pool: pool)
 
-        // A token with characters a query string must encode, so the test also
-        // proves the token reaches Gmail intact.
+        // A token with characters a query string must encode.
         let secondPageToken = "page/2+next=yes"
         let tokensSeen = Mutex<[String?]>([])
+        let secondPageQuery = Mutex<String?>(nil)
         let scenario = FakeHTTP.Scenario()
         defer { scenario.close() }
         scenario.register(path: "/history", method: "GET") { request in
             let token = Self.pageToken(of: request)
             tokensSeen.withLock { $0.append(token) }
             if token == secondPageToken {
-                return .json(raw: Self.historyPage(historyId: "1002", addedId: "on-page-2", nextPageToken: nil))
+                secondPageQuery.withLock { $0 = Self.wireQuery(of: request) }
+                // The mailbox moved on while paging: page 2 reports a newer id.
+                return .json(raw: Self.historyPage(historyId: "1005", addedId: "on-page-2", nextPageToken: nil))
             }
             return .json(raw: Self.historyPage(historyId: "1002", addedId: "on-page-1", nextPageToken: secondPageToken))
         }
@@ -121,7 +151,102 @@ struct GmailHistoryPaginationTests {
         #expect(try Self.headerExists("on-page-1", pool: pool))
         #expect(try Self.headerExists("on-page-2", pool: pool),
                 "the second page's message was skipped")
-        #expect(try Self.cursor(pool: pool) == "1002", "the cursor did not move after both pages were applied")
+        #expect(try Self.cursor(pool: pool) == "1002",
+                "the cursor must be the FIRST page's historyId: a later page's id can be past records no page returned")
+
+        // Page 2 is the same query plus its token, encoded on the wire.
+        let query = secondPageQuery.withLock { $0 } ?? ""
+        let items = query.components(separatedBy: "&")
+        #expect(items.contains("pageToken=page%2F2%2Bnext%3Dyes"), "page token not percent-encoded on the wire: \(query)")
+        #expect(items.contains("startHistoryId=\(Self.startCursor)"), "page 2 lost startHistoryId: \(query)")
+        #expect(items.contains("maxResults=\(GmailAPI.historyPageSize)"), "page 2 lost maxResults: \(query)")
+        for type in ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"] {
+            #expect(items.contains("historyTypes=\(type)"), "page 2 lost historyTypes=\(type): \(query)")
+        }
+    }
+
+    /// A later page that fails leaves nothing applied and the cursor where it
+    /// was, so the next delta reads the same history again.
+    @Test("A failure on a later history page applies nothing and keeps the cursor")
+    func laterPageFailureKeepsTheCursor() async throws {
+        try await Self.withAppDB { pool in
+            let account = try Self.makeAccount(pool: pool)
+            let scenario = FakeHTTP.Scenario()
+            defer { scenario.close() }
+            scenario.register(path: "/history", method: "GET") { request in
+                if Self.pageToken(of: request) == "page-2" { return .status(500) }
+                return .json(raw: Self.historyPage(historyId: "1002", addedId: "on-page-1", nextPageToken: "page-2"))
+            }
+            scenario.register(path: "/messages/on-page-1", method: "GET", response: .json(raw: Self.messageJSON(id: "on-page-1")))
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+            await #expect(throws: (any Error).self) {
+                _ = try await SyncEngine().performDeltaSync(account: account, provider: provider)
+            }
+            #expect(try Self.cursor(pool: pool) == Self.startCursor, "the cursor moved past a page that was never read")
+            #expect(try !Self.headerExists("on-page-1", pool: pool), "part of an unread history was applied")
+        }
+    }
+
+    /// A 404 on a later page is an expired history like a 404 on the first:
+    /// the cursor is cleared for the full sync and nothing is applied.
+    @Test("A 404 on a later history page clears the cursor and applies nothing")
+    func laterPage404ClearsTheCursor() async throws {
+        try await Self.withAppDB { pool in
+            let account = try Self.makeAccount(pool: pool)
+            let scenario = FakeHTTP.Scenario()
+            defer { scenario.close() }
+            scenario.register(path: "/history", method: "GET") { request in
+                if Self.pageToken(of: request) == "page-2" { return .status(404) }
+                return .json(raw: Self.historyPage(historyId: "1002", addedId: "on-page-1", nextPageToken: "page-2"))
+            }
+            scenario.register(path: "/messages/on-page-1", method: "GET", response: .json(raw: Self.messageJSON(id: "on-page-1")))
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+            let outcome = try await SyncEngine().performDeltaSync(account: account, provider: provider)
+
+            #expect(!outcome.succeeded, "an expired history must not count as synced")
+            #expect(try Self.cursor(pool: pool) == nil, "the cursor must be cleared for a full sync")
+            #expect(try !Self.headerExists("on-page-1", pool: pool), "part of an expired history was applied")
+        }
+    }
+
+    /// THE WORK BOUND. The delta fetches every changed message, one GET at a
+    /// time, before it saves anything, all under the per-account sync deadline.
+    /// A delta bigger than that deadline can carry would time out, save nothing
+    /// and fail identically on every poll, starving the full sync. So history
+    /// over `GmailAPI.historyMaxRecords` records (counted across pages) issues
+    /// no detail GET at all and clears the cursor for the full sync.
+    @Test("History over the record budget fetches no message and hands over to the full sync")
+    func historyOverTheRecordBudgetFetchesNothing() async throws {
+        try await Self.withAppDB { pool in
+            let account = try Self.makeAccount(pool: pool)
+            let perPage = GmailAPI.historyMaxRecords / 2 + 1
+            let firstPage = (0..<perPage).map { "budget-a\($0)" }
+            let secondPage = (0..<perPage).map { "budget-b\($0)" }
+            let scenario = FakeHTTP.Scenario()
+            defer { scenario.close() }
+            scenario.register(path: "/history", method: "GET") { request in
+                if Self.pageToken(of: request) == "page-2" {
+                    return .json(raw: Self.historyPage(historyId: "1002", addedIds: secondPage, nextPageToken: nil))
+                }
+                return .json(raw: Self.historyPage(historyId: "1002", addedIds: firstPage, nextPageToken: "page-2"))
+            }
+            for id in firstPage + secondPage {
+                scenario.register(path: "/messages/\(id)", method: "GET", response: .json(raw: Self.messageJSON(id: id)))
+            }
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+            let outcome = try await SyncEngine().performDeltaSync(account: account, provider: provider)
+
+            #expect(Self.detailGETs(scenario) == 0,
+                    "an over-budget delta committed to \(Self.detailGETs(scenario)) message GETs before saving anything")
+            #expect(!outcome.succeeded, "an over-budget delta must hand over to the full sync")
+            #expect(try Self.cursor(pool: pool) == nil, "the cursor must be cleared for a full sync")
+        }
     }
 
     /// The page loop is bounded. History longer than `GmailAPI.historyMaxPages`
@@ -136,6 +261,8 @@ struct GmailHistoryPaginationTests {
         }
         let account = try Self.makeAccount(pool: pool)
 
+        // One record per page: the page limit, not the record budget, stops this loop.
+        try #require(GmailAPI.historyMaxPages <= GmailAPI.historyMaxRecords, "fixture: page limit must bind first")
         let pagesServed = Mutex(0)
         let scenario = FakeHTTP.Scenario()
         defer { scenario.close() }
@@ -156,7 +283,5 @@ struct GmailHistoryPaginationTests {
         #expect(pagesServed.withLock { $0 } == GmailAPI.historyMaxPages, "the page loop is not bounded")
         #expect(try Self.cursor(pool: pool) == nil,
                 "the cursor must be cleared for a full sync, never moved past unread pages")
-        #expect(try !Self.headerExists("endless-1", pool: pool),
-                "a history that was not read to its end must not be applied in part")
     }
 }

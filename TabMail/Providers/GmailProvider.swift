@@ -1399,8 +1399,8 @@ actor GmailProvider: EmailProvider {
 
         // Route through Shared/API/GmailAPI — single implementation for main app
         // and NSE. 404 (historyId expired), and history longer than
-        // `GmailAPI.historyMaxPages` pages, surface as nil so callers fall back
-        // to full sync.
+        // `GmailAPI.historyMaxRecords` records or `GmailAPI.historyMaxPages`
+        // pages, surface as nil so callers fall back to full sync.
         let http = AuthedHTTP(
             auth: AccountAuthSource(accountId: userEmail, accessToken: accessToken),
             retry: .gmail, logLabel: "Gmail", session: testSession

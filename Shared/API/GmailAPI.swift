@@ -55,6 +55,15 @@ enum GmailAPI {
     /// fail the same way on every retry.
     static let historyMaxPages = 40
 
+    /// Most history records one delta takes on. Before it saves anything, the
+    /// app's delta fetches each changed message with one sequential GET, all
+    /// under the per-account sync deadline, so a delta bigger than the deadline
+    /// can carry times out, saves nothing, and fails the same way on every
+    /// poll. Gmail's default page (100 records) is a size that has always fit
+    /// that deadline. Longer history is answered like an expired history id
+    /// (nil): the caller clears its cursor and the full sync runs instead.
+    static let historyMaxRecords = 100
+
     /// `users.history.list` — incremental changes since `startHistoryId`.
     /// `historyTypes` filters which events are returned (Gmail default = all four).
     /// `labelId` restricts to a single label (e.g. "INBOX"); pass nil for mailbox-wide.
@@ -66,8 +75,9 @@ enum GmailAPI {
     /// time rather than skipped.
     ///
     /// Returns nil when Gmail responds 404 — the historyId has expired, callers
-    /// must fall back to a full sync — and when the history runs past
-    /// `historyMaxPages`. Any other error throws.
+    /// must fall back to a full sync — and when the history holds more than
+    /// `historyMaxRecords` records or runs past `historyMaxPages` pages. Any
+    /// other error throws.
     static func historyList(
         http: AuthedHTTP,
         startHistoryId: String,
@@ -82,7 +92,12 @@ enum GmailAPI {
         var pageToken: String?
         for _ in 0..<historyMaxPages {
             var pageQuery = q
-            if let pageToken { pageQuery.append("pageToken=\(queryValue(pageToken))") }
+            if let pageToken {
+                guard let encoded = queryValue(pageToken) else {
+                    throw HTTPError.invalidURL("history.list pageToken")
+                }
+                pageQuery.append("pageToken=\(encoded)")
+            }
             let url = "\(baseURL)/history?" + pageQuery.joined(separator: "&")
             let res = try await http.requestAllowing404(url: url)
             if res.statusCode == 404 { return nil }
@@ -91,6 +106,7 @@ enum GmailAPI {
                 throw HTTPError.networkError(statusCode: res.statusCode)
             }
             records.append(contentsOf: json["history"] as? [[String: Any]] ?? [])
+            if records.count > historyMaxRecords { return nil }
             if cursor == nil { cursor = json["historyId"] as? String ?? "" }
             guard let next = json["nextPageToken"] as? String, !next.isEmpty else {
                 return GmailParse.parseHistory(["historyId": cursor ?? "", "history": records])
@@ -101,11 +117,12 @@ enum GmailAPI {
     }
 
     /// Percent-encodes an opaque value (a page token) for a query string,
-    /// leaving only RFC 3986 unreserved characters bare.
-    private static func queryValue(_ value: String) -> String {
+    /// leaving only RFC 3986 unreserved characters bare. Nil when the value
+    /// cannot be encoded; it is never sent raw.
+    private static func queryValue(_ value: String) -> String? {
         let unreserved = CharacterSet(
             charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-        return value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? value
+        return value.addingPercentEncoding(withAllowedCharacters: unreserved)
     }
 
     /// `users.messages.get` with `format=metadata` — headers only, no body.
