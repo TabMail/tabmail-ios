@@ -76,8 +76,10 @@ although macOS accepts them. SwiftMail now folds those four labels to `gbk` befo
 the IANA lookup, preserving the existing GB18030 widening. Trimming, quoting and
 case variants use the same rule. Other labels keep their existing lookup.
 
-The app and NSE pin fork `main` commit `b14f52a63b7b5d0dbe57367b79fd06793b1aa6aa`;
-[upstream PR #278](https://github.com/Cocoanetics/SwiftMail/pull/278) carries the fix.
+The app and NSE pinned fork `main` commit `b14f52a63b7b5d0dbe57367b79fd06793b1aa6aa`;
+[upstream PR #278](https://github.com/Cocoanetics/SwiftMail/pull/278) carries the fix. Upstream
+merged it (`5a62e3f`), and since 2026-11-08 the pin is a fork `main` built on upstream `d16534f`,
+which contains it (memory 126).
 Received raw-EML subjects and bodies are covered in the library; the app regression
 checks both header decoders and `MessagePart.textContent`. The stored-mail policy
 above still applies: no subject migration; body refetch can recover stored mojibake.

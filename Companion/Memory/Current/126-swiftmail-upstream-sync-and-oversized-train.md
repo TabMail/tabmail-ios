@@ -467,3 +467,27 @@ serializer that writes recipients:
 - Upstream main had independently advanced to `806c55a` (#275–#277). This focused
   pin does not adopt those changes. At the next general sync, apply the normal
   collision checks and drop this fork deviation once upstream contains its content.
+
+## 2026-11-08 — general sync to upstream `d16534f` and the 8bit body fix (#437)
+
+- Fork `main` reset from `b14f52a` to upstream `d16534f` plus the four commits of
+  [upstream PR #286](https://github.com/Cocoanetics/SwiftMail/pull/286) (head `4da3876`), our
+  only open upstream PR. The GBK alias deviation is gone: upstream merged it as #278 (`5a62e3f`,
+  identical content). `pin/ios-main-b14f52a` keeps the previous app pin fetchable.
+- Upstream commits taken in (collision-checked against the app; none collide): #277 LIST response
+  limit (default unlimited), #275 wider `isValidEmail`, #276 BODYSTRUCTURE filename ranking (RFC 2231
+  names now decode), #279/#280 `fetchRawMessages` (unused), #281 append raw bytes (same bytes), #282
+  reconnect inside commands (default unchanged), #284 CI on Swift 6.4.
+- #286 (tabmail-ios #437): on an `8BITMIME` server the text and HTML bodies go out with CRLF line
+  endings, and `isSafe8BitContent` is stricter: it counts each line in UTF-8 octets and ends a line
+  only at CR or LF, so a long multibyte or joined-emoji line now falls back to quoted-printable.
+  `crlfNormalized` searches with `.literal` (a CR or LF before a combining mark, U+FE0F or an emoji
+  modifier is one `Character` with it, so a default search missed it), and the internal
+  `IMAPServer.canonicalizeCRLF` is deleted in favour of it. The app calls none of these directly; it
+  reaches them through `IMAPProvider.buildEmail` and the SMTP send, the Sent APPEND and the IMAP draft.
+- Gate: tier-1 review, then Codex (coverage-only gaps closed with tests, each proven by a detected
+  mutant). Package suite 781 tests and `swiftlint --strict` pass; upstream CI green on build-linux,
+  build-macos, build-ios, build-android and lint.
+- App and NSE pin `4da38768ceac62bd5f38250bebe50985608da1a3` (`project.yml` and the root
+  `Package.resolved`).
+
