@@ -45,8 +45,7 @@ extension SyncEngine {
             // History expired (404), or longer than one delta can apply before
             // the sync deadline (over `GmailAPI.historyMaxChanges` records or
             // changed messages, or `GmailAPI.historyMaxPages` pages) — clear
-            // the cursor so the full
-            // sync takes over when it is next due
+            // the cursor so the full sync takes over when it is next due
             BackgroundSyncLogger.logDebug("[Sync] Gmail delta: history expired or too long for \(account.emailAddress) — clearing cursor")
             BackgroundSyncLogger.log("gmailDelta: \(account.emailAddress) historyExpiredOrTooLong")
             try await dbPool.write { db in

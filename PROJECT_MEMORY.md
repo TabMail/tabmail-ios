@@ -63,7 +63,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | Swift Gotchas | [read in full](Companion/Memory/Current/038-swift-gotchas.md) |
 | Folder.== must include every UI-visible field | [read in full](Companion/Memory/Current/039-folder-must-include-every-ui-visible-field.md) |
 | IMAP Folder Role Detection & Dedup (iCloud "Trash" + "Deleted Messages") | [read in full](Companion/Memory/Current/040-imap-folder-role-detection-dedup-icloud-trash-deleted-messages.md) |
-| Two-Tier Sync (ADR-IOS-009) — Gmail `history.list` reads every page (`nextPageToken`; over `historyMaxChanges` records or changed messages, or `historyMaxPages` pages → cursor cleared, full sync; work bound sized to the sync deadline) before `lastHistoryId` moves, #429 | [read in full](Companion/Memory/Current/041-two-tier-sync-adr-ios-009.md) |
+| Two-Tier Sync (ADR-IOS-009) | [read in full](Companion/Memory/Current/041-two-tier-sync-adr-ios-009.md) |
 | `syncStartup` Budget Discipline (v50/v51 lesson) | [read in full](Companion/Memory/Current/042-syncstartup-budget-discipline-v50-v51-lesson.md) |
 | Stale Message Detection (syncMessages) | [read in full](Companion/Memory/Current/043-stale-message-detection-syncmessages.md) |
 | Benign Sync Log Noise — DraftUpsertSkip + Gmail 429 (diagnosed 2026-06-09) | [read in full](Companion/Memory/Current/044-benign-sync-log-noise-draftupsertskip-gmail-429-diagnosed-2026-06-09.md) |
