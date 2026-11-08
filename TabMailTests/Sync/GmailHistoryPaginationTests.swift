@@ -57,6 +57,16 @@ struct GmailHistoryPaginationTests {
         return #"{ "historyId": "\#(historyId)", "history": [ \#(records.joined(separator: ", ")) ]\#(token) }"#
     }
 
+    /// One page of `labelsRemoved` records, each naming every message of one
+    /// conversation, as a conversation-wide archive on the web does.
+    private static func conversationArchivePage(historyId: String, conversations: [[String]]) -> String {
+        let records = conversations.enumerated().map { index, ids in
+            let items = ids.map { #"{ "message": { "id": "\#($0)", "labelIds": [] }, "labelIds": ["INBOX"] }"# }
+            return #"{ "id": "\#(index)", "labelsRemoved": [ \#(items.joined(separator: ", ")) ] }"#
+        }
+        return #"{ "historyId": "\#(historyId)", "history": [ \#(records.joined(separator: ", ")) ] }"#
+    }
+
     private static func messageJSON(id: String) -> String {
         """
         {
@@ -217,22 +227,31 @@ struct GmailHistoryPaginationTests {
     /// time, before it saves anything, all under the per-account sync deadline.
     /// A delta bigger than that deadline can carry would time out, save nothing
     /// and fail identically on every poll, starving the full sync. So history
-    /// over `GmailAPI.historyMaxRecords` records (counted across pages) issues
-    /// no detail GET at all and clears the cursor for the full sync.
+    /// over `GmailAPI.historyMaxChanges` records (counted across pages) issues
+    /// no detail GET at all and clears the cursor for the full sync, and stops
+    /// reading at the page that crosses the budget rather than reading the
+    /// rest of the history first.
     @Test("History over the record budget fetches no message and hands over to the full sync")
     func historyOverTheRecordBudgetFetchesNothing() async throws {
         try await Self.withAppDB { pool in
             let account = try Self.makeAccount(pool: pool)
-            let perPage = GmailAPI.historyMaxRecords / 2 + 1
+            let perPage = GmailAPI.historyMaxChanges / 2 + 1
             let firstPage = (0..<perPage).map { "budget-a\($0)" }
             let secondPage = (0..<perPage).map { "budget-b\($0)" }
+            let tokensSeen = Mutex<[String?]>([])
             let scenario = FakeHTTP.Scenario()
             defer { scenario.close() }
             scenario.register(path: "/history", method: "GET") { request in
-                if Self.pageToken(of: request) == "page-2" {
-                    return .json(raw: Self.historyPage(historyId: "1002", addedIds: secondPage, nextPageToken: nil))
+                let token = Self.pageToken(of: request)
+                tokensSeen.withLock { $0.append(token) }
+                switch token {
+                case nil:
+                    return .json(raw: Self.historyPage(historyId: "1002", addedIds: firstPage, nextPageToken: "page-2"))
+                case "page-2":
+                    return .json(raw: Self.historyPage(historyId: "1002", addedIds: secondPage, nextPageToken: "page-3"))
+                default:
+                    return .json(raw: Self.historyPage(historyId: "1002", addedIds: [], nextPageToken: nil))
                 }
-                return .json(raw: Self.historyPage(historyId: "1002", addedIds: firstPage, nextPageToken: "page-2"))
             }
             for id in firstPage + secondPage {
                 scenario.register(path: "/messages/\(id)", method: "GET", response: .json(raw: Self.messageJSON(id: id)))
@@ -246,6 +265,51 @@ struct GmailHistoryPaginationTests {
                     "an over-budget delta committed to \(Self.detailGETs(scenario)) message GETs before saving anything")
             #expect(!outcome.succeeded, "an over-budget delta must hand over to the full sync")
             #expect(try Self.cursor(pool: pool) == nil, "the cursor must be cleared for a full sync")
+            #expect(tokensSeen.withLock { $0 } == [nil, "page-2"],
+                    "reading must stop at the page that crosses the budget, read \(tokensSeen.withLock { $0 })")
+        }
+    }
+
+    /// One history record can name many messages: a conversation-wide archive
+    /// or label change names every message in the conversation, and the delta
+    /// fetches each of them. So the budget counts the distinct messages the
+    /// delta would fetch, not only the records: a delta naming exactly
+    /// `GmailAPI.historyMaxChanges` messages is applied, one naming more
+    /// fetches nothing and hands over to the full sync.
+    @Test("The budget counts the messages a delta would fetch, not only its records",
+          arguments: [0, 1])
+    func budgetCountsChangedMessages(overBudget: Int) async throws {
+        try await Self.withAppDB { pool in
+            let account = try Self.makeAccount(pool: pool)
+            let messageCount = GmailAPI.historyMaxChanges + overBudget
+            let perConversation = 4
+            let ids = (0..<messageCount).map { "conv-msg-\($0)" }
+            let conversations = stride(from: 0, to: ids.count, by: perConversation).map {
+                Array(ids[$0..<min($0 + perConversation, ids.count)])
+            }
+            try #require(conversations.count <= GmailAPI.historyMaxChanges, "fixture: within the record budget")
+            let scenario = FakeHTTP.Scenario()
+            defer { scenario.close() }
+            scenario.register(path: "/history", method: "GET",
+                              response: .json(raw: Self.conversationArchivePage(historyId: "1002", conversations: conversations)))
+            for id in ids {
+                scenario.register(path: "/messages/\(id)", method: "GET", response: .json(raw: Self.messageJSON(id: id)))
+            }
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+            let outcome = try await SyncEngine().performDeltaSync(account: account, provider: provider)
+
+            if overBudget > 0 {
+                #expect(Self.detailGETs(scenario) == 0,
+                        "\(conversations.count) records naming \(messageCount) messages committed to \(Self.detailGETs(scenario)) GETs")
+                #expect(!outcome.succeeded, "an over-budget delta must hand over to the full sync")
+                #expect(try Self.cursor(pool: pool) == nil, "the cursor must be cleared for a full sync")
+            } else {
+                #expect(Self.detailGETs(scenario) == messageCount, "a delta at the budget fetches every message it names")
+                #expect(outcome.succeeded, "a delta at the budget is applied")
+                #expect(try Self.cursor(pool: pool) == "1002", "a delta at the budget moves the cursor")
+            }
         }
     }
 
@@ -262,7 +326,7 @@ struct GmailHistoryPaginationTests {
         let account = try Self.makeAccount(pool: pool)
 
         // One record per page: the page limit, not the record budget, stops this loop.
-        try #require(GmailAPI.historyMaxPages <= GmailAPI.historyMaxRecords, "fixture: page limit must bind first")
+        try #require(GmailAPI.historyMaxPages <= GmailAPI.historyMaxChanges, "fixture: page limit must bind first")
         let pagesServed = Mutex(0)
         let scenario = FakeHTTP.Scenario()
         defer { scenario.close() }

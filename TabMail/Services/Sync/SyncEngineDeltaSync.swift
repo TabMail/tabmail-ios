@@ -43,8 +43,9 @@ extension SyncEngine {
         BackgroundSyncLogger.logDebug("[Sync] Gmail delta: fetching history since \(historyId) for \(account.emailAddress)")
         guard let history = try await provider.fetchHistory(since: historyId) else {
             // History expired (404), or longer than one delta can apply before
-            // the sync deadline (`GmailAPI.historyMaxRecords` records or
-            // `GmailAPI.historyMaxPages` pages) — clear the cursor so the full
+            // the sync deadline (over `GmailAPI.historyMaxChanges` records or
+            // changed messages, or `GmailAPI.historyMaxPages` pages) — clear
+            // the cursor so the full
             // sync takes over when it is next due
             BackgroundSyncLogger.logDebug("[Sync] Gmail delta: history expired or too long for \(account.emailAddress) — clearing cursor")
             BackgroundSyncLogger.log("gmailDelta: \(account.emailAddress) historyExpiredOrTooLong")

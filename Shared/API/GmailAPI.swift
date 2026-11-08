@@ -48,21 +48,26 @@ enum GmailAPI {
     /// default is 100), to keep the number of round trips low.
     static let historyPageSize = 500
 
-    /// Most `users.history.list` pages read in one call (`historyPageSize`
-    /// records each). History longer than this is answered like an expired
+    /// Most `users.history.list` pages read in one call. With
+    /// `historyMaxChanges` in force this binds only when Gmail returns many
+    /// sparse pages. History longer than this is answered like an expired
     /// history id (nil, so the caller runs a full sync): the cursor must never
     /// move past pages that were not read, and a cap that threw instead would
     /// fail the same way on every retry.
     static let historyMaxPages = 40
 
-    /// Most history records one delta takes on. Before it saves anything, the
-    /// app's delta fetches each changed message with one sequential GET, all
-    /// under the per-account sync deadline, so a delta bigger than the deadline
-    /// can carry times out, saves nothing, and fails the same way on every
-    /// poll. Gmail's default page (100 records) is a size that has always fit
-    /// that deadline. Longer history is answered like an expired history id
-    /// (nil): the caller clears its cursor and the full sync runs instead.
-    static let historyMaxRecords = 100
+    /// Most history records, and most distinct changed messages, one delta
+    /// takes on. Before it saves anything, the app's delta fetches each changed
+    /// message with one sequential GET, all under the per-account sync
+    /// deadline, so a delta bigger than the deadline can carry times out, saves
+    /// nothing, and fails the same way on every poll. One record can name many
+    /// messages (a conversation-wide archive or label change names each
+    /// message in it), so the messages are counted, not only the records.
+    /// The value is Gmail's default page size, the delta the app took on before
+    /// it read further pages. A larger delta is answered like an expired
+    /// history id (nil): the caller clears its cursor and the full sync runs
+    /// instead. Reading stops at the page that crosses either bound.
+    static let historyMaxChanges = 100
 
     /// `users.history.list` — incremental changes since `startHistoryId`.
     /// `historyTypes` filters which events are returned (Gmail default = all four).
@@ -76,7 +81,8 @@ enum GmailAPI {
     ///
     /// Returns nil when Gmail responds 404 — the historyId has expired, callers
     /// must fall back to a full sync — and when the history holds more than
-    /// `historyMaxRecords` records or runs past `historyMaxPages` pages. Any
+    /// `historyMaxChanges` records or names more than `historyMaxChanges`
+    /// messages to fetch, or runs past `historyMaxPages` pages. Any
     /// other error throws.
     static func historyList(
         http: AuthedHTTP,
@@ -88,6 +94,7 @@ enum GmailAPI {
         for t in historyTypes { q.append("historyTypes=\(t)") }
         if let labelId { q.append("labelId=\(labelId)") }
         var records: [[String: Any]] = []
+        var changedMessageIds = Set<String>()
         var cursor: String?
         var pageToken: String?
         for _ in 0..<historyMaxPages {
@@ -105,8 +112,14 @@ enum GmailAPI {
                   let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 throw HTTPError.networkError(statusCode: res.statusCode)
             }
-            records.append(contentsOf: json["history"] as? [[String: Any]] ?? [])
-            if records.count > historyMaxRecords { return nil }
+            let pageRecords = json["history"] as? [[String: Any]] ?? []
+            records.append(contentsOf: pageRecords)
+            // The messages the delta fetches: added or relabelled ones.
+            let page = GmailParse.parseHistory(["history": pageRecords])
+            changedMessageIds.formUnion(page.added.map(\.providerMessageId))
+            changedMessageIds.formUnion(page.labelsAdded.map(\.providerMessageId))
+            changedMessageIds.formUnion(page.labelsRemoved.map(\.providerMessageId))
+            if records.count > historyMaxChanges || changedMessageIds.count > historyMaxChanges { return nil }
             if cursor == nil { cursor = json["historyId"] as? String ?? "" }
             guard let next = json["nextPageToken"] as? String, !next.isEmpty else {
                 return GmailParse.parseHistory(["historyId": cursor ?? "", "history": records])

@@ -1398,9 +1398,10 @@ actor GmailProvider: EmailProvider {
         BackgroundSyncLogger.log("gmail.fetchHistory: START hid=\(historyId) email=\(userEmail)")
 
         // Route through Shared/API/GmailAPI — single implementation for main app
-        // and NSE. 404 (historyId expired), and history longer than
-        // `GmailAPI.historyMaxRecords` records or `GmailAPI.historyMaxPages`
-        // pages, surface as nil so callers fall back to full sync.
+        // and NSE. 404 (historyId expired), and history over
+        // `GmailAPI.historyMaxChanges` records or changed messages or
+        // `GmailAPI.historyMaxPages` pages, surface as nil so callers fall
+        // back to full sync.
         let http = AuthedHTTP(
             auth: AccountAuthSource(accountId: userEmail, accessToken: accessToken),
             retry: .gmail, logLabel: "Gmail", session: testSession
