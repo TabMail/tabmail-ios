@@ -114,8 +114,9 @@ enum GraphAPI {
     /// `ProviderError` is declared in the main-app target
     /// (`TabMail/Providers/EmailProvider.swift`) — it is not visible from
     /// `Shared`, which the NSE also links. Handing each caller the `nil` lets
-    /// both keep their own error domain unchanged while the allowed set and the
-    /// encoding call itself exist exactly once.
+    /// both keep their own error domain unchanged while the allowed set is
+    /// defined once. (`ExchangeProvider`'s `$search` value is encoded with the
+    /// same set.)
     static func encodedGraphPathSegment(_ value: String) -> String? {
         value.addingPercentEncoding(withAllowedCharacters: graphPathSegmentAllowed)
     }

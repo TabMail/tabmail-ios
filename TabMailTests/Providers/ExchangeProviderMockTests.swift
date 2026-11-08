@@ -854,7 +854,7 @@ struct ExchangeProviderSelectionWiringTests {
             normalizedURL("\(Self.graphBase)/messages/backfill-route?$select=\(Self.backfillFields)"),
             normalizedURL(
                 "\(Self.graphBase)/mailFolders/search-route/messages?$select=\(h)"
-                    + "&$search=\"route\"&$top=20"),
+                    + "&$search=%22route%22&$top=20"),
             normalizedURL("\(Self.graphBase)/messages/headers-route?$select=\(h)"),
             normalizedURL(
                 "\(Self.graphBase)/mailFolders/older-route/messages?$select=\(h)"
@@ -864,6 +864,59 @@ struct ExchangeProviderSelectionWiringTests {
                 "\(Self.graphBase)/messages/details-route?$select=\(Self.metadataFields)")
         ]
         #expect(http.recordedCalls().map { $0.url } == expected)
+    }
+
+    /// The user's search text must reach Graph as exactly what they typed.
+    ///
+    /// Graph's `$search` value is one double-quoted clause: a `"` or `\` inside
+    /// it is escaped with a backslash (OData's search syntax; Microsoft Learn
+    /// documents it for directory objects), and every reserved character is
+    /// URL-encoded (Microsoft Learn, "Use the $search query parameter"). An
+    /// unencoded `&` splits the parameter, a `#` turns the rest of the URL into a
+    /// fragment, a `+` reads as a space, and a bare `"` ends the clause early.
+    /// The invariant: the request carries ONE `$search` whose decoded value is
+    /// the typed text in that quoted form, and the parameters after it survive.
+    @Test("Search text with URL and KQL metacharacters reaches Graph intact",
+          arguments: [
+              "AT&T C# a+b 100% done",
+              "say \"hello\" to back\\slash",
+              "x=1;y=2 ?query #tag /path",
+              "plain",
+          ])
+    func searchTextReachesGraphIntact(typed: String) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(
+            path: "/mailFolders/search-route/messages?",
+            response: .json(raw: pageJSON(id: "search-route", category: "category-search"))
+        )
+
+        _ = try await provider(http).search(
+            query: typed, folder: "search-route", after: nil, before: nil)
+
+        let calls = http.recordedCalls()
+        #expect(calls.count == 1)
+        let url = try #require(calls.first?.url)
+        let components = try #require(URLComponents(string: url))
+        #expect(components.fragment == nil)
+        let items = components.queryItems ?? []
+        let searchValues = items.filter { $0.name == "$search" }.map(\.value)
+        let escaped = typed
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        #expect(searchValues == ["\"\(escaped)\""])
+        // `queryItems` decodes before comparing and never reads `+` as a space, so it cannot see a
+        // reserved character left raw. On the wire the value must be only unreserved characters and
+        // `%HH` triples (Graph: every reserved character in a query value is percent-encoded), and
+        // a form-style decoder, which reads `+` as a space, must still get the typed text.
+        let raw = try #require(components.percentEncodedQueryItems?.first { $0.name == "$search" }?.value)
+        let onTheWire = try NSRegularExpression(pattern: #"^(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})*$"#)
+        #expect(onTheWire.firstMatch(in: raw, range: NSRange(raw.startIndex..., in: raw)) != nil,
+                "only unreserved characters and %HH on the wire: \(raw)")
+        #expect(raw.replacingOccurrences(of: "+", with: " ").removingPercentEncoding == "\"\(escaped)\"",
+                "a form-style decoder reads the typed text")
+        #expect(items.filter { $0.name == "$top" }.map(\.value) == ["20"])
+        #expect(items.map(\.name) == ["$select", "$search", "$top"])
     }
 
     @Test("Every parser route uses its exact request selection and parses its response")

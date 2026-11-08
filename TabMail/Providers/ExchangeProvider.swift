@@ -581,7 +581,7 @@ actor ExchangeProvider: EmailProvider {
 
     func search(query: String, folder: String, after: Date?, before: Date?, from: String? = nil, to: String? = nil) async throws -> [MessageHeaderInfo] {
         let selection = ExchangeGraphMessageRequest.search.selection
-        let queryParts = [selection.queryParameter, "$search=\"\(query)\"", topParam(20)]
+        let queryParts = [selection.queryParameter, try Self.searchParameter(query), topParam(20)]
 
         // Scope to folder via Graph API mailFolders endpoint when folder ID is available
         let basePath: String
@@ -1605,6 +1605,29 @@ actor ExchangeProvider: EmailProvider {
             throw ProviderError.invalidURL(context)
         }
         return encoded
+    }
+
+    /// The `$search=` query parameter for the user's search text.
+    ///
+    /// Graph takes the value as one double-quoted clause, and every reserved
+    /// character in a query value must be URL-encoded (Microsoft Learn, "Use the
+    /// $search query parameter"). Inside the clause a `"` or `\` is escaped with
+    /// a backslash: OData's search syntax, which Microsoft Learn documents for
+    /// directory objects; for messages it is inferred, not documented.
+    /// The quoted clause is then encoded with the same strict RFC 3986
+    /// unreserved set as a Graph id, so `&`, `#`, `+`, `=`, `%` and spaces in
+    /// what the user typed stay inside this one value instead of splitting the
+    /// query, starting a fragment, or reading as a space.
+    private static func searchParameter(_ text: String) throws -> String {
+        let escaped = text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        guard let encoded = "\"\(escaped)\"".addingPercentEncoding(
+            withAllowedCharacters: GraphAPI.graphPathSegmentAllowed)
+        else {
+            throw ProviderError.invalidURL("Graph search text")
+        }
+        return "$search=\(encoded)"
     }
 
     private func patchMessage(id: String, body: [String: Any]) async throws {
