@@ -62,15 +62,24 @@ struct ChatReplyField: Equatable {
     }
 }
 
-/// What the reply field shows (N2.7, N4.3). One rule (owner 2026-11-07): the ready AI Reply shows
-/// in the field while it holds no words of the user's, typed or said; once the user empties the
-/// field by hand it stays empty for that email; a completed send empties only the words that were
-/// sent. The field and the open chat sheet share the words, so the rule is the same in both.
+/// The chat input's words and what the reply field shows (N2.7, N4.3). One rule (owner
+/// 2026-11-07): the ready AI Reply shows in the field while it holds no words of the user's, typed
+/// or said; once the user empties the field by hand it stays empty for that email; a completed send
+/// empties only the words that were sent. The field and the open chat sheet share the words, so the
+/// rule is the same in both.
 ///
-/// The shown text is a function of the user's own words and the state at render (`shown`): nothing
-/// ever writes the AI Reply into the field, so no late reply, dictation or completion can land on
-/// the wrong text, and a new email is simply a new input.
-struct ChatFieldFill: Equatable {
+/// ONE API (owner 2026-11-08, the ADR-035 shape): `apply` is the only way the words change, for
+/// typing, dictation, a send, a completion and the app's own edits, and the view cannot write them
+/// any other way (`words` is `private(set)`). Every change is synchronous on the main actor, so the
+/// main actor is the FIFO lock: each change runs whole, in arrival order, and none is held across
+/// an await. The AI Reply never enters: what the field shows is a function of the words and the
+/// state at render (`shown`), so no late reply can land on the user's words or on another email.
+/// The one asynchronous producer that replaces words, the on-device live transcript, enters with
+/// a change-counter compare (`heard`): it is dropped once anything else changed the words.
+struct ChatFieldFill {
+    /// The user's own words in the input: typed, said, or put there by the app for them (an Edit).
+    /// Never an AI Reply.
+    private(set) var words = ""
     /// The email (`ChatThread.copyKey`) the user emptied the field on by hand: no AI Reply shows
     /// while it is the newest. A newer email is a new turn and shows its own.
     private(set) var emptiedOn: String?
@@ -78,38 +87,88 @@ struct ChatFieldFill: Equatable {
     /// send completed. An answer or a sent reply completes it, so it empties only those words:
     /// words the user wrote after it are newer and stay.
     private(set) var atSend: String?
+    /// How many changes the words have had: the change counter a live transcript compares.
+    private(set) var changes = 0
+    /// The live transcript in progress: the words it adds to, and the change count of its own last
+    /// write. Ends when anything else changes the words.
+    private var hearing: (base: String, at: Int)?
 
-    /// What the field shows: the user's `words`, or with none the newest email's ready AI Reply
+    /// Every change to the words.
+    enum Change {
+        /// The user edited the input from `shown` to the new text, which is now their words. In the
+        /// reply field, emptying it while it showed something keeps the AI Reply out of it for
+        /// `email`.
+        case typed(String, shown: String, email: String?, replyField: Bool)
+        /// A dictation's text came back: it is added to the words as they are now.
+        case said(String)
+        /// An on-device dictation starts: its live transcript adds to the words as they are now.
+        case startHearing
+        /// The live transcript so far. Dropped if anything else changed the words since the
+        /// transcript's last write (the change counter).
+        case heard(String)
+        /// The app puts words in for the user (an Edit of an earlier message).
+        case put(String)
+        /// Send from the open sheet: the words go, and nothing is left to complete.
+        case sentFromSheet
+        /// Send from the collapsed field: the words stay, pulsing, until the send completes.
+        case sentFromField
+        /// The last send completed (the reply went out, or the agent answered in the sheet): it
+        /// empties the words only if they are still the words sent, or none.
+        case completed
+        /// A confirmation card opened the sheet: the same check, and the send is still open.
+        case confirmationCard
+    }
+
+    /// The only way the words change.
+    mutating func apply(_ change: Change) {
+        let before = words
+        switch change {
+        case let .typed(typed, shown, email, replyField):
+            // A set that leaves the shown text as it was is no edit (an untouched AI Reply stays
+            // the app's, not the user's words).
+            guard typed != shown else { return }
+            if replyField, typed.isEmpty, !shown.isEmpty { emptiedOn = email }
+            words = typed
+        case let .said(text):
+            words = DictationController.appending(text, to: words)
+        case .startHearing:
+            hearing = (words, changes)
+            return
+        case let .heard(transcript):
+            guard let hearing, hearing.at == changes else { self.hearing = nil; return }
+            words = DictationController.appending(transcript, to: hearing.base)
+            changes += 1
+            self.hearing = (hearing.base, changes)
+            return
+        case let .put(text):
+            words = text
+        case .sentFromSheet:
+            atSend = ""
+            words = ""
+        case .sentFromField:
+            atSend = words
+        case .completed:
+            if clears { words = "" }
+            atSend = nil
+        case .confirmationCard:
+            if clears { words = "" }
+        }
+        if words != before { changes += 1 }
+    }
+
+    /// What the field shows: the user's words, or with none the newest email's ready AI Reply
     /// `ready`, unless the user emptied the field on that email or spoke last (`busy`: a dictation
     /// is bringing their words, or the agent is still answering them).
-    func shown(words: String, ready: String?, busy: Bool, email: String?) -> String {
+    func shown(ready: String?, busy: Bool, email: String?) -> String {
         guard words.isEmpty, !busy, let ready, emptiedOn == nil || email != emptiedOn else { return words }
         return ready
     }
 
-    /// The user edited the field from `shown` to `typed`, which are now their words. Emptying it
-    /// while it showed something keeps the AI Reply out of it for `email`.
-    mutating func edited(from shown: String, to typed: String, email: String?) -> String {
-        if typed.isEmpty, !shown.isEmpty { emptiedOn = email }
-        return typed
-    }
-
-    /// The user sent with `words` theirs in the field.
-    mutating func sent(words: String) {
-        atSend = words
-    }
-
-    /// Whether the completion of the last send (the agent answered, or the reply went out) may
-    /// empty the user's `words`: they are still the words sent, or none. Anything else the user
-    /// wrote after the send.
-    func clears(_ words: String) -> Bool {
+    /// Whether the last send's completion may empty the words: they are still the words sent, or
+    /// none. Anything else the user wrote after the send.
+    private var clears: Bool {
         guard let atSend else { return true }
         return words == atSend || words.isEmpty
-    }
-
-    /// The reply went out, or the agent answered in the sheet: the send completed.
-    mutating func cleared() {
-        atSend = nil
     }
 }
 

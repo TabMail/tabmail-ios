@@ -1929,7 +1929,7 @@ struct DictationOptOutFlagTests {
         let source = try pillSource()
         #expect(source.contains("return .chatPill(title: message.subject, header: header, messages: chatMessages, input: inputText, emailId: message.id)"))
         let send = try slice(source, from: "private func sendMessage()", to: "Task { @MainActor in")
-        #expect(send.contains("dictation.inputSent(inputText)\n        inputText = \"\""))
+        #expect(send.contains("dictation.inputSent(inputText)\n        // From the open sheet the input empties as it goes; a newer draft is what is typed next.\n        fieldFill.apply(.sentFromSheet)"))
         let disappear = try slice(source, from: ".onDisappear {", to: "// No eager cancellation")
         #expect(disappear.contains("dictation.cancel()\n            dictation.stopLearning()"))
 
@@ -1999,7 +1999,7 @@ struct DictationOptOutFlagTests {
         let start = String(try slice(source, from: "private func startDictation(auto: Bool = false)", to: "private var canSend: Bool"))
         let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in", to: "scrollPosition.scrollTo(edge: .bottom)")
         // The words land in the input (the user's words, so over a shown AI Reply they replace it, N4.3), then are sent.
-        let appended = try #require(onText.range(of: "inputText = DictationController.appending(text, to: inputText)"))
+        let appended = try #require(onText.range(of: "fieldFill.apply(.said(text))"))
         let sent = try #require(onText.range(of: "if sendWhenDictated { sendWhenDictated = false if canSend { sendMessage() }"))
         #expect(appended.upperBound <= sent.lowerBound)
 

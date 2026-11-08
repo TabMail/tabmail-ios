@@ -53,19 +53,18 @@ struct DynamicIslandChat: View {
     /// The user's own words went from the field to the agent (N4.4).
     var onFieldSend: ((String) -> Void)?
     @Environment(\.hasTabMailSession) private var hasTabMailSession
-    @State private var inputText = ""
     /// Reply field: the words sent to the agent, shown pulsing while it works (N5, A2).
     @State private var fieldSentText: String?
-    /// Reply field: what it shows besides the user's words (`ChatFieldFill`). `inputText` holds only
-    /// the user's own words; the ready AI Reply is shown, never written into it.
+    /// The input's words and the reply field's state. `ChatFieldFill.apply` is the only way the words
+    /// change; the ready AI Reply is shown, never written into them (`ChatFieldFill`).
     @State private var fieldFill = ChatFieldFill()
+    /// The user's own words in the input (`ChatFieldFill.words`), read-only here.
+    private var inputText: String { fieldFill.words }
     @State private var fieldPulse = false
     @State private var inputSelection: TextSelection?
     @State private var dictation = DictationController()
     /// Dictation for a user opted out of AI: Apple's recognition on this iPhone only (`PillDictationMode`).
     @State private var speech = OnDeviceSpeechRecognizer()
-    /// The input text the on-device transcript is appended to, captured when it starts.
-    @State private var speechBase = ""
     /// The speech and microphone permissions, read again when the app becomes active (the user may
     /// have changed them in Settings, or answered the system prompt) and when a start begins or ends.
     @State private var speechPermission = SFSpeechRecognizer.authorizationStatus()
@@ -678,14 +677,12 @@ struct DynamicIslandChat: View {
         // collapsed opens the sheet, which takes the request (A3).
         .onChange(of: replyField?.clearCount) { _, _ in
             fieldSentText = nil
-            // Words written after the send this completes are newer, and stay (`ChatFieldFill.clears`).
-            guard fieldFill.clears(inputText) else { return }
-            inputText = ""
-            fieldFill.cleared()
+            // Words written after the send this completes are newer, and stay (`ChatFieldFill`).
+            fieldFill.apply(.completed)
         }
         .onChange(of: chatMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
-            if fieldFill.clears(inputText) { inputText = "" }
+            fieldFill.apply(.confirmationCard)
             fieldSentText = nil
             withAnimation(expandSpring) { isExpanded = true }
         }
@@ -892,8 +889,7 @@ struct DynamicIslandChat: View {
     /// email (`ChatFieldFill.edited`). The app's own changes to the words do not pass through here.
     private var typedText: Binding<String> {
         Binding(get: { fieldText }, set: { typed in
-            inputText = replyField == nil
-                ? typed : fieldFill.edited(from: fieldText, to: typed, email: fieldEmail)
+            fieldFill.apply(.typed(typed, shown: fieldText, email: fieldEmail, replyField: replyField != nil))
         })
     }
 
@@ -1475,15 +1471,15 @@ struct DynamicIslandChat: View {
         if dictationMode == .onDevice {
             // Behind the sign-in or subscribe bar there is no mic or waveform: an auto-start records nothing there.
             guard canUseAI, !speech.isRecording, !speech.isStarting else { return }
-            speechBase = inputText
+            fieldFill.apply(.startHearing)
             speech.start(locale: speechLocale, auto: auto) { transcript in
-                inputText = DictationController.appending(transcript, to: speechBase)
+                fieldFill.apply(.heard(transcript))
                 inputSelection = .init(insertionPoint: inputText.endIndex)
             }
             return
         }
         dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in
-            inputText = DictationController.appending(text, to: inputText)
+            fieldFill.apply(.said(text))
             inputSelection = .init(insertionPoint: inputText.endIndex)
             Task { await DictationLanguageTip.dictationCompleted.donate() }
             if sendWhenDictated {
@@ -1571,8 +1567,6 @@ struct DynamicIslandChat: View {
             sendFromReplyField(text, replyField)
             return
         }
-        // From the open sheet the input empties as it goes; a newer draft is what is typed next.
-        if replyField != nil { fieldFill.sent(words: "") }
         let composeAdmissionAcquired: Bool
         if isComposeMode {
             guard acquireComposeEditAdmission() else { return }
@@ -1589,7 +1583,8 @@ struct DynamicIslandChat: View {
         isTextFieldFocused = false
         // The input as sent is the last word on a correction of a dictation in it (ADR-IOS-086).
         dictation.inputSent(inputText)
-        inputText = ""
+        // From the open sheet the input empties as it goes; a newer draft is what is typed next.
+        fieldFill.apply(.sentFromSheet)
         inputSelection = .init(insertionPoint: "".startIndex)
 
         Task { @MainActor in
@@ -1616,7 +1611,7 @@ struct DynamicIslandChat: View {
     /// answers in the sheet; a closed compose card leaves the words (N6.3).
     private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {
         isTextFieldFocused = false
-        fieldFill.sent(words: inputText)
+        fieldFill.apply(.sentFromField)
         if ChatReplyField.route(text: text, readyText: field.readyText) == .readyReply {
             onSendReadyReply?()
             return
@@ -1633,7 +1628,7 @@ struct DynamicIslandChat: View {
     /// What the input shows: the user's words, or the ready AI Reply while there are none
     /// (`ChatFieldFill.shown`).
     private var fieldText: String {
-        fieldFill.shown(words: inputText, ready: replyField?.readyText, busy: isDictating || isWorking, email: fieldEmail)
+        fieldFill.shown(ready: replyField?.readyText, busy: isDictating || isWorking, email: fieldEmail)
     }
 
     /// The newest email, as the field's per-email state names it: copies of one email are one.
@@ -2974,7 +2969,7 @@ struct DynamicIslandChat: View {
             }
         }
 
-        inputText = text
+        fieldFill.apply(.put(text))
         isTextFieldFocused = true
     }
 
