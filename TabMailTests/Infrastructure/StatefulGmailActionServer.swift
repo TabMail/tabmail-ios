@@ -107,6 +107,10 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// Provider message ids whose `/messages/{id}/trash` and `/untrash`
         /// return Gmail's real `"Invalid id value"` `400`.
         var invalidId400OnTrashProviderIds: Set<String> = []
+        /// Provider message ids whose `/messages/{id}/trash` and `/untrash`
+        /// fail with an answer that is NOT stale (see `TrashFailure`).
+        var trashFailureByProviderId: [String: TrashFailure] = [:]
+        var trashFailuresServed = 0
         /// Provider message ids whose `/messages/{id}/modify` returns a
         /// structural `400` whose body matches no shape the adapter
         /// classifies (since #420 "Invalid label" is not one either; it is a
@@ -289,6 +293,29 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// every later request naming it gets Gmail's `404`.
     func removeMessage(providerMessageId: String) {
         _ = state.value.withLock { $0.messagesByProviderId.removeValue(forKey: providerMessageId) }
+    }
+
+    /// A `/messages/{id}/trash` or `/untrash` failure that says nothing about
+    /// the message being gone: a transient `503`, or a structural `400` whose
+    /// body matches no shape the adapter classifies.
+    enum TrashFailure: Sendable {
+        case transient503, unclassified400
+    }
+
+    /// Fail every `/messages/{id}/trash` and `/untrash` naming
+    /// `providerMessageId` with `failure` until `clearTrashFailures()`.
+    func injectTrashFailure(providerMessageId: String, _ failure: TrashFailure) {
+        state.value.withLock { $0.trashFailureByProviderId[providerMessageId] = failure }
+    }
+
+    /// Heal every injected trash/untrash failure, leaving the served count intact.
+    func clearTrashFailures() {
+        state.value.withLock { $0.trashFailureByProviderId.removeAll() }
+    }
+
+    /// How many trash/untrash attempts were refused with an injected failure.
+    func trashFailuresServedCount() -> Int {
+        state.value.withLock { $0.trashFailuresServed }
     }
 
     /// Inject Gmail's real `"Invalid id value"` `400` for every
@@ -717,9 +744,19 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             let components = request.url.pathComponents
             guard components.count >= 2 else { return .status(404) }
             let providerId = components[components.count - 2]
-            let invalidId = state.value.withLock { model -> Bool in
+            let (invalidId, failure) = state.value.withLock { model -> (Bool, TrashFailure?) in
                 model.trashLog.append(TrashCall(providerMessageId: providerId, trash: trash))
-                return model.invalidId400OnTrashProviderIds.contains(providerId)
+                let failure = model.trashFailureByProviderId[providerId]
+                if failure != nil { model.trashFailuresServed += 1 }
+                return (model.invalidId400OnTrashProviderIds.contains(providerId), failure)
+            }
+            switch failure {
+            case .transient503:
+                return .status(503)
+            case .unclassified400:
+                return .bytes(Self.unclassifiedBadRequestBody(), contentType: "application/json", statusCode: 400)
+            case nil:
+                break
             }
             if invalidId {
                 return .bytes(Self.invalidIdErrorBody(providerId), contentType: "application/json", statusCode: 400)

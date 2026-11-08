@@ -81,7 +81,9 @@ asserts that delete from Sent or Drafts and its Undo land on the server through
 trash/untrash; that every real member of a delete from Sent and of its Undo
 lands when the first member is an invalid or missing id;
 the agent's draft delete lands; a move the server refuses stays queued rather
-than counted as done; a user move into Sent or Drafts is refused on Gmail and
+than counted as done; a delete from Sent, and its Undo, that Gmail refuses with a
+503 or an unclassified 400 on trash/untrash stays queued with the server
+unchanged and lands once the failure clears; a user move into Sent or Drafts is refused on Gmail and
 queued on IMAP. `MoveFolderPickerTests.gmailOmitsTheLabelsGmailKeeps` covers the
 picker, and `DraftDeletionTests` pins that an "Invalid label" body is not an
 authoritative rejection.

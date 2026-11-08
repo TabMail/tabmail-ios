@@ -302,6 +302,66 @@ struct GmailMaintainedLabelMoveTests {
         await finish(f)
     }
 
+    /// A trash or untrash Gmail refuses for a reason that says nothing about
+    /// the message being gone (a 503, or a 400 the adapter cannot classify)
+    /// settles nothing: the delete, and later its Undo, stay queued with the
+    /// server unchanged, and land once the fault clears.
+    @Test("A delete from Sent, and its Undo, that Gmail refuses for a non-stale reason stay queued and land once it clears",
+          arguments: [StatefulGmailActionServer.TrashFailure.transient503, .unclassified400])
+    @MainActor
+    func refusedTrashAndUntrashStayQueued(failure: StatefulGmailActionServer.TrashFailure) async throws {
+        let id = "refused-trash-\(failure)"
+        let server = Self.server(providerId: id, labels: ["SENT"])
+        defer { server.close() }
+        let f = try fixture(accountId: "gmail-refused-trash-\(failure)")
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: f.accountId, provider: server.provider())
+        let seeded = try seedHeader(f, providerId: id, folderPath: "SENT")
+
+        // The delete is refused, then lands.
+        server.injectTrashFailure(providerMessageId: id, failure)
+        pushUndo([seeded], to: "TRASH")
+        await AccountManager.shared.move([seeded], to: "TRASH")
+        try await awaitRefusal(f, server: server, after: 0)
+        #expect(server.snapshot(providerMessageId: id)?.labels == ["SENT"], "a refused delete changed the server")
+        #expect(try await queuedMemberIds(f) == [id], "a refused delete was recorded as done")
+        server.clearTrashFailures()
+        try await drainToQuiescence(f)
+        #expect(server.snapshot(providerMessageId: id)?.labels == ["SENT", "TRASH"], "the delete never landed after the fault cleared")
+
+        // The Undo is refused, then lands.
+        let servedBeforeUndo = server.trashFailuresServedCount()
+        server.injectTrashFailure(providerMessageId: id, failure)
+        await UndoService.shared.undo()
+        await AccountManager.shared.awaitWriteQueueDrain()
+        try await awaitRefusal(f, server: server, after: servedBeforeUndo)
+        #expect(server.snapshot(providerMessageId: id)?.labels == ["SENT", "TRASH"], "a refused Undo changed the server")
+        #expect(try await queuedMemberIds(f).count == 1, "a refused Undo was recorded as done")
+        server.clearTrashFailures()
+        try await drainToQuiescence(f)
+        #expect(server.snapshot(providerMessageId: id)?.labels == ["SENT"], "the Undo never landed after the fault cleared")
+        let left = try await f.pool.read { db in try PendingOperation.fetchCount(db) }
+        #expect(left == 0)
+        await finish(f)
+    }
+
+    /// Wait until an injected trash/untrash failure past `after` was served and
+    /// the queue has settled after it.
+    @MainActor
+    private func awaitRefusal(_ f: Fixture, server: StatefulGmailActionServer, after: Int) async throws {
+        await AccountManager.shared.drainPendingQueue()
+        for _ in 0..<300 {
+            let isQuiescent = await AccountManager.shared.pendingQueueIsQuiescentForTesting()
+            if server.trashFailuresServedCount() > after && isQuiescent { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(server.trashFailuresServedCount() > after, "the injected failure never reached the wire")
+    }
+
+    private func queuedMemberIds(_ f: Fixture) async throws -> [String] {
+        try await f.pool.read { db in try PendingOperation.fetchAll(db) }.flatMap(\.messageIds)
+    }
+
     /// The agent's delete of a draft goes through `performCoordinatedRoleMove`
     /// and an ordinary move, not the Drafts list's draft-delete route. RED on
     /// the code before this fix: Gmail refused removing DRAFT and the queue
