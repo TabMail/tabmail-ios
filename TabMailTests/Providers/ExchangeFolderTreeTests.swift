@@ -50,9 +50,15 @@ struct ExchangeFolderTreeTests {
         var subtree: [Node] { [self] + children.flatMap(\.subtree) }
     }
 
-    /// Six folders under the root (three pages), one of them hidden, an Inbox
-    /// with three children (two pages), a branch four levels deep, and a hidden
-    /// folder below a visible one.
+    /// A search folder whose parent is the Inbox. Graph's root listing can
+    /// return such a folder as well as the Inbox's own listing, so it is listed
+    /// twice here.
+    private static let inboxSearch = Node("f-inbox-unread", "Unread", search: true)
+
+    /// Seven folders under the root (four pages), one of them hidden, an Inbox
+    /// with four children (two pages), a branch four levels deep, a hidden
+    /// folder below a visible one, and search folders at the root, below a
+    /// folder, and in both places at once.
     private static let rootChildren: [Node] = [
         Node("f-inbox", "Inbox", [
             Node("f-clients", "Clients", [
@@ -63,12 +69,15 @@ struct ExchangeFolderTreeTests {
             ]),
             Node("f-receipts", "Receipts"),
             Node("f-newsletters", "Newsletters"),
+            inboxSearch,
         ]),
         Node("f-sent", "Sent Items"),
         Node("f-projects", "Projects", [
             Node("f-launch", "Launch"),
+            Node("f-projects-flagged", "Flagged in Projects", search: true),
         ]),
         Node("f-digest", "Weekly digests", search: true),
+        inboxSearch,
         Node("f-archive", "Archive"),
         Node("f-hidden", "Hidden notes", hidden: true),
     ]
@@ -149,7 +158,7 @@ struct ExchangeFolderTreeTests {
         return .status(404)
     }
 
-    @Test("Every real folder at every depth and on every page, hidden ones included, is listed once with its own counts; search folders are not")
+    @Test("Every real folder at every depth and on every page, hidden ones included, is listed once with its own counts; search folders at any depth, even listed twice, are not")
     func everyFolderInTheTreeIsListed() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -163,10 +172,12 @@ struct ExchangeFolderTreeTests {
         let folders = try await provider.fetchFolders()
 
         let realFolders = Self.rootChildren.flatMap(\.subtree).filter { !$0.isSearchFolder }
+        let searchFolderIds = Set(Self.rootChildren.flatMap(\.subtree).filter(\.isSearchFolder).map(\.id))
         let listedIds = folders.map(\.path)
         #expect(listedIds.count == Set(listedIds).count, "a folder was listed twice: \(listedIds)")
         #expect(Set(listedIds) == Set(realFolders.map(\.id)))
-        #expect(!listedIds.contains("f-digest"))
+        #expect(searchFolderIds == ["f-digest", "f-projects-flagged", "f-inbox-unread"])
+        #expect(Set(listedIds).isDisjoint(with: searchFolderIds), "a search folder only shows mail stored in other folders")
 
         let byId = Dictionary(uniqueKeysWithValues: folders.map { ($0.path, $0) })
         for node in realFolders {
@@ -229,9 +240,18 @@ struct ExchangeFolderTreeFailureTests {
         #expect(state.2.count == 1 && state.2.first?.folderPath == "kept")
     }
 
-    @Test("A page that fails after earlier pages, at the root or inside a folder, fails the whole sync and changes nothing stored",
-          arguments: [false, true])
-    func aFailedPageChangesNothing(insideAFolder: Bool) async throws {
+    enum FailingPage: CaseIterable {
+        /// The root listing's second page.
+        case laterRootPage
+        /// The first request for a folder's own subfolders.
+        case firstFolderPage
+        /// The second page of a folder's subfolders.
+        case laterFolderPage
+    }
+
+    @Test("A page that fails, at the root or inside a folder, first or after earlier pages, fails the whole sync and changes nothing stored",
+          arguments: FailingPage.allCases)
+    func aFailedPageChangesNothing(failing: FailingPage) async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -243,19 +263,24 @@ struct ExchangeFolderTreeFailureTests {
         http.register(path: Self.root) { request in
             guard request.url.path == Self.root else { return .status(404) }
             if request.url.query?.contains("failed") == true { return .status(503) }
-            return Self.page([Self.folder("new-parent", children: 1)], next: insideAFolder ? nil : Self.graph + "?$skiptoken=failed")
+            return Self.page([Self.folder("new-parent", children: 1)], next: failing == .laterRootPage ? Self.graph + "?$skiptoken=failed" : nil)
         }
         http.register(path: Self.root + "/new-parent/childFolders") { request in
-            if request.url.query?.contains("failed") == true { return .status(503) }
-            return Self.page([Self.folder("new-leaf")], next: insideAFolder ? Self.graph + "/new-parent/childFolders?$skiptoken=failed" : nil)
+            if failing == .firstFolderPage || request.url.query?.contains("failed") == true { return .status(503) }
+            return Self.page([Self.folder("new-leaf")], next: failing == .laterFolderPage ? Self.graph + "/new-parent/childFolders?$skiptoken=failed" : nil)
         }
         do {
             try await SyncEngine().fullSync(account: account, provider: Self.provider(http))
             Issue.record("a listing with a failed page must not be stored as the whole folder list")
         } catch ProviderError.networkError { }
         let calls = http.recordedCalls().map(\.url)
-        #expect(calls.contains { $0.contains("failed") }, "the failing page was reached")
-        if insideAFolder { #expect(calls.contains { $0.contains("new-parent/childFolders") }) }
+        switch failing {
+        case .laterRootPage, .laterFolderPage:
+            #expect(calls.contains { $0.contains("failed") }, "the failing page was reached")
+        case .firstFolderPage:
+            #expect(!calls.contains { $0.contains("failed") })
+        }
+        if failing != .laterRootPage { #expect(calls.contains { $0.contains("new-parent/childFolders") }, "the folder's own listing was asked for") }
         try await Self.expectSeedUnchanged(pool)
     }
 
