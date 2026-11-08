@@ -308,7 +308,7 @@ struct ExchangeFolderTreeSyncTests {
         #expect(Set(state.1.map(\.messageId)) == ["1", "2"], "no stored mail is removed")
         #expect(state.2.count == 1 && state.2.first?.folderPath == "old-search" && state.2.first?.messageIds == ["2"]
                 && state.2.first?.destinationPath == "kept", "the queued move stays as it was")
-        let picker = MoveFolderPicker.partition(folders: folders, currentFolderPath: "kept")
+        let picker = MoveFolderPicker.partition(folders: folders, currentFolderPath: "kept", provider: account.provider)
         let offered = Set((picker.favorites + picker.others).map(\.path))
         #expect(offered.contains("new-child"), "the new subfolder can be picked as a move target")
         #expect(offered.isDisjoint(with: ["kept", "old-search"]))

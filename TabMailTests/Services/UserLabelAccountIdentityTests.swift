@@ -508,12 +508,9 @@ struct UserLabelIdentityMigrationTests {
 ///
 ///  * on **IMAP** it writes a keyword the user never asked for onto the real
 ///    message, a wrong-VALUE server mutation; and
-///  * on **Gmail** the API answers `"Invalid label: …"`, which
-///    `GmailProvider.isAuthoritativeActionRejection` classifies as a
-///    provider-authoritative no-op — so the operation leaves the queue **as if it
-///    had succeeded** and the user's label action is silently discarded. That is
-///    a dropped user intention, the cardinal sin of this codebase, arriving with
-///    no error anywhere.
+///  * on **Gmail** the API answers `"Invalid label: …"`, and the user's label
+///    is never applied: the operation retries until the counted failure limit
+///    retires it with an error.
 ///
 /// The assertions are therefore made at the WIRE, and the label is armed as
 /// remotely-deleted under its surrogate name so a regression cannot merely look
@@ -659,9 +656,8 @@ struct UserLabelWireValueTests {
         )
         defer { server.close() }
         // ARMED: if this ever regresses to `UserLabel.id`, Gmail answers its real
-        // `"Invalid label"` 400 — which the adapter reads as an AUTHORITATIVE
-        // no-op, quietly retiring the op. The wire assertions below are what
-        // distinguish that silent discard from a success.
+        // `"Invalid label"` 400 and the label never lands. The wire assertions
+        // below are what distinguish that refusal from a success.
         server.markLabelDeleted("\(f.accountId):Label_42")
 
         defer { restore(f) }

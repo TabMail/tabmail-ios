@@ -414,9 +414,12 @@ final class AccountOperationExecutor {
 
 
     /// Returns true only when the provider's own response STRUCTURALLY PROVES the
-    /// operation can never succeed — e.g. Gmail rejecting a label modification on
-    /// a system label like `DRAFT`. Such a `400` is a provider-authoritative
-    /// no-op (exit 2) and retires the durable row.
+    /// operation can never succeed — Gmail's structured invalid-id `400` (#420:
+    /// an "Invalid label" refusal is NOT this; it proves nothing is done). Such a
+    /// `400` is a provider-authoritative no-op (exit 2) and retires the durable
+    /// row. Both Gmail requests that preserve the `400` body (`modifyMessage`,
+    /// `trashOrUntrashMessage`) settle that shape per member themselves, so it
+    /// reaches here only from a future caller that does not.
     ///
     /// 🚨 A BARE STATUS CODE IS NOT A CLASSIFICATION. The predecessor returned
     /// `true` for `HTTPError.networkError(400)`, for
@@ -427,8 +430,9 @@ final class AccountOperationExecutor {
     /// absence of evidence, not the provider telling us the work is already done
     /// or no longer applicable, and conflating the two is the exact clause-2
     /// conflation `Companion/Rules/Active/never-drop-user-intention.md` forbids.
-    /// An unclassified `400` now falls through to the generic arm and retries —
-    /// forever, if the provider never explains itself, which is the correct
+    /// An unclassified `400` now falls through to the generic arm and retries
+    /// as a counted provider failure until `SyncConfig.pendingOperationServerRefusalRetryLimit`
+    /// (the bounded fifth exit, with an App Logs error), which is the correct
     /// disposition for "we could not determine the answer". (`v2final` demotes
     /// such a chain to its queue tail via `ProviderError.persistentActionFailure`;
     /// this tree reaches the same end state by a shorter route — the generic arm
@@ -440,10 +444,10 @@ final class AccountOperationExecutor {
     /// The only shape that still retires is the one a provider can be held to:
     /// `HTTPError.networkErrorWithBody(400, body)` whose body decodes to Gmail's
     /// documented structured error object and names a deterministic rejection —
-    /// see `GmailProvider.isAuthoritativeActionRejection`. That shape reaches
-    /// here through `AuthedHTTP.requestPreservingBadRequestBody`, which action
-    /// call sites opt into precisely so the body survives to be classified
-    /// instead of being guessed at from the status line.
+    /// see `GmailProvider.isAuthoritativeActionRejection`. Only
+    /// `AuthedHTTP.requestPreservingBadRequestBody` keeps that body, and its two
+    /// callers settle the shape per member themselves (above), so today this arm
+    /// is reached by no production request.
     nonisolated static func isPermanentlyInvalidError(_ error: Error) -> Bool {
         GmailProvider.isAuthoritativeActionRejection(error)
     }
@@ -856,7 +860,8 @@ final class AccountOperationExecutor {
                 return .completed
             }
             // Permanently invalid operation — drop immediately (will never succeed on retry).
-            // E.g., Gmail "Invalid label: DRAFT" when a .move op tried to remove the DRAFT label.
+            // Only Gmail's "Invalid id value" (a malformed id) qualifies; a refused
+            // request such as "Invalid label" is a counted failure, never done.
             if Self.isPermanentlyInvalidError(error) {
                 queueLog("[Queue] Permanently invalid \(opType): \(error) — dropping")
                 do {

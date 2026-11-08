@@ -115,10 +115,10 @@ struct DraftDeletionTests {
     //
     // ⚑ The original rationale for this block ended "...which is why a stuck
     // `.move` op (Gmail 'Invalid label: Deleted Messages') retried for 9 days".
-    // That real incident is still the motivating case and is still fixed — but
-    // by RECOGNISING that body (`reason == invalidArgument`, message prefix
-    // `"Invalid label"`), not by treating its status code as terminal. See
-    // `structuredInvalidLabelBody400IsAuthoritative` below.
+    // That incident is bounded today by the counted failure limit, which
+    // retires such an op with an error after its retries, not by reading
+    // `"Invalid label"` as done: Gmail refusing a request does not mean the
+    // action happened (`structuredInvalidLabelBody400IsNotAuthoritative`).
 
     @Test("isPermanentlyInvalidError: a bodyless HTTPError 400 is NOT authoritative")
     func bodylessHTTPError400IsNotAuthoritative() {
@@ -196,10 +196,11 @@ struct DraftDeletionTests {
         #expect(manager.isPermanentlyInvalidError(error))
     }
 
-    @Test("isPermanentlyInvalidError: Gmail's structured 'Invalid label' 400 IS authoritative")
-    func structuredInvalidLabelBody400IsAuthoritative() {
-        // The 9-day stuck `.move` from the original incident, now retired for
-        // the right reason: Gmail named the label and said it cannot be applied.
+    @Test("isPermanentlyInvalidError: Gmail's structured 'Invalid label' 400 is NOT authoritative")
+    func structuredInvalidLabelBody400IsNotAuthoritative() {
+        // Gmail refused the request (a label it keeps itself, such as SENT, or
+        // one that no longer exists). The user's move or label change did not
+        // happen, so the op is never retired as done.
         let body = Data(#"""
         {"error":{"errors":[{"domain":"global","reason":"invalidArgument","message":"Invalid label: Label_9999"}],"code":400,"message":"Invalid label: Label_9999"}}
         """#.utf8)
@@ -207,7 +208,7 @@ struct DraftDeletionTests {
             underlying: HTTPError.networkErrorWithBody(statusCode: 400, body: body)
         )
         let manager = AccountManager.shared
-        #expect(manager.isPermanentlyInvalidError(error))
+        #expect(!manager.isPermanentlyInvalidError(error))
     }
 
     @Test("isPermanentlyInvalidError: an authoritative-shaped body on a non-400 status is NOT authoritative")

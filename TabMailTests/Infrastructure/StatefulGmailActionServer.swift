@@ -60,6 +60,15 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         let removeLabelIds: [String]
     }
 
+    /// One `/messages/{id}/trash` (`trash == true`) or `/untrash` call.
+    struct TrashCall: Sendable, Equatable {
+        let providerMessageId: String
+        let trash: Bool
+    }
+
+    /// The labels real Gmail refuses in `messages.modify`.
+    static let gmailMaintainedLabelIds: Set<String> = ["SENT", "DRAFT"]
+
     private struct Message: Sendable {
         let rfc822MessageId: String
         let providerMessageId: String
@@ -94,9 +103,18 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// enqueue and drain. Gmail's real shape for this is a structural
         /// `400` (not `404`): https://developers.google.com/workspace/gmail/api/guides/handle-errors
         var deletedLabelIds: Set<String> = []
+        var trashLog: [TrashCall] = []
+        /// Provider message ids whose `/messages/{id}/trash` and `/untrash`
+        /// return Gmail's real `"Invalid id value"` `400`.
+        var invalidId400OnTrashProviderIds: Set<String> = []
+        /// Provider message ids whose `/messages/{id}/trash` and `/untrash`
+        /// fail with an answer that is NOT stale (see `TrashFailure`).
+        var trashFailureByProviderId: [String: TrashFailure] = [:]
+        var trashFailuresServed = 0
         /// Provider message ids whose `/messages/{id}/modify` returns a
-        /// structural `400` whose body does NOT match the known
-        /// invalid-label shape — an UNCLASSIFIED permanent-shaped failure
+        /// structural `400` whose body matches no shape the adapter
+        /// classifies (since #420 "Invalid label" is not one either; it is a
+        /// counted failure too) — an UNCLASSIFIED permanent-shaped failure
         /// (persistent-failure chain-demotion tests). Cleared via
         /// `clearUnclassified400s()` to simulate the condition resolving.
         var unclassified400ProviderIds: Set<String> = []
@@ -230,8 +248,9 @@ final class StatefulGmailActionServer: @unchecked Sendable {
 
     /// Inject an UNCLASSIFIED structural 400 for every `/messages/{id}/modify`
     /// naming `providerMessageId`: the body is Gmail's structured error shape
-    /// but matches neither the invalid-label wording nor any other terminal
-    /// shape the adapter knows — permanent-SHAPED, not authoritative-terminal.
+    /// but matches no terminal shape the adapter knows (the invalid-id
+    /// wording; since #420 an "Invalid label" refusal is not terminal either) —
+    /// permanent-SHAPED, not authoritative-terminal.
     /// Drives the persistent-failure chain-demotion path.
     func injectUnclassified400(providerMessageId: String) {
         _ = state.value.withLock { $0.unclassified400ProviderIds.insert(providerMessageId) }
@@ -249,6 +268,11 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         state.value.withLock { $0.unclassified400Served }
     }
 
+    /// Chronological log of every `/trash` and `/untrash` call.
+    func trashLog() -> [TrashCall] {
+        state.value.withLock { $0.trashLog }
+    }
+
     /// Chronological log of every attempted modify call (including rejected
     /// ones) for ordering/attempt-count assertions.
     func modifyLog() -> [ModifyCall] {
@@ -263,6 +287,41 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// resolution layer the reference classified on the GET path).
     func injectInvalidId400OnModify(providerMessageId: String) {
         _ = state.value.withLock { $0.invalidId400OnModifyProviderIds.insert(providerMessageId) }
+    }
+
+    /// The message is gone from the mailbox (deleted from another client):
+    /// every later request naming it gets Gmail's `404`.
+    func removeMessage(providerMessageId: String) {
+        _ = state.value.withLock { $0.messagesByProviderId.removeValue(forKey: providerMessageId) }
+    }
+
+    /// A `/messages/{id}/trash` or `/untrash` failure that says nothing about
+    /// the message being gone: a transient `503`, or a structural `400` whose
+    /// body matches no shape the adapter classifies.
+    enum TrashFailure: Sendable {
+        case transient503, unclassified400
+    }
+
+    /// Fail every `/messages/{id}/trash` and `/untrash` naming
+    /// `providerMessageId` with `failure` until `clearTrashFailures()`.
+    func injectTrashFailure(providerMessageId: String, _ failure: TrashFailure) {
+        state.value.withLock { $0.trashFailureByProviderId[providerMessageId] = failure }
+    }
+
+    /// Heal every injected trash/untrash failure, leaving the served count intact.
+    func clearTrashFailures() {
+        state.value.withLock { $0.trashFailureByProviderId.removeAll() }
+    }
+
+    /// How many trash/untrash attempts were refused with an injected failure.
+    func trashFailuresServedCount() -> Int {
+        state.value.withLock { $0.trashFailuresServed }
+    }
+
+    /// Inject Gmail's real `"Invalid id value"` `400` for every
+    /// `/messages/{id}/trash` and `/untrash` naming `providerMessageId`.
+    func injectInvalidId400OnTrash(providerMessageId: String) {
+        _ = state.value.withLock { $0.invalidId400OnTrashProviderIds.insert(providerMessageId) }
     }
 
     /// How many modify attempts were rejected with the injected invalid-id 400.
@@ -655,6 +714,21 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             }) {
                 return .bytes(Self.invalidLabelErrorBody(deletedLabel), contentType: "application/json", statusCode: 400)
             }
+            // Gmail keeps SENT and DRAFT itself: its labels guide marks both as
+            // not manually applicable, and `messages.modify` naming either, to
+            // add or to remove, is refused with this same `400`.
+            if let maintained = (additions + removals).first(where: { Self.gmailMaintainedLabelIds.contains($0) }) {
+                return .bytes(Self.invalidLabelErrorBody(maintained), contentType: "application/json", statusCode: 400)
+            }
+            // "You can't apply labels to draft messages": Gmail refuses adding a
+            // label to a draft's message. Its exact wording is not modelled, so
+            // the refusal carries no shape the adapter classifies.
+            let isDraftMessage = state.value.withLock {
+                $0.messagesByProviderId[providerId]?.labels.contains("DRAFT") == true
+            }
+            if isDraftMessage && !additions.isEmpty {
+                return .bytes(Self.unclassifiedBadRequestBody(), contentType: "application/json", statusCode: 400)
+            }
             let found = state.value.withLock { model -> Bool in
                 guard var message = model.messagesByProviderId[providerId] else { return false }
                 message.labels.formUnion(additions)
@@ -664,7 +738,40 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             }
             return found ? .json(raw: "{}") : .status(404)
         }
+        // `messages.trash` / `messages.untrash`: add or remove TRASH, on any
+        // message, a draft's message included.
+        let serveTrash: @Sendable (FakeHTTP.Request, Bool) -> FakeHTTP.CannedResponse = { [state] request, trash in
+            let components = request.url.pathComponents
+            guard components.count >= 2 else { return .status(404) }
+            let providerId = components[components.count - 2]
+            let (invalidId, failure) = state.value.withLock { model -> (Bool, TrashFailure?) in
+                model.trashLog.append(TrashCall(providerMessageId: providerId, trash: trash))
+                let failure = model.trashFailureByProviderId[providerId]
+                if failure != nil { model.trashFailuresServed += 1 }
+                return (model.invalidId400OnTrashProviderIds.contains(providerId), failure)
+            }
+            switch failure {
+            case .transient503:
+                return .status(503)
+            case .unclassified400:
+                return .bytes(Self.unclassifiedBadRequestBody(), contentType: "application/json", statusCode: 400)
+            case nil:
+                break
+            }
+            if invalidId {
+                return .bytes(Self.invalidIdErrorBody(providerId), contentType: "application/json", statusCode: 400)
+            }
+            let found = state.value.withLock { model -> Bool in
+                guard var message = model.messagesByProviderId[providerId] else { return false }
+                if trash { message.labels.insert("TRASH") } else { message.labels.remove("TRASH") }
+                model.messagesByProviderId[providerId] = message
+                return true
+            }
+            return found ? .json(raw: "{}") : .status(404)
+        }
         http.register(path: "/messages/", method: "POST") { [state] request in
+            if request.url.path.hasSuffix("/trash") { return serveTrash(request, true) }
+            if request.url.path.hasSuffix("/untrash") { return serveTrash(request, false) }
             let response = serveModify(request)
             let components = request.url.pathComponents
             let providerId = components.count >= 2 ? components[components.count - 2] : ""

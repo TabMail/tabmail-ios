@@ -283,12 +283,9 @@ final class UserLabelMenuModel {
                 // account-prefixed surrogate (D10 / `IOS-LABEL-001`) and would be
                 // a value the server has never heard of. On IMAP that writes a
                 // bogus custom keyword to the real message — a wrong-value server
-                // mutation. On Gmail it is worse than a loud failure: the API
-                // replies `"Invalid label"`, which
-                // `GmailProvider.isAuthoritativeActionRejection` matches as a
-                // PROVIDER-AUTHORITATIVE no-op, so the op leaves the queue as if
-                // it had succeeded and the user's label action is silently
-                // discarded — the cardinal sin of this codebase.
+                // mutation. On Gmail the API replies `"Invalid label"`, and the op
+                // retries until the counted failure limit retires it with an
+                // error: the user's label is never applied.
                 var op = PendingOperation(
                     type: .addUserLabel,
                     messageIds: admission.providerIds,
