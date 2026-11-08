@@ -388,11 +388,15 @@ struct StatefulExchangeActionServerTests {
     /// before replacement.
     ///
     /// (1) It said those three gates "cover every mutating method
-    /// `ExchangeProvider` has". They do not. `send(draft:)` POSTs `/sendMail`, and
-    /// `saveDraft`'s create branch POSTs `/mailFolders/drafts/messages` — neither
-    /// URL contains the `/messages/` substring the fixture matches on, so neither is
-    /// gated at all. (`appendToSentFolder` and `setActionTag` issue no HTTP, so they
-    /// are vacuously outside it.)
+    /// `ExchangeProvider` has". They do not. `send(draft:)` POSTs `/sendMail` for a
+    /// message without files, and `saveDraft`'s create branch POSTs
+    /// `/mailFolders/drafts/messages` — neither URL contains the `/messages/`
+    /// substring the fixture matches on, so neither is gated at all. (A send with
+    /// files goes through that same ungated create; its attachment calls and its
+    /// `/messages/{id}/send` do contain `/messages/`, so the POST gate applies to
+    /// those, #422.)
+    /// (`appendToSentFolder` and `setActionTag` issue no HTTP, so they are
+    /// vacuously outside it.)
     ///
     /// (2) It said `markRead`/`markUnread`/`markFlagged` "and ONLY those three"
     /// reach the private `patchMessage(id:body:)`, and that `move` does NOT. Both

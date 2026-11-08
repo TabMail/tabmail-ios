@@ -990,10 +990,33 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Sending
 
+    /// A message without files goes in one `sendMail`. Graph accepts a file inline
+    /// there only under 3 MB and wants an upload session for 3-150 MB, choosing
+    /// per file (Graph: "Attach large files to Outlook messages"), so a message
+    /// with files is created as a draft, given each file the way a draft save adds
+    /// it, then sent (`POST /messages/{id}/send`) (#422). Any failure tries once to
+    /// remove that draft and rethrows the original error, so the Outbox classifies it
+    /// as before and a retry normally leaves no copy in Drafts; a refused cleanup, a
+    /// lost create answer or an app kill can leave one (`IOS-DRAFT-026`). If the send
+    /// was accepted (Graph submits it asynchronously) and only its answer was lost,
+    /// the delete finds nothing (a moved item gets a new id) or moves the leftover to
+    /// Deleted Items, and the retry may send it again, as a lost `sendMail` answer
+    /// would (a duplicate, never a drop). Nothing is deleted after an accepted send.
     func send(draft: DraftMessage) async throws {
-        let message = buildGraphSendPayload(draft: draft)
-        let jsonData = try JSONSerialization.data(withJSONObject: ["message": message])
-        let _ = try await request(path: "/sendMail", method: "POST", body: jsonData)
+        guard !draft.attachments.isEmpty else {
+            let message = buildGraphSendPayload(draft: draft)
+            let jsonData = try JSONSerialization.data(withJSONObject: ["message": message])
+            let _ = try await request(path: "/sendMail", method: "POST", body: jsonData)
+            return
+        }
+        let graphId = try await createDraftWithAttachments(draft)
+        do {
+            let encodedId = try Self.encodedGraphPathSegment(graphId, context: "Graph draft message id")
+            _ = try await request(path: "/messages/\(encodedId)/send", method: "POST")
+        } catch {
+            try? await deleteDraft(identity: .outlook(graphId: graphId))
+            throw error
+        }
     }
 
     /// Exchange/Graph API auto-saves sent messages to Sent Items — no explicit append needed.
@@ -1037,30 +1060,38 @@ actor ExchangeProvider: EmailProvider {
             try await replaceDraftAttachments(graphId: graphId, with: draft.attachments)
             return .created(.outlook(graphId: graphId))
         } else {
-            // Create the message first, then add each file through the same
-            // size-aware path as an update (#237). Sending them in this POST
-            // would reject a large file before an upload session can be made.
-            let jsonData = try JSONSerialization.data(withJSONObject: message)
-            let response = try await request(path: "/mailFolders/drafts/messages", method: "POST", body: jsonData)
-            guard let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
-                  let msgId = dict["id"] as? String else {
-                throw NSError(domain: "ExchangeProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "No message ID in draft response"])
-            }
-            do {
-                if !draft.attachments.isEmpty {
-                    try await replaceDraftAttachments(graphId: msgId, with: draft.attachments)
-                }
-            } catch {
-                // The local draft still owns every byte and the throw keeps its
-                // Save queued. Remove only this attempt's incomplete server copy
-                // so the retry normally creates one complete draft. If cleanup
-                // also fails, sync can surface that copy for ordinary deletion;
-                // preserve the original error for the queue's retry classifier.
-                try? await deleteDraft(identity: .outlook(graphId: msgId))
-                throw error
-            }
-            return .created(.outlook(graphId: msgId))
+            return .created(.outlook(graphId: try await createDraftWithAttachments(draft)))
         }
+    }
+
+    /// Create a new draft holding `draft` and every one of its files; returns its
+    /// Graph id. Used by a first draft save and by a send with files (#422).
+    private func createDraftWithAttachments(_ draft: DraftMessage) async throws -> String {
+        // Create the message first, then add each file through the same
+        // size-aware path as an update (#237). Sending them in this POST
+        // would reject a large file before an upload session can be made.
+        var messageDraft = draft
+        messageDraft.attachments = []
+        let jsonData = try JSONSerialization.data(withJSONObject: buildGraphSendPayload(draft: messageDraft))
+        let response = try await request(path: "/mailFolders/drafts/messages", method: "POST", body: jsonData)
+        guard let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
+              let msgId = dict["id"] as? String else {
+            throw NSError(domain: "ExchangeProvider", code: -1, userInfo: [NSLocalizedDescriptionKey: "No message ID in draft response"])
+        }
+        do {
+            if !draft.attachments.isEmpty {
+                try await replaceDraftAttachments(graphId: msgId, with: draft.attachments)
+            }
+        } catch {
+            // The local draft (or Outbox row) still owns every byte and the
+            // throw keeps it queued. Remove only this attempt's incomplete server
+            // copy so the retry normally creates one complete draft. If cleanup
+            // also fails, sync can surface that copy for ordinary deletion;
+            // preserve the original error for the queue's retry classifier.
+            try? await deleteDraft(identity: .outlook(graphId: msgId))
+            throw error
+        }
+        return msgId
     }
 
     /// #217: the draft's current copy, or nil on 404 (deleted elsewhere).
@@ -1108,7 +1139,7 @@ actor ExchangeProvider: EmailProvider {
                 path: "/messages/\(encodedId)/attachments/\(encodedAttachmentId)", method: "DELETE")
         }
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[Exchange] saveDraft: added \(plan.add.count), removed \(plan.deleteIds.count) attachment(s)")
+            BackgroundSyncLogger.logDebug("[Exchange] draft attachments: added \(plan.add.count), removed \(plan.deleteIds.count) attachment(s)")
         }
     }
 
@@ -1838,8 +1869,9 @@ actor ExchangeProvider: EmailProvider {
         // Threading (RFC 2822 requires angle brackets around message IDs). Graph's
         // `internetMessageHeaders` takes only custom `x-` headers, so In-Reply-To and
         // References go as the MAPI properties Exchange writes those headers from
-        // (confirmed by a live reply). Only `sendMail` carries threading today:
-        // Outlook drafts upload without it (`DraftStore.uploadThreadHeaders`).
+        // (confirmed by a live reply on `sendMail`). A send with files carries them on
+        // its draft create, then `/messages/{id}/send` (#422); a draft save uploads
+        // without them (`DraftStore.uploadThreadHeaders`).
         var threading: [[String: String]] = []
         if let inReplyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
             threading.append(["id": Self.graphInReplyToProperty, "value": inReplyTo])
