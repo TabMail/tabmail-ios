@@ -21,7 +21,7 @@ struct MoveFolderPickerTests {
             makeFolder("Inbox", path: "INBOX", role: .inbox),
             makeFolder("Sent", path: "SENT", role: .sent)
         ]
-        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "INBOX")
+        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "INBOX", provider: .imap)
         #expect(result.favorites.isEmpty)
         #expect(result.others.map(\.path) == ["SENT"])
     }
@@ -37,7 +37,7 @@ struct MoveFolderPickerTests {
             makeFolder("Archive", path: "ARCHIVE", role: .archive),
             makeFolder("Drafts", path: "DRAFTS", role: .drafts)
         ]
-        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "")
+        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "", provider: .imap)
         #expect(result.favorites.isEmpty)
         // Role order: inbox, archive, sent, drafts, trash, spam, custom
         #expect(result.others.map(\.path) == ["INBOX", "ARCHIVE", "SENT", "DRAFTS", "TRASH", "SPAM", "CUSTOM"])
@@ -52,7 +52,7 @@ struct MoveFolderPickerTests {
             makeFolder("ProjectX", path: "ProjectX", role: .custom, isFavorite: true),
             makeFolder("Archive", path: "ARCHIVE", role: .archive, isFavorite: true)
         ]
-        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "")
+        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "", provider: .imap)
         guard result.favorites.count == 2 else {
             Issue.record("Expected 2 favorites, got \(result.favorites.count)")
             return
@@ -69,7 +69,7 @@ struct MoveFolderPickerTests {
             makeFolder("ProjectX", path: "ProjectX", role: .custom, isFavorite: true),
             makeFolder("Inbox", path: "INBOX", role: .inbox)
         ]
-        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "ProjectX")
+        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "ProjectX", provider: .imap)
         #expect(result.favorites.isEmpty)
         #expect(result.others.map(\.path) == ["INBOX"])
     }
@@ -80,16 +80,31 @@ struct MoveFolderPickerTests {
             makeFolder("Inbox", path: "INBOX", role: .inbox, isFavorite: true),
             makeFolder("Sent", path: "SENT", role: .sent, isFavorite: true)
         ]
-        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "")
+        let result = MoveFolderPicker.partition(folders: folders, currentFolderPath: "", provider: .imap)
         #expect(result.favorites.map(\.path) == ["INBOX", "SENT"])
         #expect(result.others.isEmpty)
     }
 
     @Test("Empty input → empty partitions")
     func emptyInput() {
-        let result = MoveFolderPicker.partition(folders: [], currentFolderPath: "")
+        let result = MoveFolderPicker.partition(folders: [], currentFolderPath: "", provider: .imap)
         #expect(result.favorites.isEmpty)
         #expect(result.others.isEmpty)
+    }
+
+    @Test("On Gmail, Sent and Drafts are never offered as a destination; elsewhere they are")
+    func gmailOmitsTheLabelsGmailKeeps() {
+        let folders = [
+            makeFolder("Inbox", path: "INBOX", role: .inbox),
+            makeFolder("Sent", path: "SENT", role: .sent),
+            makeFolder("Drafts", path: "DRAFT", role: .drafts),
+            makeFolder("Trash", path: "TRASH", role: .trash),
+            makeFolder("Projects", path: "Label_7", role: .custom, isFavorite: true),
+        ]
+        let gmail = MoveFolderPicker.partition(folders: folders, currentFolderPath: "INBOX", provider: .gmail)
+        #expect((gmail.favorites + gmail.others).map(\.path) == ["Label_7", "TRASH"])
+        let imap = MoveFolderPicker.partition(folders: folders, currentFolderPath: "INBOX", provider: .imap)
+        #expect((imap.favorites + imap.others).map(\.path) == ["Label_7", "SENT", "DRAFT", "TRASH"])
     }
 
     @Test("folderOrder produces the documented role ordering")

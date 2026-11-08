@@ -2738,10 +2738,9 @@ final class InboxViewModel {
                 // `STORE -FLAGS (<keyword>)`), and `UserLabel.id` is the
                 // account-prefixed surrogate (D10 / `IOS-LABEL-001`). See
                 // `UserLabelMenuModel.applyLabel` for why a prefixed value is not
-                // merely a failure on Gmail but a SILENT drop: `"Invalid label"`
-                // is matched by `GmailProvider.isAuthoritativeActionRejection` as a
-                // provider-authoritative no-op, so the op leaves the queue as if
-                // it had been performed.
+                // merely a failure: Gmail refuses it with `"Invalid label"`, and
+                // the op retries until the counted failure limit retires it with
+                // an error, without the label ever being removed.
                 var op = PendingOperation(
                     type: .removeUserLabel,
                     messageIds: admission.providerIds,

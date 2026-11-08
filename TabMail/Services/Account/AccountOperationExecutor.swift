@@ -856,7 +856,8 @@ final class AccountOperationExecutor {
                 return .completed
             }
             // Permanently invalid operation — drop immediately (will never succeed on retry).
-            // E.g., Gmail "Invalid label: DRAFT" when a .move op tried to remove the DRAFT label.
+            // Only Gmail's "Invalid id value" (a malformed id) qualifies; a refused
+            // request such as "Invalid label" is a counted failure, never done.
             if Self.isPermanentlyInvalidError(error) {
                 queueLog("[Queue] Permanently invalid \(opType): \(error) — dropping")
                 do {

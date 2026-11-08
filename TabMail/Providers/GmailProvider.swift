@@ -580,16 +580,29 @@ actor GmailProvider: EmailProvider {
         removeLabelIds: [String] = [],
         moveTraceLabel: String? = nil
     ) async throws {
+        try await settleEachMessage(ids: ids, moveTraceLabel: moveTraceLabel) { id in
+            try await self.modifyMessage(
+                id: id, addLabelIds: addLabelIds, removeLabelIds: removeLabelIds)
+        }
+    }
+
+    /// The per-member boundary described above, for any single-message request:
+    /// `messages.modify`, and `messages.trash` / `messages.untrash` for a move
+    /// between Trash and a label Gmail keeps itself (`move`).
+    private func settleEachMessage(
+        ids: [String],
+        moveTraceLabel: String? = nil,
+        settleOne: (String) async throws -> Void
+    ) async throws {
         // An empty request has nothing to settle and nothing to report; silence
         // is the truthful answer, exactly as it was for a request whose every
         // member was mutated.
         guard let id = ids.first else { return }
         var absent: [String] = []
         do {
-            try await modifyMessage(
-                id: id, addLabelIds: addLabelIds, removeLabelIds: removeLabelIds)
+            try await settleOne(id)
             if let moveTraceLabel, DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[MoveTrace] \(moveTraceLabel) — modifyMessage completed for \(id)")
+                BackgroundSyncLogger.logDebug("[MoveTrace] \(moveTraceLabel) — request completed for \(id)")
             }
         } catch {
             guard ProviderMemberAbsence.isAuthoritative(error) else { throw error }
@@ -653,13 +666,42 @@ actor GmailProvider: EmailProvider {
         }
     }
 
+    /// The labels Gmail keeps itself. Its labels guide marks `SENT` and `DRAFT`
+    /// as not manually applicable, and a `messages.modify` that adds or removes
+    /// either is refused with `400 "Invalid label"`. A message keeps them
+    /// wherever it is moved, so no request ever names them: a sent message moved
+    /// out of Sent stays in Sent as well, as it does in Gmail itself. A user move
+    /// INTO Sent or Drafts is refused before it is queued
+    /// (`AccountManager.move`, `MoveFolderPicker`).
+    nonisolated static let gmailMaintainedLabelIds: Set<String> = ["SENT", "DRAFT"]
+
     func move(ids: [String], from source: String, to destination: String) async throws {
+        let maintained = GmailProvider.gmailMaintainedLabelIds
+        // Between Trash and a label Gmail keeps (a delete from Sent or Drafts,
+        // and its Undo) the only change is Trash itself. That is Gmail's own
+        // `messages.trash` / `messages.untrash`, which also take a draft's
+        // message, where labels cannot be applied.
+        if maintained.contains(source) && destination == "TRASH" {
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[MoveTrace] GmailProvider.move — trash ids=\(ids) source=\(source)") }
+            try await settleEachMessage(ids: ids, moveTraceLabel: "GmailProvider.move") { id in
+                try await self.trashOrUntrashMessage(id: id, verb: "trash")
+            }
+            return
+        }
+        if source == "TRASH" && maintained.contains(destination) {
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[MoveTrace] GmailProvider.move — untrash ids=\(ids) destination=\(destination)") }
+            try await settleEachMessage(ids: ids, moveTraceLabel: "GmailProvider.move") { id in
+                try await self.trashOrUntrashMessage(id: id, verb: "untrash")
+            }
+            return
+        }
         // source and destination are label IDs (path). Filter out empty/synthetic paths
         // that aren't valid Gmail API label IDs — e.g., "" or "__GMAIL_ALL_MAIL__" from
-        // undo-archive, where only adding the destination label is needed.
-        var remove = (source.isEmpty || source == GmailProvider.archivePath) ? [] : [source]
+        // undo-archive, where only adding the destination label is needed — and the
+        // labels Gmail keeps itself.
+        var remove = (source.isEmpty || source == GmailProvider.archivePath || maintained.contains(source)) ? [] : [source]
         // Archive = just remove source label (message stays in All Mail implicitly)
-        let add = (destination == GmailProvider.archivePath) ? [] : [destination]
+        let add = (destination == GmailProvider.archivePath || maintained.contains(destination)) ? [] : [destination]
         // Legacy-label decay (ADR-IOS-036): when moving OUT of the inbox, also
         // strip any leftover tm_* labels the account picked up from pre-ADR
         // TabMail versions. Batched into the same messages.modify call — zero
@@ -669,7 +711,8 @@ actor GmailProvider: EmailProvider {
             remove.append(contentsOf: userLabelCatalog.legacyTmLabelIds)
         }
         // No-op: both source and destination resolve to no label changes (e.g., move from
-        // All Mail to All Mail). Skip the API call — Gmail rejects empty modify bodies.
+        // All Mail to All Mail, or a sent message archived out of Sent, which Gmail keeps
+        // in Sent, and its Undo). Skip the API call — Gmail rejects empty modify bodies.
         guard !remove.isEmpty || !add.isEmpty else {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[MoveTrace] GmailProvider.move — no-op (no label changes): ids=\(ids) source=\(source) dest=\(destination)") }
             return
@@ -1706,21 +1749,22 @@ actor GmailProvider: EmailProvider {
     /// `AccountManager.isPermanentlyInvalidError` committed it for EVERY
     /// `400` — bare status codes included — until this classifier replaced it.
     ///
-    /// The two recognised messages are Gmail's own literal wordings, both of
-    /// which name something structurally impossible rather than something that
-    /// might work later:
-    ///   * `"Invalid id value"` — the message id is malformed; no retry resolves
-    ///     it (this is also the arm `modifyMessage` absorbs locally, and the
-    ///     mirror of Exchange's `ErrorInvalidIdMalformed`);
-    ///   * `"Invalid label"` — the label named cannot be modified on this
-    ///     message, e.g. the system `DRAFT` label. This is the case the queue's
-    ///     terminal arm was originally written for; before the body survived to
-    ///     be read, it could only be guessed at from the status line.
+    /// The one recognised message is Gmail's own literal wording, which names
+    /// something structurally impossible rather than something that might work
+    /// later: `"Invalid id value"` — the message id is malformed; no retry
+    /// resolves it (this is also the arm `modifyMessage` absorbs locally, and
+    /// the mirror of Exchange's `ErrorInvalidIdMalformed`).
+    ///
+    /// `"Invalid label"` is NOT recognised: it says Gmail refused the request
+    /// (a label Gmail keeps itself, or one that no longer exists), not that the
+    /// user's action is done or no longer applies. Retiring on it once silently
+    /// dropped a delete from Sent, its Undo, and a draft's delete. A refused
+    /// action stays a counted failure, retried and, at the limit, retired with
+    /// an error in App Logs, never recorded as done.
     nonisolated static func isAuthoritativeActionRejection(_ error: Error) -> Bool {
         guard let rejection = structuredBadRequestRejection(error),
               rejection.reason == "invalidArgument" else { return false }
         return rejection.message.hasPrefix("Invalid id value")
-            || rejection.message.hasPrefix("Invalid label")
     }
 
     /// Apply a label add/remove batch to one Gmail message by its native
@@ -1772,14 +1816,9 @@ actor GmailProvider: EmailProvider {
     /// the park no longer costs anything behind it.
     ///
     /// SUBTRACT — the reference also handles `isGmailInvalidLabelError` here
-    /// (invalid/gone label → stale no-op). Not ported as a local `return`,
-    /// because `isAuthoritativeActionRejection` recognises that exact body on
-    /// the queue side: the `400` reaches the queue and retires the op there, the
-    /// same end state the reference reaches by returning. ⚑ Note the brief's
-    /// stated premise for dropping it — "it only ever classified failures of the
-    /// deleted RFC search" — is FALSE: the reference calls it from
-    /// `modifyMessage` too. The drop is justified by the equivalent end state
-    /// above, not by that premise.
+    /// (invalid/gone label → stale no-op). Not ported: an `"Invalid label"`
+    /// refusal is not evidence that the action is done, so it reaches the queue
+    /// as a counted failure (see `isAuthoritativeActionRejection`).
     ///
     /// SUBTRACT — the reference's leading `guard !isHttpGoneStatus(error)`.
     /// A `404`/`410` is not a `400`, so `requestPreservingBadRequestBody`
@@ -1808,6 +1847,14 @@ actor GmailProvider: EmailProvider {
             }
             throw error
         }
+    }
+
+    /// `messages.trash` or `messages.untrash` for one message, with the same
+    /// error shapes as `modifyMessage`, so the per-member boundary and the
+    /// queue classify its failures alike.
+    private func trashOrUntrashMessage(id: String, verb: String) async throws {
+        _ = try await requestPreservingBadRequestBody(
+            path: "/messages/\(id)/\(verb)", method: "POST", body: nil)
     }
 
     // MARK: - Parsing

@@ -66,6 +66,21 @@ The SAME scenario histories as Layer 1, driven through the REAL pipeline instead
 
 **Retro-fit discipline:** a harness that can't re-catch a known bug isn't done. Both F1 and F2 were deliberately re-introduced (scrub-branch post disabled; `excludeIds` moved to post-trim) against this layer and confirmed to fail `scrubOnlyWakeStillConverges`/I8 and `paginationCompletenessTriage`/I9 respectively before the fixes were restored.
 
+## Gmail moves and the labels Gmail maintains
+
+Gmail keeps the `SENT` and `DRAFT` labels itself and refuses any
+`messages.modify` that adds or removes them with 400 "Invalid label".
+`TabMailTests/Infrastructure/StatefulGmailActionServer.swift` refuses them the
+same way, and serves `/messages/{id}/trash` and `/untrash`.
+`TabMailTests/Services/GmailMaintainedLabelMoveTests.swift` asserts the
+properties over every source and destination pair: no request ever names a
+maintained label; delete from Sent or Drafts and its Undo land on the server;
+the agent's draft delete lands; a move the server refuses stays queued rather
+than counted as done; a user move into Sent or Drafts is refused on Gmail and
+queued on IMAP. `MoveFolderPickerTests.gmailOmitsTheLabelsGmailKeeps` covers the
+picker, and `DraftDeletionTests` pins that an "Invalid label" body is not an
+authoritative rejection.
+
 ## Server-draft dismissal UI
 
 `TabMailScreenshots/ServerDraftCloseUITests.swift` runs in the existing

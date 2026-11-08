@@ -2135,22 +2135,29 @@ struct MoveFolderPicker: View {
     @Environment(\.dismiss) private var dismiss
 
     private var partitioned: (favorites: [Folder], others: [Folder]) {
-        let folders = (try? AppDatabase.dbPool.read { db in
-            try Folder.filter(Column("accountId") == accountId).order(Column("name")).fetchAll(db)
-        }) ?? []
-        return Self.partition(folders: folders, currentFolderPath: currentFolderPath)
+        let loaded = (try? AppDatabase.dbPool.read { db in
+            (try Folder.filter(Column("accountId") == accountId).order(Column("name")).fetchAll(db),
+             try Account.fetchOne(db, key: accountId)?.provider)
+        })
+        return Self.partition(
+            folders: loaded?.0 ?? [], currentFolderPath: currentFolderPath, provider: loaded?.1)
     }
 
     private var favoriteFolders: [Folder] { partitioned.favorites }
     private var otherFolders: [Folder] { partitioned.others }
 
-    /// Pure helper: filter out the current folder, sort by role, then split into
+    /// Pure helper: filter out the current folder, and on Gmail the Sent and
+    /// Drafts labels Gmail keeps itself (no move can put a message there:
+    /// `GmailProvider.gmailMaintainedLabelIds`), sort by role, then split into
     /// (favorites, others) preserving the role-sorted order within each group.
     /// `nonisolated` so unit tests (running on a cooperative-pool task, not the
     /// main actor) can call it without tripping `_swift_task_checkIsolatedSwift`.
-    nonisolated static func partition(folders: [Folder], currentFolderPath: String) -> (favorites: [Folder], others: [Folder]) {
+    nonisolated static func partition(
+        folders: [Folder], currentFolderPath: String, provider: AccountProvider?
+    ) -> (favorites: [Folder], others: [Folder]) {
         let sorted = folders
             .filter { $0.path != currentFolderPath }
+            .filter { !(provider == .gmail && GmailProvider.gmailMaintainedLabelIds.contains($0.path)) }
             .sorted { folderOrder($0.role) < folderOrder($1.role) }
         return (
             favorites: sorted.filter { $0.isFavorite },

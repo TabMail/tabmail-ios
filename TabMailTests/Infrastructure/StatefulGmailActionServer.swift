@@ -60,6 +60,15 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         let removeLabelIds: [String]
     }
 
+    /// One `/messages/{id}/trash` (`trash == true`) or `/untrash` call.
+    struct TrashCall: Sendable, Equatable {
+        let providerMessageId: String
+        let trash: Bool
+    }
+
+    /// The labels real Gmail refuses in `messages.modify`.
+    static let gmailMaintainedLabelIds: Set<String> = ["SENT", "DRAFT"]
+
     private struct Message: Sendable {
         let rfc822MessageId: String
         let providerMessageId: String
@@ -94,6 +103,7 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         /// enqueue and drain. Gmail's real shape for this is a structural
         /// `400` (not `404`): https://developers.google.com/workspace/gmail/api/guides/handle-errors
         var deletedLabelIds: Set<String> = []
+        var trashLog: [TrashCall] = []
         /// Provider message ids whose `/messages/{id}/modify` returns a
         /// structural `400` whose body does NOT match the known
         /// invalid-label shape — an UNCLASSIFIED permanent-shaped failure
@@ -247,6 +257,11 @@ final class StatefulGmailActionServer: @unchecked Sendable {
     /// 400 — one per provider attempt on the failing op.
     func unclassified400ServedCount() -> Int {
         state.value.withLock { $0.unclassified400Served }
+    }
+
+    /// Chronological log of every `/trash` and `/untrash` call.
+    func trashLog() -> [TrashCall] {
+        state.value.withLock { $0.trashLog }
     }
 
     /// Chronological log of every attempted modify call (including rejected
@@ -655,6 +670,12 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             }) {
                 return .bytes(Self.invalidLabelErrorBody(deletedLabel), contentType: "application/json", statusCode: 400)
             }
+            // Gmail keeps SENT and DRAFT itself: its labels guide marks both as
+            // not manually applicable, and `messages.modify` naming either, to
+            // add or to remove, is refused with this same `400`.
+            if let maintained = (additions + removals).first(where: { Self.gmailMaintainedLabelIds.contains($0) }) {
+                return .bytes(Self.invalidLabelErrorBody(maintained), contentType: "application/json", statusCode: 400)
+            }
             let found = state.value.withLock { model -> Bool in
                 guard var message = model.messagesByProviderId[providerId] else { return false }
                 message.labels.formUnion(additions)
@@ -664,7 +685,24 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             }
             return found ? .json(raw: "{}") : .status(404)
         }
+        // `messages.trash` / `messages.untrash`: add or remove TRASH, on any
+        // message, a draft's message included.
+        let serveTrash: @Sendable (FakeHTTP.Request, Bool) -> FakeHTTP.CannedResponse = { [state] request, trash in
+            let components = request.url.pathComponents
+            guard components.count >= 2 else { return .status(404) }
+            let providerId = components[components.count - 2]
+            let found = state.value.withLock { model -> Bool in
+                model.trashLog.append(TrashCall(providerMessageId: providerId, trash: trash))
+                guard var message = model.messagesByProviderId[providerId] else { return false }
+                if trash { message.labels.insert("TRASH") } else { message.labels.remove("TRASH") }
+                model.messagesByProviderId[providerId] = message
+                return true
+            }
+            return found ? .json(raw: "{}") : .status(404)
+        }
         http.register(path: "/messages/", method: "POST") { [state] request in
+            if request.url.path.hasSuffix("/trash") { return serveTrash(request, true) }
+            if request.url.path.hasSuffix("/untrash") { return serveTrash(request, false) }
             let response = serveModify(request)
             let components = request.url.pathComponents
             let providerId = components.count >= 2 ? components[components.count - 2] : ""

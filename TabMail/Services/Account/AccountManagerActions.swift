@@ -1457,6 +1457,16 @@ extension AccountManager {
                 for (_, msgs) in grouped {
                     let accountId = msgs[0].accountId
                     let folderPath = msgs[0].folderPath
+                    // Gmail keeps Sent and Drafts itself: no request can move a
+                    // message into either (`GmailProvider.gmailMaintainedLabelIds`),
+                    // so such a move is refused here rather than queued as a
+                    // change Gmail would refuse. An Undo back to Sent or Drafts
+                    // is queued by `undoMove`, not here.
+                    if GmailProvider.gmailMaintainedLabelIds.contains(destinationPath),
+                       try Account.fetchOne(db, key: accountId)?.provider == .gmail {
+                        admission.set(.terminalStale, ids: msgs.map(\.id))
+                        continue
+                    }
                     // Drafts are not ordinary mail: moving one out of the
                     // Drafts role breaks the provider address that makes it
                     // editable. Keep Trash available because delete has its
