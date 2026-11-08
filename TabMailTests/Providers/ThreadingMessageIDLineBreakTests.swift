@@ -43,8 +43,11 @@ struct ThreadingMessageIDLineBreakTests {
         let headers = email.additionalHeaders ?? [:]
         let stored = IMAPProvider.buildDraftEmail(from: draft, senderEmail: "me@example.com")
         let storedHeaders = stored.additionalHeaders ?? [:]
-        let graphHeaders = (exchange.buildGraphSendPayload(draft: draft)["internetMessageHeaders"]
+        let graphProperties = (exchange.buildGraphSendPayload(draft: draft)["singleValueExtendedProperties"]
             as? [[String: String]]) ?? []
+        let graphNames = [ExchangeProvider.graphInReplyToProperty: "In-Reply-To",
+                          ExchangeProvider.graphReferencesProperty: "References"]
+        let graphHeaders = graphProperties.map { ["name": graphNames[$0["id"] ?? ""] ?? ($0["id"] ?? ""), "value": $0["value"] ?? ""] }
         func graph(_ name: String) -> [String] { graphHeaders.filter { $0["name"] == name }.compactMap { $0["value"] } }
 
         return [

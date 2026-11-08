@@ -1520,10 +1520,32 @@ actor ExchangeProvider: EmailProvider {
         if let cached = authedHTTPCached { return cached }
         let built = AuthedHTTP(
             auth: AccountAuthSource(accountId: userEmail, accessToken: accessToken),
-            retry: .graph, logLabel: "Exchange", session: testSession
+            retry: .graph, logLabel: "Exchange", session: testSession,
+            onFailure: Self.logGraphFailure
         )
         authedHTTPCached = built
         return built
+    }
+
+    /// Debug log of a failed Graph request, naming Graph's error code and message
+    /// (a `400` otherwise reaches the log as a bare status). Never the request
+    /// body or the token, though Graph's own message can quote a request value
+    /// (an address, a search term); it reaches only the debug channel. A no-op
+    /// unless debug logging is on.
+    static func logGraphFailure(method: String, statusCode: Int, errorBody: Data?) {
+        BackgroundSyncLogger.logDebug(
+            "[Exchange] Graph \(method) failed: HTTP \(statusCode) \(graphErrorSummary(errorBody) ?? "(no Graph error)")")
+    }
+
+    /// `code: message` from a Graph error body (`{"error": {"code", "message"}}`),
+    /// or nil when the body isn't one.
+    static func graphErrorSummary(_ body: Data?) -> String? {
+        guard let body,
+              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let error = json["error"] as? [String: Any],
+              let code = error["code"] as? String else { return nil }
+        guard let message = error["message"] as? String, !message.isEmpty else { return code }
+        return "\(code): \(message)"
     }
 
     /// ⚑ THE `default` ARM TRAPS; IT MUST NEVER DOWNGRADE TO `GET`. Until R15-FIX-3
@@ -1735,6 +1757,11 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Sending Helpers
 
+    /// PidTagInReplyToId, the property Exchange writes a sent message's In-Reply-To from.
+    static let graphInReplyToProperty = "String 0x1042"
+    /// PidTagInternetReferences, the property Exchange writes a sent message's References from.
+    static let graphReferencesProperty = "String 0x1039"
+
     nonisolated func buildGraphSendPayload(draft: DraftMessage) -> [String: Any] {
         var message: [String: Any] = [:]
 
@@ -1759,17 +1786,21 @@ actor ExchangeProvider: EmailProvider {
             ["emailAddress": ["address": email]]
         }
 
-        // Threading headers (RFC 2822 requires angle brackets around message IDs)
-        var customHeaders: [[String: String]] = []
+        // Threading (RFC 2822 requires angle brackets around message IDs). Graph's
+        // `internetMessageHeaders` takes only custom `x-` headers, so In-Reply-To and
+        // References go as the MAPI properties Exchange writes those headers from
+        // (confirmed by a live reply). Only `sendMail` carries threading today:
+        // Outlook drafts upload without it (`DraftStore.uploadThreadHeaders`).
+        var threading: [[String: String]] = []
         if let inReplyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
-            customHeaders.append(["name": "In-Reply-To", "value": inReplyTo])
+            threading.append(["id": Self.graphInReplyToProperty, "value": inReplyTo])
         }
         let references = IMAPProvider.threadingMessageIDs(draft.references)
         if !references.isEmpty {
-            customHeaders.append(["name": "References", "value": references.joined(separator: " ")])
+            threading.append(["id": Self.graphReferencesProperty, "value": references.joined(separator: " ")])
         }
-        if !customHeaders.isEmpty {
-            message["internetMessageHeaders"] = customHeaders
+        if !threading.isEmpty {
+            message["singleValueExtendedProperties"] = threading
         }
 
         // Attachments

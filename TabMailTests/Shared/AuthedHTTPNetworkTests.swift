@@ -148,6 +148,76 @@ struct AuthedHTTPNetworkTests {
         #expect(recorder.requestCount == 2)
     }
 
+    /// Collects `onFailure` calls.
+    final class FailureLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _calls: [(method: String, status: Int, body: Data?)] = []
+        var calls: [(method: String, status: Int, body: Data?)] { lock.withLock { _calls } }
+        func record(_ method: String, _ status: Int, _ body: Data?) { lock.withLock { _calls.append((method, status, body)) } }
+    }
+
+    @Test("A final failure hands its method, status and error body to onFailure once, after the retries")
+    func finalFailureReachesOnFailure() async {
+        let errorBody = Data(#"{"error":{"code":"SomeCode","message":"Some message"}}"#.utf8)
+        let recorder = Recorder(responses: [(429, Data("rate".utf8)), (400, errorBody)])
+        let session = Self.makeSession(recorder: recorder)
+        let auth = TokenSource(initial: "t", nextRefresh: "t")
+        let log = FailureLog()
+        let http = AuthedHTTP(auth: auth, retry: HTTPRetryPolicy(retryableStatusCodes: [429], maxAttempts: 3, initialDelay: 0),
+                              logLabel: nil, session: session, onFailure: { log.record($0, $1, $2) })
+
+        await #expect(throws: HTTPError.self) { _ = try await http.post("https://example.test/v1/me/sendMail", body: Data("{}".utf8)) }
+        let calls = log.calls
+        #expect(calls.count == 1)
+        guard calls.count == 1 else { return }
+        #expect(calls[0].method == "POST")
+        #expect(calls[0].status == 400)
+        #expect(calls[0].body == errorBody)
+    }
+
+    @Test("A request that succeeds never calls onFailure")
+    func successSkipsOnFailure() async throws {
+        let recorder = Recorder(responses: [(200, Data("{}".utf8))])
+        let session = Self.makeSession(recorder: recorder)
+        let auth = TokenSource(initial: "t", nextRefresh: "t")
+        let log = FailureLog()
+        let http = AuthedHTTP(auth: auth, retry: .graph, logLabel: nil, session: session, onFailure: { log.record($0, $1, $2) })
+
+        _ = try await http.get("https://example.test/v1/me")
+        #expect(log.calls.isEmpty)
+    }
+
+    @Test("A 401 the refresh recovers from never reaches onFailure")
+    func recoveredUnauthorizedSkipsOnFailure() async throws {
+        let recorder = Recorder(responses: [(401, Data()), (200, Data("{}".utf8))])
+        let session = Self.makeSession(recorder: recorder)
+        let auth = TokenSource(initial: "old", nextRefresh: "new")
+        let log = FailureLog()
+        let http = AuthedHTTP(auth: auth, retry: .graph, logLabel: nil, session: session, onFailure: { log.record($0, $1, $2) })
+
+        _ = try await http.get("https://example.test/v1/me")
+        #expect(auth.refreshCount == 1)
+        #expect(log.calls.isEmpty, "an expired token that refreshed is not a failure")
+    }
+
+    @Test("After a 401 refresh, onFailure gets the retried request's failure, not the 401")
+    func failureAfterRefreshReachesOnFailure() async {
+        let errorBody = Data(#"{"error":{"code":"SomeCode","message":"Some message"}}"#.utf8)
+        let recorder = Recorder(responses: [(401, Data("unauth".utf8)), (400, errorBody)])
+        let session = Self.makeSession(recorder: recorder)
+        let auth = TokenSource(initial: "old", nextRefresh: "new")
+        let log = FailureLog()
+        let http = AuthedHTTP(auth: auth, retry: .graph, logLabel: nil, session: session, onFailure: { log.record($0, $1, $2) })
+
+        await #expect(throws: HTTPError.self) { _ = try await http.post("https://example.test/v1/me/sendMail", body: Data("{}".utf8)) }
+        let calls = log.calls
+        #expect(calls.count == 1)
+        guard calls.count == 1 else { return }
+        #expect(calls[0].method == "POST")
+        #expect(calls[0].status == 400)
+        #expect(calls[0].body == errorBody)
+    }
+
     @Test("Every request carries the X-Client-Timezone header")
     func timezoneHeader() async throws {
         let recorder = Recorder(responses: [(200, Data("{}".utf8))])
