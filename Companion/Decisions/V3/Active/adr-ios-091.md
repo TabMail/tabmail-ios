@@ -728,15 +728,18 @@ route to the other.
 Measured on a test Outlook.com mailbox on 2026-11-08: a single POST of exactly 3,100,000 bytes and a
 `createUploadSession` for 3,100,000 bytes were both accepted (HTTP 201). The suspected gap is not
 reproduced, so the threshold stays. The two edges are read differently: the single POST refuses
-from the binary 3,145,728 (these attachment limits are quoted in binary megabytes, 150 MB as
-157,286,400 bytes; reports say a single POST accepts larger files), and the session refuses below the
-decimal 3,000,000, the only reading both the documented error and the measured 3,100,000 allow.
+from the binary 3,145,728 (Practical365 gives the 150 MB maximum as 157,286,400 bytes, which suggests
+binary megabytes for these limits; not measured above 3,100,000, so this refusal may be stricter than
+Graph), and the session refuses below the decimal 3,000,000, the only reading both the documented
+error and the measured 3,100,000 allow (not measured below 3,000,000).
 
 Test side: `GraphAttachmentLimits` (TabMailTests/Infrastructure) states those two edges from the
 documentation and the live check, never from `ExchangeDraftConfig`. The fakes in
-`ExchangeNewDraftAttachmentTests`, `ExchangeAttachmentSendTests` and `DraftOpenReloadTests` refuse at
-them. Before this change the single-POST refusals sat at the app's own constant, so they agreed with
-it by construction. `everySizeAtTheEdgeIsAccepted`, and the send test's `edge` shape, push one file
+`ExchangeNewDraftAttachmentTests` and `ExchangeAttachmentSendTests` refuse at both;
+`DraftOpenReloadTests`, whose files are all small, models only the single-POST edge. Before this
+change the `ExchangeNewDraftAttachmentTests` and `DraftOpenReloadTests` refusals sat at the app's own
+constant, so they agreed with it by construction, and `ExchangeAttachmentSendTests` refused at its own
+3,000,000 on both routes and kept every file size out of the window. `everySizeAtTheEdgeIsAccepted`, and the send test's `edge` shape, push one file
 per size on either side of both readings through the first save and the send. A threshold below
 3,000,000 or above 3,145,728 routes one of those sizes to a route that refuses it and fails the
 suite. `ExchangeAttachmentSendTests` keeps its stricter assumption for an inline `sendMail` or draft

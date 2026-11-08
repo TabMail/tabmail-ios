@@ -18,10 +18,10 @@
 /// a single POST of exactly 3,100,000 bytes and a `createUploadSession` for
 /// 3,100,000 bytes were both accepted (HTTP 201). So the two edges are read
 /// differently, and a file of 3,000,000 to 3,145,727 bytes is accepted on both:
-/// - the single POST refuses from the binary reading, 3,145,728 bytes (these
-///   attachment limits are quoted in binary megabytes, 150 MB as 157,286,400
-///   bytes). Not measured above 3,100,000; it is reported to accept larger files,
-///   so this refusal is stricter than Graph may be and can only cause a false red;
+/// - the single POST refuses from the binary reading, 3,145,728 bytes
+///   (Practical365 gives the 150 MB maximum as 157,286,400 bytes, which suggests
+///   binary megabytes for these limits). Not measured above 3,100,000, so this
+///   refusal may be stricter than Graph and can only cause a false red;
 /// - the session refuses below the decimal reading, 3,000,000 bytes, the only
 ///   reading that both the documented error and the measured 3,100,000 allow.
 ///   Not measured below 3,000,000.

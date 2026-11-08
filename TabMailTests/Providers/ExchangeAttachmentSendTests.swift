@@ -21,7 +21,7 @@ import Testing
 @Suite("Outlook sends with attachments (#422)")
 struct ExchangeAttachmentSendTests {
     /// The inline refusal #422 reported for `sendMail`, read strictly as 3,000,000 bytes.
-    private static let documentedInlineLimit = 3_000_000
+    private static let reportedInlineLimit = 3_000_000
 
     private func draft(_ files: [DraftAttachment], html: Bool = false) -> DraftMessage {
         DraftMessage(to: ["recipient@example.com"], cc: ["copy@example.com"],
@@ -69,7 +69,7 @@ struct ExchangeAttachmentSendTests {
         init(idPrefix: String = "g") { self.idPrefix = idPrefix }
 
         private static func inlineFiles(
-            _ json: [String: Any], under limit: Int = ExchangeAttachmentSendTests.documentedInlineLimit
+            _ json: [String: Any], under limit: Int = ExchangeAttachmentSendTests.reportedInlineLimit
         ) -> [String: Data]? {
             var files: [String: Data] = [:]
             for file in json["attachments"] as? [[String: Any]] ?? [] {

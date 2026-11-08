@@ -2113,10 +2113,11 @@ private struct GraphRemoved: Decodable {
 /// gives the byte count. On a test mailbox on 2026-11-08, Graph accepted a file of
 /// 3,100,000 bytes on both routes (HTTP 201 for the single POST and for
 /// `createUploadSession`), so the gap #433 suspected between the two readings
-/// (3,000,000 to 3,145,727 bytes) was not reproduced on either route. The threshold stays a
-/// binary megabyte, the single POST's reading (these attachment limits are quoted
-/// in binary megabytes, 150 MB as 157,286,400 bytes). A file the service refuses
-/// on either path only fails its add, which is retried and never deletes anything.
+/// (3,000,000 to 3,145,727 bytes) was not reproduced on either route. The threshold
+/// stays a binary megabyte, the single POST's reading (Practical365 gives the
+/// 150 MB maximum as 157,286,400 bytes, which suggests binary megabytes for these
+/// limits). A file the service refuses on either path only fails its add, which is
+/// retried and never deletes a file the draft holds.
 enum ExchangeDraftConfig {
     static let singlePostAttachmentLimitBytes = 3 * 1024 * 1024
     /// Each PUT's byte range; Graph asks for under 4 MB per request.
