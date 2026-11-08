@@ -321,10 +321,13 @@ struct NSESummaryTextMessageCarryTests {
 
     /// The whole extension path: a Gmail push through `NotificationService.didReceive`, a summary
     /// answered with a text message, and the staged row the merge reads. Catches the extension
-    /// parsing the text message and then not passing it on.
+    /// parsing the text message and then not passing it on. An email from one of the user's
+    /// addresses (this account's or another registered account's) is the user's own: its summary is
+    /// asked for in the user's voice, as the queue asks, since the chat reuses the staged rendering.
     @MainActor
-    @Test("A push through the extension stages the summary's text message")
-    func pushStagesTextMessage() async throws {
+    @Test("A push through the extension stages the summary's text message, in the user's voice for their own email",
+          arguments: [("Sender <sender@example.com>", false), ("Me <user@example.com>", true), ("Me <Other@example.com>", true)])
+    func pushStagesTextMessage(from: String, own: Bool) async throws {
         let (dir, _) = try Self.makeStaging()
         defer { try? FileManager.default.removeItem(at: dir) }
         let stagingPath = dir.appendingPathComponent("nse_staging.sqlite").path
@@ -342,7 +345,8 @@ struct NSESummaryTextMessageCarryTests {
         try store.install(accountId: accountId, tokens: .init(accessToken: "synthetic-access",
             refreshToken: "synthetic-refresh", expiresAt: Date().addingTimeInterval(3600)))
         try h.sessions.installNewSession(CredentialTestHarness.sessionData(access: "synthetic-backend", expired: false))
-        defaults.set("{\"user@example.com\":\"\(accountId)\"}", forKey: SharedNSEData.accountMapKey)
+        defaults.set("{\"user@example.com\":\"\(accountId)\",\"other@example.com\":\"other-account\"}",
+                     forKey: SharedNSEData.accountMapKey)
         defaults.set(false, forKey: SharedNSEData.deviceSyncEnabledKey)
 
         let body = Data("Lunch on Friday?".utf8).base64EncodedString()
@@ -353,19 +357,23 @@ struct NSESummaryTextMessageCarryTests {
          "internalDate": "\(Int(Date().timeIntervalSince1970 * 1000))", "labelIds": ["INBOX", "UNREAD"],
          "snippet": "Lunch on Friday?",
          "payload": {"mimeType": "text/plain",
-           "headers": [{"name": "Subject", "value": "Lunch"}, {"name": "From", "value": "Sender <sender@example.com>"},
+           "headers": [{"name": "Subject", "value": "Lunch"}, {"name": "From", "value": "\(from)"},
                        {"name": "To", "value": "user@example.com"}, {"name": "Message-ID", "value": "<lunch@example.com>"}],
            "body": {"size": 16, "data": "\(body)"}}}
         """
         http.register(path: "/messages/synthetic-message", response: .json(raw: message))
 
         let prompts = Mutex<[String]>([])
+        let summaryOwnFlags = Mutex<[Bool]>([])
         let backend: NSETokenManager.DataForRequest = { request in
             let sent = try JSONSerialization.jsonObject(with: request.httpBody ?? Data()) as? [String: Any]
             let alias = (sent?["messages"] as? [[String: Any]])?.first?["content"] as? String ?? ""
             prompts.withLock { $0.append(alias) }
+            let ownFlag = (sent?["messages"] as? [[String: Any]])?.first?["is_sent_by_user"] as? Bool == true
+            if alias == "system_prompt_summary" { summaryOwnFlags.withLock { $0.append(ownFlag) } }
+            // The text message tells which voice was asked for.
             let assistant = alias == "system_prompt_summary"
-                ? #"{"todos": [], "summary": "Lunch on Friday.", "reminder": {"due_date": null, "due_time": null, "content": null}, "text_message": "Lunch Friday?"}"#
+                ? #"{"todos": [], "summary": "Lunch on Friday.", "reminder": {"due_date": null, "due_time": null, "content": null}, "text_message": "\#(ownFlag ? "Lunch Friday? I asked." : "Lunch Friday?")"}"#
                 : #"{"action": "reply"}"#
             return (try JSONSerialization.data(withJSONObject: ["assistant": assistant]),
                     HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
@@ -398,9 +406,10 @@ struct NSESummaryTextMessageCarryTests {
         service.serviceExtensionTimeWillExpire()
 
         #expect(prompts.withLock { $0 }.first == "system_prompt_summary")
+        #expect(summaryOwnFlags.withLock { $0 } == [own], "the summary request says whether the user wrote the email")
         let staged = try Self.decode(try DatabaseQueue(path: stagingPath), id: "\(accountId):synthetic-message")
         #expect(staged.summaryBlurb == "Lunch on Friday.")
         #expect(staged.actionTag == "reply")
-        #expect(staged.summaryTextMessage == "Lunch Friday?")
+        #expect(staged.summaryTextMessage == (own ? "Lunch Friday? I asked." : "Lunch Friday?"))
     }
 }
