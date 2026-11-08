@@ -994,12 +994,14 @@ actor ExchangeProvider: EmailProvider {
     /// there only under 3 MB and wants an upload session for 3-150 MB, choosing
     /// per file (Graph: "Attach large files to Outlook messages"), so a message
     /// with files is created as a draft, given each file the way a draft save adds
-    /// it, then sent (`POST /messages/{id}/send`) (#422). Any failure removes that
-    /// draft before rethrowing, so an Outbox retry never leaves a copy behind per
-    /// attempt. If the send itself was accepted and only its answer was lost, the
-    /// message has left: the delete finds nothing (a moved item gets a new id) or
-    /// moves the leftover to Deleted Items, and the retry may send it again, as a
-    /// lost `sendMail` answer would (a duplicate, never a drop).
+    /// it, then sent (`POST /messages/{id}/send`) (#422). Any failure tries once to
+    /// remove that draft and rethrows the original error, so the Outbox classifies it
+    /// as before and a retry normally leaves no copy in Drafts; a refused cleanup, a
+    /// lost create answer or an app kill can leave one (`IOS-DRAFT-026`). If the send
+    /// was accepted (Graph submits it asynchronously) and only its answer was lost,
+    /// the delete finds nothing (a moved item gets a new id) or moves the leftover to
+    /// Deleted Items, and the retry may send it again, as a lost `sendMail` answer
+    /// would (a duplicate, never a drop). Nothing is deleted after an accepted send.
     func send(draft: DraftMessage) async throws {
         guard !draft.attachments.isEmpty else {
             let message = buildGraphSendPayload(draft: draft)
@@ -1137,7 +1139,7 @@ actor ExchangeProvider: EmailProvider {
                 path: "/messages/\(encodedId)/attachments/\(encodedAttachmentId)", method: "DELETE")
         }
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[Exchange] saveDraft: added \(plan.add.count), removed \(plan.deleteIds.count) attachment(s)")
+            BackgroundSyncLogger.logDebug("[Exchange] draft attachments: added \(plan.add.count), removed \(plan.deleteIds.count) attachment(s)")
         }
     }
 
@@ -1867,8 +1869,9 @@ actor ExchangeProvider: EmailProvider {
         // Threading (RFC 2822 requires angle brackets around message IDs). Graph's
         // `internetMessageHeaders` takes only custom `x-` headers, so In-Reply-To and
         // References go as the MAPI properties Exchange writes those headers from
-        // (confirmed by a live reply). Only `sendMail` carries threading today:
-        // Outlook drafts upload without it (`DraftStore.uploadThreadHeaders`).
+        // (confirmed by a live reply on `sendMail`). A send with files carries them on
+        // its draft create, then `/messages/{id}/send` (#422); a draft save uploads
+        // without them (`DraftStore.uploadThreadHeaders`).
         var threading: [[String: String]] = []
         if let inReplyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
             threading.append(["id": Self.graphInReplyToProperty, "value": inReplyTo])

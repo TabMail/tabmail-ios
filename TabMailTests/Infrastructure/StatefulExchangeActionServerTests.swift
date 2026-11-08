@@ -392,7 +392,9 @@ struct StatefulExchangeActionServerTests {
     /// message without files, and `saveDraft`'s create branch POSTs
     /// `/mailFolders/drafts/messages` — neither URL contains the `/messages/`
     /// substring the fixture matches on, so neither is gated at all. (A send with
-    /// files goes through that same create, then POSTs `/messages/{id}/send`, #422.)
+    /// files goes through that same ungated create; its attachment calls and its
+    /// `/messages/{id}/send` do contain `/messages/`, so the POST gate applies to
+    /// those, #422.)
     /// (`appendToSentFolder` and `setActionTag` issue no HTTP, so they are
     /// vacuously outside it.)
     ///

@@ -8,12 +8,16 @@ import Testing
 @testable import TabMail
 
 /// An Outlook send must deliver one message carrying every authored file, whatever
-/// the files' sizes, keep a reply in its thread, and leave nothing behind in Drafts (#422). Graph limits a file
-/// added inline, in `sendMail` or in a single attachment POST, to under 3 MB, and
-/// asks for an upload session for 3-150 MB ("Attach large files to Outlook
-/// messages"). The fake mailbox refuses what Graph documents as refused, at the
-/// strict decimal reading of that limit, and records only the remote effects: what
-/// was sent and which drafts remain. The file sizes stay clear of the window
+/// the files' sizes, keep a reply in its thread, and leave nothing behind in Drafts (#422).
+/// A failed send must reach the Outbox with the error it would classify as before, and
+/// a send must never be dropped. Graph limits a file added inline to under 3 MB and
+/// asks for an upload session for 3-150 MB ("Attach large files to Outlook messages").
+/// The fake mailbox records only the remote effects: what was sent and which drafts
+/// remain. Two of its refusals are assumptions stricter than any Graph page, so they
+/// can only cause a false red: `sendMail` answers 413 for an inline file of 3,000,000
+/// bytes or more (the behaviour #422 reported; the sendMail page states no limit), and
+/// `createUploadSession` answers 400 for a smaller file (Graph says to use a session
+/// for 3-150 MB but documents no refusal). The file sizes stay clear of the window
 /// between 3,000,000 bytes and the app's binary-megabyte constant (#433).
 @Suite("Outlook sends with attachments (#422)")
 struct ExchangeAttachmentSendTests {
@@ -53,6 +57,10 @@ struct ExchangeAttachmentSendTests {
         let state = Mutex(State())
         /// A path suffix whose next POST times out once, as a lost connection would.
         let failOnce = Mutex<String?>(nil)
+        /// The next `/send` is applied, then its answer is lost.
+        let loseSendAnswerOnce = Mutex(false)
+        /// Every DELETE is refused, as an unavailable server would refuse it.
+        let refuseDeletes = Mutex(false)
 
         private static func inlineFiles(_ json: [String: Any]) -> [String: Data]? {
             var files: [String: Data] = [:]
@@ -108,7 +116,11 @@ struct ExchangeAttachmentSendTests {
                     guard state.drafts[id] != nil else { return .status(404) }
                     if path.hasSuffix("/send") {
                         state.sent.append(state.drafts.removeValue(forKey: id)!)
-                        return .status(202)
+                        let lost = self.loseSendAnswerOnce.withLock { lose in
+                            defer { lose = false }
+                            return lose
+                        }
+                        return lost ? .transportError(.timedOut) : .status(202)
                     }
                     if path.hasSuffix("/createUploadSession") {
                         guard let item = Self.json(request)?["AttachmentItem"] as? [String: Any],
@@ -139,6 +151,7 @@ struct ExchangeAttachmentSendTests {
                 }
             }
             http.register(path: "/messages/", method: "DELETE") { request in
+                if self.refuseDeletes.withLock({ $0 }) { return .status(503) }
                 let id = request.url.lastPathComponent
                 return self.state.withLock { $0.drafts.removeValue(forKey: id) } == nil ? .status(404) : .status(204)
             }
@@ -190,6 +203,8 @@ struct ExchangeAttachmentSendTests {
         #expect(mailbox.draftIds.isEmpty)
         #expect(mailbox.state.withLock { $0.uploadAuthorizations.allSatisfy { $0 == nil } },
                 "the pre-authenticated upload URL must not also carry the account token")
+        #expect(!http.recordedCalls().contains { $0.method == "DELETE" },
+                "a delete after an accepted send could withdraw the message being sent")
     }
 
     @Test("A send without attachments stays one sendMail call")
@@ -209,25 +224,35 @@ struct ExchangeAttachmentSendTests {
         #expect(http.recordedCalls().map { "\($0.method) \(URL(string: $0.url)?.path ?? "")" } == ["POST /v1.0/me/sendMail"])
     }
 
-    @Test("A failed send throws, removes only its own draft, and the retry sends exactly once",
-          arguments: ["upload", "send"])
+    /// The Outbox decides from the thrown error whether to keep retrying (a lost
+    /// connection) or to count the attempt; the draft route must hand it the same error
+    /// a lost connection gives, whatever its cleanup does.
+    private static func expectStillTransient(_ error: (any Error)?) {
+        #expect(error is URLError, "the lost connection must reach the Outbox unchanged, got \(String(describing: error))")
+        #expect(error.map(AccountManager.isTransientSendError) == true)
+    }
+
+    @Test("A failed send keeps its lost-connection error, removes only its own draft, and the retry sends exactly once",
+          arguments: ["upload", "send", "send, cleanup refused"])
     func failedSendIsRetryable(stage: String) async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let mailbox = Mailbox()
         mailbox.failOnce.withLock { $0 = stage == "upload" ? "/createUploadSession" : "/send" }
+        let cleanupRefused = stage == "send, cleanup refused"
+        mailbox.refuseDeletes.withLock { $0 = cleanupRefused }
         mailbox.install(http)
         let authored = draft([Self.file("notes.txt", bytes: 5), Self.file("photo.jpg", bytes: 6_000_000)])
         let graph = provider(http)
 
-        await #expect(throws: (any Error).self) {
-            try await graph.send(draft: authored)
-        }
+        var thrown: (any Error)?
+        do { try await graph.send(draft: authored) } catch { thrown = error }
 
+        Self.expectStillTransient(thrown)
         #expect(mailbox.sent.isEmpty)
-        #expect(mailbox.draftIds.isEmpty, "a failed send must not leave its draft behind for every retry")
-        let deleted = http.recordedCalls().filter { $0.method == "DELETE" }
-        #expect(deleted.map { URL(string: $0.url)?.path } == ["/v1.0/me/messages/g1"])
+        // A refused cleanup leaves this attempt's draft, and only it, for ordinary deletion.
+        #expect(mailbox.draftIds == (cleanupRefused ? ["g1"] : []),
+                "a failed send must not leave its draft behind for every retry")
 
         try await graph.send(draft: authored)
 
@@ -235,6 +260,30 @@ struct ExchangeAttachmentSendTests {
         #expect(sent.count == 1)
         guard sent.count == 1 else { return }
         Self.expectSent(sent[0], matches: authored)
+        #expect(mailbox.draftIds == (cleanupRefused ? ["g1"] : []))
+        let deleted = http.recordedCalls().filter { $0.method == "DELETE" }
+        #expect(deleted.map { URL(string: $0.url)?.path } == ["/v1.0/me/messages/g1"],
+                "only the failed attempt's own draft is deleted, and nothing after the accepted send")
+    }
+
+    @Test("A send whose answer is lost is retried: at worst a duplicate, never a drop")
+    func lostSendAnswerIsNeverADrop() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let mailbox = Mailbox()
+        mailbox.loseSendAnswerOnce.withLock { $0 = true }
+        mailbox.install(http)
+        let authored = draft([Self.file("photo.jpg", bytes: 6_000_000)])
+        let graph = provider(http)
+
+        var thrown: (any Error)?
+        do { try await graph.send(draft: authored) } catch { thrown = error }
+        Self.expectStillTransient(thrown)
+        try await graph.send(draft: authored)
+
+        let sent = mailbox.sent
+        #expect(!sent.isEmpty)
+        for message in sent { Self.expectSent(message, matches: authored) }
         #expect(mailbox.draftIds.isEmpty)
     }
 }

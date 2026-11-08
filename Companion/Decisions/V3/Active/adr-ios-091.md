@@ -689,11 +689,27 @@ then `POST /messages/{id}/send`. Small files take this route too: no Graph page 
 request size for `sendMail`, and routing every file through the per-file path leaves nothing to
 assume about one.
 
-Any failure, the send included, deletes only the draft this attempt created and rethrows the
-original error, so an Outbox retry never accumulates copies. The Outbox's `sentAt` firewall is
+Any failure, the send included, tries once to delete only the draft this attempt created and
+rethrows the original error unchanged, so the Outbox classifies it as before and a retry normally
+leaves no copy in Drafts (each failed attempt's soft-deleted copy goes to Deleted Items /
+Recoverable Items). The Outbox's `sentAt` firewall is
 unchanged: `send` still returns only after Graph accepted the send. If the send was accepted and
 only its answer was lost, the delete finds nothing (a moved item gets a new id, no
 `Prefer: IdType="ImmutableId"` is sent) or moves the leftover to Deleted Items, and the retry may
-send again: a duplicate, never a drop (Outbox Reliability Rule 4). A failed cleanup leaves one
-ordinary Drafts message the user can delete, the `IOS-DRAFT-015` residual. Pinned by
-`ExchangeAttachmentSendTests`, whose fake refuses an inline file of 3,000,000 bytes or more.
+send again: a duplicate, never a drop (Outbox Reliability Rule 4). Nothing is deleted after an
+accepted send: Graph's 202 is an asynchronous submission, and a delete then could withdraw it.
+
+Residual, registered as `IOS-DRAFT-026` (open, pending acceptance): a refused cleanup, a lost create
+answer or an app kill between create and send leaves that attempt's draft in Drafts, one per
+affected attempt, recoverable by one ordinary delete. Unlike the draft-save residual
+(`IOS-DRAFT-015`), a later successful attempt does not replace it, and it is a copy of a message
+that is sent. No mechanism finds and deletes it: matching Drafts by Message-ID could delete the
+user's own draft of the same message. Also stated: while files upload the draft is visible in
+Drafts on every client, and a refusal of the whole message at `/send` (for example over the
+mailbox's send-size limit) is permanent, so it repeats the full upload up to three times before
+the Outbox parks it as failed.
+
+Pinned by `ExchangeAttachmentSendTests`: every file, the threading, no draft left, no delete after an
+accepted send, a lost connection reaching the Outbox as the same transient error whether the cleanup
+succeeds or is refused, and a lost send answer giving at worst a duplicate. Its fake refuses an
+inline file of 3,000,000 bytes or more.
