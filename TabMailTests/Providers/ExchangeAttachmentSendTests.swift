@@ -24,10 +24,11 @@ struct ExchangeAttachmentSendTests {
     /// Graph's documented "under 3 MB", read strictly.
     private static let documentedInlineLimit = 3_000_000
 
-    private func draft(_ files: [DraftAttachment]) -> DraftMessage {
+    private func draft(_ files: [DraftAttachment], html: Bool = false) -> DraftMessage {
         DraftMessage(to: ["recipient@example.com"], cc: ["copy@example.com"],
-                     bcc: ["blind@example.com"], subject: "Re: Plan", body: "Authored text",
-                     inReplyTo: "parent@example.com",
+                     bcc: ["blind@example.com"], subject: "Re: Plan",
+                     body: html ? "<p>Authored <b>text</b></p><blockquote>Quoted</blockquote>" : "Authored text",
+                     isHTML: html, inReplyTo: "parent@example.com",
                      references: ["root@example.com", "parent@example.com"], attachments: files)
     }
 
@@ -61,6 +62,12 @@ struct ExchangeAttachmentSendTests {
         let loseSendAnswerOnce = Mutex(false)
         /// Every DELETE is refused, as an unavailable server would refuse it.
         let refuseDeletes = Mutex(false)
+        /// The next `/send` is refused with this HTTP status; the draft stays.
+        let refuseSendOnce = Mutex<Int?>(nil)
+        /// Created drafts get ids `\(idPrefix)1`, `\(idPrefix)2`, …; Graph ids are opaque.
+        let idPrefix: String
+
+        init(idPrefix: String = "g") { self.idPrefix = idPrefix }
 
         private static func inlineFiles(_ json: [String: Any]) -> [String: Data]? {
             var files: [String: Data] = [:]
@@ -77,9 +84,13 @@ struct ExchangeAttachmentSendTests {
             request.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         }
 
-        /// The message id in `/messages/{id}/…`.
+        /// The message id in `/messages/{id}/…`, read segment by segment from the
+        /// percent-encoded path so an id holding an encoded `/` stays one id.
         private static func messageId(_ request: FakeHTTP.Request) -> String? {
-            let parts = request.url.pathComponents
+            let encodedPath = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? ""
+            let parts = encodedPath.split(separator: "/", omittingEmptySubsequences: false).map {
+                String($0).removingPercentEncoding ?? String($0)
+            }
             return parts.firstIndex(of: "messages").flatMap { $0 + 1 < parts.count ? parts[$0 + 1] : nil }
         }
 
@@ -94,7 +105,7 @@ struct ExchangeAttachmentSendTests {
                 guard let json = Self.json(request), let files = Self.inlineFiles(json) else { return .status(413) }
                 return self.state.withLock { state in
                     state.creations += 1
-                    let id = "g\(state.creations)"
+                    let id = "\(self.idPrefix)\(state.creations)"
                     state.drafts[id] = Message(json: json, files: files)
                     return .json(raw: "{\"id\":\"\(id)\"}", statusCode: 201)
                 }
@@ -115,6 +126,11 @@ struct ExchangeAttachmentSendTests {
                 return self.state.withLock { state in
                     guard state.drafts[id] != nil else { return .status(404) }
                     if path.hasSuffix("/send") {
+                        let refusal = self.refuseSendOnce.withLock { status in
+                            defer { status = nil }
+                            return status
+                        }
+                        if let refusal { return .status(refusal) }
                         state.sent.append(state.drafts.removeValue(forKey: id)!)
                         let lost = self.loseSendAnswerOnce.withLock { lose in
                             defer { lose = false }
@@ -152,7 +168,7 @@ struct ExchangeAttachmentSendTests {
             }
             http.register(path: "/messages/", method: "DELETE") { request in
                 if self.refuseDeletes.withLock({ $0 }) { return .status(503) }
-                let id = request.url.lastPathComponent
+                let id = Self.messageId(request) ?? ""
                 return self.state.withLock { $0.drafts.removeValue(forKey: id) } == nil ? .status(404) : .status(204)
             }
         }
@@ -164,7 +180,7 @@ struct ExchangeAttachmentSendTests {
     private static func expectSent(_ message: Mailbox.Message, matches authored: DraftMessage) {
         #expect(message.files == Dictionary(uniqueKeysWithValues: authored.attachments.map { ($0.filename, $0.data) }))
         #expect(message.json["subject"] as? String == authored.subject)
-        #expect((message.json["body"] as? [String: String]) == ["contentType": "text", "content": authored.body])
+        #expect((message.json["body"] as? [String: String]) == ["contentType": authored.isHTML ? "html" : "text", "content": authored.body])
         for (key, expected) in [("toRecipients", authored.to), ("ccRecipients", authored.cc), ("bccRecipients", authored.bcc)] {
             let recipients = message.json[key] as? [[String: [String: String]]]
             #expect(recipients?.compactMap { $0["emailAddress"]?["address"] } == expected)
@@ -178,7 +194,7 @@ struct ExchangeAttachmentSendTests {
     }
 
     @Test("One message goes out carrying every file, and no draft is left behind",
-          arguments: ["small", "combined", "large", "mixed"])
+          arguments: ["small", "combined", "large", "mixed", "html"])
     func sendCarriesEveryFile(shape: String) async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -190,9 +206,11 @@ struct ExchangeAttachmentSendTests {
         case "small": [small]
         case "combined": [Self.file("one.bin", bytes: 1_600_000), Self.file("two.bin", bytes: 1_600_000)]
         case "large": [large]
+        case "html": [small, large]
         default: [small, large, Self.file("other.pdf", bytes: 7_000_000)]
         }
-        let authored = draft(files)
+        // An HTML reply or forward with files must go out as HTML, not as markup in text.
+        let authored = draft(files, html: shape == "html")
 
         try await provider(http).send(draft: authored)
 
@@ -284,6 +302,58 @@ struct ExchangeAttachmentSendTests {
         let sent = mailbox.sent
         #expect(!sent.isEmpty)
         for message in sent { Self.expectSent(message, matches: authored) }
+        #expect(mailbox.draftIds.isEmpty)
+    }
+
+    @Test("A send refused by Graph stays a counted refusal, whatever its cleanup does",
+          arguments: [false, true])
+    func refusedSendStaysPermanent(cleanupRefused: Bool) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let mailbox = Mailbox()
+        mailbox.refuseSendOnce.withLock { $0 = 403 }
+        mailbox.refuseDeletes.withLock { $0 = cleanupRefused }
+        mailbox.install(http)
+        let authored = draft([Self.file("notes.txt", bytes: 5), Self.file("photo.jpg", bytes: 6_000_000)])
+
+        var thrown: (any Error)?
+        do { try await provider(http).send(draft: authored) } catch { thrown = error }
+
+        // The same refusal a `sendMail` refusal gives, so the Outbox counts it and parks
+        // the row after its attempts instead of retrying it forever.
+        guard let failure = thrown as? ProviderError, case .networkError(let underlying) = failure,
+              let httpFailure = underlying as? HTTPError, case .networkError(let status) = httpFailure else {
+            Issue.record("the refusal must reach the Outbox as networkError(403), got \(String(describing: thrown))")
+            return
+        }
+        #expect(status == 403)
+        #expect(thrown.map(AccountManager.isTransientSendError) == false)
+        #expect(mailbox.sent.isEmpty)
+        #expect(mailbox.draftIds == (cleanupRefused ? ["g1"] : []))
+    }
+
+    @Test("A draft whose Graph id holds reserved characters is sent, and cleaned up, as that exact resource")
+    func opaqueDraftIdAddressesItsOwnResource() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let opaque = "AAMk/a+b=c?d#"
+        let mailbox = Mailbox(idPrefix: opaque)
+        mailbox.failOnce.withLock { $0 = "/send" }
+        mailbox.install(http)
+        let authored = draft([Self.file("notes.txt", bytes: 5)])
+        let graph = provider(http)
+
+        var thrown: (any Error)?
+        do { try await graph.send(draft: authored) } catch { thrown = error }
+        Self.expectStillTransient(thrown)
+        #expect(mailbox.draftIds.isEmpty, "the cleanup must delete the draft this attempt created")
+
+        try await graph.send(draft: authored)
+
+        let sent = mailbox.sent
+        #expect(sent.count == 1)
+        guard sent.count == 1 else { return }
+        Self.expectSent(sent[0], matches: authored)
         #expect(mailbox.draftIds.isEmpty)
     }
 }
