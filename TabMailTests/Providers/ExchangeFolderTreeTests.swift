@@ -22,27 +22,32 @@ import Testing
 ///   different default and maximum page sizes");
 /// - a mail search folder under the root comes back in the same listing, marked
 ///   `"@odata.type": "#microsoft.graph.mailSearchFolder"`. It is a saved query
-///   over messages that live in real folders, not a place mail can be filed.
+///   over messages that live in real folders, not a place mail can be filed;
+/// - a hidden folder (`isHidden`) is listed only when the request asks for it
+///   with `includeHiddenFolders=true` (List mailFolders), and the nextLink
+///   carries the request's options to the following pages.
 @Suite("ExchangeProvider — whole folder tree")
 struct ExchangeFolderTreeTests {
     private struct Node {
         let id: String
         let name: String
         let isSearchFolder: Bool
+        let isHidden: Bool
         let children: [Node]
 
-        init(_ id: String, _ name: String, search: Bool = false, _ children: [Node] = []) {
+        init(_ id: String, _ name: String, search: Bool = false, hidden: Bool = false, _ children: [Node] = []) {
             self.id = id
             self.name = name
             self.isSearchFolder = search
+            self.isHidden = hidden
             self.children = children
         }
 
         var subtree: [Node] { [self] + children.flatMap(\.subtree) }
     }
 
-    /// Five folders under the root (three pages), an Inbox with three children
-    /// (two pages), and a branch four levels deep.
+    /// Six folders under the root (three pages), one of them hidden, an Inbox
+    /// with three children (two pages), and a branch four levels deep.
     private static let rootChildren: [Node] = [
         Node("f-inbox", "Inbox", [
             Node("f-clients", "Clients", [
@@ -59,7 +64,15 @@ struct ExchangeFolderTreeTests {
         ]),
         Node("f-digest", "Weekly digests", search: true),
         Node("f-archive", "Archive"),
+        Node("f-hidden", "Hidden notes", hidden: true),
     ]
+
+    /// Every folder's own unread and total counts, all different, so a count
+    /// taken from the wrong field or the wrong folder shows.
+    private static func counts(_ id: String) -> (unread: Int, total: Int) {
+        let index = rootChildren.flatMap(\.subtree).firstIndex { $0.id == id } ?? 0
+        return (unread: index + 1, total: 100 + 7 * index)
+    }
 
     /// Smaller than both `$top` values the app sends, so every listing with
     /// more than this many folders needs `@odata.nextLink`.
@@ -70,20 +83,25 @@ struct ExchangeFolderTreeTests {
         let type = node.isSearchFolder
             ? "\"@odata.type\": \"#microsoft.graph.mailSearchFolder\", "
             : ""
+        let count = counts(node.id)
         return """
         {\(type)"id": "\(node.id)", "displayName": "\(node.name)", \
-        "unreadItemCount": 0, "totalItemCount": 0, "childFolderCount": \(node.children.count)}
+        "unreadItemCount": \(count.unread), "totalItemCount": \(count.total), "childFolderCount": \(node.children.count)}
         """
     }
 
     /// One page of `children`, starting at the `$skiptoken` the request carries.
-    private static func page(of children: [Node], listingPath: String, url: URL) -> String {
+    /// Hidden folders are in the listing only when the request asks for them.
+    private static func page(of allChildren: [Node], listingPath: String, url: URL) -> String {
         let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         let start = items.first { $0.name == "$skiptoken" }.flatMap { Int($0.value ?? "") } ?? 0
+        let withHidden = items.contains { $0.name == "includeHiddenFolders" && $0.value == "true" }
+        let children = allChildren.filter { withHidden || !$0.isHidden }
         let end = min(start + pageSize, children.count)
         let values = children[start..<end].map(folderJSON).joined(separator: ", ")
+        let carried = withHidden ? "&includeHiddenFolders=true" : ""
         let next = end < children.count
-            ? ", \"@odata.nextLink\": \"\(graphBase)\(listingPath)?$skiptoken=\(end)\""
+            ? ", \"@odata.nextLink\": \"\(graphBase)\(listingPath)?$skiptoken=\(end)\(carried)\""
             : ""
         return "{\"value\": [\(values)]\(next)}"
     }
@@ -114,7 +132,7 @@ struct ExchangeFolderTreeTests {
         return .status(404)
     }
 
-    @Test("Every real folder at every depth and on every page is listed once; search folders are not")
+    @Test("Every real folder at every depth and on every page, hidden ones included, is listed once with its own counts; search folders are not")
     func everyFolderInTheTreeIsListed() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -136,7 +154,10 @@ struct ExchangeFolderTreeTests {
         let byId = Dictionary(uniqueKeysWithValues: folders.map { ($0.path, $0) })
         for node in realFolders {
             #expect(byId[node.id]?.name == node.name)
+            #expect(byId[node.id]?.unreadCount == Self.counts(node.id).unread, "\(node.id) unread")
+            #expect(byId[node.id]?.totalCount == Self.counts(node.id).total, "\(node.id) total")
         }
+        #expect(listedIds.contains("f-hidden"), "a hidden folder is a real folder mail can be filed in")
         #expect(byId["f-inbox"]?.role == .inbox)
         #expect(byId["f-sent"]?.role == .sent)
         #expect(byId["f-acme-contracts"]?.role == .custom)
