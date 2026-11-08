@@ -1398,8 +1398,9 @@ actor GmailProvider: EmailProvider {
         BackgroundSyncLogger.log("gmail.fetchHistory: START hid=\(historyId) email=\(userEmail)")
 
         // Route through Shared/API/GmailAPI — single implementation for main app
-        // and NSE. 404 (historyId expired) surfaces as nil so callers fall back
-        // to full sync, matching legacy behavior.
+        // and NSE. 404 (historyId expired), and history longer than
+        // `GmailAPI.historyMaxPages` pages, surface as nil so callers fall back
+        // to full sync.
         let http = AuthedHTTP(
             auth: AccountAuthSource(accountId: userEmail, accessToken: accessToken),
             retry: .gmail, logLabel: "Gmail", session: testSession
@@ -1418,8 +1419,8 @@ actor GmailProvider: EmailProvider {
             throw ProviderError.networkError(underlying: error)
         }
         guard let delta else {
-            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] History expired (historyId: \(historyId)) — need full sync") }
-            BackgroundSyncLogger.log("gmail.fetchHistory: 404 history expired")
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] History expired or too long (historyId: \(historyId)) — need full sync") }
+            BackgroundSyncLogger.log("gmail.fetchHistory: history expired or too long")
             return nil
         }
 

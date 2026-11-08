@@ -44,29 +44,68 @@ enum GmailAPI {
     /// `metadataQuery`.
     static let fullQuery = "?format=full"
 
+    /// Records per `users.history.list` page: Gmail's documented maximum (the
+    /// default is 100), to keep the number of round trips low.
+    static let historyPageSize = 500
+
+    /// Most `users.history.list` pages read in one call (`historyPageSize`
+    /// records each). History longer than this is answered like an expired
+    /// history id (nil, so the caller runs a full sync): the cursor must never
+    /// move past pages that were not read, and a cap that threw instead would
+    /// fail the same way on every retry.
+    static let historyMaxPages = 40
+
     /// `users.history.list` — incremental changes since `startHistoryId`.
     /// `historyTypes` filters which events are returned (Gmail default = all four).
     /// `labelId` restricts to a single label (e.g. "INBOX"); pass nil for mailbox-wide.
     ///
+    /// Follows `nextPageToken` until Gmail sends none ("If you receive no
+    /// `nextPageToken` in the response, there are no updates to retrieve"), so
+    /// the delta holds every record after `startHistoryId`. Its cursor is the
+    /// FIRST page's `historyId`: a record newer than that is read again next
+    /// time rather than skipped.
+    ///
     /// Returns nil when Gmail responds 404 — the historyId has expired, callers
-    /// must fall back to a full sync. Any other error throws.
+    /// must fall back to a full sync — and when the history runs past
+    /// `historyMaxPages`. Any other error throws.
     static func historyList(
         http: AuthedHTTP,
         startHistoryId: String,
         historyTypes: [String] = ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"],
         labelId: String? = nil
     ) async throws -> HistoryDelta? {
-        var q: [String] = ["startHistoryId=\(startHistoryId)"]
+        var q: [String] = ["startHistoryId=\(startHistoryId)", "maxResults=\(historyPageSize)"]
         for t in historyTypes { q.append("historyTypes=\(t)") }
         if let labelId { q.append("labelId=\(labelId)") }
-        let url = "\(baseURL)/history?" + q.joined(separator: "&")
-        let res = try await http.requestAllowing404(url: url)
-        if res.statusCode == 404 { return nil }
-        guard let data = res.data,
-              let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw HTTPError.networkError(statusCode: res.statusCode)
+        var records: [[String: Any]] = []
+        var cursor: String?
+        var pageToken: String?
+        for _ in 0..<historyMaxPages {
+            var pageQuery = q
+            if let pageToken { pageQuery.append("pageToken=\(queryValue(pageToken))") }
+            let url = "\(baseURL)/history?" + pageQuery.joined(separator: "&")
+            let res = try await http.requestAllowing404(url: url)
+            if res.statusCode == 404 { return nil }
+            guard let data = res.data,
+                  let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw HTTPError.networkError(statusCode: res.statusCode)
+            }
+            records.append(contentsOf: json["history"] as? [[String: Any]] ?? [])
+            if cursor == nil { cursor = json["historyId"] as? String ?? "" }
+            guard let next = json["nextPageToken"] as? String, !next.isEmpty else {
+                return GmailParse.parseHistory(["historyId": cursor ?? "", "history": records])
+            }
+            pageToken = next
         }
-        return GmailParse.parseHistory(json)
+        return nil
+    }
+
+    /// Percent-encodes an opaque value (a page token) for a query string,
+    /// leaving only RFC 3986 unreserved characters bare.
+    private static func queryValue(_ value: String) -> String {
+        let unreserved = CharacterSet(
+            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+        return value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? value
     }
 
     /// `users.messages.get` with `format=metadata` — headers only, no body.
