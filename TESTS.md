@@ -387,7 +387,8 @@ it.
 The Gmail detail fetch keeps the request gate's full width of gets in flight (so a delta of a few
 dozen messages fits the background deadline), never more: a later request on the same account waits
 behind at most one window of gets, not the whole delta. A fetch larger than its window still fails on
-one message's failure.
+one message's failure, and gone messages filling the whole first window do not end it early: every
+readable message after them is still fetched.
 
 ## Calendar chat tools — the resolved calendar account
 

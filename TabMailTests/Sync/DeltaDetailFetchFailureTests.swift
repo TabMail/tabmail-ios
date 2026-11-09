@@ -482,6 +482,34 @@ struct DeltaDetailFetchFailureTests {
         }
     }
 
+    /// A gone message's answer frees its place in the window like any other.
+    /// With gone messages filling the whole first window, every readable one
+    /// after them must still be fetched: a fetch that ended early would hand the
+    /// delta a partial list as if it were complete, and the delta would move its
+    /// cursor past the changes it never read.
+    @Test("Gone Gmail messages filling the window do not end a larger detail fetch early")
+    func gmailGoneMessagesFillingTheWindowDoNotEndTheFetch() async throws {
+        let scenario = FakeHTTP.Scenario()
+        defer { scenario.close() }
+        let width = GmailAPI.maxConcurrentRequests
+        let gone = (0..<width).map { String(format: "gone-%03d", $0) }
+        let readable = (0...width).map { String(format: "kept-%03d", $0) }
+        for (index, id) in gone.enumerated() {
+            scenario.register(path: "/messages/\(id)", method: "GET", response: .status(index.isMultiple(of: 2) ? 404 : 410))
+        }
+        for id in readable {
+            scenario.register(path: "/messages/\(id)", method: "GET", response: .json(raw: Self.gmailMessageJSON(id: id)))
+        }
+        let provider = GmailProvider(
+            userEmail: "gmail-delta-detail@example.com", accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+        let details = try await provider.fetchMessageDetails(ids: gone + readable)
+
+        #expect(details.count == readable.count)
+        #expect(Set(details.map(\.header.messageId)) == Set(readable),
+                "every readable message after the gone ones must be fetched")
+    }
+
     // MARK: - Outlook
 
     private static let outlookAccountId = "outlook-delta-detail"
