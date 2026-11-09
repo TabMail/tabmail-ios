@@ -180,5 +180,6 @@ each at exactly the budget (applied) and one past it (no GET, cursor cleared); a
 `GmailProviderMockTests.searchTextReachesGmailIntact` decodes the recorded
 search request the way Gmail reads a query string (`&` separates parameters,
 `=` splits name from value, `+` is a space) and asserts that the user's text,
-including `&`, `+`, `=`, `%`, `#` and non-ASCII characters and a `from:` address
-with a `+` tag, comes back as exactly one `q`, with no stray parameter.
+including `&`, `+`, `=`, `%`, `#`, non-ASCII characters, literal percent escapes
+such as `%26` (which must not be decoded first) and a `from:` address with a `+`
+tag, comes back as exactly one `q`, with no stray parameter.

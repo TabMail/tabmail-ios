@@ -469,6 +469,7 @@ struct GmailProviderMockTests {
               ("C++ x=y", nil),
               ("100% #1 ? / ; : , @ $ ! ' ( ) *", nil),
               ("caf\u{e9} \u{1F4E7}", nil),
+              ("literal%26term%2Btag%3Dvalue%25 %2526", nil),
               ("invoice", "user+tag@example.com"),
           ])
     func searchTextReachesGmailIntact(query: String, from: String?) async throws {
