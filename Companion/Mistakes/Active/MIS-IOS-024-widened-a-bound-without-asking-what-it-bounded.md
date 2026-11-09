@@ -55,3 +55,19 @@ cd tabmail-ios && for c in $(rg -o 'static let (\w+)(Chars|Scalars|Window)\b' -r
   rg -q "$c" TabMailTests && rg -lq 'elapsed|ContinuousClock|Date\(\)\.timeIntervalSince' $(rg -l "$c" TabMailTests) || echo "NO bounded-time test for $c"
 done
 ```
+
+---
+
+## Pre-compaction index line (verbatim, 2026-11-09)
+
+Routed out of `tabmail-ios/MISTAKES.md` by the `companion-compact` skill (13026 B against
+its 12,000 B budget). The index keeps a shortened line; this is the line it replaced,
+**byte-for-byte**, source line 50 at `6597c3a7`.
+
+<!-- BEGIN VERBATIM INDEX LINE MIS-IOS-024 2026-11-09 -->
+
+```text
+- **MIS-IOS-024** — **widened a scan window (`snippetLinkScanChars` 4,000 → 32,000) on a happy-path benchmark without asking what the bound was protecting**: the regex behind `unwrapMarkdownLinks` was quadratic on unclosed `[](` / `\[` runs (3.5–6.8 s on the main actor at the new window); two cap-inside-the-regex patches each broke a valid link (MIS-005 ×28) before the construct was replaced by a linear scanner (#162, PR #163). Benchmark the ADVERSARIAL input in terms of the limit; worse than linear ⇒ replace the algorithm, never tune caps. (×1)
+```
+
+<!-- END VERBATIM INDEX LINE MIS-IOS-024 2026-11-09 -->
