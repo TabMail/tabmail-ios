@@ -213,3 +213,10 @@ nothing more. Through the real caller, `GmailReceivedDateBoundaryTests` pulls ol
 `SyncEngine.fetchOlderMessages` the way the scroller does: a full page with one message Gmail cannot
 serve still says there may be more, so the next pull loads the message beyond it, the unreadable
 message gets no row, and the stored rows stay.
+
+## On-demand folder sync — a folder the provider reports gone
+
+`FolderSyncGoneStatusTests` drives `AccountManager.syncFolders(_:)` over two folders of one account
+whose provider throws the Gmail and Outlook HTTP error shape (`ProviderError.networkError` around
+`HTTPError.networkError(statusCode:)`). A 404 or 410 skips the folder: no error reaches the caller
+and the next folder is still synced. Any other status (500) still reaches the caller.

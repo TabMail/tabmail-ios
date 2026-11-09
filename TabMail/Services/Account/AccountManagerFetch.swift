@@ -414,12 +414,11 @@ extension AccountManager {
                                 BackgroundSyncLogger.logDebug("[SyncFolders] SELECT failed for \(folder.name) — skipping")
                                 continue
                             }
-                            // 404 during folder sync is transient — e.g., a draft was just
+                            // 404/410 during folder sync is transient — e.g., a draft was just
                             // trashed and the message is no longer in this label. Skip the
                             // folder rather than surfacing to the user as a red error banner.
-                            if case ProviderError.networkError(let underlying) = error,
-                               (underlying as NSError).code == 404 {
-                                BackgroundSyncLogger.logDebug("[SyncFolders] 404 for \(folder.name) — skipping (message likely moved/deleted)")
+                            if isHttpGoneStatus(error) {
+                                BackgroundSyncLogger.logDebug("[SyncFolders] 404/410 for \(folder.name) — skipping (message likely moved/deleted)")
                                 continue
                             }
                             throw error
