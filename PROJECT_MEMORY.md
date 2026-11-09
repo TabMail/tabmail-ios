@@ -37,7 +37,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | ProviderWorkQueue Cancellation Semantics (2026-06-09) | [read in full](Companion/Memory/Current/012-providerworkqueue-cancellation-semantics-2026-06-09.md) |
 | FTS Tokenizer — NO tokenchars (ADR-024, 2026-06-09, lockstep with Rust crate) | [read in full](Companion/Memory/Current/013-fts-tokenizer-no-tokenchars-adr-024-2026-06-09-lockstep-with-rust-crate.md) |
 | SwiftUI preview convention | [read in full](Companion/Memory/Current/014-swiftui-preview-convention.md) |
-| Inbox usage-throttle banner (ADR-IOS-044); `UsageThrottleStore.trialState` + inbox trial reminder row (`InboxTrialReminder`, "Free trial · N days left", Plans) | [read in full](Companion/Memory/Current/015-inbox-usage-throttle-banner-adr-ios-044.md) |
+| Inbox usage-throttle banner (ADR-IOS-044) | [read in full](Companion/Memory/Current/015-inbox-usage-throttle-banner-adr-ios-044.md) |
 | Remote Search (SearchView) | [read in full](Companion/Memory/Current/016-remote-search-searchview.md) |
 | FTS↔GRDB id drift (folder baked into the key) — "indexed but unfindable" / wrong-subject class | [read in full](Companion/Memory/Current/017-fts-grdb-id-drift-folder-baked-into-the-key-indexed-but-unfindable-wrong.md) |
 | "Searchable but can't open / no snippet / not in its folder" — GRDB-side stuck headers (NOT FTS orphans), IMAP (under investigation 2026-06-22) | [read in full](Companion/Memory/Current/018-searchable-but-can-t-open-no-snippet-not-in-its-folder-grdb-side-stuck-h.md) |
@@ -58,7 +58,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | Optimistic UI Rollback | [read in full](Companion/Memory/Current/033-optimistic-ui-rollback.md) |
 | Gmail Label System | [read in full](Companion/Memory/Current/034-gmail-label-system.md) |
 | SwiftUI Observable Array Mutation Safety | [read in full](Companion/Memory/Current/035-swiftui-observable-array-mutation-safety.md) |
-| SwiftUI Layout Gotchas (incl. one-shot scrollTo on first List appearance dropped on device) | [read in full](Companion/Memory/Current/036-swiftui-layout-gotchas.md) |
+| SwiftUI Layout Gotchas | [read in full](Companion/Memory/Current/036-swiftui-layout-gotchas.md) |
 | HTML Email Render Pipeline (AutoSizingHTMLView) — MUST stay idempotent (ADR-IOS-039) | [read in full](Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md) |
 | Swift Gotchas | [read in full](Companion/Memory/Current/038-swift-gotchas.md) |
 | Folder.== must include every UI-visible field | [read in full](Companion/Memory/Current/039-folder-must-include-every-ui-visible-field.md) |
@@ -89,7 +89,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | Agent Chat (ADR-IOS-022, ADR-IOS-023) | [read in full](Companion/Memory/Current/064-agent-chat-adr-ios-022-adr-ios-023.md) |
 | Screen Keep-Awake (chat pill) | [read in full](Companion/Memory/Current/065-screen-keep-awake-chat-pill.md) |
 | Agent Compose FIFO Queue (ADR-IOS-030) | [read in full](Companion/Memory/Current/066-agent-compose-fifo-queue-adr-ios-030.md) |
-| Outgoing Threading — reply/forward headers; reject line-break IDs at every writer (#221); preserve Gmail folding; Outlook In-Reply-To/References as extended properties 0x1042/0x1039, never internetMessageHeaders (#419) (ADR-IOS-043) | [read in full](Companion/Memory/Current/067-outgoing-threading-reply-forward-stay-in-thread-on-every-provider-adr-io.md) |
+| Outgoing Threading — reply/forward stay in-thread on every provider (ADR-IOS-043, 2026-06-23) | [read in full](Companion/Memory/Current/067-outgoing-threading-reply-forward-stay-in-thread-on-every-provider-adr-io.md) |
 | Incoming Thread Detection — `ThreadDetection.findRelatedMessages` has NO subject-based fallback (by design) | [read in full](Companion/Memory/Current/068-incoming-thread-detection-threaddetection-findrelatedmessages-has-no-sub.md) |
 | Outbox — Persistent Offline Send Queue (ADR-IOS-019) | [read in full](Companion/Memory/Current/069-outbox-persistent-offline-send-queue-adr-ios-019.md) |
 | Proactive Local Notifications (ADR-IOS-026) | [read in full](Companion/Memory/Current/070-proactive-local-notifications-adr-ios-026.md) |
