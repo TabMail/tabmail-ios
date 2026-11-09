@@ -896,8 +896,8 @@ actor DraftStore {
         }
 
         // Completion and the placeholder's migration to the server's id are ONE
-        // write. As two writes, a placeholder could carry `serverDraftId` while
-        // its header still said `draft-…` (between them, or for good when the
+        // write. As two writes, a draft could carry `serverDraftId` while its
+        // placeholder header still said `draft-…` (between them, or for good when the
         // second write failed), and an action on that row had no address to use.
         // If this write throws, the completion rolls back with the migration and
         // the save is retried (the existing one-stray cost, see above).
