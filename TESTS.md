@@ -192,7 +192,7 @@ fetch fails (a 5xx, a non-gone 4xx, a transport failure, a body that does not de
 record has no usable date) fails the delta and keeps the cursor (the Gmail history id, the Outlook delta link); on the next pass the
 fetch succeeds and the change lands. A message that answers 404 is gone and is skipped: the rest of
 the delta is applied and the cursor moves. A Graph refusal on the detail fetch is still logged with
-its error code and message. Called directly with the gone message first, the detail fetch still
+its error code and message. Called directly with the gone message first (404 or 410), the detail fetch still
 returns the readable one. Driving `performDeltaSync`, `fullSync` and `captureSyncCursors` in that order, a Gmail message whose fetch never
 succeeds does not stop sync: the full sync completes past it (its row kept), moves the cursor, and
 later changes land. A dropped connection, a 401 the token refresh does not cure, or a cancellation

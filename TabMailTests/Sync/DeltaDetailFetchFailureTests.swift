@@ -333,11 +333,12 @@ struct DeltaDetailFetchFailureTests {
     /// The delta hands `fetchMessageDetails` its ids in set order, which
     /// varies by process. Calling it directly with the gone message FIRST pins
     /// that a gone message never ends the loop early.
-    @Test("A gone Gmail message ahead of a readable one does not stop the detail fetch")
-    func gmailGoneMessageFirstIsSkipped() async throws {
+    @Test("A gone Gmail message ahead of a readable one does not stop the detail fetch",
+          arguments: [404, 410])
+    func gmailGoneMessageFirstIsSkipped(status: Int) async throws {
         let scenario = FakeHTTP.Scenario()
         defer { scenario.close() }
-        scenario.register(path: "/messages/gone-1", method: "GET", response: .status(404))
+        scenario.register(path: "/messages/gone-1", method: "GET", response: .status(status))
         scenario.register(path: "/messages/steady-1", method: "GET",
                           response: .json(raw: Self.gmailMessageJSON(id: "steady-1")))
         let provider = GmailProvider(
@@ -477,11 +478,12 @@ struct DeltaDetailFetchFailureTests {
         }
     }
 
-    @Test("A gone Outlook message ahead of a readable one does not stop the detail fetch")
-    func outlookGoneMessageFirstIsSkipped() async throws {
+    @Test("A gone Outlook message ahead of a readable one does not stop the detail fetch",
+          arguments: [404, 410])
+    func outlookGoneMessageFirstIsSkipped(status: Int) async throws {
         let scenario = FakeHTTP.Scenario()
         defer { scenario.close() }
-        scenario.register(path: "/messages/gone-1", method: "GET", response: .status(404))
+        scenario.register(path: "/messages/gone-1", method: "GET", response: .status(status))
         scenario.register(path: "/messages/steady-1", method: "GET",
                           response: .json(raw: Self.outlookMessageJSON(id: "steady-1")))
         let provider = ExchangeProvider(
