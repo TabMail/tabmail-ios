@@ -4,7 +4,7 @@ This is the executive index for released `v1.7.5` (`50e8f63a4`). The governing p
 
 **Current executive census (2026-08-09):** 17 user-impacting records — Open **2** · Accepted recoverable limitation **15**. The full register contains 138 main records and 2 historical D4 records; its 121 fixed, settled-decision, non-defect, decomposed, historical, or provenance-only main records are intentionally omitted from this dashboard.
 
-The full records are split into [`Companion/Process/Current/KnownIssues/`](Companion/Process/Current/KnownIssues/README.md). The exact pre-split register—including all superseded reasoning, corrections, audit history, predicates, and old counts—is preserved byte-for-byte in [`Companion/Process/History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt`](Companion/Process/History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`), with row-level integrity in [`Companion/Process/Current/KnownIssues/manifest.tsv`](Companion/Process/Current/KnownIssues/manifest.tsv).
+The full records are split into [`Companion/Process/Current/KnownIssues/`](Companion/Process/Current/KnownIssues/README.md). The exact pre-split register—including all superseded reasoning, corrections, audit history, predicates, and old counts—is preserved byte-for-byte in [`Companion/Process/History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt`](Companion/Process/History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`), with row-level integrity in [`Companion/Process/Current/KnownIssues/manifest.tsv`](Companion/Process/Current/KnownIssues/manifest.tsv).
 
 ## Executive summary
 
