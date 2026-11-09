@@ -13,9 +13,10 @@ enum GraphConfig {
     /// The most Graph requests in flight at once for one mailbox, across mail,
     /// calendar, actions and sends in this process.
     static let maxConcurrentRequestsPerMailbox = 4
-    /// Parallel message fetches for Outlook backfill and body indexing. Kept below
-    /// `maxConcurrentRequestsPerMailbox` so a send, an action or a sync request
-    /// waits behind at most this many background fetches.
+    /// Parallel message fetches of one Outlook backfill or body-indexing stream.
+    /// Kept below `maxConcurrentRequestsPerMailbox` so the stream alone never
+    /// takes every slot; other requesters of the mailbox share the rest in arrival
+    /// order.
     static let bodyFetchConcurrency = 2
 }
 
@@ -24,7 +25,9 @@ enum GraphConfig {
 /// `performHTTPRequest` holds one slot for each request it sends, and only while
 /// that request is on the wire: a retry's back-off sleep and a token refresh hold
 /// none. Waiters are served in arrival order, so no caller waits behind a later one.
-/// A slot is released when the request finishes, fails or is cancelled.
+/// A slot is released when the request finishes, fails or is cancelled. A caller
+/// cancelled while queued keeps its place; it is admitted in turn, its request
+/// fails at once, and it releases the slot.
 final class HTTPConcurrencyGate: Sendable {
     private struct State {
         var inFlight = 0
@@ -46,24 +49,20 @@ final class HTTPConcurrencyGate: Sendable {
         return try await body()
     }
 
+    /// One decision under one lock: take a free slot, or queue. A slot is never
+    /// free while anyone is queued (`release` hands it to the oldest waiter), so
+    /// a free slot cannot let this caller pass an earlier one.
     private func acquire() async {
-        let admitted = state.withLock { state -> Bool in
-            guard state.inFlight < limit else { return false }
-            state.inFlight += 1
-            return true
-        }
-        if admitted { return }
         await withCheckedContinuation { continuation in
-            state.withLock { state in
-                // A slot may have opened since the check above. The queue must be
-                // empty too, or this caller would pass the ones already waiting.
-                if state.inFlight < limit, state.waiters.isEmpty {
+            let admitted = state.withLock { state -> Bool in
+                if state.inFlight < limit {
                     state.inFlight += 1
-                    continuation.resume()
-                } else {
-                    state.waiters.append(continuation)
+                    return true
                 }
+                state.waiters.append(continuation)
+                return false
             }
+            if admitted { continuation.resume() }
         }
     }
 
@@ -82,8 +81,10 @@ final class HTTPConcurrencyGate: Sendable {
 
 /// One `HTTPConcurrencyGate` per Outlook mailbox, shared by every provider of that
 /// mailbox in this process, so mail and calendar requests count against the same
-/// four. The notification service extension is a separate process and cannot share
-/// it; it sends a couple of requests per notification.
+/// four. `ExchangeProvider` and `ExchangeCalendarProvider` look theirs up from the
+/// mailbox address they are built for. The notification service extension is a
+/// separate process and cannot share it; it sends a couple of requests per
+/// notification.
 enum GraphMailboxGates {
     private static let gates = Mutex<[String: HTTPConcurrencyGate]>([:])
 

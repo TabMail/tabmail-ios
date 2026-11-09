@@ -10,20 +10,22 @@ import Foundation
 actor ExchangeCalendarProvider: CalendarProvider {
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let baseURL = "https://graph.microsoft.com/v1.0/me"
-    /// The mailbox's Graph concurrency limit (#426): `AccountManager` passes the
-    /// gate its `ExchangeProvider` also uses, so calendar and mail requests share
-    /// Graph's four concurrent requests per mailbox.
+    /// The mailbox's Graph concurrency limit (#426): the same gate as the
+    /// mailbox's `ExchangeProvider`, so calendar and mail requests share Graph's
+    /// four concurrent requests per mailbox.
     private let mailboxGate: HTTPConcurrencyGate
     /// Test-only transport override. `nil` on every production path, where
     /// `performHTTPRequest` falls back to `sharedEphemeralSession`.
     private let testSession: URLSession?
 
+    /// - Parameter mailbox: the address of the Outlook mailbox this calendar
+    ///   belongs to; it selects the mailbox's gate (`GraphMailboxGates.gate(for:)`).
     init(
-        accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
-        mailboxGate: HTTPConcurrencyGate = HTTPConcurrencyGate(limit: GraphConfig.maxConcurrentRequestsPerMailbox)
+        mailbox: String,
+        accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String
     ) {
         self.accessToken = accessToken
-        self.mailboxGate = mailboxGate
+        self.mailboxGate = GraphMailboxGates.gate(for: mailbox)
         self.testSession = nil
     }
 
@@ -36,12 +38,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// Graph's four concurrent requests is a property of the transport, visible
     /// only at the wire.
     init(
+        mailbox: String,
         accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
-        mailboxGate: HTTPConcurrencyGate,
         session: URLSession
     ) {
         self.accessToken = accessToken
-        self.mailboxGate = mailboxGate
+        self.mailboxGate = GraphMailboxGates.gate(for: mailbox)
         self.testSession = session
     }
 

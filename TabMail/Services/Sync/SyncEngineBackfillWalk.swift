@@ -1774,11 +1774,7 @@ extension SyncEngine {
                     if let gp = provider as? GmailProvider {
                         stream = await gp.fetchBackfillBatch(ids: missingIds, concurrency: bodyConcurrency)
                     } else {
-                        // Outlook: Graph allows four concurrent requests per mailbox
-                        // (#426), shared with sync, actions and sends, so its width
-                        // is its own, not the Gmail profile's.
-                        stream = await (provider as! ExchangeProvider).fetchBackfillBatch(
-                            ids: missingIds, concurrency: min(bodyConcurrency, GraphConfig.bodyFetchConcurrency))
+                        stream = await (provider as! ExchangeProvider).fetchBackfillBatch(ids: missingIds, concurrency: bodyConcurrency)
                     }
 
                     // Consume streaming results — collect headers + bodies together.

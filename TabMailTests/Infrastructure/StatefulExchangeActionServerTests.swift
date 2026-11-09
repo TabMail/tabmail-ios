@@ -601,7 +601,7 @@ struct StatefulExchangeActionServerTests {
     /// Either way `served` is `[401]` instead of `[401, 204]` and the call
     /// sequence loses an entry. (Offline, the escaping request fails at the
     /// transport instead, which throws just the same.) 401 is not in Graph's
-    /// `retryableStatusCodes` ([429]), so the transport does not retry it — the
+    /// `retryableStatusCodes` ([429, 503]), so the transport does not retry it — the
     /// second DELETE is the adapter's own token-refresh leg and nothing else.
     ///
     /// The registration uses the full `"/messages/{id}"` prefix so it wins the

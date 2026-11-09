@@ -21,12 +21,19 @@ enum HTTPConfig {
     /// (`BackendClient.llmSession`, `SyncConfig.llmResourceTimeoutSeconds`) and
     /// is unaffected.
     static let sharedResourceTimeoutSeconds: TimeInterval = 300
-    /// The longest `Retry-After` a retry waits for inside one request. A server
-    /// asking for longer gets no retry: the request fails with its status, and
-    /// the caller's own retry (the next sync pass, the queue's next drain) comes
-    /// later. Keeps one call from holding its caller for minutes, and keeps the
-    /// notification service extension inside its time budget.
-    static let maxHonouredRetryAfterSeconds: TimeInterval = 10
+    /// The most one `performHTTPRequestWithRetry` call sleeps across all its
+    /// retries, `Retry-After` waits and back-off alike. A retry whose wait would
+    /// pass it is not made: the call returns the refusal, and the caller's own
+    /// retry (the next sync pass, the queue's next drain) comes later. The
+    /// back-off without a header (1 + 2 + 4 s) fits inside it unchanged. The
+    /// bound is per call, so a queued action (`SyncConfig.pendingOperationTimeoutSeconds`)
+    /// and the notification service extension's two requests stay inside their
+    /// deadlines and a final refusal reaches the caller as a refusal, not a timeout.
+    static let retryWaitBudgetSeconds: TimeInterval = 10
+    /// Statuses with which a server says "come back later" rather than "this
+    /// request is wrong": 429 Too Many Requests and 503 Service Unavailable
+    /// (RFC 9110 §15.6.4, RFC 6585 §4). Read through `HTTPError.asksToRetryLater`.
+    static let retryLaterStatusCodes: Set<Int> = [429, 503]
 }
 
 /// Shared ephemeral URLSession for all HTTP providers (Gmail, Exchange, backend calls).
@@ -132,8 +139,9 @@ func performHTTPRequest(
 /// up to `maxAttempts` retries. Each retry waits for the response's `Retry-After`
 /// when it has one, as Graph asks ("Wait the number of seconds specified in the
 /// Retry-After header"), and otherwise backs off exponentially (initialDelay, 2×,
-/// 4×, ...). A `Retry-After` above `HTTPConfig.maxHonouredRetryAfterSeconds` ends
-/// the retries and returns that response. Gmail retries `[429, 403]` (per-user
+/// 4×, ...). The sleeps of one call add up to at most
+/// `HTTPConfig.retryWaitBudgetSeconds`: a retry whose wait would pass that ends
+/// the retries and returns the refusal. Gmail retries `[429, 403]` (per-user
 /// rateLimitExceeded is 403); Graph retries `[429, 503]`.
 func performHTTPRequestWithRetry(
     url urlString: String,
@@ -157,21 +165,18 @@ func performHTTPRequestWithRetry(
         return result
     }
 
+    var waited: TimeInterval = 0
     for attempt in 0..<maxAttempts {
-        let delay: TimeInterval
-        if let retryAfter = result.retryAfter {
-            guard retryAfter <= HTTPConfig.maxHonouredRetryAfterSeconds else {
-                if let logLabel {
-                    #if DEBUG
-                    print("[\(logLabel)] HTTP \(result.statusCode) asks to retry after \(retryAfter)s, longer than \(HTTPConfig.maxHonouredRetryAfterSeconds)s: not retrying now")
-                    #endif
-                }
-                return result
+        let delay = result.retryAfter ?? initialDelay * Double(1 << attempt)
+        guard waited + delay <= HTTPConfig.retryWaitBudgetSeconds else {
+            if let logLabel {
+                #if DEBUG
+                print("[\(logLabel)] HTTP \(result.statusCode): a \(delay)s wait would pass the \(HTTPConfig.retryWaitBudgetSeconds)s retry budget; not retrying now")
+                #endif
             }
-            delay = retryAfter
-        } else {
-            delay = initialDelay * Double(1 << attempt)
+            return result
         }
+        waited += delay
         if let logLabel {
             #if DEBUG
             print("[\(logLabel)] Rate limited (\(result.statusCode)), retrying in \(delay)s (attempt \(attempt + 1)/\(maxAttempts))")
@@ -202,4 +207,15 @@ enum HTTPError: Error, Sendable {
     /// Graph's `ErrorInvalidIdMalformed` 400) instead of guessing from the
     /// status code alone.
     case networkErrorWithBody(statusCode: Int, body: Data)
+
+    /// The server refused for now and asked to be tried again later (throttled or
+    /// temporarily unavailable). Graph and Gmail both document these as retryable
+    /// after a delay, so a caller that keeps the work for its own next pass loses
+    /// nothing.
+    var asksToRetryLater: Bool {
+        if case .networkError(let statusCode) = self {
+            return HTTPConfig.retryLaterStatusCodes.contains(statusCode)
+        }
+        return false
+    }
 }

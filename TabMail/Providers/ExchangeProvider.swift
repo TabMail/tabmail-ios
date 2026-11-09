@@ -52,22 +52,19 @@ actor ExchangeProvider: EmailProvider {
     private let testSession: URLSession?
 
     /// Graph allows four concurrent requests per app and mailbox (#426). Every
-    /// request this provider sends holds a slot of this gate while on the wire.
-    /// `AccountManager` passes the mailbox's shared gate
-    /// (`GraphMailboxGates.gate(for:)`), which its calendar provider also uses;
-    /// the default is a gate of this provider's own.
+    /// request this provider sends holds a slot of this mailbox's gate while on the
+    /// wire; the mailbox's `ExchangeCalendarProvider` looks up the same one.
     private let mailboxGate: HTTPConcurrencyGate
 
     init(
         userEmail: String,
         accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
-        session: URLSession? = nil,
-        mailboxGate: HTTPConcurrencyGate = HTTPConcurrencyGate(limit: GraphConfig.maxConcurrentRequestsPerMailbox)
+        session: URLSession? = nil
     ) {
         self.userEmail = userEmail
         self.accessToken = accessToken
         self.testSession = session
-        self.mailboxGate = mailboxGate
+        self.mailboxGate = GraphMailboxGates.gate(for: userEmail)
     }
 
     func connect() async throws {
@@ -513,9 +510,13 @@ actor ExchangeProvider: EmailProvider {
     /// Combined header+body fetch for unified backfill. Adds `body` to existing header $select fields
     /// so one API call returns both header metadata and body content.
     /// Yields results as they complete — caller writes GRDB headers + FTS bodies while more fetches are in flight.
+    ///
+    /// The caller's `concurrency` is a ceiling: Graph allows four concurrent requests
+    /// per mailbox, shared with sync, actions and sends, so the width is at most
+    /// `GraphConfig.bodyFetchConcurrency` (ADR-IOS-103).
     func fetchBackfillBatch(ids: [String], concurrency: Int) async -> AsyncStream<BackfillResult> {
         let capturedIds = ids
-        let capturedConcurrency = concurrency
+        let capturedConcurrency = min(concurrency, GraphConfig.bodyFetchConcurrency)
         let provider = self
         return AsyncStream { continuation in
             let task = Task {
@@ -561,9 +562,10 @@ actor ExchangeProvider: EmailProvider {
 
     /// Streaming body-only fetch for FTS indexing.
     /// Yields results as they complete — caller can write FTS while more fetches are in flight.
+    /// `concurrency` is a ceiling, at most `GraphConfig.bodyFetchConcurrency` (ADR-IOS-103).
     func fetchTextBodiesStream(ids: [String], concurrency: Int) async -> AsyncStream<TextBodyFetchResult> {
         let capturedIds = ids
-        let capturedConcurrency = concurrency
+        let capturedConcurrency = min(concurrency, GraphConfig.bodyFetchConcurrency)
         let provider = self
         return AsyncStream { continuation in
             let task = Task {

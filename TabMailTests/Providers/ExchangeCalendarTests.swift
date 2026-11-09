@@ -133,7 +133,7 @@ struct ExchangeCalendarErrorTests {
 struct ExchangeCalendarEmptySurfaceTests {
 
     private func makeProvider() -> ExchangeCalendarProvider {
-        ExchangeCalendarProvider(accessToken: { _ in "test-token" })
+        ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" })
     }
 
     private func decodeMSEvent(_ json: String) throws -> MSEvent {
@@ -255,7 +255,7 @@ struct ExchangeCalendarEmptySurfaceTests {
 struct ExchangeCalendarRecurringTests {
 
     private func makeProvider() -> ExchangeCalendarProvider {
-        ExchangeCalendarProvider(accessToken: { _ in "test-token" })
+        ExchangeCalendarProvider(mailbox: "calendar@example.com", accessToken: { _ in "test-token" })
     }
 
     private func decodeMSEvent(_ json: String) throws -> MSEvent {
