@@ -186,6 +186,7 @@ struct ChatThreadView: View {
             context = loaded
             scrollOnceLoaded()
         }
+        .onChange(of: viewModel.threadCopies.map(\.id)) { _, _ in noteCopies() }
         .onChange(of: memberKey) { _, _ in noteMembers() }
         .onChange(of: viewModel.hasLoadedThread) { _, _ in scrollOnceLoaded() }
         .onAppear {
@@ -240,13 +241,21 @@ struct ChatThreadView: View {
         ZStack(alignment: .bottom) {
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(spacing: ChatViewLayout.bubbleSpacing) {
+                    // A plain stack: every row has its real height, so one scroll lands where it
+                    // aims. A lazy stack starts rows at guessed heights and moves the target while
+                    // they measure (memory 036). Threads are short, and the AI work is bounded by
+                    // what the chat asks for, not by what it builds.
+                    VStack(spacing: ChatViewLayout.bubbleSpacing) {
                         ForEach(thread.items) { item in
                             row(item, thread: thread)
                         }
                         Color.clear.frame(height: ChatViewLayout.pillClearance).id(Self.bottomId)
                     }
                     .padding(.top, 8)
+                }
+                // Any scroll (a hand, the jump button, an animated scroll) ends the landing.
+                .onScrollPhaseChange { _, phase in
+                    if phase != .idle { scrollTarget = nil }
                 }
                 .defaultScrollAnchor(.bottom)
                 .scrollDismissesKeyboard(.interactively)
@@ -258,7 +267,15 @@ struct ChatThreadView: View {
                 .onChange(of: scrollTarget) { _, target in
                     guard let target else { return }
                     proxy.scrollTo(target.id, anchor: target.anchor)
-                    scrollTarget = nil
+                }
+                // The first scroll can be dropped while the screen is still settling (memory 036),
+                // and late content (attachment chips, a summary) changes the heights: the landing
+                // is issued again on every size change until a scroll begins.
+                .onScrollGeometryChange(for: [CGFloat].self) { geo in
+                    [geo.containerSize.height, geo.contentSize.height]
+                } action: { _, _ in
+                    guard let target = scrollTarget else { return }
+                    proxy.scrollTo(target.id, anchor: target.anchor)
                 }
                 .overlay(alignment: .bottomTrailing) {
                     if showsJumpButton {
@@ -302,6 +319,9 @@ struct ChatThreadView: View {
             isHighlighted: highlightedId == item.id,
             onOpen: { cardMessage = item.header })
         .id(item.id)
+        .onScrollVisibilityChange { shown in
+            if shown { askAsShown(item, in: thread) }
+        }
     }
 
     private func subject(_ thread: ChatThread) -> String {
@@ -331,7 +351,18 @@ struct ChatThreadView: View {
         let anchor: UnitPoint
     }
 
+    /// Where the open lands (`scrollOnceLoaded`). Held until a scroll of any kind begins, so the
+    /// landing is issued again while the screen settles; then the user's scroll owns the screen.
     @State private var scrollTarget: ScrollTarget?
+
+    /// Reads every other copy the thread loaded of an email the chat shows, the first time it
+    /// loads, as the shown copy is read: in another folder or account, it is the same email. Each
+    /// by its own row (ADR-IOS-068 D4). Copies place no Unread line and ask for no summary.
+    private func noteCopies() {
+        for copy in viewModel.threadCopies where seenIds.insert(copy.id).inserted {
+            viewModel.markReadIfNeeded(copy)
+        }
+    }
 
     /// Records each email the first time it shows, then marks it read. Its unread state at
     /// that moment places the Unread line.
@@ -353,7 +384,12 @@ struct ChatThreadView: View {
     private func scrollOnceLoaded() {
         guard !didInitialScroll, viewModel.hasLoadedThread, context.isLoaded else { return }
         didInitialScroll = true
+        // The thread's emails arrive with `hasLoadedThread`, and SwiftUI runs that change and the
+        // members change in either order: record their unread state first, or the Unread line can
+        // be missing and the chat opens at the bottom.
+        noteMembers()
         let thread = thread
+        askForNewest(thread)
         if highlightsOpenedMessage, let opened = viewModel.message,
            let item = thread.items.first(where: { ChatThread.copyKey($0.header) == ChatThread.copyKey(opened) }) {
             scrollTarget = ScrollTarget(id: item.id, anchor: .center)
@@ -367,6 +403,30 @@ struct ChatThreadView: View {
         } else {
             scrollTarget = ScrollTarget(id: Self.bottomId, anchor: .bottom)
         }
+    }
+
+    // MARK: - Summaries (owner 2026-11-09)
+
+    /// On open, once: the newest `ChatViewConfig.summaryWindow` emails, newest first, wherever the
+    /// chat lands. The chat view setting is read once per request, here and in `askAsShown`.
+    private func askForNewest(_ thread: ChatThread) {
+        guard ChatViewConfig.isActive else { return }
+        let newest = thread.items.suffix(ChatViewConfig.summaryWindow).reversed().map(\.header)
+        guard !newest.isEmpty else { return }
+        Task { await ActiveAIQueue.shared.enqueueChatSummaries(newest) }
+    }
+
+    /// An email older than the newest `ChatViewConfig.summaryWindow` asks for its own summary when
+    /// it comes on screen, so scrolling up summarizes as it goes. Only once the open has asked for
+    /// the newest (before that, which emails are the newest is not known yet).
+    private func askAsShown(_ item: ChatThread.Item, in thread: ChatThread) {
+        guard didInitialScroll else { return }
+        let items = thread.items
+        guard let index = items.firstIndex(where: { $0.id == item.id }),
+              index < items.count - ChatViewConfig.summaryWindow,
+              ChatViewConfig.isActive else { return }
+        let header = item.header
+        Task { await ActiveAIQueue.shared.enqueueChatSummaries([header]) }
     }
 
     // MARK: - Pill (today's Reply / Chat / Archive, on the newest email)

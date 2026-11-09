@@ -29,16 +29,14 @@ final class MessageDetailViewModel {
     var error: String?
     var messageNotFound = false
     var threadMessages: [MessageHeader] = []
+    /// The rows of the thread's emails that `threadMessages` leaves out as copies of one it shows
+    /// (`ThreadDetection.related`), from the same load: another folder's or account's copy, the
+    /// opened email's included. Shown nowhere; the chat acts on them with the email it shows.
+    private(set) var threadCopies: [MessageHeader] = []
 
     /// Guards against concurrent/duplicate `loadBody()` calls.
     /// `.task` and `.onAppear` both call `loadBody()` — the first caller wins.
     @ObservationIgnored private var loadBodyCalled = false
-
-    /// The chat-view summaries for this thread were requested (once per open; later thread
-    /// reloads after merges do not ask again).
-    @ObservationIgnored private var chatSummariesRequested = false
-    /// Test seam, like `_fetchBodyOverride`: receives the open's request instead of `ActiveAIQueue`.
-    @ObservationIgnored var _requestChatSummariesOverride: (@Sendable ([MessageHeader]) async -> Void)?
 
     /// Guards against concurrent/duplicate `markReadOnOpenIfNeeded()` calls.
     /// Independent of `loadBodyCalled` — mark-read must succeed even when
@@ -2184,6 +2182,9 @@ final class MessageDetailViewModel {
         if let idx = threadMessages.firstIndex(where: { $0.id == msg.id }) {
             threadMessages[idx].isRead = newIsRead
         }
+        if let idx = threadCopies.firstIndex(where: { $0.id == msg.id }) {
+            threadCopies[idx].isRead = newIsRead
+        }
         // Gesture intents on the same id coalesce to the NET target
         // (ADR-IOS-057) — see `InboxViewModel.toggleRead`'s doc comment.
         manager.registerGestureIntent(id: msg.id, .isRead(target: newIsRead, baseline: wasRead))
@@ -2335,8 +2336,6 @@ final class MessageDetailViewModel {
     /// Fire-and-forget async thread detection — does not block message rendering.
     private func loadThreadMessagesAsync() {
         guard let msg = message else { return }
-        // Settings snapshot for this load: whether it asks for the thread's chat summaries.
-        let requestChatSummaries = !chatSummariesRequested && ChatViewConfig.isActive
         threadLoadGeneration += 1
         let generation = threadLoadGeneration
         if DebugModeManager.isLoggingEnabled() {
@@ -2383,23 +2382,10 @@ final class MessageDetailViewModel {
                 }
             }
             do {
-                let results = try await Task.detached {
-                    try ThreadDetection.findRelatedMessages(for: msg, in: pool.pool)
+                let (results, copies) = try await Task.detached {
+                    let related = try ThreadDetection.related(to: msg, in: pool.pool)
+                    return (related.messages, related.copies)
                 }.value
-                // Opening a thread asks for the summary of every email in it that has none
-                // with a text message, from any folder, the user's own emails included.
-                if requestChatSummaries, !self.chatSummariesRequested {
-                    self.chatSummariesRequested = true
-                    let members = [msg] + results
-                    let override = self._requestChatSummariesOverride
-                    Task {
-                        if let override {
-                            await override(members)
-                        } else {
-                            await ActiveAIQueue.shared.enqueueChatSummaries(members)
-                        }
-                    }
-                }
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[ThreadDebug] Found \(results.count) related messages for \(msg.id.prefix(40))")
                     for r in results {
@@ -2420,7 +2406,8 @@ final class MessageDetailViewModel {
                 // messages", and a STALE older in-flight run with a
                 // pre-removal non-empty snapshot must not pass the guard
                 // afterwards and resurrect bubbles for deleted messages.
-                if results.isEmpty && self.threadMessages.isEmpty {
+                if results.isEmpty && self.threadMessages.isEmpty
+                    && copies.isEmpty && self.threadCopies.isEmpty {
                     self.lastAppliedThreadGeneration = generation
                     self.hasLoadedThread = true
                     return
@@ -2434,6 +2421,12 @@ final class MessageDetailViewModel {
                     self.pendingThreadRefreshOnRelease = true
                     return
                 }
+                // The copies come from the same load, so the chat's rows are one snapshot.
+                // Assigned only when they changed: nothing renders them, but the chat observes
+                // them to read a copy that joins.
+                var overlayedCopies = copies
+                self.applyOverlay(to: &overlayedCopies)
+                if overlayedCopies != self.threadCopies { self.threadCopies = overlayedCopies }
                 // Remote state wins for CONTENT: an EMPTY result CLEARS stale
                 // bubbles (e.g. an end-of-merge `.nseMergeDidCommit` after
                 // inbox removals deleted every related member). In-flight
