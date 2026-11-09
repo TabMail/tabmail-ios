@@ -45,6 +45,11 @@ actor SyncEngine {
     /// (delete-twice is a no-op) but waste a full-folder SEARCH pass.
     var deletionReconcileInFlight: Set<String> = []
 
+    /// The accounts with a sync pass running, and for each the passes waiting
+    /// their turn, oldest first (`oneSyncAtATime`).
+    var syncPassRunning: Set<String> = []
+    var syncPassWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
     /// Embedding rebuild task (one at a time).
 
     /// One-shot flag so the `recoverIncompleteHeaders` EXPLAIN QUERY PLAN probe
@@ -372,11 +377,16 @@ actor SyncEngine {
         }
         let provider = queue.provider
 
-        // No syncing guard here — background delta syncs run concurrently with
-        // foreground syncs. Delta operations are idempotent (upserts, no-op deletes),
-        // and historyId/deltaToken writes are monotonically increasing, so concurrent
-        // execution is safe and prevents pushes from being blocked by slow foreground polls.
+        // A foreground pass of the same account running now finishes first
+        // (`oneSyncAtATime`); then this delta runs.
+        return try await oneSyncAtATime(accountId: account.id) {
+            try await self.backgroundDeltaPass(account: account, queue: queue, provider: provider, inboxOnly: inboxOnly)
+        }
+    }
 
+    private func backgroundDeltaPass(
+        account: Account, queue: ProviderWorkQueue, provider: any EmailProvider, inboxOnly: Bool
+    ) async throws -> (changed: Bool, reason: String) {
         // Pool creates connections on demand via checkout — no explicit connect needed.
         // Callers (AccountManager.backgroundSyncOne) already call ensureConnected() upstream.
 
@@ -446,7 +456,7 @@ actor SyncEngine {
 
     /// Foreground sync: always tries delta first, then runs full sync separately
     /// if it's been >15 min since the last one (self-healing safety net).
-    /// Pull-to-refresh also uses this — delta is always the fast path.
+    /// Delta is always the fast path.
     @discardableResult
     func sync(account: Account) async throws -> Bool {
         guard let queue = workQueues[account.id] else {
@@ -462,8 +472,14 @@ actor SyncEngine {
             return false
         }
 
-        // No per-account sync guard — ProviderWorkQueue handles concurrency.
-        // Duplicate foreground syncs for the same account serialize through the work queue.
+        // The work queue has several slots and does not serialize passes: a pass
+        // of the same account running now finishes first (`oneSyncAtATime`).
+        return try await oneSyncAtATime(accountId: account.id) {
+            try await self.foregroundPass(account: account, queue: queue, provider: provider)
+        }
+    }
+
+    private func foregroundPass(account: Account, queue: ProviderWorkQueue, provider: any EmailProvider) async throws -> Bool {
         let accountId = account.id
         defer {
             Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }

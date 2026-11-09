@@ -1,0 +1,44 @@
+## ADR-IOS-104: One Sync Pass at a Time per Account
+
+**Status:** Active (2026-11-09; owner ruling, relayed by the coordinating session). Found while reviewing #427.
+
+**Context:** a sync pass is `SyncEngine.sync(account:)` (the delta, then the full sync when it is due,
+then its post-steps) or `SyncEngine.backgroundDeltaSync(account:)` (the delta alone, for push wakes and
+background refresh). Neither had a per-account guard. `sync(account:)` said "ProviderWorkQueue handles
+concurrency", but the work queue has several slots (Gmail and Exchange 10; IMAP as many as the pool),
+so it serializes requests, not passes. `backgroundDeltaSync` said outright that background deltas "run
+concurrently with foreground syncs", on the grounds that delta writes are idempotent and cursors only
+grow. The foreground poll, launch, account setup, Settings and a push wake could therefore run one
+pass's full sync while another pass's delta was in flight, and both write the account's delta cursor
+(`Account.lastHistoryId`). The owner's model was always that this cannot happen.
+
+**Decision:**
+1. **One semaphore per account, first in first out** (`SyncEngine.oneSyncAtATime`). Both entry points
+   run their whole pass inside it. A pass that arrives while another of the same account runs waits its
+   turn and then runs as it would have, on the account values its caller read before the wait; a
+   caller's timeout includes the wait. The turn is released on every exit, a throw included,
+   and handed straight to the oldest waiter, so a later arrival cannot overtake.
+2. **Nothing else changes** (owner: "the full sync and delta sync work the same as right now ... If one
+   is running, the other just waits. It's a simple semaphore. Do not change anything of the timing
+   logic"). There is no joining, no coalescing, no skipping and no new trigger. The 15-minute full-sync
+   interval, the 15-second recent-sync check (still taken before the wait, from the caller's account),
+   the delta-then-full-sync order inside a pass and every scheduler stay as they were.
+3. **No time cap on the wait.** A waiter whose task was cancelled still takes its turn; its pass then
+   stops at its first work-queue call, which is cancellation-aware.
+4. **Not inside it:** single-folder syncs (`SyncEngine.syncFolderMessages`: pull to refresh through
+   `AccountManager.syncFolders`, message detail, the operation executor, the outbox, on-demand fetches,
+   and the UIDVALIDITY reaction under its own per-folder single flight, ADR-IOS-061), backfill, FTS
+   indexing and the AI queues. None of them runs a delta or a full sync, or writes the account's delta
+   cursor (`Account.lastHistoryId`).
+
+**Rejected:** joining a running pass or coalescing waiters into one trailing pass (the owner asked for a
+plain semaphore, and both change what a caller's pass does); a wait cap that drops the waiter (a
+skipped pass); relying on the work queue (it has several slots by design, for throughput).
+
+**Consequence:** a push wake that arrives during a foreground full sync now waits for it. No caller
+calls a pass from inside a pass (census at the ruling: the account-manager entry points, account setup,
+three Settings actions and the launch-time epoch-rebuild kick), so the non-reentrant semaphore cannot
+deadlock; a new caller from inside a pass would. Tests: `OneSyncAtATimeTests` (a second pass, foreground
+or background, waits until the first pass's full sync is done; a pass that throws hands the turn on;
+passes waiting their turn run one at a time in arrival order, and one arriving during a handed-over turn
+waits too; another account's pass does not wait).

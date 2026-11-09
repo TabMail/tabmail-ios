@@ -180,7 +180,8 @@ extension AccountManager {
         try await connectAccount(account)
 
         // Kick off initial sync in background so the UI dismisses immediately.
-        // SyncEngine.syncing guard prevents double-sync if RootView.foregroundSyncAll fires.
+        // If RootView.foregroundSyncAll fires meanwhile, its pass waits its turn
+        // (`SyncEngine.oneSyncAtATime`); the two never run at once.
         let engine = syncEngine
         Task {
             do {
