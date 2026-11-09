@@ -663,3 +663,19 @@ into a leading `COMPANION-CURRENT-NOTE` wrapper, the index rows restored to the 
 `ios-label-001` amendments moved inside `KNOWN-ISSUES-AMENDMENT` markers, nothing re-pinned in
 `manifest.tsv`. The one raw-hashed edit, ADR-IOS-060 (`ported-manifest.tsv`), was re-pinned as that
 manifest requires.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-11-09)
+
+Routed out of `tabmail-ios/MISTAKES.md` by the `companion-compact` skill (13026 B against
+its 12,000 B budget). The index keeps a shortened line; this is the line it replaced,
+**byte-for-byte**, source line 65 at `6597c3a7`.
+
+<!-- BEGIN VERBATIM INDEX LINE MIS-IOS-009 2026-11-09 -->
+
+```text
+- **MIS-IOS-009** — edited a hash-pinned or byte-frozen GENERATED fragment in place, killed its verifier, and hid every later check behind the `abort`. ⚠️ **TWO pinning conventions:** `{Memory,Decisions}/manifest.tsv` hash the **stripped** body — NEVER re-pin; `ported-manifest.tsv` / `amendments-manifest.tsv` / `Decisions/V3/manifest.tsv` hash the **raw** file — MUST re-pin. ⚠️ a GLOB in a comment aborts it too. **Run verifiers UNPIPED — `ruby … | tail` masks rc in zsh.** ×11 feature PRs updating memory/ADRs broke it for a month: run `verify` on ANY `Companion/` diff; when the base already fails, run it MASKED (Instance 14). (×14)
+```
+
+<!-- END VERBATIM INDEX LINE MIS-IOS-009 2026-11-09 -->

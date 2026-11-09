@@ -1,0 +1,25 @@
+# companion-compact manifest — tabmail-ios/DECISIONS.md / Decisions tree (2026-11-09 pass)
+# Source: DECISIONS.md BEFORE this pass (31150 B, sha256 e1f38dc1bbdc01e207ed14a8fc56bd24d4173c5b2ccc94d18499c869a5b702f8; git 6597c3a7:DECISIONS.md)
+# CONTENT DELETED: none. Every row below is a byte-exact fragment MOVED out of the index
+# into the named route target; the index kept one shortened routing line in its place.
+# Stage 4a rebuild (run from tabmail-ios/): for each fragment, in ascending source order, replace the ONE
+# index line now at that position with the fenced verbatim lines (BEGIN VERBATIM LINES a-z in the
+# fragment files; BEGIN VERBATIM INDEX LINE <id> 2026-11-09 with its 'source line N' in each MIS entry).
+# The result must equal the Source size and sha256 above.
+fragment_id	route_target	index_line	bytes	sha256	replacement_bytes
+lines-20-27	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	20	2116	08d7f4b5c90c42578b1a0e174e4483bb4885db4c184f8086d66b1dabeefe2355	565
+lines-74-74	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	74	382	0ac4535ecbc52e77971e8200c7f4be102b61c07c2ccadee21e146c86a793759d	284
+lines-77-77	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	77	659	61bb4efcda969ae6879962b034fe7463b2b8f30cc4d3975ccee0d91f71ec984a	288
+lines-81-81	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	81	1972	02d482cbed5464250feca2655e7563ac85b7c72bf74f9524b4c7b7cc28f44273	312
+lines-83-83	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	83	592	0912a555cc12610e930defd3d713afc96d4b5d15fa8ac2eb8e1806d7a4c3bed8	275
+lines-127-127	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	127	707	e057ef406879f8d9f05c979c9a7c52e963dfc1288deab4f316f4047c4323f1cc	482
+lines-155-155	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	155	470	dbd3fdbd1ecb87706a1b04e74758ee3d17c5af724268e5231259c00609e4a23f	277
+lines-161-161	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	161	715	4a1daa9a54bd0593cba2a9a8ffc0ade1cc97bf260f6ef87b95e4b6a013bcc8b0	248
+lines-163-163	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	163	351	e6fb86edc4caced15330e7eed49274d514fcfda7ab8711822acae1d6f5ce126d	263
+lines-164-164	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	164	311	906bd4188510cf78c401ae1f5b4e918337cd5c70e008c87d884070c66f589ea4	222
+lines-167-167	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	167	310	89b80ca7229e9b63c48bc15d349f1036ba0a75acde3d68ae090ca7c391cc5e1a	208
+lines-168-168	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	168	532	78a70347c6b2b636560975702830beff40de748e7be6f787528710eea77cc02d	277
+lines-169-169	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	169	809	821766da90bd15659252a3ad3a4da7134db62701e2632eafa48cdb4b14b9a74f	221
+lines-170-170	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	170	415	ae574d00fac047d66a74b8a5f8e35ef99950d9a1810a6ad6e44edff293f92f62	220
+lines-171-171	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	171	486	b5b660a32c7150318e7086285f9860e2f5d57b8b919ad05a187bed3337f096b8	252
+lines-172-172	Companion/Decisions/V3/pre-compaction-index-lines-2026-11-09.md	172	342	2209edd8b646b2dede349ea9ff807ef1a098e783c0415ec0eeb7f391d1c1556c	220

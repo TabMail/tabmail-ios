@@ -30,3 +30,19 @@ Before calling a key, id or address wrong, read the function that mints it in th
 changing, and write the test that shows the miss. A note about keying describes a target unless it
 names the stage. Still read content stores for a header via `MessageContentStore.capture`, never
 `ContentKey(rawValue: header.id)`, so the read follows the migration.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-11-09)
+
+Routed out of `tabmail-ios/MISTAKES.md` by the `companion-compact` skill (13026 B against
+its 12,000 B budget). The index keeps a shortened line; this is the line it replaced,
+**byte-for-byte**, source line 51 at `6597c3a7`.
+
+<!-- BEGIN VERBATIM INDEX LINE MIS-IOS-025 2026-11-09 -->
+
+```text
+- **MIS-IOS-025** — **declared `ContentKey(rawValue: message.id)` a missing-body bug from the "FTS is RFC-keyed" note without reading `ContentKey.forHeader`**, which is Stage B (== header id; RFC tail only at E1); my own proving test failed. Read the mint before calling a key wrong; still read content stores via `MessageContentStore.capture`. (×1)
+```
+
+<!-- END VERBATIM INDEX LINE MIS-IOS-025 2026-11-09 -->

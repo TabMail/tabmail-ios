@@ -30,3 +30,19 @@ Never write rect geometry back into a style as px. Ratios of two rects (both scr
 absolute lengths written into styles come from layout values (`offsetWidth`/`offsetHeight`,
 computed style) in the element's own CSS px. When a check says "nothing is transformed here",
 check `transform`, `scale` and `rotate`, and test with a transform ABOVE the region too.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-11-09)
+
+Routed out of `tabmail-ios/MISTAKES.md` by the `companion-compact` skill (13026 B against
+its 12,000 B budget). The index keeps a shortened line; this is the line it replaced,
+**byte-for-byte**, source line 53 at `6597c3a7`.
+
+<!-- BEGIN VERBATIM INDEX LINE MIS-IOS-027 2026-11-09 -->
+
+```text
+- **MIS-IOS-027** — **subtracted the quoted table's screen-px `getBoundingClientRect().height` from its CSS-px `margin-bottom`** in `tmFitQuoteContent`; a sender `transform` above the quote doubled it and the next text overlapped the table; fixed with `offsetHeight`, and `tmQuoteFitTransformed` checks `transform`/`scale`/`rotate` (separate properties hide from computed `transform`); tell = rect geometry written back into a style as px (×1)
+```
+
+<!-- END VERBATIM INDEX LINE MIS-IOS-027 2026-11-09 -->

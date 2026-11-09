@@ -31,3 +31,19 @@ without one stays green whether the refusal is correct or universal.
 
 `debouncedRecordHistory` and `DeviceSyncService.applyReceived` are the tasks that take a hold after being
 created in one; `PromptSemaphoreTests.taskUnderClearedMarkIsNotNested` pins the pattern.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-11-09)
+
+Routed out of `tabmail-ios/MISTAKES.md` by the `companion-compact` skill (13026 B against
+its 12,000 B budget). The index keeps a shortened line; this is the line it replaced,
+**byte-for-byte**, source line 54 at `6597c3a7`.
+
+<!-- BEGIN VERBATIM INDEX LINE MIS-IOS-028 2026-11-09 -->
+
+```text
+- **MIS-IOS-028** — scheduled a later `withPromptStore` from a `Task` created INSIDE a hold; the task inherited the `PromptSemaphore.holding` task-local and was refused as nested (silently, debug log only); create it under `$holding.withValue(nil)`, and give every refusal test a positive control. [detail](Companion/Mistakes/Active/MIS-IOS-028-scheduled-a-hold-from-a-task-born-inside-a-hold.md)
+```
+
+<!-- END VERBATIM INDEX LINE MIS-IOS-028 2026-11-09 -->

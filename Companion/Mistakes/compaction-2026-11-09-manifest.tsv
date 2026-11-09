@@ -1,0 +1,16 @@
+# companion-compact manifest — tabmail-ios/MISTAKES.md / Mistakes tree (2026-11-09 pass)
+# Source: MISTAKES.md BEFORE this pass (13026 B, sha256 4be9d72df38c1b2cc5e70868a35565e79cd731e8ff12617d16dc92afd2fd6257; git 6597c3a7:MISTAKES.md)
+# CONTENT DELETED: none. Every row below is a byte-exact fragment MOVED out of the index
+# into the named route target; the index kept one shortened routing line in its place.
+# Stage 4a rebuild (run from tabmail-ios/): for each fragment, in ascending source order, replace the ONE
+# index line now at that position with the fenced verbatim lines (BEGIN VERBATIM LINES a-z in the
+# fragment files; BEGIN VERBATIM INDEX LINE <id> 2026-11-09 with its 'source line N' in each MIS entry).
+# The result must equal the Source size and sha256 above.
+fragment_id	route_target	index_line	bytes	sha256	replacement_bytes
+MIS-IOS-024	Companion/Mistakes/Active/MIS-IOS-024-widened-a-bound-without-asking-what-it-bounded.md	50	561	14488652a247168413245b6a91b4b05f325b06bac53d5eb167a5d9fdfef13dba	286
+MIS-IOS-025	Companion/Mistakes/Active/MIS-IOS-025-read-a-content-store-with-a-header-id.md	51	352	199c2fe0191db3fb5f1d28baf6bfe39b3360c7fdc5a087b41f35deceb6b741b4	176
+MIS-IOS-026	Companion/Mistakes/Active/MIS-IOS-026-released-a-reference-while-an-await-still-held-the-object.md	52	410	ba94955d40b403afc122c7e00354efb60d340d4392f2c23bb096cf5964f60997	246
+MIS-IOS-027	Companion/Mistakes/Active/MIS-IOS-027-mixed-screen-px-rects-with-css-px-styles.md	53	446	a502fb80e073065a6717e54f9a18a53ebeeac1c78df797adbd9bf9808e8511c3	223
+MIS-IOS-028	Companion/Mistakes/Active/MIS-IOS-028-scheduled-a-hold-from-a-task-born-inside-a-hold.md	54	398	122631c2e30027b31f2a4f09b06e8a0e1b5c2c7f163c331573550950cabfe6c0	203
+MIS-IOS-029	Companion/Mistakes/Active/MIS-IOS-029-called-a-surviving-mutant-equivalent-after-tracing-only-the-immediate-call.md	55	427	02930573aa91cb9895031e7f5fa79910b23b0ee82a2015a12415bc8d47514d6f	180
+MIS-IOS-009	Companion/Mistakes/Active/MIS-IOS-009-amended-a-hash-pinned-fragment-and-killed-the-verifier.md	65	658	cfe42847a1154044252389c82043a87b9b99bd789a022f2c262d3ff61f7334df	444

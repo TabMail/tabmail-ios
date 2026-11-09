@@ -1,0 +1,33 @@
+# companion-compact manifest — tabmail-ios/PROJECT_MEMORY.md / Memory tree (2026-11-09 pass)
+# Source: PROJECT_MEMORY.md BEFORE this pass (33077 B, sha256 54c444d7537cac45a452c64b2a4ca2b261d55246cc1f6843287aa062887d550b; git 6597c3a7:PROJECT_MEMORY.md)
+# CONTENT DELETED: none. Every row below is a byte-exact fragment MOVED out of the index
+# into the named route target; the index kept one shortened routing line in its place.
+# Stage 4a rebuild (run from tabmail-ios/): for each fragment, in ascending source order, replace the ONE
+# index line now at that position with the fenced verbatim lines (BEGIN VERBATIM LINES a-z in the
+# fragment files; BEGIN VERBATIM INDEX LINE <id> 2026-11-09 with its 'source line N' in each MIS entry).
+# The result must equal the Source size and sha256 above.
+fragment_id	route_target	index_line	bytes	sha256	replacement_bytes
+lines-17-17	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	17	657	aa2476cececc8153a4cddbc690ad0322e1a4ce1c09ba9498ea4df07965989c13	270
+lines-18-18	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	18	378	048203bfb7d6d75f11e87f7b209bca7f2931fc6b719b11d0a88fde566e13f1d4	285
+lines-152-152	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	152	383	7cd71a7f897c1ee024e6ab73ca89619ed99e1abffbf484e1cc989e3b65de2057	312
+lines-162-162	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	162	306	7937f9ad985dcfe624850c97d6ebc15b8b3c70c1db6c11dee59b415aeaf34003	254
+lines-163-163	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	163	290	209f5e0f34c8c8ff53e2a29ad736ea43da5f64f2ee6f4a395a644dea7df5fa50	238
+lines-164-164	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	164	292	a2c42fbcd06b941855b5a5e17b3727dbece8432af4011bc1ba2d3ff1ddf32a8d	231
+lines-165-165	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	165	304	219d763362b5018fdeb05b4857945406d8e883aa4e5ab29885b2c21d9f9c3c51	252
+lines-166-166	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	166	292	87fed8ce6e234d068a934df6d13023661e033e53cc3ea7aae8007c66ca2c3c9b	209
+lines-167-167	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	167	343	7c200d51d026e893b4594d7295815b387911f0ec6ccee913b7936176a3f335df	256
+lines-168-168	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	168	343	62b21f4254cccda3ae3a7f5f94ecd8ac88c54b699940eabf3aa5691b55ad2e59	240
+lines-169-169	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	169	298	6462ae234b42663df3170891f5a6a0f6866e293f8af72304b0d08e541e50fc30	232
+lines-171-171	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	171	304	2dd38407f8036c72aa6e97ac869850aa8adc553eb2c83e232a51e27409e99f64	267
+lines-172-172	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	172	307	049da6fd44bdddee102c20fb7cd757402dc548280ecd20126fc21226f0ab2474	293
+lines-174-174	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	174	316	b6fe06d11e26c570ef1987ffc9982f661ec54d58e97fce6ef60d186df4c8e001	269
+lines-176-176	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	176	323	d06117a9f9d2697e0c32f8586f4950dbac60330e56bc2be814f470cc12b9e2ab	280
+lines-177-177	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	177	296	bd59c8ed912a9a2cd26f20265019e43659428a95ab638a96cd348d9a9305955b	218
+lines-178-178	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	178	622	915836dc5b77d9ab2af5b46ac193a22fce37723e35393bda1e298284e225fbdc	271
+lines-179-179	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	179	298	41fcb820c01fca54607496a8c86d711db16551d0ecb8270a876ad7e8e23f26eb	236
+lines-180-180	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	180	299	e8f58fe4b7dd1a4f9c0161350eb87386998022a8a115cdda4523c52f2c069db8	257
+lines-181-181	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	181	281	2fd9fd3d9f5a0a5ace7967f1eef71ac0dc2a50aa037cc82cf2e3930aad3e63f3	211
+lines-183-183	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	183	1076	6c63c34b4a1572e1be6086d101304c07b200a95672fde66608bea36f6d25b857	296
+lines-184-184	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	184	705	c70038927acc9d3aa9887e2bef2b99ccad6c301c36d331b321b27c226e285350	299
+lines-185-185	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	185	460	54bb5fb9dc66da75323fff38f7417ec16c8c48f9e4f038c420b711d8d3519517	281
+lines-186-186	Companion/Memory/History/141-pre-compaction-index-rows-2026-11-09.md	186	495	4ad0617a32e968c8ad221074b158ed34fc0b0d2dc335216c59a693fda5edc135	276

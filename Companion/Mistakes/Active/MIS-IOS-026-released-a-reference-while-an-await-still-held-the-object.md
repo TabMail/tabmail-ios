@@ -34,3 +34,19 @@ When a method claims to release an object, list every live owner, including pend
 it and closures that capture it, and test the claim with a weak reference that must go nil within
 a bound, against a peer that never answers. Start long calls with a completion handler that
 captures nothing but `[weak self]` when the caller must be able to drop the object mid-call.
+
+---
+
+## Pre-compaction index line (verbatim, 2026-11-09)
+
+Routed out of `tabmail-ios/MISTAKES.md` by the `companion-compact` skill (13026 B against
+its 12,000 B budget). The index keeps a shortened line; this is the line it replaced,
+**byte-for-byte**, source line 52 at `6597c3a7`.
+
+<!-- BEGIN VERBATIM INDEX LINE MIS-IOS-026 2026-11-09 -->
+
+```text
+- **MIS-IOS-026** — **"released" `PDFTextHost`'s web view by nilling `self.webView` while `Task { await readPages(webView) }` still awaited `callAsyncJavaScript` on it**: the web view outlived a cancel by 9 s and a wedged page forever; fixed with a `[weak self]` completion handler; tell = a teardown that clears a property while a pending await/closure owns the object; test with a weak ref that must go nil
+```
+
+<!-- END VERBATIM INDEX LINE MIS-IOS-026 2026-11-09 -->
