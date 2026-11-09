@@ -218,5 +218,8 @@ exactly as given, every field appears once, and the endpoint, method and
 content type are the token endpoint's. `CredentialRefreshContractTests` reads
 the notification extension's refresh body the same way, with a grant holding
 `+`, `&`, `=` and `/`. All three use `FormDecoding` (test helper). Every one of
-these values, and Graph ids and search text and Gmail search and page tokens,
-is encoded by the single `StrictPercentEncoding` in `Shared/HTTP`.
+these values, and Graph ids and search text, Gmail search and the Gmail
+drafts.list and history.list page tokens, is encoded by the single
+`StrictPercentEncoding` in `Shared/HTTP`. A synthetic folder marker that reaches
+the bad-request-preserving entry (`modifyMessage`) is refused before any network
+call, as at the ordinary request entry.

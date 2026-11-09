@@ -10,8 +10,10 @@ import Foundation
 /// which split a field, and `+`, which a form reader turns into a space.
 ///
 /// The one definition of that set for the app and the notification service
-/// extension: Graph ids and search text, Gmail search and page tokens, Google
-/// Calendar search and the OAuth token form bodies all encode through it.
+/// extension: Graph ids and search text, Gmail search, the Gmail drafts.list
+/// and history.list page tokens, Google Calendar search and the OAuth token form
+/// bodies encode through it. Gmail messages.list page tokens and label ids are
+/// still interpolated as they come.
 enum StrictPercentEncoding {
     static let unreserved = CharacterSet(
         charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")

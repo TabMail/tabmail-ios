@@ -719,6 +719,26 @@ struct GmailProviderMockTests {
         }
         #expect(FakeHTTP.recordedCalls().isEmpty, "Guard must reject before any network call")
     }
+
+    /// A message action reads a 400 as a stale message and retires the user's
+    /// action, so a synthetic folder marker leaking into its path must be
+    /// refused before Gmail can answer.
+    @Test("bad-request-preserving boundary guard rejects leaked synthetic folder path without network call")
+    func syntheticFolderPathGuardOnMessageAction() async throws {
+        FakeHTTP.reset()
+        defer { FakeHTTP.reset() }
+
+        let provider = GmailProvider(
+            userEmail: "test@example.com",
+            accessToken: { _ in "fake-access-token" },
+            session: FakeHTTP.makeSession()
+        )
+
+        await #expect(throws: ProviderError.self) {
+            try await provider.modifyMessage(id: GmailProvider.archivePath, addLabelIds: ["STARRED"])
+        }
+        #expect(FakeHTTP.recordedCalls().isEmpty, "Guard must reject before any network call")
+    }
 }
 
 @Suite("GmailProvider exact contained-MESSAGE draft RESOURCE resolution")
