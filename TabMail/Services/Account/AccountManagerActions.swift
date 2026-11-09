@@ -2429,6 +2429,12 @@ extension AccountManager {
                 header.bcc = bcc
                 header.snippet = snippet
                 header.date = Date(timeIntervalSince1970: draft.updatedAt)
+                // Sync judges this placeholder stale only while its provider date
+                // is inside the fetched Drafts page, which holds the newest
+                // drafts. Following each save keeps it there; left at its first
+                // save, it falls below the page once enough newer drafts exist
+                // and is never reconciled away.
+                header.providerDate = header.date
                 header.isRead = true
                 header.observedUidValidity = nil
                 try header.save(db)
