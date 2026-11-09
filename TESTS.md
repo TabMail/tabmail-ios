@@ -25,6 +25,25 @@ settlement through the database returned as usable.
 `AccountManagerQueueDrainTests` retains startup-only coverage of cancelled-row
 cleanup and unrelated queued work.
 
+## Outlook calendar edits — server-side oracle
+
+`ExchangeCalendarEditPreservationTests` drives `ExchangeCalendarProvider.updateEvent` and
+`updateOccurrence` over `FakeHTTP` against `FakeGraphCalendar`, which applies Graph's documented
+event-update semantics (unsent properties keep their values; writing `location` replaces
+`locations`; `$select` returns only what it names). For every edit kind on a single event, a whole
+series and one occurrence it asserts on the stored event, not on our payload: every property the
+edit did not set (body, `showAs`, `locations`, attendee types, recurrence, start and end) comes back
+unchanged, and the edited property holds what was asked. The fake also models the recurrence
+behaviour measured live for #423 (a range written without a zone is stored as UTC; a written rule
+that differs from the stored one resets the series' exceptions; a `recurrence` PATCHed without
+`start` moves the series to UTC midnight; a range without `startDate` is refused with a 400): a
+whole-series edit that gives no rule writes no `recurrence` and resets nothing; a series moved to
+another date, timed and all day, keeps its stored recurrence but for the range's start date; an
+occurrence edit never writes a rule or the master. Also covered: an event made recurring, an
+occurrence named by its own id, an empty edit writing nothing, a PATCH retried after a 401, and an
+attendee stored in mixed case keeping its type. The fixtures hold at any host offset from -12 to +14
+hours.
+
 ## Inbox list — layered test architecture
 
 the unified inbox read (ADR-IOS-055) replaced four disagreeing inbox-list read paths with one unified reader (`InboxListReader` → `InboxListComposer.compose`). Getting this right — and *keeping* it right as the code evolves — needs coverage at four distinct layers, each catching a different class of bug. A 5-round adversarial audit of the refactor found two HIGH-severity findings (F1, F2) that lived entirely *between* layers, invisible to any single layer's test suite — that's why the fourth layer (E2E) exists.

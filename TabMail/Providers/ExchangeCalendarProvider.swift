@@ -10,9 +10,25 @@ import Foundation
 actor ExchangeCalendarProvider: CalendarProvider {
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let baseURL = "https://graph.microsoft.com/v1.0/me"
+    /// Test-only transport override. `nil` on every production path, where
+    /// `performHTTPRequest` falls back to `sharedEphemeralSession`.
+    private let testSession: URLSession?
 
     init(accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String) {
         self.accessToken = accessToken
+        self.testSession = nil
+    }
+
+    /// Explicit-session initializer, used by tests to route this provider's HTTP
+    /// through `FakeHTTP`. A separate initializer with a NON-optional session,
+    /// for the reason `GoogleCalendarProvider`'s twin gives: a nil-defaulted seam
+    /// that is silently dropped leaves a unit test talking to the live service.
+    init(
+        accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
+        session: URLSession
+    ) {
+        self.accessToken = accessToken
+        self.testSession = session
     }
 
     // MARK: - Calendars
@@ -112,9 +128,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return events
     }
 
+    /// What one event read selects (`getEvent`, and an edit's `fetchForEdit`).
+    private static let eventSelect = "id,subject,location,bodyPreview,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,createdDateTime,lastModifiedDateTime,isAllDay,seriesMasterId"
+
     func getEvent(calendarId: String = "primary", eventId: String) async throws -> GCalEvent {
         let encodedEventId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
-        let data = try await request(path: "/events/\(encodedEventId)?$select=id,subject,location,bodyPreview,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,createdDateTime,lastModifiedDateTime,isAllDay,seriesMasterId")
+        let data = try await request(path: "/events/\(encodedEventId)?$select=\(Self.eventSelect)")
         let event = try JSONDecoder().decode(MSEvent.self, from: data)
         return toGCalEvent(event)
     }
@@ -209,18 +228,23 @@ actor ExchangeCalendarProvider: CalendarProvider {
         event: GCalEventInput,
         sendUpdates: String = "all"
     ) async throws -> GCalEvent {
-        // Always fetch the existing event and merge the patch onto it, so we
-        // PATCH a FULL payload to Graph. Graph's partial-PATCH semantics are
-        // documented as "fields not specified remain unchanged" — but we've
-        // seen at least one quirk in the wild: PATCHing only `recurrence` on
-        // a master causes Graph to silently rewrite `start`/`end` to UTC
-        // midnight at `range.startDate`. The defensive full-payload approach
-        // matches CalDAV's natural full-resource PUT semantics and Google's
-        // own "prefer GET + UPDATE over PATCH" recommendation.
-        let existing = try await getEvent(calendarId: calendarId, eventId: eventId)
-        let merged = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: existing, patch: event)
+        // PATCH ONLY WHAT THE USER CHANGED (#421). Graph's event-update: "supply
+        // only the values for properties to update. Existing properties that
+        // aren't included in the request body maintain their previous values".
+        // This used to merge the patch onto a read and PATCH every property back,
+        // and the read is lossy: `body` comes back as its plain-text
+        // `bodyPreview`, `showAs` as free or busy, `locations` as one display
+        // name, every attendee as required, and a series' recurrence rebuilt from
+        // an RRULE, which resets the series' exceptions (#423). Every edit wrote
+        // all of that back. `graphPatchJSON` says what rides along and why.
+        let existing = try await fetchForEdit(eventId: eventId)
+        let json = graphPatchJSON(patch: event, existing: existing, allowRecurrence: true)
+        guard !json.isEmpty else {
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateEvent: the edit changes nothing — no PATCH")
+            return existing.event
+        }
         let encodedEventId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
-        let body = try JSONSerialization.data(withJSONObject: toGraphEventJSON(merged))
+        let body = try JSONSerialization.data(withJSONObject: json)
         // Dump the body so we can diagnose date/tz drift in smoke tests.
         // Graph responses are silent on success; without this we can't tell
         // if a wrong-time symptom came from a wrong-time request.
@@ -269,17 +293,16 @@ actor ExchangeCalendarProvider: CalendarProvider {
         let (eventId, _) = try await resolveToMaster(eventId: eventId)
         let instanceId = try await resolveInstanceId(masterId: eventId, recurrenceId: recurrenceId, zone: recurrenceIdZone)
         let encodedInstanceId = try Self.encodedGraphPathSegment(instanceId, context: "Graph event instance id")
-        // Same defensive full-payload approach as `updateEvent` — fetch the
-        // instance, merge the patch onto it, send everything. Without this an
-        // instance PATCH that touches only `attendees` (or some other field)
-        // could silently re-anchor the instance's start to the master's
-        // pattern. Strip `recurrence` defensively in case it was inherited —
-        // an instance/exception cannot carry a series rule and Graph 400s on
-        // PATCHes that include one.
-        let existingInstance = try await getEvent(eventId: instanceId)
-        var instancePatch = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: existingInstance, patch: event)
-        instancePatch.recurrence = nil
-        let body = try JSONSerialization.data(withJSONObject: toGraphEventJSON(instancePatch))
+        // Only the properties the user changed, as in `updateEvent` (#421), and
+        // never `recurrence`: an instance cannot carry a series rule and Graph
+        // 400s on a PATCH that includes one.
+        let existingInstance = try await fetchForEdit(eventId: instanceId)
+        let json = graphPatchJSON(patch: event, existing: existingInstance, allowRecurrence: false)
+        guard !json.isEmpty else {
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateOccurrence: the edit changes nothing — no PATCH")
+            return existingInstance.event
+        }
+        let body = try JSONSerialization.data(withJSONObject: json)
         if DebugModeManager.isLoggingEnabled() {
             if let bodyStr = String(data: body, encoding: .utf8) {
                 BackgroundSyncLogger.logDebug("[ExchangeCalendar] updateOccurrence PATCH body=\(bodyStr.prefix(4000))")
@@ -554,6 +577,102 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return (eventId, fetched)
     }
 
+    // MARK: - Edits (#421)
+
+    /// An event as an edit reads it: the `GCalEvent` the shared merge helper works
+    /// on, plus the Graph JSON of the same read for what that mapping narrows and
+    /// an edit must keep (the stored `recurrence`, each attendee's type).
+    struct EditSnapshot {
+        let event: GCalEvent
+        let raw: [String: Any]
+
+        /// Lowercased attendee address → Graph attendee type
+        /// (`required`, `optional`, `resource`).
+        var attendeeTypes: [String: String] {
+            var types: [String: String] = [:]
+            for attendee in raw["attendees"] as? [[String: Any]] ?? [] {
+                guard let address = (attendee["emailAddress"] as? [String: Any])?["address"] as? String,
+                      let type = attendee["type"] as? String else { continue }
+                types[address.lowercased()] = type
+            }
+            return types
+        }
+    }
+
+    private func fetchForEdit(eventId: String) async throws -> EditSnapshot {
+        let encodedEventId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
+        let data = try await request(path: "/events/\(encodedEventId)?$select=\(Self.eventSelect)")
+        let decoded = try JSONDecoder().decode(MSEvent.self, from: data)
+        let raw = (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        return EditSnapshot(event: toGCalEvent(decoded), raw: raw)
+    }
+
+    /// The PATCH body for an edit: only the properties `patch` sets, plus what a
+    /// changed property needs with it —
+    ///
+    /// - start and end together when either moves (`mergeExistingEventWithPatch`
+    ///   derives the side the user did not give from the event's duration);
+    /// - `recurrence` (when `allowRecurrence`) only when the edit gives a rule,
+    ///   with start and end beside it: PATCHing `recurrence` alone makes Graph
+    ///   rewrite a master's start and end to UTC midnight at the range's
+    ///   `startDate` (see `splitSeries`' cap PATCH);
+    /// - when a series' start moves to another date and the rule does not
+    ///   change, the stored recurrence exactly as Graph holds it, with only the
+    ///   range's `startDate` moved, because Graph requires it to match the start.
+    ///   A series edit that keeps its date writes no recurrence: any recurrence
+    ///   write that differs from the stored one resets the series' exceptions
+    ///   (#423, measured);
+    /// - attendees keep their Graph type; only a new attendee is `required`.
+    ///
+    /// Empty when the patch changes nothing.
+    nonisolated func graphPatchJSON(patch: GCalEventInput, existing: EditSnapshot, allowRecurrence: Bool) -> [String: Any] {
+        let current = existing.event
+        let movesTime = patch.startDate != nil || patch.startDateTime != nil
+            || patch.endDate != nil || patch.endDateTime != nil
+        let merged = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: current, patch: patch)
+
+        var sparse = GCalEventInput()
+        sparse.summary = patch.summary
+        sparse.location = patch.location
+        sparse.description = patch.description
+        sparse.transparency = patch.transparency
+        sparse.attendees = patch.attendees
+        if allowRecurrence { sparse.recurrence = patch.recurrence }
+        if movesTime || sparse.recurrence != nil {
+            sparse.startDate = merged.startDate
+            sparse.startDateTime = merged.startDateTime
+            sparse.startTimeZone = merged.startTimeZone
+            sparse.endDate = merged.endDate
+            sparse.endDateTime = merged.endDateTime
+            sparse.endTimeZone = merged.endTimeZone
+        }
+        var json = toGraphEventJSON(sparse, attendeeTypes: existing.attendeeTypes)
+        if allowRecurrence, sparse.recurrence == nil, movesTime,
+           var stored = existing.raw["recurrence"] as? [String: Any],
+           var range = stored["range"] as? [String: Any],
+           let newDay = Self.day(merged.startDate, merged.startDateTime),
+           newDay != Self.day(current.start?.date, current.start?.dateTime) {
+            range["startDate"] = newDay
+            stored["range"] = range
+            json["recurrence"] = stored
+        }
+        return json
+    }
+
+    /// The date a start falls on for the device: an all-day start's own date, a
+    /// timed one's instant read in the device's zone (the zone `request` asks
+    /// Graph to read starts in). Two spellings of one start give one date.
+    nonisolated static func day(_ date: String?, _ dateTime: String?) -> String? {
+        if let date { return String(date.prefix(10)) }
+        guard let dateTime, let instant = Date.fromISO8601(dateTime) else { return nil }
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.calendar = Calendar(identifier: .gregorian)
+        fmt.timeZone = .current
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.string(from: instant)
+    }
+
     /// Find the Graph instance id for the occurrence `recurrenceId` names when
     /// read in `zone`, by enumerating a wide-enough window around that instant to
     /// tolerate DST and device/event timezone deltas. See
@@ -684,7 +803,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // round-trip preserves the user's intended wall time.
         let prefTz = TimeZone.current.identifier
         let headers = ["Prefer": "outlook.timezone=\"\(prefTz)\""]
-        let result = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: token, extraHeaders: headers, logLabel: "ExchangeCalendar")
+        let result = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: token, extraHeaders: headers, session: testSession, logLabel: "ExchangeCalendar")
 
         if let data = result.data {
             return data
@@ -694,7 +813,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if result.statusCode == 401 {
             BackgroundSyncLogger.logDebug("[ExchangeCalendar] Token expired, refreshing...")
             let freshToken = try await accessToken(true)
-            let retry = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: freshToken, extraHeaders: headers, logLabel: "ExchangeCalendar")
+            let retry = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: freshToken, extraHeaders: headers, session: testSession, logLabel: "ExchangeCalendar")
             // `headers` already carries the local-tz Prefer from the first attempt above.
             if let data = retry.data {
                 return data
@@ -879,7 +998,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return iso
     }
 
-    nonisolated func toGraphEventJSON(_ input: GCalEventInput) -> [String: Any] {
+    /// `attendeeTypes` (lowercased address → Graph type) keeps an existing
+    /// attendee's type; an attendee it does not name is `required`.
+    nonisolated func toGraphEventJSON(_ input: GCalEventInput, attendeeTypes: [String: String] = [:]) -> [String: Any] {
         var json: [String: Any] = [:]
 
         if let summary = input.summary { json["subject"] = summary }
@@ -934,7 +1055,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 if let name = a.name {
                     obj["emailAddress"] = ["address": a.email, "name": name]
                 }
-                obj["type"] = "required"
+                obj["type"] = attendeeTypes[a.email.lowercased()] ?? "required"
                 return obj
             }
         }
