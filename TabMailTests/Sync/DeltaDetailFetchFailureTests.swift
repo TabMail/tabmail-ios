@@ -17,10 +17,10 @@ import Testing
 /// completes past it and moves the cursor, so later changes land.
 ///
 /// These drive production `SyncEngine.performDeltaSync` (and, for the bound,
-/// `fullSync` and `captureSyncCursors`, in the order `SyncEngine.sync(account:)`
-/// runs them) end to end on `FakeHTTP` with a real provider and a real
-/// `DatabasePool`, for both providers whose delta fetches messages by id
-/// (Gmail and Outlook).
+/// the foreground poll `SyncEngine.sync(account:)`, which runs the delta, the
+/// due full sync and the cursor capture) end to end on `FakeHTTP` with a real
+/// provider and a real `DatabasePool`, for both providers whose delta fetches
+/// messages by id (Gmail and Outlook).
 @Suite("A delta never loses a change whose message fetch failed", .serialized, .processGlobalState)
 struct DeltaDetailFetchFailureTests {
     enum Failure: String, Sendable, CaseIterable {
@@ -80,6 +80,25 @@ struct DeltaDetailFetchFailureTests {
 
     private static func cursor(accountId: String, pool: DatabasePool) throws -> String? {
         try pool.read { db in try Account.fetchOne(db, key: accountId) }?.lastHistoryId
+    }
+
+    /// One foreground poll, as the app runs it: the account is read afresh and
+    /// `SyncEngine.sync(account:)` runs on the provider's registered work queue.
+    private static func foregroundPoll(engine: SyncEngine, accountId: String, pool: DatabasePool) async throws {
+        let account = try #require(try storedAccount(id: accountId, pool: pool))
+        _ = try await engine.sync(account: account)
+    }
+
+    /// Moves the account's last poll and last full sync one poll interval back,
+    /// so the next poll runs (past the recent-sync guard) without a full sync
+    /// being due: only the delta can land what changed.
+    private static func lastPolledOneIntervalAgo(accountId: String, pool: DatabasePool) throws {
+        let earlier = Date().addingTimeInterval(-SyncConfig.foregroundPollIntervalSeconds)
+        try pool.write { db in
+            _ = try Account.filter(Column("id") == accountId).updateAll(db,
+                Column("lastSyncedAt").set(to: earlier),
+                Column("lastFullSyncAt").set(to: earlier))
+        }
     }
 
     // MARK: - Gmail
@@ -233,29 +252,35 @@ struct DeltaDetailFetchFailureTests {
             let provider = GmailProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
             let engine = SyncEngine()
+            await engine.register(
+                accountId: Self.gmailBoundAccountId, provider: provider,
+                workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
 
             await #expect(throws: (any Error).self, "the stuck message must fail the delta, not be taken for deleted") {
                 _ = try await engine.performDeltaSync(account: account, provider: provider)
             }
             #expect(try Self.cursor(accountId: Self.gmailBoundAccountId, pool: pool) == "1000")
 
-            try await engine.fullSync(account: account, provider: provider)
-            await engine.captureSyncCursors(account: account, provider: provider)
-
+            // A foreground poll with a full sync due: its delta fails on the
+            // stuck message again, and its full sync and capture bound that.
+            try await Self.foregroundPoll(engine: engine, accountId: Self.gmailBoundAccountId, pool: pool)
+            #expect(try Self.storedAccount(id: Self.gmailBoundAccountId, pool: pool)?.lastFullSyncAt != nil,
+                    "precondition: the poll ran its due full sync")
             #expect(try Self.headerExists(accountId: Self.gmailBoundAccountId, folderPath: "INBOX", messageId: "ok-1", pool: pool),
                     "the full sync must still sync the rest of the folder")
             #expect(try Self.headerExists(accountId: Self.gmailBoundAccountId, folderPath: "INBOX", messageId: Self.gmailStuckId, pool: pool),
                     "a message the server still holds must keep its row")
             #expect(try Self.cursor(accountId: Self.gmailBoundAccountId, pool: pool) == "2000",
-                    "the full sync must bound the failed delta by moving the cursor")
+                    "the poll must bound the failed delta by moving the cursor")
 
-            // Each poll reads the account afresh, as `SyncEngine.sync(account:)` callers do.
-            let reloaded = try #require(try Self.storedAccount(id: Self.gmailBoundAccountId, pool: pool))
-            let next = try await engine.performDeltaSync(account: reloaded, provider: provider)
-            #expect(next.succeeded)
+            // The next ordinary poll, with no full sync due: the delta alone
+            // lands a change made after the stuck one.
+            try Self.lastPolledOneIntervalAgo(accountId: Self.gmailBoundAccountId, pool: pool)
+            try await Self.foregroundPoll(engine: engine, accountId: Self.gmailBoundAccountId, pool: pool)
             #expect(try Self.headerExists(accountId: Self.gmailBoundAccountId, folderPath: "INBOX", messageId: "ok-2", pool: pool),
                     "a change made after the stuck one must land")
             #expect(try Self.cursor(accountId: Self.gmailBoundAccountId, pool: pool) == "2001")
+            await engine.remove(accountId: Self.gmailBoundAccountId)
         }
     }
 
@@ -499,11 +524,12 @@ struct DeltaDetailFetchFailureTests {
     private static let capturedLink = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=captured"
     private static let afterCaptureLink = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$deltatoken=after"
 
-    /// The bound on Outlook is the cursor capture alone: Outlook's full sync
-    /// lists each folder's messages in one request and never fetches the stuck
-    /// message by id, so it cannot fail on it. The capture walks the inbox's
-    /// delta pages to the end and stores the final link; a later delta from
-    /// that link lands what changed after it.
+    /// The bound on Outlook is the cursor capture the foreground poll runs after
+    /// its due full sync. Outlook's full sync lists each folder's messages in one
+    /// request and never fetches the stuck message by id, so it cannot fail on
+    /// it. The capture walks the inbox's delta pages to the end and stores the
+    /// final link; the next poll's delta from that link lands what changed
+    /// after it.
     @Test("An Outlook message whose fetch never succeeds does not stop sync: the capture moves the delta link and later changes land",
           arguments: Failure.answers)
     func outlookStuckMessageDoesNotStopSync(failure: Failure) async throws {
@@ -513,7 +539,18 @@ struct DeltaDetailFetchFailureTests {
                 folderPath: Self.outlookFolder, role: .inbox, pool: pool)
             let scenario = FakeHTTP.Scenario()
             defer { scenario.close() }
-            scenario.register(path: "/messages/delta", method: "GET") { request in
+            // The full sync: the folder list, the inbox by its well-known name,
+            // and the inbox's messages in one listing.
+            scenario.register(path: "/mailFolders", method: "GET", response: .json(
+                raw: #"{ "value": [ { "id": "\#(Self.outlookFolder)", "displayName": "Inbox", "totalItemCount": 2, "unreadItemCount": 0, "childFolderCount": 0 } ] }"#))
+            scenario.register(path: "/mailFolders/inbox", method: "GET", response: .json(
+                raw: #"{ "id": "\#(Self.outlookFolder)", "displayName": "Inbox" }"#))
+            scenario.register(path: "/mailFolders/\(Self.outlookFolder)/messages", method: "GET", response: .json(
+                raw: #"{ "value": [ \#(Self.outlookMessageJSON(id: "stuck-1")), \#(Self.outlookMessageJSON(id: "ok-1")) ] }"#))
+            // Every delta page, under each path it is requested by (the stored
+            // links name the inbox by its well-known name, the capture by id),
+            // so no shorter folder fixture above answers a delta request.
+            let delta: @Sendable (FakeHTTP.Request) -> FakeHTTP.CannedResponse = { request in
                 let url = request.url.absoluteString
                 if url.contains("deltatoken=start") {
                     return .json(raw: Self.outlookDeltaPage(ids: ["stuck-1", "ok-1"]))
@@ -527,6 +564,8 @@ struct DeltaDetailFetchFailureTests {
                 // The capture's first page, for the inbox folder by id.
                 return .json(raw: #"{ "value": [ { "id": "stuck-1" } ], "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/delta?$skiptoken=page-2" }"#)
             }
+            scenario.register(path: "/mailFolders/inbox/messages/delta", method: "GET", handler: delta)
+            scenario.register(path: "/mailFolders/\(Self.outlookFolder)/messages/delta", method: "GET", handler: delta)
             scenario.register(path: "/messages/stuck-1", method: "GET",
                               response: failure.response(id: "stuck-1", provider: .outlook))
             for id in ["ok-1", "ok-2"] {
@@ -535,23 +574,35 @@ struct DeltaDetailFetchFailureTests {
             let provider = ExchangeProvider(
                 userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
             let engine = SyncEngine()
+            await engine.register(
+                accountId: Self.outlookAccountId, provider: provider,
+                workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: 1))
 
             await #expect(throws: (any Error).self, "the stuck message must fail the delta, not be taken for deleted") {
                 _ = try await engine.performDeltaSync(account: account, provider: provider)
             }
             #expect(try Self.cursor(accountId: Self.outlookAccountId, pool: pool) == Self.startLink)
 
-            await engine.captureSyncCursors(account: account, provider: provider)
+            // A foreground poll with a full sync due: its delta fails on the
+            // stuck message again, and the capture after its full sync bounds that.
+            try await Self.foregroundPoll(engine: engine, accountId: Self.outlookAccountId, pool: pool)
+            #expect(try Self.storedAccount(id: Self.outlookAccountId, pool: pool)?.lastFullSyncAt != nil,
+                    "precondition: the poll ran its due full sync")
+            #expect(try Self.headerExists(
+                accountId: Self.outlookAccountId, folderPath: Self.outlookFolder, messageId: "stuck-1", pool: pool),
+                    "a message the server still holds must keep its row")
             #expect(try Self.cursor(accountId: Self.outlookAccountId, pool: pool) == Self.capturedLink,
-                    "the capture must bound the failed delta by storing the inbox's current delta link")
+                    "the poll must bound the failed delta by storing the inbox's current delta link")
 
-            let reloaded = try #require(try Self.storedAccount(id: Self.outlookAccountId, pool: pool))
-            let next = try await engine.performDeltaSync(account: reloaded, provider: provider)
-            #expect(next.succeeded)
+            // The next ordinary poll, with no full sync due: the delta alone
+            // lands a change made after the stuck one.
+            try Self.lastPolledOneIntervalAgo(accountId: Self.outlookAccountId, pool: pool)
+            try await Self.foregroundPoll(engine: engine, accountId: Self.outlookAccountId, pool: pool)
             #expect(try Self.headerExists(
                 accountId: Self.outlookAccountId, folderPath: Self.outlookFolder, messageId: "ok-2", pool: pool),
                     "a change made after the stuck one must land")
             #expect(try Self.cursor(accountId: Self.outlookAccountId, pool: pool) == Self.afterCaptureLink)
+            await engine.remove(accountId: Self.outlookAccountId)
         }
     }
 }
