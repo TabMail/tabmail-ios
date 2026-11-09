@@ -1496,10 +1496,11 @@ actor ExchangeProvider: EmailProvider {
             do {
                 data = try await requestAbsolute(url: link)
             } catch {
-                if link == historyId {
-                    // First request failed — delta link expired
-                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Delta link expired — need full sync") }
-                    BackgroundSyncLogger.log("exchange.fetchHistory: delta link expired (first request failed: \(error.localizedDescription))")
+                // Graph can refuse the round on any page (a reset is `410 Gone` wherever it
+                // lands), and a refused round needs a full sync from a new cursor.
+                if Self.graphRefusedDeltaToken(error) {
+                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] Delta link refused — need full sync") }
+                    BackgroundSyncLogger.log("exchange.fetchHistory: delta link refused (\(link == historyId ? "first" : "later") request failed: \(error.localizedDescription))")
                     return nil
                 }
                 BackgroundSyncLogger.log("exchange.fetchHistory: page request failed: \(error.localizedDescription)")
@@ -1536,6 +1537,19 @@ actor ExchangeProvider: EmailProvider {
             labelsAdded: [],
             labelsRemoved: []
         )
+    }
+
+    /// Whether a failed delta request, on any page, means Graph refused the round,
+    /// so the cursor is discarded and the next full sync takes a new one. Graph
+    /// answers an expired token with "a 40X-series error with error codes such as
+    /// `syncStateNotFound`" and a reset with `410 Gone` (delta-query-overview).
+    /// An authorization failure (401, 403), a timeout (408), a throttle (429), a
+    /// server error (5xx) or a dropped connection says nothing about the token, so
+    /// the error is rethrown and the cursor kept for the next delta pass.
+    private static func graphRefusedDeltaToken(_ error: Error) -> Bool {
+        guard case ProviderError.networkError(let underlying) = error,
+              case HTTPError.networkError(let status) = underlying else { return false }
+        return (400..<500).contains(status) && ![401, 403, 408, 429].contains(status)
     }
 
     /// Protocol-required: fetch message headers by ID (non-batched version for delta sync).
@@ -1580,19 +1594,24 @@ actor ExchangeProvider: EmailProvider {
     }
 
     /// Get the current delta link for a folder (used to initialize the incremental sync cursor).
+    ///
+    /// The initial delta round returns every message in the folder, so this walks
+    /// the whole folder. Pages are sized with `Prefer: odata.maxpagesize`, the
+    /// documented control, sent on every page as Graph's examples do; the round
+    /// asks for ids only.
     func getCurrentDeltaLink(folderId: String) async throws -> String? {
-        // Request delta with no changes to get the current delta link
         let encodedFolderId = try Self.encodedGraphPathSegment(folderId, context: "Graph folder id")
-        var nextLink: String? = "/mailFolders/\(encodedFolderId)/messages/delta?$select=id&\(topParam(1))"
+        var nextLink: String? = "/mailFolders/\(encodedFolderId)/messages/delta?$select=id"
         var deltaLink: String?
+        let pageSize = ["Prefer": "odata.maxpagesize=\(SyncConfig.graphDeltaCursorWalkPageSize)"]
 
         // Walk through all pages to get the final deltaLink
         while let link = nextLink {
             let data: Data
             if link.hasPrefix("http") {
-                data = try await requestAbsolute(url: link)
+                data = try await requestAbsolute(url: link, extraHeaders: pageSize)
             } else {
-                data = try await request(path: link)
+                data = try await request(path: link, extraHeaders: pageSize)
             }
             let response = try JSONDecoder().decode(GraphDeltaResponse.self, from: data)
             deltaLink = response.odataDeltaLink
@@ -1679,7 +1698,7 @@ actor ExchangeProvider: EmailProvider {
     }
 
     /// Used by delta pagination — the next/delta links are absolute URLs.
-    private func requestAbsolute(url: String) async throws -> Data {
+    private func requestAbsolute(url: String, extraHeaders: [String: String] = [:]) async throws -> Data {
         guard let components = URLComponents(string: url),
               components.scheme == "https",
               components.host?.lowercased() == "graph.microsoft.com",
@@ -1691,7 +1710,7 @@ actor ExchangeProvider: EmailProvider {
         }
 
         do {
-            return try await authedHTTP.get(url)
+            return try await authedHTTP.get(url, extraHeaders: extraHeaders)
         } catch let e as HTTPError {
             throw ProviderError.networkError(underlying: e)
         }
