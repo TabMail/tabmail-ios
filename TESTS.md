@@ -209,4 +209,7 @@ page where messages answer 404, 410, 400, 503 and an unreadable body still loads
 message, reports those five as named but not loaded, and counts the whole page as covered. A 401
 the token refresh does not cure, or a dropped connection, still fails the page, and so does a page
 cancelled while a message waits out the rate-limit backoff: it never reports coverage and asks for
-nothing more.
+nothing more. Through the real caller, `GmailReceivedDateBoundaryTests` pulls older mail with
+`SyncEngine.fetchOlderMessages` the way the scroller does: a full page with one message Gmail cannot
+serve still says there may be more, so the next pull loads the message beyond it, the unreadable
+message gets no row, and the stored rows stay.
