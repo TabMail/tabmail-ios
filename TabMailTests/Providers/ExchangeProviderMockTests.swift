@@ -105,9 +105,11 @@ struct ExchangeProviderMockTests {
         """
         FakeHTTP.register(path: "/messages/\(messageId)/attachments", method: "GET", response: .json(raw: attachmentsJSON))
 
-        // $expand call — returns envelope + body + hasAttachments=true, but no
-        // attachments list (Graph's nested expand limitation, verified against
-        // learn.microsoft.com/en-us/answers/questions/1013332/).
+        // $expand call — returns envelope + body + hasAttachments=true. Graph
+        // documents that it also returns the item's attachments, each file with
+        // its bytes (attachment-get, Example 4); this fixture leaves them out.
+        // The nested list call below is a 400 on Graph v1.0 (measured, #549);
+        // this fixture still answers it.
         let expandedJSON = """
         {
           "@odata.type": "#microsoft.graph.itemAttachment",
@@ -850,7 +852,8 @@ struct ExchangeProviderSelectionWiringTests {
                 "\(Self.graphBase)/mailFolders/fetch-route/messages?$select=\(h)"
                     + "&$top=5&$orderby=receivedDateTime desc&$skip=3"),
             normalizedURL("\(Self.graphBase)/messages/full-route?$select=\(Self.fullFields)"),
-            normalizedURL("\(Self.graphBase)/messages/full-route/attachments"),
+            normalizedURL(
+                "\(Self.graphBase)/messages/full-route/attachments?\(GraphAPI.attachmentMetadataQuery)"),
             normalizedURL("\(Self.graphBase)/messages/backfill-route?$select=\(Self.backfillFields)"),
             normalizedURL(
                 "\(Self.graphBase)/mailFolders/search-route/messages?$select=\(h)"

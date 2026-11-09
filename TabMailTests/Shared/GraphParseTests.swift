@@ -287,8 +287,8 @@ struct GraphParseTests {
 
     // MARK: - extractInlineImageRefs
 
-    /// `$expand=attachments` returns FileAttachment objects with `contentBytes`
-    /// inline; inline images are identified by `isInline=true` + non-empty
+    /// An inline image's own attachment GET returns a FileAttachment with its
+    /// `contentBytes`; inline images are identified by `isInline=true` + non-empty
     /// `contentId` + `image/*` content type. Bytes are standard base64 (NOT
     /// base64url), mirroring Graph's wire format.
     @Test("extractInlineImageRefs decodes inline FileAttachments")
@@ -346,8 +346,8 @@ struct GraphParseTests {
 
     @Test("extractInlineImageRefs skips attachments with missing contentBytes")
     func inlineImagesMissingContentBytes() {
-        // `$expand=attachments` may omit `contentBytes` if it exceeds the
-        // Graph inline-expansion size limit. Without bytes we can't resolve
+        // An entry may come without `contentBytes` (a list read with a
+        // `$select` that leaves them out, or a malformed response). Without bytes we can't resolve
         // the CID — skip rather than inserting an empty-data entry that
         // would crash BodyRenderer.
         let attachments: [[String: Any]] = [

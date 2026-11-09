@@ -166,9 +166,9 @@ enum GmailAPI {
             throw HTTPError.networkError(statusCode: 0)
         }
 
-        // Fetch CID inline images referenced in the HTML body. Unlike Graph's
-        // `$expand=attachments`, Gmail's `messages.get?format=full` returns
-        // inline image metadata on the part tree, but the actual bytes live
+        // Fetch CID inline images referenced in the HTML body. Gmail's
+        // `messages.get?format=full` returns inline image metadata on the
+        // part tree, but the actual bytes live
         // behind a separate `users.messages.attachments.get` call (unless
         // the part is small enough that Gmail inlines the base64url data
         // on `body.data`). Pre-fetching here gives the NSE-staged body

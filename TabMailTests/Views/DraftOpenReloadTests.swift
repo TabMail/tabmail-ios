@@ -785,7 +785,7 @@ struct DraftOpenReloadTests {
                 #expect(row.attachmentsDirName == draft.attachmentsDirName)
                 #expect(try DraftAttachmentStorage.loadAttachments(dirName: row.attachmentsDirName).count == 2)
                 let lists = http.recordedCalls().filter { $0.method == "GET" && $0.url.contains("/attachments") }
-                #expect(lists.count <= ExchangeDraftConfig.maxAttachmentListPages, "the list read did not stop")
+                #expect(lists.count <= GraphAPI.maxAttachmentListPages, "the list read did not stop")
                 #expect(!lists.contains { $0.url.contains("attacker.example.com") }, "a next link left Graph")
 
                 try await pool.write { db in

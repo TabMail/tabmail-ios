@@ -149,7 +149,8 @@ enum GraphParse {
         return (nil, nil)
     }
 
-    /// Enumerate attachments from a Graph message's expanded `attachments[]`.
+    /// Enumerate attachments from a Graph attachment list (`GraphAPI.messageFull`
+    /// lists them with `GraphAPI.attachmentMetadataQuery`, metadata only).
     /// Section = Graph attachment ID (used for per-attachment fetch later).
     static func extractAttachmentRefs(from attachments: [[String: Any]]?) -> [AttachmentRef] {
         guard let atts = attachments else { return [] }
@@ -165,12 +166,11 @@ enum GraphParse {
         }
     }
 
-    /// Decode inline images from a Graph message's expanded `attachments[]`.
-    /// `$expand=attachments` on `FileAttachment` includes `contentBytes`
-    /// (standard base64) in-line, so there is NO extra network call — the
-    /// bytes the `messageFull` response already carries go straight into
+    /// Decode inline images from Graph file attachments that carry their bytes
+    /// (`contentBytes`, standard base64): `GraphAPI.messageFull` passes each
+    /// inline image it fetched by id. The images go into
     /// `BodyRenderer.ingredients.inlineImages`, and the renderer substitutes
-    /// `cid:` refs with `data:` URIs in the rendered HTML.
+    /// their `cid:` refs in the rendered HTML.
     ///
     /// Only entries with `isInline=true`, a non-empty `contentId`, and an
     /// `image/*` content type count — matches `ExchangeProvider`'s main-app
