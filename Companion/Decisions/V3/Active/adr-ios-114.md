@@ -188,7 +188,7 @@ same AI result, kept as long as the email itself is shown.
    **What the chat asks for, and where it opens (decided 2026-11-09).** In the decision's words: "Just walk back
    from the recent thing until you walk through the whole thread with some cap. We already have a
    cap somewhere; it's probably good enough. If we scroll further up, we could see more summarizing
-   as we scroll up." This supersedes the 2026-11-06 window below and tabmail-main's earlier wording
+   as we scroll up." This supersedes the 2026-11-06 window below and the earlier wording
    of it. The rule:
    - On open, once the thread is loaded, the chat asks once for its newest
      `ChatViewConfig.summaryWindow` (10) emails, newest first, wherever it lands

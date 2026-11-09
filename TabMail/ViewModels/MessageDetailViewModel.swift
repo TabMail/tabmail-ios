@@ -242,6 +242,13 @@ final class MessageDetailViewModel {
         return postedId == selectedId
     }
 
+    /// Pure decision for MailNavigationView's selection change: the email a notification tap
+    /// opened stays highlighted only while that open is the selection. Any other selection
+    /// ends it, so a later inbox open of the same email lands as an ordinary open.
+    nonisolated static func notificationHighlight(afterSelecting selectedId: String?, opened: String?) -> String? {
+        selectedId == opened ? opened : nil
+    }
+
     /// Pure routing decision for a notification message deep-link tap: the id
     /// `MailNavigationView` opens. A staged row matches ONLY when the tap
     /// carries an accountId and that row belongs to it — a nil accountId

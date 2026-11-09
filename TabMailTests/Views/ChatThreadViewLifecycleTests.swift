@@ -205,8 +205,8 @@ struct ChatThreadViewLifecycleTests {
         #expect(abs(opened.belowScreen) < 2, "at the bottom, got \(opened.belowScreen) below the screen")
         #expect(opened.fullyShown.contains(Self.length - 1), "the newest email is on screen: \(opened.fullyShown.sorted())")
         Self.expectOpenRequest(opened)
-        #expect(Set(opened.older).isSubset(of: opened.partlyShown),
-                "an older email is asked for only once shown: \(opened.older) vs \(opened.partlyShown.sorted())")
+        #expect(opened.older.isEmpty,
+                "at the bottom every email on screen is among the newest asked for, so no older one asks: \(opened.older) vs \(opened.partlyShown.sorted())")
         #expect(!opened.queued.contains(0), "the oldest email waits for a scroll")
     }
 

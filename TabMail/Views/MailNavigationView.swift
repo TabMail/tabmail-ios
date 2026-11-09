@@ -620,6 +620,10 @@ struct MailNavigationView: View {
                 selectedMessageId = nil
             }
         }
+        .onChange(of: selectedMessageId) { _, newId in
+            notificationOpenedId = MessageDetailViewModel.notificationHighlight(
+                afterSelecting: newId, opened: notificationOpenedId)
+        }
         .modifier(NavigationNotificationHandlers(selection: $selection, pushedShowsAccount: $pushedShowsAccount))
         .fullScreenCover(isPresented: $showsTutorialReplay) {
             TutorialWelcomeView(onStart: {
