@@ -20,7 +20,7 @@ import SwiftMail
 ///    carries the DISPLAY NAMES — can say which opaque ids are user labels.
 ///  - `mutationRevision` is the guard that keeps the allowlist from going
 ///    stale: a `/labels` listing that was issued BEFORE a `createLabel` /
-///    `findLabelIdByName` discovery must not replace the newer knowledge, so a
+///    `findLabelByName` discovery must not replace the newer knowledge, so a
 ///    response whose recorded revision no longer matches unions instead of
 ///    replacing. An allowlist without this is a stale allowlist that silently
 ///    forgets a label the user just created.
@@ -1994,9 +1994,10 @@ actor GmailProvider: EmailProvider {
         )
     }
 
-    /// Look up a Gmail label ID by display name. Returns nil if not found.
+    /// Look up a Gmail user label by display name, compared without case.
+    /// Returns its id and Gmail's own spelling of the name, or nil if not found.
     /// Used when createLabel returns 409 Conflict (label already exists on server).
-    func findLabelIdByName(_ name: String) async throws -> String? {
+    func findLabelByName(_ name: String) async throws -> (id: String, name: String)? {
         let catalogRequest = userLabelCatalog.beginRequest()
         let data = try await request(path: "/labels")
         let response = try JSONDecoder().decode(GmailLabelsResponse.self, from: data)
@@ -2024,7 +2025,7 @@ actor GmailProvider: EmailProvider {
         // match is provider-confirmed and must survive any older request still
         // in flight until a later uncontended catalog replaces the cache.
         userLabelCatalog.recordKnownUserLabel(match.id)
-        return match.id
+        return (match.id, match.name)
     }
 
     /// Recursively check all MIME parts for attachments.

@@ -388,9 +388,9 @@ struct StatefulGmailActionServerTests {
     /// `MessageHeaderInfo.userLabelIdsAreAuthoritative` existed nowhere on
     /// `v3`. That was true when it was written and is no longer: T3.8 ported
     /// the catalog struct into `TabMail/Providers/GmailProvider.swift` and the
-    /// authoritative flag into `MessageHeaderInfo`, and `findLabelIdByName`
+    /// authoritative flag into `MessageHeaderInfo`, and `findLabelByName`
     /// now applies the reference's `UserLabelStore.shouldExcludeLabel` filter
-    /// (so `findLabelIdByName("tm_legacy") == nil` holds here too, and no
+    /// (so `findLabelByName("tm_legacy") == nil` holds here too, and no
     /// longer inverts).
     ///
     /// This test keeps its own job: the `/labels` catalog feeding `move()`'s
@@ -424,7 +424,7 @@ struct StatefulGmailActionServerTests {
             !folders.contains { $0.path == legacyLabelId },
             "legacy tm_* labels are hidden from the folder list (ADR-IOS-036)"
         )
-        #expect(try await provider.findLabelIdByName("Project") == userLabelId)
+        #expect(try await provider.findLabelByName("Project")?.id == userLabelId)
         #expect(try await provider.createLabel(name: "Created") == createdLabelId)
 
         // Inbox exit strips the recorded legacy label in the SAME modify call.
@@ -492,8 +492,8 @@ struct StatefulGmailActionServerTests {
         #expect(beforeCatalog[0].userLabelIds.isEmpty)
         #expect(!beforeCatalog[0].userLabelIdsAreAuthoritative)
 
-        #expect(try await provider.findLabelIdByName("Project") == labelId)
-        let legacyLookup = try await provider.findLabelIdByName("tm_legacy")
+        #expect(try await provider.findLabelByName("Project")?.id == labelId)
+        let legacyLookup = try await provider.findLabelByName("tm_legacy")?.id
         #expect(
             legacyLookup == nil,
             "a legacy tm_* label is not a user label and must never be resolvable by name"

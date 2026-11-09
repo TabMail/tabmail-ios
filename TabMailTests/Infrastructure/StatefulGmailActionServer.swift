@@ -472,6 +472,23 @@ final class StatefulGmailActionServer: @unchecked Sendable {
         return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
     }
 
+    /// Gmail's answer to creating a label whose name is already taken.
+    private static func labelNameConflictBody() -> Data {
+        let message = "Label name exists or conflicts"
+        let object: [String: Any] = [
+            "error": [
+                "errors": [[
+                    "domain": "global",
+                    "reason": "duplicate",
+                    "message": message,
+                ]],
+                "code": 409,
+                "message": message,
+            ],
+        ]
+        return (try? JSONSerialization.data(withJSONObject: object)) ?? Data()
+    }
+
     /// Gmail's real `400` error body for a malformed/never-valid message id
     /// on exact-ID `GET /messages/{id}` — literal wording `"Invalid id value
     /// <id>"` (matched by `GmailProvider.isGmailInvalidIdError`'s
@@ -546,6 +563,17 @@ final class StatefulGmailActionServer: @unchecked Sendable {
             let name = request.body.flatMap {
                 try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
             }?["name"] as? String
+            // Gmail refuses a second label whose name matches an existing one
+            // (compared without case, as `findLabelByName` looks it up) with
+            // 409 "Label name exists or conflicts".
+            let conflicts = name.map { name in
+                state.value.withLock { model in
+                    model.userLabels.values.contains { $0.caseInsensitiveCompare(name) == .orderedSame }
+                }
+            } ?? false
+            if conflicts {
+                return .bytes(Self.labelNameConflictBody(), contentType: "application/json", statusCode: 409)
+            }
             let created = state.value.withLock { model -> (id: String, name: String)? in
                 guard let id = model.createdLabelId, let name else { return nil }
                 model.userLabels[id] = name

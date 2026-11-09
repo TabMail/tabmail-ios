@@ -220,3 +220,13 @@ message gets no row, and the stored rows stay.
 whose provider throws the Gmail and Outlook HTTP error shape (`ProviderError.networkError` around
 `HTTPError.networkError(statusCode:)`). A 404 or 410 skips the folder: no error reaches the caller
 and the next folder is still synced. Any other status (500) still reaches the caller.
+
+## Gmail label create — a name Gmail already has
+
+`UserLabelCreateExistingNameTests` creates a label through `UserLabelMenuModel.createAndApply(name:)`
+against `StatefulGmailActionServer`, which answers 409 "Label name exists or conflicts" when a user
+label with that name (compared without case) exists. A name Gmail already has applies Gmail's
+existing label: the gesture succeeds, Gmail is asked to add that label's id, the stored row and the
+menu entry carry Gmail's spelling of the name, and a label already in the menu is listed once. A free
+name still creates and applies a new label. The 409 is read through `httpStatus(of:)`; a check of the
+bridged `NSError` code on the thrown error never sees the HTTP status.

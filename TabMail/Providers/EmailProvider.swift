@@ -681,12 +681,22 @@ extension EmailProvider {
 /// `ProviderError.messageNotFound` because Gmail/Exchange overload it for
 /// parse failures (see `fetchMessagesBatch` doc above).
 func isHttpGoneStatus(_ error: Error) -> Bool {
-    guard case ProviderError.networkError(let underlying) = error else { return false }
-    if case HTTPError.networkError(let statusCode) = underlying {
-        return statusCode == 404 || statusCode == 410
-    }
-    let nsCode = (underlying as NSError).code
-    return nsCode == 404 || nsCode == 410
+    guard let status = httpStatus(of: error) else { return false }
+    return status == 404 || status == 410
+}
+
+/// The HTTP status a provider request failed with: the status inside
+/// `ProviderError.networkError`, from `HTTPError.networkError(statusCode:)` or
+/// from an underlying `NSError` whose code the provider set to the status. Nil
+/// when the error is not a provider network error.
+///
+/// Read a status only through this. `(error as NSError).code` on the thrown
+/// error is never an HTTP status: a Swift error enum bridges to an `NSError`
+/// whose code is its case index, so a check such as `code == 409` never matches.
+func httpStatus(of error: Error) -> Int? {
+    guard case ProviderError.networkError(let underlying) = error else { return nil }
+    if case HTTPError.networkError(let statusCode) = underlying { return statusCode }
+    return (underlying as NSError).code
 }
 
 /// Result of a Gmail history.list call — tells us exactly what changed since last sync
