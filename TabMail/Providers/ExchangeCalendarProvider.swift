@@ -662,9 +662,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// The date a start falls on for the device: an all-day start's own date, a
     /// timed one's instant read in the device's zone (the zone `request` asks
     /// Graph to read starts in). Two spellings of one start give one date.
+    /// A timed start written without an offset (`…T10:00`, `…T10:00:00.000`,
+    /// which the tools pass through as given) has no instant to read, so its
+    /// own date is taken as written, as the range's `startDate` always was.
     nonisolated static func day(_ date: String?, _ dateTime: String?) -> String? {
         if let date { return String(date.prefix(10)) }
-        guard let dateTime, let instant = Date.fromISO8601(dateTime) else { return nil }
+        guard let dateTime else { return nil }
+        guard let instant = Date.fromISO8601(dateTime) else { return String(dateTime.prefix(10)) }
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.calendar = Calendar(identifier: .gregorian)

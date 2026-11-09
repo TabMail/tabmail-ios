@@ -40,7 +40,10 @@ that aren't included in the request body maintain their previous values".
 - A whole-series edit that gives no rule writes no `recurrence`, unless its start moves to another
   date: then the stored recurrence is written exactly as Graph holds it (from `fetchForEdit`'s raw
   read), with only the range's `startDate` moved to the new date, because the two must match. The
-  date is the device's (`day`), the zone `request` asks Graph to read starts in.
+  date is the device's (`day`), the zone `request` asks Graph to read starts in; a start written
+  without an offset (the tools pass `…T10:00` through as given) is taken at its own date, as written.
+  `day` reads the device's zone while the stored range keeps its `recurrenceTimeZone`; where the two
+  disagree on the date, the range start can be a day off (#463).
 - A rule the edit gives is written as before (rebuilt from the RRULE by `toGraphEventJSON`). It still
   drops the series' `recurrenceTimeZone` and `firstDayOfWeek` (#423, open), and the calendar tool's
   own recurrence format is #513.
@@ -60,9 +63,12 @@ Graph's documented PATCH semantics (unsent properties keep their values; `locati
 `locations`; `$select` returns only what it names) and the measured #423 recurrence behaviour (a range
 written without a zone is stored as UTC; a written rule that differs from the stored one counts as a
 series reset; a `recurrence` written without `start` moves the series to UTC midnight; a range with no
-`startDate` is refused). Every edit kind on a single event, a whole series and one occurrence asserts
-that every property it did not edit comes back unchanged on the server; a whole-series edit that
+`startDate` is refused). Six edit kinds (rename, move an hour, move only the end, change the room,
+add an attendee, mark busy) on a single event, a whole series and one occurrence assert that every
+property they did not edit comes back unchanged on the server; a whole-series edit that
 gives no rule sends no `recurrence` and resets nothing; a series moved to another date (timed and
-all day) keeps its stored recurrence but for the range's start date. `GraphFixture` stores its UTC
+all day, or by a start written without an offset) keeps its stored recurrence but for the range's
+start date; a series given a new rule and a new date gets the new rule; the date compared is the
+device's, not UTC's. `GraphFixture` stores its UTC
 start at the hour that puts the device on the same date, so the suite holds at any host offset from
 -12 to +14 hours.

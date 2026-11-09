@@ -34,6 +34,7 @@ final class FakeGraphCalendar: Sendable {
     private let events: Mutex<[String: Data]>
     private let resets = Mutex(0)
     private let patchLog = Mutex<[(id: String, body: Data)]>([])
+    private let patchAuthorizationLog = Mutex<[String]>([])
     private let failingRequests = Mutex<[String: [Int]]>([:])
 
     init(_ seed: [[String: Any]]) {
@@ -68,6 +69,9 @@ final class FakeGraphCalendar: Sendable {
             .compactMap { (try? JSONSerialization.jsonObject(with: $0.body)) as? [String: Any] }
     }
 
+    /// The `Authorization` header of every PATCH, refused ones included, in order.
+    var patchAuthorizations: [String] { patchAuthorizationLog.withLock { $0 } }
+
     func install(on http: FakeHTTP.Scenario) {
         http.register(path: "/v1.0/me/events/", method: "GET") { [self] request in
             if let status = takeFailure("GET") { return .status(status) }
@@ -83,6 +87,7 @@ final class FakeGraphCalendar: Sendable {
             return Self.json(Self.only(select, of: stored))
         }
         http.register(path: "/v1.0/me/events/", method: "PATCH") { [self] request in
+            patchAuthorizationLog.withLock { $0.append(request.header("Authorization") ?? "none") }
             if let status = takeFailure("PATCH") { return .status(status) }
             let parts = Self.pathParts(request.url)
             guard parts.count == 1, var stored = event(parts[0]),
@@ -217,6 +222,52 @@ enum GraphFixture {
 
     static func rfc3339(_ date: Date) -> String { naive(date) + "Z" }
 
+    /// The date `date` falls on in UTC and on the device.
+    static func utcDay(_ date: Date) -> String { String(naive(date).prefix(10)) }
+    static func deviceDay(_ date: Date) -> String {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = .current
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.string(from: date)
+    }
+
+    /// An hour either side of a UTC midnight a week ahead: two UTC dates, and one
+    /// device date unless the device is within about an hour of UTC.
+    static let acrossUTCMidnight: (from: Date, to: Date) = {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = utc
+        let midnight = cal.startOfDay(for: Date().addingTimeInterval(8 * 86_400))
+        return (midnight.addingTimeInterval(-3_600), midnight.addingTimeInterval(3_600))
+    }()
+    static var acrossUTCMidnightIsOneDeviceDay: Bool {
+        deviceDay(acrossUTCMidnight.from) == deviceDay(acrossUTCMidnight.to)
+    }
+
+    /// An hour either side of the device's midnight a week ahead: two device
+    /// dates, and one UTC date unless the device is within about an hour of UTC.
+    static let acrossDeviceMidnight: (from: Date, to: Date) = {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = .current
+        let midnight = cal.startOfDay(for: Date().addingTimeInterval(8 * 86_400))
+        return (midnight.addingTimeInterval(-3_600), midnight.addingTimeInterval(3_600))
+    }()
+    static var acrossDeviceMidnightIsOneUTCDay: Bool {
+        utcDay(acrossDeviceMidnight.from) == utcDay(acrossDeviceMidnight.to)
+    }
+
+    /// A weekly series starting at `start`, its range dated on the device's day,
+    /// as Graph keeps it in a recurrence zone that is the device's.
+    static func seriesOnDeviceDay(id: String, start: Date) -> [String: Any] {
+        var e = event(id: id, start: start, online: false, recurring: true)
+        var recurrence = e["recurrence"] as? [String: Any] ?? [:]
+        var range = recurrence["range"] as? [String: Any] ?? [:]
+        range["startDate"] = deviceDay(start)
+        recurrence["range"] = range
+        e["recurrence"] = recurrence
+        return e
+    }
+
     static func weekday(_ date: Date) -> String {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = utc
@@ -302,15 +353,16 @@ enum GraphFixture {
 /// properties it is allowed to change. Everything else must come back exactly
 /// as it was.
 enum UserCalendarEdit: String, CaseIterable, CustomTestStringConvertible, Sendable {
-    case rename, moveOneHour, addAttendee, markBusy, newDescription, newRecurrence
+    case rename, moveOneHour, endLater, moveRoom, addAttendee, markBusy, newDescription, newRecurrence
 
     var testDescription: String { rawValue }
 
     /// The edits the online-meeting fixtures take: a description edit of an
     /// online meeting is not kept around its join block yet (#511).
-    static let ofAnOnlineMeeting: [UserCalendarEdit] = [.rename, .moveOneHour, .addAttendee, .markBusy]
+    static let ofAnOnlineMeeting: [UserCalendarEdit] = [.rename, .moveOneHour, .endLater, .moveRoom, .addAttendee, .markBusy]
 
     static let newDescriptionText = "New notes\nSecond line"
+    static let newRoom = "Room 5"
 
     func patch(start: Date) -> GCalEventInput {
         var p = GCalEventInput()
@@ -320,6 +372,12 @@ enum UserCalendarEdit: String, CaseIterable, CustomTestStringConvertible, Sendab
         case .moveOneHour:
             p.startDateTime = GraphFixture.rfc3339(start.addingTimeInterval(3_600))
             p.startTimeZone = "UTC"
+        case .endLater:
+            // "make it end an hour later": the end alone.
+            p.endDateTime = GraphFixture.rfc3339(start.addingTimeInterval(1_800 + 3_600))
+            p.endTimeZone = "UTC"
+        case .moveRoom:
+            p.location = Self.newRoom
         case .addAttendee:
             // What `resolveAttendeeDelta` hands the provider: the whole resolved list.
             p.attendees = [
@@ -343,6 +401,9 @@ enum UserCalendarEdit: String, CaseIterable, CustomTestStringConvertible, Sendab
         switch self {
         case .rename: ["subject"]
         case .moveOneHour: ["start", "end", "isAllDay"]
+        // The start is written beside the end, at the same instant (asserted).
+        case .endLater: ["start", "end", "isAllDay"]
+        case .moveRoom: ["location", "locations"]
         case .addAttendee: ["attendees"]
         case .markBusy: ["showAs"]
         case .newDescription: ["body", "bodyPreview"]
@@ -401,6 +462,19 @@ private func expectOnlyEdited(
             #expect(newEnd?.hasPrefix(GraphFixture.naive(start.addingTimeInterval(1_800 + 3_600))) == true,
                     "\(label): the end did not move with the start, is \(newEnd ?? "none")")
         }
+    case .endLater:
+        if let start {
+            let newStart = (after["start"] as? [String: Any])?["dateTime"] as? String
+            let newEnd = (after["end"] as? [String: Any])?["dateTime"] as? String
+            #expect(newStart?.hasPrefix(GraphFixture.naive(start)) == true,
+                    "\(label): moving the end moved the start, is \(newStart ?? "none")")
+            #expect(newEnd?.hasPrefix(GraphFixture.naive(start.addingTimeInterval(1_800 + 3_600))) == true,
+                    "\(label): the end did not move an hour later, is \(newEnd ?? "none")")
+        }
+    case .moveRoom:
+        let room: [String: Any] = ["displayName": UserCalendarEdit.newRoom]
+        #expect(canonical(after["location"]) == canonical(room), "\(label): the new room was not written")
+        #expect(canonical(after["locations"]) == canonical([room]), "\(label): the locations do not name only the new room")
     case .newRecurrence:
         let recurrence = after["recurrence"] as? [String: Any]
         #expect((recurrence?["pattern"] as? [String: Any])?["type"] as? String == "daily", "\(label): the new rule was not written")
@@ -423,8 +497,10 @@ private func expectOnlyEdited(
     }
 }
 
+/// A provider whose sign-in hands out "stale-token" until it is asked to refresh.
 private func makeProvider(_ http: FakeHTTP.Scenario) -> ExchangeCalendarProvider {
-    ExchangeCalendarProvider(accessToken: { _ in "test-token" }, session: http.session)
+    ExchangeCalendarProvider(accessToken: { forceRefresh in forceRefresh ? "fresh-token" : "stale-token" },
+                             session: http.session)
 }
 
 // MARK: - The invariant
@@ -533,6 +609,99 @@ struct ExchangeCalendarEditPreservationTests {
         for property in watchedProperties where !["start", "end", "recurrence"].contains(property) {
             #expect(canonical(after[property]) == canonical(before[property]), "the move changed \(property)")
         }
+    }
+
+    /// "make it daily from next week": the user's rule is written, not the stored
+    /// one, and its range starts on the new date.
+    @Test("a whole series given a new rule and a new date gets the new rule from that date")
+    func wholeSeriesNewRuleAndDate() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let newStart = GraphFixture.start.addingTimeInterval(7 * 86_400)
+        var patch = UserCalendarEdit.newRecurrence.patch(start: GraphFixture.start)
+        patch.startDateTime = GraphFixture.rfc3339(newStart)
+        patch.startTimeZone = "UTC"
+
+        _ = try await makeProvider(http).updateEvent(eventId: "ser-1", event: patch)
+
+        let after = try #require(graph.event("ser-1"))
+        let recurrence = try #require(after["recurrence"] as? [String: Any])
+        #expect((recurrence["pattern"] as? [String: Any])?["type"] as? String == "daily", "the stored rule was written over the new one")
+        let range = recurrence["range"] as? [String: Any]
+        #expect(range?["type"] as? String == "numbered" && (range?["numberOfOccurrences"] as? Int) == 5)
+        #expect(range?["startDate"] as? String == GraphFixture.utcDay(newStart))
+        #expect(((after["start"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(GraphFixture.naive(newStart)) == true)
+    }
+
+    /// The date a series starts on is the device's (`request` asks Graph for starts
+    /// in the device's zone), not UTC's. A move within the device's day that
+    /// crosses UTC midnight is not a date move.
+    @Test("a series moved within the device's day across UTC midnight writes no recurrence",
+          .enabled(if: GraphFixture.acrossUTCMidnightIsOneDeviceDay))
+    func seriesMovedAcrossUTCMidnight() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let (from, to) = GraphFixture.acrossUTCMidnight
+        let graph = FakeGraphCalendar([GraphFixture.seriesOnDeviceDay(id: "ser-x", start: from)])
+        graph.install(on: http)
+        var patch = GCalEventInput()
+        patch.startDateTime = GraphFixture.rfc3339(to)
+        patch.startTimeZone = "UTC"
+
+        _ = try await makeProvider(http).updateEvent(eventId: "ser-x", event: patch)
+
+        let sent = graph.patches("ser-x")
+        #expect(sent.count == 1 && sent.allSatisfy { $0["recurrence"] == nil }, "a move within the device's day wrote a recurrence")
+        #expect(graph.seriesResets == 0)
+        #expect(((graph.event("ser-x")?["start"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(GraphFixture.naive(to)) == true)
+    }
+
+    /// The other side: a move across the device's midnight within one UTC date is a
+    /// date move, and the range's start date is the device's new date.
+    @Test("a series moved across the device's midnight moves its range's start date to the device's date",
+          .enabled(if: GraphFixture.acrossDeviceMidnightIsOneUTCDay))
+    func seriesMovedAcrossDeviceMidnight() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let (from, to) = GraphFixture.acrossDeviceMidnight
+        let graph = FakeGraphCalendar([GraphFixture.seriesOnDeviceDay(id: "ser-y", start: from)])
+        graph.install(on: http)
+        var patch = GCalEventInput()
+        patch.startDateTime = GraphFixture.rfc3339(to)
+        patch.startTimeZone = "UTC"
+
+        _ = try await makeProvider(http).updateEvent(eventId: "ser-y", event: patch)
+
+        let range = (graph.event("ser-y")?["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        #expect(graph.patches("ser-y").contains { $0["recurrence"] != nil }, "a move to the device's next day kept the old range start")
+        #expect(range?["startDate"] as? String == GraphFixture.deviceDay(to))
+    }
+
+    /// The tools pass a start they cannot read through as given, so a start can
+    /// arrive without an offset (`…T10:00`). Its date is the one written.
+    @Test("a whole series moved to another date by a start written without an offset keeps its recurrence at the new date")
+    func wholeSeriesMovedByNaiveStart() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let before = try #require(graph.event("ser-1"))
+        let newStart = GraphFixture.start.addingTimeInterval(7 * 86_400)
+        var patch = GCalEventInput()
+        patch.startDateTime = String(GraphFixture.naive(newStart).prefix(16))
+        patch.startTimeZone = "UTC"
+        patch.endDateTime = String(GraphFixture.naive(newStart.addingTimeInterval(1_800)).prefix(16))
+        patch.endTimeZone = "UTC"
+
+        _ = try await makeProvider(http).updateEvent(eventId: "ser-1", event: patch)
+
+        let after = try #require(graph.event("ser-1"))
+        let now = try #require(after["recurrence"] as? [String: Any], "the series lost its recurrence")
+        #expect(graph.patches("ser-1").contains { $0["recurrence"] != nil }, "the range's start date was not moved")
+        #expect((now["range"] as? [String: Any])?["startDate"] as? String == GraphFixture.utcDay(newStart))
+        #expect(canonical(now["pattern"]) == canonical((before["recurrence"] as? [String: Any])?["pattern"]), "the move changed the pattern")
     }
 
     @Test("an all-day series moved to another date moves its range's start date with it")
@@ -668,6 +837,8 @@ struct ExchangeCalendarEditPreservationTests {
             eventId: "ev-online", event: UserCalendarEdit.rename.patch(start: GraphFixture.start))
 
         #expect(http.recordedCalls().filter { $0.method == "PATCH" }.count == 2)
+        #expect(graph.patchAuthorizations == ["Bearer stale-token", "Bearer fresh-token"],
+                "the write was not retried with a refreshed sign-in: \(graph.patchAuthorizations)")
         #expect(graph.patches("ev-online").count == 1)
         #expect(graph.event("ev-online")?["subject"] as? String == "Planning (renamed)")
     }
