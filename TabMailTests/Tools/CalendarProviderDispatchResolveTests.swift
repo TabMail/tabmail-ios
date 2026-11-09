@@ -158,10 +158,19 @@ struct CalendarProviderDispatchResolveTests {
 
     @Test("An active preferred account wins over another registered account")
     func activePreferredAccountWins() async throws {
+        // The registry's order is not fixed, so one resolve could pick the
+        // preferred account by chance. Resolving once per preference, against
+        // the same registry, names each account in turn only if the preference
+        // is honoured.
         try await withFixture(demoActive: false, preferred: .realB, accounts: [.realA: true, .realB: true], registered: [.realA, .realB]) { f in
-            let resolved = await CalendarProviderDispatch.resolve(db: f.db)
-            #expect(resolved?.account.id == f.realBId)
-            #expect(isSame(resolved?.provider, f.realB))
+            let toB = await CalendarProviderDispatch.resolve(db: f.db)
+            #expect(toB?.account.id == f.realBId)
+            #expect(isSame(toB?.provider, f.realB))
+
+            UserDefaults.standard.set(f.realAId, forKey: CalendarProviderDispatch.preferredCalendarAccountKey)
+            let toA = await CalendarProviderDispatch.resolve(db: f.db)
+            #expect(toA?.account.id == f.realAId)
+            #expect(isSame(toA?.provider, f.realA))
         }
     }
 
