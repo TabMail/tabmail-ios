@@ -720,9 +720,9 @@ struct GmailProviderMockTests {
         #expect(FakeHTTP.recordedCalls().isEmpty, "Guard must reject before any network call")
     }
 
-    /// A message action reads a 400 as a stale message and retires the user's
-    /// action, so a synthetic folder marker leaking into its path must be
-    /// refused before Gmail can answer.
+    /// A message action reads Gmail's structured invalid-id 400 as a stale
+    /// message and retires the user's action, so a synthetic folder marker
+    /// leaking into its path must be refused before Gmail can answer.
     @Test("bad-request-preserving boundary guard rejects leaked synthetic folder path without network call")
     func syntheticFolderPathGuardOnMessageAction() async throws {
         FakeHTTP.reset()
@@ -749,11 +749,17 @@ struct GmailProviderExactDraftResourceTests {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
 
+        // The token carries the characters a form query reads as syntax, and
+        // the second page is served only for that exact token: Gmail refuses a
+        // page token it did not issue.
+        let token = "pg+2/=&x y"
         http.register(path: "/drafts", method: "GET") { request in
-            if request.url.absoluteString.contains("pageToken") {
-                return .json(raw: #"{"drafts":[{"id":"resource-exact","message":{"id":"contained-exact"}}]}"#)
+            let query = FormDecoding.fields(request.url.query ?? "")
+            guard let sentToken = query["pageToken"] else {
+                return .json(raw: #"{"drafts":[{"id":"resource-other","message":{"id":"contained-other"}}],"nextPageToken":"pg+2/=&x y"}"#)
             }
-            return .json(raw: #"{"drafts":[{"id":"resource-other","message":{"id":"contained-other"}}],"nextPageToken":"page-2"}"#)
+            guard sentToken == [token] else { return .status(400) }
+            return .json(raw: #"{"drafts":[{"id":"resource-exact","message":{"id":"contained-exact"}}]}"#)
         }
         let provider: any EmailProvider = GmailProvider(
             userEmail: "test@example.com",
@@ -770,8 +776,15 @@ struct GmailProviderExactDraftResourceTests {
             containedMessageId: "contained-exact"
         ))
         let calls = http.recordedCalls()
-        #expect(calls.filter { $0.url.contains("/drafts?") }.count == 2)
+        let lists = calls.filter { $0.url.contains("/drafts?") }
+        #expect(lists.count == 2)
         #expect(!calls.contains { $0.url.contains("/messages?") })
+        guard lists.count == 2 else { return }
+        let first = FormDecoding.fields(URL(string: lists[0].url)?.query ?? "")
+        let second = FormDecoding.fields(URL(string: lists[1].url)?.query ?? "")
+        #expect(first["pageToken"] == nil)
+        #expect(second["pageToken"] == [token], "the second page must name the token Gmail gave, exactly")
+        #expect(Set(second.keys) == Set(first.keys).union(["pageToken"]))
     }
 
     @Test("Gmail exact resolver returns no authority for zero or duplicate wrappers", arguments: [

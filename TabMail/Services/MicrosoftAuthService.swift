@@ -85,9 +85,9 @@ extension OAuthService {
         return try await exchangeMicrosoftCode(code, codeVerifier: codeVerifier, scope: scope)
     }
 
-    private func exchangeMicrosoftCode(_ code: String, codeVerifier: String, scope: String) async throws -> OAuthTokens {
+    func exchangeMicrosoftCode(_ code: String, codeVerifier: String, scope: String) async throws -> OAuthTokens {
         let request = Self.microsoftCodeExchangeRequest(code: code, codeVerifier: codeVerifier, scope: scope)
-        let (data, _) = try await sharedEphemeralSession.data(for: request)
+        let (data, _) = try await tokenSession.data(for: request)
         let response = try JSONDecoder().decode(MicrosoftTokenResponse.self, from: data)
 
         guard let accessToken = response.access_token else {
@@ -104,7 +104,7 @@ extension OAuthService {
 
     func refreshMicrosoftToken(refreshToken: String) async throws -> OAuthTokens {
         let request = Self.microsoftRefreshRequest(refreshToken: refreshToken)
-        let (data, _) = try await sharedEphemeralSession.data(for: request)
+        let (data, _) = try await tokenSession.data(for: request)
         let response = try JSONDecoder().decode(MicrosoftTokenResponse.self, from: data)
 
         guard let accessToken = response.access_token else {

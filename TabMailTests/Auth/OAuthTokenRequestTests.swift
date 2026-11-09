@@ -76,4 +76,81 @@ struct OAuthTokenRequestTests {
         #expect(fields["client_id"] == [OAuthConfig.microsoftClientId])
         #expect(Set(fields.keys) == ["client_id", "refresh_token", "grant_type", "scope"])
     }
+
+    // MARK: - The sign-in and refresh calls
+
+    /// The four calls that reach a token endpoint during sign-in and renewal.
+    enum Dispatch: String, CaseIterable, CustomTestStringConvertible {
+        case googleCode, googleRefresh, microsoftCode, microsoftRefresh
+        var testDescription: String { rawValue }
+    }
+
+    /// The requests the fake transport received, recorded from its handler thread.
+    private final class SentRequests: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: [FakeHTTP.Request] = []
+        func append(_ request: FakeHTTP.Request) { lock.lock(); stored.append(request); lock.unlock() }
+        var all: [FakeHTTP.Request] { lock.lock(); defer { lock.unlock() }; return stored }
+    }
+
+    /// Each call must send its own grant to its own provider's token endpoint:
+    /// a refresh that went to the other provider, or a code sent as a refresh
+    /// token, fails sign-in or renewal.
+    @Test("Each sign-in and refresh call sends its own grant to its own provider", arguments: Dispatch.allCases)
+    @MainActor
+    func callSendsItsOwnGrant(dispatch: Dispatch) async throws {
+        let value = Self.values[0]
+        let verifier = value + "v"
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let sent = SentRequests()
+        http.register(path: "token", method: "POST") { request in
+            sent.append(request)
+            return .json(raw: #"{"access_token":"access","refresh_token":"refresh","expires_in":3600}"#)
+        }
+        let service = OAuthService(tokenSession: http.session)
+
+        let google = "https://oauth2.googleapis.com/token"
+        let microsoft = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+        let expected: (url: String, fields: [String: [String]])
+        let tokens: OAuthTokens
+        switch dispatch {
+        case .googleCode:
+            tokens = try await service.exchangeGoogleCode(value, codeVerifier: verifier)
+            expected = (google, [
+                "code": [value], "code_verifier": [verifier], "grant_type": ["authorization_code"],
+                "client_id": [OAuthConfig.googleClientId],
+                "redirect_uri": ["\(OAuthConfig.googleRedirectScheme):/oauthredirect"],
+            ])
+        case .googleRefresh:
+            tokens = try await service.refreshGoogleToken(refreshToken: value)
+            expected = (google, [
+                "refresh_token": [value], "grant_type": ["refresh_token"], "client_id": [OAuthConfig.googleClientId],
+            ])
+        case .microsoftCode:
+            tokens = try await service.exchangeMicrosoftCode(value, codeVerifier: verifier, scope: OAuthConfig.microsoftScopes)
+            expected = (microsoft, [
+                "code": [value], "code_verifier": [verifier], "scope": [OAuthConfig.microsoftScopes],
+                "grant_type": ["authorization_code"], "client_id": [OAuthConfig.microsoftClientId],
+                "redirect_uri": ["\(OAuthConfig.microsoftRedirectScheme)://auth"],
+            ])
+        case .microsoftRefresh:
+            tokens = try await service.refreshMicrosoftToken(refreshToken: value)
+            expected = (microsoft, [
+                "refresh_token": [value], "scope": [OAuthConfig.microsoftScopes], "grant_type": ["refresh_token"],
+                "client_id": [OAuthConfig.microsoftClientId],
+            ])
+        }
+
+        #expect(tokens.accessToken == "access", "the call read the endpoint's answer")
+        let requests = sent.all
+        #expect(requests.count == 1, "requests: \(requests.map(\.url.absoluteString))")
+        guard requests.count == 1 else { return }
+        let request = requests[0]
+        #expect(request.url.absoluteString == expected.url)
+        #expect(request.method == "POST")
+        #expect(request.header("Content-Type") == "application/x-www-form-urlencoded")
+        let fields = FormDecoding.fields(request.body.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+        #expect(fields == expected.fields)
+    }
 }

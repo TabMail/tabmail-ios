@@ -215,7 +215,12 @@ literal percent escapes) comes back as exactly one `q`, with no stray parameter.
 refresh requests and reads each body as a form, asserting that a code,
 verifier or refresh token holding `+`, `&`, `=`, `/` or a literal `%2B` arrives
 exactly as given, every field appears once, and the endpoint, method and
-content type are the token endpoint's. `CredentialRefreshContractTests` reads
+content type are the token endpoint's. The same suite drives the four real
+sign-in and refresh calls (`OAuthService` with a fake token transport) and
+asserts each sends its own grant, once, to its own provider's endpoint.
+`GmailProviderExactDraftResourceTests` serves a later drafts page only for the
+exact page token it issued (one holding `+`, `/`, `=`, `&` and a space) and
+reads the second request's query as a form. `CredentialRefreshContractTests` reads
 the notification extension's refresh body the same way, with a grant holding
 `+`, `&`, `=` and `/`. All three use `FormDecoding` (test helper). Every one of
 these values, and Graph ids and search text, Gmail search and the Gmail

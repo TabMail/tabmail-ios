@@ -42,6 +42,15 @@ final class OAuthService: NSObject {
 
     var currentSession: ASWebAuthenticationSession?
 
+    /// Sends the token-endpoint requests (code exchange and refresh). The app
+    /// uses the shared session; a test passes one backed by a fake transport.
+    let tokenSession: URLSession
+
+    init(tokenSession: URLSession = sharedEphemeralSession) {
+        self.tokenSession = tokenSession
+        super.init()
+    }
+
     // MARK: - Google OAuth
 
     /// Identity-only Google OAuth — `openid email profile` scopes only,
@@ -154,9 +163,9 @@ final class OAuthService: NSObject {
         return try await exchangeGoogleCode(code, codeVerifier: codeVerifier)
     }
 
-    private func exchangeGoogleCode(_ code: String, codeVerifier: String) async throws -> OAuthTokens {
+    func exchangeGoogleCode(_ code: String, codeVerifier: String) async throws -> OAuthTokens {
         let request = Self.googleCodeExchangeRequest(code: code, codeVerifier: codeVerifier)
-        let (data, _) = try await sharedEphemeralSession.data(for: request)
+        let (data, _) = try await tokenSession.data(for: request)
         let response = try JSONDecoder().decode(GoogleTokenResponse.self, from: data)
 
         guard let accessToken = response.access_token else {
@@ -173,7 +182,7 @@ final class OAuthService: NSObject {
 
     func refreshGoogleToken(refreshToken: String) async throws -> OAuthTokens {
         let request = Self.googleRefreshRequest(refreshToken: refreshToken)
-        let (data, _) = try await sharedEphemeralSession.data(for: request)
+        let (data, _) = try await tokenSession.data(for: request)
         let response = try JSONDecoder().decode(GoogleTokenResponse.self, from: data)
 
         guard let accessToken = response.access_token else {
