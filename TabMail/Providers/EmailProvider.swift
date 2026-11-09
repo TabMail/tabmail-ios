@@ -309,6 +309,15 @@ protocol EmailProvider: Sendable {
     /// (HTTP providers); IMAP overrides to `.uid`. See `StaleWindowMode`.
     var staleWindowMode: StaleWindowMode { get }
 
+    /// Whether this provider can act on a local placeholder id (`sent-…`,
+    /// `draft-…`, see `isSyntheticPlaceholderId`). A server has no record of
+    /// one, so every provider that talks to a server says `false` and
+    /// `AccountManager.admittedOrdinaryActionTargets` refuses the row until its
+    /// real id arrives. Only a provider whose mailbox IS the local database
+    /// (`DemoProvider`) says `true`: there the placeholder is the message, and
+    /// no sync will ever replace it.
+    static var placeholderIdsAreAddressable: Bool { get }
+
     /// T1.2b: the UIDVALIDITY the MOST RECENT SELECT of `folderPath` reported, or
     /// `nil` when that SELECT reported none, when this provider has never SELECTed
     /// the folder, or when the folder concept doesn't apply (every non-IMAP
@@ -481,6 +490,10 @@ enum DraftReadConfig {
 struct DraftCopyUnsupportedAttachment: Error {}
 
 extension EmailProvider {
+    /// Default `false`: a provider that talks to a server cannot address a
+    /// local placeholder id. `DemoProvider` overrides it.
+    static var placeholderIdsAreAddressable: Bool { false }
+
     /// Default for test doubles and the demo provider, whose drafts are never
     /// read back (only Gmail and Outlook drafts reload on open, and only drafts in a
     /// Drafts folder are adopted); every other production provider overrides it.
@@ -967,7 +980,9 @@ enum ProviderError: LocalizedError {
 /// any provider's HTTP/IMAP fetch — the server has no record of them. Used
 /// as a defensive guard at the provider boundary; the upstream queues are
 /// supposed to gate these out via `bodyComplete=1`, and reaching this guard
-/// means a regression somewhere upstream.
+/// means a regression somewhere upstream. It is also the action-admission
+/// predicate: `AccountManager.admittedOrdinaryActionTargets` refuses these ids
+/// unless the account's provider says `placeholderIdsAreAddressable`.
 func isSyntheticPlaceholderId(_ id: String) -> Bool {
     id.hasPrefix("sent-") || id.hasPrefix("draft-")
 }
