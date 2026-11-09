@@ -384,6 +384,10 @@ during the rate-limit backoff still fails that folder's fetch. On Outlook, a mes
 never succeeds is bounded by the poll's cursor capture after its full sync, which walks the inbox's
 delta pages to the final link; the next ordinary poll's delta from that link lands what changed after
 it.
+The Gmail detail fetch keeps the request gate's full width of gets in flight (so a delta of a few
+dozen messages fits the background deadline), never more: a later request on the same account waits
+behind at most one window of gets, not the whole delta. A fetch larger than its window still fails on
+one message's failure.
 
 ## Calendar chat tools — the resolved calendar account
 

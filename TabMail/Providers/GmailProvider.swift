@@ -1396,27 +1396,52 @@ actor GmailProvider: EmailProvider {
     /// `fetchMessagesWithObservedEpoch`) and then moves the cursor forward. A
     /// change in the failed batch that no full-sync window covers is not
     /// recovered once that happens.
+    ///
+    /// The gets run concurrently, `GmailAPI.maxConcurrentRequests` at a time,
+    /// so a delta naming a few dozen messages fits the background sync's
+    /// per-account deadline instead of timing out and repeating on every push.
+    /// The window is the size of the `request()` gate rather than the whole
+    /// batch: the gate queues FIFO, so adding every id at once would put a
+    /// large delta's whole batch ahead of any later request on this account.
+    /// The first failure ends the call; the gets still running are cancelled.
+    /// Results are in no particular order, as the callers pass a set's ids.
     func fetchMessageDetails(ids: [String]) async throws -> [GmailMessageDetail] {
-        var results: [GmailMessageDetail] = []
-        for id in ids {
-            let msgData: Data
-            do {
-                msgData = try await request(path: "/messages/\(id)\(GmailAPI.metadataQuery)")
-            } catch where isHttpGoneStatus(error) {
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] fetchMessageDetails: skipping \(id) — gone (\(error))") }
-                continue
+        try await withThrowingTaskGroup(of: GmailMessageDetail?.self) { group in
+            var pending = ids.makeIterator()
+            for _ in 0..<GmailAPI.maxConcurrentRequests {
+                guard let id = pending.next() else { break }
+                group.addTask { try await self.fetchMessageDetail(id: id) }
             }
-            let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
-            // A record the parser refuses (no usable date) is a failed fetch,
-            // not a gone message: it says nothing about deletion and is often
-            // transient, so it fails the delta like an unreadable body would.
-            guard let header = parseGmailMessage(msg) else {
-                throw DecodingError.dataCorrupted(.init(
-                    codingPath: [], debugDescription: "Gmail message \(id) has no usable header"))
+            var results: [GmailMessageDetail] = []
+            for try await detail in group {
+                if let detail { results.append(detail) }
+                if let id = pending.next() {
+                    group.addTask { try await self.fetchMessageDetail(id: id) }
+                }
             }
-            results.append(GmailMessageDetail(header: header, labelIds: msg.labelIds ?? []))
+            return results
         }
-        return results
+    }
+
+    /// One message for `fetchMessageDetails`: nil when Gmail answers that it
+    /// is gone (404/410), and a throw for any other failure.
+    private func fetchMessageDetail(id: String) async throws -> GmailMessageDetail? {
+        let msgData: Data
+        do {
+            msgData = try await request(path: "/messages/\(id)\(GmailAPI.metadataQuery)")
+        } catch where isHttpGoneStatus(error) {
+            if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] fetchMessageDetails: skipping \(id) — gone (\(error))") }
+            return nil
+        }
+        let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
+        // A record the parser refuses (no usable date) is a failed fetch,
+        // not a gone message: it says nothing about deletion and is often
+        // transient, so it fails the delta like an unreadable body would.
+        guard let header = parseGmailMessage(msg) else {
+            throw DecodingError.dataCorrupted(.init(
+                codingPath: [], debugDescription: "Gmail message \(id) has no usable header"))
+        }
+        return GmailMessageDetail(header: header, labelIds: msg.labelIds ?? [])
     }
 
     /// True when the server answered for ONE message and that answer cannot be

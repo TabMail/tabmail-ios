@@ -374,6 +374,114 @@ struct DeltaDetailFetchFailureTests {
         #expect(details.map(\.header.messageId) == ["steady-1"])
     }
 
+    // MARK: - Gmail: the detail fetch fits a background deadline
+
+    /// Registers `ids` as messages whose responses are held until `release` is
+    /// signalled once per message, so a test can count the gets in flight.
+    private static func registerHeldGmailMessages(
+        _ ids: [String], on scenario: FakeHTTP.Scenario, release: DispatchSemaphore
+    ) {
+        for id in ids {
+            scenario.register(path: "/messages/\(id)", method: "GET", response: .parked {
+                _ = release.wait(timeout: .now() + 10)
+                return .json(raw: gmailMessageJSON(id: id))
+            })
+        }
+    }
+
+    private static func waitUntil(seconds: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition() {
+            if Date() >= deadline { return false }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return true
+    }
+
+    /// A background delta has 10 s per account. One get at a time made a delta
+    /// of a few dozen messages miss it, save nothing and repeat on every push;
+    /// the gate's full width in flight is what lets it fit.
+    @Test("A Gmail detail fetch keeps the request gate's full width of gets in flight")
+    func gmailDetailFetchRunsGetsConcurrently() async throws {
+        let scenario = FakeHTTP.Scenario()
+        defer { scenario.close() }
+        let width = GmailAPI.maxConcurrentRequests
+        let ids = (0..<(width * 3)).map { String(format: "wide-%03d", $0) }
+        let release = DispatchSemaphore(value: 0)
+        Self.registerHeldGmailMessages(ids, on: scenario, release: release)
+        let provider = GmailProvider(
+            userEmail: "gmail-delta-detail@example.com", accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+        let fetch = Task { try await provider.fetchMessageDetails(ids: ids) }
+        let reachedWidth = await Self.waitUntil { scenario.recordedCalls().count >= width }
+        let inFlight = scenario.recordedCalls().count
+        for _ in ids { release.signal() }
+        let details = try await fetch.value
+
+        #expect(reachedWidth, "only \(inFlight) of \(width) gets were in flight together")
+        #expect(inFlight == width, "the gate allows \(width) gets at once, saw \(inFlight)")
+        #expect(Set(details.map(\.header.messageId)) == Set(ids))
+    }
+
+    /// The gate queues FIFO. Adding a whole delta's gets at once would put
+    /// every one of them ahead of a later request on the same account, such as
+    /// a user's action; the window keeps that request one get behind.
+    @Test("Another request on the account is not queued behind a large Gmail detail fetch")
+    func gmailDetailFetchLeavesRoomForAnotherRequest() async throws {
+        let scenario = FakeHTTP.Scenario()
+        defer { scenario.close() }
+        let width = GmailAPI.maxConcurrentRequests
+        let ids = (0..<(width * 10)).map { String(format: "long-%03d", $0) }
+        let release = DispatchSemaphore(value: 0)
+        Self.registerHeldGmailMessages(ids, on: scenario, release: release)
+        scenario.register(path: "/profile", method: "GET",
+                          response: .json(raw: #"{"emailAddress": "gmail-delta-detail@example.com", "historyId": "42"}"#))
+        let provider = GmailProvider(
+            userEmail: "gmail-delta-detail@example.com", accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+        let fetch = Task { try await provider.fetchMessageDetails(ids: ids) }
+        #expect(await Self.waitUntil { scenario.recordedCalls().count >= width })
+        let other = Task { try await provider.getCurrentHistoryId() }
+
+        // Free one slot at a time and wait for the next request to arrive, so
+        // the order requests reach the server is the order the gate admits them.
+        var released = 0
+        while !scenario.servedCallSequence().contains("GET /gmail/v1/users/me/profile"), released < ids.count {
+            let before = scenario.recordedCalls().count
+            release.signal()
+            released += 1
+            _ = await Self.waitUntil { scenario.recordedCalls().count > before }
+        }
+        let profileIndex = scenario.servedCallSequence().firstIndex(of: "GET /gmail/v1/users/me/profile")
+        for _ in released..<ids.count { release.signal() }
+        let historyId = try await other.value
+        let details = try await fetch.value
+
+        #expect(historyId == "42")
+        #expect(details.count == ids.count)
+        let index = try #require(profileIndex, "the other request never reached the server")
+        #expect(index <= width * 2,
+                "the other request waited behind \(index - width) of the detail fetch's gets")
+    }
+
+    @Test("A Gmail detail fetch larger than its window still fails on one message's failure")
+    func gmailDetailFetchFailsOnOneFailureInALargeBatch() async throws {
+        let scenario = FakeHTTP.Scenario()
+        defer { scenario.close() }
+        let ids = (0..<(GmailAPI.maxConcurrentRequests * 3)).map { String(format: "many-%03d", $0) }
+        let failing = ids[ids.count - 2]
+        for id in ids where id != failing {
+            scenario.register(path: "/messages/\(id)", method: "GET", response: .json(raw: Self.gmailMessageJSON(id: id)))
+        }
+        scenario.register(path: "/messages/\(failing)", method: "GET", response: .status(503))
+        let provider = GmailProvider(
+            userEmail: "gmail-delta-detail@example.com", accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+        await #expect(throws: (any Error).self) {
+            _ = try await provider.fetchMessageDetails(ids: ids)
+        }
+    }
+
     // MARK: - Outlook
 
     private static let outlookAccountId = "outlook-delta-detail"
