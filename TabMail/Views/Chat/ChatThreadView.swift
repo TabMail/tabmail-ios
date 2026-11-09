@@ -65,16 +65,18 @@ struct MessageOpenView: View {
 }
 
 extension ChatViewConfig {
-    /// Whether an open goes to the chat now. Demo mode with AI declined counts as AI off, and the
-    /// tutorial keeps today's view until it moves into the chat view.
+    /// Whether an open goes to the chat now. Demo mode with AI declined counts as AI off. A
+    /// tutorial run follows what it teaches, decided when it started (`teachesChat`).
     @MainActor static var opensInChat: Bool {
-        opensInChat(active: isActive,
-                    demoHidesAI: DemoModeStore.shared.hidesAIContent,
-                    tutorialRunning: TutorialCoordinator.shared.isRunning)
+        let tutorial = TutorialCoordinator.shared
+        return opensInChat(active: isActive,
+                           demoHidesAI: DemoModeStore.shared.hidesAIContent,
+                           tutorialRunning: tutorial.isRunning,
+                           tutorialTeachesChat: tutorial.teachesChat)
     }
 
-    static func opensInChat(active: Bool, demoHidesAI: Bool, tutorialRunning: Bool) -> Bool {
-        active && !demoHidesAI && !tutorialRunning
+    static func opensInChat(active: Bool, demoHidesAI: Bool, tutorialRunning: Bool, tutorialTeachesChat: Bool) -> Bool {
+        tutorialRunning ? tutorialTeachesChat : active && !demoHidesAI
     }
 }
 
@@ -242,8 +244,12 @@ struct ChatThreadView: View {
         .onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
-                // Forward the newest email, in today's forward compose.
-                Button { forwardMessage = thread.newest } label: {
+                // Forward the newest email, in today's forward compose. The tutorial's mail
+                // actions are off (owner 2026-10-21).
+                Button {
+                    guard TutorialCoordinator.shared.admits(.other) else { return }
+                    forwardMessage = thread.newest
+                } label: {
                     Image(systemName: "arrowshape.turn.up.right")
                 }
                 .disabled(thread.newest == nil)
@@ -251,6 +257,11 @@ struct ChatThreadView: View {
             }
         }
         .onChange(of: viewModel.hasLoadedThread) { _, _ in scrollOnceLoaded() }
+        // Part 3 of the tutorial: the email reference opened this chat at Jordan's email.
+        .task(id: viewModel.message?.id) {
+            guard let opened = viewModel.message else { return }
+            TutorialCoordinator.shared.messageOpened(accountId: opened.accountId, messageId: opened.messageId)
+        }
         .onAppear {
             viewModel.isViewVisible = true
             isOnScreen = true
@@ -377,8 +388,12 @@ struct ChatThreadView: View {
                 }
             }
             .safeAreaInset(edge: .top, spacing: 0) {
-                ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) {
-                    showsReplyTo = true
+                VStack(spacing: 0) {
+                    ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) {
+                        guard TutorialCoordinator.shared.admits(.other) else { return }
+                        showsReplyTo = true
+                    }
+                    tutorialCard(thread)
                 }
             }
             .overlay {
@@ -578,6 +593,31 @@ struct ChatThreadView: View {
         Task { await ActiveAIQueue.shared.enqueueChatSummaries([header]) }
     }
 
+    // MARK: - Tutorial (parts 2 and 3)
+
+    /// Whether this chat holds Priya's practice email (part 2) or Jordan's source email (part 3).
+    private func holdsTutorialEmail(_ thread: ChatThread) -> (practice: Bool, source: Bool) {
+        let ids = Set(thread.items.filter { $0.header.accountId == DemoSeed.demoAccountId }.map(\.header.messageId))
+        return (ids.contains(DemoSeed.TutorialFixture.priyaOffsite), ids.contains(DemoSeed.TutorialFixture.jordanFlights))
+    }
+
+    /// The step's coach card under the header, in the chat the step is about.
+    @ViewBuilder
+    private func tutorialCard(_ thread: ChatThread) -> some View {
+        let tutorial = TutorialCoordinator.shared
+        let holds = holdsTutorialEmail(thread)
+        if tutorial.isRunning,
+           TutorialCoordinator.chatShowsCard(
+            step: tutorial.step, teachesChat: tutorial.teachesChat,
+            holdsPracticeEmail: holds.practice, holdsSourceEmail: holds.source) {
+            TutorialCoachView(host: .chat, onAction: { action in
+                // Next goes on in the inbox: part 3 starts there, and so does what else to ask.
+                if action == .nextLesson || action == .showMoreToAsk { dismiss() }
+            })
+            .padding(.vertical, 8)
+        }
+    }
+
     // MARK: - Swipes
 
     /// Left swipe: Trash (the inbox row's word for a move to Trash), then Archive at the edge, so a
@@ -598,11 +638,15 @@ struct ChatThreadView: View {
             ChatSwipeButton(title: action.title, systemImage: action.systemImage, tint: Theme.accent) {
                 setRead(action, at: item, thread: thread)
             },
-            ChatSwipeButton(title: "Move", systemImage: "folder", tint: Palette.untagged) { showsMove = true },
+            ChatSwipeButton(title: "Move", systemImage: "folder", tint: Palette.untagged) {
+                guard TutorialCoordinator.shared.admits(.other) else { return }
+                showsMove = true
+            },
         ]
     }
 
     private func setRead(_ action: ChatSwipe.ReadAction, at item: ChatThread.Item, thread: ChatThread) {
+        guard TutorialCoordinator.shared.admits(.other) else { return }
         let targets = ChatSwipe.readTargets(action, at: item.id, in: thread.items)
         viewModel.setRead(targets, isRead: action.isRead)
         // The Unread line moves to where unread now starts.
@@ -610,11 +654,13 @@ struct ChatThreadView: View {
     }
 
     private func archiveChat() {
+        guard TutorialCoordinator.shared.admits(.other) else { return }
         let moved = viewModel.archiveChat(viewModel.chatRows)
         if !moved.isEmpty { dismissChat(moved: moved, destinationFolderId: nil) }
     }
 
     private func deleteChat() {
+        guard TutorialCoordinator.shared.admits(.other) else { return }
         let moved = viewModel.deleteChat(viewModel.chatRows)
         if !moved.isEmpty { dismissChat(moved: moved, destinationFolderId: nil) }
     }
@@ -670,7 +716,8 @@ struct ChatThreadView: View {
                     readyText: ChatReplyField.readyText(newest: newest, isOwn: usersTurn),
                     isNoReply: isNoReply,
                     clearCount: fieldClearCount,
-                    onlyTo: replyTarget.only),
+                    onlyTo: replyTarget.only,
+                    tutorialMove: TutorialCoordinator.shared.fieldMove(inPracticeChat: holdsTutorialEmail(thread).practice)),
                 onSendReadyReply: {
                     readyReply = ChatReadyReply(message: newest, compose: ChatReplyCompose.make(
                         replyTo: newest, target: replyTarget, accounts: context.accounts))

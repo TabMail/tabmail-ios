@@ -268,7 +268,7 @@ struct TutorialCoachContentTests {
             for step in Self.allSteps {
                 for flightsAsked in [false, true] {
                     for card in cards(step, lesson, flightsAsked: flightsAsked) {
-                        #expect(card.progressLine.hasPrefix("\(lesson.rawValue) of \(TutorialLesson.allCases.count) · \(lesson.title)"))
+                        #expect(card.progressLine.hasPrefix("\(lesson.rawValue) of \(TutorialLesson.allCases.count) · \(lesson.title(teachesChat: false))"))
                         let text = ([card.progressLine, card.title, card.message] + card.examples + card.buttons.map(\.label))
                             .joined(separator: " ").lowercased()
                         #expect(!text.contains("lesson"), "\(step): \(text)")
@@ -697,14 +697,18 @@ struct TutorialLifecycleTests {
         let gateWasActive = gate.isActive
         let progressKeys = ["tutorial.version", "tutorial.completedLessons", "tutorial.discoveries"]
         let savedProgress = progressKeys.map { UserDefaults.standard.object(forKey: $0) }
+        // Today's run, with Chat View off: the chat-view run has its own suite.
+        let savedChatView = UserDefaults.standard.object(forKey: ChatViewConfig.enabledKey)
         defer {
             for (key, value) in zip(progressKeys, savedProgress) {
                 UserDefaults.standard.set(value, forKey: key)
             }
+            UserDefaults.standard.set(savedChatView, forKey: ChatViewConfig.enabledKey)
             if gateWasActive { gate.openGate() } else { gate.closeGate() }
             store._resetForTests()
             InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
         }
+        UserDefaults.standard.set(false, forKey: ChatViewConfig.enabledKey)
         store._resetForTests()
         gate.closeGate()
         // No part done yet. Each completion re-reads these, so every
@@ -919,7 +923,8 @@ struct TutorialLifecycleTests {
 
         #expect(edited == nil, "the ended run's edit must not reach a draft")
         #expect(!coordinator.replyEdited, "the new run's reply is not edited")
-        #expect(coordinator.composeEditPrompt == TutorialCoordinator.editPrompt, "the new run still offers its edit")
+        #expect(coordinator.composeEditPrompt == TutorialCoordinator.editPrompt(teachesChat: coordinator.teachesChat),
+                "the new run still offers its edit")
         #expect(!coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
         await coordinator.end()
     }
