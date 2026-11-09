@@ -262,4 +262,5 @@ Manage Subscription sits outside both.
 save land with no server address, re-saves it ten days later, and then runs the production sync
 merge over a full Drafts page whose oldest draft is newer than the first save but older than the
 latest one. The placeholder is not on the page and its latest save is inside it, so sync removes it
-and the draft is not shown twice.
+and the draft is not shown twice. The second case leaves the latest save queued: the same sync keeps
+the placeholder, because the queued save names it, and the sync after that save lands removes it.

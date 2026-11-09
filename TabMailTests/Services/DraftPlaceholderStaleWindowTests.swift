@@ -9,14 +9,16 @@ import GRDB
 
 /// A draft placeholder whose save landed without a server address (so it was
 /// never re-keyed) is removed by the next Drafts sync whose page reaches its
-/// latest save, however many drafts are newer than its FIRST save.
+/// latest save, however many drafts are newer than its FIRST save. While that
+/// save is still queued, the same sync keeps the placeholder.
 ///
 /// On a provider that windows stale detection by provider date, sync judges a
 /// local row stale only when its provider date is at or above the oldest draft
 /// on the fetched page. A re-saved draft's placeholder must therefore carry the
 /// time of its latest save; one stuck at its first save sits below the page once
 /// a full page of drafts is newer than that, and the Drafts list shows the draft
-/// twice for as long as that lasts.
+/// twice for as long as that lasts. Inside the page, the queued save is all that
+/// keeps the placeholder of a draft the server does not have yet.
 @Suite("A re-saved draft placeholder stays inside the Drafts sync window", .serialized, .processGlobalState)
 struct DraftPlaceholderStaleWindowTests {
 
@@ -34,9 +36,25 @@ struct DraftPlaceholderStaleWindowTests {
             isReplied: false, isForwarded: false, actionTag: nil)
     }
 
-    @Test("A placeholder re-saved after a page of newer drafts is reconciled away")
+    /// A Drafts folder whose draft was saved ten days ago and again an hour ago,
+    /// both through the real producer.
+    private struct Scene: Sendable {
+        let pool: DatabasePool
+        let folder: Folder
+        let placeholderMessageId: String
+        let firstSave: Date
+        let latestSave: Date
+    }
+
+    /// Builds the scene and runs `body` on it. The first save's op is retired
+    /// with no server address, as is the latest one unless
+    /// `keepLatestSaveQueued`, which leaves it in the queue the way a save that
+    /// has not reached the server stays there.
     @MainActor
-    func aReSavedPlaceholderIsReconciledAway() async throws {
+    private func withReSavedPlaceholder(
+        keepLatestSaveQueued: Bool,
+        _ body: (Scene) async throws -> Void
+    ) async throws {
         let accountId = "stale-window-\(UUID().uuidString)"
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer {
@@ -73,39 +91,74 @@ struct DraftPlaceholderStaleWindowTests {
         // placeholder row stays.
         try await pool.write { db in _ = try PendingOperation.deleteAll(db) }
 
-        // The user edits the draft an hour ago; that save lands the same way.
+        // The user edits the draft an hour ago.
         draft.updatedAt = latestSave.timeIntervalSince1970
         let secondVersion = draft
         try await pool.write { db in try secondVersion.update(db) }
         #expect(await AccountManager.shared.queueDraftSave(draftId: draftId, accountId: accountId))
-        try await pool.write { db in _ = try PendingOperation.deleteAll(db) }
+        if !keepLatestSaveQueued {
+            try await pool.write { db in _ = try PendingOperation.deleteAll(db) }
+        }
 
         let placeholderMessageId = PendingOperation.draftPlaceholderMessageId(
             draftId: draftId, instanceEpoch: draft.instanceEpoch)
-        let before = try await pool.read { db in
-            try MessageHeader.filter(Column("messageId") == placeholderMessageId).fetchCount(db)
-        }
-        #expect(before == 1, "precondition: the placeholder row exists before sync")
+        let scene = Scene(
+            pool: pool, folder: folder, placeholderMessageId: placeholderMessageId,
+            firstSave: firstSave, latestSave: latestSave)
+        #expect(try await placeholderCount(scene) == 1, "precondition: the placeholder row exists before sync")
+        try await body(scene)
+    }
 
-        // The server's Drafts page: a full page, so it does not span the folder.
-        // Its newest entry is the draft's own server copy at the latest save; the
-        // other drafts were all created after the first save.
-        var page = [Self.info(id: "server-copy", date: latestSave)]
+    /// Runs one Drafts sync against the server's page: a full page, so it does
+    /// not span the folder. Its newest entry is the draft's own server copy at
+    /// the latest save; the other drafts were all created after the first save.
+    private func syncDrafts(_ scene: Scene) async throws {
+        var page = [Self.info(id: "server-copy", date: scene.latestSave)]
         for i in 1..<Self.pageLimit {
-            page.append(Self.info(id: "newer-\(i)", date: firstSave.addingTimeInterval(86_400 + Double(i) * 60)))
+            page.append(Self.info(id: "newer-\(i)", date: scene.firstSave.addingTimeInterval(86_400 + Double(i) * 60)))
         }
         let provider = MockEmailProvider(staleWindowMode: .date)
         await provider.setFetchMessagesResult(page)
         _ = try await SyncEngine.runSyncMessages(
-            for: folder, provider: provider, limit: Self.pageLimit, dbPool: PrioritizedDatabase(pool: pool))
+            for: scene.folder, provider: provider, limit: Self.pageLimit, dbPool: PrioritizedDatabase(pool: scene.pool))
+    }
 
-        let after = try await pool.read { db in
-            try MessageHeader.filter(Column("messageId") == placeholderMessageId).fetchCount(db)
+    private func placeholderCount(_ scene: Scene) async throws -> Int {
+        try await scene.pool.read { db in
+            try MessageHeader.filter(Column("messageId") == scene.placeholderMessageId).fetchCount(db)
         }
-        #expect(after == 0, """
-            the placeholder's latest save is inside the fetched page and the server does not \
-            list it, so sync must remove it; a row left at its first save is below the page \
-            and the draft shows twice
-            """)
+    }
+
+    @Test("A placeholder re-saved after a page of newer drafts is reconciled away")
+    @MainActor
+    func aReSavedPlaceholderIsReconciledAway() async throws {
+        try await withReSavedPlaceholder(keepLatestSaveQueued: false) { scene in
+            try await syncDrafts(scene)
+            #expect(try await placeholderCount(scene) == 0, """
+                the placeholder's latest save is inside the fetched page and the server does not \
+                list it, so sync must remove it; a row left at its first save is below the page \
+                and the draft shows twice
+                """)
+        }
+    }
+
+    @Test("A re-saved placeholder whose latest save is still queued survives the sync, then goes once the save lands")
+    @MainActor
+    func aQueuedReSavedPlaceholderSurvivesTheSync() async throws {
+        try await withReSavedPlaceholder(keepLatestSaveQueued: true) { scene in
+            let queued = try await scene.pool.read { db in try PendingOperation.fetchCount(db) }
+            #expect(queued == 1, "precondition: the latest save is still in the queue")
+
+            try await syncDrafts(scene)
+            #expect(try await placeholderCount(scene) == 1, """
+                the latest save has not reached the server, so its placeholder is the draft's \
+                only row in the Drafts list; sync must keep it while that save is queued
+                """)
+
+            // The save lands with no server address.
+            try await scene.pool.write { db in _ = try PendingOperation.deleteAll(db) }
+            try await syncDrafts(scene)
+            #expect(try await placeholderCount(scene) == 0, "once the save has landed, the next sync removes the placeholder")
+        }
     }
 }
