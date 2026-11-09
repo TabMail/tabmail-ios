@@ -11,9 +11,11 @@ import GRDB
 // existing label to the message, under Gmail's spelling of the name, and the
 // menu lists that label once. Gmail refuses the second create with HTTP 409
 // "Label name exists or conflicts"; the menu then looks the label up by name
-// and applies it, rather than failing the gesture. The control case shows a
-// free name still creates a new label, so the conflict cannot be satisfied by a
-// fake that refuses every create.
+// and applies it, rather than failing the gesture. When the lookup finds no such
+// label (it was deleted elsewhere in between), the gesture fails and nothing is
+// written: no label row, no menu entry, no queued label change. The control case
+// shows a free name still creates a new label, so the conflict cannot be
+// satisfied by a fake that refuses every create.
 
 @Suite("Gmail label create: a name Gmail already has applies the existing label", .serialized, .processGlobalState)
 struct UserLabelCreateExistingNameTests {
@@ -87,13 +89,17 @@ struct UserLabelCreateExistingNameTests {
         let appliedIds: Set<String>
         /// What Gmail was last asked to add to the message.
         let added: [String]?
+        /// How many changes Gmail was asked to make to the message.
+        let modifyCalls: Int
+        /// The account's operations still queued after the drain.
+        let queued: Int
     }
 
     /// Opens the menu, creates `name` through it, drains the queue, and returns
     /// what the account, the menu and Gmail show afterwards. `listedProviderLabelId`
     /// and `listedName`, when given, put that label in the menu before the gesture.
     @MainActor
-    private func createAndApply(_ name: String, accountId: String, listedProviderLabelId: String? = nil, listedName: String? = nil) async throws -> Outcome {
+    private func createAndApply(_ name: String, accountId: String, listedProviderLabelId: String? = nil, listedName: String? = nil, configure: (StatefulGmailActionServer) -> Void = { _ in }) async throws -> Outcome {
         let listed = listedProviderLabelId.map {
             UserLabel(accountId: accountId, providerLabelId: $0, name: listedName ?? $0, isSystem: false)
         }
@@ -101,6 +107,7 @@ struct UserLabelCreateExistingNameTests {
         defer { restore(f) }
         let gmail = server()
         defer { gmail.close() }
+        configure(gmail)
         await AccountManager.shared.registerProviderForTesting(accountId: f.accountId, provider: gmail.provider())
 
         let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: f.header))
@@ -110,12 +117,14 @@ struct UserLabelCreateExistingNameTests {
         let created = await model.createAndApply(name: name)
         await AccountManager.shared.drainPendingQueue()
 
-        let stored = try await f.pool.read { db in
-            try UserLabel.filter(Column("accountId") == f.accountId).fetchAll(db)
+        let (stored, queued) = try await f.pool.read { db in
+            (try UserLabel.filter(Column("accountId") == f.accountId).fetchAll(db),
+             try PendingOperation.filter(Column("accountId") == f.accountId).fetchCount(db))
         }
         await AccountManager.shared.unregisterProviderForTesting(accountId: f.accountId)
         return Outcome(created: created, stored: stored, menu: model.sortedLabels,
-                       appliedIds: model.appliedIds, added: gmail.modifyLog().last?.addLabelIds)
+                       appliedIds: model.appliedIds, added: gmail.modifyLog().last?.addLabelIds,
+                       modifyCalls: gmail.modifyLog().count, queued: queued)
     }
 
     /// The single entry for `providerLabelId` in `labels`, or nil when there is
@@ -138,15 +147,28 @@ struct UserLabelCreateExistingNameTests {
         #expect(listed.map { result.appliedIds.contains($0.id) } == true)
     }
 
-    @Test("A name already in the menu: Gmail's label is applied and still listed once")
+    @Test("A label already in the menu under an old name: Gmail's label is applied, listed once, under Gmail's name")
     @MainActor
     func listedNameIsListedOnce() async throws {
-        let result = try await createAndApply("Receipts", accountId: "label-409-listed", listedProviderLabelId: "Label_7", listedName: "Receipts")
+        let result = try await createAndApply("Receipts", accountId: "label-409-listed", listedProviderLabelId: "Label_7", listedName: "Old receipts")
         #expect(result.created, "the create gesture failed on Gmail's 409")
         #expect(result.added == ["Label_7"], "Gmail was asked to add \(result.added ?? [])")
         #expect(result.menu.count == 1, "menu: \(result.menu.map { "\($0.providerLabelId)=\($0.name)" })")
         let listed = only("Label_7", in: result.menu)
+        #expect(listed?.name == "Receipts", "menu: \(result.menu.map { "\($0.providerLabelId)=\($0.name)" })")
         #expect(listed.map { result.appliedIds.contains($0.id) } == true)
+    }
+
+    @Test("A 409 for a name Gmail no longer lists: the gesture fails and nothing is written")
+    @MainActor
+    func conflictWithNoListedLabelWritesNothing() async throws {
+        let result = try await createAndApply("Invoices", accountId: "label-409-gone") { $0.refuseNextCreateWithConflict() }
+        #expect(!result.created, "the gesture reported success with no label to apply")
+        #expect(result.stored.isEmpty, "stored rows: \(result.stored.map { "\($0.providerLabelId)=\($0.name)" })")
+        #expect(result.menu.isEmpty, "menu: \(result.menu.map { "\($0.providerLabelId)=\($0.name)" })")
+        #expect(result.appliedIds.isEmpty)
+        #expect(result.queued == 0, "queued operations: \(result.queued)")
+        #expect(result.modifyCalls == 0, "Gmail was asked to change the message \(result.modifyCalls) times")
     }
 
     @Test("A name Gmail does not have: a new label is created and applied")

@@ -2021,8 +2021,8 @@ actor GmailProvider: EmailProvider {
         }) else {
             return nil
         }
-        // Even when this response lost an out-of-order catalog race, the exact
-        // match is provider-confirmed and must survive any older request still
+        // Even when this response lost an out-of-order catalog race, the match
+        // (compared without case) is provider-confirmed and must survive any older request still
         // in flight until a later uncontended catalog replaces the cache.
         userLabelCatalog.recordKnownUserLabel(match.id)
         return (match.id, match.name)

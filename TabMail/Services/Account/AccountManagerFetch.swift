@@ -416,7 +416,8 @@ extension AccountManager {
                             }
                             // A 404/410 here is a folder the server no longer has (a label or
                             // folder deleted elsewhere); a message that is gone is absorbed
-                            // earlier, by the providers' detail fetch. Skip the folder so the
+                            // inside the listing (Gmail's per-message read; Outlook lists
+                            // messages inline). Skip the folder so the
                             // account's other folders still sync, rather than ending the sync
                             // with a red error banner. The full sync removes a vanished folder.
                             if isHttpGoneStatus(error) {

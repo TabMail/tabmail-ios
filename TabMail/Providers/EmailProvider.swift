@@ -686,13 +686,18 @@ func isHttpGoneStatus(_ error: Error) -> Bool {
 }
 
 /// The HTTP status a provider request failed with: the status inside
-/// `ProviderError.networkError`, from `HTTPError.networkError(statusCode:)` or
-/// from an underlying `NSError` whose code the provider set to the status. Nil
-/// when the error is not a provider network error.
+/// `ProviderError.networkError`, from `HTTPError.networkError(statusCode:)`, or
+/// otherwise the underlying error's bridged `NSError` code. That code is the
+/// status only for an `NSError` the provider built with the status as its code
+/// (the draft-delete and trash paths). For any other underlying error it is not
+/// a status: `HTTPError.networkErrorWithBody` bridges to its case index (2),
+/// `HTTPError.invalidURL` to 0, a `URLError` to its negative code. Compare the
+/// result only against the 4xx/5xx statuses you mean. Nil when the error is not
+/// a provider network error.
 ///
-/// Read a status only through this. `(error as NSError).code` on the thrown
-/// error is never an HTTP status: a Swift error enum bridges to an `NSError`
-/// whose code is its case index, so a check such as `code == 409` never matches.
+/// Prefer this to reading `(error as NSError).code` on the thrown error, which
+/// is never an HTTP status: a Swift error enum bridges to an `NSError` whose
+/// code is its case index, so a check such as `code == 409` never matches.
 func httpStatus(of error: Error) -> Int? {
     guard case ProviderError.networkError(let underlying) = error else { return nil }
     if case HTTPError.networkError(let statusCode) = underlying { return statusCode }
