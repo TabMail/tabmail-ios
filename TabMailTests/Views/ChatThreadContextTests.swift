@@ -17,7 +17,7 @@ import Testing
 ///     and files without a start time are no card.
 ///  3. A thread opens as a chat only with the chat view on, outside the demo's AI-off mode and the
 ///     tutorial. A draft opens in the draft editor from every open path, never as a chat.
-///     A tap outside the keyboard dismisses it in the chat.
+///     A tap outside the keyboard dismisses it in the chat and its Reply to sheet.
 ///  4. The inbox row shows the text message only with the chat view on; else the snippet.
 ///  5. An email the body writer confirms empty is done: its bubble says so, never "Summarizing".
 @Suite("Chat thread context", .serialized)
@@ -382,7 +382,7 @@ struct ChatThreadContextTests {
         #expect(try source("TabMail/Views/Settings/RemindersSettingsView.swift").contains("MessageOpenView(messageId: messageId,"), "a reminder")
     }
 
-    @Test("A tap outside the keyboard dismisses it in the chat")
+    @Test("A tap outside the keyboard dismisses it in the chat and its Reply to sheet")
     func chatDismissesTheKeyboardOnTap() throws {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
@@ -394,6 +394,9 @@ struct ChatThreadContextTests {
         #expect(try source("TabMail/Views/Chat/ChatThreadView.swift").contains(
             ".frame(maxWidth: .infinity, maxHeight: .infinity) .background(Palette.previewPaneBg) .dismissKeyboardOnTap()"),
                 "the chat's root dismisses the keyboard on a tap outside the reply field")
+        #expect(try source("TabMail/Views/Chat/ChatReplyToSheet.swift").contains(
+            ".onAppear { contactSearch.requestAccess() } } .dismissKeyboardOnTap() .presentationDetents([.medium, .large])"),
+                "the Reply to sheet's NavigationStack dismisses the keyboard on a tap outside the address field")
     }
 
     @Test("The inbox row shows the text message with the chat view on, else the snippet")

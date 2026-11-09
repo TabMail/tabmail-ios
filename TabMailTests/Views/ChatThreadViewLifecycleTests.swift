@@ -731,7 +731,8 @@ struct ChatThreadViewLifecycleTests {
 
         // Online, the provider takes it: the send stamps `sentAt`, then writes the Sent copy, in two
         // writes, and nothing tells the chat (no merge signal is posted here).
-        func said() -> Int { HostedAccessibility.labels(in: controller.view).filter { $0.hasPrefix("You said") }.count }
+        // The user's own bubble: "You said: …", or "You replied only to …" for a reply to fewer people.
+        func said() -> Int { HostedAccessibility.labels(in: controller.view).filter { $0.hasPrefix("You said") || $0.hasPrefix("You replied") }.count }
         func sending() -> Int { HostedAccessibility.labels(in: controller.view).filter { $0.contains("Sending") }.count }
         try await pool.write { db in
             try db.execute(sql: "UPDATE outboxMessage SET sentAt = ? WHERE id = ?", arguments: [Date(), queued.outboxId])
