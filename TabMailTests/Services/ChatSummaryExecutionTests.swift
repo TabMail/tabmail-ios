@@ -20,7 +20,10 @@ import Testing
 ///  4. A chat summary is finished only with its text message, at every site that decides it
 ///     (`ActiveAIQueue.jobDone`): the executor runs it in any folder, on an old summary without a
 ///     text message, and after another device's summary (which has none), and `readJobOutcome`
-///     retries it until the text message is stored; an ordinary summary job stops at each of those.
+///     retries it after a failed call; an ordinary summary job stops at each of those. A call that
+///     completed and wrote a summary but no text message ends the job for the process: such an
+///     email costs one model call per process, however often the chat asks and whatever sync starts
+///     (launch, push wake) follow; AI re-enable asks once more; never one every backoff.
 ///  5. Chat members waiting for a body are forgotten when the queue is cancelled.
 @Suite("Chat summary execution", .serialized, .processGlobalState)
 struct ChatSummaryExecutionTests {
@@ -247,8 +250,8 @@ struct ChatSummaryExecutionTests {
         }
     }
 
-    @Test("A chat summary runs outside the Inbox, on an old summary and after another device's summary, until its text message is stored; an ordinary summary job stops")
-    func chatSummaryRunsUntilItsTextMessage() async throws {
+    @Test("A chat summary runs outside the Inbox, on an old summary and after another device's summary, and is finished once its text message is stored; an ordinary summary job stops")
+    func chatSummaryAsksForItsTextMessage() async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
         _ = try FolderEpochTestFixture.makeAccount(id: "chat", provider: .gmail, pool: pool)
@@ -267,8 +270,8 @@ struct ChatSummaryExecutionTests {
         for row in rows { try await Self.index(row, body: "Let us meet on Tuesday.") }
         let keys = rows.map { ContentKey(rawValue: $0.id) }
         do {
-            try await runsUntilTextMessage(sent: sent, legacy: legacy, complete: complete,
-                                           peerChat: peerChat, peerOrdinary: peerOrdinary, pool: pool)
+            try await asksForTextMessage(sent: sent, legacy: legacy, complete: complete,
+                                         peerChat: peerChat, peerOrdinary: peerOrdinary, pool: pool)
         } catch {
             try? await SearchIndex.shared.removeMessages(contentKeys: keys)
             throw error
@@ -276,7 +279,7 @@ struct ChatSummaryExecutionTests {
         try? await SearchIndex.shared.removeMessages(contentKeys: keys)
     }
 
-    private func runsUntilTextMessage(
+    private func asksForTextMessage(
         sent: MessageHeader, legacy: MessageHeader, complete: MessageHeader,
         peerChat: MessageHeader, peerOrdinary: MessageHeader, pool: DatabasePool
     ) async throws {
@@ -308,7 +311,7 @@ struct ChatSummaryExecutionTests {
 
             // An old summary without a text message: finished for an ordinary job, not for a chat job.
             #expect(await queue.jobVerifiedCompleteForTesting(job(legacy, chat: false)))
-            #expect(!(await queue.jobVerifiedCompleteForTesting(job(legacy, chat: true))), "retried until its text message")
+            #expect(!(await queue.jobVerifiedCompleteForTesting(job(legacy, chat: true))), "not finished without its text message")
             await queue.executeWholeJobForTesting(job(legacy, chat: false), aiService: service)
             #expect(http.recordedCalls().isEmpty, "an ordinary job takes the old summary")
             await queue.executeWholeJobForTesting(job(legacy, chat: true), aiService: service)
@@ -342,6 +345,115 @@ struct ChatSummaryExecutionTests {
             let peerChat4 = try await row(peerChat)?.summaryTextMessage
 
             #expect(peerChat4 == "See you Tuesday.")
+        }
+    }
+
+    @Test("A chat summary whose answer has a summary but no text message costs one model call per process however often the chat asks; AI re-enable asks once more")
+    func textlessChatSummaryIsAskedOncePerProcess() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        _ = try FolderEpochTestFixture.makeAccount(id: "textless", provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "textless", path: "Archive", role: .archive, pool: pool)
+        // An archived email: a chat summary runs there, and the action job it chains stops at the
+        // Inbox check without a call, so every call counted is the summary's.
+        let email = Self.header("textless", accountId: "textless", folder: "Archive")
+        try await pool.write { try email.insert($0) }
+        try await Self.index(email, body: "An image and an invitation.")
+        let keys = [ContentKey(rawValue: email.id)]
+        do {
+            try await askedOncePerProcess(email, pool: pool)
+        } catch {
+            try? await SearchIndex.shared.removeMessages(contentKeys: keys)
+            throw error
+        }
+        try? await SearchIndex.shared.removeMessages(contentKeys: keys)
+    }
+
+    private func askedOncePerProcess(_ email: MessageHeader, pool: DatabasePool) async throws {
+        // The model answers with a summary and an empty text message, every time.
+        let http = Self.summaryBackend(textMessage: "")
+        defer { http.close() }
+        try await Self.withAIOn {
+            let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+            let queue = ActiveAIQueue()
+            await queue.setDispatchSuppressedForTesting(true)
+            // The chat asks (an open, a row on screen, a joining email, the walk all ask through the
+            // same admission), then the drain runs what is queued and finishes it as it does.
+            func askAndDrain() async {
+                await queue.enqueueChatSummaries([email])
+                for job in await queue.takePendingIntoFlightForTesting() {
+                    await queue.executeWholeJobForTesting(job, aiService: service)
+                    await queue.finishInFlightForTesting(job)
+                }
+            }
+            for _ in 0..<3 { await askAndDrain() }
+            let written = try await pool.read { try MessageHeader.fetchOne($0, key: email.id) }
+            #expect(written?.summaryBlurb == "A plan." && written?.summaryTextMessage == nil,
+                    "control: the call completed and wrote a summary without a text message")
+            #expect(http.recordedCalls().count == 1,
+                    "one model call in this process, however often the chat asks: \(http.recordedCalls().count)")
+
+            // AI re-enable (the Settings switch's entry point) asks once more, and again only once.
+            await queue.aiReenabled(chatViewActive: true)
+            for _ in 0..<3 { await askAndDrain() }
+            #expect(http.recordedCalls().count == 2, "one more call after AI re-enable: \(http.recordedCalls().count)")
+        }
+    }
+
+    @Test("A textless chat answer is not asked again by a later sync start: a launch and then a push wake cost one summary model call in all")
+    func textlessChatSummaryIsNotAskedAgainBySyncStarts() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        _ = try FolderEpochTestFixture.makeAccount(id: "textless-sync", provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "textless-sync", path: "INBOX", role: .inbox, pool: pool)
+        // An Inbox email with its body indexed. Its action tag and reply are already made, so the
+        // only model call either pass can make is its summary's.
+        var email = Self.header("textless-sync", accountId: "textless-sync", folder: "INBOX")
+        email.actionTag = ActionTag.none
+        email.actionTagSetAt = Date()
+        email.cachedReply = "Thanks."
+        try await pool.write { [email] db in try email.insert(db) }
+        try await Self.index(email, body: "An image and an invitation.")
+        let keys = [ContentKey(rawValue: email.id)]
+        do {
+            try await notAskedAgainBySyncStarts(email, pool: pool)
+        } catch {
+            try? await SearchIndex.shared.removeMessages(contentKeys: keys)
+            throw error
+        }
+        try? await SearchIndex.shared.removeMessages(contentKeys: keys)
+    }
+
+    private func notAskedAgainBySyncStarts(_ email: MessageHeader, pool: DatabasePool) async throws {
+        // The model answers with a summary and an empty text message, every time.
+        let http = Self.summaryBackend(textMessage: "")
+        defer { http.close() }
+        try await Self.withAIOn {
+            let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+            let queue = ActiveAIQueue()
+            await queue.setDispatchSuppressedForTesting(true)
+            // One sync start (`SyncScheduler.syncStartup`: launch, foreground return, a push wake)
+            // with the chat view on, then the drain runs what it queued and finishes each job.
+            func syncStartAndDrain() async {
+                await queue.repopulateFromDatabase(chatViewActive: true)
+                for _ in 0..<5 {
+                    let jobs = await queue.takePendingIntoFlightForTesting()
+                    guard !jobs.isEmpty else { return }
+                    for job in jobs {
+                        await queue.executeWholeJobForTesting(job, aiService: service)
+                        await queue.finishInFlightForTesting(job)
+                    }
+                }
+            }
+            await syncStartAndDrain()  // launch
+            let written = try await pool.read { try MessageHeader.fetchOne($0, key: email.id) }
+            #expect(written?.summaryBlurb == "A plan." && written?.summaryTextMessage == nil,
+                    "control: the launch's call completed and wrote a summary without a text message")
+            #expect(http.recordedCalls().count == 1, "control: the launch asked once: \(http.recordedCalls().count)")
+
+            await syncStartAndDrain()  // a push wake
+            #expect(http.recordedCalls().count == 1,
+                    "a push wake in the same process asks no more: \(http.recordedCalls().count) summary calls")
         }
     }
 

@@ -15,11 +15,13 @@ import GRDB
 ///     (`summaryDone`) decides it for every site, so no chat job can retry forever.
 ///  2. A chat summary passes the folder scope in any folder; every other job keeps the Inbox scope.
 ///  3. `forChat` is context, not identity: a chat offer and an ordinary offer for the same message
-///     are one job, and the flags only widen.
+///     are one job, and the flags only widen. A chat offer is never lost to its ordinary twin,
+///     pending, in flight or just completed: once the twin is gone, a chat summary is asked for.
 ///  4. Opening a thread asks for every member without a done chat summary, any folder; a member
 ///     without its body is sent to the body queue and gets its job when the body is written.
 ///  5. The walk covers the threads of the newest `SyncConfig.maxRecentEmails` Inbox rows and nothing
-///     else, members with their body and without a done chat summary, never Trash.
+///     else, members with their body and without a done chat summary, never Trash. A foreground
+///     pass runs it only when the chat view was on as the pass began.
 ///  6. Release builds keep all of it off; the debug override counts only while debug is unlocked.
 ///  7. Opening a thread with the chat view on asks once per open, with the opened message and its
 ///     thread; with it off, never.
@@ -172,6 +174,102 @@ struct ChatSummaryQueueTests {
         #expect(reply.allSatisfy { !$0.forChat }, "only summary jobs are chat jobs")
     }
 
+    /// What a Device Sync peer's summary leaves on the row: a summary with no text message.
+    private func writePeerSummary(_ id: String, pool: DatabasePool) async throws {
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET summaryBlurb = 'S.', summaryTextMessage = NULL WHERE id = ?",
+                           arguments: [id])
+        }
+    }
+
+    private func chatSummaryQueued(_ queue: ActiveAIQueue, _ id: String) async -> Bool {
+        await queue.queuedJobsForTesting.contains { $0.headerId == id && $0.jobType == .summary && $0.forChat }
+    }
+
+    /// Enqueues the ordinary summary and reply for `msg` and takes both into flight, as dispatch does.
+    private func ordinaryTwinInFlight(_ msg: MessageHeader, queue: ActiveAIQueue) async throws -> ActiveAIQueue.AIJob {
+        await queue.enqueue(headerId: msg.id, accountId: msg.accountId)
+        let inFlight = await queue.takePendingIntoFlightForTesting()
+        let twin = try #require(inFlight.first { $0.headerId == msg.id && $0.jobType == .summary })
+        #expect(!twin.forChat)
+        return twin
+    }
+
+    @Test("A chat offer made while its ordinary twin is in flight is asked for once the twin ends without a text message")
+    func chatOfferOutlivesInFlightTwin() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try makeAccount("acc-cs-t1", pool: pool)
+        let msg = try insertHeader(accountId: "acc-cs-t1", uid: "u1", pool: pool)
+        let queue = ActiveAIQueue()
+        await queue.setDispatchSuppressedForTesting(true)
+        let twin = try await ordinaryTwinInFlight(msg, queue: queue)
+
+        await queue.enqueueChatSummaries([msg], requestBodies: { _ in })
+        try await writePeerSummary(msg.id, pool: pool)
+        await queue.finishInFlightForTesting(twin)
+
+        #expect(await chatSummaryQueued(queue, msg.id),
+                "nothing asks for the text message, so the open chat shows Summarizing for good")
+    }
+
+    @Test("A chat offer made just after its ordinary twin ended without a text message is asked for")
+    func chatOfferAfterTwinCompleted() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try makeAccount("acc-cs-t2", pool: pool)
+        let msg = try insertHeader(accountId: "acc-cs-t2", uid: "u1", pool: pool)
+        let queue = ActiveAIQueue()
+        await queue.setDispatchSuppressedForTesting(true)
+        let twin = try await ordinaryTwinInFlight(msg, queue: queue)
+        try await writePeerSummary(msg.id, pool: pool)
+        await queue.finishInFlightForTesting(twin)
+        #expect(!(await chatSummaryQueued(queue, msg.id)), "control: no chat offer was made yet")
+
+        await queue.enqueueChatSummaries([msg], requestBodies: { _ in })
+        #expect(await chatSummaryQueued(queue, msg.id),
+                "the twin's recent completion must not stand for the chat summary it did not write")
+    }
+
+    @Test("A chat offer made while its ordinary twin is in flight upgrades the twin when it must run again")
+    func chatOfferUpgradesTwinThatRetries() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try makeAccount("acc-cs-t3", pool: pool)
+        let msg = try insertHeader(accountId: "acc-cs-t3", uid: "u1", pool: pool)
+        let queue = ActiveAIQueue()
+        await queue.setDispatchSuppressedForTesting(true)
+        let twin = try await ordinaryTwinInFlight(msg, queue: queue)
+
+        await queue.enqueueChatSummaries([msg], requestBodies: { _ in })
+        await queue.finishInFlightForTesting(twin)   // no summary written: it runs again
+
+        let summaries = await queue.queuedJobsForTesting.filter { $0.headerId == msg.id && $0.jobType == .summary }
+        #expect(summaries.count == 1)
+        #expect(summaries.allSatisfy { $0.forChat && $0.windowExempt },
+                "the retry would finish without the text message the chat asked for")
+    }
+
+    @Test("Recovery forgets a chat offer that waited on an in-flight twin")
+    func recoveryForgetsWaitingChatOffer() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        try makeAccount("acc-cs-t4", pool: pool)
+        let msg = try insertHeader(accountId: "acc-cs-t4", uid: "u1", pool: pool)
+        let queue = ActiveAIQueue()
+        await queue.setDispatchSuppressedForTesting(true)
+        _ = try await ordinaryTwinInFlight(msg, queue: queue)
+        await queue.enqueueChatSummaries([msg], requestBodies: { _ in })
+        await queue.cancelAllInFlight()
+
+        // After recovery an ordinary pass runs the same summary; the chat asked before recovery.
+        let next = try await ordinaryTwinInFlight(msg, queue: queue)
+        try await writePeerSummary(msg.id, pool: pool)
+        await queue.finishInFlightForTesting(next)
+        #expect(!(await chatSummaryQueued(queue, msg.id)),
+                "recovery resets the queue: a request made before it is not acted on after it (the next open asks again)")
+    }
+
     // MARK: - 4. Opening a thread
 
     @Test("Opening a thread asks for every member without a done chat summary, any folder, and sends bodiless members to the body queue")
@@ -272,6 +370,34 @@ struct ChatSummaryQueueTests {
 
         let ids = try ActiveAIQueue.chatWalkCandidates(pool: pool).map(\.headerId)
         #expect(ids == [MessageIdentity.headerId(accountId: acc, folderPath: "Sent", messageId: "new-reply")])
+    }
+
+    @Test("A foreground pass walks the threads only when the chat view was on as it began", arguments: [true, false])
+    func repopulateWalksOnlyWithChatViewOn(chatViewActive: Bool) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let acc = "acc-cs-w-\(chatViewActive)"
+        try makeAccount(acc, pool: pool)
+        // The Inbox row has everything the ordinary pass asks for, but no text message.
+        let inbox = try insertHeader(accountId: acc, uid: "inbox", blurb: "S.", pool: pool)
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET actionTag = 'none', cachedReply = 'R' WHERE id = ?",
+                           arguments: [inbox.id])
+        }
+        let sentReply = try insertHeader(accountId: acc, uid: "sent", folderPath: "Sent", inReplyTo: Self.rfc("inbox"), pool: pool)
+
+        let queue = ActiveAIQueue()
+        await queue.setDispatchSuppressedForTesting(true)
+        await queue.repopulateFromDatabase(chatViewActive: chatViewActive)
+
+        let jobs = await queue.queuedJobsForTesting
+        if chatViewActive {
+            #expect(Set(jobs.map(\.headerId)) == [inbox.id, sentReply.id],
+                    "the walk asks for the thread's members without a text message, Sent included")
+            #expect(jobs.allSatisfy { $0.jobType == .summary && $0.forChat && $0.windowExempt })
+        } else {
+            #expect(jobs.isEmpty, "with the chat view off, the pass asks for no chat summaries")
+        }
     }
 
     // MARK: - 6. Release gate

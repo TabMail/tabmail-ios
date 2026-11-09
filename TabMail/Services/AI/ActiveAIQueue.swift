@@ -196,10 +196,31 @@ actor ActiveAIQueue {
     /// Why it is process-lifetime and NOT durable: an AI summary is recomputable
     /// derived content, so a row that later gains an epoch or an RFC 822 Message-ID
     /// must become eligible again rather than be poisoned. `rearmUnattributableJobs()`
-    /// clears it on every launch, foreground return and AI re-enable — the exact
-    /// moments a sync may have stamped the folder or the row. Nothing about the
-    /// refusal is ever written to the database.
+    /// clears it at every `repopulateFromDatabase` (each sync start: launch, foreground
+    /// return, push wake, background refresh; AI re-enable; the AI redrives) and on
+    /// suspension recovery (`cancelAllInFlight`) — the moments a sync may have stamped
+    /// the folder or the row. Nothing about the refusal is ever written to the database.
+    /// A refusal costs no model call, so that cadence is free. A chat summary answered
+    /// without a text message costs one, and is held apart in `textlessChatJobs`.
     private var unattributableJobs: Set<AIJob> = []
+
+    /// Chat summaries (`forChat`) whose model call completed and wrote a summary but no
+    /// text message (`.answeredWithoutTextMessage`: an image-only email, an invite).
+    /// GRDB still shows the chat job undone, so without this set every chat open, walk
+    /// and drain would ask again, and each ask is a model call. A sync cannot change
+    /// the model's answer, so `rearmUnattributableJobs()` leaves this set alone: no
+    /// launch-time, foreground, push-wake or suspension-recovery pass clears it. It
+    /// starts empty in a new process, and AI re-enable (`aiReenabled`) empties it;
+    /// nothing else does. The bound: one model call per email per process; AI re-enable
+    /// asks again (ADR-IOS-114 decision 8). In memory only.
+    private(set) var textlessChatJobs: Set<AIJob> = []
+
+    /// Whether `job` is retired for this process: its write-back is structurally
+    /// refused (`unattributableJobs`) or it is a chat summary the model answered
+    /// without a text message (`textlessChatJobs`). Every admission skips such a job.
+    func retiredForProcess(_ job: AIJob) -> Bool {
+        unattributableJobs.contains(job) || textlessChatJobs.contains(job)
+    }
 
 
     /// Cached config snapshot from last dispatchPending() call.
@@ -273,6 +294,23 @@ actor ActiveAIQueue {
         _ = await executeJob(job, config: config)
     }
 
+    /// Test seam: take every pending job into flight as `launchCandidates` does, without running
+    /// it, so a test can make an offer while its twin is in flight.
+    func takePendingIntoFlightForTesting() -> [AIJob] {
+        let jobs = storage.collectCandidates(maxJobs: Int.max)
+        for job in jobs {
+            storage.incrementActiveJobs()
+            inFlightTasks[job] = Task {}
+        }
+        return jobs
+    }
+
+    /// Test seam: finish an in-flight job as the drain does once its executor returns; the
+    /// database decides the outcome (`jobCompleted`).
+    func finishInFlightForTesting(_ job: AIJob) async {
+        await jobCompleted(job: job, report: .ordinary(retry: false))
+    }
+
     /// Test seam: whether `readJobOutcome` finds `job` finished (`verifiedComplete`) after a run.
     func jobVerifiedCompleteForTesting(_ job: AIJob) async -> Bool {
         if case .verifiedComplete = await readJobOutcome(job) { return true }
@@ -336,7 +374,7 @@ actor ActiveAIQueue {
         ]
         var added = 0
         var upgraded = 0
-        for job in jobs where !unattributableJobs.contains(job) {
+        for job in jobs where !retiredForProcess(job) {
             switch admitOrUpgrade(job) {
             case .added: added += 1
             case .upgraded: upgraded += 1
@@ -365,19 +403,34 @@ actor ActiveAIQueue {
     /// offer over a pending exempt job) returns `.rejected` and never downgrades.
     /// (Round-1 review fixed this for the S/R path; round-2 found the same class at
     /// the chain sites — ADR-IOS-078.)
-    /// The same holds for `forChat`: the stored job carries the union of both offers' flags.
+    /// The same holds for `forChat`, and a chat offer is never lost to its twin, whatever state the
+    /// twin is in: a pending twin is upgraded in place; a twin that completed within the
+    /// `recentlyCompleted` TTL does not block it (the twin may have finished without the text
+    /// message a chat summary needs, and the executor's first check reads the row again); an
+    /// in-flight twin, which the executor holds by value, keeps the offer in
+    /// `chatOffersOnInFlightTwin` until `jobCompleted` admits it.
     private enum AdmitResult { case added, upgraded, rejected }
     private func admitOrUpgrade(_ job: AIJob) -> AdmitResult {
         if storage.enqueue(job) { return .added }
-        guard let pending = storage.queue.first(where: { $0 == job }) else { return .rejected }
+        guard let pending = storage.queue.first(where: { $0 == job }) else {
+            // Not queued: `enqueue` refused it for a recently completed twin.
+            guard job.forChat else { return .rejected }
+            storage.forgetCompleted(job)
+            return storage.enqueue(job) ? .added : .rejected
+        }
         let merged = AIJob(
             headerId: pending.headerId, accountId: pending.accountId, jobType: pending.jobType,
             windowExempt: pending.windowExempt || job.windowExempt,
             forChat: pending.forChat || job.forChat
         )
-        guard merged.windowExempt != pending.windowExempt || merged.forChat != pending.forChat,
-              storage.replacePending(with: merged) else { return .rejected }
-        return .upgraded
+        guard merged.windowExempt != pending.windowExempt || merged.forChat != pending.forChat else {
+            return .rejected
+        }
+        if storage.replacePending(with: merged) { return .upgraded }
+        if merged.forChat != pending.forChat {
+            chatOffersOnInFlightTwin.insert(job)
+        }
+        return .rejected
     }
 
     /// Enqueue the action job chained after a summary (both the fresh-completion
@@ -402,7 +455,7 @@ actor ActiveAIQueue {
             allJobs.append(AIJob(headerId: item.headerId, accountId: item.accountId, jobType: .reply))
             allJobs.append(AIJob(headerId: item.headerId, accountId: item.accountId, jobType: .action))
         }
-        let added = storage.enqueueBatch(allJobs.filter { !unattributableJobs.contains($0) })
+        let added = storage.enqueueBatch(allJobs.filter { !retiredForProcess($0) })
         guard added > 0 else { return }
         activeAILog("[ActiveAI] Enqueued \(added) jobs for \(items.count) messages (total: \(storage.count))")
         BackgroundSyncLogger.logAIProcessing("Enqueued batch of \(added) jobs for \(items.count) messages (total: \(storage.count))")
@@ -417,6 +470,12 @@ actor ActiveAIQueue {
     /// leave when their body lands, and all of them on `cancelAllInFlight` (resume recovery, a
     /// background task's end), so a body that never lands is not kept past the next recovery.
     private var chatAwaitingBody: [String: String] = [:]
+
+    /// Chat offers that found their ordinary twin in flight (`admitOrUpgrade`). The executor holds
+    /// the twin by value, so it cannot be upgraded; `jobCompleted` admits the offer once the twin
+    /// leaves flight, whatever its outcome. In memory only, and emptied on `cancelAllInFlight` like
+    /// `chatAwaitingBody`, so an offer whose twin never completes is not kept past the next recovery.
+    private var chatOffersOnInFlightTwin: Set<AIJob> = []
 
     /// Opening a thread: summaries for every email of it that lacks one with a text message, the
     /// user's own included. A member with its body gets a chat summary job now; one without goes to
@@ -463,7 +522,7 @@ actor ActiveAIQueue {
         for item in items {
             let job = AIJob(headerId: item.headerId, accountId: item.accountId, jobType: .summary,
                             windowExempt: true, forChat: true)
-            guard !unattributableJobs.contains(job) else { continue }
+            guard !retiredForProcess(job) else { continue }
             if admitOrUpgrade(job) != .rejected { admitted += 1 }
         }
         guard admitted > 0 else { return }
@@ -508,10 +567,10 @@ actor ActiveAIQueue {
     /// they are still processed on arrival/user intent (open, push/NSE merge, move
     /// into the Inbox), which are window-EXEMPT since ADR-IOS-078. This bound is
     /// sync-origin only; it is not a global cap.
-    func repopulateFromDatabase() async {
-        // Settings snapshot, first: the walk below runs only if the chat view was on when this
-        // pass began.
-        let chatViewActive = ChatViewConfig.isActive
+    ///
+    /// `chatViewActive` is the settings snapshot, taken as the pass begins (the default argument is
+    /// read at the call): the chat walk at the end runs only if the chat view was on then.
+    func repopulateFromDatabase(chatViewActive: Bool = ChatViewConfig.isActive) async {
         // Throttle: skip if cancelAllInFlight() fired < 2s ago.
         // Prevents the cancel→repopulate→dispatch cycle from creating duplicate job storms
         // when the user rapidly switches apps (foreground→background→foreground).
@@ -521,9 +580,10 @@ actor ActiveAIQueue {
             try? await Task.sleep(for: .milliseconds(2000 - sinceCancelMs))
             guard !Task.isCancelled else { return }
         }
-        // Launch / foreground / AI re-enable: a sync may have stamped the folder or
+        // Every sync start and AI re-enable: a sync may have stamped the folder or
         // the row since the last refusal, so every structurally-refused job gets one
-        // more chance to be admitted. See `unattributableJobs`.
+        // more chance to be admitted. See `unattributableJobs`. A textless chat
+        // answer stays retired (`textlessChatJobs`).
         rearmUnattributableJobs()
         let t0 = CFAbsoluteTimeGetCurrent()
         do {
@@ -655,8 +715,10 @@ actor ActiveAIQueue {
         }
         inFlightTasks.removeAll()
         storage.cancelAllInFlight()
-        // Chat members waiting for a body are forgotten too: the next open or walk asks again.
+        // Chat members waiting for a body, and chat offers waiting on an in-flight twin, are
+        // forgotten too: the next open or walk asks again.
         chatAwaitingBody.removeAll()
+        chatOffersOnInFlightTwin.removeAll()
         backoff.removeAll()
         backoffRetryCount.removeAll()
         rearmUnattributableJobs()
@@ -670,15 +732,29 @@ actor ActiveAIQueue {
     }
 
     /// Forget every structurally-refused job, so the next enqueue admits it again.
-    /// Called from the entry points that follow a possible sync — launch / foreground
-    /// / AI re-enable (`repopulateFromDatabase`) and suspension recovery
+    /// Called from the entry points that follow a possible sync — every sync start
+    /// and AI re-enable (`repopulateFromDatabase`) and suspension recovery
     /// (`cancelAllInFlight`) — never from the drain-time self-repopulate, which is
-    /// the loop this memo exists to break. See `unattributableJobs`.
+    /// the loop this memo exists to break. See `unattributableJobs`. It leaves
+    /// `textlessChatJobs` alone.
     func rearmUnattributableJobs() {
         guard !unattributableJobs.isEmpty else { return }
         BackgroundSyncLogger.logAIProcessing(
             "Re-arming \(unattributableJobs.count) structurally-refused AI jobs")
         unattributableJobs.removeAll()
+    }
+
+    /// AI was turned back on (`AccountManager.reprocessInboxMessages`, the Settings
+    /// switch): every textless chat answer gets one more ask, and the queue is rebuilt
+    /// from the database as at a sync start. `chatViewActive` is the settings snapshot
+    /// for the pass, read at the call.
+    func aiReenabled(chatViewActive: Bool = ChatViewConfig.isActive) async {
+        if !textlessChatJobs.isEmpty {
+            BackgroundSyncLogger.logAIProcessing(
+                "AI re-enabled: asking again for \(textlessChatJobs.count) chat summaries answered without a text message")
+        }
+        textlessChatJobs.removeAll()
+        await repopulateFromDatabase(chatViewActive: chatViewActive)
     }
 
     /// Test-only seam (ADR-IOS-056 precedent: `dbPoolPriorityForTesting`). Internal
@@ -909,11 +985,18 @@ actor ActiveAIQueue {
         // model call because the result could not have been written back under ANY
         // outcome (`IOS-AI-002` / `IOS-AI-003`). GRDB shows the field still nil, which
         // is indistinguishable from an LLM failure — so the executor reports it.
+        // The other fact: a chat summary's model call wrote a summary but no text message, so GRDB
+        // still shows the chat job undone. Its executor put it in `textlessChatJobs`.
         let outcome: JobOutcome
         if case .unattributable = report {
             outcome = .writeRefused
         } else {
-            outcome = await readJobOutcome(job)
+            let read = await readJobOutcome(job)
+            if case .needsRetry = read, textlessChatJobs.contains(job) {
+                outcome = .answeredWithoutTextMessage
+            } else {
+                outcome = read
+            }
         }
         let retryCount = storage.retryCount(for: job)
         let shouldRetry: Bool
@@ -942,6 +1025,15 @@ actor ActiveAIQueue {
             unattributableJobs.insert(job)
             BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) write target structurally unattributable — terminal for this session, no model call issued")
             shouldRetry = false
+        case .answeredWithoutTextMessage:
+            // TERMINAL for this process, as `.writeRefused`: `textlessChatJobs` already holds the
+            // job and keeps the chat requests and `repopulateOnDrain` from asking again; only AI
+            // re-enable (`aiReenabled`) or a new process clears it.
+            _ = storage.abandonWithoutCompletion(job)
+            backoff.removeValue(forKey: job)
+            backoffRetryCount.removeValue(forKey: job)
+            BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).\(job.jobType.rawValue) chat summary has no text message — terminal for this session")
+            shouldRetry = false
         case .needsRetry:
             _ = storage.jobCompleted(job, shouldRetry: true, maxRetries: .max)
             // Exponential backoff: 1s, 2s, 4s, 8s, cap at 30s
@@ -960,6 +1052,13 @@ actor ActiveAIQueue {
                 launchCandidates()
             }
             shouldRetry = true
+        }
+
+        // A chat offer that found this job in flight is admitted now (`admitOrUpgrade`): a chat
+        // summary needs its text message, which this job may have finished without (a Device Sync
+        // peer's summary carries none). If it wrote one, the chat job ends at its first check.
+        if let chatOffer = chatOffersOnInFlightTwin.remove(job) {
+            enqueueChatSummaryJobs([(chatOffer.headerId, chatOffer.accountId)], origin: "twin")
         }
 
         let hasMore = storage.pendingCount > 0
@@ -1007,6 +1106,8 @@ actor ActiveAIQueue {
         case scopeExited
         case needsRetry
         case writeRefused
+        /// A chat summary whose model call wrote a summary but no text message (`textlessChatJobs`).
+        case answeredWithoutTextMessage
     }
 
     /// What the executor observed, over and above what GRDB can show afterwards.
@@ -1535,6 +1636,13 @@ actor ActiveAIQueue {
             guard outcome == .written else {
                 BackgroundSyncLogger.logAIProcessing("Summary write DROPPED (captured identity moved) for \(Self.logId(job.headerId))")
                 return false
+            }
+            // A chat summary the model answered without a text message: asking again would get the
+            // same answer and cost a model call every backoff, or at every sync start. Terminal for
+            // this process (`textlessChatJobs`); `jobCompleted` retires it.
+            if job.forChat && summary.textMessage == nil {
+                textlessChatJobs.insert(job)
+                BackgroundSyncLogger.logAIProcessing("[JOB] \(Self.logId(job.headerId)).summary chat summary answered without a text message — not asked again in this process")
             }
 
             NotificationCenter.default.post(name: .messageDataDidChange, object: job.headerId)

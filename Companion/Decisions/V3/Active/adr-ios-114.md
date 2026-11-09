@@ -118,12 +118,32 @@ same AI result, kept as long as the email itself is shown.
    message, a literal "None" included (`AIResponseParser.nonEmpty`; the 2.0 backend never sends an
    empty one, `readStructuredSummary`), and the local no-content summary
    (`MessageHeader.noContentSummary`), which has no text message, counts as done.
+   *Amended 2026-11-15:* a chat summary whose model call completed and wrote a summary but no
+   text message (an image-only email, an invite, a backend without the 2.0 contract) is terminal
+   for that job in this process. The executor puts the job in its own in-memory set,
+   `ActiveAIQueue.textlessChatJobs`, and `jobCompleted` retires it (`.answeredWithoutTextMessage`,
+   `abandonWithoutCompletion`). The open, the walk, a landed body and the drain all skip a job in
+   that set (`enqueueChatSummaryJobs`, `retiredForProcess`). `rearmUnattributableJobs`, which runs
+   at every sync start (launch, foreground return, every push wake, background refresh) and on
+   suspension recovery, does not clear it: a sync cannot change the model's answer. The set starts
+   empty in a new process, and AI re-enable (`ActiveAIQueue.aiReenabled`) empties it; nothing else
+   clears it. So the bound is one model call per email per process; AI re-enable asks again. Its
+   bubble reads "Summarizing" until then. Deleting the text-message requirement would leave older
+   summaries without one for good, and dropping the retry would end it for a failed call too, so
+   the bound is the fix (tests: `ChatSummaryExecutionTests.textlessChatSummaryIsNotAskedAgainBySyncStarts`,
+   a launch and a push wake through `repopulateFromDatabase`, and
+   `textlessChatSummaryIsAskedOncePerProcess`, every chat ask and AI re-enable).
    **TB parity:** a further exception to ADR-IOS-008: Thunderbird summarizes Inbox mail only.
    **Recoverable edges, decided 2026-11-05:** members awaiting their body are held in memory
    only (a relaunch forgets them; the next open or walk asks again); a member whose body arrives
    through the background backfill (not the AI-enabled body queue) is picked up by the next walk or
-   open, not at once; a chat offer rejected by `recentlyCompleted` or an in-flight twin is asked again
-   by the next walk or open.
+   open, not at once.
+   *Amended 2026-11-09:* a chat offer is never lost to its ordinary twin. That edge was listed
+   above, but it was not recoverable while the chat stayed open: a twin finished by a Device Sync
+   peer's summary has no text message, so the bubble kept "Summarizing" until a later reopen. Now a
+   pending twin is upgraded, a twin within the `recentlyCompleted` TTL no longer blocks the offer,
+   and an in-flight twin keeps the offer (`ActiveAIQueue.chatOffersOnInFlightTwin`) until
+   `jobCompleted` admits it.
 
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
@@ -150,4 +170,4 @@ including to none (`sameSummaryNewTextMessage`), the merge's second stage creati
 stage could not and caching its result with the text message (`secondStageCachesTextMessage`), a merged
 cache entry kept through the orphan grace (`mergedCacheEntryGetsTheGrace`), and a push through `NotificationService.didReceive`
 staging the text message, via `NotificationService.stagingPathOverride`).
-Decision 8: `ChatSummaryQueueTests`; `ChatSummaryExecutionTests` (the own-email field, two-sided; a real body write releasing the waiting chat summary once; the executor refusing an ordinary summary outside the Inbox, with an Inbox control).
+Decision 8: `ChatSummaryQueueTests` (including a chat offer made while its ordinary twin is in flight, just after it ended, or when it runs again, and the foreground pass's walk, two-sided on the chat view); `ChatSummaryExecutionTests` (the own-email field, two-sided; a real body write releasing the waiting chat summary once; the executor refusing an ordinary summary outside the Inbox, with an Inbox control).
