@@ -21,6 +21,12 @@ enum HTTPConfig {
     /// (`BackendClient.llmSession`, `SyncConfig.llmResourceTimeoutSeconds`) and
     /// is unaffected.
     static let sharedResourceTimeoutSeconds: TimeInterval = 300
+    /// The longest `Retry-After` a retry waits for inside one request. A server
+    /// asking for longer gets no retry: the request fails with its status, and
+    /// the caller's own retry (the next sync pass, the queue's next drain) comes
+    /// later. Keeps one call from holding its caller for minutes, and keeps the
+    /// notification service extension inside its time budget.
+    static let maxHonouredRetryAfterSeconds: TimeInterval = 10
 }
 
 /// Shared ephemeral URLSession for all HTTP providers (Gmail, Exchange, backend calls).
@@ -54,11 +60,23 @@ struct HTTPRequestResult: Sendable {
     /// defaulted `let` is baked in as a fixed constant and cannot be
     /// customized per instance.
     var errorBody: Data? = nil
+    /// The response's `Retry-After`, in seconds, when it gives a non-negative
+    /// number of seconds (the form Microsoft Graph sends on 429 and 503). `nil`
+    /// when the header is absent or is an HTTP date.
+    var retryAfter: TimeInterval? = nil
+}
+
+/// `Retry-After` as delta-seconds (RFC 9110, section 10.2.3), or nil.
+func retryAfterSeconds(_ response: URLResponse) -> TimeInterval? {
+    guard let raw = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After"),
+          let seconds = Int(raw.trimmingCharacters(in: .whitespaces)), seconds >= 0 else { return nil }
+    return TimeInterval(seconds)
 }
 
 /// Execute an HTTP request with Bearer token authentication.
 /// Shared by every REST provider (Gmail, Exchange, Google Calendar, Exchange Calendar, BackendClient).
 /// Handles URL construction, headers, Content-Type for JSON body, and optional error logging.
+/// With a `gate`, the request holds one of its slots while it is on the wire.
 func performHTTPRequest(
     url urlString: String,
     method: String,
@@ -66,7 +84,8 @@ func performHTTPRequest(
     token: String,
     extraHeaders: [String: String] = [:],
     session: URLSession? = nil,
-    logLabel: String? = nil
+    logLabel: String? = nil,
+    gate: HTTPConcurrencyGate? = nil
 ) async throws -> HTTPRequestResult {
     let session = session ?? sharedEphemeralSession
     guard let url = URL(string: urlString) else {
@@ -86,7 +105,11 @@ func performHTTPRequest(
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
     }
 
-    let (data, response) = try await session.data(for: req)
+    let (data, response) = if let gate {
+        try await gate.withSlot { try await session.data(for: req) }
+    } else {
+        try await session.data(for: req)
+    }
     let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
     if 200..<300 ~= statusCode {
         return HTTPRequestResult(data: data, statusCode: statusCode)
@@ -100,12 +123,18 @@ func performHTTPRequest(
         #endif
     }
 
-    return HTTPRequestResult(data: nil, statusCode: statusCode, errorBody: data.isEmpty ? nil : data)
+    return HTTPRequestResult(
+        data: nil, statusCode: statusCode, errorBody: data.isEmpty ? nil : data,
+        retryAfter: retryAfterSeconds(response))
 }
 
-/// Execute an HTTP request with automatic retry on rate-limiting status codes.
-/// Uses exponential backoff (initialDelay, 2×, 4×, ...) up to `maxAttempts` retries.
-/// Gmail uses `[429, 403]` (per-user rateLimitExceeded is 403); Graph uses `[429]`.
+/// Execute an HTTP request with automatic retry on rate-limiting status codes,
+/// up to `maxAttempts` retries. Each retry waits for the response's `Retry-After`
+/// when it has one, as Graph asks ("Wait the number of seconds specified in the
+/// Retry-After header"), and otherwise backs off exponentially (initialDelay, 2×,
+/// 4×, ...). A `Retry-After` above `HTTPConfig.maxHonouredRetryAfterSeconds` ends
+/// the retries and returns that response. Gmail retries `[429, 403]` (per-user
+/// rateLimitExceeded is 403); Graph retries `[429, 503]`.
 func performHTTPRequestWithRetry(
     url urlString: String,
     method: String,
@@ -116,11 +145,12 @@ func performHTTPRequestWithRetry(
     maxAttempts: Int = 3,
     initialDelay: TimeInterval = 1.0,
     session: URLSession? = nil,
-    logLabel: String? = nil
+    logLabel: String? = nil,
+    gate: HTTPConcurrencyGate? = nil
 ) async throws -> HTTPRequestResult {
     var result = try await performHTTPRequest(
         url: urlString, method: method, body: body, token: token,
-        extraHeaders: extraHeaders, session: session, logLabel: logLabel
+        extraHeaders: extraHeaders, session: session, logLabel: logLabel, gate: gate
     )
 
     if result.data != nil || !retryableStatusCodes.contains(result.statusCode) {
@@ -128,7 +158,20 @@ func performHTTPRequestWithRetry(
     }
 
     for attempt in 0..<maxAttempts {
-        let delay = initialDelay * Double(1 << attempt)
+        let delay: TimeInterval
+        if let retryAfter = result.retryAfter {
+            guard retryAfter <= HTTPConfig.maxHonouredRetryAfterSeconds else {
+                if let logLabel {
+                    #if DEBUG
+                    print("[\(logLabel)] HTTP \(result.statusCode) asks to retry after \(retryAfter)s, longer than \(HTTPConfig.maxHonouredRetryAfterSeconds)s: not retrying now")
+                    #endif
+                }
+                return result
+            }
+            delay = retryAfter
+        } else {
+            delay = initialDelay * Double(1 << attempt)
+        }
         if let logLabel {
             #if DEBUG
             print("[\(logLabel)] Rate limited (\(result.statusCode)), retrying in \(delay)s (attempt \(attempt + 1)/\(maxAttempts))")
@@ -137,7 +180,7 @@ func performHTTPRequestWithRetry(
         try await Task.sleep(for: .seconds(delay))
         result = try await performHTTPRequest(
             url: urlString, method: method, body: body, token: token,
-            extraHeaders: extraHeaders, session: session, logLabel: logLabel
+            extraHeaders: extraHeaders, session: session, logLabel: logLabel, gate: gate
         )
         if result.data != nil { return result }
         if !retryableStatusCodes.contains(result.statusCode) { break }

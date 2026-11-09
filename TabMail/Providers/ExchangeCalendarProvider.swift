@@ -10,12 +10,20 @@ import Foundation
 actor ExchangeCalendarProvider: CalendarProvider {
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let baseURL = "https://graph.microsoft.com/v1.0/me"
+    /// The mailbox's Graph concurrency limit (#426): `AccountManager` passes the
+    /// gate its `ExchangeProvider` also uses, so calendar and mail requests share
+    /// Graph's four concurrent requests per mailbox.
+    private let mailboxGate: HTTPConcurrencyGate
     /// Test-only transport override. `nil` on every production path, where
     /// `performHTTPRequest` falls back to `sharedEphemeralSession`.
     private let testSession: URLSession?
 
-    init(accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String) {
+    init(
+        accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
+        mailboxGate: HTTPConcurrencyGate = HTTPConcurrencyGate(limit: GraphConfig.maxConcurrentRequestsPerMailbox)
+    ) {
         self.accessToken = accessToken
+        self.mailboxGate = mailboxGate
         self.testSession = nil
     }
 
@@ -23,11 +31,17 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// through `FakeHTTP`. A separate initializer with a NON-optional session,
     /// for the reason `GoogleCalendarProvider`'s twin gives: a nil-defaulted seam
     /// that is silently dropped leaves a unit test talking to the live service.
+    ///
+    /// It exists because whether calendar and mail requests of one mailbox share
+    /// Graph's four concurrent requests is a property of the transport, visible
+    /// only at the wire.
     init(
         accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
+        mailboxGate: HTTPConcurrencyGate,
         session: URLSession
     ) {
         self.accessToken = accessToken
+        self.mailboxGate = mailboxGate
         self.testSession = session
     }
 
@@ -820,7 +834,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // round-trip preserves the user's intended wall time.
         let prefTz = TimeZone.current.identifier
         let headers = ["Prefer": "outlook.timezone=\"\(prefTz)\""]
-        let result = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: token, extraHeaders: headers, session: testSession, logLabel: "ExchangeCalendar")
+        // Throttling (429) and 503 are retried after Graph's `Retry-After`, like the
+        // mail provider's requests (#426).
+        let policy = HTTPRetryPolicy.graph
+        let result = try await performHTTPRequestWithRetry(
+            url: baseURL + path, method: method, body: body, token: token, extraHeaders: headers,
+            retryableStatusCodes: policy.retryableStatusCodes, maxAttempts: policy.maxAttempts,
+            initialDelay: policy.initialDelay, session: testSession, logLabel: "ExchangeCalendar", gate: mailboxGate)
 
         if let data = result.data {
             return data
@@ -830,7 +850,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if result.statusCode == 401 {
             BackgroundSyncLogger.logDebug("[ExchangeCalendar] Token expired, refreshing...")
             let freshToken = try await accessToken(true)
-            let retry = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: freshToken, extraHeaders: headers, session: testSession, logLabel: "ExchangeCalendar")
+            let retry = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: freshToken, extraHeaders: headers, session: testSession, logLabel: "ExchangeCalendar", gate: mailboxGate)
             // `headers` already carries the local-tz Prefer from the first attempt above.
             if let data = retry.data {
                 return data

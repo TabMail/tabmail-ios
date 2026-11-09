@@ -437,9 +437,9 @@ struct StatefulExchangeActionServerTests {
     /// `updateMessage`, which is declared nowhere in the tree; the method is
     /// `patchMessage(id:body:)`. The coverage conclusion survives both; the
     /// count and the symbol did not.)
-    /// A 503 is outside Graph's retryable set
-    /// (`HTTPRetryPolicy.graph` retries 429 only), so it surfaces to the caller
-    /// and the model must be unchanged.
+    /// The fixture's 503 asks for a `Retry-After` longer than the HTTP layer
+    /// waits (`FakeHTTP.CannedResponse.graphUnavailableBeyondRetry`), so it surfaces
+    /// to the caller and the model must be unchanged.
     @Test("a transient Graph mutation failure leaves state unchanged and retries clean")
     func transientMutationFailureLeavesStateUnchanged() async throws {
         let providerMessageId = "graph-transient-1"

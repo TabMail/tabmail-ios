@@ -178,10 +178,11 @@ enum BackfillProfile {
         }
     }
 
-    /// Concurrent body fetches for Gmail/Exchange (HTTP) in FTS indexing.
+    /// Concurrent body fetches for Gmail (HTTP) in backfill and FTS indexing.
     /// Gmail: 250 quota units/sec, messages.get = 5 units → ~50 req/sec max.
     /// At ~200ms RTT, 25 concurrent ≈ 125 req/sec peak — within limit with margin.
-    /// Exchange limit is ~16 qps — 429/403 retry with backoff handles overshoot.
+    /// Outlook does not use these: Graph allows four concurrent requests per
+    /// mailbox, so its width is `GraphConfig.bodyFetchConcurrency` (#426).
     var gmailBodyConcurrency: Int {
         switch self {
         case .low: return 3

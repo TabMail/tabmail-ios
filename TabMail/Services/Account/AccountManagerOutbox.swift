@@ -813,6 +813,16 @@ extension AccountManager {
                 return false
             }
         }
+        // #426: an HTTP send provider (Outlook, Gmail) answering 429 (throttled) or
+        // 503 (temporarily unavailable) is asking to be retried after a delay; the
+        // HTTP layer has already retried it after `Retry-After`. Neither says the
+        // message is wrong, so it stays queued without a strike. Other 5xx stay
+        // strikes: a server error can repeat for the same message every time.
+        if case ProviderError.networkError(let underlying) = error,
+           case HTTPError.networkError(let statusCode) = underlying,
+           statusCode == 429 || statusCode == 503 {
+            return true
+        }
         // URL/network errors are transient
         if (error as NSError).domain == NSURLErrorDomain { return true }
         // NIO connection errors are transient

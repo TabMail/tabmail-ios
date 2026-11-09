@@ -12,13 +12,17 @@ struct HTTPRetryPolicy: Sendable {
 
     /// Gmail: 429 + 403 (per-user rateLimitExceeded is 403).
     static let gmail = HTTPRetryPolicy(retryableStatusCodes: [429, 403], maxAttempts: 3, initialDelay: 1.0)
-    /// Graph / other REST APIs: 429 only.
-    static let graph = HTTPRetryPolicy(retryableStatusCodes: [429], maxAttempts: 3, initialDelay: 1.0)
+    /// Microsoft Graph: 429 (throttled) and 503 ("temporarily unavailable … You
+    /// can repeat the request after a delay, the length of which can be specified
+    /// in a Retry-After header", Graph errors page), each after its `Retry-After`.
+    static let graph = HTTPRetryPolicy(retryableStatusCodes: [429, 503], maxAttempts: 3, initialDelay: 1.0)
 }
 
 /// Single 401-retry path used by every shared REST API layer.
 /// Both main app providers and NSE clients construct one of these per call site.
-/// On 401 → `auth.refresh()` → retry once. On rate-limit → exponential backoff.
+/// On 401 → `auth.refresh()` → retry once. On rate-limit → `Retry-After`, else
+/// exponential backoff. With a `gate`, every request it sends (the first, each
+/// retry, the one after a refresh) holds one of the gate's slots while on the wire.
 struct AuthedHTTP: Sendable {
     @TaskLocal static var sessionOverride: URLSession?
     let auth: any AuthSource
@@ -34,16 +38,20 @@ struct AuthedHTTP: Sendable {
     /// the token. Not called for a transport error, a cancellation, a failed
     /// refresh, `requestAllowing404` or `requestPreservingBadRequestBody`.
     let onFailure: (@Sendable (_ method: String, _ statusCode: Int, _ errorBody: Data?) -> Void)?
+    /// The provider's concurrency limit (Outlook: one per mailbox), or nil for none.
+    let gate: HTTPConcurrencyGate?
 
     init(
         auth: any AuthSource, retry: HTTPRetryPolicy, logLabel: String? = nil, session: URLSession? = nil,
-        onFailure: (@Sendable (_ method: String, _ statusCode: Int, _ errorBody: Data?) -> Void)? = nil
+        onFailure: (@Sendable (_ method: String, _ statusCode: Int, _ errorBody: Data?) -> Void)? = nil,
+        gate: HTTPConcurrencyGate? = nil
     ) {
         self.auth = auth
         self.retry = retry
         self.logLabel = logLabel
         self.session = session ?? Self.sessionOverride
         self.onFailure = onFailure
+        self.gate = gate
     }
 
     func get(_ url: String, extraHeaders: [String: String] = [:]) async throws -> Data {
@@ -76,13 +84,14 @@ struct AuthedHTTP: Sendable {
             retryableStatusCodes: retry.retryableStatusCodes,
             maxAttempts: retry.maxAttempts, initialDelay: retry.initialDelay,
             session: session,
-            logLabel: logLabel
+            logLabel: logLabel,
+            gate: gate
         )
         if result.statusCode == 401 {
             token = try await auth.refresh(rejecting: token)
             result = try await performHTTPRequest(
                 url: url, method: method, body: body, token: token,
-                session: session, logLabel: logLabel
+                session: session, logLabel: logLabel, gate: gate
             )
         }
         return HTTPAuthedResult(data: result.data, statusCode: result.statusCode)
@@ -135,14 +144,15 @@ struct AuthedHTTP: Sendable {
             retryableStatusCodes: retry.retryableStatusCodes,
             maxAttempts: retry.maxAttempts, initialDelay: retry.initialDelay,
             session: session,
-            logLabel: logLabel
+            logLabel: logLabel,
+            gate: gate
         )
 
         if result.statusCode == 401 {
             token = try await auth.refresh(rejecting: token)
             result = try await performHTTPRequest(
                 url: url, method: method, body: body, token: token,
-                extraHeaders: extraHeaders, session: session, logLabel: logLabel
+                extraHeaders: extraHeaders, session: session, logLabel: logLabel, gate: gate
             )
         }
 
@@ -165,14 +175,15 @@ struct AuthedHTTP: Sendable {
             retryableStatusCodes: retry.retryableStatusCodes,
             maxAttempts: retry.maxAttempts, initialDelay: retry.initialDelay,
             session: session,
-            logLabel: logLabel
+            logLabel: logLabel,
+            gate: gate
         )
 
         if result.statusCode == 401 {
             token = try await auth.refresh(rejecting: token)
             result = try await performHTTPRequest(
                 url: url, method: method, body: body, token: token,
-                extraHeaders: extraHeaders, session: session, logLabel: logLabel
+                extraHeaders: extraHeaders, session: session, logLabel: logLabel, gate: gate
             )
         }
 

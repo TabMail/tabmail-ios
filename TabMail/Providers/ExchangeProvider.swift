@@ -51,14 +51,23 @@ actor ExchangeProvider: EmailProvider {
     /// `FakeHTTP` URLProtocol on this session to intercept Graph API calls.
     private let testSession: URLSession?
 
+    /// Graph allows four concurrent requests per app and mailbox (#426). Every
+    /// request this provider sends holds a slot of this gate while on the wire.
+    /// `AccountManager` passes the mailbox's shared gate
+    /// (`GraphMailboxGates.gate(for:)`), which its calendar provider also uses;
+    /// the default is a gate of this provider's own.
+    private let mailboxGate: HTTPConcurrencyGate
+
     init(
         userEmail: String,
         accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        mailboxGate: HTTPConcurrencyGate = HTTPConcurrencyGate(limit: GraphConfig.maxConcurrentRequestsPerMailbox)
     ) {
         self.userEmail = userEmail
         self.accessToken = accessToken
         self.testSession = session
+        self.mailboxGate = mailboxGate
     }
 
     func connect() async throws {
@@ -596,9 +605,9 @@ actor ExchangeProvider: EmailProvider {
 
     func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] {
         var results: [TextBodyFetchResult] = []
-        // Provider-owned concurrency: Exchange Graph API ~16 qps with backoff
-        let concurrency = BackfillProfile.normal.gmailBodyConcurrency
-        let stream = await fetchTextBodiesStream(ids: ids, concurrency: concurrency)
+        // Graph's binding limit is four concurrent requests per mailbox (#426);
+        // `mailboxGate` enforces it, and this width leaves room under it.
+        let stream = await fetchTextBodiesStream(ids: ids, concurrency: GraphConfig.bodyFetchConcurrency)
         for await result in stream {
             results.append(result)
         }
@@ -1224,7 +1233,8 @@ actor ExchangeProvider: EmailProvider {
             put.httpBody = attachment.data.subdata(in: offset..<end)
             let response: URLResponse
             do {
-                (_, response) = try await (testSession ?? sharedEphemeralSession).data(for: put)
+                let session = testSession ?? sharedEphemeralSession
+                (_, response) = try await mailboxGate.withSlot { try await session.data(for: put) }
             } catch let error as URLError {
                 // The session URL carries a pre-authenticated token, and a URLError
                 // carries its failing URL into every log line that prints the error
@@ -1268,9 +1278,11 @@ actor ExchangeProvider: EmailProvider {
         )
         // Exchange may auto-delete drafts after send. A 404 means already gone — treat as success.
         let token = try await accessToken(false)
+        let policy = HTTPRetryPolicy.graph
         let result = try await performHTTPRequestWithRetry(
             url: baseURL + "/messages/\(encodedDraftId)", method: "DELETE", body: nil, token: token,
-            retryableStatusCodes: [429], session: testSession, logLabel: "Exchange"
+            retryableStatusCodes: policy.retryableStatusCodes, maxAttempts: policy.maxAttempts,
+            initialDelay: policy.initialDelay, session: testSession, logLabel: "Exchange", gate: mailboxGate
         )
         if result.statusCode == 404 {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] deleteDraft: draft \(draftId) already deleted (404) — treating as success") }
@@ -1279,7 +1291,7 @@ actor ExchangeProvider: EmailProvider {
         if result.data != nil { return }
         if result.statusCode == 401 {
             let freshToken = try await accessToken(true)
-            let retry = try await performHTTPRequest(url: baseURL + "/messages/\(encodedDraftId)", method: "DELETE", body: nil, token: freshToken, session: testSession)
+            let retry = try await performHTTPRequest(url: baseURL + "/messages/\(encodedDraftId)", method: "DELETE", body: nil, token: freshToken, session: testSession, gate: mailboxGate)
             if retry.statusCode == 404 || retry.data != nil { return }
             throw ProviderError.networkError(underlying: NSError(domain: "Exchange", code: retry.statusCode))
         }
@@ -1587,14 +1599,15 @@ actor ExchangeProvider: EmailProvider {
     // MARK: - HTTP
 
     /// Lazily-built `AuthedHTTP` for Exchange/Graph. Shared 401-retry via
-    /// `AccountAuthSource`; rate-limit policy `.graph` = 429 only.
+    /// `AccountAuthSource`; rate-limit policy `.graph` (429 and 503, after
+    /// `Retry-After`); every request holds a slot of `mailboxGate`.
     private var authedHTTPCached: AuthedHTTP?
     private var authedHTTP: AuthedHTTP {
         if let cached = authedHTTPCached { return cached }
         let built = AuthedHTTP(
             auth: AccountAuthSource(accountId: userEmail, accessToken: accessToken),
             retry: .graph, logLabel: "Exchange", session: testSession,
-            onFailure: Self.logGraphFailure
+            onFailure: Self.logGraphFailure, gate: mailboxGate
         )
         authedHTTPCached = built
         return built

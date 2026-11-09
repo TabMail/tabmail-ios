@@ -1691,7 +1691,9 @@ actor AccountManager {
         let accessor = makeOAuthAccessor(accountId: account.id, email: account.emailAddress) { refreshToken in
             try await oauthService.refreshMicrosoftToken(refreshToken: refreshToken)
         }
-        return ExchangeProvider(userEmail: account.emailAddress, accessToken: accessor)
+        return ExchangeProvider(
+            userEmail: account.emailAddress, accessToken: accessor,
+            mailboxGate: GraphMailboxGates.gate(for: account.emailAddress))
     }
 
     private func createExchangeCalendarProvider(for account: Account) async -> ExchangeCalendarProvider {
@@ -1699,7 +1701,8 @@ actor AccountManager {
         let accessor = makeOAuthAccessor(accountId: account.id, email: account.emailAddress) { refreshToken in
             try await oauthService.refreshMicrosoftToken(refreshToken: refreshToken)
         }
-        return ExchangeCalendarProvider(accessToken: accessor)
+        return ExchangeCalendarProvider(
+            accessToken: accessor, mailboxGate: GraphMailboxGates.gate(for: account.emailAddress))
     }
 
     func createIMAPProvider(for account: Account, passwordOverride: String? = nil) throws -> IMAPProvider {
