@@ -253,6 +253,37 @@ struct GraphThrottlingTests {
         #expect(elapsed >= .seconds(retryAfter))
     }
 
+    @Test("Each refusal's own Retry-After is waited for, not only the first one's")
+    func everyRetryAfterIsHonoured() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        // Two refusals, the second asking for longer than the first; together
+        // they stay inside the budget, so both waits are made.
+        let retryAfters = [1, 3]
+        #expect(TimeInterval(retryAfters.reduce(0, +)) <= HTTPConfig.retryWaitBudgetSeconds)
+        let script = FakeHTTP.ResponseScript([429, 429, 200])
+        let refusals = Locked(0)
+        http.register(path: "/me/throttled", method: "GET") { _ in
+            guard script.next() == 429 else { return Self.emptyObject }
+            let index = refusals.withLock { count -> Int in
+                defer { count += 1 }
+                return count
+            }
+            return Self.throttled(429, retryAfter: retryAfters[index])
+        }
+        let clock = ContinuousClock()
+        let start = clock.now
+        let result = try await performHTTPRequestWithRetry(
+            url: "https://graph.microsoft.com/v1.0/me/throttled", method: "GET", body: nil, token: "token",
+            retryableStatusCodes: HTTPRetryPolicy.graph.retryableStatusCodes, maxAttempts: 3,
+            // Far below either Retry-After, so only honouring both reaches their sum.
+            initialDelay: 0.01, session: http.session)
+        let elapsed = clock.now - start
+        #expect(result.statusCode == 200)
+        #expect(script.served == [429, 429, 200])
+        #expect(elapsed >= .seconds(retryAfters.reduce(0, +)))
+    }
+
     @Test("A Retry-After above the budget ends the retries at once")
     func retryAfterAboveTheBudgetIsNotWaited() async throws {
         let http = FakeHTTP.Scenario()
@@ -273,7 +304,7 @@ struct GraphThrottlingTests {
         #expect(elapsed < .seconds(HTTPConfig.retryWaitBudgetSeconds))
     }
 
-    @Test("The waits of one call stop at the budget: a queued action's last refusal is a refusal, not a timeout")
+    @Test("The waits of one call stop at the budget: a single-request queued action's last refusal is a refusal, not a timeout")
     func retryWaitsAddUpToTheBudget() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -527,9 +558,9 @@ struct GraphThrottlingTests {
     /// Every way a Graph request leaves the providers, each run eight at a time on
     /// one mailbox: the token-refresh retry of an ordinary request and of the
     /// 404-tolerant probe, a draft delete (its first try and its refresh retry),
-    /// and the upload-session chunk `PUT`.
+    /// the upload-session chunk `PUT`, and the calendar's token-refresh retry.
     @Test("Every Graph request leg holds a slot of the mailbox's gate",
-          arguments: ["refreshedRequest", "refreshedProbe", "deleteDraft", "uploadChunk"])
+          arguments: ["refreshedRequest", "refreshedProbe", "deleteDraft", "uploadChunk", "calendarRefresh"])
     func everyLegIsGated(leg: String) async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -538,13 +569,17 @@ struct GraphThrottlingTests {
         // A stale token is refused with 401, so every request also takes its
         // refresh retry; the upload leg needs no refusal.
         let stale = leg != "uploadChunk"
+        let refreshed = Locked(0)
         @Sendable func answer(_ request: FakeHTTP.Request, _ fresh: FakeHTTP.CannedResponse) -> FakeHTTP.CannedResponse {
-            Self.metered(meter, latency: latency, request.header("Authorization") == "Bearer stale" ? .status(401) : fresh)
+            let isStale = request.header("Authorization") == "Bearer stale"
+            if !isStale { refreshed.withLock { $0 += 1 } }
+            return Self.metered(meter, latency: latency, isStale ? .status(401) : fresh)
         }
         http.register(path: "/messages/", method: "PATCH") { answer($0, Self.emptyObject) }
         http.register(path: "/messages/", method: "GET") { answer($0, .status(404)) }
         http.register(path: "/attachments", method: "GET") { answer($0, .json(raw: #"{"value":[]}"#)) }
         http.register(path: "/messages/", method: "DELETE") { answer($0, .status(204)) }
+        http.register(path: "/calendars", method: "GET") { answer($0, Self.calendarList) }
         let drafts = Locked(0)
         http.register(path: "/mailFolders/drafts/messages", method: "POST") { request in
             let id = drafts.withLock { $0 += 1; return $0 }
@@ -559,8 +594,12 @@ struct GraphThrottlingTests {
             let last = bounds.count == 3 && bounds[1] + 1 == bounds[2]
             return Self.metered(meter, latency: latency, .json(raw: "{}", statusCode: last ? 201 : 200))
         }
+        let mailbox = Self.uniqueMailbox()
         let mail = ExchangeProvider(
-            userEmail: Self.uniqueMailbox(), accessToken: { force in stale && !force ? "stale" : "fresh" },
+            userEmail: mailbox, accessToken: { force in stale && !force ? "stale" : "fresh" },
+            session: http.session)
+        let calendar = ExchangeCalendarProvider(
+            mailbox: mailbox, accessToken: { force in stale && !force ? "stale" : "fresh" },
             session: http.session)
         let large = DraftAttachment(filename: "large.bin", mimeType: "application/octet-stream",
                                     data: Data(repeating: 7, count: ExchangeDraftConfig.singlePostAttachmentLimitBytes))
@@ -572,6 +611,7 @@ struct GraphThrottlingTests {
                     case "refreshedRequest": try await mail.markRead(ids: ["m\(index)"], folder: "inbox")
                     case "refreshedProbe": _ = try await mail.fetchDraftCopy(identity: .outlook(graphId: "d\(index)"))
                     case "deleteDraft": try await mail.deleteDraft(identity: .outlook(graphId: "d\(index)"))
+                    case "calendarRefresh": _ = try await calendar.listCalendars()
                     default:
                         _ = try await mail.saveDraft(
                             DraftMessage(to: ["recipient@example.com"], subject: "Plan", body: "Text", attachments: [large]),
@@ -583,6 +623,7 @@ struct GraphThrottlingTests {
         }
         let puts = http.recordedCalls().filter { $0.method == "PUT" }.count
         #expect(leg != "uploadChunk" || puts == 8, "every upload sends its chunk")
+        #expect(!stale || refreshed.withLock { $0 } >= 8, "\(leg): every operation took its token-refresh retry")
         #expect(meter.peak <= GraphConfig.maxConcurrentRequestsPerMailbox, "\(leg): peak \(meter.peak)")
         #expect(meter.now == 0)
     }
@@ -624,6 +665,14 @@ struct GraphThrottlingTests {
             #expect(meter.peak == GraphConfig.bodyFetchConcurrency, "\(stream)")
             #expect(meter.total == ids.count, "\(stream)")
         }
+    }
+
+    @Test("Only a 429 or 503 refusal asks to be retried later")
+    func onlyThrottledOrUnavailableAsksToRetryLater() {
+        #expect(HTTPError.networkError(statusCode: 429).asksToRetryLater)
+        #expect(HTTPError.networkError(statusCode: 503).asksToRetryLater)
+        #expect(!HTTPError.networkError(statusCode: 500).asksToRetryLater)
+        #expect(!HTTPError.invalidURL("https://graph.microsoft.com").asksToRetryLater)
     }
 
     @Test("A send refused with 429 or 503 stays queued without a strike; a 500 is a strike",

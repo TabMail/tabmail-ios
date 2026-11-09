@@ -26,9 +26,13 @@ enum HTTPConfig {
     /// pass it is not made: the call returns the refusal, and the caller's own
     /// retry (the next sync pass, the queue's next drain) comes later. The
     /// back-off without a header (1 + 2 + 4 s) fits inside it unchanged. The
-    /// bound is per call, so a queued action (`SyncConfig.pendingOperationTimeoutSeconds`)
-    /// and the notification service extension's two requests stay inside their
-    /// deadlines and a final refusal reaches the caller as a refusal, not a timeout.
+    /// bound is per call, so a queued action that makes one request ends inside
+    /// its deadline (`SyncConfig.pendingOperationTimeoutSeconds`) and its final
+    /// refusal reaches the queue as a refusal, not a timeout. An action that makes
+    /// several requests (a read, then its write) can still pass that deadline; it
+    /// then reaches the queue as a timeout and is retried with the intention kept.
+    /// Likewise a notification service extension read that makes several requests
+    /// can pass the extension's watchdog, which then delivers its partial result.
     static let retryWaitBudgetSeconds: TimeInterval = 10
     /// Statuses with which a server says "come back later" rather than "this
     /// request is wrong": 429 Too Many Requests and 503 Service Unavailable

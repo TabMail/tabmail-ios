@@ -24,9 +24,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         mailbox: String,
         accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String
     ) {
-        self.accessToken = accessToken
-        self.mailboxGate = GraphMailboxGates.gate(for: mailbox)
-        self.testSession = nil
+        self.init(mailbox: mailbox, accessToken: accessToken, testSession: nil)
     }
 
     /// Explicit-session initializer, used by tests to route this provider's HTTP
@@ -42,9 +40,19 @@ actor ExchangeCalendarProvider: CalendarProvider {
         accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
         session: URLSession
     ) {
+        self.init(mailbox: mailbox, accessToken: accessToken, testSession: session)
+    }
+
+    /// The one place the mailbox's gate is chosen, so the production and test
+    /// initializers cannot pick different gates.
+    private init(
+        mailbox: String,
+        accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
+        testSession: URLSession?
+    ) {
         self.accessToken = accessToken
         self.mailboxGate = GraphMailboxGates.gate(for: mailbox)
-        self.testSession = session
+        self.testSession = testSession
     }
 
     // MARK: - Calendars

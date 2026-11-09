@@ -25,7 +25,8 @@ enum WorkPriority: Int, Comparable, Sendable {
 
 /// Bounded-concurrency work queue for email providers.
 /// ALL provider operations that hit the network MUST go through this queue.
-/// It is the SINGLE concurrency gate for a given account.
+/// It is the single scheduler of an account's provider work; what reaches the
+/// wire may be bounded further below it (see the last two design points).
 ///
 /// Design:
 /// - Three-tier priority queue: userAction > headerFetch > bodyFetch
@@ -35,6 +36,8 @@ enum WorkPriority: Int, Comparable, Sendable {
 /// - For IMAP, the connection pool's `checkout` is the real concurrency gate —
 ///   if no connections are available, callers wait in the pool's waiter queue.
 ///   The work queue provides priority scheduling on top of the pool.
+/// - For Outlook, Graph's concurrent-request limit per mailbox is held at the
+///   wire by the mailbox's `HTTPConcurrencyGate`, which the calendar shares.
 actor ProviderWorkQueue {
     /// The underlying provider. Access only inside `execute()` closures for network ops.
     /// Direct access is safe for non-network property reads (e.g. type checks).
