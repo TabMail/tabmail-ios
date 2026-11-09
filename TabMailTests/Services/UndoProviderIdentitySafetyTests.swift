@@ -6,6 +6,7 @@ import Foundation
 import GRDB
 import Synchronization
 import Testing
+import UIKit
 @testable import TabMail
 
 private actor UndoWriteGate {
@@ -977,7 +978,7 @@ struct UndoProviderIdentitySafetyTests {
             accountId: fixture.accountId,
             timestamp: Date())
         UndoService.shared.push(action)
-        await UndoService.shared.undo(expectedActionID: action.id, source: .programmatic)
+        await UndoService.shared.undo(expectedActionID: action.id, source: .compactToast)
         await AccountManager.shared.awaitWriteQueueDrain()
         return try await fixture.pool.read { db in try MessageHeader.fetchOne(db, key: original.id) }
     }
@@ -1020,6 +1021,68 @@ struct UndoProviderIdentitySafetyTests {
 
         #expect(row?.folderPath == "INBOX", "precondition: this Undo restores the message")
         #expect(UndoService.shared.undoFailureMessage == nil, "a restoring Undo shows no failure notice")
+    }
+
+    /// The "Couldn't undo" alert presented in `window`, if any.
+    @MainActor
+    private func presentedUndoFailureAlert(in window: UIWindow) -> UIAlertController? {
+        var controller = window.rootViewController?.presentedViewController
+        while let current = controller {
+            if let alert = current as? UIAlertController, alert.title == "Couldn't undo" { return alert }
+            controller = current.presentedViewController
+        }
+        return nil
+    }
+
+    @MainActor
+    private func eventually(within seconds: Double = 5, _ condition: () -> Bool) async -> Bool {
+        let end = Date().addingTimeInterval(seconds)
+        while !condition() {
+            if Date() >= end { return false }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        return true
+    }
+
+    @Test("A refused move Undo shows the Couldn't undo alert, and dismissing the alert ends the notice")
+    @MainActor
+    func refusedMoveUndoAlertIsShownAndDismissed() async throws {
+        // The test host's own RootView is the one that shows the notice.
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let sceneActive = await eventually { scene.activationState == .foregroundActive }
+        try #require(sceneActive, "precondition: the test host's scene is active")
+        let window = try #require(scene.windows.first { $0.isKeyWindow } ?? scene.windows.first)
+        // An earlier test's notice may still be closing: its alert leaves the
+        // window a moment after the notice ends.
+        UndoService.shared.dismissUndoFailure()
+        let noNoticeUp = await eventually { presentedUndoFailureAlert(in: window) == nil }
+        try #require(noNoticeUp, "precondition: no notice is up")
+
+        let fixture = try install(provider: .imap)
+        defer {
+            presentedUndoFailureAlert(in: window)?.dismiss(animated: false)
+            UndoService.shared.dismissAll()
+            UndoService.shared.dismissUndoFailure()
+            uninstall(fixture)
+        }
+        // A completed IMAP move with no proven destination UID: the Undo is refused.
+        let original = sourceHeader(fixture, providerId: "712", rfc: "refused-alert@example.com")
+        try installOptimisticallyMoved(original, pool: fixture.pool)
+
+        _ = try await undoThroughTheControl(original, fixture: fixture)
+
+        let shown = await eventually { presentedUndoFailureAlert(in: window) != nil }
+        #expect(shown, "a refused move Undo must show the user the Couldn't undo alert")
+        guard let alert = presentedUndoFailureAlert(in: window) else { return }
+        #expect(alert.message == UndoService.moveUndoRefusedMessage)
+
+        // The alert goes away through UIKit, as it does when the user taps OK,
+        // so what clears the notice is the alert's own dismissal.
+        alert.dismiss(animated: false)
+        let cleared = await eventually { UndoService.shared.undoFailureMessage == nil }
+        #expect(cleared, "dismissing the alert must end the notice")
+        try? await Task.sleep(for: .milliseconds(1_500))
+        #expect(presentedUndoFailureAlert(in: window) == nil, "a dismissed notice must not come back")
     }
 
     @Test("Completed IMAP Undo without a proven destination UID and epoch fails closed with zero local or provider mutation")

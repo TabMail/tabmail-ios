@@ -1249,4 +1249,6 @@ rule-day and split-count suites of a later slice; nothing reads them yet.
 control and shake take. When `AccountManager.undoMove` refuses it (here an IMAP move with no proven
 destination UID), the message stays where the move put it and `UndoService.undoFailureMessage` is
 set, which RootView shows as the "Couldn't undo" notice. An Undo that restores the message sets no
-notice.
+notice. A hosted case checks the notice the user sees: the test host's RootView presents the
+"Couldn't undo" alert with the move text, and dismissing that alert through UIKit clears the notice
+and the alert does not come back.
