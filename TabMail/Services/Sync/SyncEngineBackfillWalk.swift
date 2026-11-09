@@ -861,7 +861,7 @@ extension SyncEngine {
                     // `uidNext` (`getUidNextWithEpoch`), not from a separate read
                     // of `lastObservedUidValidity`. The mirror has competing
                     // writers — the walk's own per-chunk SELECTs, and through
-                    // `fetchMessageHeaders` also self-heal's and deep backfill's —
+                    // `fetchMessageHeaders` also self-heal's —
                     // and this value is one the walk WRITES, so it must be bound
                     // to its own observation rather than sampled from a shared box.
                     //

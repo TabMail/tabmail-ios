@@ -255,14 +255,6 @@ actor AccountManager {
         return false
     }
 
-    /// Account IDs where Gmail backfill hit the message ID cap (shown in settings)
-    var backfillCapReachedAccounts: Set<String> = [] {
-        didSet {
-            let copy = backfillCapReachedAccounts
-            Task { @MainActor in AccountManagerState.shared.backfillCapReachedAccounts = copy }
-        }
-    }
-
     // processingAccounts and aiProcessingTasks removed — AI processing now handled by
     // ActiveBodyQueue + ActiveAIQueue actors (event-driven, decoupled from sync).
 
@@ -1296,10 +1288,6 @@ actor AccountManager {
 
     func setFastSyncMode(_ active: Bool) {
         fastSyncModeActive = active
-    }
-
-    func markBackfillCapReached(_ accountId: String) {
-        backfillCapReachedAccounts.insert(accountId)
     }
 
 

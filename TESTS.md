@@ -85,8 +85,10 @@ than counted as done; a delete from Sent, and its Undo, that Gmail refuses with 
 503 or an unclassified 400 on trash/untrash stays queued with the server
 unchanged and lands once the failure clears; a user move into Sent or Drafts is refused on Gmail and
 queued on IMAP. `MoveFolderPickerTests.gmailOmitsTheLabelsGmailKeeps` covers the
-picker, and `DraftDeletionTests` pins that an "Invalid label" body is not an
-authoritative rejection.
+picker. That an "Invalid label" refusal stays queued rather than being
+recorded as done is pinned end to end by
+`GmailMaintainedLabelMoveTests` ("A move Gmail refuses with Invalid label stays
+queued rather than being recorded as done").
 
 ## Server-draft dismissal UI
 

@@ -88,7 +88,7 @@ actor MockEmailProvider: EmailProvider {
     ///
     /// The two are separable in production — the mirror is written by every
     /// tracked SELECT of the path (the backfill walk's, and through
-    /// `fetchMessageHeaders` also self-heal's and deep backfill's), so a
+    /// `fetchMessageHeaders` also self-heal's), so a
     /// concurrent SELECT can make it disagree with the SELECT that served THIS
     /// fetch — and a test that cannot separate them cannot tell which one a sync
     /// pass stamped.

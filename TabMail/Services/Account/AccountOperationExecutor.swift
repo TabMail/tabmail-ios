@@ -370,8 +370,6 @@ final class AccountOperationExecutor {
         return false
     }
 
-
-
     /// Stricter sibling of `isMessageNotFoundError` used to decide whether we may also
     /// DELETE the local messageHeader row. Only fires on structural signals that
     /// unambiguously confirm the message is gone from the server:
@@ -410,46 +408,6 @@ final class AccountOperationExecutor {
             if nsCode == 404 || nsCode == 410 { return true }
         }
         return false
-    }
-
-
-    /// Returns true only when the provider's own response STRUCTURALLY PROVES the
-    /// operation can never succeed — Gmail's structured invalid-id `400` (#420:
-    /// an "Invalid label" refusal is NOT this; it proves nothing is done). Such a
-    /// `400` is a provider-authoritative no-op (exit 2) and retires the durable
-    /// row. Both Gmail requests that preserve the `400` body (`modifyMessage`,
-    /// `trashOrUntrashMessage`) settle that shape per member themselves, so it
-    /// reaches here only from a future caller that does not.
-    ///
-    /// 🚨 A BARE STATUS CODE IS NOT A CLASSIFICATION. The predecessor returned
-    /// `true` for `HTTPError.networkError(400)`, for
-    /// `HTTPError.networkErrorWithBody(400, _)` with the body bound to `_`, and
-    /// for `NSError(domain: "Gmail"|"Exchange", code: 400)` — i.e. it retired the
-    /// user's intention on every `400`, INCLUDING the ones nothing had
-    /// classified. "The request was rejected and we do not know why" is an
-    /// absence of evidence, not the provider telling us the work is already done
-    /// or no longer applicable, and conflating the two is the exact clause-2
-    /// conflation `Companion/Rules/Active/never-drop-user-intention.md` forbids.
-    /// An unclassified `400` now falls through to the generic arm and retries
-    /// as a counted provider failure until `SyncConfig.pendingOperationServerRefusalRetryLimit`
-    /// (the bounded fifth exit, with an App Logs error), which is the correct
-    /// disposition for "we could not determine the answer". (`v2final` demotes
-    /// such a chain to its queue tail via `ProviderError.persistentActionFailure`;
-    /// this tree reaches the same end state by a shorter route — the generic arm
-    /// itself runs `deferRelatedChainToTail`, so the retrying chain sits at the
-    /// TAIL of the `queuePosition` order and nothing queues behind it. The cost
-    /// of the honest classification is a retrying row rather than a silently
-    /// discarded gesture, and that row costs no other intention anything.)
-    ///
-    /// The only shape that still retires is the one a provider can be held to:
-    /// `HTTPError.networkErrorWithBody(400, body)` whose body decodes to Gmail's
-    /// documented structured error object and names a deterministic rejection —
-    /// see `GmailProvider.isAuthoritativeActionRejection`. Only
-    /// `AuthedHTTP.requestPreservingBadRequestBody` keeps that body, and its two
-    /// callers settle the shape per member themselves (above), so today this arm
-    /// is reached by no production request.
-    nonisolated static func isPermanentlyInvalidError(_ error: Error) -> Bool {
-        GmailProvider.isAuthoritativeActionRejection(error)
     }
 
     nonisolated static func commitFullRetirement(
@@ -857,30 +815,6 @@ final class AccountOperationExecutor {
                     let hid = MessageIdentity.headerId(accountId: currentOp.accountId, folderPath: currentOp.folderPath, messageId: msgId)
                     await manager.deleteConfirmedGoneHeader(headerId: hid, reason: "\(opType) 404")
                 }
-                return .completed
-            }
-            // Permanently invalid operation — drop immediately (will never succeed on retry).
-            // Only Gmail's "Invalid id value" (a malformed id) qualifies; a refused
-            // request such as "Invalid label" is a counted failure, never done.
-            if Self.isPermanentlyInvalidError(error) {
-                queueLog("[Queue] Permanently invalid \(opType): \(error) — dropping")
-                do {
-                    try await retryWrite(manager.dbPool, label: "Queue") { db in
-                        _ = try PendingOperation.deleteOne(db, key: currentOp.id)
-                    }
-                } catch {
-                    // Same invariant as the conflict arm above: a `.completed` here
-                    // would claim the frontier is resolved while the row is still
-                    // `inFlight` with all of its members, and the protected-frontier
-                    // law would then stop every drain at it forever.
-                    queueLog(
-                        "[Queue] Permanently-invalid retirement of \(currentOp.id.prefix(8)) "
-                            + "(\(opType)) could not commit: \(error); the row is returned to "
-                            + "`queued` and this drain stops")
-                    await manager.requeueOrRetain(currentOp.id)
-                    return .blockedOnCommit
-                }
-                manager.dropDeferredMoveSuccessors(for: currentOp.id)
                 return .completed
             }
             // The provider REFUSED the id before touching the wire — it is not an
@@ -1544,7 +1478,6 @@ extension AccountManager {
     }
     #if DEBUG
     var hasPendingOperationSettlement: Bool { operationExecutor.hasPendingSettlement }
-    nonisolated func isPermanentlyInvalidError(_ error: Error) -> Bool { AccountOperationExecutor.isPermanentlyInvalidError(error) }
     nonisolated func isConfirmedGoneError(_ error: Error) -> Bool { AccountOperationExecutor.isConfirmedGoneError(error) }
     nonisolated func isMessageNotFoundError(_ error: Error) -> Bool { AccountOperationExecutor.isMessageNotFoundError(error) }
     @discardableResult

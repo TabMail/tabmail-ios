@@ -89,12 +89,6 @@ struct SyncConfigBoundaryTests {
         #expect(SyncConfig.maxInlineImageBytes <= 10_000_000) // Max 10MB per image
     }
 
-    @Test("Gmail backfill ID cap prevents unbounded memory")
-    func gmailBackfillCap() {
-        #expect(SyncConfig.gmailBackfillIdCap > 0)
-        #expect(SyncConfig.gmailBackfillIdCap <= 10_000_000)
-    }
-
     @Test("TTL values are positive")
     func ttlValuesPositive() {
         #expect(SyncConfig.replyTTLSeconds > 0)
@@ -111,7 +105,6 @@ struct BackfillProfileConsistencyTests {
         for i in 1..<profiles.count {
             #expect(profiles[i].backfillChunkSize >= profiles[i - 1].backfillChunkSize)
             #expect(profiles[i].imapFetchBatchSize >= profiles[i - 1].imapFetchBatchSize)
-            #expect(profiles[i].gmailFetchBatchSize >= profiles[i - 1].gmailFetchBatchSize)
         }
     }
 
@@ -120,14 +113,12 @@ struct BackfillProfileConsistencyTests {
         let profiles: [BackfillProfile] = [.low, .normal, .aggressive, .turbo]
         for i in 1..<profiles.count {
             #expect(profiles[i].imapInterBatchDelay <= profiles[i - 1].imapInterBatchDelay)
-            #expect(profiles[i].gmailInterPageDelay <= profiles[i - 1].gmailInterPageDelay)
         }
     }
 
     @Test("Turbo has zero delays for maximum throughput")
     func turboZeroDelays() {
         #expect(BackfillProfile.turbo.imapInterBatchDelay == 0)
-        #expect(BackfillProfile.turbo.gmailInterPageDelay == 0)
     }
 
     @Test("All profiles have positive chunk sizes")
@@ -135,8 +126,6 @@ struct BackfillProfileConsistencyTests {
         for profile in [BackfillProfile.low, .normal, .aggressive, .turbo] {
             #expect(profile.backfillChunkSize > 0)
             #expect(profile.imapFetchBatchSize > 0)
-            #expect(profile.gmailFetchBatchSize > 0)
-            #expect(profile.gmailPageSize > 0)
         }
     }
 
@@ -160,26 +149,5 @@ struct BackfillProfileConsistencyTests {
     func lowIsMostConservative() {
         #expect(BackfillProfile.low.backfillChunkSize <= BackfillProfile.normal.backfillChunkSize)
         #expect(BackfillProfile.low.imapInterBatchDelay >= BackfillProfile.normal.imapInterBatchDelay)
-    }
-
-    @Test("Gmail inter-fetch delays decrease with aggression")
-    func gmailInterFetchDelaysDecrease() {
-        let profiles: [BackfillProfile] = [.low, .normal, .aggressive, .turbo]
-        for i in 1..<profiles.count {
-            #expect(profiles[i].gmailInterFetchDelay <= profiles[i - 1].gmailInterFetchDelay)
-        }
-    }
-
-    @Test("Gmail inter-fetch delay values are correct")
-    func gmailInterFetchDelayValues() {
-        #expect(BackfillProfile.low.gmailInterFetchDelay == 1.0)
-        #expect(BackfillProfile.normal.gmailInterFetchDelay == 0.5)
-        #expect(BackfillProfile.aggressive.gmailInterFetchDelay == 0.1)
-        #expect(BackfillProfile.turbo.gmailInterFetchDelay == 0)
-    }
-
-    @Test("Turbo has zero gmail inter-fetch delay")
-    func turboZeroGmailInterFetchDelay() {
-        #expect(BackfillProfile.turbo.gmailInterFetchDelay == 0)
     }
 }

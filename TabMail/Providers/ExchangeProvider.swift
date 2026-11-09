@@ -1339,50 +1339,7 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Backfill
 
-    /// LIST phase: fetch message IDs in a date range for backfill.
-    func listBackfillMessageIds(
-        folder: String,
-        since: Date,
-        before: Date? = nil,
-        pageSize: Int = 500,
-        interPageDelay: TimeInterval = 0.3,
-        maxIds: Int = SyncConfig.gmailBackfillIdCap
-    ) async throws -> [String] {
-        var filter = "receivedDateTime ge \(iso8601DateTime(since))"
-        if let before { filter += " and receivedDateTime lt \(iso8601DateTime(before))" }
-        var allIds: [String] = []
-        let encodedFolder = try Self.encodedGraphPathSegment(folder, context: "Graph folder id")
-        var nextLink: String? = "/mailFolders/\(encodedFolder)/messages?$select=id&$filter=\(filter)&\(topParam(pageSize))&\(orderByReceived)"
-
-        repeat {
-            try Task.checkCancellation()
-
-            let data: Data
-            if let link = nextLink, link.hasPrefix("http") {
-                // Absolute URL from @odata.nextLink
-                data = try await requestAbsolute(url: link)
-            } else {
-                data = try await request(path: nextLink!)
-            }
-
-            let response = try JSONDecoder().decode(GraphMessageIdListResponse.self, from: data)
-            allIds.append(contentsOf: response.value.map(\.id))
-
-            if allIds.count >= maxIds {
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] WARNING: listBackfillMessageIds hit \(maxIds) ID cap — stopping pagination.") }
-                break
-            }
-
-            nextLink = response.odataNextLink
-            if nextLink != nil {
-                try await Task.sleep(for: .seconds(interPageDelay))
-            }
-        } while nextLink != nil
-
-        return allIds
-    }
-
-    /// FETCH phase: fetch message headers for specific IDs.
+    /// Fetches message headers for specific IDs.
     func fetchMessageHeaders(ids: [String], batchSize: Int = 50, interBatchDelay: TimeInterval = 0.5) async throws -> [MessageHeaderInfo] {
         let selection = ExchangeGraphMessageRequest.fetchMessageHeaders.selection
         var allHeaders: [MessageHeaderInfo] = []

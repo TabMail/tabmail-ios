@@ -612,12 +612,9 @@ actor SyncEngine {
     /// is the same rule for the paging pull.
     ///
     /// ⚠️ An earlier revision of this comment cited `deepBackfillFolder`'s
-    /// `found == 0` termination here instead. That function has ZERO callers
-    /// (`rg -n 'deepBackfillFolder' TabMail/` finds one declaration and comments
-    /// only), as does its callee `backfillWindow` outside it, so it proved
-    /// nothing about the shipping crawl. Do not restore that citation, and do
-    /// not delete the dead functions as a side effect of reading this — that is
-    /// its own decision.
+    /// `found == 0` termination here instead. That function had ZERO callers,
+    /// as did its callee `backfillWindow` outside it, so it proved nothing about
+    /// the shipping crawl; both are now deleted. Do not restore that citation.
     ///
     /// **AND `found` IS THE PROVIDER'S OWN COVERAGE REPORT, NOT THE ARRAY'S COUNT.**
     /// Every `fetchOlderMessages` implementation ends in a `compactMap` that drops
@@ -723,8 +720,8 @@ actor SyncEngine {
             // counted here — exactly as the backfill walk confirms a UID range
             // whose inserts were all skipped. Never narrow this to the insert
             // count, and never back to the materialised count. (An earlier
-            // revision cited `backfillWindow`'s `found` here; that function is
-            // unreachable in production — see the `deepBackfillFolder` note on
+            // revision cited `backfillWindow`'s `found` here; that function was
+            // unreachable in production and is deleted — see the note on
             // `fetchOlderMessages` above.)
             let found = fetched.coverage.serverRecordCount
             let sourceBoundEpoch = fetched.observedEpoch.flatMap { epoch in

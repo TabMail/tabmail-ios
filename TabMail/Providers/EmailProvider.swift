@@ -351,7 +351,7 @@ protocol EmailProvider: Sendable {
     /// `SyncEngine.runSyncMessages` is the caller, and its consumer direction is a
     /// bootstrap WRITE of `Folder.lastKnownUidValidity`. Reading the shared
     /// `lastObservedUidValidity(folderPath:)` mirror there was fail-DANGEROUS: the
-    /// backfill walk, self-heal and deep backfill all record into that mirror
+    /// backfill walk and self-heal both record into that mirror
     /// (see `IMAPProvider.selectMailboxTracked`), so one of them landing between
     /// the fetch and the read makes the pass stamp the live server's epoch over a
     /// batch that belongs to the previous one. See

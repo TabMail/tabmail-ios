@@ -35,10 +35,6 @@ struct AccountDetailView: View {
         state.authFailedAccounts.contains(account.id)
     }
 
-    private var hasBackfillCap: Bool {
-        state.backfillCapReachedAccounts.contains(account.id)
-    }
-
     @ViewBuilder
     private var accountSaveFailureSection: some View {
         let failures = navigationStore.accountFieldPersistence.failures(accountId: account.id)
@@ -79,18 +75,6 @@ struct AccountDetailView: View {
                             .font(.subheadline)
                     }
                     reauthButton
-                }
-            }
-
-            // Backfill cap warning
-            if hasBackfillCap {
-                Section {
-                    HStack(alignment: .top) {
-                        Image(systemName: "exclamationmark.circle.fill")
-                            .foregroundStyle(.orange)
-                        Text("This account has an unusually large number of messages. Some older messages may not be synced.")
-                            .font(.subheadline)
-                    }
                 }
             }
 

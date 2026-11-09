@@ -568,7 +568,8 @@ struct SelectSourcedFolderEpochTests {
     /// Round 8 routed the backfill walk's three SELECTs through
     /// `IMAPProvider.selectMailboxTracked`, and through
     /// `fetchMessageHeaders(folder:uids:batchSize:interBatchDelay:)` that reroute
-    /// also reaches self-heal and deep backfill — neither of them epoch-guarded,
+    /// also reaches self-heal and the date-window deep backfill (since
+    /// deleted) — neither of them epoch-guarded then,
     /// and `rg -n "fetchMessageHeaders\("` finds six call sites across three
     /// files, not the one the commit claimed. Any of them SELECTing this folder
     /// path between `runSyncMessages`' fetch and its read of the mirror made the

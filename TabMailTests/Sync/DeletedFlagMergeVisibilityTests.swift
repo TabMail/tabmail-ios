@@ -529,11 +529,10 @@ struct DeletedFlagMergeVisibilityTests {
     /// `SyncEngineFullSync` (`selectStaleHeaders`, `runSyncMessages`). Two further
     /// paths build a `MessageHeader` from the same `MessageHeaderInfo`s and never
     /// read the flag: `SyncEngine.insertBackfillBatchGuardable` — the single funnel
-    /// for `backfillWindow`, `deepBackfillFolder`, the header-crawl walk and
-    /// self-heal — and `SyncEngine.fetchOlderMessages`, the "load older" pull.
-    /// ⚠️ That funnel list is a STRUCTURAL enumeration, not a reachability claim:
-    /// `deepBackfillFolder` has zero callers and `backfillWindow` is reached only
-    /// from inside it, so the live feeders are the walk and self-heal.
+    /// for the header-crawl walk and self-heal — and `SyncEngine.fetchOlderMessages`,
+    /// the "load older" pull. (The date-window crawl that once also fed the funnel
+    /// had no caller and is deleted; this test feeds provider-fetched headers
+    /// into the shared funnel through `insertBackfillBatch`.)
     ///
     /// ⚠️ And the census behind "four" enumerated `MessageHeader` CONSTRUCTION
     /// sites, so it structurally could not see a path that PRESENTS a message
@@ -576,7 +575,7 @@ struct DeletedFlagMergeVisibilityTests {
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
         let accountId = "d3-backfill"
-        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try FolderEpochTestFixture.insertFolder(
             accountId: accountId, path: "Archive", role: .archive, pool: pool,
             totalCount: 2, lastKnownUidValidity: Int(Self.epoch))
@@ -591,9 +590,12 @@ struct DeletedFlagMergeVisibilityTests {
         defer { Task { try? await provider.disconnect() } }
 
         let engine = await Self.engine(accountId: accountId, provider: provider)
-        _ = try await engine.backfillWindow(
-            folder: folder, account: account,
-            since: Date(timeIntervalSince1970: 0), before: Date().addingTimeInterval(86_400))
+        let fetched = try await provider.fetchMessageHeadersWithObservedEpoch(
+            folder: folder.path, uids: [31, 32], batchSize: 10, interBatchDelay: 0)
+        _ = await engine.insertBackfillBatch(
+            fetched.messages, folderId: folder.id, accountId: accountId,
+            folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
+            observedEpoch: fetched.observedEpoch)
 
         let listed = try Self.listedUIDs(accountId: accountId, path: "Archive", pool: pool)
         #expect(!listed.contains("32"), """

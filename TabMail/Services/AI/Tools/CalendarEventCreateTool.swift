@@ -137,7 +137,7 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
             ] as [String: Any]))
         }
 
-        guard let backend = await CalendarProviderDispatch.resolve().resolved else {
+        guard let backend = await CalendarProviderDispatch.resolve() else {
             return CalendarProviderDispatch.notAvailableMessage
         }
         // Resolve the actual calendarId at creation time — stored in the queue and cache

@@ -110,15 +110,13 @@ struct AuthedHTTP: Sendable {
     /// through the ordinary `request(...)`. Nothing else calls it;
     /// `ExchangeProvider.patchMessage` and `ExchangeProvider.moveMessage` both
     /// still call the body-dropping `request`, so every Graph mutation's `400`
-    /// reaches `AccountManager.isPermanentlyInvalidError` bodyless and is
-    /// unclassifiable — which is why that function is
-    /// `GmailProvider.isAuthoritativeActionRejection(error)` and nothing else.
+    /// reaches the queue bodyless and unclassifiable, and retries as a counted
+    /// failure. The queue has no `400` classifier of its own.
     ///
     /// **The comment was corrected rather than the consumer added, deliberately.**
     /// The gap is registered as `KNOWN_ISSUES.md` `IOS-GRAPH-004` and it fails
-    /// SAFE — an unclassifiable Graph `400` retries forever instead of retiring
-    /// the user's intention, and the lane grouping confines that stall to the
-    /// one message. Wiring Graph through here is only half a fix: without the
+    /// SAFE — an unclassifiable Graph `400` retries as a counted failure, bounded
+    /// by the fifth exit, instead of being recorded as done. Wiring Graph through here is only half a fix: without the
     /// accompanying **narrow** body-parse that accepts a parsed
     /// `ErrorInvalidIdMalformed` and nothing else, it re-creates `v1.6.38`'s
     /// bare-status-code discard, which retired the intention on every `400`.

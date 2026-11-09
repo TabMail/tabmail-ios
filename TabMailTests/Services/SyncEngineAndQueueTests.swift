@@ -92,7 +92,6 @@ struct BackfillProfileTierTests {
         let normal = BackfillProfile.normal
         #expect(low.backfillChunkSize < normal.backfillChunkSize)
         #expect(low.imapFetchBatchSize < normal.imapFetchBatchSize)
-        #expect(low.gmailFetchBatchSize < normal.gmailFetchBatchSize)
         #expect(low.gmailHeaderConcurrency < normal.gmailHeaderConcurrency)
     }
 
@@ -102,7 +101,6 @@ struct BackfillProfileTierTests {
         let aggressive = BackfillProfile.aggressive
         #expect(turbo.backfillChunkSize >= aggressive.backfillChunkSize)
         #expect(turbo.imapFetchBatchSize >= aggressive.imapFetchBatchSize)
-        #expect(turbo.gmailFetchBatchSize >= aggressive.gmailFetchBatchSize)
         #expect(turbo.gmailHeaderConcurrency >= aggressive.gmailHeaderConcurrency)
     }
 
@@ -123,9 +121,6 @@ struct BackfillProfileTierTests {
     func turboZeroDelays() {
         let turbo = BackfillProfile.turbo
         #expect(turbo.imapInterBatchDelay == 0)
-        #expect(turbo.gmailInterPageDelay == 0)
-        #expect(turbo.gmailInterFetchDelay == 0)
-        #expect(turbo.deepCrawlInterWindowDelay == 0)
         #expect(turbo.interFolderDelay == 0)
         #expect(turbo.interCycleActiveDelay == 0)
     }
@@ -136,8 +131,6 @@ struct BackfillProfileTierTests {
         for profile in profiles {
             #expect(profile.backfillChunkSize > 0)
             #expect(profile.imapFetchBatchSize > 0)
-            #expect(profile.gmailFetchBatchSize > 0)
-            #expect(profile.gmailPageSize > 0)
             #expect(profile.gmailHeaderConcurrency > 0)
             #expect(profile.bodyFetchChunkSize > 0)
             #expect(profile.imapBodyFetchBatchSize > 0)
@@ -151,9 +144,6 @@ struct BackfillProfileTierTests {
         let profiles: [BackfillProfile] = [.low, .normal, .aggressive, .turbo]
         for profile in profiles {
             #expect(profile.imapInterBatchDelay >= 0)
-            #expect(profile.gmailInterPageDelay >= 0)
-            #expect(profile.gmailInterFetchDelay >= 0)
-            #expect(profile.deepCrawlInterWindowDelay >= 0)
             #expect(profile.interFolderDelay >= 0)
             #expect(profile.interCycleActiveDelay >= 0)
             #expect(profile.interCycleIdleDelay >= 0)
@@ -173,8 +163,6 @@ struct BackfillProfileTierTests {
         let normal = BackfillProfile.normal
         #expect(normal.backfillChunkSize == 500)
         #expect(normal.imapFetchBatchSize == 100)
-        #expect(normal.gmailFetchBatchSize == 50)
-        #expect(normal.gmailPageSize == 500)
         #expect(normal.imapInterBatchDelay == 0.5)
         #expect(normal.gmailHeaderConcurrency == 5)
         #expect(normal.bodyFetchChunkSize == 50)
@@ -185,7 +173,6 @@ struct BackfillProfileTierTests {
         let agg = BackfillProfile.aggressive
         #expect(agg.backfillChunkSize == 1000)
         #expect(agg.imapFetchBatchSize == 200)
-        #expect(agg.gmailFetchBatchSize == 100)
         #expect(agg.imapInterBatchDelay == 0.1)
         #expect(agg.gmailHeaderConcurrency == 10)
     }

@@ -572,60 +572,6 @@ struct PendingCalendarOperationGRDBTests {
 @Suite("Backfill Window Calculation")
 struct BackfillWindowCalculationTests {
 
-    /// UTC midnight calendar used by backfill for date alignment.
-    private static var utcCalendar: Calendar {
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC")!
-        return cal
-    }
-
-    @Test("Window boundaries align to UTC midnight")
-    func windowBoundariesAlignToUTCMidnight() {
-        let cal = Self.utcCalendar
-
-        // Given an arbitrary date/time
-        let arbitrary = Date(timeIntervalSince1970: 1700055555) // 2023-11-15 15:25:55 UTC
-
-        // Align to start of day (UTC midnight)
-        let startOfDay = cal.startOfDay(for: arbitrary)
-        let components = cal.dateComponents([.hour, .minute, .second], from: startOfDay)
-
-        #expect(components.hour == 0)
-        #expect(components.minute == 0)
-        #expect(components.second == 0)
-
-        // Verify it's still the same day
-        let dayComponents = cal.dateComponents([.year, .month, .day], from: startOfDay)
-        let origDayComponents = cal.dateComponents([.year, .month, .day], from: arbitrary)
-        #expect(dayComponents.year == origDayComponents.year)
-        #expect(dayComponents.month == origDayComponents.month)
-        #expect(dayComponents.day == origDayComponents.day)
-    }
-
-    @Test("1-day overlap between consecutive windows")
-    func oneDayOverlapBetweenWindows() {
-        let cal = Self.utcCalendar
-
-        // Simulate two consecutive 30-day backfill windows
-        let windowEnd = cal.startOfDay(for: Date(timeIntervalSince1970: 1700000000)) // 2023-11-14 UTC
-        let windowDays = 30
-        let windowStart = cal.date(byAdding: .day, value: -windowDays, to: windowEnd)!
-
-        // Next window: ends at previous windowStart, with 1-day overlap
-        let nextWindowEnd = windowStart
-        let overlapDays = 1
-        let searchSince = cal.date(byAdding: .day, value: -overlapDays, to: nextWindowEnd)!
-
-        // searchSince should be 1 day before the next window's end
-        let diff = cal.dateComponents([.day], from: searchSince, to: nextWindowEnd)
-        #expect(diff.day == overlapDays)
-
-        // The overlap region is: [searchSince, nextWindowEnd) = 1 day
-        // This ensures boundary messages are not missed
-        let overlapSeconds = nextWindowEnd.timeIntervalSince(searchSince)
-        #expect(overlapSeconds == Double(overlapDays * 86400))
-    }
-
     @Test("backfillUidCursor tracks progress")
     func backfillUidCursorTracksProgress() throws {
         let db = try TestDatabase.make()

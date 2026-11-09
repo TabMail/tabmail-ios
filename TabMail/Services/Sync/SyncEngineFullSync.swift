@@ -1101,9 +1101,10 @@ extension SyncEngine {
         // fetch, and that was a REGRESSION the moment round 8 routed the backfill
         // walk's three SELECTs through the tracked chokepoint: the walk's
         // `getUidNext`/`searchExistingUIDs`/`fetchMessageHeaders` — and, through
-        // that last one, self-heal and deep backfill, neither of them
-        // epoch-guarded — all replace the mirror for this same folder path. One
-        // of them landing between the fetch and the read let this pass bootstrap
+        // that last one, self-heal and the date-window deep backfill (since
+        // deleted), neither of them epoch-guarded then — all replace the mirror
+        // for this same folder path. One of them landing between the fetch and
+        // the read let this pass bootstrap
         // the LIVE epoch while merging the PREVIOUS one's headers, which is the
         // stamp-agrees-with-live-server-over-old-rows state that disarms the
         // ADR-IOS-051 deletion-reconcile abort guard — the mass-deletion failure

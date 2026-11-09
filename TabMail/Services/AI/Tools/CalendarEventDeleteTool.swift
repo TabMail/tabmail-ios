@@ -79,7 +79,7 @@ struct CalendarEventDeleteTool: AgentTool, Sendable {
         if !resolvedAccountId.isEmpty {
             provider = await AccountManager.shared.calendarProviders[resolvedAccountId]
         } else {
-            provider = await CalendarProviderDispatch.resolve(db: ctx.db).resolved?.provider
+            provider = await CalendarProviderDispatch.resolve(db: ctx.db)?.provider
         }
 
         if let provider, let calId = calendarId {

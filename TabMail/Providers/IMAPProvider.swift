@@ -255,8 +255,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// (`SyncEngine.selfHealFolder`) — and it is guarded WITHOUT reading this
     /// mirror, by the epoch `fetchMessageHeadersWithObservedEpoch` returns from
     /// the SELECTs that served its headers. It still WRITES the mirror, because
-    /// its fetch still routes through this helper. Deep backfill remains
-    /// unguarded and remains a writer.
+    /// its fetch still routes through this helper. (The unguarded date-window
+    /// deep backfill that was the other writer had no caller and is deleted.)
     ///
     /// That retraction is why the two consumers whose direction is a WRITE no
     /// longer read this mirror at all. They take the epoch bound to their own
@@ -3462,7 +3462,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `Folder.lastKnownUidValidity` from this value, and a write consumer cannot
     /// safely read the shared `lastObservedUidValidityBox`: any SELECT of the same
     /// path on any other connection replaces it, and after round 8 that includes
-    /// the walk's, self-heal's and deep backfill's (see `selectMailboxTracked`'s
+    /// the walk's and self-heal's (see `selectMailboxTracked`'s
     /// retraction). One of those landing between the fetch and the read makes the
     /// pass stamp an epoch that describes the live server rather than the batch it
     /// is merging — the stamp then agrees with the live epoch while old-epoch rows
@@ -6552,8 +6552,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// epoch the walk is accounted in. Reading it back out of
     /// `lastObservedUidValidityBox` instead — which round 8 did — leaves a window
     /// in which any other SELECT of the same path replaces it first, and after
-    /// round 8's widening that includes self-heal's and deep backfill's
-    /// `fetchMessageHeaders` (see `selectMailboxTracked`'s round-10 retraction).
+    /// round 8's widening that includes self-heal's `fetchMessageHeaders`
+    /// (see `selectMailboxTracked`'s round-10 retraction).
     /// The mirror is sound only for the walk's per-chunk COMPARISON, which fails
     /// closed on disagreement; it is not sound for the value the walk writes.
     func getUidNextWithEpoch(folder: String) async throws -> (uidNext: Int?, observedEpoch: UInt32?) {

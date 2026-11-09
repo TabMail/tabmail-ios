@@ -22,28 +22,12 @@ struct BackfillProfileBodyTests {
         #expect(BackfillProfile.aggressive.imapBodyFetchBatchSize <= BackfillProfile.turbo.imapBodyFetchBatchSize)
     }
 
-    @Test("Gmail page sizes are consistent")
-    func gmailPageSize() {
-        // All profiles should have reasonable page sizes
-        let profiles: [BackfillProfile] = [.low, .normal, .aggressive, .turbo]
-        for profile in profiles {
-            #expect(profile.gmailPageSize > 0)
-            #expect(profile.gmailPageSize <= 500) // Gmail API max is 500
-        }
-    }
-
     @Test("Inter-cycle idle delay > active delay for all profiles")
     func idleDelayGreaterThanActive() {
         let profiles: [BackfillProfile] = [.low, .normal, .aggressive]
         for profile in profiles {
             #expect(profile.interCycleIdleDelay >= profile.interCycleActiveDelay)
         }
-    }
-
-    @Test("Gmail inter-page delay decreases with profile")
-    func gmailInterPageDelay() {
-        #expect(BackfillProfile.low.gmailInterPageDelay >= BackfillProfile.normal.gmailInterPageDelay)
-        #expect(BackfillProfile.normal.gmailInterPageDelay >= BackfillProfile.turbo.gmailInterPageDelay)
     }
 }
 
@@ -64,19 +48,11 @@ struct BackfillProfileChunkSizeTests {
         #expect(BackfillProfile.aggressive.imapFetchBatchSize < BackfillProfile.turbo.imapFetchBatchSize)
     }
 
-    @Test("gmailFetchBatchSize strictly increases across profiles")
-    func gmailBatchStrictlyIncreases() {
-        #expect(BackfillProfile.low.gmailFetchBatchSize < BackfillProfile.normal.gmailFetchBatchSize)
-        #expect(BackfillProfile.normal.gmailFetchBatchSize < BackfillProfile.aggressive.gmailFetchBatchSize)
-        #expect(BackfillProfile.aggressive.gmailFetchBatchSize < BackfillProfile.turbo.gmailFetchBatchSize)
-    }
-
     @Test("All chunk sizes are positive")
     func allChunkSizesPositive() {
         for p in [BackfillProfile.low, .normal, .aggressive, .turbo] {
             #expect(p.backfillChunkSize > 0)
             #expect(p.imapFetchBatchSize > 0)
-            #expect(p.gmailFetchBatchSize > 0)
             #expect(p.bodyFetchChunkSize > 0)
             #expect(p.imapBodyFetchBatchSize > 0)
         }
@@ -96,9 +72,6 @@ struct BackfillProfileDelayTests {
     @Test("turbo has zero delays")
     func turboZeroDelays() {
         #expect(BackfillProfile.turbo.imapInterBatchDelay == 0)
-        #expect(BackfillProfile.turbo.gmailInterPageDelay == 0)
-        #expect(BackfillProfile.turbo.gmailInterFetchDelay == 0)
-        #expect(BackfillProfile.turbo.deepCrawlInterWindowDelay == 0)
         #expect(BackfillProfile.turbo.interFolderDelay == 0)
         #expect(BackfillProfile.turbo.interCycleActiveDelay == 0)
     }
@@ -107,9 +80,6 @@ struct BackfillProfileDelayTests {
     func lowDelaysNonNegative() {
         let p = BackfillProfile.low
         #expect(p.imapInterBatchDelay >= 0)
-        #expect(p.gmailInterPageDelay >= 0)
-        #expect(p.gmailInterFetchDelay >= 0)
-        #expect(p.deepCrawlInterWindowDelay >= 0)
         #expect(p.interFolderDelay >= 0)
         #expect(p.interCycleActiveDelay >= 0)
         #expect(p.interCycleIdleDelay >= 0)
@@ -170,8 +140,6 @@ struct BackfillProfileNormalDefaultTests {
         let p = BackfillProfile.normal
         #expect(p.backfillChunkSize == 500)
         #expect(p.imapFetchBatchSize == 100)
-        #expect(p.gmailFetchBatchSize == 50)
-        #expect(p.gmailPageSize == 500)
         #expect(p.imapInterBatchDelay == 0.5)
         #expect(p.bodyFetchChunkSize == 50)
         #expect(p.imapBodyFetchBatchSize == 10)
@@ -187,13 +155,6 @@ struct BackfillProfileNormalDefaultTests {
         #expect(p.imapInterBatchDelay == 1.0)
         #expect(p.imapBodyConcurrency == 1)
         #expect(p.gmailBodyConcurrency == 3)
-    }
-
-    @Test("gmailPageSize caps at 500 for non-low profiles")
-    func gmailPageSizeCap() {
-        #expect(BackfillProfile.normal.gmailPageSize == 500)
-        #expect(BackfillProfile.aggressive.gmailPageSize == 500)
-        #expect(BackfillProfile.turbo.gmailPageSize == 500)
     }
 }
 

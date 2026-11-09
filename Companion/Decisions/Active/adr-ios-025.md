@@ -1,3 +1,6 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note (2026-11-09, tabmail-ios #495):** The date-window deep backfill, and the 1-day overlap between its windows, are deleted; it had no caller. Backfill walks by UID (IMAP) or by page token (Gmail, Exchange).
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-025: Backfill Crawl Progress Must Not Use Date-Based Anchors From Unrelated Queries
 
