@@ -125,9 +125,14 @@ struct ChatThreadView: View {
     @State private var showsReplyTo = false
     @State private var showsOnlyList = false
     @State private var forwardMessage: MessageHeader?
+    /// The one open swipe: the chat's, or a bubble's id.
+    @State private var openSwipeId: String?
+    @State private var showsMove = false
+    @Environment(\.dismiss) private var dismiss
 
     private static let bottomId = "chat-bottom"
     private static let unreadLineId = "chat-unread-line"
+    private static let chatSwipeId = "chat-swipe"
     private static let pillSpring = Animation.spring(response: 0.45, dampingFraction: 0.82)
 
     init(messageId: String, expectedRfc822MessageId: String? = nil, highlightsOpenedMessage: Bool = false) {
@@ -170,7 +175,7 @@ struct ChatThreadView: View {
 
     private var isAnyPresentation: Bool {
         cardMessage != nil || readyReply != nil || agentCompose != nil
-            || forwardMessage != nil || showsReplyTo
+            || forwardMessage != nil || showsReplyTo || showsMove
     }
 
     // MARK: - Body
@@ -299,6 +304,13 @@ struct ChatThreadView: View {
                 replyPeople: thread.replyPeople, target: replyTarget,
                 ownAddresses: context.ownAddresses) { replyTarget = $0 }
         }
+        .sheet(isPresented: $showsMove) {
+            if let opened = viewModel.message {
+                MoveFolderPicker(accountId: opened.accountId, currentFolderPath: opened.folderPath) { path in
+                    moveChat(toFolderPath: path)
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -351,6 +363,10 @@ struct ChatThreadView: View {
                         jumpButton { withAnimation { proxy.scrollTo(Self.bottomId, anchor: .bottom) } }
                     }
                 }
+                // Swiping left anywhere between the header and the pill slides the whole chat.
+                .modifier(ChatSwipeReveal(
+                    id: Self.chatSwipeId, edge: .trailing, buttons: chatSwipeButtons,
+                    allowsFullSwipe: true, openId: $openSwipeId))
             }
             .safeAreaInset(edge: .top, spacing: 0) {
                 ChatHeaderView(thread: thread, subject: subject(thread), labels: context.labels) {
@@ -394,6 +410,14 @@ struct ChatThreadView: View {
             extras: context.extras[item.id],
             isHighlighted: highlightedId == item.id,
             onOpen: { cardMessage = item.header })
+        .modifier(ChatSwipeReveal(
+            id: item.id, edge: .leading, buttons: bubbleSwipeButtons(item, thread: thread),
+            allowsFullSwipe: false, openId: $openSwipeId))
+        .accessibilityActions {
+            ForEach(chatSwipeButtons) { button in
+                Button("\(button.title) chat", action: button.action)
+            }
+        }
         .id(item.id)
         // Shown by one rule for every height (`ChatRowVisibility`), measured against the scroll
         // view, so a row taller than the screen is shown too.
@@ -546,6 +570,60 @@ struct ChatThreadView: View {
               ChatViewConfig.isActive else { return }
         let header = item.header
         Task { await ActiveAIQueue.shared.enqueueChatSummaries([header]) }
+    }
+
+    // MARK: - Swipes
+
+    /// Left swipe: Trash (the inbox row's word for a move to Trash), then Archive at the edge, so a
+    /// full swipe archives; the whole chat.
+    private var chatSwipeButtons: [ChatSwipeButton] {
+        [
+            ChatSwipeButton(title: "Trash", systemImage: "trash", tint: .red) { deleteChat() },
+            ChatSwipeButton(title: "Archive", systemImage: "archivebox", tint: Theme.archive) { archiveChat() },
+        ]
+    }
+
+    /// Right swipe: Unread from here (or Read up to here) for this email, Move for the whole chat.
+    private func bubbleSwipeButtons(_ item: ChatThread.Item, thread: ChatThread) -> [ChatSwipeButton] {
+        let action = ChatSwipe.ReadAction(for: item.header)
+        return [
+            ChatSwipeButton(title: action.title, systemImage: action.systemImage, tint: Theme.accent) {
+                setRead(action, at: item, thread: thread)
+            },
+            ChatSwipeButton(title: "Move", systemImage: "folder", tint: Palette.untagged) { showsMove = true },
+        ]
+    }
+
+    private func setRead(_ action: ChatSwipe.ReadAction, at item: ChatThread.Item, thread: ChatThread) {
+        let targets = ChatSwipe.readTargets(action, at: item.id, in: thread.items)
+        viewModel.setRead(targets, isRead: action.isRead)
+        // The Unread line moves to where unread now starts.
+        unreadAtOpen = ChatSwipe.unreadIds(after: action, targets: targets, items: thread.items)
+    }
+
+    private func archiveChat() {
+        if viewModel.archiveChat(viewModel.chatRows) { dismissChat(destinationFolderId: nil) }
+    }
+
+    private func deleteChat() {
+        if viewModel.deleteChat(viewModel.chatRows) { dismissChat(destinationFolderId: nil) }
+    }
+
+    private func moveChat(toFolderPath path: String) {
+        guard let opened = viewModel.message else { return }
+        if viewModel.moveChat(viewModel.chatRows, toFolderPath: path) {
+            // A chosen folder can be one the list behind renders (Archive to Inbox).
+            dismissChat(destinationFolderId: MessageIdentity.folderId(accountId: opened.accountId, folderPath: path))
+        }
+    }
+
+    /// As `MessageDetailView.dismissMessage`: the list behind hides the row, then the chat closes.
+    private func dismissChat(destinationFolderId: String?) {
+        NotificationCenter.default.post(
+            name: .messageDismissedFromDetail,
+            object: viewModel.messageId,
+            userInfo: destinationFolderId.map { [MessageDetailView.dismissDestinationFolderIdKey: $0] })
+        dismiss()
     }
 
     // MARK: - Reply field

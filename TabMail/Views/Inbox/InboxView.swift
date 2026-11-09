@@ -1347,7 +1347,16 @@ struct InboxView: View {
                         TutorialLockedSwipeButton()
                     } else {
                         Button {
-                            viewModel.toggleRead(snapshot.id)
+                            // With the chat view on, Read reads the whole collapsed chat,
+                            // as opening it does; Unread stays on the newest email.
+                            if let ids = ChatSwipe.inboxReadIds(
+                                rowIsRead: snapshot.isRead, memberIds: group.members.map(\.id),
+                                collapsedThread: group.isThread && !isExpanded,
+                                chatActive: ChatViewConfig.isActive) {
+                                viewModel.markRead(ids)
+                            } else {
+                                viewModel.toggleRead(snapshot.id)
+                            }
                         } label: {
                             Label(
                                 snapshot.isRead ? "Unread" : "Read",
