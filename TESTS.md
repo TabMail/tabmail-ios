@@ -205,6 +205,8 @@ it.
 ## Gmail older-mail paging — one failed message does not stop the page
 
 `GmailOlderPageFailureTests` drives `GmailProvider.fetchOlderMessagesWithCoverage` on `FakeHTTP`. A
-page where one message answers 404, one 400 and one with an unreadable body still loads every other
-message, reports those three as named but not loaded, and counts the whole page as covered. A 401
-the token refresh does not cure, or a dropped connection, still fails the page.
+page where messages answer 404, 410, 400, 503 and an unreadable body still loads every other
+message, reports those five as named but not loaded, and counts the whole page as covered. A 401
+the token refresh does not cure, or a dropped connection, still fails the page, and so does a page
+cancelled while a message waits out the rate-limit backoff: it never reports coverage and asks for
+nothing more.
