@@ -471,6 +471,7 @@ struct GmailProviderMockTests {
               ("caf\u{e9} \u{1F4E7}", nil),
               ("literal%26term%2Btag%3Dvalue%25 %2526", nil),
               ("invoice", "user+tag@example.com"),
+              ("\(GmailProvider.archivePath) notes", nil),
           ])
     func searchTextReachesGmailIntact(query: String, from: String?) async throws {
         let http = FakeHTTP.Scenario()
@@ -518,6 +519,21 @@ struct GmailProviderMockTests {
         #expect(Set(parameters.keys) == ["q", "maxResults", "labelIds"], "stray parameters in \(rawQuery)")
         #expect(parameters["labelIds"] == ["Label_7"])
         #expect(parameters["maxResults"] == ["20"])
+    }
+
+    /// The synthetic All Mail marker is refused wherever Gmail would read it
+    /// as a folder, and nowhere else: the search text may hold anything.
+    @Test("the synthetic folder guard reads the path and folder parameters, not the search text",
+          arguments: [
+              ("/labels/\(GmailProvider.archivePath)", true),
+              ("/messages?labelIds=\(GmailProvider.archivePath)&maxResults=20", true),
+              ("/messages?q=x&labelIds=\(GmailProvider.archivePath)", true),
+              ("/messages?q=\(GmailProvider.archivePath)&maxResults=20", false),
+              ("/messages?maxResults=20&q=a%20\(GmailProvider.archivePath)&labelIds=Label_7", false),
+              ("/messages?labelIds=INBOX&maxResults=20", false),
+          ])
+    func syntheticFolderGuard(path: String, leaks: Bool) {
+        #expect(GmailProvider.leaksSyntheticFolder(path) == leaks, "\(path)")
     }
 
     @Test("search fetches and parses headers for returned refs (parallel path)")

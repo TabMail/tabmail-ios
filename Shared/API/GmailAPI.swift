@@ -101,7 +101,7 @@ enum GmailAPI {
         for _ in 0..<historyMaxPages {
             var pageQuery = q
             if let pageToken {
-                guard let encoded = queryValue(pageToken) else {
+                guard let encoded = StrictPercentEncoding.component(pageToken) else {
                     throw HTTPError.invalidURL("history.list pageToken")
                 }
                 pageQuery.append("pageToken=\(encoded)")
@@ -128,15 +128,6 @@ enum GmailAPI {
             pageToken = next
         }
         return nil
-    }
-
-    /// Percent-encodes an opaque value (a page token) for a query string,
-    /// leaving only RFC 3986 unreserved characters bare. Nil when the value
-    /// cannot be encoded; it is never sent raw.
-    private static func queryValue(_ value: String) -> String? {
-        let unreserved = CharacterSet(
-            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-        return value.addingPercentEncoding(withAllowedCharacters: unreserved)
     }
 
     /// `users.messages.get` with `format=metadata` — headers only, no body.

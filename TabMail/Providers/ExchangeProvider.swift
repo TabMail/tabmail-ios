@@ -1717,9 +1717,7 @@ actor ExchangeProvider: EmailProvider {
         let escaped = text
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
-        guard let encoded = "\"\(escaped)\"".addingPercentEncoding(
-            withAllowedCharacters: GraphAPI.graphPathSegmentAllowed)
-        else {
+        guard let encoded = StrictPercentEncoding.component("\"\(escaped)\"") else {
             throw ProviderError.invalidURL("Graph search text")
         }
         return "$search=\(encoded)"

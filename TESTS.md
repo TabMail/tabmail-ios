@@ -182,7 +182,10 @@ search request the way Gmail reads a query string (`&` separates parameters,
 `=` splits name from value, `+` is a space) and asserts that the user's text,
 including `&`, `+`, `=`, `%`, `#`, non-ASCII characters, literal percent escapes
 such as `%26` (which must not be decoded first) and a `from:` address with a `+`
-tag, comes back as exactly one `q`, with no stray parameter.
+tag, comes back as exactly one `q`, with no stray parameter. Search text holding
+the synthetic All Mail marker is sent as typed: `GmailProviderMockTests.syntheticFolderGuard`
+asserts the guard refuses the marker in the path and in folder parameters such as
+`labelIds`, and never in `q`.
 
 ## Delta detail fetches — a failed fetch is never taken for a deleted message
 
@@ -201,3 +204,19 @@ during the rate-limit backoff still fails that folder's fetch. On Outlook, a mes
 never succeeds is bounded by the poll's cursor capture after its full sync, which walks the inbox's
 delta pages to the final link; the next ordinary poll's delta from that link lands what changed after
 it.
+
+## Google Calendar search text and OAuth token bodies on the wire
+
+`GoogleCalendarSearchEncodingTests.searchTextReachesGoogleCalendarIntact`
+decodes the recorded `listEvents` request the same way and asserts that the
+event search text (with `&`, `+`, `=`, `%`, `#`, non-ASCII characters and
+literal percent escapes) comes back as exactly one `q`, with no stray parameter.
+`OAuthTokenRequestTests` builds the Google and Microsoft code-exchange and
+refresh requests and reads each body as a form, asserting that a code,
+verifier or refresh token holding `+`, `&`, `=`, `/` or a literal `%2B` arrives
+exactly as given, every field appears once, and the endpoint, method and
+content type are the token endpoint's. `CredentialRefreshContractTests` reads
+the notification extension's refresh body the same way, with a grant holding
+`+`, `&`, `=` and `/`. All three use `FormDecoding` (test helper). Every one of
+these values, and Graph ids and search text and Gmail search and page tokens,
+is encoded by the single `StrictPercentEncoding` in `Shared/HTTP`.

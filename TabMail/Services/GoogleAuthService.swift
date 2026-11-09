@@ -155,22 +155,7 @@ final class OAuthService: NSObject {
     }
 
     private func exchangeGoogleCode(_ code: String, codeVerifier: String) async throws -> OAuthTokens {
-        let url = URL(string: "https://oauth2.googleapis.com/token")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-
-        let params = [
-            "client_id": OAuthConfig.googleClientId,
-            "code": code,
-            "code_verifier": codeVerifier,
-            "grant_type": "authorization_code",
-            "redirect_uri": "\(OAuthConfig.googleRedirectScheme):/oauthredirect",
-        ]
-        request.httpBody = params.map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.value)" }
-            .joined(separator: "&")
-            .data(using: .utf8)
-
+        let request = Self.googleCodeExchangeRequest(code: code, codeVerifier: codeVerifier)
         let (data, _) = try await sharedEphemeralSession.data(for: request)
         let response = try JSONDecoder().decode(GoogleTokenResponse.self, from: data)
 
@@ -187,20 +172,7 @@ final class OAuthService: NSObject {
     }
 
     func refreshGoogleToken(refreshToken: String) async throws -> OAuthTokens {
-        let url = URL(string: "https://oauth2.googleapis.com/token")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-
-        let params = [
-            "client_id": OAuthConfig.googleClientId,
-            "refresh_token": refreshToken,
-            "grant_type": "refresh_token",
-        ]
-        request.httpBody = params.map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.value)" }
-            .joined(separator: "&")
-            .data(using: .utf8)
-
+        let request = Self.googleRefreshRequest(refreshToken: refreshToken)
         let (data, _) = try await sharedEphemeralSession.data(for: request)
         let response = try JSONDecoder().decode(GoogleTokenResponse.self, from: data)
 
@@ -300,6 +272,41 @@ final class OAuthService: NSObject {
         let (data, _) = try await sharedEphemeralSession.data(for: request)
         let info = try JSONDecoder().decode(GoogleUserInfo.self, from: data)
         return (info.email, info.name ?? info.email)
+    }
+
+    // MARK: - Token requests
+
+    /// A POST to an OAuth token endpoint with `fields` as its form body. Every
+    /// value is strictly encoded, so a code, verifier or refresh token holding
+    /// `+`, `&` or `=` reaches the endpoint unchanged.
+    nonisolated static func tokenRequest(url: URL, fields: [(name: String, value: String)]) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.httpBody = StrictPercentEncoding.formBody(fields)
+        return request
+    }
+
+    nonisolated static let googleTokenURL = URL(string: "https://oauth2.googleapis.com/token")!
+
+    /// The token request exchanging a Google authorization code.
+    nonisolated static func googleCodeExchangeRequest(code: String, codeVerifier: String) -> URLRequest {
+        tokenRequest(url: googleTokenURL, fields: [
+            ("client_id", OAuthConfig.googleClientId),
+            ("code", code),
+            ("code_verifier", codeVerifier),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", "\(OAuthConfig.googleRedirectScheme):/oauthredirect"),
+        ])
+    }
+
+    /// The token request refreshing a Google access token.
+    nonisolated static func googleRefreshRequest(refreshToken: String) -> URLRequest {
+        tokenRequest(url: googleTokenURL, fields: [
+            ("client_id", OAuthConfig.googleClientId),
+            ("refresh_token", refreshToken),
+            ("grant_type", "refresh_token"),
+        ])
     }
 
     // MARK: - PKCE Helpers

@@ -1116,12 +1116,10 @@ actor GmailProvider: EmailProvider {
         _ path: String,
         queryItems: [(name: String, value: String)]
     ) throws -> String {
-        let unreserved = CharacterSet(
-            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
         var encodedItems: [URLQueryItem] = []
         for item in queryItems {
-            guard let name = item.name.addingPercentEncoding(withAllowedCharacters: unreserved),
-                  let value = item.value.addingPercentEncoding(withAllowedCharacters: unreserved) else {
+            guard let name = StrictPercentEncoding.component(item.name),
+                  let value = StrictPercentEncoding.component(item.value) else {
                 throw ProviderError.invalidURL("Gmail request query")
             }
             encodedItems.append(URLQueryItem(name: name, value: value))
@@ -1597,6 +1595,16 @@ actor GmailProvider: EmailProvider {
         return built
     }
 
+    /// Whether `path` names the synthetic All Mail folder where Gmail reads a
+    /// folder: in the path itself, or in any query parameter but the search
+    /// text `q`, which holds what the user typed and is never a label.
+    nonisolated static func leaksSyntheticFolder(_ path: String) -> Bool {
+        let parts = path.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+        if parts[0].contains(archivePath) { return true }
+        guard parts.count == 2 else { return false }
+        return parts[1].split(separator: "&").contains { !$0.hasPrefix("q=") && $0.contains(archivePath) }
+    }
+
     /// Route all Gmail REST traffic through `Shared/HTTP/AuthedHTTP`. Previous
     /// inline 401-retry + rate-limit logic deleted — that's the shared
     /// `AuthedHTTP` path now.
@@ -1605,7 +1613,7 @@ actor GmailProvider: EmailProvider {
         // label ID. Callers must translate it (query exclusions, no labelIds) before
         // building a request — Gmail returns HTTP 400 "Invalid label" otherwise.
         // Mirrors the syntheticPlaceholderId guard in fetchMessagesBatch.
-        if path.contains(GmailProvider.archivePath) {
+        if Self.leaksSyntheticFolder(path) {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)") }
             throw ProviderError.syntheticFolderPath(path)
         }
@@ -1661,7 +1669,7 @@ actor GmailProvider: EmailProvider {
         method: String,
         body: Data?
     ) async throws -> Data {
-        if path.contains(GmailProvider.archivePath) {
+        if Self.leaksSyntheticFolder(path) {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] ERROR: synthetic folder path leaked into API path: \(path)") }
             throw ProviderError.syntheticFolderPath(path)
         }
