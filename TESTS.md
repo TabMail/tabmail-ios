@@ -279,3 +279,13 @@ retry. `GoogleSplitSeriesTailTests` and `CalDAVSplitSeriesTailTests` drive the r
 `FakeHTTP` with a series zoned to Pacific/Auckland at 07:00 and the split declared in UTC, so a rule
 read in the wrong frame counts other weekdays. A refused split sends no write: Google sends only the
 master GET, and CalDAV sends no PUT.
+
+## Outlook sends carry the Outbox's Message-ID
+
+`ExchangeSentMessageIdTests` reads the requests `ExchangeProvider.send` makes on `FakeHTTP`. The
+Outbox keys its optimistic Sent row by the Message-ID it generated, and sync replaces that row only
+with a Sent Items copy whose `internetMessageId` matches; Graph answers a send with no id of its own.
+A send without files asks `sendMail` for that id as PidTagInternetMessageId (`String 0x1035`), in
+angle brackets whether or not the stored id has them, and it normalizes to the key the row holds. A
+send with files creates its draft carrying the id, then sends that draft. A draft save (create and
+update) does not set it: its answer names the server copy.

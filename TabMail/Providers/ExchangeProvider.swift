@@ -1002,14 +1002,16 @@ actor ExchangeProvider: EmailProvider {
     /// the delete finds nothing (a moved item gets a new id) or moves the leftover to
     /// Deleted Items, and the retry may send it again, as a lost `sendMail` answer
     /// would (a duplicate, never a drop). Nothing is deleted after an accepted send.
+    /// Both routes ask Graph to give the message the draft's Message-ID, which the
+    /// optimistic Sent row is keyed by (`buildGraphSendPayload(draft:sending:)`).
     func send(draft: DraftMessage) async throws {
         guard !draft.attachments.isEmpty else {
-            let message = buildGraphSendPayload(draft: draft)
+            let message = buildGraphSendPayload(draft: draft, sending: true)
             let jsonData = try JSONSerialization.data(withJSONObject: ["message": message])
             let _ = try await request(path: "/sendMail", method: "POST", body: jsonData)
             return
         }
-        let graphId = try await createDraftWithAttachments(draft)
+        let graphId = try await createDraftWithAttachments(draft, sending: true)
         do {
             let encodedId = try Self.encodedGraphPathSegment(graphId, context: "Graph draft message id")
             _ = try await request(path: "/messages/\(encodedId)/send", method: "POST")
@@ -1060,19 +1062,21 @@ actor ExchangeProvider: EmailProvider {
             try await replaceDraftAttachments(graphId: graphId, with: draft.attachments)
             return .created(.outlook(graphId: graphId))
         } else {
-            return .created(.outlook(graphId: try await createDraftWithAttachments(draft)))
+            return .created(.outlook(graphId: try await createDraftWithAttachments(draft, sending: false)))
         }
     }
 
     /// Create a new draft holding `draft` and every one of its files; returns its
-    /// Graph id. Used by a first draft save and by a send with files (#422).
-    private func createDraftWithAttachments(_ draft: DraftMessage) async throws -> String {
+    /// Graph id. Used by a first draft save and by a send with files (#422);
+    /// `sending` is true only for the send.
+    private func createDraftWithAttachments(_ draft: DraftMessage, sending: Bool) async throws -> String {
         // Create the message first, then add each file through the same
         // size-aware path as an update (#237). Sending them in this POST
         // would reject a large file before an upload session can be made.
         var messageDraft = draft
         messageDraft.attachments = []
-        let jsonData = try JSONSerialization.data(withJSONObject: buildGraphSendPayload(draft: messageDraft))
+        let jsonData = try JSONSerialization.data(
+            withJSONObject: buildGraphSendPayload(draft: messageDraft, sending: sending))
         let response = try await request(path: "/mailFolders/drafts/messages", method: "POST", body: jsonData)
         guard let dict = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
               let msgId = dict["id"] as? String else {
@@ -1857,8 +1861,18 @@ actor ExchangeProvider: EmailProvider {
     static let graphInReplyToProperty = "String 0x1042"
     /// PidTagInternetReferences, the property Exchange writes a sent message's References from.
     static let graphReferencesProperty = "String 0x1039"
+    /// PidTagInternetMessageId, the property Exchange takes a sent message's Message-ID from.
+    static let graphMessageIdProperty = "String 0x1035"
 
-    nonisolated func buildGraphSendPayload(draft: DraftMessage) -> [String: Any] {
+    /// - Parameter sending: true when the payload sends the message (`sendMail`, or
+    ///   the draft a send with files creates). Only then does it carry
+    ///   `draft.messageId`: the Outbox keys its optimistic Sent row by that id, and
+    ///   sync replaces the row with the Sent Items copy whose `internetMessageId`
+    ///   matches it. Graph answers a send with no id of its own, so without this the
+    ///   copy gets an id Graph made up, the row is never replaced, and a reply to it
+    ///   names an id no recipient has. A draft save leaves it out: its answer names
+    ///   the server copy (`.outlook(graphId:)`).
+    nonisolated func buildGraphSendPayload(draft: DraftMessage, sending: Bool = false) -> [String: Any] {
         var message: [String: Any] = [:]
 
         message["subject"] = draft.subject
@@ -1882,22 +1896,26 @@ actor ExchangeProvider: EmailProvider {
             ["emailAddress": ["address": email]]
         }
 
-        // Threading (RFC 2822 requires angle brackets around message IDs). Graph's
-        // `internetMessageHeaders` takes only custom `x-` headers, so In-Reply-To and
-        // References go as the MAPI properties Exchange writes those headers from
-        // (confirmed by a live reply on `sendMail`). A send with files carries them on
-        // its draft create, then `/messages/{id}/send` (#422); a draft save uploads
-        // without them (`DraftStore.uploadThreadHeaders`).
-        var threading: [[String: String]] = []
+        // Message-ID and threading (RFC 2822 requires angle brackets around message
+        // IDs). Graph's `internetMessageHeaders` takes only custom `x-` headers, so
+        // Message-ID, In-Reply-To and References go as the MAPI properties Exchange
+        // writes those headers from (In-Reply-To and References confirmed by a live
+        // reply on `sendMail`). A send with files carries them on its draft create,
+        // then `/messages/{id}/send` (#422); a draft save uploads without threading
+        // (`DraftStore.uploadThreadHeaders`) and without the Message-ID (`sending`).
+        var properties: [[String: String]] = []
+        if sending, let messageId = IMAPProvider.threadingMessageIDs(draft.messageId.map { [$0] } ?? []).first {
+            properties.append(["id": Self.graphMessageIdProperty, "value": messageId])
+        }
         if let inReplyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
-            threading.append(["id": Self.graphInReplyToProperty, "value": inReplyTo])
+            properties.append(["id": Self.graphInReplyToProperty, "value": inReplyTo])
         }
         let references = IMAPProvider.threadingMessageIDs(draft.references)
         if !references.isEmpty {
-            threading.append(["id": Self.graphReferencesProperty, "value": references.joined(separator: " ")])
+            properties.append(["id": Self.graphReferencesProperty, "value": references.joined(separator: " ")])
         }
-        if !threading.isEmpty {
-            message["singleValueExtendedProperties"] = threading
+        if !properties.isEmpty {
+            message["singleValueExtendedProperties"] = properties
         }
 
         // Attachments
