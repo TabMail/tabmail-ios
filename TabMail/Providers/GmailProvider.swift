@@ -1436,11 +1436,21 @@ actor GmailProvider: EmailProvider {
         var headers: [MessageHeaderInfo] = []
         var unmaterialised = Set<String>()
         for ref in messageRefs {
-            let msgData = try await request(path: "/messages/\(ref.id)\(GmailAPI.metadataQuery)")
-            let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
-            if let header = parseGmailMessage(msg) {
-                headers.append(header)
-            } else {
+            do {
+                let msgData = try await request(path: "/messages/\(ref.id)\(GmailAPI.metadataQuery)")
+                let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
+                if let header = parseGmailMessage(msg) {
+                    headers.append(header)
+                } else {
+                    unmaterialised.insert(ref.id)
+                }
+            } catch where Self.isUnreadableAnswerForOneMessage(error) {
+                // The folder page's rule (`fetchMessagesWithObservedEpoch`):
+                // the server answered for this one message and the answer is
+                // unusable, a gone message included. It stays named but not
+                // loaded and the rest of the page still loads, so one message
+                // that keeps failing never stops older mail from paging in.
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] fetchOlderMessages: \(ref.id) unreadable (\(error)) — not loaded") }
                 unmaterialised.insert(ref.id)
             }
         }

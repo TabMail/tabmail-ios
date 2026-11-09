@@ -201,3 +201,10 @@ during the rate-limit backoff still fails that folder's fetch. On Outlook, a mes
 never succeeds is bounded by the poll's cursor capture after its full sync, which walks the inbox's
 delta pages to the final link; the next ordinary poll's delta from that link lands what changed after
 it.
+
+## Gmail older-mail paging — one failed message does not stop the page
+
+`GmailOlderPageFailureTests` drives `GmailProvider.fetchOlderMessagesWithCoverage` on `FakeHTTP`. A
+page where one message answers 404, one 400 and one with an unreadable body still loads every other
+message, reports those three as named but not loaded, and counts the whole page as covered. A 401
+the token refresh does not cure, or a dropped connection, still fails the page.
