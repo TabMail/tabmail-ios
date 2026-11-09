@@ -4482,10 +4482,9 @@ final class AppDatabase: Sendable {
         // keeps the planner from turning that around (`repairAICacheMessageIdsSQL`). Entries
         // with no such header stay NULL and are orphans, as before.
         // Convergence: a fresh install has no such rows; an upgraded DB ends with every entry
-        // whose email is in the folder its key names carrying its Message-ID. The purge
-        // itself reads a missing Message-ID from the key
-        // (`SyncEngine.aiCacheEntryHasEmail`), which also covers an email that moved before
-        // the upgrade, so this repair is no longer what keeps those entries.
+        // whose email is in the folder its key names carrying its Message-ID. An entry whose
+        // email moved before the upgrade stays without one and is purged after the grace
+        // (`SyncEngine.aiCacheEntryHasEmail`); its email's AI is asked for again if needed.
         migrator.registerTimedMigration(
             "v106_repairAICacheMessageIds", foreignKeyChecks: .immediate
         ) { db in

@@ -18,7 +18,9 @@ import Testing
 ///     shown chat observes its rows and asks again once a body lands, whatever writes it, and after
 ///     every queue rebuild (`ChatThreadViewLifecycleTests`).
 ///  3. The executor refuses an ordinary summary outside the Inbox (no model call, nothing written)
-///     even when its admission was window-exempt; the same setup in the Inbox calls and writes.
+///     even when its admission was window-exempt; the same setup in the Inbox calls and writes. It
+///     refuses a chat summary of a draft the same way, however the job was queued; a chat summary
+///     in Sent calls and writes.
 ///  4. A chat summary is finished only with its text message, at every site that decides it
 ///     (`ActiveAIQueue.jobDone`): the executor runs it in any folder, on an old summary without a
 ///     text message, and after another device's summary (which has none), and `readJobOutcome`
@@ -170,6 +172,53 @@ struct ChatSummaryExecutionTests {
                 .init(headerId: inbox.id, accountId: inbox.accountId, jobType: .summary, windowExempt: true), aiService: service)
             #expect(http.recordedCalls().count == 1, "the same setup in the Inbox calls the model")
             #expect(try await pool.read { try MessageHeader.fetchOne($0, key: inbox.id)?.summaryTextMessage } == "An actual summary text.",
+                    "and writes the result")
+        }
+    }
+
+    @Test("A chat summary of a draft is refused at the executor, however it was queued: no model call, nothing written")
+    func chatSummaryRefusesADraft() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        _ = try FolderEpochTestFixture.makeAccount(id: "draftscope", provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "draftscope", path: "Drafts", role: .drafts, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: "draftscope", path: "Sent", role: .sent, pool: pool)
+        let draft = Self.header("scope-draft", accountId: "draftscope", folder: "Drafts")
+        let sent = Self.header("scope-chat-sent", accountId: "draftscope", folder: "Sent")
+        try await pool.write { db in try draft.insert(db); try sent.insert(db) }
+        try await Self.index(draft, body: "My unsent words")
+        try await Self.index(sent, body: "A body for the admitted job")
+        let keys = [ContentKey(rawValue: draft.id), ContentKey(rawValue: sent.id)]
+        do {
+            try await refusesADraft(draft: draft, sent: sent, pool: pool)
+        } catch {
+            try? await SearchIndex.shared.removeMessages(contentKeys: keys)
+            throw error
+        }
+        try? await SearchIndex.shared.removeMessages(contentKeys: keys)
+    }
+
+    private func refusesADraft(draft: MessageHeader, sent: MessageHeader, pool: DatabasePool) async throws {
+        let http = Self.summaryBackend(textMessage: "An actual summary text.")
+        defer { http.close() }
+
+        try await Self.withAIOn {
+            let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+            let queue = ActiveAIQueue()
+            await queue.setDispatchSuppressedForTesting(true)
+
+            await queue.executeWholeJobForTesting(
+                .init(headerId: draft.id, accountId: draft.accountId, jobType: .summary, windowExempt: true, forChat: true),
+                aiService: service)
+            #expect(http.recordedCalls().isEmpty, "the draft's text never reaches the backend")
+            let refused = try await pool.read { try MessageHeader.fetchOne($0, key: draft.id) }
+            #expect(refused?.summaryBlurb == nil && refused?.summaryTextMessage == nil, "nothing written for a draft")
+
+            await queue.executeWholeJobForTesting(
+                .init(headerId: sent.id, accountId: sent.accountId, jobType: .summary, windowExempt: true, forChat: true),
+                aiService: service)
+            #expect(http.recordedCalls().count == 1, "control: a chat summary in Sent calls the model")
+            #expect(try await pool.read { try MessageHeader.fetchOne($0, key: sent.id)?.summaryTextMessage } == "An actual summary text.",
                     "and writes the result")
         }
     }

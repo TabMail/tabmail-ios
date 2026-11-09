@@ -286,8 +286,9 @@ extension SyncEngine {
 
     /// Purge AI cache entries whose email is no longer on the device. An entry untouched for
     /// `SyncConfig.aiCacheOrphanGraceDays` is kept (and re-stamped, so it is not re-checked for
-    /// another grace period) while any header, in any folder, has its Message-ID; otherwise it
-    /// is deleted. A result therefore never expires while its email exists.
+    /// another grace period) while a header of its own account, in any folder, has its
+    /// Message-ID; otherwise it is deleted. A result therefore never expires while its email
+    /// exists.
     /// Nonisolated — runs entirely off the main thread.
     ///
     /// `now` is read once and is both the cutoff's base and the re-stamp, so a kept entry always
@@ -342,25 +343,24 @@ extension SyncEngine {
         }
     }
 
-    /// Whether the email an AI cache entry belongs to is still on the device, in any folder.
-    /// The entry names it by `rfc822MessageId`. An entry an older build wrote without one
-    /// still names it in its key (`MessageIdentity.aiCacheKey`: account, folder, Message-ID),
-    /// so a header of that account with the key's last part as its Message-ID is its email,
-    /// wherever it has moved since (ADR-IOS-114). A Message-ID containing a colon cannot be
-    /// read back from the key; that entry counts as an orphan, and its email's AI is asked
-    /// for again if it is ever needed.
+    /// Whether the email an AI cache entry belongs to is still on the device: a header of the
+    /// entry's own account, in any folder, carries the entry's `rfc822MessageId` (ADR-IOS-114).
+    /// The account is the key's first part (`MessageIdentity.aiCacheKey`: account, folder,
+    /// Message-ID), so another account's copy of the email never keeps it, and a removed
+    /// account's entries go once past the grace. An entry without a Message-ID (an older
+    /// extension build's whose email had moved before `v106_repairAICacheMessageIds` could fill
+    /// it, and that no write has filled since: `MessageAICache.writeThrough` and
+    /// `NSEDataBridge.upsertAICacheFromStaging` both fill a missing one) is an orphan; its
+    /// email's AI is asked for again if it is ever needed.
     nonisolated static func aiCacheEntryHasEmail(_ entry: MessageAICache, db: Database) throws -> Bool {
-        if let msgId = entry.rfc822MessageId.map({ EmailFilter.normalizeMessageId($0) }), !msgId.isEmpty {
-            return try !MessageHeader.filter(Column("rfc822MessageId") == msgId).isEmpty(db)
+        guard let msgId = entry.rfc822MessageId.map({ EmailFilter.normalizeMessageId($0) }), !msgId.isEmpty else {
+            return false
         }
-        guard let colon = entry.key.lastIndex(of: ":") else { return false }
-        let keyMessageId = String(entry.key[entry.key.index(after: colon)...])
-        guard !keyMessageId.isEmpty else { return false }
         return try Bool.fetchOne(db, sql: """
             SELECT EXISTS(SELECT 1 FROM messageHeader
                           WHERE rfc822MessageId = ?
                             AND substr(?, 1, length(accountId) + 1) = accountId || ':')
-            """, arguments: [keyMessageId, entry.key]) ?? false
+            """, arguments: [msgId, entry.key]) ?? false
     }
 
     // MARK: - Retired calendar operation reclaim

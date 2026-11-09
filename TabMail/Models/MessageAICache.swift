@@ -116,7 +116,8 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
     /// text messages, which belong to their result: a new summary (`summaryBlurb` given) sets
     /// `summaryTextMessage` to the one passed, nil included, and a new reply (`cachedReply` given)
     /// sets `replyTextMessage` likewise, so a result without one never keeps an older result's.
-    /// No-op if rfc822MessageId is nil (skip cache for messages without Message-ID).
+    /// No-op if rfc822MessageId is nil (skip cache for messages without Message-ID). An existing
+    /// entry without a Message-ID takes this one; a stored one is never replaced.
     static func writeThrough(
         accountId: String,
         folderPath: String,
@@ -143,6 +144,9 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
             .filter(Column("key") == key)
             .fetchOne(db) ?? MessageAICache(key: key, rfc822MessageId: rfc822MessageId)
 
+        // The orphan purge keeps an entry only by this Message-ID. An existing entry without one
+        // (NULL or empty, an older build's) takes it from this write; a stored one is kept.
+        if cache.rfc822MessageId?.isEmpty ?? true { cache.rfc822MessageId = rfc822MessageId }
 
         // Only overwrite non-nil values (preserves existing fields on partial updates)
         if let summaryBlurb {

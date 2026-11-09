@@ -79,8 +79,10 @@ extension ChatViewConfig {
 }
 
 /// A thread as a chat: every email as a bubble, oldest at the top, the newest just above the
-/// pill. Tap a bubble for today's detail of that email, as a card from the bottom. Reuses
-/// `MessageDetailViewModel` for loading, thread detection, live AI updates and mark-read.
+/// reply field. Tap a bubble for today's detail of that email, as a card from the bottom.
+/// Reuses `MessageDetailViewModel` for loading, thread detection, live AI updates and mark-read.
+/// The reply field (`ChatReplyField`) is today's Chat pill on the newest email, shown as
+/// [mic] [field] [Send].
 struct ChatThreadView: View {
     @State var viewModel: MessageDetailViewModel
     let highlightsOpenedMessage: Bool
@@ -100,16 +102,24 @@ struct ChatThreadView: View {
     @State private var showsJumpButton = false
     @State private var cardMessage: MessageHeader?
 
-    // Today's pill, on the newest email (the morphing reply pill replaces it).
+    // The reply field: today's Chat pill on the newest email.
     @State private var chatExpanded = false
+    /// The collapsed pill's height, notices and chips included: the room the thread keeps under its
+    /// last bubble and the jump button. The field grows to six lines, so it is measured;
+    /// the open sheet keeps the last collapsed height, so the thread does not move under it.
+    @State private var pillHeight = ChatViewLayout.pillStartHeight
     @State private var chatInputFocused = false
     @State private var chatWorking = false
-    @State private var replyMessage: MessageHeader?
-    @State private var replyAllMessage: MessageHeader?
-    @State private var forwardMessage: MessageHeader?
-    @State private var moveMessage: MessageHeader?
+    /// The ready AI Reply's compose card: the email it answers.
+    @State private var readyReplyMessage: MessageHeader?
     @State private var agentCompose: AgentToolRouter.ComposeRequest?
-    @Environment(\.dismiss) private var dismiss
+    /// A compose card opened for the field's last request, so the agent's closing words open
+    /// no sheet.
+    @State private var fieldComposeOpened = false
+    /// Bumps to empty the field.
+    @State private var fieldClearCount = 0
+    /// The chat's replies still in the outbox (`ChatUnsentReply`), read from the database.
+    @State private var unsentReplies: [ChatUnsentReply] = []
 
     private static let bottomId = "chat-bottom"
     private static let unreadLineId = "chat-unread-line"
@@ -148,9 +158,13 @@ struct ChatThreadView: View {
         members.map { "\($0.id)|\($0.summaryTextMessage != nil)|\($0.bodyComplete)" }
     }
 
+    /// The Message-IDs of the chat's emails, normalized.
+    private var messageIds: Set<String> {
+        Set(members.compactMap { $0.rfc822MessageId.map(EmailFilter.normalizeMessageId) })
+    }
+
     private var isAnyPresentation: Bool {
-        cardMessage != nil || replyMessage != nil || replyAllMessage != nil
-            || forwardMessage != nil || moveMessage != nil || agentCompose != nil
+        cardMessage != nil || readyReplyMessage != nil || agentCompose != nil
     }
 
     // MARK: - Body
@@ -197,6 +211,22 @@ struct ChatThreadView: View {
         }
         .onChange(of: viewModel.threadCopies.map(\.id)) { _, _ in noteCopies() }
         .onChange(of: memberKey) { _, _ in noteMembers() }
+        .task(id: messageIds) {
+            // One observation per open chat of its outbox replies, keyed by its Message-IDs.
+            do {
+                for try await found in ChatUnsentReply.changes(answering: messageIds) {
+                    // A sent reply's Sent copy is in the database (`filed`), or its row left the
+                    // outbox (the send's cleanup can delete it before this saw it filed): the chat
+                    // reloads its emails, and a sent reply's bubble ends once its copy is one of
+                    // them (its Message-ID joins `messageIds`).
+                    let left = unsentReplies.contains { shown in !found.contains { $0.id == shown.id } }
+                    unsentReplies = found
+                    if left || found.contains(where: \.filed) { viewModel.reloadThread() }
+                }
+            } catch {
+                BackgroundSyncLogger.logDebug("[Chat] unsent reply observation ended: \(error)")
+            }
+        }
         .onChange(of: viewModel.hasLoadedThread) { _, _ in scrollOnceLoaded() }
         .onAppear {
             viewModel.isViewVisible = true
@@ -225,6 +255,8 @@ struct ChatThreadView: View {
         }
         .onChange(of: AgentToolRouter.shared.pendingCompose?.id) { _, newId in
             guard newId != nil else { return }
+            // Asked from the field (not the open sheet): the agent's closing words open nothing.
+            fieldComposeOpened = !chatExpanded
             agentCompose = AgentToolRouter.shared.pendingCompose
             AgentToolRouter.shared.pendingCompose = nil
         }
@@ -235,22 +267,16 @@ struct ChatThreadView: View {
             }
             .presentationDragIndicator(.visible)
         }
-        .fullScreenCover(item: $replyMessage) { ComposeView(replyTo: $0) }
-        .fullScreenCover(item: $replyAllMessage) { msg in
-            let accounts = context.accounts
-            let recipients = buildReplyAllRecipients(for: msg, allAccounts: accounts)
+        .fullScreenCover(item: $readyReplyMessage) { msg in
+            // Today's reply compose, Reply All, with the AI Reply in its suggestion box.
+            let recipients = buildReplyAllRecipients(for: msg, allAccounts: context.accounts)
             ComposeView(
                 replyTo: msg,
                 prefillTo: recipients.to.isEmpty ? nil : recipients.to,
-                prefillCc: recipients.cc.isEmpty ? nil : recipients.cc)
+                prefillCc: recipients.cc.isEmpty ? nil : recipients.cc,
+                onAgentOutcome: { outcome in composeEnded(outcome) })
         }
-        .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true) }
         .fullScreenCover(item: $agentCompose) { composeView(for: $0) }
-        .sheet(item: $moveMessage) { msg in
-            MoveFolderPicker(accountId: msg.accountId, currentFolderPath: msg.folderPath) { path in
-                handleMove(msg, toFolderPath: path)
-            }
-        }
     }
 
     @ViewBuilder
@@ -266,7 +292,11 @@ struct ChatThreadView: View {
                         ForEach(thread.items) { item in
                             row(item, thread: thread)
                         }
-                        Color.clear.frame(height: ChatViewLayout.pillClearance).id(Self.bottomId)
+                        // Replies still in the outbox.
+                        ForEach(unsentReplies) { reply in
+                            ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() })
+                        }
+                        Color.clear.frame(height: pillHeight + ChatViewLayout.pillGap).id(Self.bottomId)
                     }
                     .padding(.top, 8)
                 }
@@ -313,6 +343,9 @@ struct ChatThreadView: View {
 
             if let newest = thread.newest {
                 pill(on: newest)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                        if !chatExpanded { pillHeight = height }
+                    }
             }
         }
     }
@@ -362,7 +395,7 @@ struct ChatThreadView: View {
         }
         .buttonStyle(.plain)
         .padding(.trailing)
-        .padding(.bottom, ChatViewLayout.pillClearance)
+        .padding(.bottom, pillHeight + ChatViewLayout.pillGap)
         .transition(.opacity)
         .accessibilityLabel("Jump to the newest email")
     }
@@ -388,9 +421,14 @@ struct ChatThreadView: View {
     }
 
     /// Records each email the first time it shows, then marks it read. Its unread state at
-    /// that moment places the Unread line.
+    /// that moment places the Unread line. An email that joins the open chat is its newest,
+    /// so it asks for its summary as the open asked for the newest (owner 2026-11-09): a Sent copy
+    /// the provider filed under a Message-ID of its own has no summary from Send. A draft that joins
+    /// is passed on like any member; the queue never asks for one (`chatSummaryAllowed`).
     private func noteMembers() {
+        var joined: [MessageHeader] = []
         for member in members where seenIds.insert(member.id).inserted {
+            if didInitialScroll { joined.append(member) }
             if !member.isRead { unreadAtOpen.insert(member.id) }
             if member.id == viewModel.message?.id {
                 // Its own unstructured Task, as in today's detail: a cancelled `.task` must not
@@ -400,17 +438,21 @@ struct ChatThreadView: View {
                 viewModel.markReadIfNeeded(member)
             }
         }
+        if !joined.isEmpty, ChatViewConfig.isActive {
+            Task { await ActiveAIQueue.shared.enqueueChatSummaries(joined) }
+        }
     }
 
     /// The first scroll, once the thread and its extras are in: to the opened email when it came
     /// from search or a notification, else to the Unread line, else the bottom.
     private func scrollOnceLoaded() {
         guard !didInitialScroll, viewModel.hasLoadedThread, context.isLoaded else { return }
-        didInitialScroll = true
         // The thread's emails arrive with `hasLoadedThread`, and SwiftUI runs that change and the
         // members change in either order: record their unread state first, or the Unread line can
-        // be missing and the chat opens at the bottom.
+        // be missing and the chat opens at the bottom. Before the open counts as done, so these
+        // emails are the open's, not ones that joined.
         noteMembers()
+        didInitialScroll = true
         let thread = thread
         if highlightsOpenedMessage, let opened = viewModel.message,
            let item = thread.items.first(where: { ChatThread.copyKey($0.header) == ChatThread.copyKey(opened) }) {
@@ -485,123 +527,77 @@ struct ChatThreadView: View {
         Task { await ActiveAIQueue.shared.enqueueChatSummaries([header]) }
     }
 
-    // MARK: - Pill (today's Reply / Chat / Archive, on the newest email)
-
-    private var showSideButtons: Bool { !chatExpanded }
+    // MARK: - Reply field
 
     private func pill(on newest: MessageHeader) -> some View {
-        HStack(spacing: chatExpanded ? 0 : 12) {
-            Menu {
-                Button { replyMessage = newest } label: { Label("Reply", systemImage: "arrowshape.turn.up.left") }
-                Button { replyAllMessage = newest } label: { Label("Reply All", systemImage: "arrowshape.turn.up.left.2") }
-                Button { forwardMessage = newest } label: { Label("Forward", systemImage: "arrowshape.turn.up.right") }
-            } label: {
-                pillCircle("arrowshape.turn.up.left")
+        let isOwn = thread.items.last?.isOwn ?? false
+        // The user's turn: their email is the newest, or a reply of theirs is still in the outbox
+        // below it. No AI Reply is offered on the user's turn.
+        let usersTurn = isOwn || !unsentReplies.isEmpty
+        let isNoReply = !isOwn && EmailFilter.isNoReply(newest.fromAddress)
+        return VStack(spacing: 8) {
+            if isNoReply && !chatExpanded {
+                // The field stays usable (the agent declines to write a reply).
+                Text("This is a no-reply email. Replies won't be read.")
+                    .font(.caption)
+                    .foregroundStyle(Theme.textSecondary)
+                    .frame(maxWidth: .infinity)
             }
-            .tint(.primary)
-            .menuStyle(.button)
-            .modifier(SideButtonVisibility(visible: showSideButtons))
-
-            DynamicIslandChat(message: newest, isExpanded: $chatExpanded, isInputFocused: $chatInputFocused, isWorking: $chatWorking)
-
-            Menu {
-                RestrictedMailActionButton(
-                    isRestricted: viewModel.folderMoveIsForbidden(newest),
-                    action: { handleArchive(newest) }
-                ) { Label("Archive", systemImage: "archivebox") }
-                Button(role: .destructive) { handleDelete(newest) } label: { Label("Delete", systemImage: "trash") }
-                RestrictedMailActionButton(
-                    isRestricted: viewModel.folderMoveIsForbidden(newest),
-                    action: { moveMessage = newest }
-                ) { Label("Move", systemImage: "folder") }
-            } label: {
-                pillCircle("archivebox")
-            }
-            .tint(.primary)
-            .modifier(SideButtonVisibility(visible: showSideButtons))
+            DynamicIslandChat(
+                message: newest,
+                isExpanded: $chatExpanded,
+                isInputFocused: $chatInputFocused,
+                isWorking: $chatWorking,
+                onAgentReply: { _ in agentAnswered() },
+                replyField: ChatReplyField(
+                    readyText: ChatReplyField.readyText(newest: newest, isOwn: usersTurn),
+                    isNoReply: isNoReply,
+                    clearCount: fieldClearCount),
+                onSendReadyReply: { readyReplyMessage = newest },
+                onFieldSend: { _ in fieldComposeOpened = false })
         }
+        .padding(.horizontal, chatExpanded ? 0 : 12)
         .padding(.bottom, chatExpanded ? 8 : 34)
         .animation(Self.pillSpring, value: chatExpanded)
     }
 
-    private func pillCircle(_ systemName: String) -> some View {
-        Image(systemName: systemName)
-            .font(.title3)
-            .fontWeight(.medium)
-            .foregroundStyle(.primary)
-            .frame(width: 56, height: 56)
-            .contentShape(Circle())
-            .glassEffect(.regular.interactive(), in: .circle)
+    /// The agent finished a request from the field with something to say: the sheet rises with
+    /// the request and the answer, and the field empties. After a compose card the reply
+    /// was the point, so nothing opens.
+    private func agentAnswered() {
+        guard !fieldComposeOpened else { return }
+        fieldClearCount += 1
+        withAnimation(Self.pillSpring) { chatExpanded = true }
     }
 
-    // MARK: - Actions (as today's detail: the opened email leaves the screen, others stay)
-
-    private func handleArchive(_ msg: MessageHeader) {
-        if msg.id == viewModel.message?.id {
-            if viewModel.archive() { dismissChat(destinationFolderId: nil) }
-        } else {
-            _ = viewModel.archiveMessage(msg)
-        }
-    }
-
-    private func handleDelete(_ msg: MessageHeader) {
-        if msg.id == viewModel.message?.id {
-            if viewModel.delete() { dismissChat(destinationFolderId: nil) }
-        } else {
-            _ = viewModel.deleteMessage(msg)
-        }
-    }
-
-    private func handleMove(_ msg: MessageHeader, toFolderPath path: String) {
-        if msg.id == viewModel.message?.id {
-            if viewModel.move(toFolderPath: path) {
-                dismissChat(destinationFolderId: MessageIdentity.folderId(accountId: msg.accountId, folderPath: path))
-            }
-        } else {
-            _ = viewModel.moveMessage(msg, toFolderPath: path)
-        }
-    }
-
-    /// As `MessageDetailView.dismissMessage`: the list behind hides the row, then the chat closes.
-    private func dismissChat(destinationFolderId: String?) {
-        NotificationCenter.default.post(
-            name: .messageDismissedFromDetail,
-            object: viewModel.messageId,
-            userInfo: destinationFolderId.map { [MessageDetailView.dismissDestinationFolderIdKey: $0] })
-        dismiss()
+    /// A compose card from the chat closed. Sent: the field empties; a reply shows as its queued
+    /// email's bubble, read from the outbox.
+    private func composeEnded(_ outcome: ComposeOutcome) {
+        if case .sent = outcome { fieldClearCount += 1 }
     }
 
     @ViewBuilder
     private func composeView(for req: AgentToolRouter.ComposeRequest) -> some View {
+        let onOutcome: @MainActor (ComposeOutcome) -> Void = { outcome in
+            req.onOutcome(outcome)
+            composeEnded(outcome)
+        }
         switch req.mode {
         case .compose:
             ComposeView(
                 suggestedBody: req.body, account: context.accounts.first { $0.id == viewModel.message?.accountId },
                 prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, prefillSubject: req.subject,
-                onAgentOutcome: req.onOutcome)
+                onAgentOutcome: onOutcome)
         case .reply:
             ComposeView(
                 replyTo: req.replyTo, suggestedBody: req.body,
                 prefillTo: req.to.isEmpty ? nil : req.to, prefillCc: req.cc.isEmpty ? nil : req.cc,
-                prefillBcc: req.bcc.isEmpty ? nil : req.bcc, onAgentOutcome: req.onOutcome)
+                prefillBcc: req.bcc.isEmpty ? nil : req.bcc, onAgentOutcome: onOutcome)
         case .forward:
             ComposeView(
                 replyTo: req.replyTo, suggestedBody: req.body, isForward: true,
-                prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, onAgentOutcome: req.onOutcome)
+                prefillTo: req.to, prefillCc: req.cc, prefillBcc: req.bcc, onAgentOutcome: onOutcome)
         }
-    }
-}
-
-/// Today's pill side buttons collapse while the chat is open.
-private struct SideButtonVisibility: ViewModifier {
-    let visible: Bool
-
-    func body(content: Content) -> some View {
-        content
-            .frame(width: visible ? nil : 0, height: visible ? nil : 0)
-            .opacity(visible ? 1 : 0)
-            .offset(y: visible ? 0 : 30)
-            .allowsHitTesting(visible)
     }
 }
 

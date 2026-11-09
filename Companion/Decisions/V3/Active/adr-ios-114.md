@@ -56,7 +56,19 @@ same AI result, kept as long as the email itself is shown.
    missing value: the extension's one cache upsert (`NSEDataBridge.upsertAICacheFromStaging`, for an existing and a
    new header) records the Message-ID it has, as every new entry does.
    `v106_repairAICacheMessageIds` (`AppDatabase.repairAICacheMessageIds`) stays: it fills the Message-ID from the header in the folder the key names. The purge no
-   longer depends on it. Review round 2 (2026-11-05) also removed a second purge trigger at the end of
+   longer depends on it.
+   **Amended by the rebuild (2026-11-09):** the purge no longer reads a missing
+   Message-ID from the key. v97 has run on simulators, so it stays frozen and is the only repair: an
+   entry it could not fill (its email had moved before the upgrade) is purged after the grace and
+   its results are made again when needed (bounded, self-healing). Writers now fill a missing
+   Message-ID (NULL or empty) from the one they write with, and never replace a stored one:
+   `MessageAICache.writeThrough` and the extension's upsert (`NSEDataBridge.upsertAICacheFromStaging`,
+   also when its AI fields are unchanged). So such an entry is kept again from its next write while
+   its email is on the device (`AICacheMessageIdFillTests`). And an entry is kept only while
+   a header OF ITS OWN ACCOUNT (the key's first part) carries its Message-ID, so another account's
+   copy of the email keeps nothing and a removed account's entries go after the grace; this
+   replaces the writer-side account checks that PR 3b had added to `writeThrough` and the
+   extension merge, which are not built. Review round 2 (2026-11-05) also removed a second purge trigger at the end of
    the AI queue's drain. Review round 4 (2026-11-05): the purge reads the clock once (its `now`
    argument), the base of its cutoff and the re-stamp of a kept entry, so a kept entry always leaves
    the selection and the pass ends, even if the clock is set back while it runs. Later the same
@@ -165,8 +177,8 @@ same AI result, kept as long as the email itself is shown.
    `MessageOpenView`, which decides chat or today's email view ONCE per open (`opensInChat`, also off
    in the demo's AI-off mode and during the tutorial): the inbox, push and notification opens
    (`MessageDetailResolvedContent`), search results and the Reminders link.
-   `ChatThreadView` reuses `MessageDetailViewModel` (body, thread load, mark-read, archive, delete,
-   move); `ChatThread` is the pure model: drafts left out, one copy per `stableId` (the opened copy,
+   `ChatThreadView` reuses `MessageDetailViewModel` (body, thread load, mark-read; in 3a also
+   archive, delete and move from today's pill menus, which 3b drops, decision 10); `ChatThread` is the pure model: drafts left out, one copy per `stableId` (the opened copy,
    else one with a text message), oldest first by (date, id), own = from one of the account addresses
    or in a Sent folder, reply people = the newest email's `buildReplyAllRecipients` minus the user,
    a group when more than one other person; time stamps after `ChatViewLayout.timeStampGap`; the
@@ -300,13 +312,136 @@ same AI result, kept as long as the email itself is shown.
    released at once, so that reason is gone and the switch, the override and the two Settings
    positions went with it.
 
+10. **The reply field (amendment 2026-11-05, the fourth chat-view PR, 3b).** In the chat, today's
+   pill on the newest email is shown as a reply field, [mic] [field] [Send]: `DynamicIslandChat`
+   with a `ChatReplyField`, so it is the same agent session (`msg:{accountId}:{stableId}`) and the
+   same sheet. The field holds the ready AI Reply's text message (`ChatReplyField.readyText`: someone
+   else's email, a full `cachedReply` and a `replyTextMessage`, not a no-reply sender), with an
+   "AI Reply" caption while unchanged. Send with it unchanged (`ChatReplyField.route`, trimmed
+   compare) opens today's Reply All compose with the full AI Reply in its suggestion box and calls no
+   agent. Any other words, typed or said, go to the agent as today's Chat pill message on the newest
+   email with a short nudge (`ChatReplyField.agentMessage`): they came from that email's reply field,
+   so an unclear request is a reply to it; for a no-reply sender (`EmailFilter.isNoReply`, with the
+   "Replies won't be read" line) the nudge says not to write a reply. While the agent works the
+   words pulse in the field and the line above shows the agent's own step labels, writing a reply as
+   "Writing your email" (`ChatReplyField.statusLine`). An answer or a confirmation card opens the
+   sheet and empties the field, except after a compose the request opened (the compose was the
+   answer). Dictation in the field replaces an unchanged AI Reply rather than appending to it, and
+   the field never starts dictation by itself.
+   **The AI Reply shows only while the field holds no words of the user's, and never on the user's
+   turn (decided 2026-11-07):** `ChatFieldFill.offer`. An empty field, or the AI Reply the app itself
+   put there, takes the ready reply whenever it arrives, collapsed or in the open sheet; typed or
+   dictated words are never replaced. Three things hold it back, and nothing else (no sheet or
+   timing condition): (a) the user spoke last and is still waiting, a dictation bringing their
+   words or the agent answering them; (b) the user emptied the field by hand, which keeps it empty
+   for that newest email (`emptiedByHand`; only the user's own edits count, and a newer email
+   shows its own reply); (c) it is the user's turn: the newest email is theirs, or a reply of
+   theirs is still in the outbox below it (`ChatThreadView.pill`, `unsentReplies`), from the moment
+   of Send, online or offline, until someone else's email arrives. Words sent to the agent are not a
+   turn: once it has answered, the email still awaits a reply, so the reply shows again. The field
+   is offered the reply when the reply changes, when a dictation ends, when the agent has answered
+   and whenever the field empties.
+   **Each send names the email it is about, and the field's words stay out of logs (review,
+   2026-11-05):** a send looks up the pill's current email as it starts
+   (`DynamicIslandChat.contextNumber`), never the number found for an earlier newest email. A failed
+   send from the field logs without its text (`DynamicIslandChat.loggedText`, and
+   `AIService.sendChatMessage(logsUserText:)` for the request's own failure lines): the field's text
+   is often the AI Reply, written from the email, and the chat error log is kept with debug logging
+   off. Text typed in the chat is logged as before.
+   **Superseded (review, 2026-11-06):** a resend or rewind replayed the field's words
+   without that flag and logged them. The gate moved to the one writer instead:
+   `BackgroundSyncLogger.logChatError` always keeps the error line and adds the user's words only
+   while debug logging is on, for every caller (typed chat text included), and the flag and
+   `loggedText` are deleted. Tests: `ChatReplyFieldRuntimeTests.chatRequestFailureLog` (every
+   request failure branch, debug off and on) and `BackgroundSyncLoggerTests.chatErrorRoundTrip`.
+   Decided 2026-11-08: typed chat text no longer reaches the production
+   chat error log either (debug logging keeps it), following the rule that diagnostic logging is
+   debug-gated.
+   **The Sending bubble is read from the outbox (rebuild, 2026-11-09):** every outbox row whose
+   In-Reply-To is the Message-ID of an email in the chat, from any account, and whose own email is
+   not one of the chat's emails yet, shows as
+   the user's bubble at the bottom (`ChatUnsentReply.fetch`, one `ValueObservation` per open chat
+   keyed by the chat's Message-ID set, `ChatUnsentReply.changes`): "Not sent" with the red mark,
+   Retry and Delete when the row has failed (the Outbox's own `retryOutboxMessage` and
+   `discardOutboxMessageConfirmed`), "Sending" otherwise. Its text is the summary made at Send (the
+   AI cache under the row's `sentMessageId` in its Sent folder), "Summarizing" until then. Once the
+   provider takes the email the send stamps `sentAt`, then writes the optimistic Sent copy
+   (`insertOptimisticSentHeader`) under the row's Message-ID, then may delete the row once the
+   Sent append is done. The chat does not observe the database (it reloads its emails on
+   `.nseMergeDidCommit`), so a sent row keeps its bubble until its copy is one of the chat's
+   emails: when the copy is in the database (`ChatUnsentReply.filed`) or a shown row leaves the
+   outbox, the chat reloads its emails (`MessageDetailViewModel.reloadThread`), the copy's
+   Message-ID joins the chat's set and the bubble ends, the copy showing as an ordinary email with
+   "Sent" under it. A sent row without its Message-ID cannot be handed over and shows nothing. Ending
+   the bubble at the `sentAt` write, as the rebuild first did, left neither on screen until the
+   next merge signal; the screen tests now hand over with no merge signal posted.
+   Undo or a discard deletes the row, and the bubble goes. Nothing
+   is kept in memory: the in-memory entries and their progress, the Message-ID watch across
+   accounts, the gone-row rule, the 24-hour prune (`sentReplyLifetime`) and
+   `ComposeOutcome.sent(outboxId:)` are deleted; a sent compose card only empties the field
+   (`composeEnded`). A reply sent outside the chat to one of its emails shows the same way. An
+   email that joins the open chat (a Sent copy the provider filed under a Message-ID of its own has
+   no summary from Send) asks for its summary like the open's newest (`noteMembers`). The summary
+   at Send (`SentEmailSummary`) and the Message-ID at the queue write are unchanged.
+   **Superseded by the rebuild (2026-11-09), kept for history:**
+   **The Sending bubble follows its queued email (decided 2026-11-07):** a reply sent from
+   the chat (the ready AI Reply, or an agent compose) reports its queued email's outbox row
+   (`ComposeOutcome.sent(outboxId:)`), and `ChatSentReplies` follows that row and the email's AI
+   cache entry with one GRDB observation. The bubble shows from the queue write, Undo window
+   included: "Summarizing" until the email's summary is made, then that summary, even while still
+   sending; under it the grey caption every own email has, "Sending", then "Sent" once the provider
+   took it (`sentAt`). Undo or a discard deletes the unsent row and the bubble with it; a filed row
+   (sent, then appended to Sent) keeps the bubble, "Sent", until the email itself, by its own
+   Message-ID, is in the chat (`isInChat`, `settle`), or until no email of its account carries that
+   Message-ID any more, or after `sentReplyLifetime`. Review round 11 (2026-11-07): Outlook files
+   its own copy under a Message-ID of its own and the Sent sync then drops our optimistic copy, so
+   with no chat on screen at that moment the bubble stayed under its own email for up to a day and
+   held the user's turn; `ChatSentReplies` now follows a filed row's Message-ID and ends the bubble
+   when no email carries it. Ending it at filing instead was tried and rejected: the chat reloads
+   its emails only after the Sent sync commits, so the bubble would vanish a moment before the
+   email shows. The summary is
+   made at Send (`SentEmailSummary`, chat view on and AI allowed only): the outbox row gets its
+   Message-ID at the queue write (`persistQueuedSend`; the claim keeps it and the send uses it),
+   the summary is written to the AI cache under the Sent folder and that Message-ID, and the
+   optimistic Sent copy (`insertOptimisticSentHeader`) and every synced copy restore it, so the
+   email's own bubble shows the same summary with no second bubble. A copy that arrived before the
+   summary returned takes it when it does. The reason: the words typed in the chat are not
+   guaranteed to be the summary, so a real summary of the final email is the simpler, correct
+   source. Outlook does not keep our Message-ID, so its server copy is summarized as it arrives;
+   offline the bubble stays "Sending". **A send that failed for good (decided 2026-11-07):** it reads
+   "Not sent", with a red exclamation mark beside the bubble as in Messages; touch and hold offers
+   Retry and Delete (`ChatSentReplies.retry` / `delete`), which are the Outbox's own Retry and Discard
+   (`AccountManager.retryOutboxMessage`, `discardOutboxMessageConfirmed`) for the same outbox row, so
+   no new state: Retry queues that row again and the bubble follows it back to "Sending", and Delete
+   removes the row and the bubble with it. VoiceOver reaches both as the mark's named actions. The
+   words are kept nowhere; nothing new is persisted (ADR-004).
+   Tests: `ChatSendingBubbleTests` (`failedSendRetryAndDelete` drives the hosted chat's own actions;
+   `bubbleEndsWhateverIdTheProviderFilesUnder` sends through a provider that files its own
+   Message-ID and one that keeps ours; `summaryAtSendGate` turns each input of the gate off).
+   **Superseded by the above (2026-11-07), kept for history:**
+   *The Sent bubble before its email arrives:* a reply sent from the chat (the ready AI Reply,
+   or an agent compose asked for in the field) is kept in memory (`ChatSentReplies`, keyed by the
+   account and the replied-to Message-ID) and shown as the user's words in a pending Sent bubble at
+   the bottom until an own email answering that Message-ID, dated no earlier than the send minus
+   `ChatViewLayout.sentReplyDateSlack`, is in the chat (`settle`), or after `sentReplyLifetime`.
+   The words never go on an email: an email shows only its own text message, "Summarizing" until
+   then. Review round 10 (2026-11-07): the date match had put a chat reply's words on a different
+   reply sent elsewhere to the same email; nothing proves which email is which send, so the match
+   now only ends the pending bubble. Decided 2026-11-08: the arrived email reads
+   "Summarizing" for the few seconds until its summary, instead of the user's words. Nothing is
+   persisted (ADR-004).
+   **Product choices made in 3b, decided 2026-11-08:** the chat-view pill drops today's Reply
+   and Archive menus (swipes come with PR 5, Forward and recipients with PR 4); the field-to-sheet
+   change has no morph animation yet; the sheet is not sized to its content; a request that only
+   acts (archive, label) opens the sheet with the agent's answer.
+
 **Release order:** an iOS build at protocol 2.0.0 must not reach users before the backend change
 (its protocol 2.0.0 JSON shape) is deployed to production: an older backend sends 2.0.0 the labelled text, which this
 parser does not read.
 
 **Tests:** `AISummaryParsingTests`, `AISummaryResponseTests`, `AIReplyParseTests`, `AIReplyTests`
 (parsers and `ReplyResult`); `AICachePurgeTests` (the orphan purge, driven for real, including
-`legacyEntryKeptByItsKey`, `maintenanceRunsThePurge` and `clockOffWallClockEnds`, the clock behind and ahead of the wall clock);
+`legacyEntryWithoutMessageIdPurged`, `entryKeptOnlyByItsOwnAccount`, `maintenanceRunsThePurge` and `clockOffWallClockEnds`, the clock behind and ahead of the wall clock);
 `ComposeSuggestionPersistTests.editClearsReplyTextMessage`; migration and merge tests in this PR;
 `AITextMessageCallerTests` (the queue's summary and reply jobs, a failed reply asked again and the next
 one stored (`queueReplyFailureRecovers`), the "no content" summary clearing the text message
@@ -317,7 +452,7 @@ device's summary and reply text messages (`queuePeerActionKeepsLocalPairs`), com
 (`composeRecomputeReplacedEmail`), a filtered recompute and one from the snippet
 (`composeRecomputeFiltered`, `composeRecomputeFromSnippet`), and the extension's request, each through its real producer and a
 fake backend or peer); `AITextMessageStorageTests.upgradeKeepsResults` (a v94 database with results,
-upgraded) and `legacyEntriesSurviveUpgradeAndPurge` (including v97 filling the Message-ID that a peer's
+upgraded) and `legacyEntriesSurviveUpgradeAndPurge` (the purge keeps only the entries v97 filled; including v97 filling the Message-ID that a peer's
 probe then finds); `RFC822IdentityMergeGuardTests.preSyncInboxReclaimCarriesTextMessages`;
 `NSESummaryTextMessageCarryTests` (the staging writes, `NSEStagingDB.open(path:)` upgrading an older
 file, the extension bundle's protocol version, a later push whose only change is the text message,
@@ -327,3 +462,10 @@ cache entry kept through the orphan grace (`mergedCacheEntryGetsTheGrace`), and 
 staging the text message, via `NotificationService.stagingPathOverride`).
 Decision 8: `ChatSummaryQueueTests` (including a chat offer made while its ordinary twin is in flight, just after it ended, or when it runs again, and the foreground pass's walk, two-sided on the chat view); `ChatSummaryExecutionTests` (the own-email field, two-sided; the executor refusing an ordinary summary outside the Inbox, with an Inbox control). Decision 9: `ChatThreadTests`,
 `ChatThreadContextTests`, `ChatThreadViewLifecycleTests`, `ChatCardIdentityTests`, `ChatSummaryQueueTests.chatViewSwitch`/`activeMatrix`, `ThreadGroupTests.displayInfoUnionLabels`.
+Decision 10: `ChatReplyFieldTests` (the ready text, Send's route, the agent's message, the status
+line, and the field and chat wiring read from the source),
+`ChatReplyFieldRuntimeTests` (the ready AI Reply in the mounted field, the send's email lookup,
+a failed request's log with and without its text, and the send wiring),
+`ChatSendingBubbleTests` (`whichRowsShow`, the hosted hand-over and Retry/Delete, the summary at
+Send and its gate), `ChatThreadViewLifecycleTests.aJoiningEmailAsks`,
+`newestBubbleClearsATallField` and `sentReplyTakesTheTurn`.

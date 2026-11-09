@@ -80,14 +80,17 @@ struct BackgroundSyncLoggerTests {
         }
     }
 
-    @Test("Chat error round-trip includes the user message continuation line")
-    func chatErrorRoundTrip() {
+    @Test("A chat error is always kept; the user's words only while debug logging is on", arguments: [false, true])
+    func chatErrorRoundTrip(debugLogging: Bool) {
         withTempLog {
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = debugLogging }
+            defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } }
             let marker = "bgchat_\(UUID().uuidString.prefix(8))"
             BackgroundSyncLogger.logChatError(marker, userMessage: "what happened")
             let log = AppLogStore.read(channel: .chatError)
-            #expect(log.contains(marker))
-            #expect(log.contains("User message: what happened"))
+            #expect(log.contains(marker), "the error itself is always kept")
+            #expect(log.contains("User message: what happened") == debugLogging,
+                    "the user's words can be the email (the reply field's AI Reply): debug logging only")
         }
     }
 

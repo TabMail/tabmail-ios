@@ -155,9 +155,23 @@ actor ActiveAIQueue {
     }
 
     /// The folder scope of every job, checked by `readJobOutcome` and `executeJob`: the Inbox, for
-    /// every origin; any folder for a chat summary (a thread holds Sent and archived mail too).
-    nonisolated static func inScope(_ message: MessageHeader, for job: AIJob) -> Bool {
-        message.isInInbox || job.forChat
+    /// every origin; for a chat summary also any other folder a chat may summarize
+    /// (`chatSummaryAllowed`: a thread holds Sent and archived mail too, but never a draft).
+    nonisolated static func inScope(_ message: MessageHeader, chatAllowed: Bool, for job: AIJob) -> Bool {
+        message.isInInbox || (job.forChat && chatAllowed)
+    }
+
+    /// Whether a chat summary may be asked for this email: never for a draft. A draft's text is the
+    /// user's unsent words, and they never leave the device for a summary (ADR-IOS-114 decision 8),
+    /// whichever caller asks: the open, an email joining an open chat, a row coming on screen, the
+    /// walk, a landed body or a twin's hand-back. Decided from the email's OWN folder role, read
+    /// with the row, so it never depends on what a screen loaded (the chat's context reads only its
+    /// members' accounts' folders). An email whose folder row is missing is refused too (fail
+    /// closed): its role is unknown, and the next sync writes the folder and a later ask or walk
+    /// asks again.
+    nonisolated static func chatSummaryAllowed(_ message: MessageHeader, db: Database) throws -> Bool {
+        guard let folder = try Folder.fetchOne(db, key: message.folderId) else { return false }
+        return folder.role != .drafts
     }
 
     /// The action job chained after a summary job (both the LLM-completion and
@@ -479,14 +493,15 @@ actor ActiveAIQueue {
     /// earlier ones. A member with its body gets a chat summary job now; one without goes to the
     /// front of the body queue (`ActiveBodyQueue`; tests pass `requestBodies`), and nothing is kept
     /// for it: the shown chat observes the row and asks again once its body lands, whatever writes
-    /// it. The caller checks `ChatViewConfig`.
+    /// it. A draft is never asked for (`chatSummaryAllowed`), whatever the caller passed: it gets no
+    /// job and no body request. The caller checks `ChatViewConfig`.
     func enqueueChatSummaries(
         _ members: [MessageHeader],
         requestBodies: (@Sendable ([MessageHeader]) async -> Void)? = nil
     ) async {
         let ids = members.map(\.id)
         guard let rows = try? await dbPool.read({ db in
-            try MessageHeader.filter(keys: ids).fetchAll(db)
+            try MessageHeader.filter(keys: ids).fetchAll(db).filter { try Self.chatSummaryAllowed($0, db: db) }
         }) else { return }
         let position = Dictionary(ids.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
         let fresh = rows.sorted { (position[$0.id] ?? 0) < (position[$1.id] ?? 0) }
@@ -1202,20 +1217,21 @@ actor ActiveAIQueue {
 
     /// Re-read GRDB to decide whether the job succeeded. Ignores the executor Bool.
     private func readJobOutcome(_ job: AIJob) async -> JobOutcome {
-        guard let state = try? await dbPool.read({ db -> (MessageHeader, Bool)? in
+        guard let state = try? await dbPool.read({ db -> (MessageHeader, Bool, Bool)? in
             guard let message = try MessageHeader.fetchOne(db, key: job.headerId) else {
                 return nil
             }
             return (
                 message,
+                try Self.chatSummaryAllowed(message, db: db),
                 try Self.recentInboxWindowContains(headerId: job.headerId, db: db)
             )
         }) else {
             return .scopeExited // row gone
         }
-        let (message, inRecentWindow) = state
-        guard Self.inScope(message, for: job) else {
-            return .scopeExited // archived / moved out — every origin but a chat summary (any folder)
+        let (message, chatAllowed, inRecentWindow) = state
+        guard Self.inScope(message, chatAllowed: chatAllowed, for: job) else {
+            return .scopeExited // archived / moved out — every origin but a chat summary (any folder but Drafts)
         }
         guard !Self.windowRetires(job: job, inRecentWindow: inRecentWindow) else {
             return .scopeExited // sync-origin job deliberately outside the bounded AI population
@@ -1293,14 +1309,15 @@ actor ActiveAIQueue {
         // back to at all (`IOS-AI-002` / `IOS-AI-003`). It has to be this read: the
         // classification is only sound for a target resolved against the row it was
         // captured from, in one transaction. Zero extra round trips.
-        let captured: (message: MessageHeader, target: AIWriteTarget, admission: WriteAdmission, inRecentWindow: Bool)? =
-            (try? await dbPool.read { db -> (message: MessageHeader, target: AIWriteTarget, admission: WriteAdmission, inRecentWindow: Bool)? in
+        let captured: (message: MessageHeader, target: AIWriteTarget, admission: WriteAdmission, chatAllowed: Bool, inRecentWindow: Bool)? =
+            (try? await dbPool.read { db -> (message: MessageHeader, target: AIWriteTarget, admission: WriteAdmission, chatAllowed: Bool, inRecentWindow: Bool)? in
                 guard let message = try MessageHeader.fetchOne(db, key: job.headerId),
                       let target = try AIWriteTarget.capture(message: message, db: db) else { return nil }
                 return (
                     message,
                     target,
                     try Self.writeAdmission(db, target: target),
+                    try Self.chatSummaryAllowed(message, db: db),
                     try Self.recentInboxWindowContains(headerId: job.headerId, db: db)
                 )
             }) ?? nil
@@ -1310,8 +1327,10 @@ actor ActiveAIQueue {
 
         // Inbox membership is the unconditional scope for EVERY origin: before
         // the pathway regating this was implied by the window check (the window
-        // is a subset of the Inbox); a window-exempt job must not lose it.
-        guard Self.inScope(message, for: job) else { return .ordinary(retry: false) }
+        // is a subset of the Inbox); a window-exempt job must not lose it. A chat
+        // summary may also run outside the Inbox, but never on a draft: this is the
+        // last check before the model call, for every caller that queued it.
+        guard Self.inScope(message, chatAllowed: captured.chatAllowed, for: job) else { return .ordinary(retry: false) }
 
         // A SYNC-ORIGIN job may have aged out after it was admitted. Retire it
         // without a model call; `readJobOutcome` uses the same `windowRetires`
