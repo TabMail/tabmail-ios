@@ -1,6 +1,6 @@
 # IOS-SCROLL-003
 
-> Routed from `KNOWN_ISSUES.md` line 904 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).
+> Routed from `KNOWN_ISSUES.md` line 904 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`).
 
 - Register classification: `closed-decision`
 - Original row SHA-256: `1d38ca8d98329053beeb625ab0505cca7585d3cac2402c1e8973e70e380e41ba`

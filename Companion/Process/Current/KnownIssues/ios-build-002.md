@@ -1,6 +1,6 @@
 # IOS-BUILD-002
 
-> Routed from `KNOWN_ISSUES.md` line 1376 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).
+> Routed from `KNOWN_ISSUES.md` line 1376 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`).
 
 - Register classification: `closed-decision`
 - Original row SHA-256: `3fb8bb28655d37d65327a3b4c9e043d26a0bbac28aafb65cbc09d4115c0dfab3`
@@ -8,8 +8,10 @@
 ## Status
 
 ✅ **CLOSED AS A DECISION (reconfirmed 2026-08-09 for released `v1.7.5`)** — the **SwiftMail dependency is not pinned reproducibly**: `project.yml` pins it by `branch: main`, and `Package.resolved` — the file that would pin the exact revision — is gitignored. **PRE-EXISTING, not introduced by the v3 range**, and **accepted** because the fork is the owner's own repository
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
 
 > **SUPERSEDED 2026-11-06 (owner ruling): packages are now pinned.** A tracked root `Package.resolved` is copied into the generated project by `Scripts/xcodegen.sh`; decision [ADR-IOS-102](../../../Decisions/V3/Active/adr-ios-102.md). The text below is the history of the accepted hazard, kept for search.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 
 ## Subsystem and search terms
 

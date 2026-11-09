@@ -1,6 +1,6 @@
 # IOS-ASSET-001
 
-> Routed from `KNOWN_ISSUES.md` line 1129 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 513497704ad37e977e2fb86e4623e956e6f1ca99844122948ff74995dfa9a309`).
+> Routed from `KNOWN_ISSUES.md` line 1129 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`).
 
 - Register classification: `fixed`
 - Original row SHA-256: `264c0d53034135984a3951b2d24d60ed928630749d8054ce1fa70e2d1073a44c`

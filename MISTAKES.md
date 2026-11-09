@@ -62,7 +62,7 @@ flips, or give a test seam a default that differs from production's initial valu
 
 ## Companion tree — the proof that stopped running
 
-- **MIS-IOS-009** — edited a hash-pinned or byte-frozen GENERATED fragment in place and killed its verifier. ⚠️ **TWO pinning conventions:** `{Memory,Decisions}/manifest.tsv` hash the **stripped** body — NEVER re-pin; `ported-manifest.tsv` / `amendments-manifest.tsv` / `Decisions/V3/manifest.tsv` hash the **raw** file — MUST re-pin. A GLOB in a comment aborts it; run verifiers UNPIPED; run `verify` on ANY `Companion/` diff. (×14)
+- **MIS-IOS-009** — edited a hash-pinned or byte-frozen GENERATED fragment in place and killed its verifier. ⚠️ **TWO pinning conventions:** `{Memory,Decisions}/manifest.tsv` hash the **stripped** body — NEVER re-pin; `ported-manifest.tsv` / `amendments-manifest.tsv` / `Decisions/V3/manifest.tsv` hash the **raw** file — MUST re-pin. A GLOB in a comment aborts it; run verifiers UNPIPED; run `verify` on ANY `Companion/` diff. (×15)
 - **MIS-IOS-010** — wrote a bulk `UPDATE … WHERE observedUidValidity IS NULL`; `optimisticMoveToFolder` writes that NULL **deliberately** mid-move, so it selected exactly the rows the sentinel protected: **C3**. **Grep every WRITER of every WHERE column.** (×1)
 
 - **MIS-IOS-011** — called a finding an **accepted residual** under THE MANTRA on a mechanism I never opened: inline images persist under the **victim's** content key before `BodyAddressGate` refuses the write. **Assets on disk are a THIRD durable output of a body fetch; ask whether the named recovering peer EXISTS** (×2, ADR-IOS-079 §5). (×2)

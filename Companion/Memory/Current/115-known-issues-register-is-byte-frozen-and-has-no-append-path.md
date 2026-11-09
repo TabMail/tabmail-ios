@@ -1,3 +1,10 @@
+> **2026-11-09 (#228): the archive is re-pinned.** #356 reworded three lines of the archive to drop a private
+> document's name, so its SHA-256 is now `dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`
+> (the `513497…` below is the hash at the split; those bytes are `153fe21f~1`). Every generated file embeds the
+> archive hash, and the two reworded rows (`IOS-GRAPH-004`, `IOS-MIGRATION-003`) carry a row hash, so all were
+> re-pinned to the current archive. Restoring the old bytes would bring the name back. A deliberate rewording of
+> the archive is re-pinned in the same change, with the reason in its commit message.
+>
 > **✅ RESOLVED 2026-08-12 — the register now HAS an append path, so this file's title and its central
 > claim are superseded. Everything below is preserved as the diagnosis that motivated the fix.**
 >
