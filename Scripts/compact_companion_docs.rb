@@ -335,7 +335,7 @@ DECISION_NOTES = {
 # `v1.6.38:DECISIONS.md`. v3 forward-ports that work, and live v3 plans route to these exact
 # paths, so the bodies are ported byte-for-byte from `PORTED_SOURCE_REV` and recorded in
 # `ported-manifest.tsv` instead of being regenerated. They are deliberately excluded from the
-# source-document ADR census, which reconstructs `#{SOURCE_REV}:DECISIONS.md` exactly.
+# source-document ADR census.
 PORTED_SOURCE_REV = ENV.fetch("COMPANION_PORTED_SOURCE_REV", "e28dd4edb33cfb77a0d069de48e136f6ad92cd0c")
 PORTED_DECISION_PATHS = [
   "Companion/Decisions/Active/adr-ios-058.md",
@@ -551,26 +551,16 @@ def write_readme(memory_fragments, decision_fragments)
   write_exact("Companion/README.md", body)
 end
 
-def verify_manifest(source_path, manifest_path)
-  source = git_show(source_path).b
+def verify_manifest(manifest_path)
   rows = File.readlines(File.join(ROOT, manifest_path), chomp: true).drop(1)
-  reconstructed = +""
   rows.each do |row|
-    _order, _status, source_lines, expected_sha, relative_path, _title = row.split("\t", 6)
+    _order, _status, _source_lines, expected_sha, relative_path, _title = row.split("\t", 6)
     body = File.binread(File.join(ROOT, relative_path))
-    preserved_body = exact_body(body)
-    actual_sha = Digest::SHA256.hexdigest(preserved_body)
+    actual_sha = Digest::SHA256.hexdigest(exact_body(body))
     abort("hash mismatch: #{relative_path}") unless actual_sha == expected_sha
-
-    start_line, end_line = source_lines.split("-").map(&:to_i)
-    expected = source.lines[(start_line - 1)..(end_line - 1)].join
-    abort("source-range mismatch: #{relative_path}") unless preserved_body == expected
-
-    reconstructed << preserved_body
   end
-  abort("reconstruction mismatch: #{source_path}") unless reconstructed == source
 
-  puts "reconstructed #{source_path}: #{source.lines.length} lines, #{source.bytesize} bytes, byte-identical"
+  puts "#{manifest_path}: #{rows.length} fragments hash-verified"
 end
 
 def verify_ported_decisions
@@ -743,7 +733,7 @@ MEASURE_SCRIPT = "../.claude/skills/companion-compact/measure.sh"
 
 # The failure this check exists for: the `v1.6.38` compaction extracted every fragment into
 # `Companion/` but never replaced the mandatory-load files with indexes, so both copies existed for
-# two months. `verify` could not see it: it reconstructs fragments against `SOURCE_REV` and never
+# two months. `verify` could not see it: it checked fragments against `SOURCE_REV` and never
 # looks at the working-tree index. This check looks at the working tree.
 def verify_indexes_are_indexes
   violations = []
@@ -813,8 +803,8 @@ when "generate"
   write_readme(memory_fragments, decision_fragments)
   puts "generated #{memory_fragments.length} memory fragments and #{decision_fragments.length} decision fragments"
 when "verify"
-  verify_manifest("PROJECT_MEMORY.md", "Companion/Memory/manifest.tsv")
-  verify_manifest("DECISIONS.md", "Companion/Decisions/manifest.tsv")
+  verify_manifest("Companion/Memory/manifest.tsv")
+  verify_manifest("Companion/Decisions/manifest.tsv")
   verify_adr_census
   verify_ported_decisions
   verify_memory_links

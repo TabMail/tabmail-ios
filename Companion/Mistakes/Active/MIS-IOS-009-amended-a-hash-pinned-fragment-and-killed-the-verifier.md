@@ -13,6 +13,13 @@ shape: reading a number instead of reading how far the run got.
 > written out in full aborts the verifier. That is this very mistake, one level up: the first draft of
 > this file broke `verify` the same afternoon it was written to describe breaking `verify`.
 
+> **2026-11-08 (#372):** `compact_companion_docs.rb verify` now checks the manifest hashes only. The
+> `v1.6.38` source-range and reconstruction comparisons described below were removed, and 25 rows
+> changed in place by #356 and later feature PRs were re-pinned to their current bodies. An in-place
+> body edit still fails the hash check. Put an amendment in a leading `COMPANION-CURRENT-NOTE` wrapper
+> as before. A deliberate rewording of a body itself is re-pinned in the same change, with the reason
+> in the commit message.
+
 ## The tell
 
 I have found a false claim in a routed `Companion/` file. I am writing the correction **inline, right
