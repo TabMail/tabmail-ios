@@ -183,3 +183,21 @@ search request the way Gmail reads a query string (`&` separates parameters,
 including `&`, `+`, `=`, `%`, `#`, non-ASCII characters, literal percent escapes
 such as `%26` (which must not be decoded first) and a `from:` address with a `+`
 tag, comes back as exactly one `q`, with no stray parameter.
+
+## Delta detail fetches — a failed fetch is never taken for a deleted message
+
+`DeltaDetailFetchFailureTests` drives production `SyncEngine.performDeltaSync` end to end on
+`FakeHTTP` for Gmail and Outlook, whose deltas fetch each changed message by id. A message whose
+fetch fails (a 5xx, a non-gone 4xx, a transport failure, a body that does not decode, a 200 whose
+record has no usable date) fails the delta and keeps the cursor (the Gmail history id, the Outlook delta link); on the next pass the
+fetch succeeds and the change lands. A message that answers 404 is gone and is skipped: the rest of
+the delta is applied and the cursor moves. A Graph refusal on the detail fetch is still logged with
+its error code and message. Called directly with the gone message first (404 or 410), the detail fetch still
+returns the readable one. Through the foreground poll `SyncEngine.sync(account:)` on a registered
+work queue, with a full sync due, a Gmail message whose fetch never succeeds does not stop sync: the
+full sync completes past it (its row kept), the capture moves the cursor, and on the next ordinary
+poll (no full sync due) the delta lands later changes. A dropped connection, a 401 the token refresh does not cure, or a cancellation
+during the rate-limit backoff still fails that folder's fetch. On Outlook, a message whose fetch
+never succeeds is bounded by the poll's cursor capture after its full sync, which walks the inbox's
+delta pages to the final link; the next ordinary poll's delta from that link lands what changed after
+it.

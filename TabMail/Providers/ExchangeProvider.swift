@@ -1526,21 +1526,37 @@ actor ExchangeProvider: EmailProvider {
     }
 
     /// Fetch message details including parent folder for delta sync folder assignment.
+    ///
+    /// Skips a message only when Graph answers that it is gone (404/410): it
+    /// was deleted, or moved (a move gives it a new id), between the delta
+    /// listing and this fetch. Any other failure (a 5xx, a 4xx such as a 429
+    /// past the retry budget, a dropped connection, cancellation, an
+    /// unreadable body, a record `parseGraphMessage` refuses) throws, so the
+    /// delta fails without moving its link and
+    /// a later pass asks again. A failure that never clears is bounded by the
+    /// next foreground full sync, which captures a fresh link. A change in the
+    /// failed batch that no full-sync window covers is not recovered once
+    /// that happens.
     func fetchMessageDetails(ids: [String]) async throws -> [ExchangeMessageDetail] {
         let selection = ExchangeGraphMessageRequest.fetchMessageDetails.selection
         var results: [ExchangeMessageDetail] = []
         for id in ids {
+            let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
+            let data: Data
             do {
-                let encodedId = try Self.encodedGraphPathSegment(id, context: "Graph message id")
-                let data = try await request(path: "/messages/\(encodedId)?\(selection.queryParameter)")
-                let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
-                if let header = parseGraphMessage(msg, selection: selection) {
-                    results.append(ExchangeMessageDetail(header: header, parentFolderId: msg.parentFolderId ?? ""))
-                }
-            } catch {
-                // Message may have been deleted between delta list and detail fetch — skip
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] fetchMessageDetails: skipping \(id) — \(error)") }
+                data = try await request(path: "/messages/\(encodedId)?\(selection.queryParameter)")
+            } catch where isHttpGoneStatus(error) {
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Exchange] fetchMessageDetails: skipping \(id) — gone (\(error))") }
+                continue
             }
+            let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
+            // A record the parser refuses (no usable date) is a failed fetch,
+            // not a gone message: it fails the delta like an unreadable body.
+            guard let header = parseGraphMessage(msg, selection: selection) else {
+                throw DecodingError.dataCorrupted(.init(
+                    codingPath: [], debugDescription: "Graph message \(id) has no usable header"))
+            }
+            results.append(ExchangeMessageDetail(header: header, parentFolderId: msg.parentFolderId ?? ""))
         }
         return results
     }

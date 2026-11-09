@@ -288,9 +288,11 @@ struct FetchCoverage: Sendable, Equatable {
     var spansEntireFolder: Bool
 
     /// Ids the server NAMED in this window that the client could not
-    /// materialise. The server still holds those messages, so they are PRESENT —
-    /// a consumer asking "does the server still have this?" must answer yes, or
-    /// it deletes a message over a transient parse failure.
+    /// materialise. They are treated as PRESENT — a consumer asking "does the
+    /// server still have this?" must answer yes, or it deletes a message over a
+    /// transient parse or fetch failure. That includes an id whose own fetch
+    /// answered that it is gone: its row stays until a later full sync no
+    /// longer lists it.
     var unmaterialisedIds: Set<String>
 
     /// Fail-closed: a provider that cannot report coverage proves nothing.
@@ -678,7 +680,7 @@ extension EmailProvider {
 /// `AccountManager.isConfirmedGoneError` — does NOT match
 /// `ProviderError.messageNotFound` because Gmail/Exchange overload it for
 /// parse failures (see `fetchMessagesBatch` doc above).
-private func isHttpGoneStatus(_ error: Error) -> Bool {
+func isHttpGoneStatus(_ error: Error) -> Bool {
     guard case ProviderError.networkError(let underlying) = error else { return false }
     if case HTTPError.networkError(let statusCode) = underlying {
         return statusCode == 404 || statusCode == 410
