@@ -965,6 +965,63 @@ struct UndoProviderIdentitySafetyTests {
         #expect(result.1.first?.messageIds.contains("shared@example.com") == false)
     }
 
+    /// Pushes a move of `original` from INBOX to Archive and undoes it through
+    /// the Undo control, returning the row after every queued write settled.
+    @MainActor
+    private func undoThroughTheControl(_ original: MessageHeader, fixture: Fixture) async throws -> MessageHeader? {
+        let action = UndoableAction(
+            type: .move(fromPath: "INBOX", toPath: "Archive"),
+            messages: [original],
+            originalFolderId: original.folderId,
+            originalFolderPath: original.folderPath,
+            accountId: fixture.accountId,
+            timestamp: Date())
+        UndoService.shared.push(action)
+        await UndoService.shared.undo(expectedActionID: action.id, source: .programmatic)
+        await AccountManager.shared.awaitWriteQueueDrain()
+        return try await fixture.pool.read { db in try MessageHeader.fetchOne(db, key: original.id) }
+    }
+
+    @Test("A refused move Undo raises the Couldn't undo notice and moves nothing back")
+    @MainActor
+    func refusedMoveUndoRaisesTheNotice() async throws {
+        let fixture = try install(provider: .imap)
+        UndoService.shared.dismissUndoFailure()
+        defer {
+            UndoService.shared.dismissAll()
+            UndoService.shared.dismissUndoFailure()
+            uninstall(fixture)
+        }
+        // A completed IMAP move with no proven destination UID: the Undo is refused.
+        let original = sourceHeader(fixture, providerId: "711", rfc: "refused@example.com")
+        try installOptimisticallyMoved(original, pool: fixture.pool)
+
+        let row = try await undoThroughTheControl(original, fixture: fixture)
+
+        #expect(row?.folderPath == "Archive", "the refused Undo moves nothing back")
+        #expect(UndoService.shared.undoFailureMessage == UndoService.moveUndoRefusedMessage,
+                "a refused move Undo must tell the user it did not take")
+    }
+
+    @Test("A move Undo that restores raises no notice")
+    @MainActor
+    func restoringMoveUndoRaisesNoNotice() async throws {
+        let fixture = try install(provider: .gmail)
+        UndoService.shared.dismissUndoFailure()
+        defer {
+            UndoService.shared.dismissAll()
+            UndoService.shared.dismissUndoFailure()
+            uninstall(fixture)
+        }
+        let original = sourceHeader(fixture, providerId: "gmail-711", rfc: "restored@example.com", sourceEpoch: nil)
+        try installOptimisticallyMoved(original, pool: fixture.pool)
+
+        let row = try await undoThroughTheControl(original, fixture: fixture)
+
+        #expect(row?.folderPath == "INBOX", "precondition: this Undo restores the message")
+        #expect(UndoService.shared.undoFailureMessage == nil, "a restoring Undo shows no failure notice")
+    }
+
     @Test("Completed IMAP Undo without a proven destination UID and epoch fails closed with zero local or provider mutation")
     @MainActor
     func completedImapWithoutDestinationProofFailsClosed() async throws {

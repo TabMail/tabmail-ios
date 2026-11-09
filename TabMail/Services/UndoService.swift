@@ -198,6 +198,17 @@ final class UndoService {
     /// instead of leaving the queued closure with a deleted primary key.
     private var undoInProgressAction: UndoableAction?
     private var undoInProgressRemainingCommands = 0
+
+    /// Set when `AccountManager.undoMove` refused a move Undo, whatever the
+    /// reason: the messages stay where the move put them. RootView shows it as
+    /// one short "Couldn't undo" notice; `dismissUndoFailure()` clears it.
+    private(set) var undoFailureMessage: String?
+
+    static let moveUndoRefusedMessage = "Nothing was moved back."
+
+    func dismissUndoFailure() {
+        undoFailureMessage = nil
+    }
     private var dbPool: PrioritizedDatabase { AppDatabase.dbPool }
 
     private init() {}
@@ -501,6 +512,7 @@ final class UndoService {
                         NotificationCenter.default.post(
                             name: .inboxDataDidChange,
                             object: command.members.map(\.originalHeaderId))
+                        UndoService.shared.undoFailureMessage = UndoService.moveUndoRefusedMessage
                     }
                 }
                 await MainActor.run {

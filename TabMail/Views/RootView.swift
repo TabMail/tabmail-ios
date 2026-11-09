@@ -60,6 +60,7 @@ struct RootView: View {
     /// retained Draft without accepting a replacement owner or generation.
     @State private var reopenSnapshot: PendingSendService.ReopenSnapshot?
     private var pendingSendService: PendingSendService { PendingSendService.shared }
+    private var undoService: UndoService { UndoService.shared }
 
     /// Sync status values — observed once here and published to descendants via
     /// Environment. Centralising here keeps the observer alive across sidebar
@@ -274,6 +275,12 @@ struct RootView: View {
         if !tutorial.isRunning { requestPushPermissionAfterTutorial() }
     }
 
+    /// Clears both "Couldn't undo" notices, the Send one and the move one.
+    private func dismissUndoFailures() {
+        pendingSendService.dismissUndoFailure()
+        undoService.dismissUndoFailure()
+    }
+
     /// The launch-time notification request (TabMailApp.init) waits while the
     /// first-launch welcome or the tutorial is up: no permission prompt
     /// during them. Asked here once they are done.
@@ -395,13 +402,15 @@ struct RootView: View {
         // cancellation change and left the toast in place. The durable Send may
         // still be queued or may already be sending, so this alert says only that
         // the Undo attempt did not take; it never promises the message was stopped.
+        // A refused move Undo (`UndoService.undoFailureMessage`) shows the same
+        // notice: nothing was moved back.
         .alert("Couldn't undo", isPresented: Binding(
-            get: { pendingSendService.undoFailureMessage != nil },
-            set: { if !$0 { pendingSendService.dismissUndoFailure() } }
+            get: { pendingSendService.undoFailureMessage != nil || undoService.undoFailureMessage != nil },
+            set: { if !$0 { dismissUndoFailures() } }
         )) {
-            Button("OK", role: .cancel) { pendingSendService.dismissUndoFailure() }
+            Button("OK", role: .cancel) { dismissUndoFailures() }
         } message: {
-            Text(pendingSendService.undoFailureMessage ?? "")
+            Text(pendingSendService.undoFailureMessage ?? undoService.undoFailureMessage ?? "")
         }
         .onReceive(NotificationCenter.default.publisher(for: .demoModeDidExit)) { _ in
             demoSeedingComplete = false

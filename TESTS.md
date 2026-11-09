@@ -1242,3 +1242,11 @@ rule-day and split-count suites of a later slice; nothing reads them yet.
   skipped, and across 1996-2004, where 2000 is listed).
 - Parked cases (fail on `main`, kept out of the run under their issue, `CalendarOracle.parked`):
   none in these families.
+
+## Refused move Undo notice
+
+`UndoProviderIdentitySafetyTests` drives a move Undo through `UndoService.undo`, the path the Undo
+control and shake take. When `AccountManager.undoMove` refuses it (here an IMAP move with no proven
+destination UID), the message stays where the move put it and `UndoService.undoFailureMessage` is
+set, which RootView shows as the "Couldn't undo" notice. An Undo that restores the message sets no
+notice.
