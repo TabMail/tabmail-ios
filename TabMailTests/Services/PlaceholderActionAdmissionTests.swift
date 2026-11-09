@@ -440,6 +440,20 @@ struct PlaceholderActionAdmissionTests {
         let f = try fixture(kind: kind, suffix: "landed")
         let saved = try seedUnsavedDraft(f)
         let realId = realProviderId(kind)
+        // The placeholder is searchable before the save, as an unsaved draft is.
+        let placeholderKey = ContentKey(rawValue: saved.placeholderHeaderId)
+        _ = try await SearchIndex.shared.indexHeaders([
+            FTSHeaderRecord(
+                contentKey: placeholderKey, headerId: saved.placeholderHeaderId,
+                messageId: PendingOperation.draftPlaceholderMessageId(draftId: saved.draftId, instanceEpoch: "E1"),
+                subject: "subject", from: "Sender <sender@example.com>",
+                to: "recipient@example.com", cc: "", bcc: "",
+                dateMs: Int64(Date().timeIntervalSince1970 * 1000),
+                folderId: MessageIdentity.folderId(accountId: f.accountId, folderPath: Self.draftsPath))
+        ])
+        let indexedBefore = try? await SearchIndex.shared.testRowidForHeader(placeholderKey)
+        #expect(indexedBefore != nil, "precondition: the placeholder is indexed")
+
         let mock = MockEmailProvider(saveDraftResult: .created(createdAddress(kind, realId: realId)))
         await AccountManager.shared.registerProviderForTesting(accountId: f.accountId, provider: mock)
 
@@ -457,6 +471,13 @@ struct PlaceholderActionAdmissionTests {
         #expect(placeholderLeft == nil, "the placeholder row survived a landed save")
         let row = try #require(rekeyed, "the landed save left no row under the server id")
         #expect(row.messageId == realId)
+
+        // The saved draft stays searchable, now under its server id.
+        let serverKey = ContentKey(rawValue: realHeaderId)
+        let indexedAtServer = try? await SearchIndex.shared.testRowidForHeader(serverKey)
+        let indexedAtPlaceholder = try? await SearchIndex.shared.testRowidForHeader(placeholderKey)
+        #expect(indexedAtServer != nil, "the saved draft dropped out of search")
+        #expect(indexedAtPlaceholder == nil, "the search row still names the placeholder")
 
         if kind == .imap {
             // A re-keyed IMAP row has its UID but no listed epoch until the
@@ -479,6 +500,7 @@ struct PlaceholderActionAdmissionTests {
         #expect(calls.contains { $0.hasPrefix("move(") && $0.contains(realId) },
                 "the delete never reached the server's id: \(calls)")
         #expect(!calls.contains { $0.contains("draft-") }, "a placeholder id reached the provider: \(calls)")
+        try? await SearchIndex.shared.removeMessages(contentKeys: [serverKey, placeholderKey])
         await finish(f)
     }
 
@@ -649,16 +671,17 @@ struct PlaceholderActionAdmissionTests {
         #expect(!IMAPProvider.placeholderIdsAreAddressable)
         #expect(!MockEmailProvider.placeholderIdsAreAddressable)
 
-        func resolved(_ accountId: String, _ provider: AccountProvider) -> String {
-            AccountManager.emailProviderType(forAccountId: accountId, provider: provider)
-                .map { String(describing: $0) } ?? "nil"
+        // Each account kind answers through the provider type that serves it:
+        // only the demo account, stored as IMAP, can act on a placeholder.
+        func account(_ provider: AccountProvider, demo: Bool = false) -> Account {
+            var a = Account(emailAddress: "user@example.com", displayName: "User", provider: provider)
+            if demo { a.id = DemoSeed.demoAccountId }
+            return a
         }
-        #expect(resolved("acct", .gmail) == String(describing: GmailProvider.self))
-        #expect(resolved("acct", .outlook) == String(describing: ExchangeProvider.self))
-        #expect(resolved("acct", .imap) == String(describing: IMAPProvider.self))
-        #expect(resolved("acct", .icloud) == String(describing: IMAPProvider.self))
-        #expect(resolved("acct", .caldav) == "nil")
-        #expect(resolved(DemoSeed.demoAccountId, .imap) == String(describing: DemoProvider.self))
+        for kind: AccountProvider in [.gmail, .outlook, .imap, .icloud, .caldav] {
+            #expect(!placeholderIdsAreAddressable(for: account(kind)), "\(kind)")
+        }
+        #expect(placeholderIdsAreAddressable(for: account(.imap, demo: true)))
     }
 
     @Test("In Demo Mode the Sent copy of a sent message can be marked, flagged and deleted")

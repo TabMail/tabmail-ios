@@ -986,3 +986,24 @@ enum ProviderError: LocalizedError {
 func isSyntheticPlaceholderId(_ id: String) -> Bool {
     id.hasPrefix("sent-") || id.hasPrefix("draft-")
 }
+
+/// `EmailProvider.placeholderIdsAreAddressable` of the provider type that serves
+/// `account`, read without a provider instance so admission can ask it inside a
+/// database write. The account-to-type mapping lives here, beside the protocol,
+/// so nothing above the provider boundary names a provider type. Demo is stored
+/// as IMAP but is served by `DemoProvider`; an account kind with no mail
+/// provider (CalDAV) answers `false`.
+func placeholderIdsAreAddressable(for account: Account) -> Bool {
+    let type: (any EmailProvider.Type)?
+    if account.id == DemoSeed.demoAccountId {
+        type = DemoProvider.self
+    } else {
+        switch account.provider {
+        case .gmail: type = GmailProvider.self
+        case .outlook: type = ExchangeProvider.self
+        case .imap, .icloud: type = IMAPProvider.self
+        case .caldav: type = nil
+        }
+    }
+    return type?.placeholderIdsAreAddressable ?? false
+}

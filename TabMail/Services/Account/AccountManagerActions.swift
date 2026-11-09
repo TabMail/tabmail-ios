@@ -608,22 +608,6 @@ extension AccountManager {
         return epoch
     }
 
-    /// The provider type that backs an account, for the type-level provider
-    /// properties admission reads. Demo is stored as IMAP but is backed by
-    /// `DemoProvider`. `nil` for an account kind that has no mail provider.
-    nonisolated static func emailProviderType(
-        forAccountId accountId: String,
-        provider: AccountProvider
-    ) -> (any EmailProvider.Type)? {
-        if accountId == DemoSeed.demoAccountId { return DemoProvider.self }
-        switch provider {
-        case .gmail: return GmailProvider.self
-        case .outlook: return ExchangeProvider.self
-        case .imap, .icloud: return IMAPProvider.self
-        case .caldav: return nil
-        }
-    }
-
     /// T2.4 provider-address admission. This is the v3 provider-ID adaptation
     /// of the inverse re-key in v2final commit `a75196398`: ordinary actions
     /// persist the provider's native address, while IMAP additionally proves
@@ -663,16 +647,17 @@ extension AccountManager {
             // A local placeholder row (`sent-…`, `draft-…`) has no address on
             // a server, so unless the account's provider can act on it
             // (`EmailProvider.placeholderIdsAreAddressable`, only the local demo
-            // mailbox) it is never admitted and stays pending. A saved draft's
-            // row takes its real id in the same write that records the save
-            // (`DraftStore.pushDraftToServer`); a Sent copy's real row arrives
-            // with a later sync, which also removes the placeholder. On Gmail a
+            // mailbox) it is never admitted: the action is reported pending and
+            // nothing retries it, so the user repeats it once the real row
+            // exists. A saved draft's row normally takes its real id in the same
+            // write that records the save (`DraftStore.pushDraftToServer`); a
+            // placeholder re-created after that write stays until the draft's
+            // next save or a sync. A Sent copy's real row arrives with a later
+            // sync, which also removes the placeholder. On Gmail a
             // draft placeholder the save could not re-key stays refused until a
             // full sync drops it (see tabmail-ios#482 for when it can outlive
             // those syncs). The IMAP arm below refuses it too, as a non-UID.
-            let placeholdersAddressable = Self.emailProviderType(
-                forAccountId: accountId, provider: account.provider)?
-                .placeholderIdsAreAddressable ?? false
+            let placeholdersAddressable = placeholderIdsAreAddressable(for: account)
             let admitted = messages.filter {
                 !$0.messageId.isEmpty
                     && (placeholdersAddressable || !isSyntheticPlaceholderId($0.messageId))
