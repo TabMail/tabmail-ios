@@ -285,7 +285,12 @@ master GET, and CalDAV sends no PUT.
 `ExchangeSentMessageIdTests` reads the requests `ExchangeProvider.send` makes on `FakeHTTP`. The
 Outbox keys its optimistic Sent row by the Message-ID it generated, and sync replaces that row only
 with a Sent Items copy whose `internetMessageId` matches; Graph answers a send with no id of its own.
-A send without files asks `sendMail` for that id as PidTagInternetMessageId (`String 0x1035`), in
-angle brackets whether or not the stored id has them, and it normalizes to the key the row holds. A
-send with files creates its draft carrying the id, then sends that draft. A draft save (create and
-update) does not set it: its answer names the server copy.
+A send without files asks `sendMail` for that id as the message's `internetMessageId`, in angle
+brackets whether or not the stored id has them, and it normalizes to the key the row holds. A send
+with files creates its draft carrying the id, then sends that draft. A reply, on either route, carries
+the id together with In-Reply-To (`String 0x1042`) and References (`String 0x1039`) and no other
+extended property. A draft save (create and update) does not set the id: `DraftStore` gives every
+save a fresh one, and a Message-ID once set should stay constant. `ExchangeOutboxSentMessageIdTests`
+drives the real Outbox send (`sendClaimedOutboxMessageForTesting`) for an Outlook account over
+`FakeHTTP`, on both routes, and checks that the id Graph is asked for, the optimistic Sent row's key
+and the claim's `sentMessageId` are one id.
