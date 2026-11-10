@@ -279,7 +279,7 @@ extension SyncEngine {
 
     // MARK: - Shared server-confirmed deletion path (Phases 1 + 2 both land here)
 
-    /// Delete local headers for UIDs the server has CONFIRMED absent, applying
+    /// Delete local headers for provider ids the server has CONFIRMED absent, applying
     /// the SAME protections as the windowed stale flow in `runSyncMessages`
     /// (SyncEngineFullSync.swift): pending ops targeting this folder (source
     /// OR destination — an optimistic move places the row at the destination
@@ -291,26 +291,30 @@ extension SyncEngine {
     /// drain conflict handling (the op no-ops server-side and is dropped), and
     /// the count-mismatch evidence re-fires the reconcile after the queue drains.
     ///
+    /// `ids` are provider message ids (`MessageHeader.messageId`): the UID as a
+    /// string for IMAP, the provider's own id elsewhere. This is the ONE removal
+    /// path for every server-confirmed deletion — IDLE VANISHED, the count-mismatch
+    /// walk and the catch-up listing (ADR-IOS-107) all land here.
+    ///
     /// Returns the deleted header ids (for the FTS-removal channel).
     nonisolated static func deleteConfirmedGhostHeaders(
         folderId: String,
         folderPath: String,
         accountId: String,
         folderRole: FolderRole,
-        uids: [UInt32],
+        ids: [String],
         recentlyCompleted: [String: Date],
         db: Database
     ) throws -> [String] {
-        guard !uids.isEmpty else { return [] }
+        guard !ids.isEmpty else { return [] }
 
         // Load candidate rows by EXACT messageId membership (messageId IS the
         // UID for IMAP — pure membership, no UID/date window; ADR-IOS-042-safe).
-        let uidStrings = uids.map(String.init)
         var candidates: [MessageHeader] = []
         let sqlChunkSize = SyncConfig.sqlChunkSize
-        for start in stride(from: 0, to: uidStrings.count, by: sqlChunkSize) {
-            let end = min(start + sqlChunkSize, uidStrings.count)
-            let chunk = Array(uidStrings[start..<end])
+        for start in stride(from: 0, to: ids.count, by: sqlChunkSize) {
+            let end = min(start + sqlChunkSize, ids.count)
+            let chunk = Array(ids[start..<end])
             candidates += try MessageHeader
                 .filter(Column("folderId") == folderId && chunk.contains(Column("messageId")))
                 .fetchAll(db)
@@ -357,22 +361,22 @@ extension SyncEngine {
     /// (`staleIds → removeHeadersFromFTS`) + unread recount.
     /// Throws on DB failure so callers can abort (never mask failures).
     @discardableResult
-    func deleteServerConfirmedDeletions(folder: Folder, uids: [UInt32], reason: String) async throws -> Int {
-        guard !uids.isEmpty else { return 0 }
+    func deleteServerConfirmedDeletions(folder: Folder, ids: [String], reason: String) async throws -> Int {
+        guard !ids.isEmpty else { return 0 }
         let folderId = folder.id
         let folderPath = folder.path
         let accountId = folder.accountId
         let folderRole = folder.role
         let deletedIds: [String] = try await dbPool.write { db in
             // Protection set read INSIDE the transaction (expiry-filtered at read),
-            // so a completion landing during the SELECT/SEARCH that produced `uids`
+            // so a completion landing during the SELECT/SEARCH that produced `ids`
             // is honoured — same rule as `runSyncMessages` (issue #106).
             try Self.deleteConfirmedGhostHeaders(
                 folderId: folderId,
                 folderPath: folderPath,
                 accountId: accountId,
                 folderRole: folderRole,
-                uids: uids,
+                ids: ids,
                 recentlyCompleted: AccountManager.shared.liveRecentlyCompleted(),
                 db: db
             )
@@ -412,7 +416,7 @@ extension SyncEngine {
                 }
                 return
             }
-            try await deleteServerConfirmedDeletions(folder: inbox, uids: uids, reason: "IDLE VANISHED")
+            try await deleteServerConfirmedDeletions(folder: inbox, ids: uids.map(String.init), reason: "IDLE VANISHED")
         } catch {
             // DB failure (e.g. suspension) — abandon; the Phase 2 count-mismatch
             // trigger re-fires on the next sync pass (ADR-IOS-046).
@@ -491,7 +495,7 @@ extension SyncEngine {
             },
             deleteGhosts: { ghosts in
                 try await self.deleteServerConfirmedDeletions(
-                    folder: capturedFolder, uids: ghosts, reason: "reconcile walk"
+                    folder: capturedFolder, ids: ghosts.map(String.init), reason: "reconcile walk"
                 )
             }
         )

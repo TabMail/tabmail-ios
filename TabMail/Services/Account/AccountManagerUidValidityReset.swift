@@ -714,6 +714,7 @@ extension AccountManager {
                 if var folder = try Folder.fetchOne(db, key: folderId) {
                     folder.lastKnownUidNext = nil
                     folder.lastKnownHighestModSeq = nil
+                    folder.catchUpState = nil
                     folder.backfillComplete = false
                     folder.backfillUidCursor = nil
                     folder.backfillPageToken = nil

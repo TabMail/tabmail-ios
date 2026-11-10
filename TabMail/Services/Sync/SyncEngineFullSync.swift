@@ -160,6 +160,9 @@ extension SyncEngine {
                     var folder = Folder(name: info.name, path: info.path, role: info.role, accountId: account.id)
                     folder.totalCount = info.totalCount
                     folder.lastKnownUidNext = info.uidNext
+                    // This STATUS is the folder's first: the catch-up's first listing
+                    // stamps itself with it (ADR-IOS-107).
+                    folder.lastKnownHighestModSeq = info.highestModSeq
                     // A brand-new row is by definition a first observation — the same
                     // bootstrap rule, which here also filters the `0` = "not reported"
                     // sentinel out of the column.
@@ -491,6 +494,14 @@ extension SyncEngine {
                 }
             }
         }
+
+        // ADR-IOS-107: catch up server-side changes to older mail that no window above
+        // reaches (a read/flag change or a removal on an old message). One provider
+        // call for every syncable folder, applied through the paths above, inside this
+        // pass's lock and bounded by `SyncConfig.catchUpPassBudgetSeconds` plus one
+        // `catchUpRequestTimeoutSeconds`. Generic: a provider without catch-up returns
+        // nothing. Never throws, so it cannot trigger the caller's retry.
+        await runCatchUp(provider: provider, folderIds: syncableFolders.map(\.id))
 
         // Body fetching happens during backfill (startBackfill called after fullSync).
         // Running it inline here would block sync and explode memory for large folders.

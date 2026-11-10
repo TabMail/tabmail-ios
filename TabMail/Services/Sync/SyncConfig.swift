@@ -675,6 +675,32 @@ enum SyncConfig {
     /// folder; with it the walk aborts before the offending chunk.
     static let deletionReconcileCapSlack = 50
 
+    // MARK: - Catch-up of older mail (ADR-IOS-107)
+
+    /// Time budget for the whole catch-up step of one full-sync pass, across every
+    /// folder (seconds). Checked before EVERY provider request, so the step stops
+    /// issuing requests once it is spent. It runs under the one-sync-at-a-time lock
+    /// (ADR-IOS-104), so this is the typical added hold of a pass.
+    static let catchUpPassBudgetSeconds: TimeInterval = 2
+    /// Timeout for ONE catch-up request (seconds). A request that starts just inside
+    /// the budget can run this long, so the worst-case added hold is
+    /// `catchUpPassBudgetSeconds + catchUpRequestTimeoutSeconds` (about 5 s). A
+    /// timeout ends the step for the pass; the state written so far resumes it.
+    static let catchUpRequestTimeoutSeconds: TimeInterval = 3
+    /// How often a folder gets a full listing even when nothing signals a change
+    /// (seconds). Runs only on a non-expensive network, oldest folder first.
+    static let catchUpFullCheckIntervalSeconds: TimeInterval = 86_400
+    /// The longest a folder's full listing waits for a non-expensive network
+    /// (seconds), counted from its last completed listing, or from the catch-up's
+    /// first sight of the folder. After that it runs on any network, inside the
+    /// same pass budget, so a device that is always on cellular or a hotspot still
+    /// gets a full catch-up. About 50 bytes per message.
+    static let catchUpExpensiveNetworkMaxWaitSeconds: TimeInterval = 7 * 86_400
+    /// Width of one IMAP listing range, in UIDs (`UID FETCH lo:hi (UID FLAGS)`).
+    /// About 50 bytes per message on the wire, so a dense range stays far inside
+    /// the request timeout even on a slow link.
+    static let catchUpListingRangeSpan = 1000
+
     // MARK: - Sent-Reply Parent Discovery
 
     /// When sync discovers a Sent-folder reply, we mark the parent message's

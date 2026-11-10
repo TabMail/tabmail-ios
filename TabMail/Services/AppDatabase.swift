@@ -4255,6 +4255,19 @@ final class AppDatabase: Sendable {
                 WHERE typeof(updatedAt) IN ('integer', 'real')
                 """)
         }
+
+        // ADR-IOS-107: the provider's opaque per-folder catch-up state (where a
+        // listing of older mail resumes, and the stamp its cheap check compares).
+        // Nullable, no default: NULL means "no catch-up state yet", which is the
+        // correct start for every existing folder. Convergence: a fresh install and
+        // an upgraded DB both end with one nullable TEXT column and every row NULL.
+        migrator.registerTimedMigration(
+            "v98_addFolderCatchUpState", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "folder") { t in
+                t.add(column: "catchUpState", .text)
+            }
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

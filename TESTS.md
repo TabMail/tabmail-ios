@@ -610,3 +610,63 @@ parameter through `ICSValueType.statesDate`, which compares it whole, never as a
 `CalendarEditKeepsKindTests`, a CalDAV event stored with `VALUE=DATE-TIME` and moved with a start alone lands as a
 timed event and keeps its length, and such a weekly series split this-and-following is capped with a date-time
 `UNTIL` and continues as a timed series at the new time, in its own zone, with the same length.
+
+## Catch-up of older mail (IMAP and the generic apply)
+
+`IMAPCatchUpTests` drives the real `IMAPProvider.catchUp` against `FakeIMAPServer` (with `CONDSTORE`)
+and applies through the real `SyncEngine.runCatchUp`. Each test asserts the local rows the user sees.
+The property: a server-side change to mail older than every sync window reaches the device, and
+nothing is ever decided about a UID whose numbering is unproven (ADR-IOS-107). Covered:
+
+- **Flags.** A read or flag change made elsewhere is applied, and unchanged messages stay as they are.
+- **Removals.** A removal applies only when the server proves it: an expunged UID goes, while a UID
+  whose FETCH record is missing (a short FETCH) but which `UID SEARCH` still finds stays.
+- **Queued ops.** A queued flag op wins over the server's value, per message.
+- **Budget.** An exhausted budget resumes on the next pass from the stored UID cursor. No request
+  starts after the budget is spent, the removal proof included.
+- **Not the backfill.** With a partial backfill, no command names a UID below the lowest local UID or
+  above the highest, and no row is inserted.
+- **Always-expensive network.** After `SyncConfig.catchUpExpensiveNetworkMaxWaitSeconds` without a
+  completed listing, a folder lists on an expensive network: one never listed, one on a server
+  without CONDSTORE, and one whose listing was parked. The first sight of a folder on an expensive
+  network writes when the wait began and makes no request.
+- **A new folder.** A folder the full sync itself created follows an older-mail change on the next
+  pass.
+- **A just-completed user action** wins over a stale listing, per message.
+- **Order.** Under budget pressure the folder whose listing was tried longest ago goes first.
+  A folder whose request fails on every pass goes behind the others, and so does one that completes
+  and is due again, so the folder behind is listed on the next pass (`failingFolderGoesToTheBack`,
+  `completedFolderGoesToTheBack`).
+- **A request that stalls or fails.** A stalled listing or removal proof is abandoned at the request
+  timeout and applies nothing (`FakeIMAPServer.stallNextCommand`). A failed listing keeps what earlier
+  ranges proved and resumes at the failed range; a failed proof removes nothing and is retried; one
+  folder's failure does not cost the next folder its pass.
+- **Epoch.**
+  - A state from another UIDVALIDITY restarts the listing at UID 1.
+  - A turnover seen on the wire applies nothing (no row removed even though none of the local UIDs
+    exists in the new numbering), writes no state and raises the turnover reaction.
+  - A folder with an unknown epoch gets no listing.
+- **The first-stamp invariant (required).** A flag change made mid-listing to an already-listed
+  range is applied by the re-list that the moved counter triggers. It fails if the completion stamp
+  is the last range's.
+- **Nothing due.** No request is sent when HIGHESTMODSEQ is unchanged and the daily check is not due.
+- **Network.** The daily check waits for a non-expensive network, while a HIGHESTMODSEQ change still
+  lists on an expensive one.
+- **Turnover shapes.** A turnover that reuses the same UIDs applies no flags; one that lands between
+  a range's listing and its removal proof removes nothing.
+- **The pure plan.** `catchUpPlan` is checked for the cheap check, the interval, the network, a
+  server without CONDSTORE, a listing in progress keeping its first stamp and waiting on an expensive
+  network, and the bounded wait.
+
+`CatchUpApplyTests` covers the generic apply on stub results:
+
+- flag updates, a removal and the new state all land together, and no row is added;
+- a folder whose numbering is being reset accepts nothing;
+- a result from another epoch is reported as a turnover and applies nothing;
+- a `.uid` result that names no epoch applies nothing, and neither does a folder whose stored epoch
+  is unknown;
+- the default provider returns nothing and nothing is written;
+- the local-row reader reads by numeric range (numeric order), first id, id list and ordered scan.
+
+`FolderCatchUpStateMigrationTests` checks that v98 adds a nullable `TEXT` column and leaves existing
+folders without state.

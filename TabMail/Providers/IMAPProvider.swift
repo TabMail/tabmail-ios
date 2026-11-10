@@ -6640,6 +6640,47 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
+    /// The catch-up listing's one wire request for a UID range (ADR-IOS-107):
+    /// SELECT, then `UID FETCH from:to (UID FLAGS)` on the same folder connection.
+    /// Returns the read/flagged state of every message the server listed in the
+    /// range, keyed by UID, together with the UIDVALIDITY of THIS SELECT (`0` = not
+    /// reported), so the caller judges every UID against the epoch it was served in.
+    ///
+    /// A record that carries no parseable UID makes the whole range unanswerable —
+    /// it cannot say which message it describes — so this THROWS rather than
+    /// returning a listing with a hole in it, which the caller would read as a
+    /// removal (the `liveSourceUIDs` rule). A UID absent from the result is only a
+    /// CANDIDATE removal: the caller still confirms it with
+    /// `searchExistingUIDs(folder:uids:)`, because a short FETCH is a real server
+    /// shape (`[IMAP-FETCH-GAP]`, MIS-IOS-002).
+    func listFlagsInUIDRange(
+        folder: String, from: Int, to: Int
+    ) async throws -> (flags: [UInt32: (isRead: Bool, isFlagged: Bool)], uidValidity: UInt32) {
+        guard from >= 1, to >= from else { return ([:], 0) }
+        try Task.checkCancellation()
+        return try await withFolderConnection(folder: folder) { server in
+            let selection = try await selectMailboxTracked(server, folder: folder)
+            let infos = try await server.fetchMessageInfos(
+                uidRange: UID(UInt32(from))...UID(UInt32(to)), options: .uidFlagsOnly)
+            var flags: [UInt32: (isRead: Bool, isFlagged: Bool)] = [:]
+            for info in infos {
+                guard let uid = info.uid else {
+                    if DebugModeManager.isLoggingEnabled() {
+                        BackgroundSyncLogger.logDebug("[CatchUp] '\(folder)' \(from):\(to): a FETCH record carried no UID — the range is unanswerable this pass")
+                    }
+                    throw IMAPCatchUpRangeInconclusive.unparsedUid(folder: folder)
+                }
+                flags[uid.value] = (info.flags.contains(.seen), info.flags.contains(.flagged))
+            }
+            return (flags, selection.uidValidity.value)
+        }
+    }
+
+    /// The listing request above could not say which messages a range holds.
+    enum IMAPCatchUpRangeInconclusive: Error {
+        case unparsedUid(folder: String)
+    }
+
     /// Fetch message headers for a UID range (from...to inclusive).
     /// Creates a UIDSet from the range and fetches in sub-batches with per-batch lock.
     /// Server returns only UIDs that exist — gaps (deleted messages) are silently skipped.

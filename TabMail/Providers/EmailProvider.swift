@@ -470,6 +470,17 @@ protocol EmailProvider: Sendable {
     /// Returns successfully fetched messages keyed by message ID.
     /// Throws on connection-level errors. Individual message failures are omitted from result.
     func fetchMessagesBatch(ids: [String], folder: String) async throws -> [String: FullMessageInfo]
+
+    /// Catch up server-side changes to older mail (ADR-IOS-107; types and the
+    /// do-nothing default in `EmailProviderCatchUp.swift`). Called once per full-sync
+    /// pass with all of the pass's syncable folders, whose `catchUpState` is this
+    /// provider's own opaque state. The provider decides per folder between nothing,
+    /// a cheap check and a listing, checks `context.hasBudget()` before every
+    /// request, and returns what it proved. Never throws: a failure ends that
+    /// folder's work for the pass.
+    func catchUp(
+        folders: [Folder], localRows: any CatchUpLocalRowReader, context: CatchUpContext
+    ) async -> [CatchUpFolderResult]
 }
 
 /// #217: draft copies (`fetchDraftCopy`).
