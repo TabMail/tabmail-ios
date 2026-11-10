@@ -18,9 +18,10 @@ import Testing
 /// from: through the whole-folder branch on every provider, and through the date
 /// window on Gmail and Outlook.
 ///
-/// Reachability is measured with the production resolver,
-/// `LocallyAuthoredDraftOpenAuthority.resolve`, over every Drafts header: the
-/// question is whether any row still opens the user's draft.
+/// Reachability is measured through the production open route,
+/// `ServerDraftComposeLoader.resolveOpenAuthority`, with a provider of the
+/// account's runtime kind registered, over every Drafts header the server did
+/// not list: the question is whether any row still opens the user's draft.
 ///
 /// The other two tests pin the scope from the other side: a placeholder whose
 /// draft is gone, or whose draft has a server copy, is still removed, so no row
@@ -225,16 +226,45 @@ struct NeverUploadedDraftPlaceholderSyncTests {
         return try #require(try f.pool.read { db in try Folder.fetchOne(db, key: key) })
     }
 
-    /// Every draft id some Drafts row opens, through the production resolver.
-    private func openableDraftIds(_ f: Fixture) throws -> [String] {
-        try f.pool.read { db in
-            let folderId = MessageIdentity.folderId(accountId: f.accountId, folderPath: Self.draftsPath)
-            return try MessageHeader.filter(Column("folderId") == folderId).fetchAll(db)
-                .compactMap { header in
-                    try LocallyAuthoredDraftOpenAuthority.resolve(
-                        db: db, header: header, runtimeKind: f.item.runtimeKind)?.draftId
-                }
+    /// A provider of the case's runtime kind, as production registers one for
+    /// the account. Its HTTP goes to `http`, which has no routes.
+    private func provider(_ item: ProviderCase, http: FakeHTTP.Scenario) -> any EmailProvider {
+        switch item.runtimeKind {
+        case .gmail:
+            GmailProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+        case .outlook:
+            ExchangeProvider(userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+        default:
+            IMAPProvider(
+                host: "127.0.0.1", port: 1, username: "owner", password: "unused",
+                smtpHost: "127.0.0.1", smtpPort: 1, useTLS: false)
         }
+    }
+
+    /// Every draft id some Drafts row opens, through the production open route
+    /// (`ServerDraftComposeLoader.resolveOpenAuthority`, which every Drafts open
+    /// starts with). A row whose open throws opens nothing: production shows it
+    /// as a load failure. The rows named in `serverIds` are the server's other
+    /// drafts and are left out, as opening one reads the server.
+    @MainActor
+    private func openableDraftIds(_ f: Fixture, serverIds: [String] = []) async throws -> [String] {
+        let folderId = MessageIdentity.folderId(accountId: f.accountId, folderPath: Self.draftsPath)
+        let headers = try await f.pool.read { db in
+            try MessageHeader.filter(Column("folderId") == folderId).fetchAll(db)
+        }.filter { !serverIds.contains($0.messageId) }
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: f.accountId, provider: provider(f.item, http: http))
+        var opened: [String] = []
+        for header in headers {
+            if let draftId = try? await ServerDraftComposeLoader.resolveOpenAuthority(header: header)?.draftId {
+                opened.append(draftId)
+            }
+        }
+        await AccountManager.shared.unregisterProviderForTesting(accountId: f.accountId)
+        #expect(http.recordedCalls().isEmpty, "opening a never-uploaded draft reached the server")
+        return opened
     }
 
     // MARK: - The property
@@ -249,12 +279,14 @@ struct NeverUploadedDraftPlaceholderSyncTests {
         let f = try fixture(item, "keep-\(branch.rawValue)")
         defer { finish(f) }
         let (draftId, placeholderHeaderId) = try await saveThenUpdate(f)
-        #expect(try openableDraftIds(f) == [draftId], "the fixture's draft does not open before the sync")
+        let before = try await openableDraftIds(f)
+        #expect(before == [draftId], "the fixture's draft does not open before the sync")
 
         let server = serverDrafts(item, branch: branch)
         let result = try await runDraftsSync(f, messages: server.messages, limit: server.limit)
 
-        #expect(try openableDraftIds(f) == [draftId], """
+        let after = try await openableDraftIds(f, serverIds: server.messages.map(\.messageId))
+        #expect(after == [draftId], """
             after the full sync no Drafts row opens the draft the user wrote; its \
             content is still on the device but nothing reaches it
             """)
@@ -277,7 +309,8 @@ struct NeverUploadedDraftPlaceholderSyncTests {
         try await f.pool.writeWithoutTransaction { db in
             try DraftStore.applyDelete(id: draftId, expectedInstanceEpoch: Self.epoch, db: db)
         }
-        #expect(try openableDraftIds(f).isEmpty, "the placeholder still opens a draft that was deleted")
+        let opened = try await openableDraftIds(f)
+        #expect(opened.isEmpty, "the placeholder still opens a draft that was deleted")
 
         let server = serverDrafts(item, branch: branch)
         let result = try await runDraftsSync(f, messages: server.messages, limit: server.limit)

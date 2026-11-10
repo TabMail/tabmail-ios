@@ -1359,7 +1359,10 @@ enum ServerDraftComposeLoader {
             return nil
         }
 
-        if runtimeKind == .gmail {
+        // A placeholder id names a draft that was never uploaded, so only its
+        // local owner can open it, on every provider: Gmail's draft lookup
+        // refuses a placeholder id before any request.
+        if runtimeKind == .gmail, !isSyntheticPlaceholderId(header.messageId) {
             return try await resolveGmailDraft(header: header)
         }
 
