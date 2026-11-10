@@ -945,7 +945,54 @@ enum CalendarToolHelpers {
         guard let startDay = stringArgOpt(arguments, "start_iso").map({ String($0.prefix(10)) }) ?? targetStartDate.map({ String($0.prefix(10)) })
         else { return nil }
         guard String(endIso.prefix(10)) <= startDay else { return nil }
-        return "an all-day event's end_iso is the day after its last day, so it must be later than start_iso: give the next day, or all_day: false for a timed event"
+        return "this is an all-day event, so its end_iso is the day after its last day and must be later than start_iso. Ask the user how many days it should last, or whether it should \(allDayOrTimedQuestion)"
+    }
+
+    /// Why an edit of an all-day event cannot be written, or nil: the one rule the edit tool applies
+    /// before its confirmation card (so the assistant can ask the user first) and the queue applies
+    /// again before the write. The kind is `all_day` when the edit states it, else the stored
+    /// event's (`storedStart`, nil when the event was not read). A time of day is refused only for a
+    /// kind taken from the stored event (`allDayEditTimeRefusal`). The end is compared with
+    /// `start_iso`, else with the start the edit keeps: the stored start on `all`, the occurrence's
+    /// own date (`recurrence_id`'s) on `this_only` and `this_and_following` (`allDayEditEndRefusal`).
+    static func allDayEditRefusal(_ arguments: [String: JSONValue], storedStart: GCalDateTime?, scope: String, recurrenceId: String?) -> String? {
+        let stated = boolArg(arguments, "all_day")
+        guard stated ?? (storedStart?.date != nil) else { return nil }
+        if stated == nil, let reason = allDayEditTimeRefusal(arguments) { return reason }
+        let targetStartDate: String?
+        switch scope {
+        case "this_only", "this_and_following": targetStartDate = recurrenceId.map { String($0.prefix(10)) }
+        case "all": targetStartDate = storedStart.flatMap { $0.date ?? $0.dateTime.map { String($0.prefix(10)) } }
+        default: targetStartDate = nil
+        }
+        return allDayEditEndRefusal(arguments, allDay: true, targetStartDate: targetStartDate)
+    }
+
+    /// Why an edit that leaves `all_day` out cannot give an all-day event these times, or nil.
+    ///
+    /// A `start_iso` or `end_iso` with a time of day, for an event stored all-day, could mean a timed
+    /// event at that time or that date all day. Neither is a safe guess, so the edit is refused and the
+    /// assistant is told to ask the user which. A date alone, or at midnight (the shape
+    /// `formatDetailedEvent` prints for an all-day date, `…T00:00:00`), names no time of day. The
+    /// caller asks only when `all_day` is absent and the stored event is all-day: a stated
+    /// `all_day: true` keeps the date as stated, and `all_day: false` converts the event.
+    static func allDayEditTimeRefusal(_ arguments: [String: JSONValue]) -> String? {
+        let times = ["start_iso", "end_iso"].compactMap { stringArgOpt(arguments, $0) }
+        guard times.contains(where: namesTimeOfDay) else { return nil }
+        return "this is an all-day event, and the edit gives a time of day without all_day. Ask the user whether it should stay all-day (dates only, with end_iso the day after its last day) or \(allDayOrTimedQuestion)"
+    }
+
+    /// The second half of both all-day refusals: the timed alternative the assistant offers the user.
+    private static let allDayOrTimedQuestion =
+        "become a timed event (all_day: false, with the start time and how long it lasts), then retry with their answer"
+
+    /// Whether a naive ISO value names a time of day: its hour, minute or second is not zero. A
+    /// date alone, or a date at midnight, names none. Only the clock is read (`HH:MM[:SS]`), so an
+    /// offset or fraction after it is not taken for a time.
+    static func namesTimeOfDay(_ iso: String) -> Bool {
+        guard let t = iso.firstIndex(where: { $0 == "T" || $0 == " " }) else { return false }
+        let clock = iso[iso.index(after: t)...].prefix { $0.isNumber || $0 == ":" }
+        return clock.contains { $0.isNumber && $0 != "0" }
     }
 
     /// RFC 5545 `FREQ` is a closed token set. Returns the canonical token, or nil if unrecognised.

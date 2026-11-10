@@ -168,7 +168,10 @@ to plain moves, with the same disposition; and item 5's "a timed `start_iso` use
 now does not" now holds for every move, which is the rule the tool documents ("Omit to keep existing").
 Added at the same time: the queue refuses an all-day edit whose end date is on or before its start date
 (`CalendarToolHelpers.allDayEditEndRefusal`, `notSupported`, before any write including a split's cap
-`PUT`), and `calendar_event_edit` refuses it before its card when `all_day: true` is stated with both dates.
+`PUT`), and `calendar_event_edit` refuses it before its confirmation card. The tool and the queue call one
+function, `CalendarToolHelpers.allDayEditRefusal`: the tool with the event it reads for the card, so the
+assistant can ask the user before any card is shown, and the queue again before the write, because the event
+can change between the card and the drain.
 The start compared is `start_iso`'s date when the edit gives one; for an end-only edit it is the start the
 edit keeps, which is per scope: on `all` the event's stored start (from the read above, or one more read
 when an explicit `all_day: true` skipped it), on `this_only` and `this_and_following` the occurrence's own
@@ -177,6 +180,15 @@ comparing with it there would let a same-day end through to the cap and a zero-l
 override. On iOS an end-only edit keeps its start on every provider, so an inverted end is refused rather
 than written; this differs from the Thunderbird add-on, which keeps the event's length first and so never
 refuses an end-only edit.
+
+**A time of day on an all-day event, with `all_day` left out, is refused since 2026-11-10 (the #583 drop
+replaced).** #583 kept such an edit all-day and dropped the time (`buildGCalEventInput`'s `prefix(10)`). The
+user may have meant a timed event or that date all day, so the `.edit` case now refuses it
+(`CalendarToolHelpers.allDayEditTimeRefusal`, `notSupported`, beside the end refusal and before any write)
+when `all_day` is absent and the resolved kind is all-day, and both refusals tell the assistant to ask the
+user. A date at midnight (`…T00:00:00`, the read tools' shape for an all-day date) names no time of day
+(`namesTimeOfDay`). A stated `all_day` is still taken at its word (item 3): `true` keeps the date, `false`
+converts. The Thunderbird add-on refuses the same edit the same way.
 
 **Also corrected at the code on 2026-08-12 (R3), recorded here because the argument is not needed at the
 call site.** `validatedRRuleUntil`'s note claimed the pre-fix alternative on the split path was "a capped
