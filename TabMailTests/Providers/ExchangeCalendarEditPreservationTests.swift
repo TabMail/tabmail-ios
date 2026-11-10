@@ -917,7 +917,7 @@ struct ExchangeCalendarEditPreservationTests {
         let graph = FakeGraphCalendar([GraphFixture.seriesOnDeviceDay(id: "ser-z", start: seriesStart)])
         graph.install(on: http)
         let zone = GraphFixture.farEast
-        let patch = CalendarToolHelpers.buildGCalEventInput([
+        let patch = try CalendarToolHelpers.buildGCalEventInput([
             "start_iso": .string(spelling.spell(GraphFixture.wall(move.newStart, in: zone))),
             "end_iso": .string(spelling.spell(GraphFixture.wall(move.newStart.addingTimeInterval(1_800), in: zone))),
             "timezone": .string(zone),
@@ -980,7 +980,7 @@ struct ExchangeCalendarEditPreservationTests {
         let before = try #require(graph.event("ev-ad"))
         let day = String(GraphFixture.naive(GraphFixture.start).prefix(10))
         let newEndDay = String(GraphFixture.naive(GraphFixture.start.addingTimeInterval(2 * 86_400)).prefix(10))
-        let patch = CalendarToolHelpers.buildGCalEventInput(["end_iso": .string(newEndDay)], isAllDay: true)
+        let patch = try CalendarToolHelpers.buildGCalEventInput(["end_iso": .string(newEndDay)], isAllDay: true)
         #expect(patch.endDate == newEndDay && patch.startDate == nil && patch.startDateTime == nil)
 
         _ = try await makeProvider(http).updateEvent(eventId: "ev-ad", event: patch)
