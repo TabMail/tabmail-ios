@@ -99,6 +99,30 @@ struct ICSValueTypeTests {
                 == Self.tenUTC)
     }
 
+    @Test("the CalDAV split helpers read a VALUE=DATE-TIME master as timed, with its real length")
+    func splitHelpersTreatDateTimeAsTimed() throws {
+        let master = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN", "BEGIN:VEVENT",
+            "UID:vt-2", "DTSTAMP:20990101T000000Z",
+            "DTSTART;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T100000",
+            "DTEND;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T113000",
+            "RRULE:FREQ=WEEKLY", "SUMMARY:Review", "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+        #expect(CalDAVProvider.extractMasterDuration(from: master) == TimeInterval(90 * 60))
+        let out = try CalDAVProvider.buildNewSeriesInput(
+            masterICS: master, patch: GCalEventInput(),
+            newStartNaiveISO: "2099-03-16T10:00:00",
+            newStartZone: TimeZone(identifier: "America/Los_Angeles")!,
+            newRRule: "RRULE:FREQ=WEEKLY")
+        #expect(out.startDate == nil, "the new series was written all-day: \(out.startDate ?? "")")
+        #expect(out.startTimeZone == "America/Los_Angeles")
+        if let s = out.startDateTime.flatMap(Date.fromISO8601), let e = out.endDateTime.flatMap(Date.fromISO8601) {
+            #expect(e.timeIntervalSince(s) == TimeInterval(90 * 60))
+        } else {
+            Issue.record("no timed start/end: \(String(describing: out.startDateTime)) \(String(describing: out.endDateTime))")
+        }
+    }
+
     @Test("the CalDAV resource readers still treat VALUE=DATE as a day")
     func providerReadersTreatDateAsDay() {
         let ics = Self.calendar("DTSTART;VALUE=DATE:20990305", "DTEND;VALUE=DATE:20990306")
