@@ -282,6 +282,24 @@ struct CalendarToolHelpersFormatTests {
         #expect(!CalendarToolHelpers.formatDetailedEvent(event(conferenceUrl: nil)).contains("conference_url"))
     }
 
+    @Test("an event pill's notes put the join link first, then the description; without a join link they are the description")
+    func pillNotesCarryTheJoinLink() {
+        func event(description: String?, conferenceUrl: String?) -> GCalEvent {
+            GCalEvent(
+                id: "evt-online", summary: "Planning", location: nil, description: description,
+                start: nil, end: nil, attendees: nil, organizer: nil, recurrence: nil, transparency: nil, status: nil,
+                htmlLink: nil, created: nil, updated: nil, conferenceUrl: conferenceUrl
+            )
+        }
+        let link = "https://meet.example.com/meet/0000000000"
+        #expect(CalendarToolHelpers.eventPillNotes(from: event(description: "Agenda", conferenceUrl: link)) == "Join: \(link)\nAgenda")
+        #expect(CalendarToolHelpers.eventPillNotes(from: event(description: nil, conferenceUrl: link)) == "Join: \(link)")
+        #expect(CalendarToolHelpers.eventPillNotes(from: event(description: "", conferenceUrl: link)) == "Join: \(link)")
+        #expect(CalendarToolHelpers.eventPillNotes(from: event(description: "Agenda", conferenceUrl: nil)) == "Agenda")
+        #expect(CalendarToolHelpers.eventPillNotes(from: event(description: "Agenda", conferenceUrl: "")) == "Agenda")
+        #expect(CalendarToolHelpers.eventPillNotes(from: event(description: nil, conferenceUrl: nil)) == nil)
+    }
+
     @Test("Format all-day event")
     func formatAllDayEvent() {
         let event = GCalEvent(

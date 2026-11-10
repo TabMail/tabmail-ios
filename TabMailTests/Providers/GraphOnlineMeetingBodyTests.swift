@@ -111,6 +111,64 @@ struct GraphOnlineMeetingBodyTests {
         #expect(GraphOnlineMeetingBody.replacingNotes(in: GraphFixture.onlineBody, joinUrl: "", with: "New") == nil)
     }
 
+    /// The join link as it appears in notes: as given, or with `&` as `&amp;` (how
+    /// `replacingNotes` writes notes the assistant was handed the link in).
+    static let linkForms: [(layout: JoinLayout, escaped: Bool)] = JoinLayout.allCases.flatMap { [($0, false), ($0, true)] }
+
+    @Test("a copy of the join link in the notes is passed over: the notes are replaced and the join section kept",
+          arguments: linkForms)
+    func joinLinkInTheNotes(_ form: (layout: JoinLayout, escaped: Bool)) throws {
+        let link = form.escaped ? form.layout.joinUrl.replacingOccurrences(of: "&", with: "&amp;") : form.layout.joinUrl
+        let start = GraphFixture.htmlHead + "<p>Join here: <a href=\"" + link + "\">" + link + "</a></p>\r\n"
+        let rest = form.layout.section + GraphFixture.htmlTail
+
+        let out = try #require(GraphOnlineMeetingBody.replacingNotes(in: start + rest, joinUrl: form.layout.joinUrl, with: "New"))
+
+        #expect(out == GraphFixture.htmlHead + "\r\nNew\r\n" + rest)
+        #expect(GraphOnlineMeetingBody.beforeJoinSection(start + rest, joinUrl: form.layout.joinUrl).map(String.init) == start)
+    }
+
+    @Test("a line of underscores in the notes is part of the notes, not the join section's separator",
+          arguments: JoinLayout.allCases)
+    func separatorLikeLineInTheNotes(_ layout: JoinLayout) throws {
+        // Outlook's divider above a pasted earlier message is such a line.
+        let start = GraphFixture.htmlHead + "<p>Earlier thread</p>\r\n<div>" + String(repeating: "_", count: 32)
+            + "</div>\r\n<p>From: someone@example.com</p>\r\n"
+        let rest = layout.section + GraphFixture.htmlTail
+
+        let out = try #require(GraphOnlineMeetingBody.replacingNotes(in: start + rest, joinUrl: layout.joinUrl, with: "New"))
+
+        #expect(out == GraphFixture.htmlHead + "\r\nNew\r\n" + rest)
+        #expect(GraphOnlineMeetingBody.beforeJoinSection(start + rest, joinUrl: layout.joinUrl).map(String.init) == start)
+    }
+
+    @Test("with a line of underscores above a copy of the link in the notes, the whole join section is still kept",
+          arguments: JoinLayout.allCases)
+    func separatorLikeLineAboveALinkCopy(_ layout: JoinLayout) throws {
+        // The one shape the recogniser cannot tell apart: it places the section at the notes' line, too
+        // early, which keeps the old notes below that line and, above all, the join section.
+        let start = GraphFixture.htmlHead + "<div>" + String(repeating: "_", count: 32) + "</div>\r\n<p>Join: "
+            + layout.joinUrl + "</p>\r\n"
+        let rest = layout.section + GraphFixture.htmlTail
+
+        let out = try #require(GraphOnlineMeetingBody.replacingNotes(in: start + rest, joinUrl: layout.joinUrl, with: "New"))
+
+        #expect(out.hasSuffix(rest), "the join section was not kept whole")
+        #expect(out.hasPrefix(GraphFixture.htmlHead + "\r\nNew\r\n"))
+    }
+
+    @Test("trailing line breaks in new notes are dropped, so repeated edits do not grow the body")
+    func trailingLineBreaks() throws {
+        let rest = section
+        let html = GraphFixture.htmlHead + "Old\r\n" + rest
+
+        let once = try #require(GraphOnlineMeetingBody.replacingNotes(in: html, joinUrl: joinUrl, with: "Agenda\n\r\n"))
+        let twice = try #require(GraphOnlineMeetingBody.replacingNotes(in: once, joinUrl: joinUrl, with: "Agenda\n"))
+
+        #expect(once == GraphFixture.htmlHead + "\r\nAgenda\r\n" + rest)
+        #expect(twice == once)
+    }
+
     @Test("the document up to the join section is its start and the notes, for either layout and either join link",
           arguments: JoinLayout.allCases)
     func beforeJoinSection(_ layout: JoinLayout) {

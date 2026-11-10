@@ -63,16 +63,23 @@ turns the online meeting off (`isOnlineMeeting` false, `onlineMeetingProvider` `
 series and occurrence: the notes are replaced, the join section and everything after it are kept byte
 for byte, and the meeting stays on. Also: a read gives the stored notes as the description at full
 length (past the 255-character preview), an online meeting's without its join section and with its
-join link as `conferenceUrl`; a description read, added to and written back keeps the notes and the
-meeting; clearing the notes keeps the join section; and a layout without a separator line gets the
-description as text, as before.
+join link as `conferenceUrl`, by `getEvent` and by a `calendarView` listing (the fake lists single
+events and occurrences, never a series master); a description read, added to and written back keeps
+the notes and the meeting; after the join link is written into the notes, the next description edit
+still keeps the meeting; clearing the notes keeps the join section; and a layout without a separator
+line gets the description as text, as before.
 `GraphOnlineMeetingBodyTests` pins the recogniser over the live layout (found by either join link) and
 the older layout of Graph's online-meeting samples: bare-text and element notes, escaping and line
 breaks, a `<body>` tag with attributes or none, a join link
 written raw, a separator nested in several elements, the cases it does not recognise (no link, the
 separator only after it, a line shorter than `separatorMinUnderscores`, an unclosed `<body` tag, an
-empty link) and where the notes end. `ExchangeCalendarTests` maps an HTML, text or missing body to the
-description; `CalendarToolHelpersTests` pins the `conference_url:` line after the description.
+empty link) and where the notes end; a copy of the join link in the notes (as written and with
+`&amp;`) and a line of underscores in the notes are part of the notes; with both, the join section is
+still kept whole; trailing line breaks in new notes are dropped, so repeated edits do not grow the
+body. `ExchangeCalendarTests` maps an HTML, text or missing body to the
+description; `CalendarToolHelpersTests` pins the `conference_url:` line after the description and an
+event pill's notes (join link first); `ToolCachingTests` checks that the search and direct-read pill
+caches carry the join link.
 
 ## Inbox list — layered test architecture
 

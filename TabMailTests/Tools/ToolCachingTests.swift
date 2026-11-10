@@ -183,6 +183,25 @@ struct EventDetailCachingTests {
         #expect(detail?.location == "HQ")
     }
 
+    @Test("cacheEventDetailsForPills puts an online meeting's join link in the pill's notes")
+    func pillsCacheTheJoinLink() async {
+        let translator = makeTranslator()
+        let event = GCalEvent(
+            id: "evt-online-pill", summary: "Planning", location: nil, description: "Agenda",
+            start: nil, end: nil, attendees: nil, organizer: nil, recurrence: nil, transparency: nil, status: nil,
+            htmlLink: nil, created: nil, updated: nil, conferenceUrl: "https://meet.example.com/meet/0000000000"
+        )
+
+        await CalendarToolHelpers.cacheEventDetailsForPills(
+            [(event: event, accountId: "acct-1", calendarId: "cal-1", accessRole: "owner")],
+            translator: translator
+        )
+
+        let numericId = await translator.toNumericId(CompoundEventId.make(accountId: "acct-1", eventId: "evt-online-pill"))
+        let detail = await translator.resolveEventDetail(numericId)
+        #expect(detail?.notes == "Join: https://meet.example.com/meet/0000000000\nAgenda")
+    }
+
     @Test("cacheTemplateName stores and is retrievable via seed pattern")
     func templateNameCache() async {
         let translator = makeTranslator()
@@ -530,5 +549,47 @@ struct CalendarAllDayDefaultEndTests {
                 end by +1 day would silently extend every range the agent computed \
                 correctly. Expected \(explicitEnd), got \(Self.format(cards[0].endDate))
                 """)
+    }
+}
+
+// MARK: - The read tool's pill for an online meeting
+
+@Suite("calendar_event_read caches an online meeting's join link for its pill", .serialized, .processGlobalState)
+struct CalendarEventReadPillTests {
+
+    @Test("a direct read of an online meeting caches its join link in the pill's notes")
+    func directReadCachesTheJoinLink() async throws {
+        let accountId = "cal-read-pill"
+        let link = "https://meet.example.com/meet/0000000000"
+        let mock = MockCalendarProvider()
+        await mock.setGetEventResult(GCalEvent(
+            id: "evt-online", summary: "Planning", location: nil, description: "Agenda",
+            start: nil, end: nil, attendees: nil, organizer: nil, recurrence: nil, transparency: nil, status: nil,
+            htmlLink: nil, created: nil, updated: nil, conferenceUrl: link
+        ))
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer { Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) } }
+        let translator = MockChatIdTranslator()
+        await translator.seed(81, realId: CompoundEventId.make(accountId: accountId, eventId: "evt-online"))
+        // The calendar the read targets, as a prior search leaves it; its notes are not yet known.
+        await translator.cacheEventDetail(
+            realId: "evt-online", accountId: accountId, calendarId: "primary", calendarName: "Work",
+            title: "Planning", startDate: nil, endDate: nil, isAllDay: false,
+            location: nil, notes: nil, attendees: [], isRecurring: false, recurrenceRule: nil,
+            availability: "busy", htmlLink: nil, eventTimeZone: nil
+        )
+
+        let output = try await CalendarEventReadTool(context: ToolContext(db: try DatabaseQueue(), translator: translator))
+            .execute(arguments: ["event_id": .string("81")])
+        #expect(output.contains("conference_url: \(link)"), "setup: the read did not reach the event: \(output)")
+
+        // The read caches the pill detail in a detached task.
+        var notes: String?
+        for _ in 0..<200 {
+            notes = await translator.resolveEventDetail(81)?.notes
+            if notes != nil { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(notes == "Join: \(link)\nAgenda")
     }
 }

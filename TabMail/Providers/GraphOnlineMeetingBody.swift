@@ -46,17 +46,25 @@ enum GraphOnlineMeetingBody {
 
     /// Where the notes start (after the `<body>` tag, or at the start when there
     /// is none) and where the join section starts: at the element holding the
-    /// last separator line before the join link. Nil when there is no link to
-    /// `joinUrl` (as written, or with `&` as `&amp;`), no separator line before
-    /// it, or the `<body` tag never closes.
+    /// last separator line before the first link to `joinUrl` (as written, or
+    /// with `&` as `&amp;`) that has one before it. A copy of the link in the
+    /// notes, with no separator line above it, is passed over. Nil when no link
+    /// has a separator line before it, or the `<body` tag never closes.
+    ///
+    /// Taking the first such link can only place the section too EARLY (at a
+    /// separator-like line in the notes above a copy of the link), which keeps
+    /// the whole join section; it never places it inside the section.
     private static func joinSection(in html: String, joinUrl: String) -> (notesStart: String.Index, sectionStart: String.Index)? {
         guard !joinUrl.isEmpty, let notesStart = bodyContentStart(html) else { return nil }
-        let content = notesStart..<html.endIndex
-        let link = [joinUrl, joinUrl.replacingOccurrences(of: "&", with: "&amp;")]
-            .compactMap { html.range(of: $0, range: content)?.lowerBound }
-            .min()
-        guard let link, let separator = lastSeparator(in: html, from: notesStart, before: link) else { return nil }
-        return (notesStart, openingTagsStart(in: html, before: separator, floor: notesStart))
+        let forms = [joinUrl, joinUrl.replacingOccurrences(of: "&", with: "&amp;")]
+        var from = notesStart
+        while let link = forms.compactMap({ html.range(of: $0, range: from..<html.endIndex)?.lowerBound }).min() {
+            if let separator = lastSeparator(in: html, from: notesStart, before: link) {
+                return (notesStart, openingTagsStart(in: html, before: separator, floor: notesStart))
+            }
+            from = html.index(after: link)
+        }
+        return nil
     }
 
     /// Where the body's content starts: after the `<body …>` tag, or at the start
@@ -115,9 +123,13 @@ enum GraphOnlineMeetingBody {
         }
     }
 
-    /// Plain-text notes as HTML: escaped, each line break a `<br>`.
+    /// Plain-text notes as HTML: escaped, each line break a `<br>`. Trailing line
+    /// breaks are dropped: a `<br>` right before the join section would be read
+    /// as part of it (`openingTagsStart`) and kept by every later edit.
     private static func notesHTML(_ notes: String) -> String {
-        ICSBuilder.escapeHTML(notes)
+        var text = Substring(notes)
+        while text.last?.isNewline == true { text = text.dropLast() }
+        return ICSBuilder.escapeHTML(String(text))
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
             .replacingOccurrences(of: "\n", with: "<br>\r\n")

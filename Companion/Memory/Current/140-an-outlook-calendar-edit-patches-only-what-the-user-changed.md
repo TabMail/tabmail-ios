@@ -67,13 +67,21 @@ that aren't included in the request body maintain their previous values".
   `bodyPreview` (cut at 255 characters, join section rendered as text); an online meeting's notes stop
   at its join section, and its join link is `GCalEvent.conferenceUrl`, shown to the assistant as its own
   `conference_url:` line (the Thunderbird add-on's field name; the add-on does not fill it on read).
-  `isEmptySurfaceEvent` still reads `bodyPreview`.
+  `isEmptySurfaceEvent` still reads `bodyPreview`. An event pill's popover notes put the join link
+  first (`CalendarToolHelpers.eventPillNotes`, at every pill-cache writer built from an event), since
+  the description no longer holds it and the popover is where the user copies a meeting link from.
 - A description edit writes the user's text as the body. For an online meeting it replaces only the
   notes in the stored HTML body and keeps the join
   section as stored (`onlineMeetingBody`, `GraphOnlineMeetingBody`, #511): Graph's event-update warns
   that removing the "meeting blob" from the body turns the online meeting off. The join section is
   recognised by the join link (`onlineMeeting.joinUrl`, as written or with `&amp;`) and the last line of
   underscores before it; the section starts at the outermost element opening directly before that line.
+  The anchor is the FIRST copy of the link that has such a line before it, so a copy of the link in the
+  notes (the assistant is shown it and can be asked to put it there) is passed over, and a line of
+  underscores in the notes above the real section is not taken for its separator. The one shape it
+  cannot tell apart (a line of underscores in the notes above a copy of the link) places the section too
+  early, which keeps the join section whole; it never places it inside the section. New notes drop
+  trailing line breaks, since a `<br>` just before the section would be read as part of it.
   Checked live on a Teams meeting on a work account (#555): a text body write turned the meeting off
   (`isOnlineMeeting` false, `onlineMeetingProvider` `unknown`, `onlineMeeting` null); an HTML write that
   changed only the notes kept it. That layout: notes, then `<div>` + three `<br>` holding

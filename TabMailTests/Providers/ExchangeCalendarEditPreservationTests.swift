@@ -27,6 +27,9 @@ import Synchronization
 /// - a recurrence whose range has no `startDate` is refused with a 400
 ///   (`recurrenceRange`: "Required");
 /// - `$select` returns only the properties it names (`event-get`);
+/// - `calendarView` lists single events and occurrences, never a series master
+///   (`user-list-calendarview`); this fake lists every stored one, whatever the
+///   window, in no particular order;
 /// - a body written without an online meeting's join link turns the online
 ///   meeting off: "Inadvertently removing the meeting blob from the body would
 ///   disable meeting online" (event-update). Checked live on a work account: a
@@ -91,6 +94,14 @@ final class FakeGraphCalendar: Sendable {
             }
             guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
             return Self.json(Self.only(select, of: stored))
+        }
+        http.register(path: "/v1.0/me/calendarView", method: "GET") { [self] request in
+            if let status = takeFailure("GET") { return .status(status) }
+            let select = Self.selected(request.url)
+            let listed = events.withLock { Array($0.values) }
+                .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+                .filter { $0["recurrence"] == nil || $0["recurrence"] is NSNull }
+            return Self.json(["value": listed.map { Self.only(select, of: $0) }])
         }
         http.register(path: "/v1.0/me/events/", method: "PATCH") { [self] request in
             patchAuthorizationLog.withLock { $0.append(request.header("Authorization") ?? "none") }
@@ -1193,6 +1204,52 @@ struct ExchangeCalendarEditPreservationTests {
             #expect(description == "Agenda with bold notes and a [link](https://example.com/doc)")
             #expect(event.conferenceUrl == nil)
         }
+    }
+
+    @Test("a listing gives each event's stored notes in full as the description, an online meeting's without its join section, and its join link apart")
+    func listGivesTheNotes() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+
+        let listed = try await makeProvider(http).listEvents(
+            timeMin: GraphFixture.start.addingTimeInterval(-86_400), timeMax: GraphFixture.occurrenceStart.addingTimeInterval(86_400))
+
+        let online = try #require(listed.first { $0.id == "ev-online" })
+        let description = try #require(online.description)
+        #expect(description.components(separatedBy: "Long notes past the preview.").count == 13,
+                "the listed notes were cut: \(description)")
+        #expect(!description.contains("____") && !description.contains("Teams") && !description.contains("meet.example.com"),
+                "the join section is in the listed description: \(description)")
+        #expect(online.conferenceUrl == GraphFixture.joinUrl)
+        let plain = try #require(listed.first { $0.id == "ev-plain" })
+        #expect(plain.description == "Agenda with bold notes and a [link](https://example.com/doc)")
+        #expect(plain.conferenceUrl == nil)
+    }
+
+    @Test("after the assistant puts the join link in an online meeting's notes, the next description edit still keeps the meeting on")
+    func joinLinkWrittenIntoTheNotes() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let before = try #require(graph.event("ev-online"))
+        let read = try await provider.getEvent(eventId: "ev-online")
+        let link = try #require(read.conferenceUrl)
+        var withLink = GCalEventInput()
+        withLink.description = "Join here: " + link
+
+        _ = try await provider.updateEvent(eventId: "ev-online", event: withLink)
+        #expect(try #require(graph.event("ev-online"))["isOnlineMeeting"] as? Bool == true, "the first edit turned the meeting off")
+        #expect(try await provider.getEvent(eventId: "ev-online").description == "Join here: " + link)
+        var agenda = GCalEventInput()
+        agenda.description = "Agenda only"
+        _ = try await provider.updateEvent(eventId: "ev-online", event: agenda)
+
+        expectNewNotes("Agenda only", before: before, after: try #require(graph.event("ev-online")),
+                       label: "online meeting, edited after its notes held the join link")
     }
 
     @Test("an online meeting's description read, added to and written back keeps the notes in full and the meeting on")

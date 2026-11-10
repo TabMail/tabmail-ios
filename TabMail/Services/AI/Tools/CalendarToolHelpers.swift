@@ -641,6 +641,18 @@ enum CalendarToolHelpers {
         return lines.joined(separator: "\n")
     }
 
+    // MARK: - Notes for Pills
+
+    /// The notes an event pill's popover shows: the event's join link, when it has one, on the first
+    /// line, then its description. The description of an online meeting is its notes alone (the join
+    /// section is `conferenceUrl`), and the popover's notes are where the user copies a meeting link
+    /// from. First, so the popover's line limit never hides it.
+    static func eventPillNotes(from event: GCalEvent) -> String? {
+        guard let link = event.conferenceUrl, !link.isEmpty else { return event.description }
+        guard let notes = event.description, !notes.isEmpty else { return "Join: \(link)" }
+        return "Join: \(link)\n\(notes)"
+    }
+
     // MARK: - Attendee Parsing for Pills
 
     /// Build `[EventPillAttendee]` from a provider event's attendee list.
@@ -721,7 +733,7 @@ enum CalendarToolHelpers {
                 endDate: entry.event.endDate,
                 isAllDay: entry.event.isAllDay,
                 location: isFreeBusy ? nil : entry.event.location,
-                notes: isFreeBusy ? nil : entry.event.description,
+                notes: isFreeBusy ? nil : eventPillNotes(from: entry.event),
                 attendees: isFreeBusy ? [] : attendees,
                 isRecurring: !(entry.event.recurrence ?? []).isEmpty,
                 recurrenceRule: isFreeBusy ? nil : rrule,
