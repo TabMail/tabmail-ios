@@ -221,4 +221,8 @@ subscription that is active, trialing, past due, cancelled but not yet ended, un
 paused, or has no status counts as live, and `PlanPickerView.webManagedNote(for:)` then returns the
 one plain sentence that replaces the purchase options. An ended or never-completed web subscription,
 an Apple subscription, a signup trial (running or ended), no subscription, and an account not yet
-loaded all leave the plans on sale.
+loaded all leave the plans on sale. A status the app does not know counts as live.
+`viewHidesEveryPurchaseOptionBehindTheGate` reads the view's source (a hosted `PlanPickerView`
+fetches its own account) and pins the two gates: the billing toggle, plan cards, footnotes and Apple
+disclosure sit in the `else` of the sentence, Restore Purchases sits inside its own gate, and Cancel /
+Manage Subscription sits outside both.

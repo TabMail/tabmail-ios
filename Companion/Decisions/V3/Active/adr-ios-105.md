@@ -27,11 +27,12 @@ other side opens once it has ended.
 3. **Everything else is unchanged:** Apple subscribers keep the Cancel / Manage Subscription path;
    the pending-cancellation and pending-downgrade banners stay; a signup-trial or no-subscription
    account can buy.
-4. **The plans stay on sale until `/whoami` has loaded.** Hiding them until then would block every
-   buyer whenever the server is slow or unreachable. A purchase that still arrives for an account
-   with a live web subscription (this window, or an app version from before this decision) is caught
-   server-side: access is kept, an alert is raised, and support cancels and refunds the web
-   subscription by hand.
+4. **The plans and Restore Purchases stay available until `/whoami` has loaded.** Hiding them until
+   then would block every buyer whenever the server is slow or unreachable. A purchase or restore
+   that still arrives for an account with a live web subscription (this window, or an app version
+   from before this decision) is caught server-side: access is kept, an alert is raised, and support
+   cancels and refunds the web subscription by hand. That catch arrives with the server side of
+   this decision; until then such a purchase goes through the old automatic migration, as before.
 
 **Dependency:** the server sends `subscription_provider` and `subscription_status` only while the
 subscription grants access until its no-access branch sends them too (a separate server change).
