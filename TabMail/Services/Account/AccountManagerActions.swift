@@ -655,8 +655,8 @@ extension AccountManager {
             // next save or a sync. A Sent copy's real row arrives with a later
             // sync, which also removes the placeholder. On Gmail a
             // draft placeholder the save could not re-key stays refused until a
-            // full sync drops it (see tabmail-ios#482 for when it can outlive
-            // those syncs). The IMAP arm below refuses it too, as a non-UID.
+            // Drafts sync whose page reaches its latest save drops it. The IMAP
+            // arm below refuses it too, as a non-UID.
             let placeholdersAddressable = placeholderIdsAreAddressable(for: account)
             let admitted = messages.filter {
                 !$0.messageId.isEmpty
