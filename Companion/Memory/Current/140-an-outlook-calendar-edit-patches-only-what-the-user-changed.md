@@ -158,3 +158,11 @@ Correction to memory 064 (frozen fragment, not edited): an event pill's notes no
 `GCalEvent.description` alone. Every cache site and the live re-fetch use
 `CalendarToolHelpers.eventPillNotes(from:)`, which puts `Join: <conferenceUrl>` on the first line,
 because an Outlook online meeting's description is its notes without the join section.
+
+Series end date (#551): Graph's `recurrence.range.endDate` is an inclusive date read in the event's
+zone (`recurrenceTimeZone` is never sent). `ExchangeCalendarProvider.graphEndDate(until:in:startWallTime:)`
+dates a UTC-instant `UNTIL` in the event's zone, then applies the time-of-day rule: an `UNTIL` earlier
+in the day than the series' start ends the series the day before, as Google Calendar does. A date-only
+end arrives as 23:59:59 local, so it always stays the day the user named. A bare date or a floating
+value keeps its own date digits; there is no branch for the floating form, since no producer emits it
+for Outlook.

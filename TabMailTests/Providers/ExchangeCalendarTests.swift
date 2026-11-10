@@ -326,21 +326,192 @@ struct ExchangeCalendarRecurringTests {
         return f.date(from: "2026-05-14T22:00:00")!
     }
 
-    @Test("parseRRULEToGraphRecurrence converts a timestamp UNTIL to a YYYY-MM-DD endDate")
-    func parseRRULETimestampUntil() async {
-        let provider = makeProvider()
-        // googleUntilString emits the 16-char UTC form; the old parser only
-        // handled the bare 8-char date and left this malformed.
-        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20260527T235959Z", eventStart: nil)
-        let range = rec["range"] as? [String: Any]
+    // MARK: - #551: Graph's endDate is the series' last day in the EVENT's zone
+
+    /// A day relative to `now`, written in `format` in `zone` (never a hardcoded date). Each test
+    /// reads the clock once and passes it to every call, so a run across midnight cannot mix days.
+    private func relativeDay(_ days: Int, _ format: String, in zone: TimeZone, from now: Date) -> String {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = zone
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = cal
+        f.timeZone = zone
+        f.dateFormat = format
+        return f.string(from: cal.date(byAdding: .day, value: days, to: now)!)
+    }
+
+    /// Zones on both sides of UTC, including half-hour offsets and the extremes. A timed series is
+    /// labelled with each and the round trip reads its range in each, so those outcomes do not
+    /// depend on the simulator's zone. An all-day input carries no zone label, so for it the zone
+    /// only picks which day is today.
+    static let endDateZones = [
+        "America/Los_Angeles", "America/St_Johns", "UTC", "Asia/Kolkata", "Pacific/Kiritimati",
+    ]
+
+    /// How the user can say when a series that starts at 10:00 ends, as wall time in the event's
+    /// zone, and the day its last occurrence falls on relative to the day named: a date (read as
+    /// the end of that day), a time after the start, the start time itself (the bound is
+    /// inclusive), and times before it, where that day's 10:00 occurrence is past the end.
+    struct UntilCase: Sendable, CustomTestStringConvertible {
+        let wallTime: String?
+        let lastDayOffset: Int
+        var testDescription: String { "\(wallTime ?? "date only"), last day \(lastDayOffset)" }
+    }
+
+    static let untilCases = [
+        UntilCase(wallTime: nil, lastDayOffset: 0),
+        UntilCase(wallTime: "23:30:00", lastDayOffset: 0),
+        UntilCase(wallTime: "10:00:00", lastDayOffset: 0),
+        UntilCase(wallTime: "09:59:59", lastDayOffset: -1),
+        UntilCase(wallTime: "05:00:00", lastDayOffset: -1),
+    ]
+
+    /// INVARIANT (#551): **an Outlook series ends on the last day whose occurrence starts at or
+    /// before the user's end, in the event's zone**, as Google Calendar expands the same rule. The
+    /// user's end goes through the real producer (`buildGCalEventInput`, which writes a timed
+    /// series' `UNTIL` as a UTC instant) and the real writer (`toGraphEventJSON`), and Graph's
+    /// inclusive `endDate` must be that day. Before the fix the writer used the UTC instant's own
+    /// date: a day long behind UTC for a late end (every attendee got an extra day of
+    /// occurrences), and an end before the start time kept a day it never reaches.
+    @Test("A timed series ends on its last occurrence's day in the event's zone",
+          arguments: ExchangeCalendarRecurringTests.endDateZones, ExchangeCalendarRecurringTests.untilCases)
+    func timedSeriesEndsOnItsLastOccurrenceDay(zoneId: String, untilCase: UntilCase) throws {
+        let zone = try #require(TimeZone(identifier: zoneId))
+        let now = Date()
+        let namedDay = relativeDay(30, "yyyy-MM-dd", in: zone, from: now)
+        let lastDay = relativeDay(30 + untilCase.lastDayOffset, "yyyy-MM-dd", in: zone, from: now)
+        let firstDay = relativeDay(7, "yyyy-MM-dd", in: zone, from: now)
+        let until = untilCase.wallTime.map { "\(namedDay)T\($0)" } ?? namedDay
+        let args: [String: JSONValue] = [
+            "title": .string("Daily check-in"),
+            "start_iso": .string("\(firstDay)T10:00:00"),
+            "end_iso": .string("\(firstDay)T10:30:00"),
+            "timezone": .string(zoneId),
+            "recurrence": .dictionary(["freq": .string("daily"), "until": .string(until)]),
+        ]
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
+        let rule = try #require(input.recurrence?.first)
+        #expect(rule.hasSuffix("Z"), "premise: a timed series' UNTIL is a UTC instant (\(rule))")
+
+        let json = makeProvider().toGraphEventJSON(input)
+        let range = (json["recurrence"] as? [String: Any])?["range"] as? [String: Any]
         #expect(range?["type"] as? String == "endDate")
-        #expect(range?["endDate"] as? String == "2026-05-27")
+        #expect(range?["endDate"] as? String == lastDay, "UNTIL \(rule) in \(zoneId)")
+    }
+
+    /// A start written without seconds (`…T10:00`, which the tools pass through as given) is the
+    /// same 10:00 start: Graph stores it as `graphNaiveDateTime` pads it, so an end at 05:00 still
+    /// ends the series the day before.
+    @Test("A seconds-less start still ends the series before an unreached start time")
+    func secondsLessStartKeepsTheStartTimeRule() throws {
+        let zoneId = "America/Los_Angeles"
+        let zone = try #require(TimeZone(identifier: zoneId))
+        let now = Date()
+        let firstDay = relativeDay(7, "yyyy-MM-dd", in: zone, from: now)
+        let args: [String: JSONValue] = [
+            "title": .string("Daily check-in"),
+            "start_iso": .string("\(firstDay)T10:00"),
+            "end_iso": .string("\(firstDay)T10:30"),
+            "timezone": .string(zoneId),
+            "recurrence": .dictionary(["freq": .string("daily"),
+                                       "until": .string("\(relativeDay(30, "yyyy-MM-dd", in: zone, from: now))T05:00:00")]),
+        ]
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: false)
+        #expect(input.startDateTime?.count == 16, "premise: the start reaches the writer without seconds (\(input.startDateTime ?? "nil"))")
+        let json = makeProvider().toGraphEventJSON(input)
+        let range = (json["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        #expect(range?["endDate"] as? String == relativeDay(29, "yyyy-MM-dd", in: zone, from: now))
+    }
+
+    /// An all-day series' `UNTIL` is a bare date and stays the day the user named. The input
+    /// carries no zone label, so the writer runs in the simulator's zone here; that a bare date
+    /// keeps its digits in every zone is pinned by `graphEndDateForms` and `graphEndDateRoundTrips`.
+    @Test("An all-day series ends on the user's last day", arguments: ExchangeCalendarRecurringTests.endDateZones)
+    func allDaySeriesEndsOnTheNamedDay(zoneId: String) throws {
+        let zone = try #require(TimeZone(identifier: zoneId))
+        let now = Date()
+        let lastDay = relativeDay(30, "yyyy-MM-dd", in: zone, from: now)
+        let args: [String: JSONValue] = [
+            "title": .string("Holiday"),
+            "start_iso": .string(relativeDay(7, "yyyy-MM-dd", in: zone, from: now)),
+            "end_iso": .string(relativeDay(8, "yyyy-MM-dd", in: zone, from: now)),
+            "timezone": .string(zoneId),
+            "recurrence": .dictionary(["freq": .string("weekly"), "until": .string(lastDay)]),
+        ]
+        let input = try CalendarToolHelpers.buildGCalEventInput(args, isAllDay: true)
+        let json = makeProvider().toGraphEventJSON(input)
+        let range = (json["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        #expect(range?["endDate"] as? String == lastDay)
+    }
+
+    /// Each UNTIL form on its own: a UTC instant is dated in the given zone (the next or previous
+    /// UTC day becomes the local day), a floating time and a bare date keep their date, and a UTC
+    /// time of day before the series' start time ends the series the day before.
+    @Test("graphEndDate dates an UNTIL in the zone and ends the day before an unreached start time")
+    func graphEndDateForms() throws {
+        let behind = try #require(TimeZone(identifier: "America/Los_Angeles"))
+        let ahead = try #require(TimeZone(identifier: "Pacific/Kiritimati"))
+        let utc = try #require(TimeZone(identifier: "UTC"))
+        let now = Date()
+        let utcDay = relativeDay(30, "yyyyMMdd", in: utc, from: now)
+        let day = relativeDay(30, "yyyy-MM-dd", in: utc, from: now)
+        let previousDay = relativeDay(29, "yyyy-MM-dd", in: utc, from: now)
+        let nextDay = relativeDay(31, "yyyy-MM-dd", in: utc, from: now)
+        let tenAM = "\(day)T10:00:00"
+        let endDate = ExchangeCalendarProvider.graphEndDate(until:in:startWallTime:)
+
+        // With no start time, 06:00Z is the previous evening at UTC-7 and UTC-8; 12:00Z is 02:00
+        // the next day at UTC+14.
+        #expect(endDate("\(utcDay)T060000Z", behind, nil) == previousDay)
+        #expect(endDate("\(utcDay)T120000Z", ahead, nil) == nextDay)
+        #expect(endDate("\(utcDay)T120000Z", utc, nil) == day)
+        // A 10:00 series: that evening is after its start time, so that day stays; 02:00 is before
+        // it, so the series ends the local day before, here the UTC date.
+        #expect(endDate("\(utcDay)T060000Z", behind, tenAM) == previousDay)
+        #expect(endDate("\(utcDay)T120000Z", ahead, tenAM) == day)
+        // The bound is inclusive: at the start time the day stays, one second earlier it does not.
+        #expect(endDate("\(utcDay)T100000Z", utc, tenAM) == day)
+        #expect(endDate("\(utcDay)T095959Z", utc, tenAM) == previousDay)
+        // Floating wall time keeps its own date, whatever the start time.
+        #expect(endDate("\(utcDay)T070000", behind, nil) == day)
+        #expect(endDate("\(utcDay)T070000", behind, tenAM) == day)
+        #expect(endDate("\(utcDay)T100000", behind, tenAM) == day)
+        // A bare date has no time of day: always its own date.
+        #expect(endDate(utcDay, ahead, tenAM) == day)
+        // A start in no wall-time form leaves the UNTIL's own local day.
+        #expect(endDate("\(utcDay)T120000Z", ahead, "garbage") == nextDay)
+        // A 16-character `Z` value that does not parse (second 60) keeps its own date digits,
+        // where dating it at UTC+14 would have moved it to the next day.
+        #expect(endDate("\(utcDay)T235960Z", ahead, nil) == day)
+        // Too few date digits: no endDate (the range stays noEnd).
+        #expect(endDate("1234", behind, nil) == nil)
+    }
+
+    /// The rule `toGCalEvent` derives from Graph's own `endDate` range comes back to the same
+    /// date in any zone, so an edit that re-sends the recurrence keeps the series' end.
+    @Test("A Graph endDate range round-trips through toGCalEvent in any zone", arguments: ExchangeCalendarRecurringTests.endDateZones)
+    func graphEndDateRoundTrips(zoneId: String) async throws {
+        let zone = try #require(TimeZone(identifier: zoneId))
+        let now = Date()
+        let startDay = relativeDay(7, "yyyy-MM-dd", in: zone, from: now)
+        let endDate = relativeDay(30, "yyyy-MM-dd", in: zone, from: now)
+        let event = try decodeMSEvent("""
+        {"id": "m1", "subject": "x",
+         "recurrence": {"pattern": {"type": "daily", "interval": 1},
+                        "range": {"type": "endDate", "startDate": "\(startDay)",
+                                  "endDate": "\(endDate)"}}}
+        """)
+        let provider = makeProvider()
+        let rrule = try #require(await provider.toGCalEvent(event).recurrence?.first)
+        let regraph = provider.parseRRULEToGraphRecurrence(rrule, eventStart: nil, timeZone: zone, startWallTime: "\(startDay)T10:00:00")
+        #expect((regraph["range"] as? [String: Any])?["endDate"] as? String == endDate)
     }
 
     @Test("parseRRULEToGraphRecurrence handles the bare 8-char UNTIL date too")
     func parseRRULEBareDateUntil() async {
         let provider = makeProvider()
-        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=DAILY;UNTIL=20260527", eventStart: nil)
+        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=DAILY;UNTIL=20260527", eventStart: nil, timeZone: .current, startWallTime: nil)
         let range = rec["range"] as? [String: Any]
         #expect(range?["endDate"] as? String == "2026-05-27")
     }
@@ -348,7 +519,7 @@ struct ExchangeCalendarRecurringTests {
     @Test("parseRRULEToGraphRecurrence leaves range as noEnd for an open-ended rule")
     func parseRRULENoEnd() async {
         let provider = makeProvider()
-        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=WEEKLY;BYDAY=MO,WE", eventStart: nil)
+        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=WEEKLY;BYDAY=MO,WE", eventStart: nil, timeZone: .current, startWallTime: nil)
         let range = rec["range"] as? [String: Any]
         #expect(range?["type"] as? String == "noEnd")
         let pattern = rec["pattern"] as? [String: Any]
@@ -363,7 +534,7 @@ struct ExchangeCalendarRecurringTests {
         // Graph rejects a weekly pattern with no daysOfWeek (HTTP 400). RFC 5545:
         // FREQ=WEEKLY with no BYDAY recurs on DTSTART's weekday.
         let provider = makeProvider()
-        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=WEEKLY", eventStart: thursdayStart())
+        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=WEEKLY", eventStart: thursdayStart(), timeZone: .current, startWallTime: nil)
         let pattern = rec["pattern"] as? [String: Any]
         #expect(pattern?["type"] as? String == "weekly")
         #expect(pattern?["daysOfWeek"] as? [String] == ["thursday"])
@@ -375,7 +546,7 @@ struct ExchangeCalendarRecurringTests {
         // "monthly" is NOT a valid Graph pattern type — must be absoluteMonthly
         // (with dayOfMonth) or relativeMonthly.
         let provider = makeProvider()
-        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=MONTHLY", eventStart: thursdayStart())
+        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=MONTHLY", eventStart: thursdayStart(), timeZone: .current, startWallTime: nil)
         let pattern = rec["pattern"] as? [String: Any]
         #expect(pattern?["type"] as? String == "absoluteMonthly")
         #expect(pattern?["dayOfMonth"] as? Int == 14)
@@ -384,7 +555,7 @@ struct ExchangeCalendarRecurringTests {
     @Test("parseRRULEToGraphRecurrence: FREQ=MONTHLY;BYMONTHDAY=15 uses the explicit dayOfMonth")
     func parseRRULEMonthlyByMonthDay() async {
         let provider = makeProvider()
-        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=MONTHLY;BYMONTHDAY=15", eventStart: thursdayStart())
+        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=MONTHLY;BYMONTHDAY=15", eventStart: thursdayStart(), timeZone: .current, startWallTime: nil)
         let pattern = rec["pattern"] as? [String: Any]
         #expect(pattern?["type"] as? String == "absoluteMonthly")
         #expect(pattern?["dayOfMonth"] as? Int == 15)
@@ -393,7 +564,7 @@ struct ExchangeCalendarRecurringTests {
     @Test("parseRRULEToGraphRecurrence: FREQ=MONTHLY;BYDAY=2FR maps to relativeMonthly with index")
     func parseRRULEMonthlyRelative() async {
         let provider = makeProvider()
-        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=MONTHLY;BYDAY=2FR", eventStart: thursdayStart())
+        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=MONTHLY;BYDAY=2FR", eventStart: thursdayStart(), timeZone: .current, startWallTime: nil)
         let pattern = rec["pattern"] as? [String: Any]
         #expect(pattern?["type"] as? String == "relativeMonthly")
         #expect(pattern?["daysOfWeek"] as? [String] == ["friday"])
@@ -405,7 +576,7 @@ struct ExchangeCalendarRecurringTests {
         // "yearly" is NOT a valid Graph pattern type — must be absoluteYearly
         // (month + dayOfMonth) or relativeYearly.
         let provider = makeProvider()
-        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=YEARLY", eventStart: thursdayStart())
+        let rec = provider.parseRRULEToGraphRecurrence("RRULE:FREQ=YEARLY", eventStart: thursdayStart(), timeZone: .current, startWallTime: nil)
         let pattern = rec["pattern"] as? [String: Any]
         #expect(pattern?["type"] as? String == "absoluteYearly")
         #expect(pattern?["dayOfMonth"] as? Int == 14)
@@ -551,7 +722,7 @@ struct ExchangeCalendarRecurringTests {
         """)
         let provider = makeProvider()
         let rrule = (await provider.toGCalEvent(event)).recurrence!.first!
-        let regraph = provider.parseRRULEToGraphRecurrence(rrule, eventStart: nil)
+        let regraph = provider.parseRRULEToGraphRecurrence(rrule, eventStart: nil, timeZone: .current, startWallTime: nil)
         let pattern = regraph["pattern"] as? [String: Any]
         #expect(pattern?["type"] as? String == "relativeMonthly")
         #expect(pattern?["daysOfWeek"] as? [String] == ["monday"])
