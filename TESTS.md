@@ -222,7 +222,7 @@ asserts each sends its own grant, once, to its own provider's endpoint.
 exact page token it issued (one holding `+`, `/`, `=`, `&` and a space) and
 reads the second request's query as a form. `CredentialRefreshContractTests` reads
 the notification extension's refresh body the same way, with a grant holding
-`+`, `&`, `=` and `/`. All three use `FormDecoding` (test helper). Every one of
+`+`, `&`, `=` and `/`. All four use `FormDecoding` (test helper). Every one of
 these values, and Graph ids and search text, Gmail search and the Gmail
 drafts.list and history.list page tokens, is encoded by the single
 `StrictPercentEncoding` in `Shared/HTTP`. A synthetic folder marker that reaches
