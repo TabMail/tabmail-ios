@@ -926,7 +926,7 @@ enum CalendarToolHelpers {
     /// `buildGCalEventInput` still assigns a non-empty `input.recurrence` (`RRULE:FREQ=…`, plus any
     /// INTERVAL — a numeric COUNT takes an earlier `else if` and cannot coexist with an UNTIL). On
     /// `edit_scope: "this_and_following"`, `CalDAVProvider.buildNewSeriesInput` PREFERS a non-empty
-    /// `patch.recurrence` over `stripUntilAndCount(originalRRule)`, so the successor series is written
+    /// `patch.recurrence` over `RecurrenceTail.newSeriesRule(from: originalRRule, …)`, so the successor series is written
     /// **unbounded**, carrying only the patch's rule parts — and AFTER the cap `PUT`, which is
     /// irreversible wire operation #6. The 2026-08-12 range check did not create that path but moved
     /// out-of-range dates onto it, from emitted-verbatim (all-day and already-UTC arms) or
