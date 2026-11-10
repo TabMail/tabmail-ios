@@ -558,5 +558,22 @@ struct ExchangeCalendarRecurringTests {
         #expect(ExchangeCalendarProvider.graphNaiveDateTime("2026-05-15T20:00:00") == "2026-05-15T20:00:00")
         // The `-` in the date portion must NOT be mistaken for an offset.
         #expect(ExchangeCalendarProvider.graphNaiveDateTime("2026-05-15T20:00:00.123-0700") == "2026-05-15T20:00:00.123")
+        // A wall time without seconds gets `:00`, with or without an offset; one
+        // that is no wall time keeps its form.
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00") == "2099-05-15T20:00:00")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00Z") == "2099-05-15T20:00:00")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20:00-07:00") == "2099-05-15T20:00:00")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T2000") == "2099-05-15T2000")
+        #expect(ExchangeCalendarProvider.graphNaiveDateTime("2099-05-15T20") == "2099-05-15T20")
+    }
+
+    /// A series' range date follows its start even when the start is in no form
+    /// the wall-time reader knows: such a start is dated as written, so moving the
+    /// series to another day still moves its range rather than leaving the old date.
+    @Test("a start in no known wall-time form is dated as written")
+    func dayOfAnUnreadableStartIsItsWrittenDate() {
+        #expect(ExchangeCalendarProvider.day(nil, "2099-05-15T9:00", in: "UTC") == "2099-05-15")
+        #expect(ExchangeCalendarProvider.day(nil, "2099-05-15T2000", in: nil) == "2099-05-15")
+        #expect(ExchangeCalendarProvider.day("2099-05-15", nil, in: nil) == "2099-05-15")
     }
 }
