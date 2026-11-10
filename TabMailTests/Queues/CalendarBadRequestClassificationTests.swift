@@ -196,7 +196,7 @@ struct CalendarBadRequestClassificationTests {
     // MARK: - R13-U2 / R13-U7 — the two errors that reached no terminal arm
 
     /// An ICS master VEVENT with `DTSTART` but neither `DTEND` nor `DURATION`.
-    /// `CalDAVProvider.buildNewSeriesInput` cannot recover a duration from it,
+    /// `CalDAVProvider.seriesSplitResources` cannot recover a duration from it,
     /// which is the production path this test drives.
     private func masterWithNoRecoverableDuration() -> String {
         [
@@ -205,6 +205,7 @@ struct CalendarBadRequestClassificationTests {
             "BEGIN:VEVENT",
             "UID:no-duration-master",
             "SUMMARY:Broken master",
+            "DTSTART:20990520T170000Z",
             "RRULE:FREQ=WEEKLY",
             "END:VEVENT",
             "END:VCALENDAR",
@@ -216,7 +217,7 @@ struct CalendarBadRequestClassificationTests {
         // SYSTEM PROPERTY, not mechanism: whatever error the REAL production
         // function emits when the requested work can never be executed, some
         // terminal arm must claim it. The test never names the error type —
-        // `buildNewSeriesInput` is free to change which case it throws, and this
+        // `seriesSplitResources` is free to change which case it throws, and this
         // stays honest as long as the drain can retire it.
         //
         // Pre-fix this threw `CalDAVError.parseError`, which no arm claims
@@ -227,21 +228,23 @@ struct CalendarBadRequestClassificationTests {
         // first on every pass, and no UI clears a `pendingCalendarOperation`.
         var thrown: Error?
         do {
-            _ = try CalDAVProvider.buildNewSeriesInput(
-                masterICS: masterWithNoRecoverableDuration(),
+            _ = try CalDAVProvider.seriesSplitResources(
+                storedICS: masterWithNoRecoverableDuration(),
+                slotNaiveISO: "2099-05-27T17:00:00",
+                cappedRRule: "RRULE:FREQ=WEEKLY;UNTIL=20990527T165959Z",
+                newRRule: "RRULE:FREQ=WEEKLY",
+                newUid: "no-duration-master-split",
                 patch: GCalEventInput(),
-                newStartNaiveISO: "2026-05-20T17:00:00",
-                newStartZone: TimeZone(identifier: "UTC")!,
-                newRRule: "RRULE:FREQ=WEEKLY"
+                now: Date()
             )
         } catch {
             thrown = error
         }
         // MIS-030: anchor the PRESENCE the absence-free assertion depends on.
-        // Without this, a `buildNewSeriesInput` that silently returned a
+        // Without this, a `seriesSplitResources` that silently returned a
         // defaulted duration would make the assertion below unreachable rather
         // than false.
-        let error = try #require(thrown, "buildNewSeriesInput must refuse to invent a duration it could not recover")
+        let error = try #require(thrown, "seriesSplitResources must refuse to invent a duration it could not recover")
         #expect(claimedByATerminalArm(error),
                 "an unexecutable split is claimed by NO terminal arm, so the drain requeues it forever and head-of-line blocks every later calendar op on the account — a wedge, which sits in the same non-recoverable set as a dropped intention")
     }
@@ -302,8 +305,9 @@ struct CalendarBadRequestClassificationTests {
         // The pre-fix shape reported both rollback outcomes identically
         // (`_ = try? await updateEvent(… revertInput …)` then `throw error`), so
         // whether the master was still capped made no difference to the queue's
-        // disposition at all. This composes the real classifier used by BOTH
-        // providers with the drain's real terminal roster.
+        // disposition at all. This composes the real classifier the Outlook
+        // split uses (the one split that still caps first) with the drain's real
+        // terminal roster.
         //
         // 400 is chosen deliberately: it is exactly the code that makes the
         // difference visible. `isCalendarBadRequestError` claims a bare 400, so

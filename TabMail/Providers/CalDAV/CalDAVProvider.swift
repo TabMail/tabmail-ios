@@ -295,8 +295,8 @@ actor CalDAVProvider: CalendarProvider {
         // a conservative choice. RFC 4791 says servers SHOULD return an ETag,
         // not MUST, and `CalendarSetupView.connectCalDAV()` accepts an
         // arbitrary user-entered server URL — so the no-ETag branch is reachable
-        // and is not an iCloud-only hypothetical. See `revertMasterCap` below
-        // for the same defect at the rollback site.
+        // and is not an iCloud-only hypothetical. `splitSeries`' cap PUT follows
+        // the same rule.
         let (_, _) = try await client.put(
             url: eventURL, body: mergedICS,
             precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
@@ -354,53 +354,19 @@ actor CalDAVProvider: CalendarProvider {
         }
         let etag = getResponse.value(forHTTPHeaderField: "ETag")
 
-        // 2. Extract the master's UID for the override.
-        let uid = eventURL.deletingPathExtension().lastPathComponent
-        let masterUID = Self.extractUID(from: masterICS) ?? uid
-
-        // 3. Build a "full" patch that inherits every display-relevant field
-        //    from the master and overrides only what the LLM is changing.
-        //    RFC 5545 §3.8.4.1 says properties absent from an override
-        //    inherit from the master, but iCloud / Apple Calendar / many
-        //    CalDAV clients DISPLAY only the fields present in the override
-        //    VEVENT — so a sparse override (just DTSTART/DTEND) makes the
-        //    occurrence look like an empty event with no title/details.
-        //    Same principle as our defensive PATCH everywhere else: send
-        //    the full state, not the delta. Extracts directly from the ICS
-        //    we already have in hand (no extra round trip).
-        var inheritedPatch = event
-        if inheritedPatch.summary == nil {
-            inheritedPatch.summary = Self.extractScalar(from: masterICS, key: "SUMMARY")
-        }
-        if inheritedPatch.location == nil {
-            inheritedPatch.location = Self.extractScalar(from: masterICS, key: "LOCATION")
-        }
-        if inheritedPatch.description == nil {
-            inheritedPatch.description = Self.extractScalar(from: masterICS, key: "DESCRIPTION")
-        }
-        if inheritedPatch.transparency == nil {
-            inheritedPatch.transparency = Self.extractScalar(from: masterICS, key: "TRANSP")
-        }
-        if inheritedPatch.attendees == nil {
-            let masterAttendees = Self.extractAttendees(from: masterICS)
-            if !masterAttendees.isEmpty {
-                inheritedPatch.attendees = masterAttendees
-            }
-        }
-
-        // 4. Build the override VEVENT block (no VCALENDAR wrapper).
-        //    RFC 5545 §3.8.4.4: RECURRENCE-ID's value type MUST match the
-        //    master's DTSTART value type — classify the master's DTSTART
-        //    (all-day / zoned / UTC / floating) and emit a matching override.
-        //    Also extract the master's ORGANIZER: RFC 5545 §3.8.4.3 requires
-        //    every VEVENT that carries ATTENDEE to also carry ORGANIZER, and
-        //    iCloud's CalDAV enforces this strictly — without it, a PUT that
-        //    adds an attendee to the override fails with HTTP 403 (empty body).
+        // 2. The override: a copy of the occurrence as it stands (its existing override, else the
+        //    series' VEVENT) with the patch applied (`occurrenceOverrideResource`), spliced into the
+        //    resource in place of any override for the same occurrence.
+        //    The caller's `recurrence_id` is a wall clock in `recurrenceIdZone` (the
+        //    operation's declared timezone, device by default). RFC 5545 requires
+        //    RECURRENCE-ID to be expressed in the master's own frame — convert
+        //    through the absolute instant. See `recurrenceIdInMasterFrame`.
+        //    The splice MUST use that SAME converted value: it decides whether an
+        //    existing override is "the same occurrence", so comparing against a
+        //    differently-framed string appends a duplicate VEVENT sharing
+        //    UID+RECURRENCE-ID instead of replacing it — a malformed resource
+        //    servers resolve nondeterministically.
         let masterKind = Self.masterDTStartKind(from: masterICS)
-        // The caller's `recurrence_id` is a wall clock in `recurrenceIdZone` (the
-        // operation's declared timezone, device by default). RFC 5545 requires
-        // RECURRENCE-ID to be expressed in the master's own frame — convert
-        // through the absolute instant. See `recurrenceIdInMasterFrame`.
         guard let masterFrameRecurrenceId = Self.recurrenceIdInMasterFrame(
             recurrenceId, declaredZone: recurrenceIdZone, kind: masterKind
         ) else {
@@ -408,26 +374,11 @@ actor CalDAVProvider: CalendarProvider {
                 "Could not express recurrence_id '\(recurrenceId)' (\(recurrenceIdZone.identifier)) in this event's timezone — refusing to write an override that may name a different occurrence."
             )
         }
-        let masterOrganizerLine = Self.masterVEventLines(from: masterICS)
-            .first(where: { $0.uppercased().hasPrefix("ORGANIZER") })
-        let overrideBlock = Self.buildOverrideVEvent(
-            patch: inheritedPatch, uid: masterUID, recurrenceId: masterFrameRecurrenceId,
-            kind: masterKind, organizerLine: masterOrganizerLine
+        let updatedICS = try Self.occurrenceOverrideResource(
+            storedICS: masterICS, recurrenceIdNaive: masterFrameRecurrenceId, patch: event, now: Date()
         )
 
-        // 4. Splice it into the ICS — replace any pre-existing override with
-        //    the same RECURRENCE-ID, otherwise append before END:VCALENDAR.
-        //    MUST use the SAME converted value the override block carries: the
-        //    splice decides whether an existing override is "the same
-        //    occurrence", so comparing against a differently-framed string
-        //    appends a duplicate VEVENT sharing UID+RECURRENCE-ID instead of
-        //    replacing it — a malformed resource servers resolve
-        //    nondeterministically.
-        let updatedICS = Self.spliceOrReplaceOverride(
-            ics: masterICS, recurrenceId: masterFrameRecurrenceId, kind: masterKind, newOverrideBlock: overrideBlock
-        )
-
-        // 5. PUT back — atomic at the CalDAV resource level (one HTTP call).
+        // 3. PUT back — atomic at the CalDAV resource level (one HTTP call).
         //    No ETag ⇒ `.unconditional`: step 1's GET proved this resource
         //    exists (we spliced the override into the body it returned), so
         //    `If-None-Match: *` would assert the opposite of what we observed.
@@ -444,10 +395,21 @@ actor CalDAVProvider: CalendarProvider {
         )
     }
 
-    /// Series split (this_and_following). Cap the master's RRULE in-place via a
-    /// string-level UNTIL replacement (one PUT on the existing .ics), then
-    /// create a NEW .ics with the new series. If the new-series PUT fails,
-    /// attempt to revert the master cap.
+    /// Series split (this_and_following). Both resources are built from the
+    /// stored series first (`seriesSplitResources`): the series capped before
+    /// the split, and the new part as a copy of the series re-anchored at the
+    /// split with the patch applied. Then the new part is created as a NEW .ics
+    /// and only after that is the capped series PUT back over the existing one.
+    ///
+    /// **Create first, cap last.** The cap removes the series' occurrences after
+    /// the split, and with them the changed occurrences and extra dates that the
+    /// new part takes over. Written first, a cap whose response is lost leaves a
+    /// series that no longer holds them, and the retry copies the new part from
+    /// that series, so they are gone for good. Written last, the new part already
+    /// holds them, and every interruption leaves at worst both parts showing the
+    /// later occurrences until the retry writes the cap. The retry finds its own
+    /// new part (a 412 on the create-only PUT whose resource carries our UID) and
+    /// goes on to the cap. A failed cap is rethrown and nothing is rolled back.
     func splitSeries(
         calendarId: String,
         eventId: String,
@@ -485,14 +447,12 @@ actor CalDAVProvider: CalendarProvider {
         // frame while starting the successor in another is how a split
         // duplicates or drops the boundary occurrence.
         //
-        // ⚠️ THIS COMMENT SAID "`buildNewSeriesInput` parses it in the master's
-        // zone" UNTIL ROUND 18d, AND THAT WAS ONLY TRUE OF A `.zoned` MASTER.
-        // For a `.utc` master the function read the value in `.current`, so the
-        // conversion two lines below rendered into UTC and the reader parsed it
-        // back in the device zone — the successor's start ended up off by the
-        // device's UTC offset while `untilValue` above stayed on the correct
-        // absolute instant. `newStartZone:` is what closes that; see
-        // `masterFrameZone`.
+        // `seriesSplitResources` writes this master-frame value straight into the
+        // new part's DTSTART, in the master's own value type and TZID, so it is
+        // never read back in another frame. (The successor used to be rebuilt
+        // from fields, and a `.utc` master's value was re-read in the device
+        // zone, which moved the successor's start by the device's UTC offset
+        // while `untilValue` above stayed on the correct instant.)
         let masterKindForSplit = Self.masterDTStartKind(from: masterICS)
         guard let masterFrameRecurrenceId = Self.recurrenceIdInMasterFrame(
             recurrenceId, declaredZone: recurrenceIdZone, kind: masterKindForSplit
@@ -506,7 +466,7 @@ actor CalDAVProvider: CalendarProvider {
         // step 3, so a split the series cannot take (it already ends before the
         // split, or its COUNT cannot be counted) is refused with nothing written.
         // A patch that brings its own recurrence is still written as given
-        // (`buildNewSeriesInput` prefers it), but the check runs all the same:
+        // (`seriesSplitResources` applies it over this one), but the check runs all the same:
         // it is also what stops the cap from moving the end of a series that
         // already ended before the split.
         let newSeriesRRule = try RecurrenceTail.newSeriesRule(
@@ -515,191 +475,68 @@ actor CalDAVProvider: CalendarProvider {
             split: RecurrenceTail.Day(iso: masterFrameRecurrenceId),
             capUntil: untilValue)
         let cappedRRule = GoogleCalendarProvider.replaceOrAppendUntil(in: originalRRule, untilValue: untilValue)
-        let cappedICS = Self.replaceRRule(in: masterICS, newRRule: cappedRRule)
-
-        // 3. PUT capped master back. No ETag ⇒ `.unconditional`: step 1's GET
-        //    proved the master resource exists (its ICS is what we just capped),
-        //    so `If-None-Match: *` would assert the opposite. It is also the
-        //    precondition `revertMasterCap` must later be able to undo — a cap
-        //    that 412s never happens, but a cap that lands under a precondition
-        //    the revert cannot reproduce is the split-rollback defect again.
-        let (_, capResponse) = try await client.put(
-            url: eventURL, body: cappedICS,
-            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
-        // The entity tag the server assigned to the body we JUST wrote. This is
-        // the only witness `revertMasterCap` can use to make its rollback
-        // conditional: `.ifMatch(capETag)` overwrites our own capped write and
-        // REFUSES to overwrite anything a concurrent editor has put there since.
-        // `etag` (step 1's GET tag) is already stale by this line, and
-        // `etagCache` is cleared immediately below for exactly that reason, so
-        // the response header is the only place this value exists.
+        // Both resources are built from the STORED series before anything is
+        // written (`seriesSplitResources`): the new part is a copy of the series
+        // re-anchored at the split, so it keeps every property the series has.
+        // A series that can't be split safely is refused here, with nothing to
+        // roll back.
         //
-        // RFC 4791 §5.3.4 says a server SHOULD return an ETag on a successful
-        // PUT, not MUST. When it does not, the rollback falls back to
-        // `.unconditional` — the round-9 behaviour, byte-identical for that
-        // server population — because the alternative (refusing to roll back at
-        // all) leaves the master capped with no successor, which is strictly
-        // worse than a best-effort overwrite. Note it must NOT fall back to
-        // `.ifNoneMatchAny`: that asserts the master is absent at a resource we
-        // just proved present, which is the round-9 bug (`MIS-005`'s chain).
-        let capETag = capResponse.value(forHTTPHeaderField: "ETag")
-        etagCache.removeValue(forKey: eventId)
-
-        // 4. Build new series and PUT to a .ics resource. The UID/filename is
-        //    DETERMINISTIC (derived from master id + recurrence_id) so a retry
-        //    after a lost ACK on the PUT below re-targets the SAME resource
-        //    instead of creating a duplicate series at a fresh random URL.
-        //    ⚠ That PUT is CREATE-ONLY (`.ifNoneMatchAny`), not an overwrite —
-        //    this comment claimed "unconditional PUT → overwrite" until
-        //    2026-08-05, which the code has never done. The consequence is
-        //    deliberate and unchanged here: a retry after a lost ACK gets 412
-        //    rather than silently replacing the successor series someone may
-        //    have edited in the meantime, and the 412 routes to the rollback
-        //    below. Do not "fix" the comment by widening the precondition —
-        //    that is a behaviour change with its own overwrite risk.
+        // The UID/filename is DETERMINISTIC (derived from master id +
+        // recurrence_id) so a retry after a lost ACK on the successor PUT below
+        // re-targets the SAME resource instead of creating a duplicate series at
+        // a fresh random URL.
         let newUid = GoogleCalendarProvider.deterministicSplitEventId(masterId: eventId, recurrenceId: recurrenceId)
-        let newSeriesInput: GCalEventInput
-        do {
-            newSeriesInput = try Self.buildNewSeriesInput(
-                masterICS: masterICS, patch: patch,
-                newStartNaiveISO: masterFrameRecurrenceId,
-                newStartZone: recurrenceIdZone,
-                newRRule: newSeriesRRule
-            )
-        } catch {
-            // Couldn't construct the new series — revert the master cap before
-            // bailing so the calendar isn't left truncated with no replacement.
-            try await Self.revertMasterCap(client: client, eventURL: eventURL,
-                                           originalICS: masterICS,
-                                           capETag: capETag, cause: error)
-        }
+        let resources = try Self.seriesSplitResources(
+            storedICS: masterICS, slotNaiveISO: masterFrameRecurrenceId,
+            cappedRRule: cappedRRule, newRRule: newSeriesRRule, newUid: newUid, patch: patch, now: Date())
+        // The new part read the way a listing reads it, so the caller gets the
+        // series it will see. Read BEFORE any write: a part we cannot read back
+        // is refused with nothing written.
         let calURL = try resolveURL(calendarId)
         let newEventURL = calURL.appendingPathComponent("\(newUid).ics")
-        let newICS = newSeriesInput.toICS(uid: newUid)
+        guard let created = ICSParser.parse(icsText: resources.newPart, resourceHref: newEventURL.path, etag: nil).first else {
+            throw CalendarProviderError.notSupported("The new part of the repeating event could not be built, so it was not split.")
+        }
 
+        // 3. Create the new part at its own .ics resource, CREATE-ONLY
+        //    (`.ifNoneMatchAny`): a retry never overwrites a new part the user may
+        //    have edited since.
         do {
             _ = try await client.put(
-                url: newEventURL, body: newICS, precondition: .ifNoneMatchAny)
+                url: newEventURL, body: resources.newPart, precondition: .ifNoneMatchAny)
         } catch CalDAVError.preconditionFailed {
-            // 412 from the CREATE-ONLY successor PUT means something already
-            // occupies the DETERMINISTIC successor URL. The overwhelmingly
-            // likely cause is a LOST ACK: a previous attempt's successor PUT
-            // committed, its response never reached us, the queue retried, and
-            // this attempt has just re-capped the master and collided with its
-            // own earlier write.
+            // 412: something already occupies the DETERMINISTIC new-part URL. The
+            // likely cause is a retry: an earlier attempt created the new part and
+            // its response, or its cap, never completed. Only POSITIVE evidence
+            // that the resource is the new part THIS split derives (its ICS
+            // carries our deterministic UID) lets the split go on to the cap. A
+            // probe that throws, 404s, or finds another UID rethrows the 412 with
+            // nothing written; absence of evidence never becomes permission.
             //
-            // Neither of the two unconditional responses is acceptable there:
-            //  - rolling back un-caps the master while a live open-ended
-            //    successor still exists ⇒ every occurrence after the split point
-            //    is duplicated on the user's calendar;
-            //  - rethrowing wedges the account. `preconditionFailed` is a
-            //    dedicated `CalDAVError` case that
-            //    `AccountManager.isCalendarBadRequestError` (which
-            //    only matches `.httpError`) does not classify, so the op lands
-            //    on the "transient — always retry" arm and its account goes into
-            //    `failedAccounts`, skipping every later calendar op on that
-            //    account, forever. That is the wedge corollary of the
-            //    never-drop-a-user-intention rule, not a recoverable edge.
-            //
-            // So DISCRIMINATE rather than assume. Read the resource back and
-            // require POSITIVE evidence that it is the successor THIS call
-            // derived (its ICS carries our deterministic UID). Only that is
-            // provider-authoritative "already done". A probe that throws, 404s,
-            // returns an unparseable body, or names a different UID keeps the
-            // pre-existing rollback — absence of evidence never becomes
-            // permission (the queue's exit-2 rule: "we could not determine" is
-            // not "the provider says it is complete").
-            //
-            // The successor PUT itself stays `.ifNoneMatchAny`. Widening it to
-            // an overwrite would silently replace a series the user may have
-            // edited; that direction is deliberately held (`MIS-026`).
+            // The new-part PUT itself stays `.ifNoneMatchAny`. Widening it to an
+            // overwrite would silently replace a series the user may have edited;
+            // that direction is deliberately held (`MIS-026`).
             guard await Self.successorIsOurs(client: client, url: newEventURL, uid: newUid) else {
-                try await Self.revertMasterCap(client: client, eventURL: eventURL,
-                                               originalICS: masterICS,
-                                               capETag: capETag,
-                                               cause: CalDAVError.preconditionFailed)
+                throw CalDAVError.preconditionFailed
             }
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[CalDAV] splitSeries: successor \(newUid) already exists and is ours — treating the split as already complete (lost ACK)")
+                BackgroundSyncLogger.logDebug("[CalDAV] splitSeries: new part \(newUid) already exists and is ours — going on to the cap")
             }
-        } catch {
-            // Revert the master cap so the calendar isn't left truncated with
-            // no replacement series.
-            try await Self.revertMasterCap(client: client, eventURL: eventURL,
-                                           originalICS: masterICS,
-                                           capETag: capETag, cause: error)
         }
 
-        return GCalEvent(
-            id: newEventURL.path, summary: newSeriesInput.summary, location: newSeriesInput.location,
-            description: newSeriesInput.description, start: nil, end: nil, attendees: nil,
-            organizer: nil, recurrence: newSeriesInput.recurrence, transparency: newSeriesInput.transparency,
-            status: "confirmed", htmlLink: nil, created: nil, updated: nil
-        )
-    }
+        // 4. PUT the capped series back. No ETag ⇒ `.unconditional`: step 1's GET
+        //    proved the series resource exists (its ICS is what we just capped),
+        //    so `If-None-Match: *` would assert the opposite. With an ETag, a
+        //    concurrent edit since the GET 412s and the retry caps the series as
+        //    it now stands; the new part already exists, so nothing the series held at
+        //    the split's read is lost. A change another client made to the later
+        //    occurrences after that read is not on the new part and the cap removes it.
+        etagCache.removeValue(forKey: eventId)
+        _ = try await client.put(
+            url: eventURL, body: resources.cappedSeries,
+            precondition: etag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
 
-    /// Roll the master resource back to `originalICS` after a `splitSeries`
-    /// step failed. Always throws — never returns:
-    ///  - revert succeeds → rethrows `cause` (the split failed, but the
-    ///    calendar is back in a consistent state, so the queue can retry).
-    ///  - revert ALSO fails → throws `CalDAVError.inconsistentState` so the
-    ///    queue surfaces a clear "needs manual attention" message instead of
-    ///    silently leaving the master capped with no successor series.
-    /// WHEN `capETag` IS PRESENT the revert PUT carries `.ifMatch(capETag)`, where
-    /// `capETag` is the entity tag the CAP PUT's own 2xx response returned — by
-    /// construction the tag of the body we ourselves just stored. That is what makes
-    /// the rollback safe AND targeted: it overwrites our own write, and it refuses to
-    /// overwrite a concurrent editor's, which an unconditional PUT would silently
-    /// destroy (a lost user edit is not recoverable by syncing).
-    ///
-    /// A 412 in THAT case therefore means "the master is no longer what we capped",
-    /// and the correct response is the failure arm below (`inconsistentState`, which
-    /// the queue retires with a user-visible message), NOT a retry loop.
-    ///
-    /// ⚠️ CORRECTED 2026-08-06 — THE GUARANTEE IS CONDITIONAL, NOT UNCONDITIONAL.
-    /// This block used to open "The revert PUT carries `.ifMatch(capETag)`" flatly,
-    /// which reads as a property of the path rather than of one branch of it. When
-    /// `capETag == nil` — a server that returns no ETag on PUT, which RFC 4791 §5.3.4
-    /// permits (SHOULD, not MUST) — the revert falls back to `.unconditional` and has
-    /// NONE of the properties in the paragraph above: it is a blind overwrite that
-    /// can silently destroy a concurrent editor's change, i.e. precisely the outcome
-    /// the paragraph claims the path prevents. That is an ACCEPTED cost, registered
-    /// as `KNOWN_ISSUES.md` `IOS-CAL-002`, not an oversight: the alternative
-    /// (`.ifNoneMatchAny`) asserts ABSENCE at a resource we just proved present, so a
-    /// conforming server answers 412 to every revert and the rollback can never
-    /// succeed — a permanently broken feature rather than a recoverable edge. That
-    /// was the round-9 bug this function was rewritten to kill, and it must never be
-    /// reintroduced as a "safer default".
-    ///
-    /// ⚠ This comment said "unconditional (`etag: nil`)" from the day it was
-    /// written until 2026-08-05, and the code did the OPPOSITE of what it
-    /// claimed: `etag: nil` was the *assert-absence* mode (`If-None-Match: *`),
-    /// so a compliant server answered 412 to every revert of a master resource
-    /// that — by construction, we had just PUT to it — existed. The rollback
-    /// could never succeed and this function always took its own failure arm.
-    /// `CalDAVPutPrecondition` now makes the three states distinct so the
-    /// comment and the request cannot drift apart again.
-    private static func revertMasterCap(
-        client: CalDAVClient, eventURL: URL, originalICS: String,
-        capETag: String?, cause: Error
-    ) async throws -> Never {
-        do {
-            _ = try await client.put(
-                url: eventURL, body: originalICS,
-                precondition: capETag.map(CalDAVPutPrecondition.ifMatch) ?? .unconditional)
-        } catch {
-            // The revert PUT itself failed — the master is capped with no
-            // replacement. Surface loudly so the queue/LLM/user knows.
-            BackgroundSyncLogger.logDebug("[CalDAV] splitSeries: REVERT FAILED — master is capped with no successor series. revertError=\(error) cause=\(cause)")
-            throw CalDAVError.inconsistentState(
-                "Calendar event split failed and could not be rolled back — the recurring series may be cut short with no replacement. Please check the event in your calendar app. (cause: \(cause); revert error: \(error))"
-            )
-        }
-        // Revert succeeded — the calendar is back to consistent state. Surface
-        // the ORIGINAL failure (thrown outside the do/catch so it isn't caught
-        // by our own revert handler) so the queue can retry the split cleanly.
-        BackgroundSyncLogger.logDebug("[CalDAV] splitSeries: reverted master cap after failure: \(cause)")
-        throw cause
+        return created
     }
 
     /// POSITIVE evidence that the resource now occupying `url` is the successor
@@ -709,9 +546,8 @@ actor CalDAVProvider: CalendarProvider {
     ///
     /// Every other outcome answers `false`: a throw, a 404, a body that will not
     /// decode, a body with no master UID, or a UID that is somebody else's. The
-    /// caller must treat `false` as "roll back", so this function's failure
-    /// direction is the pre-existing behaviour and a probe outage can never
-    /// manufacture a success. Deliberately `async` but not `throws` for that
+    /// caller treats `false` as "not ours" and stops with nothing written, so a
+    /// probe outage can never manufacture a success. Deliberately `async` but not `throws` for that
     /// reason: there is no error path a caller could widen.
     ///
     /// The URL match alone is NOT sufficient. `newEventURL` is a path we chose,
@@ -726,7 +562,7 @@ actor CalDAVProvider: CalendarProvider {
             return Self.extractUID(from: ics) == uid
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[CalDAV] splitSeries: successor probe failed for \(url.path) — rolling back. error=\(error)")
+                BackgroundSyncLogger.logDebug("[CalDAV] splitSeries: successor probe failed for \(url.path), not treated as ours. error=\(error)")
             }
             return false
         }
@@ -858,7 +694,7 @@ actor CalDAVProvider: CalendarProvider {
     /// Without unfolding, a long DESCRIPTION/LOCATION would be silently
     /// truncated when extracted (because the bytes past column 75 are on the
     /// next physical line). Tolerates CRLF and bare LF.
-    private static func icsLines(_ ics: String) -> [String] {
+    static func icsLines(_ ics: String) -> [String] {
         ics
             .replacingOccurrences(of: "\r\n ", with: "")
             .replacingOccurrences(of: "\r\n\t", with: "")
@@ -943,7 +779,7 @@ actor CalDAVProvider: CalendarProvider {
         return output.joined(separator: "\r\n")
     }
 
-    // MARK: - Non-recurring PATCH merge
+    // MARK: - PATCH merge
 
     /// Apply a partial patch to an existing CalDAV resource. CalDAV PUT is a
     /// full-resource replace — sending a freshly-built ICS containing only the
@@ -958,8 +794,13 @@ actor CalDAVProvider: CalendarProvider {
     /// `shiftSeriesAnchoredValues`). Throws, before any
     /// write, when one of those values cannot be moved correctly.
     ///
-    /// NOT used for: occurrence overrides (`spliceOrReplaceOverride`) or
-    /// split-series (`splitSeries`). Those paths have their own ICS surgery.
+    /// Also applied to the copies a split and a one-occurrence edit make
+    /// (`seriesSplitResources`, `occurrenceOverrideResource`), so the patch
+    /// lands on them exactly as it lands on the series: a split's new part
+    /// whose start the edit moves takes its excluded and added dates, its
+    /// UNTIL and its changed occurrences' RECURRENCE-IDs along (their own
+    /// times stay where the user put them). An override is merged without its
+    /// RECURRENCE-ID and holds no dates or rule, so it has nothing to move.
     static func mergePatchIntoICS(_ ics: String, patch: GCalEventInput) throws -> String {
         var result = ics
 
@@ -1034,10 +875,10 @@ actor CalDAVProvider: CalendarProvider {
         return result
     }
 
-    /// Replace the first line in the MASTER VEVENT whose property name matches
-    /// `propertyKey` (`<KEY>:` or `<KEY>;…`), preserving folded continuation
-    /// lines being dropped along with it. If no match exists, insert `newLine`
-    /// just before `END:VEVENT`. Scoped to the master block (no RECURRENCE-ID).
+    /// Replace the MASTER VEVENT's own property named `propertyKey` (the first one, with its folded
+    /// continuation lines) with `newLine`, or insert `newLine` among its properties when it has none.
+    /// Only the VEVENT's own properties count: an alarm's `DESCRIPTION` or `SUMMARY` is never taken
+    /// for the event's.
     static func replaceOrAppendInMasterVEvent(in ics: String, propertyKey: String, newLine: String) -> String {
         // Sanitized HERE rather than at each caller, because this is the single point every
         // caller-supplied property line enters an ICS resource we then PUT. A value carrying CRLF
@@ -1047,175 +888,83 @@ actor CalDAVProvider: CalendarProvider {
         // property of the current call sites, not of this function, and the next caller inherits the
         // guard for free.
         let newLine = GCalEventInput.sanitizeICSLine(newLine)
-        let prefix1 = "\(propertyKey):"
-        let prefix2 = "\(propertyKey);"
-        let lines = physicalICSLines(ics)
-        var output: [String] = []
-        var i = 0
-        var handledMaster = false
-        while i < lines.count {
-            guard lines[i] == "BEGIN:VEVENT", !handledMaster else {
-                output.append(lines[i]); i += 1; continue
+        return rewriteMasterVEvent(in: ics) { block in
+            var replaced = false
+            let out = rewriteTopLevel(block) { _, name in
+                guard name == propertyKey, !replaced else { return nil }
+                replaced = true
+                return [newLine]
             }
-            var block: [String] = [lines[i]]
-            var hasRecurrenceId = false
-            i += 1
-            while i < lines.count && lines[i] != "END:VEVENT" {
-                if lines[i].hasPrefix("RECURRENCE-ID") { hasRecurrenceId = true }
-                block.append(lines[i])
-                i += 1
-            }
-            if i < lines.count { block.append(lines[i]); i += 1 }
-
-            if !hasRecurrenceId {
-                var replaced = false
-                var rewritten: [String] = []
-                var j = 0
-                while j < block.count {
-                    let line = block[j]
-                    if !replaced && (line.hasPrefix(prefix1) || line.hasPrefix(prefix2)) {
-                        rewritten.append(newLine)
-                        replaced = true
-                        j += 1
-                        while j < block.count, let first = block[j].first, first == " " || first == "\t" {
-                            j += 1
-                        }
-                        continue
-                    }
-                    rewritten.append(line)
-                    j += 1
-                }
-                if !replaced {
-                    // Insert before END:VEVENT, or at the end if missing.
-                    if let endIdx = rewritten.firstIndex(of: "END:VEVENT") {
-                        rewritten.insert(newLine, at: endIdx)
-                    } else {
-                        rewritten.append(newLine)
-                    }
-                }
-                block = rewritten
-                handledMaster = true
-            }
-            output.append(contentsOf: block)
+            return replaced ? out : insertBeforeSubcomponents(out, lines: [newLine])
         }
-        return output.joined(separator: "\r\n")
     }
 
-    /// Remove the first matching line (and its folded continuations) from the
-    /// MASTER VEVENT. Used to clear LOCATION/DESCRIPTION when the patch passes
-    /// an empty string for those fields.
+    /// Remove the MASTER VEVENT's own property named `propertyKey` (the first one, with its folded
+    /// continuation lines). Used to clear LOCATION/DESCRIPTION when the patch passes an empty string,
+    /// and to drop a DURATION an explicit end replaces. An alarm's properties are never touched.
     static func removeFromMasterVEvent(in ics: String, propertyKey: String) -> String {
-        let prefix1 = "\(propertyKey):"
-        let prefix2 = "\(propertyKey);"
-        let lines = physicalICSLines(ics)
-        var output: [String] = []
-        var i = 0
-        var handledMaster = false
-        while i < lines.count {
-            guard lines[i] == "BEGIN:VEVENT", !handledMaster else {
-                output.append(lines[i]); i += 1; continue
+        rewriteMasterVEvent(in: ics) { block in
+            var removed = false
+            return rewriteTopLevel(block) { _, name in
+                guard name == propertyKey, !removed else { return nil }
+                removed = true
+                return []
             }
-            var block: [String] = [lines[i]]
-            var hasRecurrenceId = false
-            i += 1
-            while i < lines.count && lines[i] != "END:VEVENT" {
-                if lines[i].hasPrefix("RECURRENCE-ID") { hasRecurrenceId = true }
-                block.append(lines[i])
-                i += 1
-            }
-            if i < lines.count { block.append(lines[i]); i += 1 }
-
-            if !hasRecurrenceId {
-                var rewritten: [String] = []
-                var j = 0
-                var removed = false
-                while j < block.count {
-                    let line = block[j]
-                    if !removed && (line.hasPrefix(prefix1) || line.hasPrefix(prefix2)) {
-                        removed = true
-                        j += 1
-                        while j < block.count, let first = block[j].first, first == " " || first == "\t" {
-                            j += 1
-                        }
-                        continue
-                    }
-                    rewritten.append(line)
-                    j += 1
-                }
-                block = rewritten
-                handledMaster = true
-            }
-            output.append(contentsOf: block)
         }
-        return output.joined(separator: "\r\n")
     }
 
-    /// Replace ALL ATTENDEE lines in the MASTER VEVENT with the supplied list.
+    /// Replace the MASTER VEVENT's attendees with the supplied list.
     /// The queue resolves attendee deltas (add_attendees / remove_attendees)
     /// against the existing attendee list BEFORE calling updateEvent, so by
-    /// the time we get here `attendees` is the desired final list — a full
-    /// replace correctly applies that.
+    /// the time we get here `attendees` is the desired final list.
+    ///
+    /// An attendee who stays keeps their own line: role, answer, RSVP and every other parameter the
+    /// server holds. Rewriting it would reset all of them for everyone each time one attendee is added
+    /// or removed. A new attendee is written where the attendees were, or else ahead of any nested
+    /// component (RFC 5545 puts a VEVENT's properties before its alarms).
     static func replaceAttendeesInMasterVEvent(in ics: String, attendees: [(email: String, name: String?)]) -> String {
-        let lines = physicalICSLines(ics)
-        var output: [String] = []
-        var i = 0
-        var handledMaster = false
-        while i < lines.count {
-            guard lines[i] == "BEGIN:VEVENT", !handledMaster else {
-                output.append(lines[i]); i += 1; continue
-            }
-            var block: [String] = [lines[i]]
-            var hasRecurrenceId = false
-            i += 1
-            while i < lines.count && lines[i] != "END:VEVENT" {
-                if lines[i].hasPrefix("RECURRENCE-ID") { hasRecurrenceId = true }
-                block.append(lines[i])
-                i += 1
-            }
-            if i < lines.count { block.append(lines[i]); i += 1 }
-
-            if !hasRecurrenceId {
-                var rewritten: [String] = []
-                var j = 0
-                while j < block.count {
-                    let line = block[j]
-                    if line.hasPrefix("ATTENDEE;") || line.hasPrefix("ATTENDEE:") {
-                        j += 1
-                        while j < block.count, let first = block[j].first, first == " " || first == "\t" {
-                            j += 1
-                        }
-                        continue
-                    }
-                    rewritten.append(line)
-                    j += 1
+        rewriteMasterVEvent(in: ics) { block in
+            var kept: [String: ICSUnit] = [:]
+            var rest: [ICSUnit] = []
+            var insertAt: Int?
+            var depth = 0
+            for unit in block {
+                let upper = unit.text.uppercased()
+                if upper.hasPrefix("BEGIN:") { depth += 1 } else if upper.hasPrefix("END:") { depth -= 1 }
+                if depth == 1, let p = icsProperty(unit.text), p.name == "ATTENDEE" {
+                    if let address = mailtoAddress(p.value), kept[address] == nil { kept[address] = unit }
+                    if insertAt == nil { insertAt = rest.count }
+                    continue
                 }
-                // Sanitized for the same reason as `GCalEventInput.toICS`: `cn` and `a.email` are
-                // model-supplied (an attendee name or address from tool arguments) and are
-                // interpolated with only a quote swap, so a CRLF in either would split this into an
-                // extra ICS property the CalDAV server honours — an injected ATTENDEE has the server
-                // mail the invitation to an address the user never typed.
-                //
-                // Only the lines generated HERE are sanitized. The surrounding lines came from the
-                // server's own ICS via `physicalICSLines`, which has already split on real line
-                // breaks, so there is nothing left in them to strip and rewriting them would risk
-                // altering a value the server round-trips.
-                let attendeeLines = attendees.map { a -> String in
-                    let cn = (a.name ?? a.email).replacingOccurrences(of: "\"", with: "'")
-                    return GCalEventInput.sanitizeICSLine(
-                        "ATTENDEE;CN=\"\(cn)\";ROLE=REQ-PARTICIPANT:mailto:\(a.email)"
-                    )
-                }
-                if let endIdx = rewritten.firstIndex(of: "END:VEVENT") {
-                    rewritten.insert(contentsOf: attendeeLines, at: endIdx)
-                } else {
-                    rewritten.append(contentsOf: attendeeLines)
-                }
-                block = rewritten
-                handledMaster = true
+                rest.append(unit)
             }
-            output.append(contentsOf: block)
+            // Sanitized for the same reason as `GCalEventInput.toICS`: `cn` and `a.email` are
+            // model-supplied (an attendee name or address from tool arguments) and are
+            // interpolated with only a quote swap, so a CRLF in either would split this into an
+            // extra ICS property the CalDAV server honours — an injected ATTENDEE has the server
+            // mail the invitation to an address the user never typed.
+            //
+            // Only the lines generated HERE are sanitized. The surrounding lines came from the
+            // server's own ICS via `physicalICSLines`, which has already split on real line
+            // breaks, so there is nothing left in them to strip and rewriting them would risk
+            // altering a value the server round-trips.
+            let attendeeUnits = attendees.map { a -> ICSUnit in
+                if let existing = kept[a.email.lowercased()] { return existing }
+                let cn = (a.name ?? a.email).replacingOccurrences(of: "\"", with: "'")
+                let line = GCalEventInput.sanitizeICSLine(
+                    "ATTENDEE;CN=\"\(cn)\";ROLE=REQ-PARTICIPANT:mailto:\(a.email)"
+                )
+                return ICSUnit(physical: [line], text: line)
+            }
+            // No attendees before: every line is new (a single physical line), and goes ahead of any
+            // nested component.
+            guard let insertAt else {
+                return insertBeforeSubcomponents(rest, lines: attendeeUnits.map(\.text))
+            }
+            var out = rest
+            out.insert(contentsOf: attendeeUnits, at: insertAt)
+            return out
         }
-        return output.joined(separator: "\r\n")
     }
 
     /// Build a DTSTART / DTEND line for the merge path, re-using the master's
@@ -1271,8 +1020,8 @@ actor CalDAVProvider: CalendarProvider {
     /// DTSTART uses, so `RECURRENCE-ID` names the occurrence the caller meant.
     ///
     /// 🚨 **THE INPUT IS NOT IN THE MASTER'S ZONE — IT NEVER WAS.** Until
-    /// 2026-08-07 `buildOverrideVEvent` compacted the naive digits VERBATIM and
-    /// stapled the master's `TZID` onto them, and `buildNewSeriesInput` parsed the
+    /// 2026-08-07 the occurrence-override builder compacted the naive digits VERBATIM and
+    /// stapled the master's `TZID` onto them, and the split's successor builder parsed the
     /// same string in the master's zone, both on the documented premise that "the
     /// naive recurrence_id is the occurrence's wall-clock time IN THE MASTER'S
     /// ZONE". That premise is false at the mint site:
@@ -1316,199 +1065,6 @@ actor CalDAVProvider: CalendarProvider {
             guard let masterZone = TimeZone(identifier: tzid) else { return nil }
             return RecurrenceOccurrenceResolver.renderNaive(recurrenceId, from: declaredZone, to: masterZone)
         }
-    }
-
-    /// The frame `recurrenceIdInMasterFrame` renders a value **into**, for a
-    /// given master `DTSTART` kind. It is the exact inverse of that function and
-    /// exists so the two cannot drift: whoever READS a master-frame naive value
-    /// must read it in the frame that produced it.
-    ///
-    /// 🚨 **THIS PAIRING IS THE WHOLE OF R18d-G2, and its absence was live.**
-    /// `splitSeries` computes two things from one `recurrence_id`:
-    ///
-    ///  * the RRULE cap, via `GoogleCalendarProvider.googleUntilString(…, zone:
-    ///    recurrenceIdZone)` — parsed in the DECLARED zone and emitted as an
-    ///    absolute UTC instant, which is frame-free and always correct; and
-    ///  * the successor series' `DTSTART`, via `buildNewSeriesInput`, which is
-    ///    handed `recurrenceIdInMasterFrame`'s output.
-    ///
-    /// Until round 18d `buildNewSeriesInput` derived its read frame as *"the
-    /// master's TZID if there is one, else `.current`"*. For a **`.utc`** master
-    /// (`DTSTART:20260521T000000Z`) that means the value was rendered into UTC
-    /// and then read back in the DEVICE zone, so the successor's start instant
-    /// was off by the device's UTC offset — seven hours on a Vancouver device.
-    /// The cap therefore excluded the boundary occurrence and the successor
-    /// began somewhere else entirely, which on a `this_and_following` edit
-    /// **drops that occurrence outright**. Round 18c introduced the exposure
-    /// when it changed the argument from the raw `recurrenceId` to the
-    /// master-frame value without changing the reader; before that the two
-    /// happened to agree whenever the declared zone was the device zone.
-    ///
-    /// The `.floating` arm is the same class one step quieter: the value is
-    /// passed through in the DECLARED frame, so reading it in `.current` is
-    /// correct only while the caller supplied no `timezone` argument.
-    ///
-    /// ⚠️ **WHAT BREAKS THE OTHER WAY (`MIS-026`).** The alternative was to keep
-    /// `buildNewSeriesInput` reading in `.current` and instead stop converting
-    /// for `.utc` masters. That re-opens the defect 18c closed — `RECURRENCE-ID`
-    /// and the successor `DTSTART` would name a wall clock no occurrence has —
-    /// and it puts the two writers back into different frames, which is the
-    /// mirror image rather than the fix (`MIS-005`). Converting once and reading
-    /// in the frame you converted into is the only arrangement where the cap and
-    /// the successor agree on the boundary instant.
-    static func masterFrameZone(_ kind: MasterDTStartKind, declaredZone: TimeZone) -> TimeZone {
-        switch kind {
-        case .zoned(let tzid):
-            // Unreachable from `splitSeries` — `recurrenceIdInMasterFrame`
-            // already returned nil and the split failed closed. The fallback
-            // exists for direct callers, and it is the declared zone rather than
-            // `.current` so no arm of this switch can silently reintroduce a
-            // third frame.
-            return TimeZone(identifier: tzid) ?? declaredZone
-        case .utc:
-            return TimeZone(identifier: "UTC") ?? declaredZone
-        case .floating, .allDay:
-            // Both are pass-throughs in `recurrenceIdInMasterFrame`, so the
-            // value is still in the frame the caller declared. (`.allDay` values
-            // are read by the date-only branch, which is zone-neutral; it is
-            // listed here so the switch stays exhaustive by construction.)
-            return declaredZone
-        }
-    }
-
-    /// Build a single VEVENT block (no VCALENDAR wrapper) for use as an
-    /// occurrence override. Shares the master's UID and adds RECURRENCE-ID.
-    /// Only the fields present in `patch` are emitted; unspecified fields fall
-    /// through to the master's values at expansion time.
-    ///
-    /// `kind` MUST reflect the master's DTSTART representation — RFC 5545
-    /// §3.8.4.4 requires RECURRENCE-ID (and, for a moved occurrence, DTSTART)
-    /// to use the SAME value type as the master's DTSTART. So an all-day master
-    /// yields `RECURRENCE-ID;VALUE=DATE:…`, a zoned master `…;TZID=…:…`, a UTC
-    /// master `…:…Z`, a floating master a bare local time. The override is
-    /// spliced into the master's existing VCALENDAR, which already carries the
-    /// matching VTIMEZONE for the zoned case.
-    static func buildOverrideVEvent(patch: GCalEventInput, uid: String, recurrenceId: String, kind: MasterDTStartKind, organizerLine: String? = nil) -> String {
-        let dtstampFmt = DateFormatter()
-        dtstampFmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-        dtstampFmt.timeZone = TimeZone(identifier: "UTC")
-
-        // Compact the naive recurrence_id ("2026-05-20T17:00:00" → "20260520T170000").
-        // It is the occurrence's wall-clock time; preserve the digits and attach
-        // the type marker that matches the master.
-        let ridDigits = recurrenceId
-            .replacingOccurrences(of: "-", with: "")
-            .replacingOccurrences(of: ":", with: "")
-
-        var lines: [String] = []
-        lines.append("BEGIN:VEVENT")
-        lines.append("UID:\(uid)")
-        lines.append("DTSTAMP:\(dtstampFmt.string(from: Date()))")
-
-        switch kind {
-        case .allDay:
-            lines.append("RECURRENCE-ID;VALUE=DATE:\(String(ridDigits.prefix(8)))")
-        case .zoned(let tzid):
-            lines.append("RECURRENCE-ID;TZID=\(tzid):\(ridDigits)")
-        case .utc:
-            lines.append("RECURRENCE-ID:\(ridDigits.uppercased().hasSuffix("Z") ? ridDigits : ridDigits + "Z")")
-        case .floating:
-            lines.append("RECURRENCE-ID:\(ridDigits)")
-        }
-
-        if let summary = patch.summary, !summary.isEmpty {
-            lines.append("SUMMARY:\(summary)")
-        }
-        if let location = patch.location, !location.isEmpty {
-            lines.append("LOCATION:\(location)")
-        }
-        if let description = patch.description, !description.isEmpty {
-            lines.append("DESCRIPTION:\(description)")
-        }
-        if let transp = patch.transparency {
-            lines.append("TRANSP:\(transp.uppercased())")
-        }
-        if let attendees = patch.attendees, !attendees.isEmpty {
-            // RFC 5545 §3.8.4.3 + iCloud requirement: a VEVENT carrying
-            // ATTENDEE must also carry ORGANIZER. Without this iCloud rejects
-            // the PUT with HTTP 403. Echo the master's ORGANIZER on the
-            // override; if the master has none (rare — iCloud auto-adds
-            // when an attendee is first added), fall back to a self-organized
-            // form using the FIRST attendee's domain owner. Best-effort.
-            if let org = organizerLine {
-                lines.append(org)
-            }
-            for a in attendees {
-                // Escape `"` in the CN so it can't break out of the quoted
-                // parameter value (RFC 5545 §3.2 — DQUOTE is the delimiter).
-                let cn = (a.name ?? a.email).replacingOccurrences(of: "\"", with: "'")
-                lines.append("ATTENDEE;CN=\"\(cn)\";ROLE=REQ-PARTICIPANT:mailto:\(a.email)")
-            }
-        }
-
-        // DTSTART/DTEND — emitted only when the patch moves the occurrence.
-        // Value type matches the master (RFC 5545 §3.8.4.4).
-        switch kind {
-        case .allDay:
-            let dateOnlyParse = DateFormatter()
-            dateOnlyParse.dateFormat = "yyyy-MM-dd"
-            dateOnlyParse.timeZone = .current
-            let icsDateFmt = DateFormatter()
-            icsDateFmt.dateFormat = "yyyyMMdd"
-            icsDateFmt.timeZone = .current
-            if let startStr = patch.startDate ?? patch.startDateTime,
-               let d = dateOnlyParse.date(from: String(startStr.prefix(10))) {
-                lines.append("DTSTART;VALUE=DATE:\(icsDateFmt.string(from: d))")
-            }
-            if let endStr = patch.endDate ?? patch.endDateTime,
-               let d = dateOnlyParse.date(from: String(endStr.prefix(10))) {
-                lines.append("DTEND;VALUE=DATE:\(icsDateFmt.string(from: d))")
-            }
-        case .zoned(let tzid):
-            let zfmt = DateFormatter()
-            zfmt.dateFormat = "yyyyMMdd'T'HHmmss"
-            zfmt.timeZone = TimeZone(identifier: tzid) ?? .current
-            if let iso = patch.startDateTime, let d = Date.fromISO8601(iso) {
-                lines.append("DTSTART;TZID=\(tzid):\(zfmt.string(from: d))")
-            }
-            if let iso = patch.endDateTime, let d = Date.fromISO8601(iso) {
-                lines.append("DTEND;TZID=\(tzid):\(zfmt.string(from: d))")
-            }
-        case .utc:
-            let ufmt = DateFormatter()
-            ufmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
-            ufmt.timeZone = TimeZone(identifier: "UTC")
-            if let iso = patch.startDateTime, let d = Date.fromISO8601(iso) {
-                lines.append("DTSTART:\(ufmt.string(from: d))")
-            }
-            if let iso = patch.endDateTime, let d = Date.fromISO8601(iso) {
-                lines.append("DTEND:\(ufmt.string(from: d))")
-            }
-        case .floating:
-            let ffmt = DateFormatter()
-            ffmt.dateFormat = "yyyyMMdd'T'HHmmss"
-            ffmt.timeZone = .current
-            if let iso = patch.startDateTime, let d = Date.fromISO8601(iso) {
-                lines.append("DTSTART:\(ffmt.string(from: d))")
-            }
-            if let iso = patch.endDateTime, let d = Date.fromISO8601(iso) {
-                lines.append("DTEND:\(ffmt.string(from: d))")
-            }
-        }
-        lines.append("END:VEVENT")
-        // Same ICS-injection boundary as `GCalEventInput.toICS`, for the same reason: SUMMARY,
-        // LOCATION, DESCRIPTION, TRANSP and the ATTENDEE CN/mailto above are interpolated from
-        // model-supplied tool arguments without escaping, and CRLF is the ICS property separator, so
-        // a value carrying one would split into an extra property this override PUTs on the user's
-        // behalf. This block is spliced into a full-resource PUT, so an injected
-        // `END:VEVENT`/`BEGIN:VEVENT`/`RECURRENCE-ID` pair could also reach an occurrence the
-        // gesture never named — and a CalDAV event write has no documented per-item recovery.
-        //
-        // ⚠️ Guarding `toICS` alone left this path open: `toICS` covers create and split-series,
-        // while `updateOccurrence` builds its VEVENT here and `updateEvent` builds it in
-        // `mergePatchIntoICS`. Enumerate by "what emits an ICS property line", not by "what calls
-        // toICS".
-        return lines.map { GCalEventInput.sanitizeICSLine($0) }.joined(separator: "\r\n")
     }
 
     /// Insert an override VEVENT into a CalDAV ICS resource. If the resource
@@ -1587,196 +1143,50 @@ actor CalDAVProvider: CalendarProvider {
         return normalize(a) == normalize(b)
     }
 
-    /// Construct the input for a new series of a split. Inherits the master's
-    /// title/location/description/transparency from the source ICS unless the
-    /// patch overrides; copies attendees from patch (already resolved) or
-    /// falls back to the master.
-    /// Throws `CalendarProviderError.notSupported` if the master's start/end or
-    /// the requested new start can't be recovered — silently defaulting the
-    /// duration would produce a new series with wrong length, which is worse
-    /// than failing fast.
-    ///
-    /// ⚠️ THE ERROR DOMAIN IS PART OF THE CONTRACT (R13-U2). These three throws
-    /// used to be `CalDAVError.parseError`, which
-    /// `AccountManagerCalendarQueue` claims in **no** terminal arm — so the
-    /// drain requeued the op and did `failedAccounts.insert`, head-of-line
-    /// blocking every later calendar op on that account on every subsequent
-    /// drain, forever, with no retry ceiling and no UI that can clear a
-    /// `pendingCalendarOperation` row. Every condition below is a pure function
-    /// of the persisted arguments and the master ICS, so a retry reproduces it
-    /// identically: it is unexecutable, not indeterminate.
-    /// `isCalendarUnsupportedError` claims `notSupported`, giving the same
-    /// disposition the three unexecutable-op guards in
-    /// `executeCalendarOperation` already use — terminal WITH A REASON, which
-    /// `unsupportedReason` surfaces to the agent verbatim.
-    ///
-    /// ⚠️ THE MIRROR IMAGE, stated so it is not "tidied" back in: this must NOT
-    /// become a blanket reclassification of `CalDAVError.parseError`. The four
-    /// `"Empty response for event …"` sites in `getEvent`/`updateEvent`/
-    /// `updateOccurrence`/`splitSeries` raise the SAME case for an empty or
-    /// truncated response body — genuinely indeterminate, "we could not
-    /// determine the answer" — and retiring those would drop a user intention,
-    /// which is the defect this fix exists to avoid, pointed the other way.
-    ///
-    /// `newStartNaiveISO` is a naive wall clock **already expressed in the
-    /// master's frame** (`recurrenceIdInMasterFrame`), and `newStartZone` is the
-    /// zone the caller declared for the original `recurrence_id`. The pair is
-    /// what lets this function read the value back in the frame it was written
-    /// in — see `masterFrameZone`, which is the inverse of the conversion and
-    /// carries the full rationale. There is deliberately **no default** on
-    /// `newStartZone`: a dropped frame is silent, and the whole class of defect
-    /// this parameter closes is "the value was read in a frame nobody chose".
-    static func buildNewSeriesInput(
-        masterICS: String,
-        patch: GCalEventInput,
-        newStartNaiveISO: String,
-        newStartZone: TimeZone,
-        newRRule: String
-    ) throws -> GCalEventInput {
-        var out = GCalEventInput()
-        out.summary = patch.summary ?? extractScalar(from: masterICS, key: "SUMMARY")
-        out.location = patch.location ?? extractScalar(from: masterICS, key: "LOCATION")
-        out.description = patch.description ?? extractScalar(from: masterICS, key: "DESCRIPTION")
-        out.transparency = patch.transparency ?? extractScalar(from: masterICS, key: "TRANSP")
-        // Recurrence: caller's new-series RRULE is the default, but if the LLM
-        // asked for a different pattern on the new series via patch.recurrence,
-        // honor that — matches Google/Exchange (mergeMasterAndPatch) and the
-        // TB bridge.
-        if let patchRecurrence = patch.recurrence, !patchRecurrence.isEmpty {
-            out.recurrence = patchRecurrence
-        } else {
-            out.recurrence = [newRRule]
-        }
-
-        // Inherit duration from master's DTSTART/DTEND. If we can't recover it,
-        // refuse to invent one — the caller surfaces the error to the LLM/user.
-        guard let duration = extractMasterDuration(from: masterICS) else {
-            throw CalendarProviderError.notSupported("buildNewSeriesInput: could not extract master event duration from ICS")
-        }
-
-        // CRITICAL: preserve the master's all-day-ness. An all-day master must
-        // produce an all-day new series (date-only DTSTART/DTEND) — emitting
-        // the timed form would silently convert the series to a timed event.
-        if icsIsAllDay(masterICS) {
-            let dateFmt = DateFormatter()
-            dateFmt.dateFormat = "yyyy-MM-dd"
-            dateFmt.timeZone = .current
-            // Prefer the patch's explicit new date when the LLM is moving
-            // the series with the split. `newStartNaiveISO` only identifies
-            // WHICH occurrence the split anchors at — `patch.startDate` is
-            // the user's desired NEW date. Falling back to the recurrence_id
-            // silently ignores a move the LLM was asked to perform.
-            let preferredStart = patch.startDate ?? newStartNaiveISO
-            guard let startDate = dateFmt.date(from: String(preferredStart.prefix(10))) else {
-                throw CalendarProviderError.notSupported("buildNewSeriesInput: invalid start '\(preferredStart)'")
-            }
-            var cal = Calendar(identifier: .gregorian)
-            cal.timeZone = .current
-            out.startDate = dateFmt.string(from: startDate)
-            // End: patch's explicit end wins; else start + master's duration.
-            if let patchEnd = patch.endDate, let endDate = dateFmt.date(from: String(patchEnd.prefix(10))) {
-                out.endDate = dateFmt.string(from: endDate)
-            } else {
-                let days = max(1, Int((duration / 86400).rounded()))
-                if let endDate = cal.date(byAdding: .day, value: days, to: startDate) {
-                    out.endDate = dateFmt.string(from: endDate)
-                }
-            }
-        } else {
-            // `newStartNaiveISO` arrives in the MASTER'S frame, so read it in
-            // that frame — `masterFrameZone` is the exact inverse of
-            // `recurrenceIdInMasterFrame`, and reading in any other zone is the
-            // two-framed split that drops the boundary occurrence. The new
-            // series then inherits the master's zone (via startTimeZone) when
-            // there is one, so `toICS` emits `DTSTART;TZID=…` + a matching
-            // VTIMEZONE instead of a UTC time that would drift across DST.
-            //
-            // ⚠️ THIS READ `zone = .current` FOR EVERY NON-`.zoned` MASTER UNTIL
-            // ROUND 18d. For a `.utc` master the caller hands in a UTC wall
-            // clock, so parsing it in the device zone moved the successor's
-            // start by the device's UTC offset while the RRULE cap stayed on the
-            // correct absolute instant.
-            let masterKind = Self.masterDTStartKind(from: masterICS)
-            let zone = Self.masterFrameZone(masterKind, declaredZone: newStartZone)
-            let fmt = DateFormatter()
-            fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-            fmt.timeZone = zone
-            // Same prefer-patch rule as the all-day branch above — see comment.
-            let startInstant: Date? = {
-                if let pISO = patch.startDateTime, let d = Date.fromISO8601(pISO) { return d }
-                return fmt.date(from: newStartNaiveISO)
-            }()
-            guard let startDate = startInstant else {
-                throw CalendarProviderError.notSupported("buildNewSeriesInput: invalid start (patch.startDateTime='\(patch.startDateTime ?? "")', newStartNaiveISO='\(newStartNaiveISO)')")
-            }
-            let endDate: Date = {
-                if let pISO = patch.endDateTime, let d = Date.fromISO8601(pISO) { return d }
-                return startDate.addingTimeInterval(duration)
-            }()
-            out.startDateTime = startDate.iso8601String(timeZone: zone)
-            out.endDateTime = endDate.iso8601String(timeZone: zone)
-            if case .zoned(let tzid) = masterKind {
-                out.startTimeZone = tzid
-                out.endTimeZone = tzid
-            }
-        }
-
-        // Attendees: patch's resolved list wins; otherwise inherit master's.
-        if let pa = patch.attendees {
-            out.attendees = pa
-        } else {
-            out.attendees = extractAttendees(from: masterICS)
-        }
-        return out
-    }
-
-    /// Extract a simple scalar property (`SUMMARY`, `LOCATION`, etc.) — does
-    /// not unescape ICS escapes; good enough for round-trip preservation.
-    /// Uses `icsLines` so folded lines (RFC 5545 §3.1) are joined first —
-    /// otherwise long descriptions would be silently truncated at column 75.
-    /// Scoped to the MASTER VEVENT — a VTIMEZONE's STANDARD/DAYLIGHT
-    /// subcomponents could also carry these keys, so a whole-resource scan
-    /// would be unsafe.
-    private static func extractScalar(from ics: String, key: String) -> String? {
-        let prefix = "\(key):"
-        for line in masterVEventLines(from: ics) {
-            if line.hasPrefix(prefix) {
-                return String(line.dropFirst(prefix.count))
-            }
-        }
-        return nil
-    }
-
     /// Parse the MASTER VEVENT's `DTSTART` plus **either** `DTEND` **or**
     /// `DURATION` (RFC 5545 §3.6.1 makes them alternatives, and forbids both in
-    /// one VEVENT) and return the duration in seconds. Returns nil if the start
-    /// is missing/unparseable or neither end form can be recovered. Scoped to
+    /// one VEVENT) and return the duration in seconds. With neither, the end is
+    /// the one §3.6.1 implies (`ICSParser.impliedEndValue`): an all-day start lasts
+    /// one day, and a timed start lasts no time, which is refused like any
+    /// non-positive length. Returns nil if the start is missing/unparseable or no
+    /// positive length can be recovered. Scoped to
     /// the master VEVENT so a VTIMEZONE's own `DTSTART:…T020000` lines can't be
     /// mistaken for the event's.
     ///
     /// ⚠️ The `DURATION` arm is not a nicety. This function read `DTEND` only
     /// until 2026-08-06, so an ordinary recurring master written by any other
     /// client as `DTSTART` + `DURATION:PT1H` returned nil,
-    /// `buildNewSeriesInput` threw, and — because the throw was classified by
+    /// the split's successor builder threw, and — because the throw was classified by
     /// no terminal arm — the account's whole calendar lane wedged. Reuses
     /// `ICSParser.addDuration`, the tree's existing ISO-8601 duration parser,
     /// rather than adding a second grammar.
     static func extractMasterDuration(from ics: String) -> TimeInterval? {
         var startDate: Date?
+        var startLine: String?
         var endDate: Date?
         var durationValue: String?
-        for line in masterVEventLines(from: ics) {
+        var hasEndOrDuration = false
+        // The VEVENT's own lines only: a repeating alarm's `DURATION` is not the event's length.
+        for line in masterTopLevelLines(ics) {
             if line.hasPrefix("DTSTART") {
                 startDate = parseICSDateTime(line)
+                startLine = line
             } else if line.hasPrefix("DTEND") {
+                hasEndOrDuration = true
                 endDate = parseICSDateTime(line)
             } else if line.hasPrefix("DURATION") {
+                hasEndOrDuration = true
                 guard let colonIdx = line.firstIndex(of: ":") else { continue }
                 durationValue = String(line[line.index(after: colonIdx)...])
                     .trimmingCharacters(in: .whitespaces)
             }
         }
         guard let s = startDate else { return nil }
+        // Neither line at all: the end RFC 5545 implies. An end line that can't be read stays a refusal.
+        if !hasEndOrDuration, let start = startLine.flatMap(icsProperty),
+           let end = ICSParser.impliedEndValue(dtstartParams: start.params, dtstartValue: start.value) {
+            endDate = parseICSDateTime("DTEND\(start.params):\(end)")
+        }
         // DTEND wins when present. A non-conforming resource carrying both then
         // keeps the pre-existing reading rather than silently changing meaning.
         if let e = endDate {
@@ -1829,7 +1239,7 @@ actor CalDAVProvider: CalendarProvider {
             // device timezone — a wrong absolute instant here would corrupt
             // `extractMasterDuration` (the new series would get a duration off
             // by the timezone offset). Returning nil makes the caller
-            // (`buildNewSeriesInput`) fail fast with a clear error instead.
+            // (`seriesSplitResources`) fail fast with a clear error instead.
             guard let zone = TimeZone(identifier: tzid) else {
                 BackgroundSyncLogger.logDebug("[CalDAV] parseICSDateTime: unresolvable TZID '\(tzid)' — refusing to guess")
                 return nil
@@ -1856,27 +1266,6 @@ actor CalDAVProvider: CalendarProvider {
             }
         }
         return nil
-    }
-
-    /// Scoped to the MASTER VEVENT (`masterVEventLines` unfolds folded lines
-    /// first — long CN values can push an ATTENDEE line past 75 chars).
-    private static func extractAttendees(from ics: String) -> [(email: String, name: String?)] {
-        var result: [(email: String, name: String?)] = []
-        for line in masterVEventLines(from: ics) {
-            guard line.hasPrefix("ATTENDEE") else { continue }
-            // ATTENDEE;CN="Name";ROLE=REQ-PARTICIPANT:mailto:foo@bar.com
-            guard let mailtoRange = line.range(of: "mailto:", options: .caseInsensitive) else { continue }
-            let email = String(line[mailtoRange.upperBound...]).trimmingCharacters(in: .whitespaces)
-            var name: String?
-            if let cnRange = line.range(of: "CN=\"", options: .caseInsensitive) {
-                let after = line[cnRange.upperBound...]
-                if let endQuote = after.firstIndex(of: "\"") {
-                    name = String(after[..<endQuote])
-                }
-            }
-            result.append((email: email, name: name))
-        }
-        return result
     }
 
     // MARK: - Helpers

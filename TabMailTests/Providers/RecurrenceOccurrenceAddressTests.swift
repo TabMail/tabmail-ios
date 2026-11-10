@@ -363,8 +363,13 @@ struct CalDAVOccurrenceFrameTests {
         #expect(converted == "2026-05-21T01:00:00",
                 "got '\(converted)'. Writing the declared wall clock verbatim under TZID=Asia/Tokyo keys the override to 2026-05-20 01:00 Tokyo — a wall clock no occurrence of this series has, so the user's edit lands on an orphan VEVENT (or, if it collides, on a DIFFERENT occurrence).")
 
-        let block = CalDAVProvider.buildOverrideVEvent(
-            patch: GCalEventInput(), uid: "uid-1", recurrenceId: converted, kind: .zoned("Asia/Tokyo"))
+        let series = [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", "UID:uid-1",
+            "DTSTART;TZID=Asia/Tokyo:20260514T010000", "DTEND;TZID=Asia/Tokyo:20260514T020000",
+            "RRULE:FREQ=WEEKLY", "SUMMARY:Sync", "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n") + "\r\n"
+        let block = try CalDAVProvider.occurrenceOverrideResource(
+            storedICS: series, recurrenceIdNaive: converted, patch: GCalEventInput(), now: Date())
         #expect(block.contains("RECURRENCE-ID;TZID=Asia/Tokyo:20260521T010000"),
                 "override block did not carry the master-frame RECURRENCE-ID:\n\(block)")
     }
@@ -846,7 +851,7 @@ struct CalendarQueueUntilValueTypeTests {
         guard r.splits.count == 1 else { return }
         let until = untilOf(r.splits[0].patch)
         #expect(until == "20270101",
-                "got UNTIL=\(until ?? "<absent>"). CalDAV's buildNewSeriesInput prefers patch.recurrence over its own stripped rule while forcing the successor's DTSTART to the master's all-day form, so a mismatched pair here lands AFTER the irreversible cap PUT and its rollback is best-effort.")
+                "got UNTIL=\(until ?? "<absent>"). CalDAV's split writes patch.recurrence over the new part's rule while the new part keeps the series' all-day DTSTART, so a mismatched pair here is written as the new part, which the irreversible cap PUT then relies on.")
     }
 
     @Test("no extra fetch on an edit that emits no UNTIL")

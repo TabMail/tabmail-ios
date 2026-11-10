@@ -831,9 +831,9 @@ extension AccountManager {
             // against the server's `DTSTART;VALUE=DATE:` — `mergePatchIntoICS` leaves the start
             // exactly as the server had it when the patch carries none, so nothing downstream can
             // notice the disagreement. On `edit_scope: "this_and_following"` it is worse: CalDAV's
-            // `buildNewSeriesInput` prefers `patch.recurrence` over its own stripped rule while
-            // forcing the successor's DTSTART to the master's all-day form, so the mismatched pair is
-            // written AFTER the irreversible cap PUT, whose rollback is best effort.
+            // split writes `patch.recurrence` over the new part's rule while the new part keeps the
+            // series' all-day DTSTART, so the mismatched pair is written as the new part, which the
+            // irreversible cap PUT then relies on, with no rollback (ADR-IOS-106).
             //
             // So resolve it from the resource — the only source of the landing DTSTART's value type
             // available before the write. An explicitly stated `all_day` is still taken at its word —

@@ -35,7 +35,9 @@ import Synchronization
 ///   disable meeting online" (event-update). Checked live on a work account: a
 ///   text body write left `isOnlineMeeting` false, `onlineMeetingProvider`
 ///   `unknown` and `onlineMeeting` null; an HTML write that changed only the
-///   notes kept the meeting and its join link.
+///   notes kept the meeting and its join link;
+/// - a create (`POST /me/events`) stores the event it is sent under a new id,
+///   with the same recurrence rules as a PATCH.
 ///
 /// Starts and ends are returned as stored, whatever zone `Prefer` names: a
 /// fixture stores them as Graph renders them for the device.
@@ -81,6 +83,13 @@ final class FakeGraphCalendar: Sendable {
     /// The `Authorization` header of every PATCH, refused ones included, in order.
     var patchAuthorizations: [String] { patchAuthorizationLog.withLock { $0 } }
 
+    /// The events a create stored, as stored.
+    var created: [[String: Any]] {
+        ids.filter { $0.hasPrefix(Self.createdPrefix) }.sorted().compactMap(event)
+    }
+
+    private static let createdPrefix = "created-"
+
     func install(on http: FakeHTTP.Scenario) {
         http.register(path: "/v1.0/me/events/", method: "GET") { [self] request in
             if let status = takeFailure("GET") { return .status(status) }
@@ -120,6 +129,17 @@ final class FakeGraphCalendar: Sendable {
             Self.apply(patch, to: &stored)
             store(stored)
             return Self.json(stored)
+        }
+        http.register(path: "/v1.0/me/events", method: "POST") { [self] request in
+            if let status = takeFailure("POST") { return .status(status) }
+            guard let body = request.body,
+                  var created = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+                  Self.rangeHasStart(created)
+            else { return .status(400) }
+            created["id"] = Self.createdPrefix + String(ids.filter { $0.hasPrefix(Self.createdPrefix) }.count + 1)
+            Self.defaultRecurrenceZone(in: &created)
+            store(created)
+            return Self.json(created)
         }
     }
 

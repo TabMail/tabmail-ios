@@ -94,6 +94,64 @@ exactly as written, for an online meeting and a plain event, and checks
 that a description read and written back keeps its link as a link; `EmailFilterTests` pins
 `markdownPieces` (unescaped label and destination, and the pieces joining back to the text).
 
+## Repeating events — copies keep the series' properties
+
+A this-and-following edit splits a series into the capped series and a new part, and a CalDAV
+one-occurrence edit writes an override. Both copies must carry what the stored series has.
+These tests read what each provider sent, or what the fake server ends up holding.
+
+- `CalDAVEventCopiesTests` covers both CalDAV copies, `seriesSplitResources` and
+  `occurrenceOverrideResource`, built from one rich series. The series has class, categories,
+  priority, URL, alarms, attendee parameters, organizer and X-properties; excluded and added dates
+  are checked on other fixtures. Every property line the edit does not change must come through as
+  stored.
+  - When the edit moves the meeting (a new start and end, end alone, an earlier start with the
+    same end, place, or a split's new rule), attendees are asked again.
+  - An all-day series with no end lasts its one day (`ICSParser.impliedEndValue`, RFC 5545
+    §3.6.1): restating the date keeps the answers, moving it asks again (both copies), and the
+    series can be split. A timed series with no end still can't be split, and a one-occurrence edit
+    of a zoned one keeps no length and every answer, in zones at both ends of the offsets.
+  - A one-occurrence edit that gives a repeat rule writes no rule and keeps every answer, for a
+    new override and for one changed before; a series with a start and no end can be changed.
+  - Excluded and added dates stay with the part they fall in; a changed occurrence and an added
+    date exactly at the split go to the new part only.
+  - A split that moves the new part's start moves its excluded and added dates, its UNTIL and its
+    changed occurrences' RECURRENCE-IDs with it (a changed occurrence's own time stays); the capped
+    series keeps its own.
+  - A whole-series edit keeps attendees and alarms.
+- `CalDAVSplitRefusedBeforeWriteTests` (`CalDAVSplitHelpersTests`, against `FakeCalDAVStore`): a
+  series whose excluded dates can't be read is refused with no PUT and the resource unchanged.
+- `CalDAVSplitRollbackTests` (same file): the new part is written before the cap. A failed new
+  part, or a foreign resource at its URL, leaves the series untouched; a concurrent edit between
+  the two writes survives and the retry caps it; excluded dates, added dates and changed
+  occurrences each end up in exactly one part, also when the cap's response is lost and the split
+  is retried.
+- `SeriesSplitCopyTests`, Google: the new part is the stored event JSON without the keys the
+  server owns. The test checks:
+  - the conference and attachment query flags;
+  - the capped and new rules, with excluded and added dates split at the slot, timed and all day;
+  - the attendee rule: entries are kept, a reschedule (new start, earlier start with the same end,
+    new end alone, new rule alone, new place) asks everyone but the organizer again, the organizer
+    is known by the attendee flag or by the address alone, an added attendee is asked, and a dropped
+    one is removed; `splitReschedules` is also checked trigger by trigger, including timed to all day;
+  - an excluded or an added date exactly at the split going to the new part only;
+  - `privateCopy` kept on the new part;
+  - a refusal before any write when a date can't be read.
+- `SeriesSplitCopyTests`, Outlook, against `FakeGraphCalendar`: every property in a literal list
+  (`GraphSplitFixture.keptKeys`) is copied, and the create as sent carries no key outside that list
+  and what the split writes. The test also checks:
+  - attendee names and types;
+  - a new place replacing the stored places;
+  - the stored pattern written verbatim on both parts;
+  - the range rules for noEnd, endDate and numbered series, and a range already ending on this
+    split's cap (a retry after the cap landed) written with no end;
+  - the cap of each of those three series as sent: an end date at the split and no count;
+  - the transaction id;
+  - a rule in the edit becoming the new part's rule while the capped series keeps its own;
+  - new notes on an online series keeping its join section as stored;
+  - a split whose new start can't be dated refused before the series is capped;
+  - the stored recurrence restored exactly when the create fails.
+
 ## Inbox list — layered test architecture
 
 the unified inbox read (ADR-IOS-055) replaced four disagreeing inbox-list read paths with one unified reader (`InboxListReader` → `InboxListComposer.compose`). Getting this right — and *keeping* it right as the code evolves — needs coverage at four distinct layers, each catching a different class of bug. A 5-round adversarial audit of the refactor found two HIGH-severity findings (F1, F2) that lived entirely *between* layers, invisible to any single layer's test suite — that's why the fourth layer (E2E) exists.
@@ -381,7 +439,8 @@ refused, a DATE UNTIL covering its whole day, and an UNTIL equal to the split's 
 retry. `GoogleSplitSeriesTailTests` and `CalDAVSplitSeriesTailTests` drive the real providers on
 `FakeHTTP` with a series zoned to Pacific/Auckland at 07:00 and the split declared in UTC, so a rule
 read in the wrong frame counts other weekdays. A refused split sends no write: Google sends only the
-master GET, and CalDAV sends no PUT.
+master GET, and CalDAV sends no PUT. A Google split asked to send the user's invitations sends them
+only with the new series' create; the cap of the original goes out with `sendUpdates=none`.
 
 ## Outlook sends carry the Outbox's Message-ID
 

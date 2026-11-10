@@ -157,6 +157,19 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// join link (`notes(of:)`), and the stored body an edit keeps (#511).
     private static let eventSelect = "id,subject,location,body,bodyPreview,onlineMeeting,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,createdDateTime,lastModifiedDateTime,isAllDay,seriesMasterId"
 
+    /// What a split reads from the stored series: what `getEvent` reads, and every property the
+    /// new part copies (`splitCopiedKeys`).
+    private static let splitSelect = eventSelect
+        + ",importance,sensitivity,categories,isReminderOn,reminderMinutesBeforeStart,locations,responseRequested,allowNewTimeProposals,hideAttendees"
+
+    /// The stored series' properties a split's new part copies as they are; Graph accepts each on a
+    /// create. Attendees, start, end and recurrence are written by `splitNewPartJSON` itself.
+    private static let splitCopiedKeys: Set<String> = [
+        "subject", "body", "importance", "sensitivity", "showAs", "categories", "isReminderOn",
+        "reminderMinutesBeforeStart", "location", "locations", "isAllDay", "responseRequested",
+        "allowNewTimeProposals", "hideAttendees",
+    ]
+
     func getEvent(calendarId: String = "primary", eventId: String) async throws -> GCalEvent {
         let encodedEventId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
         let data = try await request(path: "/events/\(encodedEventId)?$select=\(Self.eventSelect)")
@@ -347,10 +360,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
     /// Series split (this_and_following). For Graph:
     /// 1. PATCH the master's recurrence.range to {type: "endDate", endDate: splitDate - 1 day}
-    ///    — Graph's `endDate` is inclusive and date-only, so we set the day before splitDate.
-    /// 2. POST a new event inheriting master's fields, applying `patch`, with start/end
-    ///    shifted to recurrenceId and the same pattern but no cap.
-    /// On step-2 failure, attempt a best-effort revert of step 1.
+    ///    — Graph's `endDate` is inclusive and date-only, so we set the day before splitDate. The
+    ///    stored pattern is written back exactly.
+    /// 2. POST the new part: a copy of the stored series (`splitNewPartJSON`) starting at
+    ///    recurrenceId, with `patch` applied.
+    /// On step-2 failure, attempt a best-effort revert of step 1 to the stored recurrence.
     func splitSeries(
         calendarId: String = "primary",
         eventId: String,
@@ -363,9 +377,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // don't carry the series `recurrence`; only the master does. Resolve
         // via `seriesMasterId` (mapped onto `recurringEventId` by toGCalEvent)
         // so a split aimed at an occurrence id still finds the series to cap.
-        let (eventId, master) = try await resolveToMaster(eventId: eventId)
+        let (eventId, snapshot) = try await resolveToMaster(eventId: eventId, select: Self.splitSelect)
+        let master = snapshot.event
         guard let masterRecurrence = master.recurrence, !masterRecurrence.isEmpty,
-              let originalRRule = masterRecurrence.first(where: { $0.uppercased().hasPrefix("RRULE:") })
+              masterRecurrence.contains(where: { $0.uppercased().hasPrefix("RRULE:") }),
+              let storedRecurrence = snapshot.raw["recurrence"] as? [String: Any],
+              let storedRange = storedRecurrence["range"] as? [String: Any]
         else {
             throw CalendarProviderError.notSupported("Event \(eventId) is not recurring; can't split.")
         }
@@ -377,29 +394,31 @@ actor ExchangeCalendarProvider: CalendarProvider {
         //    its precision is lost when collapsed to a whole date, and the
         //    naive date-part of (split − 1s) is still the split day, which
         //    Graph would keep on the master. So compute the cap directly:
-        //    endDate = local date of (split occurrence − 1 day). Graph also
-        //    REQUIRES `startDate` on the range — supply the master's start.
+        //    endDate = local date of (split occurrence − 1 day). The stored
+        //    pattern and the rest of the stored range (its `startDate`, which
+        //    Graph requires, and its zone) are written back as they are.
         guard let capEndDate = Self.graphEndDateBefore(naiveISO: recurrenceId, allDay: master.isAllDay, zone: recurrenceIdZone) else {
             throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
         }
-        guard let masterStartDate = master.startDate else {
-            throw CalendarProviderError.notSupported("Master event \(eventId) has no start date — can't build a Graph recurrence range.")
-        }
-        // Build the pattern from the master's RRULE (range is replaced below).
-        // Pass the master's start so `FREQ=WEEKLY`/`MONTHLY`/`YEARLY` rules that
-        // omit BYDAY/BYMONTHDAY get the implied field filled from DTSTART.
-        var cappedRecurrence = parseRRULEToGraphRecurrence(
-            GoogleCalendarProvider.stripUntilAndCount(originalRRule),
-            eventStart: masterStartDate
+        var capRange = storedRange
+        capRange["type"] = "endDate"
+        capRange["endDate"] = capEndDate
+        capRange.removeValue(forKey: "numberOfOccurrences")
+        var cappedRecurrence = storedRecurrence
+        cappedRecurrence["range"] = capRange
+        // Built before the cap is written, so a series that can't be copied is
+        // refused while nothing has changed.
+        let transactionId = GoogleCalendarProvider.deterministicSplitEventId(
+            masterId: eventId, recurrenceId: recurrenceId
         )
-        let startDateFmt = DateFormatter()
-        startDateFmt.dateFormat = "yyyy-MM-dd"
-        startDateFmt.timeZone = .current
-        cappedRecurrence["range"] = [
-            "type": "endDate",
-            "startDate": startDateFmt.string(from: masterStartDate),
-            "endDate": capEndDate,
-        ]
+        let createJSON = try splitNewPartJSON(
+            stored: snapshot,
+            patch: patch,
+            newStartNaiveISO: recurrenceId,
+            newStartZone: recurrenceIdZone,
+            capEndDate: capEndDate,
+            transactionId: transactionId
+        )
         // CRITICAL: include the master's existing start/end on the cap PATCH.
         // If we send ONLY `recurrence`, Graph silently rewrites the master's
         // `start.dateTime`/`start.timeZone` to UTC midnight at the
@@ -438,25 +457,11 @@ actor ExchangeCalendarProvider: CalendarProvider {
             }
         }
 
-        // 2. Build the new series — inherit master + patch overrides + start at splitDate.
-        let rruleWithoutCap = GoogleCalendarProvider.stripUntilAndCount(originalRRule)
-        let newSeriesInput = GoogleCalendarProvider.mergeMasterAndPatch(
-            master: master,
-            patch: patch,
-            newStartNaiveISO: recurrenceId,
-            newStartZone: recurrenceIdZone,
-            newRecurrence: [rruleWithoutCap]
-        )
-        // Stamp a DETERMINISTIC `transactionId` (derived from master id +
-        // recurrence_id) on the create. Graph uses transactionId to dedupe
-        // POSTs — so a retry after a lost ACK on the create below won't
+        // 2. Create the new part (`createJSON`, built above). Its DETERMINISTIC
+        // `transactionId` (derived from master id + recurrence_id) lets Graph
+        // dedupe POSTs — so a retry after a lost ACK on the create below won't
         // produce a duplicate series. The two-step cap-then-create is
         // otherwise not idempotent (the PATCH is, the POST isn't).
-        let transactionId = GoogleCalendarProvider.deterministicSplitEventId(
-            masterId: eventId, recurrenceId: recurrenceId
-        )
-        var createJSON = toGraphEventJSON(newSeriesInput)
-        createJSON["transactionId"] = transactionId
         let calPath: String
         if calendarId == "primary" {
             calPath = ""
@@ -516,24 +521,15 @@ actor ExchangeCalendarProvider: CalendarProvider {
             // NOT transient: this is deliberately not "make every rollback failure
             // retryable", which would put a two-step write that has already half
             // landed into an unbounded retry.
-            var revertInput = GCalEventInput()
-            revertInput.recurrence = masterRecurrence
-            // SAME Graph quirk as the cap PATCH above — sending ONLY
-            // `recurrence` causes Graph to silently rewrite the master's
-            // start/end to UTC midnight at `range.startDate`. Include the
-            // master's existing start/end so its first occurrence stays put.
-            if let startISO = master.start?.dateTime,
-               let startTz = master.start?.timeZone {
-                revertInput.startDateTime = startISO
-                revertInput.startTimeZone = startTz
-            }
-            if let endISO = master.end?.dateTime,
-               let endTz = master.end?.timeZone {
-                revertInput.endDateTime = endISO
-                revertInput.endTimeZone = endTz
-            }
+            // The stored recurrence exactly as it was. SAME Graph quirk as the
+            // cap PATCH above — sending ONLY `recurrence` causes Graph to
+            // silently rewrite the master's start/end to UTC midnight at
+            // `range.startDate` — so the master's existing start/end, which the
+            // cap carried, go with it and its first occurrence stays put.
+            var revertJSON = cappedJSON
+            revertJSON["recurrence"] = storedRecurrence
             var revertFailure: Error?
-            if let revertBody = try? JSONSerialization.data(withJSONObject: toGraphEventJSON(revertInput)) {
+            if let revertBody = try? JSONSerialization.data(withJSONObject: revertJSON) {
                 if DebugModeManager.isLoggingEnabled() {
                     if let bodyStr = String(data: revertBody, encoding: .utf8) {
                         BackgroundSyncLogger.logDebug("[ExchangeCalendar] splitSeries revert PATCH body=\(bodyStr.prefix(4000))")
@@ -595,13 +591,88 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// commonly passes an instance id from calendar_read output, and the
     /// series-level operations (splitSeries / updateOccurrence instances
     /// endpoint) require the master id.
-    private func resolveToMaster(eventId: String) async throws -> (id: String, event: GCalEvent) {
-        let fetched = try await getEvent(eventId: eventId)
-        if let masterId = fetched.recurringEventId, !masterId.isEmpty, masterId != eventId {
-            let master = try await getEvent(eventId: masterId)
-            return (masterId, master)
+    private func resolveToMaster(eventId: String, select: String = eventSelect) async throws -> (id: String, master: EditSnapshot) {
+        let fetched = try await fetchForEdit(eventId: eventId, select: select)
+        if let masterId = fetched.event.recurringEventId, !masterId.isEmpty, masterId != eventId {
+            return (masterId, try await fetchForEdit(eventId: masterId, select: select))
         }
         return (eventId, fetched)
+    }
+
+    /// The new part of a split: the stored series' properties (`splitCopiedKeys`) as they are,
+    /// re-anchored at the split (`mergeMasterAndPatch`) with the patch applied, under
+    /// `transactionId`.
+    ///
+    /// - Attendees keep their address, name and type; one the patch adds is `required`. Their
+    ///   answers are not copied: Graph lets only the attendee write a response, so the new part's
+    ///   attendees start unanswered, as they do when Outlook splits a series itself.
+    /// - The recurrence keeps the stored pattern exactly. Its range keeps its end date and zone and
+    ///   starts on the new start's date; a range that ended after a number of occurrences has no
+    ///   end, because the number left after the split is not known here. A range that already
+    ///   ends on this split's cap (`capEndDate`) has no end either: it is a retry after the cap was
+    ///   written and the create was not, and that end is the cap, not the series' own (the rule
+    ///   `RecurrenceTail.newSeriesRule` applies on Google and CalDAV). A rule in the patch
+    ///   replaces the stored recurrence.
+    /// - A new place in the patch replaces the stored places (`locations`).
+    /// - New notes on an online series replace only the notes in the copied body; its join section
+    ///   is kept as stored (`onlineMeetingBody`). The new part is not an online meeting of its own:
+    ///   its body carries the series' join link.
+    ///
+    /// Throws `notSupported` when the new start can't be dated; nothing has been written then.
+    nonisolated func splitNewPartJSON(
+        stored: EditSnapshot,
+        patch: GCalEventInput,
+        newStartNaiveISO: String,
+        newStartZone: TimeZone,
+        capEndDate: String,
+        transactionId: String
+    ) throws -> [String: Any] {
+        // The recurrence comes from the stored series' range below, or from the patch's rule.
+        let edited = GoogleCalendarProvider.mergeMasterAndPatch(
+            master: stored.event, patch: patch, newStartNaiveISO: newStartNaiveISO,
+            newStartZone: newStartZone, newRecurrence: [])
+        guard let newDay = Self.day(edited.startDate, edited.startDateTime, in: edited.startTimeZone) else {
+            throw CalendarProviderError.notSupported("The repeating event's start can't be read, so it can't be split.")
+        }
+        var written = GCalEventInput()
+        written.summary = patch.summary
+        written.location = patch.location
+        written.description = patch.description
+        written.transparency = patch.transparency
+        written.startDate = edited.startDate
+        written.startDateTime = edited.startDateTime
+        written.startTimeZone = edited.startTimeZone
+        written.endDate = edited.endDate
+        written.endDateTime = edited.endDateTime
+        written.endTimeZone = edited.endTimeZone
+        written.recurrence = edited.recurrence
+        written.attendees = patch.attendees ?? (stored.event.attendees ?? []).compactMap { attendee in
+            guard let email = attendee.email, !email.isEmpty else { return nil }
+            return (email: email, name: attendee.displayName)
+        }
+
+        var json = stored.raw.filter { Self.splitCopiedKeys.contains($0.key) }
+        if patch.location != nil { json.removeValue(forKey: "locations") }
+        for (key, value) in toGraphEventJSON(written, attendeeTypes: stored.attendeeTypes) { json[key] = value }
+        // New notes on an online series keep its join section, as an edit of the series does.
+        if let description = patch.description, let body = Self.onlineMeetingBody(stored.raw, notes: description) {
+            json["body"] = body
+        }
+        if patch.recurrence?.isEmpty ?? true,
+           var recurrence = stored.raw["recurrence"] as? [String: Any],
+           var range = recurrence["range"] as? [String: Any] {
+            range["startDate"] = newDay
+            if range["type"] as? String == "numbered" { range["type"] = "noEnd" }
+            if range["type"] as? String == "endDate", range["endDate"] as? String == capEndDate {
+                range["type"] = "noEnd"
+            }
+            if range["type"] as? String != "endDate" { range.removeValue(forKey: "endDate") }
+            range.removeValue(forKey: "numberOfOccurrences")
+            recurrence["range"] = range
+            json["recurrence"] = recurrence
+        }
+        json["transactionId"] = transactionId
+        return json
     }
 
     // MARK: - Edits (#421)
@@ -628,9 +699,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
         }
     }
 
-    private func fetchForEdit(eventId: String) async throws -> EditSnapshot {
+    private func fetchForEdit(eventId: String, select: String = eventSelect) async throws -> EditSnapshot {
         let encodedEventId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
-        let data = try await request(path: "/events/\(encodedEventId)?$select=\(Self.eventSelect)")
+        let data = try await request(path: "/events/\(encodedEventId)?$select=\(select)")
         let decoded = try JSONDecoder().decode(MSEvent.self, from: data)
         let raw = (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
         return EditSnapshot(event: toGCalEvent(decoded), raw: raw)

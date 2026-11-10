@@ -390,20 +390,6 @@ struct GoogleCalendarSplitHelpersTests {
         #expect(out == "RRULE:FREQ=DAILY;INTERVAL=2;UNTIL=20260520T235959Z")
     }
 
-    @Test("stripUntilAndCount removes both UNTIL and COUNT in one pass")
-    func stripBoth() {
-        let input = "RRULE:FREQ=WEEKLY;UNTIL=20260101T000000Z;COUNT=5;BYDAY=WE"
-        let out = GoogleCalendarProvider.stripUntilAndCount(input)
-        #expect(out == "RRULE:FREQ=WEEKLY;BYDAY=WE")
-    }
-
-    @Test("stripUntilAndCount is case-insensitive on rule names")
-    func stripCaseInsensitive() {
-        let input = "RRULE:FREQ=WEEKLY;until=20260101T000000Z;Count=5"
-        let out = GoogleCalendarProvider.stripUntilAndCount(input)
-        #expect(out == "RRULE:FREQ=WEEKLY")
-    }
-
     @Test("googleUntilString (timed event) produces a UTC date-time, 1 second before the naive ISO")
     func googleUntilStringTimedFormat() {
         // RFC 5545: timed master (DTSTART with tz) → UNTIL must be UTC date-time.

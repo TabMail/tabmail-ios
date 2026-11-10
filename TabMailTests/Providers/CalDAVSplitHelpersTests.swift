@@ -138,98 +138,6 @@ struct CalDAVRecurringHelpersTests {
         #expect(spliced.contains("SUMMARY:Weekly sync"), "the master VEVENT must survive the splice")
     }
 
-    @Test("buildOverrideVEvent with ATTENDEE carries the master's ORGANIZER — RFC 5545 §3.8.4.3 / iCloud HTTP 403 regression")
-    func buildOverrideVEventIncludesOrganizerWithAttendees() {
-        var patch = GCalEventInput()
-        patch.attendees = [(email: "bob@example.com", name: "Bob")]
-        let masterOrg = "ORGANIZER;CN=\"Alice\":mailto:alice@example.com"
-        let block = CalDAVProvider.buildOverrideVEvent(
-            patch: patch, uid: "abc-123", recurrenceId: "2026-05-20T17:00:00",
-            kind: .floating, organizerLine: masterOrg
-        )
-        #expect(block.contains("ATTENDEE"))
-        #expect(block.contains(masterOrg), "RFC 5545 + iCloud require ORGANIZER alongside ATTENDEE")
-        // ORGANIZER must appear BEFORE the ATTENDEE lines so iTIP processors
-        // see the scheduling context before the recipients.
-        if let orgIdx = block.range(of: "ORGANIZER")?.lowerBound,
-           let attIdx = block.range(of: "ATTENDEE;")?.lowerBound {
-            #expect(orgIdx < attIdx)
-        }
-    }
-
-    @Test("buildOverrideVEvent WITHOUT ATTENDEE omits ORGANIZER — avoids spurious scheduling on simple overrides")
-    func buildOverrideVEventOmitsOrganizerWhenNoAttendees() {
-        var patch = GCalEventInput()
-        patch.summary = "title-only change"
-        let block = CalDAVProvider.buildOverrideVEvent(
-            patch: patch, uid: "abc-123", recurrenceId: "2026-05-20T17:00:00",
-            kind: .floating, organizerLine: "ORGANIZER:mailto:alice@example.com"
-        )
-        #expect(!block.contains("ORGANIZER"), "no ATTENDEE → no need for ORGANIZER (iTIP wouldn't trigger)")
-    }
-
-    @Test("buildOverrideVEvent (timed master) emits a date-time RECURRENCE-ID")
-    func buildOverrideVEventTimed() {
-        var patch = GCalEventInput()
-        patch.summary = "Special edition"
-        let block = CalDAVProvider.buildOverrideVEvent(
-            patch: patch, uid: "abc-123", recurrenceId: "2026-05-20T17:00:00", kind: .floating
-        )
-        #expect(block.hasPrefix("BEGIN:VEVENT"))
-        #expect(block.hasSuffix("END:VEVENT"))
-        #expect(block.contains("UID:abc-123"))
-        #expect(block.contains("RECURRENCE-ID:20260520T170000"))
-        // Timed form — must NOT carry the VALUE=DATE param.
-        #expect(!block.contains("RECURRENCE-ID;VALUE=DATE"))
-        #expect(block.contains("SUMMARY:Special edition"))
-    }
-
-    @Test("buildOverrideVEvent (all-day master) emits RECURRENCE-ID;VALUE=DATE — RFC 5545 §3.8.4.4")
-    func buildOverrideVEventAllDay() {
-        // RFC 5545: RECURRENCE-ID's value type must match the master's DTSTART.
-        // All-day master → RECURRENCE-ID;VALUE=DATE:YYYYMMDD (no time).
-        var patch = GCalEventInput()
-        patch.summary = "Holiday override"
-        // recurrence_id for an all-day occurrence may arrive in either form.
-        let blockA = CalDAVProvider.buildOverrideVEvent(
-            patch: patch, uid: "abc-123", recurrenceId: "2026-05-20", kind: .allDay
-        )
-        #expect(blockA.contains("RECURRENCE-ID;VALUE=DATE:20260520"))
-        #expect(!blockA.contains("RECURRENCE-ID:2026"), "must not emit a bare timed RECURRENCE-ID for an all-day master")
-        let blockB = CalDAVProvider.buildOverrideVEvent(
-            patch: patch, uid: "abc-123", recurrenceId: "2026-05-20T00:00:00", kind: .allDay
-        )
-        #expect(blockB.contains("RECURRENCE-ID;VALUE=DATE:20260520"))
-    }
-
-    @Test("buildOverrideVEvent (all-day master) emits DATE-typed DTSTART/DTEND — RFC 5545 §3.8.4.4")
-    func buildOverrideVEventAllDayDtStartEnd() {
-        // An all-day override's DTSTART/DTEND value type MUST match the
-        // DATE-typed RECURRENCE-ID — never a timed DTSTART:…THHmmss.
-        var patchDate = GCalEventInput()
-        patchDate.startDate = "2026-05-21"
-        patchDate.endDate = "2026-05-22"
-        let blockA = CalDAVProvider.buildOverrideVEvent(
-            patch: patchDate, uid: "abc-123", recurrenceId: "2026-05-20", kind: .allDay
-        )
-        #expect(blockA.contains("DTSTART;VALUE=DATE:20260521"))
-        #expect(blockA.contains("DTEND;VALUE=DATE:20260522"))
-        #expect(!blockA.contains("DTSTART:2026"), "all-day override must not emit a timed DTSTART")
-        #expect(!blockA.contains("DTEND:2026"), "all-day override must not emit a timed DTEND")
-
-        // The patch may also carry the move as a date-time string — the date
-        // component must still be taken (not the time).
-        var patchDateTime = GCalEventInput()
-        patchDateTime.startDateTime = "2026-05-21T09:30:00"
-        patchDateTime.endDateTime = "2026-05-22T09:30:00"
-        let blockB = CalDAVProvider.buildOverrideVEvent(
-            patch: patchDateTime, uid: "abc-123", recurrenceId: "2026-05-20", kind: .allDay
-        )
-        #expect(blockB.contains("DTSTART;VALUE=DATE:20260521"))
-        #expect(blockB.contains("DTEND;VALUE=DATE:20260522"))
-        #expect(!blockB.contains("T093000"), "all-day override must drop the time component")
-    }
-
     @Test("masterDTStartKind classifies all-day / UTC / floating / zoned DTSTART")
     func masterDTStartKindClassification() {
         func ics(_ dtstart: String) -> String {
@@ -243,33 +151,6 @@ struct CalDAVRecurringHelpersTests {
         // Scoped to the master VEVENT — a leading VTIMEZONE's DTSTART must not win.
         let withVTZ = "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:America/Vancouver\r\nBEGIN:STANDARD\r\nDTSTART:20071104T020000\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART;TZID=America/Vancouver:20260520T170000\r\nEND:VEVENT\r\nEND:VCALENDAR"
         #expect(CalDAVProvider.masterDTStartKind(from: withVTZ) == .zoned("America/Vancouver"))
-    }
-
-    @Test("buildOverrideVEvent (zoned master) emits TZID-qualified RECURRENCE-ID + DTSTART")
-    func buildOverrideVEventZoned() {
-        var patch = GCalEventInput()
-        patch.startDateTime = "2026-05-20T18:30:00-07:00"
-        patch.endDateTime = "2026-05-20T19:00:00-07:00"
-        let block = CalDAVProvider.buildOverrideVEvent(
-            patch: patch, uid: "abc-123", recurrenceId: "2026-05-20T17:00:00",
-            kind: .zoned("America/Vancouver")
-        )
-        // RECURRENCE-ID + DTSTART must carry the same TZID as the master (RFC 5545 §3.8.4.4).
-        #expect(block.contains("RECURRENCE-ID;TZID=America/Vancouver:20260520T170000"))
-        #expect(block.contains("DTSTART;TZID=America/Vancouver:20260520T183000"))
-        #expect(block.contains("DTEND;TZID=America/Vancouver:20260520T190000"))
-        #expect(!block.contains("RECURRENCE-ID:2026"), "must not emit a bare floating RECURRENCE-ID for a zoned master")
-    }
-
-    @Test("buildOverrideVEvent (UTC master) emits Z-suffixed RECURRENCE-ID + DTSTART")
-    func buildOverrideVEventUTC() {
-        var patch = GCalEventInput()
-        patch.startDateTime = "2026-05-20T17:00:00Z"
-        let block = CalDAVProvider.buildOverrideVEvent(
-            patch: patch, uid: "abc-123", recurrenceId: "2026-05-20T17:00:00", kind: .utc
-        )
-        #expect(block.contains("RECURRENCE-ID:20260520T170000Z"))
-        #expect(block.contains("DTSTART:20260520T170000Z"))
     }
 
     @Test("spliceOrReplaceOverride appends a new override block when none exists")
@@ -343,35 +224,6 @@ struct CalDAVRecurringHelpersTests {
         #expect(!out.contains("SUMMARY:Old all-day override"))
         let veventCount = out.components(separatedBy: "BEGIN:VEVENT").count - 1
         #expect(veventCount == 2, "must replace the existing override, not append a duplicate")
-    }
-
-    @Test("buildNewSeriesInput inherits master fields and applies patch overrides")
-    func buildNewSeriesInput() throws {
-        var patch = GCalEventInput()
-        patch.attendees = [(email: "alice@example.com", name: "Alice"), (email: "carol@example.com", name: "Carol")]
-        // `masterICS` above is `DTSTART:20260513T170000Z` — a `.utc` master — so
-        // the master-frame wall clock handed in here is a UTC one.
-        let out = try CalDAVProvider.buildNewSeriesInput(
-            masterICS: masterICS, patch: patch,
-            newStartNaiveISO: "2026-05-20T17:00:00",
-            newStartZone: TimeZone(identifier: "UTC")!,
-            newRRule: "RRULE:FREQ=WEEKLY;BYDAY=WE"
-        )
-        // Inherited from master:
-        #expect(out.summary == "Weekly sync")
-        #expect(out.location == "Room 1")
-        // From patch:
-        #expect(out.attendees?.count == 2)
-        #expect(out.attendees?.contains(where: { $0.email == "carol@example.com" }) == true)
-        // New recurrence:
-        #expect(out.recurrence == ["RRULE:FREQ=WEEKLY;BYDAY=WE"])
-        // Start was rewritten.
-        #expect(out.startDateTime != nil)
-        // Duration preserved: master is 45 minutes, so end should be start + 45min.
-        if let s = out.startDateTime, let e = out.endDateTime,
-           let sd = Date.fromISO8601(s), let ed = Date.fromISO8601(e) {
-            #expect(Int(ed.timeIntervalSince(sd)) == 45 * 60)
-        }
     }
 
     // MARK: - TZID + duration extraction (regression coverage)
@@ -477,6 +329,38 @@ struct CalDAVRecurringHelpersTests {
             from: durationOnlyMaster(duration: "", start: start)) == nil)
     }
 
+    @Test("with neither DTEND nor DURATION an all-day series lasts one day and a timed one is refused")
+    func extractMasterDurationImpliedEnd() {
+        func master(_ dtstart: String) -> String {
+            ["BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", "UID:series-1", dtstart,
+             "RRULE:FREQ=WEEKLY", "END:VEVENT", "END:VCALENDAR"].joined(separator: "\r\n") + "\r\n"
+        }
+        #expect(CalDAVProvider.extractMasterDuration(from: master("DTSTART;VALUE=DATE:20990506")) == TimeInterval(86400))
+        #expect(CalDAVProvider.extractMasterDuration(from: master("DTSTART:20990506")) == TimeInterval(86400))
+        // A timed start with no end lasts no time (RFC 5545 §3.6.1): not a length a split can copy.
+        #expect(CalDAVProvider.extractMasterDuration(from: master("DTSTART:20990506T170000Z")) == nil)
+        // Zones at both ends of the offsets, so a start read in the device's zone can't pass on any runner.
+        #expect(CalDAVProvider.extractMasterDuration(from: master("DTSTART;TZID=Pacific/Kiritimati:20990506T170000")) == nil)
+        #expect(CalDAVProvider.extractMasterDuration(from: master("DTSTART;TZID=Pacific/Pago_Pago:20990506T170000")) == nil)
+        // An end that is there but can't be read is still refused, not replaced by the implied one.
+        let unreadableEnd = master("DTSTART;VALUE=DATE:20990506").replacingOccurrences(
+            of: "RRULE:FREQ=WEEKLY", with: "DTEND;VALUE=DATE:2099MAY7\r\nRRULE:FREQ=WEEKLY")
+        #expect(CalDAVProvider.extractMasterDuration(from: unreadableEnd) == nil)
+    }
+
+    @Test("the implied end of a VEVENT with no DTEND and no DURATION, in the start's own form")
+    func impliedEndValue() {
+        #expect(ICSParser.impliedEndValue(dtstartParams: ";VALUE=DATE", dtstartValue: "20990506") == "20990507")
+        #expect(ICSParser.impliedEndValue(dtstartParams: "VALUE=DATE", dtstartValue: "20991231") == "21000101")
+        #expect(ICSParser.impliedEndValue(dtstartParams: nil, dtstartValue: "20990228") == "20990301")
+        // The days clocks spring forward in the US and the EU that year: still the next date.
+        #expect(ICSParser.impliedEndValue(dtstartParams: ";VALUE=DATE", dtstartValue: "20990308") == "20990309")
+        #expect(ICSParser.impliedEndValue(dtstartParams: ";VALUE=DATE", dtstartValue: "20990329") == "20990330")
+        #expect(ICSParser.impliedEndValue(dtstartParams: ";TZID=Europe/Paris", dtstartValue: "20990506T170000") == "20990506T170000")
+        #expect(ICSParser.impliedEndValue(dtstartParams: ";VALUE=DATE-TIME", dtstartValue: "20990506T170000Z") == "20990506T170000Z")
+        #expect(ICSParser.impliedEndValue(dtstartParams: ";VALUE=DATE", dtstartValue: "2099MAY6") == nil)
+    }
+
     @Test("DTEND wins over DURATION on a non-conforming master that carries both")
     func extractMasterDurationPrefersDTEND() {
         // RFC 5545 forbids both in one VEVENT. If a server sends both anyway,
@@ -526,35 +410,6 @@ struct CalDAVRecurringHelpersTests {
         ].joined(separator: "\r\n") + "\r\n"
         #expect(CalDAVProvider.extractMasterDuration(from: ics) == TimeInterval(30 * 60),
                 "the override's PT8H or the VTIMEZONE's DTSTART leaked into the master's duration")
-    }
-
-    @Test("buildNewSeriesInput succeeds on an ordinary DURATION-only recurring master")
-    func buildNewSeriesInputAcceptsDurationOnlyMaster() throws {
-        // This is the wedge's actual trigger: a recurring event created by any
-        // other client as DTSTART + DURATION made the split throw, and the throw
-        // was claimed by no terminal arm, so the account's calendar lane starved
-        // forever. Ordinary server data, no adversary.
-        let start = Date()
-        let ics = durationOnlyMaster(duration: "PT1H", start: icsZulu(start))
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "en_US_POSIX")
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        // `durationOnlyMaster` writes `icsZulu`, i.e. a `.utc` master, so the
-        // master-frame wall clock is rendered in UTC too.
-        fmt.timeZone = TimeZone(identifier: "UTC")!
-        let newStart = fmt.string(from: start.addingTimeInterval(7 * 86400))
-
-        let out = try CalDAVProvider.buildNewSeriesInput(
-            masterICS: ics, patch: GCalEventInput(),
-            newStartNaiveISO: newStart,
-            newStartZone: TimeZone(identifier: "UTC")!,
-            newRRule: "RRULE:FREQ=WEEKLY"
-        )
-        #expect(out.summary == "Standup")
-        let s = try #require(out.startDateTime.flatMap { Date.fromISO8601($0) })
-        let e = try #require(out.endDateTime.flatMap { Date.fromISO8601($0) })
-        #expect(Int(e.timeIntervalSince(s)) == 3600,
-                "the new series must inherit the master's DURATION-expressed length")
     }
 
     @Test("VEVENT-scoped extractors ignore a leading VTIMEZONE block (RRULE/DTSTART/UID/duration)")
@@ -681,7 +536,7 @@ struct CalDAVRecurringHelpersTests {
     @Test("extractMasterDuration returns nil when one DTSTART/DTEND line has an unresolvable TZID")
     func extractMasterDurationUnknownTZID() {
         // If either endpoint can't be parsed (unknown TZID), the duration is
-        // unrecoverable — return nil so buildNewSeriesInput fails fast rather
+        // unrecoverable — return nil so the split fails fast rather
         // than producing a series with a wrong-length duration.
         let ics = """
         BEGIN:VEVENT
@@ -716,59 +571,6 @@ struct CalDAVRecurringHelpersTests {
         END:VEVENT
         """.replacingOccurrences(of: "\n", with: "\r\n")
         #expect(CalDAVProvider.extractMasterDuration(from: ics) == nil)
-    }
-
-    @Test("buildNewSeriesInput unfolds long DESCRIPTION lines (RFC 5545 §3.1) before extracting")
-    func buildNewSeriesInputUnfoldsDescription() throws {
-        // ICS line folding splits long lines at column 75 with a leading space
-        // or tab on the continuation. Without unfolding the extractor would
-        // return only the first 75-ish chars of DESCRIPTION/LOCATION and
-        // silently drop the rest into the new series.
-        // NOTE: build with explicit "\r\n" concatenation; using `"""..."""`
-        // + a `\n→\r\n` replace would also rewrite the `\n` inside our
-        // intentional `\r\n ` continuation marker into `\r\n\r\n`, breaking
-        // the test's premise (a properly folded ICS line) before the SUT
-        // ever runs.
-        let longDesc = "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor"
-        let ics = "BEGIN:VEVENT\r\n"
-            + "UID:abc-123\r\n"
-            + "DTSTART:20260520T170000Z\r\n"
-            + "DTEND:20260520T180000Z\r\n"
-            + "SUMMARY:Long event\r\n"
-            + "DESCRIPTION:Lorem ipsum dolor sit amet consectetur adipiscing elit sed do e\r\n iusmod tempor\r\n"
-            + "RRULE:FREQ=WEEKLY\r\n"
-            + "END:VEVENT\r\n"
-        let out = try CalDAVProvider.buildNewSeriesInput(
-            masterICS: ics, patch: GCalEventInput(),
-            newStartNaiveISO: "2026-05-27T17:00:00",
-            newStartZone: TimeZone(identifier: "UTC")!,
-            newRRule: "RRULE:FREQ=WEEKLY"
-        )
-        #expect(out.description == longDesc, "description was truncated by folding: got '\(out.description ?? "nil")'")
-    }
-
-    @Test("buildNewSeriesInput throws when master duration is unrecoverable")
-    func buildNewSeriesInputThrowsOnBadDuration() {
-        let brokenICS = """
-        BEGIN:VEVENT
-        UID:abc-123
-        SUMMARY:Broken
-        END:VEVENT
-        """.replacingOccurrences(of: "\n", with: "\r\n")
-        var patch = GCalEventInput()
-        patch.attendees = [(email: "a@example.com", name: "A")]
-        var threw = false
-        do {
-            _ = try CalDAVProvider.buildNewSeriesInput(
-                masterICS: brokenICS, patch: patch,
-                newStartNaiveISO: "2026-05-20T17:00:00",
-                newStartZone: TimeZone(identifier: "UTC")!,
-                newRRule: "RRULE:FREQ=WEEKLY"
-            )
-        } catch {
-            threw = true
-        }
-        #expect(threw)
     }
 }
 
@@ -875,7 +677,7 @@ struct CalDAVMergePatchTests {
     }
 }
 
-// MARK: - splitSeries rollback over the wire
+// MARK: - splitSeries over the wire
 
 /// A minimal WebDAV/CalDAV resource store: enough of RFC 4918 §10.4 for a
 /// `PUT`'s precondition to decide its own response.
@@ -995,8 +797,8 @@ final class FakeCalDAVStore: Sendable {
     }
 
     /// A DIFFERENT client replaces `path`, minting a tag that is distinguishable
-    /// from anything this client wrote. Models the only window that matters for
-    /// the rollback: between our cap PUT and our revert PUT.
+    /// from anything this client wrote. Models an edit landing between two of
+    /// this client's writes.
     func replaceOutOfBand(path: String, ics: String) {
         state.withLock { value in
             let etag = "\"other-\(value.nextETag)\""
@@ -1071,7 +873,42 @@ private enum CalDAVWireFixture {
     }
 }
 
-@Suite("CalDAVProvider — splitSeries rollback", .serialized)
+@Suite("CalDAVProvider — a split it can't build writes nothing", .serialized)
+struct CalDAVSplitRefusedBeforeWriteTests {
+
+    @Test("a series whose excluded dates can't be read is refused before the cap, so it keeps every meeting")
+    func unreadableExcludedDatesWriteNothing() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: true)
+        let fixture = CalDAVWireFixture.make()
+        let ics = fixture.masterICS.replacingOccurrences(
+            of: "RRULE:FREQ=WEEKLY;BYDAY=WE",
+            with: "RRULE:FREQ=WEEKLY;BYDAY=WE\r\nEXDATE;TZID=Not/AZone:20990101T090000")
+        #expect(ics != fixture.masterICS, "setup: the excluded date was not added")
+        store.seed(path: CalDAVWireFixture.masterPath, ics: ics)
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+
+        await #expect {
+            _ = try await CalDAVWireFixture.makeProvider(http).splitSeries(
+                calendarId: CalDAVWireFixture.calendarId,
+                eventId: CalDAVWireFixture.masterEventId,
+                recurrenceId: fixture.recurrenceId,
+                recurrenceIdZone: .current,
+                patch: GCalEventInput(),
+                sendUpdates: "none")
+        } throws: { error in
+            if case CalendarProviderError.notSupported = error { return true }
+            return false
+        }
+
+        #expect(store.recordedPuts().isEmpty, "the split wrote before it was refused")
+        #expect(store.storedICS(path: CalDAVWireFixture.masterPath) == ics)
+    }
+}
+
+@Suite("CalDAVProvider — splitSeries writes the new part before the cap", .serialized)
 struct CalDAVSplitRollbackTests {
 
     private static let calendarId = CalDAVWireFixture.calendarId
@@ -1084,128 +921,82 @@ struct CalDAVSplitRollbackTests {
         CalDAVWireFixture.makeProvider(scenario)
     }
 
-    @Test("""
-    When the successor-series write fails, the master series is RESTORED: the \
-    resource that splitSeries capped ends the call holding its original \
-    uncapped RRULE, not a truncated series with no replacement
-    """)
-    func failedSuccessorWriteRestoresTheMasterSeries() async throws {
+    private static func split(_ provider: CalDAVProvider, _ fixture: CalDAVWireFixture.Fixture) async throws {
+        _ = try await provider.splitSeries(
+            calendarId: Self.calendarId,
+            eventId: Self.masterEventId,
+            recurrenceId: fixture.recurrenceId,
+            recurrenceIdZone: .current,
+            patch: GCalEventInput(),
+            sendUpdates: "none")
+    }
+
+    private static func newPartPath(_ fixture: CalDAVWireFixture.Fixture) -> String {
+        "/cal/\(GoogleCalendarProvider.deterministicSplitEventId(masterId: Self.masterEventId, recurrenceId: fixture.recurrenceId)).ics"
+    }
+
+    @Test("when the new part can't be written, the series is not touched")
+    func failedNewPartWriteLeavesTheSeriesUntouched() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let store = FakeCalDAVStore(servesETags: true)
         let fixture = Self.makeFixture()
         store.seed(path: Self.masterPath, ics: fixture.masterICS)
-
         http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
         http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
-        // The successor series fails at the server. Longest-prefix wins, so this
-        // route claims the new resource's PUT while the master keeps the store.
-        let newUid = GoogleCalendarProvider.deterministicSplitEventId(
-            masterId: Self.masterEventId, recurrenceId: fixture.recurrenceId)
-        http.register(
-            path: "/cal/\(newUid).ics", method: "PUT", response: .status(500))
+        // Longest prefix wins: this route claims the new part's PUT.
+        http.register(path: Self.newPartPath(fixture), method: "PUT", response: .status(500))
 
-        let provider = Self.makeProvider(http)
         await #expect(throws: (any Error).self) {
-            _ = try await provider.splitSeries(
-                calendarId: Self.calendarId,
-                eventId: Self.masterEventId,
-                recurrenceId: fixture.recurrenceId,
-                recurrenceIdZone: .current,
-                patch: GCalEventInput(),
-                sendUpdates: "none")
+            try await Self.split(Self.makeProvider(http), fixture)
         }
 
-        // THE INVARIANT: the user's recurring series is intact. Not "the revert
-        // was attempted", not "an error of the right type was thrown" — the
-        // series the split truncated is back.
-        let master = store.storedICS(path: Self.masterPath)
-        #expect(master == fixture.masterICS,
-                "the master resource must hold its ORIGINAL body after the rollback")
-        #expect(master?.contains("UNTIL=") == false,
-                "a surviving UNTIL= means the series is still truncated with no successor")
-
-        // The successor resource was never created, so nothing dangles.
-        #expect(store.storedICS(path: "/cal/\(newUid).ics") == nil)
-
-        // WHY it can succeed, stated at the wire. `If-None-Match: *` here is a
-        // guaranteed 412 against a resource we had just written ourselves, which
-        // is what made this rollback structurally impossible — so it must stay
-        // absent. `If-Match` is the opposite: it must name the entity tag the
-        // CAP PUT's own response returned, because that tag IS the body we
-        // wrote, so the rollback overwrites our own write and only our own.
-        // Asserting against the cap's returned tag rather than a literal keeps
-        // this independent of the fake's tag numbering.
-        let puts = store.recordedPuts()
-        let masterPuts = puts.filter { $0.path == Self.masterPath }
-        #expect(masterPuts.count == 2, "expected exactly a cap PUT and a rollback PUT")
-        guard masterPuts.count == 2 else {
-            Issue.record("expected a rollback PUT against the master resource")
-            return
-        }
-        let cap = masterPuts[0]
-        let revert = masterPuts[1]
-        #expect(revert.ifNoneMatch == nil)
-        #expect(cap.returnedETag != nil,
-                "the cap PUT must have been accepted for its tag to exist")
-        #expect(revert.ifMatch == cap.returnedETag,
-                "the rollback must be conditional on the tag the CAP PUT returned — the body we ourselves stored")
+        #expect(store.storedICS(path: Self.masterPath) == fixture.masterICS,
+                "the series must keep every occurrence when there is no new part to take them")
+        #expect(store.recordedPuts().allSatisfy { $0.path != Self.masterPath }, "the series was written")
+        #expect(store.storedICS(path: Self.newPartPath(fixture)) == nil)
     }
 
     @Test("""
-    A rollback never destroys a concurrent edit: when the master is changed by \
-    someone else between the cap and the rollback, the rollback is REFUSED and \
-    the other client's body survives
+    a concurrent edit of the series between the two writes survives: the cap is refused, and \
+    the retry caps the series as it now stands
     """)
-    func rollbackRefusesToOverwriteAConcurrentEdit() async throws {
+    func concurrentEditBeforeTheCapSurvives() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         let store = FakeCalDAVStore(servesETags: true)
         let fixture = Self.makeFixture()
         store.seed(path: Self.masterPath, ics: fixture.masterICS)
-
-        // What another client puts there while our split is in flight. Any body
-        // distinguishable from both the original and the capped variant will do.
         let concurrentICS = fixture.masterICS
             .replacingOccurrences(of: "SUMMARY:Weekly sync", with: "SUMMARY:Renamed by another client")
-
+        let editedOnce = Mutex(false)
         http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
         http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
-        let newUid = GoogleCalendarProvider.deterministicSplitEventId(
-            masterId: Self.masterEventId, recurrenceId: fixture.recurrenceId)
-        http.register(path: "/cal/\(newUid).ics", method: "PUT") { _ in
-            // The ONLY window this can happen in: after our cap committed and
-            // before our rollback runs. Modelled at the successor PUT because
-            // that is the call whose failure triggers the rollback.
-            store.replaceOutOfBand(path: Self.masterPath, ics: concurrentICS)
-            return .raw(statusCode: 500)
+        http.register(path: Self.newPartPath(fixture), method: "PUT") { request in
+            let response = store.handlePUT(request)
+            // Another client edits the series right after our new part lands.
+            if editedOnce.withLock({ done in defer { done = true }; return !done }) {
+                store.replaceOutOfBand(path: Self.masterPath, ics: concurrentICS)
+            }
+            return response
         }
-
         let provider = Self.makeProvider(http)
-        await #expect(throws: (any Error).self) {
-            _ = try await provider.splitSeries(
-                calendarId: Self.calendarId,
-                eventId: Self.masterEventId,
-                recurrenceId: fixture.recurrenceId,
-                recurrenceIdZone: .current,
-                patch: GCalEventInput(),
-                sendUpdates: "none")
-        }
 
-        // THE INVARIANT: a rollback is a repair of OUR write, never a licence to
-        // discard someone else's. An unconditional rollback silently replaces
-        // the other client's edit with a body derived from a GET that is now
-        // stale — a lost user edit, which no sync recovers.
+        await #expect(throws: (any Error).self) { try await Self.split(provider, fixture) }
         #expect(store.storedICS(path: Self.masterPath) == concurrentICS,
-                "the concurrent edit must survive; the rollback must not overwrite a body we did not write")
-        #expect(store.storedICS(path: Self.masterPath) != fixture.masterICS,
-                "the pre-fix unconditional rollback restores the ORIGINAL body, destroying the other client's change")
+                "the cap overwrote an edit it never read")
+
+        try await Self.split(provider, fixture)
+        let master = try #require(store.storedICS(path: Self.masterPath))
+        #expect(master.contains("UNTIL=") && master.contains("SUMMARY:Renamed by another client"),
+                "the retry must cap the series as the other client left it: \(master)")
+        #expect(store.storedICS(path: Self.newPartPath(fixture)) != nil)
     }
 
     @Test("""
     Lost ACK — when the deterministic successor resource already exists and \
-    carries OUR derived UID, the split retires instead of un-capping the master \
-    and instead of wedging the account's calendar queue on a 412
+    carries OUR derived UID, the split goes on to the cap instead of \
+    wedging the account's calendar queue on a 412
     """)
     func splitRetiresWhenItsOwnSuccessorAlreadyExists() async throws {
         let http = FakeHTTP.Scenario()
@@ -1236,19 +1027,17 @@ struct CalDAVSplitRollbackTests {
             patch: GCalEventInput(),
             sendUpdates: "none")
 
-        // THE INVARIANT, three ways — the split is COMPLETE and stays complete.
+        // THE INVARIANT, three ways — the split is COMPLETE.
         // 1. The call returns, so the queue takes its success exit. Throwing here
         //    throws `CalDAVError.preconditionFailed`, which
         //    `AccountManager.isCalendarBadRequestError` does not
         //    classify, so the op requeues forever and its account joins
         //    `failedAccounts` — the wedge, which is a dropped user intention.
         #expect(result.id == successorPath)
-        // 2. The master stays CAPPED. Rolling back here leaves an uncapped master
-        //    beside a live open-ended successor: every occurrence after the split
-        //    point renders twice on the user's calendar.
+        // 2. The series is CAPPED, so its later occurrences show once.
         let master = store.storedICS(path: Self.masterPath)
         #expect(master?.contains("UNTIL=") == true,
-                "the master must remain capped — un-capping it duplicates every post-split occurrence")
+                "the series must be capped — left open, every later occurrence shows twice")
         // 3. The successor is byte-unchanged. Recognising it must never become a
         //    licence to overwrite a series the user may have edited.
         #expect(store.storedICS(path: successorPath) == existingSuccessorICS,
@@ -1258,12 +1047,12 @@ struct CalDAVSplitRollbackTests {
         #expect(successorPuts.first?.ifNoneMatch == "*",
                 "the successor PUT stays CREATE-ONLY — the held direction is not weakened by the lost-ACK exit")
         #expect(store.recordedPuts().filter { $0.path == Self.masterPath }.count == 1,
-                "exactly the cap PUT — a second master PUT is the rollback that must not happen")
+                "exactly the cap PUT")
     }
 
     @Test("""
     Held direction — a foreign resource sitting at the successor URL is NOT \
-    mistaken for our own write: the split still rolls the master cap back \
+    mistaken for our own write: the split stops with the series untouched \
     rather than reporting a success it has no evidence for
     """)
     func foreignResourceAtTheSuccessorURLStillRollsBack() async throws {
@@ -1273,9 +1062,7 @@ struct CalDAVSplitRollbackTests {
         let fixture = Self.makeFixture()
         store.seed(path: Self.masterPath, ics: fixture.masterICS)
 
-        let newUid = GoogleCalendarProvider.deterministicSplitEventId(
-            masterId: Self.masterEventId, recurrenceId: fixture.recurrenceId)
-        let successorPath = "/cal/\(newUid).ics"
+        let successorPath = Self.newPartPath(fixture)
         // Same URL, DIFFERENT content owner. `newEventURL` is a path we chose, so
         // occupancy alone proves nothing; only the UID inside the body does.
         let foreignICS = fixture.masterICS
@@ -1285,29 +1072,119 @@ struct CalDAVSplitRollbackTests {
         http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
         http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
 
-        let provider = Self.makeProvider(http)
         await #expect(throws: (any Error).self) {
-            _ = try await provider.splitSeries(
-                calendarId: Self.calendarId,
-                eventId: Self.masterEventId,
-                recurrenceId: fixture.recurrenceId,
-                recurrenceIdZone: .current,
-                patch: GCalEventInput(),
-                sendUpdates: "none")
+            try await Self.split(Self.makeProvider(http), fixture)
         }
 
         // THE INVARIANT: absence of evidence is never permission. Without a
-        // positive UID match the split has NOT happened, so the master goes back.
+        // positive UID match there is no new part, so the series keeps everything.
         #expect(store.storedICS(path: Self.masterPath) == fixture.masterICS,
-                "the master must be restored when the successor URL holds someone else's event")
+                "the series must be untouched when the successor URL holds someone else's event")
+        #expect(store.recordedPuts().allSatisfy { $0.path != Self.masterPath }, "the series was written")
         #expect(store.storedICS(path: successorPath) == foreignICS,
                 "the foreign resource must be untouched")
+    }
+
+    // MARK: Changed occurrences and extra dates
+
+    /// The fixture series with an excluded date, an extra date and a changed occurrence on each side
+    /// of the split. Every instant is distinct from the series' own start, end, stamp and cap.
+    private struct Dated {
+        let ics: String
+        let before: [String]
+        let after: [String]
+    }
+
+    private static func dated(_ fixture: CalDAVWireFixture.Fixture) throws -> Dated {
+        let utc = CalDAVWireFixture.icsUTC
+        let start = Date().addingTimeInterval(7 * 86_400)
+        func day(_ n: Double, hour: Double = 0) -> String { utc(start.addingTimeInterval(n * 86_400 + hour * 3_600)) }
+        // The split is fourteen days after the series' start.
+        let excludedBefore = day(7), extraBefore = day(8, hour: 2), changedBefore = day(9, hour: 3)
+        let excludedAfter = day(21), extraAfter = day(22, hour: 2), changedAfter = day(23, hour: 3)
+        func changed(_ instant: String, _ summary: String) -> String {
+            ["BEGIN:VEVENT", "UID:master-1", "DTSTAMP:\(instant)", "RECURRENCE-ID:\(instant)",
+             "DTSTART:\(instant)", "DURATION:PT45M", "SUMMARY:\(summary)", "END:VEVENT"].joined(separator: "\r\n")
+        }
+        let ics = fixture.masterICS
+            .replacingOccurrences(
+                of: "RRULE:FREQ=WEEKLY;BYDAY=WE",
+                with: "RRULE:FREQ=WEEKLY;BYDAY=WE\r\nEXDATE:\(excludedBefore),\(excludedAfter)\r\nRDATE:\(extraBefore),\(extraAfter)")
+            .replacingOccurrences(
+                of: "END:VCALENDAR",
+                with: changed(changedBefore, "Changed before") + "\r\n" + changed(changedAfter, "Changed after") + "\r\nEND:VCALENDAR")
+        #expect(ics.contains("EXDATE:") && ics.contains("Changed after"), "setup: the dates were not added")
+        return Dated(ics: ics,
+                     before: [excludedBefore, extraBefore, changedBefore, "SUMMARY:Changed before"],
+                     after: [excludedAfter, extraAfter, changedAfter, "SUMMARY:Changed after"])
+    }
+
+    private static func expectPartition(_ store: FakeCalDAVStore, _ fixture: CalDAVWireFixture.Fixture,
+                                        _ dated: Dated) throws {
+        let master = try #require(store.storedICS(path: Self.masterPath))
+        let newPart = try #require(store.storedICS(path: Self.newPartPath(fixture)), "there is no new part")
+        #expect(master.contains("UNTIL="), "the series was not capped")
+        for item in dated.before {
+            #expect(master.contains(item), "the series lost '\(item)'")
+            #expect(!newPart.contains(item), "the new part took '\(item)' from before the split")
+        }
+        for item in dated.after {
+            #expect(newPart.contains(item), "the new part lost '\(item)'")
+            #expect(!master.contains(item), "the series kept '\(item)', so it shows on both parts")
+        }
+    }
+
+    @Test("excluded dates, extra dates and changed occurrences each end up in exactly one part")
+    func changedAndExtraDatesSplitBetweenTheParts() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: true)
+        let fixture = Self.makeFixture()
+        let dated = try Self.dated(fixture)
+        store.seed(path: Self.masterPath, ics: dated.ics)
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+
+        try await Self.split(Self.makeProvider(http), fixture)
+
+        try Self.expectPartition(store, fixture, dated)
+        #expect(store.recordedPuts().map(\.path) == [Self.newPartPath(fixture), Self.masterPath],
+                "the new part must be written before the cap")
+    }
+
+    @Test("""
+    a cap whose response is lost, then a retry: the later changed occurrences and dates are \
+    still on the new part
+    """)
+    func lostCapResponseKeepsTheLaterChanges() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: true)
+        let fixture = Self.makeFixture()
+        let dated = try Self.dated(fixture)
+        store.seed(path: Self.masterPath, ics: dated.ics)
+        let dropNext = Mutex(true)
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+        http.register(path: Self.masterPath, method: "PUT") { request in
+            let response = store.handlePUT(request)
+            // The server keeps the first write of the series; its response never arrives.
+            return dropNext.withLock { drop in defer { drop = false }; return drop } ? .raw(statusCode: 500) : response
+        }
+        let provider = Self.makeProvider(http)
+
+        await #expect(throws: (any Error).self) { try await Self.split(provider, fixture) }
+        #expect(store.storedICS(path: Self.masterPath)?.contains("UNTIL=") == true,
+                "setup: the first cap did not land")
+        try await Self.split(provider, fixture)
+
+        try Self.expectPartition(store, fixture, dated)
     }
 
     @Test("""
     Held direction — create-only PUTs still assert absence: creating an event \
     whose resource already exists is REFUSED, so the new-resource guard that \
-    makes retries idempotent is not weakened by the rollback fix
+    makes retries idempotent is not weakened
     """)
     func createOnlyPutsStillRefuseAnExistingResource() async throws {
         let http = FakeHTTP.Scenario()
@@ -1497,15 +1374,15 @@ struct CalDAVUpdatePreconditionTests {
         }
 
         // THE INVARIANT: the split actually happened — master capped, successor
-        // created. Pre-fix the cap 412s at step 3, before any rollback arm, so
-        // neither of these exists.
+        // created. With `If-None-Match: *` on the cap it 412s, so the series is
+        // never capped.
         let master = store.storedICS(path: masterPath)
         #expect(master?.contains("UNTIL=") == true, "the master series must be capped")
         let successorPath = "/cal/\(GoogleCalendarProvider.deterministicSplitEventId(masterId: masterPath, recurrenceId: fixture.recurrenceId)).ics"
         #expect(store.storedICS(path: successorPath) != nil, "the successor series must exist")
 
         let capPuts = store.recordedPuts().filter { $0.path == masterPath }
-        #expect(capPuts.count == 1, "exactly one cap PUT — a second means the rollback arm ran")
+        #expect(capPuts.count == 1, "exactly one cap PUT")
         guard capPuts.count == 1 else { return }
         #expect(capPuts[0].ifNoneMatch == nil)
         #expect(capPuts[0].ifMatch == nil)
@@ -1573,7 +1450,7 @@ struct CalDAVUpdatePreconditionTests {
 ///  * the RRULE cap on the master, via
 ///    `GoogleCalendarProvider.googleUntilString(…, zone: recurrenceIdZone)` —
 ///    parsed in the DECLARED zone and emitted as an absolute UTC instant; and
-///  * the successor series' `DTSTART`, via `CalDAVProvider.buildNewSeriesInput`,
+///  * the new part's `DTSTART`, via `CalDAVProvider.seriesSplitResources`,
 ///    which is handed `recurrenceIdInMasterFrame`'s output.
 ///
 /// The SYSTEM PROPERTY, stated without reference to how either is computed:
@@ -1581,10 +1458,10 @@ struct CalDAVUpdatePreconditionTests {
 /// `boundary − 1s` and the successor starts at `boundary`, so any other gap
 /// means the split dropped the boundary occurrence (successor late) or
 /// duplicated it (successor early). `splitSeries`'s cap `PUT` is an
-/// irreversible replacement-family write with only a compensating rollback, so
-/// a wrong cap destroys the master's post-split occurrences.
+/// irreversible replacement-family write, so a wrong cap destroys the master's
+/// post-split occurrences.
 ///
-/// This suite deliberately does NOT test `masterFrameZone`. It never names a
+/// This suite deliberately does NOT test how the frame is chosen. It never names a
 /// frame, an offset, or `.current` — it asserts only that two independently
 /// computed instants meet. A mechanism assertion ("the reader uses the master's
 /// zone") would stay green under the mirror-image arrangement that puts the two
@@ -1639,17 +1516,30 @@ struct CalDAVSplitBoundaryInstantTests {
                 recurrenceId, declaredZone: declared, kind: kind),
             "the recurrence_id must be expressible in the master's frame"
         )
-        let out = try CalDAVProvider.buildNewSeriesInput(
-            masterICS: masterICS, patch: GCalEventInput(),
-            newStartNaiveISO: masterFrameId,
-            newStartZone: declared,
-            newRRule: "RRULE:FREQ=WEEKLY"
+        let resources = try CalDAVProvider.seriesSplitResources(
+            storedICS: masterICS, slotNaiveISO: masterFrameId,
+            cappedRRule: "RRULE:FREQ=WEEKLY;UNTIL=\(until)", newRRule: "RRULE:FREQ=WEEKLY",
+                newUid: "boundary-master-split",
+            patch: GCalEventInput(), now: Date()
         )
-        let successor = try #require(
-            out.startDateTime.flatMap { Date.fromISO8601($0) },
-            "the successor series must carry a parseable start"
-        )
-        return (try capInstant(until), successor)
+        return (try capInstant(until), try successorStart(resources.newPart, declared: declared))
+    }
+
+    /// The new part's start as an instant. A floating `DTSTART` is a wall clock with no zone of
+    /// its own, so it is read in the declared zone — the zone the cap was computed in.
+    private func successorStart(_ newPart: String, declared: TimeZone) throws -> Date {
+        let line = try #require(
+            CalDAVProvider.masterTopLevelLines(newPart).first { $0.hasPrefix("DTSTART") },
+            "the new part must carry a start")
+        if line.contains("TZID=") || line.hasSuffix("Z") {
+            return try #require(CalDAVProvider.parseICSDateTime(line), "unparseable start '\(line)'")
+        }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyyMMdd'T'HHmmss"
+        f.timeZone = declared
+        let value = try #require(line.split(separator: ":").last.map(String.init))
+        return try #require(f.date(from: value), "unparseable floating start '\(line)'")
     }
 
     @Test("a UTC-anchored master: the successor starts one second after the cap")
@@ -1657,7 +1547,7 @@ struct CalDAVSplitBoundaryInstantTests {
         // 09:00 America/Vancouver on 2026-05-20 is 16:00Z (PDT, UTC−7), so this
         // master really is the series the declared recurrence_id names.
         //
-        // RED BEFORE THE FIX: `buildNewSeriesInput` read the master-frame value
+        // RED BEFORE THE FIX: the successor builder read the master-frame value
         // in the DEVICE zone for every non-`.zoned` master, so on any device not
         // running UTC the successor landed the device's offset away from the cap
         // (7h + 1s on a Vancouver simulator) — the boundary occurrence excluded
@@ -1718,16 +1608,15 @@ struct CalDAVSplitBoundaryInstantTests {
             let masterFrameId = try #require(
                 CalDAVProvider.recurrenceIdInMasterFrame(
                     "2026-05-27T00:00:00", declaredZone: declared, kind: .allDay))
-            let out = try CalDAVProvider.buildNewSeriesInput(
-                masterICS: ics, patch: GCalEventInput(),
-                newStartNaiveISO: masterFrameId,
-                newStartZone: declared,
-                newRRule: "RRULE:FREQ=WEEKLY"
+            let resources = try CalDAVProvider.seriesSplitResources(
+                storedICS: ics, slotNaiveISO: masterFrameId,
+                cappedRRule: "RRULE:FREQ=WEEKLY;UNTIL=\(until)", newRRule: "RRULE:FREQ=WEEKLY",
+                newUid: "boundary-master-split",
+                patch: GCalEventInput(), now: Date()
             )
-            #expect(out.startDate == "2026-05-27",
-                    "an all-day successor's start moved with the declared zone \(declared.identifier): got '\(out.startDate ?? "nil")'")
-            #expect(out.startDateTime == nil,
-                    "an all-day master must produce an all-day successor, not a timed one")
+            let starts = CalDAVProvider.masterTopLevelLines(resources.newPart).filter { $0.hasPrefix("DTSTART") }
+            #expect(starts == ["DTSTART;VALUE=DATE:20260527"],
+                    "an all-day successor's start moved with the declared zone \(declared.identifier), or took a time: got \(starts)")
         }
     }
 }
@@ -1735,8 +1624,8 @@ struct CalDAVSplitBoundaryInstantTests {
 // MARK: - ICS injection on the UPDATE paths
 
 /// `GCalEventInput.toICS` is not the only place ICS property lines are assembled, and guarding it
-/// alone left this class open: `toICS` covers create and split-series, while `updateOccurrence`
-/// builds its VEVENT in `CalDAVProvider.buildOverrideVEvent` and `updateEvent` builds it in
+/// alone left this class open: `toICS` covers create, while `updateOccurrence` builds its VEVENT in
+/// `CalDAVProvider.occurrenceOverrideResource` and `updateEvent` and the split build it in
 /// `CalDAVProvider.mergePatchIntoICS` (via `replaceOrAppendInMasterVEvent`, `replaceRRule` and
 /// `replaceAttendeesInMasterVEvent`). Every one of those interpolates model-supplied tool arguments,
 /// so each is asserted here directly rather than through the create path.
@@ -1767,35 +1656,44 @@ struct CalDAVICSInjectionTests {
     END:VCALENDAR
     """.replacingOccurrences(of: "\n", with: "\r\n")
 
-    @Test("buildOverrideVEvent: a poisoned SUMMARY cannot become a second property")
-    func overrideSummaryCannotInject() {
+    /// `masterICS` as a repeating series with a length, which a one-occurrence edit needs.
+    private var seriesICS: String {
+        masterICS.replacingOccurrences(
+            of: "SUMMARY:Original title",
+            with: "DTEND;TZID=America/Los_Angeles:20260513T174500\r\nRRULE:FREQ=WEEKLY\r\nSUMMARY:Original title"
+        )
+    }
+
+    @Test("occurrenceOverrideResource: a poisoned SUMMARY cannot become a second property")
+    func overrideSummaryCannotInject() throws {
         for brk in Self.payloadBreaks {
             var patch = GCalEventInput()
             patch.summary = "Standup\(brk)ATTENDEE;ROLE=REQ-PARTICIPANT:mailto:attacker@evil.example"
-            let block = CalDAVProvider.buildOverrideVEvent(
-                patch: patch, uid: "u", recurrenceId: "20260513T170000Z", kind: .utc
+            let block = try CalDAVProvider.occurrenceOverrideResource(
+                storedICS: seriesICS, recurrenceIdNaive: "2026-05-13T17:00:00", patch: patch, now: Date()
             )
             let lines = propertyLines(block)
-            #expect(!lines.contains { $0.hasPrefix("ATTENDEE") },
+            #expect(!lines.contains { $0.hasPrefix("ATTENDEE") && $0.contains("attacker") },
                     "break \(brk.unicodeScalars.map { String($0.value, radix: 16) }) injected ATTENDEE:\n\(block)")
             // Non-vacuity: the override itself is still produced.
-            #expect(lines.contains("BEGIN:VEVENT"))
-            #expect(lines.contains { $0.hasPrefix("SUMMARY:") }, "no SUMMARY emitted:\n\(block)")
+            #expect(lines.contains { $0.hasPrefix("RECURRENCE-ID") }, "no override emitted:\n\(block)")
+            #expect(lines.contains { $0.hasPrefix("SUMMARY:Standup") }, "no SUMMARY emitted:\n\(block)")
         }
     }
 
-    @Test("buildOverrideVEvent: a poisoned attendee name cannot forge an occurrence")
-    func overrideAttendeeCannotForgeOccurrence() {
+    @Test("occurrenceOverrideResource: a poisoned attendee name cannot forge an occurrence")
+    func overrideAttendeeCannotForgeOccurrence() throws {
         var patch = GCalEventInput()
         patch.attendees = [(email: "real@example.com",
                             name: "Bob\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nRECURRENCE-ID:20260520T170000Z\r\nSTATUS:CANCELLED")]
-        let block = CalDAVProvider.buildOverrideVEvent(
-            patch: patch, uid: "u", recurrenceId: "20260513T170000Z", kind: .utc
+        let block = try CalDAVProvider.occurrenceOverrideResource(
+            storedICS: seriesICS, recurrenceIdNaive: "2026-05-13T17:00:00", patch: patch, now: Date()
         )
         let lines = propertyLines(block)
-        // Exactly one VEVENT, and no forged cancellation of a DIFFERENT occurrence — that would be a
-        // mutation of a message the gesture never named, on a wire operation with no per-item recovery.
-        #expect(lines.filter { $0 == "BEGIN:VEVENT" }.count == 1, "forged VEVENT:\n\(block)")
+        // The series and the one override, and no forged cancellation of a DIFFERENT occurrence — that
+        // would be a mutation of an event the gesture never named, on a wire operation with no
+        // per-item recovery.
+        #expect(lines.filter { $0 == "BEGIN:VEVENT" }.count == 2, "forged VEVENT:\n\(block)")
         #expect(!lines.contains { $0.hasPrefix("STATUS:CANCELLED") }, "forged cancellation:\n\(block)")
         #expect(!lines.contains { $0.hasPrefix("RECURRENCE-ID:20260520") }, "forged RECURRENCE-ID:\n\(block)")
         // Non-vacuity: the attendee we asked for is present.
@@ -2008,8 +1906,7 @@ struct CalDAVSplitSeriesTailTests {
         let out = try await split(rrule: "RRULE:FREQ=WEEKLY;COUNT=3;BYDAY=MO,WE,FR")
         #expect(isRefusal(out.error), "got \(String(describing: out.error))")
         #expect(out.puts.isEmpty, """
-            the refusal must come before the cap PUT, which replaces the master and is only \
-            undone by a best-effort rollback. got \(out.puts.map(\.path))
+            the refusal must come before any write. got \(out.puts.map(\.path))
             """)
         #expect(out.master == out.originalMaster, "the master must be untouched")
     }

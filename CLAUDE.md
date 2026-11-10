@@ -107,8 +107,8 @@ deletion.
 > `GoogleCalendarProvider.deleteEvent` are excluded on **positive** documented per-item recovery
 > (Graph Recoverable Items; Google Calendar's 30-day event trash), not on the absence of evidence.
 > **(6) is not a DELETE at all: `CalDAVProvider.splitSeries`' cap `PUT`** replaces the master `.ics`
-> with an `UNTIL=`-capped `RRULE`, destroying every occurrence after the split point, under a
-> best-effort compensating rollback rather than a transaction.
+> with an `UNTIL=`-capped `RRULE`, destroying every occurrence after the split point; it is
+> written only after the new part holds what it removes (ADR-IOS-106), with no rollback.
 > **(7) `ExchangeProvider.replaceDraftAttachments`' attachment `DELETE`** (#217) removes a file the
 > local Outlook draft no longer names, only after every add succeeded.
 > **⚠ Membership is defined by a PROPERTY — content that existed on the server no longer does, with

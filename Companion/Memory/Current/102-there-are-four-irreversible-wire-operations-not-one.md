@@ -545,3 +545,23 @@ DELETE can run before or without the adds succeeding, if the upload PUT ever tar
 existing attachment, or if the DELETE set ever includes a server attachment kind or name the draft
 read cannot carry (it once did: before 2026-10-21 an attached email or cloud link another Outlook
 client added was unpairable, so the next save deleted it).
+
+---
+
+## 2026-11-10 — item (6) now runs after its data has a copy (ADR-IOS-106)
+
+`CalDAVProvider.splitSeries` used to PUT the cap first and create the new part second, with
+`revertMasterCap` as the compensating rollback. A cap whose response was lost threw before the
+create; the retry read the capped series, which no longer held the changed occurrences, excluded
+dates and added dates after the split, and copied the new part from it. Those were destroyed with
+no copy anywhere: this item's irreversible replacement, run before its data was safe.
+
+The order is now create first (create-only, `successorIsOurs` on a 412), cap last, no rollback. The
+cap is still in the set: it still removes content from the series resource with no per-item
+recovery. What changed is that the new part already holds every item the cap removes, so an
+interruption leaves duplicates for the retry to clear, never a loss. `revertMasterCap` no longer
+exists; the four `.unconditional` PUT sites listed under `IOS-CAL-002` are now three.
+
+The predicates were not re-run for this change: it removes one `client.put` call site and adds
+none, so pattern counts can only fall. Re-run them before restating any integer.
+

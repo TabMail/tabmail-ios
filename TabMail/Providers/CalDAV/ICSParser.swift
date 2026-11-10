@@ -303,6 +303,28 @@ enum ICSParser {
         return date.iso8601String()
     }
 
+    /// The `DTEND` value RFC 5545 §3.6.1 gives a VEVENT that has neither `DTEND` nor `DURATION`,
+    /// in the start's own form, so it pairs with the `DTSTART` parameters (`DTEND<params>:<value>`):
+    /// a start that is a date lasts that one day, so the end is the next date; a start that is a
+    /// date-time lasts no time, so the end is the start. Nil when a date start can't be read.
+    ///
+    /// The one place for this rule. `CalDAVProvider.extractMasterDuration` and
+    /// `CalDAVProvider.effectiveEnd` use it; any other reader of a VEVENT's end should too.
+    static func impliedEndValue(dtstartParams: String?, dtstartValue: String) -> String? {
+        let value = dtstartValue.trimmingCharacters(in: .whitespaces)
+        let isDate = (dtstartParams ?? "").uppercased().split(separator: ";").contains("VALUE=DATE")
+            || (value.count == 8 && !value.contains("T"))
+        guard isDate else { return value }
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = TimeZone(identifier: "UTC")
+        fmt.dateFormat = "yyyyMMdd"
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC") ?? .current
+        guard let day = fmt.date(from: value), let next = utc.date(byAdding: .day, value: 1, to: day) else { return nil }
+        return fmt.string(from: next)
+    }
+
     /// Parse ISO 8601 duration (e.g., PT1H30M, P1D) and add to a date.
     ///
     /// Internal rather than private because it is the tree's ONLY RFC 5545
@@ -367,7 +389,7 @@ enum ICSParser {
         return (name: name, email: email)
     }
 
-    private static func unescapeText(_ text: String) -> String {
+    static func unescapeText(_ text: String) -> String {
         text.replacingOccurrences(of: "\\n", with: "\n")
             .replacingOccurrences(of: "\\,", with: ",")
             .replacingOccurrences(of: "\\;", with: ";")

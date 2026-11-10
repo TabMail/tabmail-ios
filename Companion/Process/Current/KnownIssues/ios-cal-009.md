@@ -1,5 +1,17 @@
 # IOS-CAL-009
 
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **Amendment (2026-11-09): a symbol in clause (c) is renamed; the disposition is unchanged.** The
+> body is preserved unedited because it is regenerated from the hash-pinned archive and byte-compared.
+>
+> `buildOverrideVEvent` no longer exists. A CalDAV one-occurrence override is now built by
+> `CalDAVProvider.occurrenceOverrideResource` (`CalDAVEventCopies.swift`), which copies the stored
+> master's properties instead of rebuilding the override from modelled fields. Clause (c)'s
+> invariant still holds under the new name: the value `recurrenceIdInMasterFrame` produces feeds
+> both the override's `RECURRENCE-ID` and `spliceOrReplaceOverride`, so the splice replaces the
+> override rather than appending a second VEVENT with the same UID and RECURRENCE-ID. Detail:
+> `Companion/Memory/Current/142-a-copy-of-a-repeating-series-keeps-the-series-properties.md`.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 > Routed from `KNOWN_ISSUES.md` line 1133 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`).
 
 - Register classification: `closed-decision`

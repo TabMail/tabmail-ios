@@ -512,7 +512,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         // `/events/{id}/instances` endpoint requires the master id — passing an
         // instance returns 400. Resolve up front via the instance's
         // `recurringEventId` pointer.
-        let (eventId, _) = try await resolveToMaster(calendarId: calendarId, eventId: eventId)
+        let (eventId, _, _) = try await resolveToMaster(calendarId: calendarId, eventId: eventId)
         let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
         let encodedMasterId = try Self.encodedPathSegment(eventId, "Google master event id")
 
@@ -553,12 +553,20 @@ actor GoogleCalendarProvider: CalendarProvider {
     }
 
     /// Split a recurring series at `recurrenceId`:
-    /// 1. PATCH the master to add UNTIL = recurrenceId - 1 second (silent — sendUpdates="none")
-    /// 2. POST a new event with the same fields as the master, the `patch` applied,
-    ///    DTSTART = recurrenceId, and the master's RRULE ending where the original
-    ///    series ended (`RecurrenceTail.newSeriesRule`).
-    /// If step 2 fails after step 1 succeeded, attempt to revert step 1.
+    /// 1. POST the new part: a copy of the stored series (`splitNewPartJSON`) starting at
+    ///    recurrenceId, with the master's RRULE ending where the original series ended
+    ///    (`RecurrenceTail.newSeriesRule`) and the dates at or after the split, and the `patch` applied.
+    /// 2. PATCH the master to add UNTIL = recurrenceId - 1 second (silent — sendUpdates="none"),
+    ///    keeping its excluded and added dates before the split.
     /// Invitations (`sendUpdates`) fire only on the new series.
+    ///
+    /// **Create first, cap last, no rollback** (ADR-IOS-106, the order CalDAV uses). The cap
+    /// removes the excluded and added dates after the split, which the new part takes over. Written
+    /// first, a cap whose response is lost leaves a master without them, and the retry copies the
+    /// new part from that master, so they are gone for good. Written last, the new part already
+    /// holds them: a retry's insert is a proven duplicate of the deterministic id, the existing new
+    /// part is kept as it is, and the split goes on to the cap. A failed cap is rethrown; until the
+    /// retry writes it, both parts show the occurrences after the split.
     func splitSeries(
         calendarId: String = "primary",
         eventId: String,
@@ -571,8 +579,9 @@ actor GoogleCalendarProvider: CalendarProvider {
         //    The agent may have passed an INSTANCE id (Google format
         //    `<masterId>_<startTime>Z`) — instances don't carry the RRULE, only
         //    the master does. Resolve via `recurringEventId` so a split aimed at
-        //    an occurrence id still finds the series to cap.
-        let (eventId, master) = try await resolveToMaster(calendarId: calendarId, eventId: eventId)
+        //    an occurrence id still finds the series to cap. The stored JSON is
+        //    what the new part is copied from (`splitNewPartJSON`).
+        let (eventId, master, masterJSON) = try await resolveToMaster(calendarId: calendarId, eventId: eventId)
         guard let masterRecurrence = master.recurrence, !masterRecurrence.isEmpty else {
             throw CalendarProviderError.notSupported("Event \(eventId) is not recurring; can't split.")
         }
@@ -596,8 +605,72 @@ actor GoogleCalendarProvider: CalendarProvider {
         let days = Self.splitDaysInMasterFrame(master: master, recurrenceId: recurrenceId, recurrenceIdZone: recurrenceIdZone)
         let newSeriesRRule = try RecurrenceTail.newSeriesRule(
             from: originalRRule, seriesStart: days.seriesStart, split: days.split, capUntil: untilValue)
+        guard let slot = Self.splitInstant(naiveISO: recurrenceId, allDay: master.isAllDay, zone: recurrenceIdZone) else {
+            throw CalendarProviderError.notSupported("Invalid recurrence_id '\(recurrenceId)' — expected naive ISO8601 (e.g. '2026-05-20T17:00:00').")
+        }
+        // Excluded and added dates go with the part they fall in. Pure, so a
+        // series that can't be read is refused here, before anything is written.
+        let recurrenceParts = try Self.splitRecurrence(
+            masterRecurrence, cappedRRule: cappedRRule,
+            tailRRule: newSeriesRRule, slot: slot)
 
-        // 3. Build the capped-master patch. The semantic change is recurrence-
+        // 3. Build the new series: a copy of the stored series, re-anchored at
+        //    the split, with the patch applied. Pin a DETERMINISTIC id so a retry
+        //    re-targets the same series instead of creating a duplicate.
+        let newSeriesId = Self.deterministicSplitEventId(masterId: eventId, recurrenceId: recurrenceId)
+        let newSeriesJSON = Self.splitNewPartJSON(
+            masterJSON: masterJSON,
+            master: master,
+            patch: patch,
+            newStartNaiveISO: recurrenceId,
+            newStartZone: recurrenceIdZone,
+            newRecurrence: recurrenceParts.tail,
+            newId: newSeriesId
+        )
+
+        // 4. Create the new series.
+        let created: GCalEvent
+        do {
+            created = try await insertEventJSON(
+                calendarId: calendarId,
+                json: newSeriesJSON,
+                sendUpdates: sendUpdates
+            )
+        } catch GoogleCalendarError.httpError(409, let conflictBody)
+                    where Self.isDuplicateIdConflict(conflictBody) {
+            // A PROVEN duplicate of our deterministic id: an earlier attempt
+            // created the new series, and its response, or its cap, never
+            // completed. The existing new series is kept as it is (it was copied
+            // from the master before any cap) and the split goes on to the cap.
+            // Any other 409 (empty, unparseable, Google's `conflict`) is not
+            // proof: it is rethrown with nothing written, and the drain retries it.
+            //
+            // The proof-GET's own failure may not masquerade as anything else.
+            // Until 2026-08-06 this arm caught ANY 409, assumed the create had
+            // landed, and a 404 from this GET escaped to `isCalendarNotFoundError`,
+            // which deletes the `PendingCalendarOperation` (R14-F2).
+            do {
+                created = try await getEvent(calendarId: calendarId, eventId: newSeriesId)
+            } catch {
+                // The new series EXISTS — Google just said so — we merely could not
+                // read it back. Letting this error escape is forbidden: a
+                // 404/`eventNotFound` here is claimed by `isCalendarNotFoundError`
+                // and deletes the durable row. Rethrowing the ORIGINAL 409 says "we
+                // could not determine the outcome"; no terminal arm claims a 409
+                // (`isCalendarBadRequestError` excludes it as indeterminate), so the
+                // op stays queued and the next drain re-runs the split, re-proves
+                // the duplicate and retries the read. Nothing has been capped.
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries proof-GET for \(newSeriesId) FAILED after a proven duplicate: \(error) — keeping the operation queued")
+                }
+                throw GoogleCalendarError.httpError(409, conflictBody)
+            }
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries: new series \(newSeriesId) already exists — going on to the cap")
+            }
+        }
+
+        // 5. Build the capped-master patch. The semantic change is recurrence-
         //    only, but defensive-include the master's existing start/end so
         //    the provider can't silently re-anchor them on partial PATCH.
         //    Google's docs explicitly recommend "prefer GET + UPDATE over
@@ -606,7 +679,7 @@ actor GoogleCalendarProvider: CalendarProvider {
         //    omitting start/end caused the master to be rewritten to UTC
         //    midnight at `range.startDate`.
         var cappedMasterInput = GCalEventInput()
-        cappedMasterInput.recurrence = [cappedRRule]
+        cappedMasterInput.recurrence = recurrenceParts.capped
         if master.isAllDay {
             if let s = master.start?.date { cappedMasterInput.startDate = s }
             if let e = master.end?.date { cappedMasterInput.endDate = e }
@@ -617,153 +690,24 @@ actor GoogleCalendarProvider: CalendarProvider {
             if let tz = master.end?.timeZone { cappedMasterInput.endTimeZone = tz }
         }
 
-        // 4. PATCH master silently.
+        // 6. PATCH master silently. A failure is rethrown; the new series exists,
+        //    so the retry proves the duplicate above and writes the cap again.
         let _: GCalEvent = try await updateEvent(
             calendarId: calendarId,
             eventId: eventId,
             event: cappedMasterInput,
             sendUpdates: "none"
         )
-
-        // 5. Build the new series — inherit master fields, apply patch overrides.
-        //    Pin a DETERMINISTIC id so a retry after a lost ACK on step 6
-        //    re-targets the same series instead of creating a duplicate.
-        var newSeriesInput = Self.mergeMasterAndPatch(
-            master: master,
-            patch: patch,
-            newStartNaiveISO: recurrenceId,
-            newStartZone: recurrenceIdZone,
-            newRecurrence: [newSeriesRRule]
-        )
-        let newSeriesId = Self.deterministicSplitEventId(masterId: eventId, recurrenceId: recurrenceId)
-        newSeriesInput.id = newSeriesId
-
-        // 6. Create the new series.
-        do {
-            return try await createEvent(
-                calendarId: calendarId,
-                event: newSeriesInput,
-                sendUpdates: sendUpdates
-            )
-        } catch GoogleCalendarError.httpError(409, let conflictBody)
-                    where Self.isDuplicateIdConflict(conflictBody) {
-            // 🚨 R14-F2 — POSITIVELY IDENTIFIED, and the proof-GET's failure may
-            // not masquerade as anything else.
-            //
-            // Until 2026-08-06 this arm was `catch GoogleCalendarError.httpError(409, _)`
-            // and DISCARDED the body. End to end: step 4 caps the master, step 6's
-            // create returns a NON-duplicate 409, this arm assumes lost-ACK
-            // success, `getEvent(newSeriesId)` answers 404 because nothing was
-            // created, the sibling rollback `catch` below is skipped — a throw
-            // inside a `catch` clause is not claimed by a sibling `catch` of the
-            // same `do` — and that 404 reaches `isCalendarNotFoundError`, which
-            // deletes the `PendingCalendarOperation` and signals
-            // `.permanentFailure`. The recurring master stays truncated, the
-            // successor never exists, and the only durable intention that could
-            // repair it is gone. Later sync imports the truncated master and
-            // cannot reconstruct the recurrence.
-            //
-            // The `where` clause is the whole fix's first half: an unproven,
-            // empty or unparseable 409 now falls into the rollback `catch`, which
-            // restores the master's recurrence and rethrows through
-            // `splitRollbackError`. The siblings already did this — `CalDAVProvider`
-            // verifies the successor exists AND is ours before treating a
-            // collision as completion, and `ExchangeCalendarProvider` carries an
-            // explicit "THERE IS DELIBERATELY NO `catch …httpError(409, _)`" so
-            // every create failure routes through rollback accounting. Google was
-            // the only one accepting any 409 as proof.
-            //
-            // ⚠️ WHAT BREAKS THE OTHER WAY (`MIS-026`). A genuine duplicate whose
-            // body Google failed to send now rolls the cap back and retries the
-            // whole split instead of returning the existing successor. That
-            // converges (the cap is recomputed from the master's own RRULE and is
-            // idempotent) and is the same disposition the `.create` path already
-            // gives a body-less 409, which `googleBodylessConflictKeepsTheIntentionQueued`
-            // pins. Failing closed on absent evidence is always acceptable;
-            // deleting the durable row on it is never-drop clause 2.
-            do {
-                return try await getEvent(calendarId: calendarId, eventId: newSeriesId)
-            } catch {
-                // The successor EXISTS — Google just said so — we merely could not
-                // read it back. Two dispositions are forbidden here and both are
-                // reachable-looking:
-                //  * letting this error escape, because a 404/`eventNotFound` from
-                //    the proof-GET is claimed by `isCalendarNotFoundError` and
-                //    deletes the durable row on "the original event is gone",
-                //    which is exactly the defect above;
-                //  * falling into the rollback `catch`, because UNCAPPING a master
-                //    whose successor exists duplicates every future occurrence —
-                //    F2's own mirror image.
-                // Rethrowing the ORIGINAL 409 is the only honest answer: it says
-                // "we could not determine the outcome", no terminal arm claims a
-                // 409 (`isCalendarBadRequestError` excludes it as indeterminate),
-                // so the op stays queued and the next drain re-runs the split
-                // against the already-capped master — which re-conflicts, re-proves
-                // the duplicate, and retries the read. The server state is stable
-                // across that retry, so it terminates as soon as the GET succeeds.
-                // Rule 12 — a NEW diagnostic must be a no-op in production. This file
-                // carries 9 ungated `print`s and 0 `DebugModeManager` references, so
-                // the local habit is ungated; that pre-existing corpus is a closed
-                // decision about code that already existed, not a licence to add to
-                // it. A bare `print` reaches nothing in a production iOS build
-                // anyway, so this is not exception (b) either.
-                if DebugModeManager.isLoggingEnabled() {
-                    BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries proof-GET for \(newSeriesId) FAILED after a proven duplicate: \(error) — keeping the operation queued")
-                }
-                throw GoogleCalendarError.httpError(409, conflictBody)
-            }
-        } catch {
-            // Best-effort revert of step 1 so we don't leave the master truncated
-            // with no replacement series. Same defensive include-start/end as
-            // the cap above — partial PATCH could in principle re-anchor.
-            //
-            // 🚨 R13-U4 — A FAILED ROLLBACK IS NOT THE SAME OUTCOME AS A SUCCESSFUL
-            // ONE, and `try?` reported them identically. If the create failed with a
-            // 400/415/422, `isCalendarBadRequestError` claims the rethrown error and
-            // the drain DELETES the durable row — so when the revert had also
-            // failed, the master was left permanently capped, with no successor and
-            // no queued work to make one. Later sync imports the truncated master
-            // and cannot reconstruct the original recurrence.
-            //
-            // On a revert failure this raises `CalDAVError.inconsistentState`, whose
-            // drain arm is terminal-with-a-reason and surfaces the message to the
-            // user — deliberately NOT transient, because retrying a two-step write
-            // that has already half landed re-caps an already-capped master.
-            // Identical treatment to the Exchange sibling: one invariant, two
-            // spellings, kept in step on purpose.
-            var revertInput = GCalEventInput()
-            revertInput.recurrence = masterRecurrence
-            if master.isAllDay {
-                if let s = master.start?.date { revertInput.startDate = s }
-                if let e = master.end?.date { revertInput.endDate = e }
-            } else {
-                if let s = master.start?.dateTime { revertInput.startDateTime = s }
-                if let tz = master.start?.timeZone { revertInput.startTimeZone = tz }
-                if let e = master.end?.dateTime { revertInput.endDateTime = e }
-                if let tz = master.end?.timeZone { revertInput.endTimeZone = tz }
-            }
-            var revertFailure: Error?
-            do {
-                _ = try await updateEvent(
-                    calendarId: calendarId,
-                    eventId: eventId,
-                    event: revertInput,
-                    sendUpdates: "none"
-                )
-            } catch let revertError {
-                revertFailure = revertError
-                BackgroundSyncLogger.logDebug("[GoogleCalendar] splitSeries revert FAILED: \(revertError)")
-            }
-            throw Self.splitRollbackError(original: error, revertFailure: revertFailure)
-        }
+        return created
     }
 
     /// 🚨 **R13-U4 — the error a half-landed split reports depends on whether its
-    /// ROLLBACK worked.** Shared by both `splitSeries` implementations so the two
-    /// spellings of one invariant cannot drift apart.
+    /// ROLLBACK worked.** Used by `ExchangeCalendarProvider.splitSeries`, the one
+    /// split that still caps first (Google and CalDAV create first and roll nothing
+    /// back, ADR-IOS-106).
     ///
-    /// A split is cap-then-create. If the create fails, both providers try to
-    /// restore the master's original recurrence and then rethrow. Until
+    /// An Outlook split is cap-then-create. If the create fails, it tries to
+    /// restore the master's original recurrence and then rethrows. Until
     /// 2026-08-06 the restore was `_ = try? await updateEvent(…)`, which reports a
     /// failed rollback and a successful one IDENTICALLY. That matters because the
     /// rethrown error decides the queue's disposition: when the create failed with
@@ -849,13 +793,39 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// agent commonly passes an instance id because that's what
     /// `calendar_search` / `calendar_read` returns for an occurrence — resolve
     /// up front so split/updateOccurrence see the master regardless.
-    private func resolveToMaster(calendarId: String, eventId: String) async throws -> (id: String, event: GCalEvent) {
-        let fetched = try await getEvent(calendarId: calendarId, eventId: eventId)
+    private func resolveToMaster(calendarId: String, eventId: String) async throws -> (id: String, event: GCalEvent, json: [String: Any]) {
+        let (fetched, fetchedJSON) = try await getEventAndJSON(calendarId: calendarId, eventId: eventId)
         if let masterId = fetched.recurringEventId, !masterId.isEmpty, masterId != eventId {
-            let master = try await getEvent(calendarId: calendarId, eventId: masterId)
-            return (masterId, master)
+            let (master, masterJSON) = try await getEventAndJSON(calendarId: calendarId, eventId: masterId)
+            return (masterId, master, masterJSON)
         }
-        return (eventId, fetched)
+        return (eventId, fetched, fetchedJSON)
+    }
+
+    /// The event, and the JSON object it was read from. A copy of an event is made from the JSON,
+    /// so a property `GCalEvent` does not model is still carried over.
+    private func getEventAndJSON(calendarId: String, eventId: String) async throws -> (GCalEvent, [String: Any]) {
+        let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
+        let encodedEventId = try Self.encodedPathSegment(eventId, "Google event id")
+        let data = try await request(path: "/calendars/\(encodedCalId)/events/\(encodedEventId)")
+        let event = try JSONDecoder().decode(GCalEvent.self, from: data)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw DecodingError.dataCorrupted(.init(codingPath: [], debugDescription: "Google event is not a JSON object"))
+        }
+        return (event, json)
+    }
+
+    /// Create an event from a JSON object. `conferenceDataVersion=1` and `supportsAttachments=true`
+    /// make Google keep the object's conference and attachments; without them it drops both.
+    private func insertEventJSON(calendarId: String, json: [String: Any], sendUpdates: String) async throws -> GCalEvent {
+        let encodedCalId = try Self.encodedPathSegment(calendarId, "Google calendar id")
+        let body = try JSONSerialization.data(withJSONObject: json)
+        let data = try await request(
+            path: "/calendars/\(encodedCalId)/events?sendUpdates=\(sendUpdates)&conferenceDataVersion=1&supportsAttachments=true",
+            method: "POST",
+            body: body
+        )
+        return try JSONDecoder().decode(GCalEvent.self, from: data)
     }
 
     /// Find the Google instance id for the occurrence `recurrenceId` names when
@@ -977,16 +947,7 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// (silently emitting "now-1s" would cap the series in the past with
     /// nothing in the new series).
     static func googleUntilString(beforeNaiveISO naive: String, allDay: Bool, zone: TimeZone) -> String? {
-        // Parse: try full date-time first, then fall back to date-only.
-        let dtFmt = DateFormatter()
-        dtFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        dtFmt.timeZone = zone
-        let dateFmt = DateFormatter()
-        dateFmt.dateFormat = "yyyy-MM-dd"
-        dateFmt.timeZone = zone
-        let parsed = dtFmt.date(from: naive)
-            ?? dateFmt.date(from: String(naive.prefix(10)))
-        guard let date = parsed else { return nil }
+        guard let date = naiveInstant(naive, zone: zone) else { return nil }
 
         if allDay {
             // Day before, bare DATE form. Use Calendar arithmetic — subtracting
@@ -1049,25 +1010,149 @@ actor GoogleCalendarProvider: CalendarProvider {
         return prefix + (kept + ["UNTIL=\(untilValue)"]).joined(separator: ";")
     }
 
-    /// Drop UNTIL/COUNT from an RRULE, returning the open-ended pattern.
-    static func stripUntilAndCount(_ rrule: String) -> String {
-        let prefix = "RRULE:"
-        let body = rrule.hasPrefix(prefix) ? String(rrule.dropFirst(prefix.count)) : rrule
-        let kept = body.split(separator: ";")
-            .map(String.init)
-            .filter { part in
-                let upper = part.uppercased()
-                return !upper.hasPrefix("UNTIL=") && !upper.hasPrefix("COUNT=")
+    /// A naive ISO wall clock read in `zone`: the full `2026-05-20T17:00:00` form, or a date
+    /// (`2026-05-20`) read as its midnight.
+    static func naiveInstant(_ naive: String, zone: TimeZone) -> Date? {
+        let dtFmt = DateFormatter()
+        dtFmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        dtFmt.timeZone = zone
+        let dateFmt = DateFormatter()
+        dateFmt.dateFormat = "yyyy-MM-dd"
+        dateFmt.timeZone = zone
+        return dtFmt.date(from: naive) ?? dateFmt.date(from: String(naive.prefix(10)))
+    }
+
+    /// The instant a split occurs at, in the frame `EXDATE`/`RDATE` values are read in
+    /// (`CalDAVProvider.parseICSDateTime`): the wall clock read in `zone` for a timed series, the
+    /// UTC midnight of the date for an all-day one.
+    static func splitInstant(naiveISO: String, allDay: Bool, zone: TimeZone) -> Date? {
+        guard allDay else { return naiveInstant(naiveISO, zone: zone) }
+        let digits = naiveISO.prefix(10).replacingOccurrences(of: "-", with: "")
+        guard digits.count == 8, digits.allSatisfy(\.isNumber) else { return nil }
+        return CalDAVProvider.parseICSDateTime("DTSTART;VALUE=DATE:\(digits)")
+    }
+
+    /// A series' `recurrence` lines, split at `slot` for a this-and-following edit. The rule becomes
+    /// `cappedRRule` on the series and `tailRRule` on the new part. Excluded and added dates
+    /// (`EXDATE`, `RDATE`) before the slot stay with the series; those at or after it go to the new
+    /// part. Any other line is kept on both. Throws `notSupported` for a date that can't be read.
+    static func splitRecurrence(
+        _ recurrence: [String], cappedRRule: String, tailRRule: String, slot: Date
+    ) throws -> (capped: [String], tail: [String]) {
+        var capped: [String] = []
+        var tail: [String] = []
+        for line in recurrence {
+            switch line.prefix(while: { $0 != ":" && $0 != ";" }).uppercased() {
+            case "RRULE":
+                capped.append(cappedRRule)
+                tail.append(tailRRule)
+            case "EXDATE", "RDATE":
+                capped += try CalDAVProvider.filterDateList(line, keep: { $0 < slot })
+                tail += try CalDAVProvider.filterDateList(line, keep: { $0 >= slot })
+            default:
+                capped.append(line)
+                tail.append(line)
             }
-        return prefix + kept.joined(separator: ";")
+        }
+        return (capped, tail)
+    }
+
+    /// Keys of a stored event that the server owns or that name the stored event; a copy written
+    /// as a new event leaves them off.
+    static let serverOwnedEventKeys: Set<String> = [
+        "id", "iCalUID", "etag", "sequence", "htmlLink", "created", "updated", "creator", "organizer",
+        "kind", "recurringEventId", "originalStartTime", "hangoutLink", "locked", "attendeesOmitted",
+    ]
+
+    /// Attendee keys the server sets.
+    static let serverOwnedAttendeeKeys: Set<String> = ["self", "id", "organizer"]
+
+    /// The new part of a split: the stored series' JSON without the keys the server owns, under
+    /// `newId`, re-anchored at the split (`mergeMasterAndPatch`) with `newRecurrence`, and with the
+    /// patch applied. Every other property of the series is kept as stored.
+    ///
+    /// Attendees keep their entries (role, optional flag, answer). When the edit moves the new part
+    /// (its start, end, all-day form, rule or place differs from the plain re-anchored copy, or that
+    /// can't be told) every attendee but the organizer is asked again. An attendee the patch adds is
+    /// asked; one it leaves out is removed.
+    static func splitNewPartJSON(
+        masterJSON: [String: Any],
+        master: GCalEvent,
+        patch: GCalEventInput,
+        newStartNaiveISO: String,
+        newStartZone: TimeZone,
+        newRecurrence: [String],
+        newId: String
+    ) -> [String: Any] {
+        var json = masterJSON.filter { !serverOwnedEventKeys.contains($0.key) }
+        json["id"] = newId
+        let unchanged = mergeMasterAndPatch(
+            master: master, patch: GCalEventInput(), newStartNaiveISO: newStartNaiveISO,
+            newStartZone: newStartZone, newRecurrence: newRecurrence)
+        let edited = mergeMasterAndPatch(
+            master: master, patch: patch, newStartNaiveISO: newStartNaiveISO,
+            newStartZone: newStartZone, newRecurrence: newRecurrence)
+        let editedJSON = edited.toJSON()
+        if let summary = patch.summary { json["summary"] = summary }
+        if let location = patch.location { json["location"] = location }
+        if let description = patch.description { json["description"] = description }
+        if let transparency = patch.transparency { json["transparency"] = transparency }
+        json["start"] = editedJSON["start"]
+        json["end"] = editedJSON["end"]
+        json["recurrence"] = edited.recurrence
+
+        let stored = masterJSON["attendees"] as? [[String: Any]] ?? []
+        guard !stored.isEmpty || patch.attendees != nil else { return json }
+        func email(_ attendee: [String: Any]) -> String? { (attendee["email"] as? String)?.lowercased() }
+        let organizerEmail = master.organizer?.email?.lowercased()
+        var attendees = stored
+        if let wanted = patch.attendees {
+            attendees = wanted.map { want in
+                if let kept = stored.first(where: { email($0) == want.email.lowercased() }) { return kept }
+                var added: [String: Any] = ["email": want.email]
+                if let name = want.name { added["displayName"] = name }
+                return added
+            }
+        }
+        let askAgain = splitReschedules(unchanged, edited)
+        json["attendees"] = attendees.map { attendee -> [String: Any] in
+            let isOrganizer = (attendee["organizer"] as? Bool) == true
+                || (organizerEmail != nil && email(attendee) == organizerEmail)
+            var copy = attendee.filter { !serverOwnedAttendeeKeys.contains($0.key) }
+            if askAgain, !isOrganizer, copy["responseStatus"] != nil {
+                copy["responseStatus"] = "needsAction"
+            }
+            return copy
+        }
+        return json
+    }
+
+    /// Whether `edited` moves the new part away from the plain re-anchored copy `unchanged`: a
+    /// different start, end, all-day form, rule or place. A time that can't be read counts as moved.
+    static func splitReschedules(_ unchanged: GCalEventInput, _ edited: GCalEventInput) -> Bool {
+        func sameTime(_ aDateTime: String?, _ aDate: String?, _ bDateTime: String?, _ bDate: String?) -> Bool {
+            switch (aDateTime, bDateTime) {
+            case (nil, nil):
+                return aDate != nil && aDate == bDate
+            case let (a?, b?):
+                guard let x = Date.fromISO8601(a), let y = Date.fromISO8601(b) else { return false }
+                return x == y
+            default:
+                return false
+            }
+        }
+        return !sameTime(unchanged.startDateTime, unchanged.startDate, edited.startDateTime, edited.startDate)
+            || !sameTime(unchanged.endDateTime, unchanged.endDate, edited.endDateTime, edited.endDate)
+            || Set(unchanged.recurrence ?? []) != Set(edited.recurrence ?? [])
+            || (unchanged.location ?? "") != (edited.location ?? "")
     }
 
     /// Deterministic identifier for the NEW series produced by a
     /// `this_and_following` split. Derived purely from inputs that are STABLE
     /// across queue retries (`masterId` + `recurrenceId`), so retrying a split
     /// after a lost ACK targets the SAME resource instead of creating a
-    /// duplicate series (the two-step cap-then-create is otherwise not
-    /// idempotent — step 1 is, step 2 isn't).
+    /// duplicate series (the create is the step of a split that is not
+    /// idempotent by itself; the cap is).
     ///
     /// SHA-256 hex: 64 chars of `[0-9a-f]` — simultaneously a valid subset of
     /// Google's base32hex event-id charset (`a`–`v`, `0`–`9`; length 5–1024),
