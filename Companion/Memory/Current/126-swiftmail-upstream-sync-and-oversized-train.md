@@ -491,3 +491,23 @@ serializer that writes recipients:
 - App and NSE pin `4da38768ceac62bd5f38250bebe50985608da1a3` (`project.yml` and the root
   `Package.resolved`).
 
+## 2026-11-10 — upstream `faa1c2a` and address-list folding (#447)
+
+- Fork `main` reset from `13bfaed` (the unsquashed commits of upstream PR #287) to upstream `faa1c2a`
+  (#287 squash-merged, identical content) plus the one commit of
+  [upstream PR #288](https://github.com/Cocoanetics/SwiftMail/pull/288) (head `f419115`), our only
+  open upstream PR. Upstream had no other new commits.
+- #287: `quotedPrintableEncoded()` and `SMTPServer.checkHeaderFields` search CRLF with `.literal`, so a
+  line ending or a header fold directly before a combining mark, U+FE0F or an emoji modifier is found
+  (before, such a fold made the header check refuse the value on every send or append).
+- #288 (tabmail-ios #447): `Email.headerFields` (To, Cc, Bcc) and `EMLSerializer.appendAddressHeader`
+  (every address field) fold the list between addresses through `AddressFormatter.foldedList`, at 78
+  octets counted in UTF-8 octets with the field name on the first line; an address is never split, so
+  only an address over 998 octets by itself passes RFC 5322's line limit. Groups fold between members
+  (`AddressFormatter.listPieces`). Unfolded, each field reads as the old comma-separated list. The app
+  reaches this through `IMAPProvider.buildEmail` (SMTP send, Sent APPEND, IMAP draft).
+- Gate: tier-1 review, then a Codex round whose correctness finding (the composed-character unfold) was
+  already fixed by #287 in the base; its coverage gaps were closed with tests, each proven by a detected
+  mutant. Targeted package suites and `swiftlint --strict` pass.
+- App and NSE pin `f4191156dd73d84c5266549c4569d428cb97886e` (`project.yml` and the root
+  `Package.resolved`).
