@@ -156,16 +156,25 @@ struct ChangeSettingToolTests {
 
     // MARK: - Number settings: alternative input types accepted
 
-    @Test("Number setting accepts double value (truncated to int)")
+    @Test("Number setting accepts a double holding a whole number")
     func numberSettingDoubleAccepted() async throws {
         let tool = ChangeSettingTool()
-        // 15.9 should be accepted and truncated to 15 (within 1-30 range)
+        let result = try await tool.execute(arguments: [
+            "setting": .string("notifications.new_reminder_window_days"),
+            "value": .double(15.0),
+        ])
+        // Should succeed (persists to UserDefaults in test context)
+        #expect(result.contains("ok"))
+    }
+
+    @Test("Number setting refuses a fractional value instead of truncating it")
+    func numberSettingFractionRefused() async throws {
+        let tool = ChangeSettingTool()
         let result = try await tool.execute(arguments: [
             "setting": .string("notifications.new_reminder_window_days"),
             "value": .double(15.9),
         ])
-        // Should succeed (persists to UserDefaults in test context)
-        #expect(result.contains("ok"))
+        #expect(result.contains("requires an integer value"))
     }
 
     @Test("Number setting accepts string-encoded integer")

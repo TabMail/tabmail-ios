@@ -363,3 +363,19 @@ and the claim's `sentMessageId` are one id. Its refusal case runs the real claim
 while Graph refuses the send at `sendMail`, at the files route's draft create, or at its `/send`: every
 claim reuses the first claim's id, every attempt asks Graph for it, each refusal is counted, the row
 is shown as failed after the third, it is never marked sent, and no Sent row is written.
+
+## Agent tool arguments — whole numbers
+
+`ToolArgumentWholeNumberTests` covers `JSONValue.wholeNumber`, the one way a tool reads an integer
+argument. A JSON number `Int` cannot hold decodes as `.double`, so the accessor accepts an `.int`
+or a `.double` holding a whole number in `Int`'s range, and nothing else. It then drives every tool
+that reads an integer argument with values outside `Int` either way and with a fraction: the
+message tools' `unique_id`, `EmailDeleteTool.parseUniqueIds`, the settings value, the template id,
+the contact-search `limit` and the calendar-search `page_index`. Each one refuses the value rather
+than truncating it. The calendar-search reply for the largest page is checked too. The recurrence
+`interval` and `count` must be whole numbers of 1 or more: the event builder throws on anything
+else, and calendar create and edit refuse it before the confirmation card. A source check fails if
+a new `.double` binding appears under `Services/AI` or `Services/Account`, the one allowed being
+the PDF tool's page number, which is bounded before it converts. `CalendarQueueArgumentValidationTests`
+stores a create and an edit carrying such a count, as an earlier build could have queued them. The
+drain retires each one with its reason and sends nothing to the provider.

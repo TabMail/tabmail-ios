@@ -26,12 +26,8 @@ enum TemplateToolHelpers {
     }
 
     static func intArg(_ args: [String: JSONValue], _ key: String) -> Int? {
-        switch args[key] {
-        case .int(let n): return n
-        case .double(let d): return Int(d)
-        case .string(let s): return Int(s)
-        default: return nil
-        }
+        if case .string(let s) = args[key] { return Int(s) }
+        return args[key]?.wholeNumber
     }
 
     /// Resolve a numeric template ID to a real template UUID via the translator.

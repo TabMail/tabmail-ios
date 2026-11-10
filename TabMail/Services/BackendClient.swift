@@ -274,6 +274,21 @@ enum JSONValue: Sendable, Codable {
     case dictionary([String: JSONValue])
     case null
 
+    /// The whole number this value holds: an `.int`, or a `.double` with no
+    /// fractional part that fits in `Int`. nil for anything else.
+    ///
+    /// Every integer a tool reads from its arguments goes through here. A JSON
+    /// number too large for `Int` decodes as `.double` (see `init(from:)`), and
+    /// `Int(_: Double)` stops the app on a value outside `Int`'s range, so a
+    /// plain `Int(d)` on an argument is never safe.
+    var wholeNumber: Int? {
+        switch self {
+        case .int(let n): return n
+        case .double(let d): return Int(exactly: d)
+        default: return nil
+        }
+    }
+
     /// Decodes arbitrary JSON into the opaque value tree. Order matters: `Bool`
     /// before the numeric cases (Foundation's JSONDecoder only matches a JSON
     /// boolean to `Bool`, never a number), and the containers last. Used so
