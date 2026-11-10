@@ -21,9 +21,8 @@ import Testing
 ///
 /// **The lookup-failure claim, at its true width.** An earlier revision of this
 /// header asserted that "no `v3` code path sends a `$filter`". That is FALSE:
-/// `ExchangeProvider.listBackfillMessageIds` and
-/// `ExchangeProvider.fetchOlderMessages` both emit one (`receivedDateTime`
-/// windows). The claim these tests actually make — and the only one they
+/// `ExchangeProvider.fetchOlderMessages` emits one (a `receivedDateTime`
+/// window). The claim these tests actually make — and the only one they
 /// support — is narrower: **no `v3` ACTION / RFC-resolution path sends the
 /// RFC-IDENTITY `$filter`** the reference's `resolveActionMessageId` used
 /// (`internetMessageId eq '<…>'`). That is the sole shape the fixture's
@@ -378,9 +377,8 @@ struct StatefulExchangeActionServerTests {
     /// Port of the reference's transient-failure leg, keeping only the half
     /// `v3` can reach. `failNextLookup()` gates the RFC-IDENTITY `$filter`
     /// request (`internetMessageId eq '<…>'`) that no `v3` path sends — v3 does
-    /// emit `$filter` elsewhere, from `ExchangeProvider.listBackfillMessageIds`
-    /// and `fetchOlderMessages`, but those carry `receivedDateTime` windows and
-    /// never reach this hook. `failNextMutation()` gates exactly three fixture
+    /// emit `$filter` elsewhere, from `ExchangeProvider.fetchOlderMessages`, but
+    /// that carries a `receivedDateTime` window and never reaches this hook. `failNextMutation()` gates exactly three fixture
     /// handlers — `/messages/` PATCH, DELETE, and POST.
     ///
     /// ⚠ CORRECTED 2026-07-31. The previous revision of this paragraph made two

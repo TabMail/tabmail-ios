@@ -507,7 +507,7 @@ actor GmailProvider: EmailProvider {
         }
         // Synthetic "All Mail" folder is NOT a valid Gmail label ID — passing it as
         // labelIds returns HTTP 400 "Invalid label". Scope via query exclusions
-        // instead, same translation as fetchMessages/listBackfillMessageIds.
+        // instead, same translation as fetchMessages/listOlderMessageIds.
         if folder == GmailProvider.archivePath {
             q += " " + GmailProvider.allMailExclusionQuery
         }
@@ -1211,151 +1211,6 @@ actor GmailProvider: EmailProvider {
 
     // MARK: - Backfill
 
-    /// Fetch older messages within a date range that aren't already known locally.
-    /// Uses Gmail API pagination with `after:` epoch filter and `nextPageToken`.
-    /// Checks Task.isCancelled between pages for cooperative cancellation (ADR-IOS-002).
-    /// LIST phase: find all message IDs in a date range via pagination.
-    /// Returns lightweight string IDs — no message content fetched.
-    /// `pageSize` and `interPageDelay` are power-aware via BackfillProfile.
-    func listBackfillMessageIds(
-        folder: String,
-        since: Date,
-        before: Date? = nil,
-        pageSize: Int = 500,
-        interPageDelay: TimeInterval = 0.3,
-        maxIds: Int = SyncConfig.gmailBackfillIdCap
-    ) async throws -> [String] {
-        let sinceEpoch = Int(since.timeIntervalSince1970)
-        var pageToken: String? = nil
-        var allIds: [String] = []
-
-        repeat {
-            try Task.checkCancellation()
-
-            var query = "after:\(sinceEpoch)"
-            if let before { query += " before:\(Int(before.timeIntervalSince1970))" }
-            if folder == GmailProvider.archivePath {
-                query += " " + GmailProvider.allMailExclusionQuery
-            }
-            let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
-            var path: String
-            if folder == GmailProvider.archivePath {
-                path = "/messages?maxResults=\(pageSize)&q=\(encodedQuery)"
-            } else {
-                path = "/messages?labelIds=\(folder)&maxResults=\(pageSize)&q=\(encodedQuery)"
-            }
-            if let token = pageToken {
-                path += "&pageToken=\(token)"
-            }
-
-            let data = try await request(path: path)
-            let listResponse = try JSONDecoder().decode(GmailMessageListResponse.self, from: data)
-
-            guard let messageRefs = listResponse.messages else { break }
-            allIds.append(contentsOf: messageRefs.map(\.id))
-
-            // Safety cap: stop pagination if we've accumulated enough IDs.
-            // Remaining messages are picked up on next backfill cycle via date windowing.
-            if allIds.count >= maxIds {
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] WARNING: listBackfillMessageIds hit \(maxIds) ID cap — stopping pagination. This folder has an unusually large number of messages.") }
-                break
-            }
-
-            pageToken = listResponse.nextPageToken
-            if pageToken != nil {
-                try await Task.sleep(for: .seconds(interPageDelay))
-            }
-        } while pageToken != nil
-
-        return allIds
-    }
-
-    /// FETCH phase: fetch message headers for specific Gmail message IDs.
-    /// Called after existence checks have filtered to only missing IDs.
-    /// `concurrency` > 1 enables parallel API calls via TaskGroup (dramatically faster for backfill).
-    /// `interBatchDelay` controls throttle between batches (power-aware via BackfillProfile).
-    func fetchMessageHeaders(ids: [String], batchSize: Int = 50, interBatchDelay: TimeInterval = 0.5, concurrency: Int = 1) async throws -> [MessageHeaderInfo] {
-        guard !ids.isEmpty else { return [] }
-        let metadataPath = GmailAPI.metadataQuery
-
-        var allHeaders: [MessageHeaderInfo] = []
-
-        // Process in batches, with optional concurrency within each batch
-        for batchStart in stride(from: 0, to: ids.count, by: batchSize) {
-            try Task.checkCancellation()
-            let batchEnd = min(batchStart + batchSize, ids.count)
-            let batch = Array(ids[batchStart..<batchEnd])
-
-            if concurrency <= 1 {
-                // Sequential (original behavior)
-                for id in batch {
-                    try Task.checkCancellation()
-                    let msgData = try await request(path: "/messages/\(id)\(metadataPath)")
-                    let msg = try JSONDecoder().decode(GmailMessage.self, from: msgData)
-                    if let header = parseGmailMessage(msg) {
-                        allHeaders.append(header)
-                    }
-                }
-            } else {
-                // Concurrent — multiple HTTP calls in flight simultaneously.
-                // Collect raw API responses in parallel, then parse on actor (parseGmailMessage
-                // accesses actor state). The HTTP round-trips are the bottleneck, not parsing.
-                // Individual task errors are caught so one failure doesn't kill the batch.
-                // Auth errors are re-thrown to cancel everything (all requests would fail anyway).
-                let rawResponses = try await withThrowingTaskGroup(of: Data?.self) { group in
-                    var results: [Data] = []
-                    var iter = batch.makeIterator()
-
-                    // Seed initial concurrent tasks
-                    for _ in 0..<min(concurrency, batch.count) {
-                        if let id = iter.next() {
-                            group.addTask {
-                                do {
-                                    return try await self.request(path: "/messages/\(id)\(metadataPath)")
-                                } catch {
-                                    if case ProviderError.authenticationFailed = error { throw error }
-                                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] Failed to fetch header \(id): \(error)") }
-                                    return nil
-                                }
-                            }
-                        }
-                    }
-
-                    // As each completes, start the next
-                    for try await data in group {
-                        if let data { results.append(data) }
-                        if let id = iter.next() {
-                            group.addTask {
-                                do {
-                                    return try await self.request(path: "/messages/\(id)\(metadataPath)")
-                                } catch {
-                                    if case ProviderError.authenticationFailed = error { throw error }
-                                    if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Gmail] Failed to fetch header \(id): \(error)") }
-                                    return nil
-                                }
-                            }
-                        }
-                    }
-
-                    return results
-                }
-                // Parse on actor (synchronous, fast — no actor-isolated state to read)
-                for data in rawResponses {
-                    if let msg = try? JSONDecoder().decode(GmailMessage.self, from: data),
-                       let header = parseGmailMessage(msg) {
-                        allHeaders.append(header)
-                    }
-                }
-            }
-
-            // Yield between batches
-            if batchStart + batchSize < ids.count, interBatchDelay > 0 {
-                try await Task.sleep(for: .seconds(interBatchDelay))
-            }
-        }
-        return allHeaders
-    }
-
     /// Fetch older messages before a given date for infinite scroll.
     /// Returns up to `limit` messages, newest-first from the older batch.
     /// Lightweight listing of message IDs older than `before` (1 API call, no header fetch).
@@ -1789,10 +1644,10 @@ actor GmailProvider: EmailProvider {
 
     /// The `(reason, message)` pair of a Gmail `400` whose STRUCTURED body we
     /// actually parsed, or `nil` for every other error — including a `400` whose
-    /// body is absent, unparseable, or shaped differently. Factored out of
-    /// `isGmailInvalidIdError` so the queue's terminal classifier and this
-    /// provider's own stale-no-op arm read the SAME bytes the SAME way; two
-    /// independent decoders of one wire shape is how a half-port drops a guard.
+    /// body is absent, unparseable, or shaped differently. The only reader is
+    /// `isGmailInvalidIdError`, which both per-member stale-no-op arms
+    /// (`modifyMessage`, `trashOrUntrashMessage`) use, so the queue never sees
+    /// this shape as a terminal classification of its own.
     private static func structuredBadRequestRejection(
         _ error: Error
     ) -> (reason: String, message: String)? {
@@ -1806,38 +1661,6 @@ actor GmailProvider: EmailProvider {
             reason: detail?.reason ?? "",
             message: detail?.message ?? decoded.error.message ?? ""
         )
-    }
-
-    /// True only when Gmail's own structured `400` body PROVES this request can
-    /// never succeed, whatever we do — the sole `400` shape that may retire a
-    /// durable `PendingOperation` (exit 2: a provider-authoritative no-op).
-    ///
-    /// 🚨 THE NEGATIVE CASE IS THE POINT. A `400` with no body, an unparseable
-    /// body, a body whose `reason` is not `invalidArgument`, or a recognised
-    /// reason with an unrecognised message all return **false** and keep the
-    /// operation retryable. "The server rejected it and did not say why" is an
-    /// absence of evidence; treating it as authority is the clause-2 conflation
-    /// `Companion/Rules/Active/never-drop-user-intention.md` names as the single
-    /// most repeated defect in this codebase's history, and
-    /// `AccountManager.isPermanentlyInvalidError` committed it for EVERY
-    /// `400` — bare status codes included — until this classifier replaced it.
-    ///
-    /// The one recognised message is Gmail's own literal wording, which names
-    /// something structurally impossible rather than something that might work
-    /// later: `"Invalid id value"` — the message id is malformed; no retry
-    /// resolves it (this is also the arm `modifyMessage` absorbs locally, and
-    /// the mirror of Exchange's `ErrorInvalidIdMalformed`).
-    ///
-    /// `"Invalid label"` is NOT recognised: it says Gmail refused the request
-    /// (a label Gmail keeps itself, or one that no longer exists), not that the
-    /// user's action is done or no longer applies. Retiring on it once silently
-    /// dropped a delete from Sent, its Undo, and a draft's delete. A refused
-    /// action stays a counted failure, retried and, at the limit, retired with
-    /// an error in App Logs, never recorded as done.
-    nonisolated static func isAuthoritativeActionRejection(_ error: Error) -> Bool {
-        guard let rejection = structuredBadRequestRejection(error),
-              rejection.reason == "invalidArgument" else { return false }
-        return rejection.message.hasPrefix("Invalid id value")
     }
 
     /// Apply a label add/remove batch to one Gmail message by its native
@@ -1871,8 +1694,8 @@ actor GmailProvider: EmailProvider {
     /// op)". That disposition was itself the defect: the matcher bound the body
     /// to `_` and retired the op on the bare STATUS, so an unrecognised `400`
     /// destroyed the user's action rather than wedging. It no longer does —
-    /// `isPermanentlyInvalidError` now delegates to
-    /// `isAuthoritativeActionRejection`, and an unclassified `400` retries.
+    /// the queue has no `400` classifier at all: the invalid-id shape is settled
+    /// per member here, and every other `400` retries.
     ///
     /// ⚠️ CORRECTED AGAIN when the global single-operation FIFO executor landed.
     /// This paragraph used to read "**The wedge the reference's demote lane
@@ -1891,7 +1714,7 @@ actor GmailProvider: EmailProvider {
     /// SUBTRACT — the reference also handles `isGmailInvalidLabelError` here
     /// (invalid/gone label → stale no-op). Not ported: an `"Invalid label"`
     /// refusal is not evidence that the action is done, so it reaches the queue
-    /// as a counted failure (see `isAuthoritativeActionRejection`).
+    /// as a counted failure.
     ///
     /// SUBTRACT — the reference's leading `guard !isHttpGoneStatus(error)`.
     /// A `404`/`410` is not a `400`, so `requestPreservingBadRequestBody`
@@ -1926,8 +1749,8 @@ actor GmailProvider: EmailProvider {
     /// error handling as `modifyMessage`: Gmail's structured invalid-id `400`
     /// proves this exact id can never resolve, so it settles THIS member as a
     /// stale no-op here, inside the per-member boundary. Thrown instead, it
-    /// would reach the queue's whole-operation classifier and retire every
-    /// other member of the operation unattempted.
+    /// would fail the whole operation as a counted provider failure, although
+    /// only this one member can never resolve.
     private func trashOrUntrashMessage(id: String, verb: String) async throws {
         do {
             _ = try await requestPreservingBadRequestBody(

@@ -48,12 +48,6 @@ struct SyncConfigTests {
         #expect(SyncConfig.undoStackMaxSize <= 100)
     }
 
-    @Test("Gmail backfill ID cap is bounded")
-    func gmailBackfillIdCap() {
-        #expect(SyncConfig.gmailBackfillIdCap > 0)
-        #expect(SyncConfig.gmailBackfillIdCap <= 10_000_000)
-    }
-
     @Test("Max inline images bounded")
     func maxInlineImages() {
         #expect(SyncConfig.maxInlineImages > 0)
@@ -104,7 +98,6 @@ struct BackfillProfileTests {
     @Test("Turbo has zero or minimal delays")
     func turboMinimalDelays() {
         #expect(BackfillProfile.turbo.imapInterBatchDelay == 0)
-        #expect(BackfillProfile.turbo.deepCrawlInterWindowDelay == 0)
         #expect(BackfillProfile.turbo.interFolderDelay == 0)
         #expect(BackfillProfile.turbo.interCycleActiveDelay == 0)
     }

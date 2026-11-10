@@ -36,9 +36,6 @@ final class AccountManagerState {
     /// Account IDs that failed authentication (shown in Settings auth error badges).
     var authFailedAccounts: Set<String> = []
 
-    /// Account IDs where Gmail backfill hit the message ID cap (shown in Settings).
-    var backfillCapReachedAccounts: Set<String> = []
-
     /// Per-account backfill progress for progress bars. Throttled to 1Hz.
     var backfillProgressByAccount: [String: BackfillProgress] = [:]
 

@@ -370,18 +370,11 @@ struct ContactToolOutputFormatTests {
 /// event → end is exclusive next day"*.
 ///
 /// ⚠️ WHY THE ASSERTION IS AT THE CONFIRMATION CARD AND NOT AT THE PROVIDER.
-/// The provider boundary is UNREACHABLE for this tool from a test, and that is a
-/// property of production code, not of the fixture: `CalendarEventCreateTool`
-/// resolves its backend through `CalendarProviderDispatch.resolve()`, whose
-/// `backendFor` returns `.none` for anything that is not literally a
-/// `GoogleCalendarProvider`, `ExchangeCalendarProvider`, `CalDAVProvider` or
-/// `DemoCalendarProvider` — an `as?` chain over four concrete types that no
-/// conforming test double can satisfy. A `MockCalendarProvider` registered via
-/// `registerCalendarProviderForTesting` therefore resolves to `.none`, the tool
-/// returns `CalendarProviderDispatch.notAvailableMessage`, and NOTHING is ever
-/// queued or sent. (An earlier draft of this suite asserted on
-/// `MockCalendarProvider.createdEvents` and failed with `created.count == 0` for
-/// exactly that reason — recorded here so the next author does not re-derive it.)
+/// The card is delivered strictly before `CalendarProviderDispatch.resolve()`, and
+/// stopping there keeps the test deterministic (see "NO PROVIDER IS REGISTERED"
+/// below). (An earlier `resolve()` cast each provider to one of four concrete
+/// types, so a registered `MockCalendarProvider` resolved to nothing; that cast is
+/// gone, but this suite still needs no provider.)
 ///
 /// The card is nonetheless the RIGHT seam rather than a consolation one, because the
 /// value under test does not exist twice. `execute` computes ONE `endDate` local; it
@@ -480,7 +473,7 @@ struct CalendarAllDayDefaultEndTests {
     /// Drive the REAL tool and return the calendar card(s) it presented.
     ///
     /// No calendar provider is registered for `accountId`, so `resolve()` answers
-    /// `.none` and the tool returns `notAvailableMessage` right after the card — see
+    /// nil and the tool returns `notAvailableMessage` right after the card — see
     /// the suite header for why that is deliberate rather than a missing fixture.
     private func cardFromCreate(
         accountId: String, arguments: [String: JSONValue]

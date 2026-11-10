@@ -227,8 +227,10 @@ than counted as done; a delete from Sent, and its Undo, that Gmail refuses with 
 503 or an unclassified 400 on trash/untrash stays queued with the server
 unchanged and lands once the failure clears; a user move into Sent or Drafts is refused on Gmail and
 queued on IMAP. `MoveFolderPickerTests.gmailOmitsTheLabelsGmailKeeps` covers the
-picker, and `DraftDeletionTests` pins that an "Invalid label" body is not an
-authoritative rejection.
+picker. That an "Invalid label" refusal stays queued rather than being
+recorded as done is pinned end to end by
+`GmailMaintainedLabelMoveTests` ("A move Gmail refuses with Invalid label stays
+queued rather than being recorded as done").
 
 ## Local placeholder rows never reach the provider
 
@@ -382,6 +384,19 @@ during the rate-limit backoff still fails that folder's fetch. On Outlook, a mes
 never succeeds is bounded by the poll's cursor capture after its full sync, which walks the inbox's
 delta pages to the final link; the next ordinary poll's delta from that link lands what changed after
 it.
+
+## Calendar chat tools — the resolved calendar account
+
+`CalendarProviderDispatchResolveTests` pins which calendar
+`CalendarProviderDispatch.resolve` names: the demo calendar or nothing in demo
+mode, never the demo calendar outside it, an active preferred account first,
+otherwise the first active registered one. `CalendarToolResolvedAccountTests`
+pins what the tools do with that answer, through the real tool entry points: a
+confirmed create reaches the resolved account's calendar and no other registered
+calendar, and with nothing resolvable it says so and queues nothing; an edit or
+delete given a bare event id reads the event through the resolved calendar (the
+card shows the real event) but still queues nothing and sends nothing, and with
+nothing resolvable it is refused before any card.
 
 ## Google Calendar search text and OAuth token bodies on the wire
 

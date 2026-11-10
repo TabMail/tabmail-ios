@@ -46,6 +46,8 @@ Added after the line beginning "memory_read never cross modes (NULL sessionId = 
   memory.db write transaction, so each write lands before the cleanup that
   deletes it or is refused (`ChatStore.DemoTurnRefused`). A `demo:` turn with
   no admission is refused; any other turn is real history and always admitted.
+>
+> **2026-11-09, tabmail-ios #495:** the `CalendarBackend` enum named under CalendarProviderDispatch below is deleted; `resolve()` returns the provider and account directly. The demo boundary itself is unchanged.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 

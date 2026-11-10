@@ -82,11 +82,6 @@ struct SettingsView: View {
                                     .foregroundStyle(.yellow)
                                     .font(.caption)
                             }
-                            if state.backfillCapReachedAccounts.contains(account.id) {
-                                Image(systemName: "exclamationmark.circle.fill")
-                                    .foregroundStyle(.orange)
-                                    .font(.caption)
-                            }
                             Text(account.provider.displayName)
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)

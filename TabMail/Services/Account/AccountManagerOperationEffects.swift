@@ -805,7 +805,7 @@ extension AccountManager {
             let ns = underlying as NSError
             queueLog("[QueueDiag] NSError domain=\(ns.domain) code=\(ns.code)")
         }
-        queueLog("[QueueDiag] classifier: isMessageNotFoundError=\(AccountOperationExecutor.isMessageNotFoundError(error)) isConfirmedGoneError=\(AccountOperationExecutor.isConfirmedGoneError(error)) isPermanentlyInvalidError=\(AccountOperationExecutor.isPermanentlyInvalidError(error))")
+        queueLog("[QueueDiag] classifier: isMessageNotFoundError=\(AccountOperationExecutor.isMessageNotFoundError(error)) isConfirmedGoneError=\(AccountOperationExecutor.isConfirmedGoneError(error))")
 
         // Message-scoped DB dump — only rows relevant to this op + its folders.
         do {

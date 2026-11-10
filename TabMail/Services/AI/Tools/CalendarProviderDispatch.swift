@@ -5,28 +5,7 @@
 import Foundation
 import GRDB
 
-/// Dispatches calendar tool calls to the appropriate calendar API.
-/// Gmail accounts → Google Calendar API, Outlook accounts → Microsoft Graph Calendar API.
-enum CalendarBackend: Sendable {
-    case google(provider: GoogleCalendarProvider, account: Account)
-    case outlook(provider: ExchangeCalendarProvider, account: Account)
-    case caldav(provider: CalDAVProvider, account: Account)
-    /// Demo mode's local mock calendar (ADR-IOS-038) — GRDB-backed, no network.
-    case demo(provider: DemoCalendarProvider, account: Account)
-    case none
-
-    /// Returns the provider and account, regardless of backend type.
-    var resolved: (provider: any CalendarProvider, account: Account)? {
-        switch self {
-        case .google(let p, let a): return (p, a)
-        case .outlook(let p, let a): return (p, a)
-        case .caldav(let p, let a): return (p, a)
-        case .demo(let p, let a): return (p, a)
-        case .none: return nil
-        }
-    }
-}
-
+/// Resolves which connected calendar the calendar tools use.
 enum CalendarProviderDispatch {
     /// UserDefaults key for the user's preferred calendar ID.
     /// Empty / nil = "primary" (the user's main calendar).
@@ -78,7 +57,7 @@ enum CalendarProviderDispatch {
 
     /// Resolve the active calendar backend for tool calls.
     /// Uses the preferred account if set, otherwise falls back to the first account with a calendar provider.
-    static func resolve(db: (any DatabaseReader & Sendable)? = nil) async -> CalendarBackend {
+    static func resolve(db: (any DatabaseReader & Sendable)? = nil) async -> (provider: any CalendarProvider, account: Account)? {
         let dbReader: any DatabaseReader & Sendable = db ?? AppDatabase.rawPool
         let manager = AccountManager.shared
 
@@ -94,9 +73,9 @@ enum CalendarProviderDispatch {
                let account = try? await dbReader.read({ db in
                    try Account.filter(Column("id") == DemoSeed.demoAccountId && Column("isActive") == true).fetchOne(db)
                }) {
-                return backendFor(provider: demoProvider, account: account)
+                return (demoProvider, account)
             }
-            return .none
+            return nil
         }
 
         // Use preferred account if set and still active
@@ -110,7 +89,7 @@ enum CalendarProviderDispatch {
            let account = try? await dbReader.read({ db in
                try Account.filter(Column("id") == preferredAccountId && Column("isActive") == true).fetchOne(db)
            }) {
-            return backendFor(provider: calProvider, account: account)
+            return (calProvider, account)
         }
 
         // Fall back to first account with a calendar provider (never demo).
@@ -118,10 +97,10 @@ enum CalendarProviderDispatch {
             if let account = try? await dbReader.read({ db in
                 try Account.filter(Column("id") == accountId && Column("isActive") == true).fetchOne(db)
             }) {
-                return backendFor(provider: calProvider, account: account)
+                return (calProvider, account)
             }
         }
-        return .none
+        return nil
     }
 
     /// Resolve ALL connected calendar backends.
@@ -149,19 +128,4 @@ enum CalendarProviderDispatch {
 
     /// Standard error message when no calendar provider is available.
     static let notAvailableMessage = #"{"error": "Calendar features require a connected calendar (Gmail, Outlook, iCloud, or CalDAV). Add a calendar in Settings to use calendar tools."}"#
-
-    // MARK: - Helpers
-
-    private static func backendFor(provider: any CalendarProvider, account: Account) -> CalendarBackend {
-        if let google = provider as? GoogleCalendarProvider {
-            return .google(provider: google, account: account)
-        } else if let exchange = provider as? ExchangeCalendarProvider {
-            return .outlook(provider: exchange, account: account)
-        } else if let caldav = provider as? CalDAVProvider {
-            return .caldav(provider: caldav, account: account)
-        } else if let demo = provider as? DemoCalendarProvider {
-            return .demo(provider: demo, account: account)
-        }
-        return .none
-    }
 }

@@ -130,20 +130,6 @@ struct BackfillWindowTests {
         #expect(fetched?.oldestSyncedDate == nthMessageDate)
     }
 
-    @Test("Backfill window: walks from oldestSyncedDate backward")
-    func backfillWindowWalksBackward() {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "UTC")!
-
-        let oldestSyncedDate = calendar.date(from: DateComponents(year: 2024, month: 6, day: 15))!
-        let windowEnd = oldestSyncedDate
-        let windowStart = calendar.date(byAdding: .day, value: -30, to: windowEnd)!
-
-        let expectedStart = calendar.date(from: DateComponents(year: 2024, month: 5, day: 16))!
-        #expect(windowStart == expectedStart)
-        #expect(windowStart < windowEnd)
-    }
-
     @Test("Boundary: oldestSyncedDate=nil defaults to Date() equivalent")
     func nilOldestSyncedDateDefaultsToNow() throws {
         let db = try TestDatabase.make()
@@ -155,42 +141,6 @@ struct BackfillWindowTests {
         let now = Date()
         let diff = abs(anchor.timeIntervalSince(now))
         #expect(diff < 1.0)
-    }
-
-    @Test("1-day overlap between windows to catch boundary messages")
-    func oneDayOverlap() {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "UTC")!
-
-        let windowStart = calendar.date(from: DateComponents(year: 2024, month: 3, day: 15))!
-        let searchSince = calendar.date(byAdding: .day, value: -1, to: windowStart)!
-
-        let expectedOverlapDate = calendar.date(from: DateComponents(year: 2024, month: 3, day: 14))!
-        #expect(searchSince == expectedOverlapDate)
-
-        let dayDiff = calendar.dateComponents([.day], from: searchSince, to: windowStart).day!
-        #expect(dayDiff == 1)
-    }
-
-    @Test("UTC midnight alignment: dates use UTC calendar")
-    func utcMidnightAlignment() {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "UTC")!
-
-        let components = DateComponents(year: 2024, month: 7, day: 20, hour: 18, minute: 45, second: 30)
-        let date = calendar.date(from: components)!
-
-        let midnight = calendar.startOfDay(for: date)
-        let midnightComps = calendar.dateComponents([.hour, .minute, .second], from: midnight)
-
-        #expect(midnightComps.hour == 0)
-        #expect(midnightComps.minute == 0)
-        #expect(midnightComps.second == 0)
-
-        let dayComps = calendar.dateComponents([.year, .month, .day], from: midnight)
-        #expect(dayComps.year == 2024)
-        #expect(dayComps.month == 7)
-        #expect(dayComps.day == 20)
     }
 }
 
@@ -495,7 +445,6 @@ struct BackfillPowerAwareTests {
     func normalProfileDelays() {
         let p = BackfillProfile.normal
         #expect(p.imapInterBatchDelay == 0.5)
-        #expect(p.deepCrawlInterWindowDelay == 0.5)
         #expect(p.interFolderDelay == 0.5)
         #expect(p.interCycleActiveDelay == 3.0)
         #expect(p.interCycleIdleDelay == 30.0)
@@ -507,7 +456,6 @@ struct BackfillPowerAwareTests {
         let aggressive = BackfillProfile.aggressive
 
         #expect(aggressive.imapInterBatchDelay < normal.imapInterBatchDelay)
-        #expect(aggressive.deepCrawlInterWindowDelay < normal.deepCrawlInterWindowDelay)
         #expect(aggressive.interFolderDelay < normal.interFolderDelay)
         #expect(aggressive.interCycleActiveDelay < normal.interCycleActiveDelay)
         #expect(aggressive.interCycleIdleDelay < normal.interCycleIdleDelay)

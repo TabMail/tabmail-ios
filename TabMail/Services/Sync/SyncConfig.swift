@@ -40,41 +40,11 @@ enum BackfillProfile {
         }
     }
 
-    /// Gmail provider: yield delay interval (sleep every N fetches).
-    var gmailFetchBatchSize: Int {
-        switch self {
-        case .low: return 25
-        case .normal: return 50
-        case .aggressive: return 100
-        case .turbo: return 200
-        }
-    }
-
-    /// Gmail API page size (maxResults parameter).
-    var gmailPageSize: Int {
-        switch self {
-        case .low: return 250
-        case .normal: return 500
-        case .aggressive: return 500
-        case .turbo: return 500
-        }
-    }
-
-    /// Delay between IMAP FETCH batches within a single backfillWindow call (seconds).
+    /// Delay between IMAP FETCH batches within one header fetch (seconds).
     var imapInterBatchDelay: TimeInterval {
         switch self {
         case .low: return 1.0
         case .normal: return 0.5
-        case .aggressive: return 0.1
-        case .turbo: return 0
-        }
-    }
-
-    /// Delay between Gmail API pages during listBackfillMessageIds (seconds).
-    var gmailInterPageDelay: TimeInterval {
-        switch self {
-        case .low: return 0.5
-        case .normal: return 0.3
         case .aggressive: return 0.1
         case .turbo: return 0
         }
@@ -88,27 +58,6 @@ enum BackfillProfile {
         case .normal: return 5
         case .aggressive: return 10
         case .turbo: return 20
-        }
-    }
-
-    /// Delay between Gmail per-message FETCH batches (seconds).
-    var gmailInterFetchDelay: TimeInterval {
-        switch self {
-        case .low: return 1.0
-        case .normal: return 0.5
-        case .aggressive: return 0.1
-        case .turbo: return 0
-        }
-    }
-
-
-    /// Delay between deep backfill windows (seconds).
-    var deepCrawlInterWindowDelay: TimeInterval {
-        switch self {
-        case .low: return 1.0
-        case .normal: return 0.5
-        case .aggressive: return 0.2
-        case .turbo: return 0
         }
     }
 
@@ -340,10 +289,6 @@ enum SyncConfig {
     static let snippetPrefetchLookahead = 30
     /// Max snapshots held in loadedMessages before evicting oldest off-screen rows.
     static let maxLoadedMessages = 500
-    /// Max message IDs returned by Gmail listBackfillMessageIds per call.
-    /// Safety cap to bound the in-memory ID array. 1M IDs ≈ 20MB — safe for iOS devices.
-    /// In practice, 90-day deep backfill windows rarely exceed a few thousand IDs.
-    static let gmailBackfillIdCap = 1_000_000
     /// Body cache TTL — evict cached MessageBody objects older than this (non-inbox).
     /// Pre-cached by ActiveBodyQueue for all fetched messages, so a generous TTL
     /// keeps most recently-synced messages instantly readable without re-fetch.

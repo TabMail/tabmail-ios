@@ -659,10 +659,9 @@ struct StatefulGmailActionServerTests {
     ///
     /// It additionally pins the SHAPE that reaches the queue: the body-preserving
     /// `HTTPError.networkErrorWithBody(400, _)`, not the bodyless
-    /// `.networkError(400)`. That shape change is precisely what
-    /// `AccountManager.isPermanentlyInvalidError` had to be widened for; if
-    /// this assertion is ever relaxed, the widening's motivation disappears with
-    /// it and the guard silently stops matching.
+    /// `.networkError(400)`. The provider's per-member invalid-id check reads
+    /// that body; if this assertion is ever relaxed, the check silently stops
+    /// matching.
     @Test("an UNCLASSIFIED 400 on modify still throws — and reaches the queue body-preserving")
     func unclassifiedBadRequestOnModifyStillThrows() async throws {
         let providerMessageId = "gmail-unclassified-400-1"

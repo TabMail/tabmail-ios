@@ -1,3 +1,6 @@
+<!-- COMPANION-CURRENT-NOTE-BEGIN -->
+> **Current routing note (2026-11-09, tabmail-ios #495):** Item 6's `backfillWindow` is deleted with the rest of the date-window crawl; it had no caller.
+<!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-021: Backfill Power Optimization
 

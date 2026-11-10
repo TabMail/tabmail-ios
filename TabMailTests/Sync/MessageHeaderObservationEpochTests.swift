@@ -303,16 +303,4 @@ struct MessageHeaderObservationEpochTests {
     func ordinaryBackfillCarriesEpoch() async throws {
         #expect(try await Self.backfillInsert(displayId: "ordinary", observed: 117) == 117)
     }
-
-    @Test("Deep backfill stores each row with the UIDVALIDITY from its serving FETCH")
-    func deepBackfillCarriesEpoch() async throws {
-        #expect(try await Self.backfillInsert(displayId: "deep", observed: 118) == 118)
-    }
-
-    @Test("A deep-backfill retry spanning E1 and E2 stores no observation epoch")
-    func mixedDeepBackfillEpochIsNil() {
-        #expect(SyncEngine.commonObservedUidValidity([119, 120]) == nil)
-        #expect(SyncEngine.commonObservedUidValidity([119, nil]) == nil)
-        #expect(SyncEngine.commonObservedUidValidity([119, 119]) == 119)
-    }
 }

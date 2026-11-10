@@ -88,11 +88,6 @@ struct SyncConfigConstantsTests {
         #expect(SyncConfig.maxLoadedMessages == 500)
     }
 
-    @Test("gmailBackfillIdCap is 1_000_000")
-    func gmailBackfillIdCapValue() {
-        #expect(SyncConfig.gmailBackfillIdCap == 1_000_000)
-    }
-
     @Test("bodyCacheTTLHours is 72")
     func bodyCacheTTLHoursValue() {
         #expect(SyncConfig.bodyCacheTTLHours == 72)

@@ -142,6 +142,17 @@ UID walk goes all the way down to UID 1, so the "crawl past the age cutoff" job 
 crawl existed for no longer exists. **Do not delete it as a side effect of reading this note** —
 dead-code removal is a separate decision with its own risk; this entry only records the fact.)
 
+**Update (2026-11-09, tabmail-ios #495): the date-window crawl is deleted.** `deepBackfillFolder`,
+`backfillWindow` and `commonObservedUidValidity` are gone, with the `BackfillProfile` knobs only
+they read (`gmailPageSize`, `gmailFetchBatchSize`, `gmailInterPageDelay`, `gmailInterFetchDelay`,
+`deepCrawlInterWindowDelay`) and the Settings "backfill cap reached" warning, whose only writers were
+`backfillWindow`'s Gmail and Exchange arms. The provider methods only the crawl called are deleted too:
+`GmailProvider.listBackfillMessageIds`, Gmail's batched `fetchMessageHeaders(ids:batchSize:interBatchDelay:concurrency:)`,
+`ExchangeProvider.listBackfillMessageIds`, and their cap `SyncConfig.gmailBackfillIdCap`. The funnel
+`insertBackfillBatchGuardable` now has exactly the walk and self-heal as feeders.
+`DeletedFlagMergeVisibilityTests.aBackfillCrawlDoesNotMaterialiseASoftDeletedMessage` now feeds provider-fetched
+headers into the shared funnel through `insertBackfillBatch`.
+
 **The CONCLUSION survives — the mail is recoverable with no user gesture — but by
 `SyncEngine.runBackfill`'s UID-range walk, whose cursor advances on COVERAGE, not on inserts**, and
 which is reached by the two invocation paths enumerated in boundary 2. The accepted limitation

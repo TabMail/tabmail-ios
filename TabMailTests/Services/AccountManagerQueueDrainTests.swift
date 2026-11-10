@@ -1619,7 +1619,10 @@ struct AccountManagerQueueDrainTests {
     // `AuthedHTTP.requestPreservingBadRequestBody`, so a final 400 arrives as
     // `HTTPError.networkErrorWithBody(400, body)` rather than the bodyless
     // `.networkError(400)`. `AccountManager.isPermanentlyInvalidError` was
-    // widened in the same change to classify the two identically.
+    // widened in the same change to classify the two identically. (That
+    // classifier is since deleted: the queue has no `400` classifier, and the
+    // invalid-id shape is settled per member inside `GmailProvider`. The three
+    // end-state properties below are unchanged.)
     //
     // 🚨 CORRECTED (audit round 1, finding B-3). The first of these tests used
     // to assert the OPPOSITE — that an UNCLASSIFIED Gmail action 400 is
