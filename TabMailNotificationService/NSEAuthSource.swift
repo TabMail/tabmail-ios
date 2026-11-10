@@ -84,10 +84,8 @@ struct NSEAuthSource: AuthSource {
                         // The primary mail/calendar grant, matching foreground authorization.
                         fields["scope"] = "Mail.ReadWrite Mail.Send Calendars.ReadWrite offline_access User.Read"
                     }
-                    let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
-                    request.httpBody = fields.sorted(by: { $0.key < $1.key }).map {
-                        $0.key + "=" + ($0.value.addingPercentEncoding(withAllowedCharacters: allowed) ?? "")
-                    }.joined(separator: "&").data(using: .utf8)
+                    request.httpBody = StrictPercentEncoding.formBody(
+                        fields.sorted(by: { $0.key < $1.key }).map { (name: $0.key, value: $0.value) })
                     NSELog.step("NSE credential: scope=\(scope) stage=network outcome=started")
                     let (data, response) = try await dataForRequest(request)
                     NSELog.step("NSE credential: scope=\(scope) stage=network http=\((response as? HTTPURLResponse)?.statusCode ?? 0)")

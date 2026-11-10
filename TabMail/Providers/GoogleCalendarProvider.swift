@@ -401,7 +401,12 @@ actor GoogleCalendarProvider: CalendarProvider {
             queryItems.append("timeMax=\(timeMax.iso8601String().addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")")
         }
         if let query, !query.isEmpty {
-            queryItems.append("q=\(query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query)")
+            // Free text from the assistant's calendar search, so it is encoded as
+            // one query component: `&` and `=` would split it, `+` reads as a space.
+            guard let encodedQuery = StrictPercentEncoding.component(query) else {
+                throw ProviderError.invalidURL("Google Calendar search")
+            }
+            queryItems.append("q=\(encodedQuery)")
         }
 
         let path = "/calendars/\(encodedCalId)/events?\(queryItems.joined(separator: "&"))"

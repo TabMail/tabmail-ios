@@ -70,7 +70,17 @@ that aren't included in the request body maintain their previous values".
   `isEmptySurfaceEvent` still reads `bodyPreview`. An event pill's popover notes put the join link
   first (`CalendarToolHelpers.eventPillNotes`, at every pill-cache writer built from an event), since
   the description no longer holds it and the popover is where the user copies a meeting link from.
-- A description edit writes the user's text as the body. For an online meeting it replaces only the
+- A description edit writes the user's notes as an HTML body (`GraphNotesHTML`, #577), the reverse of
+  the read: each line break a `<br>`, each `[label](destination)` link the read gives
+  (`EmailFilter.markdownPieces`, the grammar `unwrapMarkdownLinks` parses) an `<a>` when its scheme is
+  web, mail or phone (`GraphNotesHTML.linkSchemes`; any other stays as its text, so a `javascript:`
+  destination never becomes a link), the href escaped as an attribute, and a space that starts a line,
+  follows a space or ends a line a `&nbsp;` (Outlook's editor may drop a `white-space` style; a
+  no-break space survives every client). A read of what it writes gives the same notes again, up to
+  white space at the ends of lines and of the notes. Text and the href
+  are escaped one Unicode scalar at a time, so a quote or `<` joined to a combining mark is escaped too.
+  Before #577 the notes were written as escaped text, so after one edit every link was literal
+  `[label](url)` text and runs of spaces collapsed. For an online meeting it replaces only the
   notes in the stored HTML body and keeps the join
   section as stored (`onlineMeetingBody`, `GraphOnlineMeetingBody`, #511): Graph's event-update warns
   that removing the "meeting blob" from the body turns the online meeting off. The join section is
@@ -91,7 +101,7 @@ that aren't included in the request body maintain their previous values".
   `<div class="me-email-text">`, which starts and ends with an `aria-hidden` div of 80 underscores, with a
   short "Join:" link and the long `meetup-join` "System reference" link (which one `joinUrl` is was not
   recorded; both are recognised). Graph's online-meeting samples show an older layout, also recognised.
-  A join section that is not recognised gets the description as text, as every description edit of an
+  A join section that is not recognised gets the description as the whole body, as every description edit of an
   online meeting did before #511, which turns the meeting off; the read then gives the whole body,
   join section included, as the description.
   A split's new series is still built from the narrowed read (#512, open).
@@ -125,7 +135,12 @@ thousands of link copies is split in linear time (`manyLinkCopies`). `ExchangeCa
 pins the edit end to end on the fake Graph calendar. `ToolCachingTests` pins the pill's join link at every
 cache site: the read tool's cached-calendar path, its scan of every calendar
 (`scannedReadCachesTheJoinLink`), and the live re-fetch (`liveFetchShowsTheJoinLink`);
-`CalendarToolHelpersTests` pins `eventPillNotes(from:)`.
+`CalendarToolHelpersTests` pins `eventPillNotes(from:)`. The notes writer (#577):
+`GraphOnlineMeetingBodyTests` pins links by scheme, the read's escapes reversed, other schemes kept as
+text, a label or destination that can't add markup, and kept spacing; `ExchangeCalendarEditPreservationTests`
+reads back what it wrote (`notesReadBackAsWritten`, online and plain) and checks that a read link is
+written back as a link (`onlineDescriptionRoundTrip`, `plainDescriptionRoundTrip`); `EmailFilterTests`
+pins `markdownPieces`.
 
 Correction to memory 064 (frozen fragment, not edited): an event pill's notes no longer come from
 `GCalEvent.description` alone. Every cache site and the live re-fetch use

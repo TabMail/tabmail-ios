@@ -12,7 +12,9 @@ struct CredentialRefreshContractTests {
     @Test("A provider refresh sends its grant only to the matching token origin and completes durable recovery", arguments: ["gmail", "outlook"])
     func providerRequest(provider: String) async throws {
         let h = CredentialTestHarness(), store = h.provider
-        let before = CredentialTestHarness.tokens("synthetic-expired", "synthetic-grant")
+        // `+`, `&`, `=` and `/` in the grant must reach the token endpoint as written.
+        let grant = "synthetic+grant&x=y/z"
+        let before = CredentialTestHarness.tokens("synthetic-expired", grant)
         try store.install(accountId: "synthetic-contract-account", tokens: before)
         let requests = Mutex(0)
         let auth = NSEAuthSource(accountId: "synthetic-contract-account", provider: provider,
@@ -25,16 +27,12 @@ struct CredentialRefreshContractTests {
             #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/x-www-form-urlencoded")
             let data = try #require(request.httpBody)
             let text = try #require(String(data: data, encoding: .utf8))
-            var fields: [String:String] = [:]
-            for field in text.split(separator: "&") {
-                let pair = field.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-                try #require(pair.count == 2)
-                let key = try #require(String(pair[0]).removingPercentEncoding)
-                let value = try #require(String(pair[1]).removingPercentEncoding)
-                try #require(fields.updateValue(value, forKey: key) == nil)
-            }
+            // Read as the token endpoint reads a form body; every field once.
+            let decoded = FormDecoding.fields(text)
+            try #require(decoded.values.allSatisfy { $0.count == 1 })
+            let fields = decoded.mapValues { $0[0] }
             #expect(fields["grant_type"] == "refresh_token")
-            #expect(fields["refresh_token"] == "synthetic-grant")
+            #expect(fields["refresh_token"] == grant)
             #expect(fields["client_id"] == "synthetic-client")
             if provider == "outlook" {
                 let scopes = Set((fields["scope"] ?? "").split(separator: " ").map(String.init))

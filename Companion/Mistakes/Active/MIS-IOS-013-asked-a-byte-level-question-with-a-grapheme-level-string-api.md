@@ -3,7 +3,7 @@
 **Class:** data-integrity
 **Severity:** high (wrong result shipped — one instance put the store's own metadata bytes into an
 outgoing email as an attachment)
-**First seen:** 2026-08 · **Recurrences:** 8 · **Status:** Active
+**First seen:** 2026-08 · **Recurrences:** 9 · **Status:** Active
 **Related:** `MIS-IOS-012` (a census whose SHAPE hid half its subjects — same root: the tool's
 notion of a unit was not the domain's), root `MIS-030` (scale is not shape) ·
 **Rule owner:** `../CLAUDE.md` § Data Integrity Rules
@@ -103,6 +103,14 @@ other by accident.
    seeded fuzzer whose fragments held no Prepend character; both were found by review differentials
    against the Rust reference over every scalar. **The tell, again: an expression that a byte-level
    parser (FTS5, SQL, a wire format) reads, scanned or edited with a `String`/`Character` API.**
+8. **Outlook notes link href (2026-11-10, tabmail-ios #577, caught in review before merge).**
+   `GraphNotesHTML` escaped a link destination for an HTML attribute with a Character-level
+   escaper, then `replacingOccurrences(of: "\"", with: "&quot;")`. Both match Characters, so a quote followed
+   by a combining mark, ZWJ or spacing mark, or preceded by a Prepend character, stayed raw and
+   ended the `href` early: the rest of the destination became attributes of the `<a>` that Graph
+   stores and sends to every attendee. Fixed with one escaper over `unicodeScalars` for text and
+   attributes. The text path was already per scalar; only the attribute path borrowed a
+   grapheme-level helper.
 
 ## Why it is not obvious
 
