@@ -116,18 +116,6 @@ struct CalendarEventEditTool: AgentTool, Sendable {
                 "event_id": compoundId,
             ] as [String: Any])
         }
-        // An all-day end on or before its start, refused before the card when the kind is known
-        // without a read (a stated `all_day: true` with both dates). The queue applies the same rule
-        // once the kind is resolved from the event, so every other such edit is refused there.
-        if let reason = CalendarToolHelpers.allDayEditEndRefusal(
-            arguments, allDay: CalendarToolHelpers.boolArg(arguments, "all_day"), targetStartDate: nil) {
-            return ToolJSON.string(from: [
-                "ok": false,
-                "error": "calendar_event_edit failed: \(reason). The event was NOT changed. Correct the arguments and call calendar_event_edit again.",
-                "event_id": compoundId,
-            ] as [String: Any])
-        }
-
         // Resolve the recurring-edit scope up front — it drives both the
         // confirmation-card date math (which occurrence to show) and the
         // scope clause appended to `changes`. Resolved here, before the API
@@ -190,6 +178,19 @@ struct CalendarEventEditTool: AgentTool, Sendable {
             return ToolJSON.string(from: [
                 "ok": false,
                 "error": "calendar_event_edit failed: could not find event with id '\(compoundId)'. The id may be wrong or the event may have been deleted. Call calendar_event_read or calendar_search to look up the correct event, then retry.",
+                "event_id": compoundId,
+            ] as [String: Any])
+        }
+
+        // An all-day event given a time of day without `all_day`, or an all-day end on or before
+        // its start, is refused here, before the card, now that the stored kind is known: the
+        // assistant asks the user instead of the user confirming an edit that is then refused.
+        // The queue applies the same rule again before the write.
+        if let reason = CalendarToolHelpers.allDayEditRefusal(
+            arguments, storedStart: fetchedEvent?.start, scope: resolvedScope, recurrenceId: recurrenceIdArg) {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_edit failed: \(reason). The event was NOT changed.",
                 "event_id": compoundId,
             ] as [String: Any])
         }

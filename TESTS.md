@@ -567,8 +567,13 @@ unmovable one is refused with no `PUT` and the server keeps the original.
 
 `CalendarEditKeepsKindTests.swift` drains real `.edit` rows through `AccountManager.drainCalendarQueue`.
 An edit that leaves `all_day` out keeps the event's kind: an all-day event given new dates stays all-day on
-those dates (a time of day in them is dropped), a start alone carries the end by whole days, and a timed
-event given a date alone stays timed at midnight. A stated `all_day` changes the kind either way. The Google
+those dates, a start alone carries the end by whole days, and a timed event given a date alone stays timed
+at midnight. A stated `all_day` changes the kind either way, and `all_day: true` with a time of day keeps
+the date. An all-day event given a time of day with `all_day` left out is refused with nothing written and
+retired with a reason that tells the assistant to ask the user whether it stays all-day or becomes timed:
+on Google, on the CalDAV split (no cap `PUT`), and in the queue suite on every `edit_scope` for a start, an
+end alone, both, and a midnight start with a timed end; a timed event given a time is written. A date at
+midnight, with or without seconds, an offset or a fraction, names no time of day (`namesTimeOfDay`). The Google
 and Outlook suites run the providers against stateful fakes on `FakeHTTP` (PATCH replaces the properties it
 names) and assert on the stored event, for a single event, one occurrence and, on Google, a split's new
 series. The CalDAV suite asserts on the stored `.ics`: a move lands as `VALUE=DATE` lines, and a split's new
@@ -577,14 +582,21 @@ days and a timed one its length across the March daylight-saving change. `CalDAV
 the same on the merge alone, plus a `DTEND` in another zone from `DTSTART`, a `DURATION` master (no `DTEND`
 added), an end the patch gives (written as given, even over a `DTEND` that could not be moved), and a `DTEND`
 that cannot be read or converted (refused). An all-day edit whose end date is on or before its start date is
-refused before any write on every `edit_scope`, including a split's cap `PUT`, and retired with the reason.
+refused before any write on every `edit_scope`, including a split's cap `PUT`, and retired with a reason
+that tells the assistant to ask the user how many days it should last.
 An end given alone is compared with the start the edit keeps: the stored start (a timed one's date included)
 on `all`, the occurrence's own date on `this_only` and `this_and_following`; a start the edit gives is what the
 end is compared with on every scope. An edit that gives no times
 still saves an all-day event stored with its end on its start. The queue suite counts
 `getEvent` calls: an edit that moves nothing and sets no UNTIL makes none, and a failed read on a move writes
-nothing and stays queued. `calendar_event_edit` refuses a stated `all_day: true` with a same-day end before
-its card, and does not refuse times of one day when `all_day` is not stated.
+nothing and stays queued. `calendar_event_edit` applies the same rule (`allDayEditRefusal`, one function for
+the tool and the queue) to the event it reads before its confirmation card: an all-day event given a time of
+day without `all_day`, and a stated `all_day: true` with a same-day end, are refused there with nothing
+queued and no card shown, also for a scoped end on the occurrence's own day (`this_only`,
+`this_and_following`), so the assistant asks the user before any card; an allowed move of an all-day or a timed
+event reaches the card and is written. Controls on the shared rule: a timed event given a
+time, an event that was not read, a stated conversion, midnight dates and an edit giving no times are not
+refused.
 
 ## ICS value types — `VALUE=DATE-TIME` is timed
 

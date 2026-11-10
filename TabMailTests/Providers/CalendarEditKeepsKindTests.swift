@@ -11,9 +11,14 @@ import Synchronization
 // MARK: - A calendar edit keeps the event's kind
 //
 // **INVARIANT.** *An edit that leaves `all_day` out keeps the event's kind.* An all-day event given
-// new dates stays all-day on those dates (a time of day in them is dropped); a timed event given a
-// date alone stays timed, at midnight. Only an `all_day` the edit states changes the kind, both ways.
-// `calendar_event_edit` documents `all_day` as "Omit to keep existing".
+// new dates stays all-day on those dates; a timed event given a date alone stays timed, at midnight.
+// Only an `all_day` the edit states changes the kind, both ways. `calendar_event_edit` documents
+// `all_day` as "Omit to keep existing".
+//
+// **AND NEVER GUESSES.** *An all-day event given a time of day with `all_day` left out is refused,
+// with nothing written, and the assistant is told to ask the user* whether it should stay all-day or
+// become timed. Dropping the time kept it all-day without asking. A date at midnight (`…T00:00:00`,
+// the shape the read tools print for an all-day date) is a date.
 //
 // The defect: `AccountManagerCalendarQueue`'s `.edit` case resolved a missing `all_day` from the event
 // only when an RRULE UNTIL was at stake, so a plain move rendered its dates as `startDateTime` /
@@ -23,8 +28,8 @@ import Synchronization
 // **A SECOND INVARIANT, its companion.** *No all-day edit is written whose end is on or before its
 // start* (an all-day end is the day after the last day). Once a missing `all_day` resolves to all-day,
 // a move given times of one day would otherwise write a zero-length event; `all_day: true` with a
-// same-day end already did. Refused before anything is written, on every `edit_scope`; an edit that
-// gives no times is not checked.
+// same-day end already did. Refused before anything is written, on every `edit_scope`, asking the
+// user how many days it should last; an edit that gives no times is not checked.
 //
 // The assertions run on what the PROVIDER ends up holding (Google and Graph fakes that apply PATCH
 // semantics, a CalDAV resource store) or, where only the queue can say it, on what reached the
@@ -48,7 +53,10 @@ private func day(_ offset: Int) -> String {
 private func compact(_ day: String) -> String { day.replacingOccurrences(of: "-", with: "") }
 
 /// The refusal the queue and the edit tool give an all-day end on or before its start.
-private let allDayEndHint = "an all-day event's end_iso is the day after its last day, so it must be later than start_iso"
+private let allDayEndHint = "this is an all-day event, so its end_iso is the day after its last day and must be later than start_iso. Ask the user how many days it should last"
+
+/// The refusal the queue gives an all-day event a time of day when the edit leaves `all_day` out.
+private let allDayTimeHint = "this is an all-day event, and the edit gives a time of day without all_day. Ask the user whether it should stay all-day"
 
 // MARK: - A stateful Google calendar
 
@@ -237,15 +245,30 @@ struct GoogleCalendarEditKeepsKindTests {
         #expect(start(after)?["dateTime"] == nil, "saved as timed: \(start(after) ?? [:])")
     }
 
-    @Test("an all-day event given a start with a time of day stays all-day on that start's date")
-    func allDayStartWithTimeOfDayKeepsTheDate() async throws {
+    @Test("an all-day event given a start with a time of day, without all_day, is refused asking the user")
+    func allDayStartWithTimeOfDayIsRefused() async throws {
         let r = try await run([FakeGoogleCalendar.allDay(id: "ad-3", start: day(0), end: day(1))], eventId: "ad-3", [
             "start_iso": .string("\(day(7))T15:30:00"), "timezone": .string("UTC"),
         ], account: "kind-g-time")
         let after = r.calendar.event("ad-3")
+        #expect(r.calendar.writes.isEmpty, "the edit was written with the time dropped or kept: \(r.calendar.writes)")
+        #expect(start(after)?["date"] as? String == day(0) && end(after)?["date"] as? String == day(1),
+                "the stored event changed: \(start(after) ?? [:]) to \(end(after) ?? [:])")
+        #expect(r.rows.count == 1 && r.rows.first?.status == PendingStatus.failed.rawValue,
+                "the refusal was not retired: \(r.rows.map { "\($0.status) \($0.failureReason ?? "")" })")
+        #expect(r.rows.first?.failureReason?.contains(allDayTimeHint) == true,
+                "reason: \(r.rows.first?.failureReason ?? "<none>")")
+    }
+
+    @Test("an explicit all_day: true with a time of day keeps the date, all-day (control)")
+    func explicitTrueWithTimeOfDayKeepsTheDate() async throws {
+        let r = try await run([FakeGoogleCalendar.allDay(id: "ad-7", start: day(0), end: day(1))], eventId: "ad-7", [
+            "all_day": .bool(true), "start_iso": .string("\(day(7))T15:30:00"), "timezone": .string("UTC"),
+        ], account: "kind-g-time-stated")
+        let after = r.calendar.event("ad-7")
         #expect(start(after)?["date"] as? String == day(7), "start is \(start(after) ?? [:])")
-        #expect(end(after)?["date"] as? String == day(8), "end is \(end(after) ?? [:])")
-        #expect(start(after)?["dateTime"] == nil, "the time of day made the event timed: \(start(after) ?? [:])")
+        #expect(start(after)?["dateTime"] == nil, "the stated all-day edit was saved as timed: \(start(after) ?? [:])")
+        #expect(r.rows.isEmpty, "the stated edit was refused: \(r.rows.map { $0.failureReason ?? $0.status })")
     }
 
     @Test("moving one occurrence of an all-day series keeps that occurrence all-day")
@@ -321,11 +344,11 @@ struct GoogleCalendarEditKeepsKindTests {
 
     // The all-day end refusal, on the wire.
 
-    @Test("an all-day event given times of one day, without all_day, is refused with nothing written")
-    func timesOfOneDayAreRefused() async throws {
+    @Test("an all-day event given dates of one day, without all_day, is refused with nothing written")
+    func datesOfOneDayAreRefused() async throws {
         let seed = FakeGoogleCalendar.allDay(id: "ad-5", start: day(0), end: day(1))
         let r = try await run([seed], eventId: "ad-5", [
-            "start_iso": .string("\(day(7))T09:00:00"), "end_iso": .string("\(day(7))T17:00:00"),
+            "start_iso": .string("\(day(7))T00:00:00"), "end_iso": .string("\(day(7))T00:00:00"),
             "timezone": .string("UTC"),
         ], account: "kind-g-refuse")
         #expect(r.calendar.writes.isEmpty, "a zero-length all-day event was written: \(r.calendar.writes)")
@@ -622,7 +645,7 @@ struct CalDAVCalendarEditKeepsKindTests {
                 "the new series starts \(line(successor, "DTSTART") ?? "<none>"), not on the date the edit gave")
     }
 
-    @Test("splitting an all-day series with times of one day writes nothing, not even the cap")
+    @Test("splitting an all-day series with times of one day, without all_day, writes nothing, not even the cap")
     func splitWithTimesOfOneDayWritesNothing() async throws {
         let store = FakeCalDAVStore(servesETags: true)
         let master = Self.allDayICS(uid: "ser-rf", start: day(0), end: day(1), recurring: true)
@@ -635,7 +658,7 @@ struct CalDAVCalendarEditKeepsKindTests {
         #expect(store.recordedPuts().isEmpty,
                 "the split wrote \(store.recordedPuts().map(\.path)); the cap PUT cuts the series, so the refusal must come first")
         #expect(store.storedICS(path: "/cal/ser-rf.ics") == master, "the master changed")
-        #expect(rows.first?.failureReason?.contains(allDayEndHint) == true,
+        #expect(rows.first?.failureReason?.contains(allDayTimeHint) == true,
                 "reason: \(rows.first?.failureReason ?? "<none>")")
     }
 }
@@ -700,12 +723,36 @@ struct CalendarQueueEditKindTests {
                 "the patch carries timed values: \(r.updates[0].event.startDateTime ?? "nil")")
     }
 
-    @Test("times of one day on an all-day event are refused on every edit_scope, with nothing written",
+    /// Start and end pairs that name a time of day; "" leaves that side out of the edit.
+    private static let timedPairs: [[String]] = [
+        ["\(day(7))T09:00:00", "\(day(7))T17:00:00"], ["\(day(7))T15:00:00", ""], ["", "\(day(8))T10:30:00"],
+        ["\(day(7))T00:00:00", "\(day(7))T00:00:01"],
+    ]
+
+    @Test("a time of day on an all-day event without all_day is refused on every edit_scope, with nothing written",
+          arguments: ["all", "this_only", "this_and_following"], Array(0..<4))
+    func timeOfDayRefusedOnEveryScope(_ scope: String, _ pair: Int) async throws {
+        let times = (start: Self.timedPairs[pair][0].isEmpty ? nil : Self.timedPairs[pair][0],
+                     end: Self.timedPairs[pair][1].isEmpty ? nil : Self.timedPairs[pair][1])
+        var args: [String: JSONValue] = ["edit_scope": .string(scope)]
+        if let s = times.start { args["start_iso"] = .string(s) }
+        if let e = times.end { args["end_iso"] = .string(e) }
+        if scope != "all" { args["recurrence_id"] = .string("\(day(7))T00:00:00") }
+        let label = "\(scope) \(times.start ?? "-") \(times.end ?? "-")"
+        let r = try await drain(args, account: "kind-q-time-\(scope)-\(pair)", resource: allDayResource())
+        #expect(r.writes == 0, "\(label): \(r.writes) write(s) reached the provider")
+        #expect(r.rows.count == 1 && r.rows.first?.status == PendingStatus.failed.rawValue,
+                "\(label): not retired: \(r.rows.map { "\($0.status) \($0.failureReason ?? "")" })")
+        #expect(r.rows.first?.failureReason?.contains(allDayTimeHint) == true,
+                "\(label): reason \(r.rows.first?.failureReason ?? "<none>")")
+    }
+
+    @Test("dates of one day on an all-day event are refused on every edit_scope, with nothing written",
           arguments: ["all", "this_only", "this_and_following"])
     func refusedOnEveryScope(_ scope: String) async throws {
         var args: [String: JSONValue] = [
             "edit_scope": .string(scope),
-            "start_iso": .string("\(day(7))T09:00:00"), "end_iso": .string("\(day(7))T17:00:00"),
+            "start_iso": .string("\(day(7))T00:00:00"), "end_iso": .string(day(7)),
         ]
         if scope != "all" { args["recurrence_id"] = .string("\(day(7))T00:00:00") }
         let r = try await drain(args, account: "kind-q-refuse-\(scope)", resource: allDayResource())
@@ -714,6 +761,28 @@ struct CalendarQueueEditKindTests {
                 "\(scope): not retired: \(r.rows.map { "\($0.status) \($0.failureReason ?? "")" })")
         #expect(r.rows.first?.failureReason?.contains(allDayEndHint) == true,
                 "\(scope): reason \(r.rows.first?.failureReason ?? "<none>")")
+    }
+
+    @Test("a stated all_day is taken at its word: true keeps the date, false converts (controls)")
+    func statedKindIsNotAsked() async throws {
+        let kept = try await drain([
+            "all_day": .bool(true), "start_iso": .string("\(day(7))T15:00:00"), "end_iso": .string("\(day(8))T15:00:00"),
+        ], account: "kind-q-stated-true", resource: allDayResource())
+        #expect(kept.rows.isEmpty && kept.updates.first?.event.startDate == day(7),
+                "rows: \(kept.rows.map { $0.failureReason ?? $0.status })")
+        let timed = try await drain([
+            "all_day": .bool(false), "start_iso": .string("\(day(7))T15:00:00"), "end_iso": .string("\(day(7))T16:00:00"),
+        ], account: "kind-q-stated-false", resource: allDayResource())
+        #expect(timed.rows.isEmpty && timed.updates.first?.event.startDateTime != nil,
+                "rows: \(timed.rows.map { $0.failureReason ?? $0.status })")
+    }
+
+    @Test("a timed event given a time of day without all_day is written (control)")
+    func timedEventWithTimeIsWritten() async throws {
+        let r = try await drain([
+            "start_iso": .string("\(day(7))T15:00:00"),
+        ], account: "kind-q-timed-time", resource: timedResource())
+        #expect(r.rows.isEmpty && r.updates.count == 1, "rows: \(r.rows.map { $0.failureReason ?? $0.status })")
     }
 
     @Test("an explicit all_day: true giving only an end on the stored start's day is refused")
@@ -740,7 +809,7 @@ struct CalendarQueueEditKindTests {
         // The series starts on day 0, so the end is after the series' start but on the occurrence's.
         // "omitted" leaves edit_scope out: a recurrence_id alone means this_only.
         var args: [String: JSONValue] = [
-            "recurrence_id": .string("\(day(7))T00:00:00"), "end_iso": .string("\(day(7))T23:59:59"),
+            "recurrence_id": .string("\(day(7))T00:00:00"), "end_iso": .string("\(day(7))T00:00:00"),
         ]
         if scope != "omitted" { args["edit_scope"] = .string(scope) }
         let r = try await drain(args, account: "kind-q-occ-end-\(scope)", resource: allDayResource())
@@ -812,41 +881,139 @@ struct CalendarQueueEditKindTests {
     }
 }
 
-// MARK: - The edit tool refuses before its card when the kind is stated
+// MARK: - The edit tool refuses before its card, with the rule the queue applies
 
-@Suite("calendar_event_edit refuses a stated all-day end on its start before the card")
+@Suite("calendar_event_edit refuses an all-day edit it cannot write before the card", .serialized, .processGlobalState)
 struct CalendarEditToolAllDayEndTests {
 
-    private func makeContext() throws -> ToolContext {
-        ToolContext(db: try TestDatabase.make(), translator: MockChatIdTranslator())
+    private func stored(allDay: Bool) -> GCalEvent {
+        GCalEvent(
+            id: "ev-1", summary: "Offsite", location: nil, description: nil,
+            start: allDay ? GCalDateTime(dateTime: nil, date: day(0), timeZone: nil)
+                          : GCalDateTime(dateTime: "\(day(0))T09:00:00Z", date: nil, timeZone: "UTC"),
+            end: allDay ? GCalDateTime(dateTime: nil, date: day(1), timeZone: nil)
+                        : GCalDateTime(dateTime: "\(day(0))T09:30:00Z", date: nil, timeZone: "UTC"),
+            attendees: nil, organizer: nil, recurrence: nil,
+            transparency: nil, status: nil, htmlLink: nil, created: nil, updated: nil)
     }
 
-    @Test("all_day: true with the end on the start's day is refused before the confirmation card")
+    /// Confirms every card and counts them.
+    @MainActor
+    private final class CountingConfirmSink: AgentUISink {
+        var cards = 0
+        func deliverConfirmation(_ confirmation: AgentToolRouter.ActionConfirmation) {
+            cards += 1
+            confirmation.onRespond(true)
+        }
+    }
+
+    /// Runs the tool against a provider holding `event`, with the app's database installed (the
+    /// tool queues its edit there) and the account in it; returns its output, the provider's
+    /// writes, the edits left in the queue and the confirmation cards shown.
+    private func run(_ arguments: [String: JSONValue], account: String, event: GCalEvent) async throws -> (out: String, writes: Int, queued: Int, cards: Int) {
+        let mock = MockCalendarProvider()
+        await mock.setGetEventResult(event)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        try await pool.write { db in
+            var acc = Account(emailAddress: "cal@example.com", displayName: "Cal", provider: .gmail)
+            acc.id = account
+            try acc.insert(db)
+        }
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: account, provider: mock)
+        defer {
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: account) }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
+        let db = try TestDatabase.make()
+        var args = arguments
+        args["event_id"] = .string(CompoundEventId.make(accountId: account, eventId: "ev-1"))
+        let sink = CountingConfirmSink()
+        let out = try await CalendarEventEditTool(context: ToolContext(db: db, translator: MockChatIdTranslator())).execute(
+            arguments: args, invocation: ToolInvocation(uiSink: sink, sessionKey: "kind-tool-\(account)"))
+        let writes = await mock.updatedEvents.count + (await mock.updatedOccurrences.count) + (await mock.splitSeriesCalls.count)
+        let queued = try await pool.read { try PendingCalendarOperation.fetchCount($0) }
+        return (out, writes, queued, await sink.cards)
+    }
+
+    @Test("an all-day event given a time of day without all_day is refused before the card, and nothing is queued")
+    func timeOfDayIsRefusedBeforeTheCard() async throws {
+        let r = try await run([
+            "start_iso": .string("\(day(7))T15:00:00"), "end_iso": .string("\(day(7))T16:00:00"),
+        ], account: "kind-tool-time", event: stored(allDay: true))
+        #expect(r.out.contains(allDayTimeHint) && r.out.contains("NOT changed"), "got \(r.out)")
+        #expect(r.writes == 0 && r.queued == 0 && r.cards == 0, "writes \(r.writes) queued \(r.queued) cards \(r.cards)")
+    }
+
+    @Test("all_day: true with the end on the start's day is refused before the card")
     func sameDayEndIsRefused() async throws {
-        let out = try await CalendarEventEditTool(context: try makeContext()).execute(arguments: [
-            "event_id": .string("evt-1"), "all_day": .bool(true),
-            "start_iso": .string(day(7)), "end_iso": .string(day(7)),
-        ])
-        #expect(out.contains(allDayEndHint), "got \(out)")
-        #expect(out.contains("NOT changed"), "got \(out)")
+        let r = try await run([
+            "all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(7)),
+        ], account: "kind-tool-end", event: stored(allDay: false))
+        #expect(r.out.contains(allDayEndHint) && r.out.contains("NOT changed"), "got \(r.out)")
+        #expect(r.writes == 0 && r.queued == 0 && r.cards == 0, "writes \(r.writes) queued \(r.queued) cards \(r.cards)")
     }
 
-    @Test("all_day: true with the end on the next day is not refused up front (control)")
-    func nextDayEndIsNotRefused() async throws {
-        let out = try await CalendarEventEditTool(context: try makeContext()).execute(arguments: [
-            "event_id": .string("evt-1"), "all_day": .bool(true),
-            "start_iso": .string(day(7)), "end_iso": .string(day(8)),
-        ])
-        #expect(!out.contains(allDayEndHint), "got \(out)")
+    @Test("a scoped end on the occurrence's own day is refused before the card, though the series starts earlier",
+          arguments: ["this_only", "this_and_following"])
+    func scopedEndOnTheOccurrenceDayIsRefused(_ scope: String) async throws {
+        let r = try await run([
+            "edit_scope": .string(scope), "recurrence_id": .string("\(day(7))T00:00:00"), "end_iso": .string(day(7)),
+        ], account: "kind-tool-scope-\(scope)", event: stored(allDay: true))
+        #expect(r.out.contains(allDayEndHint) && r.out.contains("NOT changed"), "got \(r.out)")
+        #expect(r.writes == 0 && r.queued == 0 && r.cards == 0, "writes \(r.writes) queued \(r.queued) cards \(r.cards)")
     }
 
-    @Test("times of one day without all_day are not refused up front: the kind is not known without a read (control)")
-    func unstatedKindIsNotRefusedUpFront() async throws {
-        let out = try await CalendarEventEditTool(context: try makeContext()).execute(arguments: [
-            "event_id": .string("evt-1"),
-            "start_iso": .string("\(day(7))T09:00:00"), "end_iso": .string("\(day(7))T17:00:00"),
-        ])
-        #expect(!out.contains(allDayEndHint), "a possibly timed edit was refused as all-day: \(out)")
+    @Test("an edit the rule allows reaches the card and is written (control)")
+    func allowedEditIsNotRefused() async throws {
+        let r = try await run([
+            "start_iso": .string("\(day(7))T00:00:00"), "end_iso": .string("\(day(8))T00:00:00"),
+        ], account: "kind-tool-allowed", event: stored(allDay: true))
+        #expect(r.cards == 1 && r.writes == 1, "an all-day move at midnight did not reach the card and the provider: cards \(r.cards) writes \(r.writes) \(r.out)")
+        let timed = try await run([
+            "start_iso": .string("\(day(7))T15:00:00"), "end_iso": .string("\(day(7))T16:00:00"),
+        ], account: "kind-tool-allowed-timed", event: stored(allDay: false))
+        #expect(timed.cards == 1 && timed.writes == 1, "a timed move did not reach the card and the provider: cards \(timed.cards) writes \(timed.writes) \(timed.out)")
+    }
+
+    @Test("the shared rule refuses nothing the kind allows (controls)")
+    func sharedRuleControls() {
+        let allDay = GCalDateTime(dateTime: nil, date: day(0), timeZone: nil)
+        let timed = GCalDateTime(dateTime: "\(day(0))T09:00:00Z", date: nil, timeZone: "UTC")
+        let times: [String: JSONValue] = ["start_iso": .string("\(day(7))T09:00:00"), "end_iso": .string("\(day(7))T17:00:00")]
+        func refusal(_ a: [String: JSONValue], _ s: GCalDateTime?) -> String? {
+            CalendarToolHelpers.allDayEditRefusal(a, storedStart: s, scope: "all", recurrenceId: nil)
+        }
+        #expect(refusal(times, timed) == nil, "a timed event given a time was refused")
+        #expect(refusal(times, nil) == nil, "an edit whose event was not read was refused as all-day")
+        var toTimed = times; toTimed["all_day"] = .bool(false)
+        #expect(refusal(toTimed, allDay) == nil, "a stated conversion to timed was refused")
+        #expect(refusal(["start_iso": .string("\(day(7))T00:00:00"), "end_iso": .string("\(day(8))T00:00:00")], allDay) == nil, "midnight dates were refused")
+        #expect(refusal(["all_day": .bool(true), "start_iso": .string(day(7)), "end_iso": .string(day(8))], timed) == nil)
+        #expect(refusal(["title": .string("Renamed")], allDay) == nil, "an edit giving no times was refused")
+        #expect(refusal(times, allDay)?.contains(allDayTimeHint) == true)
+        #expect(refusal(["end_iso": .string(day(0))], allDay)?.contains(allDayEndHint) == true, "an end on the stored start was not refused")
+    }
+
+    @Test("a time of day is any non-zero hour, minute or second; a date, or midnight, is none")
+    func timeOfDayRule() {
+        for iso in ["\(day(7))T09:00:00", "\(day(7))T00:30", "\(day(7))T00:00:01", "\(day(7)) 15:00", "\(day(7))T09:00:00Z"] {
+            #expect(CalendarToolHelpers.namesTimeOfDay(iso), "\(iso)")
+        }
+        for iso in [day(7), "\(day(7))T00:00:00", "\(day(7))T00:00", "\(day(7))T00:00:00Z", "\(day(7))T00:00:00+09:00",
+                    "\(day(7))T00:00+09:00", "\(day(7))T00:00:00.000-07:00"] {
+            #expect(!CalendarToolHelpers.namesTimeOfDay(iso), "\(iso)")
+        }
+        #expect(CalendarToolHelpers.allDayEditTimeRefusal(["end_iso": .string("\(day(7))T17:00:00")])?.contains(allDayTimeHint) == true)
+        #expect(CalendarToolHelpers.allDayEditTimeRefusal(["start_iso": .string("\(day(7))T00:00:00"), "end_iso": .string(day(8))]) == nil)
+        #expect(CalendarToolHelpers.allDayEditTimeRefusal(["title": .string("Renamed")]) == nil)
     }
 
     @Test("the rule compares dates: an end on or before the start is refused, a start alone never is")

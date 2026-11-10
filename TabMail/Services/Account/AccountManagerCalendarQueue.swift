@@ -850,8 +850,8 @@ extension AccountManager {
             // `patch.startDate`, so the same edit did not move the event at all. The rule, the
             // Thunderbird add-on's for the same defect: the edit's kind is `all_day` when the edit
             // states it, otherwise the event's own kind. So an all-day event given new dates stays
-            // all-day on those dates (a time of day in them is dropped, `prefix(10)`), and a timed
-            // one given a date alone (`…T00:00:00`) stays timed, at midnight. A stated `all_day`
+            // all-day on those dates (a time of day in them is refused below, asking the user), and a
+            // timed one given a date alone (`…T00:00:00`) stays timed, at midnight. A stated `all_day`
             // still wins both ways, and `.create` is unchanged (missing means timed).
             //
             // ⚠️ **TYPE-OF-CHECK / TYPE-OF-USE, accepted.** This GET is not the GET the write merges
@@ -912,19 +912,9 @@ extension AccountManager {
             // stored event above, on every scope: an occurrence has its series' kind.
             let movesEndOnly = CalendarToolHelpers.stringArgOpt(resolvedArgs, "end_iso") != nil
                 && CalendarToolHelpers.stringArgOpt(resolvedArgs, "start_iso") == nil
-            let targetStartDate: String?
-            switch scope {
-            case "this_only", "this_and_following":
-                targetStartDate = recurrenceId.map { String($0.prefix(10)) }
-            case "all":
-                var target = stored
-                if target == nil, resolvedAllDay == true, movesEndOnly {
-                    target = try await provider.getEvent(calendarId: calId, eventId: eventId)
-                }
-                targetStartDate = target.flatMap { $0.start?.date ?? $0.start?.dateTime.map { String($0.prefix(10)) } }
-            default:
-                // An unrecognized scope is refused by the switch below.
-                targetStartDate = nil
+            var target = stored
+            if scope == "all", target == nil, resolvedAllDay == true, movesEndOnly {
+                target = try await provider.getEvent(calendarId: calId, eventId: eventId)
             }
 
             // An all-day end is the day after the last day, so an all-day edit whose end is on or
@@ -937,8 +927,16 @@ extension AccountManager {
             // whole-series merge and the CalDAV single-occurrence override all carry the end by
             // the event's length. An edit that gives no times is not checked, so an event already
             // stored that way can still be renamed.
-            if resolvedAllDay == true,
-               let reason = CalendarToolHelpers.allDayEditEndRefusal(resolvedArgs, allDay: true, targetStartDate: targetStartDate) {
+            //
+            // Before it, the same place refuses an all-day event given a time of day with `all_day`
+            // left out: the user may want a timed event or that date all day, and dropping the time
+            // (`buildGCalEventInput`'s `prefix(10)`) would choose for them. Only the kind resolved
+            // from the stored event is checked; a stated `all_day` is taken at its word. Both
+            // refusals tell the assistant to ask the user. The edit tool applies the same rule
+            // (`allDayEditRefusal`) before its confirmation card; it is applied again here because
+            // the event can change between the card and the drain.
+            if let reason = CalendarToolHelpers.allDayEditRefusal(
+                resolvedArgs, storedStart: target?.start, scope: scope, recurrenceId: recurrenceId) {
                 throw CalendarProviderError.notSupported(reason)
             }
             let input = try CalendarToolHelpers.buildGCalEventInput(resolvedArgs, isAllDay: resolvedAllDay)
