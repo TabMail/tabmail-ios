@@ -30,19 +30,24 @@ cleanup and unrelated queued work.
 `ExchangeCalendarEditPreservationTests` drives `ExchangeCalendarProvider.updateEvent` and
 `updateOccurrence` over `FakeHTTP` against `FakeGraphCalendar`, which applies Graph's documented
 event-update semantics (unsent properties keep their values; writing `location` replaces
-`locations`; `$select` returns only what it names). For six edit kinds (rename, move an hour, move
-only the end, change the room, add an attendee, mark busy) on a single event, a whole series and one
+`locations`; `$select` returns only what it names). For seven edit kinds (rename, move an hour, move
+only the end, change the room, add an attendee, remove an attendee, mark busy) on a single event, a whole series and one
 occurrence, and a description edit of a plain event and a rule edit of a series, it asserts on the
 stored event, not on our payload: every property the edit did not set (body, `showAs`, `locations`, attendee types, recurrence, start and end) comes back
-unchanged, and the edited property holds what was asked. The fake also models the recurrence
+unchanged, and the edited property holds what was asked (a removed attendee is gone, the rest keep
+their types). The fake also models the recurrence
 behaviour measured live for #423 (a range written without a zone is stored as UTC; a written rule
 that differs from the stored one resets the series' exceptions; a `recurrence` PATCHed without
 `start` moves the series to UTC midnight; a range without `startDate` is refused with a 400): a
 whole-series edit that gives no rule writes no `recurrence` and resets nothing; a series moved to
-another date, timed and all day, keeps its stored recurrence but for the range's start date; an
+another date, timed and all day (its end moving with it), keeps its stored recurrence but for the
+range's start date; an
 occurrence edit never writes a rule or the master. Also covered: an event made recurring, a series
 given a new rule and a new date (the new rule is written), a series moved by a start written
-without an offset, a move across UTC midnight within the device's day (no recurrence) and across
+without an offset, a series moved by a start spelled with an offset (`Z`, `.000Z`, `+00:00`) but
+labelled with another zone, as the tools pass one through (dated where Graph stores it: within the
+device's day no recurrence, to another day the range at that day), an all-day end-only edit (the
+start stays), a move across UTC midnight within the device's day (no recurrence) and across
 the device's midnight within one UTC date (range start = the device's date; both skipped within
 about an hour of UTC), an occurrence named by its own id, an empty edit writing nothing, a PATCH
 retried after a 401 with a refreshed sign-in, and an attendee stored in mixed case keeping its

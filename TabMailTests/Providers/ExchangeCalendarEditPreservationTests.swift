@@ -268,6 +268,39 @@ enum GraphFixture {
         return e
     }
 
+    /// A zone 14 hours ahead of UTC with no daylight saving time. A wall time
+    /// in it, spelled with a UTC offset, reads as an instant 14 hours later
+    /// than the wall time in it.
+    static let farEast = "Pacific/Kiritimati"
+
+    /// `hour`:00 on the device, `days` after the device's date eight days ahead.
+    static func onDevice(days: Int, hour: Int) -> Date {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = .current
+        let base = cal.startOfDay(for: Date().addingTimeInterval(8 * 86_400))
+        let day = cal.date(byAdding: .day, value: days, to: base)!
+        return cal.date(bySettingHour: hour, minute: 0, second: 0, of: day)!
+    }
+
+    /// `date`'s wall time in `zone`, without an offset.
+    static func wall(_ date: Date, in zone: String) -> String {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = TimeZone(identifier: zone)!
+        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return fmt.string(from: date)
+    }
+
+    /// The device's date of the start Graph stores as `wall` in `zone`.
+    static func deviceDay(wall: String, in zone: String) -> String? {
+        guard let tz = TimeZone(identifier: zone) else { return nil }
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = tz
+        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return fmt.date(from: String(wall.prefix(19))).map(deviceDay)
+    }
+
     static func weekday(_ date: Date) -> String {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = utc
@@ -353,16 +386,19 @@ enum GraphFixture {
 /// properties it is allowed to change. Everything else must come back exactly
 /// as it was.
 enum UserCalendarEdit: String, CaseIterable, CustomTestStringConvertible, Sendable {
-    case rename, moveOneHour, endLater, moveRoom, addAttendee, markBusy, newDescription, newRecurrence
+    case rename, moveOneHour, endLater, moveRoom, addAttendee, removeAttendee, markBusy, newDescription, newRecurrence
 
     var testDescription: String { rawValue }
 
     /// The edits the online-meeting fixtures take: a description edit of an
     /// online meeting is not kept around its join block yet (#511).
-    static let ofAnOnlineMeeting: [UserCalendarEdit] = [.rename, .moveOneHour, .endLater, .moveRoom, .addAttendee, .markBusy]
+    static let ofAnOnlineMeeting: [UserCalendarEdit] = [
+        .rename, .moveOneHour, .endLater, .moveRoom, .addAttendee, .removeAttendee, .markBusy,
+    ]
 
     static let newDescriptionText = "New notes\nSecond line"
     static let newRoom = "Room 5"
+    static let removedAttendee = "bo@example.com"
 
     func patch(start: Date) -> GCalEventInput {
         var p = GCalEventInput()
@@ -386,6 +422,12 @@ enum UserCalendarEdit: String, CaseIterable, CustomTestStringConvertible, Sendab
                 (email: "room-1@example.com", name: "Room 1"),
                 (email: "cy@example.com", name: "Cy"),
             ]
+        case .removeAttendee:
+            // "take Bo off it": the whole resolved list, without Bo.
+            p.attendees = [
+                (email: "ana@example.com", name: "Ana"),
+                (email: "room-1@example.com", name: "Room 1"),
+            ]
         case .markBusy:
             p.transparency = "opaque"
         case .newDescription:
@@ -401,15 +443,37 @@ enum UserCalendarEdit: String, CaseIterable, CustomTestStringConvertible, Sendab
         switch self {
         case .rename: ["subject"]
         case .moveOneHour: ["start", "end", "isAllDay"]
-        // The start is written beside the end, at the same instant (asserted).
+        // The start is written beside the end, at the same instant (asserted;
+        // whether it should shift instead is #542).
         case .endLater: ["start", "end", "isAllDay"]
         case .moveRoom: ["location", "locations"]
-        case .addAttendee: ["attendees"]
+        case .addAttendee, .removeAttendee: ["attendees"]
         case .markBusy: ["showAs"]
         case .newDescription: ["body", "bodyPreview"]
         case .newRecurrence: ["recurrence"]
         }
     }
+}
+
+/// A whole series at 10:00 on the device, moved by a start the tools pass
+/// through as given: spelled with a UTC offset, labelled with
+/// `GraphFixture.farEast`. Read as an instant, each new start falls on the
+/// wrong side of a device midnight.
+enum OffsetSpelledMove: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case laterSameDay, eveningBefore, nextDay
+
+    var testDescription: String { rawValue }
+
+    /// Where the user moved the series, on the device.
+    var newStart: Date {
+        switch self {
+        case .laterSameDay: GraphFixture.onDevice(days: 0, hour: 11)
+        case .eveningBefore: GraphFixture.onDevice(days: -1, hour: 20)
+        case .nextDay: GraphFixture.onDevice(days: 1, hour: 11)
+        }
+    }
+
+    var movesDate: Bool { self != .laterSameDay }
 }
 
 /// Every property a user can see on an Outlook event and an edit must not touch
@@ -440,7 +504,7 @@ private func attendeeTypes(_ event: [String: Any]) -> [String: String] {
 /// Asserts `after` equals `before` on every watched property `edit` does not change,
 /// and that the property it edits holds what the edit asked for (`start` is the
 /// edited event's start). For an attendee edit, every attendee that stays keeps
-/// its type.
+/// its type, and the one removed is gone.
 private func expectOnlyEdited(
     _ edit: UserCalendarEdit?, before: [String: Any], after: [String: Any], start: Date? = nil, label: String
 ) {
@@ -487,13 +551,19 @@ private func expectOnlyEdited(
     default:
         break
     }
-    if edit == .addAttendee {
+    if edit == .addAttendee || edit == .removeAttendee {
         let was = attendeeTypes(before)
         let now = attendeeTypes(after)
-        for (email, type) in was {
+        let removed = edit == .removeAttendee ? UserCalendarEdit.removedAttendee : nil
+        for (email, type) in was where email != removed {
             #expect(now[email] == type, "\(label): attendee \(email) was \(type), is \(now[email] ?? "gone")")
         }
-        #expect(now["cy@example.com"] == "required", "\(label): the added attendee is \(now["cy@example.com"] ?? "missing")")
+        if let removed {
+            #expect(was[removed] != nil && now[removed] == nil, "\(label): the removed attendee is \(now[removed] ?? "gone")")
+            #expect(now.count == was.count - 1, "\(label): \(now.count) attendees after removing one of \(was.count)")
+        } else {
+            #expect(now["cy@example.com"] == "required", "\(label): the added attendee is \(now["cy@example.com"] ?? "missing")")
+        }
     }
 }
 
@@ -704,6 +774,46 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(canonical(now["pattern"]) == canonical((before["recurrence"] as? [String: Any])?["pattern"]), "the move changed the pattern")
     }
 
+    /// The tools pass a start spelled with an offset through as given and label
+    /// it with the edit's zone, and Graph stores the wall time in that zone. The
+    /// series' date is that stored start's, read on the device: a move within
+    /// the device's day writes no recurrence, and a move to another day writes
+    /// the range at that day.
+    @Test("a series moved by a start spelled with an offset is dated where Graph stores it",
+          arguments: OffsetSpelledMove.allCases, ["Z", ".000Z", "+00:00"])
+    func seriesMovedByOffsetSpelledStart(_ move: OffsetSpelledMove, _ offset: String) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let seriesStart = GraphFixture.onDevice(days: 0, hour: 10)
+        let graph = FakeGraphCalendar([GraphFixture.seriesOnDeviceDay(id: "ser-z", start: seriesStart)])
+        graph.install(on: http)
+        let zone = GraphFixture.farEast
+        let patch = CalendarToolHelpers.buildGCalEventInput([
+            "start_iso": .string(GraphFixture.wall(move.newStart, in: zone) + offset),
+            "end_iso": .string(GraphFixture.wall(move.newStart.addingTimeInterval(1_800), in: zone) + offset),
+            "timezone": .string(zone),
+        ], isAllDay: false)
+
+        _ = try await makeProvider(http).updateEvent(eventId: "ser-z", event: patch)
+
+        let after = try #require(graph.event("ser-z"))
+        let start = try #require(after["start"] as? [String: Any])
+        let storedDay = try #require(GraphFixture.deviceDay(wall: start["dateTime"] as? String ?? "",
+                                                            in: start["timeZone"] as? String ?? ""))
+        let seriesDay = GraphFixture.deviceDay(seriesStart)
+        #expect((storedDay != seriesDay) == move.movesDate, "the series is stored on \(storedDay), was on \(seriesDay)")
+        let wroteRecurrence = graph.patches("ser-z").contains { $0["recurrence"] != nil }
+        if storedDay == seriesDay {
+            #expect(!wroteRecurrence, "a move within the device's day wrote a recurrence")
+            #expect(graph.seriesResets == 0, "a move within the device's day reset the series' exceptions")
+        } else {
+            #expect(wroteRecurrence, "a move to another day kept the range's old start date")
+        }
+        let range = (after["recurrence"] as? [String: Any])?["range"] as? [String: Any]
+        #expect(range?["startDate"] as? String == storedDay,
+                "the range starts on \(range?["startDate"] as? String ?? "none"), the series on \(storedDay)")
+    }
+
     @Test("an all-day series moved to another date moves its range's start date with it")
     func allDaySeriesMoved() async throws {
         let http = FakeHTTP.Scenario()
@@ -712,6 +822,7 @@ struct ExchangeCalendarEditPreservationTests {
         graph.install(on: http)
         let before = try #require(graph.event("ser-ad"))
         let newDay = String(GraphFixture.naive(GraphFixture.start.addingTimeInterval(7 * 86_400)).prefix(10))
+        let newEndDay = String(GraphFixture.naive(GraphFixture.start.addingTimeInterval(8 * 86_400)).prefix(10))
         var patch = GCalEventInput()
         patch.startDate = newDay
 
@@ -723,7 +834,37 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(canonical(now["pattern"]) == canonical(was["pattern"]), "the move changed the pattern")
         #expect((now["range"] as? [String: Any])?["startDate"] as? String == newDay)
         #expect(((after["start"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(newDay) == true, "the series did not move")
+        #expect(((after["end"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(newEndDay) == true,
+                "the end did not move with the start, is \((after["end"] as? [String: Any])?["dateTime"] as? String ?? "none")")
         #expect(after["isAllDay"] as? Bool == true, "the series stopped being all day")
+    }
+
+    /// "make it last two days": an all-day edit that gives only the end
+    /// (`all_day` with `end_iso`) writes that end beside the start it had.
+    /// (Whether an end-only edit should shift the start instead is #542.)
+    @Test("an all-day event given only a new end keeps its start and ends on the new date")
+    func allDayEndOnly() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = FakeGraphCalendar([GraphFixture.event(id: "ev-ad", online: false, allDay: true)])
+        graph.install(on: http)
+        let before = try #require(graph.event("ev-ad"))
+        let day = String(GraphFixture.naive(GraphFixture.start).prefix(10))
+        let newEndDay = String(GraphFixture.naive(GraphFixture.start.addingTimeInterval(2 * 86_400)).prefix(10))
+        let patch = CalendarToolHelpers.buildGCalEventInput(["end_iso": .string(newEndDay)], isAllDay: true)
+        #expect(patch.endDate == newEndDay && patch.startDate == nil && patch.startDateTime == nil)
+
+        _ = try await makeProvider(http).updateEvent(eventId: "ev-ad", event: patch)
+
+        let after = try #require(graph.event("ev-ad"))
+        #expect(((after["start"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(day) == true,
+                "the start moved, is \((after["start"] as? [String: Any])?["dateTime"] as? String ?? "none")")
+        #expect(((after["end"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(newEndDay) == true,
+                "the new end was not written, is \((after["end"] as? [String: Any])?["dateTime"] as? String ?? "none")")
+        #expect(after["isAllDay"] as? Bool == true, "the event stopped being all day")
+        for property in watchedProperties where !["start", "end"].contains(property) {
+            #expect(canonical(after[property]) == canonical(before[property]), "the end edit changed \(property)")
+        }
     }
 
     @Test("a single event made recurring writes the rule at the date it starts on")

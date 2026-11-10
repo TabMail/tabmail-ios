@@ -650,8 +650,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if allowRecurrence, sparse.recurrence == nil, movesTime,
            var stored = existing.raw["recurrence"] as? [String: Any],
            var range = stored["range"] as? [String: Any],
-           let newDay = Self.day(merged.startDate, merged.startDateTime),
-           newDay != Self.day(current.start?.date, current.start?.dateTime) {
+           let newDay = Self.day(merged.startDate, merged.startDateTime, in: merged.startTimeZone),
+           newDay != Self.day(current.start?.date, current.start?.dateTime, in: current.start?.timeZone) {
             range["startDate"] = newDay
             stored["range"] = range
             json["recurrence"] = stored
@@ -660,15 +660,26 @@ actor ExchangeCalendarProvider: CalendarProvider {
     }
 
     /// The date a start falls on for the device: an all-day start's own date, a
-    /// timed one's instant read in the device's zone (the zone `request` asks
-    /// Graph to read starts in). Two spellings of one start give one date.
-    /// A timed start written without an offset (`…T10:00`, `…T10:00:00.000`,
-    /// which the tools pass through as given) has no instant to read, so its
-    /// own date is taken as written, as the range's `startDate` always was.
-    nonisolated static func day(_ date: String?, _ dateTime: String?) -> String? {
+    /// timed one's instant dated in the device's zone (the zone `request` asks
+    /// Graph to read starts in). The instant is the one Graph stores: the wall
+    /// time `toGraphEventJSON` writes (`graphNaiveDateTime`, which drops an
+    /// offset or `Z` without converting) in the zone the start is labelled with
+    /// (`timeZone`, the device's when nil, as `toGraphEventJSON` labels it).
+    /// So `…T00:30:00Z` labelled with the device's zone is 00:30 on the device,
+    /// and a start whose offset matches its label (`Z` with `UTC`) is the instant
+    /// it spells. A wall time without seconds (`…T10:00`), which the tools pass
+    /// through as given, is dated as written, as the range's `startDate` always was.
+    nonisolated static func day(_ date: String?, _ dateTime: String?, in timeZone: String?) -> String? {
         if let date { return String(date.prefix(10)) }
         guard let dateTime else { return nil }
-        guard let instant = Date.fromISO8601(dateTime) else { return String(dateTime.prefix(10)) }
+        let wall = DateFormatter()
+        wall.locale = Locale(identifier: "en_US_POSIX")
+        wall.calendar = Calendar(identifier: .gregorian)
+        wall.timeZone = timeZone.flatMap(TimeZone.init(identifier:)) ?? .current
+        wall.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        guard let instant = wall.date(from: String(graphNaiveDateTime(dateTime).prefix(19))) else {
+            return String(dateTime.prefix(10))
+        }
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
         fmt.calendar = Calendar(identifier: .gregorian)
