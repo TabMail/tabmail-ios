@@ -1,10 +1,12 @@
+> **Archived 2026-11-10.** This log is no longer loaded, searched by default, or added to. The detail files moved with it, into the `Archive/Mistakes` folder beside this file.
+
 # TabMail iOS — Mistakes Index
 
 > **Compact index. One line per mistake, no link.** Detail lives in `Companion/Mistakes/Active/`, in the
 > file whose name starts with the id (`ls Companion/Mistakes/Active/MIS-IOS-009-*`). Search this
 > file and the tree with `rg -ni` before planning, reviewing, or fixing; read every match **in full**.
 > Cross-cutting mistakes (design process, review discipline, agent ops, testing, secrets) are in
-> [`../MISTAKES.md`](../MISTAKES.md) — read that one too; most iOS defects are instances of its classes.
+> [`../MISTAKES.md`](../../../Companion/Archive/MISTAKES.md) — read that one too; most iOS defects are instances of its classes.
 
 **When you are about to:** write a migration → MIS-IOS-001 · **look up a table's columns, keys or
 FKs → MIS-IOS-007** · touch sync/stale/cursor → MIS-IOS-002 ·
@@ -71,5 +73,5 @@ flips, or give a test seam a default that differs from production's initial valu
 
 ---
 
-Recording obligation, entry format, and the `Retired/` rule: [`../Companion/Mistakes/README.md`](../Companion/Mistakes/README.md).
+Recording obligation, entry format, and the `Retired/` rule: [`../../../Companion/Archive/Mistakes/README.md`](../../../Companion/Archive/Mistakes/README.md).
 Increment `Recurrences` on an existing entry before creating a new one.

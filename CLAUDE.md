@@ -4,20 +4,19 @@
 
 ## Companion Files
 
-**Loading rule lives in the root `../CLAUDE.md` § Companion Routing (owner 2026-09-09).** ALWAYS LOADED in full: `../CLAUDE.md`, `../PROJECT_STRUCTURE.md`, this file, and this project's `PROJECT_STRUCTURE.md`. SEARCH-ONLY (`rg -ni`, read every hit in full, never read whole): the `PROJECT_MEMORY.md`, `DECISIONS.md`, `MISTAKES.md` indexes at root and here, and every `Companion/` tree. Update the routed detail plus its index line when you learn something durable.
+**Loading rule lives in the root `../CLAUDE.md` § Companion Routing (owner 2026-09-09).** ALWAYS LOADED in full: `../CLAUDE.md`, `../PROJECT_STRUCTURE.md`, this file, and this project's `PROJECT_STRUCTURE.md`. SEARCH-ONLY (`rg -ni`, read every hit in full, never read whole): the `PROJECT_MEMORY.md` and `DECISIONS.md` indexes at root and here, and every `Companion/` tree. Update the routed detail plus its index line when you learn something durable.
 
 **Global (parent directory):**
 - **`../CLAUDE.md`** — Global rules that apply to all subprojects.
 - **`../PROJECT_STRUCTURE.md`** — Monorepo layout, tech stack, component relationships.
 - **`../PROJECT_MEMORY.md`** — Cross-cutting knowledge and workflows.
 - **`../DECISIONS.md`** — Cross-cutting architectural decisions.
-- **`../MISTAKES.md`** — Cross-cutting mistakes an agent has actually made here, with the *tell* that precedes each. Detail in `../Companion/Mistakes/`.
 
 **This project:**
 - **`PROJECT_STRUCTURE.md`** — Directory tree, entry points, sub-component map.
 - **`PROJECT_MEMORY.md`** — iOS-specific knowledge, patterns, quirks.
 - **`DECISIONS.md`** — iOS-specific architectural decisions.
-- **`MISTAKES.md`** — iOS-specific mistakes (migrations, IMAP sync windows, the action queue, build/test ops). Detail in `Companion/Mistakes/`.
+- The mistakes log is archived at `Companion/Archive/` (`MISTAKES.md`, `Mistakes/`): not loaded, searched only by hand. A mistake worth preventing becomes a hook, a test, or a one-line rule.
 
 **⚠️ `KNOWN_ISSUES.md` is a generated dashboard, NOT the register.** Search `Companion/Process/Current/KnownIssues/`; never infer completeness or hand-edit it. [Full routing rule](Companion/Process/Current/known-issues-dashboard-routing-rule.md).
 
