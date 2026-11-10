@@ -233,6 +233,7 @@ struct ExchangeCalendarEmptySurfaceTests {
             "subject": "Quarterly Review",
             "location": {"displayName": "HQ"},
             "bodyPreview": "Bring slides",
+            "body": {"contentType": "html", "content": "<html><body><p>Bring slides</p></body></html>"},
             "attendees": [{"emailAddress": {"address": "bob@example.com"}}],
             "showAs": "busy",
             "isAllDay": false
@@ -246,6 +247,19 @@ struct ExchangeCalendarEmptySurfaceTests {
         #expect(gcal.location == "HQ")
         #expect(gcal.description == "Bring slides")
         #expect(gcal.attendees?.count == 1)
+    }
+
+    @Test("the description is the stored body at full length, never the 255-character preview, and nil without a body")
+    func descriptionFromTheBody() async throws {
+        let long = String(repeating: "Notes past the preview. ", count: 20).trimmingCharacters(in: .whitespaces)
+        let provider = makeProvider()
+        let html = try decodeMSEvent(#"{"id": "evt-html", "bodyPreview": "Notes past", "body": {"contentType": "html", "content": "<p>\#(long)</p>"}}"#)
+        #expect(await provider.toGCalEvent(html).description == long)
+        let text = try decodeMSEvent(#"{"id": "evt-text", "bodyPreview": "Line one", "body": {"contentType": "text", "content": "Line one\r\nLine two"}}"#)
+        #expect(await provider.toGCalEvent(text).description == "Line one\r\nLine two")
+        let none = try decodeMSEvent(#"{"id": "evt-none", "bodyPreview": "Preview only"}"#)
+        #expect(await provider.toGCalEvent(none).description == nil)
+        #expect(await provider.toGCalEvent(none).conferenceUrl == nil)
     }
 }
 

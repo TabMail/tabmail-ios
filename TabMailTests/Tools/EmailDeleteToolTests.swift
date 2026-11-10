@@ -119,18 +119,17 @@ struct EmailDeleteToolTests {
 
     // MARK: - Double values in array
 
-    @Test("Double values in unique_ids are truncated to int")
+    @Test("A fractional id in unique_ids is not used")
     func doubleValues() async throws {
         let db = try TestDatabase.make()
         let translator = MockChatIdTranslator()
         await translator.seed(3, realId: "acc1:INBOX:msg3")
         let tool = try makeTool(db: db, translator: translator)
 
-        // 3.7 should be truncated to 3
+        // 3.7 is not truncated to 3, so it names no email and the call is refused.
         let result = try await tool.execute(arguments: [
             "unique_ids": .array([.double(3.7)])
         ])
-        // Should resolve the ID but not find a message in the empty DB
-        #expect(result.contains("none of the specified emails could be found"))
+        #expect(result.contains("missing or empty unique_ids array"))
     }
 }

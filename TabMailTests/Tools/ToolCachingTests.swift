@@ -183,6 +183,25 @@ struct EventDetailCachingTests {
         #expect(detail?.location == "HQ")
     }
 
+    @Test("cacheEventDetailsForPills puts an online meeting's join link in the pill's notes")
+    func pillsCacheTheJoinLink() async {
+        let translator = makeTranslator()
+        let event = GCalEvent(
+            id: "evt-online-pill", summary: "Planning", location: nil, description: "Agenda",
+            start: nil, end: nil, attendees: nil, organizer: nil, recurrence: nil, transparency: nil, status: nil,
+            htmlLink: nil, created: nil, updated: nil, conferenceUrl: "https://meet.example.com/meet/0000000000"
+        )
+
+        await CalendarToolHelpers.cacheEventDetailsForPills(
+            [(event: event, accountId: "acct-1", calendarId: "cal-1", accessRole: "owner")],
+            translator: translator
+        )
+
+        let numericId = await translator.toNumericId(CompoundEventId.make(accountId: "acct-1", eventId: "evt-online-pill"))
+        let detail = await translator.resolveEventDetail(numericId)
+        #expect(detail?.notes == "Join: https://meet.example.com/meet/0000000000\nAgenda")
+    }
+
     @Test("cacheTemplateName stores and is retrievable via seed pattern")
     func templateNameCache() async {
         let translator = makeTranslator()
@@ -530,5 +549,134 @@ struct CalendarAllDayDefaultEndTests {
                 end by +1 day would silently extend every range the agent computed \
                 correctly. Expected \(explicitEnd), got \(Self.format(cards[0].endDate))
                 """)
+    }
+}
+
+// MARK: - The read tool's pill for an online meeting
+
+@Suite("calendar_event_read caches an online meeting's join link for its pill", .serialized, .processGlobalState)
+struct CalendarEventReadPillTests {
+
+    @Test("a direct read of an online meeting caches its join link in the pill's notes")
+    func directReadCachesTheJoinLink() async throws {
+        let accountId = "cal-read-pill"
+        let link = "https://meet.example.com/meet/0000000000"
+        let mock = MockCalendarProvider()
+        await mock.setGetEventResult(GCalEvent(
+            id: "evt-online", summary: "Planning", location: nil, description: "Agenda",
+            start: nil, end: nil, attendees: nil, organizer: nil, recurrence: nil, transparency: nil, status: nil,
+            htmlLink: nil, created: nil, updated: nil, conferenceUrl: link
+        ))
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer { Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) } }
+        let translator = MockChatIdTranslator()
+        await translator.seed(81, realId: CompoundEventId.make(accountId: accountId, eventId: "evt-online"))
+        // The calendar the read targets, as a prior search leaves it; its notes are not yet known.
+        await translator.cacheEventDetail(
+            realId: "evt-online", accountId: accountId, calendarId: "primary", calendarName: "Work",
+            title: "Planning", startDate: nil, endDate: nil, isAllDay: false,
+            location: nil, notes: nil, attendees: [], isRecurring: false, recurrenceRule: nil,
+            availability: "busy", htmlLink: nil, eventTimeZone: nil
+        )
+
+        let output = try await CalendarEventReadTool(context: ToolContext(db: try DatabaseQueue(), translator: translator))
+            .execute(arguments: ["event_id": .string("81")])
+        #expect(output.contains("conference_url: \(link)"), "setup: the read did not reach the event: \(output)")
+
+        // The read caches the pill detail in a detached task.
+        var notes: String?
+        for _ in 0..<200 {
+            notes = await translator.resolveEventDetail(81)?.notes
+            if notes != nil { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(notes == "Join: \(link)\nAgenda")
+    }
+}
+
+// MARK: - A pill's live fetch for an online meeting
+
+/// `.serialized, .processGlobalState`: replaces `AppDatabase.shared` and uses the
+/// `ChatIdTranslator.shared` actor and `AccountManager.shared`'s provider table.
+@Suite("A chat pill fetched live shows an online meeting's join link", .serialized, .processGlobalState)
+struct EventPillLiveFetchTests {
+
+    @Test("in a new session a pill tap fetches the event and shows its join link above the notes")
+    func liveFetchShowsTheJoinLink() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: [], directory: dir)
+        }
+        let translator = ChatIdTranslator.shared
+        await translator.clearAll()
+
+        let accountId = "pill-live-fetch"
+        let link = "https://meet.example.com/meet/0000000000"
+        let mock = MockCalendarProvider()
+        await mock.setGetEventResult(GCalEvent(
+            id: "evt-online", summary: "Planning", location: nil, description: "Agenda",
+            start: nil, end: nil, attendees: nil, organizer: nil, recurrence: nil, transparency: nil, status: nil,
+            htmlLink: nil, created: nil, updated: nil, conferenceUrl: link
+        ))
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer { Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) } }
+
+        // What a previous session leaves: the pill's id and the event's calendar on disk, no detail in memory.
+        let compoundId = CompoundEventId.make(accountId: accountId, eventId: "evt-online")
+        let numericId = await translator.toNumericId(compoundId)
+        try await pool.write { db in
+            try db.execute(
+                sql: "INSERT INTO chatEventCalendar (compoundId, accountId, calendarId, calendarName) VALUES (?, ?, ?, ?)",
+                arguments: [compoundId, accountId, "primary", "Work"])
+        }
+
+        let detail = await translator.resolveEventDetail(numericId)
+
+        #expect(await mock.callLog.contains("getEvent(calendarId:primary,eventId:evt-online)"),
+                "setup: the pill did not fetch the event live")
+        #expect(detail?.notes == "Join: \(link)\nAgenda")
+        await translator.clearAll()
+    }
+
+    @Test("a read that finds the event by scanning every calendar caches its join link in the pill's notes")
+    func scannedReadCachesTheJoinLink() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: [], directory: dir)
+        }
+        let accountId = "pill-scan"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        let link = "https://meet.example.com/meet/0000000000"
+        let mock = MockCalendarProvider()
+        await mock.setListCalendarsResult([GCalCalendar(
+            id: "work", summary: "Work", primary: true, accessRole: "owner", backgroundColor: nil, selected: true)])
+        await mock.setGetEventResult(GCalEvent(
+            id: "evt-online", summary: "Planning", location: nil, description: "Agenda",
+            start: nil, end: nil, attendees: nil, organizer: nil, recurrence: nil, transparency: nil, status: nil,
+            htmlLink: nil, created: nil, updated: nil, conferenceUrl: link
+        ))
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer { Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) } }
+        // No calendar is known for the id, so the read scans every account's calendars.
+        let translator = MockChatIdTranslator()
+        await translator.seed(82, realId: "evt-online")
+
+        let output = try await CalendarEventReadTool(context: ToolContext(db: try DatabaseQueue(), translator: translator))
+            .execute(arguments: ["event_id": .string("82")])
+        #expect(output.contains("conference_url: \(link)"), "setup: the scan did not reach the event: \(output)")
+        #expect(await mock.callLog.contains("listCalendars"), "setup: the read did not scan the calendars")
+
+        // The read caches the pill detail in a detached task.
+        let compoundId = CompoundEventId.make(accountId: accountId, eventId: "evt-online")
+        let numericId = await translator.toNumericId(compoundId)
+        var notes: String?
+        for _ in 0..<200 {
+            notes = await translator.resolveEventDetail(numericId)?.notes
+            if notes != nil { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(notes == "Join: \(link)\nAgenda")
     }
 }

@@ -95,7 +95,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         var queryItems: [String] = []
         queryItems.append("$top=\(maxResults)")
         queryItems.append("$orderby=start/dateTime")
-        queryItems.append("$select=id,subject,location,bodyPreview,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,createdDateTime,lastModifiedDateTime,isAllDay,seriesMasterId")
+        queryItems.append("$select=\(Self.eventSelect)")
 
         let calPath: String
         if calendarId == "primary" {
@@ -152,8 +152,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return events
     }
 
-    /// What one event read selects (`getEvent`, and an edit's `fetchForEdit`).
-    private static let eventSelect = "id,subject,location,bodyPreview,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,createdDateTime,lastModifiedDateTime,isAllDay,seriesMasterId"
+    /// What an event read selects (`listEvents`, `getEvent`, and an edit's
+    /// `fetchForEdit`). `body` and `onlineMeeting` give the description and the
+    /// join link (`notes(of:)`), and the stored body an edit keeps (#511).
+    private static let eventSelect = "id,subject,location,body,bodyPreview,onlineMeeting,start,end,attendees,organizer,recurrence,showAs,isCancelled,webLink,createdDateTime,lastModifiedDateTime,isAllDay,seriesMasterId"
 
     func getEvent(calendarId: String = "primary", eventId: String) async throws -> GCalEvent {
         let encodedEventId = try Self.encodedGraphPathSegment(eventId, context: "Graph event id")
@@ -256,11 +258,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // only the values for properties to update. Existing properties that
         // aren't included in the request body maintain their previous values".
         // This used to merge the patch onto a read and PATCH every property back,
-        // and the read is lossy: `body` comes back as its plain-text
-        // `bodyPreview`, `showAs` as free or busy, `locations` as one display
-        // name, every attendee as required, and a series' recurrence rebuilt from
-        // an RRULE, which resets the series' exceptions (#423). Every edit wrote
-        // all of that back. `graphPatchJSON` says what rides along and why.
+        // and the read is lossy: `showAs` comes back as free or busy, `locations`
+        // as one display name, every attendee as required, and a series'
+        // recurrence rebuilt from an RRULE, which resets the series' exceptions
+        // (#423). The description was then the 255-character `bodyPreview`; it is
+        // now the full notes (`notes(of:)`). Every edit wrote all of that back.
+        // `graphPatchJSON` says what rides along and why.
         let existing = try await fetchForEdit(eventId: eventId)
         let json = graphPatchJSON(patch: event, existing: existing, allowRecurrence: true)
         guard !json.isEmpty else {
@@ -605,7 +608,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
     /// An event as an edit reads it: the `GCalEvent` the shared merge helper works
     /// on, plus the Graph JSON of the same read for what that mapping narrows and
-    /// an edit must keep (the stored `recurrence`, each attendee's type).
+    /// an edit must keep (the stored `recurrence`, each attendee's type, and an
+    /// online meeting's stored HTML `body` and `onlineMeeting`, which
+    /// `onlineMeetingBody` writes new notes around).
     struct EditSnapshot {
         let event: GCalEvent
         let raw: [String: Any]
@@ -646,7 +651,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///   A series edit that keeps its date writes no recurrence: any recurrence
     ///   write that differs from the stored one resets the series' exceptions
     ///   (#423, measured);
-    /// - attendees keep their Graph type; only a new attendee is `required`.
+    /// - attendees keep their Graph type; only a new attendee is `required`;
+    /// - a new description of an online meeting replaces only the notes in the
+    ///   stored body, keeping its join section (`onlineMeetingBody`, #511); the
+    ///   description the assistant read is those notes (`notes(of:)`).
     ///
     /// Empty when the patch changes nothing.
     nonisolated func graphPatchJSON(patch: GCalEventInput, existing: EditSnapshot, allowRecurrence: Bool) -> [String: Any] {
@@ -680,7 +688,30 @@ actor ExchangeCalendarProvider: CalendarProvider {
             stored["range"] = range
             json["recurrence"] = stored
         }
+        if let description = patch.description, let body = Self.onlineMeetingBody(existing.raw, notes: description) {
+            json["body"] = body
+        }
         return json
+    }
+
+    /// The `body` a description edit of an online meeting writes: the stored HTML
+    /// with only its notes replaced and the join section kept as stored
+    /// (`GraphOnlineMeetingBody`, #511). Nil for an event that is no online
+    /// meeting, or whose join section is not recognised: the description is then
+    /// written as text, as for any event, and an online meeting with a layout
+    /// unlike the recognised ones loses its join section and is turned off, as
+    /// every description edit of an online meeting did before #511.
+    nonisolated static func onlineMeetingBody(_ stored: [String: Any], notes description: String) -> [String: Any]? {
+        guard let joinUrl = (stored["onlineMeeting"] as? [String: Any])?["joinUrl"] as? String else { return nil }
+        guard let body = stored["body"] as? [String: Any],
+              (body["contentType"] as? String)?.lowercased() == "html",
+              let html = body["content"] as? String,
+              let kept = GraphOnlineMeetingBody.replacingNotes(in: html, joinUrl: joinUrl, with: description)
+        else {
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] online meeting: join section not recognised, the description is written as text")
+            return nil
+        }
+        return ["contentType": "html", "content": kept]
     }
 
     /// The date a start falls on for the device: an all-day start's own date, a
@@ -988,7 +1019,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
             id: e.id,
             summary: e.subject,
             location: e.location?.displayName,
-            description: e.bodyPreview,
+            description: Self.notes(of: e),
             start: toGCalDateTime(e.start, isAllDay: e.isAllDay ?? false),
             end: toGCalDateTime(e.end, isAllDay: e.isAllDay ?? false),
             attendees: attendees,
@@ -1001,8 +1032,25 @@ actor ExchangeCalendarProvider: CalendarProvider {
             updated: e.lastModifiedDateTime,
             // Graph's seriesMasterId → our recurringEventId, so calendar_search
             // enrichment can fetch the master's rule for Exchange instances too.
-            recurringEventId: e.seriesMasterId
+            recurringEventId: e.seriesMasterId,
+            conferenceUrl: e.onlineMeeting?.joinUrl
         )
+    }
+
+    /// An event's description: the notes in its stored body as text, at full
+    /// length, as the page shows them (`EmailFilter.htmlToPlainText`, keeping the
+    /// spacing, as for a draft's editable text). An online meeting's notes stop
+    /// where its join section starts (`GraphOnlineMeetingBody`); the join link is
+    /// `conferenceUrl`. So the description the assistant edits is the notes, and
+    /// a description edit writes them back in place of the notes (#511). Never
+    /// `bodyPreview`, which is cut at 255 characters and renders the join section
+    /// as text. Nil when the read carries no body.
+    nonisolated static func notes(of e: MSEvent) -> String? {
+        guard let content = e.body?.content else { return nil }
+        guard e.body?.contentType?.lowercased() == "html" else { return content }
+        let notes = e.onlineMeeting?.joinUrl.flatMap { GraphOnlineMeetingBody.beforeJoinSection(content, joinUrl: $0) }
+            .map(String.init) ?? content
+        return EmailFilter.htmlToPlainText(notes, keepingSpacing: true).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func toGCalDateTime(_ dt: MSDateTimeZone?, isAllDay: Bool) -> GCalDateTime? {
@@ -1357,6 +1405,8 @@ struct MSEvent: Decodable {
     let subject: String?
     let location: MSLocation?
     let bodyPreview: String?
+    let body: MSItemBody?
+    let onlineMeeting: MSOnlineMeeting?
     let start: MSDateTimeZone?
     let end: MSDateTimeZone?
     let attendees: [MSAttendee]?
@@ -1377,6 +1427,17 @@ struct MSEvent: Decodable {
 
 struct MSLocation: Decodable {
     let displayName: String?
+}
+
+/// Graph's `itemBody`.
+struct MSItemBody: Decodable {
+    let contentType: String?
+    let content: String?
+}
+
+/// Graph's `onlineMeetingInfo`, the part the app reads.
+struct MSOnlineMeeting: Decodable {
+    let joinUrl: String?
 }
 
 struct MSDateTimeZone: Decodable {

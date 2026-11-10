@@ -627,6 +627,9 @@ enum CalendarToolHelpers {
             if let desc = event.description, !desc.trimmingCharacters(in: .whitespaces).isEmpty {
                 lines.append("description: \(desc)")
             }
+            if let conferenceUrl = event.conferenceUrl, !conferenceUrl.isEmpty {
+                lines.append("conference_url: \(conferenceUrl)")
+            }
 
             if let link = event.htmlLink, !link.isEmpty {
                 lines.append("link: \(link)")
@@ -636,6 +639,18 @@ enum CalendarToolHelpers {
         }
 
         return lines.joined(separator: "\n")
+    }
+
+    // MARK: - Notes for Pills
+
+    /// The notes an event pill's popover shows: the event's join link, when it has one, on the first
+    /// line, then its description. The description of an online meeting is its notes alone (the join
+    /// section is `conferenceUrl`), and the popover's notes are where the user copies a meeting link
+    /// from. First, so the popover's line limit never hides it.
+    static func eventPillNotes(from event: GCalEvent) -> String? {
+        guard let link = event.conferenceUrl, !link.isEmpty else { return event.description }
+        guard let notes = event.description, !notes.isEmpty else { return "Join: \(link)" }
+        return "Join: \(link)\n\(notes)"
     }
 
     // MARK: - Attendee Parsing for Pills
@@ -718,7 +733,7 @@ enum CalendarToolHelpers {
                 endDate: entry.event.endDate,
                 isAllDay: entry.event.isAllDay,
                 location: isFreeBusy ? nil : entry.event.location,
-                notes: isFreeBusy ? nil : entry.event.description,
+                notes: isFreeBusy ? nil : eventPillNotes(from: entry.event),
                 attendees: isFreeBusy ? [] : attendees,
                 isRecurring: !(entry.event.recurrence ?? []).isEmpty,
                 recurrenceRule: isFreeBusy ? nil : rrule,
@@ -763,7 +778,10 @@ enum CalendarToolHelpers {
     }
 
     /// Build a `GCalEventInput` from tool arguments.
-    static func buildGCalEventInput(_ arguments: [String: JSONValue], isAllDay: Bool?) -> GCalEventInput {
+    ///
+    /// Throws `CalendarProviderError.notSupported` when a recurrence `interval` or `count` is
+    /// present but is not a whole number of 1 or more (see `recurrenceNumber`).
+    static func buildGCalEventInput(_ arguments: [String: JSONValue], isAllDay: Bool?) throws -> GCalEventInput {
         let resolvedTz = resolveTimeZone(arguments)
         let tz = resolvedTz.identifier
         var input = GCalEventInput()
@@ -825,10 +843,8 @@ enum CalendarToolHelpers {
            case .string(let rawFreq) = rec["freq"],
            let freq = Self.validatedRRuleFreq(rawFreq) {
             var rrule = "RRULE:FREQ=\(freq)"
-            if case .int(let n) = rec["interval"], n > 1 { rrule += ";INTERVAL=\(n)" }
-            else if case .double(let d) = rec["interval"], Int(d) > 1 { rrule += ";INTERVAL=\(Int(d))" }
-            if case .int(let count) = rec["count"] { rrule += ";COUNT=\(count)" }
-            else if case .double(let count) = rec["count"] { rrule += ";COUNT=\(Int(count))" }
+            if let n = try Self.recurrenceNumber(rec, "interval"), n > 1 { rrule += ";INTERVAL=\(n)" }
+            if let count = try Self.recurrenceNumber(rec, "count") { rrule += ";COUNT=\(count)" }
             else if case .string(let until) = rec["until"],
                     // `allDay:`/`zone:` are not decoration — UNTIL's value type is dictated by the
                     // DTSTART this same builder emits (RFC 5545 §3.3.10), and the naive→UTC conversion
@@ -841,6 +857,31 @@ enum CalendarToolHelpers {
         }
 
         return input
+    }
+
+    /// A recurrence `interval` or `count` from the tool arguments: nil when absent or null, the
+    /// value when it is a whole number of 1 or more. Any other value is refused, never dropped:
+    /// dropping `count` would save a finite series as an endless one.
+    static func recurrenceNumber(_ rec: [String: JSONValue], _ key: String) throws -> Int? {
+        guard let value = rec[key] else { return nil }
+        if case .null = value { return nil }
+        guard let n = value.wholeNumber, n >= 1 else {
+            throw CalendarProviderError.notSupported("recurrence.\(key) must be a whole number of 1 or more")
+        }
+        return n
+    }
+
+    /// The confirmation-card text for a `recurrence` argument (`every 2 weekly (5 times)`), or nil
+    /// when there is none. Reads `interval` and `count` through `recurrenceNumber`, so it throws on
+    /// the same values the builder refuses and a tool can refuse the call before its card is shown.
+    static func recurrenceSummary(_ arguments: [String: JSONValue]) throws -> String? {
+        guard case .dictionary(let rec) = arguments["recurrence"],
+              case .string(let freq) = rec["freq"] else { return nil }
+        var desc = freq.lowercased()
+        if let n = try recurrenceNumber(rec, "interval"), n > 1 { desc = "every \(n) \(desc)" }
+        if let count = try recurrenceNumber(rec, "count") { desc += " (\(count) times)" }
+        else if case .string(let until) = rec["until"] { desc += " (until \(until))" }
+        return desc
     }
 
     /// Could `buildGCalEventInput(arguments:isAllDay:)` emit an `UNTIL` for these arguments?
@@ -868,8 +909,9 @@ enum CalendarToolHelpers {
     ///   1. a `recurrence` dictionary with a `freq` `validatedRRuleFreq` accepts — without it the
     ///      producer emits no `RRULE` at all, so there is no UNTIL and no value type to match;
     ///   2. **no numeric `count`** — the producer's `if/else if/else if` chain gives COUNT priority,
-    ///      so a rule carrying COUNT never reaches its UNTIL branch. A `count` that is a STRING is
-    ///      not one of those cases and does NOT suppress the UNTIL, here or there;
+    ///      so a rule carrying COUNT never reaches its UNTIL branch. Any other present `count` (a
+    ///      string, a fraction) makes the producer throw (`recurrenceNumber`), so no rule is built
+    ///      and the answer here does not matter;
     ///   3. an `until` STRING — the only input the UNTIL branch reads.
     ///
     /// Whether that string survives `validatedRRuleUntil` is not asked (see the headline). A dropped

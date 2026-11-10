@@ -1096,7 +1096,7 @@ actor ChatIdTranslator {
                 endDate: event.endDate,
                 isAllDay: event.isAllDay,
                 location: event.location,
-                notes: event.description,
+                notes: CalendarToolHelpers.eventPillNotes(from: event),
                 attendees: attendees,
                 isRecurring: !(event.recurrence ?? []).isEmpty,
                 recurrenceRule: rrule,

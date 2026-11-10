@@ -936,12 +936,12 @@ struct CalendarQueueUntilValueTypeTests {
         #expect(!CalendarToolHelpers.recurrenceUntilIsAtStake(
             ["recurrence": .dictionary(["freq": .string("DAILY"), "count": .double(5), "until": until])]),
                 "a double COUNT is the producer's second case and wins too")
-        // A STRING count is NOT one of the producer's two COUNT cases, so it does not suppress the
-        // UNTIL there and must not suppress the fetch here. This is the asymmetry a predicate written
-        // from the schema instead of from the producer would get wrong.
+        // A STRING count is not one of the predicate's two COUNT cases, so it does not suppress the
+        // fetch. The producer refuses a string count (`recurrenceNumber`), so no rule is built and
+        // the fetch is merely unneeded; the predicate is left as it was.
         #expect(CalendarToolHelpers.recurrenceUntilIsAtStake(
             ["recurrence": .dictionary(["freq": .string("DAILY"), "count": .string("5"), "until": until])]),
-                "a string count does not reach the producer's COUNT branch, so the UNTIL is still emitted")
+                "a string count is not a numeric COUNT, so the predicate does not suppress the fetch")
     }
 }
 

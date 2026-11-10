@@ -26,7 +26,16 @@ import Synchronization
 ///   UTC midnight on the range's `startDate` (measured, see `splitSeries`);
 /// - a recurrence whose range has no `startDate` is refused with a 400
 ///   (`recurrenceRange`: "Required");
-/// - `$select` returns only the properties it names (`event-get`).
+/// - `$select` returns only the properties it names (`event-get`);
+/// - `calendarView` lists single events and occurrences, never a series master
+///   (`user-list-calendarview`); this fake lists every stored one, whatever the
+///   window, in no particular order;
+/// - a body written without an online meeting's join link turns the online
+///   meeting off: "Inadvertently removing the meeting blob from the body would
+///   disable meeting online" (event-update). Checked live on a work account: a
+///   text body write left `isOnlineMeeting` false, `onlineMeetingProvider`
+///   `unknown` and `onlineMeeting` null; an HTML write that changed only the
+///   notes kept the meeting and its join link.
 ///
 /// Starts and ends are returned as stored, whatever zone `Prefer` names: a
 /// fixture stores them as Graph renders them for the device.
@@ -86,6 +95,14 @@ final class FakeGraphCalendar: Sendable {
             guard parts.count == 1, let stored = event(parts[0]) else { return .status(404) }
             return Self.json(Self.only(select, of: stored))
         }
+        http.register(path: "/v1.0/me/calendarView", method: "GET") { [self] request in
+            if let status = takeFailure("GET") { return .status(status) }
+            let select = Self.selected(request.url)
+            let listed = events.withLock { Array($0.values) }
+                .compactMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+                .filter { $0["recurrence"] == nil || $0["recurrence"] is NSNull }
+            return Self.json(["value": listed.map { Self.only(select, of: $0) }])
+        }
         http.register(path: "/v1.0/me/events/", method: "PATCH") { [self] request in
             patchAuthorizationLog.withLock { $0.append(request.header("Authorization") ?? "none") }
             if let status = takeFailure("PATCH") { return .status(status) }
@@ -125,6 +142,12 @@ final class FakeGraphCalendar: Sendable {
         defaultRecurrenceZone(in: &stored)
         if let content = (patch["body"] as? [String: Any])?["content"] as? String {
             stored["bodyPreview"] = preview(content)
+            if let joinUrl = (stored["onlineMeeting"] as? [String: Any])?["joinUrl"] as? String,
+               !content.contains(joinUrl), !content.contains(joinUrl.replacingOccurrences(of: "&", with: "&amp;")) {
+                stored["isOnlineMeeting"] = false
+                stored["onlineMeetingProvider"] = "unknown"
+                stored["onlineMeeting"] = NSNull()
+            }
         }
     }
 
@@ -317,13 +340,71 @@ enum GraphFixture {
         ["emailAddress": ["address": "room-1@example.com", "name": "Room 1"], "type": "resource", "status": ["response": "accepted"]],
     ] }
 
+    /// An online meeting's join link (`onlineMeeting.joinUrl`): the long
+    /// `meetup-join` form, which a Teams join section holds on its "System
+    /// reference" link, after the short "Join:" link.
     static let joinUrl = "https://meet.example.com/l/meetup-join/19%3ameeting_123/0?context=a&lang=en"
+    /// The short link a Teams join section shows first ("Join:").
+    static let shortJoinUrl = "https://meet.example.com/meet/0000000000?p=PLACEHOLDER"
 
-    /// An online meeting's body: HTML, a link, text past the 255-character
-    /// preview, and the join link.
-    static let onlineBody = "<html><body><p>Agenda with a <a href=\"https://example.com/doc\">linked doc</a></p><p>"
-        + String(repeating: "Long notes past the preview. ", count: 12)
-        + "</p><div><a href=\"" + joinUrl.replacingOccurrences(of: "&", with: "&amp;") + "\">Join the meeting</a></div></body></html>"
+    /// A line of underscores that opens and closes a Teams join section.
+    static let joinSeparator = "<div aria-hidden=\"true\" style=\"margin-bottom:24px; overflow:hidden; white-space:nowrap\">\r\n"
+        + String(repeating: "_", count: 80) + "</div>\r\n"
+
+    /// An online meeting's join section as Graph stored it for a meeting made in
+    /// Teams on a work account (checked live, #555), every link, id, number and
+    /// passcode a placeholder: an outer `<div>` opening with three `<br>`, then
+    /// the Teams block, which starts and ends with a line of underscores.
+    static let joinSection = "<div><br>\r\n<br>\r\n<br>\r\n"
+        + "<div class=\"me-email-text\" lang=\"en-GB\" style=\"max-width:1024px; color:#242424; font-family:'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif\">\r\n"
+        + joinSeparator
+        + "<div style=\"margin-bottom:12px\"><span class=\"me-email-text\" style=\"font-size:20px; color:#242424; font-weight:600\">Microsoft Teams meeting</span>\r\n</div>\r\n"
+        + "<div style=\"margin-bottom:6px\"><span class=\"me-email-text\" style=\"font-size:20px; color:#242424; font-weight:600\">Join:\r\n</span><a href=\""
+        + shortJoinUrl + "\" id=\"meet_invite_block.action.join_link\" title=\"Meeting join\" aria-label=\"Meeting join\" class=\"me-email-link\" style=\"font-size:20px; text-decoration:underline; color:#5B5FC7\">"
+        + shortJoinUrl + "</a>\r\n</div>\r\n"
+        + "<div style=\"margin-bottom:6px\"><span class=\"me-email-text-secondary\" style=\"font-size:14px; color:#616161\">Meeting ID:\r\n</span><span class=\"me-email-text\" style=\"font-size:14px; color:#242424\">000 000 000 000</span>\r\n</div>\r\n"
+        + "<div style=\"margin-bottom:32px\"><span class=\"me-email-text-secondary\" style=\"font-size:14px; color:#616161\">Passcode:\r\n</span><span class=\"me-email-text\" style=\"font-size:14px; color:#242424\">PASSCODE</span>\r\n</div>\r\n"
+        + "<div style=\"margin-bottom:12px; max-width:1024px\">\r\n<hr style=\"border:0; background:#616161; height:1px\">\r\n</div>\r\n"
+        + "<div style=\"margin-bottom:24px\"><a href=\"https://help.example.com/join\" id=\"meet_invite_block.action.help\" class=\"me-email-link\" style=\"font-size:14px; text-decoration:underline; color:#5B5FC7\">Need help?</a>\r\n"
+        + "<span style=\"color:#616161\">|</span> <a href=\"" + joinUrl.replacingOccurrences(of: "&", with: "&amp;")
+        + "\" id=\"meet_invite_block.action.join_link_compatibility\" class=\"me-email-link\" style=\"font-size:14px; text-decoration:underline; color:#5B5FC7\">\r\nSystem reference</a> </div>\r\n"
+        + "<div><span class=\"me-email-text-secondary\" style=\"font-size:14px; color:#616161\">For organisers:\r\n</span><a href=\"https://meet.example.com/meetingOptions/?organizerId=ORGANIZER&amp;tenantId=TENANT&amp;threadId=THREAD&amp;messageId=0&amp;language=en-GB\" id=\"meet_invite_block.action.organizer_meet_options\" class=\"me-email-link\" style=\"font-size:14px; text-decoration:underline; color:#5B5FC7\">Meeting\r\n options</a> </div>\r\n"
+        + "<div style=\"margin-top:24px; margin-bottom:6px\"></div>\r\n<div style=\"margin-bottom:24px\"></div>\r\n"
+        + joinSeparator
+        + "</div>\r\n</div>\r\n"
+
+    /// The join section of Graph's online-meeting samples
+    /// (learn.microsoft.com/en-us/graph/outlook-calendar-online-meetings, the
+    /// create and update responses), an older Teams layout, with placeholders:
+    /// a line of underscores in a `<span>`, the join link, dial-in details, and
+    /// the line again.
+    static let sampleJoinSection = sampleJoinSeparator
+        + "<div class=\"me-email-text\" style=\"color:#252424; font-family:'Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif\">\r\n"
+        + "<div style=\"margin-top:24px; margin-bottom:10px\"><a class=\"me-email-headline\" href=\""
+        + joinUrl.replacingOccurrences(of: "&", with: "&amp;")
+        + "\" target=\"_blank\" rel=\"noreferrer noopener\" style=\"font-size:18px; font-family:'Segoe UI Semibold','Segoe UI','Helvetica Neue',Helvetica,Arial,sans-serif; text-decoration:underline; color:#6264a7\">Join\r\n Microsoft Teams Meeting</a> </div>\r\n"
+        + "<div>\r\n<div><a class=\"me-email-link\" href=\"tel:&#43;1 555-0100,,000000000# \" target=\"_blank\" rel=\"noreferrer noopener\" style=\"font-size:14px; text-decoration:none; color:#6264a7\">&#43;1 555-0100</a>\r\n"
+        + "<span style=\"font-size:12px\">&nbsp; Placeholder City (Toll) </span></div>\r\n</div>\r\n"
+        + "<div style=\"margin-top:10px; margin-bottom:20px\"><span style=\"font-size:12px\">Conference ID:\r\n</span><span style=\"font-size:14px\">000 000 000# </span></div>\r\n"
+        + "<div style=\"margin-bottom:24px\"><a class=\"me-email-link\" target=\"_blank\" href=\"https://dialin.example.com/conference?id=000000000\" rel=\"noreferrer noopener\" style=\"font-size:12px; text-decoration:none; color:#6264a7\">Local\r\n numbers</a>"
+        + " | <a class=\"me-email-link\" target=\"_blank\" href=\"https://settings.example.com/pstnconferencing\" rel=\"noreferrer noopener\" style=\"font-size:12px; text-decoration:none; color:#6264a7\">\r\nReset PIN</a>"
+        + " | <a class=\"me-email-link\" target=\"_blank\" href=\"https://help.example.com/join\" rel=\"noreferrer noopener\" style=\"font-size:12px; text-decoration:none; color:#6264a7\">\r\nLearn more about Teams</a>"
+        + " | <a class=\"me-email-link\" target=\"_blank\" href=\"https://meet.example.com/meetingOptions/?organizerId=ORGANIZER&amp;tenantId=TENANT&amp;threadId=THREAD&amp;messageId=0&amp;language=en-US\" rel=\"noreferrer noopener\" style=\"font-size:12px; text-decoration:none; color:#6264a7\">\r\nMeeting options</a> </div>\r\n"
+        + "<div style=\"font-size:14px; margin-bottom:4px\"></div>\r\n<div style=\"font-size:12px\"></div>\r\n</div>\r\n"
+        + sampleJoinSeparator
+    static let sampleJoinSeparator = "<div style=\"width:100%; height:20px\"><span style=\"white-space:nowrap; color:gray; opacity:.36\">"
+        + String(repeating: "_", count: 80) + "</span>\r\n</div>\r\n"
+
+    /// The document around a body's content, as Graph stores it.
+    static let htmlHead = "<html>\r\n<head>\r\n<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\">\r\n</head>\r\n<body>\r\n"
+    static let htmlTail = "</body>\r\n</html>\r\n"
+
+    /// An online meeting's body: notes in HTML with a link and text past the
+    /// 255-character preview, then the join section.
+    static let onlineBody = htmlHead
+        + "<p>Agenda with a <a href=\"https://example.com/doc\" title=\"https://example.com/doc\">\r\nlinked doc</a></p>\r\n<p>"
+        + String(repeating: "Long notes past the preview. ", count: 12) + "</p>\r\n"
+        + joinSection + htmlTail
 
     static let plainBody = "<p>Agenda with <b>bold</b> notes and a <a href=\"https://example.com/doc\">link</a></p>"
 
@@ -341,6 +422,7 @@ enum GraphFixture {
             "body": ["contentType": "html", "content": online ? onlineBody : plainBody],
             "bodyPreview": "Agenda with a linked doc",
             "isOnlineMeeting": online,
+            "onlineMeetingProvider": online ? "teamsForBusiness" : "unknown",
             "showAs": "tentative",
             "location": ["displayName": "Room A"],
             "locations": [["displayName": "Room A"], ["displayName": "Room B"]],
@@ -393,10 +475,10 @@ enum UserCalendarEdit: String, CaseIterable, CustomTestStringConvertible, Sendab
 
     var testDescription: String { rawValue }
 
-    /// The edits the online-meeting fixtures take: a description edit of an
-    /// online meeting is not kept around its join block yet (#511).
+    /// The edits the online-meeting fixtures take: every edit but a new rule,
+    /// which only a series takes.
     static let ofAnOnlineMeeting: [UserCalendarEdit] = [
-        .rename, .moveOneHour, .endLater, .moveRoom, .addAttendee, .removeAttendee, .markBusy,
+        .rename, .moveOneHour, .endLater, .moveRoom, .addAttendee, .removeAttendee, .markBusy, .newDescription,
     ]
 
     static let newDescriptionText = "New notes\nSecond line"
@@ -499,7 +581,7 @@ enum StartSpelling: String, CaseIterable, CustomTestStringConvertible, Sendable 
 /// Every property a user can see on an Outlook event and an edit must not touch
 /// unless it is the one edited.
 private let watchedProperties = [
-    "subject", "body", "bodyPreview", "isOnlineMeeting", "onlineMeeting", "showAs", "location",
+    "subject", "body", "bodyPreview", "isOnlineMeeting", "onlineMeetingProvider", "onlineMeeting", "showAs", "location",
     "locations", "attendees", "start", "end", "isAllDay", "recurrence",
 ]
 
@@ -519,6 +601,30 @@ private func attendeeTypes(_ event: [String: Any]) -> [String: String] {
         out[email.lowercased()] = attendee["type"] as? String ?? "?"
     }
     return out
+}
+
+/// Asserts a description edit wrote `notes`: as the text body of an event that is
+/// no online meeting; for an online meeting, in place of the stored notes, with
+/// the join section and everything after it as stored, and the meeting on.
+private func expectNewNotes(_ notes: String, before: [String: Any], after: [String: Any], label: String) {
+    let body = after["body"] as? [String: Any]
+    guard before["onlineMeeting"] is [String: Any] else {
+        #expect(body?["contentType"] as? String == "text", "\(label): the description was not written as text")
+        #expect(body?["content"] as? String == notes, "\(label): the description written is \(body?["content"] ?? "none")")
+        return
+    }
+    let was = (before["body"] as? [String: Any])?["content"] as? String ?? ""
+    let content = body?["content"] as? String ?? ""
+    let section = was.range(of: GraphFixture.joinSection).map { String(was[$0.lowerBound...]) }
+    #expect(section != nil, "\(label): the fixture holds no join section")
+    #expect(body?["contentType"] as? String == "html", "\(label): the online meeting's body is not HTML")
+    #expect(section.map(content.hasSuffix) == true, "\(label): the join section was not kept as stored")
+    #expect(content.hasPrefix(GraphFixture.htmlHead), "\(label): the document before the notes was not kept")
+    let html = notes.replacingOccurrences(of: "\n", with: "<br>\r\n")
+    // The notes start after `<body>`, so the head's closing line break is the one written before them.
+    #expect(content == GraphFixture.htmlHead + html + "\r\n" + (section ?? ""),
+            "\(label): the notes were not replaced by the new ones alone")
+    #expect(after["isOnlineMeeting"] as? Bool == true, "\(label): the edit turned the online meeting off")
 }
 
 /// Asserts `after` equals `before` on every watched property `edit` does not change,
@@ -559,6 +665,8 @@ private func expectOnlyEdited(
         let room: [String: Any] = ["displayName": UserCalendarEdit.newRoom]
         #expect(canonical(after["location"]) == canonical(room), "\(label): the new room was not written")
         #expect(canonical(after["locations"]) == canonical([room]), "\(label): the locations do not name only the new room")
+    case .newDescription:
+        expectNewNotes(UserCalendarEdit.newDescriptionText, before: before, after: after, label: label)
     case .newRecurrence:
         let recurrence = after["recurrence"] as? [String: Any]
         #expect((recurrence?["pattern"] as? [String: Any])?["type"] as? String == "daily", "\(label): the new rule was not written")
@@ -810,7 +918,7 @@ struct ExchangeCalendarEditPreservationTests {
         let graph = FakeGraphCalendar([GraphFixture.seriesOnDeviceDay(id: "ser-z", start: seriesStart)])
         graph.install(on: http)
         let zone = GraphFixture.farEast
-        let patch = CalendarToolHelpers.buildGCalEventInput([
+        let patch = try CalendarToolHelpers.buildGCalEventInput([
             "start_iso": .string(spelling.spell(GraphFixture.wall(move.newStart, in: zone))),
             "end_iso": .string(spelling.spell(GraphFixture.wall(move.newStart.addingTimeInterval(1_800), in: zone))),
             "timezone": .string(zone),
@@ -873,7 +981,7 @@ struct ExchangeCalendarEditPreservationTests {
         let before = try #require(graph.event("ev-ad"))
         let day = String(GraphFixture.naive(GraphFixture.start).prefix(10))
         let newEndDay = String(GraphFixture.naive(GraphFixture.start.addingTimeInterval(2 * 86_400)).prefix(10))
-        let patch = CalendarToolHelpers.buildGCalEventInput(["end_iso": .string(newEndDay)], isAllDay: true)
+        let patch = try CalendarToolHelpers.buildGCalEventInput(["end_iso": .string(newEndDay)], isAllDay: true)
         #expect(patch.endDate == newEndDay && patch.startDate == nil && patch.startDateTime == nil)
 
         _ = try await makeProvider(http).updateEvent(eventId: "ev-ad", event: patch)
@@ -1043,5 +1151,166 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(attendeeTypes(after)["optional.person@example.com"] == "optional",
                 "the mixed-case attendee is \(attendeeTypes(after)["optional.person@example.com"] ?? "gone")")
         #expect(attendeeTypes(after)["bo@example.com"] == "optional")
+    }
+
+    // MARK: Online meetings (#511)
+
+    @Test("in the fake, as measured live, a text body turns an online meeting off and an HTML body with only new notes keeps it")
+    func fakeOnlineMeetingBodyWrites() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let before = try #require(graph.event("ev-online"))
+        func patch(_ id: String, body: [String: Any]) async throws {
+            var request = URLRequest(url: URL(string: "https://graph.microsoft.com/v1.0/me/events/" + id)!)
+            request.httpMethod = "PATCH"
+            request.httpBody = try JSONSerialization.data(withJSONObject: ["body": body])
+            _ = try await http.session.data(for: request)
+        }
+
+        let notesOnly = GraphFixture.htmlHead + "<p>New notes</p>\r\n" + GraphFixture.joinSection + GraphFixture.htmlTail
+        try await patch("ev-online", body: ["contentType": "html", "content": notesOnly])
+        let kept = try #require(graph.event("ev-online"))
+        #expect(kept["isOnlineMeeting"] as? Bool == true)
+        #expect(kept["onlineMeetingProvider"] as? String == "teamsForBusiness")
+        #expect(canonical(kept["onlineMeeting"]) == canonical(before["onlineMeeting"]))
+
+        try await patch("ev-online", body: ["contentType": "text", "content": "New notes"])
+        let after = try #require(graph.event("ev-online"))
+        #expect(after["isOnlineMeeting"] as? Bool == false)
+        #expect(after["onlineMeetingProvider"] as? String == "unknown")
+        #expect(!(after["onlineMeeting"] is [String: Any]))
+    }
+
+    @Test("a read gives the stored notes in full as the description, an online meeting's without its join section, and its join link apart",
+          arguments: ["ev-online", "ev-plain"])
+    func readGivesTheNotes(_ id: String) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+
+        let event = try await makeProvider(http).getEvent(eventId: id)
+
+        let description = try #require(event.description)
+        if id == "ev-online" {
+            #expect(description.contains("[linked doc](https://example.com/doc)"), "the notes' link is \(description)")
+            #expect(description.components(separatedBy: "Long notes past the preview.").count == 13,
+                    "the notes past the 255-character preview were cut: \(description)")
+            #expect(!description.contains("____") && !description.contains("Teams") && !description.contains("meet.example.com"),
+                    "the join section is in the description: \(description)")
+            #expect(event.conferenceUrl == GraphFixture.joinUrl)
+        } else {
+            #expect(description == "Agenda with bold notes and a [link](https://example.com/doc)")
+            #expect(event.conferenceUrl == nil)
+        }
+    }
+
+    @Test("a listing gives each event's stored notes in full as the description, an online meeting's without its join section, and its join link apart")
+    func listGivesTheNotes() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+
+        let listed = try await makeProvider(http).listEvents(
+            timeMin: GraphFixture.start.addingTimeInterval(-86_400), timeMax: GraphFixture.occurrenceStart.addingTimeInterval(86_400))
+
+        let online = try #require(listed.first { $0.id == "ev-online" })
+        let description = try #require(online.description)
+        #expect(description.components(separatedBy: "Long notes past the preview.").count == 13,
+                "the listed notes were cut: \(description)")
+        #expect(!description.contains("____") && !description.contains("Teams") && !description.contains("meet.example.com"),
+                "the join section is in the listed description: \(description)")
+        #expect(online.conferenceUrl == GraphFixture.joinUrl)
+        let plain = try #require(listed.first { $0.id == "ev-plain" })
+        #expect(plain.description == "Agenda with bold notes and a [link](https://example.com/doc)")
+        #expect(plain.conferenceUrl == nil)
+    }
+
+    @Test("after the assistant puts the join link in an online meeting's notes, the next description edit still keeps the meeting on")
+    func joinLinkWrittenIntoTheNotes() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let before = try #require(graph.event("ev-online"))
+        let read = try await provider.getEvent(eventId: "ev-online")
+        let link = try #require(read.conferenceUrl)
+        var withLink = GCalEventInput()
+        withLink.description = "Join here: " + link
+
+        _ = try await provider.updateEvent(eventId: "ev-online", event: withLink)
+        #expect(try #require(graph.event("ev-online"))["isOnlineMeeting"] as? Bool == true, "the first edit turned the meeting off")
+        #expect(try await provider.getEvent(eventId: "ev-online").description == "Join here: " + link)
+        var agenda = GCalEventInput()
+        agenda.description = "Agenda only"
+        _ = try await provider.updateEvent(eventId: "ev-online", event: agenda)
+
+        expectNewNotes("Agenda only", before: before, after: try #require(graph.event("ev-online")),
+                       label: "online meeting, edited after its notes held the join link")
+    }
+
+    @Test("an online meeting's description read, added to and written back keeps the notes in full and the meeting on")
+    func onlineDescriptionRoundTrip() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let provider = makeProvider(http)
+        let before = try #require(graph.event("ev-online"))
+        let read = try #require(try await provider.getEvent(eventId: "ev-online").description)
+        var patch = GCalEventInput()
+        patch.description = read + "\nAdded line"
+
+        _ = try await provider.updateEvent(eventId: "ev-online", event: patch)
+
+        let after = try #require(graph.event("ev-online"))
+        expectNewNotes(read + "\nAdded line", before: before, after: after, label: "online meeting, read and written back")
+        for property in watchedProperties where property != "body" && property != "bodyPreview" {
+            #expect(canonical(after[property]) == canonical(before[property]), "the round trip changed \(property)")
+        }
+        #expect(try await provider.getEvent(eventId: "ev-online").description == read + "\nAdded line")
+    }
+
+    @Test("clearing an online meeting's description keeps its join section")
+    func clearedOnlineDescription() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let before = try #require(graph.event("ev-online"))
+        var patch = GCalEventInput()
+        patch.description = ""
+
+        _ = try await makeProvider(http).updateEvent(eventId: "ev-online", event: patch)
+
+        let after = try #require(graph.event("ev-online"))
+        for property in watchedProperties where property != "body" && property != "bodyPreview" {
+            #expect(canonical(after[property]) == canonical(before[property]), "clearing the notes changed \(property)")
+        }
+        let content = try #require((after["body"] as? [String: Any])?["content"] as? String)
+        #expect(content == GraphFixture.htmlHead + "\r\n" + GraphFixture.joinSection + GraphFixture.htmlTail)
+    }
+
+    @Test("an online meeting whose join section is not recognised gets the description as text, as any event does")
+    func unrecognisedJoinSection() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        var event = GraphFixture.event(id: "ev-unknown-layout")
+        // The join link with no separator line before it.
+        event["body"] = ["contentType": "html", "content": GraphFixture.htmlHead + "<div>Notes</div><div><a href=\""
+            + GraphFixture.joinUrl.replacingOccurrences(of: "&", with: "&amp;") + "\">Join</a></div>" + GraphFixture.htmlTail]
+        let graph = FakeGraphCalendar([event])
+        graph.install(on: http)
+
+        _ = try await makeProvider(http).updateEvent(
+            eventId: "ev-unknown-layout", event: UserCalendarEdit.newDescription.patch(start: GraphFixture.start))
+
+        let sent = try #require(graph.patches("ev-unknown-layout").first?["body"] as? [String: Any])
+        #expect(sent["contentType"] as? String == "text")
+        #expect(sent["content"] as? String == UserCalendarEdit.newDescriptionText)
     }
 }
