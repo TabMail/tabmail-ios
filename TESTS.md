@@ -33,9 +33,11 @@ event-update semantics (unsent properties keep their values; writing `location` 
 `locations`; `$select` returns only what it names). For seven edit kinds (rename, move an hour, move
 only the end, change the room, add an attendee, remove an attendee, mark busy) on a single event, a whole series and one
 occurrence, and a description edit of a plain event and a rule edit of a series, it asserts on the
-stored event, not on our payload: every property the edit did not set (body, `showAs`, `locations`, attendee types, recurrence, start and end) comes back
-unchanged, and the edited property holds what was asked (a removed attendee is gone, the rest keep
-their types). The fake also models the recurrence
+stored event, not on our payload: every property the edit did not set (body, `showAs`, `locations`, attendees, recurrence, start and end) comes back
+unchanged, and the edited property holds what was asked (a removed attendee is gone, each kept attendee's whole stored entry, type, answer and its time,
+is unchanged, and an added one is `required` and unanswered). The fake refuses with 405, as measured
+on Outlook.com for #622, an attendee PATCH in which any entry has no `status`
+(`fakeRefusesAttendeeWithoutStatus`). The fake also models the recurrence
 behaviour measured live for #423 (a range written without a zone is stored as UTC; a written rule
 that differs from the stored one resets the series' exceptions; a `recurrence` PATCHed without
 `start` moves the series to UTC midnight; a range without `startDate` is refused with a 400): a

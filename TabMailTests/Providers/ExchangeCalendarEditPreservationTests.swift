@@ -37,7 +37,12 @@ import Synchronization
 ///   `unknown` and `onlineMeeting` null; an HTML write that changed only the
 ///   notes kept the meeting and its join link;
 /// - a create (`POST /me/events`) stores the event it is sent under a new id,
-///   with the same recurrence rules as a PATCH.
+///   with the same recurrence rules as a PATCH;
+/// - a PATCH whose `attendees` holds any entry without a `status` is refused
+///   with 405 `UnknownError` and an empty message, and changes nothing.
+///   Measured on an Outlook.com account (#622): a list with every entry
+///   carrying its status was accepted, and a kept attendee sent with their
+///   stored status kept their answer.
 ///
 /// Starts and ends are returned as stored, whatever zone `Prefer` names: a
 /// fixture stores them as Graph renders them for the device.
@@ -121,6 +126,9 @@ final class FakeGraphCalendar: Sendable {
                   let patch = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
                   Self.rangeHasStart(patch)
             else { return .status(400) }
+            if let attendees = patch["attendees"] as? [[String: Any]], attendees.contains(where: { $0["status"] == nil }) {
+                return .json(raw: #"{"error":{"code":"UnknownError","message":""}}"#, statusCode: 405)
+            }
             patchLog.withLock { $0.append((id: parts[0], body: body)) }
             if let written = patch["recurrence"],
                Self.canonicalJSON(written) != Self.canonicalJSON(stored["recurrence"]) {
@@ -354,10 +362,16 @@ enum GraphFixture {
         return names[cal.component(.weekday, from: date) - 1]
     }
 
+    /// When the fixture's guests answered: a day before the test runs.
+    static let answeredAt = rfc3339(Date().addingTimeInterval(-86_400))
+
     static var attendees: [[String: Any]] { [
-        ["emailAddress": ["address": "ana@example.com", "name": "Ana"], "type": "required", "status": ["response": "accepted"]],
-        ["emailAddress": ["address": "bo@example.com", "name": "Bo"], "type": "optional", "status": ["response": "tentativelyAccepted"]],
-        ["emailAddress": ["address": "room-1@example.com", "name": "Room 1"], "type": "resource", "status": ["response": "accepted"]],
+        ["emailAddress": ["address": "ana@example.com", "name": "Ana"], "type": "required",
+         "status": ["response": "accepted", "time": answeredAt]],
+        ["emailAddress": ["address": "bo@example.com", "name": "Bo"], "type": "optional",
+         "status": ["response": "tentativelyAccepted", "time": answeredAt]],
+        ["emailAddress": ["address": "room-1@example.com", "name": "Room 1"], "type": "resource",
+         "status": ["response": "accepted", "time": answeredAt]],
     ] }
 
     /// An online meeting's join link (`onlineMeeting.joinUrl`): the long
@@ -615,10 +629,15 @@ private func canonical(_ value: Any?) -> String {
 
 /// email → attendee type.
 private func attendeeTypes(_ event: [String: Any]) -> [String: String] {
-    var out: [String: String] = [:]
+    attendeeEntries(event).mapValues { $0["type"] as? String ?? "?" }
+}
+
+/// email (lowercased) → the whole attendee entry: type, status (answer and its time) and name.
+private func attendeeEntries(_ event: [String: Any]) -> [String: [String: Any]] {
+    var out: [String: [String: Any]] = [:]
     for attendee in event["attendees"] as? [[String: Any]] ?? [] {
         guard let email = (attendee["emailAddress"] as? [String: Any])?["address"] as? String else { continue }
-        out[email.lowercased()] = attendee["type"] as? String ?? "?"
+        out[email.lowercased()] = attendee
     }
     return out
 }
@@ -650,8 +669,9 @@ private func expectNewNotes(_ notes: String, before: [String: Any], after: [Stri
 
 /// Asserts `after` equals `before` on every watched property `edit` does not change,
 /// and that the property it edits holds what the edit asked for (`start` is the
-/// edited event's start). For an attendee edit, every attendee that stays keeps
-/// its type, and the one removed is gone.
+/// edited event's start). For an attendee edit, every attendee that stays is
+/// written exactly as stored (type, answer and its time, name), the one removed
+/// is gone, and the one added is `required` and unanswered.
 private func expectOnlyEdited(
     _ edit: UserCalendarEdit?, before: [String: Any], after: [String: Any], start: Date? = nil, label: String
 ) {
@@ -703,15 +723,21 @@ private func expectOnlyEdited(
     if edit == .addAttendee || edit == .removeAttendee {
         let was = attendeeTypes(before)
         let now = attendeeTypes(after)
+        let wasEntries = attendeeEntries(before)
+        let nowEntries = attendeeEntries(after)
         let removed = edit == .removeAttendee ? UserCalendarEdit.removedAttendee : nil
         for (email, type) in was where email != removed {
             #expect(now[email] == type, "\(label): attendee \(email) was \(type), is \(now[email] ?? "gone")")
+            #expect(canonical(nowEntries[email]) == canonical(wasEntries[email]),
+                    "\(label): attendee \(email) was \(canonical(wasEntries[email])), is \(canonical(nowEntries[email]))")
         }
         if let removed {
             #expect(was[removed] != nil && now[removed] == nil, "\(label): the removed attendee is \(now[removed] ?? "gone")")
             #expect(now.count == was.count - 1, "\(label): \(now.count) attendees after removing one of \(was.count)")
         } else {
             #expect(now["cy@example.com"] == "required", "\(label): the added attendee is \(now["cy@example.com"] ?? "missing")")
+            let added = nowEntries["cy@example.com"]?["status"] as? [String: Any]
+            #expect(added?["response"] as? String == "none", "\(label): the added attendee's status is \(canonical(added))")
         }
     }
 }
@@ -1152,14 +1178,36 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(graph.patches("ser-1").isEmpty)
     }
 
-    @Test("an attendee whose address is stored in mixed case keeps its type when the attendees are written")
+    @Test("in the fake, as measured live, an attendee list with an entry that has no status is refused with 405 and changes nothing")
+    func fakeRefusesAttendeeWithoutStatus() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let before = try #require(graph.event("ev-online"))
+        let body = try JSONSerialization.data(withJSONObject: [
+            "attendees": [["emailAddress": ["address": "cy@example.com", "name": "Cy"], "type": "required"]],
+        ])
+        var request = URLRequest(url: URL(string: "https://graph.microsoft.com/v1.0/me/events/ev-online")!)
+        request.httpMethod = "PATCH"
+        request.httpBody = body
+        let (data, response) = try await http.session.data(for: request)
+
+        #expect((response as? HTTPURLResponse)?.statusCode == 405)
+        let error = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? [String: Any]
+        #expect(error?["code"] as? String == "UnknownError")
+        #expect(graph.patches("ev-online").isEmpty)
+        #expect(canonical(graph.event("ev-online")?["attendees"]) == canonical(before["attendees"]))
+    }
+
+    @Test("an attendee whose address is stored in mixed case keeps its type and answer when the attendees are written")
     func mixedCaseAttendeeKeepsItsType() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
         var event = GraphFixture.event(id: "ev-case", online: false)
         event["attendees"] = GraphFixture.attendees + [
             ["emailAddress": ["address": "Optional.Person@Example.com", "name": "Optional Person"], "type": "optional",
-             "status": ["response": "none"]],
+             "status": ["response": "declined", "time": GraphFixture.answeredAt]],
         ]
         let graph = FakeGraphCalendar([event])
         graph.install(on: http)
@@ -1172,6 +1220,9 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(attendeeTypes(after)["optional.person@example.com"] == "optional",
                 "the mixed-case attendee is \(attendeeTypes(after)["optional.person@example.com"] ?? "gone")")
         #expect(attendeeTypes(after)["bo@example.com"] == "optional")
+        let stored = try #require(event["attendees"] as? [[String: Any]])
+        #expect(canonical(attendeeEntries(after)["optional.person@example.com"]) == canonical(stored.last),
+                "the mixed-case attendee was not written as stored")
     }
 
     // MARK: Online meetings (#511)

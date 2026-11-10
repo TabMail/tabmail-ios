@@ -722,7 +722,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     ///   A series edit that keeps its date writes no recurrence: any recurrence
     ///   write that differs from the stored one resets the series' exceptions
     ///   (#423, measured);
-    /// - attendees keep their Graph type; only a new attendee is `required`;
+    /// - attendees the edit keeps are written as stored, a new one `required` and unanswered
+    ///   (`editAttendeesJSON`, #622);
     /// - a new description of an online meeting replaces only the notes in the
     ///   stored body, keeping its join section (`onlineMeetingBody`, #511); the
     ///   description the assistant read is those notes (`notes(of:)`).
@@ -749,7 +750,10 @@ actor ExchangeCalendarProvider: CalendarProvider {
             sparse.endDateTime = merged.endDateTime
             sparse.endTimeZone = merged.endTimeZone
         }
-        var json = toGraphEventJSON(sparse, attendeeTypes: existing.attendeeTypes)
+        var json = toGraphEventJSON(sparse)
+        if let wanted = sparse.attendees {
+            json["attendees"] = Self.editAttendeesJSON(stored: existing.raw["attendees"] as? [[String: Any]] ?? [], wanted: wanted)
+        }
         if allowRecurrence, sparse.recurrence == nil, movesTime,
            var stored = existing.raw["recurrence"] as? [String: Any],
            var range = stored["range"] as? [String: Any],
@@ -763,6 +767,29 @@ actor ExchangeCalendarProvider: CalendarProvider {
             json["body"] = body
         }
         return json
+    }
+
+    /// The status a new attendee is written with: unanswered, with no response time (the form
+    /// measured accepted on an Outlook.com account, #622).
+    nonisolated static var unansweredAttendeeStatus: [String: Any] { ["response": "none", "time": "0001-01-01T00:00:00Z"] }
+
+    /// The attendee list an edit writes when it changes who attends (#622): each attendee it
+    /// keeps exactly as the edit's read holds them (type, answer and name, matched by address in
+    /// any letter case), in the order the edit asks for; each one it adds as `required` and
+    /// unanswered. Measured on an Outlook.com account: Graph refuses with 405 an attendee list
+    /// in which any entry has no `status`, and an attendee sent with their stored status keeps
+    /// their answer.
+    nonisolated static func editAttendeesJSON(stored: [[String: Any]], wanted: [(email: String, name: String?)]) -> [[String: Any]] {
+        wanted.map { want in
+            if let kept = stored.first(where: {
+                (($0["emailAddress"] as? [String: Any])?["address"] as? String)?.lowercased() == want.email.lowercased()
+            }) {
+                return kept
+            }
+            var address: [String: Any] = ["address": want.email]
+            if let name = want.name { address["name"] = name }
+            return ["emailAddress": address, "type": "required", "status": unansweredAttendeeStatus]
+        }
     }
 
     /// The `body` a description edit of an online meeting writes: the stored HTML
