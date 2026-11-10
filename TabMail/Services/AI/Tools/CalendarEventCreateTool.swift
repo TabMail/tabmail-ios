@@ -41,7 +41,7 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
 
         // Resolve start date
         let startDate: Date
-        if !startIso.isEmpty, let parsed = EKEventStoreHelper.parseNaiveISO(startIso, timeZone: tz) {
+        if !startIso.isEmpty, let parsed = CalendarToolHelpers.toolInstant(startIso, timeZone: tz, allDay: allDay == true) {
             startDate = parsed
         } else {
             startDate = Date()
@@ -72,7 +72,7 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         // mirror image would be normalising every all-day end by +1 day, which would
         // silently extend every explicit range the agent already computed correctly.
         let endDate: Date
-        if !endIso.isEmpty, let parsed = EKEventStoreHelper.parseNaiveISO(endIso, timeZone: tz) {
+        if !endIso.isEmpty, let parsed = CalendarToolHelpers.toolInstant(endIso, timeZone: tz, allDay: allDay == true) {
             endDate = parsed
         } else if allDay == true {
             // Default = ONE day, which under the half-open convention is the next

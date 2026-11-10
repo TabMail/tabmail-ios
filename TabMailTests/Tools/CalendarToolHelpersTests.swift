@@ -74,6 +74,57 @@ struct CalendarToolHelpersArgTests {
 @Suite("CalendarToolHelpers buildGCalEventInput")
 struct CalendarToolHelpersBuildInputTests {
 
+    /// The tool boundary reads a start one way: an offset spelling names the instant it spells, one
+    /// without names the wall time in the edit's zone, and either is handed on spelled with that
+    /// zone's offset, so its wall time is the instant's wall time in the zone it is labelled with.
+    @Test("A start and end spelled with or without an offset are handed on at the instant they name, in the edit's zone",
+          arguments: StartSpelling.allCases, ["America/Los_Angeles", "Pacific/Kiritimati", "UTC"])
+    func spelledStartIsReadOnce(_ spelling: StartSpelling, _ zoneId: String) throws {
+        let zone = try #require(TimeZone(identifier: zoneId))
+        let start = try #require(Date.fromISO8601("2099-03-02T07:30:00Z"))
+        let input = try CalendarToolHelpers.buildGCalEventInput([
+            "start_iso": .string(spelling.spell(start, label: zoneId)),
+            "end_iso": .string(spelling.spell(start.addingTimeInterval(1_800), label: zoneId)),
+            "timezone": .string(zoneId),
+        ], isAllDay: false)
+        #expect(input.startDateTime == start.iso8601String(timeZone: zone))
+        #expect(input.endDateTime == start.addingTimeInterval(1_800).iso8601String(timeZone: zone))
+    }
+
+    /// A timed start and end spelled as a bare date are midnight in the edit's zone, handed on
+    /// spelled with that zone's offset.
+    @Test("A timed start and end spelled as a bare date are midnight in the edit's zone",
+          arguments: ["America/Los_Angeles", "Pacific/Kiritimati", "UTC"])
+    func timedBareDateIsMidnightInZone(_ zoneId: String) throws {
+        let zone = try #require(TimeZone(identifier: zoneId))
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = zone
+        let start = try #require(cal.date(from: DateComponents(year: 2099, month: 3, day: 2)))
+        let end = try #require(cal.date(from: DateComponents(year: 2099, month: 3, day: 3)))
+        let input = try CalendarToolHelpers.buildGCalEventInput([
+            "start_iso": .string("2099-03-02"),
+            "end_iso": .string("2099-03-03"),
+            "timezone": .string(zoneId),
+        ], isAllDay: false)
+        #expect(input.startDateTime == start.iso8601String(timeZone: zone))
+        #expect(input.endDateTime == end.iso8601String(timeZone: zone))
+        #expect(input.startDate == nil)
+    }
+
+    /// An all-day start and end are plain dates: the date spelled, whatever offset follows it.
+    @Test("An all-day start and end spelled with a time and an offset keep the spelled dates",
+          arguments: AllDaySpelling.allCases)
+    func allDaySpelledDateIsKept(_ spelling: AllDaySpelling) throws {
+        let input = try CalendarToolHelpers.buildGCalEventInput([
+            "start_iso": .string(spelling.spell(AllDaySpelling.day)),
+            "end_iso": .string(spelling.spell(AllDaySpelling.nextDay)),
+            "timezone": .string(AllDaySpelling.label),
+        ], isAllDay: true)
+        #expect(input.startDate == AllDaySpelling.day)
+        #expect(input.endDate == AllDaySpelling.nextDay)
+        #expect(input.startDateTime == nil)
+    }
+
     @Test("Sets summary from title argument")
     func setsSummary() throws {
         let args: [String: JSONValue] = ["title": .string("Team Standup")]

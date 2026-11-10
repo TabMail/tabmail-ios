@@ -558,6 +558,22 @@ struct GoogleCalendarSplitHelpersTests {
         #expect(fromStart.endDateTime == "2099-03-02T15:00:00+09:00")
     }
 
+    /// A start alone keeps the event's length. However the assistant spells the start, the merged
+    /// start is the instant it names and the end is that instant plus the length.
+    @Test("a start-only move spelled with or without an offset keeps the event's length",
+          arguments: StartSpelling.allCases)
+    func startOnlyMoveBySpelledStart(_ spelling: StartSpelling) throws {
+        let existing = Self.tokyoEvent(recurrence: nil)
+        let newStart = try #require(Date.fromISO8601("2099-03-02T23:30:00+09:00"))
+        let patch = try CalendarToolHelpers.buildGCalEventInput([
+            "start_iso": .string(spelling.spell(newStart, label: "Asia/Tokyo")),
+            "timezone": .string("Asia/Tokyo"),
+        ], isAllDay: false)
+        let merged = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: existing, patch: patch)
+        #expect(merged.startDateTime.flatMap(Date.fromISO8601) == newStart, "start \(merged.startDateTime ?? "nil")")
+        #expect(merged.endDateTime.flatMap(Date.fromISO8601) == newStart.addingTimeInterval(3_600), "end \(merged.endDateTime ?? "nil")")
+    }
+
     @Test("mergeMasterAndPatch falls back to newRecurrence when patch.recurrence is nil")
     func mergeMasterAndPatchFallsBackToDefault() {
         let master = GCalEvent(

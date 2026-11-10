@@ -813,8 +813,7 @@ enum CalendarToolHelpers {
         // Start
         if let startIso = stringArgOpt(arguments, "start_iso") {
             if isAllDay == true {
-                // All-day: use date-only format (YYYY-MM-DD)
-                input.startDate = String(startIso.prefix(10))
+                input.startDate = toolAllDayDate(startIso)
             } else {
                 input.startDateTime = toRFC3339(startIso, timeZone: resolvedTz)
                 input.startTimeZone = tz
@@ -824,7 +823,7 @@ enum CalendarToolHelpers {
         // End
         if let endIso = stringArgOpt(arguments, "end_iso") {
             if isAllDay == true {
-                input.endDate = String(endIso.prefix(10))
+                input.endDate = toolAllDayDate(endIso)
             } else {
                 input.endDateTime = toRFC3339(endIso, timeZone: resolvedTz)
                 input.endTimeZone = tz
@@ -1227,19 +1226,49 @@ enum CalendarToolHelpers {
         }
     }
 
-    /// Convert a naive ISO string (yyyy-MM-dd'T'HH:mm:ss) to RFC 3339 with timezone offset.
-    private static func toRFC3339(_ naiveISO: String, timeZone: TimeZone) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
-        fmt.timeZone = timeZone
-        guard let date = fmt.date(from: naiveISO) else {
-            // Try date-only
-            fmt.dateFormat = "yyyy-MM-dd"
-            guard let dateOnly = fmt.date(from: naiveISO) else { return naiveISO }
-            return dateOnly.iso8601String(timeZone: timeZone)
-        }
+    /// A tool start or end as RFC 3339 in `timeZone`: the instant `toolInstant` reads, spelled with
+    /// `timeZone`'s offset, so the wall time before the offset is the wall time in the zone the
+    /// value is labelled with. Every later reader (the Graph write, the end of a start-only move,
+    /// a weekly rule's weekday, the CalDAV lines) then reads the same instant. A value in no form
+    /// `toolInstant` reads is passed on as given.
+    private static func toRFC3339(_ iso: String, timeZone: TimeZone) -> String {
+        guard let date = toolInstant(iso, timeZone: timeZone) else { return iso }
         return date.iso8601String(timeZone: timeZone)
     }
+
+    /// The instant a calendar tool's `start_iso` or `end_iso` names. The tools ask for a wall time
+    /// without an offset, read in `timeZone` (the edit's `timezone`, else the device's), with or
+    /// without seconds, or a date alone (midnight there). A value spelled with a UTC offset or `Z`
+    /// (`…Z`, `…+00:00`, `….000Z`, with or without seconds) names the instant it spells, as Google
+    /// Calendar reads it, whatever the label. nil for any other form.
+    ///
+    /// `allDay`: an all-day value is a plain calendar date with no zone, so it is the date as
+    /// spelled (`toolAllDayDate`), at midnight in `timeZone`, never the day an offset's instant
+    /// falls on there.
+    static func toolInstant(_ iso: String, timeZone: TimeZone, allDay: Bool = false) -> Date? {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.calendar = Calendar(identifier: .gregorian)
+        fmt.timeZone = timeZone
+        if allDay {
+            fmt.dateFormat = "yyyy-MM-dd"
+            return fmt.date(from: toolAllDayDate(iso))
+        }
+        for format in toolWallTimeFormats {
+            fmt.dateFormat = format
+            if let date = fmt.date(from: iso) { return date }
+        }
+        if let date = Date.fromISO8601(iso) { return date }
+        fmt.dateFormat = "yyyy-MM-dd'T'HH:mmXXXXX"
+        return fmt.date(from: iso)
+    }
+
+    /// The calendar date an all-day `start_iso` or `end_iso` spells: the date itself, or the first
+    /// ten characters of a date-time, whatever offset follows.
+    static func toolAllDayDate(_ iso: String) -> String { String(iso.prefix(10)) }
+
+    /// The offset-free forms `toolInstant` reads in the label's zone, longest first.
+    private static let toolWallTimeFormats = ["yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd"]
 
     // MARK: - Attendee Delta (calendar_event_edit-v1.5.21)
 

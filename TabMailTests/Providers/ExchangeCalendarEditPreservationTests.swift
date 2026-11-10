@@ -360,6 +360,17 @@ enum GraphFixture {
         return fmt.date(from: String(wall.prefix(16))).map(deviceDay)
     }
 
+    /// The instant a stored Graph `start` or `end` names: its wall time read in its label.
+    static func instant(_ side: [String: Any]?) -> Date? {
+        guard let wall = side?["dateTime"] as? String, let zone = side?["timeZone"] as? String,
+              let tz = TimeZone(identifier: zone) else { return nil }
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = tz
+        fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        return fmt.date(from: String(wall.prefix(19)))
+    }
+
     static func weekday(_ date: Date) -> String {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = utc
@@ -600,21 +611,48 @@ enum OffsetSpelledMove: String, CaseIterable, CustomTestStringConvertible, Senda
     var movesDate: Bool { self != .laterSameDay }
 }
 
-/// How the tools may spell that new start and pass it through as given: with a
-/// UTC offset, or without seconds (bare or with `Z`).
+/// How the assistant may spell a start or end it hands the calendar tools: the
+/// asked-for wall time without an offset (with or without seconds), read in the
+/// edit's zone, or a time with a UTC offset or `Z`, which names the instant it
+/// spells (as Google Calendar reads it) whatever zone the edit is labelled with.
 enum StartSpelling: String, CaseIterable, CustomTestStringConvertible, Sendable {
-    case z = "Z", fractionZ = ".000Z", plusZero = "+00:00", noSeconds = "HH:mm", noSecondsZ = "HH:mmZ"
+    case z = "Z", fractionZ = ".000Z", plusZero = "+00:00", noSecondsZ = "HH:mmZ"
+    case plusFourteen = "+14:00", noSecondsPlusFourteen = "HH:mm+14:00"
+    case naive = "HH:mm:ss", noSeconds = "HH:mm"
 
     var testDescription: String { rawValue }
 
-    /// `wall` (`yyyy-MM-dd'T'HH:mm:ss`) spelled this way.
-    func spell(_ wall: String) -> String {
+    /// `instant` spelled this way, for an edit labelled with `zone`.
+    func spell(_ instant: Date, label zone: String) -> String {
+        let utc = GraphFixture.naive(instant)
+        let farEast = GraphFixture.wall(instant, in: GraphFixture.farEast)
+        let wall = GraphFixture.wall(instant, in: zone)
         switch self {
-        case .z, .fractionZ, .plusZero: wall + rawValue
-        case .noSeconds: String(wall.prefix(16))
-        case .noSecondsZ: String(wall.prefix(16)) + "Z"
+        case .z, .fractionZ, .plusZero: return utc + rawValue
+        case .noSecondsZ: return String(utc.prefix(16)) + "Z"
+        case .plusFourteen: return farEast + "+14:00"
+        case .noSecondsPlusFourteen: return String(farEast.prefix(16)) + "+14:00"
+        case .naive: return wall
+        case .noSeconds: return String(wall.prefix(16))
         }
     }
+}
+
+/// An all-day date the assistant spells with a time and an offset whose instant falls on
+/// another calendar day in the edit's zone (`label`), on either side of midnight. An all-day
+/// value is a plain date with no zone, so the date is the one spelled.
+enum AllDaySpelling: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    /// Midnight UTC is the evening before in Los Angeles.
+    case eastOfLabel = "T00:00:00Z"
+    /// 23:30 at UTC-10 is the next morning in Los Angeles.
+    case westOfLabel = "T23:30:00-10:00"
+
+    var testDescription: String { rawValue }
+    static let label = "America/Los_Angeles"
+    static let day = "2099-05-20"
+    static let nextDay = "2099-05-21"
+
+    func spell(_ day: String) -> String { day + rawValue }
 }
 
 /// Every property a user can see on an Outlook event and an edit must not touch
@@ -936,9 +974,8 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(range?["startDate"] as? String == GraphFixture.deviceDay(to))
     }
 
-    /// The tools pass a start they cannot read through as given, so a start can
-    /// arrive without an offset or seconds (`…T10:00`). It is read like any other
-    /// start: the wall time in its label, dated on the device.
+    /// A start written without an offset or seconds (`…T10:00`) is the wall time in
+    /// the edit's zone, dated on the device like any other start.
     @Test("a whole series moved to another date by a start written without an offset keeps its recurrence at the new date")
     func wholeSeriesMovedByNaiveStart() async throws {
         let http = FakeHTTP.Scenario()
@@ -947,11 +984,11 @@ struct ExchangeCalendarEditPreservationTests {
         graph.install(on: http)
         let before = try #require(graph.event("ser-1"))
         let newStart = GraphFixture.start.addingTimeInterval(7 * 86_400)
-        var patch = GCalEventInput()
-        patch.startDateTime = String(GraphFixture.naive(newStart).prefix(16))
-        patch.startTimeZone = "UTC"
-        patch.endDateTime = String(GraphFixture.naive(newStart.addingTimeInterval(1_800)).prefix(16))
-        patch.endTimeZone = "UTC"
+        let patch = try CalendarToolHelpers.buildGCalEventInput([
+            "start_iso": .string(String(GraphFixture.naive(newStart).prefix(16))),
+            "end_iso": .string(String(GraphFixture.naive(newStart.addingTimeInterval(1_800)).prefix(16))),
+            "timezone": .string("UTC"),
+        ], isAllDay: false)
 
         _ = try await makeProvider(http).updateEvent(eventId: "ser-1", event: patch)
 
@@ -962,11 +999,11 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(canonical(now["pattern"]) == canonical((before["recurrence"] as? [String: Any])?["pattern"]), "the move changed the pattern")
     }
 
-    /// The tools pass a start spelled with an offset, or without seconds, through
-    /// as given and label it with the edit's zone, and Graph stores the wall time
-    /// in that zone. The series' date is that stored start's, read on the device:
-    /// a move within the device's day writes no recurrence, and a move to another
-    /// day writes the range at that day.
+    /// A start the assistant spells with an offset names that instant, and one
+    /// without names the wall time in the edit's zone: Graph stores that instant,
+    /// and the series' date is that stored start's, read on the device. A move
+    /// within the device's day writes no recurrence, and a move to another day
+    /// writes the range at that day.
     @Test("a series moved by a start spelled with an offset or without seconds is dated where Graph stores it",
           arguments: OffsetSpelledMove.allCases, StartSpelling.allCases)
     func seriesMovedByOffsetSpelledStart(_ move: OffsetSpelledMove, _ spelling: StartSpelling) async throws {
@@ -977,8 +1014,8 @@ struct ExchangeCalendarEditPreservationTests {
         graph.install(on: http)
         let zone = GraphFixture.farEast
         let patch = try CalendarToolHelpers.buildGCalEventInput([
-            "start_iso": .string(spelling.spell(GraphFixture.wall(move.newStart, in: zone))),
-            "end_iso": .string(spelling.spell(GraphFixture.wall(move.newStart.addingTimeInterval(1_800), in: zone))),
+            "start_iso": .string(spelling.spell(move.newStart, label: zone)),
+            "end_iso": .string(spelling.spell(move.newStart.addingTimeInterval(1_800), label: zone)),
             "timezone": .string(zone),
         ], isAllDay: false)
 
@@ -986,6 +1023,9 @@ struct ExchangeCalendarEditPreservationTests {
 
         let after = try #require(graph.event("ser-z"))
         let start = try #require(after["start"] as? [String: Any])
+        #expect(GraphFixture.instant(start) == move.newStart,
+                "Graph stores \(start["dateTime"] as? String ?? "none") in \(start["timeZone"] as? String ?? "none"), the user moved it to \(move.newStart)")
+        #expect(GraphFixture.instant(after["end"] as? [String: Any]) == move.newStart.addingTimeInterval(1_800), "the end is not the one given")
         let storedDay = try #require(GraphFixture.deviceDay(wall: start["dateTime"] as? String ?? "",
                                                             in: start["timeZone"] as? String ?? ""))
         let seriesDay = GraphFixture.deviceDay(seriesStart)
@@ -1000,6 +1040,36 @@ struct ExchangeCalendarEditPreservationTests {
         let range = (after["recurrence"] as? [String: Any])?["range"] as? [String: Any]
         #expect(range?["startDate"] as? String == storedDay,
                 "the range starts on \(range?["startDate"] as? String ?? "none"), the series on \(storedDay)")
+    }
+
+    /// "move it to 23:30": a start alone keeps the event's length. However the start
+    /// is spelled, Graph stores the instant it names, and the end is that instant
+    /// plus the length, so the end never lands before the start or hours late.
+    @Test("an event moved by a start alone, spelled with or without an offset, starts there and keeps its length",
+          arguments: StartSpelling.allCases)
+    func startOnlyMoveBySpelledStart(_ spelling: StartSpelling) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = GraphFixture.calendar()
+        graph.install(on: http)
+        let before = try #require(graph.event("ev-plain"))
+        let length = try #require(GraphFixture.instant(before["end"] as? [String: Any])).timeIntervalSince(
+            try #require(GraphFixture.instant(before["start"] as? [String: Any])))
+        let newStart = GraphFixture.onDevice(days: 1, hour: 23).addingTimeInterval(1_800)
+        let patch = try CalendarToolHelpers.buildGCalEventInput([
+            "start_iso": .string(spelling.spell(newStart, label: GraphFixture.farEast)),
+            "timezone": .string(GraphFixture.farEast),
+        ], isAllDay: false)
+
+        _ = try await makeProvider(http).updateEvent(eventId: "ev-plain", event: patch)
+
+        let after = try #require(graph.event("ev-plain"))
+        let start = after["start"] as? [String: Any]
+        let end = after["end"] as? [String: Any]
+        #expect(GraphFixture.instant(start) == newStart,
+                "Graph stores \(start?["dateTime"] as? String ?? "none") in \(start?["timeZone"] as? String ?? "none"), the user moved it to \(newStart)")
+        #expect(GraphFixture.instant(end) == newStart.addingTimeInterval(length),
+                "the end is \(end?["dateTime"] as? String ?? "none") in \(end?["timeZone"] as? String ?? "none"), not the start plus the event's length")
     }
 
     @Test("an all-day series moved to another date moves its range's start date with it")
@@ -1024,6 +1094,32 @@ struct ExchangeCalendarEditPreservationTests {
         #expect(((after["start"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(newDay) == true, "the series did not move")
         #expect(((after["end"] as? [String: Any])?["dateTime"] as? String)?.hasPrefix(newEndDay) == true,
                 "the end did not move with the start, is \((after["end"] as? [String: Any])?["dateTime"] as? String ?? "none")")
+        #expect(after["isAllDay"] as? Bool == true, "the series stopped being all day")
+    }
+
+    /// An all-day edit is dated as spelled, never by the day an offset's instant falls on in
+    /// the edit's zone: Graph stores the spelled day, midnight to midnight.
+    @Test("an all-day series moved by a date spelled with a time and an offset lands on the spelled date",
+          arguments: AllDaySpelling.allCases)
+    func allDaySeriesMovedBySpelledDate(_ spelling: AllDaySpelling) async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let graph = FakeGraphCalendar([GraphFixture.event(id: "ser-ad", online: false, recurring: true, allDay: true)])
+        graph.install(on: http)
+        let patch = try CalendarToolHelpers.buildGCalEventInput([
+            "start_iso": .string(spelling.spell(AllDaySpelling.day)),
+            "end_iso": .string(spelling.spell(AllDaySpelling.nextDay)),
+            "timezone": .string(AllDaySpelling.label),
+        ], isAllDay: true)
+
+        _ = try await makeProvider(http).updateEvent(eventId: "ser-ad", event: patch)
+
+        let after = try #require(graph.event("ser-ad"))
+        let start = (after["start"] as? [String: Any])?["dateTime"] as? String
+        let end = (after["end"] as? [String: Any])?["dateTime"] as? String
+        #expect(start?.hasPrefix(AllDaySpelling.day) == true, "the series starts on \(start ?? "none"), spelled \(AllDaySpelling.day)")
+        #expect(end?.hasPrefix(AllDaySpelling.nextDay) == true, "the series ends on \(end ?? "none"), spelled \(AllDaySpelling.nextDay)")
+        #expect(((after["recurrence"] as? [String: Any])?["range"] as? [String: Any])?["startDate"] as? String == AllDaySpelling.day)
         #expect(after["isAllDay"] as? Bool == true, "the series stopped being all day")
     }
 
