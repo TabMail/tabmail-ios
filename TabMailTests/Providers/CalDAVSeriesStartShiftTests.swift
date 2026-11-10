@@ -183,6 +183,10 @@ struct CalDAVSeriesStartShiftTests {
         let nextDay = try CalDAVProvider.mergePatchIntoICS(
             ics, patch: Self.timedPatch(start: "2099-03-03T10:00:00-08:00", end: "2099-03-03T11:00:00-08:00"))
         #expect(nextDay.contains("RRULE:FREQ=WEEKLY;UNTIL=20990331"))
+        // 23 hours later, on the next day: a day, not a duration rounded down.
+        let nextDayEarlier = try CalDAVProvider.mergePatchIntoICS(
+            ics, patch: Self.timedPatch(start: "2099-03-03T09:00:00-08:00", end: "2099-03-03T10:00:00-08:00"))
+        #expect(nextDayEarlier.contains("RRULE:FREQ=WEEKLY;UNTIL=20990331"))
     }
 
     @Test("An RRULE the patch writes is kept as written; the other values still move")
@@ -203,11 +207,13 @@ struct CalDAVSeriesStartShiftTests {
             "RRULE:FREQ=WEEKLY;COUNT=5",
             "RDATE;TZID=America/Vancouver:20990305T100000",
             "RDATE;VALUE=PERIOD:20990306T180000Z/20990306T190000Z,20990307T180000Z/PT1H",
+            "RDATE;VALUE=PERIOD:20990305T180000Z/+PT1H",
         ])
         let merged = try CalDAVProvider.mergePatchIntoICS(
             ics, patch: Self.timedPatch(start: "2099-03-02T15:00:00-08:00", end: "2099-03-02T16:00:00-08:00"))
         #expect(merged.contains("RDATE;TZID=America/Vancouver:20990305T150000"))
         #expect(merged.contains("RDATE;VALUE=PERIOD:20990306T230000Z/20990307T000000Z,20990307T230000Z/PT1H"))
+        #expect(merged.contains("RDATE;VALUE=PERIOD:20990305T230000Z/+PT1H"))
         #expect(merged.contains("RRULE:FREQ=WEEKLY;COUNT=5"))
     }
 
@@ -291,6 +297,71 @@ struct CalDAVSeriesStartShiftTests {
         #expect(merged.contains("DTSTART;TZID=America/Vancouver:20990302T150000"))
         #expect(merged.contains("EXDATE;TZID=America/Vancouver:20990316T150000"))
         #expect(merged.contains("RECURRENCE-ID;TZID=America/Vancouver:20990323T150000"))
+    }
+
+    @Test("Moving a series into another zone moves its UTC values through their instants")
+    func crossZoneMoveConvertsThroughInstants() throws {
+        // A New York series (10:00 EST, then EDT from 03-08) moved to 09:00 in Vancouver.
+        let ics = Self.series(
+            master: [
+                "DTSTART;TZID=America/New_York:20990302T100000",
+                "DTEND;TZID=America/New_York:20990302T110000",
+                "RRULE:FREQ=WEEKLY;UNTIL=20990330T140000Z",
+                "EXDATE:20990316T140000Z",
+            ],
+            override: [
+                "RECURRENCE-ID:20990323T140000Z",
+                "DTSTART;TZID=America/New_York:20990323T113000",
+                "DTEND;TZID=America/New_York:20990323T123000",
+            ],
+            timezone: false)
+        #expect(try SeriesOracle.states(ics) == Self.shown, "non-vacuity: the fixture reads as intended")
+        let merged = try CalDAVProvider.mergePatchIntoICS(
+            ics, patch: Self.timedPatch(start: "2099-03-02T09:00:00-08:00", end: "2099-03-02T10:00:00-08:00"))
+        #expect(merged.contains("DTSTART;TZID=America/Vancouver:20990302T090000"), "non-vacuity: the zone changed")
+        #expect(try SeriesOracle.states(merged) == Self.shown)
+        // 09:00 PDT is 16:00 UTC; the same wall-clock shift without the zones would give 13:00.
+        #expect(merged.contains("UNTIL=20990330T160000Z"))
+        #expect(merged.contains("EXDATE:20990316T160000Z"))
+        #expect(merged.contains("RECURRENCE-ID:20990323T160000Z"))
+    }
+
+    @Test("A UTC value moved by a week across a daylight-saving change keeps its wall clock in the series' zone")
+    func utcValueAcrossDaylightSaving() throws {
+        // The first occurrence (10:00 PST, 18:00 UTC) is deleted; a week later it is 10:00 PDT.
+        let ics = Self.series(
+            master: [
+                "DTSTART;TZID=America/Vancouver:20990302T100000",
+                "DTEND;TZID=America/Vancouver:20990302T110000",
+                "RRULE:FREQ=WEEKLY;UNTIL=20990330T170000Z",
+                "EXDATE;TZID=America/Vancouver:20990316T100000",
+                "EXDATE:20990302T180000Z",
+            ],
+            override: [
+                "RECURRENCE-ID;TZID=America/Vancouver:20990323T100000",
+                "DTSTART;TZID=America/Vancouver:20990323T113000",
+                "DTEND;TZID=America/Vancouver:20990323T123000",
+            ])
+        let states: [SeriesOracle.State] = [.deleted, .shown, .deleted, .changed, .shown]
+        #expect(try SeriesOracle.states(ics) == states, "non-vacuity")
+        let merged = try CalDAVProvider.mergePatchIntoICS(
+            ics, patch: Self.timedPatch(start: "2099-03-09T10:00:00-07:00", end: "2099-03-09T11:00:00-07:00"))
+        #expect(merged.contains("EXDATE:20990309T170000Z"))
+        #expect(try SeriesOracle.states(merged) == states)
+    }
+
+    @Test("A start this code cannot read refuses the edit instead of moving nothing")
+    func unreadableStartIsRefused() throws {
+        let ics = Self.series(master: [
+            "DTSTART;TZID=America/Vancouver:20990302T1000",
+            "DTEND;TZID=America/Vancouver:20990302T110000",
+            "RRULE:FREQ=WEEKLY;UNTIL=20990330T170000Z",
+            "EXDATE;TZID=America/Vancouver:20990316T100000",
+        ])
+        #expect(throws: CalendarProviderError.self) {
+            _ = try CalDAVProvider.mergePatchIntoICS(
+                ics, patch: Self.timedPatch(start: "2099-03-02T15:00:00-08:00", end: "2099-03-02T16:00:00-08:00"))
+        }
     }
 
     @Test("A value that would need an unknown zone to move is refused, never written at the old time")
