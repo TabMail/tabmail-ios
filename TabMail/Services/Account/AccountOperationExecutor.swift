@@ -545,7 +545,8 @@ final class AccountOperationExecutor {
 
         do {
             // The HTTP layer sees the same deadline, so a refusal received in
-            // time is returned rather than retried past it (`HTTPDeadline`).
+            // time is returned rather than retried past it, unless a retry runs
+            // slower than the request before it (`HTTPDeadline`).
             let deadline = ContinuousClock.now + .seconds(SyncConfig.pendingOperationTimeoutSeconds)
             let executed = try await withTimeout(
                 seconds: SyncConfig.pendingOperationTimeoutSeconds

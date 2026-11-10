@@ -678,6 +678,7 @@ struct GraphThrottlingTests {
             }
             #expect(yielded == ids.count, "\(stream)")
             #expect(meter.peak == GraphConfig.bodyFetchConcurrency, "\(stream)")
+            #expect(meter.peak < Self.graphDocumentedConcurrentRequests, "\(stream) leaves room under the mailbox limit")
             #expect(meter.total == ids.count, "\(stream)")
         }
     }

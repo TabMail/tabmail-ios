@@ -41,8 +41,9 @@ enum HTTPConfig {
 /// its wait plus one more request (as long as the one just answered took, slot
 /// wait included) ends before it, and otherwise returns the refusal it holds, so
 /// a refusal received in time reaches the caller as a refusal rather than being
-/// cut off by the caller's timeout. A request still on the wire when the
-/// deadline passes has an unknown outcome, and the caller's timeout handles it.
+/// cut off by the caller's timeout, as long as the next request is no slower than
+/// the last one. A retry that runs slower, and any request still on the wire when
+/// the deadline passes, has an unknown outcome, and the caller's timeout handles it.
 /// Nil (sync passes, the notification service extension) leaves only
 /// `HTTPConfig.retryWaitBudgetSeconds`.
 enum HTTPDeadline {

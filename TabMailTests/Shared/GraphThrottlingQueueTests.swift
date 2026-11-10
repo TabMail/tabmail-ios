@@ -13,9 +13,9 @@ import Testing
 ///
 /// - a queued action runs under `SyncConfig.pendingOperationTimeoutSeconds`; a
 ///   refusal the HTTP layer receives in time reaches the queue as a refusal
-///   (`retryCount` charged, the intention kept), however slowly each refusal
-///   arrives, and a request still on the wire at the deadline is an uncounted
-///   timeout with the intention kept;
+///   (`retryCount` charged, the intention kept) as long as each retry is no
+///   slower than the request before it, and a request still on the wire at the
+///   deadline is an uncounted timeout with the intention kept;
 /// - a persisted send refused with 429 or 503 stays queued with its content whole,
 ///   no strike and no acceptance stamp, and goes out once the server accepts it;
 ///   a 500 is a strike;
