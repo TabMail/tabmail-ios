@@ -466,7 +466,7 @@ actor CalDAVProvider: CalendarProvider {
         let etag = getResponse.value(forHTTPHeaderField: "ETag")
 
         // 2. Parse the original RRULE so we can build the capped variant + the
-        //    new-series RRULE (without UNTIL/COUNT).
+        //    new-series RRULE (the original end carried over).
         guard let originalRRule = Self.extractRRule(from: masterICS) else {
             throw CalendarProviderError.notSupported("Master event has no RRULE; can't split.")
         }
@@ -501,6 +501,19 @@ actor CalDAVProvider: CalendarProvider {
                 "Could not express recurrence_id '\(recurrenceId)' (\(recurrenceIdZone.identifier)) in this event's timezone — refusing to split a series at an occurrence we cannot name."
             )
         }
+        // The new series ends where the original one did: the same UNTIL, or
+        // what is left of its COUNT. Worked out here, before the cap PUT in
+        // step 3, so a split the series cannot take (it already ends before the
+        // split, or its COUNT cannot be counted) is refused with nothing written.
+        // A patch that brings its own recurrence is still written as given
+        // (`buildNewSeriesInput` prefers it), but the check runs all the same:
+        // it is also what stops the cap from moving the end of a series that
+        // already ended before the split.
+        let newSeriesRRule = try RecurrenceTail.newSeriesRule(
+            from: originalRRule,
+            seriesStart: Self.masterDTStartDay(from: masterICS),
+            split: RecurrenceTail.Day(iso: masterFrameRecurrenceId),
+            capUntil: untilValue)
         let cappedRRule = GoogleCalendarProvider.replaceOrAppendUntil(in: originalRRule, untilValue: untilValue)
         let cappedICS = Self.replaceRRule(in: masterICS, newRRule: cappedRRule)
 
@@ -545,14 +558,13 @@ actor CalDAVProvider: CalendarProvider {
         //    below. Do not "fix" the comment by widening the precondition —
         //    that is a behaviour change with its own overwrite risk.
         let newUid = GoogleCalendarProvider.deterministicSplitEventId(masterId: eventId, recurrenceId: recurrenceId)
-        let rruleWithoutCap = GoogleCalendarProvider.stripUntilAndCount(originalRRule)
         let newSeriesInput: GCalEventInput
         do {
             newSeriesInput = try Self.buildNewSeriesInput(
                 masterICS: masterICS, patch: patch,
                 newStartNaiveISO: masterFrameRecurrenceId,
                 newStartZone: recurrenceIdZone,
-                newRRule: rruleWithoutCap
+                newRRule: newSeriesRRule
             )
         } catch {
             // Couldn't construct the new series — revert the master cap before
@@ -621,7 +633,7 @@ actor CalDAVProvider: CalendarProvider {
         return GCalEvent(
             id: newEventURL.path, summary: newSeriesInput.summary, location: newSeriesInput.location,
             description: newSeriesInput.description, start: nil, end: nil, attendees: nil,
-            organizer: nil, recurrence: [rruleWithoutCap], transparency: newSeriesInput.transparency,
+            organizer: nil, recurrence: newSeriesInput.recurrence, transparency: newSeriesInput.transparency,
             status: "confirmed", htmlLink: nil, created: nil, updated: nil
         )
     }
@@ -770,6 +782,18 @@ actor CalDAVProvider: CalendarProvider {
     static func extractRRule(from ics: String) -> String? {
         for line in Self.masterVEventLines(from: ics) {
             if line.hasPrefix("RRULE:") { return line }
+        }
+        return nil
+    }
+
+    /// The MASTER VEVENT's DTSTART day as written, which is the day in the
+    /// frame its RRULE expands in (its TZID, UTC for a `Z` value, or floating).
+    /// Scoped like `icsIsAllDay` so a VTIMEZONE's DTSTART can't stand in for it.
+    static func masterDTStartDay(from ics: String) -> RecurrenceTail.Day? {
+        for line in Self.masterVEventLines(from: ics) {
+            guard line.uppercased().hasPrefix("DTSTART"), let colonIdx = line.firstIndex(of: ":") else { continue }
+            let value = String(line[line.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)
+            return RecurrenceTail.Day(ical: value)
         }
         return nil
     }
@@ -1597,7 +1621,7 @@ actor CalDAVProvider: CalendarProvider {
         out.location = patch.location ?? extractScalar(from: masterICS, key: "LOCATION")
         out.description = patch.description ?? extractScalar(from: masterICS, key: "DESCRIPTION")
         out.transparency = patch.transparency ?? extractScalar(from: masterICS, key: "TRANSP")
-        // Recurrence: caller's stripped-RRULE is the default, but if the LLM
+        // Recurrence: caller's new-series RRULE is the default, but if the LLM
         // asked for a different pattern on the new series via patch.recurrence,
         // honor that — matches Google/Exchange (mergeMasterAndPatch) and the
         // TB bridge.

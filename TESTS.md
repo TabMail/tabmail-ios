@@ -264,3 +264,18 @@ merge over a full Drafts page whose oldest draft is newer than the first save bu
 latest one. The placeholder is not on the page and its latest save is inside it, so sync removes it
 and the draft is not shown twice. The second case leaves the latest save queued: the same sync keeps
 the placeholder, because the queued save names it, and the sync after that save lands removes it.
+
+## Recurring series split — the new series' end
+
+`RecurrenceTailCountTests` checks `RecurrenceTail.occurrences` against the worked examples of
+RFC 5545 §3.8.5.3, whose occurrence lists are the oracle (the expected counts were also checked
+against python-dateutil), plus the edges the RFC states in prose and every rule shape the counter
+refuses, including INTERVAL above `RecurrenceTail.maxInterval` and BY values of `Int.min`, which would
+otherwise overflow or trap. `RecurrenceTailNewSeriesRuleTests` covers the rule a split's new series
+gets: COUNT reduced in place, a used-up or uncountable COUNT refused (the message names unreadable
+dates or the uncountable rule, whichever it was), an UNTIL at or after the split kept, one before it
+refused, a DATE UNTIL covering its whole day, and an UNTIL equal to the split's own cap read as a
+retry. `GoogleSplitSeriesTailTests` and `CalDAVSplitSeriesTailTests` drive the real providers on
+`FakeHTTP` with a series zoned to Pacific/Auckland at 07:00 and the split declared in UTC, so a rule
+read in the wrong frame counts other weekdays. A refused split sends no write: Google sends only the
+master GET, and CalDAV sends no PUT.
