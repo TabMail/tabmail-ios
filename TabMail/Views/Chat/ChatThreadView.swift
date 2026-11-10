@@ -581,10 +581,9 @@ struct ChatThreadView: View {
     }
 
     /// An email older than the newest `ChatViewConfig.summaryWindow` asks for its own summary when
-    /// it comes on screen, so scrolling up summarizes as it goes. Only once the open has asked for
-    /// the newest (before that, which emails are the newest is not known yet).
+    /// it comes on screen, so scrolling up summarizes as it goes. That includes an email on screen
+    /// as the chat lands: SwiftUI reports a view's visibility only when it changes.
     private func askAsShown(_ item: ChatThread.Item, in thread: ChatThread) {
-        guard didInitialScroll else { return }
         let items = thread.items
         guard let index = items.firstIndex(where: { $0.id == item.id }),
               index < items.count - ChatViewConfig.summaryWindow,
