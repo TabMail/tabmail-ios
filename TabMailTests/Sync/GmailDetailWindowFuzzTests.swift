@@ -38,7 +38,9 @@ import Testing
 ///    never a cancellation; a cancelled fetch never returns success, and with
 ///    no failing id it throws its cancellation.
 /// 5. **Termination**: the fetch returns within a bound, nothing it started
-///    is still in flight afterwards, and nothing more reaches the server.
+///    is still in flight afterwards, and nothing more reaches the server
+///    (after a failure or a cancellation, at most the gate's width of gets
+///    already on their way when they were cancelled; see `run`).
 /// 6. **Gate reuse**: afterwards a full width of gets is in flight together.
 ///
 /// Knobs (`TEST_RUNNER_` prefix on the CLI, so they reach the simulator-hosted
@@ -376,8 +378,17 @@ struct GmailDetailWindowFuzzTests {
         }
         if !drained { report.violations.append("\(wire.active) gets were still in flight after the fetch returned") }
         try? await Task.sleep(for: .milliseconds(FuzzConfig.quietAfterReturnMilliseconds))
-        if wire.arrivals != arrivalsAtReturn {
-            report.violations.append("\(wire.arrivals - arrivalsAtReturn) gets reached the server after the fetch returned")
+        // The wire counts a get when the URL loader calls `startLoading`, on its
+        // own thread. A get the fetch had already handed to URLSession when a
+        // failure or a cancellation cancelled it can therefore be counted after
+        // the fetch returned, although its call ended before the return. So the
+        // count must stay put exactly when no get was cancelled (a fetch that
+        // succeeded), and otherwise may grow by at most the gate's width, the
+        // most gets that can be on their way when the fetch is cancelled.
+        let lateArrivals = wire.arrivals - arrivalsAtReturn
+        let cancelledGets = report.cancelApplied || (try? result.get()) == nil
+        if cancelledGets ? lateArrivals > width : lateArrivals != 0 {
+            report.violations.append("\(lateArrivals) gets reached the server after the fetch returned")
         }
 
         // 3 and 4. Results and throw semantics.
