@@ -411,3 +411,26 @@ when no conversion is needed, refused when one is).
 `CalDAVSeriesStartShiftWireTests` drives the same through `updateEvent` over
 the fake CalDAV store: a movable series lands whole in one `PUT`; an
 unmovable one is refused with no `PUT` and the server keeps the original.
+
+## Calendar edits keep the event's kind
+
+`CalendarEditKeepsKindTests.swift` drains real `.edit` rows through `AccountManager.drainCalendarQueue`.
+An edit that leaves `all_day` out keeps the event's kind: an all-day event given new dates stays all-day on
+those dates (a time of day in them is dropped), a start alone carries the end by whole days, and a timed
+event given a date alone stays timed at midnight. A stated `all_day` changes the kind either way. The Google
+and Outlook suites run the providers against stateful fakes on `FakeHTTP` (PATCH replaces the properties it
+names) and assert on the stored event, for a single event, one occurrence and, on Google, a split's new
+series. The CalDAV suite asserts on the stored `.ics`: a move lands as `VALUE=DATE` lines, and a split's new
+series starts on the date given; a start given alone moves `DTEND` with it, so an all-day event keeps its
+days and a timed one its length across the March daylight-saving change. `CalDAVSeriesStartShiftTests` checks
+the same on the merge alone, plus a `DTEND` in another zone from `DTSTART`, a `DURATION` master (no `DTEND`
+added), an end the patch gives (written as given, even over a `DTEND` that could not be moved), and a `DTEND`
+that cannot be read or converted (refused). An all-day edit whose end date is on or before its start date is
+refused before any write on every `edit_scope`, including a split's cap `PUT`, and retired with the reason.
+An end given alone is compared with the start the edit keeps: the stored start (a timed one's date included)
+on `all`, the occurrence's own date on `this_only` and `this_and_following`; a start the edit gives is what the
+end is compared with on every scope. An edit that gives no times
+still saves an all-day event stored with its end on its start. The queue suite counts
+`getEvent` calls: an edit that moves nothing and sets no UNTIL makes none, and a failed read on a move writes
+nothing and stays queued. `calendar_event_edit` refuses a stated `all_day: true` with a same-day end before
+its card, and does not refuse times of one day when `all_day` is not stated.
