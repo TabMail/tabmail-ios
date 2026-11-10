@@ -907,13 +907,31 @@ struct CalendarEditToolAllDayEndTests {
         }
     }
 
-    /// Runs the tool against a provider holding `event`; returns its output, the provider's writes,
-    /// the edits queued and the confirmation cards shown.
+    /// Runs the tool against a provider holding `event`, with the app's database installed (the
+    /// tool queues its edit there) and the account in it; returns its output, the provider's
+    /// writes, the edits left in the queue and the confirmation cards shown.
     private func run(_ arguments: [String: JSONValue], account: String, event: GCalEvent) async throws -> (out: String, writes: Int, queued: Int, cards: Int) {
         let mock = MockCalendarProvider()
         await mock.setGetEventResult(event)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        let pool = try DatabasePool(path: dir.appendingPathComponent("test.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        try await pool.write { db in
+            var acc = Account(emailAddress: "cal@example.com", displayName: "Cal", provider: .gmail)
+            acc.id = account
+            try acc.insert(db)
+        }
         await AccountManager.shared.registerCalendarProviderForTesting(accountId: account, provider: mock)
-        defer { Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: account) } }
+        defer {
+            Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: account) }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir)
+        }
         let db = try TestDatabase.make()
         var args = arguments
         args["event_id"] = .string(CompoundEventId.make(accountId: account, eventId: "ev-1"))
@@ -921,7 +939,7 @@ struct CalendarEditToolAllDayEndTests {
         let out = try await CalendarEventEditTool(context: ToolContext(db: db, translator: MockChatIdTranslator())).execute(
             arguments: args, invocation: ToolInvocation(uiSink: sink, sessionKey: "kind-tool-\(account)"))
         let writes = await mock.updatedEvents.count + (await mock.updatedOccurrences.count) + (await mock.splitSeriesCalls.count)
-        let queued = try await db.read { try PendingCalendarOperation.fetchCount($0) }
+        let queued = try await pool.read { try PendingCalendarOperation.fetchCount($0) }
         return (out, writes, queued, await sink.cards)
     }
 
@@ -953,16 +971,16 @@ struct CalendarEditToolAllDayEndTests {
         #expect(r.writes == 0 && r.queued == 0 && r.cards == 0, "writes \(r.writes) queued \(r.queued) cards \(r.cards)")
     }
 
-    @Test("an edit the rule allows is not refused before the card (control)")
+    @Test("an edit the rule allows reaches the card and is written (control)")
     func allowedEditIsNotRefused() async throws {
         let r = try await run([
             "start_iso": .string("\(day(7))T00:00:00"), "end_iso": .string("\(day(8))T00:00:00"),
         ], account: "kind-tool-allowed", event: stored(allDay: true))
-        #expect(r.cards == 1 && r.queued == 1, "an all-day move at midnight did not reach the card and the queue: \(r.out)")
+        #expect(r.cards == 1 && r.writes == 1, "an all-day move at midnight did not reach the card and the provider: cards \(r.cards) writes \(r.writes) \(r.out)")
         let timed = try await run([
             "start_iso": .string("\(day(7))T15:00:00"), "end_iso": .string("\(day(7))T16:00:00"),
         ], account: "kind-tool-allowed-timed", event: stored(allDay: false))
-        #expect(timed.cards == 1 && timed.queued == 1, "a timed move did not reach the card and the queue: \(timed.out)")
+        #expect(timed.cards == 1 && timed.writes == 1, "a timed move did not reach the card and the provider: cards \(timed.cards) writes \(timed.writes) \(timed.out)")
     }
 
     @Test("the shared rule refuses nothing the kind allows (controls)")
