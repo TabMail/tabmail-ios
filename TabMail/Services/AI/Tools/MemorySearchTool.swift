@@ -31,7 +31,7 @@ struct MemorySearchTool: AgentTool, Sendable {
         }
 
         let pageIndex: Int
-        if case .int(let p) = arguments["page_index"] {
+        if let p = arguments["page_index"]?.wholeNumber {
             pageIndex = max(1, p)
         } else if case .string(let s) = arguments["page_index"], let p = Int(s) {
             pageIndex = max(1, p)

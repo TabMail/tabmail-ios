@@ -152,6 +152,44 @@ struct MemoryReadToolTests {
         #expect(!result.contains("error"))
     }
 
+    // MARK: - Whole-number arguments
+
+    @Test("a timestamp that is not a whole number is refused",
+          arguments: [JSONValue.string("1e300"), .string("nan"), .string("inf"), .string("12.5"), .double(2.5), .double(1e300)])
+    func nonWholeTimestampRefused(value: JSONValue) async throws {
+        let tool = try makeTool()
+        let result = try await tool.execute(arguments: ["timestamp": value])
+        #expect(result.contains("Invalid or missing timestamp"))
+    }
+
+    /// Whole numbers at the ends of `Int`, alone or with a tolerance whose window edge falls past
+    /// Int64's range: the read answers (the window is unbounded on that side) instead of failing.
+    @Test("extreme whole-number timestamps and tolerances are answered",
+          arguments: [
+            (JSONValue.int(Int.max), JSONValue?.none, false),
+            (.int(Int.min), nil, false),
+            (.string("9000000000000000000"), .int(4_000_000_000_000), false),
+            (.int(Int.max), .int(Int.max), true),
+            (.int(0), .int(Int.max), true),
+            (.int(Int.min), .int(Int.max), false),
+            (.int(1), .int(Int.max), true),
+          ])
+    func extremeWholeNumbersAnswered(timestamp: JSONValue, tolerance: JSONValue?, findsTurn: Bool) async throws {
+        let (memPool, memDir) = try await installMemoryIndex()
+        defer { Task { await cleanupMemoryIndex(pool: memPool, dir: memDir) } }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "u1", sessionId: "s", role: "user", dateMs: now, text: "the only turn")
+
+        var args: [String: JSONValue] = ["timestamp": timestamp]
+        if let tolerance { args["tolerance_minutes"] = tolerance }
+        let result = try await makeTool().execute(arguments: args)
+        if findsTurn {
+            #expect(result.contains("the only turn"), "result: \(result)")
+        } else {
+            #expect(result == "No conversation found around this timestamp.", "result: \(result)")
+        }
+    }
+
     // MARK: - Empty Result
 
     @Test("No matching turns returns TB-parity empty-string literal")

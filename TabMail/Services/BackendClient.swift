@@ -274,6 +274,22 @@ enum JSONValue: Sendable, Codable {
     case dictionary([String: JSONValue])
     case null
 
+    /// The whole number this value holds: an `.int`, or a `.double` with no
+    /// fractional part that fits in `Int`. nil for anything else.
+    ///
+    /// Tool arguments read integers through here, so a fraction or a number
+    /// outside `Int`'s range is refused rather than truncated or rounded. Both
+    /// argument decoders (`BackendClient.jsonValueFromAny` for live calls and
+    /// `PendingCalendarOperation.arguments` for stored ones) give such a number
+    /// as `.double`.
+    var wholeNumber: Int? {
+        switch self {
+        case .int(let n): return n
+        case .double(let d): return Int(exactly: d)
+        default: return nil
+        }
+    }
+
     /// Decodes arbitrary JSON into the opaque value tree. Order matters: `Bool`
     /// before the numeric cases (Foundation's JSONDecoder only matches a JSON
     /// boolean to `Bool`, never a number), and the containers last. Used so

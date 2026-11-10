@@ -20,12 +20,10 @@ struct EmailReplyTool: AgentTool, Sendable {
     func execute(arguments: [String: JSONValue]) async throws -> String {
         // Parse unique_id (numeric ID from ChatIdTranslator)
         let numericId: Int
-        if case .int(let n) = arguments["unique_id"] {
+        if let n = arguments["unique_id"]?.wholeNumber {
             numericId = n
         } else if case .string(let s) = arguments["unique_id"], let n = Int(s) {
             numericId = n
-        } else if case .double(let d) = arguments["unique_id"] {
-            numericId = Int(d)
         } else {
             return ComposeOutcome.failed("missing or invalid unique_id").describeForLLM
         }

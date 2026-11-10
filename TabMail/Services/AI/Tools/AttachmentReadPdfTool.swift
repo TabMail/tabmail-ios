@@ -58,11 +58,9 @@ struct AttachmentReadPdfTool: AgentTool, Sendable {
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
         let numericId: Int
-        if case .int(let n) = arguments["unique_id"] {
+        if let n = arguments["unique_id"]?.wholeNumber {
             numericId = n
         } else if case .string(let s) = arguments["unique_id"], let n = Int(s) {
-            numericId = n
-        } else if case .double(let d) = arguments["unique_id"], let n = Int(exactly: d) {
             numericId = n
         } else {
             return Self.error("invalid or missing unique_id")
