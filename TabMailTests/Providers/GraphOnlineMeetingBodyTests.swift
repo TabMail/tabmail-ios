@@ -124,7 +124,7 @@ struct GraphOnlineMeetingBodyTests {
 
         let out = try #require(GraphOnlineMeetingBody.replacingNotes(in: start + rest, joinUrl: form.layout.joinUrl, with: "New"))
 
-        #expect(out == GraphFixture.htmlHead + "\r\nNew\r\n" + rest)
+        #expect(out == GraphFixture.htmlHead + "New\r\n" + rest)
         #expect(GraphOnlineMeetingBody.beforeJoinSection(start + rest, joinUrl: form.layout.joinUrl).map(String.init) == start)
     }
 
@@ -138,7 +138,7 @@ struct GraphOnlineMeetingBodyTests {
 
         let out = try #require(GraphOnlineMeetingBody.replacingNotes(in: start + rest, joinUrl: layout.joinUrl, with: "New"))
 
-        #expect(out == GraphFixture.htmlHead + "\r\nNew\r\n" + rest)
+        #expect(out == GraphFixture.htmlHead + "New\r\n" + rest)
         #expect(GraphOnlineMeetingBody.beforeJoinSection(start + rest, joinUrl: layout.joinUrl).map(String.init) == start)
     }
 
@@ -154,7 +154,7 @@ struct GraphOnlineMeetingBodyTests {
         let out = try #require(GraphOnlineMeetingBody.replacingNotes(in: start + rest, joinUrl: layout.joinUrl, with: "New"))
 
         #expect(out.hasSuffix(rest), "the join section was not kept whole")
-        #expect(out.hasPrefix(GraphFixture.htmlHead + "\r\nNew\r\n"))
+        #expect(out.hasPrefix(GraphFixture.htmlHead + "New\r\n"))
     }
 
     @Test("trailing line breaks in new notes are dropped, so repeated edits do not grow the body")
@@ -165,8 +165,37 @@ struct GraphOnlineMeetingBodyTests {
         let once = try #require(GraphOnlineMeetingBody.replacingNotes(in: html, joinUrl: joinUrl, with: "Agenda\n\r\n"))
         let twice = try #require(GraphOnlineMeetingBody.replacingNotes(in: once, joinUrl: joinUrl, with: "Agenda\n"))
 
-        #expect(once == GraphFixture.htmlHead + "\r\nAgenda\r\n" + rest)
+        #expect(once == GraphFixture.htmlHead + "Agenda\r\n" + rest)
         #expect(twice == once)
+    }
+
+    /// Copies of the join link an organizer's notes hold, and the time the
+    /// recogniser may take over them. A scan that restarts from the notes for
+    /// each copy takes many seconds here; one pass takes a few milliseconds.
+    static let hostileLinkCopies = 5_000
+    static let hostileTimeLimit: Duration = .seconds(2)
+
+    @Test("thousands of copies of the join link in the notes are passed over in time linear in the body",
+          arguments: [true, false])
+    func manyLinkCopies(_ withSection: Bool) {
+        let start = GraphFixture.htmlHead + String(repeating: "<p>" + joinUrl + "</p>\r\n", count: Self.hostileLinkCopies)
+        let rest = withSection ? section : GraphFixture.htmlTail
+        var out: String?
+        var before: Substring?
+
+        let elapsed = ContinuousClock().measure {
+            out = GraphOnlineMeetingBody.replacingNotes(in: start + rest, joinUrl: joinUrl, with: "New")
+            before = GraphOnlineMeetingBody.beforeJoinSection(start + rest, joinUrl: joinUrl)
+        }
+
+        if withSection {
+            #expect(out == GraphFixture.htmlHead + "New\r\n" + rest)
+            #expect(before.map(String.init) == start)
+        } else {
+            #expect(out == nil)
+            #expect(before == nil)
+        }
+        #expect(elapsed < Self.hostileTimeLimit, "took \(elapsed)")
     }
 
     @Test("the document up to the join section is its start and the notes, for either layout and either join link",

@@ -593,3 +593,49 @@ struct CalendarEventReadPillTests {
         #expect(notes == "Join: \(link)\nAgenda")
     }
 }
+
+// MARK: - A pill's live fetch for an online meeting
+
+/// `.serialized, .processGlobalState`: replaces `AppDatabase.shared` and uses the
+/// `ChatIdTranslator.shared` actor and `AccountManager.shared`'s provider table.
+@Suite("A chat pill fetched live shows an online meeting's join link", .serialized, .processGlobalState)
+struct EventPillLiveFetchTests {
+
+    @Test("in a new session a pill tap fetches the event and shows its join link above the notes")
+    func liveFetchShowsTheJoinLink() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: [], directory: dir)
+        }
+        let translator = ChatIdTranslator.shared
+        await translator.clearAll()
+
+        let accountId = "pill-live-fetch"
+        let link = "https://meet.example.com/meet/0000000000"
+        let mock = MockCalendarProvider()
+        await mock.setGetEventResult(GCalEvent(
+            id: "evt-online", summary: "Planning", location: nil, description: "Agenda",
+            start: nil, end: nil, attendees: nil, organizer: nil, recurrence: nil, transparency: nil, status: nil,
+            htmlLink: nil, created: nil, updated: nil, conferenceUrl: link
+        ))
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: mock)
+        defer { Task { await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId) } }
+
+        // What a previous session leaves: the pill's id and the event's calendar on disk, no detail in memory.
+        let compoundId = CompoundEventId.make(accountId: accountId, eventId: "evt-online")
+        let numericId = await translator.toNumericId(compoundId)
+        try await pool.write { db in
+            try db.execute(
+                sql: "INSERT INTO chatEventCalendar (compoundId, accountId, calendarId, calendarName) VALUES (?, ?, ?, ?)",
+                arguments: [compoundId, accountId, "primary", "Work"])
+        }
+
+        let detail = await translator.resolveEventDetail(numericId)
+
+        #expect(await mock.callLog.contains("getEvent(calendarId:primary,eventId:evt-online)"),
+                "setup: the pill did not fetch the event live")
+        #expect(detail?.notes == "Join: \(link)\nAgenda")
+        await translator.clearAll()
+    }
+}

@@ -80,7 +80,10 @@ that aren't included in the request body maintain their previous values".
   notes (the assistant is shown it and can be asked to put it there) is passed over, and a line of
   underscores in the notes above the real section is not taken for its separator. The one shape it
   cannot tell apart (a line of underscores in the notes above a copy of the link) places the section too
-  early, which keeps the join section whole; it never places it inside the section. New notes drop
+  early, which keeps the join section whole; it never places it inside the section. The body is the
+  organizer's, so the search stays linear in it: a link has such a line before it exactly when it starts
+  after the first line of underscores is complete, so one search from there finds the anchor (a search
+  that restarted from the notes for each copy was quadratic in the copies). New notes drop
   trailing line breaks, since a `<br>` just before the section would be read as part of it.
   Checked live on a Teams meeting on a work account (#555): a text body write turned the meeting off
   (`isOnlineMeeting` false, `onlineMeetingProvider` `unknown`, `onlineMeeting` null); an HTML write that

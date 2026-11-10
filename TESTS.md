@@ -76,10 +76,13 @@ separator only after it, a line shorter than `separatorMinUnderscores`, an unclo
 empty link) and where the notes end; a copy of the join link in the notes (as written and with
 `&amp;`) and a line of underscores in the notes are part of the notes; with both, the join section is
 still kept whole; trailing line breaks in new notes are dropped, so repeated edits do not grow the
-body. `ExchangeCalendarTests` maps an HTML, text or missing body to the
+body; and thousands of copies of the join link in the notes, with or without a join section after
+them, are recognised as the clean body is, within a time limit a scan that restarts for each copy
+exceeds. `ExchangeCalendarTests` maps an HTML, text or missing body to the
 description; `CalendarToolHelpersTests` pins the `conference_url:` line after the description and an
 event pill's notes (join link first); `ToolCachingTests` checks that the search and direct-read pill
-caches carry the join link.
+caches carry the join link, and that in a new session a pill tap that fetches the event live shows
+it.
 
 ## Inbox list — layered test architecture
 

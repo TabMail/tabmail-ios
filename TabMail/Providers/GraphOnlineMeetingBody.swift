@@ -54,15 +54,34 @@ enum GraphOnlineMeetingBody {
     /// Taking the first such link can only place the section too EARLY (at a
     /// separator-like line in the notes above a copy of the link), which keeps
     /// the whole join section; it never places it inside the section.
+    ///
+    /// A link has a separator line before it exactly when it starts after the
+    /// point where the first separator line is complete, so the link is found by
+    /// one search from there. Each step is a single pass, so the work stays
+    /// linear in the body however many copies of the link the organizer's notes
+    /// hold.
     private static func joinSection(in html: String, joinUrl: String) -> (notesStart: String.Index, sectionStart: String.Index)? {
-        guard !joinUrl.isEmpty, let notesStart = bodyContentStart(html) else { return nil }
+        guard !joinUrl.isEmpty, let notesStart = bodyContentStart(html),
+              let firstSeparatorEnd = firstSeparatorEnd(in: html, from: notesStart) else { return nil }
         let forms = [joinUrl, joinUrl.replacingOccurrences(of: "&", with: "&amp;")]
-        var from = notesStart
-        while let link = forms.compactMap({ html.range(of: $0, range: from..<html.endIndex)?.lowerBound }).min() {
-            if let separator = lastSeparator(in: html, from: notesStart, before: link) {
-                return (notesStart, openingTagsStart(in: html, before: separator, floor: notesStart))
+        guard let link = forms.compactMap({ html.range(of: $0, range: firstSeparatorEnd..<html.endIndex)?.lowerBound }).min(),
+              let separator = lastSeparator(in: html, from: notesStart, before: link) else { return nil }
+        return (notesStart, openingTagsStart(in: html, before: separator, floor: notesStart))
+    }
+
+    /// Just past the underscore at which the first run in `html[from...]`
+    /// reaches `separatorMinUnderscores`. Nil when no run does.
+    private static func firstSeparatorEnd(in html: String, from: String.Index) -> String.Index? {
+        var runLength = 0
+        var i = from
+        while i < html.endIndex {
+            if html[i] == "_" {
+                runLength += 1
+                if runLength == separatorMinUnderscores { return html.index(after: i) }
+            } else {
+                runLength = 0
             }
-            from = html.index(after: link)
+            i = html.index(after: i)
         }
         return nil
     }

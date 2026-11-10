@@ -234,11 +234,12 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // only the values for properties to update. Existing properties that
         // aren't included in the request body maintain their previous values".
         // This used to merge the patch onto a read and PATCH every property back,
-        // and the read is lossy: `body` comes back as its plain-text
-        // `bodyPreview`, `showAs` as free or busy, `locations` as one display
-        // name, every attendee as required, and a series' recurrence rebuilt from
-        // an RRULE, which resets the series' exceptions (#423). Every edit wrote
-        // all of that back. `graphPatchJSON` says what rides along and why.
+        // and the read is lossy: `showAs` comes back as free or busy, `locations`
+        // as one display name, every attendee as required, and a series'
+        // recurrence rebuilt from an RRULE, which resets the series' exceptions
+        // (#423). The description was then the 255-character `bodyPreview`; it is
+        // now the full notes (`notes(of:)`). Every edit wrote all of that back.
+        // `graphPatchJSON` says what rides along and why.
         let existing = try await fetchForEdit(eventId: eventId)
         let json = graphPatchJSON(patch: event, existing: existing, allowRecurrence: true)
         guard !json.isEmpty else {
@@ -583,7 +584,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
     /// An event as an edit reads it: the `GCalEvent` the shared merge helper works
     /// on, plus the Graph JSON of the same read for what that mapping narrows and
-    /// an edit must keep (the stored `recurrence`, each attendee's type).
+    /// an edit must keep (the stored `recurrence`, each attendee's type, and an
+    /// online meeting's stored HTML `body` and `onlineMeeting`, which
+    /// `onlineMeetingBody` writes new notes around).
     struct EditSnapshot {
         let event: GCalEvent
         let raw: [String: Any]
