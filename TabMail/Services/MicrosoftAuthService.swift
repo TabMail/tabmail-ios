@@ -85,26 +85,9 @@ extension OAuthService {
         return try await exchangeMicrosoftCode(code, codeVerifier: codeVerifier, scope: scope)
     }
 
-    private func exchangeMicrosoftCode(_ code: String, codeVerifier: String, scope: String) async throws -> OAuthTokens {
-        let url = URL(string: "https://login.microsoftonline.com/common/oauth2/v2.0/token")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-
-        let redirectUri = "\(OAuthConfig.microsoftRedirectScheme)://auth"
-        let params = [
-            "client_id": OAuthConfig.microsoftClientId,
-            "code": code,
-            "code_verifier": codeVerifier,
-            "grant_type": "authorization_code",
-            "redirect_uri": redirectUri,
-            "scope": scope,
-        ]
-        request.httpBody = params.map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.value)" }
-            .joined(separator: "&")
-            .data(using: .utf8)
-
-        let (data, _) = try await sharedEphemeralSession.data(for: request)
+    func exchangeMicrosoftCode(_ code: String, codeVerifier: String, scope: String) async throws -> OAuthTokens {
+        let request = Self.microsoftCodeExchangeRequest(code: code, codeVerifier: codeVerifier, scope: scope)
+        let (data, _) = try await tokenSession.data(for: request)
         let response = try JSONDecoder().decode(MicrosoftTokenResponse.self, from: data)
 
         guard let accessToken = response.access_token else {
@@ -120,22 +103,8 @@ extension OAuthService {
     }
 
     func refreshMicrosoftToken(refreshToken: String) async throws -> OAuthTokens {
-        let url = URL(string: "https://login.microsoftonline.com/common/oauth2/v2.0/token")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-
-        let params = [
-            "client_id": OAuthConfig.microsoftClientId,
-            "refresh_token": refreshToken,
-            "grant_type": "refresh_token",
-            "scope": OAuthConfig.microsoftScopes,
-        ]
-        request.httpBody = params.map { "\($0.key)=\($0.value.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0.value)" }
-            .joined(separator: "&")
-            .data(using: .utf8)
-
-        let (data, _) = try await sharedEphemeralSession.data(for: request)
+        let request = Self.microsoftRefreshRequest(refreshToken: refreshToken)
+        let (data, _) = try await tokenSession.data(for: request)
         let response = try JSONDecoder().decode(MicrosoftTokenResponse.self, from: data)
 
         guard let accessToken = response.access_token else {
@@ -148,6 +117,32 @@ extension OAuthService {
             expiresAt: response.expires_in.map { Date().addingTimeInterval(TimeInterval($0)) },
             idToken: response.id_token
         )
+    }
+
+    // MARK: - Microsoft Token Requests
+
+    nonisolated static let microsoftTokenURL = URL(string: "https://login.microsoftonline.com/common/oauth2/v2.0/token")!
+
+    /// The token request exchanging a Microsoft authorization code.
+    nonisolated static func microsoftCodeExchangeRequest(code: String, codeVerifier: String, scope: String) -> URLRequest {
+        tokenRequest(url: microsoftTokenURL, fields: [
+            ("client_id", OAuthConfig.microsoftClientId),
+            ("code", code),
+            ("code_verifier", codeVerifier),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", "\(OAuthConfig.microsoftRedirectScheme)://auth"),
+            ("scope", scope),
+        ])
+    }
+
+    /// The token request refreshing a Microsoft access token.
+    nonisolated static func microsoftRefreshRequest(refreshToken: String) -> URLRequest {
+        tokenRequest(url: microsoftTokenURL, fields: [
+            ("client_id", OAuthConfig.microsoftClientId),
+            ("refresh_token", refreshToken),
+            ("grant_type", "refresh_token"),
+            ("scope", OAuthConfig.microsoftScopes),
+        ])
     }
 
     // MARK: - Microsoft User Info

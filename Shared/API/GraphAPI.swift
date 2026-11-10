@@ -90,24 +90,15 @@ enum GraphAPI {
 
     // MARK: - Path-segment encoding (single source of truth for BOTH targets)
 
-    /// The RFC 3986 **unreserved** set — the only characters that may appear
-    /// literally in a Graph path segment.
+    /// Percent-encode `value` as one strict path segment, or `nil` if it cannot
+    /// be encoded.
     ///
     /// Graph resource ids (message ids, attachment ids, folder ids) are opaque
     /// server-minted strings. Interpolating one raw into a URL lets `/`, `?`,
     /// `#`, `+` or `=` inside it change which **route** the server selects, so
-    /// every id is encoded as exactly one path segment before composition.
-    ///
-    /// This set was authored on the main-app side (`ExchangeProvider`) and is
-    /// **moved** here, not copied: `Shared` is linked by the app AND the
-    /// notification-service extension, and a second copy is precisely how the
-    /// `$select` field lists above drifted apart before they were consolidated.
-    static let graphPathSegmentAllowed = CharacterSet(
-        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-    )
-
-    /// Percent-encode `value` as one strict path segment, or `nil` if it cannot
-    /// be encoded.
+    /// every id is encoded as exactly one path segment, leaving only the RFC
+    /// 3986 unreserved characters bare (`StrictPercentEncoding`, the single
+    /// definition of that set for the app and the extension).
     ///
     /// **Returns an optional rather than throwing, deliberately.** The main app
     /// surfaces this failure as `ProviderError.invalidURL(context)`, and
@@ -118,7 +109,7 @@ enum GraphAPI {
     /// defined once. (`ExchangeProvider`'s `$search` value is encoded with the
     /// same set.)
     static func encodedGraphPathSegment(_ value: String) -> String? {
-        value.addingPercentEncoding(withAllowedCharacters: graphPathSegmentAllowed)
+        StrictPercentEncoding.component(value)
     }
 
     /// Walk a `$delta` pagination chain starting from `deltaLink` (or fresh
