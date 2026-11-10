@@ -389,7 +389,7 @@ struct DeltaDetailFetchFailureTests {
         }
     }
 
-    private static func waitUntil(seconds: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
+    static func waitUntil(seconds: TimeInterval = 5, _ condition: () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
         while !condition() {
             if Date() >= deadline { return false }
@@ -423,45 +423,137 @@ struct DeltaDetailFetchFailureTests {
         #expect(Set(details.map(\.header.messageId)) == Set(ids))
     }
 
-    /// The gate queues FIFO. Adding a whole delta's gets at once would put
-    /// every one of them ahead of a later request on the same account, such as
-    /// a user's action; the window keeps that request one get behind.
-    @Test("Another request on the account is not queued behind a large Gmail detail fetch")
+    /// How long a test lets the gets a detail fetch has already started settle
+    /// into the request gate's queue before another request joins it. Only
+    /// the extra gets a window wider than the gate would start are in that
+    /// queue, so the settle decides whether such a window is seen, never
+    /// whether a correct one passes.
+    static let admissionSettleMilliseconds = 100
+
+    /// Runs on the provider actor: `entered` is called there, and the
+    /// profile's request then reaches the account's request gate with no
+    /// suspension in between, so once `entered` has been seen that request is
+    /// queued at the gate (or holds a slot) ahead of any slot freed later.
+    static func currentHistoryIdOnceEntered(
+        on provider: isolated GmailProvider, entered: @Sendable () -> Void
+    ) async throws -> String? {
+        entered()
+        return try await provider.getCurrentHistoryId()
+    }
+
+    /// What a cancelled fetch throws: the task's own cancellation, or the URL
+    /// loader's for a get the cancellation stopped.
+    static func isCancellation(_ error: any Error) -> Bool {
+        error is CancellationError || (error as? URLError)?.code == .cancelled
+    }
+
+    /// The gate queues FIFO. Adding more of a delta's gets than the gate's
+    /// width would queue the extra ones ahead of a later request on the same
+    /// account, such as a user's action; with the window at the gate's width
+    /// that request takes the first slot the fetch frees. Observed on the
+    /// wire, not in the fetch's task group: with the first window's answers
+    /// held and the other request waiting at the gate, exactly one answer is
+    /// released, and the next request to reach the server must be the other
+    /// one, ahead of every further get of the fetch.
+    @Test("Another request on the account takes the first slot a large Gmail detail fetch frees")
     func gmailDetailFetchLeavesRoomForAnotherRequest() async throws {
         let scenario = FakeHTTP.Scenario()
         defer { scenario.close() }
         let width = GmailAPI.maxConcurrentRequests
-        let ids = (0..<(width * 10)).map { String(format: "long-%03d", $0) }
+        let ids = (0..<(width * 3)).map { String(format: "long-%03d", $0) }
         let release = DispatchSemaphore(value: 0)
         Self.registerHeldGmailMessages(ids, on: scenario, release: release)
         scenario.register(path: "/profile", method: "GET",
                           response: .json(raw: #"{"emailAddress": "gmail-delta-detail@example.com", "historyId": "42"}"#))
         let provider = GmailProvider(
             userEmail: "gmail-delta-detail@example.com", accessToken: { _ in "fake-access-token" }, session: scenario.session)
+        let profileCall = "GET /gmail/v1/users/me/profile"
 
         let fetch = Task { try await provider.fetchMessageDetails(ids: ids) }
-        #expect(await Self.waitUntil { scenario.recordedCalls().count >= width })
-        let other = Task { try await provider.getCurrentHistoryId() }
-
-        // Free one slot at a time and wait for the next request to arrive, so
-        // the order requests reach the server is the order the gate admits them.
-        var released = 0
-        while !scenario.servedCallSequence().contains("GET /gmail/v1/users/me/profile"), released < ids.count {
-            let before = scenario.recordedCalls().count
-            release.signal()
-            released += 1
-            _ = await Self.waitUntil { scenario.recordedCalls().count > before }
+        let windowHeld = await Self.waitUntil { scenario.recordedCalls().count >= width }
+        try await Task.sleep(for: .milliseconds(Self.admissionSettleMilliseconds))
+        let entered = Mutex(false)
+        let other = Task {
+            try await Self.currentHistoryIdOnceEntered(on: provider) { entered.withLock { $0 = true } }
         }
-        let profileIndex = scenario.servedCallSequence().firstIndex(of: "GET /gmail/v1/users/me/profile")
-        for _ in released..<ids.count { release.signal() }
+        let otherQueued = await Self.waitUntil { entered.withLock { $0 } }
+
+        release.signal()
+        let nextArrived = await Self.waitUntil { scenario.recordedCalls().count > width }
+        let sequence = scenario.servedCallSequence()
+        for _ in ids { release.signal() }
         let historyId = try await other.value
         let details = try await fetch.value
 
+        #expect(windowHeld, "the detail fetch never had \(width) gets in flight")
+        #expect(otherQueued, "the other request never ran on the provider")
+        #expect(nextArrived, "nothing reached the server after one get of the window was answered")
+        let next = sequence.count > width ? sequence[width] : "nothing"
+        #expect(next == profileCall,
+                "the first slot the detail fetch freed went to \(next), ahead of the waiting request")
         #expect(historyId == "42")
         #expect(details.count == ids.count)
-        let index = try #require(profileIndex, "the other request never reached the server")
-        #expect(index <= width * 2,
-                "the other request waited behind \(index - width) of the detail fetch's gets")
+        #expect(Set(details.map(\.header.messageId)) == Set(ids))
+    }
+
+    /// A cancelled detail fetch is not a complete one: a delta handed a
+    /// partial list would save it and move its cursor past the changes it
+    /// never read. Cancelled after a successful get was replaced in the window
+    /// and while every other get waits out Gmail's rate-limit backoff, the
+    /// fetch must throw the cancellation, send nothing more once it has
+    /// returned, and leave every slot of the account's gate to what comes next.
+    @Test("A cancelled Gmail detail fetch throws instead of returning what it read, and gives back the whole gate")
+    func gmailDetailFetchFailsWhenCancelled() async throws {
+        let scenario = FakeHTTP.Scenario()
+        defer { scenario.close() }
+        let width = GmailAPI.maxConcurrentRequests
+        let ids = (0..<(width * 3)).map { String(format: "cancel-%03d", $0) }
+        let readable = ids[0]
+        scenario.register(path: "/messages/cancel-", method: "GET") { request in
+            request.url.lastPathComponent == readable ? .json(raw: Self.gmailMessageJSON(id: readable)) : .status(429)
+        }
+        let provider = GmailProvider(
+            userEmail: "gmail-delta-detail-cancel@example.com", accessToken: { _ in "fake-access-token" }, session: scenario.session)
+
+        let fetch = Task { try await provider.fetchMessageDetails(ids: ids) }
+        // The first window plus the get that replaced the answered one; each
+        // 429 starts a backoff of `initialDelay`, so cancel well inside it.
+        let backoff = HTTPRetryPolicy.gmail.initialDelay
+        let refilled = await Self.waitUntil(seconds: backoff / 2) {
+            Set(scenario.recordedCalls().compactMap { URL(string: $0.url)?.lastPathComponent })
+                .isSuperset(of: ids[0...width])
+        }
+        fetch.cancel()
+        let result = await fetch.result
+        let callsAtReturn = scenario.recordedCalls().count
+
+        #expect(refilled, "the answered get was not replaced in the window before the cancel")
+        switch result {
+        case .success(let details):
+            Issue.record("a cancelled detail fetch returned \(details.count) of \(ids.count) messages as if complete")
+        case .failure(let error):
+            #expect(Self.isCancellation(error), "a cancelled detail fetch threw \(error) instead of its cancellation")
+        }
+        // Past the backoff every get was waiting out: a retry still running
+        // after the fetch returned would reach the server by now.
+        try await Task.sleep(for: .seconds(backoff + backoff / 2))
+        #expect(scenario.recordedCalls().count == callsAtReturn,
+                "a get of the cancelled fetch reached the server after it returned")
+
+        // Every slot is back: a full window of held gets is in flight together.
+        let wave = (0..<width).map { String(format: "after-%03d", $0) }
+        let release = DispatchSemaphore(value: 0)
+        Self.registerHeldGmailMessages(wave, on: scenario, release: release)
+        let next = Task { try await provider.fetchMessageDetails(ids: wave) }
+        let fullWidth = await Self.waitUntil {
+            scenario.recordedCalls().filter { $0.url.contains("/messages/after-") }.count >= width
+        }
+        let inFlight = scenario.recordedCalls().filter { $0.url.contains("/messages/after-") }.count
+        for _ in wave { release.signal() }
+        let details = try await next.value
+
+        #expect(fullWidth, "after the cancelled fetch only \(inFlight) of \(width) gets could be in flight")
+        #expect(Set(details.map(\.header.messageId)) == Set(wave))
     }
 
     @Test("A Gmail detail fetch larger than its window still fails on one message's failure")
