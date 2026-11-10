@@ -243,8 +243,10 @@ struct NeverUploadedDraftPlaceholderSyncTests {
 
     /// Every draft id some Drafts row opens, through the production open route
     /// (`ServerDraftComposeLoader.resolveOpenAuthority`, which every Drafts open
-    /// starts with). A row whose open throws opens nothing: production shows it
-    /// as a load failure. The rows named in `serverIds` are the server's other
+    /// starts with). No fixture's row should fail to resolve: a thrown open is
+    /// the retryable load failure, which production shows instead of the final
+    /// "no editable copy" answer, so it fails the test rather than counting as
+    /// "opens nothing". The rows named in `serverIds` are the server's other
     /// drafts and are left out, as opening one reads the server.
     @MainActor
     private func openableDraftIds(_ f: Fixture, serverIds: [String] = []) async throws -> [String] {
@@ -258,7 +260,7 @@ struct NeverUploadedDraftPlaceholderSyncTests {
             accountId: f.accountId, provider: provider(f.item, http: http))
         var opened: [String] = []
         for header in headers {
-            if let draftId = try? await ServerDraftComposeLoader.resolveOpenAuthority(header: header)?.draftId {
+            if let draftId = try await ServerDraftComposeLoader.resolveOpenAuthority(header: header)?.draftId {
                 opened.append(draftId)
             }
         }

@@ -1359,7 +1359,8 @@ enum ServerDraftComposeLoader {
             return nil
         }
 
-        // A placeholder id names a draft that was never uploaded, so only its
+        // A placeholder id names a local save the server has not received (a
+        // draft never uploaded, or a newer edit not yet uploaded), so only its
         // local owner can open it, on every provider: Gmail's draft lookup
         // refuses a placeholder id before any request.
         if runtimeKind == .gmail, !isSyntheticPlaceholderId(header.messageId) {

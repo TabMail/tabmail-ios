@@ -69,8 +69,10 @@ retired operation, so the full sync the boundary schedules deleted it (the whole
 provider, the date window on Gmail and Outlook) and the draft could no longer be opened. The full
 sync's stale rule now never deletes the placeholder of a local `Draft` that has no server copy
 (`SyncEngine.neverUploadedDraftPlaceholderIds`, consulted by `runSyncMessages`); the placeholder of a
-draft that is gone (sent, deleted, evicted) or has a server copy is removed as before. The boundary
-itself is unchanged.
+draft that is gone (sent, deleted, evicted) or has a server copy is removed as before. On Gmail the
+open route also had to change: it sent every Drafts row to the Gmail draft lookup, which refuses a
+placeholder id, so `ServerDraftComposeLoader.resolveOpenAuthority` now sends a placeholder id to its
+local owner on every provider. The boundary itself is unchanged.
 
 **Why a blanket purge rather than a version-aware migration.** The same reason IOS-ACTION-001 gives
 for `v74`: deciding per row would mean decoding each one and validating its address space against
