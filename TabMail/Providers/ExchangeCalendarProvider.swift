@@ -698,7 +698,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// with only its notes replaced and the join section kept as stored
     /// (`GraphOnlineMeetingBody`, #511). Nil for an event that is no online
     /// meeting, or whose join section is not recognised: the description is then
-    /// written as text, as for any event, and an online meeting with a layout
+    /// written as the whole body, as for any event, and an online meeting with a layout
     /// unlike the recognised ones loses its join section and is turned off, as
     /// every description edit of an online meeting did before #511.
     nonisolated static func onlineMeetingBody(_ stored: [String: Any], notes description: String) -> [String: Any]? {
@@ -708,7 +708,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
               let html = body["content"] as? String,
               let kept = GraphOnlineMeetingBody.replacingNotes(in: html, joinUrl: joinUrl, with: description)
         else {
-            BackgroundSyncLogger.logDebug("[ExchangeCalendar] online meeting: join section not recognised, the description is written as text")
+            BackgroundSyncLogger.logDebug("[ExchangeCalendar] online meeting: join section not recognised, the description is written as the whole body")
             return nil
         }
         return ["contentType": "html", "content": kept]
@@ -1042,7 +1042,9 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// spacing, as for a draft's editable text). An online meeting's notes stop
     /// where its join section starts (`GraphOnlineMeetingBody`); the join link is
     /// `conferenceUrl`. So the description the assistant edits is the notes, and
-    /// a description edit writes them back in place of the notes (#511). Never
+    /// a description edit writes them back in place of the notes (#511), as HTML
+    /// whose read gives the same notes again, up to white space at the ends of
+    /// lines and of the notes (`GraphNotesHTML`, #577). Never
     /// `bodyPreview`, which is cut at 255 characters and renders the join section
     /// as text. Nil when the read carries no body.
     nonisolated static func notes(of e: MSEvent) -> String? {
@@ -1107,7 +1109,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
 
         if let summary = input.summary { json["subject"] = summary }
         if let location = input.location { json["location"] = ["displayName": location] }
-        if let desc = input.description { json["body"] = ["contentType": "text", "content": desc] }
+        if let desc = input.description { json["body"] = ["contentType": "html", "content": GraphNotesHTML.html(desc)] }
 
         // showAs (transparency mapping)
         if let transparency = input.transparency {
