@@ -11,12 +11,13 @@ import Testing
 /// throttled client to wait for `Retry-After` (#426). These tests pin the system
 /// properties that follow:
 ///
-/// - no more than `GraphConfig.maxConcurrentRequestsPerMailbox` requests of one
-///   mailbox are ever on the wire at once, whatever mix of backfill, actions,
-///   sends and calendar calls is running;
+/// - no more than four requests of one mailbox (Graph's documented limit) are
+///   ever on the wire at once, whatever mix of backfill, actions, sends and
+///   calendar calls is running;
 /// - a 429 or 503 is retried after its `Retry-After`, and the waits of one call
-///   add up to at most `HTTPConfig.retryWaitBudgetSeconds`, so a queued action's
-///   final refusal reaches the queue as a refusal, not a timeout;
+///   add up to at most `HTTPConfig.retryWaitBudgetSeconds`; under an
+///   `HTTPDeadline` a retry is made only if it would end before the deadline
+///   (`GraphThrottlingQueueTests` drives that through the real queue);
 /// - a request waiting out a `Retry-After` holds no slot, and a caller cancelled
 ///   while queued leaks none;
 /// - every Graph request leg (token-refresh retries, draft deletes, upload
@@ -41,6 +42,13 @@ private final class Locked<Value: Sendable>: Sendable {
 
 @Suite("Graph throttling: four per mailbox, Retry-After", .timeLimit(.minutes(2)))
 struct GraphThrottlingTests {
+
+    /// Graph's documented limit, written out rather than read from
+    /// `GraphConfig.maxConcurrentRequestsPerMailbox`: "Four concurrent requests"
+    /// per app and mailbox (learn.microsoft.com/graph/throttling-limits, Outlook
+    /// service limits). A wrong production constant then fails these tests
+    /// instead of moving their oracle with it.
+    static let graphDocumentedConcurrentRequests = 4
 
     // MARK: - Wire meter
 
@@ -225,7 +233,7 @@ struct GraphThrottlingTests {
         let gate = GraphMailboxGates.gate(for: "Owner.426@Example.com")
         #expect(gate === GraphMailboxGates.gate(for: "owner.426@example.com"))
         #expect(gate !== GraphMailboxGates.gate(for: "other.426@example.com"))
-        #expect(gate.limit == GraphConfig.maxConcurrentRequestsPerMailbox)
+        #expect(gate.limit == Self.graphDocumentedConcurrentRequests)
     }
 
     // MARK: - Retry-After
@@ -371,30 +379,37 @@ struct GraphThrottlingTests {
     func retrySleepReleasesTheSlot() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
+        // Long enough that "during the wait" and "after it" are seconds apart.
+        let retryAfter = 4
         let script = FakeHTTP.ResponseScript([429, 200])
         http.register(path: "/me/first", method: "GET") { _ in
-            script.next() == 429 ? Self.throttled(429, retryAfter: 1) : Self.emptyObject
+            script.next() == 429 ? Self.throttled(429, retryAfter: retryAfter) : Self.emptyObject
         }
         http.register(path: "/me/second", method: "GET", response: Self.emptyObject)
         let gate = HTTPConcurrencyGate(limit: 1)
-        let finished = Locked<[String]>([])
 
         let first = Task {
             _ = try await performHTTPRequestWithRetry(
                 url: "https://graph.microsoft.com/v1.0/me/first", method: "GET", body: nil, token: "token",
                 retryableStatusCodes: HTTPRetryPolicy.graph.retryableStatusCodes, session: http.session, gate: gate)
-            finished.withLock { $0.append("first") }
         }
         await Self.waitUntil { !script.served.isEmpty }
         // The first request is now asleep for its Retry-After. Holding the only
-        // slot through that sleep would keep this one waiting until it ends.
+        // slot through that sleep would keep this one off the wire until the
+        // first one's retry had been answered.
+        let clock = ContinuousClock()
+        let start = clock.now
         _ = try await performHTTPRequest(
             url: "https://graph.microsoft.com/v1.0/me/second", method: "GET", body: nil, token: "token",
             session: http.session, gate: gate)
-        finished.withLock { $0.append("second") }
+        let elapsed = clock.now - start
+        let servedFirstWhenSecondReturned = script.served
         try await first.value
 
-        #expect(finished.withLock { $0 } == ["second", "first"])
+        #expect(servedFirstWhenSecondReturned == [429],
+                "the second request went out after the first one's retry, not during its wait")
+        #expect(elapsed < .seconds(retryAfter) / 2, "the second request waited \(elapsed) for the slot")
+        #expect(http.servedCallSequence() == ["GET /v1.0/me/first", "GET /v1.0/me/second", "GET /v1.0/me/first"])
         #expect(script.served == [429, 200])
     }
 
@@ -551,7 +566,7 @@ struct GraphThrottlingTests {
         let expected: Int = 40 + 10 + 3 + 3
         #expect(ended == expected)
         #expect(result.outcomes.allSatisfy { $0.outcome == .success })
-        #expect(meter.peak == GraphConfig.maxConcurrentRequestsPerMailbox)
+        #expect(meter.peak == Self.graphDocumentedConcurrentRequests)
         #expect(meter.now == 0)
     }
 
@@ -624,7 +639,7 @@ struct GraphThrottlingTests {
         let puts = http.recordedCalls().filter { $0.method == "PUT" }.count
         #expect(leg != "uploadChunk" || puts == 8, "every upload sends its chunk")
         #expect(!stale || refreshed.withLock { $0 } >= 8, "\(leg): every operation took its token-refresh retry")
-        #expect(meter.peak <= GraphConfig.maxConcurrentRequestsPerMailbox, "\(leg): peak \(meter.peak)")
+        #expect(meter.peak <= Self.graphDocumentedConcurrentRequests, "\(leg): peak \(meter.peak)")
         #expect(meter.now == 0)
     }
 
@@ -762,7 +777,7 @@ struct GraphThrottlingTests {
                     cancel: cancelling ? Chaos(seed: roundSeed ^ 0xCA9C_E1CA_9CE1_CA9C) : nil,
                     cancelOneIn: cancelling ? 6 : 0)
 
-                let limit = GraphConfig.maxConcurrentRequestsPerMailbox
+                let limit = Self.graphDocumentedConcurrentRequests
                 let unexpected = result.outcomes.filter { !$0.cancelled && ![.success, .refused].contains($0.outcome) }
                 #expect(unexpected.isEmpty, "\(label): \(unexpected.map(\.outcome))")
                 for operation in 0..<result.operations where !result.cancelledOperations.contains(operation) {

@@ -544,10 +544,15 @@ final class AccountOperationExecutor {
         let opMsgCount = currentOp.messageIds.count
 
         do {
+            // The HTTP layer sees the same deadline, so a refusal received in
+            // time is returned rather than retried past it (`HTTPDeadline`).
+            let deadline = ContinuousClock.now + .seconds(SyncConfig.pendingOperationTimeoutSeconds)
             let executed = try await withTimeout(
                 seconds: SyncConfig.pendingOperationTimeoutSeconds
             ) { () -> ExecutedOperation in
-                try await manager.executeOperation(currentOp, provider: provider)
+                try await HTTPDeadline.$current.withValue(deadline) {
+                    try await manager.executeOperation(currentOp, provider: provider)
+                }
             }
             let provenMembers = executed.provenMembers
             // 🚨 RETIREMENT IS PER MEMBER, NEVER PER BATCH. A provider that

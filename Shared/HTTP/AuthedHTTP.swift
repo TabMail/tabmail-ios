@@ -24,6 +24,9 @@ struct HTTPRetryPolicy: Sendable {
 /// exponential backoff. With a `gate`, every request it sends (the first, each
 /// retry, the one after a refresh) holds one of the gate's slots while on the wire.
 struct AuthedHTTP: Sendable {
+    /// A test's URLSession for every shared HTTP request made in its scope:
+    /// `AuthedHTTP` and `performHTTPRequest` alike, including those of providers
+    /// built by code the test does not construct. Nil in production.
     @TaskLocal static var sessionOverride: URLSession?
     let auth: any AuthSource
     let retry: HTTPRetryPolicy
