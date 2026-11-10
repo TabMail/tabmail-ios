@@ -443,7 +443,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                     model.lookupFailuresConsumed += 1
                     return true
                 }
-                guard !lookupFailed else { return .status(503) }
+                guard !lookupFailed else { return .graphUnavailableBeyondRetry }
             }
             let top = queryItems.first(where: { $0.name == "$top" })?.value
                 .flatMap(Int.init) ?? Int.max
@@ -496,9 +496,9 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                 if let error = state.value.withLock({ $0.patchFailureTransport }) {
                     return .transportError(error)
                 }
-                return .status(503)
+                return .graphUnavailableBeyondRetry
             }
-            guard !Self.consumeMutationFailure(state) else { return .status(503) }
+            guard !Self.consumeMutationFailure(state) else { return .graphUnavailableBeyondRetry }
             guard let providerId = Self.messageId(from: request.url, move: false) else {
                 return .status(404)
             }
@@ -539,7 +539,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             return .parked { Thread.sleep(forTimeInterval: latency); return response }
         }
         http.register(path: "/messages/", method: "DELETE") { [state] request in
-            guard !Self.consumeMutationFailure(state) else { return .status(503) }
+            guard !Self.consumeMutationFailure(state) else { return .graphUnavailableBeyondRetry }
             guard let providerId = Self.messageId(from: request.url, move: false) else {
                 return .status(404)
             }
@@ -598,7 +598,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
     private static func serveMove(
         _ request: FakeHTTP.Request, state: StateBox, churnsIdOnMove: Bool
     ) -> FakeHTTP.CannedResponse {
-        guard !Self.consumeMutationFailure(state) else { return .status(503) }
+        guard !Self.consumeMutationFailure(state) else { return .graphUnavailableBeyondRetry }
         guard let providerId = Self.messageId(from: request.url, move: true) else {
             return .status(404)
         }
@@ -610,7 +610,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             if let error = state.value.withLock({ $0.oneShotMoveTransportFailures.removeValue(forKey: providerId) }) {
                 return .transportError(error)
             }
-            return .status(503)
+            return .graphUnavailableBeyondRetry
         }
         let body = request.body.flatMap {
             try? JSONSerialization.jsonObject(with: $0) as? [String: Any]

@@ -142,9 +142,10 @@ struct AuthedHTTPMockTests {
         #expect(HTTPRetryPolicy.gmail.retryableStatusCodes.contains(403))
     }
 
-    @Test("HTTPRetryPolicy.graph includes 429 only (not 403)")
+    @Test("HTTPRetryPolicy.graph includes 429 and 503 (not 403)")
     func graphPolicy() {
         #expect(HTTPRetryPolicy.graph.retryableStatusCodes.contains(429))
+        #expect(HTTPRetryPolicy.graph.retryableStatusCodes.contains(503))
         #expect(HTTPRetryPolicy.graph.retryableStatusCodes.contains(403) == false)
     }
 }

@@ -437,9 +437,9 @@ struct StatefulExchangeActionServerTests {
     /// `updateMessage`, which is declared nowhere in the tree; the method is
     /// `patchMessage(id:body:)`. The coverage conclusion survives both; the
     /// count and the symbol did not.)
-    /// A 503 is outside Graph's retryable set
-    /// (`HTTPRetryPolicy.graph` retries 429 only), so it surfaces to the caller
-    /// and the model must be unchanged.
+    /// The fixture's 503 asks for a `Retry-After` longer than the HTTP layer
+    /// waits (`FakeHTTP.CannedResponse.graphUnavailableBeyondRetry`), so it surfaces
+    /// to the caller and the model must be unchanged.
     @Test("a transient Graph mutation failure leaves state unchanged and retries clean")
     func transientMutationFailureLeavesStateUnchanged() async throws {
         let providerMessageId = "graph-transient-1"
@@ -601,7 +601,7 @@ struct StatefulExchangeActionServerTests {
     /// Either way `served` is `[401]` instead of `[401, 204]` and the call
     /// sequence loses an entry. (Offline, the escaping request fails at the
     /// transport instead, which throws just the same.) 401 is not in Graph's
-    /// `retryableStatusCodes` ([429]), so the transport does not retry it — the
+    /// `retryableStatusCodes` ([429, 503]), so the transport does not retry it — the
     /// second DELETE is the adapter's own token-refresh leg and nothing else.
     ///
     /// The registration uses the full `"/messages/{id}"` prefix so it wins the

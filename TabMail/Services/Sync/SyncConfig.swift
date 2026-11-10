@@ -178,10 +178,11 @@ enum BackfillProfile {
         }
     }
 
-    /// Concurrent body fetches for Gmail/Exchange (HTTP) in FTS indexing.
+    /// Concurrent body fetches requested of an HTTP provider in backfill and FTS indexing.
     /// Gmail: 250 quota units/sec, messages.get = 5 units → ~50 req/sec max.
     /// At ~200ms RTT, 25 concurrent ≈ 125 req/sec peak — within limit with margin.
-    /// Exchange limit is ~16 qps — 429/403 retry with backoff handles overshoot.
+    /// The width is a ceiling: a provider whose service limits concurrency serves
+    /// the request narrower, inside the provider (ADR-IOS-103).
     var gmailBodyConcurrency: Int {
         switch self {
         case .low: return 3

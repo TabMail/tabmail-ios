@@ -10,25 +10,49 @@ import Foundation
 actor ExchangeCalendarProvider: CalendarProvider {
     private let accessToken: @Sendable (_ forceRefresh: Bool) async throws -> String
     private let baseURL = "https://graph.microsoft.com/v1.0/me"
+    /// The mailbox's Graph concurrency limit (#426): the same gate as the
+    /// mailbox's `ExchangeProvider`, so calendar and mail requests share Graph's
+    /// four concurrent requests per mailbox.
+    private let mailboxGate: HTTPConcurrencyGate
     /// Test-only transport override. `nil` on every production path, where
     /// `performHTTPRequest` falls back to `sharedEphemeralSession`.
     private let testSession: URLSession?
 
-    init(accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String) {
-        self.accessToken = accessToken
-        self.testSession = nil
+    /// - Parameter mailbox: the address of the Outlook mailbox this calendar
+    ///   belongs to; it selects the mailbox's gate (`GraphMailboxGates.gate(for:)`).
+    init(
+        mailbox: String,
+        accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String
+    ) {
+        self.init(mailbox: mailbox, accessToken: accessToken, testSession: nil)
     }
 
     /// Explicit-session initializer, used by tests to route this provider's HTTP
     /// through `FakeHTTP`. A separate initializer with a NON-optional session,
     /// for the reason `GoogleCalendarProvider`'s twin gives: a nil-defaulted seam
     /// that is silently dropped leaves a unit test talking to the live service.
+    ///
+    /// It exists because whether calendar and mail requests of one mailbox share
+    /// Graph's four concurrent requests is a property of the transport, visible
+    /// only at the wire.
     init(
+        mailbox: String,
         accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
         session: URLSession
     ) {
+        self.init(mailbox: mailbox, accessToken: accessToken, testSession: session)
+    }
+
+    /// The one place the mailbox's gate is chosen, so the production and test
+    /// initializers cannot pick different gates.
+    private init(
+        mailbox: String,
+        accessToken: @escaping @Sendable (_ forceRefresh: Bool) async throws -> String,
+        testSession: URLSession?
+    ) {
         self.accessToken = accessToken
-        self.testSession = session
+        self.mailboxGate = GraphMailboxGates.gate(for: mailbox)
+        self.testSession = testSession
     }
 
     // MARK: - Calendars
@@ -851,7 +875,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // round-trip preserves the user's intended wall time.
         let prefTz = TimeZone.current.identifier
         let headers = ["Prefer": "outlook.timezone=\"\(prefTz)\""]
-        let result = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: token, extraHeaders: headers, session: testSession, logLabel: "ExchangeCalendar")
+        // Throttling (429) and 503 are retried after Graph's `Retry-After`, like the
+        // mail provider's requests (#426).
+        let policy = HTTPRetryPolicy.graph
+        let result = try await performHTTPRequestWithRetry(
+            url: baseURL + path, method: method, body: body, token: token, extraHeaders: headers,
+            retryableStatusCodes: policy.retryableStatusCodes, maxAttempts: policy.maxAttempts,
+            initialDelay: policy.initialDelay, session: testSession, logLabel: "ExchangeCalendar", gate: mailboxGate)
 
         if let data = result.data {
             return data
@@ -861,7 +891,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         if result.statusCode == 401 {
             BackgroundSyncLogger.logDebug("[ExchangeCalendar] Token expired, refreshing...")
             let freshToken = try await accessToken(true)
-            let retry = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: freshToken, extraHeaders: headers, session: testSession, logLabel: "ExchangeCalendar")
+            let retry = try await performHTTPRequest(url: baseURL + path, method: method, body: body, token: freshToken, extraHeaders: headers, session: testSession, logLabel: "ExchangeCalendar", gate: mailboxGate)
             // `headers` already carries the local-tz Prefer from the first attempt above.
             if let data = retry.data {
                 return data
