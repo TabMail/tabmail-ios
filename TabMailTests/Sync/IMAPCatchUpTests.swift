@@ -316,6 +316,103 @@ struct IMAPCatchUpTests {
         }
     }
 
+    // MARK: - A request that stalls or fails
+
+    /// The budget is checked before a request starts; only the per-request timeout
+    /// bounds one that does not come back.
+    @Test("A stalled listing request is abandoned at the request timeout and applies nothing")
+    func stalledListingIsAbandoned() async throws {
+        try await Self.withWorld("cu-stall-fetch", serverUIDs: [1, 2], localUIDs: [1, 2]) { world async throws in
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 1)
+            let timeout = SyncConfig.catchUpRequestTimeoutSeconds
+            world.server.stallNextCommand(containing: "UID FETCH", seconds: timeout * 2)
+
+            let started = Date()
+            await Self.pass(world)
+            let elapsed = Date().timeIntervalSince(started)
+
+            #expect(elapsed < timeout * 1.5, "the pass waited \(elapsed) s for a request whose timeout is \(timeout) s")
+            #expect(try Self.rows(world)["1"]?.isRead == false, "an unanswered listing applies nothing")
+            #expect(try Self.state(world)?.lastCompletedAt == nil, "and completes nothing")
+        }
+    }
+
+    @Test("A stalled removal proof is abandoned at the request timeout and removes nothing")
+    func stalledRemovalProofIsAbandoned() async throws {
+        try await Self.withWorld("cu-stall-search", serverUIDs: [1], localUIDs: [1, 2]) { world async throws in
+            let timeout = SyncConfig.catchUpRequestTimeoutSeconds
+            world.server.stallNextCommand(containing: "UID SEARCH", seconds: timeout * 2)
+
+            let started = Date()
+            await Self.pass(world)
+            let elapsed = Date().timeIntervalSince(started)
+
+            #expect(elapsed < timeout * 1.5, "the pass waited \(elapsed) s for a request whose timeout is \(timeout) s")
+            #expect(try Self.rows(world)["2"] != nil, "an unanswered proof removes nothing")
+            #expect(try Self.state(world)?.lastCompletedAt == nil)
+        }
+    }
+
+    @Test("A failed listing request keeps what earlier ranges proved and resumes at the failed range")
+    func failedListingKeepsProvenRanges() async throws {
+        try await Self.withWorld("cu-fail-fetch", serverUIDs: [1, 2001], localUIDs: [1, 2001]) { world async throws in
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 1)
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 2001)
+            world.server.failCommand(containing: "UID FETCH", onMatch: 2)
+            await Self.pass(world)
+
+            #expect(world.server.consumedInjectedFailureCount() == 1, "precondition: the second range's request failed")
+            #expect(try Self.rows(world)["1"]?.isRead == true, "the first range's result is applied")
+            #expect(try Self.rows(world)["2001"]?.isRead == false, "the failed range applies nothing")
+            let state = try #require(try Self.state(world))
+            #expect(state.lastCompletedAt == nil && state.completionStamp == nil, "a failed listing is not a completed one")
+            let cursor = try #require(state.listing?.nextUid)
+            #expect(cursor > 1 && cursor <= 2001, "the cursor sits at the failed range: \(cursor)")
+
+            await Self.pass(world)
+            #expect(try Self.rows(world)["2001"]?.isRead == true, "the next pass finishes the listing")
+            #expect(try Self.state(world)?.lastCompletedAt != nil)
+        }
+    }
+
+    @Test("A failed removal proof removes nothing, keeps the range's flags, and is retried")
+    func failedRemovalProofRemovesNothing() async throws {
+        try await Self.withWorld("cu-fail-search", serverUIDs: [1], localUIDs: [1, 2]) { world async throws in
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 1)
+            world.server.failNextCommand(containing: "UID SEARCH")
+            await Self.pass(world)
+
+            #expect(world.server.consumedInjectedFailureCount() == 1, "precondition: the proof failed")
+            #expect(try Self.rows(world)["2"] != nil, "a failed proof removes nothing")
+            #expect(try Self.rows(world)["1"]?.isRead == true, "the range's flags still count")
+            let state = try #require(try Self.state(world))
+            #expect(state.listing?.nextUid == 1 && state.lastCompletedAt == nil, "the range is listed again")
+
+            await Self.pass(world)
+            #expect(try Self.rows(world)["2"] == nil, "the next pass proves and applies the removal")
+        }
+    }
+
+    @Test("One folder's failed request does not cost the next folder its pass")
+    func failureInOneFolderLeavesTheNext() async throws {
+        let other = "Older"
+        try await Self.withWorld("cu-fail-next", serverUIDs: [1], localUIDs: [1], otherMailboxes: [other: [1]]) { world async throws in
+            try FolderEpochTestFixture.insertFolder(
+                accountId: world.accountId, path: other, role: .custom, pool: world.pool,
+                totalCount: 1, lastKnownUidValidity: Int(Self.epoch))
+            try FolderEpochTestFixture.insertHeaders(accountId: world.accountId, path: other, uids: [1], pool: world.pool)
+            let otherId = "\(world.accountId):\(other)"
+            world.server.setFlags(["\\Seen"], in: Self.path, uid: 1)
+            // The caller's order holds for two folders never listed: Older goes first.
+            world.server.failNextCommand(containing: "UID FETCH")
+            await world.engine.runCatchUp(
+                provider: world.provider, folderIds: [otherId, world.folderId], context: Self.unlimited())
+
+            #expect(world.server.consumedInjectedFailureCount() == 1, "precondition: the first folder's request failed")
+            #expect(try Self.rows(world)["1"]?.isRead == true, "the second folder was still listed in the same pass")
+        }
+    }
+
     @Test("Under budget pressure the folder whose listing completed longest ago goes first")
     func oldestCompletedFolderFirst() async throws {
         let other = "Older"
@@ -653,6 +750,23 @@ struct CatchUpApplyTests {
                 "an IMAP result that names no epoch is unproven")
 
         #expect(try FolderEpochTestFixture.headerCount(accountId: "cua-epoch", path: "Archive", pool: w.pool) == 3)
+        #expect(try Self.catchUpState(w.pool, w.folderId) == nil)
+    }
+
+    @Test("A folder whose numbering is being reset accepts nothing, even from its stored epoch")
+    func quarantinedFolder() async throws {
+        let w = try Self.world("cua-quarantine", storedEpoch: Self.epoch)
+        defer { AppDatabase.shared.withLock { $0 = w.previous }; TestDatabaseTeardown.retire(pool: w.pool, directory: w.dir) }
+        let folderId = w.folderId
+        try await w.pool.write { db in
+            try db.execute(sql: "UPDATE folder SET uidValidityResetPendingAt = ? WHERE id = ?", arguments: [Date(), folderId])
+        }
+        var result = CatchUpFolderResult(folderId: w.folderId, epoch: Self.epoch)
+        result.flagUpdates = [CatchUpFlagUpdate(messageId: "1", isRead: true, isFlagged: false)]
+        result.removedIds = ["3"]
+        result.newState = "must-not-land"
+        #expect(await SyncEngine().applyCatchUpResult(result, windowMode: .uid) == .skipped)
+        #expect(try FolderEpochTestFixture.headerCount(accountId: "cua-quarantine", path: "Archive", pool: w.pool) == 3)
         #expect(try Self.catchUpState(w.pool, w.folderId) == nil)
     }
 

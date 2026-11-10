@@ -90,8 +90,9 @@ The owner's rulings of 2026-11-09:
      the wait counts from `createdAt` in the state, written on the catch-up's first sight of the
      folder (with no request, when the network holds it back). After the wait the network no longer
      holds the folder back. **So every folder gets a full catch-up at least every 7 days on any
-     network**, plus the passes its listing needs; a device that is always on cellular, a hotspot or
-     Low Data Mode is covered.
+     network**, plus the passes its listing needs; a device that is always on cellular or a
+     hotspot is covered. ("Expensive" is `NetworkMonitor.checkExpensive()`, the path's `isExpensive`;
+     Low Data Mode on Wi-Fi is not expensive and never waits.)
    - **Order.** The oldest-completed folder goes first.
    - **Listing.** Ranges of `SyncConfig.catchUpListingRangeSpan` UIDs start at the first LOCAL UID at
      or above the cursor. For each range:
@@ -145,6 +146,13 @@ The owner's rulings of 2026-11-09:
     cheap check may read "unchanged" (the full check is the backstop).
   - A pathologically slow link where request 1 alone exceeds the budget relists the same range and
     applies only its flags. That fails closed and is recoverable.
+  - The oldest-completed folder goes first and keeps that place until its listing completes. While
+    one folder's request times out on EVERY pass, that request uses the whole pass budget, so the
+    folders behind it get no catch-up either, and the 7-day statement does not hold for them. It
+    heals when the link or server recovers; nothing is lost, and the hold stays bounded. A request
+    that fails quickly does not do this: the pass moves on to the next folder.
+  - Only read and flagged are caught up. An action tag, `\Answered`, or a message left
+    `\Deleted`-but-present on older mail is not.
 
 **Alternatives rejected.**
 

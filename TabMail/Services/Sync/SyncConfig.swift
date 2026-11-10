@@ -693,8 +693,8 @@ enum SyncConfig {
     /// The longest a folder's full listing waits for a non-expensive network
     /// (seconds), counted from its last completed listing, or from the catch-up's
     /// first sight of the folder. After that it runs on any network, inside the
-    /// same pass budget, so a device that is always on cellular, a hotspot or Low
-    /// Data Mode still gets a full catch-up. About 50 bytes per message.
+    /// same pass budget, so a device that is always on cellular or a hotspot still
+    /// gets a full catch-up. About 50 bytes per message.
     static let catchUpExpensiveNetworkMaxWaitSeconds: TimeInterval = 7 * 86_400
     /// Width of one IMAP listing range, in UIDs (`UID FETCH lo:hi (UID FLAGS)`).
     /// About 50 bytes per message on the wire, so a dense range stays far inside

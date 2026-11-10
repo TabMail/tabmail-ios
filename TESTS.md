@@ -634,6 +634,10 @@ nothing is ever decided about a UID whose numbering is unproven (ADR-IOS-107). C
   pass.
 - **A just-completed user action** wins over a stale listing, per message.
 - **Order.** Under budget pressure the folder whose listing completed longest ago goes first.
+- **A request that stalls or fails.** A stalled listing or removal proof is abandoned at the request
+  timeout and applies nothing (`FakeIMAPServer.stallNextCommand`). A failed listing keeps what earlier
+  ranges proved and resumes at the failed range; a failed proof removes nothing and is retried; one
+  folder's failure does not cost the next folder its pass.
 - **Epoch.**
   - A state from another UIDVALIDITY restarts the listing at UID 1.
   - A turnover seen on the wire applies nothing (no row removed even though none of the local UIDs
@@ -653,8 +657,8 @@ nothing is ever decided about a UID whose numbering is unproven (ADR-IOS-107). C
 
 `CatchUpApplyTests` covers the generic apply on stub results:
 
-- flag updates, a removal, a new message (through `insertBackfillBatch`) and the new state all land
-  together;
+- flag updates, a removal and the new state all land together, and no row is added;
+- a folder whose numbering is being reset accepts nothing;
 - a result from another epoch is reported as a turnover and applies nothing;
 - a `.uid` result that names no epoch applies nothing, and neither does a folder whose stored epoch
   is unknown;

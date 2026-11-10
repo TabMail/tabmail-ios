@@ -427,6 +427,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// /keepalive NOOP RTT) — turning a lottery-rare race into a
         /// routinely-reproducible one via REAL latency, not a pause hook.
         var latencyInjection: LatencyInjection?
+        /// Command fragment (uppercased) → seconds to hold the NEXT matching
+        /// command's response, one entry per match. See `stallNextCommand`.
+        var stalls: [String: [Double]] = [:]
     }
 
     /// See `State.latencyInjection`'s doc comment.
@@ -653,6 +656,12 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// is supplementary/diagnostic rather than the oracle's primary signal.
     func logoutFdLog() -> [Int32] {
         withState { $0.logoutFdLog }
+    }
+
+    /// Hold the response to the next command containing `fragment` for
+    /// `seconds`: a stalled link, for a caller that must bound how long it waits.
+    func stallNextCommand(containing fragment: String, seconds: Double) {
+        withState { $0.stalls[fragment.uppercased(), default: []].append(seconds) }
     }
 
     func consumedInjectedFailureCount() -> Int {
@@ -1640,6 +1649,14 @@ final class FakeIMAPServer: @unchecked Sendable {
                 if let delayMs = withState({ drawLatencyDelayMs(command: command, state: &$0) }) {
                     usleep(UInt32(delayMs * 1000))
                 }
+                let stallSeconds: Double? = withState { state in
+                    let upper = recordedCommand.uppercased()
+                    guard let key = state.stalls.keys.sorted().first(where: {
+                        upper.contains($0) && !(state.stalls[$0] ?? []).isEmpty
+                    }) else { return nil }
+                    return state.stalls[key]?.removeFirst()
+                }
+                if let stallSeconds { usleep(UInt32(stallSeconds * 1_000_000)) }
                 let response = handleCommand(
                     tag: tag, command: command, args: args, fd: fd,
                     authenticated: &authenticated, selectedMailbox: &selectedMailbox

@@ -26,7 +26,7 @@ enum CatchUpApplyOutcome: Sendable, Equatable {
     /// Applied, with the state written in the same transaction.
     case applied(updatedFlags: Int, removedIds: [String])
     /// Nothing written: the folder is gone or quarantined, its epoch is unknown or
-    /// unproven for this result, an insert was refused, or the write failed. The
+    /// unproven for this result, or the write failed. The
     /// provider redoes the work from its previous state on a later pass.
     case skipped
     /// The provider was served a different epoch than the folder's stored one.
