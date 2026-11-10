@@ -1281,7 +1281,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
                 }
                 return nil
             }()
-            var graphRec = parseRRULEToGraphRecurrence(rrule, eventStart: recEventStart)
+            // The event's zone, as a timed `start` is sent above (`input.startTimeZone`, else the
+            // device's): Graph reads the range's dates there. The start's wall time is the one
+            // sent above, in that zone; an all-day series has none, and its rule's UNTIL is a bare
+            // date, which `graphEndDate` keeps as written in any zone.
+            let rangeZone = input.startTimeZone.flatMap { TimeZone(identifier: $0) } ?? .current
+            let startWallTime = input.startDateTime.map(Self.graphNaiveDateTime)
+            var graphRec = parseRRULEToGraphRecurrence(rrule, eventStart: recEventStart, timeZone: rangeZone, startWallTime: startWallTime)
             if var range = graphRec["range"] as? [String: Any], range["startDate"] == nil {
                 let startDateStr: String? = {
                     if let sd = input.startDate { return sd }                       // already YYYY-MM-DD
@@ -1299,6 +1305,78 @@ actor ExchangeCalendarProvider: CalendarProvider {
         return json
     }
 
+    /// Graph's `recurrenceRange.endDate` for an RFC 5545 `UNTIL`: the series' LAST DAY, a bare
+    /// `yyyy-MM-dd` date that Graph reads INCLUSIVELY in the event's zone.
+    ///
+    /// `UNTIL` comes in three forms (RFC 5545 §3.3.10):
+    /// - `YYYYMMDD` is already a date (all-day series, and every rule `toGCalEvent` derives from
+    ///   Graph's own range), so its digits are the answer.
+    /// - `YYYYMMDDTHHMMSS` is floating wall time in the event's zone. No producer emits it for
+    ///   Outlook; it keeps its own date digits, like any other non-UTC shape.
+    /// - `YYYYMMDDTHHMMSSZ` is a UTC INSTANT, the form `CalendarToolHelpers.validatedRRuleUntil`
+    ///   emits for every timed series (a date-only end becomes 23:59:59 in the event's zone, then
+    ///   UTC). Its own date digits are the UTC date. Behind UTC that is the NEXT day, and Graph,
+    ///   reading the end inclusively, added one extra day of occurrences for every attendee
+    ///   (UTC−8: Dec 31 23:59:59 local is Jan 1 07:59:59Z). Ahead of UTC an early-morning end
+    ///   lands on the PREVIOUS UTC day and dropped the last day. So the instant is dated in
+    ///   `timeZone`.
+    ///
+    /// A UTC-instant `UNTIL` whose time of day in `timeZone` is earlier than the series' own start time
+    /// ends the series the day before. RFC 5545 bounds the last occurrence's START by the `UNTIL`
+    /// instant, inclusively, and on the `UNTIL`'s local day an occurrence starts at the series'
+    /// start time: a 10:00 series with
+    /// `UNTIL` at 05:00 on the 20th last meets on the 19th, as Google Calendar and CalDAV servers
+    /// expand it. So the end date is the last local day whose start time is at or before the
+    /// `UNTIL`: that day when the `UNTIL`'s time of day in `timeZone` is at or after the start's,
+    /// else the day before. A date-only end reaches here as 23:59:59 in the event's zone, so it is
+    /// always the day the user named. `startWallTime` is the series' start as Graph stores it, the
+    /// naive `yyyy-MM-ddTHH:mm:ss` wall time `graphNaiveDateTime` writes, read in `timeZone`; nil
+    /// (an all-day series) or a start in no such form keeps the `UNTIL`'s own local day.
+    ///
+    /// nil when fewer than 8 date digits can be recovered (the caller leaves the range `noEnd`).
+    /// A value that is not a 16-character `Z` instant, or one that does not parse, keeps its date
+    /// digits, as every form did before.
+    nonisolated static func graphEndDate(until: String, in timeZone: TimeZone, startWallTime: String?) -> String? {
+        let compact = until
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: ":", with: "")
+            .uppercased()
+        let digits = compact.filter { $0.isNumber }
+        guard digits.count >= 8 else { return nil }
+        let d = String(digits.prefix(8))
+        let ownDate = "\(d.prefix(4))-\(d.dropFirst(4).prefix(2))-\(d.suffix(2))"
+
+        // The UNTIL's instant: only a UTC one is read; every other shape keeps its own date.
+        let parser = DateFormatter()
+        parser.locale = Locale(identifier: "en_US_POSIX")
+        parser.calendar = Calendar(identifier: .gregorian)
+        if compact.count == 16, compact.hasSuffix("Z") {
+            parser.timeZone = TimeZone(identifier: "UTC")
+            parser.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        } else {
+            return ownDate
+        }
+        guard let instant = parser.date(from: compact) else { return ownDate }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let local = DateFormatter()
+        local.locale = Locale(identifier: "en_US_POSIX")
+        local.calendar = calendar
+        local.timeZone = timeZone
+        var lastInstant = instant
+        local.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+        if let startWallTime, let start = local.date(from: String(startWallTime.prefix(19))) {
+            local.dateFormat = "HHmmss"
+            if local.string(from: instant) < local.string(from: start) {
+                lastInstant = calendar.startOfDay(for: instant).addingTimeInterval(-1)
+            }
+        }
+        local.dateFormat = "yyyy-MM-dd"
+        return local.string(from: lastInstant)
+    }
+
     /// Convert an RFC 5545 `RRULE` to a Microsoft Graph `patternedRecurrence`.
     ///
     /// Graph's `recurrencePattern.type` is a CLOSED enum — `daily`, `weekly`,
@@ -1313,7 +1391,13 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// by `DTSTART` (e.g. `FREQ=WEEKLY` with no `BYDAY` recurs on DTSTART's
     /// weekday). `eventStart` is that DTSTART — it lets us fill the implied
     /// field correctly instead of emitting a body Graph rejects with HTTP 400.
-    nonisolated func parseRRULEToGraphRecurrence(_ rrule: String, eventStart: Date?) -> [String: Any] {
+    ///
+    /// `timeZone` is the zone Graph reads the range in: the event's start zone
+    /// (`recurrenceTimeZone` is never sent, so Graph uses the event's own). An
+    /// `UNTIL` that names a UTC instant is dated there, and one earlier in its
+    /// day than the series' start time (`startWallTime`, the start's wall time
+    /// in that zone) ends the series the day before; see `graphEndDate`.
+    nonisolated func parseRRULEToGraphRecurrence(_ rrule: String, eventStart: Date?, timeZone: TimeZone, startWallTime: String?) -> [String: Any] {
         let parts = rrule.replacingOccurrences(of: "RRULE:", with: "").split(separator: ";")
         var freq = "weekly"
         var interval = 1
@@ -1345,22 +1429,14 @@ actor ExchangeCalendarProvider: CalendarProvider {
         var range: [String: Any] = ["type": "noEnd"]
         if let count {
             range = ["type": "numbered", "numberOfOccurrences": count]
-        } else if let until {
-            // RFC 5545 UNTIL can be `YYYYMMDD` (all-day), `YYYYMMDDTHHMMSS`
-            // (local), or `YYYYMMDDTHHMMSSZ` (UTC) — Graph's endDate is a bare
-            // date, so take the leading 8 date digits regardless of form.
+        } else if let until, let endDate = Self.graphEndDate(until: until, in: timeZone, startWallTime: startWallTime) {
             // NOTE: callers that need a precise split should NOT route through
             // here (Graph's date-inclusive endDate loses the instant). See
             // `splitSeries` / `graphEndDateBefore`. This path exists for plain
             // create/update of an already-date-bounded series.
-            let digits = until.filter { $0.isNumber }
-            if digits.count >= 8 {
-                let d = String(digits.prefix(8))
-                let endDate = "\(d.prefix(4))-\(d.dropFirst(4).prefix(2))-\(d.suffix(2))"
-                range = ["type": "endDate", "endDate": endDate]
-            }
-            // If we can't recover 8 date digits, leave range as noEnd rather
-            // than emitting a malformed endDate that Graph would reject.
+            // If `graphEndDate` can't recover 8 date digits, the range stays
+            // noEnd rather than a malformed endDate that Graph would reject.
+            range = ["type": "endDate", "endDate": endDate]
         }
 
         // Calendar fields implied by DTSTART when the RRULE doesn't spell them out.

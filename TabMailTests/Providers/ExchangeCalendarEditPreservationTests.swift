@@ -18,7 +18,8 @@ import Synchronization
 /// - "If you update the location property, any prior locations in the locations
 ///   collection would be removed and replaced by the new location value";
 /// - writing a series' `recurrence` (measured against Outlook.com on 2026-11-07):
-///   a range written without `recurrenceTimeZone` is stored in UTC, and a rule
+///   a range written without `recurrenceTimeZone` came back labelled UTC (see
+///   `defaultRecurrenceZone`), and a rule
 ///   that differs from the stored one makes Graph restore deleted occurrences
 ///   and move moved ones back — counted in `seriesResets`. Writing the stored
 ///   recurrence back exactly changed nothing;
@@ -208,7 +209,11 @@ final class FakeGraphCalendar: Sendable {
         }
     }
 
-    /// A recurrence written without `recurrenceTimeZone` is stored in UTC.
+    /// A recurrence written without `recurrenceTimeZone` is stored labelled UTC, as
+    /// measured on a series that the same write moved to UTC. Graph's documented
+    /// default is the event's own zone (`recurrenceRange`), which is the zone the
+    /// app dates `endDate` in. This fake models the measured label, and nothing
+    /// here reads a range's dates in it.
     private static func defaultRecurrenceZone(in stored: inout [String: Any]) {
         guard var recurrence = stored["recurrence"] as? [String: Any],
               var range = recurrence["range"] as? [String: Any], range["recurrenceTimeZone"] == nil

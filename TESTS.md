@@ -670,3 +670,23 @@ nothing is ever decided about a UID whose numbering is unproven (ADR-IOS-107). C
 
 `FolderCatchUpStateMigrationTests` checks that v98 adds a nullable `TEXT` column and leaves existing
 folders without state.
+
+## Outlook series end — the last day in the event's zone
+
+Graph's `recurrence.range.endDate` is a date, read inclusively in the event's zone. A timed series'
+`UNTIL` reaches the writer as a UTC instant (`CalendarToolHelpers.validatedRRuleUntil` turns a date
+into 23:59:59 in the event's zone, then UTC), so `ExchangeCalendarProvider.graphEndDate` dates it in
+that zone, and an `UNTIL` earlier in its day than the series' start time ends the series the day
+before (RFC 5545 bounds the last occurrence's start inclusively, as Google Calendar expands it).
+`ExchangeCalendarRecurringTests.timedSeriesEndsOnItsLastOccurrenceDay` drives the real producer and
+writer for a 10:00 series in five zones on both sides of UTC (half-hour offsets and UTC+14 included)
+and five ways of naming the end: a date, 23:30 and 10:00 end on the day named, 09:59:59 and 05:00 on
+the day before; `secondsLessStartKeepsTheStartTimeRule` does the same for a start written `…T10:00`.
+`allDaySeriesEndsOnTheNamedDay` keeps an all-day series' bare date (its input has no
+zone label, so it runs in the simulator's zone). `graphEndDateForms` pins each `UNTIL` form in fixed
+zones: a UTC instant moves to its local day and ends the day before a start time it does not reach
+(inclusive at the start time itself), a floating time and a bare date keep their date whatever the
+start, an unparsable 16-character `Z` value keeps its own date digits, and a start in
+no wall-time form leaves the `UNTIL`'s local day. `graphEndDateRoundTrips` brings the rule
+`toGCalEvent` derives from Graph's own `endDate` back to the same date in every zone. All dates are
+relative to today, read once per test.
