@@ -54,6 +54,36 @@ about an hour of UTC), an occurrence named by its own id, an empty edit writing 
 retried after a 401 with a refreshed sign-in, and an attendee stored in mixed case keeping its
 type. The fixtures hold at any host offset from -12 to +14 hours.
 
+Online meetings (#511): the online fixture's body follows the layout a Teams meeting on a work
+account stored when checked live (notes, then a join section between two lines of underscores with a
+short "Join:" link and the long `meetup-join` one; every link, id, number and passcode a
+placeholder), and the fake models what that check measured: a body written without the join link
+turns the online meeting off (`isOnlineMeeting` false, `onlineMeetingProvider` `unknown`,
+`onlineMeeting` null). A description edit is one of the edit kinds on the online single event,
+series and occurrence: the notes are replaced, the join section and everything after it are kept byte
+for byte, and the meeting stays on. Also: a read gives the stored notes as the description at full
+length (past the 255-character preview), an online meeting's without its join section and with its
+join link as `conferenceUrl`, by `getEvent` and by a `calendarView` listing (the fake lists single
+events and occurrences, never a series master); a description read, added to and written back keeps
+the notes and the meeting; after the join link is written into the notes, the next description edit
+still keeps the meeting; clearing the notes keeps the join section; and a layout without a separator
+line gets the description as text, as before.
+`GraphOnlineMeetingBodyTests` pins the recogniser over the live layout (found by either join link) and
+the older layout of Graph's online-meeting samples: bare-text and element notes, escaping and line
+breaks, a `<body>` tag with attributes or none, a join link
+written raw, a separator nested in several elements, the cases it does not recognise (no link, the
+separator only after it, a line shorter than `separatorMinUnderscores`, an unclosed `<body` tag, an
+empty link) and where the notes end; a copy of the join link in the notes (as written and with
+`&amp;`) and a line of underscores in the notes are part of the notes; with both, the join section is
+still kept whole; trailing line breaks in new notes are dropped, so repeated edits do not grow the
+body; and thousands of copies of the join link in the notes, with or without a join section after
+them, are recognised as the clean body is, within a time limit a scan that restarts for each copy
+exceeds. `ExchangeCalendarTests` maps an HTML, text or missing body to the
+description; `CalendarToolHelpersTests` pins the `conference_url:` line after the description and an
+event pill's notes (join link first); `ToolCachingTests` checks that the search and direct-read pill
+caches carry the join link (including a read that finds the event by scanning every calendar), and
+that in a new session a pill tap that fetches the event live shows it.
+
 ## Inbox list — layered test architecture
 
 the unified inbox read (ADR-IOS-055) replaced four disagreeing inbox-list read paths with one unified reader (`InboxListReader` → `InboxListComposer.compose`). Getting this right — and *keeping* it right as the code evolves — needs coverage at four distinct layers, each catching a different class of bug. A 5-round adversarial audit of the refactor found two HIGH-severity findings (F1, F2) that lived entirely *between* layers, invisible to any single layer's test suite — that's why the fourth layer (E2E) exists.
