@@ -63,6 +63,15 @@ local `Draft` keeps its content and reopening/editing/saving admits fresh work. 
 and no automatic re-admission are added**, and sync alone does not upload content that never reached
 the server; a never-uploaded draft stays a draft until the user saves it again.
 
+**Reachability, fixed 2026-11-09 (GitHub #519).** "Saving again" needs the draft to still open, and
+it opens only from its `draft-…` placeholder header. That header used to lose its protection with the
+retired operation, so the full sync the boundary schedules deleted it (the whole-folder branch on any
+provider, the date window on Gmail and Outlook) and the draft could no longer be opened. The full
+sync's stale rule now never deletes the placeholder of a local `Draft` that has no server copy
+(`SyncEngine.neverUploadedDraftPlaceholderIds`, consulted by `runSyncMessages`); the placeholder of a
+draft that is gone (sent, deleted, evicted) or has a server copy is removed as before. The boundary
+itself is unchanged.
+
 **Why a blanket purge rather than a version-aware migration.** The same reason IOS-ACTION-001 gives
 for `v74`: deciding per row would mean decoding each one and validating its address space against
 whatever keying the previous release used — the "reconstruct an address the system was already told
