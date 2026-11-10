@@ -97,7 +97,7 @@ extension CalDAVProvider {
             return nil
         }
         guard let property = ICSProperty(line),
-              let value = parseICSWallTime(property.value, tzid: property.tzid, isDate: property.valueType == "DATE") else {
+              let value = parseICSWallTime(property.value, tzid: property.tzid, isDate: ICSValueType.statesDate(property.head)) else {
             throw CalendarProviderError.notSupported(
                 "TabMail could not read this event's start time, so it did not change the series. Change the time in your calendar app instead.")
         }
@@ -197,7 +197,7 @@ extension CalDAVProvider {
             return changed ? property.head + ":" + parts.joined(separator: ";") : nil
         }
 
-        let isDate = property.valueType == "DATE"
+        let isDate = ICSValueType.statesDate(property.head)
         var movedZone: String?
         func move(_ text: String) throws -> String {
             let moved = try shift.moved(try readValue(text, property: property, tzid: property.tzid, isDate: isDate))

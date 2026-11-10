@@ -126,7 +126,7 @@ enum ICSParser {
         if hasRecurrenceId { return nil }
 
         // Parse dates
-        let isAllDay = dtstartParams?.contains("VALUE=DATE") == true
+        let isAllDay = dtstartParams.map { ICSValueType.statesDate($0) } == true
             || (dtstart.map { $0.count == 8 } ?? false)
 
         let startDate = dtstart.flatMap { parseICSDate($0, params: dtstartParams) }
@@ -312,7 +312,7 @@ enum ICSParser {
     /// `CalDAVProvider.effectiveEnd` use it; any other reader of a VEVENT's end should too.
     static func impliedEndValue(dtstartParams: String?, dtstartValue: String) -> String? {
         let value = dtstartValue.trimmingCharacters(in: .whitespaces)
-        let isDate = (dtstartParams ?? "").uppercased().split(separator: ";").contains("VALUE=DATE")
+        let isDate = ICSValueType.statesDate(dtstartParams ?? "")
             || (value.count == 8 && !value.contains("T"))
         guard isDate else { return value }
         let fmt = DateFormatter()

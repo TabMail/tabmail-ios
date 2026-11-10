@@ -520,6 +520,90 @@ struct CalDAVCalendarEditKeepsKindTests {
         #expect(rows.isEmpty)
     }
 
+    @Test("a timed event whose DTSTART states VALUE=DATE-TIME, given only a new start, moves as a timed event")
+    func explicitDateTimeStartAloneMovesTimed() async throws {
+        let store = FakeCalDAVStore(servesETags: true)
+        store.seed(path: "/cal/tm-2.ics", ics: [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN", "BEGIN:VEVENT",
+            "UID:tm-2", "DTSTAMP:20990101T000000Z",
+            "DTSTART;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T100000",
+            "DTEND;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T113000",
+            "SUMMARY:Planning", "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n"))
+        let rows = try await run(store, eventId: "/cal/tm-2.ics", [
+            "start_iso": .string("2099-03-02T14:00:00"), "timezone": .string("America/Los_Angeles"),
+        ], account: "kind-c-explicit-datetime")
+        let ics = store.storedICS(path: "/cal/tm-2.ics")
+        let start = line(ics, "DTSTART")
+        let end = line(ics, "DTEND")
+        #expect(start?.hasSuffix(":20990302T140000") == true, "start: \(start ?? "<none>")")
+        #expect(start?.contains("TZID=America/Los_Angeles") == true, "start: \(start ?? "<none>")")
+        #expect(end?.hasSuffix(":20990302T153000") == true, "the event did not keep its length: \(end ?? "<none>")")
+        #expect(rows.isEmpty, "the move was refused: \(rows.first?.failureReason ?? "<none>")")
+    }
+
+    @Test("a timed series whose DTSTART states VALUE=DATE-TIME splits as a timed series")
+    func explicitDateTimeSeriesSplitsTimed() async throws {
+        let store = FakeCalDAVStore(servesETags: true)
+        // 2099-03-02 is a Monday; weekly from there.
+        store.seed(path: "/cal/tm-3.ics", ics: [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN", "BEGIN:VEVENT",
+            "UID:tm-3", "DTSTAMP:20990101T000000Z",
+            "DTSTART;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T100000",
+            "DTEND;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T113000",
+            "RRULE:FREQ=WEEKLY", "SUMMARY:Planning", "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n"))
+        let rid = "2099-03-16T10:00:00"
+        let rows = try await run(store, eventId: "/cal/tm-3.ics", [
+            "edit_scope": .string("this_and_following"), "recurrence_id": .string(rid),
+            "start_iso": .string("2099-03-16T14:00:00"), "timezone": .string("America/Los_Angeles"),
+        ], account: "kind-c-explicit-datetime-split")
+        #expect(rows.isEmpty, "the split was refused: \(rows.first?.failureReason ?? "<none>")")
+        // Read inside the VEVENT: a written VTIMEZONE carries its own DTSTART and RRULE lines.
+        func eventLine(_ ics: String?, _ name: String) -> String? {
+            guard let ics, let begin = ics.range(of: "BEGIN:VEVENT") else { return nil }
+            return line(String(ics[begin.lowerBound...]), name)
+        }
+        let capped = eventLine(store.storedICS(path: "/cal/tm-3.ics"), "RRULE")
+        #expect(capped?.contains("UNTIL=") == true, "the series was not capped: \(capped ?? "<none>")")
+        #expect(capped?.range(of: #"UNTIL=\d{8}T\d{6}Z"#, options: .regularExpression) != nil,
+                "a timed series needs a date-time UNTIL: \(capped ?? "<none>")")
+        let newUid = GoogleCalendarProvider.deterministicSplitEventId(masterId: "/cal/tm-3.ics", recurrenceId: rid)
+        let successor = store.storedICS(path: "/cal/\(newUid).ics")
+        #expect(successor != nil, "no successor series was written; PUTs: \(store.recordedPuts().map(\.path))")
+        let start = eventLine(successor, "DTSTART")
+        let end = eventLine(successor, "DTEND")
+        #expect(start?.hasSuffix(":20990316T140000") == true, "new series start: \(start ?? "<none>")")
+        #expect(start?.contains("TZID=America/Los_Angeles") == true, "new series start: \(start ?? "<none>")")
+        #expect(end?.hasSuffix(":20990316T153000") == true, "the new series did not keep the length: \(end ?? "<none>")")
+    }
+
+    @Test("one occurrence of a timed series whose DTSTART states VALUE=DATE-TIME, given only a new start, keeps a timed end")
+    func explicitDateTimeOccurrenceKeepsTimedEnd() async throws {
+        let store = FakeCalDAVStore(servesETags: true)
+        // 2099-03-02 is a Monday; weekly from there.
+        store.seed(path: "/cal/tm-4.ics", ics: [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//TabMail//Test//EN", "BEGIN:VEVENT",
+            "UID:tm-4", "DTSTAMP:20990101T000000Z",
+            "DTSTART;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T100000",
+            "DTEND;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T113000",
+            "RRULE:FREQ=WEEKLY", "SUMMARY:Planning", "END:VEVENT", "END:VCALENDAR",
+        ].joined(separator: "\r\n"))
+        let rows = try await run(store, eventId: "/cal/tm-4.ics", [
+            "edit_scope": .string("this_only"), "recurrence_id": .string("2099-03-16T10:00:00"),
+            "start_iso": .string("2099-03-16T14:00:00"), "timezone": .string("America/Los_Angeles"),
+        ], account: "kind-c-explicit-datetime-occurrence")
+        #expect(rows.isEmpty, "the change was refused: \(rows.first?.failureReason ?? "<none>")")
+        // The changed occurrence is the VEVENT that carries a RECURRENCE-ID.
+        let blocks = (store.storedICS(path: "/cal/tm-4.ics") ?? "").components(separatedBy: "BEGIN:VEVENT")
+        let override = blocks.first { $0.contains("RECURRENCE-ID") }
+        #expect(override != nil, "no changed occurrence was written")
+        let start = line(override, "DTSTART")
+        let end = line(override, "DTEND")
+        #expect(start?.hasSuffix(":20990316T140000") == true, "occurrence start: \(start ?? "<none>")")
+        #expect(end?.hasSuffix(":20990316T153000") == true, "the occurrence did not keep a timed end of its length: \(end ?? "<none>")")
+    }
+
     @Test("splitting an all-day series with a move starts the new series on the given date")
     func allDaySplitStartsOnTheGivenDate() async throws {
         let store = FakeCalDAVStore(servesETags: true)
