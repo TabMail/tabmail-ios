@@ -275,10 +275,20 @@ struct RootView: View {
         if !tutorial.isRunning { requestPushPermissionAfterTutorial() }
     }
 
-    /// Clears both "Couldn't undo" notices, the Send one and the move one.
-    private func dismissUndoFailures() {
-        pendingSendService.dismissUndoFailure()
-        undoService.dismissUndoFailure()
+    /// Clears the "Couldn't undo" notice the alert was showing, and only that
+    /// one: the Send notice when there is one (the alert shows it first),
+    /// otherwise the move notice. A move refusal that arrived while the Send
+    /// notice was up stays set, so the alert comes back with it. (A Send notice
+    /// cannot arrive while the move notice is up: its only producer is the
+    /// Send toast's Undo, which the alert covers.) Only the
+    /// alert's binding calls this, once per dismissal: a second call would
+    /// clear the notice still waiting to be shown.
+    private func dismissShownUndoFailure() {
+        if pendingSendService.undoFailureMessage != nil {
+            pendingSendService.dismissUndoFailure()
+        } else {
+            undoService.dismissUndoFailure()
+        }
     }
 
     /// The launch-time notification request (TabMailApp.init) waits while the
@@ -403,12 +413,14 @@ struct RootView: View {
         // still be queued or may already be sending, so this alert says only that
         // the Undo attempt did not take; it never promises the message was stopped.
         // A refused move Undo (`UndoService.undoFailureMessage`) shows the same
-        // notice: nothing was moved back.
+        // notice: nothing was moved back. Each notice is shown before it is
+        // cleared (`dismissShownUndoFailure`). OK has no action of its own:
+        // tapping it dismisses through the binding.
         .alert("Couldn't undo", isPresented: Binding(
             get: { pendingSendService.undoFailureMessage != nil || undoService.undoFailureMessage != nil },
-            set: { if !$0 { dismissUndoFailures() } }
+            set: { if !$0 { dismissShownUndoFailure() } }
         )) {
-            Button("OK", role: .cancel) { dismissUndoFailures() }
+            Button("OK", role: .cancel) {}
         } message: {
             Text(pendingSendService.undoFailureMessage ?? undoService.undoFailureMessage ?? "")
         }

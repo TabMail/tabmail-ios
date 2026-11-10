@@ -1246,9 +1246,13 @@ rule-day and split-count suites of a later slice; nothing reads them yet.
 ## Refused move Undo notice
 
 `UndoProviderIdentitySafetyTests` drives a move Undo through `UndoService.undo`, the path the Undo
-control and shake take. When `AccountManager.undoMove` refuses it (here an IMAP move with no proven
-destination UID), the message stays where the move put it and `UndoService.undoFailureMessage` is
-set, which RootView shows as the "Couldn't undo" notice. An Undo that restores the message sets no
-notice. A hosted case checks the notice the user sees: the test host's RootView presents the
-"Couldn't undo" alert with the move text, and dismissing that alert through UIKit clears the notice
-and the alert does not come back.
+control and shake take, passing each source (toast, shake and programmatic); no branch reads the
+source, so these show the notice does not depend on it. When
+`AccountManager.undoMove` refuses it (here an IMAP move with no proven destination UID), the message
+stays where the move put it and `UndoService.undoFailureMessage` is set, which RootView shows as the
+"Couldn't undo" notice. An Undo that restores the message sets no notice. Hosted cases check the
+notice the user sees in the test host's RootView: the move notice's alert, dismissed through UIKit,
+clears it and does not come back; a refused Send Undo (its cancellation commit refused) shows its own
+text, and tapping OK clears only it and leaves the Send queued; and a move Undo refused while the Send
+notice is up keeps its notice when the Send one is dismissed, is shown next, and clears on its own
+OK. The OK taps run the button's own handler after UIKit dismisses the alert, as a real tap does.
