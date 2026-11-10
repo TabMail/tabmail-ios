@@ -72,6 +72,8 @@ struct RecurrenceTailCountTests {
     ]
 
     static let derivedCases: [Case] = [
+        Case(name: "a step almost as long as every four-digit year still places its second occurrence",
+             rrule: "RRULE:FREQ=DAILY;INTERVAL=3652423;COUNT=3", start: "0000-01-01", split: "9999-12-31", expected: 2),
         Case(name: "monthly from the 31st skips the shorter months: 31 Jan, 31 Mar, 31 May",
              rrule: "RRULE:FREQ=MONTHLY", start: "1997-01-31", split: "1997-06-01", expected: 3),
         Case(name: "yearly from 29 Feb lands only in leap years: 2000, 2004, 2008",
@@ -150,11 +152,13 @@ struct RecurrenceTailCountTests {
     func intervalBound() throws {
         let start = try #require(RecurrenceTail.Day(iso: "1997-09-02"))
         let split = try #require(RecurrenceTail.Day(iso: "1997-09-05"))
-        let atBound = "RRULE:FREQ=DAILY;INTERVAL=\(RecurrenceTail.maxInterval)"
-        let aboveBound = "RRULE:FREQ=DAILY;INTERVAL=\(RecurrenceTail.maxInterval + 1)"
-        #expect(RecurrenceTail.occurrences(of: atBound, seriesStart: start, before: split) == 1,
-                "only DTSTART falls before the split")
-        #expect(RecurrenceTail.occurrences(of: aboveBound, seriesStart: start, before: split) == nil)
+        for freq in ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"] {
+            let atBound = "RRULE:FREQ=\(freq);INTERVAL=\(RecurrenceTail.maxInterval)"
+            let aboveBound = "RRULE:FREQ=\(freq);INTERVAL=\(RecurrenceTail.maxInterval + 1)"
+            #expect(RecurrenceTail.occurrences(of: atBound, seriesStart: start, before: split) == 1,
+                    "\(freq): only DTSTART falls before the split")
+            #expect(RecurrenceTail.occurrences(of: aboveBound, seriesStart: start, before: split) == nil, "\(freq)")
+        }
     }
 
     private func check(_ c: Case) throws {

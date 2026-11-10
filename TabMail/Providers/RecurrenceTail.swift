@@ -187,7 +187,7 @@ enum RecurrenceTail {
     /// COUNT and UNTIL are ignored: this counts what the pattern generates.
     ///
     /// Returns nil for a rule outside the supported subset:
-    /// FREQ DAILY/WEEKLY/MONTHLY/YEARLY with INTERVAL, BYMONTH, BYMONTHDAY,
+    /// FREQ DAILY/WEEKLY/MONTHLY/YEARLY with INTERVAL (up to `maxInterval`), BYMONTH, BYMONTHDAY,
     /// BYDAY, WKST, and BYSETPOS (MONTHLY, or YEARLY with BYMONTH, over a plain
     /// BYDAY set). BYWEEKNO, BYYEARDAY, BYHOUR/BYMINUTE/BYSECOND, FREQ below
     /// DAILY and unknown parts are not supported, nor are BYMONTHDAY with
@@ -232,7 +232,7 @@ enum RecurrenceTail {
 
     /// The largest INTERVAL the counter accepts: the days four-digit years
     /// span (10000 years of at most 366 days). A larger step, in any unit,
-    /// places no second occurrence before a split such a year can name, and
+    /// places no second period before a split such a year can name, and
     /// the bound keeps every step of the counter's arithmetic far from
     /// overflow. A rule above it is not counted.
     static let maxInterval = 10_000 * 366
