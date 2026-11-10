@@ -538,7 +538,8 @@ struct ExchangeDeltaCursorTests {
     @Test("A walk that stopped partway resumes from its next page; a refused kept link or another folder starts at page 1")
     func walkResumesWhereItStopped() async throws {
         let walk = InboxModel(messageCount: 500)
-        // One failure, served once, for the page whose `$skiptoken` is the key.
+        // One failure, served once, for the page whose `$skiptoken` is the key. A
+        // transient failure is a 500: the Graph retry policy retries 429 and 503.
         let failOnce = Mutex<[String: Int]>([:])
         let http = FakeHTTP.Scenario()
         defer { http.close() }
@@ -558,7 +559,7 @@ struct ExchangeDeltaCursorTests {
         }
 
         // A server error on page 3 fails the walk after two pages.
-        failOnce.withLock { $0["200"] = 503 }
+        failOnce.withLock { $0["200"] = 500 }
         await #expect(throws: (any Error).self) { _ = try await provider.getCurrentDeltaLink(folderId: Self.inboxId) }
         #expect(newPages() == ["0", "100", "200"])
 
@@ -572,7 +573,7 @@ struct ExchangeDeltaCursorTests {
 
         // Stopped again at page 3; then Graph refuses the kept link (410 Gone):
         // the same call starts again at page 1 and finishes.
-        failOnce.withLock { $0["200"] = 503 }
+        failOnce.withLock { $0["200"] = 500 }
         await #expect(throws: (any Error).self) { _ = try await provider.getCurrentDeltaLink(folderId: Self.inboxId) }
         #expect(newPages() == ["0", "100", "200"])
         failOnce.withLock { $0["200"] = 410 }
@@ -580,7 +581,7 @@ struct ExchangeDeltaCursorTests {
         #expect(newPages() == ["200", "0", "100", "200", "300", "400"], "a refused kept link restarts the walk")
 
         // Stopped at page 2 of the Inbox; a walk of another folder starts at its own page 1.
-        failOnce.withLock { $0["100"] = 503 }
+        failOnce.withLock { $0["100"] = 500 }
         await #expect(throws: (any Error).self) { _ = try await provider.getCurrentDeltaLink(folderId: Self.inboxId) }
         #expect(newPages() == ["0", "100"])
         let before = Self.deltaRequests(http).count
@@ -625,7 +626,7 @@ struct ExchangeDeltaCursorTests {
         #expect(newPages() == ["0", "100", "200", "300", "400"], "the refused walk kept nothing")
 
         // Stopped at page 3; the kept link is refused, and so is the restarted page 1.
-        failOnce.withLock { $0["200"] = 503 }
+        failOnce.withLock { $0["200"] = 500 }
         await #expect(throws: (any Error).self) { _ = try await provider.getCurrentDeltaLink(folderId: Self.inboxId) }
         #expect(newPages() == ["0", "100", "200"])
         failOnce.withLock { $0["200"] = 410; $0["0"] = 410 }
