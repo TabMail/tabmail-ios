@@ -669,7 +669,8 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// and a start whose offset matches its label (`Z` with `UTC`) is the instant
     /// it spells. A wall time without seconds (`…T10:00`), which the tools pass
     /// through as given, is read the same way: `graphNaiveDateTime` writes it with
-    /// `:00`. Only a string that is no wall time at all is dated as written.
+    /// `:00`. A string in none of these forms (no wall time, or a one-digit
+    /// hour such as `…T9:00`) is dated as written.
     nonisolated static func day(_ date: String?, _ dateTime: String?, in timeZone: String?) -> String? {
         if let date { return String(date.prefix(10)) }
         guard let dateTime else { return nil }
@@ -1006,7 +1007,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
     /// aren't mistaken for an offset.
     ///
     /// A wall time without seconds (`…T10:00`, which the tools pass through as
-    /// given) gets `:00`: Graph documents `dateTime` with seconds, and `day`
+    /// given) gets `:00`, the form Graph's example and responses use, and `day`
     /// reads this same string, so the date an edit is judged by is the date of
     /// the start Graph stores.
     nonisolated static func graphNaiveDateTime(_ iso: String) -> String {

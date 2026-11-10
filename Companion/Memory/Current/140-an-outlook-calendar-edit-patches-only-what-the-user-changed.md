@@ -48,10 +48,10 @@ that aren't included in the request body maintain their previous values".
   reading the offset as the instant wrote a recurrence, resetting exceptions, for a same-day time
   change, and missed or misdated a real date move). A start whose offset matches its label (`Z` with
   `UTC`) is the instant it spells. A wall time without seconds (`…T10:00`, bare or with an offset) is
-  read the same way: `graphNaiveDateTime` writes it with `:00` (Graph documents `dateTime` with
-  seconds) and `day` reads that same string, so the writer and the date check share one form (found
-  in review: dating it as written misdated a seconds-less start labelled with another zone). Only a
-  string that is no wall time at all is dated as written. The tools still pass unknown start
+  read the same way: `graphNaiveDateTime` writes it with `:00` (the form Graph's example and
+  responses use) and `day` reads that same string, so the writer and the date check share one form (found
+  in review: dating it as written misdated a seconds-less start labelled with another zone). A string in
+  none of these forms (no wall time, or a one-digit hour) is dated as written. The tools still pass unknown start
   spellings through unparsed; reading them once at the tool boundary is #543.
   `day` reads the device's zone while the stored range keeps its `recurrenceTimeZone`; where the two
   disagree on the date, the range start can be a day off (#463).
@@ -81,7 +81,7 @@ description edit and a rule edit, run on a plain event and a series); a whole-se
 gives no rule sends no `recurrence` and resets nothing; a series moved to another date (timed and
 all day, or by a start written without an offset) keeps its stored recurrence but for the range's
 start date; a series given a new rule and a new date gets the new rule; the date compared is the
-device's, not UTC's; a series moved by a start spelled `Z`, `.000Z` or `+00:00` but labelled with a
+device's, not UTC's; a series moved by a start spelled `Z`, `.000Z`, `+00:00`, `HH:mm` or `HH:mmZ` but labelled with a
 zone 14 hours ahead (`seriesMovedByOffsetSpelledStart`, built by `buildGCalEventInput`) is dated
 where Graph stores it; an all-day edit that gives only the end keeps the start. `GraphFixture` stores its UTC
 start at the hour that puts the device on the same date, so the suite holds at any host offset from
