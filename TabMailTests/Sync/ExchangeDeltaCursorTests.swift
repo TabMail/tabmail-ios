@@ -590,6 +590,51 @@ struct ExchangeDeltaCursorTests {
                 "another folder's walk starts at its own page 1: \(otherFirst ?? "none")")
     }
 
+    /// The same-call restart is bounded: a walk that started at page 1 and is
+    /// refused throws without starting again, and a restarted walk that is
+    /// refused again throws too. Either way nothing is kept, so the next walk
+    /// starts at page 1. Every refusal here is served once, so a walk that
+    /// restarted when it should not finishes (a wrong page sequence) instead of
+    /// asking forever.
+    @Test("A refused walk restarts at page 1 at most once per call and then throws, keeping nothing")
+    func refusedWalkRestartsAtMostOnce() async throws {
+        let walk = InboxModel(messageCount: 500)
+        let failOnce = Mutex<[String: Int]>([:])
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/v1.0/me") { request in
+            let items = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            let page = items.first { $0.name == "$skiptoken" }?.value ?? "0"
+            if let status = failOnce.withLock({ $0.removeValue(forKey: page) }) { return .status(status) }
+            if request.url.path.hasSuffix("/messages/delta") { return walk.serve(request) }
+            return .status(404)
+        }
+        let provider = Self.provider("deltawalkrefusalbound", http)
+        var seen = 0
+        func newPages() -> [String] {
+            let all = Self.walkPages(http)
+            defer { seen = all.count }
+            return Array(all.dropFirst(seen))
+        }
+
+        // A walk from page 1 refused on page 2 throws; it does not start again.
+        failOnce.withLock { $0["100"] = 404 }
+        await #expect(throws: (any Error).self) { _ = try await provider.getCurrentDeltaLink(folderId: Self.inboxId) }
+        #expect(newPages() == ["0", "100"], "a refused walk from page 1 throws without restarting")
+        #expect(try await provider.getCurrentDeltaLink(folderId: Self.inboxId) == InboxModel.finalDeltaLink)
+        #expect(newPages() == ["0", "100", "200", "300", "400"], "the refused walk kept nothing")
+
+        // Stopped at page 3; the kept link is refused, and so is the restarted page 1.
+        failOnce.withLock { $0["200"] = 503 }
+        await #expect(throws: (any Error).self) { _ = try await provider.getCurrentDeltaLink(folderId: Self.inboxId) }
+        #expect(newPages() == ["0", "100", "200"])
+        failOnce.withLock { $0["200"] = 410; $0["0"] = 410 }
+        await #expect(throws: (any Error).self) { _ = try await provider.getCurrentDeltaLink(folderId: Self.inboxId) }
+        #expect(newPages() == ["200", "0"], "the walk restarts once, then throws")
+        #expect(try await provider.getCurrentDeltaLink(folderId: Self.inboxId) == InboxModel.finalDeltaLink)
+        #expect(newPages() == ["0", "100", "200", "300", "400"], "the twice-refused walk kept nothing")
+    }
+
     /// The capture walk runs inside the foreground pass, which
     /// `AccountManager.foregroundSyncOne` cuts at a per-account deadline. A large
     /// Inbox's walk can need longer than one pass has: each pass then walks the
@@ -597,6 +642,10 @@ struct ExchangeDeltaCursorTests {
     /// number of passes the full sync is recorded with a fresh link, and the
     /// walk requests stay near the folder's page count (a cut pass redoes at most
     /// the page it was waiting on). Passes run under production `withTimeout`.
+    /// Pacing is a page budget, not wall time: each pass is served `perPass`
+    /// pages at once and its next walk request is held past the deadline, so
+    /// every cut lands on a request in flight whatever the machine's load, and
+    /// the last pass finishes well before its deadline.
     @Test("A capture walk longer than the pass deadline finishes over later passes without starting again")
     func walkLongerThanTheDeadlineFinishes() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -608,19 +657,27 @@ struct ExchangeDeltaCursorTests {
         _ = try Self.seedAccount(id: accountId, cursor: Self.heldCursor, pool: pool)
 
         let pages = 24
-        let pageSeconds = 0.25
-        let deadline = 2.0
-        let maxPasses = 12
+        let perPass = 8
+        let deadline = 4.0
+        let maxPasses = 6
         let walk = InboxModel(messageCount: pages * SyncConfig.graphDeltaCursorWalkPageSize)
+        // Walk requests served in the current pass; reset before each pass.
+        let servedThisPass = Mutex(0)
+        // Releases any held request once the test is done with the passes.
+        let released = Mutex(false)
         let http = FakeHTTP.Scenario()
         defer { http.close() }
+        defer { released.withLock { $0 = true } }
         http.register(path: "/v1.0/me") { request in
             let url = request.url.absoluteString.removingPercentEncoding ?? request.url.absoluteString
             let path = request.url.path
             if url == Self.heldCursor { return .json(raw: "{\"value\": [], \"@odata.deltaLink\": \"\(Self.heldCursor)\"}") }
             if path.hasSuffix("/messages/delta") {
+                let served = servedThisPass.withLock { count -> Int in count += 1; return count }
+                if served <= perPass { return walk.serve(request) }
                 return .parked {
-                    Thread.sleep(forTimeInterval: pageSeconds)
+                    let until = Date().addingTimeInterval(deadline + 1)
+                    while Date() < until, !released.withLock({ $0 }) { Thread.sleep(forTimeInterval: 0.02) }
                     return walk.serve(request)
                 }
             }
@@ -644,6 +701,7 @@ struct ExchangeDeltaCursorTests {
                     .updateAll(db, Column("lastSyncedAt").set(to: Date().addingTimeInterval(-300)))
             }
             let account = try #require(try await pool.read { try Account.fetchOne($0, key: accountId) })
+            servedThisPass.withLock { $0 = 0 }
             passes += 1
             do {
                 _ = try await withTimeout(seconds: deadline) { try await engine.sync(account: account) }

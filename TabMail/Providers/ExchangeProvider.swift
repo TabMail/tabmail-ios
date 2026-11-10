@@ -1610,8 +1610,9 @@ actor ExchangeProvider: EmailProvider {
     /// asks for ids only.
     ///
     /// A walk that was cut (see `deltaWalkContinuation`) resumes from its next
-    /// page when it is the same folder. If Graph refuses that kept page link, the
-    /// walk starts again at page 1 in the same call.
+    /// page when it is the same folder. If Graph refuses any page of a resumed
+    /// walk (its round is gone), the walk starts again at page 1 once, in the
+    /// same call; a refusal of a walk that started at page 1 throws.
     func getCurrentDeltaLink(folderId: String) async throws -> String? {
         let encodedFolderId = try Self.encodedGraphPathSegment(folderId, context: "Graph folder id")
         let firstPage = "/mailFolders/\(encodedFolderId)/messages/delta?$select=id"
@@ -1642,7 +1643,7 @@ actor ExchangeProvider: EmailProvider {
                 if Self.graphRefusedDeltaToken(error) {
                     deltaWalkContinuation = nil
                     if resumed {
-                        BackgroundSyncLogger.logDebug("[Exchange] Delta cursor walk: kept page link refused, starting again")
+                        BackgroundSyncLogger.logDebug("[Exchange] Delta cursor walk: resumed walk refused, starting again")
                         resumed = false
                         nextLink = firstPage
                         continue
