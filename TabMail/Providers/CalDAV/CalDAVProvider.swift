@@ -287,7 +287,7 @@ actor CalDAVProvider: CalendarProvider {
         }
         let etag = getResponse.value(forHTTPHeaderField: "ETag")
 
-        let mergedICS = Self.mergePatchIntoICS(existingICS, patch: event)
+        let mergedICS = try Self.mergePatchIntoICS(existingICS, patch: event)
         // No ETag ⇒ `.unconditional`, NEVER `.ifNoneMatchAny`. The GET above
         // returned a non-empty body for this exact URL, so the resource
         // PROVABLY exists; `If-None-Match: *` asserts it does NOT, which
@@ -873,7 +873,7 @@ actor CalDAVProvider: CalendarProvider {
     /// rewrite the resource and must preserve its folded structure for a clean
     /// round-trip — they only need the line endings normalized so a server that
     /// emits bare `\n` (valid per RFC 5545 §3.1) isn't treated as one giant line.
-    private static func physicalICSLines(_ ics: String) -> [String] {
+    static func physicalICSLines(_ ics: String) -> [String] {
         ics.replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
             .components(separatedBy: "\n")
@@ -951,11 +951,15 @@ actor CalDAVProvider: CalendarProvider {
     /// strict servers (iCloud) reject with 403 and lax ones silently corrupt.
     /// This merge surgically writes the patched fields into the MASTER VEVENT
     /// of the existing ICS, leaving VTIMEZONE, ORGANIZER, RECURRENCE-ID
-    /// overrides, and every other field untouched.
+    /// overrides, and every other field untouched — except that a patch which
+    /// moves the series' start also moves every value tied to it (EXDATE,
+    /// RDATE, an UNTIL the patch did not write, and each override's
+    /// RECURRENCE-ID; see `shiftSeriesAnchoredValues`). Throws, before any
+    /// write, when one of those values cannot be moved correctly.
     ///
     /// NOT used for: occurrence overrides (`spliceOrReplaceOverride`) or
     /// split-series (`splitSeries`). Those paths have their own ICS surgery.
-    static func mergePatchIntoICS(_ ics: String, patch: GCalEventInput) -> String {
+    static func mergePatchIntoICS(_ ics: String, patch: GCalEventInput) throws -> String {
         var result = ics
 
         if let summary = patch.summary, !summary.isEmpty {
@@ -990,8 +994,8 @@ actor CalDAVProvider: CalendarProvider {
                 newLine: "TRANSP:\(transparency.uppercased())"
             )
         }
-        if let recurrence = patch.recurrence,
-           let rrule = recurrence.first(where: { $0.uppercased().hasPrefix("RRULE:") }) {
+        let patchedRRule = patch.recurrence?.first(where: { $0.uppercased().hasPrefix("RRULE:") })
+        if let rrule = patchedRRule {
             // `replaceRRule` handles the existing-RRULE case AND the
             // master-has-no-RRULE case via its replaceOrAppendInMaster fallback.
             if extractRRule(from: result) != nil {
@@ -1006,7 +1010,14 @@ actor CalDAVProvider: CalendarProvider {
         // (all-day / zoned / utc / floating) so RFC 5545 §3.8.4.4 is preserved.
         let kind = masterDTStartKind(from: result)
         if let dtstart = formatDTLine(name: "DTSTART", patch: patch, isStart: true, kind: kind) {
+            let oldStart = try masterStartWallTime(in: result)
             result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTSTART", newLine: dtstart)
+            // Moving the start moves everything RFC 5545 ties to it. An RRULE
+            // the patch wrote was written for the new start, so its UNTIL stays.
+            if let oldStart, let newStart = try masterStartWallTime(in: result), newStart != oldStart {
+                result = try shiftSeriesAnchoredValues(
+                    in: result, by: SeriesStartShift(old: oldStart, new: newStart), moveUntil: patchedRRule == nil)
+            }
         }
         if let dtend = formatDTLine(name: "DTEND", patch: patch, isStart: false, kind: kind) {
             result = replaceOrAppendInMasterVEvent(in: result, propertyKey: "DTEND", newLine: dtend)

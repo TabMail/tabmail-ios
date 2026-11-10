@@ -792,10 +792,10 @@ struct CalDAVMergePatchTests {
     """.replacingOccurrences(of: "\n", with: "\r\n")
 
     @Test("recurrence-only patch preserves DTSTART/SUMMARY (regression: iCloud 403 on partial overwrites)")
-    func recurrenceOnlyPreservesEverythingElse() {
+    func recurrenceOnlyPreservesEverythingElse() throws {
         var patch = GCalEventInput()
         patch.recurrence = ["RRULE:FREQ=WEEKLY"]
-        let merged = CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
+        let merged = try CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
         #expect(merged.contains("RRULE:FREQ=WEEKLY"))
         #expect(merged.contains("DTSTART;TZID=America/Los_Angeles:20260513T170000"))
         #expect(merged.contains("DTEND;TZID=America/Los_Angeles:20260513T180000"))
@@ -807,10 +807,10 @@ struct CalDAVMergePatchTests {
     }
 
     @Test("setting summary replaces in master, preserves the rest")
-    func updateSummary() {
+    func updateSummary() throws {
         var patch = GCalEventInput()
         patch.summary = "New title"
-        let merged = CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
+        let merged = try CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
         #expect(merged.contains("SUMMARY:New title"))
         #expect(!merged.contains("SUMMARY:Original title"))
         #expect(merged.contains("DTSTART"))
@@ -818,10 +818,10 @@ struct CalDAVMergePatchTests {
     }
 
     @Test("clearing location with empty string removes the LOCATION line entirely")
-    func clearLocation() {
+    func clearLocation() throws {
         var patch = GCalEventInput()
         patch.location = ""
-        let merged = CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
+        let merged = try CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
         #expect(!merged.contains("LOCATION:"))
         // Other fields intact.
         #expect(merged.contains("SUMMARY:Original title"))
@@ -829,10 +829,10 @@ struct CalDAVMergePatchTests {
     }
 
     @Test("replacing attendees removes the old set and inserts the new")
-    func replaceAttendees() {
+    func replaceAttendees() throws {
         var patch = GCalEventInput()
         patch.attendees = [(email: "bob@example.com", name: "Bob")]
-        let merged = CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
+        let merged = try CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
         #expect(merged.contains("bob@example.com"))
         #expect(!merged.contains("alice@example.com"))
         // No duplicate VEVENT and structural fields preserved.
@@ -841,13 +841,13 @@ struct CalDAVMergePatchTests {
     }
 
     @Test("changing DTSTART/DTEND on a zoned master re-emits in TZID form")
-    func updateZonedDTStart() {
+    func updateZonedDTStart() throws {
         var patch = GCalEventInput()
         patch.startDateTime = "2026-05-20T15:00:00-07:00"
         patch.endDateTime = "2026-05-20T16:00:00-07:00"
         patch.startTimeZone = "America/Los_Angeles"
         patch.endTimeZone = "America/Los_Angeles"
-        let merged = CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
+        let merged = try CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
         #expect(merged.contains("DTSTART;TZID=America/Los_Angeles:20260520T150000"))
         #expect(merged.contains("DTEND;TZID=America/Los_Angeles:20260520T160000"))
         // Old timed lines gone.
@@ -855,17 +855,17 @@ struct CalDAVMergePatchTests {
     }
 
     @Test("only fields IN the patch are touched — empty patch returns input unchanged")
-    func emptyPatchIsIdentity() {
-        let merged = CalDAVProvider.mergePatchIntoICS(masterICS, patch: GCalEventInput())
+    func emptyPatchIsIdentity() throws {
+        let merged = try CalDAVProvider.mergePatchIntoICS(masterICS, patch: GCalEventInput())
         // Every line of the original survives (order/CRLF preserved).
         #expect(merged == masterICS)
     }
 
     @Test("appending RRULE when master has none inserts before END:VEVENT")
-    func appendNewRRule() {
+    func appendNewRRule() throws {
         var patch = GCalEventInput()
         patch.recurrence = ["RRULE:FREQ=DAILY;COUNT=5"]
-        let merged = CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
+        let merged = try CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
         #expect(merged.contains("RRULE:FREQ=DAILY;COUNT=5"))
         // Still well-formed: one BEGIN/END pair, RRULE inside.
         let lines = merged.components(separatedBy: "\r\n")
@@ -1828,11 +1828,11 @@ struct CalDAVICSInjectionTests {
     }
 
     @Test("mergePatchIntoICS: end to end, a poisoned attendee name cannot add a property")
-    func mergePatchAttendeeCannotInject() {
+    func mergePatchAttendeeCannotInject() throws {
         var patch = GCalEventInput()
         patch.attendees = [(email: "real@example.com",
                             name: "Bob\u{2028}ORGANIZER:mailto:attacker@evil.example")]
-        let merged = CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
+        let merged = try CalDAVProvider.mergePatchIntoICS(masterICS, patch: patch)
         let lines = propertyLines(merged)
         #expect(!lines.contains { $0.hasPrefix("ORGANIZER:mailto:attacker") }, "injected ORGANIZER:\n\(merged)")
         #expect(lines.filter { $0 == "BEGIN:VEVENT" }.count == 1, "extra VEVENT:\n\(merged)")
@@ -2087,5 +2087,85 @@ struct CalDAVSplitSeriesTailTests {
             """)
         #expect(out.puts.isEmpty, "got \(out.puts.map(\.path))")
         #expect(out.master == out.originalMaster, "the master must be untouched")
+    }
+}
+
+/// Moving a repeating series' time through `updateEvent`, observed at the
+/// resource: what the server ends up holding is the moved series with every
+/// occurrence in the state it had, or, when a tied value cannot be moved, the
+/// untouched original with no PUT sent. Dates are in 2099 (testing rule 7's
+/// fixed-date exception).
+@Suite("CalDAVProvider — moving a series' time over the wire", .serialized)
+struct CalDAVSeriesStartShiftWireTests {
+
+    private static let calendarId = CalDAVWireFixture.calendarId
+
+    private static func route(_ http: FakeHTTP.Scenario, to store: FakeCalDAVStore) {
+        http.register(path: "/cal/", method: "GET") { store.handleGET($0) }
+        http.register(path: "/cal/", method: "PUT") { store.handlePUT($0) }
+    }
+
+    private static func series(zone: String, until: String) -> String {
+        [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Example//Test//EN",
+            "BEGIN:VEVENT", "UID:series-wire", "DTSTAMP:20990101T000000Z",
+            "DTSTART;TZID=\(zone):20990302T100000", "DTEND;TZID=\(zone):20990302T110000",
+            "RRULE:FREQ=WEEKLY;\(until)", "EXDATE;TZID=\(zone):20990316T100000",
+            "SUMMARY:Weekly sync", "END:VEVENT",
+            "BEGIN:VEVENT", "UID:series-wire", "DTSTAMP:20990101T000000Z",
+            "RECURRENCE-ID;TZID=\(zone):20990323T100000",
+            "DTSTART;TZID=\(zone):20990323T113000", "DTEND;TZID=\(zone):20990323T123000",
+            "SUMMARY:Weekly sync (moved)", "END:VEVENT",
+            "END:VCALENDAR",
+        ].joined(separator: "\r\n")
+    }
+
+    private static func moveTo15() -> GCalEventInput {
+        var patch = GCalEventInput()
+        patch.startDateTime = "2099-03-02T15:00:00-08:00"
+        patch.endDateTime = "2099-03-02T16:00:00-08:00"
+        patch.startTimeZone = "America/Vancouver"
+        patch.endTimeZone = "America/Vancouver"
+        return patch
+    }
+
+    @Test("A moved series reaches the server with its deleted, changed and last occurrences intact")
+    func movedSeriesLandsWhole() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: true)
+        let path = "/cal/series-move.ics"
+        let seed = Self.series(zone: "America/Vancouver", until: "UNTIL=20990330T170000Z")
+        #expect(try SeriesOracle.states(seed) == [.shown, .shown, .deleted, .changed, .shown], "non-vacuity")
+        store.seed(path: path, ics: seed)
+        Self.route(http, to: store)
+
+        _ = try await CalDAVWireFixture.makeProvider(http).updateEvent(
+            calendarId: Self.calendarId, eventId: path, event: Self.moveTo15(), sendUpdates: "none")
+
+        let stored = try #require(store.storedICS(path: path))
+        #expect(stored.contains("DTSTART;TZID=America/Vancouver:20990302T150000"), "non-vacuity: the start moved")
+        #expect(try SeriesOracle.states(stored) == [.shown, .shown, .deleted, .changed, .shown])
+        #expect(store.recordedPuts().filter { $0.path == path }.count == 1)
+    }
+
+    @Test("A series whose tied values cannot be moved is refused before any write; the server keeps the original")
+    func unmovableSeriesIsNeverWritten() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let store = FakeCalDAVStore(servesETags: true)
+        let path = "/cal/series-unknown-zone.ics"
+        let zone = "Customized Time Zone"
+        #expect(TimeZone(identifier: zone) == nil, "non-vacuity: the device does not know this zone")
+        let seed = Self.series(zone: zone, until: "UNTIL=20990330T170000Z")
+        store.seed(path: path, ics: seed)
+        Self.route(http, to: store)
+
+        await #expect(throws: CalendarProviderError.self) {
+            _ = try await CalDAVWireFixture.makeProvider(http).updateEvent(
+                calendarId: Self.calendarId, eventId: path, event: Self.moveTo15(), sendUpdates: "none")
+        }
+        #expect(store.recordedPuts().isEmpty, "no PUT may carry a series whose tied values were left behind")
+        #expect(store.storedICS(path: path) == seed)
     }
 }
