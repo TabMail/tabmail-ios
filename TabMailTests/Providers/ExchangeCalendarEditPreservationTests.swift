@@ -738,6 +738,12 @@ private func expectOnlyEdited(
             #expect(now["cy@example.com"] == "required", "\(label): the added attendee is \(now["cy@example.com"] ?? "missing")")
             let added = nowEntries["cy@example.com"]?["status"] as? [String: Any]
             #expect(added?["response"] as? String == "none", "\(label): the added attendee's status is \(canonical(added))")
+            // The form measured accepted, spelled out: comparing with the provider's own
+            // constant would pass whatever that constant held.
+            #expect(canonical(added) == canonical(["response": "none", "time": "0001-01-01T00:00:00Z"]),
+                    "\(label): the added attendee's status is \(canonical(added))")
+            let address = nowEntries["cy@example.com"]?["emailAddress"] as? [String: Any]
+            #expect(address?["name"] as? String == "Cy", "\(label): the added attendee's name is \(canonical(address))")
         }
     }
 }
@@ -1212,7 +1218,8 @@ struct ExchangeCalendarEditPreservationTests {
         let graph = FakeGraphCalendar([event])
         graph.install(on: http)
         var patch = UserCalendarEdit.addAttendee.patch(start: GraphFixture.start)
-        patch.attendees?.append((email: "Optional.Person@Example.com", name: "Optional Person"))
+        // Asked for in another letter case than Graph stores.
+        patch.attendees?.append((email: "optional.person@example.com", name: "Optional Person"))
 
         _ = try await makeProvider(http).updateEvent(eventId: "ev-case", event: patch)
 
