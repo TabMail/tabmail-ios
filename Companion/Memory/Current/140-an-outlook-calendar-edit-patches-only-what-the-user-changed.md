@@ -59,8 +59,20 @@ that aren't included in the request body maintain their previous values".
   drops the series' `recurrenceTimeZone` and `firstDayOfWeek` (#423, open), and the calendar tool's
   own recurrence format is #513.
 - An occurrence edit never writes `recurrence` (an instance cannot carry a rule; Graph refuses it).
-- `fetchForEdit` keeps the Graph JSON of the read beside the `GCalEvent` (`EditSnapshot`): existing
-  attendees keep their Graph type (matched by lowercased address); a new one is `required`.
+- `fetchForEdit` keeps the Graph JSON of the read beside the `GCalEvent` (`EditSnapshot`). An edit
+  that changes who attends (whole event or one occurrence) writes each attendee it keeps exactly as
+  the read holds them: type, answer (`status`) and name, matched by lowercased address
+  (`editAttendeesJSON`). A new one is `required` and unanswered:
+  `status {"response": "none", "time": "0001-01-01T00:00:00Z"}`.
+- Measured on an Outlook.com account (2026-11-10, #622):
+  - Graph refuses with **405 `UnknownError`, empty message**, an attendee PATCH in which any entry
+    has no `status`. The earlier `{emailAddress, type}` shape failed on every guest change there.
+  - With every entry carrying its status, the PATCH returns 200, and a kept attendee keeps their
+    answer and its time. Graph stores the new attendee's time as `1601-01-01`.
+  - A POST (create, split) accepts attendees without `status`, so `splitNewPartJSON` still writes
+    `toGraphEventJSON`'s shape with `attendeeTypes`.
+  - Whether Exchange Online (work accounts) refuses the no-status shape too is unmeasured. The
+    status-carrying shape is the documented form either way.
 - Every read (`listEvents`, `getEvent`, `fetchForEdit`: one `eventSelect`) selects `body` and
   `onlineMeeting`. The description is the stored body's notes as text at full length
   (`ExchangeCalendarProvider.notes(of:)`, `EmailFilter.htmlToPlainText` keeping spacing), never
