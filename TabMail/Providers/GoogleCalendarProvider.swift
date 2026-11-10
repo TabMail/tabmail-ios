@@ -1190,9 +1190,9 @@ actor GoogleCalendarProvider: CalendarProvider {
     /// helper makes that pattern available everywhere.
     ///
     /// Attendees are deliberately NOT inherited from `existing`: re-sending
-    /// the existing attendees in a PATCH would reset their `responseStatus`
-    /// fields (Graph/Google treat re-sent attendees as newly invited). We
-    /// only include attendees when `patch` explicitly changes them; the
+    /// them by address and name alone would reset what the server holds for
+    /// them (their answer, optional flag, comment). We only include
+    /// attendees when `patch` explicitly changes them; the
     /// caller is responsible for delta-resolving against the existing list
     /// (see `AccountManager.resolveAttendeeDelta`), and `editJSON` writes
     /// each attendee the list keeps as the stored event holds them.

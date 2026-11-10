@@ -159,9 +159,43 @@ struct GoogleAttendeeEditTests {
         #expect(patches.count == 1)
         guard patches.count == 1 else { return }
         #expect(F.canonical(F.sent(patches[0], "alice@example.com")) == F.canonical(F.stored("alice@example.com")))
+        // The list goes out in the order the edit asks for, not the stored order.
+        let sentOrder = (patches[0]["attendees"] as? [[String: Any]])?.compactMap { $0["email"] as? String }
+        #expect(sentOrder == ["olivia@example.com", "room-1@example.com", "bob@example.com", "alice@example.com"])
     }
 
-    @Test("an edit that does not change who attends sends no attendee list")
+    @Test("an attendee stored in capitals is still matched to their stored entry")
+    func storedAddressCaseIsIgnored() async throws {
+        var stored = F.attendees
+        stored[3]["email"] = "Bob@Example.com"
+        var patch = GCalEventInput()
+        // The queue builds the wanted list from the stored entries, so Bob keeps his capitals here.
+        patch.attendees = F.wanted(adding: [(email: "carol@example.com", name: nil)], from: stored)
+
+        let patches = try await F.editEvent(F.event(id: "evt-1", attendees: stored), patch: patch)
+
+        #expect(patches.count == 1)
+        guard patches.count == 1 else { return }
+        #expect(F.canonical(F.sent(patches[0], "bob@example.com")) == F.canonical(stored[3]))
+        #expect((patches[0]["attendees"] as? [[String: Any]])?.count == 5)
+    }
+
+    @Test("adding the first attendee to an event with none sends just that attendee")
+    func firstAttendeeOnAnEventWithNone() async throws {
+        var event = F.event(id: "evt-1")
+        event.removeValue(forKey: "attendees")
+        var patch = GCalEventInput()
+        patch.attendees = [(email: "carol@example.com", name: "Carol")]
+
+        let patches = try await F.editEvent(event, patch: patch)
+
+        #expect(patches.count == 1)
+        guard patches.count == 1 else { return }
+        #expect(F.canonical(patches[0]["attendees"])
+            == F.canonical([["email": "carol@example.com", "displayName": "Carol"]]))
+    }
+
+    @Test("an edit that names no attendee change sends no attendee list")
     func otherEditsSendNoAttendees() async throws {
         var patch = GCalEventInput()
         patch.summary = "Planning (moved)"
@@ -199,6 +233,7 @@ struct GoogleAttendeeEditTests {
                     "\(address) was not sent as the occurrence stores them")
         }
         #expect(F.canonical(F.sent(patches[0], "carol@example.com")) == F.canonical(["email": "carol@example.com"]))
+        #expect((patches[0]["attendees"] as? [[String: Any]])?.count == 4)
         #expect(patches[0]["recurrence"] == nil)
     }
 }

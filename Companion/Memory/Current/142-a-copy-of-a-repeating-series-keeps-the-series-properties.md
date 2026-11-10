@@ -121,7 +121,7 @@ The same attendee rule holds for an ordinary Google edit. Google stores the atte
 sent as sent, so an edit that adds or removes someone (`updateEvent`, `updateOccurrence`) writes
 each attendee it keeps as the stored event holds them (`keptAttendeesJSON`, via `editJSON`),
 matched by address in any letter case, and only a new one by address and name. An occurrence edit
-matches against that occurrence's own stored attendees. An edit that does not change who attends
+matches against that occurrence's own stored attendees. An edit that names no attendee change
 sends no attendee list. Tests: `GoogleAttendeeEditTests`.
 
 ## Tests

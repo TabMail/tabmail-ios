@@ -161,8 +161,10 @@ the PATCH body the fake calendar received:
 - adding an attendee sends every other attendee exactly as stored (organizer, optional, resource,
   additional guests) and the new one by address and name;
 - removing one drops only that attendee;
-- an address in another letter case still matches its stored entry;
-- an edit that does not change who attends sends no attendee list;
+- an address in another letter case still matches its stored entry, on either side, and the list
+  keeps the order the edit asks for;
+- adding the first attendee to an event with none sends just that attendee;
+- an edit that names no attendee change sends no attendee list;
 - an occurrence edit keeps that occurrence's own stored attendees.
 
 ## Inbox list — layered test architecture
