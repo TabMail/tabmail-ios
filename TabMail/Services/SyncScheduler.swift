@@ -949,9 +949,9 @@ final class SyncScheduler {
     /// Callers use this to decide whether to dequeue pending sync entries.
     @discardableResult
     func backgroundPoll(inboxOnly: Bool = false, scheduleProcessing: Bool = true, accountEmail: String? = nil) async -> Bool {
-        // No overlap guards — delta syncs are idempotent and ProviderWorkQueue
-        // handles per-account concurrency. Two concurrent syncs for the same account
-        // just queue through the work queue.
+        // No overlap guard here: `SyncEngine.oneSyncAtATime` runs one sync pass
+        // per account at a time, so a delta arriving during another pass of the
+        // same account waits its turn.
         guard NetworkMonitor.checkConnected() else {
             BackgroundSyncLogger.log("backgroundPoll: SKIPPED reason=noNetwork (account=\(accountEmail ?? "all"))")
             return false
