@@ -104,7 +104,7 @@ that aren't included in the request body maintain their previous values".
   A join section that is not recognised gets the description as the whole body, as every description edit of an
   online meeting did before #511, which turns the meeting off; the read then gives the whole body,
   join section included, as the description.
-  A split's new series is still built from the narrowed read (#512, open).
+  A split's new series is copied from the stored series, not the narrowed read (#512; [memory 142](142-a-copy-of-a-repeating-series-keeps-the-series-properties.md)).
 
 `GCalEvent` is a lossy view for the agent and the merge helpers. Never write a narrowed read back to
 the provider.

@@ -328,12 +328,11 @@ struct CalendarConflictDispositionTests {
 //
 // INVARIANT (system property): **after a `this_and_following` split whose
 // successor creation fails, either the master is UNCAPPED or a durable
-// `PendingCalendarOperation` still exists.** Never both absent. A split is
-// cap-then-create: if the create fails and the cap stays, the recurring series
-// ends early on the server forever, and if the durable row is also gone there is
-// no queued intention left to repair it — later sync imports the truncated master
-// and cannot reconstruct the recurrence. That is a dropped user intention plus
-// silent server-side data loss in one step.
+// `PendingCalendarOperation` still exists.** Never both absent. A Google split is
+// create-then-cap (ADR-IOS-106), so a failed create must leave the master
+// uncapped; and if the durable row were gone while the series was capped with no
+// successor, there would be no queued intention left to repair it — later sync
+// imports the truncated master and cannot reconstruct the recurrence.
 //
 // 🚨 WHAT WAS BROKEN (R14-F2). `GoogleCalendarProvider.splitSeries`'s step-6 catch
 // was `catch GoogleCalendarError.httpError(409, _)` — ANY 409, body discarded. So a
@@ -349,8 +348,8 @@ struct CalendarConflictDispositionTests {
 // Nothing below looks at a `where` clause, an error case, or a log line: each test
 // reads the durable row count back out of the database AND the `recurrence` array
 // of every PATCH that reached the wire. A fix that satisfied one leg by breaking
-// the other — e.g. uncapping a master whose successor DOES exist, which duplicates
-// every future occurrence — fails `provenDuplicateWhoseProofReadFailsDoesNotUncapTheMaster`.
+// the other — e.g. dropping the row while the successor exists and the master is
+// still open — fails `provenDuplicateWhoseProofReadFailsDoesNotUncapTheMaster`.
 //
 // ⚠️ TWO-SIDED (`MIS-026`, `MIS-030`). `provenDuplicateWhoseProofReadSucceedsRetiresTheOp`
 // is the deliberately-held direction: gating the arm on positively-parsed proof must
@@ -363,7 +362,6 @@ struct CalendarSplitConflictDispositionTests {
 
     private static let masterId = "master-1"
     private static let recurrenceId = "2026-05-20T17:00:00"
-    private static let originalRRule = "RRULE:FREQ=WEEKLY;BYDAY=WE"
     private static let createPath = "/calendar/v3/calendars/primary/events"
     private static let masterPath = "/calendar/v3/calendars/primary/events/master-1"
 
@@ -393,9 +391,9 @@ struct CalendarSplitConflictDispositionTests {
         let outcome: CalendarOpOutcome
         let wire: [String]
         /// The `recurrence` array of every PATCH that reached the wire, in order.
-        /// One entry = the master was capped and left that way; two = capped then
-        /// restored. This is how "the master is uncapped" is observed as a
-        /// SERVER-SIDE fact rather than as a provider return value.
+        /// None = the master was never capped; one = it was capped. This is how
+        /// "the master is uncapped" is observed as a SERVER-SIDE fact rather than
+        /// as a provider return value.
         let patchedRecurrences: [[String]]
     }
 
@@ -489,11 +487,7 @@ struct CalendarSplitConflictDispositionTests {
 
         #expect(result.wire == [
             "GET \(Self.masterPath)",     // resolveToMaster
-            "GET \(Self.masterPath)",     // updateEvent's GET-then-PATCH (cap)
-            "PATCH \(Self.masterPath)",   // the cap
             "POST \(Self.createPath)",    // the successor create → 409
-            "GET \(Self.masterPath)",     // updateEvent's GET-then-PATCH (revert)
-            "PATCH \(Self.masterPath)"    // the revert
         ], "got \(result.wire)")
 
         // BOTH LEGS ARE ASSERTED BEFORE THE ARRAY GUARD, deliberately. The durable
@@ -505,16 +499,11 @@ struct CalendarSplitConflictDispositionTests {
                 "the durable row is the user's intention to split this series. An UNPROVEN 409 was read as 'the create already landed', the proof-GET answered 404 because nothing was created, and that 404 escaped to `isCalendarNotFoundError` — which deletes the row. Neither leg of the invariant survived: master capped, intention gone.")
         #expect(isStillQueued(result.outcome), "got \(result.outcome)")
 
-        #expect(result.patchedRecurrences.count == 2,
-                "the master must be PATCHed twice — capped, then restored. One PATCH means the series was left ending early on the server with no successor. got \(result.patchedRecurrences)")
-        guard result.patchedRecurrences.count == 2 else { return }
-        #expect(result.patchedRecurrences[0].contains { $0.uppercased().contains("UNTIL=") },
-                "the fixture must actually cap the master first, or 'it was uncapped' is vacuous (MIS-030) — got \(result.patchedRecurrences[0])")
-        #expect(result.patchedRecurrences[1] == [Self.originalRRule],
-                "the master's ORIGINAL recurrence must be back on the server; anything else leaves the user's series truncated. got \(result.patchedRecurrences[1])")
+        #expect(result.patchedRecurrences.isEmpty,
+                "the master must not be capped when its successor was not created: a cap with no successor leaves the series ending early on the server. got \(result.patchedRecurrences)")
     }
 
-    @Test("A PROVEN duplicate whose proof read then fails keeps the intention queued and does NOT uncap the master")
+    @Test("A PROVEN duplicate whose proof read then fails keeps the intention queued with nothing capped")
     func provenDuplicateWhoseProofReadFailsDoesNotUncapTheMaster() async throws {
         let result = try await drainOneSplitThroughRealGoogleProvider(
             accountId: "cal-r14-f2-proven-unreadable",
@@ -529,14 +518,12 @@ struct CalendarSplitConflictDispositionTests {
 
         #expect(result.wire == [
             "GET \(Self.masterPath)",
-            "GET \(Self.masterPath)",
-            "PATCH \(Self.masterPath)",
             "POST \(Self.createPath)",
             "GET \(Self.successorPath)"
         ], "got \(result.wire)")
 
-        #expect(result.patchedRecurrences.count == 1,
-                "THE MIRROR IMAGE. The successor EXISTS — Google said so — so rolling the cap back would leave the master repeating over the successor's occurrences and duplicate every one of them. Exactly one PATCH (the cap) may reach the wire. got \(result.patchedRecurrences)")
+        #expect(result.patchedRecurrences.isEmpty,
+                "the split stops at the failed read with nothing capped; the retry re-proves the duplicate and caps. got \(result.patchedRecurrences)")
 
         #expect(result.remaining == 1,
                 "'we could not read it back' is not a provider-authoritative statement that the work is done or inapplicable — never-drop clause 2. The proof-GET's 404 must not be allowed to masquerade as 'the original event is gone' and delete the row.")
@@ -561,13 +548,16 @@ struct CalendarSplitConflictDispositionTests {
 
         #expect(result.wire == [
             "GET \(Self.masterPath)",
-            "GET \(Self.masterPath)",
-            "PATCH \(Self.masterPath)",
             "POST \(Self.createPath)",
-            "GET \(Self.successorPath)"
+            "GET \(Self.successorPath)",
+            "GET \(Self.masterPath)",     // updateEvent's GET-then-PATCH (cap)
+            "PATCH \(Self.masterPath)"    // the cap
         ], "got \(result.wire)")
         #expect(result.patchedRecurrences.count == 1,
-                "the successor exists; the cap stays. got \(result.patchedRecurrences)")
+                "the successor exists, so the split goes on to the cap. got \(result.patchedRecurrences)")
+        guard result.patchedRecurrences.count == 1 else { return }
+        #expect(result.patchedRecurrences[0].contains { $0.uppercased().contains("UNTIL=") },
+                "the PATCH must be the cap: got \(result.patchedRecurrences[0])")
         #expect(isSuccess(result.outcome), "got \(result.outcome)")
         #expect(result.remaining == 0,
                 "a lost ACK on a create we can PROVE landed is exit 2 — provider-authoritative. Requiring proof must not make this case retry forever (MIS-026), and the fixture must be able to retire a split op at all or both survivals above are vacuous (MIS-030).")

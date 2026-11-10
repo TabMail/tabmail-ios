@@ -530,7 +530,7 @@ enum CalendarToolHelpers {
         // Both forms resolve identically downstream — `prefix(10)` is what every
         // consumer reads (`RecurrenceOccurrenceResolver.select`/`.windowCenter`,
         // `GoogleCalendarProvider.googleUntilString`,
-        // `CalDAVProvider.buildNewSeriesInput`) — so the narrower change is the
+        // `CalDAVProvider.icsDateValue`) — so the narrower change is the
         // right one.
         if event.isAllDay, let startDay = event.start?.date {
             lines.append("start_iso: \(Self.allDayNaiveISO(startDay))")
@@ -988,10 +988,10 @@ enum CalendarToolHelpers {
     /// ⚠️ **WHAT `nil` COSTS ON THE SPLIT PATH.** Returning nil drops the `UNTIL` clause while
     /// `buildGCalEventInput` still assigns a non-empty `input.recurrence` (`RRULE:FREQ=…`, plus any
     /// INTERVAL — a numeric COUNT takes an earlier `else if` and cannot coexist with an UNTIL). On
-    /// `edit_scope: "this_and_following"`, `CalDAVProvider.buildNewSeriesInput` PREFERS a non-empty
-    /// `patch.recurrence` over `RecurrenceTail.newSeriesRule(from: originalRRule, …)`, so the successor series is written
-    /// **unbounded**, carrying only the patch's rule parts — and AFTER the cap `PUT`, which is
-    /// irreversible wire operation #6. The 2026-08-12 range check did not create that path but moved
+    /// `edit_scope: "this_and_following"`, `CalDAVProvider.seriesSplitResources` writes a non-empty
+    /// `patch.recurrence` over the new part's rule (`RecurrenceTail.newSeriesRule(from: originalRRule, …)`),
+    /// so the new part is written **unbounded**, carrying only the patch's rule parts, and the cap `PUT` that follows it
+    /// is irreversible wire operation #6 (ADR-IOS-106: new part first, no rollback). The 2026-08-12 range check did not create that path but moved
     /// out-of-range dates onto it, from emitted-verbatim (all-day and already-UTC arms) or
     /// silently-rolled (naive arm) to nil. So a NEW rejection here is not free: weigh it against an
     /// unbounded successor, which one further edit can re-cap.

@@ -68,6 +68,8 @@ struct GoogleSplitSeriesTailTests {
     private struct Outcome {
         let error: Error?
         let wire: [String]
+        /// Every request as sent, query included.
+        let calls: [(method: String, url: String, body: Data?)]
         /// The `recurrence` the new series was created with, or nil if no create was sent.
         let created: [String]?
         let recurrenceId: String
@@ -76,7 +78,7 @@ struct GoogleSplitSeriesTailTests {
     /// Split a Monday/Wednesday/Friday series the following Monday. Three
     /// occurrences fall before the split in Auckland (Monday, Wednesday,
     /// Friday); read in UTC the same days are Sunday, Tuesday and Thursday.
-    private func split(rrule: String, patch: GCalEventInput = GCalEventInput()) async throws -> Outcome {
+    private func split(rrule: String, patch: GCalEventInput = GCalEventInput(), sendUpdates: String = "none") async throws -> Outcome {
         let start = try Self.mondayInAuckland()
         let splitAt = try Self.aucklandDays(7, after: start)
         let recurrenceId = Self.format(splitAt, "yyyy-MM-dd'T'HH:mm:ss", Self.utc)
@@ -96,16 +98,17 @@ struct GoogleSplitSeriesTailTests {
             _ = try await provider.splitSeries(
                 calendarId: "primary", eventId: Self.masterId,
                 recurrenceId: recurrenceId, recurrenceIdZone: Self.utc,
-                patch: patch, sendUpdates: "none")
+                patch: patch, sendUpdates: sendUpdates)
         } catch {
             thrown = error
         }
-        let created = http.recordedCalls()
+        let calls = http.recordedCalls()
+        let created = calls
             .first { $0.method == "POST" }
             .flatMap { $0.body }
             .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
             .flatMap { $0["recurrence"] as? [String] }
-        return Outcome(error: thrown, wire: http.servedCallSequence(), created: created, recurrenceId: recurrenceId)
+        return Outcome(error: thrown, wire: http.servedCallSequence(), calls: calls, created: created, recurrenceId: recurrenceId)
     }
 
     private func isRefusal(_ error: Error?) -> Bool {
@@ -151,6 +154,22 @@ struct GoogleSplitSeriesTailTests {
         let out = try await split(rrule: rule)
         #expect(out.error == nil, "got \(String(describing: out.error))")
         #expect(out.created == [rule], "the new series must end where the original did. got \(String(describing: out.created))")
+    }
+
+    @Test("Only the new series sends the user's invitations; the cap of the original is written silently")
+    func onlyTheNewSeriesNotifies() async throws {
+        let out = try await split(rrule: "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR", sendUpdates: "all")
+        #expect(out.error == nil, "got \(String(describing: out.error))")
+        let creates = out.calls.filter { $0.method == "POST" }
+        let caps = out.calls.filter { $0.method == "PATCH" }
+        guard creates.count == 1, caps.count == 1 else {
+            Issue.record("expected one create and one cap, got \(out.wire)")
+            return
+        }
+        #expect(URLComponents(string: creates[0].url)?.queryItems?.first { $0.name == "sendUpdates" }?.value == "all",
+                "the new series did not send the invitations: \(creates[0].url)")
+        #expect(URLComponents(string: caps[0].url)?.queryItems?.first { $0.name == "sendUpdates" }?.value == "none",
+                "the cap told every attendee the series changed: \(caps[0].url)")
     }
 
     @Test("A master already carrying this split's cap is a retry: the new series is written without an end")
