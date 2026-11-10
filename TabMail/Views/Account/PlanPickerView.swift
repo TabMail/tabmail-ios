@@ -43,102 +43,112 @@ struct PlanPickerView: View {
                     )
                 }
 
-                // Billing interval toggle
-                Picker("Billing", selection: $billingInterval) {
-                    Text("Monthly").tag("monthly")
-                    Text("Yearly").tag("yearly")
-                }
-                .pickerStyle(.segmented)
-                .padding(.horizontal)
-
-                let filteredProducts = billingInterval == "monthly"
-                    ? storeKit.monthlyProducts()
-                    : storeKit.yearlyProducts()
-
-                ForEach(filteredProducts, id: \.id) { product in
-                    PlanCard(
-                        product: product,
-                        monthlyEquivalent: monthlyPrice(for: product),
-                        savingsPercent: savingsPercent(for: product),
-                        isCurrentPlan: isCurrentPlan(product),
-                        hasAnyAppleSub: storeKit.isAppleSubscriber || (accountInfo?.hasSubscription == true && accountInfo?.subscriptionProvider == "apple"),
-                        // Backend tier preferred; StoreKit-local plan covers the
-                        // window where /whoami hasn't loaded (offline, fresh launch)
-                        // so upgrade/downgrade labels stay rank-correct.
-                        backendTier: accountInfo?.planTier ?? storeKit.activePlan,
-                        isPurchasing: isPurchasing
-                    ) {
-                        await purchaseProduct(product)
+                // A subscription bought on the website is managed only there:
+                // one plain sentence, no link and no button (ADR-IOS-105).
+                if let webManagedNote = Self.webManagedNote(for: accountInfo) {
+                    Text(verbatim: webManagedNote)
+                        .font(.subheadline)
+                        .foregroundStyle(Palette.textMuted)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                } else {
+                    // Billing interval toggle
+                    Picker("Billing", selection: $billingInterval) {
+                        Text("Monthly").tag("monthly")
+                        Text("Yearly").tag("yearly")
                     }
-                }
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal)
 
-                if storeKit.products.isEmpty {
-                    if let loadError = storeKit.productsLoadError {
-                        VStack(spacing: 12) {
-                            Image(systemName: "exclamationmark.triangle")
-                                .font(.largeTitle)
-                                .foregroundStyle(Palette.textMuted)
-                            Text(loadError)
-                                .font(.subheadline)
-                                .foregroundStyle(Palette.textMuted)
-                                .multilineTextAlignment(.center)
-                            Button("Retry") {
-                                Task { await storeKit.loadProducts() }
+                    let filteredProducts = billingInterval == "monthly"
+                        ? storeKit.monthlyProducts()
+                        : storeKit.yearlyProducts()
+
+                    ForEach(filteredProducts, id: \.id) { product in
+                        PlanCard(
+                            product: product,
+                            monthlyEquivalent: monthlyPrice(for: product),
+                            savingsPercent: savingsPercent(for: product),
+                            isCurrentPlan: isCurrentPlan(product),
+                            hasAnyAppleSub: storeKit.isAppleSubscriber || (accountInfo?.hasSubscription == true && accountInfo?.subscriptionProvider == "apple"),
+                            // Backend tier preferred; StoreKit-local plan covers the
+                            // window where /whoami hasn't loaded (offline, fresh launch)
+                            // so upgrade/downgrade labels stay rank-correct.
+                            backendTier: accountInfo?.planTier ?? storeKit.activePlan,
+                            isPurchasing: isPurchasing
+                        ) {
+                            await purchaseProduct(product)
+                        }
+                    }
+
+                    if storeKit.products.isEmpty {
+                        if let loadError = storeKit.productsLoadError {
+                            VStack(spacing: 12) {
+                                Image(systemName: "exclamationmark.triangle")
+                                    .font(.largeTitle)
+                                    .foregroundStyle(Palette.textMuted)
+                                Text(loadError)
+                                    .font(.subheadline)
+                                    .foregroundStyle(Palette.textMuted)
+                                    .multilineTextAlignment(.center)
+                                Button("Retry") {
+                                    Task { await storeKit.loadProducts() }
+                                }
+                            }
+                            .padding(.top, 40)
+                        } else {
+                            VStack(spacing: 12) {
+                                ProgressView()
+                                Text("Loading plans...")
+                                    .font(.subheadline)
+                                    .foregroundStyle(Palette.textMuted)
+                            }
+                            .padding(.top, 40)
+                            .task {
+                                await storeKit.loadProducts()
                             }
                         }
-                        .padding(.top, 40)
-                    } else {
-                        VStack(spacing: 12) {
-                            ProgressView()
-                            Text("Loading plans...")
-                                .font(.subheadline)
-                                .foregroundStyle(Palette.textMuted)
-                        }
-                        .padding(.top, 40)
-                        .task {
-                            await storeKit.loadProducts()
-                        }
                     }
-                }
 
-                if let purchaseError {
-                    Text(purchaseError)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .padding(.horizontal)
-                }
-
-                // Footnotes
-                if !filteredProducts.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("* After using your priority quota, AI agent requests continue at a slower pace to ensure fair access for all users.")
-                        Text("** Priority AI agent requests may be throttled during peak usage to ensure quality of service.")
-                        Text("*** Prices exclude taxes. Taxes will be added at checkout where applicable.")
-                        // Zero plan cost disclosure (D7 — parity with the site's "What is the Zero plan?" FAQ)
-                        Text("Zero plan: the subscription covers TabMail's email infrastructure only — AI runs on your own provider account using your own API keys. Depending on your provider and model choice, TabMail's AI features can consume a significant API bill on your account. Running on TabMail's own AI infrastructure (the Basic and Pro plans) is generally 10–100× cheaper for the same usage.")
-                            .padding(.top, 8)
+                    if let purchaseError {
+                        Text(purchaseError)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .padding(.horizontal)
                     }
-                    .font(.caption2)
-                    .foregroundStyle(Palette.textMuted)
-                    .padding(.horizontal, 4)
-                }
 
-                // Apple-required subscription disclosure (Schedule 2, Section 3.8(b))
-                if !filteredProducts.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Payment will be charged to your Apple ID account at confirmation of purchase. Subscriptions automatically renew unless canceled at least 24 hours before the end of the current period. Your account will be charged for renewal within 24 hours prior to the end of the current period. You can manage and cancel your subscriptions by going to your Account Settings on the App Store after purchase. Any unused portion of a free trial period, if offered, will be forfeited when you purchase a subscription.")
-                            .font(.caption2)
-                            .foregroundStyle(Palette.textMuted)
-
-                        HStack(spacing: 4) {
-                            Link("Terms of Use", destination: URL(string: "https://tabmail.ai/terms")!)
-                            Text("·")
-                                .foregroundStyle(Palette.textMuted)
-                            Link("Privacy Policy", destination: URL(string: "https://tabmail.ai/privacy")!)
+                    // Footnotes
+                    if !filteredProducts.isEmpty {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("* After using your priority quota, AI agent requests continue at a slower pace to ensure fair access for all users.")
+                            Text("** Priority AI agent requests may be throttled during peak usage to ensure quality of service.")
+                            Text("*** Prices exclude taxes. Taxes will be added at checkout where applicable.")
+                            // Zero plan cost disclosure (D7 — parity with the site's "What is the Zero plan?" FAQ)
+                            Text("Zero plan: the subscription covers TabMail's email infrastructure only — AI runs on your own provider account using your own API keys. Depending on your provider and model choice, TabMail's AI features can consume a significant API bill on your account. Running on TabMail's own AI infrastructure (the Basic and Pro plans) is generally 10–100× cheaper for the same usage.")
+                                .padding(.top, 8)
                         }
                         .font(.caption2)
+                        .foregroundStyle(Palette.textMuted)
+                        .padding(.horizontal, 4)
                     }
-                    .padding(.horizontal, 4)
+
+                    // Apple-required subscription disclosure (Schedule 2, Section 3.8(b))
+                    if !filteredProducts.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Payment will be charged to your Apple ID account at confirmation of purchase. Subscriptions automatically renew unless canceled at least 24 hours before the end of the current period. Your account will be charged for renewal within 24 hours prior to the end of the current period. You can manage and cancel your subscriptions by going to your Account Settings on the App Store after purchase. Any unused portion of a free trial period, if offered, will be forfeited when you purchase a subscription.")
+                                .font(.caption2)
+                                .foregroundStyle(Palette.textMuted)
+
+                            HStack(spacing: 4) {
+                                Link("Terms of Use", destination: URL(string: "https://tabmail.ai/terms")!)
+                                Text("·")
+                                    .foregroundStyle(Palette.textMuted)
+                                Link("Privacy Policy", destination: URL(string: "https://tabmail.ai/privacy")!)
+                            }
+                            .font(.caption2)
+                        }
+                        .padding(.horizontal, 4)
+                    }
                 }
 
                 Divider()
@@ -173,60 +183,62 @@ struct PlanPickerView: View {
                     .tint(.red)
                 }
 
-                // Restore purchases
-                Button(isRestoring ? "Restoring..." : "Restore Purchases") {
-                    isRestoring = true
-                    Task {
-                        await storeKit.restorePurchases()
-                        isRestoring = false
-                        if storeKit.isAppleSubscriber {
-                            // Open the current user's AI gate only when the active
-                            // Apple entitlement is NOT owned by a different TabMail
-                            // account. Fails OPEN when ownership is unknown (no
-                            // appAccountToken) and for the impossible no-session edge
-                            // on this signed-in screen, so a legitimate restore is
-                            // never blocked; fails CLOSED only when the active
-                            // entitlement provably belongs to someone else. Only the
-                            // restore path is guarded — the purchase path stamps a
-                            // fresh appAccountToken and can never mismatch.
-                            let currentUserId = TabMailAuthService.getSession()?.userId
-                            let mayOpen = currentUserId
-                                .map { storeKit.shouldOpenGateForRestoredEntitlement(currentUserId: $0) } ?? true
-                            if mayOpen {
-                                AISubscriptionGate.shared.openGate()
-                                if let jws = await storeKit.latestEntitlementJWS() {
-                                    Self.verifyPurchaseWithBackend(jws: jws)
+                if Self.webManagedNote(for: accountInfo) == nil {
+                    // Restore purchases
+                    Button(isRestoring ? "Restoring..." : "Restore Purchases") {
+                        isRestoring = true
+                        Task {
+                            await storeKit.restorePurchases()
+                            isRestoring = false
+                            if storeKit.isAppleSubscriber {
+                                // Open the current user's AI gate only when the active
+                                // Apple entitlement is NOT owned by a different TabMail
+                                // account. Fails OPEN when ownership is unknown (no
+                                // appAccountToken) and for the impossible no-session edge
+                                // on this signed-in screen, so a legitimate restore is
+                                // never blocked; fails CLOSED only when the active
+                                // entitlement provably belongs to someone else. Only the
+                                // restore path is guarded — the purchase path stamps a
+                                // fresh appAccountToken and can never mismatch.
+                                let currentUserId = TabMailAuthService.getSession()?.userId
+                                let mayOpen = currentUserId
+                                    .map { storeKit.shouldOpenGateForRestoredEntitlement(currentUserId: $0) } ?? true
+                                if mayOpen {
+                                    AISubscriptionGate.shared.openGate()
+                                    if let jws = await storeKit.latestEntitlementJWS() {
+                                        Self.verifyPurchaseWithBackend(jws: jws)
+                                    }
+                                    let restored = try? await backend.fetchAccountInfo()
+                                    accountInfo = restored
+                                    // This body races the detached `verifyPurchaseWithBackend`
+                                    // write, so it may still be the pre-restore state. Route
+                                    // it through the open-only seam: it can refresh the
+                                    // sidebar copy and reopen the gate when the backend
+                                    // already confirmed the subscription, but it must NEVER
+                                    // close the gate `openGate()` just opened from local
+                                    // StoreKit truth. A later authoritative whoami reconciles
+                                    // if this one raced.
+                                    if let restored { AISubscriptionGate.shared.refreshAfterLocalPurchase(restored) }
+                                } else {
+                                    // Active Apple entitlement belongs to a different
+                                    // TabMail account — never open the current user's gate
+                                    // on someone else's subscription.
+                                    storeKit.restoreResult = "That subscription belongs to a different TabMail account."
                                 }
-                                let restored = try? await backend.fetchAccountInfo()
-                                accountInfo = restored
-                                // This body races the detached `verifyPurchaseWithBackend`
-                                // write, so it may still be the pre-restore state. Route
-                                // it through the open-only seam: it can refresh the
-                                // sidebar copy and reopen the gate when the backend
-                                // already confirmed the subscription, but it must NEVER
-                                // close the gate `openGate()` just opened from local
-                                // StoreKit truth. A later authoritative whoami reconciles
-                                // if this one raced.
-                                if let restored { AISubscriptionGate.shared.refreshAfterLocalPurchase(restored) }
-                            } else {
-                                // Active Apple entitlement belongs to a different
-                                // TabMail account — never open the current user's gate
-                                // on someone else's subscription.
-                                storeKit.restoreResult = "That subscription belongs to a different TabMail account."
                             }
                         }
                     }
-                }
-                .font(.subheadline)
-                .foregroundStyle(Palette.accentColor)
-                .disabled(isRestoring)
+                    .font(.subheadline)
+                    .foregroundStyle(Palette.accentColor)
+                    .disabled(isRestoring)
 
-                if let restoreResult = storeKit.restoreResult {
-                    Text(restoreResult)
-                        .font(.caption)
-                        .foregroundStyle(Palette.textMuted)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
+                    if let restoreResult = storeKit.restoreResult {
+                        Text(restoreResult)
+                            .font(.caption)
+                            .foregroundStyle(Palette.textMuted)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                    }
                 }
             }
             .padding()
@@ -293,6 +305,17 @@ struct PlanPickerView: View {
         default:
             return nil
         }
+    }
+
+    /// The sentence shown in place of the purchase options when the account's
+    /// subscription was bought on the website and has not ended, or `nil` when
+    /// the plans are for sale. Plain text with no link or button: outside the
+    /// US storefront App Review forbids pointing to another way to buy
+    /// (3.1.1(a), 3.1.3), and saying where a subscription is managed does not.
+    /// A pure function, so the gate can be tested without building the view.
+    nonisolated static func webManagedNote(for accountInfo: AccountInfo?) -> String? {
+        guard accountInfo?.hasLiveWebSubscription == true else { return nil }
+        return "Your subscription is managed on tabmail.ai, so it can't be changed in this app. For help, contact support."
     }
 
     /// Determine if this product is the user's current active plan.
