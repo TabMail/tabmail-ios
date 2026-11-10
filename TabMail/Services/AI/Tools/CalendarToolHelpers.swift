@@ -627,6 +627,9 @@ enum CalendarToolHelpers {
             if let desc = event.description, !desc.trimmingCharacters(in: .whitespaces).isEmpty {
                 lines.append("description: \(desc)")
             }
+            if let conferenceUrl = event.conferenceUrl, !conferenceUrl.isEmpty {
+                lines.append("conference_url: \(conferenceUrl)")
+            }
 
             if let link = event.htmlLink, !link.isEmpty {
                 lines.append("link: \(link)")

@@ -263,6 +263,25 @@ struct CalendarToolHelpersFormatTests {
         #expect(output.contains("link: https://calendar.google.com/event/123"))
     }
 
+    @Test("an online meeting's join link is its own conference_url line after the description, as the add-on writes it")
+    func formatConferenceUrl() {
+        func event(conferenceUrl: String?) -> GCalEvent {
+            GCalEvent(
+                id: "evt-online", summary: "Planning", location: nil, description: "Agenda",
+                start: GCalDateTime(dateTime: "2099-03-15T10:00:00Z", date: nil, timeZone: nil),
+                end: GCalDateTime(dateTime: "2099-03-15T10:30:00Z", date: nil, timeZone: nil),
+                attendees: nil, organizer: nil, recurrence: nil, transparency: nil, status: nil,
+                htmlLink: nil, created: nil, updated: nil, conferenceUrl: conferenceUrl
+            )
+        }
+        let lines = CalendarToolHelpers.formatDetailedEvent(event(conferenceUrl: "https://meet.example.com/meet/0000000000"))
+            .components(separatedBy: "\n")
+        let description = lines.firstIndex(of: "description: Agenda")
+        let conference = lines.firstIndex(of: "conference_url: https://meet.example.com/meet/0000000000")
+        #expect(description != nil && conference == description.map { $0 + 1 }, "lines: \(lines)")
+        #expect(!CalendarToolHelpers.formatDetailedEvent(event(conferenceUrl: nil)).contains("conference_url"))
+    }
+
     @Test("Format all-day event")
     func formatAllDayEvent() {
         let event = GCalEvent(

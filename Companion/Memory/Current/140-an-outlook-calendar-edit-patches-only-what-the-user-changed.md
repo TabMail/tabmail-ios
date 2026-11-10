@@ -61,8 +61,29 @@ that aren't included in the request body maintain their previous values".
 - An occurrence edit never writes `recurrence` (an instance cannot carry a rule; Graph refuses it).
 - `fetchForEdit` keeps the Graph JSON of the read beside the `GCalEvent` (`EditSnapshot`): existing
   attendees keep their Graph type (matched by lowercased address); a new one is `required`.
-- A description edit writes the user's text as the body. For an online meeting that still replaces
-  the join block (#511, open). A split's new series is still built from the narrowed read (#512, open).
+- Every read (`listEvents`, `getEvent`, `fetchForEdit`: one `eventSelect`) selects `body` and
+  `onlineMeeting`. The description is the stored body's notes as text at full length
+  (`ExchangeCalendarProvider.notes(of:)`, `EmailFilter.htmlToPlainText` keeping spacing), never
+  `bodyPreview` (cut at 255 characters, join section rendered as text); an online meeting's notes stop
+  at its join section, and its join link is `GCalEvent.conferenceUrl`, shown to the assistant as its own
+  `conference_url:` line (the Thunderbird add-on's field name; the add-on does not fill it on read).
+  `isEmptySurfaceEvent` still reads `bodyPreview`.
+- A description edit writes the user's text as the body. For an online meeting it replaces only the
+  notes in the stored HTML body and keeps the join
+  section as stored (`onlineMeetingBody`, `GraphOnlineMeetingBody`, #511): Graph's event-update warns
+  that removing the "meeting blob" from the body turns the online meeting off. The join section is
+  recognised by the join link (`onlineMeeting.joinUrl`, as written or with `&amp;`) and the last line of
+  underscores before it; the section starts at the outermost element opening directly before that line.
+  Checked live on a Teams meeting on a work account (#555): a text body write turned the meeting off
+  (`isOnlineMeeting` false, `onlineMeetingProvider` `unknown`, `onlineMeeting` null); an HTML write that
+  changed only the notes kept it. That layout: notes, then `<div>` + three `<br>` holding
+  `<div class="me-email-text">`, which starts and ends with an `aria-hidden` div of 80 underscores, with a
+  short "Join:" link and the long `meetup-join` "System reference" link (which one `joinUrl` is was not
+  recorded; both are recognised). Graph's online-meeting samples show an older layout, also recognised.
+  A join section that is not recognised gets the description as text, as every description edit of an
+  online meeting did before #511, which turns the meeting off; the read then gives the whole body,
+  join section included, as the description.
+  A split's new series is still built from the narrowed read (#512, open).
 
 `GCalEvent` is a lossy view for the agent and the merge helpers. Never write a narrowed read back to
 the provider.

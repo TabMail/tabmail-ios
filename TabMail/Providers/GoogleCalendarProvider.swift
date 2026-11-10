@@ -1412,6 +1412,10 @@ struct GCalEvent: Codable, Sendable {
     /// the LLM-facing search output with the master's RRULE so a recurring
     /// series's UNTIL/COUNT is visible on every occurrence line.
     let recurringEventId: String?
+    /// An online meeting's join link, shown to the assistant on its own line
+    /// (`conference_url`, as the Thunderbird add-on names it) rather than inside
+    /// the description. Outlook's `onlineMeeting.joinUrl` (#511); nil elsewhere.
+    var conferenceUrl: String? = nil
 }
 
 // Convenience initializer that fills in `eventType`/`iCalUID`/`kind`/`visibility`
@@ -1434,7 +1438,8 @@ extension GCalEvent {
         htmlLink: String?,
         created: String?,
         updated: String?,
-        recurringEventId: String? = nil
+        recurringEventId: String? = nil,
+        conferenceUrl: String? = nil
     ) {
         self.init(
             id: id, summary: summary, location: location, description: description,
@@ -1442,7 +1447,7 @@ extension GCalEvent {
             recurrence: recurrence, transparency: transparency, status: status,
             htmlLink: htmlLink, created: created, updated: updated,
             eventType: nil, iCalUID: nil, kind: nil, visibility: nil,
-            recurringEventId: recurringEventId
+            recurringEventId: recurringEventId, conferenceUrl: conferenceUrl
         )
     }
 }
