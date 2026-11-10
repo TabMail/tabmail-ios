@@ -307,5 +307,5 @@ provider to prove the corpus renders unchanged.
 Required reading before any such work: this record, `IOS-UI-004`, `IOS-PRIVACY-003`, `IOS-PRIVACY-002`,
 ADR-IOS-076, ADR-IOS-039,
 [`Companion/Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md`](../../../../Memory/Current/037-html-email-render-pipeline-autosizinghtmlview-must-stay-idempotent-adr-i.md),
-and [`MIS-IOS-011`](../../../../Mistakes/Active/MIS-IOS-011-declared-a-residual-acceptable-on-an-argument-i-never-ran.md)
+and [`MIS-IOS-011`](../../../../Archive/Mistakes/Active/MIS-IOS-011-declared-a-residual-acceptable-on-an-argument-i-never-ran.md)
 — the mistake of declaring a residual acceptable on an argument never actually run.

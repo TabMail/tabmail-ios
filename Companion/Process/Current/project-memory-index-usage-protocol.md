@@ -18,7 +18,7 @@ searchable. Nothing was summarised, merged, or dropped.
 Load only the topics your task mechanically matches.
 
 1. Build search terms from the request, named files/symbols, subsystem, provider, invariant, and likely defect class.
-2. Run `rg -ni '<terms>' PROJECT_MEMORY.md DECISIONS.md MISTAKES.md Companion/` and a code census with `rg`.
+2. Run `rg -ni '<terms>' PROJECT_MEMORY.md DECISIONS.md Companion/` and a code census with `rg`.
 3. Read each matched detailed topic, ADR, process, rule, and mistake document completely before acting.
 4. Record every required routed path in any plan, implementation brief, or review prompt.
 5. Update the relevant detail file and its index row when durable knowledge changes; do not grow this file into an unconditional archive.
