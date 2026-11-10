@@ -117,6 +117,42 @@ queued on IMAP. `MoveFolderPickerTests.gmailOmitsTheLabelsGmailKeeps` covers the
 picker, and `DraftDeletionTests` pins that an "Invalid label" body is not an
 authoritative rejection.
 
+## Local placeholder rows never reach the provider
+
+A `sent-…` row (the optimistic Sent copy of a sent message, written before sync
+lists the server's copy) or a `draft-…` row (a draft the server has not saved
+yet) has no address on a server.
+`TabMailTests/Services/PlaceholderActionAdmissionTests.swift` runs these producers
+of a message action (the agent's delete, a user move, mark unread, flag, applying
+and removing a label from the label menu, removing a label from the row, and the
+reply and forward flags set when a reply or forward finishes sending) on Gmail,
+Outlook and IMAP. Mark read and undo move go through the same admission check but have no case here.
+On a placeholder alone, each action queues nothing and changes nothing locally,
+and the agent's delete reports the row pending; the same action on a real row
+queues an op for it. For the actions that take several rows, a placeholder and a
+real message together reach the provider with only the real id, and the
+placeholder row stays as it was.
+
+An open message shows what was stored. When a read toggle from the message view
+(the focused message, or a message in its thread) is refused for a placeholder,
+the view returns to the stored row; on a real row it keeps the toggled state.
+
+The same file covers what happens once a draft save lands. On Gmail, Outlook and
+IMAP the row takes the server's id, its search entry moves to that id, and an
+agent delete reaches that id. A Gmail
+save that returns no contained message id leaves the placeholder, which an agent
+delete reports pending. An Outlook re-save onto a server row the Drafts sync had
+already listed drops the placeholder row, its cached body and its search entry,
+and an agent delete reaches the server id. When the re-keyed row cannot be
+written, the draft records no server copy (the save and the re-key are one
+write), and the retry lands both.
+
+On the demo account the mailbox is the local database and nothing ever replaces
+a placeholder, so `DemoProvider` is the one provider that can act on one
+(`EmailProvider.placeholderIdsAreAddressable`). With the real `DemoProvider`, the
+Sent copy of a demo send can be marked unread, flagged and deleted, and a saved
+demo draft's row can be deleted.
+
 ## Server-draft dismissal UI
 
 `TabMailScreenshots/ServerDraftCloseUITests.swift` runs in the existing
