@@ -527,7 +527,8 @@ struct ActionConfirmationCard: View {
     /// user can verify the zone before accepting (especially when the agent
     /// silently fell back to device local).
     private func eventTimezoneLabel(_ event: AgentToolRouter.ActionConfirmation.CalendarEventDetail) -> String {
-        let tz: TimeZone = if let tzId = event.timeZoneId, let resolved = TimeZone(identifier: tzId) {
+        let tz: TimeZone = if let tzId = event.timeZoneId,
+                              let resolved = CalendarTimeZoneResolver.zone(named: tzId, in: .none) {
             resolved
         } else {
             .current
@@ -541,7 +542,8 @@ struct ActionConfirmationCard: View {
     private func formatEventTime(_ event: AgentToolRouter.ActionConfirmation.CalendarEventDetail) -> String {
         // The dedicated 🌐 row beneath this label carries the timezone — keep
         // the time string itself clean so we don't render the zone twice.
-        let tz: TimeZone = if let tzId = event.timeZoneId, let resolved = TimeZone(identifier: tzId) {
+        let tz: TimeZone = if let tzId = event.timeZoneId,
+                              let resolved = CalendarTimeZoneResolver.zone(named: tzId, in: .none) {
             resolved
         } else {
             .current

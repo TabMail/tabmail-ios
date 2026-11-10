@@ -175,6 +175,22 @@ struct GCalEventInputICSTests {
         #expect(ics.hasSuffix("\r\n"))
     }
 
+    @Test("toICS writes a Windows zone as its CLDR zone, with that zone's VTIMEZONE, at the same instant")
+    func windowsZoneIsWrittenAsItsIANAZone() throws {
+        var input = GCalEventInput(summary: "Planning")
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss"
+        let zone = try #require(TimeZone(identifier: "America/Los_Angeles"))
+        formatter.timeZone = zone
+        let start = try #require(formatter.date(from: "20990715T100000"))
+        input.startDateTime = start.iso8601String(timeZone: try #require(TimeZone(identifier: "UTC")))
+        input.startTimeZone = "Pacific Standard Time"
+        let lines = input.toICS(uid: "uid1").components(separatedBy: "\r\n")
+        #expect(lines.contains("DTSTART;TZID=America/Los_Angeles:20990715T100000"), "\(lines)")
+        #expect(lines.contains("TZID:America/Los_Angeles"), "\(lines)")
+    }
+
     @Test("toICS folds long lines")
     func foldsLongLines() {
         let longSummary = String(repeating: "A", count: 100)

@@ -358,8 +358,8 @@ struct CalDAVOccurrenceFrameTests {
 
     @Test("a Vancouver-declared address becomes the master's Tokyo wall clock before it is written as RECURRENCE-ID")
     func overrideIsKeyedInTheMastersFrame() throws {
-        let converted = try #require(CalDAVProvider.recurrenceIdInMasterFrame(
-            "2026-05-20T09:00:00", declaredZone: vancouver, kind: .zoned("Asia/Tokyo")))
+        let converted = try #require(try CalDAVProvider.recurrenceIdInMasterFrame(
+            "2026-05-20T09:00:00", declaredZone: vancouver, kind: .zoned("Asia/Tokyo"), zones: .none))
         #expect(converted == "2026-05-21T01:00:00",
                 "got '\(converted)'. Writing the declared wall clock verbatim under TZID=Asia/Tokyo keys the override to 2026-05-20 01:00 Tokyo — a wall clock no occurrence of this series has, so the user's edit lands on an orphan VEVENT (or, if it collides, on a DIFFERENT occurrence).")
 
@@ -376,24 +376,37 @@ struct CalDAVOccurrenceFrameTests {
 
     @Test("identity when the declared zone IS the master's zone — the single-timezone user sees no change")
     func identityWhenTheDeclaredZoneIsTheMastersZone() throws {
-        let same = try #require(CalDAVProvider.recurrenceIdInMasterFrame(
-            "2026-05-20T09:00:00", declaredZone: tokyo, kind: .zoned("Asia/Tokyo")))
+        let same = try #require(try CalDAVProvider.recurrenceIdInMasterFrame(
+            "2026-05-20T09:00:00", declaredZone: tokyo, kind: .zoned("Asia/Tokyo"), zones: .none))
         #expect(same == "2026-05-20T09:00:00")
     }
 
     @Test("an all-day master's RECURRENCE-ID is never offset-shifted")
     func allDayIsNeverShifted() throws {
-        let allDay = try #require(CalDAVProvider.recurrenceIdInMasterFrame(
-            "2026-05-20T00:00:00", declaredZone: tokyo, kind: .allDay))
+        let allDay = try #require(try CalDAVProvider.recurrenceIdInMasterFrame(
+            "2026-05-20T00:00:00", declaredZone: tokyo, kind: .allDay, zones: .none))
         #expect(allDay == "2026-05-20T00:00:00",
                 "a DATE has no zone; shifting it by an offset moves the override onto the adjacent day's occurrence")
     }
 
-    @Test("an unresolvable master TZID refuses rather than falling back to the raw digits")
+    @Test("an unrecognized master TZID refuses, naming the zone, rather than falling back to the raw digits")
     func unknownMasterZoneFailsClosed() {
-        #expect(CalDAVProvider.recurrenceIdInMasterFrame(
-            "2026-05-20T09:00:00", declaredZone: vancouver, kind: .zoned("Pacific Standard Time")) == nil,
-                "falling back to the raw digits IS the pre-fix defect — it writes a plausible-looking RECURRENCE-ID for a wall clock we never established")
+        // Falling back to the raw digits IS the pre-fix defect: it writes a plausible-looking
+        // RECURRENCE-ID for a wall clock we never established.
+        #expect {
+            _ = try CalDAVProvider.recurrenceIdInMasterFrame(
+                "2099-05-20T09:00:00", declaredZone: vancouver, kind: .zoned("Customized Time Zone"), zones: .none)
+        } throws: { error in
+            guard case CalendarProviderError.notSupported(let reason) = error else { return false }
+            return reason.contains("\"Customized Time Zone\"")
+        }
+    }
+
+    @Test("a Windows-named master TZID is re-expressed like its CLDR zone")
+    func windowsMasterZoneIsRecognized() throws {
+        let windows = try #require(try CalDAVProvider.recurrenceIdInMasterFrame(
+            "2099-05-20T09:00:00", declaredZone: vancouver, kind: .zoned("Tokyo Standard Time"), zones: .none))
+        #expect(windows == "2099-05-21T01:00:00", "got '\(windows)'")
     }
 }
 

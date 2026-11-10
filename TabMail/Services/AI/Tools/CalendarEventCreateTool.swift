@@ -26,7 +26,18 @@ struct CalendarEventCreateTool: AgentTool, Sendable {
         let startIso = CalendarToolHelpers.stringArg(arguments, "start_iso")
         let endIso = CalendarToolHelpers.stringArg(arguments, "end_iso")
         let allDay = CalendarToolHelpers.boolArg(arguments, "all_day")
-        let tz = CalendarToolHelpers.resolveTimeZone(arguments)
+        // A `timezone` TabMail does not recognize is refused here, before the card, rather than
+        // read as the device's zone (which would create the event at the wrong time).
+        let tz: TimeZone
+        do {
+            tz = try CalendarToolHelpers.resolveWriteTimeZone(arguments, consequence: "it did not create the event")
+        } catch CalendarProviderError.notSupported(let reason) {
+            return ToolJSON.string(from: [
+                "ok": false,
+                "error": "calendar_event_create failed: \(reason) The event was NOT created. Name the zone by its IANA name (e.g. 'America/Los_Angeles') and call calendar_event_create again.",
+                "event_title": title.isEmpty ? "(No title)" : title,
+            ])
+        }
 
         // Resolve start date
         let startDate: Date

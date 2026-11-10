@@ -85,7 +85,7 @@ struct ICSValueTypeTests {
     // MARK: CalDAVProvider's resource readers
 
     @Test("the CalDAV resource readers treat VALUE=DATE-TIME as timed")
-    func providerReadersTreatDateTimeAsTimed() {
+    func providerReadersTreatDateTimeAsTimed() throws {
         let utc = Self.calendar("DTSTART;VALUE=DATE-TIME:20990305T100000Z", "DTEND;VALUE=DATE-TIME:20990305T110000Z")
         #expect(!CalDAVProvider.icsIsAllDay(utc))
         #expect(CalDAVProvider.masterDTStartKind(from: utc) == .utc)
@@ -93,9 +93,9 @@ struct ICSValueTypeTests {
                                   "DTEND;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990305T030000")
         #expect(!CalDAVProvider.icsIsAllDay(zoned))
         #expect(CalDAVProvider.masterDTStartKind(from: zoned) == .zoned("America/Los_Angeles"))
-        #expect(CalDAVProvider.parseICSDateTime("DTSTART;VALUE=DATE-TIME:20990305T100000Z") == Self.tenUTC)
+        #expect(try CalDAVProvider.parseICSDateTime("DTSTART;VALUE=DATE-TIME:20990305T100000Z", zones: .none) == Self.tenUTC)
         // 02:00 in Los Angeles on 2099-03-05 (before the March change, UTC-8) is 10:00 UTC.
-        #expect(CalDAVProvider.parseICSDateTime("DTSTART;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990305T020000")
+        #expect(try CalDAVProvider.parseICSDateTime("DTSTART;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990305T020000", zones: .none)
                 == Self.tenUTC)
     }
 
@@ -108,7 +108,7 @@ struct ICSValueTypeTests {
             "DTEND;VALUE=DATE-TIME;TZID=America/Los_Angeles:20990302T113000",
             "RRULE:FREQ=WEEKLY", "SUMMARY:Review", "END:VEVENT", "END:VCALENDAR",
         ].joined(separator: "\r\n")
-        #expect(CalDAVProvider.extractMasterDuration(from: master) == TimeInterval(90 * 60))
+        #expect(try CalDAVProvider.extractMasterDuration(from: master) == TimeInterval(90 * 60))
         // An empty patch: the new part's start and end are the copy's own, so its end is the one
         // the copy wrote and no later merge rewrites it.
         let split = try CalDAVProvider.seriesSplitResources(
@@ -125,7 +125,7 @@ struct ICSValueTypeTests {
     }
 
     @Test("the CalDAV resource readers still treat VALUE=DATE as a day")
-    func providerReadersTreatDateAsDay() {
+    func providerReadersTreatDateAsDay() throws {
         let ics = Self.calendar("DTSTART;VALUE=DATE:20990305", "DTEND;VALUE=DATE:20990306")
         #expect(CalDAVProvider.icsIsAllDay(ics))
         #expect(CalDAVProvider.masterDTStartKind(from: ics) == .allDay)
@@ -134,7 +134,7 @@ struct ICSValueTypeTests {
         #expect(CalDAVProvider.masterDTStartKind(from: lower) == .allDay)
         var utc = Calendar(identifier: .gregorian)
         utc.timeZone = TimeZone(identifier: "UTC")!
-        #expect(CalDAVProvider.parseICSDateTime("DTSTART;VALUE=DATE:20990305")
+        #expect(try CalDAVProvider.parseICSDateTime("DTSTART;VALUE=DATE:20990305", zones: .none)
                 == utc.date(from: DateComponents(year: 2099, month: 3, day: 5)))
     }
 }

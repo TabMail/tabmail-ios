@@ -536,7 +536,7 @@ struct ICSBuilderParsingCoverageTests {
         """
         let invite = ICSBuilder.parseIncoming(ics)
         #expect(invite != nil)
-        // mapWindowsTimezone returns nil for unknown, falls back to .current
+        // An unrecognized zone is read in the device zone: a read never refuses.
         #expect(invite?.startDate != nil)
     }
 

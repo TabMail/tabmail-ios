@@ -951,7 +951,10 @@ extension AccountManager {
             // The frame was present on both ends the entire time and was simply
             // never carried across — the calendar instance of THE ADDRESS PROBLEM.
             // Resolving it here, once, is what lets every provider agree.
-            let recurrenceIdZone = CalendarToolHelpers.resolveTimeZone(resolvedArgs)
+            // A `timezone` the resolver does not recognize was already refused by
+            // `buildGCalEventInput` above, through the same function.
+            let recurrenceIdZone = try CalendarToolHelpers.resolveWriteTimeZone(
+                resolvedArgs, consequence: "it did not change the event")
 
             switch scope {
             case "this_only":

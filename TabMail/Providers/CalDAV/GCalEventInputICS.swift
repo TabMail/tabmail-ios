@@ -100,14 +100,19 @@ extension GCalEventInput {
 
         // Emit a timed DTSTART/DTEND: use `TZID=` + a registered VTIMEZONE when
         // the zone is resolvable, otherwise a UTC `Z` time (needs no VTIMEZONE).
+        // The TZID written is the resolved zone's identifier, the one its
+        // VTIMEZONE is generated under. (The tools hand this a zone the
+        // resolver already recognized; an assistant `timezone` it does not
+        // recognize is refused before the create is queued.)
         func appendTimed(property: String, iso: String, tzid: String?) {
             guard let date = parseRFC3339(iso) else { return }
-            if let tzid, !tzid.isEmpty, let tz = TimeZone(identifier: tzid) {
-                if vtimezones[tzid] == nil, let block = VTimeZoneBuilder.vtimezone(for: tz) {
-                    vtimezones[tzid] = block
+            if let tzid, !tzid.isEmpty, let tz = CalendarTimeZoneResolver.zone(named: tzid, in: .none) {
+                let written = tz.identifier
+                if vtimezones[written] == nil, let block = VTimeZoneBuilder.vtimezone(for: tz) {
+                    vtimezones[written] = block
                 }
-                if vtimezones[tzid] != nil {
-                    lines.append("\(property);TZID=\(tzid):\(formatLocal(date, timeZone: tzid))")
+                if vtimezones[written] != nil {
+                    lines.append("\(property);TZID=\(written):\(formatLocal(date, timeZone: tz))")
                     return
                 }
             }
@@ -169,10 +174,10 @@ extension GCalEventInput {
         return fmt.string(from: date)
     }
 
-    private func formatLocal(_ date: Date, timeZone tz: String) -> String {
+    private func formatLocal(_ date: Date, timeZone tz: TimeZone) -> String {
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyyMMdd'T'HHmmss"
-        fmt.timeZone = TimeZone(identifier: tz) ?? .current
+        fmt.timeZone = tz
         return fmt.string(from: date)
     }
 

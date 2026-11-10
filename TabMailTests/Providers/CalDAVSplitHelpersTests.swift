@@ -229,9 +229,9 @@ struct CalDAVRecurringHelpersTests {
     // MARK: - TZID + duration extraction (regression coverage)
 
     @Test("parseICSDateTime parses TZID-qualified DTSTART in the named timezone")
-    func parseICSDateTimeTZID() {
+    func parseICSDateTimeTZID() throws {
         let line = "DTSTART;TZID=America/Los_Angeles:20260520T170000"
-        let date = CalDAVProvider.parseICSDateTime(line)
+        let date = try CalDAVProvider.parseICSDateTime(line, zones: .none)
         #expect(date != nil)
         // 5pm PT on 2026-05-20 — PT is UTC-7 (PDT). Spot-check the UTC instant
         // by reading back in UTC.
@@ -244,9 +244,9 @@ struct CalDAVRecurringHelpersTests {
     }
 
     @Test("parseICSDateTime parses zulu (Z) DTSTART as UTC")
-    func parseICSDateTimeUTC() {
+    func parseICSDateTimeUTC() throws {
         let line = "DTSTART:20260520T170000Z"
-        let date = CalDAVProvider.parseICSDateTime(line)
+        let date = try CalDAVProvider.parseICSDateTime(line, zones: .none)
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd'T'HH:mm:ssXXX"
         fmt.timeZone = TimeZone(identifier: "UTC")
@@ -255,20 +255,20 @@ struct CalDAVRecurringHelpersTests {
     }
 
     @Test("parseICSDateTime parses date-only all-day forms")
-    func parseICSDateTimeDateOnly() {
-        #expect(CalDAVProvider.parseICSDateTime("DTSTART;VALUE=DATE:20260520") != nil)
-        #expect(CalDAVProvider.parseICSDateTime("DTSTART:20260520") != nil)
+    func parseICSDateTimeDateOnly() throws {
+        #expect(try CalDAVProvider.parseICSDateTime("DTSTART;VALUE=DATE:20990520", zones: .none) != nil)
+        #expect(try CalDAVProvider.parseICSDateTime("DTSTART:20990520", zones: .none) != nil)
     }
 
     @Test("extractMasterDuration is correct when DTSTART/DTEND share a TZID")
-    func extractMasterDurationTZID() {
+    func extractMasterDurationTZID() throws {
         let ics = """
         BEGIN:VEVENT
         DTSTART;TZID=America/Los_Angeles:20260520T170000
         DTEND;TZID=America/Los_Angeles:20260520T174500
         END:VEVENT
         """.replacingOccurrences(of: "\n", with: "\r\n")
-        let d = CalDAVProvider.extractMasterDuration(from: ics)
+        let d = try CalDAVProvider.extractMasterDuration(from: ics)
         #expect(d == TimeInterval(45 * 60))
     }
 
@@ -302,50 +302,50 @@ struct CalDAVRecurringHelpersTests {
     }
 
     @Test("extractMasterDuration reads the DTSTART + DURATION form (RFC 5545 §3.6.1)")
-    func extractMasterDurationFromDurationProperty() {
+    func extractMasterDurationFromDurationProperty() throws {
         // DTEND and DURATION are ALTERNATIVES in RFC 5545 §3.6.1, and plenty of
         // clients emit the second. Reading DTEND only returned nil here, which
         // made an ordinary recurring master unsplittable.
         let start = icsZulu(Date())
-        #expect(CalDAVProvider.extractMasterDuration(
+        #expect(try CalDAVProvider.extractMasterDuration(
             from: durationOnlyMaster(duration: "PT1H30M", start: start)) == TimeInterval(90 * 60))
-        #expect(CalDAVProvider.extractMasterDuration(
+        #expect(try CalDAVProvider.extractMasterDuration(
             from: durationOnlyMaster(duration: "PT45M", start: start)) == TimeInterval(45 * 60))
-        #expect(CalDAVProvider.extractMasterDuration(
+        #expect(try CalDAVProvider.extractMasterDuration(
             from: durationOnlyMaster(duration: "P1D", start: start)) == TimeInterval(86400))
     }
 
     @Test("extractMasterDuration still returns nil for an unparseable or non-positive DURATION")
-    func extractMasterDurationRejectsBadDuration() {
+    func extractMasterDurationRejectsBadDuration() throws {
         // ⚠️ THE NEGATIVE CASE. The mirror image of the fix above is inventing a
         // duration from garbage — a new series of the wrong length is a silent
         // wrong-data write, which is worse than the refusal.
         let start = icsZulu(Date())
-        #expect(CalDAVProvider.extractMasterDuration(
+        #expect(try CalDAVProvider.extractMasterDuration(
             from: durationOnlyMaster(duration: "1H30M", start: start)) == nil)   // no leading P
-        #expect(CalDAVProvider.extractMasterDuration(
+        #expect(try CalDAVProvider.extractMasterDuration(
             from: durationOnlyMaster(duration: "PT0S", start: start)) == nil)    // zero length
-        #expect(CalDAVProvider.extractMasterDuration(
+        #expect(try CalDAVProvider.extractMasterDuration(
             from: durationOnlyMaster(duration: "", start: start)) == nil)
     }
 
     @Test("with neither DTEND nor DURATION an all-day series lasts one day and a timed one is refused")
-    func extractMasterDurationImpliedEnd() {
+    func extractMasterDurationImpliedEnd() throws {
         func master(_ dtstart: String) -> String {
             ["BEGIN:VCALENDAR", "VERSION:2.0", "BEGIN:VEVENT", "UID:series-1", dtstart,
              "RRULE:FREQ=WEEKLY", "END:VEVENT", "END:VCALENDAR"].joined(separator: "\r\n") + "\r\n"
         }
-        #expect(CalDAVProvider.extractMasterDuration(from: master("DTSTART;VALUE=DATE:20990506")) == TimeInterval(86400))
-        #expect(CalDAVProvider.extractMasterDuration(from: master("DTSTART:20990506")) == TimeInterval(86400))
+        #expect(try CalDAVProvider.extractMasterDuration(from: master("DTSTART;VALUE=DATE:20990506")) == TimeInterval(86400))
+        #expect(try CalDAVProvider.extractMasterDuration(from: master("DTSTART:20990506")) == TimeInterval(86400))
         // A timed start with no end lasts no time (RFC 5545 §3.6.1): not a length a split can copy.
-        #expect(CalDAVProvider.extractMasterDuration(from: master("DTSTART:20990506T170000Z")) == nil)
+        #expect(try CalDAVProvider.extractMasterDuration(from: master("DTSTART:20990506T170000Z")) == nil)
         // Zones at both ends of the offsets, so a start read in the device's zone can't pass on any runner.
-        #expect(CalDAVProvider.extractMasterDuration(from: master("DTSTART;TZID=Pacific/Kiritimati:20990506T170000")) == nil)
-        #expect(CalDAVProvider.extractMasterDuration(from: master("DTSTART;TZID=Pacific/Pago_Pago:20990506T170000")) == nil)
+        #expect(try CalDAVProvider.extractMasterDuration(from: master("DTSTART;TZID=Pacific/Kiritimati:20990506T170000")) == nil)
+        #expect(try CalDAVProvider.extractMasterDuration(from: master("DTSTART;TZID=Pacific/Pago_Pago:20990506T170000")) == nil)
         // An end that is there but can't be read is still refused, not replaced by the implied one.
         let unreadableEnd = master("DTSTART;VALUE=DATE:20990506").replacingOccurrences(
             of: "RRULE:FREQ=WEEKLY", with: "DTEND;VALUE=DATE:2099MAY7\r\nRRULE:FREQ=WEEKLY")
-        #expect(CalDAVProvider.extractMasterDuration(from: unreadableEnd) == nil)
+        #expect(try CalDAVProvider.extractMasterDuration(from: unreadableEnd) == nil)
     }
 
     @Test("the implied end of a VEVENT with no DTEND and no DURATION, in the start's own form")
@@ -362,7 +362,7 @@ struct CalDAVRecurringHelpersTests {
     }
 
     @Test("DTEND wins over DURATION on a non-conforming master that carries both")
-    func extractMasterDurationPrefersDTEND() {
+    func extractMasterDurationPrefersDTEND() throws {
         // RFC 5545 forbids both in one VEVENT. If a server sends both anyway,
         // the pre-existing DTEND reading must not silently change meaning.
         let now = Date()
@@ -376,11 +376,11 @@ struct CalDAVRecurringHelpersTests {
             "END:VEVENT",
             "END:VCALENDAR",
         ].joined(separator: "\r\n") + "\r\n"
-        #expect(CalDAVProvider.extractMasterDuration(from: ics) == TimeInterval(15 * 60))
+        #expect(try CalDAVProvider.extractMasterDuration(from: ics) == TimeInterval(15 * 60))
     }
 
     @Test("The DURATION arm stays scoped to the master VEVENT, ignoring VTIMEZONE and override blocks")
-    func extractMasterDurationDurationIsVEventScoped() {
+    func extractMasterDurationDurationIsVEventScoped() throws {
         // The scoping this function already had must survive the new arm: a
         // VTIMEZONE's own DTSTART lines and an override VEVENT's DURATION must
         // both be invisible.
@@ -408,12 +408,12 @@ struct CalDAVRecurringHelpersTests {
             "END:VEVENT",
             "END:VCALENDAR",
         ].joined(separator: "\r\n") + "\r\n"
-        #expect(CalDAVProvider.extractMasterDuration(from: ics) == TimeInterval(30 * 60),
+        #expect(try CalDAVProvider.extractMasterDuration(from: ics) == TimeInterval(30 * 60),
                 "the override's PT8H or the VTIMEZONE's DTSTART leaked into the master's duration")
     }
 
     @Test("VEVENT-scoped extractors ignore a leading VTIMEZONE block (RRULE/DTSTART/UID/duration)")
-    func extractorsIgnoreVTimezone() {
+    func extractorsIgnoreVTimezone() throws {
         // A real CalDAV .ics resource leads with a VTIMEZONE whose
         // STANDARD/DAYLIGHT subcomponents have their OWN DTSTART + RRULE (the
         // timezone's DST rule). A naive "first RRULE/DTSTART" scan would grab
@@ -457,7 +457,7 @@ struct CalDAVRecurringHelpersTests {
         // split counts the series' occurrences from the series' own start.
         #expect(CalDAVProvider.masterDTStartDay(from: ics) == RecurrenceTail.Day(year: 2026, month: 5, day: 13))
         // Duration: 45 min from the EVENT's DTSTART/DTEND, not the timezone's.
-        #expect(CalDAVProvider.extractMasterDuration(from: ics) == TimeInterval(45 * 60))
+        #expect(try CalDAVProvider.extractMasterDuration(from: ics) == TimeInterval(45 * 60))
     }
 
     @Test("masterVEventLines picks the VEVENT with no RECURRENCE-ID, skipping override blocks")
@@ -519,32 +519,45 @@ struct CalDAVRecurringHelpersTests {
         #expect(!CalDAVProvider.recurrenceIdsMatch("20260520", "2026-05-20T00:00:00"))
     }
 
-    @Test("parseICSDateTime refuses to guess on an unresolvable TZID — returns nil, no device-tz fallback")
-    func parseICSDateTimeUnknownTZID() {
-        // Windows-style TZID names (common from Outlook .ics exports) are not
-        // IANA identifiers; TimeZone(identifier:) returns nil for them. We must
-        // NOT silently reinterpret in the device tz — that would corrupt the
-        // absolute instant (and thus extractMasterDuration). Expect nil.
-        let line = "DTSTART;TZID=Central European Standard Time:20260520T170000"
-        #expect(CalDAVProvider.parseICSDateTime(line) == nil)
+    @Test("parseICSDateTime refuses an unrecognized TZID by naming it, never reading it in the device zone")
+    func parseICSDateTimeUnknownTZID() throws {
+        // A TZID TabMail does not recognize must NOT be reinterpreted in the
+        // device zone: that would corrupt the absolute instant (and thus
+        // extractMasterDuration) of a write. It is refused, naming the zone.
+        let line = "DTSTART;TZID=Customized Time Zone:20990520T170000"
+        #expect {
+            _ = try CalDAVProvider.parseICSDateTime(line, zones: .none)
+        } throws: { error in
+            guard case CalendarProviderError.notSupported(let reason) = error else { return false }
+            return reason.contains("\"Customized Time Zone\"")
+        }
+        // A Windows zone name (common in Outlook exports) is recognized, at the
+        // same instant as its CLDR zone.
+        #expect(try CalDAVProvider.parseICSDateTime("DTSTART;TZID=Central European Standard Time:20990520T170000", zones: .none)
+                == CalDAVProvider.parseICSDateTime("DTSTART;TZID=Europe/Warsaw:20990520T170000", zones: .none))
         // A recognized IANA TZID still parses fine.
-        #expect(CalDAVProvider.parseICSDateTime("DTSTART;TZID=America/Los_Angeles:20260520T170000") != nil)
+        #expect(try CalDAVProvider.parseICSDateTime("DTSTART;TZID=America/Los_Angeles:20990520T170000", zones: .none) != nil)
         // Floating time (no TZID) still parses (device-local interpretation).
-        #expect(CalDAVProvider.parseICSDateTime("DTSTART:20260520T170000") != nil)
+        #expect(try CalDAVProvider.parseICSDateTime("DTSTART:20990520T170000", zones: .none) != nil)
     }
 
-    @Test("extractMasterDuration returns nil when one DTSTART/DTEND line has an unresolvable TZID")
-    func extractMasterDurationUnknownTZID() {
-        // If either endpoint can't be parsed (unknown TZID), the duration is
-        // unrecoverable — return nil so the split fails fast rather
-        // than producing a series with a wrong-length duration.
+    @Test("extractMasterDuration refuses when one DTSTART/DTEND line has an unrecognized TZID")
+    func extractMasterDurationUnknownTZID() throws {
+        // If either endpoint can't be read (unrecognized TZID), the duration is
+        // unrecoverable: the split is refused, naming the zone, rather than
+        // producing a series with a wrong-length duration.
         let ics = """
         BEGIN:VEVENT
-        DTSTART;TZID=Central European Standard Time:20260520T140000
+        DTSTART;TZID=Customized Time Zone:20990520T140000
         DTEND;TZID=America/Los_Angeles:20260520T150000
         END:VEVENT
         """.replacingOccurrences(of: "\n", with: "\r\n")
-        #expect(CalDAVProvider.extractMasterDuration(from: ics) == nil)
+        #expect {
+            _ = try CalDAVProvider.extractMasterDuration(from: ics)
+        } throws: { error in
+            guard case CalendarProviderError.notSupported(let reason) = error else { return false }
+            return reason.contains("\"Customized Time Zone\"")
+        }
     }
 
     @Test("icsIsAllDay detects VALUE=DATE and bare 8-digit DTSTART forms")
@@ -564,13 +577,13 @@ struct CalDAVRecurringHelpersTests {
     }
 
     @Test("extractMasterDuration returns nil when DTSTART/DTEND missing or malformed")
-    func extractMasterDurationMissing() {
+    func extractMasterDurationMissing() throws {
         let ics = """
         BEGIN:VEVENT
         SUMMARY:Nothing here
         END:VEVENT
         """.replacingOccurrences(of: "\n", with: "\r\n")
-        #expect(CalDAVProvider.extractMasterDuration(from: ics) == nil)
+        #expect(try CalDAVProvider.extractMasterDuration(from: ics) == nil)
     }
 }
 
@@ -812,7 +825,7 @@ final class FakeCalDAVStore: Sendable {
 /// file. ONE fixture, deliberately: the rollback suite and the precondition
 /// suite must exercise the same master resource and the same provider wiring,
 /// or a change to one silently stops covering the other.
-private enum CalDAVWireFixture {
+enum CalDAVWireFixture {
 
     static let calendarHome = URL(string: "https://caldav.example.com/cal/")!
     static let calendarId = "/cal/"
@@ -1512,8 +1525,8 @@ struct CalDAVSplitBoundaryInstantTests {
         )
         let kind = CalDAVProvider.masterDTStartKind(from: masterICS)
         let masterFrameId = try #require(
-            CalDAVProvider.recurrenceIdInMasterFrame(
-                recurrenceId, declaredZone: declared, kind: kind),
+            try CalDAVProvider.recurrenceIdInMasterFrame(
+                recurrenceId, declaredZone: declared, kind: kind, zones: CalendarTimeZoneContext(calendarText: masterICS)),
             "the recurrence_id must be expressible in the master's frame"
         )
         let resources = try CalDAVProvider.seriesSplitResources(
@@ -1532,7 +1545,7 @@ struct CalDAVSplitBoundaryInstantTests {
             CalDAVProvider.masterTopLevelLines(newPart).first { $0.hasPrefix("DTSTART") },
             "the new part must carry a start")
         if line.contains("TZID=") || line.hasSuffix("Z") {
-            return try #require(CalDAVProvider.parseICSDateTime(line), "unparseable start '\(line)'")
+            return try #require(try CalDAVProvider.parseICSDateTime(line, zones: .none), "unparseable start '\(line)'")
         }
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -1606,8 +1619,8 @@ struct CalDAVSplitBoundaryInstantTests {
             #expect(until == "20260526",
                     "an all-day cap moved with the declared zone \(declared.identifier): got '\(until)'")
             let masterFrameId = try #require(
-                CalDAVProvider.recurrenceIdInMasterFrame(
-                    "2026-05-27T00:00:00", declaredZone: declared, kind: .allDay))
+                try CalDAVProvider.recurrenceIdInMasterFrame(
+                    "2026-05-27T00:00:00", declaredZone: declared, kind: .allDay, zones: CalendarTimeZoneContext(calendarText: ics)))
             let resources = try CalDAVProvider.seriesSplitResources(
                 storedICS: ics, slotNaiveISO: masterFrameId,
                 cappedRRule: "RRULE:FREQ=WEEKLY;UNTIL=\(until)", newRRule: "RRULE:FREQ=WEEKLY",

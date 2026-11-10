@@ -13,6 +13,8 @@ enum ICSParser {
     /// `resourceHref` is used as the event ID (for CalDAV GET/PUT/DELETE operations).
     /// `etag` is stored for conflict detection on updates.
     static func parse(icsText: String, resourceHref: String, etag: String?) -> [GCalEvent] {
+        // What the resource's VTIMEZONE components say about its zone names, read once for all its events.
+        let zones = CalendarTimeZoneContext(calendarText: icsText)
         let unfolded = unfold(icsText)
         let lines = unfolded.components(separatedBy: .newlines)
 
@@ -29,7 +31,7 @@ enum ICSParser {
             }
             if trimmed == "END:VEVENT" {
                 inEvent = false
-                if let event = parseVEvent(lines: eventLines, resourceHref: resourceHref, etag: etag) {
+                if let event = parseVEvent(lines: eventLines, resourceHref: resourceHref, etag: etag, zones: zones) {
                     events.append(event)
                 }
                 continue
@@ -55,7 +57,8 @@ enum ICSParser {
 
     // MARK: - Private
 
-    private static func parseVEvent(lines: [String], resourceHref: String, etag: String?) -> GCalEvent? {
+    /// `zones` is the zone context of the resource the event is in.
+    private static func parseVEvent(lines: [String], resourceHref: String, etag: String?, zones: CalendarTimeZoneContext) -> GCalEvent? {
         var summary = ""
         var location: String?
         var description: String?
@@ -129,8 +132,8 @@ enum ICSParser {
         let isAllDay = dtstartParams.map { ICSValueType.statesDate($0) } == true
             || (dtstart.map { $0.count == 8 } ?? false)
 
-        let startDate = dtstart.flatMap { parseICSDate($0, params: dtstartParams) }
-        var endDate = dtend.flatMap { parseICSDate($0, params: dtendParams) }
+        let startDate = dtstart.flatMap { parseICSDate($0, params: dtstartParams, zones: zones) }
+        var endDate = dtend.flatMap { parseICSDate($0, params: dtendParams, zones: zones) }
 
         // Compute end from duration if DTEND not present
         if endDate == nil, let dur = duration, let start = startDate {
@@ -274,7 +277,7 @@ enum ICSParser {
         return nil
     }
 
-    private static func parseICSDate(_ value: String, params: String?) -> Date? {
+    private static func parseICSDate(_ value: String, params: String?, zones: CalendarTimeZoneContext) -> Date? {
         let cleaned = value.trimmingCharacters(in: .whitespaces)
         let fmt = DateFormatter()
         fmt.locale = Locale(identifier: "en_US_POSIX")
@@ -291,7 +294,11 @@ enum ICSParser {
         }
         fmt.dateFormat = "yyyyMMdd'T'HHmmss"
         if let params, let tzid = extractTZID(params) {
-            fmt.timeZone = TimeZone(identifier: tzid) ?? .current
+            // A read never refuses. A zone the resolver does not recognize (one a VTIMEZONE defines
+            // only by its rules, say) is read in the device's zone, so the event is still shown; that
+            // reading is wrong whenever the two zones differ. Writes of such an event are refused
+            // instead (`CalDAVProvider.zone(forTZID:zones:)`).
+            fmt.timeZone = CalendarTimeZoneResolver.zone(named: tzid, in: zones) ?? .current
         } else {
             fmt.timeZone = .current
         }
@@ -299,7 +306,8 @@ enum ICSParser {
     }
 
     private static func icsDateToRFC3339(_ icsDate: String) -> String? {
-        guard let date = parseICSDate(icsDate, params: nil) else { return nil }
+        // No parameters, so no zone name to read.
+        guard let date = parseICSDate(icsDate, params: nil, zones: .none) else { return nil }
         return date.iso8601String()
     }
 

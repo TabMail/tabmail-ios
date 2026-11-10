@@ -527,6 +527,37 @@ struct GoogleCalendarSplitHelpersTests {
         #expect(out2.endTimeZone == TimeZone.current.identifier)
     }
 
+    private static func tokyoEvent(recurrence: [String]?) -> GCalEvent {
+        GCalEvent(
+            id: "m1", summary: "Weekly sync", location: nil, description: nil,
+            start: GCalDateTime(dateTime: "2099-03-02T10:00:00+09:00", date: nil, timeZone: "Tokyo Standard Time"),
+            end: GCalDateTime(dateTime: "2099-03-02T11:00:00+09:00", date: nil, timeZone: "Tokyo Standard Time"),
+            attendees: nil, organizer: nil,
+            recurrence: recurrence, transparency: nil, status: "confirmed",
+            htmlLink: nil, created: nil, updated: nil
+        )
+    }
+
+    @Test("a split of a series in a Windows zone is placed on that zone's days")
+    func splitDaysInAWindowsZone() throws {
+        // 2099-03-09 18:00 UTC is 2099-03-10 03:00 in Tokyo.
+        let days = GoogleCalendarProvider.splitDaysInMasterFrame(
+            master: Self.tokyoEvent(recurrence: ["RRULE:FREQ=WEEKLY"]),
+            recurrenceId: "2099-03-09T18:00:00", recurrenceIdZone: try #require(TimeZone(identifier: "UTC")))
+        #expect(days.seriesStart == RecurrenceTail.Day(iso: "2099-03-02"))
+        #expect(days.split == RecurrenceTail.Day(iso: "2099-03-10"))
+    }
+
+    @Test("a patch that moves the start in a Windows zone writes the end in that zone")
+    func patchInAWindowsZoneKeepsTheLength() {
+        let existing = Self.tokyoEvent(recurrence: nil)
+        var moveStart = GCalEventInput()
+        moveStart.startDateTime = "2099-03-02T05:00:00Z"
+        moveStart.startTimeZone = "Tokyo Standard Time"
+        let fromStart = GoogleCalendarProvider.mergeExistingEventWithPatch(existing: existing, patch: moveStart)
+        #expect(fromStart.endDateTime == "2099-03-02T15:00:00+09:00")
+    }
+
     @Test("mergeMasterAndPatch falls back to newRecurrence when patch.recurrence is nil")
     func mergeMasterAndPatchFallsBackToDefault() {
         let master = GCalEvent(

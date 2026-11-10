@@ -10,13 +10,28 @@ enum CalendarToolHelpers {
 
     // MARK: - Timezone Resolution
 
-    /// Resolve timezone from tool arguments. Returns specified IANA timezone or device default.
+    /// Resolve the `timezone` argument for a READ (`CalendarTimeZoneResolver`: an IANA or Windows
+    /// name). With no argument, or one the resolver does not recognize, it is the device's zone; every
+    /// read output names the zone its times are in (`timezone:`), so the reading stays consistent.
+    /// A write resolves the argument with `resolveWriteTimeZone` instead.
     static func resolveTimeZone(_ arguments: [String: JSONValue]) -> TimeZone {
         if let tzId = stringArgOpt(arguments, "timezone"),
-           let tz = TimeZone(identifier: tzId) {
+           let tz = CalendarTimeZoneResolver.zone(named: tzId, in: .none) {
             return tz
         }
         return .current
+    }
+
+    /// Resolve the `timezone` argument for a WRITE: the zone the argument names, or the device's zone
+    /// when there is none. A zone the resolver does not recognize is refused (`notSupported`, naming
+    /// the zone) instead of being replaced by the device's zone, which would write every time in the
+    /// edit at the wrong instant. `consequence` says what was therefore not done.
+    static func resolveWriteTimeZone(_ arguments: [String: JSONValue], consequence: String) throws -> TimeZone {
+        guard let tzId = stringArgOpt(arguments, "timezone"), !tzId.isEmpty else { return .current }
+        guard let tz = CalendarTimeZoneResolver.zone(named: tzId, in: .none) else {
+            throw CalendarProviderError.unrecognizedTimeZone(tzId, consequence: consequence)
+        }
+        return tz
     }
 
     // MARK: - Date Range Resolution (matching TB's resolveDateRange)
@@ -782,7 +797,7 @@ enum CalendarToolHelpers {
     /// Throws `CalendarProviderError.notSupported` when a recurrence `interval` or `count` is
     /// present but is not a whole number of 1 or more (see `recurrenceNumber`).
     static func buildGCalEventInput(_ arguments: [String: JSONValue], isAllDay: Bool?) throws -> GCalEventInput {
-        let resolvedTz = resolveTimeZone(arguments)
+        let resolvedTz = try resolveWriteTimeZone(arguments, consequence: "it did not write the event")
         let tz = resolvedTz.identifier
         var input = GCalEventInput()
 
