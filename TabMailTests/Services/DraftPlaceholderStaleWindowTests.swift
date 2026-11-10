@@ -142,17 +142,35 @@ struct DraftPlaceholderStaleWindowTests {
         }
     }
 
-    @Test("A re-saved placeholder whose latest save is still queued survives the sync, then goes once the save lands")
+    /// Queued, and in flight: the drain claims a save (status `inFlight`) before
+    /// it awaits the provider, and a Drafts sync can run while it waits.
+    @Test(
+        "A re-saved placeholder whose latest save has not landed survives the sync, then goes once the save lands",
+        arguments: [PendingStatus.queued, PendingStatus.inFlight])
     @MainActor
-    func aQueuedReSavedPlaceholderSurvivesTheSync() async throws {
+    func anOutstandingReSavedPlaceholderSurvivesTheSync(saveStatus: PendingStatus) async throws {
         try await withReSavedPlaceholder(keepLatestSaveQueued: true) { scene in
-            let queued = try await scene.pool.read { db in try PendingOperation.fetchCount(db) }
-            #expect(queued == 1, "precondition: the latest save is still in the queue")
+            let ops = try await scene.pool.read { db in try PendingOperation.fetchAll(db) }
+            #expect(ops.count == 1, "precondition: the latest save is still in the queue")
+            guard ops.count == 1 else { return }
+            var save = ops[0]
+            #expect(save.type == .saveDraft)
+            #expect(save.messageIds.contains(scene.placeholderMessageId))
+            if saveStatus == .inFlight {
+                // What the drain's claim writes before it awaits the provider.
+                save.status = PendingStatus.inFlight.rawValue
+                save.everAttempted = true
+                let claimed = save
+                try await scene.pool.write { db in try claimed.update(db) }
+            }
+            let saveId = save.id
+            let stored = try await scene.pool.read { db in try PendingOperation.fetchOne(db, key: saveId) }
+            #expect(stored?.status == saveStatus.rawValue, "precondition: the save is \(saveStatus.rawValue)")
 
             try await syncDrafts(scene)
             #expect(try await placeholderCount(scene) == 1, """
                 the latest save has not reached the server, so its placeholder is the draft's \
-                only row in the Drafts list; sync must keep it while that save is queued
+                only row in the Drafts list; sync must keep it while that save is \(saveStatus.rawValue)
                 """)
 
             // The save lands with no server address.
