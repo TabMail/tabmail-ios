@@ -46,7 +46,7 @@ struct ExchangeSendPayloadTests {
             DraftMessage(to: ["alice@example.com"], subject: "Hello", body: "Hi"),
         ]
         for draft in drafts {
-            let payload = makeProvider().buildGraphSendPayload(draft: draft)
+            let payload = makeProvider().buildGraphSendPayload(draft: draft, sending: false)
             let headers = payload["internetMessageHeaders"] as? [[String: String]] ?? []
             for name in headers.map({ $0["name"] ?? "" }) {
                 #expect(name.lowercased().hasPrefix("x-"), "standard header \(name) in internetMessageHeaders")
@@ -66,7 +66,7 @@ struct ExchangeSendPayloadTests {
             to: ["alice@example.com"], subject: "Re: Hello", body: "Sure",
             inReplyTo: "parent@example.com", references: ["root@example.com", "parent@example.com"]
         )
-        let payload = makeProvider().buildGraphSendPayload(draft: draft)
+        let payload = makeProvider().buildGraphSendPayload(draft: draft, sending: false)
         #expect(header("In-Reply-To", in: payload) == "<parent@example.com>")
         #expect(header("References", in: payload) == "<root@example.com> <parent@example.com>")
     }
@@ -74,7 +74,7 @@ struct ExchangeSendPayloadTests {
     @Test("New compose emits no threading")
     func newComposeNoThreadingHeaders() {
         let draft = DraftMessage(to: ["alice@example.com"], subject: "Hello", body: "Hi")
-        let payload = makeProvider().buildGraphSendPayload(draft: draft)
+        let payload = makeProvider().buildGraphSendPayload(draft: draft, sending: false)
         #expect(payload["singleValueExtendedProperties"] == nil)
         #expect(payload["internetMessageHeaders"] == nil)
     }
@@ -85,7 +85,7 @@ struct ExchangeSendPayloadTests {
             to: ["alice@example.com"], subject: "Re: Hello", body: "Sure",
             references: ["root@example.com"]
         )
-        let payload = makeProvider().buildGraphSendPayload(draft: draft)
+        let payload = makeProvider().buildGraphSendPayload(draft: draft, sending: false)
         #expect(header("References", in: payload) == "<root@example.com>")
         #expect(header("In-Reply-To", in: payload) == nil)
     }
@@ -94,7 +94,7 @@ struct ExchangeSendPayloadTests {
     func graphSubjectRemainsSemanticText() {
         let subject = "Re: =?UTF-8?B?SGVsbG8=?= explained"
         let draft = DraftMessage(to: ["alice@example.com"], subject: subject, body: "Hi")
-        let payload = makeProvider().buildGraphSendPayload(draft: draft)
+        let payload = makeProvider().buildGraphSendPayload(draft: draft, sending: false)
         #expect(payload["subject"] as? String == subject)
     }
 
