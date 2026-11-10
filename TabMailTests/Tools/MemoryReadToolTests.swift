@@ -172,6 +172,7 @@ struct MemoryReadToolTests {
             (.int(Int.max), .int(Int.max), true),
             (.int(0), .int(Int.max), true),
             (.int(Int.min), .int(Int.max), false),
+            (.int(1), .int(Int.max), true),
           ])
     func extremeWholeNumbersAnswered(timestamp: JSONValue, tolerance: JSONValue?, findsTurn: Bool) async throws {
         let (memPool, memDir) = try await installMemoryIndex()
